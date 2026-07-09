@@ -1,0 +1,80 @@
+# context-memory
+
+`context-memory` 是一個私人 git repo，用來抵抗 **architectural knowledge vaporization**：討論當下理解得很清楚，但隔一段時間只剩關鍵字，真正的脈絡、取捨、風險與下一步都蒸發了。
+
+MVP 的核心不是做完整 PM 系統，而是讓 OpenCode 透過 skill 幫你把「當下還在腦中的 context」快速轉成可恢復的記憶檔。
+
+## 現在可以怎麼用
+
+在 repo 根目錄啟動 OpenCode：
+
+```bash
+opencode
+```
+
+常用指令：
+
+```text
+/cm-capture 剛剛跟同事討論了 xxx，關鍵字是 ...
+/cm-enrich memory/2026/07/2026-07-09-context-memory-project-vision.md
+/cm-update memory/2026/07/2026-07-09-context-memory-project-vision.md 今天決定先做 opencode skill MVP
+/cm-review
+```
+
+也可以直接對 OpenCode 說：
+
+```text
+Use the context-memory skill to capture this discussion.
+```
+
+## 資料結構
+
+```text
+.opencode/
+  skills/context-memory/SKILL.md   # OpenCode 會自動發現的 skill
+  commands/*.md                    # OpenCode slash commands
+docs/
+  methodology.md                   # 方法論
+  research-notes.md                # survey 摘要與來源
+memory/
+  INDEX.md                         # 記憶條目索引
+  YYYY/MM/YYYY-MM-DD-slug.md       # 每個 topic/item 一個檔案
+templates/
+  memory-item.md                   # 條目範本
+scripts/
+  context_memory.py                # 建立、索引、驗證記憶條目的小工具
+```
+
+## CLI
+
+建立空白 quick capture 條目：
+
+```bash
+python3 scripts/context_memory.py new --title "Payment retry strategy" --summary "Discussed retry/backoff options with Alice."
+```
+
+更新索引：
+
+```bash
+python3 scripts/context_memory.py index
+```
+
+驗證條目格式：
+
+```bash
+python3 scripts/context_memory.py validate
+```
+
+列出條目：
+
+```bash
+python3 scripts/context_memory.py list
+```
+
+## 設計原則
+
+- 快速建立階段只要求最少問題，先把易蒸發的脈絡留下。
+- 完整補充階段才補決策理由、替代方案、限制、風險、未知與恢復線索。
+- 每個 record 都應該讓「未來的你」能回答：當時為什麼這樣想？下一步是什麼？什麼情境下需要重看或推翻？
+- 用 git 版本化記憶，不急著引入資料庫或服務。
+

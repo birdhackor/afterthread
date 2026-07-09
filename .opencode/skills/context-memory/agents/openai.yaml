@@ -1,0 +1,5 @@
+interface:
+  display_name: "Context Memory"
+  short_description: "Capture durable project context"
+  default_prompt: "Use $context-memory to capture this project discussion as durable context memory."
+
