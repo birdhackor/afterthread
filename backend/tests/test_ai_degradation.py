@@ -162,6 +162,50 @@ def test_capture_end_to_end_array_of_objects_returns_502_no_rows(
     assert _total(client) == 0
 
 
+def test_capture_end_to_end_prose_wrapped_array_of_objects_returns_502_no_rows(
+    client: TestClient,
+    configure_llm: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The array-of-objects rejection above must hold even when the array is
+    wrapped in prose rather than being the model's whole answer: prose makes
+    the full-text parse fail inside the real generate_json, so this exercises
+    the candidate-scan fallback rather than the top-level-shape check --
+    proving the whole chain still rejects the array as a whole instead of the
+    fallback silently extracting and persisting just its first element.
+    """
+    configure_llm(base_url=_SECRET_URL, model="m")
+    array_json = json.dumps([_DRAFT, {**_DRAFT, "title": "second element"}], ensure_ascii=False)
+    prose = f"Here are two drafts, pick one:\n{array_json}\nLet me know!"
+    _install_client(monkeypatch, _StubClient(content=prose))
+
+    response = client.post("/api/capture", json={"raw_text": "raw discussion"})
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "llm_upstream_error"
+    assert _total(client) == 0
+
+
+def test_capture_end_to_end_prose_with_innocent_bracket_before_object_returns_201(
+    client: TestClient,
+    configure_llm: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An innocent scalar bracket ahead of the real object in prose (e.g. a
+    footnote-style "[1]") must not block the real generate_json from finding
+    the object that follows it: the candidate scan skips the scalar array and
+    the object flows through to a normal 201, one row written.
+    """
+    configure_llm(base_url=_SECRET_URL, model="m")
+    draft_json = json.dumps(_DRAFT, ensure_ascii=False)
+    prose = f"Answer[1]: {draft_json}"
+    _install_client(monkeypatch, _StubClient(content=prose))
+
+    response = client.post("/api/capture", json={"raw_text": "raw discussion"})
+    assert response.status_code == 201, response.text
+    assert response.json()["item"]["title"] == "端到端草稿"
+    assert _total(client) == 1
+
+
 def test_capture_end_to_end_empty_completion_returns_502_no_rows(
     client: TestClient,
     configure_llm: Callable[..., Settings],

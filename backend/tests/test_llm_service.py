@@ -29,6 +29,7 @@ from app.services.llm import (
     _build_client,
     _extract_json_object,
     _get_client,
+    _json_candidates,
     generate_json,
     llm_configured,
     normalized_model,
@@ -295,6 +296,23 @@ def test_generate_json_array_of_objects_raises_upstream_not_first_element(
     """
     array_content = json.dumps([{"title": "A"}, {"title": "B"}])
     _configured(monkeypatch, content=array_content)
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        asyncio.run(generate_json("system", "user"))
+    assert "WrongShape" in str(excinfo.value)
+
+
+def test_generate_json_prose_wrapped_array_raises_upstream_wrong_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prose-wrapped counterpart to the regression above: the array is
+    embedded in prose instead of being the whole completion, so the full-text
+    parse FAILS and this exercises the candidate-scan fallback inside
+    _extract_json_object instead of the top-level-shape check. It must still
+    reject the array as a whole rather than let the fallback extract and
+    return just its first element.
+    """
+    array_json = json.dumps([{"title": "A"}, {"title": "B"}])
+    _configured(monkeypatch, content=f"Sure, here you go: {array_json}")
     with pytest.raises(LLMUpstreamError) as excinfo:
         asyncio.run(generate_json("system", "user"))
     assert "WrongShape" in str(excinfo.value)
@@ -606,6 +624,32 @@ def test_extract_json_object_nested(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _extract_json_object(nested) == {"outer": {"inner": [1, 2]}, "flag": True}
 
 
+def test_json_candidates_orders_outer_array_before_nested_objects() -> None:
+    """An array's span starts before any object nested inside it (nesting
+    implies the outer bracket opens first), so ordering by start position
+    alone guarantees the outer array is the FIRST candidate considered --
+    this is what lets _extract_json_object reject the whole array before ever
+    reaching one of its own elements.
+    """
+    array_json = json.dumps([{"title": "A"}, {"title": "B"}])
+    text = f"prose {array_json} more prose"
+    candidates = _json_candidates(text)
+    assert candidates[0] == array_json
+
+
+def test_json_candidates_finds_both_bracket_types_in_order_of_appearance() -> None:
+    """A scalar array and a later object are both found, in the order they
+    appear in the text -- regardless of bracket type -- so a caller scanning
+    candidates left to right reaches the object right after the array.
+    """
+    text = f"Answer[1]: {_SAMPLE_JSON}"
+    assert _json_candidates(text) == ["[1]", _SAMPLE_JSON]
+
+
+def test_json_candidates_none_without_brackets() -> None:
+    assert _json_candidates("no brackets here at all") == []
+
+
 # --- _extract_json_object: non-object top level (finding 1) ---------------
 
 
@@ -636,6 +680,31 @@ def test_extract_json_object_prose_wrapped_still_falls_back_to_brace_slice() -> 
     assert _extract_json_object(prose) == {"title": "A"}
 
 
+def test_extract_json_object_prose_wrapped_array_raises_upstream_wrong_shape() -> None:
+    """The array-of-objects rejection must also hold when the array is
+    embedded in prose rather than being the LLM's whole answer: prose makes
+    the full-text parse FAIL, so this exercises the candidate-scan fallback,
+    not the top-level-shape check. Without this, a naive fallback would
+    extract just the array's first element and silently persist a shape the
+    caller never asked for.
+    """
+    array_json = json.dumps([{"title": "A"}, {"title": "B"}])
+    prose = f"Here are two drafts: {array_json} Take your pick!"
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        _extract_json_object(prose)
+    assert "WrongShape" in str(excinfo.value)
+
+
+def test_extract_json_object_skips_innocent_scalar_bracket_before_object() -> None:
+    """A scalar array that appears before the real object in prose (e.g. a
+    footnote-style "[1]") must not be mistaken for the answer, and must not
+    block the scan from reaching the object that follows it: it parses as a
+    list with no dict inside, so the scan skips it and keeps going.
+    """
+    prose = f"Answer[1]: {_SAMPLE_JSON} (see footnote 1 for caveats)"
+    assert _extract_json_object(prose) == _SAMPLE_OBJECT
+
+
 def test_extract_json_object_invalid_raises_upstream() -> None:
     with pytest.raises(LLMUpstreamError):
         _extract_json_object("definitely not json")
@@ -649,6 +718,42 @@ def test_extract_json_object_deeply_nested_brackets_raises_upstream() -> None:
     deep = "[" * 50000 + "]" * 50000
     with pytest.raises(LLMUpstreamError):
         _extract_json_object(deep)
+
+
+# --- candidate scan: bounded, no pathological rescans (prose-wrapped array) -
+
+
+def test_extract_json_object_bounded_with_many_unmatched_brace_opens() -> None:
+    """A long run of unmatched ``{`` with no closing ``}`` at all must not
+    trigger an O(n^2) "retry every position independently" scan: the
+    candidate scan performs one linear pass per bracket type regardless of
+    how many opens never find a match, so this must stay fast even at a size
+    where a quadratic implementation would visibly stall (tens of seconds or
+    more, versus low milliseconds here).
+    """
+    text = "{" * 30000 + " not valid json, just noise"
+    started = time.monotonic()
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        _extract_json_object(text)
+    elapsed = time.monotonic() - started
+    assert "UnparseableOutput" in str(excinfo.value)
+    assert elapsed < 2.0
+
+
+def test_extract_json_object_bounded_with_many_skippable_candidates() -> None:
+    """Many innocent scalar-array candidates ahead of the real object -- each
+    individually cheap to reject -- must not add up to quadratic work:
+    finding every candidate is two linear passes over the whole text (see
+    _json_candidates), so this must stay fast even with thousands of them
+    ahead of the object the scan is really looking for.
+    """
+    noise = "".join(f"[{i}]" for i in range(5000))
+    prose = f"{noise} {_SAMPLE_JSON}"
+    started = time.monotonic()
+    result = _extract_json_object(prose)
+    elapsed = time.monotonic() - started
+    assert result == _SAMPLE_OBJECT
+    assert elapsed < 2.0
 
 
 # --- generate_json: nonconforming-but-200 upstream bodies (finding 2) ------

@@ -252,6 +252,78 @@ def _balanced_brace_slice(text: str) -> str | None:
     return None
 
 
+def _balanced_spans(text: str, open_char: str, close_char: str) -> list[tuple[int, int]]:
+    """Return every top-level ``open_char ... close_char`` span in ``text``.
+
+    Generalizes the depth-tracking scan above (ignore the OTHER bracket type
+    entirely, and anything inside a JSON string literal, exactly as
+    ``_balanced_brace_slice`` ignores ``[``/``]`` while hunting for ``{``/``}``)
+    to keep going after each span closes instead of stopping at the first, so
+    a single left-to-right pass locates all of them.
+
+    Each returned span is disjoint from the others this same call returns:
+    once depth returns to 0 the scan resets and only looks for the next
+    ``open_char`` from there on, so their combined length can never exceed
+    ``len(text)``. An ``open_char`` that never reaches a matching
+    ``close_char`` simply leaves depth above 0 for the rest of the text with
+    no span recorded for it -- the scan does NOT restart from the next
+    ``open_char`` and re-walk the remaining text, which is what would make a
+    text full of unmatched opens quadratic. This is always O(len(text)),
+    independent of how many spans it finds or how many opens never close.
+    """
+    spans: list[tuple[int, int]] = []
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if depth == 0:
+            if char == open_char:
+                depth = 1
+                start = index
+                in_string = False
+                escaped = False
+            continue
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == open_char:
+            depth += 1
+        elif char == close_char:
+            depth -= 1
+            if depth == 0:
+                spans.append((start, index + 1))
+    return spans
+
+
+def _json_candidates(text: str) -> list[str]:
+    """Return every top-level ``{...}``/``[...]`` substring of ``text``, IN
+    ORDER OF APPEARANCE.
+
+    Combines the independent ``{``/``}`` and ``[``/``]`` passes from
+    ``_balanced_spans`` and sorts by start index. Because an enclosing span
+    always starts before anything nested inside it, this ordering alone
+    guarantees a wrapping array is considered -- and, if it hides a dict,
+    rejected -- before any object nested inside it is ever reached: exactly
+    what keeps a prose-wrapped ``[{"title": "A"}, {"title": "B"}]`` from being
+    reduced to just its first element the way scanning for ``{`` alone would.
+    Two O(len(text)) passes plus a sort over at most O(len(text)) spans whose
+    combined length is itself bounded by ``2 * len(text)`` (each pass's own
+    spans are mutually disjoint) -- bounded regardless of how many candidates
+    the text contains.
+    """
+    spans = _balanced_spans(text, "{", "}") + _balanced_spans(text, "[", "]")
+    spans.sort(key=lambda span: span[0])
+    return [text[start:end] for start, end in spans]
+
+
 def _extract_json_object(text: str) -> dict[str, Any]:
     """Parse a JSON object out of raw completion text, robustly.
 
@@ -260,22 +332,47 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     attempted: a dict is returned as-is, while anything else -- a top-level
     array, string, number, bool, or null -- raises LLMUpstreamError
     immediately. That fallthrough is deliberately not taken: a top-level array
-    such as ``[{"title": "A"}, {"title": "B"}]`` parses cleanly, and the
-    balanced-brace pass below would happily find and return its first embedded
-    object -- silently persisting one arbitrary element of a shape the caller
-    never asked for, instead of surfacing the true "wrong shape" failure as a
-    502. The balanced-brace fallback (recovering an object embedded in
-    surrounding prose, e.g. "Here is the draft: {..}. Hope this helps!") is
-    only ever attempted when the full text FAILS to parse as JSON at all --
-    and even then must itself yield a dict, or this still raises. The
-    workflows require an object to map onto their pydantic models, and a bare
-    array/scalar is as unusable as unparseable garbage.
+    such as ``[{"title": "A"}, {"title": "B"}]`` parses cleanly, and a naive
+    fallback would happily find and return its first embedded object --
+    silently persisting one arbitrary element of a shape the caller never
+    asked for, instead of surfacing the true "wrong shape" failure as a 502.
+
+    The fallback below (recovering an object embedded in surrounding prose,
+    e.g. "Here is the draft: {..}. Hope this helps!") is only ever attempted
+    when the full text FAILS to parse as JSON at all -- and it must apply the
+    SAME shape discipline as the full-text check above, not just grab the
+    first ``{...}`` it can find. It walks every top-level balanced
+    ``{...}``/``[...]`` substring of the text, in order of appearance (see
+    ``_json_candidates``), and for each one in turn:
+
+    * a dict -> use it, stop;
+    * a list containing at least one dict -> this is the exact same
+      "ambiguous multi-draft output" the top-level-array check above guards
+      against, just wrapped in prose instead of being the whole response
+      (e.g. ``Here are two drafts: [{"title": "A"}, {"title": "B"}]``) --
+      raise LLMUpstreamError here too, rather than let a later candidate (or a
+      naive single-object scan) mistake one embedded element for the answer;
+    * anything else -- a list of scalars such as ``[1]``, a bare number or
+      string, or a candidate that does not even parse as JSON -- is not
+      usable: skip it and keep scanning. This is what lets an innocent scalar
+      bracket ahead of the real object (e.g. "Answer[1]: {...}") fall through
+      to the object instead of being mistaken for the answer or blocking the
+      scan entirely.
+
+    If no candidate ever yields a dict (and none is an ambiguous array), this
+    raises UnparseableOutput. The workflows require an object to map onto
+    their pydantic models, and a bare array/scalar is as unusable as
+    unparseable garbage.
 
     Pathologically nested input (tens of thousands of ``[``) makes ``json.loads``
     exhaust the interpreter's recursion limit and raise ``RecursionError`` rather
     than ``JSONDecodeError``; that is caught alongside the ordinary parse errors
-    on both the full-text and balanced-brace attempts, and treated as
+    on the full-text attempt AND every candidate attempt below, and treated as
     unparseable (502), never left to escape as an unhandled 500.
+    ``_json_candidates`` itself never recurses (its nesting tracking is a plain
+    counter, not Python call recursion) and never rescans a prefix, so a
+    pathological input -- deeply nested or simply full of unmatched brackets --
+    cannot make this scan quadratic.
     """
     cleaned = _strip_code_fences(text)
     try:
@@ -287,20 +384,41 @@ def _extract_json_object(text: str) -> dict[str, Any]:
             return parsed
         # Well-formed JSON, but not an object: this is the LLM's whole answer,
         # not prose wrapping an object, so it fails here and now rather than
-        # falling through to the balanced-brace fallback below (which could
-        # otherwise extract and silently persist the first embedded object out
-        # of a top-level array).
+        # falling through to the candidate scan below (which could otherwise
+        # extract and silently persist one embedded object out of a top-level
+        # array).
         raise LLMUpstreamError("WrongShape: the LLM returned a non-object JSON value")
 
-    brace = _balanced_brace_slice(cleaned)
-    if brace is not None and brace != cleaned:
+    for candidate in _json_candidates(cleaned):
+        if candidate == cleaned:
+            # Only possible when the whole cleaned text is itself one
+            # top-level {...}/[...] span -- exactly what the full-text attempt
+            # above already tried and just failed to parse. json.loads is
+            # pure, so re-parsing the identical string here would
+            # deterministically fail again (paying to exhaust the recursion
+            # limit a second time, for the deeply nested case above) -- skip
+            # the guaranteed-redundant attempt.
+            continue
         try:
-            parsed = json.loads(brace)
+            parsed = json.loads(candidate)
         except json.JSONDecodeError, ValueError, RecursionError:
-            pass
-        else:
-            if isinstance(parsed, dict):
-                return parsed
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, list) and any(isinstance(item, dict) for item in parsed):
+            # Same "ambiguous multi-draft output" as the top-level-array check
+            # above -- just embedded in prose instead of being the whole
+            # response. Raise immediately rather than let a later candidate
+            # (e.g. one of this array's own elements) be mistaken for the
+            # answer.
+            raise LLMUpstreamError(
+                "WrongShape: the LLM returned an ambiguous array of draft objects"
+            )
+        # Anything else -- a list with no dict in it (e.g. [1]), or a
+        # candidate that failed to parse at all -- is not usable. Skip it and
+        # keep scanning; this is what lets an innocent scalar bracket ahead of
+        # the real object (e.g. "Answer[1]: {...}") fall through instead of
+        # being mistaken for the answer.
     raise LLMUpstreamError("UnparseableOutput: could not parse a JSON object from the LLM output")
 
 
