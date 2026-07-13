@@ -70,25 +70,53 @@ def _build_client(base_url: str, api_key: str, timeout: float) -> AsyncOpenAI:
     Cached rather than rebuilt per call so the SDK's connection pool is reused,
     but keyed on the config values themselves so that changing configuration
     (in production via a restart, in tests via a settings override) yields a
-    fresh client instead of a stale one bound to the old endpoint. ``max_retries=1``
-    keeps a single automatic retry; the surrounding handler adds no more.
+    fresh client instead of a stale one bound to the old endpoint.
+
+    ``max_retries=0`` disables the SDK's automatic retries so that
+    ``openai_timeout_seconds`` is the true end-to-end latency bound. With a
+    retry budget, a genuine failure waits out the full timeout on every attempt
+    (plus exponential backoff between them), so a "1s timeout" quietly becomes
+    several seconds before the caller sees a 502 -- unacceptable for an
+    interactive tool where the user would rather retry from the UI. One request,
+    one timeout, no hidden multiplier.
     """
     return AsyncOpenAI(
         base_url=base_url,
         api_key=api_key or _UNSET_API_KEY_PLACEHOLDER,
         timeout=timeout,
-        max_retries=1,
+        max_retries=0,
     )
 
 
 def _get_client() -> AsyncOpenAI:
-    """Return the cached client for the current settings, building it lazily."""
+    """Return the cached client for the current settings, building it lazily.
+
+    Construction is wrapped because a syntactically malformed endpoint -- an
+    invalid port in ``openai_base_url`` such as ``http://host:8o80/v1`` -- makes
+    ``AsyncOpenAI`` raise at CONSTRUCTION time (an ``httpx.InvalidURL``, which is
+    NOT an ``OpenAIError`` and so slips past ``generate_json``'s upstream
+    handler), which would otherwise surface as an unhandled 500 whose traceback
+    echoes the offending URL fragment (``Invalid port: '8o80'``). That is
+    operator misconfiguration, not an upstream failure, so it is mapped to
+    ``LLMNotConfiguredError`` -> 503 here.
+
+    ``except Exception`` because the SDK does not promise which exception type a
+    malformed config raises. ``from None`` deliberately severs the original
+    exception: its ``str`` carries a fragment of the configured URL, and
+    chaining it would let that fragment ride along in any traceback this error
+    later reached. The message is a fixed, config-free literal -- it names
+    neither the URL nor ``str(exc)`` -- so nothing config-derived survives past
+    this boundary, independent of whether the caller happens to log it.
+    """
     settings = get_settings()
-    return _build_client(
-        settings.openai_base_url,
-        settings.openai_api_key,
-        settings.openai_timeout_seconds,
-    )
+    try:
+        return _build_client(
+            settings.openai_base_url,
+            settings.openai_api_key,
+            settings.openai_timeout_seconds,
+        )
+    except Exception:
+        raise LLMNotConfiguredError("the configured LLM endpoint is invalid") from None
 
 
 def _strip_code_fences(text: str) -> str:
@@ -153,6 +181,11 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     that is not, in the end, a JSON *object* raises LLMUpstreamError -- the
     workflows require an object to map onto their pydantic models, and a bare
     array/scalar is as unusable as unparseable garbage.
+
+    Pathologically nested input (tens of thousands of ``[``) makes ``json.loads``
+    exhaust the interpreter's recursion limit and raise ``RecursionError`` rather
+    than ``JSONDecodeError``; that is caught alongside the ordinary parse errors
+    and treated as unparseable (502), never left to escape as an unhandled 500.
     """
     cleaned = _strip_code_fences(text)
     candidates = [cleaned]
@@ -162,7 +195,7 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     for candidate in candidates:
         try:
             parsed = json.loads(candidate)
-        except json.JSONDecodeError, ValueError:
+        except json.JSONDecodeError, ValueError, RecursionError:
             continue
         if isinstance(parsed, dict):
             return parsed
@@ -200,10 +233,23 @@ async def generate_json(system: str, user: str) -> dict[str, Any]:
         # carries the response body -- either would leak past this boundary.
         raise LLMUpstreamError(f"{type(exc).__name__}: the upstream LLM request failed") from exc
 
-    choices = completion.choices
-    if not choices:
+    # A conformant response is choices=[choice, ...] with choice.message.content
+    # a string. A merely OpenAI-*compatible* gateway can return a 200 whose body
+    # violates that shape without the SDK rejecting it: choices missing / None /
+    # empty / not a list, a choice with no message, or a null message/content.
+    # The SDK models these leniently, so a naive choices[0].message.content would
+    # raise AttributeError/TypeError here -- an unhandled 500 -- on such
+    # nonconforming-but-200 output. Validate each hop defensively instead and map
+    # every unusable shape onto the same 502 taxonomy as any other bad output;
+    # the messages carry only a category, never the (attacker/gateway-controlled)
+    # body.
+    choices = getattr(completion, "choices", None)
+    if not isinstance(choices, list) or not choices:
         raise LLMUpstreamError("EmptyResponse: the LLM returned no choices")
-    content = choices[0].message.content
-    if content is None or not content.strip():
+    message = getattr(choices[0], "message", None)
+    if message is None:
+        raise LLMUpstreamError("MalformedResponse: the LLM choice had no message")
+    content = getattr(message, "content", None)
+    if content is None or not isinstance(content, str) or not content.strip():
         raise LLMUpstreamError("EmptyResponse: the LLM returned empty content")
     return _extract_json_object(content)

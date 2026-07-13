@@ -167,3 +167,25 @@ def test_capture_max_length_raw_text_accepted(
 ) -> None:
     _patch_generate_json(monkeypatch, result=_DRAFT)
     assert client.post("/api/capture", json={"raw_text": "a" * 20000}).status_code == 201
+
+
+def test_capture_deeply_nested_field_returns_502_and_no_rows(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A capture field returned as a pathologically nested list must degrade to
+    502 with no row written. The draft is a valid JSON object, so it clears
+    generate_json; the danger is the sanitizer's _coerce_str, which recursed
+    unboundedly pre-fix -- a ~1500-deep list blew the stack (RecursionError,
+    which pydantic does NOT wrap) and escaped as a 500. Depth-bounding it makes
+    the deep list raise ValueError, which pydantic folds into a ValidationError
+    the workflow maps to 502.
+    """
+    deep: Any = "x"
+    for _ in range(1500):
+        deep = [deep]
+    _patch_generate_json(monkeypatch, result={**_DRAFT, "snapshot": deep})
+
+    response = client.post("/api/capture", json={"raw_text": "raw"})
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "llm_upstream_error"
+    assert _total(client) == 0

@@ -11,6 +11,7 @@ pytest-asyncio plugin is required (none is a project dependency).
 
 import asyncio
 import json
+import traceback
 from types import SimpleNamespace
 from typing import Any
 
@@ -23,6 +24,7 @@ from app.services.llm import (
     LLMNotConfiguredError,
     LLMUpstreamError,
     _balanced_brace_slice,
+    _build_client,
     _extract_json_object,
     generate_json,
     llm_configured,
@@ -85,6 +87,30 @@ def _install(monkeypatch: pytest.MonkeyPatch, settings: Settings, stub: _StubCli
 def _configured(monkeypatch: pytest.MonkeyPatch, **completion_kwargs: Any) -> _StubClient:
     settings = _settings(base_url=_CONFIGURED_BASE_URL, model=_CONFIGURED_MODEL)
     return _install(monkeypatch, settings, _StubClient(**completion_kwargs))
+
+
+class _RawCompletions:
+    """``client.chat.completions`` whose ``create`` returns a caller-supplied
+    completion object VERBATIM -- to model a nonconforming-but-200 body from a
+    merely OpenAI-compatible gateway (missing/None message, null content, etc.).
+    """
+
+    def __init__(self, completion: Any) -> None:
+        self._completion = completion
+
+    async def create(self, **kwargs: Any) -> Any:
+        return self._completion
+
+
+class _RawClient:
+    def __init__(self, completion: Any) -> None:
+        self.chat = SimpleNamespace(completions=_RawCompletions(completion))
+
+
+def _install_raw(monkeypatch: pytest.MonkeyPatch, completion: Any) -> None:
+    settings = _settings(base_url=_CONFIGURED_BASE_URL, model=_CONFIGURED_MODEL)
+    monkeypatch.setattr("app.services.llm.get_settings", lambda: settings)
+    monkeypatch.setattr("app.services.llm._get_client", lambda: _RawClient(completion))
 
 
 # --- llm_configured -------------------------------------------------------
@@ -278,3 +304,88 @@ def test_extract_json_object_nested(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_extract_json_object_invalid_raises_upstream() -> None:
     with pytest.raises(LLMUpstreamError):
         _extract_json_object("definitely not json")
+
+
+def test_extract_json_object_deeply_nested_brackets_raises_upstream() -> None:
+    """Tens of thousands of nested ``[`` make json.loads raise RecursionError,
+    not JSONDecodeError. That must be caught and mapped to the same unparseable
+    502 as any other bad output -- never left to escape as an unhandled 500.
+    """
+    deep = "[" * 50000 + "]" * 50000
+    with pytest.raises(LLMUpstreamError):
+        _extract_json_object(deep)
+
+
+# --- generate_json: nonconforming-but-200 upstream bodies (finding 2) ------
+
+
+@pytest.mark.parametrize(
+    "completion",
+    [
+        SimpleNamespace(choices=None),
+        SimpleNamespace(choices=[]),
+        SimpleNamespace(choices=[SimpleNamespace()]),
+        SimpleNamespace(choices=[SimpleNamespace(message=None)]),
+    ],
+    ids=["choices-none", "choices-empty", "choice-without-message", "message-none"],
+)
+def test_generate_json_nonconforming_200_raises_upstream(
+    monkeypatch: pytest.MonkeyPatch, completion: Any
+) -> None:
+    """A compatible gateway can return a 200 whose body violates the SDK's
+    expected shape (choices None/empty/non-list, a choice with no message, a
+    null message). The lenient SDK does not reject it, so the service must:
+    every such shape becomes an LLMUpstreamError (502), never an AttributeError
+    or TypeError surfacing as a 500.
+    """
+    _install_raw(monkeypatch, completion)
+    with pytest.raises(LLMUpstreamError):
+        asyncio.run(generate_json("system", "user"))
+
+
+# --- generate_json: malformed endpoint config (finding 1) ------------------
+
+
+def test_generate_json_malformed_endpoint_raises_not_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A syntactically invalid endpoint (bad port) makes AsyncOpenAI raise at
+    CONSTRUCTION -- an httpx.InvalidURL, not an OpenAIError -- which the config
+    gate must catch and remap to LLMNotConfiguredError (503). The real
+    _get_client/_build_client run here (not stubbed) so construction genuinely
+    fails, and the raised error must carry neither the URL fragment nor the key.
+    """
+    monkeypatch.setattr(
+        "app.services.llm.get_settings",
+        lambda: _settings(base_url="http://h:8o80/v1", model=_CONFIGURED_MODEL),
+    )
+    with pytest.raises(LLMNotConfiguredError) as excinfo:
+        asyncio.run(generate_json("system", "user"))
+
+    message = str(excinfo.value)
+    assert "8o80" not in message
+    assert _CONFIGURED_KEY not in message
+    # `from None` clears __cause__ and sets __suppress_context__, so the
+    # httpx.InvalidURL (whose text carries the URL fragment) is suppressed from
+    # any rendered traceback -- exactly what a logger's exc_info would emit.
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__ is True
+    rendered = "".join(
+        traceback.format_exception(type(excinfo.value), excinfo.value, excinfo.value.__traceback__)
+    )
+    assert "8o80" not in rendered
+    assert _CONFIGURED_KEY not in rendered
+
+
+# --- retry policy (finding 6) ---------------------------------------------
+
+
+def test_build_client_disables_automatic_retries() -> None:
+    """max_retries=0 so the configured openai_timeout_seconds is the true
+    end-to-end latency bound: a retry would silently wait out the whole timeout
+    again (plus backoff), multiplying real-failure latency for an interactive
+    tool. Asserted on the constructed client's own attribute, not via wall-clock
+    timing, so it is deterministic.
+    """
+    client = _build_client("http://retry-policy.example/v1", "k", 1.0)
+    assert client.max_retries == 0

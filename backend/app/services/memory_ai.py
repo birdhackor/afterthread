@@ -32,12 +32,29 @@ _MAX_QUESTIONS = 3
 # --- defensive coercion helpers -------------------------------------------
 
 
-def _coerce_str(value: object) -> str:
-    """Coerce arbitrary JSON-decoded input to a string, never raising.
+# Max nesting depth _coerce_str will descend into a list/tuple before refusing.
+# LLM output is untrusted and can be pathologically nested; a list ~1000 deep
+# blows Python's recursion limit, and an unbounded _coerce_str would then raise
+# RecursionError from inside the pydantic before-validators below -- which
+# pydantic does NOT convert to a ValidationError, so it would escape as an
+# unhandled 500. Bounding the descent to a small constant makes such input raise
+# ValueError instead, which pydantic DOES fold into a ValidationError (mapped to
+# 502). Legitimate capture/enrich fields nest at most one level (a flat list of
+# strings), so this ceiling is never reached by real output.
+_MAX_COERCE_DEPTH = 8
+
+
+def _coerce_str(value: object, _depth: int = 0) -> str:
+    """Coerce arbitrary JSON-decoded input to a string.
 
     LLM output is untrusted: a field the prompt asked to be a string may come
     back as a number, bool, or list. Map each to a reasonable string rather
     than letting pydantic reject the whole draft over one stray type.
+
+    Raises ValueError on ONE input only: a list/tuple nested beyond
+    ``_MAX_COERCE_DEPTH`` (see that constant), so a pathologically nested payload
+    degrades to a 502 rather than a RecursionError-driven 500. ``_depth`` is
+    internal recursion bookkeeping; callers never pass it.
     """
     if value is None:
         return ""
@@ -48,7 +65,9 @@ def _coerce_str(value: object) -> str:
     if isinstance(value, (int, float)):
         return str(value)
     if isinstance(value, (list, tuple)):
-        return "\n".join(_coerce_str(item) for item in value if item is not None)
+        if _depth >= _MAX_COERCE_DEPTH:
+            raise ValueError("nested list/tuple exceeds the maximum coercion depth")
+        return "\n".join(_coerce_str(item, _depth + 1) for item in value if item is not None)
     return str(value)
 
 
