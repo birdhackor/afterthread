@@ -298,6 +298,33 @@ def test_enrich_upstream_error_returns_502_and_item_unchanged(
     assert [entry["note"] for entry in detail["progress"]] == ["建立項目"]
 
 
+def test_enrich_rejects_lone_surrogate_in_gap_returns_502_and_item_unchanged(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # remaining_gaps goes through the very same _coerce_str choke point (via
+    # _clean_str_list) as any section or tag, so a lone surrogate there must
+    # 502 with the item left completely untouched -- no section write, no
+    # progress entry, no `updated` bump -- exactly like the existing
+    # upstream-error case above, not merely a truncated/garbled gap.
+    item = _create(client, snapshot="keep me")
+    _patch_generate_json(
+        monkeypatch,
+        result={
+            "sections": {"decisions": "d"},
+            "remaining_gaps": ["缺少驗收標準\ud800"],
+            "progress_note": "n",
+        },
+    )
+    response = client.post(f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"})
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "llm_upstream_error"
+    detail = client.get(f"/api/items/{item['id']}").json()
+    assert detail["snapshot"] == "keep me"
+    assert detail["decisions"] == ""
+    assert detail["updated"] == item["updated"]
+    assert [entry["note"] for entry in detail["progress"]] == ["建立項目"]
+
+
 def test_enrich_races_with_concurrent_delete_after_llm_returns_404(
     client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:

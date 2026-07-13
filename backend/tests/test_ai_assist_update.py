@@ -146,6 +146,27 @@ def test_assist_update_upstream_error_returns_502_and_item_unchanged(
     assert [entry["note"] for entry in detail["progress"]] == ["建立項目"]
 
 
+def test_assist_update_rejects_lone_surrogate_in_section_returns_502_and_item_unchanged(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # UpdateResult has no sanitizer of its own beyond _extract_sections /
+    # _clean_text -- the same _coerce_str choke point CaptureDraft and
+    # EnrichResult share -- so a lone surrogate in a section here must 502
+    # with the item left completely untouched too.
+    item = _create(client, next_actions="keep")
+    _patch_generate_json(
+        monkeypatch,
+        result={"sections": {"next_actions": "下一步\ud800"}, "progress_note": "p"},
+    )
+    response = client.post(f"/api/items/{item['id']}/assist-update", json={"note": "n"})
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "llm_upstream_error"
+    detail = client.get(f"/api/items/{item['id']}").json()
+    assert detail["next_actions"] == "keep"
+    assert detail["updated"] == item["updated"]
+    assert [entry["note"] for entry in detail["progress"]] == ["建立項目"]
+
+
 def test_assist_update_races_with_concurrent_delete_after_llm_returns_404(
     client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -7,6 +7,7 @@ run without any network. Row counts are checked through the public list API to
 avoid cross-thread session reads.
 """
 
+import json
 import traceback
 from collections.abc import Callable
 from typing import Any
@@ -16,7 +17,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.services.llm import LLMUpstreamError
-from app.services.memory_ai import CaptureDraft, _validate
+from app.services.memory_ai import CaptureDraft, _coerce_str, _validate
 
 # A full, well-formed draft. ``questions`` deliberately has 5 entries to prove
 # the server truncates to 3; ``suggested_status`` is one of the two allowed.
@@ -239,3 +240,130 @@ def test_capture_deeply_nested_field_returns_502_and_no_rows(
     assert response.status_code == 502
     assert response.json()["detail"]["code"] == "llm_upstream_error"
     assert _total(client) == 0
+
+
+def test_coerce_str_rejects_lone_surrogate() -> None:
+    """_coerce_str is the single choke point every sanitized string passes
+    through (_clean_text, _clean_str_list, and -- via recursion -- each item
+    of a nested list). A lone (unpaired) Unicode surrogate is valid per
+    ``json.loads`` -- it accepts it without complaint -- but not UTF-8
+    encodable. Left unchecked it would sail through every cap/strip and pass
+    pydantic untouched, only to blow up LATER as an uncaught
+    ``UnicodeEncodeError`` from SQLite text binding or FastAPI response
+    serialization, possibly after a write already committed. It must raise
+    ValueError here instead, so pydantic folds it into the same
+    ValidationError -> 502 path as any other malformed input, before any
+    write happens.
+    """
+    with pytest.raises(ValueError, match="UTF-8"):
+        _coerce_str("開頭正常\ud800結尾正常")
+
+
+def test_coerce_str_accepts_cjk_and_emoji() -> None:
+    """Regression for the rejection above: ordinary CJK and emoji content --
+    fully valid and UTF-8 encodable -- must still pass through unchanged,
+    including an emoji decoded from a genuine (PAIRED) surrogate pair, as a
+    compatible endpoint emitting UTF-16-style JSON escapes would send it.
+    ``json.loads`` combines a valid high+low surrogate pair into the single
+    non-surrogate code point it represents -- not a lone surrogate -- so this
+    must not be mistaken for the malformed case above.
+    """
+    cjk = "正體中文測試內容"
+    assert _coerce_str(cjk) == cjk
+    paired_emoji = json.loads('"\\ud83d\\ude00"')
+    assert paired_emoji == "😀"
+    assert _coerce_str(paired_emoji) == paired_emoji
+
+
+def test_capture_rejects_lone_surrogate_in_section_returns_502_and_no_rows(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A lone surrogate embedded in an ordinary free-text section (mid-string,
+    # not the whole value) must be caught by the sanitizer before any write,
+    # not slip through to crash later at the DB/response boundary.
+    _patch_generate_json(
+        monkeypatch, result={**_DRAFT, "snapshot": "討論內容包含異常字元\ud800后續段落"}
+    )
+    response = client.post("/api/capture", json={"raw_text": "raw"})
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "llm_upstream_error"
+    assert _total(client) == 0
+
+
+def test_capture_rejects_lone_surrogate_in_tag_returns_502_and_no_rows(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Tags go through the very same _coerce_str choke point (via
+    # _clean_str_list), so a lone surrogate there must 502 too.
+    _patch_generate_json(monkeypatch, result={**_DRAFT, "tags": ["payment", "帶\ud800標籤"]})
+    response = client.post("/api/capture", json={"raw_text": "raw"})
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "llm_upstream_error"
+    assert _total(client) == 0
+
+
+def test_capture_accepts_cjk_and_emoji_content(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression for the two lone-surrogate rejections above: ordinary CJK
+    # and emoji content across section, tags, and questions -- well-formed
+    # and fully encodable -- must still sail through untouched end to end.
+    draft = {
+        **_DRAFT,
+        "snapshot": "完成付款流程討論 🎉",
+        "tags": ["付款", "😀重構"],
+        "questions": ["進度如何? 💡"],
+    }
+    _patch_generate_json(monkeypatch, result=draft)
+    response = client.post("/api/capture", json={"raw_text": "raw"})
+    assert response.status_code == 201, response.text
+    item = response.json()["item"]
+    assert item["snapshot"] == "完成付款流程討論 🎉"
+    assert item["tags"] == ["付款", "😀重構"]
+    assert item["open_questions"] == "- 進度如何? 💡"
+
+
+def test_capture_caps_joined_open_questions_at_per_section_cap(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Each of the (at most 3) questions is independently capped at 20000
+    # chars by CaptureDraft._sanitize, but the bullet-joined string persisted
+    # to open_questions is a NEW, larger blob built by the router -- 3
+    # max-sized questions join to ~60008 chars, bypassing the 20000-char
+    # section cap every OTHER section respects. It must be truncated again to
+    # that same cap, marked, exactly like any other oversized section.
+    oversized = ["q" * 20000, "w" * 20000, "e" * 20000]
+    _patch_generate_json(monkeypatch, result={**_DRAFT, "questions": oversized})
+    response = client.post("/api/capture", json={"raw_text": "raw"})
+    assert response.status_code == 201, response.text
+    body = response.json()
+    # The response's questions list stays untouched -- it is already
+    # per-item bounded and is not rejoined into one blob.
+    assert body["questions"] == oversized
+    open_questions = body["item"]["open_questions"]
+    assert len(open_questions) == 20000
+    assert open_questions.endswith("…[內容過長已截斷]")
+
+    # Durable: re-fetching the item shows the same capped value, not the
+    # original ~60008-char join.
+    detail = client.get(f"/api/items/{body['item']['id']}").json()
+    assert detail["open_questions"] == open_questions
+
+
+def test_capture_capped_open_questions_patch_round_trips(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Before the fix, persisting the untruncated ~60008-char join meant a
+    # later client PATCH round-tripping that same value straight back would
+    # 422 against schemas._CRUD_SECTION_MAX (20000). The capture-side cap
+    # keeps the persisted value within that same bound, so the round trip
+    # succeeds.
+    oversized = ["q" * 20000, "w" * 20000, "e" * 20000]
+    _patch_generate_json(monkeypatch, result={**_DRAFT, "questions": oversized})
+    item = client.post("/api/capture", json={"raw_text": "raw"}).json()["item"]
+
+    response = client.patch(
+        f"/api/items/{item['id']}", json={"open_questions": item["open_questions"]}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["open_questions"] == item["open_questions"]

@@ -52,24 +52,46 @@ def _coerce_str(value: object, _depth: int = 0) -> str:
     back as a number, bool, or list. Map each to a reasonable string rather
     than letting pydantic reject the whole draft over one stray type.
 
-    Raises ValueError on ONE input only: a list/tuple nested beyond
-    ``_MAX_COERCE_DEPTH`` (see that constant), so a pathologically nested payload
-    degrades to a 502 rather than a RecursionError-driven 500. ``_depth`` is
-    internal recursion bookkeeping; callers never pass it.
+    Raises ValueError on two shapes of malformed input -- both accepted
+    without complaint by ``json.loads`` itself, so this is where they must
+    be caught:
+
+    * a list/tuple nested beyond ``_MAX_COERCE_DEPTH`` (see that constant),
+      so a pathologically nested payload degrades to a 502 rather than a
+      RecursionError-driven 500;
+    * a string that is not UTF-8 encodable -- concretely, one carrying an
+      unpaired Unicode surrogate (e.g. ``"\\ud800"`` with no partner). A JSON
+      parser may hand that back as an ordinary-looking ``str``, and it would
+      then sail through every cap/strip below and pass pydantic untouched,
+      only to blow up LATER as an uncaught ``UnicodeEncodeError`` -- from
+      SQLite text binding or FastAPI response serialization -- possibly
+      AFTER a write has already committed. Checking it here, the single
+      choke point every sanitized string passes through (directly, or via
+      recursion for a list item), routes it into the same pre-write
+      ``ValidationError`` -> 502 path as every other malformed-input case
+      instead.
+
+    ``_depth`` is internal recursion bookkeeping; callers never pass it.
     """
     if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, (list, tuple)):
+        result = ""
+    elif isinstance(value, str):
+        result = value
+    elif isinstance(value, bool):
+        result = "true" if value else "false"
+    elif isinstance(value, (int, float)):
+        result = str(value)
+    elif isinstance(value, (list, tuple)):
         if _depth >= _MAX_COERCE_DEPTH:
             raise ValueError("nested list/tuple exceeds the maximum coercion depth")
-        return "\n".join(_coerce_str(item, _depth + 1) for item in value if item is not None)
-    return str(value)
+        result = "\n".join(_coerce_str(item, _depth + 1) for item in value if item is not None)
+    else:
+        result = str(value)
+    try:
+        result.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("string is not valid UTF-8 (e.g. an unpaired surrogate)") from exc
+    return result
 
 
 def _clean_text(value: object, cap: int = _PER_SECTION_CAP) -> str:

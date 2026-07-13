@@ -47,10 +47,12 @@ from app.services.llm import (
     normalized_model,
 )
 from app.services.memory_ai import (
+    _PER_SECTION_CAP,
     HISTORY_SECTIONS,
     SECTION_FIELD_ORDER,
     EnrichResult,
     UpdateResult,
+    _truncate_to,
     assist_update,
     capture_draft,
     enrich_item,
@@ -275,8 +277,19 @@ async def capture(payload: CaptureRequest, session: SessionDep) -> CaptureRespon
         # questions" minimum durable quick-capture field is actually
         # persisted, not only echoed in the response below. "\n".join of an
         # empty list is "", so a questionless draft leaves this at its
-        # ordinary default.
-        open_questions="\n".join(f"- {question}" for question in draft.questions),
+        # ordinary default. Bullet-joining up to 3 items each up to
+        # _PER_SECTION_CAP chars can itself run to ~60008 chars -- past the
+        # per-section bound every OTHER section respects (enforced inside
+        # CaptureDraft._sanitize) and past what a later client PATCH of this
+        # same field would accept (schemas._CRUD_SECTION_MAX, the same
+        # 20000) -- so the joined string is capped again here, sharing
+        # _PER_SECTION_CAP and the truncation-marker convention (_truncate_to)
+        # rather than hardcoding a second copy of the bound. The response's
+        # `questions` list below is untouched: it is already per-item
+        # bounded, not rejoined into one blob.
+        open_questions=_truncate_to(
+            "\n".join(f"- {question}" for question in draft.questions), _PER_SECTION_CAP
+        ),
         next_actions=draft.next_actions,
         recovery_keywords=draft.recovery_keywords,
         recovery_people=draft.recovery_people,
