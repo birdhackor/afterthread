@@ -7,6 +7,7 @@ run without any network. Row counts are checked through the public list API to
 avoid cross-thread session reads.
 """
 
+import traceback
 from collections.abc import Callable
 from typing import Any
 
@@ -15,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.services.llm import LLMUpstreamError
+from app.services.memory_ai import CaptureDraft, _validate
 
 # A full, well-formed draft. ``questions`` deliberately has 5 entries to prove
 # the server truncates to 3; ``suggested_status`` is one of the two allowed.
@@ -137,6 +139,26 @@ def test_capture_invalid_draft_returns_502_and_no_rows(
     assert response.status_code == 502
     assert response.json()["detail"]["code"] == "llm_upstream_error"
     assert _total(client) == 0
+
+
+def test_validate_failure_severs_chain_and_leaks_no_raw_content() -> None:
+    """memory_ai._validate maps a pydantic ValidationError to LLMUpstreamError
+    with `from None`, so the raw LLM output the error embeds (its str and
+    .errors() carry the offending input) cannot ride along in __cause__ into a
+    rendered traceback. Driven directly on _validate with a draft whose blank
+    title fails the CaptureDraft sanitizer while a secret rides in another field.
+    """
+    secret = "SECRET-MEMORY-CONTENT-do-not-leak-9f3a"
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        _validate(CaptureDraft, {"title": "  ", "snapshot": secret})
+
+    exc = excinfo.value
+    assert "ValidationError" in str(exc)
+    assert secret not in str(exc)
+    assert exc.__cause__ is None
+    assert exc.__suppress_context__ is True
+    rendered = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    assert secret not in rendered
 
 
 def test_capture_unconfigured_returns_503_and_no_rows(

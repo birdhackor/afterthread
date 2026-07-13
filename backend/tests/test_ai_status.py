@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
@@ -76,3 +77,22 @@ def test_status_configured_when_base_url_syntactically_valid(
 ) -> None:
     configure_llm(base_url=_SECRET_URL, model="gpt-test")
     assert client.get("/api/llm/status").json() == {"configured": True, "model": "gpt-test"}
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    ["localhost:8000/v1", "http:///v1", "ftp://h/v1"],
+    ids=["scheme-less-authority", "empty-host", "non-http-scheme"],
+)
+def test_status_and_capture_agree_on_parseable_but_unusable_url(
+    client: TestClient, configure_llm: Callable[..., Settings], base_url: str
+) -> None:
+    # Each URL parses under httpx.URL but is unreachable (no http/https scheme,
+    # or no host), so it must read as unconfigured everywhere: the status
+    # endpoint reports False and the capture workflow degrades to 503, never
+    # claiming a working endpoint the request would then fail to reach.
+    configure_llm(base_url=base_url, model="m")
+    assert client.get("/api/llm/status").json() == {"configured": False, "model": None}
+    capture = client.post("/api/capture", json={"raw_text": "raw"})
+    assert capture.status_code == 503
+    assert capture.json()["detail"]["code"] == "llm_not_configured"

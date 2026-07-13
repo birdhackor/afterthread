@@ -117,13 +117,18 @@ def _validate[ModelT: BaseModel](model: type[ModelT], raw: dict[str, Any]) -> Mo
 
     Only the exception *category* is surfaced (never ``str(exc)``, which can
     echo the offending output) so the message stays safe and config-free.
+    ``from None`` (not ``from exc``) severs the cause chain as well: a pydantic
+    ``ValidationError`` embeds the offending input -- raw LLM output / memory
+    content -- in its ``str`` and ``.errors()``, which would otherwise ride
+    along in ``__cause__`` into any traceback-logging sink. The safe category
+    prefix keeps diagnosis possible without that leak.
     """
     try:
         return model.model_validate(raw)
     except ValidationError as exc:
         raise LLMUpstreamError(
             f"{type(exc).__name__}: the LLM output failed schema validation"
-        ) from exc
+        ) from None
 
 
 # --- methodology rule fragments (asserted verbatim in prompt tests) --------

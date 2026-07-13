@@ -73,10 +73,16 @@ def llm_configured() -> bool:
     ``AsyncOpenAI`` would reject at construction (e.g. an invalid port like
     ``http://host:8o80/v1``, which the SDK parses with ``httpx.URL``) is not a
     working endpoint, so this reparses it the same way and reports unconfigured
-    on failure. Without that, ``llm_configured`` would answer True while every
-    workflow using the same config degrades to 503 -- the status endpoint would
-    disagree with actual usability. The URL is only parsed, never echoed, so no
-    fragment of it leaks out of this function.
+    on failure. It further requires the parsed URL to carry an ``http``/``https``
+    scheme AND a non-empty host, rejecting a scheme-less authority
+    (``localhost:8000/v1``), an empty host (``http:///v1``), or a non-HTTP scheme
+    (``ftp://h/v1``) -- each parses but no OpenAI-compatible request could reach
+    it. Without that, ``llm_configured`` would answer True while every workflow
+    using the same config degrades to 503 -- the status endpoint would disagree
+    with actual usability. The URL is only parsed, never echoed, so no fragment
+    of it leaks out of this function. The stripped value is the same one
+    ``_get_client`` builds the client from, so status and runtime agree even for
+    a whitespace-padded override.
     """
     settings = get_settings()
     base_url = settings.openai_base_url.strip()
@@ -84,10 +90,15 @@ def llm_configured() -> bool:
     if not (base_url and model):
         return False
     try:
-        httpx.URL(base_url)
+        url = httpx.URL(base_url)
     except Exception:
         return False
-    return True
+    # Parseable is not usable: httpx.URL accepts a scheme-less authority
+    # ("localhost:8000/v1" parses with scheme "localhost"), an empty host
+    # ("http:///v1"), and a non-HTTP scheme ("ftp://h/v1"). Require an
+    # http/https scheme AND a non-empty host so this can never claim an endpoint
+    # the workflows would then fail to reach.
+    return url.scheme in ("http", "https") and bool(url.host)
 
 
 @lru_cache(maxsize=8)
@@ -138,7 +149,10 @@ def _get_client() -> AsyncOpenAI:
     settings = get_settings()
     try:
         return _build_client(
-            settings.openai_base_url,
+            # Strip to the SAME normalized base URL `llm_configured` validated,
+            # so a whitespace-padded override that reads as configured is the
+            # exact value the client is built from (status and runtime agree).
+            settings.openai_base_url.strip(),
             settings.openai_api_key,
             settings.openai_timeout_seconds,
         )
@@ -251,7 +265,9 @@ async def generate_json(system: str, user: str) -> dict[str, Any]:
     client = _get_client()
     try:
         completion = await client.chat.completions.create(
-            model=settings.openai_model,
+            # Stripped to match the normalization llm_configured / _get_client
+            # apply, so the model sent at runtime is the one status validated.
+            model=settings.openai_model.strip(),
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -262,8 +278,12 @@ async def generate_json(system: str, user: str) -> dict[str, Any]:
         # Category only (the SDK error's class name) plus the fixed shared
         # reason. Never str(exc): APIConnectionError chains the target URL,
         # APIStatusError carries the response body -- either would leak past
-        # this boundary.
-        raise LLMUpstreamError(f"{type(exc).__name__}: {_UPSTREAM_REASON}") from exc
+        # this boundary. `from None` (not `from exc`) severs the cause chain so
+        # the original SDK error -- whose str/args can embed base_url, api_key,
+        # or a raw response body -- cannot ride along in __cause__ into a
+        # traceback-logging sink; the safe category prefix keeps diagnosis
+        # possible.
+        raise LLMUpstreamError(f"{type(exc).__name__}: {_UPSTREAM_REASON}") from None
 
     # A conformant response is choices=[choice, ...] with choice.message.content
     # a string. A merely OpenAI-*compatible* gateway can return a 200 whose body

@@ -26,6 +26,7 @@ from app.services.llm import (
     _balanced_brace_slice,
     _build_client,
     _extract_json_object,
+    _get_client,
     generate_json,
     llm_configured,
 )
@@ -294,6 +295,81 @@ def test_upstream_error_message_never_leaks_config(monkeypatch: pytest.MonkeyPat
     assert _CONFIGURED_BASE_URL not in message
     assert "llm.internal.example" not in message
     assert _CONFIGURED_KEY not in message
+
+    # `from None` severs the cause chain: the original SDK error (whose text
+    # embeds the URL and key above) must not ride along in __cause__ into a
+    # rendered traceback -- exactly what a logger's exc_info would emit.
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__ is True
+    rendered = "".join(
+        traceback.format_exception(type(excinfo.value), excinfo.value, excinfo.value.__traceback__)
+    )
+    assert _CONFIGURED_BASE_URL not in rendered
+    assert "llm.internal.example" not in rendered
+    assert _CONFIGURED_KEY not in rendered
+
+
+# --- llm_configured: parseable-but-unusable URLs (finding: strict endpoint) --
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    ["localhost:8000/v1", "http:///v1", "ftp://h/v1"],
+    ids=["scheme-less-authority", "empty-host", "non-http-scheme"],
+)
+def test_llm_configured_false_for_parseable_but_unusable_url(
+    monkeypatch: pytest.MonkeyPatch, base_url: str
+) -> None:
+    """A URL that parses under httpx.URL but carries no http/https scheme or no
+    host is not a reachable OpenAI-compatible endpoint: llm_configured must
+    report unconfigured, and generate_json must gate to LLMNotConfiguredError
+    (503) before any client is built or request sent.
+    """
+    monkeypatch.setattr(
+        "app.services.llm.get_settings",
+        lambda: _settings(base_url=base_url, model=_CONFIGURED_MODEL),
+    )
+    assert llm_configured() is False
+
+    def _must_not_build() -> _StubClient:
+        raise AssertionError("_get_client must not run when unconfigured")
+
+    monkeypatch.setattr("app.services.llm._get_client", _must_not_build)
+    with pytest.raises(LLMNotConfiguredError):
+        asyncio.run(generate_json("system", "user"))
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    ["http://host.example/v1", "https://host.example/v1"],
+    ids=["http", "https"],
+)
+def test_llm_configured_true_for_http_and_https_with_host(
+    monkeypatch: pytest.MonkeyPatch, base_url: str
+) -> None:
+    monkeypatch.setattr(
+        "app.services.llm.get_settings",
+        lambda: _settings(base_url=base_url, model=_CONFIGURED_MODEL),
+    )
+    assert llm_configured() is True
+
+
+def test_configured_and_get_client_agree_on_whitespace_padded_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A whitespace-padded URL reads as configured (llm_configured strips before
+    validating) AND the real client is built from the SAME stripped value, so
+    status and runtime never disagree over stray whitespace. _get_client runs
+    for real here (not stubbed) so construction genuinely uses the stripped URL.
+    """
+    monkeypatch.setattr(
+        "app.services.llm.get_settings",
+        lambda: _settings(base_url="  http://spaced.example/v1  ", model=_CONFIGURED_MODEL),
+    )
+    assert llm_configured() is True
+    rendered = str(_get_client().base_url)
+    assert "spaced.example" in rendered
+    assert " " not in rendered
 
 
 # --- pure extraction helpers ---------------------------------------------
