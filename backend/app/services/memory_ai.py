@@ -192,6 +192,11 @@ class CaptureDraft(BaseModel):
     ``suggested_status`` is constrained to the two capture statuses; a missing
     or blank title fails (mapped to 502 upstream) rather than creating a
     title-less item.
+
+    There is no ``open_questions`` field here: ``questions`` (below) is its
+    SOLE source. The router (``routers.ai.capture``) derives the created
+    item's ``open_questions`` section from ``questions`` directly, as bullet
+    lines, in addition to returning them in the one-shot response.
     """
 
     model_config = ConfigDict(extra="ignore")

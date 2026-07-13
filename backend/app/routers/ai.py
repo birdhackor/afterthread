@@ -44,6 +44,7 @@ from app.services.llm import (
     LLMNotConfiguredError,
     LLMUpstreamError,
     llm_configured,
+    normalized_model,
 )
 from app.services.memory_ai import (
     HISTORY_SECTIONS,
@@ -205,10 +206,14 @@ def llm_status() -> LLMStatus:
     """Report whether an LLM endpoint is configured, and the model name only.
 
     Never returns the base URL or API key -- only the boolean and the
-    non-secret model name (null when unconfigured).
+    non-secret model name (null when unconfigured). The model is run through
+    the same `normalized_model` helper `generate_json` uses for the actual
+    request, so a whitespace-padded override is never echoed back padded
+    while the real call underneath sends the trimmed value.
     """
+    settings = get_settings()
     configured = llm_configured()
-    model = get_settings().openai_model if configured else None
+    model = normalized_model(settings) if configured else None
     return LLMStatus(configured=configured, model=model)
 
 
@@ -263,6 +268,15 @@ async def capture(payload: CaptureRequest, session: SessionDep) -> CaptureRespon
         known=draft.known,
         inferred=draft.inferred,
         unknown=draft.unknown,
+        # CaptureDraft has no open_questions field of its own; draft.questions
+        # (the model's follow-up questions -- already server-capped at 3
+        # items, each up to _PER_SECTION_CAP chars, by CaptureDraft._sanitize)
+        # is the SOLE source for this section, so methodology.md's "open
+        # questions" minimum durable quick-capture field is actually
+        # persisted, not only echoed in the response below. "\n".join of an
+        # empty list is "", so a questionless draft leaves this at its
+        # ordinary default.
+        open_questions="\n".join(f"- {question}" for question in draft.questions),
         next_actions=draft.next_actions,
         recovery_keywords=draft.recovery_keywords,
         recovery_people=draft.recovery_people,

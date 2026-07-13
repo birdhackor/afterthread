@@ -85,6 +85,34 @@ def test_capture_truncates_questions_to_three(
     assert body["questions"] == ["q1", "q2", "q3"]
 
 
+def test_capture_persists_questions_as_open_questions_bullet_lines(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # docs/methodology.md lists "open questions" as a minimum durable
+    # quick-capture field; CaptureDraft has no open_questions field of its
+    # own, so the created item's open_questions must be derived from the
+    # model's questions, not left empty while the response merely echoes them.
+    _patch_generate_json(monkeypatch, result={**_DRAFT, "questions": ["問題一?", "問題二?"]})
+    response = client.post("/api/capture", json={"raw_text": "raw"})
+    body = response.json()
+    assert body["questions"] == ["問題一?", "問題二?"]
+    assert body["item"]["open_questions"] == "- 問題一?\n- 問題二?"
+
+    # Durable, not just a one-shot response echo: re-fetching the item still
+    # carries both questions as "- " bullet lines.
+    detail = client.get(f"/api/items/{body['item']['id']}").json()
+    assert detail["open_questions"] == "- 問題一?\n- 問題二?"
+
+
+def test_capture_zero_questions_leaves_open_questions_at_default(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_generate_json(monkeypatch, result={**_DRAFT, "questions": []})
+    body = client.post("/api/capture", json={"raw_text": "raw"}).json()
+    assert body["questions"] == []
+    assert body["item"]["open_questions"] == ""
+
+
 def test_capture_seeds_ai_progress_entry_and_one_row(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

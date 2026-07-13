@@ -24,7 +24,7 @@ from typing import Any
 import httpx
 from openai import AsyncOpenAI, OpenAIError
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 
 # Placeholder passed as the API key when the operator has not configured one.
 # Some OpenAI-compatible servers (e.g. a local gateway) require no key, but the
@@ -61,13 +61,26 @@ class LLMUpstreamError(RuntimeError):
 _UPSTREAM_REASON = "the upstream LLM request failed"
 
 
+def normalized_model(settings: Settings) -> str:
+    """Return the configured model name with surrounding whitespace stripped.
+
+    The one normalization every caller must share, so none of them can ever
+    disagree over a whitespace-padded override: ``llm_configured``'s gate, the
+    actual request ``generate_json`` sends, and (via
+    ``app.routers.ai.llm_status``) what ``/llm/status`` reports back to a
+    client all read the model through this single helper.
+    """
+    return settings.openai_model.strip()
+
+
 def llm_configured() -> bool:
     """True only when a usable endpoint URL and a model name are configured.
 
     The API key is intentionally NOT part of this check: a keyless
     OpenAI-compatible gateway is legitimate (see ``_UNSET_API_KEY_PLACEHOLDER``),
     so requiring a key would wrongly report a working endpoint as unconfigured.
-    Both fields are stripped so a whitespace-only override still reads as unset.
+    Both fields are stripped (the model via ``normalized_model``) so a
+    whitespace-only override still reads as unset.
 
     "Usable" also means syntactically constructible: a base URL that
     ``AsyncOpenAI`` would reject at construction (e.g. an invalid port like
@@ -86,7 +99,7 @@ def llm_configured() -> bool:
     """
     settings = get_settings()
     base_url = settings.openai_base_url.strip()
-    model = settings.openai_model.strip()
+    model = normalized_model(settings)
     if not (base_url and model):
         return False
     try:
@@ -265,9 +278,10 @@ async def generate_json(system: str, user: str) -> dict[str, Any]:
     client = _get_client()
     try:
         completion = await client.chat.completions.create(
-            # Stripped to match the normalization llm_configured / _get_client
-            # apply, so the model sent at runtime is the one status validated.
-            model=settings.openai_model.strip(),
+            # Same normalized_model helper llm_configured and /llm/status use,
+            # so the model sent at runtime is exactly the one status validated
+            # and reported back to the client.
+            model=normalized_model(settings),
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},

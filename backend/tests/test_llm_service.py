@@ -30,6 +30,7 @@ from app.services.llm import (
     _get_client,
     generate_json,
     llm_configured,
+    normalized_model,
 )
 
 _CONFIGURED_BASE_URL = "http://llm.internal.example/v1"
@@ -172,6 +173,27 @@ def test_llm_configured_false_when_base_url_syntactically_invalid(
         lambda: _settings(base_url="http://h:8o80/v1", model=_CONFIGURED_MODEL),
     )
     assert llm_configured() is False
+
+
+# --- normalized_model ------------------------------------------------------
+
+
+def test_normalized_model_strips_surrounding_whitespace() -> None:
+    settings = _settings(base_url=_CONFIGURED_BASE_URL, model="  test-model  ")
+    assert normalized_model(settings) == "test-model"
+
+
+def test_normalized_model_matches_llm_configured_and_generate_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The same helper backs llm_configured's gate and generate_json's actual
+    # request, so a whitespace-padded model can never make them disagree.
+    settings = _settings(base_url=_CONFIGURED_BASE_URL, model="  padded-model  ")
+    stub = _install(monkeypatch, settings, _StubClient(content=_SAMPLE_JSON))
+    assert normalized_model(settings) == "padded-model"
+    assert llm_configured() is True
+    asyncio.run(generate_json("system", "user"))
+    assert stub.chat.completions.calls[0]["model"] == "padded-model"
 
 
 # --- generate_json: config gate ------------------------------------------

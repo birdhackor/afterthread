@@ -20,6 +20,19 @@ def test_status_reports_configured_with_model_name(
     assert response.json() == {"configured": True, "model": "gpt-test"}
 
 
+def test_status_returns_stripped_model_name(
+    client: TestClient, configure_llm: Callable[..., Settings]
+) -> None:
+    # llm_configured()/generate_json normalize the model via a shared strip
+    # helper; the status endpoint must report that SAME normalized value, not
+    # the raw configured string, or a whitespace-padded override would make
+    # the status endpoint lie about what a real request actually sends.
+    configure_llm(base_url=_SECRET_URL, model="  test-model  ")
+    response = client.get("/api/llm/status")
+    assert response.status_code == 200
+    assert response.json() == {"configured": True, "model": "test-model"}
+
+
 def test_status_reports_unconfigured(
     client: TestClient, configure_llm: Callable[..., Settings]
 ) -> None:
