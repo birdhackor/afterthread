@@ -44,9 +44,10 @@ function HomePage() {
 		let cancelled = false;
 
 		fetch("/api/health")
-			.then((response) => {
+			.then((response) => response.json())
+			.then((data) => {
 				if (!cancelled) {
-					setConnected(response.ok);
+					setConnected(data?.status === "ok");
 				}
 			})
 			.catch(() => {
