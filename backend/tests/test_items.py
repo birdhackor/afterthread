@@ -7,6 +7,7 @@ from sqlalchemy import Engine, delete, event
 from sqlalchemy.orm.exc import StaleDataError
 from sqlmodel import Session, col, select
 
+from app.config import get_settings
 from app.models import MemoryItem, ProgressEntry
 from app.routers.items import SQLITE_MAX_INT
 
@@ -96,6 +97,26 @@ def test_create_first_progress_entry_seeded(client: TestClient) -> None:
     item = _create(client)
     detail = client.get(f"/api/items/{item['id']}").json()
     assert [entry["note"] for entry in detail["progress"]] == ["建立項目"]
+
+
+def test_needs_enrichment_item_goes_stale_past_threshold(
+    client: TestClient, session: Session
+) -> None:
+    """Stale-eligibility spans all five non-terminal statuses
+    (models.STALE_ELIGIBLE_STATUSES), not just active/waiting/parked: a
+    needs-enrichment item left untouched past the threshold must report
+    is_stale=true, so it surfaces for review before the topic goes cold.
+    """
+    item = _create(client, status="needs-enrichment")
+    stored = session.get(MemoryItem, item["id"])
+    assert stored is not None
+    stored.updated = datetime.now(UTC) - timedelta(days=get_settings().stale_after_days + 1)
+    session.add(stored)
+    session.commit()
+
+    detail = client.get(f"/api/items/{item['id']}").json()
+    assert detail["status"] == "needs-enrichment"
+    assert detail["is_stale"] is True
 
 
 def test_create_empty_title_rejected(client: TestClient) -> None:

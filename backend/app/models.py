@@ -24,6 +24,25 @@ class MemoryStatus(StrEnum):
     superseded = "superseded"
 
 
+# The five non-terminal statuses -- every status except the terminal `done`
+# and `superseded`. An item in any of these is eligible to go stale once its
+# `updated` timestamp passes the configured threshold (see
+# schemas.MemoryItemRead.is_stale). Defined here, next to MemoryStatus, as the
+# single source of truth for stale-eligibility: it is the repo's methodology to
+# enrich and keep context warm *before* the topic goes cold, which applies just
+# as much to a still-unenriched capture-quick / needs-enrichment item as to an
+# active one -- so all five, not only active/waiting/parked, are included.
+STALE_ELIGIBLE_STATUSES = frozenset(
+    {
+        MemoryStatus.capture_quick,
+        MemoryStatus.needs_enrichment,
+        MemoryStatus.active,
+        MemoryStatus.waiting,
+        MemoryStatus.parked,
+    }
+)
+
+
 class MemoryStage(StrEnum):
     """Two-stage capture workflow marker."""
 

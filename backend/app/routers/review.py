@@ -1,4 +1,4 @@
-"""Review endpoint grouping in-progress items that need attention."""
+"""Review endpoint grouping non-terminal items that need attention."""
 
 from typing import Annotated
 
@@ -27,15 +27,16 @@ _STATUS_TO_GROUP: dict[MemoryStatus, str] = {
 
 @router.get("", response_model=ReviewResponse)
 def review(session: SessionDep) -> ReviewResponse:
-    """Group in-progress items into disjoint buckets, oldest first per group.
+    """Group non-terminal items into disjoint buckets, oldest first per group.
 
-    A single query fetches every reviewable item so the buckets reflect one
-    consistent snapshot. Building each bucket from its own query would let a
-    status PATCH race between them and double-place or misplace an item (and
-    the ORM identity map could hand back stale state for a row re-read across
-    queries). ``done`` and ``superseded`` are excluded entirely; staleness is
-    surfaced per item via ``MemoryItemRead.is_stale`` rather than as a
-    separate group.
+    The reviewable statuses are exactly the five non-terminal ones
+    (models.STALE_ELIGIBLE_STATUSES); ``done`` and ``superseded`` are terminal
+    and excluded entirely. A single query fetches every reviewable item so the
+    buckets reflect one consistent snapshot. Building each bucket from its own
+    query would let a status PATCH race between them and double-place or
+    misplace an item (and the ORM identity map could hand back stale state for
+    a row re-read across queries). Staleness is surfaced per item via
+    ``MemoryItemRead.is_stale`` rather than as a separate group.
     """
     stmt = (
         select(MemoryItem)

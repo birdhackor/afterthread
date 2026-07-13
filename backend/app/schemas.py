@@ -11,10 +11,7 @@ from pydantic import (
 )
 
 from app.config import get_settings
-from app.models import MemoryStage, MemoryStatus
-
-# Statuses considered "in progress" and therefore eligible to go stale.
-_IN_PROGRESS = {MemoryStatus.active, MemoryStatus.waiting, MemoryStatus.parked}
+from app.models import STALE_ELIGIBLE_STATUSES, MemoryStage, MemoryStatus
 
 
 def _ensure_aware(value: datetime) -> datetime:
@@ -145,8 +142,13 @@ class MemoryItemRead(MemoryItemContent):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def is_stale(self) -> bool:
-        """True for in-progress items whose `updated` is past the threshold."""
-        if self.status not in _IN_PROGRESS:
+        """True for a stale-eligible (non-terminal) item whose `updated` is
+        past the configured threshold; always False for terminal items.
+
+        Stale-eligibility is the shared models.STALE_ELIGIBLE_STATUSES set
+        (all five non-terminal statuses), not a schema-local subset.
+        """
+        if self.status not in STALE_ELIGIBLE_STATUSES:
             return False
         threshold = timedelta(days=get_settings().stale_after_days)
         return datetime.now(UTC) - self.updated > threshold
