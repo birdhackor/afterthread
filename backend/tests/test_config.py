@@ -63,3 +63,32 @@ def test_openai_timeout_seconds_zero_rejected() -> None:
 def test_openai_timeout_seconds_negative_rejected() -> None:
     with pytest.raises(ValidationError):
         Settings(openai_timeout_seconds=-1)
+
+
+# `llm_prompt_budget_chars` caps the serialized item snapshot in an enrich /
+# assist-update prompt (see app.services.memory_ai). Its Field(ge=4000,
+# le=200000) bound makes a nonsensical override fail at startup via
+# pydantic-settings, matching the openai_timeout_seconds / stale_after_days
+# convention, rather than only when the first AI prompt is built.
+
+
+def test_llm_prompt_budget_chars_default_is_32000() -> None:
+    assert Settings().llm_prompt_budget_chars == 32000
+
+
+def test_llm_prompt_budget_chars_lower_bound_accepted() -> None:
+    assert Settings(llm_prompt_budget_chars=4000).llm_prompt_budget_chars == 4000
+
+
+def test_llm_prompt_budget_chars_upper_bound_accepted() -> None:
+    assert Settings(llm_prompt_budget_chars=200000).llm_prompt_budget_chars == 200000
+
+
+def test_llm_prompt_budget_chars_below_lower_bound_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Settings(llm_prompt_budget_chars=3999)
+
+
+def test_llm_prompt_budget_chars_above_upper_bound_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Settings(llm_prompt_budget_chars=200001)

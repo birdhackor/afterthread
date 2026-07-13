@@ -64,8 +64,9 @@ _ENRICH_NOTE = "AI 全面補充"
 _UPDATE_NOTE = "AI 協助更新"
 
 # Item fields snapshotted (before the LLM call) to build the enrich/update
-# prompt: the title plus every whitelisted section.
-_AI_ITEM_FIELDS: tuple[str, ...] = ("title", *SECTION_FIELD_ORDER)
+# prompt: the metadata header (title/status/stage/tags, rendered in full by the
+# budgeted serializer) plus every whitelisted section.
+_AI_ITEM_FIELDS: tuple[str, ...] = ("title", "status", "stage", "tags", *SECTION_FIELD_ORDER)
 
 # Error contract. Codes and messages are fixed and config-free. The `code`
 # fields (and the 503 message) in the OpenAPI examples below are built from the

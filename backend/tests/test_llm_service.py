@@ -21,6 +21,7 @@ import pytest
 
 from app.config import Settings
 from app.services.llm import (
+    _UPSTREAM_REASON,
     LLMNotConfiguredError,
     LLMUpstreamError,
     _balanced_brace_slice,
@@ -276,6 +277,73 @@ def test_generate_json_timeout_raises_upstream(monkeypatch: pytest.MonkeyPatch) 
     _configured(monkeypatch, exc=openai.APITimeoutError(request=request))
     with pytest.raises(LLMUpstreamError):
         asyncio.run(generate_json("system", "user"))
+
+
+# --- generate_json: total SDK-call boundary (finding 1) -------------------
+
+
+def test_generate_json_sdk_json_decode_error_raises_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A merely OpenAI-*compatible* endpoint can return a 2xx whose body is
+    broken JSON; the SDK parses that body INTERNALLY and raises
+    json.JSONDecodeError -- NOT an OpenAIError. The total call boundary must map
+    it to LLMUpstreamError (502), never let it escape as an unhandled 500.
+    """
+    _configured(monkeypatch, exc=json.JSONDecodeError("Expecting value", "", 0))
+    with pytest.raises(LLMUpstreamError):
+        asyncio.run(generate_json("system", "user"))
+
+
+def test_generate_json_sdk_value_error_raises_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bare ValueError from the SDK boundary (an empty-body parse) is likewise
+    mapped onto the 502 taxonomy rather than surfacing as a 500.
+    """
+    _configured(monkeypatch, exc=ValueError("could not parse response body"))
+    with pytest.raises(LLMUpstreamError):
+        asyncio.run(generate_json("system", "user"))
+
+
+def test_generate_json_sdk_parse_error_message_carries_only_category(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The mapped message is the safe category + fixed reason -- config-free and
+    chain-severed -- exactly as for an OpenAIError, so a broken response body can
+    never ride along in __cause__ into a traceback sink.
+    """
+    _configured(monkeypatch, exc=json.JSONDecodeError("Expecting value", "raw body", 0))
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        asyncio.run(generate_json("system", "user"))
+    message = str(excinfo.value)
+    assert "JSONDecodeError" in message
+    assert _UPSTREAM_REASON in message
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__ is True
+
+
+def test_generate_json_not_configured_error_from_create_stays_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """503 stays 503: if the SDK call itself surfaces one of our own taxonomy
+    errors, the total boundary re-raises it UNCHANGED -- it must never rewrap an
+    LLMNotConfiguredError into a generic 502 and destroy its real status.
+    """
+    _configured(monkeypatch, exc=LLMNotConfiguredError("still unconfigured"))
+    with pytest.raises(LLMNotConfiguredError):
+        asyncio.run(generate_json("system", "user"))
+
+
+def test_generate_json_upstream_error_from_create_passes_through_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An already-shaped LLMUpstreamError raised at the SDK call is re-raised as
+    the SAME object (502 stays 502), never double-wrapped by the catch-all.
+    """
+    original = LLMUpstreamError("EmptyResponse: the LLM returned no choices")
+    _configured(monkeypatch, exc=original)
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        asyncio.run(generate_json("system", "user"))
+    assert excinfo.value is original
 
 
 def test_upstream_error_message_never_leaks_config(monkeypatch: pytest.MonkeyPatch) -> None:

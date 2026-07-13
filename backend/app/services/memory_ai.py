@@ -15,6 +15,7 @@ from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from app.config import get_settings
 from app.models import MemoryStatus, utcnow
 from app.services.llm import LLMUpstreamError, generate_json
 
@@ -370,12 +371,112 @@ def _extract_sections(data: dict[str, Any]) -> dict[str, str]:
     return sections
 
 
-def _render_item_fields(item_fields: Mapping[str, Any]) -> str:
-    """Render the current item (title + every section) for the user prompt."""
-    lines = [f"title: {_coerce_str(item_fields.get('title')).strip() or '(empty)'}"]
+# --- budgeted item serialization (bound the enrich/update prompt) ----------
+
+# Characters each non-empty section is guaranteed before the remaining budget is
+# shared out proportionally, so a section is never dropped to nothing while a
+# larger one keeps everything. Only lowered below this when the budget cannot
+# afford the floor for every competing section (see _allocate_section_budget).
+_SECTION_MIN_KEEP = 400
+# Appended to a section value that had to be cut to fit the budget, so the model
+# can tell the content was truncated rather than genuinely ending there.
+_TRUNCATION_MARKER = "…[內容過長已截斷]"
+
+# The short metadata rendered in full at the top of the serialized item, in
+# order. These are bounded by construction (title <= 300, the two enums are tiny,
+# tags <= 10 x 50) so they always fit; only the free-text sections are budgeted.
+_HEADER_FIELD_ORDER: tuple[str, ...] = ("title", "status", "stage", "tags")
+
+
+def _render_header_value(value: object) -> str:
+    """Render one header field to a single-line string (tags comma-joined)."""
+    if isinstance(value, (list, tuple)):
+        parts = [_coerce_str(item).strip() for item in value]
+        return ", ".join(part for part in parts if part)
+    return _coerce_str(value).strip()
+
+
+def _allocate_section_budget(lengths: list[int], budget: int) -> list[int]:
+    """Deterministically cap each section's length so the total fits ``budget``.
+
+    Returns a per-section character cap. When the sections already fit, each cap
+    is its own full length (no truncation). Otherwise every section is floored at
+    ``min(length, min(_SECTION_MIN_KEEP, budget // n))`` -- a short section is kept
+    whole and none is dropped -- and the leftover budget is then handed out in a
+    single pass proportional to each section's unmet demand. The result always
+    sums to ``<= budget`` and each cap is ``<=`` its section's own length, so the
+    caller can never exceed the budget however the values are truncated.
+    """
+    n = len(lengths)
+    if n == 0:
+        return []
+    if sum(lengths) <= budget:
+        return list(lengths)
+    floor = min(_SECTION_MIN_KEEP, budget // n)
+    caps = [min(length, floor) for length in lengths]
+    remaining = budget - sum(caps)
+    unmet_total = sum(length - cap for length, cap in zip(lengths, caps, strict=True))
+    if remaining > 0 and unmet_total > 0:
+        for index, (length, cap) in enumerate(zip(lengths, caps, strict=True)):
+            unmet = length - cap
+            if unmet <= 0:
+                continue
+            caps[index] += min(unmet, unmet * remaining // unmet_total)
+    return caps
+
+
+def _truncate_to(value: str, cap: int) -> str:
+    """Return ``value`` cut to at most ``cap`` chars, marked when it was cut."""
+    if len(value) <= cap:
+        return value
+    marker_len = len(_TRUNCATION_MARKER)
+    if cap <= marker_len:
+        return value[:cap]
+    return value[: cap - marker_len] + _TRUNCATION_MARKER
+
+
+def _serialize_item_for_prompt(item_fields: Mapping[str, Any], budget: int) -> str:
+    """Render the item (header + every section) into at most ``budget`` chars.
+
+    The header (title/status/stage/tags) is always rendered in full -- short,
+    bounded metadata the model needs to orient itself. The free-text sections
+    then share whatever budget remains: an item whose sections fit is rendered
+    verbatim, while an oversized one (up to 19 sections x 20k chars = ~380k) is
+    truncated section-by-section behind an explicit marker. This keeps the whole
+    snapshot bounded so a small-context model is never handed an unusable ~380k
+    prompt that would fail every enrich/update as a permanent 502. Deterministic:
+    the same item and budget always serialize identically.
+    """
+    header_lines = [
+        f"{field}: {_render_header_value(item_fields.get(field)) or '(empty)'}"
+        for field in _HEADER_FIELD_ORDER
+    ]
+    section_values = {
+        field: _coerce_str(item_fields.get(field)).strip() for field in SECTION_FIELD_ORDER
+    }
+    nonempty = [(field, value) for field, value in section_values.items() if value]
+
+    # Charge the fixed scaffolding (header, every section label, "(empty)"
+    # placeholders, and all the joining newlines) against the budget first, so
+    # what remains is exactly the room available for the section VALUES. Because
+    # the final string only adds each value into its already-counted label line,
+    # header + labels + sum(values) is the true total -- keeping sum(values) under
+    # value_budget keeps the whole output at or under budget.
+    scaffold_lines = [*header_lines]
+    scaffold_lines += [
+        f"{field}: " if value else f"{field}: (empty)" for field, value in section_values.items()
+    ]
+    value_budget = max(0, budget - len("\n".join(scaffold_lines)))
+
+    caps = _allocate_section_budget([len(value) for _, value in nonempty], value_budget)
+    capped = {
+        field: _truncate_to(value, cap) for (field, value), cap in zip(nonempty, caps, strict=True)
+    }
+
+    lines = [*header_lines]
     for field in SECTION_FIELD_ORDER:
-        value = _coerce_str(item_fields.get(field)).strip()
-        lines.append(f"{field}: {value or '(empty)'}")
+        value = section_values[field]
+        lines.append(f"{field}: {capped[field]}" if value else f"{field}: (empty)")
     return "\n".join(lines)
 
 
@@ -480,10 +581,11 @@ class EnrichResult(BaseModel):
 
 
 def _enrich_user_prompt(item_fields: Mapping[str, Any], additional_context: str) -> str:
+    budget = get_settings().llm_prompt_budget_chars
     return "\n\n".join(
         [
             "Existing memory item:",
-            _render_item_fields(item_fields),
+            _serialize_item_for_prompt(item_fields, budget),
             "New context to integrate:",
             additional_context,
         ]
@@ -554,10 +656,11 @@ class UpdateResult(BaseModel):
 
 
 def _update_user_prompt(item_fields: Mapping[str, Any], note: str) -> str:
+    budget = get_settings().llm_prompt_budget_chars
     return "\n\n".join(
         [
             "Existing memory item:",
-            _render_item_fields(item_fields),
+            _serialize_item_for_prompt(item_fields, budget),
             "Progress note to record:",
             note,
         ]

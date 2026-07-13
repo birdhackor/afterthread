@@ -204,6 +204,42 @@ def test_enrich_empty_sections_still_records_progress(
     assert "看過了" in _progress_notes(client, item["id"])
 
 
+def test_enrich_prompt_is_budgeted_for_a_huge_item(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A huge item must not blow up the enrich prompt. The serialized item
+    snapshot is capped at llm_prompt_budget_chars, so the mocked LLM receives a
+    bounded prompt instead of the ~unbounded one the raw sections would produce
+    (which a small-context model would permanently 502 on).
+    """
+    # Three sections that, serialized naively, would be ~18k characters.
+    big = "字" * 6000
+    item = _create(client, snapshot=big, known=big, decisions=big)
+
+    captured: dict[str, str] = {}
+
+    async def _fake(system: str, user: str) -> dict[str, Any]:
+        captured["user"] = user
+        return {"sections": {"snapshot": "s"}, "progress_note": "n"}
+
+    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+    # Force a small budget so the bound is unmistakable.
+    monkeypatch.setattr(
+        "app.services.memory_ai.get_settings",
+        lambda: Settings(llm_prompt_budget_chars=4000),
+    )
+
+    response = client.post(f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"})
+    assert response.status_code == 200, response.text
+
+    user = captured["user"]
+    # Whole prompt = a small fixed preamble + the <=4000-char item snapshot + the
+    # (separately bounded) context -- far under the ~18k the raw sections would be.
+    assert len(user) < 4000 + 200
+    # Truncation actually happened: the marker is present in the serialized item.
+    assert "內容過長已截斷" in user
+
+
 def test_enrich_missing_returns_404(client: TestClient) -> None:
     response = client.post("/api/items/9999/enrich", json={"additional_context": "ctx"})
     assert response.status_code == 404

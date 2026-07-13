@@ -274,6 +274,13 @@ async def generate_json(system: str, user: str) -> dict[str, Any]:
             ],
             temperature=0.2,
         )
+    except LLMNotConfiguredError, LLMUpstreamError:
+        # Our own taxonomy carries its own HTTP mapping (503 stays 503, an
+        # already-shaped 502 stays 502). Re-raise it UNCHANGED so the total
+        # catch-all below can never rewrap one of these into a generic upstream
+        # 502 and destroy its real status. Listed first so it wins over the
+        # broad `except Exception` (both are Exception subclasses).
+        raise
     except OpenAIError as exc:
         # Category only (the SDK error's class name) plus the fixed shared
         # reason. Never str(exc): APIConnectionError chains the target URL,
@@ -283,6 +290,16 @@ async def generate_json(system: str, user: str) -> dict[str, Any]:
         # or a raw response body -- cannot ride along in __cause__ into a
         # traceback-logging sink; the safe category prefix keeps diagnosis
         # possible.
+        raise LLMUpstreamError(f"{type(exc).__name__}: {_UPSTREAM_REASON}") from None
+    except Exception as exc:
+        # Total boundary. A merely OpenAI-*compatible* endpoint can return a 2xx
+        # whose body is broken or empty JSON; the SDK parses that body INTERNALLY
+        # and raises json.JSONDecodeError / ValueError (a ValueError subclass) --
+        # NEITHER an OpenAIError -- so without this arm such output escapes as an
+        # unhandled 500 instead of the intended 502. Map every remaining
+        # non-taxonomy failure at this call onto the same upstream taxonomy,
+        # carrying only the exception category (never str(exc), which could embed
+        # a response body) and severing the chain with `from None`.
         raise LLMUpstreamError(f"{type(exc).__name__}: {_UPSTREAM_REASON}") from None
 
     # A conformant response is choices=[choice, ...] with choice.message.content

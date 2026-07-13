@@ -29,6 +29,17 @@ class Settings(BaseSettings):
     # made. Ten minutes is a generous ceiling for a single completion.
     openai_timeout_seconds: float = Field(default=60, gt=0, le=600)
 
+    # Hard ceiling on the number of characters the serialized item snapshot may
+    # occupy in an enrich / assist-update prompt (see
+    # app/services/memory_ai.py). Without it, an item with 19 sections of up to
+    # 20k characters each serializes to a ~380k-character prompt that a
+    # small-context model rejects on every call -- surfacing as a permanent 502
+    # rather than a config error. Bounded to [4000, 200000] (startup-validated
+    # via pydantic-settings, matching the openai_timeout_seconds /
+    # stale_after_days convention): below 4k the header alone crowds out the
+    # sections, and 200k is already generous for any real context window.
+    llm_prompt_budget_chars: int = Field(default=32000, ge=4000, le=200000)
+
     database_url: str = "sqlite:///./context_memory.db"
 
     # An item in any stale-eligible status (models.STALE_ELIGIBLE_STATUSES --
