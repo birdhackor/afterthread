@@ -158,6 +158,20 @@ def test_llm_configured_true_without_api_key(monkeypatch: pytest.MonkeyPatch) ->
     assert llm_configured() is True
 
 
+def test_llm_configured_false_when_base_url_syntactically_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A base URL AsyncOpenAI would reject at construction (invalid port) is not a
+    # usable endpoint. llm_configured reparses it with httpx.URL, the same way
+    # the SDK does, and reports unconfigured -- so the status endpoint agrees
+    # with the 503 the workflows would raise for the identical config.
+    monkeypatch.setattr(
+        "app.services.llm.get_settings",
+        lambda: _settings(base_url="http://h:8o80/v1", model=_CONFIGURED_MODEL),
+    )
+    assert llm_configured() is False
+
+
 # --- generate_json: config gate ------------------------------------------
 
 

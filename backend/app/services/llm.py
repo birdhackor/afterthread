@@ -21,6 +21,7 @@ import json
 from functools import lru_cache
 from typing import Any
 
+import httpx
 from openai import AsyncOpenAI, OpenAIError
 
 from app.config import get_settings
@@ -61,15 +62,32 @@ _UPSTREAM_REASON = "the upstream LLM request failed"
 
 
 def llm_configured() -> bool:
-    """True only when both an endpoint URL and a model name are configured.
+    """True only when a usable endpoint URL and a model name are configured.
 
     The API key is intentionally NOT part of this check: a keyless
     OpenAI-compatible gateway is legitimate (see ``_UNSET_API_KEY_PLACEHOLDER``),
     so requiring a key would wrongly report a working endpoint as unconfigured.
     Both fields are stripped so a whitespace-only override still reads as unset.
+
+    "Usable" also means syntactically constructible: a base URL that
+    ``AsyncOpenAI`` would reject at construction (e.g. an invalid port like
+    ``http://host:8o80/v1``, which the SDK parses with ``httpx.URL``) is not a
+    working endpoint, so this reparses it the same way and reports unconfigured
+    on failure. Without that, ``llm_configured`` would answer True while every
+    workflow using the same config degrades to 503 -- the status endpoint would
+    disagree with actual usability. The URL is only parsed, never echoed, so no
+    fragment of it leaks out of this function.
     """
     settings = get_settings()
-    return bool(settings.openai_base_url.strip() and settings.openai_model.strip())
+    base_url = settings.openai_base_url.strip()
+    model = settings.openai_model.strip()
+    if not (base_url and model):
+        return False
+    try:
+        httpx.URL(base_url)
+    except Exception:
+        return False
+    return True
 
 
 @lru_cache(maxsize=8)
@@ -223,7 +241,11 @@ async def generate_json(system: str, user: str) -> dict[str, Any]:
             or a full response body.
     """
     if not llm_configured():
-        raise LLMNotConfiguredError("The LLM endpoint is not configured.")
+        # `from None` severs any context: this gate now also fields a
+        # syntactically invalid base_url (llm_configured reparses it and reports
+        # unconfigured), and suppressing context keeps that path's traceback as
+        # free of a URL fragment as the _get_client construction path already is.
+        raise LLMNotConfiguredError("The LLM endpoint is not configured.") from None
 
     settings = get_settings()
     client = _get_client()
