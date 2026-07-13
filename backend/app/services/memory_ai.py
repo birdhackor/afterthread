@@ -316,6 +316,50 @@ def _history_lines_preserved(old: str, new: str) -> bool:
     return all(_normalize_ws(line) in new_lines for line in old.splitlines() if line.strip())
 
 
+# Storage cap for the history-bearing sections, applied AFTER
+# merge_with_supersede concatenates -- a SECOND, LARGER tier above
+# _PER_SECTION_CAP (20000 chars, the per-input bound on what a single LLM
+# response may contribute -- see the top of this module). A history section
+# legitimately accumulates a superseded block on every enrich/assist-update
+# round that changes it (that is the whole point of supersede-not-delete), so
+# two rounds of maximal input alone already reach ~40000 -- past the per-input
+# cap but still a normal, honest history. Left unbounded, repeated rounds grow
+# it without limit, so the AI path would end up persisting content the CRUD
+# schemas' own _CRUD_SECTION_MAX (20000) would reject outright on a direct
+# write. This cap instead bounds the ACCUMULATED, SERVER-GENERATED value --
+# built only by this module's own concatenation, never a single untrusted
+# blob -- so it can safely be looser than the per-input cap while still being
+# bounded.
+_HISTORY_STORE_CAP = 60000
+
+# Appended once accumulated history is trimmed to fit _HISTORY_STORE_CAP, so a
+# reader can tell that older superseded content was dropped rather than never
+# having existed -- mirroring _TRUNCATION_MARKER's role for a single
+# over-budget section (see _serialize_item_for_prompt below) but for this
+# module's own storage cap rather than the prompt budget.
+_HISTORY_TRUNCATION_MARKER = "\n\n…[更早的歷史已截斷]"
+
+
+def _bound_history_store(merged: str, *, protected_len: int) -> str:
+    """Trim ``merged`` to at most ``_HISTORY_STORE_CAP`` chars, oldest-first.
+
+    ``merged`` is newest-first (``new``, then a dated marker, then ``old`` --
+    and ``old`` may itself nest earlier rounds the same way), so the OLDEST
+    superseded content always sits at the very tail. Cutting the tail off
+    therefore drops the oldest block(s) first while the current content and
+    its most recently superseded neighbours survive, behind a final
+    truncation marker. ``protected_len`` (``new`` plus its marker) floors how
+    much of the head is kept, so ``new`` itself is never trimmed below its own
+    sanitized form -- in practice this floor is never binding, since
+    ``_PER_SECTION_CAP`` leaves ``new`` at most a third of
+    ``_HISTORY_STORE_CAP``.
+    """
+    if len(merged) <= _HISTORY_STORE_CAP:
+        return merged
+    keep = max(protected_len, _HISTORY_STORE_CAP - len(_HISTORY_TRUNCATION_MARKER))
+    return merged[:keep] + _HISTORY_TRUNCATION_MARKER
+
+
 def merge_with_supersede(old: str, new: str) -> str:
     """Losslessly fold an existing history-section value into its replacement.
 
@@ -325,8 +369,16 @@ def merge_with_supersede(old: str, new: str) -> str:
     ``_history_lines_preserved`` -- line-level containment, not substring, so a
     rewritten line is not mistaken for a preserved one); otherwise ``old`` is
     appended below ``new`` behind a dated 'superseded' marker so no prior decision
-    or rationale is ever silently dropped. An empty/whitespace ``old`` (nothing to
-    preserve) yields ``new`` unchanged, and vice versa.
+    or rationale is dropped without a visible trace. An empty/whitespace ``old``
+    (nothing to preserve) yields ``new`` unchanged, and vice versa.
+
+    The concatenation is then bounded to ``_HISTORY_STORE_CAP`` chars (see that
+    constant for the two-tier rationale): once accumulated history exceeds it,
+    the OLDEST superseded content is trimmed from the tail behind a final
+    truncation marker, while ``new`` itself always survives intact (see
+    ``_bound_history_store``). So the lossless guarantee is bounded, not
+    unlimited -- content is ever dropped only past the storage cap, and even
+    then loudly (a marker), never silently.
 
     Pure apart from the UTC date it stamps into the marker; it reads only its
     two string arguments and never touches configuration.
@@ -340,7 +392,8 @@ def merge_with_supersede(old: str, new: str) -> str:
     if _history_lines_preserved(old, new):
         return new
     marker = f"\n\n--- (superseded {utcnow().date().isoformat()}) ---\n"
-    return new + marker + old
+    head = new + marker
+    return _bound_history_store(head + old, protected_len=len(head))
 
 
 # Defensive count cap on the returned checklist gaps.
