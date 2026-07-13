@@ -1,7 +1,6 @@
 """Database engine, schema initialisation and session dependency."""
 
 from collections.abc import Generator
-from urllib.parse import parse_qs, urlsplit
 
 from sqlalchemy import Engine, event, make_url, text
 from sqlalchemy.engine.interfaces import DBAPIConnection
@@ -68,121 +67,13 @@ def _url_dialect(url: str) -> str:
         return "<unparseable database URL>"
 
 
-_URI_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
-
-
-def _uri_mode_enabled(query: dict[str, list[str]]) -> bool:
-    """Whether `query`'s `uri` parameter turns on SQLite's URI-filename mode.
-
-    Mirrors `sqlalchemy.util.asbool`, case-insensitively: `"1"`, `"true"`,
-    `"yes"`, `"on"` enable it; `"0"`, `"false"`, `"no"`, `"off"`, an absent
-    `uri` key, or any other spelling all leave it disabled. (The real
-    `asbool` also recognises a couple of single-letter synonyms and raises
-    `ValueError` for a spelling it does not recognise at all, rather than
-    treating it as false; neither distinction matters here, since a value
-    this function cannot make sense of is still caught for real -- loudly,
-    via that same `ValueError` -- by pysqlite's own `asbool` call the first
-    time a connection is actually attempted. This function only has to
-    decide, ahead of that, whether `_is_memory_sqlite_url`'s URI-only checks
-    below apply.) A URL with more than one `uri=` value (e.g.
-    `uri=false&uri=true`) is treated as enabled if *any* value is truthy,
-    erring toward applying the extra rejection checks rather than skipping
-    them.
-    """
-    return any(value.strip().lower() in _URI_TRUE_VALUES for value in query.get("uri", []))
-
-
-def _is_memory_sqlite_url(url: str) -> bool:
-    """True for SQLite URLs that do not address a durable, file-backed database.
-
-    Covers an explicit `:memory:` database, the bare `sqlite://` DSN (no
-    database at all), and `sqlite:///` with an empty path -- SQLite treats a
-    missing/empty filename as a private, anonymous on-disk database that
-    exists only for the connection that opened it, which is just as unsafe
-    to share across threads/requests as `:memory:` is.
-
-    Also covers SQLite's URI-filename form (`sqlite:///file:name?...`, see
-    https://www.sqlite.org/uri.html): a `database` of e.g. `file:memdb1`
-    looks file-backed, but `mode=memory` in its query string still opens an
-    in-memory database (optionally a named, shared-cache one), even though
-    no literal `:memory:` substring appears anywhere in the URL, e.g.
-    `sqlite:///file:memdb1?mode=memory&cache=shared&uri=true`. A URI-form
-    filename *without* `mode=memory` (e.g. `sqlite:///file:real.db?uri=true`)
-    genuinely is file-backed and must remain allowed.
-
-    The three checks below (empty URI filename, `vfs=memdb`, `mode=memory`)
-    apply only once SQLite's URI-filename parsing is actually *in effect*,
-    per `_uri_mode_enabled` above. SQLAlchemy's pysqlite dialect decides
-    whether to pass `uri=True` to `sqlite3.connect()` -- activating
-    https://www.sqlite.org/uri.html syntax -- by running the URL's `uri`
-    query value through `sqlalchemy.util.asbool` (see the
-    `_pysqlite_uri_connections` section of
-    `sqlalchemy.dialects.sqlite.pysqlite`, and `coerce_kw_type`'s use of it
-    in `create_connect_args`), which accepts far more spellings than just
-    the literal string `"true"` -- `uri=1`, `uri=True`, `uri=on` all enable
-    it too, case-insensitively. Gating only on the literal `"true"` would
-    reopen exactly the hole these checks exist to close: e.g.
-    `sqlite:///file:mem1?vfs=memdb&uri=True` is opened by pysqlite as an
-    in-memory database (capitalised `True` still satisfies `asbool`) but
-    would slip past a literal-`"true"` check unrejected. Conversely, when
-    `uri` is genuinely absent or falsy, pysqlite treats the whole `file:...`
-    string as a literal on-disk filename (odd-looking, but a real,
-    persistent, single file) and never even looks at the rest of the query
-    string -- so a `mode=memory` or `vfs=memdb` there is inert text, and
-    such a URL must stay allowed, e.g. `sqlite:///file:x.db?mode=memory`
-    with no `uri` key at all is a literal, persistent filename that merely
-    happens to contain that substring -- the checks below must not fire for
-    it:
-
-    - An empty URI filename, e.g. `sqlite:///file:?uri=true` (nothing
-      between `file:` and `?`): SQLite documents this as opening a private,
-      anonymous on-disk database scoped to the single connection that opened
-      it -- the same unsafe-to-share problem as the empty-path case above,
-      just spelled through the URI form instead.
-    - `vfs=memdb` in the query, e.g.
-      `sqlite:///file:mem1?vfs=memdb&uri=true`: this selects SQLite's
-      in-memory VFS explicitly, opening a memory-backed database regardless
-      of what the filename portion says.
-    - `mode=memory` in the query, e.g.
-      `sqlite:///file:memdb1?mode=memory&cache=shared&uri=true`: opens an
-      in-memory (optionally named, shared-cache) database; see the class
-      docstring above.
-    """
-    # Compare the exact parsed `database` component, not a substring search
-    # over the whole URL string: SQLite treats only the literal, *exact*
-    # filename ":memory:" as its special in-memory database, so a substring
-    # check (`":memory:" in url`) would wrongly reject a genuine, file-backed
-    # path that merely *contains* that text, e.g.
-    # "sqlite:///./notes:memory:.db" is a real on-disk file named
-    # "notes:memory:.db", not an in-memory database. The runtime
-    # `pragma_database_list` probe in `create_db_engine` below remains the
-    # authoritative backstop for exotic spellings this static, best-effort
-    # check does not (or cannot) recognise -- see that function's docstring.
-    database = make_url(url).database
-    if database == ":memory:":
-        return True
-    if not database:
-        return True
-    if database.startswith("file:"):
-        query = parse_qs(urlsplit(url).query)
-        if _uri_mode_enabled(query):
-            if database == "file:":
-                return True
-            if "memdb" in query.get("vfs", []):
-                return True
-            if "memory" in query.get("mode", []):
-                return True
-    return False
-
-
 def _non_persistent_sqlite_error(database_url: str) -> RuntimeError:
     """Build the RuntimeError raised for a SQLite URL that does not durably
     persist to a file.
 
-    Shared by the static `_is_memory_sqlite_url` check and the runtime
-    `pragma_database_list` probe in `create_db_engine` below, so both raise
-    an identical, "same style" error regardless of which one catches a
-    given URL -- see `create_db_engine`'s docstring for why there are two.
+    Raised by the runtime `pragma_database_list` probe in `create_db_engine`
+    below -- the sole gate on non-persistent SQLite URLs -- which asks SQLite
+    itself whether the database it opened is backed by a real on-disk file.
     """
     return RuntimeError(
         "In-memory SQLite database URLs are not supported "
@@ -245,61 +136,51 @@ def create_db_engine(database_url: str) -> Engine:
     any other backend is rejected here rather than silently behaving
     differently at query time.
 
-    In-memory SQLite is also rejected, in two layers: a static URL-shape
-    check (`_is_memory_sqlite_url`) raises a friendly, fast-fail error for
-    common misspellings, and a runtime `pragma_database_list` probe (see the
-    comment above that check, below) independently re-verifies against
-    SQLite itself once the engine exists, catching every remaining spelling
-    the static check was not taught to recognise. Rejected either way: this
-    is a persistence app, so the server has no legitimate in-memory mode
-    (data must survive restarts). A single shared in-memory database also
-    requires SQLAlchemy's StaticPool -- one DBAPI connection reused by every
-    thread -- which defeats transaction isolation between concurrent
-    sessions (one session's commit can commit another session's pending
-    writes). Tests that want an isolated, ephemeral database should build
-    their own engine directly (see `tests/conftest.py`) rather than calling
-    this function.
+    In-memory SQLite is also rejected, by a single runtime
+    `pragma_database_list` probe (see the comment above that check, below):
+    once the engine exists, it asks SQLite itself whether the database it
+    opened is backed by a real on-disk file, catching every in-memory URL
+    spelling by construction rather than re-deriving the answer from the URL
+    text. Rejected because this is a persistence app, so the server has no
+    legitimate in-memory mode (data must survive restarts). A single shared
+    in-memory database also requires SQLAlchemy's StaticPool -- one DBAPI
+    connection reused by every thread -- which defeats transaction isolation
+    between concurrent sessions (one session's commit can commit another
+    session's pending writes). Tests that want an isolated, ephemeral
+    database should build their own engine directly (see `tests/conftest.py`)
+    rather than calling this function.
     """
     dialect = _url_dialect(database_url)
     if dialect != "sqlite":
         raise RuntimeError(f'Only SQLite database URLs are supported (got dialect: "{dialect}")')
 
-    if _is_memory_sqlite_url(database_url):
-        raise _non_persistent_sqlite_error(database_url)
-
-    # check_same_thread is a pysqlite-specific flag; safe unconditionally now
-    # that non-SQLite and in-memory URLs are rejected above -- every
-    # remaining connection opens the same on-disk file, so SQLAlchemy's
-    # default pool for file-based SQLite already shares one database across
-    # threads without needing StaticPool.
+    # check_same_thread is a pysqlite-specific flag; safe unconditionally
+    # because every URL create_db_engine ultimately *returns* an engine for is
+    # file-backed SQLite (non-SQLite is rejected above; in-memory is rejected
+    # by the probe below) -- each such connection opens the same on-disk file,
+    # so SQLAlchemy's default pool for file-based SQLite already shares one
+    # database across threads without needing StaticPool.
     connect_args: dict[str, object] = {"check_same_thread": False}
     engine = create_engine(database_url, connect_args=connect_args)
     enable_sqlite_foreign_keys(engine)
 
-    # `database_url` comes from the operator's own `.env`. The static check
-    # above is a fast-fail UX nicety: a friendly, SQLite-specific error for
-    # common misspellings, raised before ever touching the filesystem. But
-    # it is necessarily a *reimplementation* of pysqlite's own `uri=`
-    # query-string parsing rules, and review keeps finding new spellings it
-    # doesn't yet know to reject -- e.g. SQLAlchemy's real `uri=` coercion
-    # accepts far more truthy spellings than `_uri_mode_enabled` above
-    # replicates (`uri=y`, `uri=t`); a duplicated `uri=false&uri=false` is
-    # coerced to *true* by SQLAlchemy's own `coerce_kw_type`/`asbool`
-    # through a non-empty tuple (`bool(("false", "false"))` is `True`,
-    # regardless of the strings it contains), even though neither value is
-    # truthy on its own; and a percent-encoded `file:%3Amemory%3A` or
-    # authority-form `file://` filename looks like a non-empty, unremarkable
-    # path to `_is_memory_sqlite_url`'s string comparisons, only resolving
-    # to an in-memory/anonymous-temp database once SQLite's own URI parser
-    # actually runs, at connection time. Rather than keep chasing individual
-    # spellings, this probe asks SQLite itself what it opened: per
+    # `database_url` comes from the operator's own `.env`. Rather than
+    # statically re-deriving from the URL text whether it addresses a durable
+    # file -- a fragile reimplementation of pysqlite's own `uri=` query-string
+    # parsing rules, where review kept finding new in-memory spellings it did
+    # not yet reject (truthy `uri=` variants like `uri=y`/`uri=t`/`uri=True`; a
+    # duplicated `uri=false&uri=false` that SQLAlchemy's own `coerce_kw_type`
+    # still coerces to *true* through a non-empty tuple, even though neither
+    # value is truthy on its own; a percent-encoded `file:%3Amemory%3A`; an
+    # authority-form `file://`), all of which only resolve to an
+    # in-memory/anonymous-temp database once SQLite's own URI parser runs at
+    # connection time -- this probe asks SQLite itself what it opened: per
     # https://www.sqlite.org/pragma.html#pragma_database_list, any database
     # that is not backed by a real on-disk file -- in-memory,
     # private/anonymous temp, or opened via SQLite's `memdb` VFS -- always
-    # reports an empty `file` column, however its URL was spelled. This is
-    # the authoritative backstop that closes every URI spelling, known or
-    # not, by construction; the static check above only ever gets to be a
-    # friendly early error for the common cases.
+    # reports an empty `file` column, however its URL was spelled. That makes
+    # this the sole gate on non-persistent SQLite URLs, closing every spelling
+    # (known or not) by construction.
     with engine.connect() as connection:
         main_file = connection.execute(
             text("SELECT file FROM pragma_database_list WHERE name = 'main'")
