@@ -49,6 +49,8 @@ def _tag_filter(tag: str) -> ColumnElement[bool]:
     decoded element values instead: exact membership, Unicode-correct, and a
     tag like "工" cannot match an item tagged "工作".
     """
+    # json_each is SQLite-only; app.db.create_db_engine rejects any non-SQLite
+    # database_url at engine creation, so that precondition is guaranteed here.
     element = func.json_each(col(MemoryItem.tags)).table_valued("value")
     return select(1).select_from(element).where(element.c.value == tag).exists()
 

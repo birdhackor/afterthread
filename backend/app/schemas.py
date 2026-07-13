@@ -1,7 +1,6 @@
 """Pydantic request/response schemas for the Context Memory API."""
 
 from datetime import UTC, datetime, timedelta
-from typing import Self
 
 from pydantic import (
     BaseModel,
@@ -9,7 +8,6 @@ from pydantic import (
     Field,
     computed_field,
     field_validator,
-    model_validator,
 )
 
 from app.config import get_settings
@@ -70,64 +68,55 @@ class MemoryItemCreate(MemoryItemContent):
 
 
 class MemoryItemUpdate(BaseModel):
-    """Partial update payload; every field is optional."""
+    """Partial update payload; every field is optional via omission.
 
-    title: str | None = None
-    source: str | None = None
-    confidence: str | None = None
-    tags: list[str] | None = None
-    status: MemoryStatus | None = None
-    stage: MemoryStage | None = None
+    Every field is typed as its ordinary, non-nullable type with a default
+    that is never actually applied: the router (`update_item`) always calls
+    `model_dump(exclude_unset=True)`, so an omitted field's default is never
+    read or written, and pydantic v2 does not validate defaults unless
+    `validate_default` is set (it isn't here). The payoff is that the
+    generated OpenAPI schema advertises each field's real type -- not
+    nullable -- so an explicit JSON `null`, which no field here legitimately
+    accepts, now fails ordinary type validation (422) instead of requiring a
+    bespoke validator to catch it after the fact.
+    """
 
-    snapshot: str | None = None
-    why_matters: str | None = None
-    known: str | None = None
-    inferred: str | None = None
-    unknown: str | None = None
-    decisions: str | None = None
-    alternatives: str | None = None
-    rationale: str | None = None
-    consequences: str | None = None
-    constraints: str | None = None
-    assumptions: str | None = None
-    risks: str | None = None
-    evidence: str | None = None
-    open_questions: str | None = None
-    next_actions: str | None = None
-    recovery_keywords: str | None = None
-    recovery_people: str | None = None
-    recovery_files: str | None = None
-    resume_trigger: str | None = None
+    title: str = ""
+    source: str = ""
+    confidence: str = ""
+    tags: list[str] = Field(default_factory=list)
+    status: MemoryStatus = MemoryStatus.capture_quick
+    stage: MemoryStage = MemoryStage.quick
+
+    snapshot: str = ""
+    why_matters: str = ""
+    known: str = ""
+    inferred: str = ""
+    unknown: str = ""
+    decisions: str = ""
+    alternatives: str = ""
+    rationale: str = ""
+    consequences: str = ""
+    constraints: str = ""
+    assumptions: str = ""
+    risks: str = ""
+    evidence: str = ""
+    open_questions: str = ""
+    next_actions: str = ""
+    recovery_keywords: str = ""
+    recovery_people: str = ""
+    recovery_files: str = ""
+    resume_trigger: str = ""
 
     @field_validator("title")
     @classmethod
-    def _title_not_blank(cls, value: str | None) -> str | None:
+    def _title_not_blank(cls, value: str) -> str:
         # Only runs when the client actually sends `title`; an omitted title
-        # keeps its default and is skipped. Reject blanks and explicit null.
-        if value is None:
-            raise ValueError("title must not be null")
+        # keeps its never-applied default and this validator is skipped.
         stripped = value.strip()
         if not stripped:
             raise ValueError("title must not be empty")
         return stripped
-
-    @model_validator(mode="after")
-    def _no_explicit_nulls(self) -> Self:
-        # Every field is `X | None = None` so it can be *omitted* from a
-        # partial update, but that same type also lets a client send an
-        # explicit JSON `null`. `model_fields_set` distinguishes "omitted"
-        # from "sent as null"; the router applies `exclude_unset=True`, so a
-        # `null` that slips through here survives and gets written straight
-        # into NOT NULL columns (or corrupts list/enum fields). No field in
-        # this model legitimately accepts null, so reject it outright rather
-        # than silently dropping or persisting it.
-        nulled = sorted(name for name in self.model_fields_set if getattr(self, name) is None)
-        if nulled:
-            fields = ", ".join(nulled)
-            raise ValueError(
-                f"null is not allowed for: {fields}. Omit the field(s) instead of sending null."
-            )
-        return self
 
 
 class MemoryItemRead(MemoryItemContent):
