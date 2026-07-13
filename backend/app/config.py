@@ -20,6 +20,15 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = ""
 
+    # Per-request timeout (seconds) for the OpenAI-compatible endpoint, passed
+    # straight to AsyncOpenAI(timeout=...) in app/services/llm.py. Bounded at
+    # construction (0 < value <= 600) so a nonsensical override -- a zero/
+    # negative timeout the SDK would reject, or an absurdly large one that
+    # would hang a request for hours -- fails loudly at startup via
+    # pydantic-settings, rather than surfacing only when the first AI call is
+    # made. Ten minutes is a generous ceiling for a single completion.
+    openai_timeout_seconds: float = Field(default=60, gt=0, le=600)
+
     database_url: str = "sqlite:///./context_memory.db"
 
     # An item in any stale-eligible status (models.STALE_ELIGIBLE_STATUSES --

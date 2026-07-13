@@ -30,3 +30,36 @@ def test_stale_after_days_above_upper_bound_rejected() -> None:
 def test_stale_after_days_negative_rejected() -> None:
     with pytest.raises(ValidationError):
         Settings(stale_after_days=-1)
+
+
+# `openai_timeout_seconds` is passed straight to AsyncOpenAI(timeout=...). Its
+# Field(gt=0, le=600) bound makes a nonsensical override -- a zero/negative
+# timeout the SDK would reject, or an hours-long one -- fail at startup via
+# pydantic-settings, rather than only when the first AI request is made.
+
+
+def test_openai_timeout_seconds_default_is_sixty() -> None:
+    assert Settings().openai_timeout_seconds == 60
+
+
+def test_openai_timeout_seconds_small_positive_accepted() -> None:
+    assert Settings(openai_timeout_seconds=0.5).openai_timeout_seconds == 0.5
+
+
+def test_openai_timeout_seconds_upper_bound_accepted() -> None:
+    assert Settings(openai_timeout_seconds=600).openai_timeout_seconds == 600
+
+
+def test_openai_timeout_seconds_above_upper_bound_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Settings(openai_timeout_seconds=601)
+
+
+def test_openai_timeout_seconds_zero_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Settings(openai_timeout_seconds=0)
+
+
+def test_openai_timeout_seconds_negative_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Settings(openai_timeout_seconds=-1)
