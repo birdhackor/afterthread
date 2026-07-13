@@ -43,10 +43,12 @@ from app.services.llm import (
     llm_configured,
 )
 from app.services.memory_ai import (
+    HISTORY_SECTIONS,
     SECTION_FIELD_ORDER,
     assist_update,
     capture_draft,
     enrich_item,
+    merge_with_supersede,
 )
 
 router = APIRouter(tags=["ai"])
@@ -74,6 +76,15 @@ _AI_ITEM_FIELDS: tuple[str, ...] = ("title", *SECTION_FIELD_ORDER)
 _LLM_NOT_CONFIGURED_CODE = "llm_not_configured"
 _LLM_UPSTREAM_CODE = "llm_upstream_error"
 _LLM_NOT_CONFIGURED_MESSAGE = "The LLM endpoint is not configured."
+
+# Optimistic-concurrency conflict (enrich / assist-update only): the item's
+# `updated` timestamp changed between the pre-LLM snapshot and the post-LLM
+# re-fetch, so another writer touched the row while the model was running. The
+# message is a fixed zh-TW literal -- it carries no config value and no item
+# content -- and the code mirrors the constant-derivation style of the 502/503
+# examples so the OpenAPI 409 example below cannot drift from what is raised.
+_CONFLICT_CODE = "conflict"
+_CONFLICT_MESSAGE = "項目在 AI 處理期間已被其他變更修改。請重新載入後再試一次。"
 
 _LLM_UNCONFIGURED_RESPONSE: dict[int | str, dict[str, Any]] = {
     503: {
@@ -114,6 +125,25 @@ _AI_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     **_LLM_UPSTREAM_RESPONSE,
 }
 
+# 409 applies ONLY to the two by-id write workflows (enrich/assist-update),
+# which snapshot the item, await the LLM, then re-fetch: capture creates a new
+# row and has nothing to conflict with.
+_CONFLICT_RESPONSE: dict[int | str, dict[str, Any]] = {
+    409: {
+        "description": "Item changed during AI processing (optimistic concurrency)",
+        "content": {
+            "application/json": {
+                "example": {
+                    "detail": {
+                        "code": _CONFLICT_CODE,
+                        "message": _CONFLICT_MESSAGE,
+                    }
+                }
+            }
+        },
+    }
+}
+
 
 def _service_unavailable() -> HTTPException:
     return HTTPException(
@@ -128,6 +158,13 @@ def _bad_gateway(exc: LLMUpstreamError) -> HTTPException:
     return HTTPException(
         status_code=502,
         detail={"code": _LLM_UPSTREAM_CODE, "message": str(exc)},
+    )
+
+
+def _conflict() -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={"code": _CONFLICT_CODE, "message": _CONFLICT_MESSAGE},
     )
 
 
@@ -193,9 +230,12 @@ async def capture(payload: CaptureRequest, session: SessionDep) -> CaptureRespon
 
 
 # The two by-id AI routes can 404 (unknown item, or an item deleted during the
-# await) on top of the 503/502 AI failure modes.
+# await) and 409 (item changed during the await) on top of the 503/502 AI
+# failure modes. Sharing this one entry declares 409 on exactly those two
+# operations and nowhere else.
 _AI_BY_ID_RESPONSES: dict[int | str, dict[str, Any]] = {
     **_NOT_FOUND_RESPONSE,
+    **_CONFLICT_RESPONSE,
     **_AI_ERROR_RESPONSES,
 }
 
@@ -208,19 +248,25 @@ _AI_BY_ID_RESPONSES: dict[int | str, dict[str, Any]] = {
 async def enrich(item_id: ItemId, payload: EnrichRequest, session: SessionDep) -> EnrichResponse:
     """Full-enrich an item: merge whitelisted section updates and append progress.
 
-    Order (constraint): 404 first, then snapshot the item fields, then run the
-    LLM strictly OUTSIDE any transaction (the read transaction is released
-    before the await). Only after a successful result do writes begin -- merge
-    the returned sections (untouched fields stay as they were), flip stage to
-    full when the checklist is complete, append the progress entry, bump
-    `updated`. The response snapshot is built after flush, before commit; the
-    flush is race-wrapped so a concurrent delete resolves to 404, not a 500.
-    A 503/502 (or an item deleted mid-await) leaves the row unchanged.
+    Order (constraint): 404 first, then snapshot the item fields (and its
+    `updated` timestamp), then run the LLM strictly OUTSIDE any transaction (the
+    read transaction is released before the await). On re-fetch, a changed
+    `updated` means another writer touched the row mid-await, so respond 409 and
+    write NOTHING. Otherwise writes begin -- merge the returned sections
+    (untouched fields stay as they were; history-bearing sections are superseded,
+    never overwritten), flip stage to full when the checklist is complete, append
+    the progress entry, bump `updated`. The response snapshot is built after
+    flush, before commit; the flush is race-wrapped so a concurrent delete
+    resolves to 404, not a 500. A 503/502/409 (or an item deleted mid-await)
+    leaves the row unchanged.
     """
     item = session.get(MemoryItem, item_id)
     if item is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
     item_fields = {name: getattr(item, name) for name in _AI_ITEM_FIELDS}
+    # Snapshot `updated` BEFORE the await so a concurrent write during the LLM
+    # call can be detected on re-fetch (optimistic concurrency, below).
+    original_updated = item.updated
     # Release the read transaction so the LLM call holds no DB transaction open.
     session.rollback()
 
@@ -235,7 +281,17 @@ async def enrich(item_id: ItemId, payload: EnrichRequest, session: SessionDep) -
     item = session.get(MemoryItem, item_id)
     if item is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
+    # Optimistic concurrency: if another writer bumped `updated` while the model
+    # was running, the sections we enriched against are stale. Write NOTHING and
+    # return 409 so the caller re-reads and retries.
+    if item.updated != original_updated:
+        raise _conflict()
     for key, value in result.sections.items():
+        # Supersede-not-delete for the history-bearing sections: merge losslessly
+        # so a prior decision/rationale is never overwritten (see
+        # memory_ai.merge_with_supersede). Other sections replace wholesale.
+        if key in HISTORY_SECTIONS:
+            value = merge_with_supersede(getattr(item, key), value)
         setattr(item, key, value)
     if result.checklist_complete:
         item.stage = MemoryStage.full
@@ -272,15 +328,19 @@ async def assist_update_item(
 ) -> AssistUpdateResponse:
     """Assist an update: merge whitelisted section refreshes and append progress.
 
-    Same discipline as enrich (404 first, snapshot, LLM outside any
-    transaction, writes only after success, snapshot after flush before commit,
-    race-wrapped flush -> 404), but records a progress note without touching
-    stage or returning gaps.
+    Same discipline as enrich (404 first, snapshot including `updated`, LLM
+    outside any transaction, 409 on a concurrent mid-await write, supersede-not-
+    delete on history sections, writes only after success, snapshot after flush
+    before commit, race-wrapped flush -> 404), but records a progress note
+    without touching stage or returning gaps.
     """
     item = session.get(MemoryItem, item_id)
     if item is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
     item_fields = {name: getattr(item, name) for name in _AI_ITEM_FIELDS}
+    # Snapshot `updated` before the await for the same optimistic-concurrency
+    # check enrich performs (see there).
+    original_updated = item.updated
     session.rollback()
 
     try:
@@ -293,7 +353,12 @@ async def assist_update_item(
     item = session.get(MemoryItem, item_id)
     if item is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
+    if item.updated != original_updated:
+        raise _conflict()
     for key, value in result.sections.items():
+        # Supersede-not-delete for history-bearing sections, exactly as enrich.
+        if key in HISTORY_SECTIONS:
+            value = merge_with_supersede(getattr(item, key), value)
         setattr(item, key, value)
     note = result.progress_note or _UPDATE_NOTE
     # Explicit FK-bearing entry, not item.entries.append(...): the relationship

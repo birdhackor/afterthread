@@ -15,7 +15,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from app.models import MemoryStatus
+from app.models import MemoryStatus, utcnow
 from app.services.llm import LLMUpstreamError, generate_json
 
 # --- caps (constraint: bound everything; LLM output is untrusted) ----------
@@ -272,6 +272,51 @@ SECTION_FIELD_ORDER: tuple[str, ...] = (
     "resume_trigger",
 )
 SECTION_FIELDS = frozenset(SECTION_FIELD_ORDER)
+
+# The history-bearing sections. Overwriting any of these would erase the
+# reasoning trail the methodology's supersede-not-delete rule exists to
+# protect, so the server MERGES rather than replaces them (see
+# `merge_with_supersede`); every other section is a current-state field an
+# enrich/update may legitimately replace wholesale. A subset of SECTION_FIELDS.
+HISTORY_SECTIONS: frozenset[str] = frozenset(
+    {"decisions", "rationale", "alternatives", "consequences"}
+)
+
+
+def _normalize_ws(text: str) -> str:
+    """Collapse every run of whitespace to a single space and strip the ends.
+
+    Used only to compare two section values for containment, so a model that
+    reflows whitespace while keeping the words still reads as having preserved
+    the old text (and is not needlessly superseded).
+    """
+    return " ".join(text.split())
+
+
+def merge_with_supersede(old: str, new: str) -> str:
+    """Losslessly fold an existing history-section value into its replacement.
+
+    Enforces supersede-not-delete on the SERVER (a prompt rule alone cannot
+    guarantee it): when the model's ``new`` value already contains the existing
+    ``old`` text (compared whitespace-normalized) it is kept as-is; otherwise
+    ``old`` is appended below ``new`` behind a dated 'superseded' marker so no
+    prior decision or rationale is ever silently dropped. An empty/whitespace
+    ``old`` (nothing to preserve) yields ``new`` unchanged, and vice versa.
+
+    Pure apart from the UTC date it stamps into the marker; it reads only its
+    two string arguments and never touches configuration.
+    """
+    old = old or ""
+    new = new or ""
+    if not old.strip():
+        return new
+    if not new.strip():
+        return old
+    if _normalize_ws(old) in _normalize_ws(new):
+        return new
+    marker = f"\n\n--- (superseded {utcnow().date().isoformat()}) ---\n"
+    return new + marker + old
+
 
 # Defensive count cap on the returned checklist gaps.
 _MAX_GAPS = 20

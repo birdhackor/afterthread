@@ -1,0 +1,174 @@
+"""Optimistic-concurrency (409) tests for the by-id AI write workflows.
+
+Each handler snapshots the item's `updated` before the LLM await and re-checks
+it after. If another writer bumped `updated` while the model was running, the
+sections were enriched against stale state, so the handler must write NOTHING
+and return 409. The conflict is injected deterministically: the mocked
+`generate_json` mutates the row through the shared DBAPI connection (a stand-in
+for a second session committing mid-await) before returning its result.
+"""
+
+from typing import Any
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import Engine
+from sqlmodel import Session
+
+from app.main import app
+
+
+def _create(client: TestClient, **fields: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {"title": "Sample"} | fields
+    response = client.post("/api/items", json=payload)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def _bump_updated_via_raw_connection(session: Session, item_id: int) -> None:
+    """Set the item's `updated` to a distinctly different value directly through
+    the shared DBAPI connection, committing immediately -- the same raw-connection
+    technique tests/test_items.py uses to model an independently committed write
+    another session's rollback-and-refetch will observe. The value is written in
+    SQLAlchemy's SQLite datetime string format so it round-trips to a datetime.
+    """
+    bind = session.get_bind()
+    assert isinstance(bind, Engine)
+    raw_connection = bind.raw_connection()
+    try:
+        cursor = raw_connection.cursor()
+        try:
+            cursor.execute(
+                "UPDATE memory_item SET updated = ? WHERE id = ?",
+                ("2000-01-01 00:00:00.000000", item_id),
+            )
+        finally:
+            cursor.close()
+        raw_connection.commit()
+    finally:
+        raw_connection.close()
+
+
+def _progress_notes(client: TestClient, item_id: int) -> list[str]:
+    detail = client.get(f"/api/items/{item_id}").json()
+    return [entry["note"] for entry in detail["progress"]]
+
+
+def test_enrich_conflict_during_await_returns_409_and_writes_nothing(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = _create(client, snapshot="keep", decisions="原決策")
+    item_id = item["id"]
+
+    async def _fake(system: str, user: str) -> dict[str, Any]:
+        # A concurrent writer bumps `updated` while the model is "running".
+        _bump_updated_via_raw_connection(session, item_id)
+        return {"sections": {"decisions": "新決策"}, "progress_note": "應被丟棄"}
+
+    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+
+    response = client.post(f"/api/items/{item_id}/enrich", json={"additional_context": "ctx"})
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "conflict"
+    assert "message" in response.json()["detail"]
+
+    # Nothing was written: sections untouched, no progress entry appended.
+    detail = client.get(f"/api/items/{item_id}").json()
+    assert detail["snapshot"] == "keep"
+    assert detail["decisions"] == "原決策"
+    assert _progress_notes(client, item_id) == ["建立項目"]
+
+
+def test_assist_update_conflict_during_await_returns_409_and_writes_nothing(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = _create(client, next_actions="keep")
+    item_id = item["id"]
+
+    async def _fake(system: str, user: str) -> dict[str, Any]:
+        _bump_updated_via_raw_connection(session, item_id)
+        return {"sections": {"next_actions": "changed"}, "progress_note": "應被丟棄"}
+
+    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+
+    response = client.post(f"/api/items/{item_id}/assist-update", json={"note": "n"})
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "conflict"
+
+    detail = client.get(f"/api/items/{item_id}").json()
+    assert detail["next_actions"] == "keep"
+    assert _progress_notes(client, item_id) == ["建立項目"]
+
+
+def test_enrich_no_conflict_still_succeeds(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = _create(client)
+
+    async def _fake(system: str, user: str) -> dict[str, Any]:
+        return {"sections": {"decisions": "d"}, "progress_note": "n"}
+
+    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+    response = client.post(f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"})
+    assert response.status_code == 200
+    assert "d" in response.json()["item"]["decisions"]
+
+
+def test_assist_update_no_conflict_still_succeeds(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = _create(client)
+
+    async def _fake(system: str, user: str) -> dict[str, Any]:
+        return {"sections": {"next_actions": "n"}, "progress_note": "note"}
+
+    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+    response = client.post(f"/api/items/{item['id']}/assist-update", json={"note": "n"})
+    assert response.status_code == 200
+
+
+def test_conflict_message_carries_no_config_or_item_content(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = _create(client, snapshot="secret-snapshot-value")
+    item_id = item["id"]
+
+    async def _fake(system: str, user: str) -> dict[str, Any]:
+        _bump_updated_via_raw_connection(session, item_id)
+        return {"sections": {"decisions": "x"}, "progress_note": "y"}
+
+    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+    body = client.post(f"/api/items/{item_id}/enrich", json={"additional_context": "ctx"}).text
+    # The 409 body must not echo item content (nor any config, which is never
+    # in scope of this message at all).
+    assert "secret-snapshot-value" not in body
+
+
+# --- OpenAPI contract -----------------------------------------------------
+
+
+def _declaring(schema: dict[str, Any], status: int) -> set[tuple[str, str]]:
+    return {
+        (path, method)
+        for path, operations in schema["paths"].items()
+        for method, operation in operations.items()
+        if str(status) in operation.get("responses", {})
+    }
+
+
+def test_409_declared_on_exactly_the_two_by_id_ai_operations() -> None:
+    schema = TestClient(app).get("/openapi.json").json()
+    assert _declaring(schema, 409) == {
+        ("/api/items/{item_id}/enrich", "post"),
+        ("/api/items/{item_id}/assist-update", "post"),
+    }
+
+
+def test_declared_409_detail_shape_matches_runtime() -> None:
+    schema = TestClient(app).get("/openapi.json").json()
+    for path in ("/api/items/{item_id}/enrich", "/api/items/{item_id}/assist-update"):
+        example = schema["paths"][path]["post"]["responses"]["409"]["content"]["application/json"][
+            "example"
+        ]
+        assert example["detail"]["code"] == "conflict"
+        assert "message" in example["detail"]
