@@ -8,8 +8,10 @@ garbage-returning endpoint degrades to 502 with a safe, config-free detail and
 no partial rows, while a realistic fenced-JSON success flows through to 201.
 """
 
+import asyncio
 import json
 import logging
+import time
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
@@ -42,14 +44,21 @@ class _StubCompletions:
         content: str | None = None,
         exc: Exception | None = None,
         completion: Any = _UNSET,
+        delay: float = 0.0,
     ) -> None:
         self._content = content
         self._exc = exc
         # A verbatim completion object models a nonconforming-but-200 body from a
         # merely OpenAI-compatible gateway (missing message, null content, ...).
         self._completion = completion
+        # Simulates a slow-drip endpoint that never returns within the caller's
+        # wall-clock deadline -- see
+        # test_capture_end_to_end_wall_clock_timeout_returns_502_within_bound.
+        self._delay = delay
 
     async def create(self, **kwargs: Any) -> Any:
+        if self._delay:
+            await asyncio.sleep(self._delay)
         if self._exc is not None:
             raise self._exc
         if self._completion is not _UNSET:
@@ -88,6 +97,33 @@ def test_capture_end_to_end_upstream_failure_returns_502_no_rows_no_leak(
     assert _SECRET_KEY not in body
     assert _SECRET_URL not in body
     assert "llm.internal.example" not in body
+    assert _total(client) == 0
+
+
+def test_capture_end_to_end_wall_clock_timeout_returns_502_within_bound(
+    client: TestClient,
+    configure_llm: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow-drip endpoint that never completes within openai_timeout_seconds
+    must still degrade to 502 close to that configured deadline, not after
+    however long the stubbed upstream call actually takes: the asyncio.timeout
+    wrapped around the SDK call in generate_json is a genuine wall-clock bound,
+    unlike the SDK/httpx client-level timeout alone (per-phase inactivity; see
+    app.services.llm._build_client).
+    """
+    configure_llm(base_url=_SECRET_URL, model="m", openai_timeout_seconds=0.05)
+    _install_client(monkeypatch, _StubClient(delay=2.0, content="unused, never reached"))
+
+    started = time.monotonic()
+    response = client.post("/api/capture", json={"raw_text": "raw discussion"})
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "llm_upstream_error"
+    assert response.json()["detail"]["message"].startswith("Timeout: ")
+    # Bounded by the configured 0.05s deadline, not the stub's 2s delay.
+    assert elapsed < 1.0
     assert _total(client) == 0
 
 

@@ -58,11 +58,18 @@ def configure_llm(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Settings]:
     depends on ambient environment or a stray backend/.env.
     """
 
-    def _configure(*, base_url: str = "", model: str = "", api_key: str = "") -> Settings:
+    def _configure(
+        *,
+        base_url: str = "",
+        model: str = "",
+        api_key: str = "",
+        openai_timeout_seconds: float = 60,
+    ) -> Settings:
         settings = Settings(
             openai_base_url=base_url,
             openai_api_key=api_key,
             openai_model=model,
+            openai_timeout_seconds=openai_timeout_seconds,
         )
         for target in ("app.services.llm.get_settings", "app.routers.ai.get_settings"):
             monkeypatch.setattr(target, lambda settings=settings: settings)

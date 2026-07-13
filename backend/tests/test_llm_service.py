@@ -11,6 +11,7 @@ pytest-asyncio plugin is required (none is a project dependency).
 
 import asyncio
 import json
+import time
 import traceback
 from types import SimpleNamespace
 from typing import Any
@@ -50,14 +51,21 @@ class _StubCompletions:
         content: str | None = None,
         exc: Exception | None = None,
         empty_choices: bool = False,
+        delay: float = 0.0,
     ) -> None:
         self._content = content
         self._exc = exc
         self._empty_choices = empty_choices
+        # Simulates an upstream call that never returns within the caller's
+        # wall-clock deadline (a slow-drip endpoint) -- see
+        # test_generate_json_wall_clock_timeout_raises_upstream_with_timeout_category.
+        self._delay = delay
         self.calls: list[dict[str, Any]] = []
 
     async def create(self, **kwargs: Any) -> SimpleNamespace:
         self.calls.append(kwargs)
+        if self._delay:
+            await asyncio.sleep(self._delay)
         if self._exc is not None:
             raise self._exc
         if self._empty_choices:
@@ -242,12 +250,17 @@ def test_generate_json_extracts_object_from_prose(monkeypatch: pytest.MonkeyPatc
     assert asyncio.run(generate_json("system", "user")) == _SAMPLE_OBJECT
 
 
-def test_generate_json_passes_model_and_low_temperature(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_generate_json_passes_model_and_omits_temperature(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No fixed temperature is sent: some OpenAI-compatible endpoints --
+    reasoning-style models in particular -- reject the parameter outright,
+    which would otherwise turn every call against them into a 400 -> 502.
+    Omitting it lets the model/endpoint apply its own default.
+    """
     stub = _configured(monkeypatch, content=_SAMPLE_JSON)
     asyncio.run(generate_json("SYSTEM PROMPT", "USER PROMPT"))
     call = stub.chat.completions.calls[0]
     assert call["model"] == _CONFIGURED_MODEL
-    assert call["temperature"] == 0.2
+    assert "temperature" not in call
     assert call["messages"] == [
         {"role": "system", "content": "SYSTEM PROMPT"},
         {"role": "user", "content": "USER PROMPT"},
@@ -295,10 +308,60 @@ def test_generate_json_api_error_raises_upstream(monkeypatch: pytest.MonkeyPatch
 
 
 def test_generate_json_timeout_raises_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The SDK raising its own timeout error immediately (as opposed to the
+    call simply hanging -- see the wall-clock deadline test below) must still
+    map to LLMUpstreamError via the ordinary OpenAIError arm.
+    """
     request = httpx.Request("POST", f"{_CONFIGURED_BASE_URL}/chat/completions")
     _configured(monkeypatch, exc=openai.APITimeoutError(request=request))
     with pytest.raises(LLMUpstreamError):
         asyncio.run(generate_json("system", "user"))
+
+
+# --- generate_json: wall-clock deadline (finding: asyncio.timeout) --------
+
+
+def test_generate_json_wall_clock_timeout_raises_upstream_with_timeout_category(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """asyncio.timeout wraps the whole SDK call with a genuine wall-clock
+    deadline. A stub that never returns within the configured
+    openai_timeout_seconds must still raise LLMUpstreamError -- with the
+    distinct "Timeout" category -- well before the stub's own (much longer)
+    delay elapses. This is exactly what the client-level timeout alone cannot
+    guarantee (see _build_client's docstring): a slow-drip endpoint that keeps
+    sending a byte just before each read timeout would otherwise hold the
+    request open indefinitely.
+    """
+    settings = Settings(
+        openai_base_url=_CONFIGURED_BASE_URL,
+        openai_api_key=_CONFIGURED_KEY,
+        openai_model=_CONFIGURED_MODEL,
+        openai_timeout_seconds=0.05,
+    )
+    stub = _install(monkeypatch, settings, _StubClient(content=_SAMPLE_JSON, delay=1.0))
+
+    started = time.monotonic()
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        asyncio.run(generate_json("system", "user"))
+    elapsed = time.monotonic() - started
+
+    message = str(excinfo.value)
+    assert message.startswith("Timeout: ")
+    assert _UPSTREAM_REASON in message
+    # `from None` severs the cause chain, same as every other arm in this
+    # boundary.
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__ is True
+    # Bounded by the configured deadline, not the stub's 1s delay -- proves
+    # this is a genuine wall-clock cap around the whole call, not merely the
+    # SDK/httpx per-phase inactivity timer (irrelevant here anyway, since this
+    # stub bypasses the real client entirely).
+    assert elapsed < 0.5
+
+    # The request was still genuinely attempted (with the model/messages, no
+    # temperature) before the deadline cut it off.
+    assert stub.chat.completions.calls[0]["model"] == _CONFIGURED_MODEL
 
 
 # --- generate_json: total SDK-call boundary (finding 1) -------------------
@@ -561,10 +624,13 @@ def test_generate_json_malformed_endpoint_raises_not_configured(
 
 
 def test_build_client_disables_automatic_retries() -> None:
-    """max_retries=0 so the configured openai_timeout_seconds is the true
-    end-to-end latency bound: a retry would silently wait out the whole timeout
-    again (plus backoff), multiplying real-failure latency for an interactive
-    tool. Asserted on the constructed client's own attribute, not via wall-clock
+    """max_retries=0 so a retry never silently waits out the whole per-attempt
+    timeout again (plus backoff), multiplying real-failure latency for an
+    interactive tool -- one piece of what keeps openai_timeout_seconds close to
+    an end-to-end bound; the genuine wall-clock deadline is the asyncio.timeout
+    wrapped around the call in generate_json (see
+    test_generate_json_wall_clock_timeout_raises_upstream_with_timeout_category).
+    Asserted on the constructed client's own attribute, not via wall-clock
     timing, so it is deterministic.
     """
     client = _build_client("http://retry-policy.example/v1", "k", 1.0)

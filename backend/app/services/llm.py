@@ -17,6 +17,7 @@ Two hard rules shape this file:
   or a full response body) and never a config value.
 """
 
+import asyncio
 import json
 from functools import lru_cache
 from typing import Any
@@ -123,13 +124,23 @@ def _build_client(base_url: str, api_key: str, timeout: float) -> AsyncOpenAI:
     (in production via a restart, in tests via a settings override) yields a
     fresh client instead of a stale one bound to the old endpoint.
 
-    ``max_retries=0`` disables the SDK's automatic retries so that
-    ``openai_timeout_seconds`` is the true end-to-end latency bound. With a
-    retry budget, a genuine failure waits out the full timeout on every attempt
-    (plus exponential backoff between them), so a "1s timeout" quietly becomes
-    several seconds before the caller sees a 502 -- unacceptable for an
-    interactive tool where the user would rather retry from the UI. One request,
-    one timeout, no hidden multiplier.
+    ``max_retries=0`` disables the SDK's automatic retries: a retry would
+    silently wait out the whole per-attempt timeout again (plus exponential
+    backoff between attempts), so a "1s timeout" quietly becomes several
+    seconds before the caller sees a 502 -- unacceptable for an interactive
+    tool where the user would rather retry from the UI. One request, one
+    timeout, no hidden multiplier.
+
+    That alone does NOT make ``openai_timeout_seconds`` an end-to-end
+    wall-clock bound, though: the ``timeout`` passed here only configures the
+    SDK/httpx client's PER-PHASE (connect/read/write) inactivity timeout, not a
+    cap on the total request duration. A slow-drip endpoint that sends a byte
+    just before every read timeout could otherwise hold the request -- and its
+    connection -- open indefinitely, even with retries disabled. The genuine
+    end-to-end deadline is the ``asyncio.timeout`` wrapped around the call in
+    ``generate_json``; this client-level timeout stays in place alongside it as
+    an inner belt that still fast-fails a dead connect/read leg without waiting
+    for the outer deadline.
     """
     return AsyncOpenAI(
         base_url=base_url,
@@ -262,10 +273,13 @@ async def generate_json(system: str, user: str) -> dict[str, Any]:
     Raises:
         LLMNotConfiguredError: if no endpoint/model is configured (checked
             first, before any client construction or network call).
-        LLMUpstreamError: on any SDK/API error, timeout, empty completion, or
-            output that does not parse to a JSON object. The message is a safe
-            category + short reason; it never contains the base URL, API key,
-            or a full response body.
+        LLMUpstreamError: on any SDK/API error, empty completion, output that
+            does not parse to a JSON object, or a timeout -- either the SDK's
+            own (a per-phase inactivity timeout expiring) or the call
+            exceeding ``openai_timeout_seconds`` as a genuine wall-clock
+            deadline (see the ``asyncio.timeout`` below). The message is a
+            safe category + short reason; it never contains the base URL, API
+            key, or a full response body.
     """
     if not llm_configured():
         # `from None` severs any context: this gate now also fields a
@@ -277,17 +291,27 @@ async def generate_json(system: str, user: str) -> dict[str, Any]:
     settings = get_settings()
     client = _get_client()
     try:
-        completion = await client.chat.completions.create(
-            # Same normalized_model helper llm_configured and /llm/status use,
-            # so the model sent at runtime is exactly the one status validated
-            # and reported back to the client.
-            model=normalized_model(settings),
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.2,
-        )
+        # asyncio.timeout enforces a genuine WALL-CLOCK deadline around the
+        # entire call -- unlike the client-level timeout (see _build_client),
+        # which only bounds per-phase inactivity and would otherwise let a
+        # slow-drip endpoint hold the request open past openai_timeout_seconds
+        # by sending a byte just before each read timeout.
+        async with asyncio.timeout(settings.openai_timeout_seconds):
+            completion = await client.chat.completions.create(
+                # Same normalized_model helper llm_configured and /llm/status use,
+                # so the model sent at runtime is exactly the one status validated
+                # and reported back to the client.
+                model=normalized_model(settings),
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                # No fixed temperature: some OpenAI-compatible endpoints --
+                # reasoning-style models in particular -- reject the parameter
+                # outright, which would otherwise turn every call against them
+                # into a 400 -> 502. Omit it and let the model/endpoint apply
+                # its own default.
+            )
     except LLMNotConfiguredError, LLMUpstreamError:
         # Our own taxonomy carries its own HTTP mapping (503 stays 503, an
         # already-shaped 502 stays 502). Re-raise it UNCHANGED so the total
@@ -295,6 +319,13 @@ async def generate_json(system: str, user: str) -> dict[str, Any]:
         # 502 and destroy its real status. Listed first so it wins over the
         # broad `except Exception` (both are Exception subclasses).
         raise
+    except TimeoutError:
+        # asyncio.timeout's own deadline expiry (see the comment above) --
+        # distinguished from the total boundary below with its own "Timeout"
+        # category. An SDK-raised openai.APITimeoutError is an unrelated class
+        # (an OpenAIError, not a builtin TimeoutError) and still falls through
+        # to the OpenAIError arm, independent of this clause's position.
+        raise LLMUpstreamError(f"Timeout: {_UPSTREAM_REASON}") from None
     except OpenAIError as exc:
         # Category only (the SDK error's class name) plus the fixed shared
         # reason. Never str(exc): APIConnectionError chains the target URL,
