@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from app.services.memory_ai import EnrichResult, UpdateResult
+from app.services.memory_ai import EnrichResult, UpdateResult, _coerce_bool
 
 
 def _create(client: TestClient, **fields: Any) -> dict[str, Any]:
@@ -76,6 +76,40 @@ def test_enrich_result_complete_with_no_gaps_stays_complete() -> None:
 def test_update_result_accepts_only_a_progress_note() -> None:
     result = UpdateResult.model_validate({"progress_note": "just a note"})
     assert result.progress_note == "just a note"
+
+
+# --- checklist_complete strict coercion -------------------------------------
+#
+# _coerce_bool feeds EnrichResult.checklist_complete, which drives a real
+# state transition (a True reading promotes a still-capturing item to active
+# -- see routers.ai._enrich_persist). Out-of-spec LLM output must never be
+# silently read as true: only bool-as-is, the exact ints 0/1, and the
+# case-insensitive strings "true"/"false" are accepted -- everything else
+# (any other number, any other string, a list, a dict, None) coerces to
+# False, never True.
+
+# Values the OLD lenient coercion (`bool(value)` / a loose string allow-list)
+# would have wrongly accepted as true; the strict version must reject all of
+# them. "1" (string) is deliberately distinct from the int 1 below -- the old
+# code's string allow-list included "1", "yes", "complete", "done", "y".
+_AMBIGUOUS_VALUES = [2, -1, "yes", [], {}, 1.5, "1", "complete", "done", "y", "no", None]
+_TRUE_VALUES = [True, 1, "true", "True", " TRUE "]
+_FALSE_VALUES = [False, 0, "false", "False"]
+
+
+@pytest.mark.parametrize("value", _AMBIGUOUS_VALUES)
+def test_coerce_bool_rejects_ambiguous_values(value: Any) -> None:
+    assert _coerce_bool(value) is False
+
+
+@pytest.mark.parametrize("value", _TRUE_VALUES)
+def test_coerce_bool_accepts_only_exact_true_forms(value: Any) -> None:
+    assert _coerce_bool(value) is True
+
+
+@pytest.mark.parametrize("value", _FALSE_VALUES)
+def test_coerce_bool_accepts_exact_false_forms(value: Any) -> None:
+    assert _coerce_bool(value) is False
 
 
 # --- end-to-end through the endpoints -------------------------------------

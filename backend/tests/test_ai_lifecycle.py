@@ -105,6 +105,25 @@ def test_incomplete_checklist_does_not_promote(
     assert updated["stage"] == "quick"
 
 
+def test_ambiguous_checklist_complete_does_not_promote(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An out-of-spec checklist_complete value ("yes") must NOT be read as
+    # true: strict coercion (memory_ai._coerce_bool) maps anything other than
+    # bool/0/1/"true"/"false" to False, so a still-capturing item is not
+    # wrongly promoted to active/full the way a lenient `bool("yes")`-style
+    # coercion would have.
+    item = _create(client)  # capture-quick
+    assert item["status"] == "capture-quick"
+    _patch_generate_json(
+        monkeypatch,
+        {"sections": {"decisions": "d"}, "checklist_complete": "yes", "progress_note": "n"},
+    )
+    updated = _enrich(client, item["id"])
+    assert updated["status"] == "capture-quick"
+    assert updated["stage"] == "quick"
+
+
 def test_contradictory_complete_with_gaps_does_not_promote(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

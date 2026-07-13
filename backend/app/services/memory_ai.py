@@ -348,14 +348,25 @@ _MAX_GAPS = 20
 
 
 def _coerce_bool(value: object) -> bool:
-    """Coerce untrusted JSON to a bool (true/yes/1/complete/done -> True)."""
+    """Strictly coerce untrusted JSON to a bool; anything ambiguous -> False.
+
+    ``checklist_complete`` drives a real state transition -- a True reading
+    promotes a still-capturing item to active (see
+    routers.ai._enrich_persist) -- so an out-of-spec value must never be
+    silently read as true. Only three shapes are accepted as true: the bool
+    ``True`` itself, the exact int ``1``, and the case-insensitive string
+    ``"true"``. Only three shapes are accepted as false: ``False``, the exact
+    int ``0``, and the case-insensitive string ``"false"``. Every other input
+    -- any other number (2, -1, 1.5, ...), any other string ("yes", "1",
+    "complete", ...), a list, a dict, None -- coerces to False rather than
+    raising, matching every other sanitizer helper in this module (defensive,
+    never a 500), but conservatively: ambiguous input never promotes.
+    """
     if isinstance(value, bool):
         return value
-    if isinstance(value, (int, float)):
+    if isinstance(value, int) and value in (0, 1):
         return bool(value)
-    if isinstance(value, str):
-        return value.strip().lower() in {"true", "yes", "1", "complete", "done", "y"}
-    return False
+    return isinstance(value, str) and value.strip().lower() == "true"
 
 
 def _clean_sections(value: object) -> dict[str, str]:
