@@ -185,6 +185,31 @@ def test_capture_end_to_end_prose_wrapped_array_of_objects_returns_502_no_rows(
     assert _total(client) == 0
 
 
+def test_capture_end_to_end_juxtaposed_objects_returns_502_no_rows(
+    client: TestClient,
+    configure_llm: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 10: two top-level objects juxtaposed rather than wrapped in an
+    array (``{...} {...}``) fail the full-text parse as "extra data", so this
+    exercises the candidate-scan fallback inside the real generate_json.
+    Pre-fix, that fallback returned on the FIRST usable dict it found --
+    persisting row "A" and silently dropping "B". The exactly-one rule must
+    reject the pair as a whole instead: 502, no row written.
+    """
+    configure_llm(base_url=_SECRET_URL, model="m")
+    second_draft = {**_DRAFT, "title": "second element"}
+    juxtaposed = (
+        json.dumps(_DRAFT, ensure_ascii=False) + " " + json.dumps(second_draft, ensure_ascii=False)
+    )
+    _install_client(monkeypatch, _StubClient(content=juxtaposed))
+
+    response = client.post("/api/capture", json={"raw_text": "raw discussion"})
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "llm_upstream_error"
+    assert _total(client) == 0
+
+
 def test_capture_end_to_end_prose_with_innocent_bracket_before_object_returns_201(
     client: TestClient,
     configure_llm: Callable[..., Settings],
@@ -198,6 +223,29 @@ def test_capture_end_to_end_prose_with_innocent_bracket_before_object_returns_20
     configure_llm(base_url=_SECRET_URL, model="m")
     draft_json = json.dumps(_DRAFT, ensure_ascii=False)
     prose = f"Answer[1]: {draft_json}"
+    _install_client(monkeypatch, _StubClient(content=prose))
+
+    response = client.post("/api/capture", json={"raw_text": "raw discussion"})
+    assert response.status_code == 201, response.text
+    assert response.json()["item"]["title"] == "端到端草稿"
+    assert _total(client) == 1
+
+
+def test_capture_end_to_end_single_object_with_scalar_junk_before_and_after_returns_201(
+    client: TestClient,
+    configure_llm: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exactly-one rule counts USABLE DICTS only: scalar-array junk on
+    BOTH sides of the one real object must not be miscounted as a second
+    object (which would wrongly 502 this) and must not block the scan from
+    reaching the object at all. This exercises the real generate_json's new
+    walk-to-completion behaviour (needed to catch a second dict anywhere in
+    the text) with trailing noise, not just leading noise.
+    """
+    configure_llm(base_url=_SECRET_URL, model="m")
+    draft_json = json.dumps(_DRAFT, ensure_ascii=False)
+    prose = f"Answer[1]: {draft_json} (see footnote [2] for caveats)"
     _install_client(monkeypatch, _StubClient(content=prose))
 
     response = client.post("/api/capture", json={"raw_text": "raw discussion"})

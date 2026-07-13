@@ -318,6 +318,21 @@ def test_generate_json_prose_wrapped_array_raises_upstream_wrong_shape(
     assert "WrongShape" in str(excinfo.value)
 
 
+def test_generate_json_juxtaposed_objects_raises_upstream_wrong_shape_not_first_element(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 10: two objects juxtaposed (not wrapped in an array, not
+    comma-separated) fail the full-text parse as "extra data" and reach the
+    candidate-scan fallback, which pre-fix returned on the first usable dict
+    it found -- silently persisting "A" and dropping "B". The exactly-one
+    rule must reject the pair as a whole instead.
+    """
+    _configured(monkeypatch, content='{"title": "A"} {"title": "B"}')
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        asyncio.run(generate_json("system", "user"))
+    assert "WrongShape" in str(excinfo.value)
+
+
 def test_generate_json_empty_content_raises_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
     _configured(monkeypatch, content="   ")
     with pytest.raises(LLMUpstreamError):
@@ -695,6 +710,34 @@ def test_extract_json_object_prose_wrapped_array_raises_upstream_wrong_shape() -
     assert "WrongShape" in str(excinfo.value)
 
 
+def test_extract_json_object_juxtaposed_objects_raises_upstream_wrong_shape() -> None:
+    """Two top-level objects juxtaposed rather than wrapped in an array or
+    comma-separated (``{"title": "A"} {"title": "B"}``) make the full-text
+    parse fail as "extra data" -- neither the top-level-shape check (not valid
+    JSON at all) nor the old array check (there is no array here) catches
+    this. Pre-fix, the candidate-scan fallback returned on the FIRST usable
+    dict it found, silently dropping the second. The exactly-one rule closes
+    this: the scan finds two usable dicts, so it must reject the pair as a
+    whole -- 502 WrongShape, not a silent pick of "A".
+    """
+    prose = '{"title": "A"} {"title": "B"}'
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        _extract_json_object(prose)
+    assert "WrongShape" in str(excinfo.value)
+    assert "multiple JSON objects" in str(excinfo.value)
+
+
+def test_extract_json_object_three_juxtaposed_objects_raises_upstream_wrong_shape() -> None:
+    """The exactly-one rule is a COUNT, not a special case for exactly two:
+    three juxtaposed objects must be rejected the same way as two.
+    """
+    prose = '{"title": "A"} {"title": "B"} {"title": "C"}'
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        _extract_json_object(prose)
+    assert "WrongShape" in str(excinfo.value)
+    assert "multiple JSON objects" in str(excinfo.value)
+
+
 def test_extract_json_object_skips_innocent_scalar_bracket_before_object() -> None:
     """A scalar array that appears before the real object in prose (e.g. a
     footnote-style "[1]") must not be mistaken for the answer, and must not
@@ -702,6 +745,18 @@ def test_extract_json_object_skips_innocent_scalar_bracket_before_object() -> No
     list with no dict inside, so the scan skips it and keeps going.
     """
     prose = f"Answer[1]: {_SAMPLE_JSON} (see footnote 1 for caveats)"
+    assert _extract_json_object(prose) == _SAMPLE_OBJECT
+
+
+def test_extract_json_object_skips_innocent_scalar_brackets_before_and_after_object() -> None:
+    """The exactly-one rule counts USABLE DICTS only: scalar-array junk both
+    before AND after the real object must neither be mistaken for a second
+    usable object nor block the scan from finishing. This is what proves the
+    new walk-to-completion behaviour (needed to catch a second dict anywhere
+    in the text) does not turn trailing scalar noise into a false
+    "multiple objects" rejection.
+    """
+    prose = f"Answer[1]: {_SAMPLE_JSON} (see footnote [2] for caveats)"
     assert _extract_json_object(prose) == _SAMPLE_OBJECT
 
 

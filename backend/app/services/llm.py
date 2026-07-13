@@ -339,30 +339,46 @@ def _extract_json_object(text: str) -> dict[str, Any]:
 
     The fallback below (recovering an object embedded in surrounding prose,
     e.g. "Here is the draft: {..}. Hope this helps!") is only ever attempted
-    when the full text FAILS to parse as JSON at all -- and it must apply the
-    SAME shape discipline as the full-text check above, not just grab the
-    first ``{...}`` it can find. It walks every top-level balanced
-    ``{...}``/``[...]`` substring of the text, in order of appearance (see
-    ``_json_candidates``), and for each one in turn:
+    when the full text FAILS to parse as JSON at all -- and it is governed by
+    ONE closing rule, not a first-match grab: THE FALLBACK SUCCEEDS ONLY WHEN
+    THE SCAN FINDS EXACTLY ONE USABLE OBJECT. It walks every top-level
+    balanced ``{...}``/``[...]`` substring of the text, in order of appearance
+    (see ``_json_candidates``), classifying each candidate as it goes:
 
-    * a dict -> use it, stop;
-    * a list containing at least one dict -> this is the exact same
-      "ambiguous multi-draft output" the top-level-array check above guards
-      against, just wrapped in prose instead of being the whole response
-      (e.g. ``Here are two drafts: [{"title": "A"}, {"title": "B"}]``) --
-      raise LLMUpstreamError here too, rather than let a later candidate (or a
-      naive single-object scan) mistake one embedded element for the answer;
+    * a dict-bearing list -- a list containing at least one dict -- is the
+      same "ambiguous multi-draft output" the top-level-array check above
+      guards against, just wrapped in prose (or interleaved with other
+      objects) instead of being the whole response (e.g. ``Here are two
+      drafts: [{"title": "A"}, {"title": "B"}]``). This raises
+      LLMUpstreamError THE INSTANT it is found -- regardless of how many
+      usable dicts were already collected or how many candidates remain --
+      rather than let a later candidate (or a naive single-object scan)
+      mistake one embedded element for the answer;
+    * a dict is USABLE: unlike a first-match scan, finding one does NOT stop
+      the walk. Returning on the first dict is exactly what let juxtaposed
+      objects (``{"title": "A"} {"title": "B"}``, two top-level values that
+      make the full-text parse fail as "extra data") silently keep the first
+      and drop the rest -- so every usable dict is collected and the scan
+      keeps going, which is what lets a second (or third) one be noticed at
+      all;
     * anything else -- a list of scalars such as ``[1]``, a bare number or
-      string, or a candidate that does not even parse as JSON -- is not
-      usable: skip it and keep scanning. This is what lets an innocent scalar
-      bracket ahead of the real object (e.g. "Answer[1]: {...}") fall through
-      to the object instead of being mistaken for the answer or blocking the
-      scan entirely.
+      string, or a candidate that does not even parse as JSON -- is
+      skippable junk: neither counted nor allowed to block the scan. This is
+      what lets an innocent scalar bracket before OR after the real object
+      (e.g. "Answer[1]: {...}") fall through to the object instead of being
+      mistaken for the answer or blocking the scan entirely.
 
-    If no candidate ever yields a dict (and none is an ambiguous array), this
-    raises UnparseableOutput. The workflows require an object to map onto
-    their pydantic models, and a bare array/scalar is as unusable as
-    unparseable garbage.
+    Once the walk finishes without an earlier dict-bearing-list raise, the
+    usable-dict count is the whole decision: zero raises UnparseableOutput
+    (the workflows require an object to map onto their pydantic models, and a
+    bare array/scalar/unparseable candidate is as unusable as no candidate at
+    all); exactly one returns it; more than one raises LLMUpstreamError
+    WrongShape ("multiple JSON objects") -- the juxtaposition case this rule
+    closes. This single count-based rule subsumes the earlier special cases
+    rather than sitting alongside them: a lone prose-wrapped object is simply
+    the count-of-one case, a prose-wrapped array is caught by the
+    dict-bearing-list short-circuit before any count is even taken, and
+    scalar-bracket noise around either was never counted in the first place.
 
     Pathologically nested input (tens of thousands of ``[``) makes ``json.loads``
     exhaust the interpreter's recursion limit and raise ``RecursionError`` rather
@@ -372,7 +388,11 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     ``_json_candidates`` itself never recurses (its nesting tracking is a plain
     counter, not Python call recursion) and never rescans a prefix, so a
     pathological input -- deeply nested or simply full of unmatched brackets --
-    cannot make this scan quadratic.
+    cannot make this scan quadratic. Walking every candidate to completion
+    (instead of stopping at the first usable dict) does not change that bound
+    either: the combined length of every candidate this scan ever parses is
+    already bounded by ``2 * len(text)`` regardless of where in the walk a
+    dict happens to be found (see ``_json_candidates``).
     """
     cleaned = _strip_code_fences(text)
     try:
@@ -389,6 +409,12 @@ def _extract_json_object(text: str) -> dict[str, Any]:
         # array).
         raise LLMUpstreamError("WrongShape: the LLM returned a non-object JSON value")
 
+    # Every usable dict the scan finds, in order of appearance. Collected
+    # rather than returned on first sight so a second (or third) top-level
+    # object -- juxtaposed with, not nested inside, the first -- is noticed
+    # instead of silently dropped; see the "exactly one" rule in the
+    # docstring above.
+    usable_dicts: list[dict[str, Any]] = []
     for candidate in _json_candidates(cleaned):
         if candidate == cleaned:
             # Only possible when the whole cleaned text is itself one
@@ -404,21 +430,33 @@ def _extract_json_object(text: str) -> dict[str, Any]:
         except json.JSONDecodeError, ValueError, RecursionError:
             continue
         if isinstance(parsed, dict):
-            return parsed
+            usable_dicts.append(parsed)
+            continue
         if isinstance(parsed, list) and any(isinstance(item, dict) for item in parsed):
             # Same "ambiguous multi-draft output" as the top-level-array check
             # above -- just embedded in prose instead of being the whole
             # response. Raise immediately rather than let a later candidate
             # (e.g. one of this array's own elements) be mistaken for the
-            # answer.
+            # answer, and regardless of how many usable dicts already sit in
+            # usable_dicts.
             raise LLMUpstreamError(
                 "WrongShape: the LLM returned an ambiguous array of draft objects"
             )
         # Anything else -- a list with no dict in it (e.g. [1]), or a
         # candidate that failed to parse at all -- is not usable. Skip it and
-        # keep scanning; this is what lets an innocent scalar bracket ahead of
-        # the real object (e.g. "Answer[1]: {...}") fall through instead of
-        # being mistaken for the answer.
+        # keep scanning; this is what lets an innocent scalar bracket before
+        # or after the real object (e.g. "Answer[1]: {...}") fall through
+        # instead of being mistaken for the answer.
+
+    if len(usable_dicts) > 1:
+        # The juxtaposition case this rule closes: more than one top-level
+        # object was found and none of them is privileged over another, so
+        # silently picking the first would drop the rest exactly like the
+        # bug this replaces. Same safe WrongShape message family as the
+        # dict-bearing-list case above.
+        raise LLMUpstreamError("WrongShape: the LLM returned multiple JSON objects")
+    if usable_dicts:
+        return usable_dicts[0]
     raise LLMUpstreamError("UnparseableOutput: could not parse a JSON object from the LLM output")
 
 
