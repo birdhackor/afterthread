@@ -1,6 +1,6 @@
 """CRUD endpoints for memory items and their append-only progress log."""
 
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from sqlalchemy import func, or_
@@ -27,6 +27,20 @@ router = APIRouter(prefix="/items", tags=["items"])
 SessionDep = Annotated[Session, Depends(get_session)]
 
 _NOT_FOUND = "Memory item not found"
+
+# OpenAPI declaration for the 404 that the four by-id routes below can return
+# (GET/PATCH/DELETE /items/{item_id} and POST /items/{item_id}/progress).
+# Applied via each of those decorators' `responses=` so the generated schema
+# matches runtime; the collection routes (POST/GET /items, GET /review) cannot
+# 404 and deliberately do not carry it. Both the description and the example
+# derive from `_NOT_FOUND`, so neither can drift from the detail the handlers
+# actually raise.
+_NOT_FOUND_RESPONSE: dict[int | str, dict[str, Any]] = {
+    404: {
+        "description": _NOT_FOUND,
+        "content": {"application/json": {"example": {"detail": _NOT_FOUND}}},
+    }
+}
 
 # SQLite's INTEGER storage class is a signed 64-bit two's-complement integer
 # (https://www.sqlite.org/datatype3.html#the_integer_datatypes): 2**63 - 1 is
@@ -167,7 +181,11 @@ def list_items(
     )
 
 
-@router.get("/{item_id}", response_model=MemoryItemReadWithProgress)
+@router.get(
+    "/{item_id}",
+    response_model=MemoryItemReadWithProgress,
+    responses=_NOT_FOUND_RESPONSE,
+)
 def get_item(item_id: ItemId, session: SessionDep) -> MemoryItemReadWithProgress:
     """Return a single item with its full progress history (oldest first)."""
     # Load the item and its entries in ONE statement (joinedload), not a
@@ -189,7 +207,7 @@ def get_item(item_id: ItemId, session: SessionDep) -> MemoryItemReadWithProgress
     return result
 
 
-@router.patch("/{item_id}", response_model=MemoryItemRead)
+@router.patch("/{item_id}", response_model=MemoryItemRead, responses=_NOT_FOUND_RESPONSE)
 def update_item(item_id: ItemId, payload: MemoryItemUpdate, session: SessionDep) -> MemoryItemRead:
     """Apply a partial update; bump `updated` only when a field is provided."""
     item = session.get(MemoryItem, item_id)
@@ -230,7 +248,7 @@ def update_item(item_id: ItemId, payload: MemoryItemUpdate, session: SessionDep)
     return result
 
 
-@router.delete("/{item_id}", status_code=204)
+@router.delete("/{item_id}", status_code=204, responses=_NOT_FOUND_RESPONSE)
 def delete_item(item_id: ItemId, session: SessionDep) -> None:
     """Delete an item; its progress entries are removed via cascade."""
     item = session.get(MemoryItem, item_id)
@@ -240,33 +258,39 @@ def delete_item(item_id: ItemId, session: SessionDep) -> None:
     try:
         session.commit()
     except StaleDataError as exc:
-        # Reality check: a zero-row-matched DELETE does NOT raise in current
-        # SQLAlchemy. Without a `version_id_col` on the mapper (`MemoryItem`
-        # has none), the unit of work only emits a warning (see Mapper's
-        # confirm_deleted_rows docs: "the warning may be changed to an
-        # exception in a future release"). So the real-world version of this
-        # race -- the item existed at session.get() above but was deleted
-        # (and that delete committed) by another session before this flush
-        # -- never lands here at all: session.commit() above simply
-        # succeeds, and this handler falls through to its normal 204
-        # response. That is by design, not an oversight: delete-after-delete
-        # is idempotent-DELETE semantics -- asking to delete a resource
-        # that is already gone is a no-op success, not an error, the same
-        # 204 a client would get deleting it the first time. This except
-        # clause is retained only as forward-compatible hardening for a
-        # future/alternate SQLAlchemy behaviour (or a mapper reconfigured
-        # with `version_id_col`) where a zero-row DELETE does raise
-        # StaleDataError instead of warning -- kept symmetric with the
-        # UPDATE-based races above, which genuinely do raise today. See
+        # Delete-race contract, stated honestly: a mid-commit race -- the item
+        # existed at session.get() above but was deleted (and that delete
+        # committed) by another session before this commit -- resolves to 204
+        # TODAY, and would resolve to 404 only IF a future SQLAlchemy changed
+        # how a zero-row DELETE is handled. This is NOT a claim that
+        # delete-after-delete is deliberately idempotent "no-op success"
+        # semantics; it is simply that SQLAlchemy does not check a DELETE's
+        # matched-row count. Without a `version_id_col` on the mapper
+        # (`MemoryItem` has none), a zero-row-matched DELETE only emits a
+        # warning, not StaleDataError (see Mapper's confirm_deleted_rows docs:
+        # "the warning may be changed to an exception in a future release"), so
+        # session.commit() above just succeeds and the handler falls through to
+        # its normal 204 -- meaning this except clause is unreachable in the
+        # real world today. It is retained purely as forward-compatible
+        # hardening: if a future/alternate SQLAlchemy (or a mapper reconfigured
+        # with `version_id_col`) does raise StaleDataError for a zero-row
+        # DELETE, this translates that into the same 404 a not-found lookup
+        # gives, kept symmetric with the UPDATE-based races above (which do
+        # raise today). See
         # tests/test_items.py::test_delete_races_with_concurrent_delete_returns_204
-        # for the actually-reachable real-world behaviour, and
+        # for the reachable 204 path and
         # ::test_delete_races_with_manufactured_stale_data_error_returns_404
-        # for this except clause's defensive-only coverage.
+        # for this clause's defensive-only coverage.
         session.rollback()
         raise HTTPException(status_code=404, detail=_NOT_FOUND) from exc
 
 
-@router.post("/{item_id}/progress", response_model=ProgressEntryRead, status_code=201)
+@router.post(
+    "/{item_id}/progress",
+    response_model=ProgressEntryRead,
+    status_code=201,
+    responses=_NOT_FOUND_RESPONSE,
+)
 def add_progress(
     item_id: ItemId, payload: ProgressEntryCreate, session: SessionDep
 ) -> ProgressEntryRead:

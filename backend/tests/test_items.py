@@ -724,13 +724,13 @@ def test_delete_races_with_concurrent_delete_returns_204(
     not: without one, a mismatch here only emits a warning (see the ORM
     `Mapper`'s `confirm_deleted_rows` parameter docs -- "the warning may be
     changed to an exception in a future release"). So `session.commit()`
-    simply succeeds and the handler falls through to its normal 204
-    response -- which is correct, idempotent-DELETE behaviour: asking to
-    delete a resource that is already gone is a no-op success, not an
-    error. (See
-    `test_delete_races_with_manufactured_stale_data_error_returns_404` for
-    the handler's StaleDataError->404 translation, which this real-world
-    race does not actually exercise.)
+    simply succeeds and the handler falls through to its normal 204 response.
+    That 204 is not a deliberate idempotent-DELETE guarantee -- it is just the
+    consequence of SQLAlchemy not checking a DELETE's matched-row count today.
+    IF a future SQLAlchemy raised StaleDataError for a zero-row DELETE, this
+    same race would instead resolve to 404 (see
+    `test_delete_races_with_manufactured_stale_data_error_returns_404` for that
+    defensive path, which this real-world race does not exercise today).
 
     Made deterministic without real threads via a `before_flush` *session*
     event (see `test_progress_add_races_with_concurrent_delete_returns_404`
@@ -772,8 +772,9 @@ def test_delete_races_with_manufactured_stale_data_error_returns_404(
     NOT produce a StaleDataError at all -- see
     `test_delete_races_with_concurrent_delete_returns_204` above, which
     drives the exact same underlying race through the real (non-raising)
-    DELETE path and gets 204, by design (idempotent-DELETE semantics).
-    SQLAlchemy's unit of work does not raise for a zero-row-matched DELETE
+    DELETE path and gets 204 today -- simply because SQLAlchemy does not check
+    a DELETE's matched-row count, not by any deliberate idempotent-DELETE
+    design. SQLAlchemy's unit of work does not raise for a zero-row-matched DELETE
     unless the mapper has a `version_id_col` configured, which `MemoryItem`
     does not: without one, a mismatch here only emits a warning (see the
     ORM `Mapper`'s `confirm_deleted_rows` parameter docs -- "the warning may

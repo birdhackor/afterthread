@@ -54,3 +54,26 @@ def test_memory_item_update_openapi_properties_have_no_default_key() -> None:
     assert properties, "expected MemoryItemUpdate to have properties"
     for name, prop in properties.items():
         assert "default" not in prop, f"{name} still has a default: {prop}"
+
+
+def test_only_by_id_routes_declare_404() -> None:
+    """The four by-id routes -- GET/PATCH/DELETE /api/items/{item_id} and
+    POST /api/items/{item_id}/progress -- can return 404 and must declare it
+    in OpenAPI so generated clients and docs match runtime. The collection,
+    review, and health routes (POST/GET /api/items, GET /api/review, GET
+    /api/health) cannot 404 and must not declare it.
+    """
+    client = TestClient(app)
+    schema = client.get("/openapi.json").json()
+    declaring_404 = {
+        (path, method)
+        for path, operations in schema["paths"].items()
+        for method, operation in operations.items()
+        if "404" in operation.get("responses", {})
+    }
+    assert declaring_404 == {
+        ("/api/items/{item_id}", "get"),
+        ("/api/items/{item_id}", "patch"),
+        ("/api/items/{item_id}", "delete"),
+        ("/api/items/{item_id}/progress", "post"),
+    }
