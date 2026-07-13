@@ -206,6 +206,47 @@ def test_list_offset_at_sqlite_max_returns_empty_items_and_correct_total(
     assert body["total"] == 3
 
 
+def test_list_derives_total_and_page_from_single_query(
+    client: TestClient, session: Session
+) -> None:
+    """list_items must derive `total` and the page rows from ONE query (a
+    COUNT(*) window), not a separate COUNT followed by a separate SELECT. Two
+    queries can straddle a concurrent write and contradict each other -- e.g.
+    report total=1 alongside two returned items. A single statement makes the
+    page and its total one atomic snapshot. Proven by counting the
+    memory_item SELECTs issued while serving a (non-empty) list request:
+    exactly one.
+    """
+    for index in range(3):
+        _create(client, title=f"Item {index}")
+
+    bind = session.get_bind()
+    assert isinstance(bind, Engine)
+    memory_item_selects: list[str] = []
+
+    def _record_memory_item_selects(
+        conn: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: object,
+    ) -> None:
+        normalized = " ".join(statement.split()).lower()
+        if normalized.startswith("select") and "from memory_item" in normalized:
+            memory_item_selects.append(normalized)
+
+    event.listen(bind, "after_cursor_execute", _record_memory_item_selects)
+    try:
+        body = client.get("/api/items", params={"limit": 2, "offset": 0}).json()
+    finally:
+        event.remove(bind, "after_cursor_execute", _record_memory_item_selects)
+
+    assert body["total"] == 3
+    assert len(body["items"]) == 2
+    assert len(memory_item_selects) == 1, memory_item_selects
+
+
 def test_filter_by_status(client: TestClient) -> None:
     _create(client, title="Active one", status="active")
     _create(client, title="Parked one", status="parked")
@@ -314,6 +355,58 @@ def test_get_item_id_at_sqlite_max_in_range_returns_404(client: TestClient) -> N
     """
     response = client.get(f"/api/items/{SQLITE_MAX_INT}")
     assert response.status_code == 404
+
+
+def test_get_item_loads_progress_in_single_statement(client: TestClient, session: Session) -> None:
+    """get_item must load the item and its progress entries in ONE statement
+    (joinedload), not a session.get() followed by a lazy load of `entries`.
+    Two separate SELECTs leave a gap a concurrent committed DELETE can slip
+    into: the item SELECT returns the row, the delete lands, and the entries
+    SELECT then comes back empty -- yielding 200 with progress=[], a phantom
+    state (creation always seeds one entry). Folding entries into the item
+    query removes that gap entirely: the read yields either the full
+    item+entries or a 404, never an item with empty progress.
+
+    Proven both structurally -- no standalone `progress_entry` SELECT is
+    emitted while serving the request, so there is no second statement for a
+    concurrent delete to race -- and behaviorally: the seeded and appended
+    entries come back, oldest first (the relationship's order_by).
+    """
+    item = _create(client)
+    item_id = item["id"]
+    client.post(f"/api/items/{item_id}/progress", json={"note": "second entry"})
+
+    bind = session.get_bind()
+    assert isinstance(bind, Engine)
+    entry_lazy_loads: list[str] = []
+
+    def _record_entry_selects(
+        conn: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: object,
+    ) -> None:
+        normalized = " ".join(statement.split()).lower()
+        # A lazy load reads entries with a standalone `... FROM progress_entry
+        # WHERE ...`; joinedload instead folds them into the item query as
+        # `... JOIN progress_entry ...`, so no such statement should appear.
+        if normalized.startswith("select") and "from progress_entry" in normalized:
+            entry_lazy_loads.append(normalized)
+
+    event.listen(bind, "after_cursor_execute", _record_entry_selects)
+    try:
+        response = client.get(f"/api/items/{item_id}")
+    finally:
+        event.remove(bind, "after_cursor_execute", _record_entry_selects)
+
+    assert response.status_code == 200
+    assert [entry["note"] for entry in response.json()["progress"]] == [
+        "建立項目",
+        "second entry",
+    ]
+    assert entry_lazy_loads == [], f"unexpected lazy load of entries: {entry_lazy_loads}"
 
 
 def test_patch_partial_update_bumps_updated(client: TestClient, session: Session) -> None:

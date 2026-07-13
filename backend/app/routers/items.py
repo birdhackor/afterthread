@@ -5,6 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import joinedload
 from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.sql.elements import ColumnElement
 from sqlmodel import Session, col, select
@@ -130,19 +131,28 @@ def list_items(
             )
         )
 
-    count_stmt = select(func.count()).select_from(MemoryItem)
-    list_stmt = select(MemoryItem)
-    for condition in filters:
-        count_stmt = count_stmt.where(condition)
-        list_stmt = list_stmt.where(condition)
-
-    total = session.exec(count_stmt).one()
+    # Single snapshot: fetch the page rows and their true (pre-pagination)
+    # total in one query via a COUNT(*) window, reusing the same `filters`
+    # list, so a concurrent write cannot make `total` disagree with `items`
+    # (two separate SELECTs could return e.g. total=1 alongside 2 rows). The
+    # window count rides on every returned row; read it from the first.
     list_stmt = (
-        list_stmt.order_by(col(MemoryItem.updated).desc(), col(MemoryItem.id).desc())
+        select(MemoryItem, func.count().over())
+        .where(*filters)
+        .order_by(col(MemoryItem.updated).desc(), col(MemoryItem.id).desc())
         .offset(offset)
         .limit(limit)
     )
-    items = session.exec(list_stmt).all()
+    rows = session.exec(list_stmt).all()
+    if rows:
+        total = rows[0][1]
+        items = [row[0] for row in rows]
+    else:
+        # An empty page (e.g. an offset past the end of the result set) carries
+        # no window-count row, so fall back to a standalone COUNT over the same
+        # `filters` for the true total.
+        total = session.exec(select(func.count()).select_from(MemoryItem).where(*filters)).one()
+        items = []
     return ItemListResponse(
         items=[MemoryItemRead.model_validate(item) for item in items],
         total=total,
@@ -152,14 +162,22 @@ def list_items(
 @router.get("/{item_id}", response_model=MemoryItemReadWithProgress)
 def get_item(item_id: ItemId, session: SessionDep) -> MemoryItemReadWithProgress:
     """Return a single item with its full progress history (oldest first)."""
-    item = session.get(MemoryItem, item_id)
+    # Load the item and its entries in ONE statement (joinedload), not a
+    # session.get() followed by a lazy load of `entries`: two SELECTs with a
+    # gap a concurrent committed DELETE can slip into, returning 200 with an
+    # empty progress list -- a phantom state, since creation always seeds one
+    # entry. A single statement yields either the full item+entries or a 404.
+    # session.get()'s options path applies the joinedload and handles the
+    # eager collection's row uniquing internally.
+    entries_loader = joinedload(MemoryItem.entries)  # ty: ignore[invalid-argument-type]
+    item = session.get(MemoryItem, item_id, options=(entries_loader,))
     if item is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
     result = MemoryItemReadWithProgress.model_validate(item)
-    result.progress = [
-        ProgressEntryRead.model_validate(entry)
-        for entry in sorted(item.entries, key=lambda e: (e.date, e.id or 0))
-    ]
+    # entries arrive already ordered by the relationship's order_by
+    # (ProgressEntry.date, ProgressEntry.id in models.py) -- the single source
+    # of truth for progress ordering -- so iterate directly, no re-sort here.
+    result.progress = [ProgressEntryRead.model_validate(entry) for entry in item.entries]
     return result
 
 
