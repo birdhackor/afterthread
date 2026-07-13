@@ -1,6 +1,9 @@
 """Tests for the memory item CRUD and progress endpoints."""
 
+import json
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
+from typing import Any
 
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, delete, event
@@ -9,7 +12,7 @@ from sqlmodel import Session, col, select
 
 from app.config import get_settings
 from app.models import MemoryItem, ProgressEntry
-from app.routers.items import SQLITE_MAX_INT
+from app.routers.items import _EMPTY_PAGE_MAX_RETRIES, SQLITE_MAX_INT
 
 # One past SQLite's signed-64-bit INTEGER ceiling (2**63): FastAPI parses this
 # fine as a Python int, but binding it into a SQLite query raises OverflowError
@@ -67,6 +70,80 @@ def _hard_delete_item_via_raw_connection(session: Session, item_id: int | None) 
                 )
             else:
                 cursor.execute("DELETE FROM memory_item WHERE id = ?", (item_id,))
+        finally:
+            cursor.close()
+        raw_connection.commit()
+    finally:
+        raw_connection.close()
+
+
+def _insert_matching_item_via_raw_connection(session: Session, **fields: object) -> None:
+    """Insert a `memory_item` row directly through the shared DBAPI connection,
+    bypassing the ORM session and committing immediately -- the list-endpoint
+    analogue of `_hard_delete_item_via_raw_connection` above.
+
+    Used from cursor-execute hooks below to land a concurrent, matching insert
+    in the window between `list_items`' empty page query and its fallback
+    COUNT, so the COUNT sees a row the page query did not (the incoherent
+    `items=[] total>offset` the bounded retry must reconcile). Column values
+    come from a throwaway ORM instance, so every NOT NULL column carries its
+    real Python-side default; the non-text columns are encoded exactly as
+    SQLAlchemy persists them (tags as JSON text, the status/stage enums by
+    member NAME as SQLAlchemy's Enum type stores them -- `capture_quick`, not
+    the `capture-quick` value -- and the aware UTC timestamps as naive ISO
+    strings matching SQLite's DATETIME storage) so the row reads back cleanly.
+    `id` is omitted so SQLite's AUTOINCREMENT assigns a fresh one.
+    """
+    item_fields: dict[str, Any] = {"title": "Injected"}
+    item_fields.update(fields)
+    item = MemoryItem(**item_fields)
+    table = MemoryItem.__table__  # ty: ignore[unresolved-attribute]
+    columns = [column.name for column in table.columns if column.name != "id"]
+
+    def _encode(name: str) -> object:
+        value = getattr(item, name)
+        if name == "tags":
+            return json.dumps(value)
+        if isinstance(value, datetime):
+            return value.replace(tzinfo=None).isoformat(sep=" ")
+        if isinstance(value, StrEnum):
+            return value.name
+        return value
+
+    values = [_encode(name) for name in columns]
+    column_list = ", ".join(columns)
+    placeholders = ", ".join("?" for _ in columns)
+    bind = session.get_bind()
+    assert isinstance(bind, Engine)
+    raw_connection = bind.raw_connection()
+    try:
+        cursor = raw_connection.cursor()
+        try:
+            cursor.execute(
+                f"INSERT INTO memory_item ({column_list}) VALUES ({placeholders})", values
+            )
+        finally:
+            cursor.close()
+        raw_connection.commit()
+    finally:
+        raw_connection.close()
+
+
+def _delete_all_items_via_raw_connection(session: Session) -> None:
+    """Delete every `memory_item` row through the shared DBAPI connection,
+    committing immediately (progress entries cascade via the FK). Paired with
+    `_insert_matching_item_via_raw_connection` to drive a hostile
+    delete-before-page / insert-before-count churn that keeps `list_items`'
+    page query empty while its COUNT keeps reporting a row -- exercising the
+    bounded-retry ceiling.
+    """
+    bind = session.get_bind()
+    assert isinstance(bind, Engine)
+    raw_connection = bind.raw_connection()
+    try:
+        cursor = raw_connection.cursor()
+        try:
+            cursor.execute("DELETE FROM memory_item")
         finally:
             cursor.close()
         raw_connection.commit()
@@ -266,6 +343,114 @@ def test_list_derives_total_and_page_from_single_query(
     assert body["total"] == 3
     assert len(body["items"]) == 2
     assert len(memory_item_selects) == 1, memory_item_selects
+
+
+def test_list_empty_page_converges_when_row_inserted_between_page_and_count(
+    client: TestClient, session: Session
+) -> None:
+    """Deterministic reproduction of the empty-page incoherence, and proof the
+    bounded retry reconciles it.
+
+    With an empty result set, list_items runs the windowed page query (0 rows)
+    then a fallback COUNT -- in a *different* SQLite snapshot, since SELECTs run
+    in pysqlite's autocommit mode, so nothing spans the two. A concurrent insert
+    landing between them makes the COUNT report total=1 while the page stayed
+    empty: the incoherent `items=[] total=1 offset=0` (a row that belongs on
+    this very page, absent from it). list_items must notice total>offset,
+    re-read, and return a coherent pair.
+
+    The insert fires exactly once, from an after_cursor_execute hook on the
+    windowed page query, so it lands after that query but before the COUNT.
+    Pre-fix (a single COUNT with no retry) this returns items=[] total=1 and
+    fails the coherence assertions below.
+    """
+    bind = session.get_bind()
+    assert isinstance(bind, Engine)
+    injected = {"done": False}
+
+    def _inject_after_page_query(
+        conn: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: object,
+    ) -> None:
+        normalized = " ".join(statement.split()).lower()
+        is_page_query = "count(*) over" in normalized and "from memory_item" in normalized
+        if is_page_query and not injected["done"]:
+            injected["done"] = True
+            _insert_matching_item_via_raw_connection(session, title="Injected")
+
+    event.listen(bind, "after_cursor_execute", _inject_after_page_query)
+    try:
+        response = client.get("/api/items", params={"limit": 50, "offset": 0})
+    finally:
+        event.remove(bind, "after_cursor_execute", _inject_after_page_query)
+
+    assert injected["done"] is True
+    assert response.status_code == 200
+    body = response.json()
+    # Coherent: the injected row now appears on this page and total matches it,
+    # rather than items=[] alongside total=1.
+    assert body["total"] == 1
+    assert [item["title"] for item in body["items"]] == ["Injected"]
+
+
+def test_list_empty_page_bounded_retry_terminates_under_continuous_churn(
+    client: TestClient, session: Session
+) -> None:
+    """The empty-page retry is BOUNDED: a hostile hook that re-creates the
+    incoherent interleaving on every attempt must still terminate, returning
+    the final iteration's own (page, count) pair rather than looping forever.
+
+    The adversary uses before_cursor_execute so its writes are deterministic
+    relative to each statement: it DELETEs all rows just before every windowed
+    page query (forcing an empty page) and INSERTs a matching row just before
+    every standalone COUNT (forcing total=1 > offset=0). Every attempt is thus
+    incoherent, so the loop can only stop by hitting its ceiling. We assert the
+    windowed page query ran exactly _EMPTY_PAGE_MAX_RETRIES + 1 times (the
+    bound -- without it this would spin forever) and that the response is the
+    final turn's own internally consistent pair.
+    """
+    bind = session.get_bind()
+    assert isinstance(bind, Engine)
+    page_query_executions: list[str] = []
+
+    def _churn_before_each_statement(
+        conn: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: object,
+    ) -> None:
+        normalized = " ".join(statement.split()).lower()
+        if "from memory_item" not in normalized:
+            return
+        if "count(*) over" in normalized:
+            # Windowed page query about to run: force it to see an empty page.
+            page_query_executions.append(normalized)
+            _delete_all_items_via_raw_connection(session)
+        elif normalized.startswith("select count(*)"):
+            # Standalone COUNT about to run: force it to see one matching row,
+            # so total (1) > offset (0) and the page/count pair is incoherent.
+            _insert_matching_item_via_raw_connection(session, title="Churn")
+
+    event.listen(bind, "before_cursor_execute", _churn_before_each_statement)
+    try:
+        response = client.get("/api/items", params={"limit": 50, "offset": 0})
+    finally:
+        event.remove(bind, "before_cursor_execute", _churn_before_each_statement)
+
+    assert response.status_code == 200
+    # Bounded: one initial read plus at most _EMPTY_PAGE_MAX_RETRIES re-reads.
+    assert len(page_query_executions) == _EMPTY_PAGE_MAX_RETRIES + 1
+    body = response.json()
+    # Terminates on the final turn's own pair: that turn's page saw the
+    # just-deleted empty set, and its COUNT saw the just-inserted single row.
+    assert body["items"] == []
+    assert body["total"] == 1
 
 
 def test_filter_by_status(client: TestClient) -> None:

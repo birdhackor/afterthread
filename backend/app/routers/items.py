@@ -117,6 +117,13 @@ def create_item(payload: MemoryItemCreate, session: SessionDep) -> MemoryItemRea
     return result
 
 
+# Bound on how many times list_items re-reads an EMPTY page whose standalone
+# COUNT disagrees with it (total > offset -- see the coherence contract in
+# list_items). One initial read plus at most this many re-reads, so a
+# concurrent-write storm cannot make the empty-page path spin here forever.
+_EMPTY_PAGE_MAX_RETRIES = 2
+
+
 @router.get("", response_model=ItemListResponse)
 def list_items(
     session: SessionDep,
@@ -153,11 +160,33 @@ def list_items(
             )
         )
 
-    # Single snapshot: fetch the page rows and their true (pre-pagination)
-    # total in one query via a COUNT(*) window, reusing the same `filters`
-    # list, so a concurrent write cannot make `total` disagree with `items`
-    # (two separate SELECTs could return e.g. total=1 alongside 2 rows). The
-    # window count rides on every returned row; read it from the first.
+    # Coherence contract for the (items, total) pair, stated honestly:
+    #
+    #   * A NON-EMPTY page is single-snapshot BY CONSTRUCTION. Its rows and
+    #     their true (pre-pagination) total come from ONE query: a COUNT(*)
+    #     window that reuses the same `filters` and rides on every returned row
+    #     (read from the first). No concurrent write can wedge between the count
+    #     and the rows, so `total` can never disagree with `items` here (two
+    #     separate SELECTs could return e.g. total=1 alongside 2 rows; this
+    #     cannot).
+    #
+    #   * An EMPTY page carries no window-count row, so its total needs a
+    #     standalone COUNT -- and that COUNT runs in a DIFFERENT SQLite snapshot
+    #     than the page query (SELECTs execute in pysqlite's autocommit mode; no
+    #     BEGIN spans the two, and adding one is out of scope). A concurrent
+    #     insert landing between them could otherwise yield the incoherent
+    #     `items=[] total>offset`: a row that belongs on THIS very page, yet is
+    #     absent from it. So empty pages CONVERGE via bounded retry instead:
+    #     when the COUNT reports rows that should fall on this page
+    #     (total > offset), the state moved between the two statements, so
+    #     re-read both (page + count). When total <= offset the pair is already
+    #     coherent (the offset is genuinely at/past the end of the result set)
+    #     -- return it as-is. The retry count is bounded
+    #     (_EMPTY_PAGE_MAX_RETRIES), so unrelenting concurrent churn cannot spin
+    #     here forever; if the bound is reached while still incoherent, we
+    #     return the final iteration's OWN page and its OWN count -- an
+    #     internally consistent pair drawn from a single loop turn -- rather
+    #     than pairing rows and a total read at different times.
     list_stmt = (
         select(MemoryItem, func.count().over())
         .where(*filters)
@@ -165,16 +194,26 @@ def list_items(
         .offset(offset)
         .limit(limit)
     )
-    rows = session.exec(list_stmt).all()
-    if rows:
-        total = rows[0][1]
-        items = [row[0] for row in rows]
-    else:
-        # An empty page (e.g. an offset past the end of the result set) carries
-        # no window-count row, so fall back to a standalone COUNT over the same
-        # `filters` for the true total.
-        total = session.exec(select(func.count()).select_from(MemoryItem).where(*filters)).one()
+    count_stmt = select(func.count()).select_from(MemoryItem).where(*filters)
+    items: list[MemoryItem] = []
+    total = 0
+    for _attempt in range(_EMPTY_PAGE_MAX_RETRIES + 1):
+        rows = session.exec(list_stmt).all()
+        if rows:
+            # Non-empty page: items and total are one atomic snapshot.
+            total = rows[0][1]
+            items = [row[0] for row in rows]
+            break
+        # Empty page: derive the true total from a standalone COUNT.
+        total = session.exec(count_stmt).one()
         items = []
+        if total <= offset:
+            # Offset at/beyond the end of the result set: an empty page with
+            # this total is coherent. Done.
+            break
+        # total > offset: a row should sit on this page but the page query did
+        # not see it -- the DB moved between the two statements. Loop to re-read
+        # both; the bound above guarantees this terminates.
     return ItemListResponse(
         items=[MemoryItemRead.model_validate(item) for item in items],
         total=total,
