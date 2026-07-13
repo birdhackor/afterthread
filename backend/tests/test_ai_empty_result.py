@@ -1,0 +1,122 @@
+"""Tests that an all-empty AI result is rejected as upstream garbage (502),
+leaving the item untouched, while a minimal-but-meaningful result still 200s.
+
+The rejection lives in the EnrichResult / UpdateResult model validators, so it
+is asserted both directly (the models raise) and end-to-end through the two
+by-id endpoints (mocked at the service boundary).
+"""
+
+from typing import Any
+
+import pytest
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
+
+from app.services.memory_ai import EnrichResult, UpdateResult
+
+
+def _create(client: TestClient, **fields: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {"title": "Sample"} | fields
+    response = client.post("/api/items", json=payload)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def _patch_generate_json(monkeypatch: pytest.MonkeyPatch, result: dict[str, Any]) -> None:
+    async def _fake(system: str, user: str) -> dict[str, Any]:
+        return result
+
+    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+
+
+def _progress_notes(client: TestClient, item_id: int) -> list[str]:
+    detail = client.get(f"/api/items/{item_id}").json()
+    return [entry["note"] for entry in detail["progress"]]
+
+
+# --- model-level validators -----------------------------------------------
+
+
+def test_enrich_result_rejects_all_empty() -> None:
+    with pytest.raises(ValidationError):
+        EnrichResult.model_validate({})
+
+
+def test_update_result_rejects_all_empty() -> None:
+    with pytest.raises(ValidationError):
+        UpdateResult.model_validate({})
+
+
+def test_enrich_result_accepts_only_checklist_complete() -> None:
+    result = EnrichResult.model_validate({"checklist_complete": True})
+    assert result.checklist_complete is True
+
+
+def test_enrich_result_accepts_only_a_gap() -> None:
+    result = EnrichResult.model_validate({"remaining_gaps": ["missing X"]})
+    assert result.remaining_gaps == ["missing X"]
+
+
+def test_update_result_accepts_only_a_progress_note() -> None:
+    result = UpdateResult.model_validate({"progress_note": "just a note"})
+    assert result.progress_note == "just a note"
+
+
+# --- end-to-end through the endpoints -------------------------------------
+
+
+def test_enrich_empty_result_returns_502_and_leaves_item_unchanged(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = _create(client, snapshot="keep")
+    before = client.get(f"/api/items/{item['id']}").json()["updated"]
+    _patch_generate_json(monkeypatch, {})
+
+    response = client.post(f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"})
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "llm_upstream_error"
+
+    detail = client.get(f"/api/items/{item['id']}").json()
+    assert detail["snapshot"] == "keep"
+    # No progress entry appended and `updated` not bumped.
+    assert _progress_notes(client, item["id"]) == ["建立項目"]
+    assert detail["updated"] == before
+
+
+def test_assist_update_empty_result_returns_502_and_leaves_item_unchanged(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = _create(client, next_actions="keep")
+    before = client.get(f"/api/items/{item['id']}").json()["updated"]
+    _patch_generate_json(monkeypatch, {})
+
+    response = client.post(f"/api/items/{item['id']}/assist-update", json={"note": "n"})
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "llm_upstream_error"
+
+    detail = client.get(f"/api/items/{item['id']}").json()
+    assert detail["next_actions"] == "keep"
+    assert _progress_notes(client, item["id"]) == ["建立項目"]
+    assert detail["updated"] == before
+
+
+def test_enrich_minimal_meaningful_result_still_200(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only checklist_complete is meaningful enough to accept.
+    item = _create(client)
+    _patch_generate_json(monkeypatch, {"checklist_complete": True})
+    response = client.post(f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"})
+    assert response.status_code == 200
+    # And it flowed through the lifecycle promotion.
+    assert response.json()["item"]["status"] == "active"
+
+
+def test_assist_update_minimal_meaningful_result_still_200(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = _create(client)
+    _patch_generate_json(monkeypatch, {"progress_note": "只記錄一句"})
+    response = client.post(f"/api/items/{item['id']}/assist-update", json={"note": "n"})
+    assert response.status_code == 200
+    assert "只記錄一句" in _progress_notes(client, item["id"])

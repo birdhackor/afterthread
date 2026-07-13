@@ -11,7 +11,7 @@ constants so their methodology rules can be asserted directly in tests.
 """
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -402,7 +402,9 @@ ENRICH_SYSTEM_PROMPT = "\n".join(
         '- "sections": an object whose keys are any of ['
         + ", ".join(SECTION_FIELD_ORDER)
         + "], each value a string.",
-        '- "checklist_complete": true only when the item is materially complete (boolean).',
+        '- "checklist_complete": true only when the item is materially complete '
+        "(boolean). Marking it complete promotes a still-capturing item to the "
+        "active status.",
         '- "remaining_gaps": checklist items still missing (array of strings).',
         '- "progress_note": a short note describing what you added (string).',
     ]
@@ -436,6 +438,22 @@ class EnrichResult(BaseModel):
             ),
             "progress_note": _clean_text(data.get("progress_note")),
         }
+
+    @model_validator(mode="after")
+    def _require_signal(self) -> Self:
+        """Reject an all-empty result as upstream garbage.
+
+        After sanitization an enrichment must carry at least one meaningful
+        signal -- a section, a gap, a completion flag, or a progress note --
+        otherwise the model returned nothing usable. Raising here yields a
+        ValidationError, which ``_validate`` maps to the 502 upstream-error path
+        so the router writes nothing (no progress entry, no bumped `updated`).
+        """
+        if not (
+            self.sections or self.remaining_gaps or self.checklist_complete or self.progress_note
+        ):
+            raise ValueError("enrichment result carries no usable signal")
+        return self
 
 
 def _enrich_user_prompt(item_fields: Mapping[str, Any], additional_context: str) -> str:
@@ -497,6 +515,19 @@ class UpdateResult(BaseModel):
             "sections": _extract_sections(data),
             "progress_note": _clean_text(data.get("progress_note")),
         }
+
+    @model_validator(mode="after")
+    def _require_signal(self) -> Self:
+        """Reject an all-empty result as upstream garbage.
+
+        An assisted update must carry at least one non-empty section or a
+        progress note; otherwise the model returned nothing usable. As with
+        EnrichResult, the raised ValidationError maps to the 502 path and the
+        router writes nothing.
+        """
+        if not (self.sections or self.progress_note):
+            raise ValueError("update result carries no usable signal")
+        return self
 
 
 def _update_user_prompt(item_fields: Mapping[str, Any], note: str) -> str:

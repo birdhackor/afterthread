@@ -24,7 +24,7 @@ from sqlmodel import Session
 
 from app.config import get_settings
 from app.db import get_session
-from app.models import MemoryItem, MemoryStage, ProgressEntry, utcnow
+from app.models import MemoryItem, MemoryStage, MemoryStatus, ProgressEntry, utcnow
 from app.routers.items import _NOT_FOUND, _NOT_FOUND_RESPONSE, ItemId
 from app.schemas import (
     AssistUpdateRequest,
@@ -254,8 +254,9 @@ async def enrich(item_id: ItemId, payload: EnrichRequest, session: SessionDep) -
     `updated` means another writer touched the row mid-await, so respond 409 and
     write NOTHING. Otherwise writes begin -- merge the returned sections
     (untouched fields stay as they were; history-bearing sections are superseded,
-    never overwritten), flip stage to full when the checklist is complete, append
-    the progress entry, bump `updated`. The response snapshot is built after
+    never overwritten); on a complete checklist flip stage to full and graduate a
+    still-capturing item (capture-quick/needs-enrichment) to active; append the
+    progress entry, bump `updated`. The response snapshot is built after
     flush, before commit; the flush is race-wrapped so a concurrent delete
     resolves to 404, not a 500. A 503/502/409 (or an item deleted mid-await)
     leaves the row unchanged.
@@ -295,6 +296,11 @@ async def enrich(item_id: ItemId, payload: EnrichRequest, session: SessionDep) -
         setattr(item, key, value)
     if result.checklist_complete:
         item.stage = MemoryStage.full
+        # A completed checklist means the item is materially recoverable, so an
+        # item still in a capture status graduates to active. Terminal and
+        # explicitly-parked/waiting statuses are deliberately left untouched.
+        if item.status in (MemoryStatus.capture_quick, MemoryStatus.needs_enrichment):
+            item.status = MemoryStatus.active
     note = result.progress_note or _ENRICH_NOTE
     # Append via an explicit, FK-bearing ProgressEntry -- mirroring
     # items.add_progress -- NOT via item.entries.append(...). Touching the
