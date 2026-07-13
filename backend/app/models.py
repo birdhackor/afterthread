@@ -83,10 +83,27 @@ class MemoryItem(MemoryItemBase, table=True):
     # runtime forward reference (a real name, not PEP 563 lazy strings).
     entries: list["ProgressEntry"] = Relationship(  # noqa: UP037
         back_populates="item",
-        # Deleting an item deletes its progress history (ORM-level cascade).
-        # order_by keeps the append-only log in chronological order.
+        # Deleting an item deletes its progress history. The FK's
+        # ondelete="CASCADE" (see ProgressEntry.item_id below) makes SQLite
+        # itself responsible for removing the child rows; passive_deletes
+        # tells SQLAlchemy not to first SELECT the entries collection into
+        # memory and issue an individual DELETE per row. That preload is what
+        # created a race: a session that already loaded `entries` and then
+        # commits its DELETE would not see a ProgressEntry inserted by a
+        # concurrent session in between, so that untouched row still
+        # references this item, and the parent DELETE hits the FK
+        # constraint instead of silently dropping it (see
+        # tests/test_items.py::test_delete_cascades_progress_entries and
+        # app/db.py::_set_sqlite_foreign_keys_pragma). Deferring to the
+        # database's own cascade closes that window: the DELETE and the
+        # removal of every row currently referencing it happen as one
+        # statement. cascade="all, delete-orphan" is kept for the ORM-level
+        # case of an entry being detached from `entries` while the item
+        # itself is not deleted. order_by keeps the append-only log in
+        # chronological order.
         sa_relationship_kwargs={
             "cascade": "all, delete-orphan",
+            "passive_deletes": True,
             "order_by": "ProgressEntry.date, ProgressEntry.id",
         },
     )
@@ -98,7 +115,10 @@ class ProgressEntry(SQLModel, table=True):
     __tablename__ = "progress_entry"
 
     id: int | None = Field(default=None, primary_key=True)
-    item_id: int = Field(foreign_key="memory_item.id", index=True)
+    # ondelete="CASCADE" pushes deletion of orphaned entries down to SQLite
+    # itself; see the passive_deletes note on MemoryItem.entries above for
+    # why that -- rather than the ORM-level cascade alone -- is required.
+    item_id: int = Field(foreign_key="memory_item.id", ondelete="CASCADE", index=True)
     date: datetime = Field(default_factory=utcnow)
     note: str
 

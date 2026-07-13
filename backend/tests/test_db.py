@@ -30,6 +30,23 @@ def test_non_sqlite_url_error_message_includes_dialect() -> None:
         create_db_engine("postgres://example/db")
 
 
+def test_sqlite_prefixed_non_sqlite_dialect_rejected() -> None:
+    """A URL like `sqlitefoo://...` shares the literal `"sqlite"` prefix but
+    parses to a distinct, unsupported dialect. A `str.startswith("sqlite")`
+    guard would wrongly accept it and let it reach `create_engine()` with
+    SQLite-specific `connect_args` and the PRAGMA foreign-key listener
+    attached to a foreign dialect. The guard must instead compare the exact
+    parsed dialect (`make_url(...).get_backend_name() == "sqlite"`), and the
+    resulting error must mention only that parsed dialect -- no other URL
+    component.
+    """
+    with pytest.raises(RuntimeError) as exc_info:
+        create_db_engine("sqlitefoo://x")
+    message = str(exc_info.value)
+    assert 'got dialect: "sqlitefoo"' in message
+    assert "x" not in message
+
+
 def test_non_sqlite_url_error_message_leaks_no_url_components() -> None:
     """A misconfigured URL for another backend must not leak into logs: not
     just its password component, but nothing at all beyond the dialect name.

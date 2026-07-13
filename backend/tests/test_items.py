@@ -3,7 +3,10 @@
 from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
-from sqlmodel import Session, select
+from sqlalchemy import delete, event
+from sqlalchemy.engine import Connection
+from sqlalchemy.orm import Mapper
+from sqlmodel import Session, col, select
 
 from app.models import MemoryItem, ProgressEntry
 
@@ -300,3 +303,46 @@ def test_progress_empty_note_rejected(client: TestClient) -> None:
 
 def test_progress_missing_item_returns_404(client: TestClient) -> None:
     assert client.post("/api/items/9999/progress", json={"note": "x"}).status_code == 404
+
+
+def test_progress_add_races_with_concurrent_delete_returns_404(
+    client: TestClient, session: Session
+) -> None:
+    """If the item is deleted+committed by another session between this
+    handler's `session.get()` and its `commit()`, the FK constraint now
+    rejects the INSERT of the new ProgressEntry, and the API must translate
+    that IntegrityError into 404, not crash with an unhandled 500.
+
+    Made deterministic without real threads via a `before_insert` mapper
+    event on ProgressEntry: it fires exactly once, right before the new
+    entry's own INSERT statement -- regardless of where the unrelated
+    `item.updated` UPDATE lands in the flush plan -- and deletes the item
+    (and its existing progress entries, mirroring what a real concurrent
+    `DELETE /api/items/{id}` leaves behind) directly through the flush's
+    own connection, bypassing the session/identity map exactly as another
+    session's independently committed DELETE would be invisible to this
+    one. The FK check that immediately follows, for the new entry's INSERT,
+    then sees no matching parent row -- exactly as if the concurrent delete
+    had already landed.
+    """
+    item = _create(client)
+    item_id = item["id"]
+
+    def _delete_item_before_insert(
+        mapper: Mapper[ProgressEntry], connection: Connection, target: ProgressEntry
+    ) -> None:
+        connection.execute(delete(ProgressEntry).where(col(ProgressEntry.item_id) == item_id))
+        connection.execute(delete(MemoryItem).where(col(MemoryItem.id) == item_id))
+
+    event.listen(ProgressEntry, "before_insert", _delete_item_before_insert)
+    try:
+        response = client.post(f"/api/items/{item_id}/progress", json={"note": "late"})
+    finally:
+        event.remove(ProgressEntry, "before_insert", _delete_item_before_insert)
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Memory item not found"
+
+    # The handler's session.rollback() must leave the shared session usable
+    # for later requests, not stuck raising PendingRollbackError.
+    assert client.get("/api/items").status_code == 200

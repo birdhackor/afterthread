@@ -4,6 +4,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.sql.elements import ColumnElement
 from sqlmodel import Session, col, select
 
@@ -166,6 +167,15 @@ def add_progress(item_id: int, payload: ProgressEntryCreate, session: SessionDep
     item.updated = utcnow()
     session.add(entry)
     session.add(item)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        # The item existed at the session.get() above but was deleted (and
+        # that delete committed) by another session before this flush -- the
+        # FK constraint on `entry` now rejects it. Translate that race into
+        # the same 404 a simple not-found lookup would give, instead of
+        # letting the IntegrityError surface as an unhandled 500.
+        session.rollback()
+        raise HTTPException(status_code=404, detail=_NOT_FOUND) from exc
     session.refresh(entry)
     return entry

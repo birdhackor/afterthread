@@ -146,10 +146,9 @@ def create_db_engine(database_url: str) -> Engine:
     that want an isolated, ephemeral database should build their own engine
     directly (see `tests/conftest.py`) rather than calling this function.
     """
-    if not database_url.startswith("sqlite"):
-        raise RuntimeError(
-            f'Only SQLite database URLs are supported (got dialect: "{_url_dialect(database_url)}")'
-        )
+    dialect = _url_dialect(database_url)
+    if dialect != "sqlite":
+        raise RuntimeError(f'Only SQLite database URLs are supported (got dialect: "{dialect}")')
 
     if _is_memory_sqlite_url(database_url):
         raise RuntimeError(
