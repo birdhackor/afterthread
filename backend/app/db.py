@@ -1,6 +1,7 @@
 """Database engine, schema initialisation and session dependency."""
 
 from collections.abc import Generator
+from urllib.parse import parse_qs, urlsplit
 
 from sqlalchemy import Engine, make_url
 from sqlmodel import Session, SQLModel, create_engine
@@ -14,14 +15,17 @@ def _mask_db_url(url: str) -> str:
 
     A misconfigured URL (e.g. `postgresql://user:s3cret@host/db`) must never
     have its credentials echoed back in a raised exception, since that text
-    tends to end up in logs or error-tracking services. Falls back to just
-    the URL scheme if `url` cannot be parsed at all.
+    tends to end up in logs or error-tracking services. Falls back to a
+    fixed placeholder -- echoing nothing from `url` -- if it cannot be
+    parsed at all: a malformed DSN may have no `://` separator at all (e.g.
+    `postgresql:user:s3cret@host/db`), in which case naively splitting on
+    `://` yields the *entire* string, credentials included, as the
+    "scheme".
     """
     try:
         return make_url(url).render_as_string(hide_password=True)
     except Exception:
-        scheme = url.split("://", 1)[0]
-        return f"{scheme}://..."
+        return "<unparseable database URL>"
 
 
 def _is_memory_sqlite_url(url: str) -> bool:
@@ -32,10 +36,26 @@ def _is_memory_sqlite_url(url: str) -> bool:
     missing/empty filename as a private, anonymous on-disk database that
     exists only for the connection that opened it, which is just as unsafe
     to share across threads/requests as `:memory:` is.
+
+    Also covers SQLite's URI-filename form (`sqlite:///file:name?...`, see
+    https://www.sqlite.org/uri.html): a `database` of e.g. `file:memdb1`
+    looks file-backed, but `mode=memory` in its query string still opens an
+    in-memory database (optionally a named, shared-cache one), even though
+    no literal `:memory:` substring appears anywhere in the URL, e.g.
+    `sqlite:///file:memdb1?mode=memory&cache=shared&uri=true`. A URI-form
+    filename *without* `mode=memory` (e.g. `sqlite:///file:real.db?uri=true`)
+    genuinely is file-backed and must remain allowed.
     """
     if ":memory:" in url:
         return True
-    return not make_url(url).database
+    database = make_url(url).database
+    if not database:
+        return True
+    if database.startswith("file:"):
+        query = parse_qs(urlsplit(url).query)
+        if "memory" in query.get("mode", []):
+            return True
+    return False
 
 
 def create_db_engine(database_url: str) -> Engine:

@@ -1,9 +1,10 @@
 """Tests for engine construction in app.db: the SQLite-only guard, the
-credential-masking error message for rejected non-SQLite URLs, and the
-in-memory SQLite rejection (an in-memory database has no legitimate use in
-this server -- it cannot survive a restart, and safely sharing one across
-threads would require StaticPool, which defeats transaction isolation
-between concurrent sessions).
+credential-masking error message for rejected non-SQLite URLs (including the
+fallback for a URL too malformed to parse at all), and the in-memory SQLite
+rejection -- including SQLite's URI-filename `mode=memory` spelling -- (an
+in-memory database has no legitimate use in this server -- it cannot survive
+a restart, and safely sharing one across threads would require StaticPool,
+which defeats transaction isolation between concurrent sessions).
 """
 
 import threading
@@ -37,6 +38,21 @@ def test_non_sqlite_url_error_message_masks_password() -> None:
     assert "h/db" in message
 
 
+def test_unparseable_url_error_message_leaks_nothing() -> None:
+    """A DSN with no `://` separator at all (e.g. a `postgresql:` URL where
+    someone forgot the slashes) cannot be parsed by SQLAlchemy's `make_url`.
+    The `_mask_db_url` fallback for that case must be a fixed placeholder
+    that echoes nothing from the input -- a naive `scheme = url.split("://",
+    1)[0]` fallback would treat the *entire* unparseable string, including
+    any embedded credentials, as the "scheme" and echo it straight back.
+    """
+    with pytest.raises(RuntimeError) as exc_info:
+        create_db_engine("postgresql:user:s3cret@host/db")
+    message = str(exc_info.value)
+    assert "s3cret" not in message
+    assert "host" not in message
+
+
 def test_memory_sqlite_url_rejected() -> None:
     """An explicit `:memory:` database is rejected: this is a persistence
     app, so the server has no legitimate in-memory mode.
@@ -60,6 +76,33 @@ def test_empty_path_sqlite_url_rejected() -> None:
     """
     with pytest.raises(RuntimeError, match="In-memory SQLite"):
         create_db_engine("sqlite:///")
+
+
+def test_sqlite_uri_mode_memory_rejected() -> None:
+    """SQLite's URI-filename form (`file:name?mode=memory...`, see
+    https://www.sqlite.org/uri.html) parses with a non-empty `database`
+    (`file:memdb1`) and contains no literal `:memory:` substring anywhere in
+    the URL, yet `mode=memory` in its query string still opens an in-memory
+    (optionally named, shared-cache) database. It must be rejected exactly
+    like the plain `:memory:` spelling.
+    """
+    with pytest.raises(RuntimeError, match="In-memory SQLite"):
+        create_db_engine("sqlite:///file:memdb1?mode=memory&cache=shared&uri=true")
+
+
+def test_sqlite_uri_file_backed_without_mode_memory_is_allowed(tmp_path: Path) -> None:
+    """A URI-form SQLite filename *without* `mode=memory` genuinely addresses
+    a durable file and must remain allowed. Uses an absolute path inside
+    `tmp_path` (rather than relying on the process's cwd) so the database
+    file cannot land in the repo.
+    """
+    db_path = tmp_path / "realfile.db"
+    engine = create_db_engine(f"sqlite:///file:{db_path}?uri=true")
+    try:
+        SQLModel.metadata.create_all(engine)
+        assert db_path.exists()
+    finally:
+        engine.dispose()
 
 
 def test_file_sqlite_url_does_not_use_static_pool(tmp_path: Path) -> None:
