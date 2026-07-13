@@ -21,6 +21,10 @@ class Settings(BaseSettings):
 
     database_url: str = "sqlite:///./context_memory.db"
 
+    # An item in an in-progress status is considered stale once its `updated`
+    # timestamp is older than this many days (surfaced via MemoryItemRead.is_stale).
+    stale_after_days: int = 14
+
 
 @lru_cache
 def get_settings() -> Settings:

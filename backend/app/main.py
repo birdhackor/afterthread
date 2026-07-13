@@ -1,9 +1,22 @@
 """FastAPI application entrypoint for the Context Memory backend."""
 
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Context Memory API")
+from app.db import init_db
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
+    """Create database tables on startup."""
+    init_db()
+    yield
+
+
+app = FastAPI(title="Context Memory API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
