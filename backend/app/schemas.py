@@ -204,3 +204,48 @@ class ReviewResponse(BaseModel):
     active: list[MemoryItemRead]
     waiting: list[MemoryItemRead]
     parked: list[MemoryItemRead]
+
+
+# Upper bound on every AI free-text request field. Stripped-non-empty is
+# enforced per field below; the length is validated on the raw input (a 20001
+# character body is 422) so an oversized payload is rejected before any LLM
+# call. Mirrors the per-section output cap in app.services.memory_ai.
+_MAX_AI_INPUT_CHARS = 20000
+
+
+def _stripped_non_empty(value: str, field: str) -> str:
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError(f"{field} must not be empty")
+    return stripped
+
+
+class LLMStatus(BaseModel):
+    """Whether an LLM endpoint is configured, and the model name only.
+
+    Deliberately excludes the base URL and API key -- only the boolean and the
+    non-secret model name are surfaced. ``model`` is genuinely null exactly
+    when unconfigured, so its nullability is honest rather than a schema
+    artifact.
+    """
+
+    configured: bool
+    model: str | None
+
+
+class CaptureRequest(BaseModel):
+    """Payload for AI quick capture: the raw discussion text to structure."""
+
+    raw_text: str = Field(min_length=1, max_length=_MAX_AI_INPUT_CHARS)
+
+    @field_validator("raw_text")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        return _stripped_non_empty(value, "raw_text")
+
+
+class CaptureResponse(BaseModel):
+    """AI quick-capture result: the created item plus follow-up questions."""
+
+    item: MemoryItemRead
+    questions: list[str]

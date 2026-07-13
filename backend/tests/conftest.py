@@ -1,12 +1,13 @@
 """Shared fixtures: an isolated in-memory database and a client bound to it."""
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
+from app.config import Settings
 from app.db import enable_sqlite_foreign_keys, get_session
 from app.main import app
 
@@ -44,3 +45,27 @@ def client(session: Session) -> Generator[TestClient]:
     app.dependency_overrides[get_session] = override_get_session
     yield TestClient(app)
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def configure_llm(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Settings]:
+    """Force the LLM configuration seen by both the service and the router.
+
+    ``llm_configured`` / ``generate_json`` read ``app.services.llm.get_settings``
+    while the status endpoint reads ``app.routers.ai.get_settings``; both module
+    references are overridden together so their view of configuration never
+    disagrees. Explicit empty defaults make "unconfigured" hermetic -- it never
+    depends on ambient environment or a stray backend/.env.
+    """
+
+    def _configure(*, base_url: str = "", model: str = "", api_key: str = "") -> Settings:
+        settings = Settings(
+            openai_base_url=base_url,
+            openai_api_key=api_key,
+            openai_model=model,
+        )
+        for target in ("app.services.llm.get_settings", "app.routers.ai.get_settings"):
+            monkeypatch.setattr(target, lambda settings=settings: settings)
+        return settings
+
+    return _configure
