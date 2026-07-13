@@ -1,7 +1,9 @@
 """Tests for engine construction in app.db: the SQLite-only guard and its
 dialect-only (never host/database/query-string) rejection message -- including
 the fallback for a URL too malformed to parse at all -- the in-memory SQLite
-rejection -- including SQLite's URI-filename `mode=memory` spelling -- (an
+rejection -- including SQLite's URI-filename `mode=memory` spelling, and the
+runtime `pragma_database_list` probe that independently catches every other
+URI-filename spelling the static check does not (or cannot) recognise -- (an
 in-memory database has no legitimate use in this server -- it cannot survive
 a restart, and safely sharing one across threads would require StaticPool,
 which defeats transaction isolation between concurrent sessions) -- and
@@ -12,6 +14,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, select
@@ -185,7 +188,134 @@ def test_sqlite_uri_titlecase_true_flag_rejected() -> None:
         create_db_engine("sqlite:///file:mem1?vfs=memdb&uri=True")
 
 
-def test_sqlite_file_prefixed_literal_filename_without_uri_flag_is_allowed() -> None:
+# The checks above are a static, best-effort reimplementation of pysqlite's
+# own `uri=` query-string parsing rules -- and every review of them finds a
+# new spelling they don't yet know to reject. The tests below prove several
+# such spellings slip past every static check above unrejected, yet are
+# still caught -- by construction, not by being individually taught -- by
+# `create_db_engine`'s runtime `pragma_database_list` probe, which asks
+# SQLite itself whether the database it actually opened is backed by a real
+# file rather than re-deriving the answer from the URL text.
+
+
+def test_sqlite_uri_short_truthy_flag_y_rejected() -> None:
+    """`uri=y` is one of `sqlalchemy.util.asbool`'s single-letter truthy
+    spellings (`"y"` and `"t"`, distinct from the words/numeral
+    `_URI_TRUE_VALUES` above already recognises). `_uri_mode_enabled` does
+    not recognise it, so `_is_memory_sqlite_url` does not either, and
+    `sqlite:///file:mem?mode=memory&uri=y` slips past the static check
+    unrejected -- even though pysqlite's real `asbool("y")` is `True`, and
+    it opens exactly the same shared in-memory database as the
+    already-covered `uri=true` spelling does. Confirmed empirically:
+    `pragma_database_list` reports an empty `file` for it. Only the runtime
+    probe catches this spelling.
+    """
+    with pytest.raises(RuntimeError, match="In-memory SQLite"):
+        create_db_engine("sqlite:///file:mem?mode=memory&uri=y")
+
+
+def test_sqlite_uri_short_truthy_flag_t_rejected() -> None:
+    """`uri=t` is `asbool`'s other single-letter truthy spelling; see
+    `test_sqlite_uri_short_truthy_flag_y_rejected` immediately above -- same
+    reasoning, only caught by the runtime probe, not the static check.
+    """
+    with pytest.raises(RuntimeError, match="In-memory SQLite"):
+        create_db_engine("sqlite:///file:mem?mode=memory&uri=t")
+
+
+def test_sqlite_uri_duplicated_false_flag_still_rejected() -> None:
+    """A duplicated `uri=false&uri=false` is, perhaps surprisingly, still
+    rejected -- and for a subtler reason than the other spellings in this
+    block: the static check does not reject it either, but not because it
+    was fooled the same way. `_uri_mode_enabled` above parses each `uri=`
+    value individually via `parse_qs`, sees two literal `"false"` strings,
+    and -- correctly, taken alone -- decides URI-filename parsing is not
+    enabled, so `_is_memory_sqlite_url` lets this URL through. But that is
+    not what pysqlite's *own* coercion actually does: SQLAlchemy's
+    `URL.query` stores a repeated key as a tuple of its values (here,
+    `("false", "false")`), and `coerce_kw_type`'s use of `asbool`
+    (`sqlalchemy.util.langhelpers`) only special-cases `str` values --  a
+    non-`str` value like this tuple instead falls through to a bare
+    `bool(...)` call, which is `True` for any non-empty tuple regardless of
+    the strings inside it. So pysqlite actually opens this URL *with*
+    URI-filename parsing enabled despite both values reading "false", and
+    an empty URI filename (nothing between `file:` and `?`) is SQLite's
+    private, anonymous on-disk database. Confirmed empirically:
+    `pragma_database_list` reports an empty `file` for it, with
+    `journal_mode` `"delete"` rather than `"memory"` (it is a private
+    on-disk temp file deleted on close, not a RAM-resident database) --
+    which is exactly why the probe keys off an empty *file path* rather
+    than any memory-specific signal: it does not need to know *why* SQLite
+    considers a database non-persistent, only that it does.
+    """
+    with pytest.raises(RuntimeError, match="In-memory SQLite"):
+        create_db_engine("sqlite:///file:?uri=false&uri=false")
+
+
+def test_sqlite_uri_percent_encoded_memory_path_rejected() -> None:
+    """`file:%3Amemory%3A` percent-encodes `:memory:` (`%3A` is `:`) as the
+    URI path. `_is_memory_sqlite_url`'s literal `":memory:" in url` check
+    operates on the raw URL string, which contains the *encoded* form, not
+    the literal substring, so it does not match; `make_url(url).database`
+    (`'file:%3Amemory%3A'`) does not decode it either, so none of the other
+    static comparisons (`database == "file:"`, `mode=memory`, `vfs=memdb`)
+    match it. Percent-decoding only happens once SQLite's own URI-filename
+    parser actually runs, at connection time (see
+    https://www.sqlite.org/uri.html), resolving the path to the literal
+    string `:memory:` -- which SQLite special-cases as a private, temporary
+    in-memory database. Confirmed empirically: `pragma_database_list`
+    reports an empty `file` for it. The static check cannot see this
+    without decoding the URL itself; the runtime probe catches it for free.
+    """
+    with pytest.raises(RuntimeError, match="In-memory SQLite"):
+        create_db_engine("sqlite:///file:%3Amemory%3A?uri=true")
+
+
+def test_sqlite_uri_empty_authority_form_rejected() -> None:
+    """`file://` (two slashes after the scheme, then nothing) is yet
+    another spelling of an empty URI filename, distinct from the bare
+    `file:` the static check's `database == "file:"` comparison recognises:
+    `make_url(...).database` for this URL is the literal string
+    `'file://'`, which does not equal `'file:'`, so it slips past that
+    check too. SQLite's URI parser treats the empty authority/path the same
+    as the other empty-filename spellings above -- another private,
+    anonymous on-disk database. Confirmed empirically: `pragma_database_list`
+    reports an empty `file` for it. Only the runtime probe catches it.
+    """
+    with pytest.raises(RuntimeError, match="In-memory SQLite"):
+        create_db_engine("sqlite:///file://?uri=true")
+
+
+def test_pragma_database_list_reports_empty_file_for_memdb_vfs() -> None:
+    """Empirical verification that the runtime probe's single "is the `file`
+    column empty" check, by itself, would independently catch `vfs=memdb`
+    even without the static check above (`test_sqlite_uri_vfs_memdb_rejected`)
+    also rejecting it: SQLite's `memdb` VFS opens a database that is
+    *addressable* by the name in its URI, so multiple connections can share
+    it -- which might suggest `pragma_database_list` could report that name
+    back as a "file" -- but empirically it does not. A `memdb`-VFS database
+    is never backed by a real path on disk, so SQLite reports the same
+    empty `file` column for it as for `:memory:` or an anonymous temp
+    database. That confirms no second runtime signal (e.g. `PRAGMA
+    journal_mode`) is needed alongside the probe's empty-path check.
+    """
+    engine = create_engine(
+        "sqlite:///file:probetest?vfs=memdb&uri=true",
+        connect_args={"check_same_thread": False},
+    )
+    try:
+        with engine.connect() as connection:
+            main_file = connection.execute(
+                text("SELECT file FROM pragma_database_list WHERE name = 'main'")
+            ).scalar()
+        assert main_file == ""
+    finally:
+        engine.dispose()
+
+
+def test_sqlite_file_prefixed_literal_filename_without_uri_flag_is_allowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Without `uri=true` present in the query string, pysqlite never
     enables SQLite's URI-filename parsing at all (see the
     `_pysqlite_uri_connections` section of
@@ -198,21 +328,24 @@ def test_sqlite_file_prefixed_literal_filename_without_uri_flag_is_allowed() -> 
     two checks above are correctly gated on `uri=true` rather than firing on
     `vfs=memdb`/an empty filename unconditionally.
 
-    Deliberately does not open a real connection (e.g. via
-    `SQLModel.metadata.create_all()`): without `uri=true`, pysqlite resolves
-    a literal filename with `os.path.abspath()` relative to the process's
-    current working directory, not any `tmp_path` this test could control,
-    so actually opening the connection risks creating a stray file inside
-    the repo. Asserting `create_db_engine()` itself accepts the URL without
-    raising -- the entire extent of what `_is_memory_sqlite_url` governs --
-    is sufficient to prove the acceptance behaviour under test without
-    touching the filesystem at all.
+    Without `uri=true`, pysqlite resolves a literal filename with
+    `os.path.abspath()` relative to the process's current working
+    directory -- and `create_db_engine`'s runtime persistence probe (see
+    its comment, above) now always opens a real connection as part of
+    accepting *any* URL, so this test redirects the process cwd into
+    `tmp_path` first (via `monkeypatch`) to keep the resulting file out of
+    the repo, and then asserts it landed there -- positive proof this URL
+    is genuinely file-backed, not just an absence of a raised exception.
     """
+    monkeypatch.chdir(tmp_path)
     engine = create_db_engine("sqlite:///file:mem1?vfs=memdb")
     engine.dispose()
+    assert (tmp_path / "file:mem1").exists()
 
 
-def test_sqlite_mode_memory_text_without_uri_flag_is_allowed() -> None:
+def test_sqlite_mode_memory_text_without_uri_flag_is_allowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """`sqlite:///file:x.db?mode=memory` -- with no `uri` key in the query
     string at all -- must be allowed: without `uri` parsing as true (see
     `test_sqlite_file_prefixed_literal_filename_without_uri_flag_is_allowed`
@@ -226,15 +359,35 @@ def test_sqlite_mode_memory_text_without_uri_flag_is_allowed() -> None:
     (unconditionally on) the `uri=true` gate, so it wrongly rejected this
     URL even though pysqlite would have opened it as a normal file.
 
-    Deliberately does not open a real connection, for the same reason as
-    `test_sqlite_file_prefixed_literal_filename_without_uri_flag_is_allowed`
-    above: without `uri=true`, pysqlite resolves this as a literal filename
-    via `os.path.abspath()` relative to the process's cwd, which this test
-    does not control, so actually connecting risks creating a stray file in
-    the repo.
+    Without `uri=true`, pysqlite resolves this as a literal filename via
+    `os.path.abspath()` relative to the process's cwd -- and, like the test
+    above, the runtime persistence probe now always opens a real connection
+    as part of accepting *any* URL, so the cwd is redirected into
+    `tmp_path` first to keep the resulting file out of the repo, and the
+    test asserts it landed there.
     """
+    monkeypatch.chdir(tmp_path)
     engine = create_db_engine("sqlite:///file:x.db?mode=memory")
     engine.dispose()
+    assert (tmp_path / "file:x.db").exists()
+
+
+def test_default_style_relative_sqlite_url_is_allowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact URL shape `Settings.database_url` defaults to --
+    `sqlite:///./context_memory.db`, a relative, non-URI path -- must be
+    accepted end-to-end, including by the runtime probe: `pragma_database_list`
+    must report a non-empty (absolute) path for it, not just "no exception
+    was raised". cwd is redirected into `tmp_path` so the relative
+    `./context_memory.db` resolves there rather than into the repo.
+    """
+    monkeypatch.chdir(tmp_path)
+    engine = create_db_engine("sqlite:///./context_memory.db")
+    try:
+        assert (tmp_path / "context_memory.db").exists()
+    finally:
+        engine.dispose()
 
 
 def test_file_sqlite_url_does_not_use_static_pool(tmp_path: Path) -> None:

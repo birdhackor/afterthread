@@ -3,7 +3,7 @@
 from collections.abc import Generator
 from urllib.parse import parse_qs, urlsplit
 
-from sqlalchemy import Engine, event, make_url
+from sqlalchemy import Engine, event, make_url, text
 from sqlalchemy.engine.interfaces import DBAPIConnection
 from sqlalchemy.pool import ConnectionPoolEntry
 from sqlmodel import Session, SQLModel, create_engine
@@ -153,6 +153,25 @@ def _is_memory_sqlite_url(url: str) -> bool:
     return False
 
 
+def _non_persistent_sqlite_error(database_url: str) -> RuntimeError:
+    """Build the RuntimeError raised for a SQLite URL that does not durably
+    persist to a file.
+
+    Shared by the static `_is_memory_sqlite_url` check and the runtime
+    `pragma_database_list` probe in `create_db_engine` below, so both raise
+    an identical, "same style" error regardless of which one catches a
+    given URL -- see `create_db_engine`'s docstring for why there are two.
+    """
+    return RuntimeError(
+        "In-memory SQLite database URLs are not supported "
+        f"(got: {_mask_db_url(database_url)}). This server requires a "
+        "file-backed SQLite path so data survives restarts, e.g. "
+        "'sqlite:///./context_memory.db'. Tests that need an isolated, "
+        "ephemeral database may build their own engine directly instead "
+        "of calling create_db_engine()."
+    )
+
+
 def _set_sqlite_foreign_keys_pragma(
     dbapi_connection: DBAPIConnection, connection_record: ConnectionPoolEntry
 ) -> None:
@@ -204,28 +223,27 @@ def create_db_engine(database_url: str) -> Engine:
     any other backend is rejected here rather than silently behaving
     differently at query time.
 
-    In-memory SQLite is also rejected: this is a persistence app, so the
-    server has no legitimate in-memory mode (data must survive restarts).
-    A single shared in-memory database also requires SQLAlchemy's
-    StaticPool -- one DBAPI connection reused by every thread -- which
-    defeats transaction isolation between concurrent sessions (one
-    session's commit can commit another session's pending writes). Tests
-    that want an isolated, ephemeral database should build their own engine
-    directly (see `tests/conftest.py`) rather than calling this function.
+    In-memory SQLite is also rejected, in two layers: a static URL-shape
+    check (`_is_memory_sqlite_url`) raises a friendly, fast-fail error for
+    common misspellings, and a runtime `pragma_database_list` probe (see the
+    comment above that check, below) independently re-verifies against
+    SQLite itself once the engine exists, catching every remaining spelling
+    the static check was not taught to recognise. Rejected either way: this
+    is a persistence app, so the server has no legitimate in-memory mode
+    (data must survive restarts). A single shared in-memory database also
+    requires SQLAlchemy's StaticPool -- one DBAPI connection reused by every
+    thread -- which defeats transaction isolation between concurrent
+    sessions (one session's commit can commit another session's pending
+    writes). Tests that want an isolated, ephemeral database should build
+    their own engine directly (see `tests/conftest.py`) rather than calling
+    this function.
     """
     dialect = _url_dialect(database_url)
     if dialect != "sqlite":
         raise RuntimeError(f'Only SQLite database URLs are supported (got dialect: "{dialect}")')
 
     if _is_memory_sqlite_url(database_url):
-        raise RuntimeError(
-            "In-memory SQLite database URLs are not supported "
-            f"(got: {_mask_db_url(database_url)}). This server requires a "
-            "file-backed SQLite path so data survives restarts, e.g. "
-            "'sqlite:///./context_memory.db'. Tests that need an isolated, "
-            "ephemeral database may build their own engine directly instead "
-            "of calling create_db_engine()."
-        )
+        raise _non_persistent_sqlite_error(database_url)
 
     # check_same_thread is a pysqlite-specific flag; safe unconditionally now
     # that non-SQLite and in-memory URLs are rejected above -- every
@@ -235,6 +253,39 @@ def create_db_engine(database_url: str) -> Engine:
     connect_args: dict[str, object] = {"check_same_thread": False}
     engine = create_engine(database_url, connect_args=connect_args)
     enable_sqlite_foreign_keys(engine)
+
+    # `database_url` comes from the operator's own `.env`. The static check
+    # above is a fast-fail UX nicety: a friendly, SQLite-specific error for
+    # common misspellings, raised before ever touching the filesystem. But
+    # it is necessarily a *reimplementation* of pysqlite's own `uri=`
+    # query-string parsing rules, and review keeps finding new spellings it
+    # doesn't yet know to reject -- e.g. SQLAlchemy's real `uri=` coercion
+    # accepts far more truthy spellings than `_uri_mode_enabled` above
+    # replicates (`uri=y`, `uri=t`); a duplicated `uri=false&uri=false` is
+    # coerced to *true* by SQLAlchemy's own `coerce_kw_type`/`asbool`
+    # through a non-empty tuple (`bool(("false", "false"))` is `True`,
+    # regardless of the strings it contains), even though neither value is
+    # truthy on its own; and a percent-encoded `file:%3Amemory%3A` or
+    # authority-form `file://` filename looks like a non-empty, unremarkable
+    # path to `_is_memory_sqlite_url`'s string comparisons, only resolving
+    # to an in-memory/anonymous-temp database once SQLite's own URI parser
+    # actually runs, at connection time. Rather than keep chasing individual
+    # spellings, this probe asks SQLite itself what it opened: per
+    # https://www.sqlite.org/pragma.html#pragma_database_list, any database
+    # that is not backed by a real on-disk file -- in-memory,
+    # private/anonymous temp, or opened via SQLite's `memdb` VFS -- always
+    # reports an empty `file` column, however its URL was spelled. This is
+    # the authoritative backstop that closes every URI spelling, known or
+    # not, by construction; the static check above only ever gets to be a
+    # friendly early error for the common cases.
+    with engine.connect() as connection:
+        main_file = connection.execute(
+            text("SELECT file FROM pragma_database_list WHERE name = 'main'")
+        ).scalar()
+    if not main_file:
+        engine.dispose()
+        raise _non_persistent_sqlite_error(database_url)
+
     return engine
 
 
