@@ -6,8 +6,9 @@ runtime `pragma_database_list` probe that independently catches every other
 URI-filename spelling the static check does not (or cannot) recognise -- (an
 in-memory database has no legitimate use in this server -- it cannot survive
 a restart, and safely sharing one across threads would require StaticPool,
-which defeats transaction isolation between concurrent sessions) -- and
-foreign-key enforcement.
+which defeats transaction isolation between concurrent sessions) -- the
+in-memory-SQLite rejection message's own database-only (never query-string)
+redaction -- and foreign-key enforcement.
 """
 
 import threading
@@ -120,6 +121,27 @@ def test_sqlite_uri_mode_memory_rejected() -> None:
     """
     with pytest.raises(RuntimeError, match="In-memory SQLite"):
         create_db_engine("sqlite:///file:memdb1?mode=memory&cache=shared&uri=true")
+
+
+def test_non_persistent_sqlite_error_omits_query_string() -> None:
+    """The in-memory-SQLite rejection message must never echo the URL's query
+    string, only the parsed `database`/filename component. SQLite's
+    URI-filename form (see `test_sqlite_uri_mode_memory_rejected` above) lets
+    an encrypted-SQLite driver (e.g. SQLCipher) carry a passphrase in a
+    `key=` query parameter -- unlike a URL's `password` *component*, which
+    `render_as_string(hide_password=True)` masks, a query parameter is not
+    covered by that masking, so a naive full-URL render would leak it
+    straight into this error message (and from there, into logs). The
+    `database` component itself (`file:mem` here) remains fine to include:
+    this URL is already confirmed to be SQLite, which has no
+    username/password/host/port component to begin with.
+    """
+    with pytest.raises(RuntimeError) as exc_info:
+        create_db_engine("sqlite:///file:mem?mode=memory&uri=true&key=s3cret")
+    message = str(exc_info.value)
+    assert "s3cret" not in message
+    assert "key=" not in message
+    assert "file:mem" in message
 
 
 def test_sqlite_filename_containing_memory_substring_is_allowed(tmp_path: Path) -> None:

@@ -74,6 +74,21 @@ class MemoryItem(MemoryItemBase, table=True):
     """A single unit of stored context."""
 
     __tablename__ = "memory_item"
+    # Without this, SQLite's default ROWID assignment for an INTEGER PRIMARY
+    # KEY column reuses the id of the just-deleted highest-id row on the next
+    # insert (it is recomputed as max(id) + 1 each time, not drawn from a
+    # persistent sequence): delete the item with the current-highest id, then
+    # create a new one, and the new row silently gets the *same* id back. A
+    # client holding a stale reference to the deleted item -- an open tab, a
+    # bookmark, an in-flight PATCH/DELETE request built before the delete --
+    # would then land on the new, unrelated item instead of getting the 404
+    # it should. sqlite_autoincrement makes SQLite track the historical
+    # maximum in its internal sqlite_sequence table instead, so a new id is
+    # always strictly greater than every id ever used before, even after the
+    # highest-id row is gone (see
+    # https://www.sqlite.org/autoinc.html). See
+    # tests/test_items.py::test_delete_then_create_does_not_reuse_id.
+    __table_args__ = {"sqlite_autoincrement": True}
 
     id: int | None = Field(default=None, primary_key=True)
     created: datetime = Field(default_factory=utcnow)
@@ -113,6 +128,16 @@ class ProgressEntry(SQLModel, table=True):
     """Append-only progress log entry belonging to a memory item."""
 
     __tablename__ = "progress_entry"
+    # No endpoint currently mutates an entry by id (see routers/items.py --
+    # only POST .../progress, which always creates), so the stale-reference
+    # footgun this guards against on MemoryItem (see its __table_args__
+    # comment) is not reachable through today's API. Applied anyway for
+    # consistency: entry ids are already exposed in API responses
+    # (ProgressEntryRead.id), the cost is a single DDL keyword, and it
+    # removes the footgun in advance of any future id-targeted endpoint
+    # (e.g. an edit/delete-single-entry route) rather than waiting to
+    # rediscover the same bug there.
+    __table_args__ = {"sqlite_autoincrement": True}
 
     id: int | None = Field(default=None, primary_key=True)
     # ondelete="CASCADE" pushes deletion of orphaned entries down to SQLite

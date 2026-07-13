@@ -12,22 +12,32 @@ from app import models  # noqa: F401  # ensure tables are registered on metadata
 from app.config import get_settings
 
 
-def _mask_db_url(url: str) -> str:
-    """Render `url` with any embedded password hidden, for use in error messages.
+def _url_database(url: str) -> str:
+    """Return only the parsed `database` (filename/URI-path) component of
+    `url`, for use in the in-memory-SQLite rejection message below.
 
-    Used only for the in-memory-SQLite rejection message below. That URL has
-    already been confirmed to start with `sqlite`, so -- unlike an arbitrary
-    rejected non-SQLite URL (see `_url_dialect`) -- it cannot be a full
-    production connection string for another backend, which makes masking
-    (rather than omitting entirely) an acceptable tradeoff for keeping the
-    path useful for debugging. Falls back to a fixed placeholder -- echoing
-    nothing from `url` -- if it cannot be parsed at all: a malformed DSN may
-    have no `://` separator at all (e.g. `postgresql:user:s3cret@host/db`),
-    in which case naively splitting on `://` yields the *entire* string,
-    credentials included, as the "scheme".
+    Used only for that message. That URL has already been confirmed to
+    parse with dialect "sqlite" (see `create_db_engine`), so -- unlike an
+    arbitrary rejected non-SQLite URL (see `_url_dialect`) -- it cannot be a
+    full production connection string for another backend, and has no
+    username/password/host/port component to begin with. Its *query
+    string* is not automatically safe, though: SQLite's URI-filename form
+    (https://www.sqlite.org/uri.html) lets encrypted-SQLite drivers (e.g.
+    SQLCipher) carry a passphrase in a `key=` parameter, e.g.
+    `sqlite:///file:app.db?uri=true&key=s3cret`. A full masked render via
+    `render_as_string(hide_password=True)` would leak that straight into
+    this error message -- that call only ever masks a URL's own `password`
+    *component*, and does nothing for a secret sitting in an arbitrary
+    query parameter instead. Returning only the parsed `database` component
+    (here, `file:app.db`) sidesteps the problem entirely: the query string
+    is never included, secret or not. Falls back to a fixed placeholder --
+    echoing nothing from `url` -- if it cannot be parsed at all: a malformed
+    DSN may have no `://` separator at all (e.g.
+    `postgresql:user:s3cret@host/db`), in which case naively splitting on
+    `://` yields the *entire* string, credentials included, as the "scheme".
     """
     try:
-        return make_url(url).render_as_string(hide_password=True)
+        return make_url(url).database or ""
     except Exception:
         return "<unparseable database URL>"
 
@@ -36,14 +46,16 @@ def _url_dialect(url: str) -> str:
     """Return only the parsed dialect/backend name of `url` (e.g. "postgresql"),
     for use in the non-SQLite rejection error message below.
 
-    `render_as_string(hide_password=True)` (see `_mask_db_url` above) only
-    masks a URL's `password` *component*. It does nothing about credentials
-    embedded elsewhere, which several real drivers do use -- e.g. a `PWD=`
-    buried inside an ODBC `odbc_connect=...` connection string, or a
-    `?sslpassword=...` query parameter -- so it is not safe here: the
-    rejected `database_url` could be a full, credential-bearing production
-    connection string for another database entirely, and this error tends to
-    end up in logs or error-tracking services. The dialect name is the only
+    A masked render via `render_as_string(hide_password=True)` only masks a
+    URL's `password` *component* (see `_url_database` above, which sidesteps
+    this altogether by never rendering the query string, rather than by
+    masking it). It does nothing about credentials embedded elsewhere, which
+    several real drivers do use -- e.g. a `PWD=` buried inside an ODBC
+    `odbc_connect=...` connection string, or a `?sslpassword=...` query
+    parameter -- so it is not safe here: the rejected `database_url` could
+    be a full, credential-bearing production connection string for another
+    database entirely, and this error tends to end up in logs or
+    error-tracking services. The dialect name is the only
     component that is always safe to echo back. Falls back to a fixed
     placeholder -- echoing nothing from `url` -- if it cannot be parsed at
     all: a malformed DSN may have no `://` separator at all (e.g.
@@ -174,7 +186,7 @@ def _non_persistent_sqlite_error(database_url: str) -> RuntimeError:
     """
     return RuntimeError(
         "In-memory SQLite database URLs are not supported "
-        f"(got: {_mask_db_url(database_url)}). This server requires a "
+        f"(got: {_url_database(database_url)}). This server requires a "
         "file-backed SQLite path so data survives restarts, e.g. "
         "'sqlite:///./context_memory.db'. Tests that need an isolated, "
         "ephemeral database may build their own engine directly instead "

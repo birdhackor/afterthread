@@ -509,6 +509,28 @@ def test_delete_cascades_progress_entries(client: TestClient, session: Session) 
     assert session.get(MemoryItem, item_id) is None
 
 
+def test_delete_then_create_does_not_reuse_id(client: TestClient) -> None:
+    """SQLite's default ROWID assignment for an `INTEGER PRIMARY KEY` column
+    reuses the id of the just-deleted highest-id row on the next insert: it
+    is recomputed as `max(id) + 1` each time, not drawn from a persistent
+    sequence. Delete the item with the current-highest id, then create a new
+    one, and -- without `sqlite_autoincrement` (see `MemoryItem.__table_args__`
+    in models.py) -- the new row would silently get the *same* id back. That
+    is dangerous here: a client holding a stale reference to the deleted
+    item (an open tab, a bookmark, an in-flight PATCH/DELETE built before the
+    delete) would then land on the new, unrelated item instead of getting
+    the 404 it should. `sqlite_autoincrement` makes SQLite track the
+    historical maximum in its internal `sqlite_sequence` table instead, so a
+    new id must always be strictly greater than every id ever used before.
+    """
+    first = _create(client, title="First")
+    first_id = first["id"]
+    assert client.delete(f"/api/items/{first_id}").status_code == 204
+
+    second = _create(client, title="Second")
+    assert second["id"] > first_id
+
+
 def test_delete_missing_returns_404(client: TestClient) -> None:
     assert client.delete("/api/items/9999").status_code == 404
 
@@ -633,6 +655,38 @@ def test_delete_races_with_manufactured_stale_data_error_returns_404(
     # The handler's session.rollback() must leave the shared session usable
     # for later requests, not stuck raising PendingRollbackError.
     assert client.get("/api/items").status_code == 200
+
+
+def test_progress_entry_delete_then_create_does_not_reuse_id(
+    client: TestClient, session: Session
+) -> None:
+    """Consistency companion to test_delete_then_create_does_not_reuse_id
+    above: ProgressEntry also sets `sqlite_autoincrement` (see
+    `ProgressEntry.__table_args__` in models.py), even though no endpoint
+    today deletes a single entry by id -- guarding in advance against the
+    same id-reuse footgun should an id-targeted entry endpoint (edit/delete
+    a single entry) ever be added. Exercised directly at the session level,
+    since there is no API to delete a single progress entry today: deleting
+    the highest-id entry without deleting its parent item, then appending a
+    new one, must not hand back the id that was just freed.
+    """
+    item = _create(client)
+    item_id = item["id"]
+    client.post(f"/api/items/{item_id}/progress", json={"note": "second entry"})
+
+    highest = session.exec(
+        select(ProgressEntry)
+        .where(col(ProgressEntry.item_id) == item_id)
+        .order_by(col(ProgressEntry.id).desc())
+    ).first()
+    assert highest is not None
+    highest_id = highest.id
+    session.delete(highest)
+    session.commit()
+
+    response = client.post(f"/api/items/{item_id}/progress", json={"note": "third entry"})
+    assert response.status_code == 201
+    assert response.json()["id"] > highest_id
 
 
 def test_progress_append_bumps_item_updated(client: TestClient, session: Session) -> None:
