@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
-from app.db import get_session
+from app.db import enable_sqlite_foreign_keys, get_session
 from app.main import app
 
 
@@ -19,6 +19,11 @@ def session() -> Generator[Session]:
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
+    # This engine is built directly rather than via create_db_engine() (which
+    # rejects in-memory SQLite -- see its docstring), so it must opt into the
+    # same foreign-key enforcement production gets, or tests would run under
+    # laxer FK semantics than the app they're testing.
+    enable_sqlite_foreign_keys(engine)
     SQLModel.metadata.create_all(engine)
     with Session(engine) as test_session:
         yield test_session

@@ -3,7 +3,9 @@
 from collections.abc import Generator
 from urllib.parse import parse_qs, urlsplit
 
-from sqlalchemy import Engine, make_url
+from sqlalchemy import Engine, event, make_url
+from sqlalchemy.engine.interfaces import DBAPIConnection
+from sqlalchemy.pool import ConnectionPoolEntry
 from sqlmodel import Session, SQLModel, create_engine
 
 from app import models  # noqa: F401  # ensure tables are registered on metadata
@@ -13,17 +15,43 @@ from app.config import get_settings
 def _mask_db_url(url: str) -> str:
     """Render `url` with any embedded password hidden, for use in error messages.
 
-    A misconfigured URL (e.g. `postgresql://user:s3cret@host/db`) must never
-    have its credentials echoed back in a raised exception, since that text
-    tends to end up in logs or error-tracking services. Falls back to a
-    fixed placeholder -- echoing nothing from `url` -- if it cannot be
-    parsed at all: a malformed DSN may have no `://` separator at all (e.g.
-    `postgresql:user:s3cret@host/db`), in which case naively splitting on
-    `://` yields the *entire* string, credentials included, as the
-    "scheme".
+    Used only for the in-memory-SQLite rejection message below. That URL has
+    already been confirmed to start with `sqlite`, so -- unlike an arbitrary
+    rejected non-SQLite URL (see `_url_dialect`) -- it cannot be a full
+    production connection string for another backend, which makes masking
+    (rather than omitting entirely) an acceptable tradeoff for keeping the
+    path useful for debugging. Falls back to a fixed placeholder -- echoing
+    nothing from `url` -- if it cannot be parsed at all: a malformed DSN may
+    have no `://` separator at all (e.g. `postgresql:user:s3cret@host/db`),
+    in which case naively splitting on `://` yields the *entire* string,
+    credentials included, as the "scheme".
     """
     try:
         return make_url(url).render_as_string(hide_password=True)
+    except Exception:
+        return "<unparseable database URL>"
+
+
+def _url_dialect(url: str) -> str:
+    """Return only the parsed dialect/backend name of `url` (e.g. "postgresql"),
+    for use in the non-SQLite rejection error message below.
+
+    `render_as_string(hide_password=True)` (see `_mask_db_url` above) only
+    masks a URL's `password` *component*. It does nothing about credentials
+    embedded elsewhere, which several real drivers do use -- e.g. a `PWD=`
+    buried inside an ODBC `odbc_connect=...` connection string, or a
+    `?sslpassword=...` query parameter -- so it is not safe here: the
+    rejected `database_url` could be a full, credential-bearing production
+    connection string for another database entirely, and this error tends to
+    end up in logs or error-tracking services. The dialect name is the only
+    component that is always safe to echo back. Falls back to a fixed
+    placeholder -- echoing nothing from `url` -- if it cannot be parsed at
+    all: a malformed DSN may have no `://` separator at all (e.g.
+    `postgresql:user:s3cret@host/db`), in which case naively splitting on
+    `://` yields the *entire* string, credentials included, as the "scheme".
+    """
+    try:
+        return make_url(url).get_backend_name()
     except Exception:
         return "<unparseable database URL>"
 
@@ -58,6 +86,48 @@ def _is_memory_sqlite_url(url: str) -> bool:
     return False
 
 
+def _set_sqlite_foreign_keys_pragma(
+    dbapi_connection: DBAPIConnection, connection_record: ConnectionPoolEntry
+) -> None:
+    """Connect-event listener: turn on SQLite foreign-key enforcement.
+
+    SQLite parses `FOREIGN KEY` clauses but does not enforce them unless
+    `PRAGMA foreign_keys = ON` is issued on *every* connection -- it is off
+    by default, and is a per-connection setting rather than one a database
+    file can persist. Without it, e.g. a `POST /api/items/{id}/progress`
+    racing a committed `DELETE /api/items/{id}` can insert a `ProgressEntry`
+    whose `item_id` references an already-deleted `MemoryItem`: nothing
+    rejects the insert, leaving an orphan row no API call can ever remove.
+
+    This is SQLAlchemy's documented recipe for SQLite FK enforcement (see
+    https://docs.sqlalchemy.org/en/20/dialects/sqlite.html#foreign-key-support),
+    including the temporary `autocommit` flip: SQLite treats `PRAGMA
+    foreign_keys` as a no-op while a transaction is open, and the sqlite3
+    driver's default "legacy" transaction-control mode can leave one open on
+    a freshly made connection, which would otherwise silently swallow this.
+    """
+    previous_autocommit = dbapi_connection.autocommit
+    dbapi_connection.autocommit = True
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+    finally:
+        cursor.close()
+    dbapi_connection.autocommit = previous_autocommit
+
+
+def enable_sqlite_foreign_keys(engine: Engine) -> None:
+    """Register `_set_sqlite_foreign_keys_pragma` on `engine`'s "connect" event.
+
+    Attached per-engine rather than globally on the `Engine` class, so only
+    engines that opt in are affected. Shared between `create_db_engine`
+    below and `tests/conftest.py`'s isolated test engine -- which cannot go
+    through `create_db_engine` itself, see that function's docstring -- so
+    both run under the same foreign-key semantics as production.
+    """
+    event.listen(engine, "connect", _set_sqlite_foreign_keys_pragma)
+
+
 def create_db_engine(database_url: str) -> Engine:
     """Build the SQLAlchemy engine for `database_url`.
 
@@ -78,7 +148,7 @@ def create_db_engine(database_url: str) -> Engine:
     """
     if not database_url.startswith("sqlite"):
         raise RuntimeError(
-            f"Only SQLite database URLs are supported (got: {_mask_db_url(database_url)})"
+            f'Only SQLite database URLs are supported (got dialect: "{_url_dialect(database_url)}")'
         )
 
     if _is_memory_sqlite_url(database_url):
@@ -97,7 +167,9 @@ def create_db_engine(database_url: str) -> Engine:
     # default pool for file-based SQLite already shares one database across
     # threads without needing StaticPool.
     connect_args: dict[str, object] = {"check_same_thread": False}
-    return create_engine(database_url, connect_args=connect_args)
+    engine = create_engine(database_url, connect_args=connect_args)
+    enable_sqlite_foreign_keys(engine)
+    return engine
 
 
 engine = create_db_engine(get_settings().database_url)

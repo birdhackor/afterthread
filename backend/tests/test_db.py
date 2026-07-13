@@ -1,21 +1,23 @@
-"""Tests for engine construction in app.db: the SQLite-only guard, the
-credential-masking error message for rejected non-SQLite URLs (including the
-fallback for a URL too malformed to parse at all), and the in-memory SQLite
+"""Tests for engine construction in app.db: the SQLite-only guard and its
+dialect-only (never host/database/query-string) rejection message -- including
+the fallback for a URL too malformed to parse at all -- the in-memory SQLite
 rejection -- including SQLite's URI-filename `mode=memory` spelling -- (an
 in-memory database has no legitimate use in this server -- it cannot survive
 a restart, and safely sharing one across threads would require StaticPool,
-which defeats transaction isolation between concurrent sessions).
+which defeats transaction isolation between concurrent sessions) -- and
+foreign-key enforcement.
 """
 
 import threading
 from pathlib import Path
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, select
 
 from app.db import create_db_engine
-from app.models import MemoryItem
+from app.models import MemoryItem, ProgressEntry
 
 
 def test_non_sqlite_url_rejected() -> None:
@@ -23,25 +25,34 @@ def test_non_sqlite_url_rejected() -> None:
         create_db_engine("postgresql://user:pass@localhost/db")
 
 
-def test_non_sqlite_url_error_message_includes_url() -> None:
-    with pytest.raises(RuntimeError, match="postgres://example/db"):
+def test_non_sqlite_url_error_message_includes_dialect() -> None:
+    with pytest.raises(RuntimeError, match='got dialect: "postgres"'):
         create_db_engine("postgres://example/db")
 
 
-def test_non_sqlite_url_error_message_masks_password() -> None:
-    """A misconfigured postgres URL must not leak its password into logs."""
+def test_non_sqlite_url_error_message_leaks_no_url_components() -> None:
+    """A misconfigured URL for another backend must not leak into logs: not
+    just its password component, but nothing at all beyond the dialect name.
+    In particular, a password hidden in a query parameter (e.g.
+    `?sslpassword=...`, or a `PWD=` buried inside an ODBC
+    `odbc_connect=...` connection string) must not leak either --
+    `render_as_string(hide_password=True)` alone would not catch those, since
+    it only masks a URL's own `password` component.
+    """
     with pytest.raises(RuntimeError) as exc_info:
-        create_db_engine("postgresql://user:s3cret@h/db")
+        create_db_engine("postgresql://user:s3cret@h/db?sslpassword=qs3cret")
     message = str(exc_info.value)
+    assert "postgresql" in message
     assert "s3cret" not in message
-    assert "user" in message
-    assert "h/db" in message
+    assert "qs3cret" not in message
+    assert "h" not in message
+    assert "db" not in message
 
 
 def test_unparseable_url_error_message_leaks_nothing() -> None:
     """A DSN with no `://` separator at all (e.g. a `postgresql:` URL where
     someone forgot the slashes) cannot be parsed by SQLAlchemy's `make_url`.
-    The `_mask_db_url` fallback for that case must be a fixed placeholder
+    The `_url_dialect` fallback for that case must be a fixed placeholder
     that echoes nothing from the input -- a naive `scheme = url.split("://",
     1)[0]` fallback would treat the *entire* unparseable string, including
     any embedded credentials, as the "scheme" and echo it straight back.
@@ -49,6 +60,7 @@ def test_unparseable_url_error_message_leaks_nothing() -> None:
     with pytest.raises(RuntimeError) as exc_info:
         create_db_engine("postgresql:user:s3cret@host/db")
     message = str(exc_info.value)
+    assert "<unparseable database URL>" in message
     assert "s3cret" not in message
     assert "host" not in message
 
@@ -146,5 +158,25 @@ def test_file_sqlite_engine_shares_database_across_threads(tmp_path: Path) -> No
 
         assert "error" not in result, result.get("error")
         assert result["items"] == []
+    finally:
+        engine.dispose()
+
+
+def test_foreign_keys_enforced(tmp_path: Path) -> None:
+    """Every connection from create_db_engine() must enforce foreign keys:
+    SQLite does not do so by default, so without `PRAGMA foreign_keys=ON`
+    this insert would silently succeed instead of raising -- e.g. a `POST
+    /api/items/{id}/progress` racing a committed `DELETE /api/items/{id}`
+    could insert a `ProgressEntry` referencing an already-deleted
+    `MemoryItem`, an orphan row no API call could ever remove.
+    """
+    db_path = tmp_path / "fk.db"
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        SQLModel.metadata.create_all(engine)
+        with Session(engine) as session:
+            session.add(ProgressEntry(item_id=9999, note="orphan"))
+            with pytest.raises(IntegrityError):
+                session.commit()
     finally:
         engine.dispose()
