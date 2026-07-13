@@ -136,9 +136,19 @@ def _is_memory_sqlite_url(url: str) -> bool:
       in-memory (optionally named, shared-cache) database; see the class
       docstring above.
     """
-    if ":memory:" in url:
-        return True
+    # Compare the exact parsed `database` component, not a substring search
+    # over the whole URL string: SQLite treats only the literal, *exact*
+    # filename ":memory:" as its special in-memory database, so a substring
+    # check (`":memory:" in url`) would wrongly reject a genuine, file-backed
+    # path that merely *contains* that text, e.g.
+    # "sqlite:///./notes:memory:.db" is a real on-disk file named
+    # "notes:memory:.db", not an in-memory database. The runtime
+    # `pragma_database_list` probe in `create_db_engine` below remains the
+    # authoritative backstop for exotic spellings this static, best-effort
+    # check does not (or cannot) recognise -- see that function's docstring.
     database = make_url(url).database
+    if database == ":memory:":
+        return True
     if not database:
         return True
     if database.startswith("file:"):

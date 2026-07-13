@@ -2,7 +2,7 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.exc import StaleDataError
@@ -26,6 +26,27 @@ router = APIRouter(prefix="/items", tags=["items"])
 SessionDep = Annotated[Session, Depends(get_session)]
 
 _NOT_FOUND = "Memory item not found"
+
+# SQLite's INTEGER storage class is a signed 64-bit two's-complement integer
+# (https://www.sqlite.org/datatype3.html#the_integer_datatypes): 2**63 - 1 is
+# the largest value it can hold. FastAPI's `int` path/query converters accept
+# any Python int, which is unbounded, so a value beyond this -- e.g.
+# `item_id=9223372036854775808` (2**63) -- parses fine at the routing layer
+# but raises OverflowError from the pysqlite driver the moment it is bound
+# into a query, which FastAPI does not catch: it propagates as an unhandled
+# 500 instead of a client error. Every `int` path/query parameter that is
+# bound into a SQLite query below must be capped at this constant so
+# out-of-range values are instead rejected with 422 during FastAPI's own
+# validation, before ever reaching the database.
+SQLITE_MAX_INT = 9223372036854775807  # 2**63 - 1
+
+# Shared path type for `item_id`: applied to every route below that looks up
+# a MemoryItem by id (GET/PATCH/DELETE /{item_id} and POST
+# /{item_id}/progress) so all four enforce the same bounds. Lower-bounded at
+# 1 since SQLite's `INTEGER PRIMARY KEY` rowids -- MemoryItem.id here -- are
+# always positive; upper-bounded at SQLITE_MAX_INT for the OverflowError
+# reason above.
+ItemId = Annotated[int, Path(ge=1, le=SQLITE_MAX_INT)]
 
 # Escape character for user-built LIKE/ILIKE patterns. It must be escaped
 # first in `_like_escape` so a literal backslash in the input round-trips.
@@ -89,7 +110,7 @@ def list_items(
     tag: str | None = None,
     q: str | None = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    offset: Annotated[int, Query(ge=0, le=SQLITE_MAX_INT)] = 0,
 ) -> ItemListResponse:
     """List items (newest first) with optional filtering and pagination."""
     filters: list[ColumnElement[bool]] = []
@@ -129,7 +150,7 @@ def list_items(
 
 
 @router.get("/{item_id}", response_model=MemoryItemReadWithProgress)
-def get_item(item_id: int, session: SessionDep) -> MemoryItemReadWithProgress:
+def get_item(item_id: ItemId, session: SessionDep) -> MemoryItemReadWithProgress:
     """Return a single item with its full progress history (oldest first)."""
     item = session.get(MemoryItem, item_id)
     if item is None:
@@ -143,7 +164,7 @@ def get_item(item_id: int, session: SessionDep) -> MemoryItemReadWithProgress:
 
 
 @router.patch("/{item_id}", response_model=MemoryItemRead)
-def update_item(item_id: int, payload: MemoryItemUpdate, session: SessionDep) -> MemoryItemRead:
+def update_item(item_id: ItemId, payload: MemoryItemUpdate, session: SessionDep) -> MemoryItemRead:
     """Apply a partial update; bump `updated` only when a field is provided."""
     item = session.get(MemoryItem, item_id)
     if item is None:
@@ -184,7 +205,7 @@ def update_item(item_id: int, payload: MemoryItemUpdate, session: SessionDep) ->
 
 
 @router.delete("/{item_id}", status_code=204)
-def delete_item(item_id: int, session: SessionDep) -> None:
+def delete_item(item_id: ItemId, session: SessionDep) -> None:
     """Delete an item; its progress entries are removed via cascade."""
     item = session.get(MemoryItem, item_id)
     if item is None:
@@ -221,7 +242,7 @@ def delete_item(item_id: int, session: SessionDep) -> None:
 
 @router.post("/{item_id}/progress", response_model=ProgressEntryRead, status_code=201)
 def add_progress(
-    item_id: int, payload: ProgressEntryCreate, session: SessionDep
+    item_id: ItemId, payload: ProgressEntryCreate, session: SessionDep
 ) -> ProgressEntryRead:
     """Append a progress entry and bump the item's `updated` timestamp."""
     item = session.get(MemoryItem, item_id)

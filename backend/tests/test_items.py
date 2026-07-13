@@ -8,6 +8,13 @@ from sqlalchemy.orm.exc import StaleDataError
 from sqlmodel import Session, col, select
 
 from app.models import MemoryItem, ProgressEntry
+from app.routers.items import SQLITE_MAX_INT
+
+# One past SQLite's signed-64-bit INTEGER ceiling (2**63): FastAPI parses this
+# fine as a Python int, but binding it into a SQLite query raises OverflowError
+# from the driver -- id/offset values this large must be rejected by FastAPI's
+# own path/query validation (422) before ever reaching the database.
+_OUT_OF_SQLITE_RANGE = SQLITE_MAX_INT + 1
 
 
 def _create(client: TestClient, **fields: object) -> dict:
@@ -169,6 +176,36 @@ def test_list_limit_out_of_range_rejected(client: TestClient) -> None:
     assert client.get("/api/items", params={"limit": 201}).status_code == 422
 
 
+def test_list_offset_over_sqlite_max_rejected(client: TestClient) -> None:
+    """`offset` beyond SQLite's signed-64-bit range must be rejected by
+    FastAPI's own query validation (422) before it ever reaches the
+    database: binding a Python int this large as the OFFSET parameter raises
+    OverflowError from the driver, which would otherwise surface as an
+    unhandled 500.
+    """
+    response = client.get("/api/items", params={"offset": _OUT_OF_SQLITE_RANGE})
+    assert response.status_code == 422
+
+
+def test_list_offset_at_sqlite_max_returns_empty_items_and_correct_total(
+    client: TestClient,
+) -> None:
+    """The maximum in-range offset (SQLite's signed-64-bit ceiling itself)
+    must pass FastAPI's query validation and reach the database, where it is
+    simply an offset past the end of the result set: an empty `items` page,
+    with `total` still reporting the real row count -- unaffected by
+    pagination.
+    """
+    for index in range(3):
+        _create(client, title=f"Item {index}")
+
+    response = client.get("/api/items", params={"offset": SQLITE_MAX_INT})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["items"] == []
+    assert body["total"] == 3
+
+
 def test_filter_by_status(client: TestClient) -> None:
     _create(client, title="Active one", status="active")
     _create(client, title="Parked one", status="parked")
@@ -260,6 +297,25 @@ def test_get_missing_returns_404(client: TestClient) -> None:
     assert client.get("/api/items/9999").status_code == 404
 
 
+def test_get_item_id_over_sqlite_max_rejected(client: TestClient) -> None:
+    """`item_id` beyond SQLite's signed-64-bit range must be rejected by
+    FastAPI's own path validation (422) before ever reaching the database --
+    binding a Python int this large into a SQLite query raises OverflowError
+    from the driver, which would otherwise surface as an unhandled 500.
+    """
+    response = client.get(f"/api/items/{_OUT_OF_SQLITE_RANGE}")
+    assert response.status_code == 422
+
+
+def test_get_item_id_at_sqlite_max_in_range_returns_404(client: TestClient) -> None:
+    """The maximum in-range id (SQLite's signed-64-bit ceiling itself) must
+    pass FastAPI's path validation and reach the database, where -- absent
+    any item with that id -- it is a normal 404, not a validation error.
+    """
+    response = client.get(f"/api/items/{SQLITE_MAX_INT}")
+    assert response.status_code == 404
+
+
 def test_patch_partial_update_bumps_updated(client: TestClient, session: Session) -> None:
     item = _create(client)
     stored = session.get(MemoryItem, item["id"])
@@ -339,6 +395,25 @@ def test_patch_normal_partial_update_leaves_other_fields_untouched(client: TestC
 
 def test_patch_missing_returns_404(client: TestClient) -> None:
     assert client.patch("/api/items/9999", json={"status": "active"}).status_code == 404
+
+
+def test_patch_item_id_over_sqlite_max_rejected(client: TestClient) -> None:
+    """`item_id` beyond SQLite's signed-64-bit range must be rejected by
+    FastAPI's own path validation (422) before ever reaching the database --
+    binding a Python int this large into a SQLite query raises OverflowError
+    from the driver, which would otherwise surface as an unhandled 500.
+    """
+    response = client.patch(f"/api/items/{_OUT_OF_SQLITE_RANGE}", json={"snapshot": "x"})
+    assert response.status_code == 422
+
+
+def test_patch_item_id_at_sqlite_max_in_range_returns_404(client: TestClient) -> None:
+    """The maximum in-range id (SQLite's signed-64-bit ceiling itself) must
+    pass FastAPI's path validation and reach the database, where -- absent
+    any item with that id -- it is a normal 404, not a validation error.
+    """
+    response = client.patch(f"/api/items/{SQLITE_MAX_INT}", json={"snapshot": "x"})
+    assert response.status_code == 404
 
 
 def test_patch_races_with_concurrent_delete_returns_404(
@@ -436,6 +511,25 @@ def test_delete_cascades_progress_entries(client: TestClient, session: Session) 
 
 def test_delete_missing_returns_404(client: TestClient) -> None:
     assert client.delete("/api/items/9999").status_code == 404
+
+
+def test_delete_item_id_over_sqlite_max_rejected(client: TestClient) -> None:
+    """`item_id` beyond SQLite's signed-64-bit range must be rejected by
+    FastAPI's own path validation (422) before ever reaching the database --
+    binding a Python int this large into a SQLite query raises OverflowError
+    from the driver, which would otherwise surface as an unhandled 500.
+    """
+    response = client.delete(f"/api/items/{_OUT_OF_SQLITE_RANGE}")
+    assert response.status_code == 422
+
+
+def test_delete_item_id_at_sqlite_max_in_range_returns_404(client: TestClient) -> None:
+    """The maximum in-range id (SQLite's signed-64-bit ceiling itself) must
+    pass FastAPI's path validation and reach the database, where -- absent
+    any item with that id -- it is a normal 404, not a validation error.
+    """
+    response = client.delete(f"/api/items/{SQLITE_MAX_INT}")
+    assert response.status_code == 404
 
 
 def test_delete_races_with_concurrent_delete_returns_204(
@@ -569,6 +663,25 @@ def test_progress_empty_note_rejected(client: TestClient) -> None:
 
 def test_progress_missing_item_returns_404(client: TestClient) -> None:
     assert client.post("/api/items/9999/progress", json={"note": "x"}).status_code == 404
+
+
+def test_progress_item_id_over_sqlite_max_rejected(client: TestClient) -> None:
+    """`item_id` beyond SQLite's signed-64-bit range must be rejected by
+    FastAPI's own path validation (422) before ever reaching the database --
+    binding a Python int this large into a SQLite query raises OverflowError
+    from the driver, which would otherwise surface as an unhandled 500.
+    """
+    response = client.post(f"/api/items/{_OUT_OF_SQLITE_RANGE}/progress", json={"note": "x"})
+    assert response.status_code == 422
+
+
+def test_progress_item_id_at_sqlite_max_in_range_returns_404(client: TestClient) -> None:
+    """The maximum in-range id (SQLite's signed-64-bit ceiling itself) must
+    pass FastAPI's path validation and reach the database, where -- absent
+    any item with that id -- it is a normal 404, not a validation error.
+    """
+    response = client.post(f"/api/items/{SQLITE_MAX_INT}/progress", json={"note": "x"})
+    assert response.status_code == 404
 
 
 def test_progress_add_races_with_concurrent_delete_returns_404(

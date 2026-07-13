@@ -122,6 +122,26 @@ def test_sqlite_uri_mode_memory_rejected() -> None:
         create_db_engine("sqlite:///file:memdb1?mode=memory&cache=shared&uri=true")
 
 
+def test_sqlite_filename_containing_memory_substring_is_allowed(tmp_path: Path) -> None:
+    """The static in-memory check must compare the *exact* parsed `database`
+    component against ":memory:", not search for it as a substring of the
+    whole URL: SQLite treats only the literal, exact filename ":memory:" as
+    its special in-memory database, so a genuine on-disk file whose name
+    merely *contains* that text -- e.g. "notes:memory:.db" -- must remain
+    allowed. A prior version of this guard used `":memory:" in url`, which
+    would have wrongly rejected this URL, since that substring does appear
+    inside the filename even though the filename as a whole does not equal
+    ":memory:".
+    """
+    db_path = tmp_path / "notes:memory:.db"
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        SQLModel.metadata.create_all(engine)
+        assert db_path.exists()
+    finally:
+        engine.dispose()
+
+
 def test_sqlite_uri_file_backed_without_mode_memory_is_allowed(tmp_path: Path) -> None:
     """A URI-form SQLite filename *without* `mode=memory` genuinely addresses
     a durable file and must remain allowed. Uses an absolute path inside
