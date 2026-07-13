@@ -3,7 +3,7 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import String, cast, func, or_
+from sqlalchemy import func, or_
 from sqlalchemy.sql.elements import ColumnElement
 from sqlmodel import Session, col, select
 
@@ -24,6 +24,33 @@ router = APIRouter(prefix="/items", tags=["items"])
 SessionDep = Annotated[Session, Depends(get_session)]
 
 _NOT_FOUND = "Memory item not found"
+
+# Escape character for user-built LIKE/ILIKE patterns. It must be escaped
+# first in `_like_escape` so a literal backslash in the input round-trips.
+_LIKE_ESCAPE = "\\"
+
+
+def _like_escape(value: str) -> str:
+    """Escape LIKE metacharacters so `value` matches only as a literal substring."""
+    return (
+        value.replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
+        .replace("%", f"{_LIKE_ESCAPE}%")
+        .replace("_", f"{_LIKE_ESCAPE}_")
+    )
+
+
+def _tag_filter(tag: str) -> ColumnElement[bool]:
+    """Exact JSON-array membership test: does `tag` appear as an element of tags?
+
+    tags is a JSON array persisted as text, and SQLAlchemy's default JSON
+    serializer uses ensure_ascii=True, so non-ASCII tags (e.g. Chinese) are
+    stored as \\uXXXX escapes. A LIKE match over that serialized text can
+    never find them. json_each unpacks the array server-side so this compares
+    decoded element values instead: exact membership, Unicode-correct, and a
+    tag like "工" cannot match an item tagged "工作".
+    """
+    element = func.json_each(col(MemoryItem.tags)).table_valued("value")
+    return select(1).select_from(element).where(element.c.value == tag).exists()
 
 
 @router.post("", response_model=MemoryItemRead, status_code=201)
@@ -56,18 +83,14 @@ def list_items(
     if stage is not None:
         filters.append(col(MemoryItem.stage) == stage)
     if tag is not None:
-        # MVP tradeoff: tags is a JSON array persisted as text, so we match the
-        # quoted token with LIKE rather than doing a true array-membership test.
-        # The surrounding quotes make token boundaries reliable for plain tags;
-        # a tag whose text embeds a quoted substring could still over-match.
-        filters.append(cast(col(MemoryItem.tags), String).like(f'%"{tag}"%'))
+        filters.append(_tag_filter(tag))
     if q is not None:
-        like = f"%{q}%"
+        like = f"%{_like_escape(q)}%"
         filters.append(
             or_(
-                col(MemoryItem.title).ilike(like),
-                col(MemoryItem.snapshot).ilike(like),
-                col(MemoryItem.recovery_keywords).ilike(like),
+                col(MemoryItem.title).ilike(like, escape=_LIKE_ESCAPE),
+                col(MemoryItem.snapshot).ilike(like, escape=_LIKE_ESCAPE),
+                col(MemoryItem.recovery_keywords).ilike(like, escape=_LIKE_ESCAPE),
             )
         )
 

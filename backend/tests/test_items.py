@@ -106,6 +106,25 @@ def test_filter_by_tag(client: TestClient) -> None:
     assert result["items"][0]["title"] == "Work item"
 
 
+def test_filter_by_tag_chinese_exact_membership(client: TestClient) -> None:
+    # ensure_ascii JSON serialization must not break matching non-ASCII tags,
+    # and membership must stay exact (no LIKE-style substring over-matching).
+    _create(client, title="Chinese tagged", tags=["工作", "付款"])
+    _create(client, title="Ascii tagged", tags=["ascii-tag"])
+
+    hit = client.get("/api/items", params={"tag": "工作"}).json()
+    assert hit["total"] == 1
+    assert hit["items"][0]["title"] == "Chinese tagged"
+
+    # "工" is a substring of "工作" but must NOT match as a distinct tag.
+    miss = client.get("/api/items", params={"tag": "工"}).json()
+    assert miss["total"] == 0
+
+    ascii_result = client.get("/api/items", params={"tag": "ascii-tag"}).json()
+    assert ascii_result["total"] == 1
+    assert ascii_result["items"][0]["title"] == "Ascii tagged"
+
+
 def test_q_search_matches_title(client: TestClient) -> None:
     _create(client, title="Findable Alpha")
     _create(client, title="Unrelated Beta")
@@ -129,6 +148,23 @@ def test_q_search_matches_recovery_keywords(client: TestClient) -> None:
     result = client.get("/api/items", params={"q": "needle"}).json()
     assert result["total"] == 1
     assert result["items"][0]["title"] == "Keyword holder"
+
+
+def test_q_search_escapes_like_metacharacters(client: TestClient) -> None:
+    _create(client, title="Has foo_bar token")
+    # "_" is a single-character LIKE wildcard; must not match "X" here.
+    _create(client, title="Has fooXbar token")
+    # "%" is a multi-character LIKE wildcard; an unescaped q="%" would match
+    # every row instead of only rows with a literal "%".
+    _create(client, title="Has 100% literal percent")
+
+    underscore_result = client.get("/api/items", params={"q": "foo_bar"}).json()
+    assert underscore_result["total"] == 1
+    assert underscore_result["items"][0]["title"] == "Has foo_bar token"
+
+    percent_result = client.get("/api/items", params={"q": "%"}).json()
+    assert percent_result["total"] == 1
+    assert percent_result["items"][0]["title"] == "Has 100% literal percent"
 
 
 def test_get_missing_returns_404(client: TestClient) -> None:
