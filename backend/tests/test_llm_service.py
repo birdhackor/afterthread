@@ -283,6 +283,23 @@ def test_generate_json_array_output_raises_upstream(monkeypatch: pytest.MonkeyPa
         asyncio.run(generate_json("system", "user"))
 
 
+def test_generate_json_array_of_objects_raises_upstream_not_first_element(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A top-level array of OBJECTS -- unlike a bare array of scalars above --
+    once let the balanced-brace fallback inside _extract_json_object silently
+    extract and return just the FIRST element, quietly persisting a shape the
+    caller never asked for instead of surfacing the true "wrong shape"
+    failure. The full array must still be rejected as a whole: 502, and the
+    (never reached) first element is not returned.
+    """
+    array_content = json.dumps([{"title": "A"}, {"title": "B"}])
+    _configured(monkeypatch, content=array_content)
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        asyncio.run(generate_json("system", "user"))
+    assert "WrongShape" in str(excinfo.value)
+
+
 def test_generate_json_empty_content_raises_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
     _configured(monkeypatch, content="   ")
     with pytest.raises(LLMUpstreamError):
@@ -507,6 +524,51 @@ def test_llm_configured_true_for_http_and_https_with_host(
     assert llm_configured() is True
 
 
+# --- llm_configured: out-of-range port (finding: port range) --------------
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    ["http://host.example:99999/v1", "http://host.example:0/v1"],
+    ids=["port-above-65535", "port-zero"],
+)
+def test_llm_configured_false_for_out_of_range_port(
+    monkeypatch: pytest.MonkeyPatch, base_url: str
+) -> None:
+    """httpx.URL parses a numerically out-of-range port (99999, beyond the
+    16-bit TCP range) or port 0 WITHOUT error -- unlike a non-numeric port such
+    as "8o80", which fails at the httpx.URL/AsyncOpenAI construction stage --
+    and AsyncOpenAI builds a client from it happily. But no TCP connect can
+    ever target such a port, so every real call would fail as a 502 instead of
+    the config-error 503 this function exists to produce. llm_configured must
+    report unconfigured, and generate_json must gate to LLMNotConfiguredError
+    (503) before any client is built or request sent.
+    """
+    monkeypatch.setattr(
+        "app.services.llm.get_settings",
+        lambda: _settings(base_url=base_url, model=_CONFIGURED_MODEL),
+    )
+    assert llm_configured() is False
+
+    def _must_not_build() -> _StubClient:
+        raise AssertionError("_get_client must not run when unconfigured")
+
+    monkeypatch.setattr("app.services.llm._get_client", _must_not_build)
+    with pytest.raises(LLMNotConfiguredError):
+        asyncio.run(generate_json("system", "user"))
+
+
+def test_llm_configured_true_for_explicit_valid_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A normal, in-range explicit port must remain configured -- the new port
+    check rejects only 0 and values above 65535, never an ordinary port.
+    """
+    monkeypatch.setattr(
+        "app.services.llm.get_settings",
+        lambda: _settings(base_url="http://host.example:8000/v1", model=_CONFIGURED_MODEL),
+    )
+    assert llm_configured() is True
+
+
 def test_configured_and_get_client_agree_on_whitespace_padded_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -542,6 +604,36 @@ def test_balanced_brace_slice_none_without_object() -> None:
 def test_extract_json_object_nested(monkeypatch: pytest.MonkeyPatch) -> None:
     nested = '{"outer": {"inner": [1, 2]}, "flag": true}'
     assert _extract_json_object(nested) == {"outer": {"inner": [1, 2]}, "flag": True}
+
+
+# --- _extract_json_object: non-object top level (finding 1) ---------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    ['[{"title": "A"}, {"title": "B"}]', '"just a string"', "42", "true", "null"],
+    ids=["array-of-objects", "string", "number", "bool", "null"],
+)
+def test_extract_json_object_top_level_non_object_raises_upstream_wrong_shape(value: str) -> None:
+    """The full text parsing successfully as JSON but NOT as an object -- most
+    notably a top-level array of objects, whose first element the
+    balanced-brace fallback could otherwise mistake for a valid embedded
+    object -- must raise immediately rather than fall through to that
+    fallback. See the array-of-objects regression at the generate_json level:
+    test_generate_json_array_of_objects_raises_upstream_not_first_element.
+    """
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        _extract_json_object(value)
+    assert "WrongShape" in str(excinfo.value)
+
+
+def test_extract_json_object_prose_wrapped_still_falls_back_to_brace_slice() -> None:
+    """Full text that FAILS to parse as JSON at all (prose is not valid JSON)
+    is unaffected by the new top-level-shape check above: this must still fall
+    through to the balanced-brace fallback and recover the embedded object.
+    """
+    prose = 'Sure, here is the draft: {"title": "A"} Hope this helps!'
+    assert _extract_json_object(prose) == {"title": "A"}
 
 
 def test_extract_json_object_invalid_raises_upstream() -> None:

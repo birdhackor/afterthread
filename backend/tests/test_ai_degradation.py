@@ -141,6 +141,27 @@ def test_capture_end_to_end_unparseable_returns_502_no_rows(
     assert _total(client) == 0
 
 
+def test_capture_end_to_end_array_of_objects_returns_502_no_rows(
+    client: TestClient,
+    configure_llm: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A top-level JSON array of objects (each one individually shaped like a
+    plausible draft) must not let the balanced-brace fallback inside
+    _extract_json_object silently extract and persist just the first element.
+    The real generate_json runs here (only _get_client is stubbed), so this
+    proves the whole chain rejects the array as a whole: 502, no row written.
+    """
+    configure_llm(base_url=_SECRET_URL, model="m")
+    array_content = json.dumps([_DRAFT, {**_DRAFT, "title": "second element"}], ensure_ascii=False)
+    _install_client(monkeypatch, _StubClient(content=array_content))
+
+    response = client.post("/api/capture", json={"raw_text": "raw discussion"})
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "llm_upstream_error"
+    assert _total(client) == 0
+
+
 def test_capture_end_to_end_empty_completion_returns_502_no_rows(
     client: TestClient,
     configure_llm: Callable[..., Settings],

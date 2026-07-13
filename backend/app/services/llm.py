@@ -93,10 +93,18 @@ def llm_configured() -> bool:
     (``ftp://h/v1``) -- each parses but no OpenAI-compatible request could reach
     it. Without that, ``llm_configured`` would answer True while every workflow
     using the same config degrades to 503 -- the status endpoint would disagree
-    with actual usability. The URL is only parsed, never echoed, so no fragment
-    of it leaks out of this function. The stripped value is the same one
-    ``_get_client`` builds the client from, so status and runtime agree even for
-    a whitespace-padded override.
+    with actual usability. It also rejects a numerically out-of-range port
+    (``http://host:99999/v1``) or port ``0`` (``http://host:0/v1``): unlike the
+    non-numeric ``8o80`` above, ``httpx.URL`` parses either of these without
+    error and ``AsyncOpenAI`` builds a client from the result happily, but no
+    TCP connect can ever target a port outside 1..65535 -- so every real call
+    against it would fail as a 502 instead of the config-error 503 this
+    function exists to produce. A URL with no port at all (``url.port is
+    None``, meaning "use the scheme's default port") is unaffected by this
+    check. The URL is only parsed, never echoed, so no fragment of it leaks
+    out of this function. The stripped value is the same one ``_get_client``
+    builds the client from, so status and runtime agree even for a
+    whitespace-padded override.
     """
     settings = get_settings()
     base_url = settings.openai_base_url.strip()
@@ -109,10 +117,16 @@ def llm_configured() -> bool:
         return False
     # Parseable is not usable: httpx.URL accepts a scheme-less authority
     # ("localhost:8000/v1" parses with scheme "localhost"), an empty host
-    # ("http:///v1"), and a non-HTTP scheme ("ftp://h/v1"). Require an
-    # http/https scheme AND a non-empty host so this can never claim an endpoint
-    # the workflows would then fail to reach.
-    return url.scheme in ("http", "https") and bool(url.host)
+    # ("http:///v1"), a non-HTTP scheme ("ftp://h/v1"), AND a numerically
+    # out-of-range or zero port ("http://host:99999/v1", "http://host:0/v1") --
+    # each parses without error, so each needs an explicit check here rather
+    # than relying on the try/except above. Require an http/https scheme, a
+    # non-empty host, and (when a port is present at all) a port in 1..65535,
+    # so this can never claim an endpoint the workflows would then fail to
+    # reach.
+    if url.scheme not in ("http", "https") or not url.host:
+        return False
+    return url.port is None or 1 <= url.port <= 65535
 
 
 @lru_cache(maxsize=8)
@@ -241,29 +255,52 @@ def _balanced_brace_slice(text: str) -> str | None:
 def _extract_json_object(text: str) -> dict[str, Any]:
     """Parse a JSON object out of raw completion text, robustly.
 
-    Tries the fence-stripped text directly first (the common case), then falls
-    back to the first balanced-brace slice (prose-wrapped output). Anything
-    that is not, in the end, a JSON *object* raises LLMUpstreamError -- the
+    Tries the fence-stripped text directly first (the common case). If that
+    full text parses as JSON at all, its shape is FINAL and no fallback is
+    attempted: a dict is returned as-is, while anything else -- a top-level
+    array, string, number, bool, or null -- raises LLMUpstreamError
+    immediately. That fallthrough is deliberately not taken: a top-level array
+    such as ``[{"title": "A"}, {"title": "B"}]`` parses cleanly, and the
+    balanced-brace pass below would happily find and return its first embedded
+    object -- silently persisting one arbitrary element of a shape the caller
+    never asked for, instead of surfacing the true "wrong shape" failure as a
+    502. The balanced-brace fallback (recovering an object embedded in
+    surrounding prose, e.g. "Here is the draft: {..}. Hope this helps!") is
+    only ever attempted when the full text FAILS to parse as JSON at all --
+    and even then must itself yield a dict, or this still raises. The
     workflows require an object to map onto their pydantic models, and a bare
     array/scalar is as unusable as unparseable garbage.
 
     Pathologically nested input (tens of thousands of ``[``) makes ``json.loads``
     exhaust the interpreter's recursion limit and raise ``RecursionError`` rather
     than ``JSONDecodeError``; that is caught alongside the ordinary parse errors
-    and treated as unparseable (502), never left to escape as an unhandled 500.
+    on both the full-text and balanced-brace attempts, and treated as
+    unparseable (502), never left to escape as an unhandled 500.
     """
     cleaned = _strip_code_fences(text)
-    candidates = [cleaned]
-    brace = _balanced_brace_slice(cleaned)
-    if brace is not None and brace != cleaned:
-        candidates.append(brace)
-    for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError, ValueError, RecursionError:
-            continue
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError, ValueError, RecursionError:
+        pass
+    else:
         if isinstance(parsed, dict):
             return parsed
+        # Well-formed JSON, but not an object: this is the LLM's whole answer,
+        # not prose wrapping an object, so it fails here and now rather than
+        # falling through to the balanced-brace fallback below (which could
+        # otherwise extract and silently persist the first embedded object out
+        # of a top-level array).
+        raise LLMUpstreamError("WrongShape: the LLM returned a non-object JSON value")
+
+    brace = _balanced_brace_slice(cleaned)
+    if brace is not None and brace != cleaned:
+        try:
+            parsed = json.loads(brace)
+        except json.JSONDecodeError, ValueError, RecursionError:
+            pass
+        else:
+            if isinstance(parsed, dict):
+                return parsed
     raise LLMUpstreamError("UnparseableOutput: could not parse a JSON object from the LLM output")
 
 

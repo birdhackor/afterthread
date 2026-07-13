@@ -109,3 +109,32 @@ def test_status_and_capture_agree_on_parseable_but_unusable_url(
     capture = client.post("/api/capture", json={"raw_text": "raw"})
     assert capture.status_code == 503
     assert capture.json()["detail"]["code"] == "llm_not_configured"
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    ["http://internal-llm:99999/v1", "http://internal-llm:0/v1"],
+    ids=["port-above-65535", "port-zero"],
+)
+def test_status_and_capture_agree_on_out_of_range_port(
+    client: TestClient, configure_llm: Callable[..., Settings], base_url: str
+) -> None:
+    # httpx.URL parses an out-of-range port (99999, beyond the 16-bit TCP
+    # range) or port 0 WITHOUT error -- unlike a non-numeric port, which fails
+    # at construction -- so each needs its own explicit range check. Without
+    # it, status would report configured while capture could only ever fail as
+    # a 502 at the TCP layer instead of the config-error 503.
+    configure_llm(base_url=base_url, model="m")
+    assert client.get("/api/llm/status").json() == {"configured": False, "model": None}
+    capture = client.post("/api/capture", json={"raw_text": "raw"})
+    assert capture.status_code == 503
+    assert capture.json()["detail"]["code"] == "llm_not_configured"
+
+
+def test_status_configured_true_for_explicit_valid_port(
+    client: TestClient, configure_llm: Callable[..., Settings]
+) -> None:
+    # A normal, in-range explicit port must remain configured -- the new port
+    # check rejects only 0 and values above 65535, never an ordinary port.
+    configure_llm(base_url="http://internal-llm:8000/v1", model="m")
+    assert client.get("/api/llm/status").json() == {"configured": True, "model": "m"}
