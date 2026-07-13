@@ -73,6 +73,28 @@ def _is_memory_sqlite_url(url: str) -> bool:
     `sqlite:///file:memdb1?mode=memory&cache=shared&uri=true`. A URI-form
     filename *without* `mode=memory` (e.g. `sqlite:///file:real.db?uri=true`)
     genuinely is file-backed and must remain allowed.
+
+    The two checks below apply only once SQLite's URI-filename parsing is
+    actually *in effect*, i.e. `uri=true` is present in the query string.
+    SQLAlchemy's pysqlite dialect only passes `uri=True` to
+    `sqlite3.connect()` -- activating https://www.sqlite.org/uri.html syntax
+    -- when the URL spells it exactly that way (see the
+    `_pysqlite_uri_connections` section of
+    `sqlalchemy.dialects.sqlite.pysqlite`). Without `uri=true`, pysqlite
+    instead treats the whole `file:...` string as a literal on-disk
+    filename (odd-looking, but a real, persistent, single file) and never
+    even looks at the rest of the query string -- so a `mode=memory` or
+    `vfs=memdb` there is inert, and such a URL must stay allowed:
+
+    - An empty URI filename, e.g. `sqlite:///file:?uri=true` (nothing
+      between `file:` and `?`): SQLite documents this as opening a private,
+      anonymous on-disk database scoped to the single connection that opened
+      it -- the same unsafe-to-share problem as the empty-path case above,
+      just spelled through the URI form instead.
+    - `vfs=memdb` in the query, e.g.
+      `sqlite:///file:mem1?vfs=memdb&uri=true`: this selects SQLite's
+      in-memory VFS explicitly, opening a memory-backed database regardless
+      of what the filename portion says.
     """
     if ":memory:" in url:
         return True
@@ -83,6 +105,11 @@ def _is_memory_sqlite_url(url: str) -> bool:
         query = parse_qs(urlsplit(url).query)
         if "memory" in query.get("mode", []):
             return True
+        if "true" in query.get("uri", []):
+            if database == "file:":
+                return True
+            if "memdb" in query.get("vfs", []):
+                return True
     return False
 
 

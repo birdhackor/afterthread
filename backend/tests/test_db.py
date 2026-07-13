@@ -124,6 +124,11 @@ def test_sqlite_uri_file_backed_without_mode_memory_is_allowed(tmp_path: Path) -
     a durable file and must remain allowed. Uses an absolute path inside
     `tmp_path` (rather than relying on the process's cwd) so the database
     file cannot land in the repo.
+
+    This also covers the "`file:real.db?uri=true` still accepted" case for
+    the `uri=true`-gated empty-filename and `vfs=memdb` checks below: this
+    URL has `uri=true` in effect, a non-empty filename, and no `vfs=memdb`,
+    so neither new check should fire.
     """
     db_path = tmp_path / "realfile.db"
     engine = create_db_engine(f"sqlite:///file:{db_path}?uri=true")
@@ -132,6 +137,56 @@ def test_sqlite_uri_file_backed_without_mode_memory_is_allowed(tmp_path: Path) -
         assert db_path.exists()
     finally:
         engine.dispose()
+
+
+def test_sqlite_uri_empty_filename_rejected() -> None:
+    """`sqlite:///file:?uri=true` -- nothing between `file:` and `?` -- is
+    SQLite's documented spelling for a private, anonymous on-disk database
+    scoped to the single connection that opens it: the same
+    unsafe-to-share-across-requests problem as the empty-path
+    (`sqlite:///`) case above, just reached through the URI form with an
+    empty filename instead of a bare empty path.
+    """
+    with pytest.raises(RuntimeError, match="In-memory SQLite"):
+        create_db_engine("sqlite:///file:?uri=true")
+
+
+def test_sqlite_uri_vfs_memdb_rejected() -> None:
+    """`vfs=memdb` in a URI-form SQLite URL selects SQLite's in-memory VFS
+    outright, regardless of what the filename portion says -- e.g.
+    `sqlite:///file:mem1?vfs=memdb&uri=true` opens an in-memory database
+    named `mem1`, not a file called `mem1`. It must be rejected exactly like
+    `mode=memory`.
+    """
+    with pytest.raises(RuntimeError, match="In-memory SQLite"):
+        create_db_engine("sqlite:///file:mem1?vfs=memdb&uri=true")
+
+
+def test_sqlite_file_prefixed_literal_filename_without_uri_flag_is_allowed() -> None:
+    """Without `uri=true` present in the query string, pysqlite never
+    enables SQLite's URI-filename parsing at all (see the
+    `_pysqlite_uri_connections` section of
+    `sqlalchemy.dialects.sqlite.pysqlite`): a `file:`-prefixed `database` --
+    even one whose query string contains `vfs=memdb`, which would otherwise
+    be rejected as selecting an in-memory VFS -- is passed to
+    `sqlite3.connect()` as a literal (if oddly named) filename, and the
+    query string is simply never passed to the driver at all. Such a URL is
+    therefore genuinely file-backed and must remain allowed, proving the
+    two checks above are correctly gated on `uri=true` rather than firing on
+    `vfs=memdb`/an empty filename unconditionally.
+
+    Deliberately does not open a real connection (e.g. via
+    `SQLModel.metadata.create_all()`): without `uri=true`, pysqlite resolves
+    a literal filename with `os.path.abspath()` relative to the process's
+    current working directory, not any `tmp_path` this test could control,
+    so actually opening the connection risks creating a stray file inside
+    the repo. Asserting `create_db_engine()` itself accepts the URL without
+    raising -- the entire extent of what `_is_memory_sqlite_url` governs --
+    is sufficient to prove the acceptance behaviour under test without
+    touching the filesystem at all.
+    """
+    engine = create_db_engine("sqlite:///file:mem1?vfs=memdb")
+    engine.dispose()
 
 
 def test_file_sqlite_url_does_not_use_static_pool(tmp_path: Path) -> None:

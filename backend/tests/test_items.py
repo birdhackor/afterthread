@@ -4,8 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, event
-from sqlalchemy.engine import Connection
-from sqlalchemy.orm import Mapper
+from sqlalchemy.orm.exc import StaleDataError
 from sqlmodel import Session, col, select
 
 from app.models import MemoryItem, ProgressEntry
@@ -255,6 +254,50 @@ def test_patch_missing_returns_404(client: TestClient) -> None:
     assert client.patch("/api/items/9999", json={"status": "active"}).status_code == 404
 
 
+def test_patch_races_with_concurrent_delete_returns_404(
+    client: TestClient, session: Session
+) -> None:
+    """If the item is deleted+committed by another session between this
+    handler's `session.get()` and its `commit()`, this handler's own UPDATE
+    for `item` (setting the changed fields and bumping `updated`) now
+    matches zero rows -- the row is already gone. SQLAlchemy reports that as
+    StaleDataError, not silence, so the API must translate it into 404
+    rather than crash with an unhandled 500.
+
+    Made deterministic without real threads via a `before_flush` *session*
+    event (see `test_progress_add_races_with_concurrent_delete_returns_404`
+    for why session-level `before_flush` -- firing before this flush has
+    emitted any of its own SQL -- is what reproduces genuine ordering,
+    versus a mapper-level event that could run after other work in the same
+    flush). The delete goes through `session.connection()`, the session's
+    own in-transaction connection, bypassing the session/identity map
+    exactly as another session's independently committed DELETE would be
+    invisible to this one.
+    """
+    item = _create(client)
+    item_id = item["id"]
+
+    def _delete_item_before_flush(
+        flush_session: Session, flush_context: object, instances: object
+    ) -> None:
+        connection = flush_session.connection()
+        connection.execute(delete(ProgressEntry).where(col(ProgressEntry.item_id) == item_id))
+        connection.execute(delete(MemoryItem).where(col(MemoryItem.id) == item_id))
+
+    event.listen(session, "before_flush", _delete_item_before_flush)
+    try:
+        response = client.patch(f"/api/items/{item_id}", json={"snapshot": "late"})
+    finally:
+        event.remove(session, "before_flush", _delete_item_before_flush)
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Memory item not found"
+
+    # The handler's session.rollback() must leave the shared session usable
+    # for later requests, not stuck raising PendingRollbackError.
+    assert client.get("/api/items").status_code == 200
+
+
 def test_delete_cascades_progress_entries(client: TestClient, session: Session) -> None:
     item = _create(client)
     item_id = item["id"]
@@ -273,6 +316,57 @@ def test_delete_cascades_progress_entries(client: TestClient, session: Session) 
 
 def test_delete_missing_returns_404(client: TestClient) -> None:
     assert client.delete("/api/items/9999").status_code == 404
+
+
+def test_delete_races_with_concurrent_delete_returns_404(
+    client: TestClient, session: Session
+) -> None:
+    """If the item is deleted+committed by another session between this
+    handler's `session.get()` and its `commit()`, this session's own DELETE
+    for `item` matches zero rows -- the row is already gone, so
+    delete-after-delete should surface as the same 404 a simple not-found
+    lookup would give.
+
+    Unlike the UPDATE-based races (see
+    `test_progress_add_races_with_concurrent_delete_returns_404` and
+    `test_patch_races_with_concurrent_delete_returns_404`), SQLAlchemy's
+    unit of work does not raise for a zero-row-matched DELETE unless the
+    mapper has a `version_id_col` configured, which `MemoryItem` does not:
+    without one, a mismatch here only emits a warning (see the ORM
+    `Mapper`'s `confirm_deleted_rows` parameter docs -- "the warning may be
+    changed to an exception in a future release"). The handler is hardened
+    against StaleDataError anyway, symmetric with the UPDATE-based races and
+    forward-compatible with that future behaviour, so this test drives it
+    directly: the `before_flush` hook performs the same real
+    concurrent-delete simulation used by the races above, then raises
+    StaleDataError itself to exercise the handler's translation to 404,
+    rather than relying on today's (non-raising) real DELETE path.
+    """
+    item = _create(client)
+    item_id = item["id"]
+
+    def _delete_item_before_flush(
+        flush_session: Session, flush_context: object, instances: object
+    ) -> None:
+        connection = flush_session.connection()
+        connection.execute(delete(ProgressEntry).where(col(ProgressEntry.item_id) == item_id))
+        connection.execute(delete(MemoryItem).where(col(MemoryItem.id) == item_id))
+        raise StaleDataError(
+            "DELETE statement on table 'memory_item' expected to delete 1 row(s); 0 were matched."
+        )
+
+    event.listen(session, "before_flush", _delete_item_before_flush)
+    try:
+        response = client.delete(f"/api/items/{item_id}")
+    finally:
+        event.remove(session, "before_flush", _delete_item_before_flush)
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Memory item not found"
+
+    # The handler's session.rollback() must leave the shared session usable
+    # for later requests, not stuck raising PendingRollbackError.
+    assert client.get("/api/items").status_code == 200
 
 
 def test_progress_append_bumps_item_updated(client: TestClient, session: Session) -> None:
@@ -309,36 +403,45 @@ def test_progress_add_races_with_concurrent_delete_returns_404(
     client: TestClient, session: Session
 ) -> None:
     """If the item is deleted+committed by another session between this
-    handler's `session.get()` and its `commit()`, the FK constraint now
-    rejects the INSERT of the new ProgressEntry, and the API must translate
-    that IntegrityError into 404, not crash with an unhandled 500.
+    handler's `session.get()` and its `commit()`, this session's own flush
+    now runs against a row that is already gone. This handler bumps
+    `item.updated`, and that UPDATE is what the flush emits first -- before
+    the INSERT for the new `entry` -- so an UPDATE matching zero rows is
+    what actually happens, which SQLAlchemy reports as StaleDataError. The
+    API must translate that into 404, not crash with an unhandled 500 (and
+    must still do so on the rarer ordering where the INSERT goes first
+    instead, which the FK constraint on `entry.item_id` rejects with
+    IntegrityError -- see the handler's `except` clause).
 
-    Made deterministic without real threads via a `before_insert` mapper
-    event on ProgressEntry: it fires exactly once, right before the new
-    entry's own INSERT statement -- regardless of where the unrelated
-    `item.updated` UPDATE lands in the flush plan -- and deletes the item
-    (and its existing progress entries, mirroring what a real concurrent
-    `DELETE /api/items/{id}` leaves behind) directly through the flush's
-    own connection, bypassing the session/identity map exactly as another
-    session's independently committed DELETE would be invisible to this
-    one. The FK check that immediately follows, for the new entry's INSERT,
-    then sees no matching parent row -- exactly as if the concurrent delete
-    had already landed.
+    Made deterministic without real threads via a `before_flush` *session*
+    event rather than a mapper-level `before_insert` event: `before_flush`
+    fires once, before this flush has emitted any of its own SQL, whereas
+    `before_insert` only fires right before its own target's INSERT and so
+    can run *after* an unrelated UPDATE earlier in the same flush already
+    went out -- too late to reproduce the UPDATE-sees-zero-rows ordering
+    this test is for. Deleting the item (and its existing progress entries,
+    mirroring what a real concurrent `DELETE /api/items/{id}` leaves
+    behind) through `session.connection()` -- the session's own
+    in-transaction connection -- bypasses the session/identity map exactly
+    as another session's independently committed DELETE would be invisible
+    to this one, so the flush's own UPDATE for `item` then matches zero
+    rows exactly as if that concurrent delete had already landed.
     """
     item = _create(client)
     item_id = item["id"]
 
-    def _delete_item_before_insert(
-        mapper: Mapper[ProgressEntry], connection: Connection, target: ProgressEntry
+    def _delete_item_before_flush(
+        flush_session: Session, flush_context: object, instances: object
     ) -> None:
+        connection = flush_session.connection()
         connection.execute(delete(ProgressEntry).where(col(ProgressEntry.item_id) == item_id))
         connection.execute(delete(MemoryItem).where(col(MemoryItem.id) == item_id))
 
-    event.listen(ProgressEntry, "before_insert", _delete_item_before_insert)
+    event.listen(session, "before_flush", _delete_item_before_flush)
     try:
         response = client.post(f"/api/items/{item_id}/progress", json={"note": "late"})
     finally:
-        event.remove(ProgressEntry, "before_insert", _delete_item_before_insert)
+        event.remove(session, "before_flush", _delete_item_before_flush)
 
     assert response.status_code == 404
     assert response.json()["detail"] == "Memory item not found"

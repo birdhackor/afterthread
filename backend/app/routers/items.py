@@ -5,6 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.sql.elements import ColumnElement
 from sqlmodel import Session, col, select
 
@@ -142,7 +143,18 @@ def update_item(item_id: int, payload: MemoryItemUpdate, session: SessionDep) ->
             setattr(item, key, value)
         item.updated = utcnow()
         session.add(item)
-        session.commit()
+        try:
+            session.commit()
+        except StaleDataError as exc:
+            # The item existed at the session.get() above but was deleted
+            # (and that delete committed) by another session before this
+            # flush -- the UPDATE this handler issues for `item` now matches
+            # zero rows, which SQLAlchemy reports as StaleDataError rather
+            # than silently doing nothing. Translate that race into the same
+            # 404 a simple not-found lookup would give, instead of letting
+            # it surface as an unhandled 500.
+            session.rollback()
+            raise HTTPException(status_code=404, detail=_NOT_FOUND) from exc
         session.refresh(item)
     return item
 
@@ -154,7 +166,23 @@ def delete_item(item_id: int, session: SessionDep) -> None:
     if item is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
     session.delete(item)
-    session.commit()
+    try:
+        session.commit()
+    except StaleDataError as exc:
+        # The item existed at session.get() above but was deleted (and that
+        # delete committed) by another session before this flush -- this
+        # session's own DELETE for `item` now matches zero rows. Without a
+        # `version_id_col` on the mapper, SQLAlchemy's unit of work today
+        # only warns about that mismatch rather than raising (see Mapper's
+        # confirm_deleted_rows docs: "the warning may be changed to an
+        # exception in a future release"), so this is hardening for that
+        # future/alternate behaviour rather than a path reachable today --
+        # kept symmetric with the UPDATE-based races above, since a row
+        # that's already gone by commit time is indistinguishable from "not
+        # found": delete-after-delete is itself a no-op a client should see
+        # as 404, not 500.
+        session.rollback()
+        raise HTTPException(status_code=404, detail=_NOT_FOUND) from exc
 
 
 @router.post("/{item_id}/progress", response_model=ProgressEntryRead, status_code=201)
@@ -169,12 +197,17 @@ def add_progress(item_id: int, payload: ProgressEntryCreate, session: SessionDep
     session.add(item)
     try:
         session.commit()
-    except IntegrityError as exc:
+    except (StaleDataError, IntegrityError) as exc:
         # The item existed at the session.get() above but was deleted (and
-        # that delete committed) by another session before this flush -- the
-        # FK constraint on `entry` now rejects it. Translate that race into
-        # the same 404 a simple not-found lookup would give, instead of
-        # letting the IntegrityError surface as an unhandled 500.
+        # that delete committed) by another session before this flush.
+        # Which exception surfaces depends on flush ordering, which this
+        # handler does not control: if the flush emits `item`'s UPDATE
+        # (bumping `updated`) first, that UPDATE now matches zero rows and
+        # SQLAlchemy raises StaleDataError; if it emits `entry`'s INSERT
+        # first instead, the FK constraint on `entry.item_id` rejects it
+        # with IntegrityError. Either way the item is gone, so both
+        # translate to the same 404 a simple not-found lookup would give,
+        # instead of letting either surface as an unhandled 500.
         session.rollback()
         raise HTTPException(status_code=404, detail=_NOT_FOUND) from exc
     session.refresh(entry)
