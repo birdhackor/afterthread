@@ -85,10 +85,26 @@ def _non_persistent_sqlite_error(database_url: str) -> RuntimeError:
     )
 
 
+def _py_casefold(value: str | None) -> str | None:
+    """Backing implementation of the `py_casefold` SQLite function registered
+    below.
+
+    Returns `str.casefold()` -- full Unicode case folding, so accented and
+    other non-ASCII letters compare case-insensitively (SQLite's built-in
+    `lower()` and LIKE fold only ASCII, so e.g. "École" would never match a
+    query of "école"). NULL-safe: a NULL column value arrives here as `None`
+    and must map back to `None` (returned unchanged) rather than raising, so
+    the function can be applied to nullable columns without crashing.
+    """
+    if value is None:
+        return None
+    return value.casefold()
+
+
 def _set_sqlite_foreign_keys_pragma(
     dbapi_connection: DBAPIConnection, connection_record: ConnectionPoolEntry
 ) -> None:
-    """Connect-event listener: turn on SQLite foreign-key enforcement.
+    """Connect-event listener: enable FK enforcement and register `py_casefold`.
 
     SQLite parses `FOREIGN KEY` clauses but does not enforce them unless
     `PRAGMA foreign_keys = ON` is issued on *every* connection -- it is off
@@ -104,6 +120,14 @@ def _set_sqlite_foreign_keys_pragma(
     foreign_keys` as a no-op while a transaction is open, and the sqlite3
     driver's default "legacy" transaction-control mode can leave one open on
     a freshly made connection, which would otherwise silently swallow this.
+
+    The same connect event also registers `py_casefold` (see `_py_casefold`)
+    as a deterministic, single-argument SQLite function, so `routers/items.py`'s
+    `q` search can match titles/snapshots/keywords case-insensitively over the
+    full Unicode range rather than ASCII-only. Registered here, on the one
+    connect event every engine shares (production and the test engine alike,
+    via `enable_sqlite_foreign_keys`), so the function exists on every
+    connection the app opens.
     """
     previous_autocommit = dbapi_connection.autocommit
     dbapi_connection.autocommit = True
@@ -113,16 +137,22 @@ def _set_sqlite_foreign_keys_pragma(
     finally:
         cursor.close()
     dbapi_connection.autocommit = previous_autocommit
+    # deterministic=True: `py_casefold` is a pure function of its input, so
+    # SQLite may cache/reuse its result freely. One argument; None-safe.
+    dbapi_connection.create_function("py_casefold", 1, _py_casefold, deterministic=True)
 
 
 def enable_sqlite_foreign_keys(engine: Engine) -> None:
     """Register `_set_sqlite_foreign_keys_pragma` on `engine`'s "connect" event.
 
-    Attached per-engine rather than globally on the `Engine` class, so only
-    engines that opt in are affected. Shared between `create_db_engine`
-    below and `tests/conftest.py`'s isolated test engine -- which cannot go
-    through `create_db_engine` itself, see that function's docstring -- so
-    both run under the same foreign-key semantics as production.
+    Attaches the per-connection SQLite setup this app relies on -- foreign-key
+    enforcement plus the `py_casefold` case-folding search function (see
+    `_set_sqlite_foreign_keys_pragma`). Attached per-engine rather than
+    globally on the `Engine` class, so only engines that opt in are affected.
+    Shared between `create_db_engine` below and `tests/conftest.py`'s isolated
+    test engine -- which cannot go through `create_db_engine` itself, see that
+    function's docstring -- so both run under the same foreign-key and search
+    semantics as production.
     """
     event.listen(engine, "connect", _set_sqlite_foreign_keys_pragma)
 

@@ -334,6 +334,49 @@ def test_q_search_escapes_like_metacharacters(client: TestClient) -> None:
     assert percent_result["items"][0]["title"] == "Has 100% literal percent"
 
 
+def test_q_search_unicode_case_insensitive_both_directions(client: TestClient) -> None:
+    """SQLite's ilike folds only ASCII, so an accented capital (e.g. "É")
+    would not match its lowercase form. py_casefold folds the full Unicode
+    range, so search is case-insensitive in both directions.
+    """
+    _create(client, title="École de commerce")
+    _create(client, title="résumé notes")
+    _create(client, title="Unrelated")
+
+    # Lowercase query finds the stored title-cased accented letter.
+    lower = client.get("/api/items", params={"q": "école"}).json()
+    assert lower["total"] == 1
+    assert lower["items"][0]["title"] == "École de commerce"
+
+    # Uppercase/accented query finds the stored lowercase value.
+    upper = client.get("/api/items", params={"q": "RÉSUMÉ"}).json()
+    assert upper["total"] == 1
+    assert upper["items"][0]["title"] == "résumé notes"
+
+
+def test_q_search_casefold_sharp_s_matches_ss(client: TestClient) -> None:
+    """casefold() maps "ß" to "ss" (plain lower() does not), so a query of
+    "strasse" matches a stored "Straße" -- the case-folding edge that
+    distinguishes str.casefold() from str.lower().
+    """
+    _create(client, title="Straße")
+    _create(client, title="Other")
+    hit = client.get("/api/items", params={"q": "strasse"}).json()
+    assert hit["total"] == 1
+    assert hit["items"][0]["title"] == "Straße"
+
+
+def test_q_search_chinese_unaffected(client: TestClient) -> None:
+    """Chinese has no letter case, so casefold is the identity there and
+    substring search keeps working exactly as before.
+    """
+    _create(client, title="付款流程說明")
+    _create(client, title="其他項目")
+    result = client.get("/api/items", params={"q": "付款"}).json()
+    assert result["total"] == 1
+    assert result["items"][0]["title"] == "付款流程說明"
+
+
 def test_get_missing_returns_404(client: TestClient) -> None:
     assert client.get("/api/items/9999").status_code == 404
 

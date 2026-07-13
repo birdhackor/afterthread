@@ -122,12 +122,20 @@ def list_items(
     if tag is not None:
         filters.append(_tag_filter(tag))
     if q is not None:
-        like = f"%{_like_escape(q)}%"
+        # SQLite's ilike() lowercases only ASCII, so a title of "École" would
+        # not match a query of "école". Fold both the column and the (already
+        # LIKE-escaped) pattern through py_casefold -- full Unicode case
+        # folding (see app/db.py) -- then match with a plain LIKE, keeping the
+        # same escape char. The escape char and wildcards (\, %, _) are
+        # uncased, so folding the pattern leaves the LIKE escaping intact.
+        pattern = func.py_casefold(f"%{_like_escape(q)}%")
         filters.append(
             or_(
-                col(MemoryItem.title).ilike(like, escape=_LIKE_ESCAPE),
-                col(MemoryItem.snapshot).ilike(like, escape=_LIKE_ESCAPE),
-                col(MemoryItem.recovery_keywords).ilike(like, escape=_LIKE_ESCAPE),
+                func.py_casefold(col(MemoryItem.title)).like(pattern, escape=_LIKE_ESCAPE),
+                func.py_casefold(col(MemoryItem.snapshot)).like(pattern, escape=_LIKE_ESCAPE),
+                func.py_casefold(col(MemoryItem.recovery_keywords)).like(
+                    pattern, escape=_LIKE_ESCAPE
+                ),
             )
         )
 
