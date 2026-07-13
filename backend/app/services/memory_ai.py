@@ -401,18 +401,37 @@ _SECTION_MIN_KEEP = 400
 # can tell the content was truncated rather than genuinely ending there.
 _TRUNCATION_MARKER = "…[內容過長已截斷]"
 
-# The short metadata rendered in full at the top of the serialized item, in
-# order. These are bounded by construction (title <= 300, the two enums are tiny,
-# tags <= 10 x 50) so they always fit; only the free-text sections are budgeted.
+# Defensive per-field caps applied when rendering the header, independent of
+# any upstream schema bound: an item predating schemas.MemoryItemCreate/
+# Update's own title/tags bounds, or written directly against the database,
+# could otherwise carry a title or tags list large enough to blow the header
+# past the whole prompt budget even after every section is truncated to
+# nothing. Matches memory_ai's own _TITLE_MAX; tags are capped on their
+# rendered (comma-joined) line rather than per-tag, since it is the joined
+# string that competes for header space.
+_HEADER_TAGS_MAX = 2500
+
+# The short metadata rendered at the top of the serialized item, in order.
+# status/stage are tiny by construction (StrEnum members); title and tags are
+# defensively truncated to _TITLE_MAX / _HEADER_TAGS_MAX (see
+# _render_header_value) so the header is always small and fixed-size
+# regardless of what the source row actually contains -- only the free-text
+# sections are budgeted against what remains.
 _HEADER_FIELD_ORDER: tuple[str, ...] = ("title", "status", "stage", "tags")
+_HEADER_FIELD_CAPS: dict[str, int] = {"title": _TITLE_MAX, "tags": _HEADER_TAGS_MAX}
 
 
-def _render_header_value(value: object) -> str:
-    """Render one header field to a single-line string (tags comma-joined)."""
+def _render_header_value(value: object, cap: int | None = None) -> str:
+    """Render one header field to a single-line string (tags comma-joined),
+    truncated to ``cap`` chars (behind the shared truncation marker, via
+    ``_truncate_to``) when a cap is given.
+    """
     if isinstance(value, (list, tuple)):
         parts = [_coerce_str(item).strip() for item in value]
-        return ", ".join(part for part in parts if part)
-    return _coerce_str(value).strip()
+        rendered = ", ".join(part for part in parts if part)
+    else:
+        rendered = _coerce_str(value).strip()
+    return _truncate_to(rendered, cap) if cap is not None else rendered
 
 
 def _allocate_section_budget(lengths: list[int], budget: int) -> list[int]:
@@ -457,19 +476,27 @@ def _truncate_to(value: str, cap: int) -> str:
 def _serialize_item_for_prompt(item_fields: Mapping[str, Any], budget: int) -> str:
     """Render the item (header + every section) into at most ``budget`` chars.
 
-    The header (title/status/stage/tags) is always rendered in full -- short,
-    bounded metadata the model needs to orient itself. The free-text sections
-    then share whatever budget remains: an item whose sections fit is rendered
-    verbatim, while an oversized one (up to 19 sections x 20k chars = ~380k) is
+    The header (title/status/stage/tags) is rendered first: status/stage are
+    tiny by construction (StrEnum members), while title and tags are
+    defensively capped at a small fixed size (_TITLE_MAX / _HEADER_TAGS_MAX,
+    truncated behind the same marker as an oversized section -- see
+    _render_header_value) regardless of what the source row actually
+    contains. That holds even for a row that predates
+    schemas.MemoryItemCreate/Update's own title/tags bounds, so the header can
+    never itself consume the whole budget. The free-text sections then share
+    whatever budget remains: an item whose sections fit is rendered verbatim,
+    while an oversized one (up to 19 sections x 20k chars = ~380k) is
     truncated section-by-section behind an explicit marker. This keeps the whole
     snapshot bounded so a small-context model is never handed an unusable ~380k
     prompt that would fail every enrich/update as a permanent 502. Deterministic:
     the same item and budget always serialize identically.
     """
-    header_lines = [
-        f"{field}: {_render_header_value(item_fields.get(field)) or '(empty)'}"
-        for field in _HEADER_FIELD_ORDER
-    ]
+
+    def _header_line(field: str) -> str:
+        rendered = _render_header_value(item_fields.get(field), _HEADER_FIELD_CAPS.get(field))
+        return f"{field}: {rendered or '(empty)'}"
+
+    header_lines = [_header_line(field) for field in _HEADER_FIELD_ORDER]
     section_values = {
         field: _coerce_str(item_fields.get(field)).strip() for field in SECTION_FIELD_ORDER
     }

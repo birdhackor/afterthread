@@ -209,6 +209,58 @@ def test_create_invalid_stage_rejected(client: TestClient) -> None:
     assert client.post("/api/items", json={"title": "x", "stage": "bogus"}).status_code == 422
 
 
+def test_create_title_over_max_length_rejected(client: TestClient) -> None:
+    assert client.post("/api/items", json={"title": "x" * 301}).status_code == 422
+
+
+def test_create_title_at_max_length_accepted(client: TestClient) -> None:
+    item = _create(client, title="x" * 300)
+    assert len(item["title"]) == 300
+
+
+def test_create_too_many_tags_rejected(client: TestClient) -> None:
+    payload = {"title": "x", "tags": [f"t{i}" for i in range(21)]}
+    assert client.post("/api/items", json=payload).status_code == 422
+
+
+def test_create_tags_at_max_count_accepted(client: TestClient) -> None:
+    tags = [f"t{i}" for i in range(20)]
+    item = _create(client, tags=tags)
+    assert len(item["tags"]) == 20
+
+
+def test_create_tag_over_max_length_rejected(client: TestClient) -> None:
+    payload = {"title": "x", "tags": ["a" * 101]}
+    assert client.post("/api/items", json=payload).status_code == 422
+
+
+def test_create_tag_at_max_length_accepted(client: TestClient) -> None:
+    item = _create(client, tags=["a" * 100])
+    assert item["tags"] == ["a" * 100]
+
+
+def test_create_blank_tag_rejected(client: TestClient) -> None:
+    # A whitespace-only tag strips to empty, so it must be rejected (422)
+    # rather than silently stored as "".
+    payload = {"title": "x", "tags": ["   "]}
+    assert client.post("/api/items", json=payload).status_code == 422
+
+
+def test_create_tag_is_stripped(client: TestClient) -> None:
+    item = _create(client, tags=["  work  "])
+    assert item["tags"] == ["work"]
+
+
+def test_create_section_over_max_length_rejected(client: TestClient) -> None:
+    payload = {"title": "x", "snapshot": "s" * 20001}
+    assert client.post("/api/items", json=payload).status_code == 422
+
+
+def test_create_section_at_max_length_accepted(client: TestClient) -> None:
+    item = _create(client, snapshot="s" * 20000)
+    assert len(item["snapshot"]) == 20000
+
+
 def test_create_response_survives_row_deleted_immediately_after_commit(
     client: TestClient, session: Session
 ) -> None:
@@ -694,6 +746,44 @@ def test_patch_invalid_enum_rejected(client: TestClient) -> None:
     assert response.status_code == 422
 
 
+def test_patch_title_over_max_length_rejected(client: TestClient) -> None:
+    item = _create(client)
+    response = client.patch(f"/api/items/{item['id']}", json={"title": "x" * 301})
+    assert response.status_code == 422
+
+
+def test_patch_too_many_tags_rejected(client: TestClient) -> None:
+    item = _create(client)
+    payload = {"tags": [f"t{i}" for i in range(21)]}
+    response = client.patch(f"/api/items/{item['id']}", json=payload)
+    assert response.status_code == 422
+
+
+def test_patch_tag_over_max_length_rejected(client: TestClient) -> None:
+    item = _create(client)
+    response = client.patch(f"/api/items/{item['id']}", json={"tags": ["a" * 101]})
+    assert response.status_code == 422
+
+
+def test_patch_blank_tag_rejected(client: TestClient) -> None:
+    item = _create(client)
+    response = client.patch(f"/api/items/{item['id']}", json={"tags": ["   "]})
+    assert response.status_code == 422
+
+
+def test_patch_section_over_max_length_rejected(client: TestClient) -> None:
+    item = _create(client)
+    response = client.patch(f"/api/items/{item['id']}", json={"snapshot": "s" * 20001})
+    assert response.status_code == 422
+
+
+def test_patch_section_at_max_length_accepted(client: TestClient) -> None:
+    item = _create(client)
+    response = client.patch(f"/api/items/{item['id']}", json={"snapshot": "s" * 20000})
+    assert response.status_code == 200
+    assert len(response.json()["snapshot"]) == 20000
+
+
 def test_patch_explicit_null_snapshot_rejected(client: TestClient) -> None:
     item = _create(client)
     response = client.patch(f"/api/items/{item['id']}", json={"snapshot": None})
@@ -1056,6 +1146,19 @@ def test_progress_empty_note_rejected(client: TestClient) -> None:
     item = _create(client)
     response = client.post(f"/api/items/{item['id']}/progress", json={"note": "   "})
     assert response.status_code == 422
+
+
+def test_progress_note_over_max_length_rejected(client: TestClient) -> None:
+    item = _create(client)
+    response = client.post(f"/api/items/{item['id']}/progress", json={"note": "n" * 20001})
+    assert response.status_code == 422
+
+
+def test_progress_note_at_max_length_accepted(client: TestClient) -> None:
+    item = _create(client)
+    response = client.post(f"/api/items/{item['id']}/progress", json={"note": "n" * 20000})
+    assert response.status_code == 201
+    assert len(response.json()["note"]) == 20000
 
 
 def test_progress_missing_item_returns_404(client: TestClient) -> None:

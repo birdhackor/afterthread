@@ -14,6 +14,8 @@ still represented and visibly marked as truncated.
 
 from app.models import MemoryStage, MemoryStatus
 from app.services.memory_ai import (
+    _HEADER_TAGS_MAX,
+    _TITLE_MAX,
     _TRUNCATION_MARKER,
     SECTION_FIELD_ORDER,
     _serialize_item_for_prompt,
@@ -123,3 +125,60 @@ def test_budget_is_honored_at_the_minimum_setting() -> None:
 def test_serialization_is_deterministic() -> None:
     item = _oversized_item()
     assert _serialize_item_for_prompt(item, _BUDGET) == _serialize_item_for_prompt(item, _BUDGET)
+
+
+# --- defensive header caps (title/tags), independent of any CRUD-schema bound ---
+
+
+def _oversized_header_item() -> dict[str, object]:
+    """An item whose title/tags are pathologically large -- as if written
+    directly against the database, or predating schemas.MemoryItemCreate/
+    Update's own title/tags bounds -- bypassing CRUD-schema validation
+    entirely. This dict is handed straight to the serializer, exactly as
+    routers.ai._snapshot_item_for_ai does with a real ORM row's attributes.
+    """
+    item: dict[str, object] = {
+        "title": "T" * 5000,
+        "status": MemoryStatus.active,
+        "stage": MemoryStage.full,
+        "tags": [f"tag{i}" * 20 for i in range(200)],
+    }
+    for field in SECTION_FIELD_ORDER:
+        item[field] = "字" * 20000
+    return item
+
+
+def test_oversized_header_is_bounded_by_budget() -> None:
+    # Even a pathologically oversized title/tags -- on top of every section
+    # already maxed out -- can never push the total past budget: the header is
+    # defensively capped independent of the CRUD-schema bound or the section
+    # budgeting below it.
+    out = _serialize_item_for_prompt(_oversized_header_item(), _BUDGET)
+    assert len(out) <= _BUDGET
+
+
+def test_oversized_header_is_bounded_even_at_minimum_budget() -> None:
+    out = _serialize_item_for_prompt(_oversized_header_item(), 4000)
+    assert len(out) <= 4000
+
+
+def test_oversized_title_is_capped_and_marked() -> None:
+    out = _serialize_item_for_prompt(_oversized_header_item(), _BUDGET)
+    title_line = _section_line(out, "title")
+    assert len(title_line) <= _TITLE_MAX
+    assert title_line.endswith(_TRUNCATION_MARKER)
+
+
+def test_oversized_tags_line_is_capped_and_marked() -> None:
+    out = _serialize_item_for_prompt(_oversized_header_item(), _BUDGET)
+    tags_line = _section_line(out, "tags")
+    assert len(tags_line) <= _HEADER_TAGS_MAX
+    assert tags_line.endswith(_TRUNCATION_MARKER)
+
+
+def test_oversized_header_still_leaves_sections_represented() -> None:
+    # The header eating its own fixed cap must not starve the sections down to
+    # nothing -- every section still gets the min-keep floor's worth of content.
+    out = _serialize_item_for_prompt(_oversized_header_item(), _BUDGET)
+    for field in SECTION_FIELD_ORDER:
+        assert len(_section_line(out, field)) > 0, field

@@ -5,6 +5,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.services.memory_ai import SECTION_FIELD_ORDER
 
 
 def _allows_null(prop: dict[str, Any]) -> bool:
@@ -54,6 +55,43 @@ def test_memory_item_update_openapi_properties_have_no_default_key() -> None:
     assert properties, "expected MemoryItemUpdate to have properties"
     for name, prop in properties.items():
         assert "default" not in prop, f"{name} still has a default: {prop}"
+
+
+def _assert_title_tags_section_bounds(props: dict[str, Any]) -> None:
+    """title max_length 300, tags max 20 items of 1..100 chars, every section
+    text field max_length 20000 -- the CRUD-side bound that keeps a
+    legitimate POST/PATCH from writing an item whose title/tags/sections are
+    large enough to blow the enrich/assist-update prompt header budget (see
+    app.services.memory_ai._serialize_item_for_prompt and its _CRUD_* mirror
+    constants in app.schemas).
+    """
+    assert props["title"]["maxLength"] == 300
+    assert props["tags"]["maxItems"] == 20
+    assert props["tags"]["items"]["minLength"] == 1
+    assert props["tags"]["items"]["maxLength"] == 100
+    for field in SECTION_FIELD_ORDER:
+        assert props[field]["maxLength"] == 20000, field
+
+
+def test_memory_item_create_declares_title_tags_and_section_bounds() -> None:
+    client = TestClient(app)
+    schema = client.get("/openapi.json").json()
+    props = schema["components"]["schemas"]["MemoryItemCreate"]["properties"]
+    _assert_title_tags_section_bounds(props)
+
+
+def test_memory_item_update_declares_title_tags_and_section_bounds() -> None:
+    client = TestClient(app)
+    schema = client.get("/openapi.json").json()
+    props = schema["components"]["schemas"]["MemoryItemUpdate"]["properties"]
+    _assert_title_tags_section_bounds(props)
+
+
+def test_progress_entry_create_declares_note_length_bound() -> None:
+    client = TestClient(app)
+    schema = client.get("/openapi.json").json()
+    prop = schema["components"]["schemas"]["ProgressEntryCreate"]["properties"]["note"]
+    assert prop["maxLength"] == 20000
 
 
 def test_only_by_id_routes_declare_404() -> None:
