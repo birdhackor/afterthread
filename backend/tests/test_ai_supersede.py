@@ -73,11 +73,47 @@ def test_merge_disjoint_appends_old_behind_marker() -> None:
     assert "新決策" in merged
 
 
-def test_merge_uses_whitespace_normalized_containment() -> None:
-    # `old` appears inside `new` but with different internal whitespace, so it
-    # counts as preserved -- no marker, no duplication.
+def test_merge_line_level_containment_normalizes_whitespace_within_a_line() -> None:
+    # A whole old line, reflowed with different internal whitespace, still counts
+    # as a preserved COMPLETE line of `new` -- no marker, no duplication. This is
+    # line-level containment, so the old line must match a whole new line (here
+    # the middle one), not merely sit as a substring inside a longer line.
     old = "決策  A\tB"
-    new = "序言 決策 A B 結尾"
+    new = "序言\n決策 A B\n結尾"
+    assert merge_with_supersede(old, new) == new
+    assert "superseded" not in merge_with_supersede(old, new)
+
+
+def test_merge_substring_within_a_line_now_supersedes() -> None:
+    # A rewrite that merely CONTAINS the old text as a substring of a line -- the
+    # meaning was changed -- must supersede: history counts as preserved only at
+    # the line level, never on a substring match. Losslessly appended behind the
+    # marker so nothing is dropped.
+    old = "成本低"
+    new = "成本低估，實際昂貴"  # noqa: RUF001 (fullwidth comma is authentic zh-TW punctuation)
+    merged = merge_with_supersede(old, new)
+    assert "superseded" in merged
+    assert old in merged
+    assert new in merged
+
+
+def test_merge_multiline_partial_retention_supersedes() -> None:
+    # Every non-empty old line must survive as a complete new line. If even one is
+    # dropped (here 論點2, rewritten into 新論點), history is NOT fully preserved,
+    # so the whole old block is appended behind the marker.
+    old = "論點1\n論點2"
+    new = "論點1\n新論點"
+    merged = merge_with_supersede(old, new)
+    assert "superseded" in merged
+    # The dropped line survives behind the marker; nothing is lost.
+    assert "論點2" in merged
+
+
+def test_merge_multiline_full_retention_skips_marker() -> None:
+    # When every old line reappears as a complete new line (even interleaved with
+    # a fresh line), history is fully preserved and no redundant marker is added.
+    old = "論點1\n論點2"
+    new = "論點1\n新論點\n論點2"
     assert merge_with_supersede(old, new) == new
     assert "superseded" not in merge_with_supersede(old, new)
 
@@ -112,14 +148,16 @@ def test_enrich_supersedes_existing_decision_losslessly(
 def test_enrich_no_supersede_when_model_keeps_old_rationale(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The model genuinely keeps the old rationale as a COMPLETE line and adds a
+    # new one below it, so line-level containment holds and no marker is added.
     item = _create(client, rationale="因為 X")
     _patch_generate_json(
-        monkeypatch, {"sections": {"rationale": "因為 X 也因為 Y"}, "progress_note": "n"}
+        monkeypatch, {"sections": {"rationale": "因為 X\n也因為 Y"}, "progress_note": "n"}
     )
     updated = client.post(
         f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"}
     ).json()["item"]
-    assert updated["rationale"] == "因為 X 也因為 Y"
+    assert updated["rationale"] == "因為 X\n也因為 Y"
     assert "superseded" not in updated["rationale"]
 
 

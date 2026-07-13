@@ -240,6 +240,32 @@ def test_enrich_prompt_is_budgeted_for_a_huge_item(
     assert "內容過長已截斷" in user
 
 
+def test_enrich_runs_end_to_end_through_the_threadpool(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression pin for the threadpool refactor (finding 4): the pre-await read
+    and the post-await write both run off the event loop via run_in_threadpool,
+    reusing the dependency's session sequentially. This drives that path end to
+    end -- snapshot read, LLM, guarded conditional UPDATE, progress insert,
+    response snapshot, commit -- and asserts the merge, the untouched field, and
+    the progress log all land exactly as before. (The conflict/race/lifecycle
+    suites cover the behavior in depth; this is the simple smoke test the finding
+    asks for -- the whole suite staying green is the main evidence.)
+    """
+    item = _create(client, snapshot="orig snap")
+    _patch_generate_json(
+        monkeypatch,
+        result={"sections": {"decisions": "採用方案 A"}, "progress_note": "透過執行緒池補充"},
+    )
+    response = client.post(f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"})
+    assert response.status_code == 200, response.text
+    updated = response.json()["item"]
+    assert updated["decisions"] == "採用方案 A"
+    # A field the model did not return is preserved through the threadpool write.
+    assert updated["snapshot"] == "orig snap"
+    assert "透過執行緒池補充" in _progress_notes(client, item["id"])
+
+
 def test_enrich_missing_returns_404(client: TestClient) -> None:
     response = client.post("/api/items/9999/enrich", json={"additional_context": "ctx"})
     assert response.status_code == 404

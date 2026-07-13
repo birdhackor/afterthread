@@ -23,6 +23,7 @@ from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.exc import StaleDataError
 from sqlmodel import Session, col
+from starlette.concurrency import run_in_threadpool
 
 from app.config import get_settings
 from app.db import get_session
@@ -47,6 +48,8 @@ from app.services.llm import (
 from app.services.memory_ai import (
     HISTORY_SECTIONS,
     SECTION_FIELD_ORDER,
+    EnrichResult,
+    UpdateResult,
     assist_update,
     capture_draft,
     enrich_item,
@@ -209,6 +212,21 @@ def llm_status() -> LLMStatus:
     return LLMStatus(configured=configured, model=model)
 
 
+def _capture_persist(session: Session, item: MemoryItem) -> MemoryItemRead:
+    """Persist the new capture item and snapshot the response (sync, off-loop).
+
+    The DB transaction segment: flush to assign id/DB defaults, snapshot the
+    response BEFORE commit (no post-commit session.refresh), then commit --
+    mirroring items.create_item. Run via run_in_threadpool so this blocking
+    SQLite work does not sit on the event loop.
+    """
+    session.add(item)
+    session.flush()
+    result = MemoryItemRead.model_validate(item)
+    session.commit()
+    return result
+
+
 @router.post(
     "/capture",
     response_model=CaptureResponse,
@@ -222,7 +240,8 @@ async def capture(payload: CaptureRequest, session: SessionDep) -> CaptureRespon
     successful draft does ONE transaction create the item (source "llm-capture",
     stage quick, status from the model's suggestion) and seed its progress log.
     A 502 (unparseable or failed draft) therefore leaves the database untouched
-    -- no partial rows -- because no write has happened yet.
+    -- no partial rows -- because no write has happened yet. The blocking write
+    itself runs in a threadpool (see _capture_persist), off the event loop.
     """
     try:
         draft = await capture_draft(payload.raw_text)
@@ -231,6 +250,8 @@ async def capture(payload: CaptureRequest, session: SessionDep) -> CaptureRespon
     except LLMUpstreamError as exc:
         raise _bad_gateway(exc) from exc
 
+    # Building the ORM object is pure in-memory work (no SQL until flush), so it
+    # stays on the loop; only the flush/commit segment is handed to the threadpool.
     item = MemoryItem(
         title=draft.title,
         source="llm-capture",
@@ -249,12 +270,7 @@ async def capture(payload: CaptureRequest, session: SessionDep) -> CaptureRespon
         resume_trigger=draft.resume_trigger,
     )
     item.entries.append(ProgressEntry(note=_CAPTURE_NOTE))  # ty: ignore[missing-argument]
-    session.add(item)
-    # Flush to assign id/DB defaults, snapshot the response BEFORE commit (no
-    # post-commit session.refresh), then commit -- mirroring items.create_item.
-    session.flush()
-    result = MemoryItemRead.model_validate(item)
-    session.commit()
+    result = await run_in_threadpool(_capture_persist, session, item)
     return CaptureResponse(item=result, questions=draft.questions)
 
 
@@ -269,31 +285,14 @@ _AI_BY_ID_RESPONSES: dict[int | str, dict[str, Any]] = {
 }
 
 
-@router.post(
-    "/items/{item_id}/enrich",
-    response_model=EnrichResponse,
-    responses=_AI_BY_ID_RESPONSES,
-)
-async def enrich(item_id: ItemId, payload: EnrichRequest, session: SessionDep) -> EnrichResponse:
-    """Full-enrich an item: merge whitelisted section updates and append progress.
+def _snapshot_item_for_ai(session: Session, item_id: int) -> tuple[dict[str, Any], datetime]:
+    """Pre-await read segment shared by enrich and assist-update (sync, off-loop).
 
-    Order (constraint): 404 first, then snapshot the item fields (and its
-    `updated` timestamp), then run the LLM strictly OUTSIDE any transaction (the
-    read transaction is released before the await). Writes then land through a
-    SINGLE conditional UPDATE guarded on the pre-await `updated`: merge the
-    returned sections (untouched fields stay as they were; history-bearing
-    sections are superseded, never overwritten) and, on a complete checklist,
-    flip stage to full and graduate a still-capturing item
-    (capture-quick/needs-enrichment) to active. If that UPDATE matches no row a
-    writer touched the item mid-await and NOTHING is written -- a concurrent
-    UPDATE (`updated` moved, row present) is 409, a concurrent DELETE (row gone)
-    is 404. Closing the check with the write (rather than comparing `updated`
-    then flushing) leaves no window a competing PATCH could slip through. On a
-    match the progress entry is appended and the flush is race-wrapped so a
-    delete landing in the remaining window still resolves to 404, not a 500. The
-    response snapshot is built (after flush, before commit) from the values just
-    written -- not a re-read. A 503/502/409 (or an item deleted mid-await) leaves
-    the row unchanged.
+    404 first, snapshot the prompt fields plus the `updated` timestamp the
+    optimistic-concurrency guard pins, then release the read transaction so the
+    LLM call that follows holds no DB transaction open. Runs via run_in_threadpool
+    so this blocking read never sits on the event loop; a 404 raised here
+    propagates out of the awaited call to FastAPI unchanged.
     """
     item = session.get(MemoryItem, item_id)
     if item is None:
@@ -304,14 +303,22 @@ async def enrich(item_id: ItemId, payload: EnrichRequest, session: SessionDep) -
     original_updated = item.updated
     # Release the read transaction so the LLM call holds no DB transaction open.
     session.rollback()
+    return item_fields, original_updated
 
-    try:
-        result = await enrich_item(item_fields, payload.additional_context)
-    except LLMNotConfiguredError as exc:
-        raise _service_unavailable() from exc
-    except LLMUpstreamError as exc:
-        raise _bad_gateway(exc) from exc
 
+def _enrich_persist(
+    session: Session, item_id: int, original_updated: datetime, result: EnrichResult
+) -> MemoryItemRead:
+    """Post-await write segment for enrich (sync, off-loop).
+
+    Re-fetch (a mid-await delete -> 404), merge the returned sections (history
+    sections superseded, never overwritten; a complete checklist flips stage to
+    full and graduates a still-capturing item to active), then land everything
+    through the SINGLE guarded conditional UPDATE (rowcount 0 -> 404 or 409),
+    append the FK-bearing progress entry in a race-wrapped flush, snapshot the
+    response before commit, and commit. Identical logic to the pre-threadpool
+    handler -- only relocated here so it runs off the event loop.
+    """
     # Re-fetch: the item may have been deleted during the await. This is also the
     # merge base for history sections; it is NOT mutated, so the item stays clean
     # and the conditional UPDATE below is the only write (no autoflush ahead of it).
@@ -363,43 +370,63 @@ async def enrich(item_id: ItemId, payload: EnrichRequest, session: SessionDep) -
         raise HTTPException(status_code=404, detail=_NOT_FOUND) from exc
     result_read = MemoryItemRead.model_validate(item)
     session.commit()
-    return EnrichResponse(item=result_read, gaps=result.remaining_gaps)
+    return result_read
 
 
 @router.post(
-    "/items/{item_id}/assist-update",
-    response_model=AssistUpdateResponse,
+    "/items/{item_id}/enrich",
+    response_model=EnrichResponse,
     responses=_AI_BY_ID_RESPONSES,
 )
-async def assist_update_item(
-    item_id: ItemId, payload: AssistUpdateRequest, session: SessionDep
-) -> AssistUpdateResponse:
-    """Assist an update: merge whitelisted section refreshes and append progress.
+async def enrich(item_id: ItemId, payload: EnrichRequest, session: SessionDep) -> EnrichResponse:
+    """Full-enrich an item: merge whitelisted section updates and append progress.
 
-    Same discipline as enrich (404 first, snapshot including `updated`, LLM
-    outside any transaction, then a SINGLE conditional UPDATE guarded on the
-    pre-await `updated` that resolves a mid-await writer to 409 or a delete to
-    404, supersede-not-delete on history sections, writes only on a matching
-    UPDATE, a response snapshot built from the written values after a race-wrapped
-    flush before commit), but records a progress note without touching stage or
-    returning gaps.
+    Order (constraint): 404 first, then snapshot the item fields (and its
+    `updated` timestamp), then run the LLM strictly OUTSIDE any transaction (the
+    read transaction is released before the await). Writes then land through a
+    SINGLE conditional UPDATE guarded on the pre-await `updated`: merge the
+    returned sections (untouched fields stay as they were; history-bearing
+    sections are superseded, never overwritten) and, on a complete checklist,
+    flip stage to full and graduate a still-capturing item
+    (capture-quick/needs-enrichment) to active. If that UPDATE matches no row a
+    writer touched the item mid-await and NOTHING is written -- a concurrent
+    UPDATE (`updated` moved, row present) is 409, a concurrent DELETE (row gone)
+    is 404. Closing the check with the write (rather than comparing `updated`
+    then flushing) leaves no window a competing PATCH could slip through. On a
+    match the progress entry is appended and the flush is race-wrapped so a
+    delete landing in the remaining window still resolves to 404, not a 500. The
+    response snapshot is built (after flush, before commit) from the values just
+    written -- not a re-read. A 503/502/409 (or an item deleted mid-await) leaves
+    the row unchanged. The two blocking DB segments run in a threadpool (see
+    _snapshot_item_for_ai / _enrich_persist) so they never sit on the event loop;
+    the session created by the dependency is used sequentially, never concurrently.
     """
-    item = session.get(MemoryItem, item_id)
-    if item is None:
-        raise HTTPException(status_code=404, detail=_NOT_FOUND)
-    item_fields = {name: getattr(item, name) for name in _AI_ITEM_FIELDS}
-    # Snapshot `updated` before the await for the same optimistic-concurrency
-    # guard enrich performs (see there).
-    original_updated = item.updated
-    session.rollback()
+    item_fields, original_updated = await run_in_threadpool(_snapshot_item_for_ai, session, item_id)
 
     try:
-        result = await assist_update(item_fields, payload.note)
+        result = await enrich_item(item_fields, payload.additional_context)
     except LLMNotConfiguredError as exc:
         raise _service_unavailable() from exc
     except LLMUpstreamError as exc:
         raise _bad_gateway(exc) from exc
 
+    result_read = await run_in_threadpool(
+        _enrich_persist, session, item_id, original_updated, result
+    )
+    return EnrichResponse(item=result_read, gaps=result.remaining_gaps)
+
+
+def _assist_persist(
+    session: Session, item_id: int, original_updated: datetime, result: UpdateResult
+) -> MemoryItemRead:
+    """Post-await write segment for assist-update (sync, off-loop).
+
+    Same race-closing discipline as _enrich_persist (re-fetch -> 404, merge with
+    supersede-not-delete on history sections, ONE guarded conditional UPDATE ->
+    404/409, race-wrapped progress insert, snapshot before commit), but records a
+    progress note without touching stage or returning gaps. Identical logic to the
+    pre-threadpool handler -- only relocated here so it runs off the event loop.
+    """
     # Re-fetch for the merge base + a possible mid-await delete; not mutated, so
     # `item` stays clean and the conditional UPDATE is the sole write.
     item = session.get(MemoryItem, item_id)
@@ -434,4 +461,39 @@ async def assist_update_item(
         raise HTTPException(status_code=404, detail=_NOT_FOUND) from exc
     result_read = MemoryItemRead.model_validate(item)
     session.commit()
+    return result_read
+
+
+@router.post(
+    "/items/{item_id}/assist-update",
+    response_model=AssistUpdateResponse,
+    responses=_AI_BY_ID_RESPONSES,
+)
+async def assist_update_item(
+    item_id: ItemId, payload: AssistUpdateRequest, session: SessionDep
+) -> AssistUpdateResponse:
+    """Assist an update: merge whitelisted section refreshes and append progress.
+
+    Same discipline as enrich (404 first, snapshot including `updated`, LLM
+    outside any transaction, then a SINGLE conditional UPDATE guarded on the
+    pre-await `updated` that resolves a mid-await writer to 409 or a delete to
+    404, supersede-not-delete on history sections, writes only on a matching
+    UPDATE, a response snapshot built from the written values after a race-wrapped
+    flush before commit), but records a progress note without touching stage or
+    returning gaps. The two blocking DB segments run in a threadpool (see
+    _snapshot_item_for_ai / _assist_persist), off the event loop, using the
+    dependency's session sequentially.
+    """
+    item_fields, original_updated = await run_in_threadpool(_snapshot_item_for_ai, session, item_id)
+
+    try:
+        result = await assist_update(item_fields, payload.note)
+    except LLMNotConfiguredError as exc:
+        raise _service_unavailable() from exc
+    except LLMUpstreamError as exc:
+        raise _bad_gateway(exc) from exc
+
+    result_read = await run_in_threadpool(
+        _assist_persist, session, item_id, original_updated, result
+    )
     return AssistUpdateResponse(item=result_read)

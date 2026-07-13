@@ -292,22 +292,41 @@ HISTORY_SECTIONS: frozenset[str] = frozenset(
 def _normalize_ws(text: str) -> str:
     """Collapse every run of whitespace to a single space and strip the ends.
 
-    Used only to compare two section values for containment, so a model that
-    reflows whitespace while keeping the words still reads as having preserved
-    the old text (and is not needlessly superseded).
+    Used only to compare two section values line-by-line, so a model that reflows
+    a line's internal whitespace while keeping its words still reads as having
+    preserved that line (and is not needlessly superseded).
     """
     return " ".join(text.split())
+
+
+def _history_lines_preserved(old: str, new: str) -> bool:
+    """True only if EVERY non-empty line of ``old`` survives as a COMPLETE line of
+    ``new`` (both whitespace-normalized).
+
+    Deliberately line-level, NOT substring: an old line rewritten into a longer
+    line (``成本低`` -> ``成本低估``, cost "low" turned into "underestimated")
+    shares a substring but no whole line, and its meaning has changed -- so it
+    does NOT count as preserved. The
+    asymmetry is intentional and load-bearing: a redundant 'superseded' marker is
+    lossless, but a MISSED marker silently destroys the reasoning trail the
+    supersede-not-delete rule exists to protect, so we err toward marking whenever
+    an old line is not reproduced verbatim.
+    """
+    new_lines = {_normalize_ws(line) for line in new.splitlines() if line.strip()}
+    return all(_normalize_ws(line) in new_lines for line in old.splitlines() if line.strip())
 
 
 def merge_with_supersede(old: str, new: str) -> str:
     """Losslessly fold an existing history-section value into its replacement.
 
     Enforces supersede-not-delete on the SERVER (a prompt rule alone cannot
-    guarantee it): when the model's ``new`` value already contains the existing
-    ``old`` text (compared whitespace-normalized) it is kept as-is; otherwise
-    ``old`` is appended below ``new`` behind a dated 'superseded' marker so no
-    prior decision or rationale is ever silently dropped. An empty/whitespace
-    ``old`` (nothing to preserve) yields ``new`` unchanged, and vice versa.
+    guarantee it): ``new`` is kept as-is ONLY when every non-empty line of ``old``
+    reappears as a complete whitespace-normalized line of ``new`` (see
+    ``_history_lines_preserved`` -- line-level containment, not substring, so a
+    rewritten line is not mistaken for a preserved one); otherwise ``old`` is
+    appended below ``new`` behind a dated 'superseded' marker so no prior decision
+    or rationale is ever silently dropped. An empty/whitespace ``old`` (nothing to
+    preserve) yields ``new`` unchanged, and vice versa.
 
     Pure apart from the UTC date it stamps into the marker; it reads only its
     two string arguments and never touches configuration.
@@ -318,7 +337,7 @@ def merge_with_supersede(old: str, new: str) -> str:
         return new
     if not new.strip():
         return old
-    if _normalize_ws(old) in _normalize_ws(new):
+    if _history_lines_preserved(old, new):
         return new
     marker = f"\n\n--- (superseded {utcnow().date().isoformat()}) ---\n"
     return new + marker + old
