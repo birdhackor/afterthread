@@ -36,7 +36,12 @@ from app.schemas import (
     LLMStatus,
     MemoryItemRead,
 )
-from app.services.llm import LLMNotConfiguredError, LLMUpstreamError, llm_configured
+from app.services.llm import (
+    _UPSTREAM_REASON,
+    LLMNotConfiguredError,
+    LLMUpstreamError,
+    llm_configured,
+)
 from app.services.memory_ai import (
     SECTION_FIELD_ORDER,
     assist_update,
@@ -58,9 +63,14 @@ _UPDATE_NOTE = "AI 協助更新"
 # prompt: the title plus every whitelisted section.
 _AI_ITEM_FIELDS: tuple[str, ...] = ("title", *SECTION_FIELD_ORDER)
 
-# Error contract. Codes and messages are fixed and config-free; the OpenAPI
-# examples below are built from the very same constants so the declared shape
-# cannot drift from what the handlers raise.
+# Error contract. Codes and messages are fixed and config-free. The `code`
+# fields (and the 503 message) in the OpenAPI examples below are built from the
+# very same constants the handlers raise, so those cannot drift. The 502
+# message is only PARTLY constant at runtime -- "<category>: <reason>", where
+# the category is the failing SDK error's class name and varies per failure --
+# so its example pairs one realistic, illustrative category
+# ("APIConnectionError") with the reason substring, which does derive from the
+# same _UPSTREAM_REASON constant the service embeds in every SDK-error message.
 _LLM_NOT_CONFIGURED_CODE = "llm_not_configured"
 _LLM_UPSTREAM_CODE = "llm_upstream_error"
 _LLM_NOT_CONFIGURED_MESSAGE = "The LLM endpoint is not configured."
@@ -89,7 +99,7 @@ _LLM_UPSTREAM_RESPONSE: dict[int | str, dict[str, Any]] = {
                 "example": {
                     "detail": {
                         "code": _LLM_UPSTREAM_CODE,
-                        "message": "LLMUpstreamError: the upstream LLM request failed",
+                        "message": f"APIConnectionError: {_UPSTREAM_REASON}",
                     }
                 }
             }
@@ -230,7 +240,16 @@ async def enrich(item_id: ItemId, payload: EnrichRequest, session: SessionDep) -
     if result.checklist_complete:
         item.stage = MemoryStage.full
     note = result.progress_note or _ENRICH_NOTE
-    item.entries.append(ProgressEntry(note=note))  # ty: ignore[missing-argument]
+    # Append via an explicit, FK-bearing ProgressEntry -- mirroring
+    # items.add_progress -- NOT via item.entries.append(...). Touching the
+    # relationship lazy-loads `entries`, and with the item already dirty (the
+    # setattrs above) that lazy load AUTOFLUSHES first: the item's UPDATE is
+    # emitted right here, BEFORE the race-wrapped flush below, so a concurrent
+    # delete would surface its StaleDataError outside the try/except -- an
+    # undeclared 500 instead of the 404 this route promises. session.add of a
+    # standalone entry touches no relationship and loads nothing, keeping every
+    # write inside the wrapped flush.
+    session.add(ProgressEntry(item_id=item_id, note=note))
     item.updated = utcnow()
     session.add(item)
     try:
@@ -277,7 +296,10 @@ async def assist_update_item(
     for key, value in result.sections.items():
         setattr(item, key, value)
     note = result.progress_note or _UPDATE_NOTE
-    item.entries.append(ProgressEntry(note=note))  # ty: ignore[missing-argument]
+    # Explicit FK-bearing entry, not item.entries.append(...): the relationship
+    # touch would lazy-load + autoflush the dirty item's UPDATE before the
+    # race-wrapped flush below -- see the identical comment in `enrich`.
+    session.add(ProgressEntry(item_id=item_id, note=note))
     item.updated = utcnow()
     session.add(item)
     try:

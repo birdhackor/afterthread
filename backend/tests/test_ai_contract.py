@@ -5,12 +5,17 @@ shapes, an honestly-nullable status model, and declared request bounds.
 """
 
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
+import httpx
+import openai
+import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import app
+from app.services.llm import _UPSTREAM_REASON
 
 # The three AI workflow operations that call the LLM and can degrade.
 _THREE_AI_OPS = {
@@ -120,3 +125,39 @@ def test_ai_request_fields_declare_length_bounds() -> None:
         assert not _allows_null(prop)
         assert "default" not in prop
         assert field in schemas[schema_name].get("required", [])
+
+
+def test_runtime_502_message_and_declared_example_share_reason_constant(
+    client: TestClient,
+    configure_llm: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """502-message honesty, at the honest granularity: the runtime message is
+    "<category>: <reason>" where the category is the failing SDK error's class
+    name, so the declared example cannot promise the whole string -- but both
+    must share the same reason substring, the _UPSTREAM_REASON constant the
+    service embeds in every SDK-error message. Driven through the REAL
+    generate_json (only the low-level client is stubbed) so the message the
+    runtime 502 carries is the one the service genuinely builds.
+    """
+    configure_llm(base_url="http://llm.internal.example/v1", model="m")
+    request = httpx.Request("POST", "http://llm.internal.example/v1/chat/completions")
+
+    class _FailingCompletions:
+        async def create(self, **kwargs: Any) -> Any:
+            raise openai.APIConnectionError(request=request)
+
+    stub = SimpleNamespace(chat=SimpleNamespace(completions=_FailingCompletions()))
+    monkeypatch.setattr("app.services.llm._get_client", lambda: stub)
+
+    runtime = client.post("/api/capture", json={"raw_text": "raw"})
+    assert runtime.status_code == 502
+    message = runtime.json()["detail"]["message"]
+    assert message.endswith(_UPSTREAM_REASON)
+    # Category prefix is the SDK error's class name, as documented.
+    assert message.startswith("APIConnectionError: ")
+
+    declared = _openapi()["paths"]["/api/capture"]["post"]["responses"]["502"]["content"][
+        "application/json"
+    ]["example"]
+    assert _UPSTREAM_REASON in declared["detail"]["message"]

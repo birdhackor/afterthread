@@ -51,6 +51,15 @@ class LLMUpstreamError(RuntimeError):
     """
 
 
+# The fixed, config-free reason embedded in every SDK-error-driven
+# LLMUpstreamError message ("<SDKClassName>: <reason>"). Shared with
+# app.routers.ai, whose OpenAPI 502 example is built from it, so the example's
+# reason substring can never drift from what runtime messages actually carry
+# (the category prefix varies with the failing SDK error's class and is only
+# illustrative in the example).
+_UPSTREAM_REASON = "the upstream LLM request failed"
+
+
 def llm_configured() -> bool:
     """True only when both an endpoint URL and a model name are configured.
 
@@ -228,10 +237,11 @@ async def generate_json(system: str, user: str) -> dict[str, Any]:
             temperature=0.2,
         )
     except OpenAIError as exc:
-        # Category only (the SDK error's class name) plus a fixed reason. Never
-        # str(exc): APIConnectionError chains the target URL, APIStatusError
-        # carries the response body -- either would leak past this boundary.
-        raise LLMUpstreamError(f"{type(exc).__name__}: the upstream LLM request failed") from exc
+        # Category only (the SDK error's class name) plus the fixed shared
+        # reason. Never str(exc): APIConnectionError chains the target URL,
+        # APIStatusError carries the response body -- either would leak past
+        # this boundary.
+        raise LLMUpstreamError(f"{type(exc).__name__}: {_UPSTREAM_REASON}") from exc
 
     # A conformant response is choices=[choice, ...] with choice.message.content
     # a string. A merely OpenAI-*compatible* gateway can return a 200 whose body
