@@ -249,3 +249,38 @@ class CaptureResponse(BaseModel):
 
     item: MemoryItemRead
     questions: list[str]
+
+
+class EnrichRequest(BaseModel):
+    """Payload for AI full enrichment: new context to integrate."""
+
+    additional_context: str = Field(min_length=1, max_length=_MAX_AI_INPUT_CHARS)
+
+    @field_validator("additional_context")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        return _stripped_non_empty(value, "additional_context")
+
+
+class EnrichResponse(BaseModel):
+    """AI enrichment result: the updated item plus remaining checklist gaps."""
+
+    item: MemoryItemRead
+    gaps: list[str]
+
+
+class AssistUpdateRequest(BaseModel):
+    """Payload for AI assisted update: a progress note to record."""
+
+    note: str = Field(min_length=1, max_length=_MAX_AI_INPUT_CHARS)
+
+    @field_validator("note")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        return _stripped_non_empty(value, "note")
+
+
+class AssistUpdateResponse(BaseModel):
+    """AI assisted-update result: the updated item."""
+
+    item: MemoryItemRead

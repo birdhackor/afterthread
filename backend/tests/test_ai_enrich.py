@@ -1,0 +1,225 @@
+"""Tests for POST /api/items/{item_id}/enrich (AI full enrichment).
+
+LLM interaction is mocked at the service boundary (``generate_json``), so the
+real sanitizer, the whitelist merge, and the router's transaction discipline
+run without any network.
+"""
+
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlmodel import Session
+
+from app.config import Settings
+from app.models import MemoryItem
+from app.services.llm import LLMUpstreamError
+from app.services.memory_ai import SECTION_FIELDS
+
+
+def _create(client: TestClient, **fields: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {"title": "Sample"} | fields
+    response = client.post("/api/items", json=payload)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def _patch_generate_json(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    result: dict[str, Any] | None = None,
+    exc: Exception | None = None,
+) -> None:
+    async def _fake(system: str, user: str) -> dict[str, Any]:
+        if exc is not None:
+            raise exc
+        assert result is not None
+        return result
+
+    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+
+
+def _progress_notes(client: TestClient, item_id: int) -> list[str]:
+    detail = client.get(f"/api/items/{item_id}").json()
+    return [entry["note"] for entry in detail["progress"]]
+
+
+def test_section_fields_are_all_memory_item_fields() -> None:
+    """The whitelist must be a subset of real MemoryItem fields (so a sanitized
+    section can be setattr'd safely) and must exclude identity/metadata fields.
+    """
+    model_fields = set(MemoryItem.model_fields)
+    assert SECTION_FIELDS.issubset(model_fields)
+    assert "title" in model_fields
+    for protected in ("id", "status", "source", "stage", "tags", "created", "updated"):
+        assert protected not in SECTION_FIELDS
+
+
+def test_enrich_merges_sections_and_appends_progress(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = _create(client, snapshot="original snap")
+    _patch_generate_json(
+        monkeypatch,
+        result={
+            "sections": {"decisions": "採用方案A", "risks": "風險X", "not_a_field": "drop me"},
+            "checklist_complete": False,
+            "remaining_gaps": ["缺少 stakeholders"],
+            "progress_note": "補充了決策與風險",
+        },
+    )
+    response = client.post(
+        f"/api/items/{item['id']}/enrich", json={"additional_context": "新的背景資訊"}
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    updated = body["item"]
+
+    assert updated["decisions"] == "採用方案A"
+    assert updated["risks"] == "風險X"
+    # Merged: a field the model did not return stays as it was.
+    assert updated["snapshot"] == "original snap"
+    # Unknown key was dropped: it is not a MemoryItem field at all.
+    assert "not_a_field" not in updated
+    assert body["gaps"] == ["缺少 stakeholders"]
+    assert updated["stage"] == "quick"  # checklist not complete
+    assert "補充了決策與風險" in _progress_notes(client, item["id"])
+
+
+def test_enrich_flips_stage_when_checklist_complete(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = _create(client)
+    _patch_generate_json(
+        monkeypatch,
+        result={
+            "sections": {"decisions": "定案"},
+            "checklist_complete": True,
+            "remaining_gaps": [],
+            "progress_note": "全面補充完成",
+        },
+    )
+    body = client.post(f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"}).json()
+    assert body["item"]["stage"] == "full"
+
+
+def test_enrich_drops_unknown_and_protected_keys(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only whitelisted section keys are applied; id/status/source and any
+    # hallucinated key are dropped, so the model cannot mutate identity/metadata.
+    item = _create(client, status="active", source="manual")
+    _patch_generate_json(
+        monkeypatch,
+        result={
+            "sections": {
+                "decisions": "d",
+                "status": "done",
+                "id": 999,
+                "source": "hacked",
+                "made_up": "x",
+            },
+            "progress_note": "note",
+        },
+    )
+    updated = client.post(
+        f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"}
+    ).json()["item"]
+    assert updated["decisions"] == "d"
+    assert updated["status"] == "active"
+    assert updated["source"] == "manual"
+    assert updated["id"] == item["id"]
+
+
+def test_enrich_truncates_oversized_section(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = _create(client)
+    _patch_generate_json(
+        monkeypatch,
+        result={"sections": {"snapshot": "y" * 25000}, "progress_note": "n"},
+    )
+    updated = client.post(
+        f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"}
+    ).json()["item"]
+    assert len(updated["snapshot"]) == 20000
+
+
+def test_enrich_bumps_updated(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = _create(client)
+    stored = session.get(MemoryItem, item["id"])
+    assert stored is not None
+    old = datetime.now(UTC) - timedelta(days=10)
+    stored.updated = old
+    session.add(stored)
+    session.commit()
+
+    _patch_generate_json(monkeypatch, result={"sections": {"decisions": "d"}, "progress_note": "n"})
+    body = client.post(f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"}).json()
+    assert datetime.fromisoformat(body["item"]["updated"]) > old
+
+
+def test_enrich_empty_sections_still_records_progress(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A result with no section changes still appends a progress entry (using
+    # the model note) without erasing anything.
+    item = _create(client, snapshot="keep")
+    _patch_generate_json(
+        monkeypatch,
+        result={"sections": {}, "remaining_gaps": ["still missing X"], "progress_note": "看過了"},
+    )
+    body = client.post(f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"}).json()
+    assert body["item"]["snapshot"] == "keep"
+    assert body["gaps"] == ["still missing X"]
+    assert "看過了" in _progress_notes(client, item["id"])
+
+
+def test_enrich_missing_returns_404(client: TestClient) -> None:
+    response = client.post("/api/items/9999/enrich", json={"additional_context": "ctx"})
+    assert response.status_code == 404
+
+
+def test_enrich_unconfigured_returns_503_and_item_unchanged(
+    client: TestClient, configure_llm: Callable[..., Settings]
+) -> None:
+    item = _create(client)
+    configure_llm(base_url="", model="")
+    response = client.post(f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"})
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "llm_not_configured"
+    # No partial write: only the seeded entry remains, stage untouched.
+    detail = client.get(f"/api/items/{item['id']}").json()
+    assert [entry["note"] for entry in detail["progress"]] == ["建立項目"]
+    assert detail["stage"] == "quick"
+
+
+def test_enrich_upstream_error_returns_502_and_item_unchanged(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = _create(client, snapshot="keep me")
+    _patch_generate_json(monkeypatch, exc=LLMUpstreamError("UnparseableOutput: garbage"))
+    response = client.post(f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"})
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "llm_upstream_error"
+    detail = client.get(f"/api/items/{item['id']}").json()
+    assert detail["snapshot"] == "keep me"
+    assert [entry["note"] for entry in detail["progress"]] == ["建立項目"]
+
+
+def test_enrich_empty_context_rejected(client: TestClient) -> None:
+    item = _create(client)
+    response = client.post(f"/api/items/{item['id']}/enrich", json={"additional_context": "  "})
+    assert response.status_code == 422
+
+
+def test_enrich_oversized_context_rejected(client: TestClient) -> None:
+    item = _create(client)
+    response = client.post(
+        f"/api/items/{item['id']}/enrich", json={"additional_context": "a" * 20001}
+    )
+    assert response.status_code == 422

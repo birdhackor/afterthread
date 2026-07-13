@@ -10,6 +10,7 @@ or unexpected can reach the database. The system prompts are module-level
 constants so their methodology rules can be asserted directly in tests.
 """
 
+from collections.abc import Mapping
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -221,3 +222,231 @@ async def capture_draft(raw_text: str) -> CaptureDraft:
     """Run quick capture: prompt the LLM and validate the sanitized draft."""
     raw = await generate_json(CAPTURE_SYSTEM_PROMPT, _capture_user_prompt(raw_text))
     return _validate(CaptureDraft, raw)
+
+
+# --- section whitelist (untrusted enrich/update output) --------------------
+
+# The anti-vaporization section fields an enrich/update may write, in checklist
+# order. This is the whitelist: any other key the model returns (id, status,
+# source, tags, or a hallucinated field) is dropped before anything is written,
+# so a sanitized section dict can be setattr'd straight onto the item. A test
+# pins that every entry is a real MemoryItem field.
+SECTION_FIELD_ORDER: tuple[str, ...] = (
+    "snapshot",
+    "why_matters",
+    "known",
+    "inferred",
+    "unknown",
+    "decisions",
+    "alternatives",
+    "rationale",
+    "consequences",
+    "constraints",
+    "assumptions",
+    "risks",
+    "evidence",
+    "open_questions",
+    "next_actions",
+    "recovery_keywords",
+    "recovery_people",
+    "recovery_files",
+    "resume_trigger",
+)
+SECTION_FIELDS = frozenset(SECTION_FIELD_ORDER)
+
+# Defensive count cap on the returned checklist gaps.
+_MAX_GAPS = 20
+
+
+def _coerce_bool(value: object) -> bool:
+    """Coerce untrusted JSON to a bool (true/yes/1/complete/done -> True)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "1", "complete", "done", "y"}
+    return False
+
+
+def _clean_sections(value: object) -> dict[str, str]:
+    """Keep only whitelisted, non-empty, capped section fields from a mapping.
+
+    Non-whitelisted keys are dropped (so the model cannot set id/status/etc via
+    a section), and empty values are dropped too -- an enrich/update must never
+    blank an existing section, only add to it or replace it with real content.
+    """
+    if not isinstance(value, dict):
+        return {}
+    cleaned: dict[str, str] = {}
+    for key, raw in value.items():
+        if not isinstance(key, str) or key not in SECTION_FIELDS:
+            continue
+        text = _clean_text(raw)
+        if text:
+            cleaned[key] = text
+    return cleaned
+
+
+def _extract_sections(data: dict[str, Any]) -> dict[str, str]:
+    """Pull sanitized sections from a "sections" object, tolerating top-level.
+
+    The prompt asks for a nested ``sections`` object; if the model instead
+    places section fields at the top level, recover them there rather than
+    silently returning nothing.
+    """
+    sections = _clean_sections(data.get("sections"))
+    if not sections:
+        sections = _clean_sections({k: v for k, v in data.items() if k in SECTION_FIELDS})
+    return sections
+
+
+def _render_item_fields(item_fields: Mapping[str, Any]) -> str:
+    """Render the current item (title + every section) for the user prompt."""
+    lines = [f"title: {_coerce_str(item_fields.get('title')).strip() or '(empty)'}"]
+    for field in SECTION_FIELD_ORDER:
+        value = _coerce_str(item_fields.get(field)).strip()
+        lines.append(f"{field}: {value or '(empty)'}")
+    return "\n".join(lines)
+
+
+_RULE_SUPERSEDE = (
+    "Preserve history: never delete an existing decision or its rationale. "
+    "When a decision changes, keep the previous rationale and append a "
+    "'superseded' marker noting what replaced it and why."
+)
+
+
+# --- full enrichment -------------------------------------------------------
+
+
+ENRICH_SYSTEM_PROMPT = "\n".join(
+    [
+        "You are the Context Memory enrichment assistant. Given an existing "
+        "memory item and new context, fill the anti-vaporization checklist "
+        "(background, stakeholders, current state, desired outcome, decisions, "
+        "rationale, alternatives, constraints, assumptions, risks, evidence, "
+        "next actions, recovery cues) so a future reader can recover the full "
+        "reasoning.",
+        _RULE_HONESTY,
+        _RULE_SUPERSEDE,
+        _RULE_BULLETS,
+        _RULE_LANGUAGE,
+        "Only include a section when you are adding to or improving it. Omit "
+        "sections you would leave unchanged, and never blank an existing section.",
+        "Respond with a single JSON object and nothing else. Use exactly these keys:",
+        '- "sections": an object whose keys are any of ['
+        + ", ".join(SECTION_FIELD_ORDER)
+        + "], each value a string.",
+        '- "checklist_complete": true only when the item is materially complete (boolean).',
+        '- "remaining_gaps": checklist items still missing (array of strings).',
+        '- "progress_note": a short note describing what you added (string).',
+    ]
+)
+
+
+class EnrichResult(BaseModel):
+    """Sanitized enrichment result: whitelisted section updates + metadata.
+
+    ``sections`` carries only the fields the model chose to add or improve, so
+    the router merges them onto the item (untouched fields stay as they were).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    sections: dict[str, str] = Field(default_factory=dict)
+    checklist_complete: bool = False
+    remaining_gaps: list[str] = Field(default_factory=list)
+    progress_note: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _sanitize(cls, data: Any) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            raise ValueError("expected a JSON object")
+        return {
+            "sections": _extract_sections(data),
+            "checklist_complete": _coerce_bool(data.get("checklist_complete")),
+            "remaining_gaps": _clean_str_list(
+                data.get("remaining_gaps"), max_items=_MAX_GAPS, item_cap=_PER_SECTION_CAP
+            ),
+            "progress_note": _clean_text(data.get("progress_note")),
+        }
+
+
+def _enrich_user_prompt(item_fields: Mapping[str, Any], additional_context: str) -> str:
+    return "\n\n".join(
+        [
+            "Existing memory item:",
+            _render_item_fields(item_fields),
+            "New context to integrate:",
+            additional_context,
+        ]
+    )
+
+
+async def enrich_item(item_fields: Mapping[str, Any], additional_context: str) -> EnrichResult:
+    """Run full enrichment: prompt the LLM and validate the sanitized result."""
+    raw = await generate_json(
+        ENRICH_SYSTEM_PROMPT, _enrich_user_prompt(item_fields, additional_context)
+    )
+    return _validate(EnrichResult, raw)
+
+
+# --- assisted update -------------------------------------------------------
+
+
+UPDATE_SYSTEM_PROMPT = "\n".join(
+    [
+        "You are the Context Memory update assistant. Given an existing memory "
+        "item and a progress note, refresh the current state, next actions, and "
+        "open questions, and record what changed.",
+        _RULE_HONESTY,
+        _RULE_SUPERSEDE,
+        _RULE_BULLETS,
+        _RULE_LANGUAGE,
+        "Only include a section when you are changing it. Omit unchanged "
+        "sections, and never blank an existing section.",
+        "Respond with a single JSON object and nothing else. Use exactly these keys:",
+        '- "sections": an object whose keys are any of ['
+        + ", ".join(SECTION_FIELD_ORDER)
+        + "], each value a string.",
+        '- "progress_note": a short note describing the update (string).',
+    ]
+)
+
+
+class UpdateResult(BaseModel):
+    """Sanitized assisted-update result: whitelisted section updates + note."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    sections: dict[str, str] = Field(default_factory=dict)
+    progress_note: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _sanitize(cls, data: Any) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            raise ValueError("expected a JSON object")
+        return {
+            "sections": _extract_sections(data),
+            "progress_note": _clean_text(data.get("progress_note")),
+        }
+
+
+def _update_user_prompt(item_fields: Mapping[str, Any], note: str) -> str:
+    return "\n\n".join(
+        [
+            "Existing memory item:",
+            _render_item_fields(item_fields),
+            "Progress note to record:",
+            note,
+        ]
+    )
+
+
+async def assist_update(item_fields: Mapping[str, Any], note: str) -> UpdateResult:
+    """Run assisted update: prompt the LLM and validate the sanitized result."""
+    raw = await generate_json(UPDATE_SYSTEM_PROMPT, _update_user_prompt(item_fields, note))
+    return _validate(UpdateResult, raw)

@@ -57,11 +57,13 @@ def test_memory_item_update_openapi_properties_have_no_default_key() -> None:
 
 
 def test_only_by_id_routes_declare_404() -> None:
-    """The four by-id routes -- GET/PATCH/DELETE /api/items/{item_id} and
-    POST /api/items/{item_id}/progress -- can return 404 and must declare it
-    in OpenAPI so generated clients and docs match runtime. The collection,
-    review, and health routes (POST/GET /api/items, GET /api/review, GET
-    /api/health) cannot 404 and must not declare it.
+    """Every by-id route -- and only those -- must declare 404 in OpenAPI so
+    generated clients and docs match runtime. That is the four item routes
+    (GET/PATCH/DELETE /api/items/{item_id} and POST /api/items/{item_id}/progress)
+    plus the two by-id AI routes (POST /api/items/{item_id}/enrich and
+    /assist-update). The collection, review, health, status, and capture routes
+    (POST/GET /api/items, GET /api/review, GET /api/health, GET /api/llm/status,
+    POST /api/capture) cannot 404 and must not declare it.
     """
     client = TestClient(app)
     schema = client.get("/openapi.json").json()
@@ -76,4 +78,6 @@ def test_only_by_id_routes_declare_404() -> None:
         ("/api/items/{item_id}", "patch"),
         ("/api/items/{item_id}", "delete"),
         ("/api/items/{item_id}/progress", "post"),
+        ("/api/items/{item_id}/enrich", "post"),
+        ("/api/items/{item_id}/assist-update", "post"),
     }
