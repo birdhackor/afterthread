@@ -171,6 +171,47 @@ def test_patch_invalid_enum_rejected(client: TestClient) -> None:
     assert response.status_code == 422
 
 
+def test_patch_explicit_null_snapshot_rejected(client: TestClient) -> None:
+    item = _create(client)
+    response = client.patch(f"/api/items/{item['id']}", json={"snapshot": None})
+    assert response.status_code == 422
+
+
+def test_patch_explicit_null_status_rejected(client: TestClient) -> None:
+    item = _create(client)
+    response = client.patch(f"/api/items/{item['id']}", json={"status": None})
+    assert response.status_code == 422
+
+
+def test_patch_explicit_null_tags_rejected(client: TestClient) -> None:
+    item = _create(client)
+    response = client.patch(f"/api/items/{item['id']}", json={"tags": None})
+    assert response.status_code == 422
+
+
+def test_patch_explicit_null_does_not_mutate_item(client: TestClient) -> None:
+    # A rejected null-payload must not partially apply: the item stays as-is.
+    item = _create(client, snapshot="original")
+    response = client.patch(f"/api/items/{item['id']}", json={"snapshot": None})
+    assert response.status_code == 422
+
+    unchanged = client.get(f"/api/items/{item['id']}").json()
+    assert unchanged["snapshot"] == "original"
+    assert unchanged["updated"] == item["updated"]
+
+
+def test_patch_normal_partial_update_leaves_other_fields_untouched(client: TestClient) -> None:
+    item = _create(client, source="import", tags=["work"], status="active")
+    response = client.patch(f"/api/items/{item['id']}", json={"snapshot": "x"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["snapshot"] == "x"
+    assert body["title"] == item["title"]
+    assert body["source"] == "import"
+    assert body["tags"] == ["work"]
+    assert body["status"] == "active"
+
+
 def test_patch_missing_returns_404(client: TestClient) -> None:
     assert client.patch("/api/items/9999", json={"status": "active"}).status_code == 404
 

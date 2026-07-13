@@ -1,8 +1,16 @@
 """Pydantic request/response schemas for the Context Memory API."""
 
 from datetime import UTC, datetime, timedelta
+from typing import Self
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 from app.config import get_settings
 from app.models import MemoryStage, MemoryStatus
@@ -102,6 +110,24 @@ class MemoryItemUpdate(BaseModel):
         if not stripped:
             raise ValueError("title must not be empty")
         return stripped
+
+    @model_validator(mode="after")
+    def _no_explicit_nulls(self) -> Self:
+        # Every field is `X | None = None` so it can be *omitted* from a
+        # partial update, but that same type also lets a client send an
+        # explicit JSON `null`. `model_fields_set` distinguishes "omitted"
+        # from "sent as null"; the router applies `exclude_unset=True`, so a
+        # `null` that slips through here survives and gets written straight
+        # into NOT NULL columns (or corrupts list/enum fields). No field in
+        # this model legitimately accepts null, so reject it outright rather
+        # than silently dropping or persisting it.
+        nulled = sorted(name for name in self.model_fields_set if getattr(self, name) is None)
+        if nulled:
+            fields = ", ".join(nulled)
+            raise ValueError(
+                f"null is not allowed for: {fields}. Omit the field(s) instead of sending null."
+            )
+        return self
 
 
 class MemoryItemRead(MemoryItemContent):
