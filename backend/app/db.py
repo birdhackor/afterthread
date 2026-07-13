@@ -1,6 +1,7 @@
 """Database engine, schema initialisation and session dependency."""
 
 from collections.abc import Generator
+from functools import lru_cache
 
 from sqlalchemy import Engine, event, make_url, text
 from sqlalchemy.engine.interfaces import DBAPIConnection
@@ -222,15 +223,43 @@ def create_db_engine(database_url: str) -> Engine:
     return engine
 
 
-engine = create_db_engine(get_settings().database_url)
+@lru_cache
+def get_engine() -> Engine:
+    """Return the process-wide database engine, created lazily on first use.
+
+    Deliberately NOT a module-level `engine = create_db_engine(...)`: that
+    variant connects at IMPORT time, because `create_db_engine` runs its
+    persistence probe immediately (see its docstring), and for a file-backed
+    URL that probe creates the database file. Importing `app.main`/`app.db`
+    then had a filesystem side effect -- it materialised `./context_memory.db`
+    in the process's cwd -- which broke read-only checkouts at test-collection
+    time and left a real DB file behind even in tests that override
+    `get_session` and never run the app lifespan.
+
+    Deferring construction to the first call moves that probe to STARTUP:
+    `init_db()`, invoked from the app lifespan, is the first caller (see
+    `app/main.py`), so the probe runs once, before any request is handled, and
+    never at import. `lru_cache` makes this a per-process singleton -- the
+    engine and its one-time probe are created exactly once and reused -- so the
+    probe is a startup cost, NOT a per-request one. Tests that need an
+    isolated engine still build one directly via `create_db_engine` /
+    `create_engine` (see `tests/test_db.py`, `tests/conftest.py`) and are
+    unaffected by this accessor.
+    """
+    return create_db_engine(get_settings().database_url)
 
 
 def init_db() -> None:
-    """Create all tables that do not yet exist."""
-    SQLModel.metadata.create_all(engine)
+    """Create all tables that do not yet exist.
+
+    Called from the app lifespan at startup. As the first `get_engine()`
+    caller it triggers the lazy engine's creation -- and thus its persistence
+    probe -- here, before any request handling, rather than at import time.
+    """
+    SQLModel.metadata.create_all(get_engine())
 
 
 def get_session() -> Generator[Session]:
     """FastAPI dependency yielding a database session."""
-    with Session(engine) as session:
+    with Session(get_engine()) as session:
         yield session

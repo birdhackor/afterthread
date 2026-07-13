@@ -11,16 +11,21 @@ the in-memory-SQLite rejection message's own database-only (never query-string)
 redaction -- and foreign-key enforcement.
 """
 
+import os
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, select
 
-from app.db import create_db_engine
+from app.config import Settings
+from app.db import create_db_engine, get_engine
 from app.models import MemoryItem, ProgressEntry
 
 
@@ -319,3 +324,57 @@ def test_foreign_keys_enforced(tmp_path: Path) -> None:
                 session.commit()
     finally:
         engine.dispose()
+
+
+def test_importing_app_creates_no_database_file(tmp_path: Path) -> None:
+    """Importing app.main / app.db must have NO filesystem side effect. The
+    engine is created lazily (see app.db.get_engine), not at module import, so
+    a read-only checkout can be imported -- e.g. during pytest collection --
+    without create_db_engine's persistence probe materialising a database file
+    in the process cwd. Run in a subprocess whose cwd is an empty tmp_path, so
+    any stray relative-path DB file would land -- and be caught -- there rather
+    than in the repo. Regression guard for the import-time
+    `engine = create_db_engine(...)` this replaced.
+    """
+    backend_dir = Path(__file__).resolve().parent.parent
+    env = {**os.environ, "PYTHONPATH": str(backend_dir)}
+    result = subprocess.run(
+        [sys.executable, "-c", "import app.main"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert list(tmp_path.glob("*.db")) == []
+
+
+def test_app_lifespan_creates_configured_database_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The persistence probe / file creation now happens at STARTUP -- via the
+    app lifespan (init_db -> get_engine) -- not at import. Point the lazy engine
+    at a tmp_path file, confirm merely constructing/importing the app leaves it
+    absent, then run the lifespan (TestClient used as a context manager) and
+    confirm the file now exists under the configured path.
+
+    get_engine is lru_cached, so its cache is cleared before (to pick up the
+    patched settings) and after (so later tests never inherit this tmp engine).
+    """
+    db_path = tmp_path / "lifespan.db"
+    settings = Settings(database_url=f"sqlite:///{db_path}")
+    monkeypatch.setattr("app.db.get_settings", lambda: settings)
+    get_engine.cache_clear()
+    try:
+        from app.main import app
+
+        # Importing/constructing the app must not have created the file yet.
+        assert not db_path.exists()
+        # Entering the context manager runs the lifespan startup -> init_db ->
+        # get_engine, which builds the engine, runs the probe, and creates the
+        # file under the configured path.
+        with TestClient(app):
+            assert db_path.exists()
+    finally:
+        get_engine().dispose()
+        get_engine.cache_clear()
