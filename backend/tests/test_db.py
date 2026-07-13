@@ -151,6 +151,17 @@ def test_sqlite_uri_empty_filename_rejected() -> None:
         create_db_engine("sqlite:///file:?uri=true")
 
 
+def test_sqlite_uri_numeric_true_flag_rejected() -> None:
+    """`uri=1` is SQLAlchemy's numeric spelling of true (see
+    `sqlalchemy.util.asbool`, which SQLAlchemy's pysqlite dialect actually
+    uses to parse this query parameter) and must enable URI-filename parsing
+    exactly like the literal string `uri=true` does -- not just that one
+    exact spelling.
+    """
+    with pytest.raises(RuntimeError, match="In-memory SQLite"):
+        create_db_engine("sqlite:///file:?uri=1")
+
+
 def test_sqlite_uri_vfs_memdb_rejected() -> None:
     """`vfs=memdb` in a URI-form SQLite URL selects SQLite's in-memory VFS
     outright, regardless of what the filename portion says -- e.g.
@@ -160,6 +171,18 @@ def test_sqlite_uri_vfs_memdb_rejected() -> None:
     """
     with pytest.raises(RuntimeError, match="In-memory SQLite"):
         create_db_engine("sqlite:///file:mem1?vfs=memdb&uri=true")
+
+
+def test_sqlite_uri_titlecase_true_flag_rejected() -> None:
+    """`uri=True` (title-cased, as e.g. Python's own `str(True)` would spell
+    it) must be recognised as enabling URI-filename parsing
+    case-insensitively, exactly like the lowercase `uri=true` spelling --
+    proven here via the `vfs=memdb` check, which a case-sensitive
+    `"true" in query.get("uri", [])` match would wrongly let slip through
+    unrejected for this spelling.
+    """
+    with pytest.raises(RuntimeError, match="In-memory SQLite"):
+        create_db_engine("sqlite:///file:mem1?vfs=memdb&uri=True")
 
 
 def test_sqlite_file_prefixed_literal_filename_without_uri_flag_is_allowed() -> None:
@@ -186,6 +209,31 @@ def test_sqlite_file_prefixed_literal_filename_without_uri_flag_is_allowed() -> 
     touching the filesystem at all.
     """
     engine = create_db_engine("sqlite:///file:mem1?vfs=memdb")
+    engine.dispose()
+
+
+def test_sqlite_mode_memory_text_without_uri_flag_is_allowed() -> None:
+    """`sqlite:///file:x.db?mode=memory` -- with no `uri` key in the query
+    string at all -- must be allowed: without `uri` parsing as true (see
+    `test_sqlite_file_prefixed_literal_filename_without_uri_flag_is_allowed`
+    above for why pysqlite never enables URI-filename parsing in that case),
+    `mode=memory` is inert text, not a live in-memory directive -- this URL
+    is a literal, persistent filename that merely happens to contain that
+    substring. The `mode=memory` check must be gated on `uri` parsing as
+    true exactly like the `vfs=memdb` and empty-filename checks are, not
+    fire unconditionally -- which is exactly the bug this test guards
+    against: a prior version of this guard checked `mode=memory` before
+    (unconditionally on) the `uri=true` gate, so it wrongly rejected this
+    URL even though pysqlite would have opened it as a normal file.
+
+    Deliberately does not open a real connection, for the same reason as
+    `test_sqlite_file_prefixed_literal_filename_without_uri_flag_is_allowed`
+    above: without `uri=true`, pysqlite resolves this as a literal filename
+    via `os.path.abspath()` relative to the process's cwd, which this test
+    does not control, so actually connecting risks creating a stray file in
+    the repo.
+    """
+    engine = create_db_engine("sqlite:///file:x.db?mode=memory")
     engine.dispose()
 
 

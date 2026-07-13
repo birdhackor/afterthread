@@ -58,16 +58,27 @@ def _tag_filter(tag: str) -> ColumnElement[bool]:
 
 
 @router.post("", response_model=MemoryItemRead, status_code=201)
-def create_item(payload: MemoryItemCreate, session: SessionDep) -> MemoryItem:
+def create_item(payload: MemoryItemCreate, session: SessionDep) -> MemoryItemRead:
     """Create an item and seed its history with the first progress entry."""
     item = MemoryItem(**payload.model_dump())
     # Seed the append-only history so it starts at creation time. The cascade
     # relationship assigns the foreign key on commit, so item_id is unset here.
     item.entries.append(ProgressEntry(note="建立項目"))  # ty: ignore[missing-argument]
     session.add(item)
+    # Flush (not commit) to populate item.id and other DB-assigned defaults
+    # while the instance's attributes are still loaded in memory, then
+    # snapshot the response into a plain pydantic model *before* committing.
+    # A post-commit session.refresh(item) -- the previous approach -- issues
+    # a fresh SELECT against the row; if another session's DELETE for this
+    # same item lands and commits in the gap between our commit and that
+    # refresh, the SELECT finds nothing and refresh() raises
+    # InvalidRequestError, turning an already-successful create into a 500.
+    # Returning a detached snapshot instead means nothing after commit ever
+    # touches the database again, so that race cannot affect the response.
+    session.flush()
+    result = MemoryItemRead.model_validate(item)
     session.commit()
-    session.refresh(item)
-    return item
+    return result
 
 
 @router.get("", response_model=ItemListResponse)
@@ -132,31 +143,44 @@ def get_item(item_id: int, session: SessionDep) -> MemoryItemReadWithProgress:
 
 
 @router.patch("/{item_id}", response_model=MemoryItemRead)
-def update_item(item_id: int, payload: MemoryItemUpdate, session: SessionDep) -> MemoryItem:
+def update_item(item_id: int, payload: MemoryItemUpdate, session: SessionDep) -> MemoryItemRead:
     """Apply a partial update; bump `updated` only when a field is provided."""
     item = session.get(MemoryItem, item_id)
     if item is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
     changes = payload.model_dump(exclude_unset=True)
-    if changes:
-        for key, value in changes.items():
-            setattr(item, key, value)
-        item.updated = utcnow()
-        session.add(item)
-        try:
-            session.commit()
-        except StaleDataError as exc:
-            # The item existed at the session.get() above but was deleted
-            # (and that delete committed) by another session before this
-            # flush -- the UPDATE this handler issues for `item` now matches
-            # zero rows, which SQLAlchemy reports as StaleDataError rather
-            # than silently doing nothing. Translate that race into the same
-            # 404 a simple not-found lookup would give, instead of letting
-            # it surface as an unhandled 500.
-            session.rollback()
-            raise HTTPException(status_code=404, detail=_NOT_FOUND) from exc
-        session.refresh(item)
-    return item
+    if not changes:
+        return MemoryItemRead.model_validate(item)
+    for key, value in changes.items():
+        setattr(item, key, value)
+    item.updated = utcnow()
+    session.add(item)
+    try:
+        # Flush (not commit) so a zero-row-matched UPDATE still raises
+        # StaleDataError here, before we build the response snapshot below.
+        session.flush()
+    except StaleDataError as exc:
+        # The item existed at the session.get() above but was deleted
+        # (and that delete committed) by another session before this
+        # flush -- the UPDATE this handler issues for `item` now matches
+        # zero rows, which SQLAlchemy reports as StaleDataError rather
+        # than silently doing nothing. Translate that race into the same
+        # 404 a simple not-found lookup would give, instead of letting
+        # it surface as an unhandled 500.
+        session.rollback()
+        raise HTTPException(status_code=404, detail=_NOT_FOUND) from exc
+    # Snapshot the response into a plain pydantic model *before* committing,
+    # while item's attributes are still loaded in memory. A post-commit
+    # session.refresh(item) -- the previous approach -- issues a fresh
+    # SELECT against the row; if another session's DELETE for this same
+    # item lands and commits in the gap between our commit and that
+    # refresh, the SELECT finds nothing and refresh() raises
+    # InvalidRequestError, turning an already-successful update into a 500.
+    # Returning a detached snapshot instead means nothing after commit ever
+    # touches the database again, so that race cannot affect the response.
+    result = MemoryItemRead.model_validate(item)
+    session.commit()
+    return result
 
 
 @router.delete("/{item_id}", status_code=204)
@@ -169,24 +193,36 @@ def delete_item(item_id: int, session: SessionDep) -> None:
     try:
         session.commit()
     except StaleDataError as exc:
-        # The item existed at session.get() above but was deleted (and that
-        # delete committed) by another session before this flush -- this
-        # session's own DELETE for `item` now matches zero rows. Without a
-        # `version_id_col` on the mapper, SQLAlchemy's unit of work today
-        # only warns about that mismatch rather than raising (see Mapper's
+        # Reality check: a zero-row-matched DELETE does NOT raise in current
+        # SQLAlchemy. Without a `version_id_col` on the mapper (`MemoryItem`
+        # has none), the unit of work only emits a warning (see Mapper's
         # confirm_deleted_rows docs: "the warning may be changed to an
-        # exception in a future release"), so this is hardening for that
-        # future/alternate behaviour rather than a path reachable today --
-        # kept symmetric with the UPDATE-based races above, since a row
-        # that's already gone by commit time is indistinguishable from "not
-        # found": delete-after-delete is itself a no-op a client should see
-        # as 404, not 500.
+        # exception in a future release"). So the real-world version of this
+        # race -- the item existed at session.get() above but was deleted
+        # (and that delete committed) by another session before this flush
+        # -- never lands here at all: session.commit() above simply
+        # succeeds, and this handler falls through to its normal 204
+        # response. That is by design, not an oversight: delete-after-delete
+        # is idempotent-DELETE semantics -- asking to delete a resource
+        # that is already gone is a no-op success, not an error, the same
+        # 204 a client would get deleting it the first time. This except
+        # clause is retained only as forward-compatible hardening for a
+        # future/alternate SQLAlchemy behaviour (or a mapper reconfigured
+        # with `version_id_col`) where a zero-row DELETE does raise
+        # StaleDataError instead of warning -- kept symmetric with the
+        # UPDATE-based races above, which genuinely do raise today. See
+        # tests/test_items.py::test_delete_races_with_concurrent_delete_returns_204
+        # for the actually-reachable real-world behaviour, and
+        # ::test_delete_races_with_manufactured_stale_data_error_returns_404
+        # for this except clause's defensive-only coverage.
         session.rollback()
         raise HTTPException(status_code=404, detail=_NOT_FOUND) from exc
 
 
 @router.post("/{item_id}/progress", response_model=ProgressEntryRead, status_code=201)
-def add_progress(item_id: int, payload: ProgressEntryCreate, session: SessionDep) -> ProgressEntry:
+def add_progress(
+    item_id: int, payload: ProgressEntryCreate, session: SessionDep
+) -> ProgressEntryRead:
     """Append a progress entry and bump the item's `updated` timestamp."""
     item = session.get(MemoryItem, item_id)
     if item is None:
@@ -196,7 +232,9 @@ def add_progress(item_id: int, payload: ProgressEntryCreate, session: SessionDep
     session.add(entry)
     session.add(item)
     try:
-        session.commit()
+        # Flush (not commit) so the StaleDataError/IntegrityError races
+        # below still surface here, before we build the response snapshot.
+        session.flush()
     except (StaleDataError, IntegrityError) as exc:
         # The item existed at the session.get() above but was deleted (and
         # that delete committed) by another session before this flush.
@@ -210,5 +248,17 @@ def add_progress(item_id: int, payload: ProgressEntryCreate, session: SessionDep
         # instead of letting either surface as an unhandled 500.
         session.rollback()
         raise HTTPException(status_code=404, detail=_NOT_FOUND) from exc
-    session.refresh(entry)
-    return entry
+    # Snapshot the response into a plain pydantic model *before* committing,
+    # while entry's attributes (including the id the flush above just
+    # assigned) are still loaded in memory. A post-commit
+    # session.refresh(entry) -- the previous approach -- issues a fresh
+    # SELECT against the row; if another session's DELETE for this entry's
+    # item cascades into deleting this entry too and commits in the gap
+    # between our commit and that refresh, the SELECT finds nothing and
+    # refresh() raises InvalidRequestError, turning an already-successful
+    # append into a 500. Returning a detached snapshot instead means
+    # nothing after commit ever touches the database again, so that race
+    # cannot affect the response.
+    result = ProgressEntryRead.model_validate(entry)
+    session.commit()
+    return result

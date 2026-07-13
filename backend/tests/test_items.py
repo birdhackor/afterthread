@@ -3,7 +3,7 @@
 from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, event
+from sqlalchemy import Engine, delete, event
 from sqlalchemy.orm.exc import StaleDataError
 from sqlmodel import Session, col, select
 
@@ -15,6 +15,55 @@ def _create(client: TestClient, **fields: object) -> dict:
     response = client.post("/api/items", json=payload)
     assert response.status_code == 201, response.text
     return response.json()
+
+
+def _hard_delete_item_via_raw_connection(session: Session, item_id: int | None) -> None:
+    """Delete a `memory_item` row directly through the shared DBAPI
+    connection, bypassing the ORM session entirely and committing
+    immediately at the DBAPI level. `item_id=None` deletes whichever row
+    currently has the highest id -- for callers (see
+    `test_create_response_survives_row_deleted_immediately_after_commit`
+    below) that don't know the id up front because it's assigned by the
+    very request this runs inside of. `ProgressEntry.item_id`'s
+    `ondelete="CASCADE"` (see models.py) removes its progress entries too,
+    since SQLite enforces that at the database level once `PRAGMA
+    foreign_keys=ON` is active for the connection (see
+    `app.db.enable_sqlite_foreign_keys`), regardless of how the DELETE is
+    issued.
+
+    Used from `after_commit` session-event hooks below to simulate a
+    concurrent delete landing in the instant after a handler's own commit --
+    i.e. exactly where a post-commit `session.refresh()` used to run next.
+    At that point the session itself is in SQLAlchemy's post-commit
+    "committed" state and cannot emit SQL through the ORM
+    (`session.connection()` raises `InvalidRequestError` there -- "no
+    further SQL can be emitted within this transaction"), so this reaches
+    the underlying connection directly instead, through the engine's
+    StaticPool -- which the `session`/`client` fixtures always use (see
+    conftest.py) -- making it genuinely the same connection/database rather
+    than an unrelated one.
+    """
+    bind = session.get_bind()
+    # The session/client fixtures (see conftest.py) always bind Session
+    # directly to an Engine, never a Connection -- only Engine has
+    # raw_connection(), which is what makes reaching the shared StaticPool
+    # connection below possible.
+    assert isinstance(bind, Engine)
+    raw_connection = bind.raw_connection()
+    try:
+        cursor = raw_connection.cursor()
+        try:
+            if item_id is None:
+                cursor.execute(
+                    "DELETE FROM memory_item WHERE id = (SELECT MAX(id) FROM memory_item)"
+                )
+            else:
+                cursor.execute("DELETE FROM memory_item WHERE id = ?", (item_id,))
+        finally:
+            cursor.close()
+        raw_connection.commit()
+    finally:
+        raw_connection.close()
 
 
 def test_create_applies_defaults(client: TestClient) -> None:
@@ -53,6 +102,44 @@ def test_create_invalid_status_rejected(client: TestClient) -> None:
 
 def test_create_invalid_stage_rejected(client: TestClient) -> None:
     assert client.post("/api/items", json={"title": "x", "stage": "bogus"}).status_code == 422
+
+
+def test_create_response_survives_row_deleted_immediately_after_commit(
+    client: TestClient, session: Session
+) -> None:
+    """create_item must snapshot its response before `session.commit()` and
+    return that snapshot with no further session/DB access afterward -- not
+    call `session.refresh()` the way it used to. Proven by deleting the new
+    row through an `after_commit` hook, i.e. the instant after this
+    handler's own commit lands: the old `session.refresh(item)` call at
+    that point would hit `InvalidRequestError` ("Could not refresh
+    instance") against the now-missing row and turn a create that already
+    succeeded into a 500. With `refresh()` gone, the response is built from
+    already-in-memory attributes and is unaffected by what happens to the
+    row afterward.
+
+    See `_hard_delete_item_via_raw_connection` for why this reaches the
+    database directly rather than through the session: at `after_commit`
+    time the session itself cannot emit SQL (it is in SQLAlchemy's
+    post-commit "committed" state).
+    """
+
+    def _delete_after_commit(commit_session: Session) -> None:
+        _hard_delete_item_via_raw_connection(commit_session, None)
+
+    event.listen(session, "after_commit", _delete_after_commit)
+    try:
+        response = client.post("/api/items", json={"title": "Vanishes immediately"})
+    finally:
+        event.remove(session, "after_commit", _delete_after_commit)
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["title"] == "Vanishes immediately"
+
+    # The row is genuinely gone -- confirms this test would have caught the
+    # old session.refresh()-based bug, not exercised a no-op hook.
+    assert client.get(f"/api/items/{body['id']}").status_code == 404
 
 
 def test_list_pagination_and_total(client: TestClient) -> None:
@@ -298,6 +385,39 @@ def test_patch_races_with_concurrent_delete_returns_404(
     assert client.get("/api/items").status_code == 200
 
 
+def test_patch_response_survives_row_deleted_immediately_after_commit(
+    client: TestClient, session: Session
+) -> None:
+    """update_item must snapshot its response before `session.commit()` and
+    return that snapshot with no further session/DB access afterward -- not
+    call `session.refresh()` the way it used to. Proven the same way as
+    `test_create_response_survives_row_deleted_immediately_after_commit`
+    above: deleting the row via an `after_commit` hook, right where the old
+    `session.refresh(item)` call used to run next and would have hit
+    `InvalidRequestError` against the now-missing row.
+    """
+    item = _create(client)
+    item_id = item["id"]
+
+    def _delete_after_commit(commit_session: Session) -> None:
+        _hard_delete_item_via_raw_connection(commit_session, item_id)
+
+    event.listen(session, "after_commit", _delete_after_commit)
+    try:
+        response = client.patch(f"/api/items/{item_id}", json={"snapshot": "still returned"})
+    finally:
+        event.remove(session, "after_commit", _delete_after_commit)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == item_id
+    assert body["snapshot"] == "still returned"
+
+    # The row is genuinely gone -- confirms this test would have caught the
+    # old session.refresh()-based bug, not exercised a no-op hook.
+    assert client.get(f"/api/items/{item_id}").status_code == 404
+
+
 def test_delete_cascades_progress_entries(client: TestClient, session: Session) -> None:
     item = _create(client)
     item_id = item["id"]
@@ -318,29 +438,81 @@ def test_delete_missing_returns_404(client: TestClient) -> None:
     assert client.delete("/api/items/9999").status_code == 404
 
 
-def test_delete_races_with_concurrent_delete_returns_404(
+def test_delete_races_with_concurrent_delete_returns_204(
     client: TestClient, session: Session
 ) -> None:
     """If the item is deleted+committed by another session between this
     handler's `session.get()` and its `commit()`, this session's own DELETE
-    for `item` matches zero rows -- the row is already gone, so
-    delete-after-delete should surface as the same 404 a simple not-found
-    lookup would give.
-
-    Unlike the UPDATE-based races (see
+    for `item` matches zero rows -- but, unlike the UPDATE-based races (see
     `test_progress_add_races_with_concurrent_delete_returns_404` and
     `test_patch_races_with_concurrent_delete_returns_404`), SQLAlchemy's
-    unit of work does not raise for a zero-row-matched DELETE unless the
-    mapper has a `version_id_col` configured, which `MemoryItem` does not:
-    without one, a mismatch here only emits a warning (see the ORM
+    unit of work does NOT raise for a zero-row-matched DELETE today unless
+    the mapper has a `version_id_col` configured, which `MemoryItem` does
+    not: without one, a mismatch here only emits a warning (see the ORM
     `Mapper`'s `confirm_deleted_rows` parameter docs -- "the warning may be
-    changed to an exception in a future release"). The handler is hardened
-    against StaleDataError anyway, symmetric with the UPDATE-based races and
-    forward-compatible with that future behaviour, so this test drives it
-    directly: the `before_flush` hook performs the same real
-    concurrent-delete simulation used by the races above, then raises
-    StaleDataError itself to exercise the handler's translation to 404,
-    rather than relying on today's (non-raising) real DELETE path.
+    changed to an exception in a future release"). So `session.commit()`
+    simply succeeds and the handler falls through to its normal 204
+    response -- which is correct, idempotent-DELETE behaviour: asking to
+    delete a resource that is already gone is a no-op success, not an
+    error. (See
+    `test_delete_races_with_manufactured_stale_data_error_returns_404` for
+    the handler's StaleDataError->404 translation, which this real-world
+    race does not actually exercise.)
+
+    Made deterministic without real threads via a `before_flush` *session*
+    event (see `test_progress_add_races_with_concurrent_delete_returns_404`
+    for why session-level `before_flush` -- firing before this flush has
+    emitted any of its own SQL -- is what reproduces genuine ordering,
+    versus a mapper-level event that could run after other work in the same
+    flush). The delete goes through `session.connection()`, the session's
+    own in-transaction connection, bypassing the session/identity map
+    exactly as another session's independently committed DELETE would be
+    invisible to this one.
+    """
+    item = _create(client)
+    item_id = item["id"]
+
+    def _delete_item_before_flush(
+        flush_session: Session, flush_context: object, instances: object
+    ) -> None:
+        connection = flush_session.connection()
+        connection.execute(delete(ProgressEntry).where(col(ProgressEntry.item_id) == item_id))
+        connection.execute(delete(MemoryItem).where(col(MemoryItem.id) == item_id))
+
+    event.listen(session, "before_flush", _delete_item_before_flush)
+    try:
+        response = client.delete(f"/api/items/{item_id}")
+    finally:
+        event.remove(session, "before_flush", _delete_item_before_flush)
+
+    assert response.status_code == 204
+
+    # The handler's normal (non-exceptional) commit path must leave the
+    # shared session usable for later requests too.
+    assert client.get("/api/items").status_code == 200
+
+
+def test_delete_races_with_manufactured_stale_data_error_returns_404(
+    client: TestClient, session: Session
+) -> None:
+    """Defensive-only: in the real world today, the race this simulates does
+    NOT produce a StaleDataError at all -- see
+    `test_delete_races_with_concurrent_delete_returns_204` above, which
+    drives the exact same underlying race through the real (non-raising)
+    DELETE path and gets 204, by design (idempotent-DELETE semantics).
+    SQLAlchemy's unit of work does not raise for a zero-row-matched DELETE
+    unless the mapper has a `version_id_col` configured, which `MemoryItem`
+    does not: without one, a mismatch here only emits a warning (see the
+    ORM `Mapper`'s `confirm_deleted_rows` parameter docs -- "the warning may
+    be changed to an exception in a future release"). This test exists only
+    to exercise the handler's StaleDataError->404 translation anyway, kept
+    as hardening for that future/alternate SQLAlchemy behaviour (or a
+    future `version_id_col` addition) rather than a path reachable today --
+    so it manufactures the exception directly: the `before_flush` hook
+    performs the same real concurrent-delete simulation used by the races
+    above, then raises StaleDataError itself to exercise the handler's
+    translation to 404, rather than relying on today's (non-raising) real
+    DELETE path.
     """
     item = _create(client)
     item_id = item["id"]
@@ -449,3 +621,38 @@ def test_progress_add_races_with_concurrent_delete_returns_404(
     # The handler's session.rollback() must leave the shared session usable
     # for later requests, not stuck raising PendingRollbackError.
     assert client.get("/api/items").status_code == 200
+
+
+def test_progress_add_response_survives_item_deleted_immediately_after_commit(
+    client: TestClient, session: Session
+) -> None:
+    """add_progress must snapshot its response before `session.commit()` and
+    return that snapshot with no further session/DB access afterward -- not
+    call `session.refresh()` the way it used to. Proven the same way as
+    `test_create_response_survives_row_deleted_immediately_after_commit`
+    above: deleting the item (which cascades to the entry just inserted by
+    this same request) via an `after_commit` hook, right where the old
+    `session.refresh(entry)` call used to run next and would have hit
+    `InvalidRequestError` against the now-missing row.
+    """
+    item = _create(client)
+    item_id = item["id"]
+
+    def _delete_after_commit(commit_session: Session) -> None:
+        _hard_delete_item_via_raw_connection(commit_session, item_id)
+
+    event.listen(session, "after_commit", _delete_after_commit)
+    try:
+        response = client.post(f"/api/items/{item_id}/progress", json={"note": "still returned"})
+    finally:
+        event.remove(session, "after_commit", _delete_after_commit)
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["note"] == "still returned"
+    assert body["item_id"] == item_id
+
+    # The item (and this new entry, via cascade) is genuinely gone --
+    # confirms this test would have caught the old session.refresh()-based
+    # bug, not exercised a no-op hook.
+    assert client.get(f"/api/items/{item_id}").status_code == 404

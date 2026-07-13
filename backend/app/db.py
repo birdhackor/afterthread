@@ -56,6 +56,30 @@ def _url_dialect(url: str) -> str:
         return "<unparseable database URL>"
 
 
+_URI_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def _uri_mode_enabled(query: dict[str, list[str]]) -> bool:
+    """Whether `query`'s `uri` parameter turns on SQLite's URI-filename mode.
+
+    Mirrors `sqlalchemy.util.asbool`, case-insensitively: `"1"`, `"true"`,
+    `"yes"`, `"on"` enable it; `"0"`, `"false"`, `"no"`, `"off"`, an absent
+    `uri` key, or any other spelling all leave it disabled. (The real
+    `asbool` also recognises a couple of single-letter synonyms and raises
+    `ValueError` for a spelling it does not recognise at all, rather than
+    treating it as false; neither distinction matters here, since a value
+    this function cannot make sense of is still caught for real -- loudly,
+    via that same `ValueError` -- by pysqlite's own `asbool` call the first
+    time a connection is actually attempted. This function only has to
+    decide, ahead of that, whether `_is_memory_sqlite_url`'s URI-only checks
+    below apply.) A URL with more than one `uri=` value (e.g.
+    `uri=false&uri=true`) is treated as enabled if *any* value is truthy,
+    erring toward applying the extra rejection checks rather than skipping
+    them.
+    """
+    return any(value.strip().lower() in _URI_TRUE_VALUES for value in query.get("uri", []))
+
+
 def _is_memory_sqlite_url(url: str) -> bool:
     """True for SQLite URLs that do not address a durable, file-backed database.
 
@@ -74,17 +98,29 @@ def _is_memory_sqlite_url(url: str) -> bool:
     filename *without* `mode=memory` (e.g. `sqlite:///file:real.db?uri=true`)
     genuinely is file-backed and must remain allowed.
 
-    The two checks below apply only once SQLite's URI-filename parsing is
-    actually *in effect*, i.e. `uri=true` is present in the query string.
-    SQLAlchemy's pysqlite dialect only passes `uri=True` to
-    `sqlite3.connect()` -- activating https://www.sqlite.org/uri.html syntax
-    -- when the URL spells it exactly that way (see the
+    The three checks below (empty URI filename, `vfs=memdb`, `mode=memory`)
+    apply only once SQLite's URI-filename parsing is actually *in effect*,
+    per `_uri_mode_enabled` above. SQLAlchemy's pysqlite dialect decides
+    whether to pass `uri=True` to `sqlite3.connect()` -- activating
+    https://www.sqlite.org/uri.html syntax -- by running the URL's `uri`
+    query value through `sqlalchemy.util.asbool` (see the
     `_pysqlite_uri_connections` section of
-    `sqlalchemy.dialects.sqlite.pysqlite`). Without `uri=true`, pysqlite
-    instead treats the whole `file:...` string as a literal on-disk
-    filename (odd-looking, but a real, persistent, single file) and never
-    even looks at the rest of the query string -- so a `mode=memory` or
-    `vfs=memdb` there is inert, and such a URL must stay allowed:
+    `sqlalchemy.dialects.sqlite.pysqlite`, and `coerce_kw_type`'s use of it
+    in `create_connect_args`), which accepts far more spellings than just
+    the literal string `"true"` -- `uri=1`, `uri=True`, `uri=on` all enable
+    it too, case-insensitively. Gating only on the literal `"true"` would
+    reopen exactly the hole these checks exist to close: e.g.
+    `sqlite:///file:mem1?vfs=memdb&uri=True` is opened by pysqlite as an
+    in-memory database (capitalised `True` still satisfies `asbool`) but
+    would slip past a literal-`"true"` check unrejected. Conversely, when
+    `uri` is genuinely absent or falsy, pysqlite treats the whole `file:...`
+    string as a literal on-disk filename (odd-looking, but a real,
+    persistent, single file) and never even looks at the rest of the query
+    string -- so a `mode=memory` or `vfs=memdb` there is inert text, and
+    such a URL must stay allowed, e.g. `sqlite:///file:x.db?mode=memory`
+    with no `uri` key at all is a literal, persistent filename that merely
+    happens to contain that substring -- the checks below must not fire for
+    it:
 
     - An empty URI filename, e.g. `sqlite:///file:?uri=true` (nothing
       between `file:` and `?`): SQLite documents this as opening a private,
@@ -95,6 +131,10 @@ def _is_memory_sqlite_url(url: str) -> bool:
       `sqlite:///file:mem1?vfs=memdb&uri=true`: this selects SQLite's
       in-memory VFS explicitly, opening a memory-backed database regardless
       of what the filename portion says.
+    - `mode=memory` in the query, e.g.
+      `sqlite:///file:memdb1?mode=memory&cache=shared&uri=true`: opens an
+      in-memory (optionally named, shared-cache) database; see the class
+      docstring above.
     """
     if ":memory:" in url:
         return True
@@ -103,12 +143,12 @@ def _is_memory_sqlite_url(url: str) -> bool:
         return True
     if database.startswith("file:"):
         query = parse_qs(urlsplit(url).query)
-        if "memory" in query.get("mode", []):
-            return True
-        if "true" in query.get("uri", []):
+        if _uri_mode_enabled(query):
             if database == "file:":
                 return True
             if "memdb" in query.get("vfs", []):
+                return True
+            if "memory" in query.get("mode", []):
                 return True
     return False
 
