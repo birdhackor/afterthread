@@ -412,6 +412,9 @@ ENRICH_SYSTEM_PROMPT = "\n".join(
         "active status.",
         '- "remaining_gaps": checklist items still missing (array of strings).',
         '- "progress_note": a short note describing what you added (string).',
+        "checklist_complete and remaining_gaps are mutually exclusive: if any "
+        "checklist gap remains, the item is not complete -- leave "
+        "checklist_complete false.",
     ]
 )
 
@@ -443,6 +446,21 @@ class EnrichResult(BaseModel):
             ),
             "progress_note": _clean_text(data.get("progress_note")),
         }
+
+    @model_validator(mode="after")
+    def _gaps_block_completion(self) -> Self:
+        """Gaps and completion are mutually exclusive.
+
+        A non-empty ``remaining_gaps`` means the checklist is not materially
+        complete, so a model that returns both is contradictory. Resolve it
+        deterministically here (a prompt rule alone cannot guarantee it): the
+        gaps win, forcing ``checklist_complete`` False, so a contradictory result
+        never promotes a still-capturing item to active. Forgiving to a sloppy
+        model that sets both rather than rejecting the whole enrichment.
+        """
+        if self.remaining_gaps:
+            self.checklist_complete = False
+        return self
 
     @model_validator(mode="after")
     def _require_signal(self) -> Self:

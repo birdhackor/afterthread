@@ -105,6 +105,39 @@ def test_incomplete_checklist_does_not_promote(
     assert updated["stage"] == "quick"
 
 
+def test_contradictory_complete_with_gaps_does_not_promote(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A result that flags checklist_complete=true while still listing
+    # remaining_gaps is contradictory. The EnrichResult normalization forces
+    # completion False, so the still-capturing item is NOT promoted -- stage and
+    # status stay put -- and the gaps flow back to the caller.
+    item = _create(client)  # capture-quick / stage quick
+    assert item["status"] == "capture-quick"
+    _patch_generate_json(
+        monkeypatch,
+        {
+            "sections": {"decisions": "d"},
+            "checklist_complete": True,
+            "remaining_gaps": ["缺少 stakeholders"],
+            "progress_note": "n",
+        },
+    )
+    response = client.post(f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["item"]["status"] == "capture-quick"
+    assert body["item"]["stage"] == "quick"
+    assert body["gaps"] == ["缺少 stakeholders"]
+
+
 def test_enrich_prompt_states_completion_promotes_to_active() -> None:
     assert "active" in ENRICH_SYSTEM_PROMPT.lower()
     assert "promotes" in ENRICH_SYSTEM_PROMPT.lower()
+
+
+def test_enrich_prompt_states_gaps_and_completion_are_mutually_exclusive() -> None:
+    prompt = ENRICH_SYSTEM_PROMPT
+    assert "mutually exclusive" in prompt.lower()
+    assert "remaining_gaps" in prompt
+    assert "checklist_complete" in prompt

@@ -57,6 +57,22 @@ def test_enrich_result_accepts_only_a_gap() -> None:
     assert result.remaining_gaps == ["missing X"]
 
 
+def test_enrich_result_gaps_force_checklist_incomplete() -> None:
+    # Contradictory input -- complete AND gaps remaining -- is normalized
+    # deterministically: the gaps win, checklist_complete is forced False, so a
+    # sloppy model can never both flag completion and list what is still missing.
+    result = EnrichResult.model_validate(
+        {"checklist_complete": True, "remaining_gaps": ["still missing X"]}
+    )
+    assert result.checklist_complete is False
+    assert result.remaining_gaps == ["still missing X"]
+
+
+def test_enrich_result_complete_with_no_gaps_stays_complete() -> None:
+    result = EnrichResult.model_validate({"checklist_complete": True, "remaining_gaps": []})
+    assert result.checklist_complete is True
+
+
 def test_update_result_accepts_only_a_progress_note() -> None:
     result = UpdateResult.model_validate({"progress_note": "just a note"})
     assert result.progress_note == "just a note"

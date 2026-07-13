@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine
+from sqlalchemy import Engine, event
 from sqlmodel import Session
 
 from app.main import app
@@ -41,6 +41,30 @@ def _bump_updated_via_raw_connection(session: Session, item_id: int) -> None:
             cursor.execute(
                 "UPDATE memory_item SET updated = ? WHERE id = ?",
                 ("2000-01-01 00:00:00.000000", item_id),
+            )
+        finally:
+            cursor.close()
+        raw_connection.commit()
+    finally:
+        raw_connection.close()
+
+
+def _commit_competing_write(session: Session, item_id: int, field: str, value: str) -> None:
+    """Commit a competing writer's change to one field AND a distinct `updated`
+    directly through the shared DBAPI connection (see
+    _bump_updated_via_raw_connection). Bumping `updated` is what a real PATCH
+    does, and it is exactly what the handler's conditional UPDATE guards on, so
+    this stands in for a second session's PATCH committing mid-request.
+    """
+    bind = session.get_bind()
+    assert isinstance(bind, Engine)
+    raw_connection = bind.raw_connection()
+    try:
+        cursor = raw_connection.cursor()
+        try:
+            cursor.execute(
+                f"UPDATE memory_item SET {field} = ?, updated = ? WHERE id = ?",
+                (value, "2001-02-03 04:05:06.000000", item_id),
             )
         finally:
             cursor.close()
@@ -142,6 +166,108 @@ def test_conflict_message_carries_no_config_or_item_content(
     # The 409 body must not echo item content (nor any config, which is never
     # in scope of this message at all).
     assert "secret-snapshot-value" not in body
+
+
+def test_enrich_conflict_between_guard_and_update_preserves_competing_write(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PATCH committing in the instant between the handler's optimistic guard
+    and its own write must not be silently overwritten. The guard and the write
+    are ONE conditional UPDATE, so a competing commit landing right before that
+    UPDATE (injected via a before_cursor_execute hook -- the same deterministic
+    ambush the delete-race tests use) moves `updated`, the UPDATE matches zero
+    rows -> 409, and the competing value survives. Pre-fix (compare `updated`,
+    then flush a PK-keyed UPDATE) this exact window produced a 200 that clobbered
+    the competing write.
+    """
+    item = _create(client, decisions="原決策")
+    item_id = item["id"]
+
+    async def _fake(system: str, user: str) -> dict[str, Any]:
+        return {"sections": {"decisions": "AI 決策"}, "progress_note": "AI note"}
+
+    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+
+    bind = session.get_bind()
+    assert isinstance(bind, Engine)
+    ambushed = {"done": False}
+
+    def _competing_write_before_update(
+        conn: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: object,
+    ) -> None:
+        normalized = " ".join(statement.split()).lower()
+        if normalized.startswith("update memory_item") and not ambushed["done"]:
+            ambushed["done"] = True
+            _commit_competing_write(session, item_id, "decisions", "他人決策")
+
+    event.listen(bind, "before_cursor_execute", _competing_write_before_update)
+    try:
+        response = client.post(f"/api/items/{item_id}/enrich", json={"additional_context": "ctx"})
+    finally:
+        event.remove(bind, "before_cursor_execute", _competing_write_before_update)
+
+    assert ambushed["done"] is True
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "conflict"
+
+    # The competing writer's value survives; the AI enrich wrote nothing.
+    detail = client.get(f"/api/items/{item_id}").json()
+    assert detail["decisions"] == "他人決策"
+    assert "AI 決策" not in detail["decisions"]
+    assert _progress_notes(client, item_id) == ["建立項目"]
+
+
+def test_assist_update_conflict_between_guard_and_update_preserves_competing_write(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Assist-update shares the same guarded UPDATE (see the enrich twin): a
+    competing PATCH landing right before that UPDATE resolves to 409 and its
+    value survives, with no check-then-write window to lose it through.
+    """
+    item = _create(client, next_actions="原下一步")
+    item_id = item["id"]
+
+    async def _fake(system: str, user: str) -> dict[str, Any]:
+        return {"sections": {"next_actions": "AI 下一步"}, "progress_note": "AI note"}
+
+    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+
+    bind = session.get_bind()
+    assert isinstance(bind, Engine)
+    ambushed = {"done": False}
+
+    def _competing_write_before_update(
+        conn: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: object,
+    ) -> None:
+        normalized = " ".join(statement.split()).lower()
+        if normalized.startswith("update memory_item") and not ambushed["done"]:
+            ambushed["done"] = True
+            _commit_competing_write(session, item_id, "next_actions", "他人下一步")
+
+    event.listen(bind, "before_cursor_execute", _competing_write_before_update)
+    try:
+        response = client.post(f"/api/items/{item_id}/assist-update", json={"note": "n"})
+    finally:
+        event.remove(bind, "before_cursor_execute", _competing_write_before_update)
+
+    assert ambushed["done"] is True
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "conflict"
+
+    detail = client.get(f"/api/items/{item_id}").json()
+    assert detail["next_actions"] == "他人下一步"
+    assert "AI 下一步" not in detail["next_actions"]
+    assert _progress_notes(client, item_id) == ["建立項目"]
 
 
 # --- OpenAPI contract -----------------------------------------------------

@@ -15,12 +15,14 @@ the HTTP contract:
   generated clients and docs never overstate or understate what can happen.
 """
 
+from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.exc import StaleDataError
-from sqlmodel import Session
+from sqlmodel import Session, col
 
 from app.config import get_settings
 from app.db import get_session
@@ -168,6 +170,32 @@ def _conflict() -> HTTPException:
     )
 
 
+def _conditional_update(
+    session: Session, item_id: int, snapshot_updated: datetime, values: dict[str, Any]
+) -> int:
+    """Apply ``values`` to the item via ONE UPDATE guarded on ``snapshot_updated``.
+
+    This is the optimistic-concurrency check closed BY CONSTRUCTION: the WHERE
+    pins the item's pre-await ``updated``, so a PATCH committing anytime between
+    the snapshot and this statement moves ``updated`` and the row no longer
+    matches -- there is no separate compare-then-flush step a competing write
+    could slip through and be silently overwritten. Returns the affected row
+    count: 1 when the guard matched (the write landed and
+    ``synchronize_session="evaluate"`` folded ``values`` back onto the in-session
+    item, so a response snapshot needs no re-read), 0 when a concurrent writer
+    moved ``updated`` or deleted the row. ``col(...)`` yields real column
+    expressions for the typed WHERE; ``exec`` returns a ``CursorResult`` for a
+    DML statement, whose ``rowcount`` is the number of rows the guard matched.
+    """
+    result = session.exec(
+        update(MemoryItem)
+        .where(col(MemoryItem.id) == item_id, col(MemoryItem.updated) == snapshot_updated)
+        .values(**values),
+        execution_options={"synchronize_session": "evaluate"},
+    )
+    return result.rowcount
+
+
 @router.get("/llm/status", response_model=LLMStatus)
 def llm_status() -> LLMStatus:
     """Report whether an LLM endpoint is configured, and the model name only.
@@ -250,23 +278,28 @@ async def enrich(item_id: ItemId, payload: EnrichRequest, session: SessionDep) -
 
     Order (constraint): 404 first, then snapshot the item fields (and its
     `updated` timestamp), then run the LLM strictly OUTSIDE any transaction (the
-    read transaction is released before the await). On re-fetch, a changed
-    `updated` means another writer touched the row mid-await, so respond 409 and
-    write NOTHING. Otherwise writes begin -- merge the returned sections
-    (untouched fields stay as they were; history-bearing sections are superseded,
-    never overwritten); on a complete checklist flip stage to full and graduate a
-    still-capturing item (capture-quick/needs-enrichment) to active; append the
-    progress entry, bump `updated`. The response snapshot is built after
-    flush, before commit; the flush is race-wrapped so a concurrent delete
-    resolves to 404, not a 500. A 503/502/409 (or an item deleted mid-await)
-    leaves the row unchanged.
+    read transaction is released before the await). Writes then land through a
+    SINGLE conditional UPDATE guarded on the pre-await `updated`: merge the
+    returned sections (untouched fields stay as they were; history-bearing
+    sections are superseded, never overwritten) and, on a complete checklist,
+    flip stage to full and graduate a still-capturing item
+    (capture-quick/needs-enrichment) to active. If that UPDATE matches no row a
+    writer touched the item mid-await and NOTHING is written -- a concurrent
+    UPDATE (`updated` moved, row present) is 409, a concurrent DELETE (row gone)
+    is 404. Closing the check with the write (rather than comparing `updated`
+    then flushing) leaves no window a competing PATCH could slip through. On a
+    match the progress entry is appended and the flush is race-wrapped so a
+    delete landing in the remaining window still resolves to 404, not a 500. The
+    response snapshot is built (after flush, before commit) from the values just
+    written -- not a re-read. A 503/502/409 (or an item deleted mid-await) leaves
+    the row unchanged.
     """
     item = session.get(MemoryItem, item_id)
     if item is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
     item_fields = {name: getattr(item, name) for name in _AI_ITEM_FIELDS}
     # Snapshot `updated` BEFORE the await so a concurrent write during the LLM
-    # call can be detected on re-fetch (optimistic concurrency, below).
+    # call can be detected by the conditional UPDATE's guard (below).
     original_updated = item.updated
     # Release the read transaction so the LLM call holds no DB transaction open.
     session.rollback()
@@ -278,42 +311,50 @@ async def enrich(item_id: ItemId, payload: EnrichRequest, session: SessionDep) -
     except LLMUpstreamError as exc:
         raise _bad_gateway(exc) from exc
 
-    # Re-fetch: the item may have been deleted during the await.
+    # Re-fetch: the item may have been deleted during the await. This is also the
+    # merge base for history sections; it is NOT mutated, so the item stays clean
+    # and the conditional UPDATE below is the only write (no autoflush ahead of it).
     item = session.get(MemoryItem, item_id)
     if item is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
-    # Optimistic concurrency: if another writer bumped `updated` while the model
-    # was running, the sections we enriched against are stale. Write NOTHING and
-    # return 409 so the caller re-reads and retries.
-    if item.updated != original_updated:
-        raise _conflict()
-    for key, value in result.sections.items():
+    values: dict[str, Any] = {}
+    for key, section_value in result.sections.items():
         # Supersede-not-delete for the history-bearing sections: merge losslessly
         # so a prior decision/rationale is never overwritten (see
         # memory_ai.merge_with_supersede). Other sections replace wholesale.
         if key in HISTORY_SECTIONS:
-            value = merge_with_supersede(getattr(item, key), value)
-        setattr(item, key, value)
+            section_value = merge_with_supersede(getattr(item, key), section_value)
+        values[key] = section_value
     if result.checklist_complete:
-        item.stage = MemoryStage.full
+        values["stage"] = MemoryStage.full
         # A completed checklist means the item is materially recoverable, so an
         # item still in a capture status graduates to active. Terminal and
         # explicitly-parked/waiting statuses are deliberately left untouched.
         if item.status in (MemoryStatus.capture_quick, MemoryStatus.needs_enrichment):
-            item.status = MemoryStatus.active
+            values["status"] = MemoryStatus.active
+    values["updated"] = utcnow()
+
+    # Optimistic concurrency closed by construction (see _conditional_update): a
+    # single guarded UPDATE, so a PATCH committing after the snapshot cannot be
+    # silently overwritten.
+    if _conditional_update(session, item_id, original_updated, values) == 0:
+        session.rollback()
+        # rowcount 0 is a concurrent DELETE (row gone -> 404, this route's
+        # delete-during-await contract) or a concurrent UPDATE (row present,
+        # `updated` moved -> 409). The rollback expired the identity map, so this
+        # re-fetch genuinely re-queries to tell the two apart.
+        if session.get(MemoryItem, item_id) is None:
+            raise HTTPException(status_code=404, detail=_NOT_FOUND)
+        raise _conflict()
+
     note = result.progress_note or _ENRICH_NOTE
     # Append via an explicit, FK-bearing ProgressEntry -- mirroring
-    # items.add_progress -- NOT via item.entries.append(...). Touching the
-    # relationship lazy-loads `entries`, and with the item already dirty (the
-    # setattrs above) that lazy load AUTOFLUSHES first: the item's UPDATE is
-    # emitted right here, BEFORE the race-wrapped flush below, so a concurrent
-    # delete would surface its StaleDataError outside the try/except -- an
-    # undeclared 500 instead of the 404 this route promises. session.add of a
-    # standalone entry touches no relationship and loads nothing, keeping every
-    # write inside the wrapped flush.
+    # items.add_progress -- NOT via item.entries.append(...), whose relationship
+    # touch would lazy-load `entries` and could autoflush outside the wrapped
+    # flush. `item` is clean (the conditional UPDATE synced it in place), so this
+    # flush emits only the entry INSERT; a delete landing in the remaining window
+    # trips the FK -> IntegrityError -> 404.
     session.add(ProgressEntry(item_id=item_id, note=note))
-    item.updated = utcnow()
-    session.add(item)
     try:
         session.flush()
     except (StaleDataError, IntegrityError) as exc:
@@ -335,17 +376,19 @@ async def assist_update_item(
     """Assist an update: merge whitelisted section refreshes and append progress.
 
     Same discipline as enrich (404 first, snapshot including `updated`, LLM
-    outside any transaction, 409 on a concurrent mid-await write, supersede-not-
-    delete on history sections, writes only after success, snapshot after flush
-    before commit, race-wrapped flush -> 404), but records a progress note
-    without touching stage or returning gaps.
+    outside any transaction, then a SINGLE conditional UPDATE guarded on the
+    pre-await `updated` that resolves a mid-await writer to 409 or a delete to
+    404, supersede-not-delete on history sections, writes only on a matching
+    UPDATE, a response snapshot built from the written values after a race-wrapped
+    flush before commit), but records a progress note without touching stage or
+    returning gaps.
     """
     item = session.get(MemoryItem, item_id)
     if item is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
     item_fields = {name: getattr(item, name) for name in _AI_ITEM_FIELDS}
     # Snapshot `updated` before the await for the same optimistic-concurrency
-    # check enrich performs (see there).
+    # guard enrich performs (see there).
     original_updated = item.updated
     session.rollback()
 
@@ -356,23 +399,33 @@ async def assist_update_item(
     except LLMUpstreamError as exc:
         raise _bad_gateway(exc) from exc
 
+    # Re-fetch for the merge base + a possible mid-await delete; not mutated, so
+    # `item` stays clean and the conditional UPDATE is the sole write.
     item = session.get(MemoryItem, item_id)
     if item is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
-    if item.updated != original_updated:
-        raise _conflict()
-    for key, value in result.sections.items():
+    values: dict[str, Any] = {}
+    for key, section_value in result.sections.items():
         # Supersede-not-delete for history-bearing sections, exactly as enrich.
         if key in HISTORY_SECTIONS:
-            value = merge_with_supersede(getattr(item, key), value)
-        setattr(item, key, value)
+            section_value = merge_with_supersede(getattr(item, key), section_value)
+        values[key] = section_value
+    values["updated"] = utcnow()
+
+    # Same race-closing guarded UPDATE as enrich (see _conditional_update): a
+    # mid-await PATCH's value survives (rowcount 0 -> 409, or 404 if the row was
+    # deleted) with no check-then-write gap.
+    if _conditional_update(session, item_id, original_updated, values) == 0:
+        session.rollback()
+        if session.get(MemoryItem, item_id) is None:
+            raise HTTPException(status_code=404, detail=_NOT_FOUND)
+        raise _conflict()
+
     note = result.progress_note or _UPDATE_NOTE
-    # Explicit FK-bearing entry, not item.entries.append(...): the relationship
-    # touch would lazy-load + autoflush the dirty item's UPDATE before the
-    # race-wrapped flush below -- see the identical comment in `enrich`.
+    # Explicit FK-bearing entry, not item.entries.append(...); `item` is clean
+    # after the synced UPDATE so this flush emits only the entry INSERT (see the
+    # identical reasoning in `enrich`).
     session.add(ProgressEntry(item_id=item_id, note=note))
-    item.updated = utcnow()
-    session.add(item)
     try:
         session.flush()
     except (StaleDataError, IntegrityError) as exc:
