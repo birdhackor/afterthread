@@ -240,6 +240,16 @@ export function ItemDetailPage() {
 		return data;
 	}, [itemId]);
 
+	// 重試 from the error state: show the loader while refetching, and land
+	// back on the error state with the new error on failure (never a silent
+	// no-op).
+	const retryLoad = () => {
+		setState((prev) => ({ ...prev, phase: "loading", error: null }));
+		refresh().catch((error) => {
+			setState({ phase: "error", item: null, error });
+		});
+	};
+
 	// Initial load / reload when the route param changes.
 	useEffect(() => {
 		const id = ++reqRef.current;
@@ -334,7 +344,7 @@ export function ItemDetailPage() {
 			<Alert color="red" title="載入失敗">
 				<Stack gap="sm" align="flex-start">
 					<Text size="sm">{state.error?.message ?? "無法載入項目"}</Text>
-					<Button size="xs" onClick={() => refresh().catch(() => {})}>
+					<Button size="xs" onClick={retryLoad}>
 						重試
 					</Button>
 				</Stack>

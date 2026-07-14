@@ -13,10 +13,10 @@ import {
 	Title,
 } from "@mantine/core";
 import { Link } from "@tanstack/react-router";
-import { useAtomValue } from "jotai";
+import { useAtomValue, useSetAtom } from "jotai";
 import { useCallback, useEffect, useState } from "react";
 import { apiGet } from "../api/client.js";
-import { llmStatusAtom } from "../atoms/llm.js";
+import { llmStatusAtom, loadLlmStatusAtom } from "../atoms/llm.js";
 import { DateText } from "../components/DateText.jsx";
 import { StaleBadge } from "../components/StaleBadge.jsx";
 import { StatusBadge } from "../components/StatusBadge.jsx";
@@ -102,6 +102,7 @@ function StaleSummary({ staleCount }) {
 // home page always shows whether the backend and AI are reachable.
 function StatusFooter() {
 	const llm = useAtomValue(llmStatusAtom);
+	const loadLlmStatus = useSetAtom(loadLlmStatusAtom);
 	const [connected, setConnected] = useState(null);
 
 	useEffect(() => {
@@ -122,9 +123,15 @@ function StatusFooter() {
 		};
 	}, []);
 
+	// A failed status request must not assert either configured state (both
+	// would be a guess), so it gets its own honest "can't tell" badge with a
+	// way to retry the check.
 	let llmColor = "gray";
 	let llmLabel = "檢查中";
-	if (llm.loaded) {
+	if (llm.error) {
+		llmColor = "gray";
+		llmLabel = "無法確認";
+	} else if (llm.loaded) {
 		llmColor = llm.configured ? "green" : "orange";
 		if (llm.configured) {
 			llmLabel = llm.model ? `已設定（${llm.model}）` : "已設定";
@@ -154,6 +161,16 @@ function StatusFooter() {
 				<Badge size="sm" variant="light" color={llmColor}>
 					{llmLabel}
 				</Badge>
+				{llm.error ? (
+					<Button
+						size="xs"
+						variant="subtle"
+						loading={llm.loading}
+						onClick={() => loadLlmStatus({ force: true })}
+					>
+						重試
+					</Button>
+				) : null}
 			</Group>
 		</Group>
 	);

@@ -148,10 +148,21 @@ export function ItemsListPage() {
 				if (id !== requestId.current) {
 					return;
 				}
+				const items = data?.items ?? [];
+				const total = data?.total ?? 0;
+				// The persisted page can outlive its data (e.g. the last item on
+				// it was deleted elsewhere). Clamp back to the last valid page and
+				// let that refetch supply real state, instead of rendering the
+				// "no data" empty state for this transient, page-that-no-longer-
+				// exists response.
+				if (items.length === 0 && total > 0 && page > 1) {
+					setPage(Math.max(1, Math.ceil(total / DEFAULT_LIMIT)));
+					return;
+				}
 				setState({
 					phase: "success",
-					items: data?.items ?? [],
-					total: data?.total ?? 0,
+					items,
+					total,
 					error: null,
 				});
 			})
@@ -166,7 +177,7 @@ export function ItemsListPage() {
 					message: error?.message ?? "無法載入記憶清單",
 				});
 			});
-	}, [status, stage, debouncedTag, debouncedQ, offset]);
+	}, [status, stage, debouncedTag, debouncedQ, offset, page, setPage]);
 
 	useEffect(() => {
 		load();
@@ -295,7 +306,7 @@ export function ItemsListPage() {
 
 			{body}
 
-			{state.total > DEFAULT_LIMIT ? (
+			{state.total > 0 ? (
 				<Group justify="space-between" align="center">
 					<Text size="sm" c="dimmed">
 						共 {state.total} 筆

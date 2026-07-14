@@ -58,13 +58,9 @@ function AiActionCard({
 			return;
 		}
 		setConflict(false);
+		let result;
 		try {
-			const result = await action(value);
-			reset({ [fieldName]: "" });
-			if (onSuccess) {
-				await onSuccess(result);
-			}
-			notifications.show({ color: "green", message: successMessage });
+			result = await action(value);
 		} catch (error) {
 			if (error?.status === 409) {
 				setConflict(true);
@@ -74,7 +70,22 @@ function AiActionCard({
 				title: "AI 處理失敗",
 				message: error?.message ?? "AI 服務暫時無法使用，請稍後再試",
 			});
+			return;
 		}
+		reset({ [fieldName]: "" });
+		if (onSuccess) {
+			try {
+				await onSuccess(result);
+			} catch (_error) {
+				notifications.show({
+					color: "red",
+					title: "重新載入失敗",
+					message: "AI 已完成，但重新載入失敗，請重新整理頁面",
+				});
+				return;
+			}
+		}
+		notifications.show({ color: "green", message: successMessage });
 	});
 
 	return (
@@ -207,7 +218,7 @@ export function ItemAiActions({ item, onRefresh }) {
 				}
 				onSuccess={async (result) => {
 					setGaps(result?.gaps ?? []);
-					await onRefresh().catch(() => {});
+					await onRefresh();
 				}}
 				onRefresh={onRefresh}
 			>
@@ -227,7 +238,7 @@ export function ItemAiActions({ item, onRefresh }) {
 					apiPost(`/api/items/${item.id}/assist-update`, { note: value })
 				}
 				onSuccess={async () => {
-					await onRefresh().catch(() => {});
+					await onRefresh();
 				}}
 				onRefresh={onRefresh}
 			/>
