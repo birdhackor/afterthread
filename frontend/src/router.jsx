@@ -19,6 +19,8 @@ import { useEffect, useState } from "react";
 import { apiGet } from "./api/client.js";
 import { llmStatusAtom, loadLlmStatusAtom } from "./atoms/llm.js";
 import { ItemDetailPage } from "./pages/ItemDetailPage.jsx";
+import { ItemEditPage } from "./pages/ItemEditPage.jsx";
+import { ItemNewPage } from "./pages/ItemNewPage.jsx";
 import { ItemsListPage } from "./pages/ItemsListPage.jsx";
 
 // Navbar entry rendered as a TanStack Link. Active highlighting is driven by
@@ -163,17 +165,31 @@ const itemsRoute = createRoute({
 	component: ItemsListPage,
 });
 
+const itemNewRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/items/new",
+	component: ItemNewPage,
+});
+
 const itemDetailRoute = createRoute({
 	getParentRoute: () => rootRoute,
 	path: "/items/$itemId",
 	component: ItemDetailPage,
 });
 
+const itemEditRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/items/$itemId/edit",
+	component: ItemEditPage,
+});
+
 const routeTree = rootRoute.addChildren([
 	indexRoute,
 	captureRoute,
 	itemsRoute,
+	itemNewRoute,
 	itemDetailRoute,
+	itemEditRoute,
 ]);
 
 export const router = createRouter({
