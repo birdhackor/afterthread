@@ -11,7 +11,9 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import BaseModel, ValidationError
 
+from app.services.llm import LLMUpstreamError
 from app.services.memory_ai import (
     _HISTORY_STORE_CAP,
     HISTORY_SECTIONS,
@@ -27,11 +29,21 @@ def _create(client: TestClient, **fields: Any) -> dict[str, Any]:
     return response.json()
 
 
-def _patch_generate_json(monkeypatch: pytest.MonkeyPatch, result: dict[str, Any]) -> None:
-    async def _fake(system: str, user: str) -> dict[str, Any]:
-        return result
+def _patch_generate_structured(monkeypatch: pytest.MonkeyPatch, result: dict[str, Any]) -> None:
+    """Stub the structured-output boundary: skip the network/parse and run the
+    workflow's real model validation on ``result``, mirroring generate_structured
+    (a validation failure maps to the same 502 upstream error).
+    """
 
-    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
+        try:
+            return model_cls.model_validate(result)
+        except ValidationError:
+            raise LLMUpstreamError(
+                "InvalidStructuredOutput: the LLM did not return a valid structured result"
+            ) from None
+
+    monkeypatch.setattr("app.services.memory_ai.generate_structured", _fake)
 
 
 # --- pure helper ----------------------------------------------------------
@@ -191,7 +203,7 @@ def test_enrich_supersedes_existing_decision_losslessly(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     item = _create(client, decisions="原決策 採用方案A")
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch, {"sections": {"decisions": "改採方案B"}, "progress_note": "n"}
     )
     updated = client.post(
@@ -209,7 +221,7 @@ def test_enrich_no_supersede_when_model_keeps_old_rationale(
     # The model genuinely keeps the old rationale as a COMPLETE line and adds a
     # new one below it, so line-level containment holds and no marker is added.
     item = _create(client, rationale="因為 X")
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch, {"sections": {"rationale": "因為 X\n也因為 Y"}, "progress_note": "n"}
     )
     updated = client.post(
@@ -224,7 +236,9 @@ def test_enrich_non_history_section_is_replaced_not_merged(
 ) -> None:
     # snapshot is a current-state field, not history-bearing: it is overwritten.
     item = _create(client, snapshot="舊快照")
-    _patch_generate_json(monkeypatch, {"sections": {"snapshot": "新快照"}, "progress_note": "n"})
+    _patch_generate_structured(
+        monkeypatch, {"sections": {"snapshot": "新快照"}, "progress_note": "n"}
+    )
     updated = client.post(
         f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"}
     ).json()["item"]
@@ -242,7 +256,7 @@ def test_enrich_supersedes_all_four_history_sections(
         alternatives="舊備案",
         consequences="舊後果",
     )
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch,
         {
             "sections": {
@@ -274,7 +288,7 @@ def test_assist_update_supersedes_existing_history_section(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     item = _create(client, consequences="原後果")
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch, {"sections": {"consequences": "新後果"}, "progress_note": "n"}
     )
     updated = client.post(f"/api/items/{item['id']}/assist-update", json={"note": "n"}).json()[

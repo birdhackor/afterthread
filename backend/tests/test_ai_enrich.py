@@ -1,7 +1,7 @@
 """Tests for POST /api/items/{item_id}/enrich (AI full enrichment).
 
-LLM interaction is mocked at the service boundary (``generate_json``), so the
-real sanitizer, the whitelist merge, and the router's transaction discipline
+LLM interaction is mocked at the service boundary (``generate_structured``), so
+the real sanitizer, the whitelist merge, and the router's transaction discipline
 run without any network.
 """
 
@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import Engine, event
 from sqlmodel import Session
 
@@ -51,19 +52,29 @@ def _hard_delete_item_via_raw_connection(session: Session, item_id: int) -> None
         raw_connection.close()
 
 
-def _patch_generate_json(
+def _patch_generate_structured(
     monkeypatch: pytest.MonkeyPatch,
     *,
     result: dict[str, Any] | None = None,
     exc: Exception | None = None,
 ) -> None:
-    async def _fake(system: str, user: str) -> dict[str, Any]:
+    """Stub the structured-output boundary: skip the network/parse and run the
+    workflow's real model validation on ``result``, mirroring generate_structured
+    (a validation failure maps to the same 502 upstream error).
+    """
+
+    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
         if exc is not None:
             raise exc
         assert result is not None
-        return result
+        try:
+            return model_cls.model_validate(result)
+        except ValidationError:
+            raise LLMUpstreamError(
+                "InvalidStructuredOutput: the LLM did not return a valid structured result"
+            ) from None
 
-    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+    monkeypatch.setattr("app.services.memory_ai.generate_structured", _fake)
 
 
 def _progress_notes(client: TestClient, item_id: int) -> list[str]:
@@ -86,7 +97,7 @@ def test_enrich_merges_sections_and_appends_progress(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     item = _create(client, snapshot="original snap")
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch,
         result={
             "sections": {"decisions": "採用方案A", "risks": "風險X", "not_a_field": "drop me"},
@@ -117,7 +128,7 @@ def test_enrich_flips_stage_when_checklist_complete(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     item = _create(client)
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch,
         result={
             "sections": {"decisions": "定案"},
@@ -136,7 +147,7 @@ def test_enrich_drops_unknown_and_protected_keys(
     # Only whitelisted section keys are applied; id/status/source and any
     # hallucinated key are dropped, so the model cannot mutate identity/metadata.
     item = _create(client, status="active", source="manual")
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch,
         result={
             "sections": {
@@ -162,7 +173,7 @@ def test_enrich_truncates_oversized_section(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     item = _create(client)
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch,
         result={"sections": {"snapshot": "y" * 25000}, "progress_note": "n"},
     )
@@ -183,7 +194,9 @@ def test_enrich_bumps_updated(
     session.add(stored)
     session.commit()
 
-    _patch_generate_json(monkeypatch, result={"sections": {"decisions": "d"}, "progress_note": "n"})
+    _patch_generate_structured(
+        monkeypatch, result={"sections": {"decisions": "d"}, "progress_note": "n"}
+    )
     body = client.post(f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"}).json()
     assert datetime.fromisoformat(body["item"]["updated"]) > old
 
@@ -194,7 +207,7 @@ def test_enrich_empty_sections_still_records_progress(
     # A result with no section changes still appends a progress entry (using
     # the model note) without erasing anything.
     item = _create(client, snapshot="keep")
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch,
         result={"sections": {}, "remaining_gaps": ["still missing X"], "progress_note": "看過了"},
     )
@@ -218,11 +231,11 @@ def test_enrich_prompt_is_budgeted_for_a_huge_item(
 
     captured: dict[str, str] = {}
 
-    async def _fake(system: str, user: str) -> dict[str, Any]:
+    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
         captured["user"] = user
-        return {"sections": {"snapshot": "s"}, "progress_note": "n"}
+        return model_cls.model_validate({"sections": {"snapshot": "s"}, "progress_note": "n"})
 
-    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+    monkeypatch.setattr("app.services.memory_ai.generate_structured", _fake)
     # Force a small budget so the bound is unmistakable.
     monkeypatch.setattr(
         "app.services.memory_ai.get_settings",
@@ -253,7 +266,7 @@ def test_enrich_runs_end_to_end_through_the_threadpool(
     asks for -- the whole suite staying green is the main evidence.)
     """
     item = _create(client, snapshot="orig snap")
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch,
         result={"sections": {"decisions": "採用方案 A"}, "progress_note": "透過執行緒池補充"},
     )
@@ -289,7 +302,7 @@ def test_enrich_upstream_error_returns_502_and_item_unchanged(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     item = _create(client, snapshot="keep me")
-    _patch_generate_json(monkeypatch, exc=LLMUpstreamError("UnparseableOutput: garbage"))
+    _patch_generate_structured(monkeypatch, exc=LLMUpstreamError("UnparseableOutput: garbage"))
     response = client.post(f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"})
     assert response.status_code == 502
     assert response.json()["detail"]["code"] == "llm_upstream_error"
@@ -307,7 +320,7 @@ def test_enrich_rejects_lone_surrogate_in_gap_returns_502_and_item_unchanged(
     # progress entry, no `updated` bump -- exactly like the existing
     # upstream-error case above, not merely a truncated/garbled gap.
     item = _create(client, snapshot="keep me")
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch,
         result={
             "sections": {"decisions": "d"},
@@ -349,7 +362,9 @@ def test_enrich_races_with_concurrent_delete_after_llm_returns_404(
     """
     item = _create(client, snapshot="keep")
     item_id = item["id"]
-    _patch_generate_json(monkeypatch, result={"sections": {"decisions": "d"}, "progress_note": "n"})
+    _patch_generate_structured(
+        monkeypatch, result={"sections": {"decisions": "d"}, "progress_note": "n"}
+    )
 
     bind = session.get_bind()
     assert isinstance(bind, Engine)

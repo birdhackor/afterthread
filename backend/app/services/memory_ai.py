@@ -1,23 +1,26 @@
-"""AI memory workflows: prompts, untrusted-output sanitizers, and validation.
+"""AI memory workflows: prompts and untrusted-output sanitizers.
 
-Each workflow (``capture_draft``, and in a later commit ``enrich_item`` /
-``assist_update``) builds a system prompt that encodes the context-memory
-methodology, calls ``generate_json``, and validates the result through a
-pydantic model whose *sanitizers treat the LLM output as untrusted input*:
-types are coerced defensively, unknown keys dropped, and every field is capped
-(per-section length, tag/question counts, title length) so nothing oversized
-or unexpected can reach the database. The system prompts are module-level
-constants so their methodology rules can be asserted directly in tests.
+Each workflow (``capture_draft`` / ``enrich_item`` / ``assist_update``) builds a
+system prompt that encodes the context-memory methodology and delegates to
+``generate_structured`` with the workflow's pydantic model. That model both
+guides the LLM (its JSON Schema is injected into the prompt) and validates the
+reply: its *sanitizers treat the LLM output as untrusted input* -- types are
+coerced defensively, unknown keys dropped, and every field capped (per-section
+length, tag/question counts, title length) so nothing oversized or unexpected
+can reach the database. A validation failure is retried once and otherwise
+mapped to a 502 inside ``generate_structured``; the workflows here no longer
+validate separately. The system prompts are module-level constants so their
+methodology rules can be asserted directly in tests.
 """
 
 from collections.abc import Mapping
 from typing import Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.config import get_settings
 from app.models import MemoryStatus, utcnow
-from app.services.llm import LLMUpstreamError, generate_json
+from app.services.llm import generate_structured
 
 # --- caps (constraint: bound everything; LLM output is untrusted) ----------
 
@@ -135,25 +138,6 @@ def _clean_capture_status(value: object) -> MemoryStatus:
     return MemoryStatus.capture_quick
 
 
-def _validate[ModelT: BaseModel](model: type[ModelT], raw: dict[str, Any]) -> ModelT:
-    """Validate raw LLM JSON through ``model``, mapping failure to 502.
-
-    Only the exception *category* is surfaced (never ``str(exc)``, which can
-    echo the offending output) so the message stays safe and config-free.
-    ``from None`` (not ``from exc``) severs the cause chain as well: a pydantic
-    ``ValidationError`` embeds the offending input -- raw LLM output / memory
-    content -- in its ``str`` and ``.errors()``, which would otherwise ride
-    along in ``__cause__`` into any traceback-logging sink. The safe category
-    prefix keeps diagnosis possible without that leak.
-    """
-    try:
-        return model.model_validate(raw)
-    except ValidationError as exc:
-        raise LLMUpstreamError(
-            f"{type(exc).__name__}: the LLM output failed schema validation"
-        ) from None
-
-
 # --- methodology rule fragments (asserted verbatim in prompt tests) --------
 
 _RULE_HONESTY = (
@@ -186,7 +170,7 @@ CAPTURE_SYSTEM_PROMPT = "\n".join(
         _RULE_MAX_QUESTIONS,
         _RULE_BULLETS,
         _RULE_LANGUAGE,
-        "Respond with a single JSON object and nothing else. Use exactly these keys:",
+        "Use exactly these keys (the injected JSON Schema is the binding contract):",
         '- "title": a concise title (string).',
         '- "snapshot": a one-paragraph snapshot of the topic (string).',
         '- "why_matters": why this matters (string).',
@@ -271,9 +255,10 @@ def _capture_user_prompt(raw_text: str) -> str:
 
 
 async def capture_draft(raw_text: str) -> CaptureDraft:
-    """Run quick capture: prompt the LLM and validate the sanitized draft."""
-    raw = await generate_json(CAPTURE_SYSTEM_PROMPT, _capture_user_prompt(raw_text))
-    return _validate(CaptureDraft, raw)
+    """Run quick capture: prompt the LLM for a schema-guided, sanitized draft."""
+    return await generate_structured(
+        CAPTURE_SYSTEM_PROMPT, _capture_user_prompt(raw_text), CaptureDraft
+    )
 
 
 # --- section whitelist (untrusted enrich/update output) --------------------
@@ -641,7 +626,7 @@ ENRICH_SYSTEM_PROMPT = "\n".join(
         _RULE_LANGUAGE,
         "Only include a section when you are adding to or improving it. Omit "
         "sections you would leave unchanged, and never blank an existing section.",
-        "Respond with a single JSON object and nothing else. Use exactly these keys:",
+        "Use exactly these keys (the injected JSON Schema is the binding contract):",
         '- "sections": an object whose keys are any of ['
         + ", ".join(SECTION_FIELD_ORDER)
         + "], each value a string.",
@@ -707,8 +692,9 @@ class EnrichResult(BaseModel):
         After sanitization an enrichment must carry at least one meaningful
         signal -- a section, a gap, a completion flag, or a progress note --
         otherwise the model returned nothing usable. Raising here yields a
-        ValidationError, which ``_validate`` maps to the 502 upstream-error path
-        so the router writes nothing (no progress entry, no bumped `updated`).
+        ValidationError, which ``generate_structured`` retries once and otherwise
+        maps to the 502 upstream-error path so the router writes nothing (no
+        progress entry, no bumped `updated`).
         """
         if not (
             self.sections or self.remaining_gaps or self.checklist_complete or self.progress_note
@@ -730,11 +716,10 @@ def _enrich_user_prompt(item_fields: Mapping[str, Any], additional_context: str)
 
 
 async def enrich_item(item_fields: Mapping[str, Any], additional_context: str) -> EnrichResult:
-    """Run full enrichment: prompt the LLM and validate the sanitized result."""
-    raw = await generate_json(
-        ENRICH_SYSTEM_PROMPT, _enrich_user_prompt(item_fields, additional_context)
+    """Run full enrichment: prompt the LLM for a schema-guided, sanitized result."""
+    return await generate_structured(
+        ENRICH_SYSTEM_PROMPT, _enrich_user_prompt(item_fields, additional_context), EnrichResult
     )
-    return _validate(EnrichResult, raw)
 
 
 # --- assisted update -------------------------------------------------------
@@ -751,7 +736,7 @@ UPDATE_SYSTEM_PROMPT = "\n".join(
         _RULE_LANGUAGE,
         "Only include a section when you are changing it. Omit unchanged "
         "sections, and never blank an existing section.",
-        "Respond with a single JSON object and nothing else. Use exactly these keys:",
+        "Use exactly these keys (the injected JSON Schema is the binding contract):",
         '- "sections": an object whose keys are any of ['
         + ", ".join(SECTION_FIELD_ORDER)
         + "], each value a string.",
@@ -805,6 +790,7 @@ def _update_user_prompt(item_fields: Mapping[str, Any], note: str) -> str:
 
 
 async def assist_update(item_fields: Mapping[str, Any], note: str) -> UpdateResult:
-    """Run assisted update: prompt the LLM and validate the sanitized result."""
-    raw = await generate_json(UPDATE_SYSTEM_PROMPT, _update_user_prompt(item_fields, note))
-    return _validate(UpdateResult, raw)
+    """Run assisted update: prompt the LLM for a schema-guided, sanitized result."""
+    return await generate_structured(
+        UPDATE_SYSTEM_PROMPT, _update_user_prompt(item_fields, note), UpdateResult
+    )

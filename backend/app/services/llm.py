@@ -1,9 +1,19 @@
-"""LLM client service: lazy client factory, JSON extraction, and error taxonomy.
+"""LLM client service: lazy client factory, a schema-guided structured-output
+contract, and the error taxonomy.
 
 This module is the single boundary between the app and the configured
 OpenAI-compatible endpoint. Everything above it (routers, workflows) speaks in
-terms of ``generate_json`` and the two exceptions defined here, never in terms
-of the OpenAI SDK or the endpoint's URL/key.
+terms of ``generate_structured`` and the two exceptions defined here, never in
+terms of the OpenAI SDK or the endpoint's URL/key.
+
+``generate_structured`` replaces the old ``generate_json`` + external-validate
+split with ONE strict contract: the caller's pydantic model is turned into a
+JSON Schema, injected into the system prompt, and the model is told to emit
+EXACTLY one conforming JSON object. Output that fails to parse as an object, or
+fails the model's own validation, earns ONE corrective retry (the model is
+shown its own bad reply and asked again); a second failure is a 502. There is
+no forgiving prose/array scavenger any more -- the contract is stated up front
+and re-stated on deviation.
 
 Two hard rules shape this file:
 
@@ -14,7 +24,10 @@ Two hard rules shape this file:
   appear in an exception message or a log line. ``LLMUpstreamError`` messages
   are built from the exception's *category* (its class name) plus a fixed
   short reason -- never ``str(exc)`` of an SDK error (which can carry the URL
-  or a full response body) and never a config value.
+  or a full response body) and never a config value. The final
+  ``InvalidStructuredOutput`` message is likewise a fixed literal: the
+  json/pydantic details that drove the rejection are fed back to the LLM in the
+  retry request, never into our API error.
 """
 
 import asyncio
@@ -24,6 +37,8 @@ from typing import Any
 
 import httpx
 from openai import AsyncOpenAI, OpenAIError
+from openai.types.chat import ChatCompletionMessageParam
+from pydantic import BaseModel, ValidationError
 
 from app.config import Settings, get_settings
 
@@ -33,6 +48,12 @@ from app.config import Settings, get_settings
 # and raising OpenAIError if it finds nothing. A fixed non-secret placeholder
 # lets the client build; it is never a real credential and never logged.
 _UNSET_API_KEY_PLACEHOLDER = "not-required"
+
+# At most this many attempts per structured call: the first try plus ONE
+# corrective retry. Deliberately small -- an interactive tool would rather
+# surface a 502 the user can retry from the UI than silently burn several
+# upstream round-trips (and their latency) behind a single request.
+_MAX_ATTEMPTS = 2
 
 
 class LLMNotConfiguredError(RuntimeError):
@@ -46,10 +67,12 @@ class LLMUpstreamError(RuntimeError):
     """Raised when the upstream LLM call fails or returns unusable output.
 
     Maps to HTTP 502 at the router. Covers every failure past a valid config:
-    an SDK/API error, a timeout, an empty completion, or output that cannot be
-    parsed into a JSON object. Messages are deliberately safe -- an exception
-    *category* plus a short reason -- and never contain the configured base
-    URL / API key or a full upstream response body.
+    an SDK/API error, a timeout, an empty completion, or output that -- even
+    after one corrective retry -- cannot be parsed and validated into the
+    requested model. Messages are deliberately safe -- an exception *category*
+    plus a short reason, or a fixed literal -- and never contain the configured
+    base URL / API key, a full upstream response body, or the json/pydantic
+    details of a rejected structured output.
     """
 
 
@@ -61,13 +84,32 @@ class LLMUpstreamError(RuntimeError):
 # illustrative in the example).
 _UPSTREAM_REASON = "the upstream LLM request failed"
 
+# The safe, config-free message for the terminal structured-output failure:
+# the LLM's reply could not be parsed and validated into the requested model,
+# even after one corrective retry. Deliberately carries NO json/pydantic detail
+# (those were fed back to the LLM in the retry request, not leaked here) so a
+# rejected output body can never ride along into our API error.
+_INVALID_STRUCTURED_OUTPUT = (
+    "InvalidStructuredOutput: the LLM did not return a valid structured result"
+)
+
+# Appended (after the shared strict-output rule) to every workflow's system
+# prompt, followed by the model's own JSON Schema. Naming the exact schema and
+# demanding a single bare object is what replaces the old forgiving scavenger:
+# the contract is stated, and any deviation is corrected via retry rather than
+# scraped out of prose.
+_STRICT_OUTPUT_RULE = (
+    "Respond with EXACTLY one JSON object and nothing else -- no prose, no code "
+    "fences. It must conform to this JSON Schema:"
+)
+
 
 def normalized_model(settings: Settings) -> str:
     """Return the configured model name with surrounding whitespace stripped.
 
     The one normalization every caller must share, so none of them can ever
     disagree over a whitespace-padded override: ``llm_configured``'s gate, the
-    actual request ``generate_json`` sends, and (via
+    actual request ``generate_structured`` sends, and (via
     ``app.routers.ai.llm_status``) what ``/llm/status`` reports back to a
     client all read the model through this single helper.
     """
@@ -138,12 +180,14 @@ def _build_client(base_url: str, api_key: str, timeout: float) -> AsyncOpenAI:
     (in production via a restart, in tests via a settings override) yields a
     fresh client instead of a stale one bound to the old endpoint.
 
-    ``max_retries=0`` disables the SDK's automatic retries: a retry would
-    silently wait out the whole per-attempt timeout again (plus exponential
-    backoff between attempts), so a "1s timeout" quietly becomes several
-    seconds before the caller sees a 502 -- unacceptable for an interactive
-    tool where the user would rather retry from the UI. One request, one
-    timeout, no hidden multiplier.
+    ``max_retries=0`` disables the SDK's automatic transport retries: a retry
+    would silently wait out the whole per-attempt timeout again (plus
+    exponential backoff between attempts), so a "1s timeout" quietly becomes
+    several seconds before the caller sees a 502 -- unacceptable for an
+    interactive tool where the user would rather retry from the UI. One request,
+    one timeout, no hidden multiplier. This is deliberately distinct from
+    ``generate_structured``'s ONE corrective retry, which re-prompts only on a
+    bad-SHAPE output, never on a transport error.
 
     That alone does NOT make ``openai_timeout_seconds`` an end-to-end
     wall-clock bound, though: the ``timeout`` passed here only configures the
@@ -151,10 +195,10 @@ def _build_client(base_url: str, api_key: str, timeout: float) -> AsyncOpenAI:
     cap on the total request duration. A slow-drip endpoint that sends a byte
     just before every read timeout could otherwise hold the request -- and its
     connection -- open indefinitely, even with retries disabled. The genuine
-    end-to-end deadline is the ``asyncio.timeout`` wrapped around the call in
-    ``generate_json``; this client-level timeout stays in place alongside it as
-    an inner belt that still fast-fails a dead connect/read leg without waiting
-    for the outer deadline.
+    end-to-end deadline is the ``asyncio.timeout`` wrapped around the whole
+    attempt loop in ``generate_structured``; this client-level timeout stays in
+    place alongside it as an inner belt that still fast-fails a dead
+    connect/read leg without waiting for the outer deadline.
     """
     return AsyncOpenAI(
         base_url=base_url,
@@ -170,7 +214,7 @@ def _get_client() -> AsyncOpenAI:
     Construction is wrapped because a syntactically malformed endpoint -- an
     invalid port in ``openai_base_url`` such as ``http://host:8o80/v1`` -- makes
     ``AsyncOpenAI`` raise at CONSTRUCTION time (an ``httpx.InvalidURL``, which is
-    NOT an ``OpenAIError`` and so slips past ``generate_json``'s upstream
+    NOT an ``OpenAIError`` and so slips past ``generate_structured``'s upstream
     handler), which would otherwise surface as an unhandled 500 whose traceback
     echoes the offending URL fragment (``Invalid port: '8o80'``). That is
     operator misconfiguration, not an upstream failure, so it is mapped to
@@ -202,8 +246,10 @@ def _strip_code_fences(text: str) -> str:
     """Remove a leading/trailing Markdown code fence, if present.
 
     Models frequently wrap JSON in a ```json ... ``` block. Strip only the
-    outer fence lines; the JSON-decoder fallback below handles anything else
-    (prose around the object, trailing commentary).
+    outer fence lines; the strict parser below then json.loads the remainder.
+    This is the ONLY forgiveness left in the parse path -- a fenced bare object
+    is a common, unambiguous shape, so it is accepted rather than burning a
+    corrective retry on it.
     """
     stripped = text.strip()
     if not stripped.startswith("```"):
@@ -217,263 +263,57 @@ def _strip_code_fences(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-def _extract_json_object(text: str) -> dict[str, Any]:
-    """Parse a JSON object out of raw completion text, robustly.
+def _parse_json_object(text: str) -> dict[str, Any]:
+    """Parse ``text`` as EXACTLY one JSON object (a dict), strictly.
 
-    Tries the fence-stripped text directly first (the common case). If that
-    full text parses as JSON at all, its shape is FINAL and no fallback is
-    attempted: a dict is returned as-is, while anything else -- a top-level
-    array, string, number, bool, or null -- raises LLMUpstreamError
-    immediately. That fallthrough is deliberately not taken: a top-level array
-    such as ``[{"title": "A"}, {"title": "B"}]`` parses cleanly, and a naive
-    fallback would happily find and return its first embedded object --
-    silently persisting one arbitrary element of a shape the caller never
-    asked for, instead of surfacing the true "wrong shape" failure as a 502.
-
-    The fallback below (recovering an object embedded in surrounding prose,
-    e.g. "Here is the draft: {..}. Hope this helps!") is only ever attempted
-    when the full text FAILS to parse as JSON at all. It does NOT hand-roll a
-    bracket scanner -- a depth counter that tracks ``{``/``[`` cannot tell a
-    real bracket from one sitting inside a JSON string literal, so a legitimate
-    object whose value contains ``"[{}]"`` once grew a phantom array candidate
-    and produced a false 502. Instead the walk asks the REAL parser: starting
-    at each ``{``/``[``, one reused ``json.JSONDecoder`` tries to ``raw_decode``
-    a value there; a ``JSONDecodeError`` means "no JSON begins here" (advance one
-    character), while success yields the value and the index just past it (jump
-    to ``end``, so nested brackets inside a decoded value are never rescanned).
-    Being string/escape-aware by construction, the decoder consumes a bracket
-    inside a string as part of that string -- the phantom-candidate bug cannot
-    recur.
-
-    Each decoded value is classified in order of appearance:
-
-    * a dict-bearing list -- a list containing at least one dict -- is the same
-      "ambiguous multi-draft output" the top-level-array check above guards
-      against, just wrapped in prose (e.g. ``Here are two drafts: [{"title":
-      "A"}, {"title": "B"}]``). It raises LLMUpstreamError THE INSTANT it is
-      found, rather than let one of the array's own elements be mistaken for the
-      answer;
-    * a dict is USABLE, but its immediate left context is inspected first: if
-      the last non-whitespace character before it is ``[`` or ``,`` the object
-      is syntactically an ELEMENT of an array that -- since the full-text parse
-      failed -- did not parse as a whole (a garbled multi-draft array like
-      ``[{"title": "A"}, {bad}]``, or one with a trailing comma). Promoting the
-      single element that happens to parse would silently persist an arbitrary
-      draft, so this raises WrongShape too. DELIBERATE TRADEOFF: innocent prose
-      ending in ``,`` or ``[`` right before a lone object ("as shown, {json}")
-      also trips this and 502s -- accepted, because a 502 merely triggers a
-      retry while a silent element-pick misleads, and a conforming model emits a
-      bare single object anyway;
-    * any other dict is collected (not returned on sight) so a second or third
-      top-level object juxtaposed with it (``{"title": "A"} {"title": "B"}``,
-      which fails the full-text parse as "extra data") is noticed rather than
-      silently dropped;
-    * anything else -- a scalar, a scalar list such as ``[1]``, or a bracket
-      that begins no valid JSON at all -- is skippable junk, letting an innocent
-      scalar bracket before OR after the real object ("Answer[1]: {...}") fall
-      through to it.
-
-    Once the walk finishes without an earlier raise, the usable-dict count is
-    the whole decision: zero raises UnparseableOutput (the workflows require an
-    object to map onto their pydantic models), exactly one returns it, and more
-    than one raises WrongShape ("multiple JSON objects") -- the juxtaposition
-    case this rule closes.
-
-    Pathologically nested input (tens of thousands of ``[``) makes the decoder
-    exhaust the interpreter's recursion limit and raise ``RecursionError``
-    rather than ``JSONDecodeError``; such nesting is never legitimate, so the
-    first time it happens -- on the full-text attempt (caught alongside the
-    ordinary parse errors) or on any ``raw_decode`` in the walk -- the whole
-    text is rejected as unparseable (502), never left to escape as an unhandled
-    500 and never allowed to drive an O(n*depth) re-descent. The walk is
-    otherwise linear: ``raw_decode`` fails at the first character of an unmatched
-    ``{`` (so a run of them is O(1) per position), jumps past every value it does
-    parse (so the parsed spans are mutually disjoint), and the left-context
-    lookback only scans the whitespace immediately before each object, itself
-    disjoint across objects.
-    """
-    cleaned = _strip_code_fences(text)
-    try:
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError, ValueError, RecursionError:
-        pass
-    else:
-        if isinstance(parsed, dict):
-            return parsed
-        # Well-formed JSON, but not an object: this is the LLM's whole answer,
-        # not prose wrapping an object, so it fails here and now rather than
-        # falling through to the candidate walk below (which could otherwise
-        # extract and silently persist one embedded object out of a top-level
-        # array).
-        raise LLMUpstreamError("WrongShape: the LLM returned a non-object JSON value")
-
-    # Fallback: the full text is not valid JSON on its own, so an object may be
-    # embedded in surrounding prose. One decoder instance is reused across every
-    # attempt below (it holds no per-call state).
-    decoder = json.JSONDecoder()
-    # Every usable dict the walk finds, in order of appearance. Collected rather
-    # than returned on first sight so a second (or third) top-level object
-    # juxtaposed with the first is noticed instead of silently dropped; see the
-    # "exactly one" rule in the docstring above.
-    usable_dicts: list[dict[str, Any]] = []
-    index = 0
-    length = len(cleaned)
-    while index < length:
-        if cleaned[index] not in "{[":
-            index += 1
-            continue
-        try:
-            value, end = decoder.raw_decode(cleaned, index)
-        except json.JSONDecodeError:
-            # No JSON value begins here (a bare "{" with no valid object after
-            # it, a bracket sitting in prose). Advance one character and keep
-            # scanning; because the decoder is string-aware, a bracket inside a
-            # string literal is never mistaken for a candidate of its own.
-            index += 1
-            continue
-        except RecursionError:
-            # Pathologically nested input exhausted the recursion limit. Such
-            # nesting is never a legitimate answer, so reject the whole text at
-            # once rather than let a RecursionError escape as an unhandled 500
-            # or drive an O(n*depth) walk.
-            raise LLMUpstreamError(
-                "UnparseableOutput: could not parse a JSON object from the LLM output"
-            ) from None
-        if isinstance(value, dict):
-            # Array-element-context rule: an object whose last non-whitespace
-            # neighbour on the left is "[" or "," is syntactically an element of
-            # an array that -- since the full-text parse failed -- did not parse
-            # as a whole. Promoting the one element that happens to parse would
-            # silently persist an arbitrary draft, so reject the ambiguity.
-            # DELIBERATE TRADEOFF: innocent prose ending in "," or "[" right
-            # before a lone object ("as shown, {json}") also trips this and 502s
-            # -- accepted, because a 502 merely triggers a retry while a silent
-            # element-pick misleads, and a conforming model emits a bare single
-            # object anyway.
-            before = index - 1
-            while before >= 0 and cleaned[before].isspace():
-                before -= 1
-            if before >= 0 and cleaned[before] in "[,":
-                raise LLMUpstreamError(
-                    "WrongShape: the LLM returned an ambiguous array of draft objects"
-                )
-            usable_dicts.append(value)
-        elif isinstance(value, list) and any(isinstance(item, dict) for item in value):
-            # Same "ambiguous multi-draft output" as the top-level-array check
-            # above, just embedded in prose. Raise immediately rather than let
-            # one of the array's own elements be mistaken for the answer.
-            raise LLMUpstreamError(
-                "WrongShape: the LLM returned an ambiguous array of draft objects"
-            )
-        # Anything else -- a scalar, or a list with no dict in it (e.g. [1]) --
-        # is not usable. Jump past whatever was decoded and keep scanning; this
-        # is what lets an innocent scalar bracket before or after the real
-        # object (e.g. "Answer[1]: {...}") fall through instead of being
-        # mistaken for the answer.
-        index = end
-
-    if len(usable_dicts) > 1:
-        # The juxtaposition case this rule closes: more than one top-level
-        # object was found and none of them is privileged over another, so
-        # silently picking the first would drop the rest exactly like the bug
-        # this replaces. Same safe WrongShape message family as the
-        # dict-bearing-list case above.
-        raise LLMUpstreamError("WrongShape: the LLM returned multiple JSON objects")
-    if usable_dicts:
-        return usable_dicts[0]
-    raise LLMUpstreamError("UnparseableOutput: could not parse a JSON object from the LLM output")
-
-
-async def generate_json(system: str, user: str) -> dict[str, Any]:
-    """Call the configured LLM with a system+user prompt and return parsed JSON.
+    Strips an optional code fence (see ``_strip_code_fences``), strips
+    surrounding whitespace, then ``json.loads``. Anything that is not a single
+    top-level JSON object -- a bare array, a scalar, prose wrapping an object,
+    two juxtaposed objects (``json.loads`` rejects the trailing data) -- fails
+    here and is treated by ``generate_structured`` as an output-shape failure
+    eligible for one corrective retry.
 
     Raises:
-        LLMNotConfiguredError: if no endpoint/model is configured (checked
-            first, before any client construction or network call).
-        LLMUpstreamError: on any SDK/API error, empty completion, output that
-            does not parse to a JSON object, or a timeout -- either the SDK's
-            own (a per-phase inactivity timeout expiring) or the call
-            exceeding ``openai_timeout_seconds`` as a genuine wall-clock
-            deadline (see the ``asyncio.timeout`` below). The message is a
-            safe category + short reason; it never contains the base URL, API
-            key, or a full response body.
+        json.JSONDecodeError: the text is not well-formed JSON.
+        ValueError: well-formed JSON that is not an object, OR a value
+            ``json.loads`` itself rejects without being a decode error -- most
+            notably a numeric literal with more digits than
+            ``sys.int_max_str_digits`` (a 5000-digit integer raises a bare
+            ``ValueError``, not a ``JSONDecodeError``). Both must be caught.
+        RecursionError: pathologically nested brackets exhaust the interpreter's
+            recursion limit inside ``json.loads`` -- never a legitimate answer,
+            so it is caught alongside the parse errors rather than escaping as an
+            unhandled 500.
+
+    The forgiving prose/array scavenger this replaces (a real-decoder walk with
+    exactly-one and array-element-context rules) is deliberately gone: rather
+    than guess which embedded object the caller "meant", the model is told the
+    exact schema up front and asked again on any deviation.
     """
-    if not llm_configured():
-        # `from None` severs any context: this gate now also fields a
-        # syntactically invalid base_url (llm_configured reparses it and reports
-        # unconfigured), and suppressing context keeps that path's traceback as
-        # free of a URL fragment as the _get_client construction path already is.
-        raise LLMNotConfiguredError("The LLM endpoint is not configured.") from None
+    cleaned = _strip_code_fences(text).strip()
+    parsed = json.loads(cleaned)
+    if not isinstance(parsed, dict):
+        raise ValueError("the LLM output was not a single JSON object")
+    return parsed
 
-    settings = get_settings()
-    client = _get_client()
-    try:
-        # asyncio.timeout enforces a genuine WALL-CLOCK deadline around the
-        # entire call -- unlike the client-level timeout (see _build_client),
-        # which only bounds per-phase inactivity and would otherwise let a
-        # slow-drip endpoint hold the request open past openai_timeout_seconds
-        # by sending a byte just before each read timeout.
-        async with asyncio.timeout(settings.openai_timeout_seconds):
-            completion = await client.chat.completions.create(
-                # Same normalized_model helper llm_configured and /llm/status use,
-                # so the model sent at runtime is exactly the one status validated
-                # and reported back to the client.
-                model=normalized_model(settings),
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                # No fixed temperature: some OpenAI-compatible endpoints --
-                # reasoning-style models in particular -- reject the parameter
-                # outright, which would otherwise turn every call against them
-                # into a 400 -> 502. Omit it and let the model/endpoint apply
-                # its own default.
-            )
-    except LLMNotConfiguredError, LLMUpstreamError:
-        # Our own taxonomy carries its own HTTP mapping (503 stays 503, an
-        # already-shaped 502 stays 502). Re-raise it UNCHANGED so the total
-        # catch-all below can never rewrap one of these into a generic upstream
-        # 502 and destroy its real status. Listed first so it wins over the
-        # broad `except Exception` (both are Exception subclasses).
-        raise
-    except TimeoutError:
-        # asyncio.timeout's own deadline expiry (see the comment above) --
-        # distinguished from the total boundary below with its own "Timeout"
-        # category. An SDK-raised openai.APITimeoutError is an unrelated class
-        # (an OpenAIError, not a builtin TimeoutError) and still falls through
-        # to the OpenAIError arm, independent of this clause's position.
-        raise LLMUpstreamError(f"Timeout: {_UPSTREAM_REASON}") from None
-    except OpenAIError as exc:
-        # Category only (the SDK error's class name) plus the fixed shared
-        # reason. Never str(exc): APIConnectionError chains the target URL,
-        # APIStatusError carries the response body -- either would leak past
-        # this boundary. `from None` (not `from exc`) severs the cause chain so
-        # the original SDK error -- whose str/args can embed base_url, api_key,
-        # or a raw response body -- cannot ride along in __cause__ into a
-        # traceback-logging sink; the safe category prefix keeps diagnosis
-        # possible.
-        raise LLMUpstreamError(f"{type(exc).__name__}: {_UPSTREAM_REASON}") from None
-    except Exception as exc:
-        # Total boundary. A merely OpenAI-*compatible* endpoint can return a 2xx
-        # whose body is broken or empty JSON; the SDK parses that body INTERNALLY
-        # and raises json.JSONDecodeError / ValueError (a ValueError subclass) --
-        # NEITHER an OpenAIError -- so without this arm such output escapes as an
-        # unhandled 500 instead of the intended 502. Map every remaining
-        # non-taxonomy failure at this call onto the same upstream taxonomy,
-        # carrying only the exception category (never str(exc), which could embed
-        # a response body) and severing the chain with `from None`.
-        raise LLMUpstreamError(f"{type(exc).__name__}: {_UPSTREAM_REASON}") from None
 
-    # A conformant response is choices=[choice, ...] with choice.message.content
-    # a string. A merely OpenAI-*compatible* gateway can return a 200 whose body
-    # violates that shape without the SDK rejecting it: choices missing / None /
-    # empty / not a list, a choice with no message, or a null message/content.
-    # The SDK models these leniently, so a naive choices[0].message.content would
-    # raise AttributeError/TypeError here -- an unhandled 500 -- on such
-    # nonconforming-but-200 output. Validate each hop defensively instead and map
-    # every unusable shape onto the same 502 taxonomy as any other bad output;
-    # the messages carry only a category, never the (attacker/gateway-controlled)
-    # body.
+def _extract_content(completion: Any) -> str:
+    """Defensively pull ``choices[0].message.content`` (a non-empty str) from a
+    completion, mapping every nonconforming-but-200 shape to a 502.
+
+    A conformant response is choices=[choice, ...] with choice.message.content a
+    string. A merely OpenAI-*compatible* gateway can return a 200 whose body
+    violates that shape (choices missing / None / empty / not a list, a choice
+    with no message, a null message/content) without the SDK rejecting it. A
+    naive ``choices[0].message.content`` would then raise AttributeError/
+    TypeError -- an unhandled 500. Validate each hop instead and map every
+    unusable shape onto the 502 taxonomy; the messages carry only a category,
+    never the (attacker/gateway-controlled) body.
+
+    An empty/malformed completion is NOT retried -- that is a transport-shaped
+    failure, and ``generate_structured`` retries only output-SHAPE failures --
+    so raising ``LLMUpstreamError`` here surfaces straight through the loop.
+    """
     choices = getattr(completion, "choices", None)
     if not isinstance(choices, list) or not choices:
         raise LLMUpstreamError("EmptyResponse: the LLM returned no choices")
@@ -483,4 +323,178 @@ async def generate_json(system: str, user: str) -> dict[str, Any]:
     content = getattr(message, "content", None)
     if content is None or not isinstance(content, str) or not content.strip():
         raise LLMUpstreamError("EmptyResponse: the LLM returned empty content")
-    return _extract_json_object(content)
+    return content
+
+
+def _schema_guided_system_prompt(system_prompt: str, model_cls: type[BaseModel]) -> str:
+    """Append the shared strict-output rule and ``model_cls``'s JSON Schema.
+
+    The schema is DERIVED from the model (``model_json_schema``), so the contract
+    the LLM is shown can never drift from the model the output is validated
+    against -- there is no second, hand-maintained copy of the field list to keep
+    in sync. ``ensure_ascii=False`` keeps any non-ASCII field metadata readable
+    rather than escaped.
+    """
+    schema = json.dumps(model_cls.model_json_schema(), ensure_ascii=False)
+    return f"{system_prompt}\n\n{_STRICT_OUTPUT_RULE}\n{schema}"
+
+
+def _corrective_user_message(exc: Exception) -> str:
+    """Build the attempt-2 corrective user turn from the attempt-1 failure.
+
+    Carries a COMPACT summary of WHY the previous reply was rejected -- the json
+    error string, or the first few pydantic errors -- so the model can fix the
+    specific defect. Echoing the model's own error back to it is fine. This text
+    only ever rides in the RETRY REQUEST sent to the LLM; it is never folded into
+    an ``LLMUpstreamError``, so no json/pydantic fragment leaks into our API
+    error (the terminal 502 is the fixed ``_INVALID_STRUCTURED_OUTPUT`` literal).
+    """
+    if isinstance(exc, ValidationError):
+        problems = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc']) or '<root>'}: {error['msg']}"
+            for error in exc.errors()[:3]
+        )
+        summary = (
+            f"it failed schema validation ({problems})"
+            if problems
+            else "it failed schema validation"
+        )
+    else:
+        summary = f"it was not a single valid JSON object ({exc})"
+    return (
+        "Your previous reply was rejected: "
+        f"{summary}. "
+        "Reply with ONLY the corrected JSON object -- no prose, no code fences -- "
+        "conforming exactly to the JSON Schema in the system instructions."
+    )
+
+
+async def generate_structured[ModelT: BaseModel](
+    system_prompt: str, user_prompt: str, model_cls: type[ModelT]
+) -> ModelT:
+    """Call the configured LLM under a strict, schema-guided contract and return
+    a validated ``model_cls`` instance, with ONE corrective retry on bad output.
+
+    The system prompt is augmented with a fixed single-object rule and
+    ``model_cls``'s own JSON Schema (see ``_schema_guided_system_prompt``), so
+    the model is told the exact shape to emit. The completion is parsed as
+    EXACTLY one JSON object (``_parse_json_object``) and validated through
+    ``model_cls`` (whose before-validators sanitize the untrusted output). On an
+    output-shape failure -- a parse error or a ``ValidationError`` -- the model
+    is shown its own reply plus a corrective note and asked once more; a second
+    failure raises the fixed ``InvalidStructuredOutput`` 502.
+
+    Raises:
+        LLMNotConfiguredError: if no endpoint/model is configured (checked
+            first, before any client construction or network call). Maps to 503.
+        LLMUpstreamError: on any SDK/API error, empty completion, a timeout, or
+            output that fails parse+validation even after the corrective retry.
+            Maps to 502. The message is a safe category + short reason, or the
+            fixed InvalidStructuredOutput literal; it never contains the base
+            URL, API key, a full response body, or json/pydantic detail.
+    """
+    if not llm_configured():
+        # `from None` severs any context: this gate also fields a syntactically
+        # invalid base_url (llm_configured reparses it and reports unconfigured),
+        # and suppressing context keeps that path's traceback as free of a URL
+        # fragment as the _get_client construction path already is.
+        raise LLMNotConfiguredError("The LLM endpoint is not configured.") from None
+
+    settings = get_settings()
+    client = _get_client()
+
+    # The conversation accumulates across attempts: attempt 2 appends the
+    # assistant's rejected reply plus a corrective user turn (built below).
+    messages: list[ChatCompletionMessageParam] = [
+        {"role": "system", "content": _schema_guided_system_prompt(system_prompt, model_cls)},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    try:
+        # ONE asyncio.timeout spans the WHOLE attempt loop, so the R7 wall-clock
+        # contract now bounds first-try-plus-retry end to end, not each attempt
+        # separately -- a slow retry cannot quietly double the budget. Unlike the
+        # client-level timeout (see _build_client), which only bounds per-phase
+        # inactivity, this is a genuine deadline on total duration.
+        async with asyncio.timeout(settings.openai_timeout_seconds):
+            for attempt in range(_MAX_ATTEMPTS):
+                try:
+                    completion = await client.chat.completions.create(
+                        # Same normalized_model helper llm_configured and
+                        # /llm/status use, so the model sent at runtime is exactly
+                        # the one status validated and reported back to the client.
+                        model=normalized_model(settings),
+                        messages=messages,
+                        # No fixed temperature: some OpenAI-compatible endpoints --
+                        # reasoning-style models in particular -- reject the
+                        # parameter outright, turning every call into a 400 -> 502.
+                        # Omit it and let the model/endpoint apply its own default.
+                    )
+                except LLMNotConfiguredError, LLMUpstreamError:
+                    # Our own taxonomy carries its own HTTP mapping (503 stays
+                    # 503, an already-shaped 502 stays 502). Re-raise UNCHANGED so
+                    # the broad handlers below can never rewrap one into a generic
+                    # upstream 502. This is a TRANSPORT-boundary failure, not an
+                    # output-shape one, so it is never retried.
+                    raise
+                except TimeoutError:
+                    # A genuine builtin TimeoutError raised at the SDK boundary
+                    # (not asyncio.timeout's own expiry, which arrives as a
+                    # CancelledError -- a BaseException the clauses here do not
+                    # catch -- and is converted to TimeoutError by the async-with
+                    # exit). Re-raise so the outer handler maps it to the "Timeout"
+                    # category rather than letting `except Exception` mislabel it.
+                    raise
+                except OpenAIError as exc:
+                    # Category only (the SDK error's class name) plus the fixed
+                    # shared reason. Never str(exc): APIConnectionError chains the
+                    # target URL, APIStatusError carries the response body. `from
+                    # None` severs the cause chain so neither can ride along in
+                    # __cause__ into a traceback-logging sink. Transport failure ->
+                    # no retry.
+                    raise LLMUpstreamError(f"{type(exc).__name__}: {_UPSTREAM_REASON}") from None
+                except Exception as exc:
+                    # Total boundary. A merely OpenAI-*compatible* endpoint can
+                    # return a 2xx whose body is broken/empty JSON; the SDK parses
+                    # that body INTERNALLY and raises json.JSONDecodeError /
+                    # ValueError -- NEITHER an OpenAIError -- so without this arm
+                    # such output escapes as an unhandled 500. Carry only the
+                    # category (never str(exc), which could embed a response body)
+                    # and sever the chain. Transport-shaped failure -> no retry.
+                    raise LLMUpstreamError(f"{type(exc).__name__}: {_UPSTREAM_REASON}") from None
+
+                content = _extract_content(completion)
+
+                try:
+                    parsed = _parse_json_object(content)
+                    # Every sanitizer/validator on model_cls still runs here --
+                    # defense in depth against untrusted output.
+                    return model_cls.model_validate(parsed)
+                except (json.JSONDecodeError, ValueError, RecursionError, ValidationError) as exc:
+                    # OUTPUT-SHAPE failure -- the ONLY thing eligible for a
+                    # corrective retry. ValueError covers both a non-object result
+                    # and json.loads' huge-integer rejection; RecursionError covers
+                    # pathological nesting; ValidationError covers the model's own
+                    # sanitizers (empty title, all-empty result, lone surrogate,
+                    # ...). On the last attempt, fail with a FIXED, config-free
+                    # message: the json/pydantic detail went to the LLM in the
+                    # corrective turn, never into our API error.
+                    if attempt + 1 >= _MAX_ATTEMPTS:
+                        raise LLMUpstreamError(_INVALID_STRUCTURED_OUTPUT) from None
+                    messages = [
+                        *messages,
+                        {"role": "assistant", "content": content},
+                        {"role": "user", "content": _corrective_user_message(exc)},
+                    ]
+    except TimeoutError:
+        # asyncio.timeout's deadline expiry (converted from the CancelledError it
+        # injects) OR a re-raised builtin TimeoutError from the SDK boundary --
+        # both land here with the distinct "Timeout" category. `from None` severs
+        # the cause chain, same as every other arm.
+        raise LLMUpstreamError(f"Timeout: {_UPSTREAM_REASON}") from None
+
+    # Unreachable at runtime -- the loop always returns a validated instance or
+    # raises -- but present so every path provably returns/raises (satisfying the
+    # type checker) and a future change to the loop bound cannot fall through to
+    # an implicit `None`.
+    raise LLMUpstreamError(_INVALID_STRUCTURED_OUTPUT)

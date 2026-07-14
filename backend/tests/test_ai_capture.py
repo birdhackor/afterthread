@@ -1,23 +1,24 @@
 """Tests for POST /api/capture (AI quick capture).
 
-All LLM interaction is mocked at the service boundary: ``generate_json`` (the
-function ``capture_draft`` calls) is monkeypatched to return canned JSON or
-raise, so the real sanitizer/validation and the router's transaction discipline
-run without any network. Row counts are checked through the public list API to
-avoid cross-thread session reads.
+All LLM interaction is mocked at the service boundary: ``generate_structured``
+(the function ``capture_draft`` calls) is monkeypatched to run the workflow's
+real model validation on canned output or to raise, so the real
+sanitizer/validation and the router's transaction discipline run without any
+network. Row counts are checked through the public list API to avoid
+cross-thread session reads.
 """
 
 import json
-import traceback
 from collections.abc import Callable
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import BaseModel, ValidationError
 
 from app.config import Settings
 from app.services.llm import LLMUpstreamError
-from app.services.memory_ai import CaptureDraft, _coerce_str, _validate
+from app.services.memory_ai import _coerce_str
 
 # A full, well-formed draft. ``questions`` deliberately has 5 entries to prove
 # the server truncates to 3; ``suggested_status`` is one of the two allowed.
@@ -39,19 +40,31 @@ _DRAFT: dict[str, Any] = {
 }
 
 
-def _patch_generate_json(
+def _patch_generate_structured(
     monkeypatch: pytest.MonkeyPatch,
     *,
     result: dict[str, Any] | None = None,
     exc: Exception | None = None,
 ) -> None:
-    async def _fake(system: str, user: str) -> dict[str, Any]:
+    """Stub the structured-output boundary (``generate_structured``): skip the
+    network/parse and run the workflow's real model validation on ``result``,
+    mirroring generate_structured so a canned draft that fails the CaptureDraft
+    sanitizer maps to the same 502 upstream error the real path would raise
+    after its corrective retry.
+    """
+
+    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
         if exc is not None:
             raise exc
         assert result is not None
-        return result
+        try:
+            return model_cls.model_validate(result)
+        except ValidationError:
+            raise LLMUpstreamError(
+                "InvalidStructuredOutput: the LLM did not return a valid structured result"
+            ) from None
 
-    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+    monkeypatch.setattr("app.services.memory_ai.generate_structured", _fake)
 
 
 def _total(client: TestClient) -> int:
@@ -61,7 +74,7 @@ def _total(client: TestClient) -> int:
 def test_capture_happy_path_maps_fields(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _patch_generate_json(monkeypatch, result=_DRAFT)
+    _patch_generate_structured(monkeypatch, result=_DRAFT)
     response = client.post("/api/capture", json={"raw_text": "some raw discussion"})
     assert response.status_code == 201, response.text
     body = response.json()
@@ -81,7 +94,7 @@ def test_capture_happy_path_maps_fields(
 def test_capture_truncates_questions_to_three(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _patch_generate_json(monkeypatch, result=_DRAFT)
+    _patch_generate_structured(monkeypatch, result=_DRAFT)
     body = client.post("/api/capture", json={"raw_text": "raw"}).json()
     assert body["questions"] == ["q1", "q2", "q3"]
 
@@ -93,7 +106,7 @@ def test_capture_persists_questions_as_open_questions_bullet_lines(
     # quick-capture field; CaptureDraft has no open_questions field of its
     # own, so the created item's open_questions must be derived from the
     # model's questions, not left empty while the response merely echoes them.
-    _patch_generate_json(monkeypatch, result={**_DRAFT, "questions": ["問題一?", "問題二?"]})
+    _patch_generate_structured(monkeypatch, result={**_DRAFT, "questions": ["問題一?", "問題二?"]})
     response = client.post("/api/capture", json={"raw_text": "raw"})
     body = response.json()
     assert body["questions"] == ["問題一?", "問題二?"]
@@ -108,7 +121,7 @@ def test_capture_persists_questions_as_open_questions_bullet_lines(
 def test_capture_zero_questions_leaves_open_questions_at_default(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _patch_generate_json(monkeypatch, result={**_DRAFT, "questions": []})
+    _patch_generate_structured(monkeypatch, result={**_DRAFT, "questions": []})
     body = client.post("/api/capture", json={"raw_text": "raw"}).json()
     assert body["questions"] == []
     assert body["item"]["open_questions"] == ""
@@ -117,7 +130,7 @@ def test_capture_zero_questions_leaves_open_questions_at_default(
 def test_capture_seeds_ai_progress_entry_and_one_row(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _patch_generate_json(monkeypatch, result=_DRAFT)
+    _patch_generate_structured(monkeypatch, result=_DRAFT)
     body = client.post("/api/capture", json={"raw_text": "raw"}).json()
     assert _total(client) == 1
     detail = client.get(f"/api/items/{body['item']['id']}").json()
@@ -129,13 +142,13 @@ def test_capture_coerces_disallowed_status_to_capture_quick(
 ) -> None:
     # The model is only allowed to suggest capture-quick / needs-enrichment;
     # any other value (here "active") collapses to capture-quick server-side.
-    _patch_generate_json(monkeypatch, result={**_DRAFT, "suggested_status": "active"})
+    _patch_generate_structured(monkeypatch, result={**_DRAFT, "suggested_status": "active"})
     body = client.post("/api/capture", json={"raw_text": "raw"}).json()
     assert body["item"]["status"] == "capture-quick"
 
 
 def test_capture_caps_tags_at_ten(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    _patch_generate_json(monkeypatch, result={**_DRAFT, "tags": [f"t{i}" for i in range(15)]})
+    _patch_generate_structured(monkeypatch, result={**_DRAFT, "tags": [f"t{i}" for i in range(15)]})
     body = client.post("/api/capture", json={"raw_text": "raw"}).json()
     assert len(body["item"]["tags"]) == 10
 
@@ -143,7 +156,7 @@ def test_capture_caps_tags_at_ten(client: TestClient, monkeypatch: pytest.Monkey
 def test_capture_truncates_oversized_section(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _patch_generate_json(monkeypatch, result={**_DRAFT, "snapshot": "x" * 25000})
+    _patch_generate_structured(monkeypatch, result={**_DRAFT, "snapshot": "x" * 25000})
     body = client.post("/api/capture", json={"raw_text": "raw"}).json()
     assert len(body["item"]["snapshot"]) == 20000
 
@@ -151,7 +164,7 @@ def test_capture_truncates_oversized_section(
 def test_capture_upstream_error_returns_502_and_no_rows(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _patch_generate_json(monkeypatch, exc=LLMUpstreamError("UnparseableOutput: garbage"))
+    _patch_generate_structured(monkeypatch, exc=LLMUpstreamError("UnparseableOutput: garbage"))
     response = client.post("/api/capture", json={"raw_text": "raw"})
     assert response.status_code == 502
     assert response.json()["detail"]["code"] == "llm_upstream_error"
@@ -163,37 +176,17 @@ def test_capture_invalid_draft_returns_502_and_no_rows(
 ) -> None:
     # Well-formed JSON but an empty title fails CaptureDraft validation, which
     # the workflow maps to LLMUpstreamError -> 502, and no row is written.
-    _patch_generate_json(monkeypatch, result={"title": "   ", "snapshot": "x"})
+    _patch_generate_structured(monkeypatch, result={"title": "   ", "snapshot": "x"})
     response = client.post("/api/capture", json={"raw_text": "raw"})
     assert response.status_code == 502
     assert response.json()["detail"]["code"] == "llm_upstream_error"
     assert _total(client) == 0
 
 
-def test_validate_failure_severs_chain_and_leaks_no_raw_content() -> None:
-    """memory_ai._validate maps a pydantic ValidationError to LLMUpstreamError
-    with `from None`, so the raw LLM output the error embeds (its str and
-    .errors() carry the offending input) cannot ride along in __cause__ into a
-    rendered traceback. Driven directly on _validate with a draft whose blank
-    title fails the CaptureDraft sanitizer while a secret rides in another field.
-    """
-    secret = "SECRET-MEMORY-CONTENT-do-not-leak-9f3a"
-    with pytest.raises(LLMUpstreamError) as excinfo:
-        _validate(CaptureDraft, {"title": "  ", "snapshot": secret})
-
-    exc = excinfo.value
-    assert "ValidationError" in str(exc)
-    assert secret not in str(exc)
-    assert exc.__cause__ is None
-    assert exc.__suppress_context__ is True
-    rendered = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    assert secret not in rendered
-
-
 def test_capture_unconfigured_returns_503_and_no_rows(
     client: TestClient, configure_llm: Callable[..., Settings]
 ) -> None:
-    # No generate_json patch: the real workflow reaches the real config gate.
+    # No generate_structured patch: the real workflow reaches the real config gate.
     configure_llm(base_url="", model="")
     response = client.post("/api/capture", json={"raw_text": "raw discussion"})
     assert response.status_code == 503
@@ -216,7 +209,7 @@ def test_capture_oversized_raw_text_rejected(client: TestClient) -> None:
 def test_capture_max_length_raw_text_accepted(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _patch_generate_json(monkeypatch, result=_DRAFT)
+    _patch_generate_structured(monkeypatch, result=_DRAFT)
     assert client.post("/api/capture", json={"raw_text": "a" * 20000}).status_code == 201
 
 
@@ -224,8 +217,8 @@ def test_capture_deeply_nested_field_returns_502_and_no_rows(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A capture field returned as a pathologically nested list must degrade to
-    502 with no row written. The draft is a valid JSON object, so it clears
-    generate_json; the danger is the sanitizer's _coerce_str, which recursed
+    502 with no row written. The draft is a valid JSON object, so it parses
+    cleanly; the danger is the sanitizer's _coerce_str, which recursed
     unboundedly pre-fix -- a ~1500-deep list blew the stack (RecursionError,
     which pydantic does NOT wrap) and escaped as a 500. Depth-bounding it makes
     the deep list raise ValueError, which pydantic folds into a ValidationError
@@ -234,7 +227,7 @@ def test_capture_deeply_nested_field_returns_502_and_no_rows(
     deep: Any = "x"
     for _ in range(1500):
         deep = [deep]
-    _patch_generate_json(monkeypatch, result={**_DRAFT, "snapshot": deep})
+    _patch_generate_structured(monkeypatch, result={**_DRAFT, "snapshot": deep})
 
     response = client.post("/api/capture", json={"raw_text": "raw"})
     assert response.status_code == 502
@@ -281,7 +274,7 @@ def test_capture_rejects_lone_surrogate_in_section_returns_502_and_no_rows(
     # A lone surrogate embedded in an ordinary free-text section (mid-string,
     # not the whole value) must be caught by the sanitizer before any write,
     # not slip through to crash later at the DB/response boundary.
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch, result={**_DRAFT, "snapshot": "討論內容包含異常字元\ud800后續段落"}
     )
     response = client.post("/api/capture", json={"raw_text": "raw"})
@@ -295,7 +288,7 @@ def test_capture_rejects_lone_surrogate_in_tag_returns_502_and_no_rows(
 ) -> None:
     # Tags go through the very same _coerce_str choke point (via
     # _clean_str_list), so a lone surrogate there must 502 too.
-    _patch_generate_json(monkeypatch, result={**_DRAFT, "tags": ["payment", "帶\ud800標籤"]})
+    _patch_generate_structured(monkeypatch, result={**_DRAFT, "tags": ["payment", "帶\ud800標籤"]})
     response = client.post("/api/capture", json={"raw_text": "raw"})
     assert response.status_code == 502
     assert response.json()["detail"]["code"] == "llm_upstream_error"
@@ -314,7 +307,7 @@ def test_capture_accepts_cjk_and_emoji_content(
         "tags": ["付款", "😀重構"],
         "questions": ["進度如何? 💡"],
     }
-    _patch_generate_json(monkeypatch, result=draft)
+    _patch_generate_structured(monkeypatch, result=draft)
     response = client.post("/api/capture", json={"raw_text": "raw"})
     assert response.status_code == 201, response.text
     item = response.json()["item"]
@@ -333,7 +326,7 @@ def test_capture_caps_joined_open_questions_at_per_section_cap(
     # section cap every OTHER section respects. It must be truncated again to
     # that same cap, marked, exactly like any other oversized section.
     oversized = ["q" * 20000, "w" * 20000, "e" * 20000]
-    _patch_generate_json(monkeypatch, result={**_DRAFT, "questions": oversized})
+    _patch_generate_structured(monkeypatch, result={**_DRAFT, "questions": oversized})
     response = client.post("/api/capture", json={"raw_text": "raw"})
     assert response.status_code == 201, response.text
     body = response.json()
@@ -359,7 +352,7 @@ def test_capture_capped_open_questions_patch_round_trips(
     # keeps the persisted value within that same bound, so the round trip
     # succeeds.
     oversized = ["q" * 20000, "w" * 20000, "e" * 20000]
-    _patch_generate_json(monkeypatch, result={**_DRAFT, "questions": oversized})
+    _patch_generate_structured(monkeypatch, result={**_DRAFT, "questions": oversized})
     item = client.post("/api/capture", json={"raw_text": "raw"}).json()["item"]
 
     response = client.patch(

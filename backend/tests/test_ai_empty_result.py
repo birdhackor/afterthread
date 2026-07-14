@@ -10,8 +10,9 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
+from app.services.llm import LLMUpstreamError
 from app.services.memory_ai import EnrichResult, UpdateResult, _coerce_bool
 
 
@@ -22,11 +23,21 @@ def _create(client: TestClient, **fields: Any) -> dict[str, Any]:
     return response.json()
 
 
-def _patch_generate_json(monkeypatch: pytest.MonkeyPatch, result: dict[str, Any]) -> None:
-    async def _fake(system: str, user: str) -> dict[str, Any]:
-        return result
+def _patch_generate_structured(monkeypatch: pytest.MonkeyPatch, result: dict[str, Any]) -> None:
+    """Stub the structured-output boundary: skip the network/parse and run the
+    workflow's real model validation on ``result``, mirroring generate_structured
+    (a validation failure maps to the same 502 upstream error).
+    """
 
-    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
+        try:
+            return model_cls.model_validate(result)
+        except ValidationError:
+            raise LLMUpstreamError(
+                "InvalidStructuredOutput: the LLM did not return a valid structured result"
+            ) from None
+
+    monkeypatch.setattr("app.services.memory_ai.generate_structured", _fake)
 
 
 def _progress_notes(client: TestClient, item_id: int) -> list[str]:
@@ -120,7 +131,7 @@ def test_enrich_empty_result_returns_502_and_leaves_item_unchanged(
 ) -> None:
     item = _create(client, snapshot="keep")
     before = client.get(f"/api/items/{item['id']}").json()["updated"]
-    _patch_generate_json(monkeypatch, {})
+    _patch_generate_structured(monkeypatch, {})
 
     response = client.post(f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"})
     assert response.status_code == 502
@@ -138,7 +149,7 @@ def test_assist_update_empty_result_returns_502_and_leaves_item_unchanged(
 ) -> None:
     item = _create(client, next_actions="keep")
     before = client.get(f"/api/items/{item['id']}").json()["updated"]
-    _patch_generate_json(monkeypatch, {})
+    _patch_generate_structured(monkeypatch, {})
 
     response = client.post(f"/api/items/{item['id']}/assist-update", json={"note": "n"})
     assert response.status_code == 502
@@ -155,7 +166,7 @@ def test_enrich_minimal_meaningful_result_still_200(
 ) -> None:
     # Only checklist_complete is meaningful enough to accept.
     item = _create(client)
-    _patch_generate_json(monkeypatch, {"checklist_complete": True})
+    _patch_generate_structured(monkeypatch, {"checklist_complete": True})
     response = client.post(f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"})
     assert response.status_code == 200
     # And it flowed through the lifecycle promotion.
@@ -166,7 +177,7 @@ def test_assist_update_minimal_meaningful_result_still_200(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     item = _create(client)
-    _patch_generate_json(monkeypatch, {"progress_note": "只記錄一句"})
+    _patch_generate_structured(monkeypatch, {"progress_note": "只記錄一句"})
     response = client.post(f"/api/items/{item['id']}/assist-update", json={"note": "n"})
     assert response.status_code == 200
     assert "只記錄一句" in _progress_notes(client, item["id"])

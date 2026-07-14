@@ -1,6 +1,6 @@
 """Tests for POST /api/items/{item_id}/assist-update (AI assisted update).
 
-LLM interaction is mocked at the service boundary (``generate_json``).
+LLM interaction is mocked at the service boundary (``generate_structured``).
 """
 
 from collections.abc import Callable
@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import Engine, event
 from sqlmodel import Session
 
@@ -46,19 +47,29 @@ def _hard_delete_item_via_raw_connection(session: Session, item_id: int) -> None
         raw_connection.close()
 
 
-def _patch_generate_json(
+def _patch_generate_structured(
     monkeypatch: pytest.MonkeyPatch,
     *,
     result: dict[str, Any] | None = None,
     exc: Exception | None = None,
 ) -> None:
-    async def _fake(system: str, user: str) -> dict[str, Any]:
+    """Stub the structured-output boundary: skip the network/parse and run the
+    workflow's real model validation on ``result``, mirroring generate_structured
+    (a validation failure maps to the same 502 upstream error).
+    """
+
+    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
         if exc is not None:
             raise exc
         assert result is not None
-        return result
+        try:
+            return model_cls.model_validate(result)
+        except ValidationError:
+            raise LLMUpstreamError(
+                "InvalidStructuredOutput: the LLM did not return a valid structured result"
+            ) from None
 
-    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+    monkeypatch.setattr("app.services.memory_ai.generate_structured", _fake)
 
 
 def _progress_notes(client: TestClient, item_id: int) -> list[str]:
@@ -70,7 +81,7 @@ def test_assist_update_refreshes_sections_and_appends_progress(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     item = _create(client, next_actions="old action")
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch,
         result={
             "sections": {"next_actions": "下一步B", "open_questions": "問題C"},
@@ -90,7 +101,7 @@ def test_assist_update_uses_fallback_note_when_model_note_empty(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     item = _create(client)
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch, result={"sections": {"next_actions": "x"}, "progress_note": ""}
     )
     client.post(f"/api/items/{item['id']}/assist-update", json={"note": "note"})
@@ -101,7 +112,7 @@ def test_assist_update_drops_unknown_keys(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     item = _create(client, status="active")
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch,
         result={
             "sections": {"next_actions": "n", "status": "done", "bogus": "x"},
@@ -137,7 +148,7 @@ def test_assist_update_upstream_error_returns_502_and_item_unchanged(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     item = _create(client, next_actions="keep")
-    _patch_generate_json(monkeypatch, exc=LLMUpstreamError("boom"))
+    _patch_generate_structured(monkeypatch, exc=LLMUpstreamError("boom"))
     response = client.post(f"/api/items/{item['id']}/assist-update", json={"note": "n"})
     assert response.status_code == 502
     assert response.json()["detail"]["code"] == "llm_upstream_error"
@@ -154,7 +165,7 @@ def test_assist_update_rejects_lone_surrogate_in_section_returns_502_and_item_un
     # EnrichResult share -- so a lone surrogate in a section here must 502
     # with the item left completely untouched too.
     item = _create(client, next_actions="keep")
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch,
         result={"sections": {"next_actions": "下一步\ud800"}, "progress_note": "p"},
     )
@@ -184,7 +195,7 @@ def test_assist_update_races_with_concurrent_delete_after_llm_returns_404(
     """
     item = _create(client, next_actions="keep")
     item_id = item["id"]
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch, result={"sections": {"next_actions": "next"}, "progress_note": "n"}
     )
 

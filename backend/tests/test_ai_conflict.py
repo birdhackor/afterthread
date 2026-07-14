@@ -4,14 +4,15 @@ Each handler snapshots the item's `updated` before the LLM await and re-checks
 it after. If another writer bumped `updated` while the model was running, the
 sections were enriched against stale state, so the handler must write NOTHING
 and return 409. The conflict is injected deterministically: the mocked
-`generate_json` mutates the row through the shared DBAPI connection (a stand-in
-for a second session committing mid-await) before returning its result.
+`generate_structured` mutates the row through the shared DBAPI connection (a
+stand-in for a second session committing mid-await) before returning its result.
 """
 
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import BaseModel
 from sqlalchemy import Engine, event
 from sqlmodel import Session
 
@@ -84,12 +85,14 @@ def test_enrich_conflict_during_await_returns_409_and_writes_nothing(
     item = _create(client, snapshot="keep", decisions="原決策")
     item_id = item["id"]
 
-    async def _fake(system: str, user: str) -> dict[str, Any]:
+    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
         # A concurrent writer bumps `updated` while the model is "running".
         _bump_updated_via_raw_connection(session, item_id)
-        return {"sections": {"decisions": "新決策"}, "progress_note": "應被丟棄"}
+        return model_cls.model_validate(
+            {"sections": {"decisions": "新決策"}, "progress_note": "應被丟棄"}
+        )
 
-    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+    monkeypatch.setattr("app.services.memory_ai.generate_structured", _fake)
 
     response = client.post(f"/api/items/{item_id}/enrich", json={"additional_context": "ctx"})
     assert response.status_code == 409
@@ -109,11 +112,13 @@ def test_assist_update_conflict_during_await_returns_409_and_writes_nothing(
     item = _create(client, next_actions="keep")
     item_id = item["id"]
 
-    async def _fake(system: str, user: str) -> dict[str, Any]:
+    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
         _bump_updated_via_raw_connection(session, item_id)
-        return {"sections": {"next_actions": "changed"}, "progress_note": "應被丟棄"}
+        return model_cls.model_validate(
+            {"sections": {"next_actions": "changed"}, "progress_note": "應被丟棄"}
+        )
 
-    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+    monkeypatch.setattr("app.services.memory_ai.generate_structured", _fake)
 
     response = client.post(f"/api/items/{item_id}/assist-update", json={"note": "n"})
     assert response.status_code == 409
@@ -129,10 +134,10 @@ def test_enrich_no_conflict_still_succeeds(
 ) -> None:
     item = _create(client)
 
-    async def _fake(system: str, user: str) -> dict[str, Any]:
-        return {"sections": {"decisions": "d"}, "progress_note": "n"}
+    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
+        return model_cls.model_validate({"sections": {"decisions": "d"}, "progress_note": "n"})
 
-    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+    monkeypatch.setattr("app.services.memory_ai.generate_structured", _fake)
     response = client.post(f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"})
     assert response.status_code == 200
     assert "d" in response.json()["item"]["decisions"]
@@ -143,10 +148,12 @@ def test_assist_update_no_conflict_still_succeeds(
 ) -> None:
     item = _create(client)
 
-    async def _fake(system: str, user: str) -> dict[str, Any]:
-        return {"sections": {"next_actions": "n"}, "progress_note": "note"}
+    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
+        return model_cls.model_validate(
+            {"sections": {"next_actions": "n"}, "progress_note": "note"}
+        )
 
-    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+    monkeypatch.setattr("app.services.memory_ai.generate_structured", _fake)
     response = client.post(f"/api/items/{item['id']}/assist-update", json={"note": "n"})
     assert response.status_code == 200
 
@@ -157,11 +164,11 @@ def test_conflict_message_carries_no_config_or_item_content(
     item = _create(client, snapshot="secret-snapshot-value")
     item_id = item["id"]
 
-    async def _fake(system: str, user: str) -> dict[str, Any]:
+    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
         _bump_updated_via_raw_connection(session, item_id)
-        return {"sections": {"decisions": "x"}, "progress_note": "y"}
+        return model_cls.model_validate({"sections": {"decisions": "x"}, "progress_note": "y"})
 
-    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+    monkeypatch.setattr("app.services.memory_ai.generate_structured", _fake)
     body = client.post(f"/api/items/{item_id}/enrich", json={"additional_context": "ctx"}).text
     # The 409 body must not echo item content (nor any config, which is never
     # in scope of this message at all).
@@ -183,10 +190,12 @@ def test_enrich_conflict_between_guard_and_update_preserves_competing_write(
     item = _create(client, decisions="原決策")
     item_id = item["id"]
 
-    async def _fake(system: str, user: str) -> dict[str, Any]:
-        return {"sections": {"decisions": "AI 決策"}, "progress_note": "AI note"}
+    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
+        return model_cls.model_validate(
+            {"sections": {"decisions": "AI 決策"}, "progress_note": "AI note"}
+        )
 
-    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+    monkeypatch.setattr("app.services.memory_ai.generate_structured", _fake)
 
     bind = session.get_bind()
     assert isinstance(bind, Engine)
@@ -232,10 +241,12 @@ def test_assist_update_conflict_between_guard_and_update_preserves_competing_wri
     item = _create(client, next_actions="原下一步")
     item_id = item["id"]
 
-    async def _fake(system: str, user: str) -> dict[str, Any]:
-        return {"sections": {"next_actions": "AI 下一步"}, "progress_note": "AI note"}
+    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
+        return model_cls.model_validate(
+            {"sections": {"next_actions": "AI 下一步"}, "progress_note": "AI note"}
+        )
 
-    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+    monkeypatch.setattr("app.services.memory_ai.generate_structured", _fake)
 
     bind = session.get_bind()
     assert isinstance(bind, Engine)

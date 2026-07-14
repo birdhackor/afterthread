@@ -5,8 +5,17 @@ driven per-test replaces the real ``_get_client`` (via monkeypatch), and
 ``get_settings`` is overridden so ``llm_configured`` reports the desired state.
 No real ``AsyncOpenAI`` is ever constructed and nothing reaches the network.
 
-``generate_json`` is async; each call is driven with ``asyncio.run`` so no
+``generate_structured`` is async; each call is driven with ``asyncio.run`` so no
 pytest-asyncio plugin is required (none is a project dependency).
+
+The old forgiving JSON scavenger (``_extract_json_object`` and its exactly-one /
+array-element-context rules) is gone. In its place is a strict schema-guided
+contract: the model is shown the target JSON Schema and must emit EXACTLY one
+conforming object; any deviation earns ONE corrective retry, and a second
+failure is a fixed ``InvalidStructuredOutput`` 502. The scavenger's unit tests
+are deleted; the behaviours they pinned (prose-wrapped objects, juxtaposed
+objects, bare/nested/garbled arrays, scalar junk, top-level scalars) are
+re-expressed here as retry-contract tests.
 """
 
 import asyncio
@@ -19,45 +28,74 @@ from typing import Any
 import httpx
 import openai
 import pytest
+from pydantic import BaseModel, ConfigDict
 
 from app.config import Settings
 from app.services.llm import (
+    _INVALID_STRUCTURED_OUTPUT,
+    _STRICT_OUTPUT_RULE,
     _UPSTREAM_REASON,
     LLMNotConfiguredError,
     LLMUpstreamError,
     _build_client,
-    _extract_json_object,
     _get_client,
-    generate_json,
+    generate_structured,
     llm_configured,
     normalized_model,
+)
+from app.services.memory_ai import (
+    CAPTURE_SYSTEM_PROMPT,
+    ENRICH_SYSTEM_PROMPT,
+    UPDATE_SYSTEM_PROMPT,
+    CaptureDraft,
+    EnrichResult,
+    UpdateResult,
 )
 
 _CONFIGURED_BASE_URL = "http://llm.internal.example/v1"
 _CONFIGURED_KEY = "sk-super-secret-key"
 _CONFIGURED_MODEL = "test-model"
 
+
+class _Sample(BaseModel):
+    """Minimal target model for the parse/retry mechanics tests, independent of
+    the memory_ai workflow models (which have their own richer sanitizers)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    title: str
+    count: int = 0
+
+
 _SAMPLE_OBJECT: dict[str, Any] = {"title": "Draft", "count": 2}
 _SAMPLE_JSON = json.dumps(_SAMPLE_OBJECT)
 
 
 class _StubCompletions:
-    """Stand-in for ``client.chat.completions`` with a scripted ``create``."""
+    """Stand-in for ``client.chat.completions`` with a scripted ``create``.
+
+    ``content`` returns the same string every call; ``contents`` scripts a
+    per-call sequence (the last element is held once the script is exhausted, so
+    a bad-then-bad retry keeps failing identically). Every call's kwargs -- most
+    importantly ``messages`` -- are recorded in ``self.calls`` so a test can
+    assert how many attempts ran and what the retry request carried.
+    """
 
     def __init__(
         self,
         *,
         content: str | None = None,
+        contents: list[str] | None = None,
         exc: Exception | None = None,
         empty_choices: bool = False,
         delay: float = 0.0,
     ) -> None:
         self._content = content
+        self._contents = list(contents) if contents is not None else None
         self._exc = exc
         self._empty_choices = empty_choices
         # Simulates an upstream call that never returns within the caller's
-        # wall-clock deadline (a slow-drip endpoint) -- see
-        # test_generate_json_wall_clock_timeout_raises_upstream_with_timeout_category.
+        # wall-clock deadline (a slow-drip endpoint) -- see the timeout tests.
         self._delay = delay
         self.calls: list[dict[str, Any]] = []
 
@@ -69,7 +107,11 @@ class _StubCompletions:
             raise self._exc
         if self._empty_choices:
             return SimpleNamespace(choices=[])
-        message = SimpleNamespace(content=self._content)
+        if self._contents is not None:
+            content = self._contents[0] if len(self._contents) == 1 else self._contents.pop(0)
+        else:
+            content = self._content
+        message = SimpleNamespace(content=content)
         return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
 
@@ -99,6 +141,15 @@ def _configured(monkeypatch: pytest.MonkeyPatch, **completion_kwargs: Any) -> _S
     return _install(monkeypatch, settings, _StubClient(**completion_kwargs))
 
 
+def _run(system: str = "system", user: str = "user") -> _Sample:
+    """Drive generate_structured for the local _Sample model."""
+    return asyncio.run(generate_structured(system, user, _Sample))
+
+
+def _calls(stub: _StubClient) -> list[dict[str, Any]]:
+    return stub.chat.completions.calls
+
+
 class _RawCompletions:
     """``client.chat.completions`` whose ``create`` returns a caller-supplied
     completion object VERBATIM -- to model a nonconforming-but-200 body from a
@@ -107,8 +158,10 @@ class _RawCompletions:
 
     def __init__(self, completion: Any) -> None:
         self._completion = completion
+        self.calls: list[dict[str, Any]] = []
 
     async def create(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
         return self._completion
 
 
@@ -117,10 +170,35 @@ class _RawClient:
         self.chat = SimpleNamespace(completions=_RawCompletions(completion))
 
 
-def _install_raw(monkeypatch: pytest.MonkeyPatch, completion: Any) -> None:
+def _install_raw(monkeypatch: pytest.MonkeyPatch, completion: Any) -> _RawClient:
     settings = _settings(base_url=_CONFIGURED_BASE_URL, model=_CONFIGURED_MODEL)
     monkeypatch.setattr("app.services.llm.get_settings", lambda: settings)
-    monkeypatch.setattr("app.services.llm._get_client", lambda: _RawClient(completion))
+    client = _RawClient(completion)
+    monkeypatch.setattr("app.services.llm._get_client", lambda: client)
+    return client
+
+
+# The scavenger-behaviour cases, re-expressed as bad completions the strict
+# contract must reject (each is either not valid JSON, or valid JSON that is not
+# a single object). These drive the retry-contract tests below: bad-then-good ->
+# success in two attempts, bad-then-bad -> 502 in two attempts.
+_BAD_SHAPES: list[tuple[str, str]] = [
+    ("prose-wrapped-object", f"Sure, here is the draft:\n{_SAMPLE_JSON}\nHope that helps!"),
+    ("bare-array", "[1, 2, 3]"),
+    ("array-of-objects", json.dumps([{"title": "A"}, {"title": "B"}])),
+    ("prose-wrapped-array", f"Here you go: {json.dumps([{'title': 'A'}, {'title': 'B'}])}"),
+    ("nested-array-then-object", '[[{"title": "A"}]] {"title": "B"}'),
+    ("garbled-array", '[{bad}, note: {"title": "A"}]'),
+    ("juxtaposed-objects", '{"title": "A"} {"title": "B"}'),
+    ("scalar-junk", "Answer[1]: no object here at all"),
+    ("top-level-string", '"just a string"'),
+    ("top-level-number", "42"),
+    ("top-level-bool", "true"),
+    ("top-level-null", "null"),
+    ("not-json", "definitely not json"),
+    ("huge-integer", "1" * 5000),
+]
+_BAD_IDS = [name for name, _ in _BAD_SHAPES]
 
 
 # --- llm_configured -------------------------------------------------------
@@ -190,23 +268,23 @@ def test_normalized_model_strips_surrounding_whitespace() -> None:
     assert normalized_model(settings) == "test-model"
 
 
-def test_normalized_model_matches_llm_configured_and_generate_json(
+def test_normalized_model_matches_llm_configured_and_generate_structured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The same helper backs llm_configured's gate and generate_json's actual
-    # request, so a whitespace-padded model can never make them disagree.
+    # The same helper backs llm_configured's gate and generate_structured's
+    # actual request, so a whitespace-padded model can never make them disagree.
     settings = _settings(base_url=_CONFIGURED_BASE_URL, model="  padded-model  ")
     stub = _install(monkeypatch, settings, _StubClient(content=_SAMPLE_JSON))
     assert normalized_model(settings) == "padded-model"
     assert llm_configured() is True
-    asyncio.run(generate_json("system", "user"))
-    assert stub.chat.completions.calls[0]["model"] == "padded-model"
+    _run()
+    assert _calls(stub)[0]["model"] == "padded-model"
 
 
-# --- generate_json: config gate ------------------------------------------
+# --- generate_structured: config gate ------------------------------------
 
 
-def test_generate_json_unconfigured_raises_before_building_client(
+def test_generate_structured_unconfigured_raises_before_building_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The config gate runs first: no client is built and nothing is sent."""
@@ -220,233 +298,285 @@ def test_generate_json_unconfigured_raises_before_building_client(
 
     monkeypatch.setattr("app.services.llm._get_client", _must_not_build)
     with pytest.raises(LLMNotConfiguredError):
-        asyncio.run(generate_json("system", "user"))
+        _run()
 
 
-# --- generate_json: happy parsing ----------------------------------------
+# --- generate_structured: happy parsing ----------------------------------
 
 
-def test_generate_json_plain_object(monkeypatch: pytest.MonkeyPatch) -> None:
-    _configured(monkeypatch, content=_SAMPLE_JSON)
-    assert asyncio.run(generate_json("system", "user")) == _SAMPLE_OBJECT
+def test_generate_structured_returns_validated_model_instance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single conforming object is parsed AND validated into the target model
+    (not returned as a bare dict), in exactly one attempt."""
+    stub = _configured(monkeypatch, content=_SAMPLE_JSON)
+    result = _run()
+    assert isinstance(result, _Sample)
+    assert result.title == "Draft"
+    assert result.count == 2
+    assert len(_calls(stub)) == 1
 
 
-def test_generate_json_strips_json_code_fence(monkeypatch: pytest.MonkeyPatch) -> None:
-    fenced = f"```json\n{_SAMPLE_JSON}\n```"
-    _configured(monkeypatch, content=fenced)
-    assert asyncio.run(generate_json("system", "user")) == _SAMPLE_OBJECT
+def test_generate_structured_strips_json_code_fence(monkeypatch: pytest.MonkeyPatch) -> None:
+    stub = _configured(monkeypatch, content=f"```json\n{_SAMPLE_JSON}\n```")
+    assert _run().title == "Draft"
+    assert len(_calls(stub)) == 1  # a fenced bare object is accepted, not retried
 
 
-def test_generate_json_strips_bare_code_fence(monkeypatch: pytest.MonkeyPatch) -> None:
-    fenced = f"```\n{_SAMPLE_JSON}\n```"
-    _configured(monkeypatch, content=fenced)
-    assert asyncio.run(generate_json("system", "user")) == _SAMPLE_OBJECT
+def test_generate_structured_strips_bare_code_fence(monkeypatch: pytest.MonkeyPatch) -> None:
+    stub = _configured(monkeypatch, content=f"```\n{_SAMPLE_JSON}\n```")
+    assert _run().title == "Draft"
+    assert len(_calls(stub)) == 1
 
 
-def test_generate_json_extracts_object_from_prose(monkeypatch: pytest.MonkeyPatch) -> None:
-    prose = f"Sure, here is the draft:\n{_SAMPLE_JSON}\nLet me know if you want changes."
-    _configured(monkeypatch, content=prose)
-    assert asyncio.run(generate_json("system", "user")) == _SAMPLE_OBJECT
-
-
-def test_generate_json_passes_model_and_omits_temperature(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No fixed temperature is sent: some OpenAI-compatible endpoints --
-    reasoning-style models in particular -- reject the parameter outright,
-    which would otherwise turn every call against them into a 400 -> 502.
-    Omitting it lets the model/endpoint apply its own default.
+def test_generate_structured_passes_model_omits_temperature_and_injects_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No fixed temperature is sent (some reasoning-style endpoints reject it,
+    turning every call into a 400 -> 502). The system message is the caller's
+    prompt augmented with the strict-output rule and the model's schema; the
+    user message is passed through untouched.
     """
     stub = _configured(monkeypatch, content=_SAMPLE_JSON)
-    asyncio.run(generate_json("SYSTEM PROMPT", "USER PROMPT"))
-    call = stub.chat.completions.calls[0]
+    _run("SYSTEM PROMPT", "USER PROMPT")
+    call = _calls(stub)[0]
     assert call["model"] == _CONFIGURED_MODEL
     assert "temperature" not in call
-    assert call["messages"] == [
-        {"role": "system", "content": "SYSTEM PROMPT"},
-        {"role": "user", "content": "USER PROMPT"},
-    ]
+    messages = call["messages"]
+    assert len(messages) == 2
+    assert messages[0]["role"] == "system"
+    assert messages[0]["content"].startswith("SYSTEM PROMPT")
+    assert _STRICT_OUTPUT_RULE in messages[0]["content"]
+    # The _Sample schema (its "title"/"count" properties) rides in the system msg.
+    assert '"title"' in messages[0]["content"]
+    assert messages[1] == {"role": "user", "content": "USER PROMPT"}
 
 
-# --- generate_json: failure paths (all -> LLMUpstreamError) ---------------
+# --- generate_structured: schema injection for the three workflows --------
 
 
-def test_generate_json_invalid_output_raises_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
-    _configured(monkeypatch, content="this is not json at all, sorry")
-    with pytest.raises(LLMUpstreamError):
-        asyncio.run(generate_json("system", "user"))
+@pytest.mark.parametrize(
+    "prompt, model_cls, distinctive_field, good",
+    [
+        (CAPTURE_SYSTEM_PROMPT, CaptureDraft, "recovery_keywords", {"title": "t"}),
+        (ENRICH_SYSTEM_PROMPT, EnrichResult, "checklist_complete", {"checklist_complete": True}),
+        (UPDATE_SYSTEM_PROMPT, UpdateResult, "progress_note", {"progress_note": "n"}),
+    ],
+    ids=["capture", "enrich", "update"],
+)
+def test_generate_structured_injects_each_workflow_schema_and_strict_rule(
+    monkeypatch: pytest.MonkeyPatch,
+    prompt: str,
+    model_cls: type[BaseModel],
+    distinctive_field: str,
+    good: dict[str, Any],
+) -> None:
+    """For all three workflows, the outgoing system prompt carries the strict
+    single-object rule AND the model's own JSON Schema (spot-checked via a
+    distinctive field name), appended after the methodology prompt.
+    """
+    stub = _configured(monkeypatch, content=json.dumps(good))
+    asyncio.run(generate_structured(prompt, "user", model_cls))
+    system_message = _calls(stub)[0]["messages"][0]["content"]
+    assert system_message.startswith(prompt)  # methodology rules preserved verbatim
+    assert _STRICT_OUTPUT_RULE in system_message
+    assert distinctive_field in system_message  # the model's schema is present
 
 
-def test_generate_json_array_output_raises_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A bare JSON array parses but is not a usable object for the workflows.
-    _configured(monkeypatch, content="[1, 2, 3]")
-    with pytest.raises(LLMUpstreamError):
-        asyncio.run(generate_json("system", "user"))
+# --- generate_structured: corrective retry (replaces the scavenger) -------
 
 
-def test_generate_json_array_of_objects_raises_upstream_not_first_element(
+@pytest.mark.parametrize("content", [c for _, c in _BAD_SHAPES], ids=_BAD_IDS)
+def test_generate_structured_retries_bad_then_good_succeeds(
+    monkeypatch: pytest.MonkeyPatch, content: str
+) -> None:
+    """Every shape the old scavenger tried to salvage (prose-wrapped object,
+    juxtaposed objects, bare/nested/garbled arrays, scalar junk, top-level
+    scalars, a 5000-digit integer) is now rejected on the first attempt and
+    corrected on the second: bad-then-good yields the validated model in EXACTLY
+    two create() calls, and the retry request echoes the bad reply plus a
+    corrective instruction.
+    """
+    stub = _configured(monkeypatch, contents=[content, _SAMPLE_JSON])
+    result = _run()
+    assert isinstance(result, _Sample)
+    assert result.title == "Draft"
+
+    calls = _calls(stub)
+    assert len(calls) == 2
+    # First attempt: just system + user, no corrective turn yet.
+    assert len(calls[0]["messages"]) == 2
+    # Second attempt: system, user, the echoed bad assistant reply, the corrective.
+    retry_messages = calls[1]["messages"]
+    assert len(retry_messages) == 4
+    assert retry_messages[2] == {"role": "assistant", "content": content}
+    corrective = retry_messages[3]
+    assert corrective["role"] == "user"
+    assert "previous reply was rejected" in corrective["content"]
+    assert "corrected JSON object" in corrective["content"]
+
+
+@pytest.mark.parametrize("content", [c for _, c in _BAD_SHAPES], ids=_BAD_IDS)
+def test_generate_structured_bad_then_bad_raises_invalid_structured_output(
+    monkeypatch: pytest.MonkeyPatch, content: str
+) -> None:
+    """Two bad replies exhaust the single retry: a fixed InvalidStructuredOutput
+    502 in EXACTLY two create() calls."""
+    stub = _configured(monkeypatch, contents=[content, content])
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        _run()
+    assert str(excinfo.value) == _INVALID_STRUCTURED_OUTPUT
+    assert len(_calls(stub)) == 2
+
+
+def test_generate_structured_validation_failure_is_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A top-level array of OBJECTS -- unlike a bare array of scalars above --
-    once let the balanced-brace fallback inside _extract_json_object silently
-    extract and return just the FIRST element, quietly persisting a shape the
-    caller never asked for instead of surfacing the true "wrong shape"
-    failure. The full array must still be rejected as a whole: 502, and the
-    (never reached) first element is not returned.
+    """A well-formed object that fails the target model's validation (here a
+    missing required field) is an output-shape failure too: it is retried, and a
+    good second reply succeeds. This is what makes the memory_ai validator
+    families (empty title, all-empty result, lone surrogate) retryable now that
+    validation lives inside generate_structured.
     """
-    array_content = json.dumps([{"title": "A"}, {"title": "B"}])
-    _configured(monkeypatch, content=array_content)
-    with pytest.raises(LLMUpstreamError) as excinfo:
-        asyncio.run(generate_json("system", "user"))
-    assert "WrongShape" in str(excinfo.value)
+    stub = _configured(monkeypatch, contents=['{"count": 5}', _SAMPLE_JSON])
+    result = _run()
+    assert result.title == "Draft"
+    assert len(_calls(stub)) == 2
 
 
-def test_generate_json_prose_wrapped_array_raises_upstream_wrong_shape(
+def test_generate_structured_good_first_reply_does_not_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The prose-wrapped counterpart to the regression above: the array is
-    embedded in prose instead of being the whole completion, so the full-text
-    parse FAILS and this exercises the candidate-scan fallback inside
-    _extract_json_object instead of the top-level-shape check. It must still
-    reject the array as a whole rather than let the fallback extract and
-    return just its first element.
-    """
-    array_json = json.dumps([{"title": "A"}, {"title": "B"}])
-    _configured(monkeypatch, content=f"Sure, here you go: {array_json}")
-    with pytest.raises(LLMUpstreamError) as excinfo:
-        asyncio.run(generate_json("system", "user"))
-    assert "WrongShape" in str(excinfo.value)
+    """A conforming first reply must NOT trigger a spurious second call."""
+    stub = _configured(monkeypatch, contents=[_SAMPLE_JSON, _SAMPLE_JSON])
+    _run()
+    assert len(_calls(stub)) == 1
 
 
-def test_generate_json_juxtaposed_objects_raises_upstream_wrong_shape_not_first_element(
+def test_generate_structured_huge_integer_is_parse_failure_not_500(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Round 10: two objects juxtaposed (not wrapped in an array, not
-    comma-separated) fail the full-text parse as "extra data" and reach the
-    candidate-scan fallback, which pre-fix returned on the first usable dict
-    it found -- silently persisting "A" and dropping "B". The exactly-one
-    rule must reject the pair as a whole instead.
+    """Round-12 carryover: a 5000-digit integer makes json.loads raise a bare
+    ValueError (not JSONDecodeError, and not an unhandled 500). It is caught as
+    an output-shape failure -- retried, then a repeated failure is a clean 502.
     """
-    _configured(monkeypatch, content='{"title": "A"} {"title": "B"}')
+    stub = _configured(monkeypatch, contents=["1" * 5000, "1" * 5000])
     with pytest.raises(LLMUpstreamError) as excinfo:
-        asyncio.run(generate_json("system", "user"))
-    assert "WrongShape" in str(excinfo.value)
+        _run()
+    assert str(excinfo.value) == _INVALID_STRUCTURED_OUTPUT
+    assert len(_calls(stub)) == 2
 
 
-def test_generate_json_empty_content_raises_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
-    _configured(monkeypatch, content="   ")
-    with pytest.raises(LLMUpstreamError):
-        asyncio.run(generate_json("system", "user"))
-
-
-def test_generate_json_none_content_raises_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
-    _configured(monkeypatch, content=None)
-    with pytest.raises(LLMUpstreamError):
-        asyncio.run(generate_json("system", "user"))
-
-
-def test_generate_json_empty_choices_raises_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
-    _configured(monkeypatch, empty_choices=True)
-    with pytest.raises(LLMUpstreamError):
-        asyncio.run(generate_json("system", "user"))
-
-
-def test_generate_json_api_error_raises_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
-    _configured(monkeypatch, exc=openai.OpenAIError("simulated api failure"))
-    with pytest.raises(LLMUpstreamError):
-        asyncio.run(generate_json("system", "user"))
-
-
-def test_generate_json_timeout_raises_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The SDK raising its own timeout error immediately (as opposed to the
-    call simply hanging -- see the wall-clock deadline test below) must still
-    map to LLMUpstreamError via the ordinary OpenAIError arm.
+def test_generate_structured_invalid_output_message_leaks_no_internals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Secret hygiene for the terminal structured-output 502: the message is the
+    fixed InvalidStructuredOutput literal and carries NO json/pydantic detail
+    (those went to the LLM in the corrective request, not into our API error),
+    and the cause chain is severed so nothing rides along in __cause__.
+    Replaces the deleted _validate chain-severing test.
     """
+    secret = "SECRET-MEMORY-CONTENT-do-not-leak-9f3a"
+    bad = json.dumps({"snapshot": secret})  # valid JSON object, but no _Sample.title
+    stub = _configured(monkeypatch, contents=[bad, bad])
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        _run()
+    exc = excinfo.value
+    message = str(exc)
+    assert message == _INVALID_STRUCTURED_OUTPUT
+    for leaked in (secret, "ValidationError", "JSONDecodeError", "validation error", "title"):
+        assert leaked not in message
+    assert exc.__cause__ is None
+    assert exc.__suppress_context__ is True
+    rendered = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    assert secret not in rendered
+    assert len(_calls(stub)) == 2
+
+
+# --- generate_structured: empty/malformed content (no retry) --------------
+
+
+def test_generate_structured_empty_content_raises_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
+    stub = _configured(monkeypatch, content="   ")
+    with pytest.raises(LLMUpstreamError):
+        _run()
+    # An empty completion is a transport-shaped failure, not an output-shape one:
+    # it is NOT retried.
+    assert len(_calls(stub)) == 1
+
+
+def test_generate_structured_none_content_raises_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
+    stub = _configured(monkeypatch, content=None)
+    with pytest.raises(LLMUpstreamError):
+        _run()
+    assert len(_calls(stub)) == 1
+
+
+def test_generate_structured_empty_choices_raises_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
+    stub = _configured(monkeypatch, empty_choices=True)
+    with pytest.raises(LLMUpstreamError):
+        _run()
+    assert len(_calls(stub)) == 1
+
+
+# --- generate_structured: transport failures (no retry) -------------------
+
+
+def test_generate_structured_api_error_raises_upstream_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An OpenAIError is a transport failure: mapped to 502 and NEVER retried
+    (the corrective retry re-prompts only on bad-SHAPE output)."""
+    stub = _configured(monkeypatch, exc=openai.OpenAIError("simulated api failure"))
+    with pytest.raises(LLMUpstreamError):
+        _run()
+    assert len(_calls(stub)) == 1
+
+
+def test_generate_structured_timeout_error_from_sdk_raises_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SDK raising its own timeout error immediately (an APITimeoutError, an
+    OpenAIError subclass) maps via the OpenAIError arm to 502, one call."""
     request = httpx.Request("POST", f"{_CONFIGURED_BASE_URL}/chat/completions")
-    _configured(monkeypatch, exc=openai.APITimeoutError(request=request))
+    stub = _configured(monkeypatch, exc=openai.APITimeoutError(request=request))
     with pytest.raises(LLMUpstreamError):
-        asyncio.run(generate_json("system", "user"))
+        _run()
+    assert len(_calls(stub)) == 1
 
 
-# --- generate_json: wall-clock deadline (finding: asyncio.timeout) --------
-
-
-def test_generate_json_wall_clock_timeout_raises_upstream_with_timeout_category(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """asyncio.timeout wraps the whole SDK call with a genuine wall-clock
-    deadline. A stub that never returns within the configured
-    openai_timeout_seconds must still raise LLMUpstreamError -- with the
-    distinct "Timeout" category -- well before the stub's own (much longer)
-    delay elapses. This is exactly what the client-level timeout alone cannot
-    guarantee (see _build_client's docstring): a slow-drip endpoint that keeps
-    sending a byte just before each read timeout would otherwise hold the
-    request open indefinitely.
-    """
-    settings = Settings(
-        openai_base_url=_CONFIGURED_BASE_URL,
-        openai_api_key=_CONFIGURED_KEY,
-        openai_model=_CONFIGURED_MODEL,
-        openai_timeout_seconds=0.05,
-    )
-    stub = _install(monkeypatch, settings, _StubClient(content=_SAMPLE_JSON, delay=1.0))
-
-    started = time.monotonic()
-    with pytest.raises(LLMUpstreamError) as excinfo:
-        asyncio.run(generate_json("system", "user"))
-    elapsed = time.monotonic() - started
-
-    message = str(excinfo.value)
-    assert message.startswith("Timeout: ")
-    assert _UPSTREAM_REASON in message
-    # `from None` severs the cause chain, same as every other arm in this
-    # boundary.
-    assert excinfo.value.__cause__ is None
-    assert excinfo.value.__suppress_context__ is True
-    # Bounded by the configured deadline, not the stub's 1s delay -- proves
-    # this is a genuine wall-clock cap around the whole call, not merely the
-    # SDK/httpx per-phase inactivity timer (irrelevant here anyway, since this
-    # stub bypasses the real client entirely).
-    assert elapsed < 0.5
-
-    # The request was still genuinely attempted (with the model/messages, no
-    # temperature) before the deadline cut it off.
-    assert stub.chat.completions.calls[0]["model"] == _CONFIGURED_MODEL
-
-
-# --- generate_json: total SDK-call boundary (finding 1) -------------------
-
-
-def test_generate_json_sdk_json_decode_error_raises_upstream(
+def test_generate_structured_sdk_json_decode_error_raises_upstream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A merely OpenAI-*compatible* endpoint can return a 2xx whose body is
     broken JSON; the SDK parses that body INTERNALLY and raises
-    json.JSONDecodeError -- NOT an OpenAIError. The total call boundary must map
-    it to LLMUpstreamError (502), never let it escape as an unhandled 500.
+    json.JSONDecodeError -- NOT an OpenAIError. The total call boundary maps it to
+    502, one call (a transport-boundary failure, not retried).
     """
-    _configured(monkeypatch, exc=json.JSONDecodeError("Expecting value", "", 0))
+    stub = _configured(monkeypatch, exc=json.JSONDecodeError("Expecting value", "", 0))
     with pytest.raises(LLMUpstreamError):
-        asyncio.run(generate_json("system", "user"))
+        _run()
+    assert len(_calls(stub)) == 1
 
 
-def test_generate_json_sdk_value_error_raises_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A bare ValueError from the SDK boundary (an empty-body parse) is likewise
-    mapped onto the 502 taxonomy rather than surfacing as a 500.
-    """
-    _configured(monkeypatch, exc=ValueError("could not parse response body"))
+def test_generate_structured_sdk_value_error_raises_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub = _configured(monkeypatch, exc=ValueError("could not parse response body"))
     with pytest.raises(LLMUpstreamError):
-        asyncio.run(generate_json("system", "user"))
+        _run()
+    assert len(_calls(stub)) == 1
 
 
-def test_generate_json_sdk_parse_error_message_carries_only_category(
+def test_generate_structured_sdk_parse_error_message_carries_only_category(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The mapped message is the safe category + fixed reason -- config-free and
-    chain-severed -- exactly as for an OpenAIError, so a broken response body can
-    never ride along in __cause__ into a traceback sink.
+    chain-severed -- so a broken response body can never ride along in __cause__.
     """
     _configured(monkeypatch, exc=json.JSONDecodeError("Expecting value", "raw body", 0))
     with pytest.raises(LLMUpstreamError) as excinfo:
-        asyncio.run(generate_json("system", "user"))
+        _run()
     message = str(excinfo.value)
     assert "JSONDecodeError" in message
     assert _UPSTREAM_REASON in message
@@ -454,34 +584,32 @@ def test_generate_json_sdk_parse_error_message_carries_only_category(
     assert excinfo.value.__suppress_context__ is True
 
 
-def test_generate_json_not_configured_error_from_create_stays_503(
+def test_generate_structured_not_configured_error_from_create_stays_503(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """503 stays 503: if the SDK call itself surfaces one of our own taxonomy
-    errors, the total boundary re-raises it UNCHANGED -- it must never rewrap an
-    LLMNotConfiguredError into a generic 502 and destroy its real status.
-    """
+    errors, the boundary re-raises it UNCHANGED (never a generic 502)."""
     _configured(monkeypatch, exc=LLMNotConfiguredError("still unconfigured"))
     with pytest.raises(LLMNotConfiguredError):
-        asyncio.run(generate_json("system", "user"))
+        _run()
 
 
-def test_generate_json_upstream_error_from_create_passes_through_verbatim(
+def test_generate_structured_upstream_error_from_create_passes_through_verbatim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An already-shaped LLMUpstreamError raised at the SDK call is re-raised as
-    the SAME object (502 stays 502), never double-wrapped by the catch-all.
-    """
+    the SAME object (502 stays 502), never double-wrapped and never retried."""
     original = LLMUpstreamError("EmptyResponse: the LLM returned no choices")
-    _configured(monkeypatch, exc=original)
+    stub = _configured(monkeypatch, exc=original)
     with pytest.raises(LLMUpstreamError) as excinfo:
-        asyncio.run(generate_json("system", "user"))
+        _run()
     assert excinfo.value is original
+    assert len(_calls(stub)) == 1
 
 
 def test_upstream_error_message_never_leaks_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """Even when the SDK error text embeds URL/key-like values, the safe
-    LLMUpstreamError message must carry only the exception category, never the
+    LLMUpstreamError message carries only the exception category, never the
     configured base URL or API key.
     """
     leaky = openai.OpenAIError(
@@ -489,7 +617,7 @@ def test_upstream_error_message_never_leaks_config(monkeypatch: pytest.MonkeyPat
     )
     _configured(monkeypatch, exc=leaky)
     with pytest.raises(LLMUpstreamError) as excinfo:
-        asyncio.run(generate_json("system", "user"))
+        _run()
 
     message = str(excinfo.value)
     assert "OpenAIError" in message
@@ -510,7 +638,68 @@ def test_upstream_error_message_never_leaks_config(monkeypatch: pytest.MonkeyPat
     assert _CONFIGURED_KEY not in rendered
 
 
-# --- llm_configured: parseable-but-unusable URLs (finding: strict endpoint) --
+# --- generate_structured: wall-clock deadline (spans the retry) -----------
+
+
+def test_generate_structured_wall_clock_timeout_raises_upstream_with_timeout_category(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """asyncio.timeout wraps the WHOLE attempt loop with a genuine wall-clock
+    deadline. A stub that never returns within the configured
+    openai_timeout_seconds must raise LLMUpstreamError -- with the distinct
+    "Timeout" category -- well before the stub's own (much longer) delay elapses.
+    """
+    settings = Settings(
+        openai_base_url=_CONFIGURED_BASE_URL,
+        openai_api_key=_CONFIGURED_KEY,
+        openai_model=_CONFIGURED_MODEL,
+        openai_timeout_seconds=0.05,
+    )
+    stub = _install(monkeypatch, settings, _StubClient(content=_SAMPLE_JSON, delay=1.0))
+
+    started = time.monotonic()
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        _run()
+    elapsed = time.monotonic() - started
+
+    message = str(excinfo.value)
+    assert message.startswith("Timeout: ")
+    assert _UPSTREAM_REASON in message
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__ is True
+    # Bounded by the configured deadline, not the stub's 1s delay.
+    assert elapsed < 0.5
+    # The request was still genuinely attempted before the deadline cut it off.
+    assert _calls(stub)[0]["model"] == _CONFIGURED_MODEL
+
+
+def test_generate_structured_deadline_spans_both_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The wall-clock budget is ONE deadline around the whole loop, not reset per
+    attempt. Two attempts that each individually fit the budget but together
+    exceed it must Timeout during the second -- proving the retry does not get a
+    fresh budget. Each attempt returns bad (so, absent the deadline, the run
+    would end in InvalidStructuredOutput, not Timeout).
+    """
+    settings = Settings(
+        openai_base_url=_CONFIGURED_BASE_URL,
+        openai_api_key=_CONFIGURED_KEY,
+        openai_model=_CONFIGURED_MODEL,
+        openai_timeout_seconds=0.30,
+    )
+    # Each create sleeps 0.20: attempt 1 (~0.20) fits under 0.30 and returns bad,
+    # attempt 2 pushes the cumulative time past 0.30 and is cut off mid-call.
+    stub = _install(
+        monkeypatch, settings, _StubClient(contents=["not json", "not json"], delay=0.20)
+    )
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        _run()
+    assert str(excinfo.value).startswith("Timeout: ")
+    # Both attempts were entered -- the failure is the budget spanning them, not a
+    # single slow call.
+    assert len(_calls(stub)) == 2
+
+
+# --- llm_configured: parseable-but-unusable URLs --------------------------
 
 
 @pytest.mark.parametrize(
@@ -522,9 +711,9 @@ def test_llm_configured_false_for_parseable_but_unusable_url(
     monkeypatch: pytest.MonkeyPatch, base_url: str
 ) -> None:
     """A URL that parses under httpx.URL but carries no http/https scheme or no
-    host is not a reachable OpenAI-compatible endpoint: llm_configured must
-    report unconfigured, and generate_json must gate to LLMNotConfiguredError
-    (503) before any client is built or request sent.
+    host is not a reachable OpenAI-compatible endpoint: llm_configured reports
+    unconfigured, and generate_structured gates to LLMNotConfiguredError (503)
+    before any client is built or request sent.
     """
     monkeypatch.setattr(
         "app.services.llm.get_settings",
@@ -537,7 +726,7 @@ def test_llm_configured_false_for_parseable_but_unusable_url(
 
     monkeypatch.setattr("app.services.llm._get_client", _must_not_build)
     with pytest.raises(LLMNotConfiguredError):
-        asyncio.run(generate_json("system", "user"))
+        _run()
 
 
 @pytest.mark.parametrize(
@@ -555,9 +744,6 @@ def test_llm_configured_true_for_http_and_https_with_host(
     assert llm_configured() is True
 
 
-# --- llm_configured: out-of-range port (finding: port range) --------------
-
-
 @pytest.mark.parametrize(
     "base_url",
     ["http://host.example:99999/v1", "http://host.example:0/v1"],
@@ -566,14 +752,10 @@ def test_llm_configured_true_for_http_and_https_with_host(
 def test_llm_configured_false_for_out_of_range_port(
     monkeypatch: pytest.MonkeyPatch, base_url: str
 ) -> None:
-    """httpx.URL parses a numerically out-of-range port (99999, beyond the
-    16-bit TCP range) or port 0 WITHOUT error -- unlike a non-numeric port such
-    as "8o80", which fails at the httpx.URL/AsyncOpenAI construction stage --
-    and AsyncOpenAI builds a client from it happily. But no TCP connect can
-    ever target such a port, so every real call would fail as a 502 instead of
-    the config-error 503 this function exists to produce. llm_configured must
-    report unconfigured, and generate_json must gate to LLMNotConfiguredError
-    (503) before any client is built or request sent.
+    """httpx.URL parses a numerically out-of-range port (99999) or port 0 WITHOUT
+    error and AsyncOpenAI builds a client from it happily, but no TCP connect can
+    ever target such a port. llm_configured reports unconfigured, and
+    generate_structured gates to LLMNotConfiguredError (503) before any request.
     """
     monkeypatch.setattr(
         "app.services.llm.get_settings",
@@ -586,13 +768,12 @@ def test_llm_configured_false_for_out_of_range_port(
 
     monkeypatch.setattr("app.services.llm._get_client", _must_not_build)
     with pytest.raises(LLMNotConfiguredError):
-        asyncio.run(generate_json("system", "user"))
+        _run()
 
 
 def test_llm_configured_true_for_explicit_valid_port(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A normal, in-range explicit port must remain configured -- the new port
-    check rejects only 0 and values above 65535, never an ordinary port.
-    """
+    """A normal, in-range explicit port must remain configured -- the port check
+    rejects only 0 and values above 65535, never an ordinary port."""
     monkeypatch.setattr(
         "app.services.llm.get_settings",
         lambda: _settings(base_url="http://host.example:8000/v1", model=_CONFIGURED_MODEL),
@@ -605,8 +786,7 @@ def test_configured_and_get_client_agree_on_whitespace_padded_url(
 ) -> None:
     """A whitespace-padded URL reads as configured (llm_configured strips before
     validating) AND the real client is built from the SAME stripped value, so
-    status and runtime never disagree over stray whitespace. _get_client runs
-    for real here (not stubbed) so construction genuinely uses the stripped URL.
+    status and runtime never disagree over stray whitespace.
     """
     monkeypatch.setattr(
         "app.services.llm.get_settings",
@@ -618,253 +798,7 @@ def test_configured_and_get_client_agree_on_whitespace_padded_url(
     assert " " not in rendered
 
 
-# --- _extract_json_object: pure extraction (behavior-level) ---------------
-# The hand-rolled span scanner (_balanced_brace_slice / _balanced_spans /
-# _json_candidates) is gone; the fallback now walks the text with the real
-# json decoder. The unit tests that were pinned to those helpers are
-# re-expressed here as observable behaviour of _extract_json_object itself.
-
-
-def test_extract_json_object_nested(monkeypatch: pytest.MonkeyPatch) -> None:
-    nested = '{"outer": {"inner": [1, 2]}, "flag": true}'
-    assert _extract_json_object(nested) == {"outer": {"inner": [1, 2]}, "flag": True}
-
-
-def test_extract_json_object_recovers_object_with_brace_inside_string() -> None:
-    """A "}" inside a JSON string value must not end the object early: the real
-    decoder is string/escape-aware, so a prose-wrapped object whose value
-    contains a brace is still recovered whole. Behaviour-level replacement for
-    the deleted _balanced_brace_slice string-awareness test.
-    """
-    text = 'prefix {"a": "has a } brace", "b": {"c": 1}} suffix'
-    assert _extract_json_object(text) == {"a": "has a } brace", "b": {"c": 1}}
-
-
-def test_extract_json_object_no_object_raises_unparseable() -> None:
-    """Text with no JSON object at all yields no usable dict -> UnparseableOutput.
-    Behaviour-level replacement for the deleted "nothing found" helper tests
-    (_balanced_brace_slice returning None / _json_candidates returning []).
-    """
-    with pytest.raises(LLMUpstreamError) as excinfo:
-        _extract_json_object("no object here at all")
-    assert "UnparseableOutput" in str(excinfo.value)
-
-
-def test_extract_json_object_outer_array_rejected_not_reduced_to_nested_object() -> None:
-    """A prose-wrapped array of objects is rejected as a whole (WrongShape),
-    never reduced to its first nested element: the decoder parses the whole
-    array first and classifies it as a dict-bearing list. Behaviour-level
-    replacement for the deleted _json_candidates ordering test.
-    """
-    array_json = json.dumps([{"title": "A"}, {"title": "B"}])
-    with pytest.raises(LLMUpstreamError) as excinfo:
-        _extract_json_object(f"prose {array_json} more prose")
-    assert "WrongShape" in str(excinfo.value)
-
-
-def test_extract_json_object_finding1_prose_object_with_bracket_string_returns_object() -> None:
-    """Finding 1 regression: a legitimate prose-wrapped object whose string
-    field literally contains "[{}]" must be extracted as-is. The old bracket
-    scanner counted the "[" and "}" INSIDE that string and grew a phantom array
-    candidate -- a dict-bearing list -> false 502; the string-aware decoder
-    consumes the brackets as part of the string and returns the object.
-    """
-    text = 'Here is the draft: {"note": "[{}]"} Hope this helps!'
-    assert _extract_json_object(text) == {"note": "[{}]"}
-
-
-def test_extract_json_object_finding1_object_with_nested_bracket_string_returns_object() -> None:
-    """Finding 1 regression, heavier bracket payload: a string value of
-    "[{},{}]" (which the old scanner would have mis-read as a two-element array
-    of objects and rejected) is just a string; the object is returned whole.
-    """
-    assert _extract_json_object('{"nested": "[{},{}]"}') == {"nested": "[{},{}]"}
-    prose = 'Result: {"nested": "[{},{}]"} done'
-    assert _extract_json_object(prose) == {"nested": "[{},{}]"}
-
-
-# --- _extract_json_object: non-object top level (finding 1) ---------------
-
-
-@pytest.mark.parametrize(
-    "value",
-    ['[{"title": "A"}, {"title": "B"}]', '"just a string"', "42", "true", "null"],
-    ids=["array-of-objects", "string", "number", "bool", "null"],
-)
-def test_extract_json_object_top_level_non_object_raises_upstream_wrong_shape(value: str) -> None:
-    """The full text parsing successfully as JSON but NOT as an object -- most
-    notably a top-level array of objects, whose first element the
-    balanced-brace fallback could otherwise mistake for a valid embedded
-    object -- must raise immediately rather than fall through to that
-    fallback. See the array-of-objects regression at the generate_json level:
-    test_generate_json_array_of_objects_raises_upstream_not_first_element.
-    """
-    with pytest.raises(LLMUpstreamError) as excinfo:
-        _extract_json_object(value)
-    assert "WrongShape" in str(excinfo.value)
-
-
-def test_extract_json_object_prose_wrapped_still_falls_back_to_brace_slice() -> None:
-    """Full text that FAILS to parse as JSON at all (prose is not valid JSON)
-    is unaffected by the new top-level-shape check above: this must still fall
-    through to the balanced-brace fallback and recover the embedded object.
-    """
-    prose = 'Sure, here is the draft: {"title": "A"} Hope this helps!'
-    assert _extract_json_object(prose) == {"title": "A"}
-
-
-def test_extract_json_object_prose_wrapped_array_raises_upstream_wrong_shape() -> None:
-    """The array-of-objects rejection must also hold when the array is
-    embedded in prose rather than being the LLM's whole answer: prose makes
-    the full-text parse FAIL, so this exercises the candidate-scan fallback,
-    not the top-level-shape check. Without this, a naive fallback would
-    extract just the array's first element and silently persist a shape the
-    caller never asked for.
-    """
-    array_json = json.dumps([{"title": "A"}, {"title": "B"}])
-    prose = f"Here are two drafts: {array_json} Take your pick!"
-    with pytest.raises(LLMUpstreamError) as excinfo:
-        _extract_json_object(prose)
-    assert "WrongShape" in str(excinfo.value)
-
-
-# --- _extract_json_object: unparseable array elements (finding 2) ----------
-
-
-@pytest.mark.parametrize(
-    "content",
-    ['[{"title": "A"}, {bad}]', '[{"title": "A"},]', '[{bad}, {"title": "A"}]'],
-    ids=["garbled-second-element", "trailing-comma", "garbled-first-element"],
-)
-def test_extract_json_object_unparseable_array_element_raises_wrong_shape(content: str) -> None:
-    """Finding 2: an outer array that fails to parse as a whole (a garbled
-    multi-draft array, or one with a trailing comma) must NOT have its one
-    parseable inner object promoted. The parseable object's last
-    non-whitespace left neighbour is "[" or "," -- syntactically an array
-    element -- so it is rejected as an ambiguous multi-draft response
-    (WrongShape), not silently persisted. Pre-fix, the hand-rolled scanner
-    skipped the unparseable outer array as junk and returned the inner object.
-    """
-    with pytest.raises(LLMUpstreamError) as excinfo:
-        _extract_json_object(content)
-    assert "WrongShape" in str(excinfo.value)
-
-
-def test_extract_json_object_prose_comma_before_object_false_positives_by_design() -> None:
-    """DELIBERATE TRADEOFF (documented in _extract_json_object): prose whose
-    last non-whitespace character before a lone object is "," (or "[") is
-    indistinguishable from a garbled array element, so it 502s. Accepted -- a
-    502 triggers a retry, whereas silently picking an array element misleads,
-    and conforming models emit a bare single object anyway. Pinned so the
-    tradeoff is not "fixed" back into a silent element-pick by accident.
-    """
-    with pytest.raises(LLMUpstreamError) as excinfo:
-        _extract_json_object('As shown, {"title": "A"}')
-    assert "WrongShape" in str(excinfo.value)
-
-
-def test_extract_json_object_juxtaposed_objects_raises_upstream_wrong_shape() -> None:
-    """Two top-level objects juxtaposed rather than wrapped in an array or
-    comma-separated (``{"title": "A"} {"title": "B"}``) make the full-text
-    parse fail as "extra data" -- neither the top-level-shape check (not valid
-    JSON at all) nor the old array check (there is no array here) catches
-    this. Pre-fix, the candidate-scan fallback returned on the FIRST usable
-    dict it found, silently dropping the second. The exactly-one rule closes
-    this: the scan finds two usable dicts, so it must reject the pair as a
-    whole -- 502 WrongShape, not a silent pick of "A".
-    """
-    prose = '{"title": "A"} {"title": "B"}'
-    with pytest.raises(LLMUpstreamError) as excinfo:
-        _extract_json_object(prose)
-    assert "WrongShape" in str(excinfo.value)
-    assert "multiple JSON objects" in str(excinfo.value)
-
-
-def test_extract_json_object_three_juxtaposed_objects_raises_upstream_wrong_shape() -> None:
-    """The exactly-one rule is a COUNT, not a special case for exactly two:
-    three juxtaposed objects must be rejected the same way as two.
-    """
-    prose = '{"title": "A"} {"title": "B"} {"title": "C"}'
-    with pytest.raises(LLMUpstreamError) as excinfo:
-        _extract_json_object(prose)
-    assert "WrongShape" in str(excinfo.value)
-    assert "multiple JSON objects" in str(excinfo.value)
-
-
-def test_extract_json_object_skips_innocent_scalar_bracket_before_object() -> None:
-    """A scalar array that appears before the real object in prose (e.g. a
-    footnote-style "[1]") must not be mistaken for the answer, and must not
-    block the scan from reaching the object that follows it: it parses as a
-    list with no dict inside, so the scan skips it and keeps going.
-    """
-    prose = f"Answer[1]: {_SAMPLE_JSON} (see footnote 1 for caveats)"
-    assert _extract_json_object(prose) == _SAMPLE_OBJECT
-
-
-def test_extract_json_object_skips_innocent_scalar_brackets_before_and_after_object() -> None:
-    """The exactly-one rule counts USABLE DICTS only: scalar-array junk both
-    before AND after the real object must neither be mistaken for a second
-    usable object nor block the scan from finishing. This is what proves the
-    new walk-to-completion behaviour (needed to catch a second dict anywhere
-    in the text) does not turn trailing scalar noise into a false
-    "multiple objects" rejection.
-    """
-    prose = f"Answer[1]: {_SAMPLE_JSON} (see footnote [2] for caveats)"
-    assert _extract_json_object(prose) == _SAMPLE_OBJECT
-
-
-def test_extract_json_object_invalid_raises_upstream() -> None:
-    with pytest.raises(LLMUpstreamError):
-        _extract_json_object("definitely not json")
-
-
-def test_extract_json_object_deeply_nested_brackets_raises_upstream() -> None:
-    """Tens of thousands of nested ``[`` make json.loads raise RecursionError,
-    not JSONDecodeError. That must be caught and mapped to the same unparseable
-    502 as any other bad output -- never left to escape as an unhandled 500.
-    """
-    deep = "[" * 50000 + "]" * 50000
-    with pytest.raises(LLMUpstreamError):
-        _extract_json_object(deep)
-
-
-# --- candidate scan: bounded, no pathological rescans (prose-wrapped array) -
-
-
-def test_extract_json_object_bounded_with_many_unmatched_brace_opens() -> None:
-    """A long run of unmatched ``{`` with no closing ``}`` at all must not
-    trigger an O(n^2) "retry every position independently" scan: raw_decode
-    fails at the first character of each unmatched ``{`` (O(1) per position),
-    so the walk stays linear regardless of how many opens never find a match --
-    fast even at a size where a quadratic implementation would visibly stall
-    (tens of seconds or more, versus low milliseconds here).
-    """
-    text = "{" * 30000 + " not valid json, just noise"
-    started = time.monotonic()
-    with pytest.raises(LLMUpstreamError) as excinfo:
-        _extract_json_object(text)
-    elapsed = time.monotonic() - started
-    assert "UnparseableOutput" in str(excinfo.value)
-    assert elapsed < 2.0
-
-
-def test_extract_json_object_bounded_with_many_skippable_candidates() -> None:
-    """Many innocent scalar-array candidates ahead of the real object -- each
-    individually cheap to reject -- must not add up to quadratic work: the walk
-    decodes each candidate once and jumps past it (i = end), so the parsed
-    spans are mutually disjoint and total work stays linear in len(text), fast
-    even with thousands of them ahead of the object the scan is looking for.
-    """
-    noise = "".join(f"[{i}]" for i in range(5000))
-    prose = f"{noise} {_SAMPLE_JSON}"
-    started = time.monotonic()
-    result = _extract_json_object(prose)
-    elapsed = time.monotonic() - started
-    assert result == _SAMPLE_OBJECT
-    assert elapsed < 2.0
-
-
-# --- generate_json: nonconforming-but-200 upstream bodies (finding 2) ------
+# --- generate_structured: nonconforming-but-200 upstream bodies -----------
 
 
 @pytest.mark.parametrize(
@@ -877,45 +811,40 @@ def test_extract_json_object_bounded_with_many_skippable_candidates() -> None:
     ],
     ids=["choices-none", "choices-empty", "choice-without-message", "message-none"],
 )
-def test_generate_json_nonconforming_200_raises_upstream(
+def test_generate_structured_nonconforming_200_raises_upstream(
     monkeypatch: pytest.MonkeyPatch, completion: Any
 ) -> None:
     """A compatible gateway can return a 200 whose body violates the SDK's
-    expected shape (choices None/empty/non-list, a choice with no message, a
-    null message). The lenient SDK does not reject it, so the service must:
-    every such shape becomes an LLMUpstreamError (502), never an AttributeError
-    or TypeError surfacing as a 500.
+    expected shape. The service maps every such shape to LLMUpstreamError (502),
+    never an AttributeError/TypeError 500.
     """
     _install_raw(monkeypatch, completion)
     with pytest.raises(LLMUpstreamError):
-        asyncio.run(generate_json("system", "user"))
+        _run()
 
 
-# --- generate_json: malformed endpoint config (finding 1) ------------------
+# --- generate_structured: malformed endpoint config -----------------------
 
 
-def test_generate_json_malformed_endpoint_raises_not_configured(
+def test_generate_structured_malformed_endpoint_raises_not_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A syntactically invalid endpoint (bad port) makes AsyncOpenAI raise at
     CONSTRUCTION -- an httpx.InvalidURL, not an OpenAIError -- which the config
-    gate must catch and remap to LLMNotConfiguredError (503). The real
-    _get_client/_build_client run here (not stubbed) so construction genuinely
-    fails, and the raised error must carry neither the URL fragment nor the key.
+    gate catches and remaps to LLMNotConfiguredError (503). The real
+    _get_client/_build_client run here (not stubbed); the raised error carries
+    neither the URL fragment nor the key.
     """
     monkeypatch.setattr(
         "app.services.llm.get_settings",
         lambda: _settings(base_url="http://h:8o80/v1", model=_CONFIGURED_MODEL),
     )
     with pytest.raises(LLMNotConfiguredError) as excinfo:
-        asyncio.run(generate_json("system", "user"))
+        _run()
 
     message = str(excinfo.value)
     assert "8o80" not in message
     assert _CONFIGURED_KEY not in message
-    # `from None` clears __cause__ and sets __suppress_context__, so the
-    # httpx.InvalidURL (whose text carries the URL fragment) is suppressed from
-    # any rendered traceback -- exactly what a logger's exc_info would emit.
     assert excinfo.value.__cause__ is None
     assert excinfo.value.__suppress_context__ is True
     rendered = "".join(
@@ -925,18 +854,14 @@ def test_generate_json_malformed_endpoint_raises_not_configured(
     assert _CONFIGURED_KEY not in rendered
 
 
-# --- retry policy (finding 6) ---------------------------------------------
+# --- retry policy ---------------------------------------------------------
 
 
 def test_build_client_disables_automatic_retries() -> None:
-    """max_retries=0 so a retry never silently waits out the whole per-attempt
-    timeout again (plus backoff), multiplying real-failure latency for an
-    interactive tool -- one piece of what keeps openai_timeout_seconds close to
-    an end-to-end bound; the genuine wall-clock deadline is the asyncio.timeout
-    wrapped around the call in generate_json (see
-    test_generate_json_wall_clock_timeout_raises_upstream_with_timeout_category).
-    Asserted on the constructed client's own attribute, not via wall-clock
-    timing, so it is deterministic.
+    """max_retries=0 so an SDK transport retry never silently waits out the whole
+    per-attempt timeout again (plus backoff). This is distinct from
+    generate_structured's ONE corrective retry, which re-prompts only on bad
+    output. Asserted on the constructed client's own attribute, not via timing.
     """
     client = _build_client("http://retry-policy.example/v1", "k", 1.0)
     assert client.max_retries == 0

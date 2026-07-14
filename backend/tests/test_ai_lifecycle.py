@@ -7,7 +7,9 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import BaseModel, ValidationError
 
+from app.services.llm import LLMUpstreamError
 from app.services.memory_ai import ENRICH_SYSTEM_PROMPT
 
 
@@ -18,11 +20,22 @@ def _create(client: TestClient, **fields: Any) -> dict[str, Any]:
     return response.json()
 
 
-def _patch_generate_json(monkeypatch: pytest.MonkeyPatch, result: dict[str, Any]) -> None:
-    async def _fake(system: str, user: str) -> dict[str, Any]:
-        return result
+def _patch_generate_structured(monkeypatch: pytest.MonkeyPatch, result: dict[str, Any]) -> None:
+    """Stub the structured-output boundary: skip the network/parse and run the
+    workflow's real model validation on ``result``, mirroring generate_structured
+    (a validation failure maps to the same 502 upstream error, no retry needed
+    for a fixed canned result).
+    """
 
-    monkeypatch.setattr("app.services.memory_ai.generate_json", _fake)
+    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
+        try:
+            return model_cls.model_validate(result)
+        except ValidationError:
+            raise LLMUpstreamError(
+                "InvalidStructuredOutput: the LLM did not return a valid structured result"
+            ) from None
+
+    monkeypatch.setattr("app.services.memory_ai.generate_structured", _fake)
 
 
 def _enrich(client: TestClient, item_id: int) -> dict[str, Any]:
@@ -36,7 +49,7 @@ def test_complete_checklist_promotes_capture_quick_to_active(
 ) -> None:
     item = _create(client)  # defaults to capture-quick
     assert item["status"] == "capture-quick"
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch,
         {"sections": {"decisions": "定案"}, "checklist_complete": True, "progress_note": "done"},
     )
@@ -54,7 +67,7 @@ def test_complete_checklist_promotes_needs_enrichment_to_active(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     item = _create(client, status="needs-enrichment")
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch,
         {"sections": {"decisions": "d"}, "checklist_complete": True, "progress_note": "n"},
     )
@@ -67,7 +80,7 @@ def test_complete_checklist_leaves_waiting_status_untouched(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     item = _create(client, status="waiting")
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch,
         {"sections": {"decisions": "d"}, "checklist_complete": True, "progress_note": "n"},
     )
@@ -84,7 +97,7 @@ def test_complete_checklist_leaves_parked_status_untouched(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     item = _create(client, status="parked")
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch,
         {"sections": {"decisions": "d"}, "checklist_complete": True, "progress_note": "n"},
     )
@@ -96,7 +109,7 @@ def test_incomplete_checklist_does_not_promote(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     item = _create(client)  # capture-quick
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch,
         {"sections": {"decisions": "d"}, "checklist_complete": False, "progress_note": "n"},
     )
@@ -115,7 +128,7 @@ def test_ambiguous_checklist_complete_does_not_promote(
     # coercion would have.
     item = _create(client)  # capture-quick
     assert item["status"] == "capture-quick"
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch,
         {"sections": {"decisions": "d"}, "checklist_complete": "yes", "progress_note": "n"},
     )
@@ -133,7 +146,7 @@ def test_contradictory_complete_with_gaps_does_not_promote(
     # status stay put -- and the gaps flow back to the caller.
     item = _create(client)  # capture-quick / stage quick
     assert item["status"] == "capture-quick"
-    _patch_generate_json(
+    _patch_generate_structured(
         monkeypatch,
         {
             "sections": {"decisions": "d"},
