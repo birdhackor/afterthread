@@ -138,6 +138,7 @@ export function ItemEditPage() {
 				submitLabel="儲存變更"
 				onSubmit={onSubmit}
 				onCancel={backToDetail}
+				isEdit
 			/>
 		</Stack>
 	);

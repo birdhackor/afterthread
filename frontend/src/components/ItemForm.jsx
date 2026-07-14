@@ -79,7 +79,23 @@ export function applyServerFieldErrors(error, setError) {
 // lets the create page POST the whole payload while the edit page PATCHes only
 // the dirty fields. Client-side rules mirror the backend bounds; server 422s
 // are surfaced via applyServerFieldErrors.
-export function ItemForm({ defaultValues, submitLabel, onSubmit, onCancel }) {
+//
+// `isEdit` (false for the create page) gates the section-field length rule:
+// a pre-existing item's section can already hold more than SECTION_MAX_LENGTH
+// chars server-side -- e.g. a history section (decisions/alternatives/
+// rationale/consequences) the backend merged past 20000 via
+// merge_with_supersede, which stores up to 60000 -- so validating an
+// untouched field's length would block submitting an unrelated change (like
+// the title) even though that field is never sent (edit PATCHes only dirty
+// fields, see ItemEditPage). The cap still applies once the user actually
+// edits that field.
+export function ItemForm({
+	defaultValues,
+	submitLabel,
+	onSubmit,
+	onCancel,
+	isEdit = false,
+}) {
 	const {
 		control,
 		handleSubmit,
@@ -185,36 +201,46 @@ export function ItemForm({ defaultValues, submitLabel, onSubmit, onCancel }) {
 					return (
 						<Stack key={group.id} gap="sm">
 							<Title order={4}>{group.title}</Title>
-							{group.fields.map((sectionField) => (
-								<Controller
-									key={sectionField.key}
-									name={sectionField.key}
-									control={control}
-									rules={{
-										maxLength: {
-											value: SECTION_MAX_LENGTH,
-											message: `不可超過 ${SECTION_MAX_LENGTH} 字`,
-										},
-									}}
-									render={({ field, fieldState }) => (
-										<div>
-											<Textarea
-												{...field}
-												label={single ? undefined : sectionField.label}
-												placeholder={single ? group.title : sectionField.label}
-												autosize
-												minRows={3}
-												maxLength={SECTION_MAX_LENGTH}
-												error={fieldState.error?.message}
-											/>
-											<CharCounter
-												value={field.value}
-												max={SECTION_MAX_LENGTH}
-											/>
-										</div>
-									)}
-								/>
-							))}
+							{group.fields.map((sectionField) => {
+								// Never block submit over a field the user didn't touch --
+								// it isn't part of the dirty-only PATCH either way (see the
+								// module doc comment above).
+								const untouchedInEdit =
+									isEdit && !dirtyFields[sectionField.key];
+								return (
+									<Controller
+										key={sectionField.key}
+										name={sectionField.key}
+										control={control}
+										rules={{
+											validate: (value) =>
+												untouchedInEdit ||
+												value.length <= SECTION_MAX_LENGTH ||
+												`不可超過 ${SECTION_MAX_LENGTH} 字`,
+										}}
+										render={({ field, fieldState }) => (
+											<div>
+												<Textarea
+													{...field}
+													label={single ? undefined : sectionField.label}
+													placeholder={
+														single ? group.title : sectionField.label
+													}
+													autosize
+													minRows={3}
+													maxLength={SECTION_MAX_LENGTH}
+													error={fieldState.error?.message}
+												/>
+												<CharCounter
+													value={field.value}
+													max={SECTION_MAX_LENGTH}
+													suppressOverLimit={untouchedInEdit}
+												/>
+											</div>
+										)}
+									/>
+								);
+							})}
 						</Stack>
 					);
 				})}
