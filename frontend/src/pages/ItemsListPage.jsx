@@ -1,7 +1,6 @@
 import {
 	Alert,
 	Anchor,
-	Badge,
 	Button,
 	Group,
 	Pagination,
@@ -28,34 +27,19 @@ import {
 	statusFilterAtom,
 	tagFilterAtom,
 } from "../atoms/filters.js";
+import { DateText } from "../components/DateText.jsx";
+import { EmptyState } from "../components/EmptyState.jsx";
+import { StaleBadge } from "../components/StaleBadge.jsx";
+import { StatusBadge } from "../components/StatusBadge.jsx";
+import { TagList } from "../components/TagList.jsx";
 import {
 	STAGE_META,
 	STAGE_OPTIONS,
-	STATUS_META,
 	STATUS_OPTIONS,
 } from "../constants/labels.js";
 
-// Local YYYY-MM-DD formatter (a shared DateText primitive replaces this later).
-function formatDate(value) {
-	if (!value) {
-		return "";
-	}
-	const date = new Date(value);
-	if (Number.isNaN(date.getTime())) {
-		return "";
-	}
-	const year = date.getFullYear();
-	const month = String(date.getMonth() + 1).padStart(2, "0");
-	const day = String(date.getDate()).padStart(2, "0");
-	return `${year}-${month}-${day}`;
-}
-
 // A single memory item rendered as a table row.
 function ItemRow({ item }) {
-	const statusMeta = STATUS_META[item.status] ?? {
-		label: item.status,
-		color: "gray",
-	};
 	const stageMeta = STAGE_META[item.stage] ?? { label: item.stage };
 	return (
 		<Table.Tr>
@@ -64,34 +48,20 @@ function ItemRow({ item }) {
 					<Anchor component={Link} to={`/items/${item.id}`} fw={500}>
 						{item.title}
 					</Anchor>
-					{item.is_stale ? (
-						<Badge color="yellow" variant="light" size="sm">
-							陳舊
-						</Badge>
-					) : null}
+					<StaleBadge stale={item.is_stale} />
 				</Group>
 			</Table.Td>
 			<Table.Td>
-				<Badge color={statusMeta.color} variant="light">
-					{statusMeta.label}
-				</Badge>
+				<StatusBadge status={item.status} />
 			</Table.Td>
 			<Table.Td>
 				<Text size="sm">{stageMeta.label}</Text>
 			</Table.Td>
 			<Table.Td>
-				<Group gap={4}>
-					{(item.tags ?? []).map((tag) => (
-						<Badge key={tag} variant="outline" color="gray" size="sm">
-							{tag}
-						</Badge>
-					))}
-				</Group>
+				<TagList tags={item.tags} />
 			</Table.Td>
 			<Table.Td>
-				<Text size="sm" c="dimmed">
-					{formatDate(item.updated)}
-				</Text>
+				<DateText value={item.updated} size="sm" c="dimmed" />
 			</Table.Td>
 		</Table.Tr>
 	);
@@ -234,15 +204,13 @@ export function ItemsListPage() {
 		);
 	} else if (state.items.length === 0) {
 		body = hasFilters ? (
-			<Stack gap="sm" align="flex-start" py="xl">
-				<Text c="dimmed">找不到符合條件的項目</Text>
+			<EmptyState message="找不到符合條件的項目" align="flex-start">
 				<Button variant="light" size="xs" onClick={() => resetFilters()}>
 					清除篩選
 				</Button>
-			</Stack>
+			</EmptyState>
 		) : (
-			<Stack gap="sm" align="center" py="xl">
-				<Text c="dimmed">尚無記憶項目</Text>
+			<EmptyState message="尚無記憶項目">
 				<Group gap="sm">
 					<Anchor component={Link} to="/capture">
 						快速捕捉
@@ -251,7 +219,7 @@ export function ItemsListPage() {
 						新增項目
 					</Anchor>
 				</Group>
-			</Stack>
+			</EmptyState>
 		);
 	} else {
 		body = (
