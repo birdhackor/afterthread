@@ -147,16 +147,36 @@ const itemNewRoute = createRoute({
 	component: ItemNewPage,
 });
 
+// Remount-per-id contract: TanStack Router reuses the matched route's
+// component instance across navigations that only change a path param (e.g.
+// /items/1 -> /items/2 stays the same ItemDetailPage instance, just
+// re-rendered with a new itemId). ItemDetailPage and ItemEditPage each keep
+// per-item refs (reqRef, isMountedRef) and in-flight async closures (AI/
+// progress refresh, edit-page PATCH -> backToDetail) that capture the itemId
+// current at the time they were created; without a forced remount those
+// closures can resolve after the param has moved on and act on/navigate to
+// the wrong item. Keying the rendered page on itemId forces React to unmount
+// the old instance (running its cleanup, so isMountedRef flips false and the
+// old reqRef is discarded) and mount a fresh one whenever itemId changes, so
+// every stale callback from the previous item becomes a no-op. The pages
+// still read itemId via useParams internally -- this wrapper only adds the
+// key.
 const itemDetailRoute = createRoute({
 	getParentRoute: () => rootRoute,
 	path: "/items/$itemId",
-	component: ItemDetailPage,
+	component: () => {
+		const { itemId } = itemDetailRoute.useParams();
+		return <ItemDetailPage key={itemId} />;
+	},
 });
 
 const itemEditRoute = createRoute({
 	getParentRoute: () => rootRoute,
 	path: "/items/$itemId/edit",
-	component: ItemEditPage,
+	component: () => {
+		const { itemId } = itemEditRoute.useParams();
+		return <ItemEditPage key={itemId} />;
+	},
 });
 
 const routeTree = rootRoute.addChildren([

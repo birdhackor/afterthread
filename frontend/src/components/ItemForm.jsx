@@ -248,7 +248,6 @@ export function ItemForm({
 										value={field.value}
 										onChange={field.onChange}
 										onBlur={field.onBlur}
-										maxTags={MAX_TAGS}
 										placeholder="輸入後按 Enter 新增"
 										error={fieldState.error?.message}
 									/>
