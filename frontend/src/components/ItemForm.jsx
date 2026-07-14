@@ -286,7 +286,12 @@ export function ItemForm({
 				})}
 
 				<Group justify="flex-end">
-					<Button type="button" variant="default" onClick={onCancel}>
+					<Button
+						type="button"
+						variant="default"
+						onClick={onCancel}
+						disabled={isSubmitting}
+					>
 						取消
 					</Button>
 					<Button type="submit" loading={isSubmitting}>

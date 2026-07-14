@@ -115,9 +115,17 @@ function AiActionCard({
 							<Button
 								size="xs"
 								variant="light"
-								onClick={() => {
-									setConflict(false);
-									onRefresh?.().catch(() => {});
+								onClick={async () => {
+									try {
+										await onRefresh?.();
+										setConflict(false);
+									} catch (_error) {
+										notifications.show({
+											color: "red",
+											title: "重新載入失敗",
+											message: "請再試一次",
+										});
+									}
 								}}
 							>
 								重新整理

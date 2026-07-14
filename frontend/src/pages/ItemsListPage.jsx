@@ -304,12 +304,27 @@ export function ItemsListPage() {
 				</Button>
 			</Group>
 
+			{state.phase === "error" && state.items.length > 0 ? (
+				<Alert color="red" title="重新載入失敗" variant="light">
+					<Stack gap="sm" align="flex-start">
+						<Text size="sm">
+							{state.error?.message ?? "無法重新載入記憶清單"}
+							，顯示的是先前的結果
+						</Text>
+						<Button size="xs" onClick={load}>
+							重試
+						</Button>
+					</Stack>
+				</Alert>
+			) : null}
+
 			{body}
 
 			{state.total > 0 ? (
 				<Group justify="space-between" align="center">
 					<Text size="sm" c="dimmed">
 						共 {state.total} 筆
+						{state.phase === "error" ? "（顯示先前結果）" : ""}
 					</Text>
 					<Pagination total={totalPages} value={page} onChange={setPage} />
 				</Group>

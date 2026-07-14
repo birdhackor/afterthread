@@ -535,11 +535,18 @@ export function ItemDetailPage() {
 				onClose={confirm.close}
 				title="刪除項目"
 				centered
+				closeOnEscape={!deleting}
+				closeOnClickOutside={!deleting}
+				withCloseButton={!deleting}
 			>
 				<Stack gap="md">
 					<Text>確定要刪除「{item.title}」嗎？此動作無法復原。</Text>
 					<Group justify="flex-end">
-						<Button variant="default" onClick={confirm.close}>
+						<Button
+							variant="default"
+							onClick={confirm.close}
+							disabled={deleting}
+						>
 							取消
 						</Button>
 						<Button color="red" loading={deleting} onClick={handleDelete}>
