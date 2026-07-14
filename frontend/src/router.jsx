@@ -1,4 +1,12 @@
-import { AppShell, Badge, Group, NavLink, Text, Title } from "@mantine/core";
+import {
+	Alert,
+	AppShell,
+	Badge,
+	Group,
+	NavLink,
+	Text,
+	Title,
+} from "@mantine/core";
 import {
 	createRootRoute,
 	createRoute,
@@ -6,11 +14,60 @@ import {
 	Link,
 	Outlet,
 } from "@tanstack/react-router";
+import { useAtomValue, useSetAtom } from "jotai";
 import { useEffect, useState } from "react";
+import { apiGet } from "./api/client.js";
+import { llmStatusAtom, loadLlmStatusAtom } from "./atoms/llm.js";
+
+// Navbar entry rendered as a TanStack Link. Active highlighting is driven by
+// `activeProps` (data-active), which Mantine's NavLink styles via its
+// [data-active] selector; `exact` is used for the index route so it is not
+// marked active on every sub-path.
+function NavItem({ to, label, exact }) {
+	return (
+		<NavLink
+			component={Link}
+			to={to}
+			label={label}
+			activeOptions={exact ? { exact: true } : undefined}
+			activeProps={{ "data-active": true }}
+		/>
+	);
+}
+
+// Dismissible top banner shown only once the LLM status has loaded and the
+// backend reports the endpoint is not configured. Content matches the shared
+// UX rules; AI action buttons on other pages are disabled separately.
+function LlmBanner() {
+	const status = useAtomValue(llmStatusAtom);
+	const [dismissed, setDismissed] = useState(false);
+
+	if (dismissed || !status.loaded || status.configured) {
+		return null;
+	}
+
+	return (
+		<Alert
+			color="orange"
+			withCloseButton
+			onClose={() => setDismissed(true)}
+			mb="md"
+		>
+			AI 功能未設定：請在 backend/.env 填入 OPENAI_BASE_URL 後重啟
+		</Alert>
+	);
+}
 
 // Root layout shared by every route: Mantine AppShell with a header and a
-// navbar, page content is rendered into AppShell.Main via <Outlet />.
+// navbar; page content is rendered into AppShell.Main via <Outlet />. Loads
+// the LLM status once on mount so the banner and AI buttons can react to it.
 function RootLayout() {
+	const loadLlmStatus = useSetAtom(loadLlmStatusAtom);
+
+	useEffect(() => {
+		loadLlmStatus();
+	}, [loadLlmStatus]);
+
 	return (
 		<AppShell
 			header={{ height: 60 }}
@@ -23,11 +80,13 @@ function RootLayout() {
 				</Group>
 			</AppShell.Header>
 			<AppShell.Navbar p="md">
-				<NavLink component={Link} to="/" label="總覽" />
-				<NavLink component={Link} to="/capture" label="快速捕捉" />
-				<NavLink component={Link} to="/items" label="記憶清單" />
+				<NavItem to="/" label="總覽" exact />
+				<NavItem to="/capture" label="快速捕捉" />
+				<NavItem to="/items" label="記憶清單" />
+				<NavItem to="/items/new" label="新增項目" />
 			</AppShell.Navbar>
 			<AppShell.Main>
+				<LlmBanner />
 				<Outlet />
 			</AppShell.Main>
 		</AppShell>
@@ -35,16 +94,15 @@ function RootLayout() {
 }
 
 // Home page: pings the backend health endpoint on mount and reports the
-// connection status. The backend may not be running yet, so a fetch
-// failure (network error, non-OK status, etc.) must not crash the page.
+// connection status. A fetch failure (backend down, network error) must not
+// crash the page. Agent 3 replaces this with the review dashboard.
 function HomePage() {
 	const [connected, setConnected] = useState(false);
 
 	useEffect(() => {
 		let cancelled = false;
 
-		fetch("/api/health")
-			.then((response) => response.json())
+		apiGet("/api/health")
 			.then((data) => {
 				if (!cancelled) {
 					setConnected(data?.status === "ok");
