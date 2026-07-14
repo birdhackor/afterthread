@@ -69,7 +69,7 @@ ty check / pytest 386 passed；`uvicorn` 啟動後 `GET /api/health` 回
   title／snapshot／recovery_keywords 做大小寫不分、Unicode-casefold 的模糊搜尋）
   篩選；依 `updated` 新到舊排序。
 - `GET /api/items/{id}` — 單筆項目 + 完整 progress 歷史（依時間正序）。
-- `PATCH /api/items/{id}` — 局部更新；有實際欄位變更才會推進 `updated`。
+- `PATCH /api/items/{id}` — 局部更新；有提供欄位即推進 `updated`（即使值與現值相同），空 payload 不推進。
 - `DELETE /api/items/{id}` — 刪除項目；progress entries 透過 DB 層 FK cascade 一併刪除。
 - `POST /api/items/{id}/progress` — 追加一筆 append-only progress entry。
 
