@@ -42,6 +42,7 @@ export function ItemEditPage() {
 	// rest of the component's life once the page has actually unmounted.
 	const isMountedRef = useRef(true);
 	useEffect(() => {
+		isMountedRef.current = true;
 		return () => {
 			isMountedRef.current = false;
 		};
