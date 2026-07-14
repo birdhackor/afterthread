@@ -13,9 +13,12 @@
 #   A  unconfigured backend  -> health / llm-status / capture-503 / full CRUD
 #                               lifecycle / input-bound rejects
 #   B  backend + good mock   -> real capture / enrich (merge, gaps, lifecycle,
-#                               supersede) / assist-update
-#   C  backend + degraded    -> garbage mock (502, no row) and slow mock (502
-#                               Timeout within the configured deadline)
+#                               supersede) / assist-update / list filters (tag,
+#                               q) and pagination (limit/offset)
+#   C  backend + degraded    -> garbage mock (502, no row), slow mock (502
+#                               Timeout within the configured deadline), and a
+#                               PATCH racing an in-flight enrich (409 conflict,
+#                               PATCH survives)
 #   D  frontend build        -> `pnpm build` + `pnpm preview` serve the SPA shell
 #
 # Every assertion prints PASS/FAIL; the script exits non-zero if any FAIL.
@@ -123,6 +126,26 @@ except Exception:
 PY
 }
 
+# ts_bumped BEFORE AFTER -> "yes" if AFTER is a strictly later ISO-8601
+# timestamp than BEFORE, "no" otherwise -- including when either argument is
+# missing/malformed (e.g. a jget that already turned an unparseable body into
+# ""). Values travel via argv, not string-interpolated into the python source,
+# and the parse is wrapped in try/except so this can never raise: it always
+# prints "yes" or "no" and exits 0, so callers can feed the result straight to
+# assert_eq and get a labeled FAIL instead of aborting the phase under set -e.
+ts_bumped() {
+    python3 - "$1" "$2" <<'PY'
+import sys
+from datetime import datetime
+try:
+    before = datetime.fromisoformat(sys.argv[1])
+    after = datetime.fromisoformat(sys.argv[2])
+    print("yes" if after > before else "no")
+except Exception:
+    print("no")
+PY
+}
+
 phase_banner() {
     CURRENT_PHASE="$1"
     printf '\n========== PHASE %s ==========\n' "$1"
@@ -145,6 +168,13 @@ req() {
 reqf() {
     curl -s --max-time 30 -o "$3" -w '%{http_code}' \
         -X "$1" -H 'Content-Type: application/json' --data-binary @"$4" "$2"
+}
+
+# urlenc STRING -> percent-encoded STRING (query-string safe), via Python's
+# urllib.parse.quote, so non-ASCII query values (e.g. Chinese tag/q filters)
+# are never sent as raw UTF-8 bytes in the request line.
+urlenc() {
+    python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
 }
 
 # --- process management ----------------------------------------------------
@@ -293,7 +323,7 @@ phase_a() {
     local before after bumped
     before="$(jget "$create" 'd["updated"]')"
     after="$(jget "$patched" 'd["updated"]')"
-    bumped="$(python3 -c "from datetime import datetime as t; print('yes' if t.fromisoformat('$after') > t.fromisoformat('$before') else 'no')")"
+    bumped="$(ts_bumped "$before" "$after")"
     assert_eq "patch bumps updated timestamp" "$bumped" "yes"
 
     # -- progress append -----------------------------------------------------
@@ -356,7 +386,7 @@ PY
 # PHASE B -- backend + good mock: capture, enrich, supersede, assist-update
 # ===========================================================================
 phase_b() {
-    phase_banner "B (good mock: capture / enrich / supersede / assist-update)"
+    phase_banner "B (good mock: capture / enrich / supersede / assist-update / filters+pagination)"
     local mport bport db mlog blog body
     mport="$(free_port)"
     bport="$(free_port)"
@@ -429,13 +459,43 @@ phase_b() {
         "$(req POST "$base/items/$id/assist-update" "$up" '{"note":"與第三方支付商確認串接文件進度。"}')" "200"
     local after_u ubumped
     after_u="$(jget "$up" 'd["item"]["updated"]')"
-    ubumped="$(python3 -c "from datetime import datetime as t; print('yes' if t.fromisoformat('$after_u') > t.fromisoformat('$before_u') else 'no')")"
+    ubumped="$(ts_bumped "$before_u" "$after_u")"
     assert_eq "assist-update bumps updated timestamp" "$ubumped" "yes"
     req GET "$base/items/$id" "$body" >/dev/null
     assert_true "assist-update appends its progress note" "$body" \
         'd["progress"][-1]["note"] == "更新後續行動與待答問題"'
     assert_true "full progress trail recorded in order" "$body" \
         '[e["note"] for e in d["progress"]] == ["AI 快速捕捉", "補充初步決策與背景資訊", "checklist 完成,決策改為方案B", "更新後續行動與待答問題"]'
+
+    # -- list filters: tag / q substring (+ non-match) on the captured item --
+    # The captured item is still the only row in this phase's DB, and it
+    # carries known zh-TW tags (["付款", "重構", "金流"]) and title
+    # ("重構付款流程以支援新金流商") from the mock's capture draft, untouched by
+    # either enrich call above (neither variant's `sections` includes "tags").
+    req GET "$base/items?tag=$(urlenc "付款")" "$body" >/dev/null
+    assert_true "tag filter (one of the captured item's tags) -> total 1" "$body" 'd["total"] == 1'
+
+    # The title is pure Traditional Chinese, which has no upper/lower
+    # distinction, so a "case-variant" of a substring is byte-identical to the
+    # substring itself here -- this still exercises the py_casefold-driven
+    # q substring match end-to-end (cross-case folding on a cased script, e.g.
+    # "école"/"RÉSUMÉ", is covered by backend/tests/test_items.py).
+    local qsub
+    qsub="$(python3 -c 'print("付款流程".upper())')"
+    req GET "$base/items?q=$(urlenc "$qsub")" "$body" >/dev/null
+    assert_true "q filter (case-variant substring of captured title) -> total 1" "$body" \
+        'd["total"] == 1'
+
+    req GET "$base/items?q=$(urlenc "不存在的字串xyz")" "$body" >/dev/null
+    assert_true "q filter non-matching substring -> total 0" "$body" 'd["total"] == 0'
+
+    # -- pagination: limit/offset once a second item exists ------------------
+    local second="$TMPDIR_E2E/b-second-create.json"
+    assert_eq "create second item 201" \
+        "$(req POST "$base/items" "$second" '{"title":"第二個項目","snapshot":"用於分頁測試"}')" "201"
+    req GET "$base/items?limit=1&offset=1" "$body" >/dev/null
+    assert_true "limit=1&offset=1 returns exactly 1 item" "$body" 'len(d["items"]) == 1'
+    assert_true "limit=1&offset=1 total == 2" "$body" 'd["total"] == 2'
 
     stop_servers
 }
@@ -444,7 +504,7 @@ phase_b() {
 # PHASE C -- degradation: garbage output (502, no row) and slow (502 Timeout)
 # ===========================================================================
 phase_c() {
-    phase_banner "C (degradation: garbage 502 + slow Timeout 502)"
+    phase_banner "C (degradation: garbage 502 + slow Timeout 502 + conflict 409)"
 
     # -- garbage: prose junk -> retry -> 502, nothing written ----------------
     local mport bport db mlog blog body
@@ -494,6 +554,63 @@ phase_c() {
     assert_eq "slow capture bounded (<6s, not the 10s sleep); took ${elapsed}s" "$within" "yes"
     req GET "$base/items" "$body" >/dev/null
     assert_true "slow capture wrote no row (total == 0)" "$body" 'd["total"] == 0'
+    stop_servers
+
+    # -- conflict: a PATCH landing mid-await races an in-flight enrich -------
+    # backend OPENAI_TIMEOUT_SECONDS is deliberately large (30) here: unlike
+    # the slow-Timeout leg above, this scenario wants the mock's slow reply to
+    # actually SUCCEED (just slowly), so the race is between the in-flight
+    # enrich and a concurrent PATCH -- not between the mock and the deadline.
+    mport="$(free_port)"
+    bport="$(free_port)"
+    db="$TMPDIR_E2E/c-conflict.sqlite"
+    mlog="$TMPDIR_E2E/c-conflict-mock.log"
+    blog="$TMPDIR_E2E/c-conflict-backend.log"
+    body="$TMPDIR_E2E/c-conflict-body.json"
+    start_mock "$mport" "slow" "4" "$mlog"
+    start_backend "$bport" "$db" "$blog" \
+        OPENAI_BASE_URL="http://127.0.0.1:$mport/v1" OPENAI_API_KEY="test" \
+        OPENAI_MODEL="mock" OPENAI_TIMEOUT_SECONDS="30"
+    base="http://127.0.0.1:$bport/api"
+
+    local ccreate="$TMPDIR_E2E/c-conflict-create.json"
+    assert_eq "conflict: create item 201" \
+        "$(req POST "$base/items" "$ccreate" '{"title":"併發衝突測試項目","status":"needs-enrichment"}')" "201"
+    local cid
+    cid="$(jget "$ccreate" 'd["id"]')"
+
+    # Fire enrich in the background: the handler snapshots `updated` almost
+    # immediately, then blocks for the mock's slow-seconds sleep inside the
+    # LLM call, which runs strictly outside any DB transaction (see
+    # backend/README.md's optimistic-409 design note). Its HTTP status lands
+    # in $enrich_code; curl itself always exits 0 here (no -f), so this
+    # background job cannot trip `set -e` in the parent shell regardless of
+    # what status the server returns.
+    local enrich_out="$TMPDIR_E2E/c-conflict-enrich.json"
+    local enrich_code="$TMPDIR_E2E/c-conflict-enrich-code.txt"
+    (req POST "$base/items/$cid/enrich" "$enrich_out" \
+        '{"additional_context":"背景補充,預期與併發 PATCH 衝突。"}' >"$enrich_code") &
+    local enrich_pid=$!
+
+    # Give the background request time to reach the handler and take its
+    # pre-await `updated` snapshot before racing it with a PATCH; the mock is
+    # still 3s+ away from replying at this point.
+    sleep 1
+
+    local cpatch="$TMPDIR_E2E/c-conflict-patch.json"
+    assert_eq "conflict: concurrent PATCH -> 200" \
+        "$(req PATCH "$base/items/$cid" "$cpatch" '{"status":"active"}')" "200"
+
+    wait "$enrich_pid"
+    local ccode
+    ccode="$(cat "$enrich_code")"
+    assert_eq "conflict: enrich racing a concurrent PATCH -> 409" "$ccode" "409"
+    assert_true "conflict: 409 detail.code == conflict" "$enrich_out" 'd["detail"]["code"] == "conflict"'
+
+    req GET "$base/items/$cid" "$body" >/dev/null
+    assert_true "conflict: concurrent PATCH's value survived (not overwritten)" "$body" \
+        'd["status"] == "active"'
+
     stop_servers
 }
 
@@ -546,8 +663,8 @@ main() {
     echo "========== SUMMARY =========="
     local ph
     for ph in "A (unconfigured backend: probes + CRUD)" \
-        "B (good mock: capture / enrich / supersede / assist-update)" \
-        "C (degradation: garbage 502 + slow Timeout 502)" \
+        "B (good mock: capture / enrich / supersede / assist-update / filters+pagination)" \
+        "C (degradation: garbage 502 + slow Timeout 502 + conflict 409)" \
         "D (frontend build + preview serves SPA shell)"; do
         printf '  PHASE %s: %d passed, %d failed\n' \
             "$ph" "${PHASE_PASS[$ph]:-0}" "${PHASE_FAIL[$ph]:-0}"
