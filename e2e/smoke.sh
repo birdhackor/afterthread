@@ -133,13 +133,19 @@ PY
 # and the parse is wrapped in try/except so this can never raise: it always
 # prints "yes" or "no" and exits 0, so callers can feed the result straight to
 # assert_eq and get a labeled FAIL instead of aborting the phase under set -e.
+# The API serializes UTC timestamps with a trailing "Z" (pydantic v2's
+# default), which datetime.fromisoformat only accepts natively from Python
+# 3.11 onward -- a bare `python3` on an older interpreter (<=3.10) raises
+# ValueError on it, silently landing "no" for every call via the except
+# clause below. Both values are normalized (Z -> +00:00) before parsing so
+# this works on any python3, not just whatever happens to be first on PATH.
 ts_bumped() {
     python3 - "$1" "$2" <<'PY'
 import sys
 from datetime import datetime
 try:
-    before = datetime.fromisoformat(sys.argv[1])
-    after = datetime.fromisoformat(sys.argv[2])
+    before = datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
+    after = datetime.fromisoformat(sys.argv[2].replace("Z", "+00:00"))
     print("yes" if after > before else "no")
 except Exception:
     print("no")
@@ -195,6 +201,21 @@ wait_200() {
     return 1
 }
 
+# wait_log_line FILE PATTERN [TRIES] -> 0 once FILE contains the fixed
+# string PATTERN, else 1 after TRIES*0.1s (default 100 tries => ~10s). Lets
+# callers wait for a server-side signal (e.g. a request the server logged)
+# instead of guessing a fixed sleep.
+wait_log_line() {
+    local file=$1 pattern=$2 tries=${3:-100} i
+    for ((i = 1; i <= tries; i++)); do
+        if grep -qF -- "$pattern" "$file" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
 # start_mock PORT MODE SLOW_SECONDS LOGFILE
 start_mock() {
     setsid python3 "$MOCK" --port "$1" --mode "$2" --slow-seconds "$3" >"$4" 2>&1 &
@@ -208,15 +229,29 @@ start_mock() {
 }
 
 # start_backend PORT DB_FILE LOGFILE [ENV=VAL ...]
-# Always scrubs ambient OPENAI_* so "unconfigured" is hermetic; extra ENV=VAL
-# args (e.g. the OPENAI_* triple) are layered on for the configured phases.
+# The three OPENAI_* fields llm_configured() gates on (base_url, api_key,
+# model) default to EXPLICIT empty-string overrides here, not `env -u`
+# unsets. pydantic-settings' precedence is env > dotenv, so an *unset* var
+# still falls through to backend/.env if the checkout has one configured
+# (e.g. a developer's real credentials) -- silently making an "unconfigured"
+# phase read configured:true. An explicit `NAME=` assignment, by contrast, IS
+# present in the child's environment (even though its value is empty), so it
+# always wins over dotenv, closing that hole. Extra ENV=VAL args (e.g. the
+# OPENAI_* triple the configured phases pass) are listed after these
+# defaults in the `env` invocation, so `env`'s left-to-right assignment
+# semantics let them override the empty defaults for phases B/C.
+# OPENAI_TIMEOUT_SECONDS is still scrubbed via `-u` rather than defaulted to
+# "": it is a gt=0-bounded float, so an empty override would fail
+# pydantic-settings validation and crash the backend at startup instead of
+# merely reading as unconfigured (and it plays no part in llm_configured()).
 start_backend() {
     local port=$1 db=$2 logf=$3
     shift 3
     (
         cd "$BACKEND_DIR" &&
-            setsid env -u OPENAI_BASE_URL -u OPENAI_API_KEY -u OPENAI_MODEL -u OPENAI_TIMEOUT_SECONDS \
-                DATABASE_URL="sqlite:///$db" "$@" \
+            setsid env -u OPENAI_TIMEOUT_SECONDS \
+                DATABASE_URL="sqlite:///$db" \
+                OPENAI_BASE_URL= OPENAI_API_KEY= OPENAI_MODEL= "$@" \
                 uv run uvicorn app.main:app --host 127.0.0.1 --port "$port" >"$logf" 2>&1 &
         echo $! >"$TMPDIR_E2E/last.sid"
     )
@@ -592,10 +627,20 @@ phase_c() {
         '{"additional_context":"背景補充,預期與併發 PATCH 衝突。"}' >"$enrich_code") &
     local enrich_pid=$!
 
-    # Give the background request time to reach the handler and take its
-    # pre-await `updated` snapshot before racing it with a PATCH; the mock is
-    # still 3s+ away from replying at this point.
-    sleep 1
+    # Wait for a SIGNAL instead of a fixed sleep: _snapshot_item_for_ai
+    # (app/routers/ai.py) is awaited to completion BEFORE enrich_item ever
+    # posts to the mock, so the mock logging "mode=slow sleeping" -- written
+    # the instant it has received and JSON-parsed the request, strictly
+    # BEFORE its artificial slow-seconds delay -- is proof the pre-await
+    # `updated` snapshot has already been taken. A fixed `sleep 1` was a
+    # guess that could be too short under a loaded runner (letting the PATCH
+    # land before the snapshot and silently turning the expected 409 into a
+    # 200) or needlessly long otherwise; polling the log removes the
+    # guesswork regardless of runner load.
+    if ! wait_log_line "$mlog" "mode=slow sleeping"; then
+        echo "  (timed out waiting for the mock to log the enrich request; log:)"
+        sed 's/^/    /' "$mlog" || true
+    fi
 
     local cpatch="$TMPDIR_E2E/c-conflict-patch.json"
     assert_eq "conflict: concurrent PATCH -> 200" \
