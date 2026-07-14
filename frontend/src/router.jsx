@@ -18,6 +18,7 @@ import { useAtomValue, useSetAtom } from "jotai";
 import { useEffect, useState } from "react";
 import { apiGet } from "./api/client.js";
 import { llmStatusAtom, loadLlmStatusAtom } from "./atoms/llm.js";
+import { ItemDetailPage } from "./pages/ItemDetailPage.jsx";
 import { ItemsListPage } from "./pages/ItemsListPage.jsx";
 
 // Navbar entry rendered as a TanStack Link. Active highlighting is driven by
@@ -162,7 +163,18 @@ const itemsRoute = createRoute({
 	component: ItemsListPage,
 });
 
-const routeTree = rootRoute.addChildren([indexRoute, captureRoute, itemsRoute]);
+const itemDetailRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/items/$itemId",
+	component: ItemDetailPage,
+});
+
+const routeTree = rootRoute.addChildren([
+	indexRoute,
+	captureRoute,
+	itemsRoute,
+	itemDetailRoute,
+]);
 
 export const router = createRouter({
 	routeTree,
