@@ -18,6 +18,7 @@ import { useAtomValue, useSetAtom } from "jotai";
 import { useEffect, useState } from "react";
 import { apiGet } from "./api/client.js";
 import { llmStatusAtom, loadLlmStatusAtom } from "./atoms/llm.js";
+import { ItemsListPage } from "./pages/ItemsListPage.jsx";
 
 // Navbar entry rendered as a TanStack Link. Active highlighting is driven by
 // `activeProps` (data-active), which Mantine's NavLink styles via its
@@ -135,10 +136,6 @@ function CapturePage() {
 	return <Text>將於後續階段實作</Text>;
 }
 
-function ItemsPage() {
-	return <Text>將於後續階段實作</Text>;
-}
-
 function NotFoundPage() {
 	return <Text>找不到頁面</Text>;
 }
@@ -162,7 +159,7 @@ const captureRoute = createRoute({
 const itemsRoute = createRoute({
 	getParentRoute: () => rootRoute,
 	path: "/items",
-	component: ItemsPage,
+	component: ItemsListPage,
 });
 
 const routeTree = rootRoute.addChildren([indexRoute, captureRoute, itemsRoute]);
