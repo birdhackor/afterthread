@@ -16,7 +16,11 @@ import { useAtomValue, useSetAtom } from "jotai";
 import { useState } from "react";
 import { Controller, useForm } from "react-hook-form";
 import { apiPost } from "../api/client.js";
-import { llmStatusAtom, loadLlmStatusAtom } from "../atoms/llm.js";
+import {
+	llmStatusAtom,
+	loadLlmStatusAtom,
+	markLlmUnconfiguredAtom,
+} from "../atoms/llm.js";
 import { LLM_NOT_CONFIGURED_NOTICE } from "../constants/labels.js";
 import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { codePointLength } from "../utils/text.js";
@@ -81,10 +85,11 @@ function AiActionCard({
 				setConflict(true);
 			}
 			if (error?.code === "llm_not_configured") {
-				// Backend just told us AI is unavailable (503) -- re-probe so the
-				// shared atom (and therefore the shell banner and every AI button)
-				// reflects this immediately instead of staying on a stale
-				// `configured: true` until the next full page load.
+				// Backend just told us AI is unavailable (503) -- caller
+				// synchronously downgrades the shared atom before re-probing, so
+				// the shell banner and every AI button reflect this immediately
+				// instead of staying on a stale `configured: true` until the next
+				// full page load (see ItemAiActions' handleLlmNotConfigured).
 				onLlmNotConfigured?.();
 			}
 			notifications.show({
@@ -289,12 +294,31 @@ export function ItemAiActions({
 }) {
 	const llm = useAtomValue(llmStatusAtom);
 	const configured = llm.configured;
+	// llm.loading is intentionally not also checked in the button `disabled`
+	// conditions below: handleLlmNotConfigured (see below) flips `configured`
+	// to false synchronously the moment a 503 comes back, before any
+	// re-probe's `loading` flag even turns on -- so repeat guaranteed
+	// failures already find the buttons disabled without needing to
+	// additionally couple to `loading`.
 	const loadLlmStatus = useSetAtom(loadLlmStatusAtom);
+	const markLlmUnconfigured = useSetAtom(markLlmUnconfiguredAtom);
 	// Only the gaps array from the last AI 補齊 call. The completion copy
 	// derived from it is NOT stored here -- GapsChecklist re-derives it from
 	// the live `item.stage` prop at render (see its doc comment), so this
 	// never goes stale relative to a later quick-Select stage change.
 	const [gaps, setGaps] = useState(null);
+
+	// Backend just told us (on THIS request) that AI is unavailable -- flip
+	// the shared atom synchronously first so the shell banner and every AI
+	// button reflect it immediately, THEN fire the async re-probe so a
+	// since-fixed backend can restore `configured: true`. The re-probe is
+	// fire-and-forget: it can only confirm this downgrade or correct it, and
+	// the UI is already accurate in the meantime regardless of its latency
+	// or failure (see markLlmUnconfiguredAtom's doc comment).
+	const handleLlmNotConfigured = () => {
+		markLlmUnconfigured();
+		loadLlmStatus({ force: true });
+	};
 
 	return (
 		<Stack gap="md">
@@ -324,7 +348,7 @@ export function ItemAiActions({
 				pending={pending}
 				onMutationStart={onMutationStart}
 				onMutationEnd={onMutationEnd}
-				onLlmNotConfigured={() => loadLlmStatus({ force: true })}
+				onLlmNotConfigured={handleLlmNotConfigured}
 			>
 				{gaps ? <GapsChecklist gaps={gaps} stage={item.stage} /> : null}
 			</AiActionCard>
@@ -353,7 +377,7 @@ export function ItemAiActions({
 				pending={pending}
 				onMutationStart={onMutationStart}
 				onMutationEnd={onMutationEnd}
-				onLlmNotConfigured={() => loadLlmStatus({ force: true })}
+				onLlmNotConfigured={handleLlmNotConfigured}
 			/>
 		</Stack>
 	);

@@ -64,3 +64,25 @@ export const loadLlmStatusAtom = atom(null, async (get, set, options = {}) => {
 		}
 	}
 });
+
+// Write-only action: synchronously downgrade the shared status to "not
+// configured". Call this the moment an actual AI call comes back with a 503
+// llm_not_configured -- that response IS authoritative (the backend just
+// told us, on this very request, that it can't serve AI calls right now), so
+// this must not wait on loadLlmStatusAtom's async re-probe. That re-probe can
+// itself be slow or keep failing (a transport blip preserves the prior
+// `configured` per the catch branch above, which after this downgrade is
+// already `false`), and until it resolves the buttons/banner must already
+// read "not configured" -- otherwise a repeat guaranteed-failure keeps
+// finding the AI buttons enabled. Callers still fire the force re-probe
+// afterwards so a since-fixed backend can flip this back to `true`; this
+// action only ever moves state to the disabled reading.
+export const markLlmUnconfiguredAtom = atom(null, (_get, set) => {
+	set(llmStatusAtom, {
+		loaded: true,
+		loading: false,
+		configured: false,
+		model: null,
+		error: null,
+	});
+});

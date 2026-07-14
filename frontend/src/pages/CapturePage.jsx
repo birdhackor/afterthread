@@ -18,7 +18,11 @@ import { useAtomValue, useSetAtom } from "jotai";
 import { useState } from "react";
 import { Controller, useForm } from "react-hook-form";
 import { apiPost } from "../api/client.js";
-import { llmStatusAtom, loadLlmStatusAtom } from "../atoms/llm.js";
+import {
+	llmStatusAtom,
+	loadLlmStatusAtom,
+	markLlmUnconfiguredAtom,
+} from "../atoms/llm.js";
 import { CharCounter } from "../components/CharCounter.jsx";
 import { StaleBadge } from "../components/StaleBadge.jsx";
 import { StatusBadge } from "../components/StatusBadge.jsx";
@@ -97,7 +101,14 @@ export function CapturePage() {
 	usePageTitle("快速捕捉");
 	const llm = useAtomValue(llmStatusAtom);
 	const configured = llm.configured;
+	// llm.loading is intentionally not also checked in the submit button's
+	// `disabled` below: on a 503 the catch block flips `configured` to false
+	// synchronously (see markLlmUnconfigured below) before any re-probe's
+	// `loading` flag even turns on, so a repeat guaranteed failure already
+	// finds the button disabled without needing to additionally couple to
+	// `loading`.
 	const loadLlmStatus = useSetAtom(loadLlmStatusAtom);
+	const markLlmUnconfigured = useSetAtom(markLlmUnconfiguredAtom);
 	const [result, setResult] = useState(null);
 	const [error, setError] = useState(null);
 
@@ -123,10 +134,15 @@ export function CapturePage() {
 		} catch (submitError) {
 			setError(submitError);
 			if (submitError?.code === "llm_not_configured") {
-				// Backend just told us AI is unavailable (503) -- re-probe so the
-				// shared atom (and therefore the shell banner and this page's own
-				// submit button) reflects this immediately instead of staying on a
-				// stale `configured: true` until the next full page load.
+				// Backend just told us (on THIS request) AI is unavailable (503) --
+				// downgrade the shared atom synchronously FIRST so the shell banner
+				// and this page's own submit button reflect it immediately instead
+				// of staying on a stale `configured: true` until the next full page
+				// load, THEN fire the async re-probe so a since-fixed backend can
+				// restore `configured: true` -- it can only confirm or correct this
+				// downgrade, so it's fire-and-forget here (see
+				// markLlmUnconfiguredAtom's doc comment).
+				markLlmUnconfigured();
 				loadLlmStatus({ force: true });
 			}
 		}

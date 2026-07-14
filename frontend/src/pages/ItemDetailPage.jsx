@@ -290,6 +290,22 @@ export function ItemDetailPage() {
 	// applied.
 	const reqRef = useRef(0);
 
+	// If the user navigates away (e.g. browser back) while handleDelete's
+	// DELETE below is still in flight, this page unmounts but the promise
+	// still resolves -- skip the success-path navigate in that case so it
+	// can't yank the user back to the (now-deleted) item's list view from
+	// wherever they already navigated to instead. The toast still shows
+	// (it's still true, and no longer where anyone's looking makes it
+	// harmless). Same pattern as ItemNewPage: set true in effect setup, false
+	// in cleanup, so it's reset correctly under StrictMode's double-mount.
+	const isMountedRef = useRef(true);
+	useEffect(() => {
+		isMountedRef.current = true;
+		return () => {
+			isMountedRef.current = false;
+		};
+	}, []);
+
 	// Replace the loaded item (accepts a value or an updater). Used by the quick
 	// status/stage controls and the progress form for in-place updates that must
 	// not trigger a full reload.
@@ -392,7 +408,9 @@ export function ItemDetailPage() {
 				title: "已刪除",
 				message: `已刪除「${item.title}」`,
 			});
-			navigate({ to: "/items" });
+			if (isMountedRef.current) {
+				navigate({ to: "/items" });
+			}
 		} catch (error) {
 			setDeleting(false);
 			confirm.close();

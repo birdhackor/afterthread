@@ -1,8 +1,10 @@
 import {
 	Alert,
 	Anchor,
+	Box,
 	Button,
 	Group,
+	LoadingOverlay,
 	Pagination,
 	Select,
 	Skeleton,
@@ -256,25 +258,35 @@ export function ItemsListPage() {
 			</EmptyState>
 		);
 	} else {
+		// A page/filter reload keeps the previous rows on screen (only the
+		// first load shows the skeleton above) so the table doesn't flash
+		// empty, but that means a reload in flight is otherwise silent --
+		// this overlay is the only signal that the visible rows are stale
+		// and a new query is running.
 		body = (
-			<Table.ScrollContainer minWidth={640}>
-				<Table striped highlightOnHover verticalSpacing="sm">
-					<Table.Thead>
-						<Table.Tr>
-							<Table.Th>標題</Table.Th>
-							<Table.Th>狀態</Table.Th>
-							<Table.Th>階段</Table.Th>
-							<Table.Th>標籤</Table.Th>
-							<Table.Th>更新</Table.Th>
-						</Table.Tr>
-					</Table.Thead>
-					<Table.Tbody>
-						{state.items.map((item) => (
-							<ItemRow key={item.id} item={item} />
-						))}
-					</Table.Tbody>
-				</Table>
-			</Table.ScrollContainer>
+			<Box pos="relative">
+				<LoadingOverlay
+					visible={state.phase === "loading" && state.items.length > 0}
+				/>
+				<Table.ScrollContainer minWidth={640}>
+					<Table striped highlightOnHover verticalSpacing="sm">
+						<Table.Thead>
+							<Table.Tr>
+								<Table.Th>標題</Table.Th>
+								<Table.Th>狀態</Table.Th>
+								<Table.Th>階段</Table.Th>
+								<Table.Th>標籤</Table.Th>
+								<Table.Th>更新</Table.Th>
+							</Table.Tr>
+						</Table.Thead>
+						<Table.Tbody>
+							{state.items.map((item) => (
+								<ItemRow key={item.id} item={item} />
+							))}
+						</Table.Tbody>
+					</Table>
+				</Table.ScrollContainer>
+			</Box>
 		);
 	}
 
