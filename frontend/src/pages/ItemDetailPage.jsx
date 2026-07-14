@@ -24,6 +24,7 @@ import { Controller, useForm } from "react-hook-form";
 import { apiDelete, apiGet, apiPatch, apiPost } from "../api/client.js";
 import { DateText } from "../components/DateText.jsx";
 import { EmptyState } from "../components/EmptyState.jsx";
+import { ItemAiActions } from "../components/ItemAiActions.jsx";
 import { StaleBadge } from "../components/StaleBadge.jsx";
 import { StatusBadge } from "../components/StatusBadge.jsx";
 import { TagList } from "../components/TagList.jsx";
@@ -414,6 +415,11 @@ export function ItemDetailPage() {
 				/>
 			</Group>
 			<SectionGroupsView item={item} showEmpty={showEmpty} />
+
+			<Divider />
+
+			<Title order={3}>AI 協助</Title>
+			<ItemAiActions item={item} onRefresh={refresh} />
 
 			<Divider />
 
