@@ -213,25 +213,38 @@ function AiActionCard({
 }
 
 // Read-only checklist of the enrichment gaps the backend still wants filled.
-function GapsChecklist({ gaps }) {
-	if (gaps.length === 0) {
+// An empty list alone is not "done": the backend can legitimately return
+// checklist_complete:false with an empty gaps array (item stays at stage
+// "quick"), so the caller threads in the REFRESHED item's stage and only
+// stage "full" earns the green completion copy -- otherwise this pass simply
+// didn't list anything, worded as a neutral status rather than a false claim
+// of completion.
+function GapsChecklist({ gaps, stage }) {
+	if (gaps.length > 0) {
+		return (
+			<Stack gap="xs">
+				<Text fw={600} size="sm">
+					仍待補齊
+				</Text>
+				<Stack gap={4}>
+					{gaps.map((gap) => (
+						<Checkbox key={gap} checked={false} readOnly label={gap} />
+					))}
+				</Stack>
+			</Stack>
+		);
+	}
+	if (stage === "full") {
 		return (
 			<Text size="sm" c="green">
-				目前沒有仍待補齊的缺口
+				補齊完成，無待補缺口
 			</Text>
 		);
 	}
 	return (
-		<Stack gap="xs">
-			<Text fw={600} size="sm">
-				仍待補齊
-			</Text>
-			<Stack gap={4}>
-				{gaps.map((gap) => (
-					<Checkbox key={gap} checked={false} readOnly label={gap} />
-				))}
-			</Stack>
-		</Stack>
+		<Text size="sm" c="dimmed">
+			本次未列出待補項目（項目仍為快速捕捉階段）
+		</Text>
 	);
 }
 
@@ -271,15 +284,23 @@ export function ItemAiActions({
 					})
 				}
 				onSuccess={async (result) => {
-					setGaps(result?.gaps ?? []);
-					await onRefresh();
+					// GapsChecklist's honest copy needs the REFRESHED item's stage --
+					// this closure's own `item` prop is still the pre-refresh value.
+					// onRefresh() is ItemDetailPage's refresh(), which resolves to the
+					// item it just fetched, so read the stage off that rather than off
+					// `item` here.
+					const refreshed = await onRefresh();
+					setGaps({
+						items: result?.gaps ?? [],
+						stage: refreshed?.stage ?? item.stage,
+					});
 				}}
 				onRefresh={onRefresh}
 				pending={pending}
 				onMutationStart={onMutationStart}
 				onMutationEnd={onMutationEnd}
 			>
-				{gaps ? <GapsChecklist gaps={gaps} /> : null}
+				{gaps ? <GapsChecklist gaps={gaps.items} stage={gaps.stage} /> : null}
 			</AiActionCard>
 
 			<AiActionCard
@@ -295,6 +316,11 @@ export function ItemAiActions({
 					apiPost(`/api/items/${item.id}/assist-update`, { note: value })
 				}
 				onSuccess={async () => {
+					// An assist-update can resolve (or otherwise make stale) the gaps
+					// the last AI 補齊 flagged, so clear that checklist rather than
+					// leave a superseded one on screen -- the next AI 補齊 recomputes
+					// it from scratch.
+					setGaps(null);
 					await onRefresh();
 				}}
 				onRefresh={onRefresh}

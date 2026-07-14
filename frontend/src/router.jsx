@@ -1,9 +1,12 @@
 import {
 	Alert,
 	AppShell,
+	Button,
 	Container,
 	Group,
 	NavLink,
+	Stack,
+	Text,
 	Title,
 } from "@mantine/core";
 import {
@@ -43,9 +46,14 @@ function NavItem({ to, label, exact }) {
 
 // Dismissible top banner shown only once the LLM status has loaded and the
 // backend reports the endpoint is not configured. Content matches the shared
-// UX rules; AI action buttons on other pages are disabled separately.
+// UX rules; AI action buttons on other pages are disabled separately. Also
+// offers a 重新檢查 action -- without it, a user who fixes backend/.env and
+// restarts the backend has no way back to "已設定" short of a full page
+// reload, since the status is otherwise only ever fetched once on mount (see
+// RootLayout below).
 function LlmBanner() {
 	const status = useAtomValue(llmStatusAtom);
+	const loadLlmStatus = useSetAtom(loadLlmStatusAtom);
 	const [dismissed, setDismissed] = useState(false);
 
 	if (dismissed || !status.loaded || status.configured) {
@@ -59,7 +67,17 @@ function LlmBanner() {
 			onClose={() => setDismissed(true)}
 			mb="md"
 		>
-			{LLM_NOT_CONFIGURED_NOTICE}
+			<Stack gap="xs" align="flex-start">
+				<Text size="sm">{LLM_NOT_CONFIGURED_NOTICE}</Text>
+				<Button
+					size="xs"
+					variant="light"
+					loading={status.loading}
+					onClick={() => loadLlmStatus({ force: true })}
+				>
+					重新檢查
+				</Button>
+			</Stack>
 		</Alert>
 	);
 }

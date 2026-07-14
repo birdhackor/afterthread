@@ -170,14 +170,20 @@ function StatusFooter() {
 				<Badge size="sm" variant="light" color={llmColor}>
 					{llmLabel}
 				</Badge>
-				{llm.error ? (
+				{/* Same action, two triggers: a transport error (llm.error) and an
+				honest "not configured" reading (llm.loaded && !llm.configured) --
+				e.g. after the user fixes backend/.env and restarts the backend,
+				this is the only way back to "已設定" short of a full page reload.
+				The two states are mutually exclusive (the atom forces configured
+				back to true on error), so one button covers both. */}
+				{llm.error || (llm.loaded && !llm.configured) ? (
 					<Button
 						size="xs"
 						variant="subtle"
 						loading={llm.loading}
 						onClick={() => loadLlmStatus({ force: true })}
 					>
-						重試
+						{llm.error ? "重試" : "重新檢查"}
 					</Button>
 				) : null}
 			</Group>
