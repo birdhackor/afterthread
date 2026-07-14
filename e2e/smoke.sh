@@ -55,10 +55,13 @@ TMPDIR_E2E="$(mktemp -d "${TMPDIR:-/tmp}/cm-e2e.XXXXXX")"
 
 # --- server bookkeeping (for teardown) -------------------------------------
 
-# Parallel arrays of session-leader PIDs and their ports for every server this
-# harness starts, so stop_servers can kill each process group and free its port.
+# Session-leader PIDs for every server this harness starts, so stop_servers
+# can signal each one's process group. Teardown only ever touches PIDs this
+# script itself launched and tracked here -- never anything discovered by
+# port number, which could belong to an unrelated process that grabbed the
+# port after ours exited (or one it never owned at all, e.g. a colliding CI
+# job or a developer's local service). See stop_servers.
 declare -a SIDS=()
-declare -a PORTS=()
 
 # --- assertion counters ----------------------------------------------------
 
@@ -217,11 +220,20 @@ wait_log_line() {
 }
 
 # start_mock PORT MODE SLOW_SECONDS LOGFILE
+#
+# `setsid cmd &` backgrounds setsid directly -- no wrapping subshell or `&&`
+# list -- so $! is exactly the PID bash forks to exec setsid. Job control is
+# off in this non-interactive script, so that forked PID is never a
+# process-group leader when setsid() runs, meaning the syscall succeeds in
+# place (no internal setsid re-fork) and setsid's own exec into python3
+# preserves the PID. $! is therefore the new session AND process-group
+# leader: PID == PGID == SID, confirmed with `ps -o pid,pgid,sid`. See
+# start_backend/start_preview for the same guarantee when a `cd` is also
+# needed.
 start_mock() {
     setsid python3 "$MOCK" --port "$1" --mode "$2" --slow-seconds "$3" >"$4" 2>&1 &
     local sid=$!
     SIDS+=("$sid")
-    PORTS+=("$1")
     if ! wait_200 "http://127.0.0.1:$1/health" 80; then
         echo "  (mock failed to start; log:)"; sed 's/^/    /' "$4" || true
         return 1
@@ -244,12 +256,26 @@ start_mock() {
 # "": it is a gt=0-bounded float, so an empty override would fail
 # pydantic-settings validation and crash the backend at startup instead of
 # merely reading as unconfigured (and it plays no part in llm_configured()).
+#
+# The outer subshell only exists to scope the `cd` without disturbing the
+# caller's CWD; $! set inside it isn't visible outside, hence the last.sid
+# handoff file. Backgrounding `cd dir && setsid ... &` verbatim (no `exec`)
+# would make $! the PID of that wrapping "cd && setsid" job -- NOT the setsid
+# session leader underneath it -- whenever bash forks rather than execs the
+# trailing command in place, which this script cannot rely on. `exec` before
+# setsid removes the ambiguity: it forces the backgrounded job to replace
+# itself with setsid (same PID, no further fork), and setsid then execs into
+# uv/uvicorn the same way, so the PID captured as $! is, by construction,
+# the actual session/group leader (PID == PGID == SID, confirmed with
+# `ps -o pid,pgid,sid`) that stop_servers' `kill -- -$sid` targets. uv/uvicorn
+# may fork further children of their own (workers, etc.), but those inherit
+# this same process group, so the group kill still reaps the whole tree.
 start_backend() {
     local port=$1 db=$2 logf=$3
     shift 3
     (
         cd "$BACKEND_DIR" &&
-            setsid env -u OPENAI_TIMEOUT_SECONDS \
+            exec setsid env -u OPENAI_TIMEOUT_SECONDS \
                 DATABASE_URL="sqlite:///$db" \
                 OPENAI_BASE_URL= OPENAI_API_KEY= OPENAI_MODEL= "$@" \
                 uv run uvicorn app.main:app --host 127.0.0.1 --port "$port" >"$logf" 2>&1 &
@@ -258,7 +284,6 @@ start_backend() {
     local sid
     sid="$(cat "$TMPDIR_E2E/last.sid")"
     SIDS+=("$sid")
-    PORTS+=("$port")
     if ! wait_200 "http://127.0.0.1:$port/api/health" 200; then
         echo "  (backend failed to start; log tail:)"; tail -n 15 "$logf" | sed 's/^/    /' || true
         return 1
@@ -266,25 +291,41 @@ start_backend() {
 }
 
 # start_preview PORT LOGFILE
+#
+# Same PID == PGID == SID guarantee as start_backend, and for the same
+# reason: `exec` before setsid forces the backgrounded "cd && setsid" job to
+# become setsid in place (no extra fork), so $! is the actual session/group
+# leader that stop_servers' `kill -- -$sid` targets. pnpm may itself spawn
+# the real vite preview process as a child, but that child inherits this
+# process group too, so the group kill still reaps it.
 start_preview() {
     (
         cd "$FRONTEND_DIR" &&
-            setsid pnpm preview --host 127.0.0.1 --port "$1" --strictPort >"$2" 2>&1 &
+            exec setsid pnpm preview --host 127.0.0.1 --port "$1" --strictPort >"$2" 2>&1 &
         echo $! >"$TMPDIR_E2E/last.sid"
     )
     local sid
     sid="$(cat "$TMPDIR_E2E/last.sid")"
     SIDS+=("$sid")
-    PORTS+=("$1")
     if ! wait_200 "http://127.0.0.1:$1/" 120; then
         echo "  (preview failed to start; log tail:)"; tail -n 15 "$2" | sed 's/^/    /' || true
         return 1
     fi
 }
 
-# Kill every tracked server (process group + a port sweep) and reset the arrays.
+# Kill every tracked server's process group (TERM, then KILL after a grace
+# period) and reset the array. This signals ONLY PIDs the harness itself
+# started and tracked into SIDS -- there is deliberately no port-based
+# fallback kill here. A port-number sweep (e.g. `lsof -ti tcp:$p | xargs
+# kill`) can't distinguish "our server, still bound" from "our server already
+# exited and something unrelated grabbed the port in the race window since"
+# and would SIGKILL whatever it finds either way -- on a shared CI box or a
+# dev machine that "whatever" can be someone else's process. Each $sid is the
+# tracked launch's own session/group leader (see start_backend/start_mock/
+# start_preview), so `kill -- -$sid` reaps that server's entire tree by
+# construction, making a port sweep both unnecessary and unsafe.
 stop_servers() {
-    local sid p
+    local sid
     for sid in "${SIDS[@]:-}"; do
         [ -n "$sid" ] && kill -TERM -"$sid" 2>/dev/null || true
     done
@@ -292,11 +333,7 @@ stop_servers() {
     for sid in "${SIDS[@]:-}"; do
         [ -n "$sid" ] && kill -KILL -"$sid" 2>/dev/null || true
     done
-    for p in "${PORTS[@]:-}"; do
-        lsof -ti tcp:"$p" 2>/dev/null | xargs -r kill -KILL 2>/dev/null || true
-    done
     SIDS=()
-    PORTS=()
 }
 
 teardown() {
