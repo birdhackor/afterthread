@@ -7,7 +7,7 @@ HTTP API，並在最後驗證前端 production build 能正常提供 SPA。
 ## 前置需求
 
 - `uv`（啟動後端：`uv run uvicorn`）
-- `pnpm`（前端 `build` / `preview`）
+- `pnpm`（前端 `build` / `preview`；Phase D 執行前會自動跑 `pnpm install --frozen-lockfile`，不需手動預先安裝前端相依套件）
 - `python3`（mock 伺服器為純標準函式庫；腳本也用它做 JSON 斷言）
 
 ## 執行方式

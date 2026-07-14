@@ -19,7 +19,8 @@
 #                               Timeout within the configured deadline), and a
 #                               PATCH racing an in-flight enrich (409 conflict,
 #                               PATCH survives)
-#   D  frontend build        -> `pnpm build` + `pnpm preview` serve the SPA shell
+#   D  frontend build        -> `pnpm install --frozen-lockfile` + `pnpm build` +
+#                               `pnpm preview` serve the SPA shell
 #
 # Every assertion prints PASS/FAIL; the script exits non-zero if any FAIL.
 # Servers and the temp dir are always cleaned up via an EXIT trap.
@@ -637,12 +638,34 @@ phase_b() {
     assert_true "q filter non-matching substring -> total 0" "$body" 'd["total"] == 0'
 
     # -- pagination: limit/offset once a second item exists ------------------
+    # Checking the item COUNT at a single offset can't tell "offset applied"
+    # apart from "offset ignored": an implementation that always serves page 0
+    # would still return len==1/total==2 for limit=1&offset=1 here (there are
+    # only 2 rows total). Fetch both offset=0 and offset=1 and additionally
+    # compare the returned ids -- a real offset must page to a DIFFERENT row.
+    # List order is `updated DESC, id DESC` (see routers/items.py::list_items).
+    # Item #1 (`$id`) was last touched by assist-update above; the second item
+    # is created after that (and gets a higher id too), so it is the
+    # more-recently-updated row and sorts first (offset=0), while item #1 --
+    # older by `updated`, and by `id` -- sorts second (offset=1) regardless of
+    # timestamp precision.
     local second="$TMPDIR_E2E/b-second-create.json"
     assert_eq "create second item 201" \
         "$(req POST "$base/items" "$second" '{"title":"第二個項目","snapshot":"用於分頁測試"}')" "201"
-    req GET "$base/items?limit=1&offset=1" "$body" >/dev/null
-    assert_true "limit=1&offset=1 returns exactly 1 item" "$body" 'len(d["items"]) == 1'
-    assert_true "limit=1&offset=1 total == 2" "$body" 'd["total"] == 2'
+
+    local page0="$TMPDIR_E2E/b-page0.json" page1="$TMPDIR_E2E/b-page1.json"
+    req GET "$base/items?limit=1&offset=0" "$page0" >/dev/null
+    req GET "$base/items?limit=1&offset=1" "$page1" >/dev/null
+    assert_true "limit=1&offset=0 returns exactly 1 item" "$page0" 'len(d["items"]) == 1'
+    assert_true "limit=1&offset=0 total == 2" "$page0" 'd["total"] == 2'
+    assert_true "limit=1&offset=1 returns exactly 1 item" "$page1" 'len(d["items"]) == 1'
+    assert_true "limit=1&offset=1 total == 2" "$page1" 'd["total"] == 2'
+
+    local id1
+    id1="$(jget "$page1" 'd["items"][0]["id"]')"
+    assert_true "offset=0 and offset=1 return different item ids" "$page0" \
+        "d[\"items\"][0][\"id\"] != $id1"
+    assert_eq "offset=1 id is item #1, the older-updated row" "$id1" "$id"
 
     stop_servers
 }
@@ -787,6 +810,21 @@ phase_c() {
 # ===========================================================================
 phase_d() {
     phase_banner "D (frontend build + preview serves SPA shell)"
+
+    # A fresh clone has no frontend/node_modules, so `pnpm build` below would
+    # fail outright. Installing first (frozen to the committed lockfile, so
+    # this never silently drifts deps) makes the phase self-sufficient; when
+    # node_modules is already up to date -- the common case on a dev machine
+    # or a warm CI cache -- pnpm's own up-to-date check makes this near-instant.
+    local installlog="$TMPDIR_E2E/d-install.log"
+    if (cd "$FRONTEND_DIR" && pnpm install --frozen-lockfile >"$installlog" 2>&1); then
+        pass "pnpm install --frozen-lockfile succeeds"
+    else
+        fail "pnpm install --frozen-lockfile failed"
+        tail -n 15 "$installlog" | sed 's/^/    /' || true
+        return 0
+    fi
+
     local buildlog="$TMPDIR_E2E/d-build.log"
     if (cd "$FRONTEND_DIR" && pnpm build >"$buildlog" 2>&1); then
         pass "pnpm build succeeds"
