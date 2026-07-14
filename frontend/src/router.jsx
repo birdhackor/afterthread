@@ -1,12 +1,4 @@
-import {
-	Alert,
-	AppShell,
-	Badge,
-	Group,
-	NavLink,
-	Text,
-	Title,
-} from "@mantine/core";
+import { Alert, AppShell, Group, NavLink, Text, Title } from "@mantine/core";
 import {
 	createRootRoute,
 	createRoute,
@@ -16,9 +8,9 @@ import {
 } from "@tanstack/react-router";
 import { useAtomValue, useSetAtom } from "jotai";
 import { useEffect, useState } from "react";
-import { apiGet } from "./api/client.js";
 import { llmStatusAtom, loadLlmStatusAtom } from "./atoms/llm.js";
 import { CapturePage } from "./pages/CapturePage.jsx";
+import { HomePage } from "./pages/HomePage.jsx";
 import { ItemDetailPage } from "./pages/ItemDetailPage.jsx";
 import { ItemEditPage } from "./pages/ItemEditPage.jsx";
 import { ItemNewPage } from "./pages/ItemNewPage.jsx";
@@ -95,44 +87,6 @@ function RootLayout() {
 				<Outlet />
 			</AppShell.Main>
 		</AppShell>
-	);
-}
-
-// Home page: pings the backend health endpoint on mount and reports the
-// connection status. A fetch failure (backend down, network error) must not
-// crash the page. Agent 3 replaces this with the review dashboard.
-function HomePage() {
-	const [connected, setConnected] = useState(false);
-
-	useEffect(() => {
-		let cancelled = false;
-
-		apiGet("/api/health")
-			.then((data) => {
-				if (!cancelled) {
-					setConnected(data?.status === "ok");
-				}
-			})
-			.catch(() => {
-				if (!cancelled) {
-					setConnected(false);
-				}
-			});
-
-		return () => {
-			cancelled = true;
-		};
-	}, []);
-
-	return (
-		<div>
-			<Title order={2} mb="md">
-				總覽
-			</Title>
-			<Badge color={connected ? "green" : "red"}>
-				{connected ? "後端連線正常" : "無法連線後端"}
-			</Badge>
-		</div>
 	);
 }
 
