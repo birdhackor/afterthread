@@ -17,6 +17,7 @@ import {
 	ItemForm,
 	SCALAR_FIELD_KEYS,
 } from "../components/ItemForm.jsx";
+import { usePageTitle } from "../hooks/usePageTitle.js";
 
 // True when two tag arrays hold the same values in the same order.
 function sameTags(a, b) {
@@ -30,6 +31,7 @@ function sameTags(a, b) {
 // (RHF dirtyFields for scalars, an explicit array diff for tags) so unchanged
 // values are never resent and no field is ever nulled.
 export function ItemEditPage() {
+	usePageTitle("編輯項目");
 	const { itemId } = useParams({ strict: false });
 	const navigate = useNavigate();
 	const [state, setState] = useState({

@@ -1,4 +1,11 @@
-import { Alert, AppShell, Group, NavLink, Text, Title } from "@mantine/core";
+import {
+	Alert,
+	AppShell,
+	Container,
+	Group,
+	NavLink,
+	Title,
+} from "@mantine/core";
 import {
 	createRootRoute,
 	createRoute,
@@ -15,6 +22,7 @@ import { ItemDetailPage } from "./pages/ItemDetailPage.jsx";
 import { ItemEditPage } from "./pages/ItemEditPage.jsx";
 import { ItemNewPage } from "./pages/ItemNewPage.jsx";
 import { ItemsListPage } from "./pages/ItemsListPage.jsx";
+import { NotFoundPage } from "./pages/NotFoundPage.jsx";
 
 // Navbar entry rendered as a TanStack Link. Active highlighting is driven by
 // `activeProps` (data-active), which Mantine's NavLink styles via its
@@ -83,15 +91,13 @@ function RootLayout() {
 				<NavItem to="/items/new" label="新增項目" />
 			</AppShell.Navbar>
 			<AppShell.Main>
-				<LlmBanner />
-				<Outlet />
+				<Container size="lg" px={0}>
+					<LlmBanner />
+					<Outlet />
+				</Container>
 			</AppShell.Main>
 		</AppShell>
 	);
-}
-
-function NotFoundPage() {
-	return <Text>找不到頁面</Text>;
 }
 
 const rootRoute = createRootRoute({

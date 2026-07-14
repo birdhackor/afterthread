@@ -9,9 +9,11 @@ import {
 	ItemForm,
 } from "../components/ItemForm.jsx";
 import { SECTION_FIELD_KEYS } from "../constants/sections.js";
+import { usePageTitle } from "../hooks/usePageTitle.js";
 
 // Manual create page: POST the full form, then jump to the new item's detail.
 export function ItemNewPage() {
+	usePageTitle("新增項目");
 	const navigate = useNavigate();
 	const defaults = useMemo(() => buildFormDefaults(), []);
 

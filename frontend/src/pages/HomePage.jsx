@@ -20,6 +20,7 @@ import { llmStatusAtom } from "../atoms/llm.js";
 import { DateText } from "../components/DateText.jsx";
 import { StaleBadge } from "../components/StaleBadge.jsx";
 import { StatusBadge } from "../components/StatusBadge.jsx";
+import { usePageTitle } from "../hooks/usePageTitle.js";
 
 // The four review buckets in methodology order. Keys mirror the /api/review
 // response; each bucket is returned oldest-first and is rendered as-is.
@@ -162,6 +163,7 @@ function StatusFooter() {
 // buckets in methodology order (待補齊 / 進行中 / 等待中 / 擱置), a stale-first
 // summary, quick actions, and a health/LLM footer.
 export function HomePage() {
+	usePageTitle("總覽");
 	const [state, setState] = useState({
 		phase: "loading",
 		data: null,

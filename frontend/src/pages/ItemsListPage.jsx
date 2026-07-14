@@ -37,6 +37,7 @@ import {
 	STAGE_OPTIONS,
 	STATUS_OPTIONS,
 } from "../constants/labels.js";
+import { usePageTitle } from "../hooks/usePageTitle.js";
 
 // A single memory item rendered as a table row.
 function ItemRow({ item }) {
@@ -85,6 +86,7 @@ function SkeletonRows() {
 }
 
 export function ItemsListPage() {
+	usePageTitle("記憶清單");
 	const [status, setStatus] = useAtom(statusFilterAtom);
 	const [stage, setStage] = useAtom(stageFilterAtom);
 	const [tag, setTag] = useAtom(tagFilterAtom);

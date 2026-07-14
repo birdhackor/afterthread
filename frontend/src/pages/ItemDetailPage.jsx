@@ -34,6 +34,7 @@ import {
 	STATUS_OPTIONS,
 } from "../constants/labels.js";
 import { SECTION_GROUPS, SECTION_MAX_LENGTH } from "../constants/sections.js";
+import { usePageTitle } from "../hooks/usePageTitle.js";
 
 // A section field counts as filled only when it holds non-whitespace text.
 function isFilled(value) {
@@ -206,6 +207,16 @@ export function ItemDetailPage() {
 	const [stageSaving, setStageSaving] = useState(false);
 	const [deleting, setDeleting] = useState(false);
 	const [confirmOpen, confirm] = useDisclosure(false);
+
+	// Reflect the loaded item's title in the document title, falling back while
+	// loading or when the item is missing.
+	let pageTitle = "項目詳情";
+	if (state.phase === "success" && state.item) {
+		pageTitle = state.item.title;
+	} else if (state.phase === "notfound") {
+		pageTitle = "找不到項目";
+	}
+	usePageTitle(pageTitle);
 
 	// Monotonic id so a slow initial fetch cannot clobber a newer one when the
 	// route param changes.

@@ -22,6 +22,7 @@ import { llmStatusAtom } from "../atoms/llm.js";
 import { StaleBadge } from "../components/StaleBadge.jsx";
 import { StatusBadge } from "../components/StatusBadge.jsx";
 import { SECTION_MAX_LENGTH } from "../constants/sections.js";
+import { usePageTitle } from "../hooks/usePageTitle.js";
 
 // The capture textarea shares the backend's per-field bound (20000 chars).
 const CAPTURE_MAX = SECTION_MAX_LENGTH;
@@ -94,6 +95,7 @@ function CaptureResult({ result }) {
 // submit is disabled (with an explanatory tooltip) and an inline fallback points
 // at manual creation; a 502/503 keeps the typed text so the user can retry.
 export function CapturePage() {
+	usePageTitle("快速捕捉");
 	const llm = useAtomValue(llmStatusAtom);
 	const configured = llm.configured;
 	const [result, setResult] = useState(null);
