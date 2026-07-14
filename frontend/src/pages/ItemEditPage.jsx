@@ -16,16 +16,9 @@ import {
 	buildFormDefaults,
 	ItemForm,
 	SCALAR_FIELD_KEYS,
+	sameTags,
 } from "../components/ItemForm.jsx";
 import { usePageTitle } from "../hooks/usePageTitle.js";
-
-// True when two tag arrays hold the same values in the same order.
-function sameTags(a, b) {
-	if (a.length !== b.length) {
-		return false;
-	}
-	return a.every((value, index) => value === b[index]);
-}
 
 // Manual edit page: load the item, then PATCH only the fields the user changed
 // (RHF dirtyFields for scalars, an explicit array diff for tags) so unchanged

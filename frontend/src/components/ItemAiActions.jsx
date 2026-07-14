@@ -25,6 +25,13 @@ import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 // request is in flight), disables + explains the button when the LLM is not
 // configured, and surfaces the shared error mapping. A 409 additionally offers
 // an inline 重新整理 action, since the item changed under the AI mid-request.
+//
+// `pending` is ItemDetailPage's page-wide mutation gate -- true while this
+// card's own submit, the OTHER AI card's submit, a quick Select PATCH or the
+// progress-note submit is in flight -- combined below with this card's own
+// `isSubmitting` so the button is disabled for either reason.
+// `onMutationStart`/`onMutationEnd` bracket this card's own action()+refresh
+// so every other mutating control is disabled for its duration too.
 function AiActionCard({
 	title,
 	description,
@@ -37,6 +44,9 @@ function AiActionCard({
 	action,
 	onSuccess,
 	onRefresh,
+	pending,
+	onMutationStart,
+	onMutationEnd,
 	children,
 }) {
 	const {
@@ -48,11 +58,12 @@ function AiActionCard({
 	const [conflict, setConflict] = useState(false);
 
 	const submit = handleSubmit(async (values) => {
-		if (!configured || isSubmitting) {
+		if (!configured || isSubmitting || pending) {
 			return;
 		}
 		const value = values[fieldName].trim();
 		setConflict(false);
+		onMutationStart();
 		let result;
 		try {
 			result = await action(value);
@@ -65,6 +76,7 @@ function AiActionCard({
 				title: "AI 處理失敗",
 				message: error?.message ?? "AI 服務暫時無法使用，請稍後再試",
 			});
+			onMutationEnd();
 			return;
 		}
 		reset({ [fieldName]: "" });
@@ -77,10 +89,12 @@ function AiActionCard({
 					title: "重新載入失敗",
 					message: "AI 已完成，但重新載入失敗，請重新整理頁面",
 				});
+				onMutationEnd();
 				return;
 			}
 		}
 		notifications.show({ color: "green", message: successMessage });
+		onMutationEnd();
 	});
 
 	return (
@@ -139,8 +153,8 @@ function AiActionCard({
 						/>
 						<Group justify="flex-end">
 							<Tooltip
-								label={LLM_NOT_CONFIGURED_NOTICE}
-								disabled={configured}
+								label={configured ? "處理中…" : LLM_NOT_CONFIGURED_NOTICE}
+								disabled={configured && !pending}
 								multiline
 								w={260}
 								withArrow
@@ -149,7 +163,7 @@ function AiActionCard({
 									<Button
 										type="submit"
 										loading={isSubmitting}
-										disabled={!configured || isSubmitting}
+										disabled={!configured || isSubmitting || pending}
 									>
 										{submitLabel}
 									</Button>
@@ -191,7 +205,18 @@ function GapsChecklist({ gaps }) {
 // The two AI cards shown on the detail page: full enrichment (returns a gaps
 // checklist) and an assisted progress update. Both refresh the parent item on
 // success so status/stage/section/progress changes made server-side appear.
-export function ItemAiActions({ item, onRefresh }) {
+//
+// `pending`/`onMutationStart`/`onMutationEnd` are ItemDetailPage's page-wide
+// mutation gate, threaded through unchanged to both cards below (see
+// AiActionCard's doc comment) so an AI submit is exclusive with the quick
+// Selects, the progress-note submit and the OTHER AI card's submit.
+export function ItemAiActions({
+	item,
+	onRefresh,
+	pending,
+	onMutationStart,
+	onMutationEnd,
+}) {
 	const llm = useAtomValue(llmStatusAtom);
 	const configured = llm.configured;
 	const [gaps, setGaps] = useState(null);
@@ -217,6 +242,9 @@ export function ItemAiActions({ item, onRefresh }) {
 					await onRefresh();
 				}}
 				onRefresh={onRefresh}
+				pending={pending}
+				onMutationStart={onMutationStart}
+				onMutationEnd={onMutationEnd}
 			>
 				{gaps ? <GapsChecklist gaps={gaps} /> : null}
 			</AiActionCard>
@@ -237,6 +265,9 @@ export function ItemAiActions({ item, onRefresh }) {
 					await onRefresh();
 				}}
 				onRefresh={onRefresh}
+				pending={pending}
+				onMutationStart={onMutationStart}
+				onMutationEnd={onMutationEnd}
 			/>
 		</Stack>
 	);

@@ -110,7 +110,22 @@ function SectionGroupsView({ item, showEmpty }) {
 // then refetches (`onRefresh`) so the item's `updated`/is_stale -- bumped
 // server-side by the same POST, see add_progress in app/routers/items.py --
 // stay honest rather than frozen at their pre-post values.
-function ProgressPanel({ itemId, progress, onAdded, onRefresh }) {
+//
+// `pending` is the page-wide mutation gate from ItemDetailPage (true while
+// this submit, a quick Select PATCH or an AI action is in flight elsewhere);
+// `onMutationStart`/`onMutationEnd` bracket this submit's own POST+refresh so
+// the Selects and AI actions are disabled for its duration too -- see
+// ItemDetailPage's `mutationGate` comment for why no two of these mutations
+// may ever overlap.
+function ProgressPanel({
+	itemId,
+	progress,
+	onAdded,
+	onRefresh,
+	pending,
+	onMutationStart,
+	onMutationEnd,
+}) {
 	const {
 		control,
 		handleSubmit,
@@ -119,7 +134,11 @@ function ProgressPanel({ itemId, progress, onAdded, onRefresh }) {
 	} = useForm({ defaultValues: { note: "" } });
 
 	const submit = handleSubmit(async ({ note }) => {
+		if (pending) {
+			return;
+		}
 		const trimmed = note.trim();
+		onMutationStart();
 		try {
 			const entry = await apiPost(`/api/items/${itemId}/progress`, {
 				note: trimmed,
@@ -133,6 +152,7 @@ function ProgressPanel({ itemId, progress, onAdded, onRefresh }) {
 				title: "新增進度失敗",
 				message: error?.message ?? "無法新增進度",
 			});
+			onMutationEnd();
 			return;
 		}
 		// Separate try/catch from the add above (mirrors ItemAiActions'
@@ -146,6 +166,8 @@ function ProgressPanel({ itemId, progress, onAdded, onRefresh }) {
 				title: "重新載入失敗",
 				message: "進度已新增，但重新載入失敗，請重新整理頁面",
 			});
+		} finally {
+			onMutationEnd();
 		}
 	});
 
@@ -197,7 +219,12 @@ function ProgressPanel({ itemId, progress, onAdded, onRefresh }) {
 						)}
 					/>
 					<Group justify="flex-end">
-						<Button type="submit" size="sm" loading={isSubmitting}>
+						<Button
+							type="submit"
+							size="sm"
+							loading={isSubmitting}
+							disabled={pending}
+						>
 							新增進度
 						</Button>
 					</Group>
@@ -217,10 +244,19 @@ export function ItemDetailPage() {
 		error: null,
 	});
 	const [showEmpty, setShowEmpty] = useState(false);
-	// Shared by both quick-update Selects below (not one flag each) so a
-	// second PATCH can never be in flight while the first is still pending --
-	// see patchField for why that serialization matters.
-	const [quickUpdatePending, setQuickUpdatePending] = useState(false);
+	// Page-wide mutation gate: ONE shared flag for every control that can
+	// mutate this item -- both quick-update Selects, the progress-note
+	// submit and both AI action submits (via ItemAiActions, see its
+	// `pending`/`onMutationStart`/`onMutationEnd` props below) -- so at most
+	// one PATCH/POST is ever in flight at a time. Every initiator disables
+	// itself while `mutationPending` is true, so a second mutation can never
+	// start before the first settles; see patchField for why that
+	// serialization matters (a slower response's full-item snapshot would
+	// otherwise silently overwrite whatever a faster, later one just wrote).
+	// Delete is intentionally NOT gated by this -- it navigates away on
+	// success, so it can't race a snapshot-merge the way an in-place update
+	// can.
+	const [mutationPending, mutationGate] = useDisclosure(false);
 	const [deleting, setDeleting] = useState(false);
 	const [confirmOpen, confirm] = useDisclosure(false);
 
@@ -292,17 +328,19 @@ export function ItemDetailPage() {
 
 	// PATCH a single scalar field (status or stage). The PATCH response is a
 	// full MemoryItemRead WITHOUT progress (so we merge the existing progress
-	// back in) -- and, being a full snapshot, applying two such responses out
-	// of order would silently overwrite whichever field the OTHER in-flight
-	// PATCH just changed. Both quick-update Selects share `quickUpdatePending`
-	// and are disabled by it while any one PATCH is in flight, so a second
-	// quick-update request can never start before the first settles -- no
-	// merge logic needed because the race is prevented, not resolved.
+	// back in) -- and, being a full snapshot, applying it while a fresher
+	// state from another in-flight mutation (the other quick Select, the
+	// progress form or an AI action) is still landing would silently
+	// overwrite whatever that other mutation just wrote. Every mutating
+	// control shares `mutationPending` and disables itself while any one of
+	// them is in flight, so a second mutation can never start before the
+	// first settles -- no merge logic needed because the race is prevented,
+	// not resolved.
 	const patchField = async (field, value, successMessage) => {
 		if (!item || value === item[field]) {
 			return;
 		}
-		setQuickUpdatePending(true);
+		mutationGate.open();
 		try {
 			const updated = await apiPatch(`/api/items/${item.id}`, {
 				[field]: value,
@@ -316,7 +354,7 @@ export function ItemDetailPage() {
 				message: error?.message ?? "無法更新項目",
 			});
 		} finally {
-			setQuickUpdatePending(false);
+			mutationGate.close();
 		}
 	};
 
@@ -420,7 +458,7 @@ export function ItemDetailPage() {
 						value && patchField("status", value, "已更新狀態")
 					}
 					allowDeselect={false}
-					disabled={quickUpdatePending}
+					disabled={mutationPending}
 					w={150}
 				/>
 				<Select
@@ -431,7 +469,7 @@ export function ItemDetailPage() {
 						value && patchField("stage", value, "已更新階段")
 					}
 					allowDeselect={false}
-					disabled={quickUpdatePending}
+					disabled={mutationPending}
 					w={130}
 				/>
 				<Button
@@ -462,7 +500,13 @@ export function ItemDetailPage() {
 			<Divider />
 
 			<Title order={3}>AI 協助</Title>
-			<ItemAiActions item={item} onRefresh={refresh} />
+			<ItemAiActions
+				item={item}
+				onRefresh={refresh}
+				pending={mutationPending}
+				onMutationStart={mutationGate.open}
+				onMutationEnd={mutationGate.close}
+			/>
 
 			<Divider />
 
@@ -476,6 +520,9 @@ export function ItemDetailPage() {
 					}))
 				}
 				onRefresh={refresh}
+				pending={mutationPending}
+				onMutationStart={mutationGate.open}
+				onMutationEnd={mutationGate.close}
 			/>
 
 			<Modal

@@ -23,13 +23,27 @@ const TAG_MAX = 100;
 const MAX_TAGS = 20;
 
 // Scalar fields whose dirtiness RHF tracks reliably. Tags (an array) is diffed
-// separately by the edit page.
+// separately (see sameTags below) by both the edit page's PATCH decision and
+// this form's dirty-only validation bypass, so the two can never disagree
+// about what counts as "untouched".
 export const SCALAR_FIELD_KEYS = [
 	"title",
 	"status",
 	"stage",
 	...SECTION_FIELD_KEYS,
 ];
+
+// True when two tag arrays hold the same values in the same order. Shared by
+// ItemEditPage (decides whether tags belongs in the PATCH) and this form's
+// tags validate rule (decides whether an edit-mode tags value is "untouched"
+// and should therefore skip the count/length rules) -- one definition keeps
+// "will be PATCHed" and "validation applies" in sync.
+export function sameTags(a, b) {
+	if (a.length !== b.length) {
+		return false;
+	}
+	return a.every((value, index) => value === b[index]);
+}
 
 // Build a complete default-values object (every field present) from a partial
 // item, so the form is fully controlled and dirty-tracking has a stable
@@ -80,15 +94,20 @@ export function applyServerFieldErrors(error, setError) {
 // the dirty fields. Client-side rules mirror the backend bounds; server 422s
 // are surfaced via applyServerFieldErrors.
 //
-// `isEdit` (false for the create page) gates the section-field length rule:
-// a pre-existing item's section can already hold more than SECTION_MAX_LENGTH
-// chars server-side -- e.g. a history section (decisions/alternatives/
+// `isEdit` (false for the create page) gates EVERY bounded field's cap/format
+// rule -- title (maxLength + required-trim), tags (count/length) and every
+// section textarea -- so each one applies only once that specific field is
+// dirty (scalars via RHF `dirtyFields`, tags via the value-equality
+// `sameTags` check above). A pre-existing item can already violate today's
+// bounds -- a title saved before the 300-char limit existed, a tags array
+// from before the 20-tag cap, or a history section (decisions/alternatives/
 // rationale/consequences) the backend merged past 20000 via
 // merge_with_supersede, which stores up to 60000 -- so validating an
-// untouched field's length would block submitting an unrelated change (like
-// the title) even though that field is never sent (edit PATCHes only dirty
-// fields, see ItemEditPage). The cap still applies once the user actually
-// edits that field.
+// untouched field would block submitting an unrelated change (like just the
+// status) even though that untouched field is never sent (edit PATCHes only
+// dirty fields, see ItemEditPage). Each cap/required/trim check still applies
+// the moment the user actually edits that specific field. Create mode is
+// unaffected (isEdit defaults to false, and ItemNewPage never passes it).
 export function ItemForm({
 	defaultValues,
 	submitLabel,
@@ -108,6 +127,10 @@ export function ItemForm({
 		onSubmit(values, { dirtyFields, setError, reset }),
 	);
 
+	// Same bypass as the section fields below, hoisted once since (unlike
+	// tags) title dirtiness doesn't depend on the value passed into validate.
+	const titleUntouchedInEdit = isEdit && !dirtyFields.title;
+
 	return (
 		<form onSubmit={submit}>
 			<Stack gap="lg">
@@ -116,12 +139,18 @@ export function ItemForm({
 						name="title"
 						control={control}
 						rules={{
-							required: "請輸入標題",
-							maxLength: {
-								value: TITLE_MAX,
-								message: `標題不可超過 ${TITLE_MAX} 字`,
+							validate: (value) => {
+								if (titleUntouchedInEdit) {
+									return true;
+								}
+								if (value.trim() === "") {
+									return "請輸入標題";
+								}
+								if (value.length > TITLE_MAX) {
+									return `標題不可超過 ${TITLE_MAX} 字`;
+								}
+								return true;
 							},
-							validate: (value) => value.trim() !== "" || "請輸入標題",
 						}}
 						render={({ field, fieldState }) => (
 							<div>
@@ -133,7 +162,11 @@ export function ItemForm({
 									placeholder="這個項目在追蹤什麼？"
 									error={fieldState.error?.message}
 								/>
-								<CharCounter value={field.value} max={TITLE_MAX} />
+								<CharCounter
+									value={field.value}
+									max={TITLE_MAX}
+									suppressOverLimit={titleUntouchedInEdit}
+								/>
 							</div>
 						)}
 					/>
@@ -169,7 +202,15 @@ export function ItemForm({
 						name="tags"
 						control={control}
 						rules={{
+							// Unlike title, "untouched" can't be hoisted from dirtyFields
+							// (tags dirtiness isn't reliably tracked by RHF -- see
+							// SCALAR_FIELD_KEYS above) so it's recomputed here from the
+							// live value against the original, exactly mirroring
+							// ItemEditPage's own sameTags-based PATCH decision.
 							validate: (tags) => {
+								if (isEdit && sameTags(tags, defaultValues.tags)) {
+									return true;
+								}
 								if (tags.length > MAX_TAGS) {
 									return `標籤最多 ${MAX_TAGS} 個`;
 								}
