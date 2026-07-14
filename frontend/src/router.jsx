@@ -18,6 +18,7 @@ import { useAtomValue, useSetAtom } from "jotai";
 import { useEffect, useState } from "react";
 import { apiGet } from "./api/client.js";
 import { llmStatusAtom, loadLlmStatusAtom } from "./atoms/llm.js";
+import { CapturePage } from "./pages/CapturePage.jsx";
 import { ItemDetailPage } from "./pages/ItemDetailPage.jsx";
 import { ItemEditPage } from "./pages/ItemEditPage.jsx";
 import { ItemNewPage } from "./pages/ItemNewPage.jsx";
@@ -133,10 +134,6 @@ function HomePage() {
 			</Badge>
 		</div>
 	);
-}
-
-function CapturePage() {
-	return <Text>將於後續階段實作</Text>;
 }
 
 function NotFoundPage() {
