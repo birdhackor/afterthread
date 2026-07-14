@@ -123,12 +123,21 @@ function StatusFooter() {
 		};
 	}, []);
 
-	// A failed status request must not assert either configured state (both
-	// would be a guess), so it gets its own honest "can't tell" badge with a
-	// way to retry the check.
+	// `loading` must win over everything else: it covers both the first
+	// request and a forced retry, and in the retry case `loaded`/`configured`
+	// still hold their previous (possibly stale) values while `error` was
+	// just cleared back to null for the new attempt -- so without checking
+	// `loading` first, a retry of a failed check would render as a confident
+	// green "已設定" while the probe is still hanging. A failed status
+	// request must not assert either configured state (both would be a
+	// guess) once it does settle, so it gets its own honest "can't tell"
+	// badge with a way to retry the check.
 	let llmColor = "gray";
 	let llmLabel = "檢查中";
-	if (llm.error) {
+	if (llm.loading) {
+		llmColor = "gray";
+		llmLabel = "確認中…";
+	} else if (llm.error) {
 		llmColor = "gray";
 		llmLabel = "無法確認";
 	} else if (llm.loaded) {

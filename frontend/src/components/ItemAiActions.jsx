@@ -32,7 +32,13 @@ import { codePointLength } from "../utils/text.js";
 // progress-note submit is in flight -- combined below with this card's own
 // `isSubmitting` so the button is disabled for either reason.
 // `onMutationStart`/`onMutationEnd` bracket this card's own action()+refresh
-// so every other mutating control is disabled for its duration too.
+// so every other mutating control is disabled for its duration too. The
+// conflict banner's own 重新整理 button is a plain GET (no action() call) but
+// still brackets itself with the same pair and checks `pending`/its own
+// `refreshing` lock before firing, so it is just as exclusive with every
+// other mutating control -- and ItemDetailPage's refresh() tags every
+// request with a monotonic id, so a slow, superseded GET from here can never
+// clobber state a faster, later request already landed.
 function AiActionCard({
 	title,
 	description,
@@ -57,6 +63,7 @@ function AiActionCard({
 		formState: { isSubmitting },
 	} = useForm({ defaultValues: { [fieldName]: "" } });
 	const [conflict, setConflict] = useState(false);
+	const [refreshing, setRefreshing] = useState(false);
 
 	const submit = handleSubmit(async (values) => {
 		if (!configured || isSubmitting || pending) {
@@ -115,7 +122,14 @@ function AiActionCard({
 							<Button
 								size="xs"
 								variant="light"
+								loading={refreshing}
+								disabled={pending || refreshing}
 								onClick={async () => {
+									if (pending || refreshing) {
+										return;
+									}
+									setRefreshing(true);
+									onMutationStart();
 									try {
 										await onRefresh?.();
 										setConflict(false);
@@ -125,6 +139,9 @@ function AiActionCard({
 											title: "重新載入失敗",
 											message: "請再試一次",
 										});
+									} finally {
+										setRefreshing(false);
+										onMutationEnd();
 									}
 								}}
 							>

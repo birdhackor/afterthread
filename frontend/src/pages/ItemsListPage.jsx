@@ -154,10 +154,19 @@ export function ItemsListPage() {
 				// it was deleted elsewhere). Clamp back to the last valid page and
 				// let that refetch supply real state, instead of rendering the
 				// "no data" empty state for this transient, page-that-no-longer-
-				// exists response.
+				// exists response. Only do that when the clamp target actually
+				// differs from the current page: setPage() with the same value is
+				// a no-op that would never retrigger `load` (its deps, including
+				// `offset`, would all stay unchanged), sticking the UI in
+				// "loading" forever. When the target is already the current page,
+				// this response IS the coherent state for it, so fall through and
+				// render it honestly instead.
 				if (items.length === 0 && total > 0 && page > 1) {
-					setPage(Math.max(1, Math.ceil(total / DEFAULT_LIMIT)));
-					return;
+					const lastPage = Math.max(1, Math.ceil(total / DEFAULT_LIMIT));
+					if (lastPage !== page) {
+						setPage(lastPage);
+						return;
+					}
 				}
 				setState({
 					phase: "success",

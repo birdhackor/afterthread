@@ -275,8 +275,13 @@ export function ItemDetailPage() {
 	}
 	usePageTitle(pageTitle);
 
-	// Monotonic id so a slow initial fetch cannot clobber a newer one when the
-	// route param changes.
+	// Monotonic id so a slow initial fetch or refresh cannot clobber a newer
+	// one -- shared by both the initial-load effect below and refresh(), so
+	// every GET this page issues (mount/route-param load, retryLoad, both AI
+	// cards' post-success refresh and the conflict banner's manual refresh)
+	// is tagged from the same counter and a late, superseded response is
+	// discarded instead of overwriting state a faster, later request already
+	// applied.
 	const reqRef = useRef(0);
 
 	// Replace the loaded item (accepts a value or an updater). Used by the quick
@@ -290,10 +295,15 @@ export function ItemDetailPage() {
 	}, []);
 
 	// Refetch the full item (with progress). Throws on failure so callers that
-	// refresh after a mutation surface the error themselves.
+	// refresh after a mutation surface the error themselves. Tags the request
+	// with the shared monotonic id (see reqRef above) and drops the response
+	// if a newer load/refresh has since superseded it.
 	const refresh = useCallback(async () => {
+		const id = ++reqRef.current;
 		const data = await apiGet(`/api/items/${itemId}`);
-		setState({ phase: "success", item: data, error: null });
+		if (id === reqRef.current) {
+			setState({ phase: "success", item: data, error: null });
+		}
 		return data;
 	}, [itemId]);
 
