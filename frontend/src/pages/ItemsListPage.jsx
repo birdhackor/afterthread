@@ -130,21 +130,27 @@ export function ItemsListPage() {
 	// Fetch the current page. A monotonic request id drops stale responses when
 	// filters change faster than the network resolves.
 	const requestId = useRef(0);
+
+	// Trimmed once here, shared by both the query below and hasFilters --
+	// backend tags are stored trimmed and matched exactly, and q's whitespace
+	// would otherwise become part of the LIKE pattern, so whitespace-only
+	// input must mean "no filter" (buildQuery drops the resulting "", and
+	// hasFilters must agree or an empty DB would show 找不到符合條件的項目
+	// instead of 尚無記憶項目). The atoms/debounced values themselves stay
+	// untrimmed (see changeTag/changeQ) so the input's caret/typing is never
+	// fought -- only this derived pair is trimmed.
+	const trimmedTag = debouncedTag.trim();
+	const trimmedQ = debouncedQ.trim();
+
 	const load = useCallback(() => {
 		const id = ++requestId.current;
 		setState((prev) => ({ ...prev, phase: "loading", error: null }));
 
-		// Trimmed here only -- backend tags are stored trimmed and matched
-		// exactly, and q's whitespace would otherwise become part of the LIKE
-		// pattern, so whitespace-only input must mean "no filter" (buildQuery
-		// drops the resulting ""). The atoms/debounced values themselves stay
-		// untrimmed (see changeTag/changeQ) so the input's caret/typing is
-		// never fought.
 		const query = buildQuery({
 			status,
 			stage,
-			tag: debouncedTag.trim(),
-			q: debouncedQ.trim(),
+			tag: trimmedTag,
+			q: trimmedQ,
 			limit: DEFAULT_LIMIT,
 			offset,
 		});
@@ -192,13 +198,13 @@ export function ItemsListPage() {
 					message: error?.message ?? "無法載入記憶清單",
 				});
 			});
-	}, [status, stage, debouncedTag, debouncedQ, offset, page, setPage]);
+	}, [status, stage, trimmedTag, trimmedQ, offset, page, setPage]);
 
 	useEffect(() => {
 		load();
 	}, [load]);
 
-	const hasFilters = Boolean(status || stage || debouncedTag || debouncedQ);
+	const hasFilters = Boolean(status || stage || trimmedTag || trimmedQ);
 	const totalPages = Math.max(1, Math.ceil(state.total / DEFAULT_LIMIT));
 
 	let body;

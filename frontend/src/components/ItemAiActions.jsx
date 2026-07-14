@@ -158,11 +158,15 @@ function AiActionCard({
 							control={control}
 							rules={{
 								required: "請輸入內容",
+								// Trim first, validate the trimmed value -- submit sends
+								// values[fieldName].trim() (see submit above), so the length
+								// cap must apply to what's actually posted.
 								validate: (value) => {
-									if (value.trim() === "") {
+									const trimmed = value.trim();
+									if (trimmed === "") {
 										return "請輸入內容";
 									}
-									if (codePointLength(value) > SECTION_MAX_LENGTH) {
+									if (codePointLength(trimmed) > SECTION_MAX_LENGTH) {
 										return `內容不可超過 ${SECTION_MAX_LENGTH} 字`;
 									}
 									return true;

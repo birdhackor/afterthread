@@ -153,14 +153,20 @@ export function ItemForm({
 								name="title"
 								control={control}
 								rules={{
+									// Trim first, then validate the trimmed value -- both
+									// ItemNewPage and ItemEditPage send title as
+									// values.title.trim(), so a title that's only invalid
+									// because of leading/trailing whitespace must validate
+									// against what's actually submitted.
 									validate: (value) => {
 										if (titleUntouchedInEdit) {
 											return true;
 										}
-										if (value.trim() === "") {
+										const trimmed = value.trim();
+										if (trimmed === "") {
 											return "請輸入標題";
 										}
-										if (codePointLength(value) > TITLE_MAX) {
+										if (codePointLength(trimmed) > TITLE_MAX) {
 											return `標題不可超過 ${TITLE_MAX} 字`;
 										}
 										return true;
@@ -267,6 +273,10 @@ export function ItemForm({
 												name={sectionField.key}
 												control={control}
 												rules={{
+													// Intentionally validated UNtrimmed: unlike title, ItemNewPage
+													// and ItemEditPage both send section fields as values[key] with
+													// no .trim(), so this length check must mirror that untrimmed
+													// payload rather than diverge from what's actually submitted.
 													validate: (value) =>
 														untouchedInEdit ||
 														codePointLength(value) <= SECTION_MAX_LENGTH ||

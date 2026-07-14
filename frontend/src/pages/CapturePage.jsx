@@ -156,11 +156,15 @@ export function CapturePage() {
 						control={control}
 						rules={{
 							required: "請貼上要捕捉的內容",
+							// Trim first, validate the trimmed value -- submit sends
+							// values.raw_text.trim(), so the length cap must apply to
+							// what's actually posted, not the raw textarea value.
 							validate: (value) => {
-								if (value.trim() === "") {
+								const trimmed = value.trim();
+								if (trimmed === "") {
 									return "請貼上要捕捉的內容";
 								}
-								if (codePointLength(value) > CAPTURE_MAX) {
+								if (codePointLength(trimmed) > CAPTURE_MAX) {
 									return `內容不可超過 ${CAPTURE_MAX} 字`;
 								}
 								return true;
