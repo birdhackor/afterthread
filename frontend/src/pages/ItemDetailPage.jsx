@@ -106,8 +106,11 @@ function SectionGroupsView({ item, showEmpty }) {
 }
 
 // Progress timeline (dates ascending, as returned by the backend) plus a small
-// RHF note form that appends a new entry optimistically from the POST response.
-function ProgressPanel({ itemId, progress, onAdded }) {
+// RHF note form that appends a new entry optimistically from the POST response,
+// then refetches (`onRefresh`) so the item's `updated`/is_stale -- bumped
+// server-side by the same POST, see add_progress in app/routers/items.py --
+// stay honest rather than frozen at their pre-post values.
+function ProgressPanel({ itemId, progress, onAdded, onRefresh }) {
 	const {
 		control,
 		handleSubmit,
@@ -129,6 +132,19 @@ function ProgressPanel({ itemId, progress, onAdded }) {
 				color: "red",
 				title: "新增進度失敗",
 				message: error?.message ?? "無法新增進度",
+			});
+			return;
+		}
+		// Separate try/catch from the add above (mirrors ItemAiActions'
+		// onSuccess/onRefresh split): the add already succeeded, so a refresh
+		// failure here must read as "refresh failed", never as "add failed".
+		try {
+			await onRefresh();
+		} catch (_error) {
+			notifications.show({
+				color: "red",
+				title: "重新載入失敗",
+				message: "進度已新增，但重新載入失敗，請重新整理頁面",
 			});
 		}
 	});
@@ -201,8 +217,10 @@ export function ItemDetailPage() {
 		error: null,
 	});
 	const [showEmpty, setShowEmpty] = useState(false);
-	const [statusSaving, setStatusSaving] = useState(false);
-	const [stageSaving, setStageSaving] = useState(false);
+	// Shared by both quick-update Selects below (not one flag each) so a
+	// second PATCH can never be in flight while the first is still pending --
+	// see patchField for why that serialization matters.
+	const [quickUpdatePending, setQuickUpdatePending] = useState(false);
 	const [deleting, setDeleting] = useState(false);
 	const [confirmOpen, confirm] = useDisclosure(false);
 
@@ -273,12 +291,18 @@ export function ItemDetailPage() {
 	const item = state.item;
 
 	// PATCH a single scalar field (status or stage). The PATCH response is a
-	// MemoryItemRead WITHOUT progress, so we merge the existing progress back in.
-	const patchField = async (field, value, setSaving, successMessage) => {
+	// full MemoryItemRead WITHOUT progress (so we merge the existing progress
+	// back in) -- and, being a full snapshot, applying two such responses out
+	// of order would silently overwrite whichever field the OTHER in-flight
+	// PATCH just changed. Both quick-update Selects share `quickUpdatePending`
+	// and are disabled by it while any one PATCH is in flight, so a second
+	// quick-update request can never start before the first settles -- no
+	// merge logic needed because the race is prevented, not resolved.
+	const patchField = async (field, value, successMessage) => {
 		if (!item || value === item[field]) {
 			return;
 		}
-		setSaving(true);
+		setQuickUpdatePending(true);
 		try {
 			const updated = await apiPatch(`/api/items/${item.id}`, {
 				[field]: value,
@@ -292,7 +316,7 @@ export function ItemDetailPage() {
 				message: error?.message ?? "無法更新項目",
 			});
 		} finally {
-			setSaving(false);
+			setQuickUpdatePending(false);
 		}
 	};
 
@@ -393,10 +417,10 @@ export function ItemDetailPage() {
 					data={STATUS_OPTIONS}
 					value={item.status}
 					onChange={(value) =>
-						value && patchField("status", value, setStatusSaving, "已更新狀態")
+						value && patchField("status", value, "已更新狀態")
 					}
 					allowDeselect={false}
-					disabled={statusSaving}
+					disabled={quickUpdatePending}
 					w={150}
 				/>
 				<Select
@@ -404,10 +428,10 @@ export function ItemDetailPage() {
 					data={STAGE_OPTIONS}
 					value={item.stage}
 					onChange={(value) =>
-						value && patchField("stage", value, setStageSaving, "已更新階段")
+						value && patchField("stage", value, "已更新階段")
 					}
 					allowDeselect={false}
-					disabled={stageSaving}
+					disabled={quickUpdatePending}
 					w={130}
 				/>
 				<Button
@@ -451,6 +475,7 @@ export function ItemDetailPage() {
 						progress: [...(prev.progress ?? []), entry],
 					}))
 				}
+				onRefresh={refresh}
 			/>
 
 			<Modal

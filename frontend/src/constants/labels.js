@@ -36,6 +36,9 @@ export const STAGE_OPTIONS = Object.entries(STAGE_META).map(
 // Shown wherever an AI action is unavailable because the backend has no LLM
 // endpoint configured: disabled-button tooltips, the shell banner, and the
 // capture-page fallback alert. Kept as one constant so the wording never
-// drifts between call sites.
+// drifts between call sites. Names BOTH env vars llm_configured() actually
+// requires (app/services/llm.py) -- a base URL alone is a half-configured
+// endpoint the backend still reports as unconfigured, so the notice must not
+// imply setting only OPENAI_BASE_URL is enough.
 export const LLM_NOT_CONFIGURED_NOTICE =
-	"AI 功能尚未設定：請在 backend/.env 填入 OPENAI_BASE_URL 後重啟";
+	"AI 功能尚未設定：請在 backend/.env 填入 OPENAI_BASE_URL 與 OPENAI_MODEL 後重啟";
