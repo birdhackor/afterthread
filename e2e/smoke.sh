@@ -63,6 +63,13 @@ TMPDIR_E2E="$(mktemp -d "${TMPDIR:-/tmp}/cm-e2e.XXXXXX")"
 # job or a developer's local service). See stop_servers.
 declare -a SIDS=()
 
+# Set by start_mock/start_backend/start_preview to the port the just-started
+# server actually bound (parsed from its own log line -- see port_from_log).
+# A plain global "return value" handoff: each start_* call is immediately
+# followed by the caller reading LAST_PORT, so there is no risk of a stale
+# value leaking across servers.
+LAST_PORT=""
+
 # --- assertion counters ----------------------------------------------------
 
 PASS_COUNT=0
@@ -188,10 +195,6 @@ urlenc() {
 
 # --- process management ----------------------------------------------------
 
-free_port() {
-    python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'
-}
-
 # wait_200 URL [TRIES] -> 0 once URL answers 200, else 1 after TRIES*0.25s.
 wait_200() {
     local url=$1 tries=${2:-160} i
@@ -219,7 +222,35 @@ wait_log_line() {
     return 1
 }
 
-# start_mock PORT MODE SLOW_SECONDS LOGFILE
+# port_from_log FILE PATTERN -> prints the run of digits immediately after
+# PATTERN's first occurrence in FILE, else empty. Callers must wait_log_line
+# for PATTERN first (bounded wait) -- this performs one synchronous read of
+# an already-written line, never a poll of its own.
+port_from_log() {
+    awk -v pat="$2" '
+        index($0, pat) {
+            rest = substr($0, index($0, pat) + length(pat))
+            if (match(rest, /[0-9]+/)) { print substr(rest, RSTART, RLENGTH); exit }
+        }
+    ' "$1" 2>/dev/null
+}
+
+# Distinctive substrings each server logs immediately before the port it
+# actually bound -- mock_llm.py's own startup line, uvicorn's "Uvicorn
+# running on ..." line, and vite preview's "Local: ..." line -- consumed by
+# wait_log_line + port_from_log below instead of pre-picking a port with a
+# free()-then-bind TOCTOU window (see start_mock/start_backend/start_preview).
+MOCK_PORT_PATTERN="mock-llm listening on port "
+BACKEND_PORT_PATTERN="Uvicorn running on http://127.0.0.1:"
+PREVIEW_PORT_PATTERN="http://127.0.0.1:"
+
+# start_mock MODE SLOW_SECONDS LOGFILE [EXTRA_ARG ...]
+#
+# Always binds to an OS-assigned ephemeral port (`--port 0`), so there is no
+# free()-then-bind TOCTOU window: this function waits (bounded) for the mock
+# to log the port it actually got (MOCK_PORT_PATTERN), parses it out, and
+# leaves it in LAST_PORT for the caller -- see port_from_log above. Trailing
+# args pass through verbatim (e.g. `--release-file FILE` for --mode hold).
 #
 # `setsid cmd &` backgrounds setsid directly -- no wrapping subshell or `&&`
 # list -- so $! is exactly the PID bash forks to exec setsid. Job control is
@@ -231,16 +262,27 @@ wait_log_line() {
 # start_backend/start_preview for the same guarantee when a `cd` is also
 # needed.
 start_mock() {
-    setsid python3 "$MOCK" --port "$1" --mode "$2" --slow-seconds "$3" >"$4" 2>&1 &
+    local mode=$1 slow=$2 logf=$3
+    shift 3
+    setsid python3 "$MOCK" --port 0 --mode "$mode" --slow-seconds "$slow" "$@" >"$logf" 2>&1 &
     local sid=$!
     SIDS+=("$sid")
-    if ! wait_200 "http://127.0.0.1:$1/health" 80; then
-        echo "  (mock failed to start; log:)"; sed 's/^/    /' "$4" || true
+    if ! wait_log_line "$logf" "$MOCK_PORT_PATTERN" 200; then
+        echo "  (mock failed to start; log:)"; sed 's/^/    /' "$logf" || true
+        return 1
+    fi
+    LAST_PORT="$(port_from_log "$logf" "$MOCK_PORT_PATTERN")"
+    if [ -z "$LAST_PORT" ]; then
+        echo "  (mock: could not parse bound port from log:)"; sed 's/^/    /' "$logf" || true
+        return 1
+    fi
+    if ! wait_200 "http://127.0.0.1:$LAST_PORT/health" 80; then
+        echo "  (mock failed readiness check; log:)"; sed 's/^/    /' "$logf" || true
         return 1
     fi
 }
 
-# start_backend PORT DB_FILE LOGFILE [ENV=VAL ...]
+# start_backend DB_FILE LOGFILE [ENV=VAL ...]
 # The three OPENAI_* fields llm_configured() gates on (base_url, api_key,
 # model) default to EXPLICIT empty-string overrides here, not `env -u`
 # unsets. pydantic-settings' precedence is env > dotenv, so an *unset* var
@@ -257,6 +299,13 @@ start_mock() {
 # pydantic-settings validation and crash the backend at startup instead of
 # merely reading as unconfigured (and it plays no part in llm_configured()).
 #
+# Always launched with `--port 0`: uvicorn binds an OS-assigned ephemeral
+# port (no free()-then-bind TOCTOU window) and, once ASGI startup completes,
+# logs it in its own "Uvicorn running on http://127.0.0.1:<port>" line. This
+# function waits for that line (bounded, BACKEND_PORT_PATTERN), parses the
+# port out of it, and leaves it in LAST_PORT for the caller -- see
+# port_from_log above.
+#
 # The outer subshell only exists to scope the `cd` without disturbing the
 # caller's CWD; $! set inside it isn't visible outside, hence the last.sid
 # handoff file. Backgrounding `cd dir && setsid ... &` verbatim (no `exec`)
@@ -271,26 +320,42 @@ start_mock() {
 # may fork further children of their own (workers, etc.), but those inherit
 # this same process group, so the group kill still reaps the whole tree.
 start_backend() {
-    local port=$1 db=$2 logf=$3
-    shift 3
+    local db=$1 logf=$2
+    shift 2
     (
         cd "$BACKEND_DIR" &&
             exec setsid env -u OPENAI_TIMEOUT_SECONDS \
                 DATABASE_URL="sqlite:///$db" \
                 OPENAI_BASE_URL= OPENAI_API_KEY= OPENAI_MODEL= "$@" \
-                uv run uvicorn app.main:app --host 127.0.0.1 --port "$port" >"$logf" 2>&1 &
+                uv run uvicorn app.main:app --host 127.0.0.1 --port 0 >"$logf" 2>&1 &
         echo $! >"$TMPDIR_E2E/last.sid"
     )
     local sid
     sid="$(cat "$TMPDIR_E2E/last.sid")"
     SIDS+=("$sid")
-    if ! wait_200 "http://127.0.0.1:$port/api/health" 200; then
+    if ! wait_log_line "$logf" "$BACKEND_PORT_PATTERN" 500; then
         echo "  (backend failed to start; log tail:)"; tail -n 15 "$logf" | sed 's/^/    /' || true
+        return 1
+    fi
+    LAST_PORT="$(port_from_log "$logf" "$BACKEND_PORT_PATTERN")"
+    if [ -z "$LAST_PORT" ]; then
+        echo "  (backend: could not parse bound port from log tail:)"; tail -n 15 "$logf" | sed 's/^/    /' || true
+        return 1
+    fi
+    if ! wait_200 "http://127.0.0.1:$LAST_PORT/api/health" 200; then
+        echo "  (backend failed readiness check; log tail:)"; tail -n 15 "$logf" | sed 's/^/    /' || true
         return 1
     fi
 }
 
-# start_preview PORT LOGFILE
+# start_preview LOGFILE
+#
+# Always launched with `--port 0` (no --strictPort: with an OS-assigned port
+# "already in use" can't happen, so it would be a no-op) -- vite prints the
+# port it actually bound in its own "Local: http://127.0.0.1:<port>/" line.
+# This function waits for that line (bounded, PREVIEW_PORT_PATTERN), parses
+# the port out of it, and leaves it in LAST_PORT for the caller -- see
+# port_from_log above.
 #
 # Same PID == PGID == SID guarantee as start_backend, and for the same
 # reason: `exec` before setsid forces the backgrounded "cd && setsid" job to
@@ -299,16 +364,26 @@ start_backend() {
 # the real vite preview process as a child, but that child inherits this
 # process group too, so the group kill still reaps it.
 start_preview() {
+    local logf=$1
     (
         cd "$FRONTEND_DIR" &&
-            exec setsid pnpm preview --host 127.0.0.1 --port "$1" --strictPort >"$2" 2>&1 &
+            exec setsid pnpm preview --host 127.0.0.1 --port 0 >"$logf" 2>&1 &
         echo $! >"$TMPDIR_E2E/last.sid"
     )
     local sid
     sid="$(cat "$TMPDIR_E2E/last.sid")"
     SIDS+=("$sid")
-    if ! wait_200 "http://127.0.0.1:$1/" 120; then
-        echo "  (preview failed to start; log tail:)"; tail -n 15 "$2" | sed 's/^/    /' || true
+    if ! wait_log_line "$logf" "$PREVIEW_PORT_PATTERN" 300; then
+        echo "  (preview failed to start; log tail:)"; tail -n 15 "$logf" | sed 's/^/    /' || true
+        return 1
+    fi
+    LAST_PORT="$(port_from_log "$logf" "$PREVIEW_PORT_PATTERN")"
+    if [ -z "$LAST_PORT" ]; then
+        echo "  (preview: could not parse bound port from log tail:)"; tail -n 15 "$logf" | sed 's/^/    /' || true
+        return 1
+    fi
+    if ! wait_200 "http://127.0.0.1:$LAST_PORT/" 120; then
+        echo "  (preview failed readiness check; log tail:)"; tail -n 15 "$logf" | sed 's/^/    /' || true
         return 1
     fi
 }
@@ -350,11 +425,11 @@ trap teardown EXIT
 phase_a() {
     phase_banner "A (unconfigured backend: probes + CRUD)"
     local port db log body
-    port="$(free_port)"
     db="$TMPDIR_E2E/a.sqlite"
     log="$TMPDIR_E2E/a-backend.log"
     body="$TMPDIR_E2E/a-body.json"
-    start_backend "$port" "$db" "$log"
+    start_backend "$db" "$log"
+    port="$LAST_PORT"
     local base="http://127.0.0.1:$port/api"
 
     # -- liveness + llm status ------------------------------------------------
@@ -460,16 +535,16 @@ PY
 phase_b() {
     phase_banner "B (good mock: capture / enrich / supersede / assist-update / filters+pagination)"
     local mport bport db mlog blog body
-    mport="$(free_port)"
-    bport="$(free_port)"
     db="$TMPDIR_E2E/b.sqlite"
     mlog="$TMPDIR_E2E/b-mock.log"
     blog="$TMPDIR_E2E/b-backend.log"
     body="$TMPDIR_E2E/b-body.json"
-    start_mock "$mport" "good" "10" "$mlog"
-    start_backend "$bport" "$db" "$blog" \
+    start_mock "good" "10" "$mlog"
+    mport="$LAST_PORT"
+    start_backend "$db" "$blog" \
         OPENAI_BASE_URL="http://127.0.0.1:$mport/v1" OPENAI_API_KEY="test" \
         OPENAI_MODEL="mock" OPENAI_TIMEOUT_SECONDS="30"
+    bport="$LAST_PORT"
     local base="http://127.0.0.1:$bport/api"
 
     req GET "$base/llm/status" "$body" >/dev/null
@@ -580,16 +655,16 @@ phase_c() {
 
     # -- garbage: prose junk -> retry -> 502, nothing written ----------------
     local mport bport db mlog blog body
-    mport="$(free_port)"
-    bport="$(free_port)"
     db="$TMPDIR_E2E/c-garbage.sqlite"
     mlog="$TMPDIR_E2E/c-garbage-mock.log"
     blog="$TMPDIR_E2E/c-garbage-backend.log"
     body="$TMPDIR_E2E/c-garbage-body.json"
-    start_mock "$mport" "garbage" "10" "$mlog"
-    start_backend "$bport" "$db" "$blog" \
+    start_mock "garbage" "10" "$mlog"
+    mport="$LAST_PORT"
+    start_backend "$db" "$blog" \
         OPENAI_BASE_URL="http://127.0.0.1:$mport/v1" OPENAI_API_KEY="test" \
         OPENAI_MODEL="mock" OPENAI_TIMEOUT_SECONDS="30"
+    bport="$LAST_PORT"
     local base="http://127.0.0.1:$bport/api"
 
     assert_eq "garbage capture -> 502" \
@@ -601,17 +676,17 @@ phase_c() {
     stop_servers
 
     # -- slow: sleeps past a tiny timeout -> 502 Timeout within the deadline --
-    mport="$(free_port)"
-    bport="$(free_port)"
     db="$TMPDIR_E2E/c-slow.sqlite"
     mlog="$TMPDIR_E2E/c-slow-mock.log"
     blog="$TMPDIR_E2E/c-slow-backend.log"
     body="$TMPDIR_E2E/c-slow-body.json"
-    start_mock "$mport" "slow" "10" "$mlog"
+    start_mock "slow" "10" "$mlog"
+    mport="$LAST_PORT"
     # Tiny 2s deadline; the mock sleeps 10s, so the wall-clock bound must fire.
-    start_backend "$bport" "$db" "$blog" \
+    start_backend "$db" "$blog" \
         OPENAI_BASE_URL="http://127.0.0.1:$mport/v1" OPENAI_API_KEY="test" \
         OPENAI_MODEL="mock" OPENAI_TIMEOUT_SECONDS="2"
+    bport="$LAST_PORT"
     base="http://127.0.0.1:$bport/api"
 
     local start elapsed code
@@ -630,19 +705,27 @@ phase_c() {
 
     # -- conflict: a PATCH landing mid-await races an in-flight enrich -------
     # backend OPENAI_TIMEOUT_SECONDS is deliberately large (30) here: unlike
-    # the slow-Timeout leg above, this scenario wants the mock's slow reply to
-    # actually SUCCEED (just slowly), so the race is between the in-flight
+    # the slow-Timeout leg above, this scenario wants the mock's held reply to
+    # actually SUCCEED (just late), so the race is between the in-flight
     # enrich and a concurrent PATCH -- not between the mock and the deadline.
-    mport="$(free_port)"
-    bport="$(free_port)"
+    #
+    # This is a barrier by construction, not a timing window: --mode hold
+    # blocks the mock's reply until this scenario touches --release-file, so
+    # there is no fixed delay to race against (unlike a --mode slow sleep,
+    # which could in principle elapse before the PATCH lands on a slow/busy
+    # runner). The PATCH is guaranteed to land while the enrich is still
+    # parked on the mock, every run, on any runner.
     db="$TMPDIR_E2E/c-conflict.sqlite"
     mlog="$TMPDIR_E2E/c-conflict-mock.log"
     blog="$TMPDIR_E2E/c-conflict-backend.log"
     body="$TMPDIR_E2E/c-conflict-body.json"
-    start_mock "$mport" "slow" "4" "$mlog"
-    start_backend "$bport" "$db" "$blog" \
+    local release_file="$TMPDIR_E2E/c-conflict.release"
+    start_mock "hold" "0" "$mlog" --release-file "$release_file"
+    mport="$LAST_PORT"
+    start_backend "$db" "$blog" \
         OPENAI_BASE_URL="http://127.0.0.1:$mport/v1" OPENAI_API_KEY="test" \
         OPENAI_MODEL="mock" OPENAI_TIMEOUT_SECONDS="30"
+    bport="$LAST_PORT"
     base="http://127.0.0.1:$bport/api"
 
     local ccreate="$TMPDIR_E2E/c-conflict-create.json"
@@ -652,9 +735,9 @@ phase_c() {
     cid="$(jget "$ccreate" 'd["id"]')"
 
     # Fire enrich in the background: the handler snapshots `updated` almost
-    # immediately, then blocks for the mock's slow-seconds sleep inside the
-    # LLM call, which runs strictly outside any DB transaction (see
-    # backend/README.md's optimistic-409 design note). Its HTTP status lands
+    # immediately, then blocks inside the LLM call -- which runs strictly
+    # outside any DB transaction (see backend/README.md's optimistic-409
+    # design note) -- until the mock is released below. Its HTTP status lands
     # in $enrich_code; curl itself always exits 0 here (no -f), so this
     # background job cannot trip `set -e` in the parent shell regardless of
     # what status the server returns.
@@ -666,22 +749,25 @@ phase_c() {
 
     # Wait for a SIGNAL instead of a fixed sleep: _snapshot_item_for_ai
     # (app/routers/ai.py) is awaited to completion BEFORE enrich_item ever
-    # posts to the mock, so the mock logging "mode=slow sleeping" -- written
+    # posts to the mock, so the mock logging "holding response" -- written
     # the instant it has received and JSON-parsed the request, strictly
-    # BEFORE its artificial slow-seconds delay -- is proof the pre-await
-    # `updated` snapshot has already been taken. A fixed `sleep 1` was a
-    # guess that could be too short under a loaded runner (letting the PATCH
-    # land before the snapshot and silently turning the expected 409 into a
-    # 200) or needlessly long otherwise; polling the log removes the
-    # guesswork regardless of runner load.
-    if ! wait_log_line "$mlog" "mode=slow sleeping"; then
-        echo "  (timed out waiting for the mock to log the enrich request; log:)"
+    # BEFORE it starts polling for the release file -- is proof the pre-await
+    # `updated` snapshot has already been taken. The mock then blocks there
+    # (bounded by its own 60s hard cap) until released below, so -- unlike a
+    # fixed sleep -- there is no risk of the reply racing ahead of the PATCH
+    # on a loaded runner.
+    if ! wait_log_line "$mlog" "holding response"; then
+        echo "  (timed out waiting for the mock to hold the enrich request; log:)"
         sed 's/^/    /' "$mlog" || true
     fi
 
     local cpatch="$TMPDIR_E2E/c-conflict-patch.json"
     assert_eq "conflict: concurrent PATCH -> 200" \
         "$(req PATCH "$base/items/$cid" "$cpatch" '{"status":"active"}')" "200"
+
+    # Only now release the mock's held reply: the PATCH is guaranteed to have
+    # already landed, so the enrich's own DB write must lose the race.
+    touch "$release_file"
 
     wait "$enrich_pid"
     local ccode
@@ -711,11 +797,11 @@ phase_d() {
     fi
 
     local pport plog root items
-    pport="$(free_port)"
     plog="$TMPDIR_E2E/d-preview.log"
     root="$TMPDIR_E2E/d-root.html"
     items="$TMPDIR_E2E/d-items.html"
-    start_preview "$pport" "$plog"
+    start_preview "$plog"
+    pport="$LAST_PORT"
     local base="http://127.0.0.1:$pport"
 
     assert_eq "GET / -> 200" "$(req GET "$base/" "$root")" "200"

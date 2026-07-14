@@ -35,14 +35,24 @@ Modes (``--mode``):
   * slow    -> sleeps ``--slow-seconds`` before replying with otherwise-good
                JSON, so a backend with a tiny OPENAI_TIMEOUT_SECONDS times out
                first (exercising the 502 ``Timeout`` path).
+  * hold    -> logs "holding response" then blocks until ``--release-file``
+               appears (polling every 0.1s, hard-capped at 60s so a forgotten
+               release can't hang the process), then replies with otherwise-
+               good JSON. Turns a race (e.g. "does a concurrent PATCH land
+               before an in-flight enrich's LLM call returns?") into a
+               barrier: the caller only lets go of the release once whatever
+               must happen first has definitely happened.
 
-Every request is logged as one line to stderr.
+Every request is logged as one line to stderr. At startup the server also
+logs the port it actually bound (see ``--port 0`` below) in a distinctive
+line a caller can wait on and parse.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -140,6 +150,14 @@ _GARBAGE_PROSE = (
     "以下只是一段純文字說明,並不是有效的 JSON 物件,也沒有任何欄位。"
 )
 
+# --- hold-mode barrier -------------------------------------------------------
+
+# --mode hold polls for the release file at this interval, capped at this
+# many seconds total so a caller that forgets to release (e.g. a smoke bug)
+# can't hang the mock -- and thus the whole harness -- forever.
+_HOLD_POLL_SECONDS = 0.1
+_HOLD_TIMEOUT_SECONDS = 60.0
+
 
 def _variant(user_text: str) -> str:
     match = _VARIANT_RE.search(user_text)
@@ -187,6 +205,7 @@ class _Handler(BaseHTTPRequestHandler):
     # Set on the class from CLI args before the server starts serving.
     mode: str = "good"
     slow_seconds: float = 10.0
+    release_file: str | None = None
 
     protocol_version = "HTTP/1.1"
 
@@ -198,6 +217,27 @@ class _Handler(BaseHTTPRequestHandler):
     def _log(self, line: str) -> None:
         sys.stderr.write(f"[mock_llm] {line}\n")
         sys.stderr.flush()
+
+    def _await_release(self) -> None:
+        """Block until ``self.release_file`` exists, or the hard cap elapses.
+
+        Polls every _HOLD_POLL_SECONDS. The timeout is a safety valve, not
+        part of the intended flow: a caller driving --mode hold is expected
+        to always touch the release file once whatever must happen first
+        (e.g. a concurrent PATCH) has happened.
+        """
+        if not self.release_file:
+            self._log("mode=hold but no --release-file configured; not holding")
+            return
+        deadline = time.monotonic() + _HOLD_TIMEOUT_SECONDS
+        while not os.path.exists(self.release_file):
+            if time.monotonic() >= deadline:
+                self._log(
+                    f"hold timed out after {_HOLD_TIMEOUT_SECONDS}s waiting for "
+                    f"release file {self.release_file}"
+                )
+                return
+            time.sleep(_HOLD_POLL_SECONDS)
 
     def _send_json(self, status: int, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -248,6 +288,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._log(f"POST {self.path} mode=slow sleeping {self.slow_seconds}s")
             time.sleep(self.slow_seconds)
 
+        if self.mode == "hold":
+            self._log(f"POST {self.path} mode=hold holding response")
+            self._await_release()
+
         if self.mode == "garbage":
             workflow, variant, content, kind = "*", "-", _GARBAGE_PROSE, "garbage"
         else:
@@ -263,12 +307,21 @@ class _Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="OpenAI-compatible mock LLM for the e2e smoke.")
-    parser.add_argument("--port", type=int, default=8900, help="TCP port to listen on.")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8900,
+        help="TCP port to listen on; 0 asks the OS for a free ephemeral port (see docstring).",
+    )
     parser.add_argument(
         "--mode",
-        choices=("good", "garbage", "slow"),
+        choices=("good", "garbage", "slow", "hold"),
         default="good",
-        help="good: valid JSON; garbage: prose junk (502); slow: sleep past a short timeout.",
+        help=(
+            "good: valid JSON; garbage: prose junk (502); slow: sleep past a "
+            "short timeout; hold: block until --release-file appears, then "
+            "reply with valid JSON (for barrier-based conflict tests)."
+        ),
     )
     parser.add_argument(
         "--slow-seconds",
@@ -276,16 +329,30 @@ def main() -> int:
         default=10.0,
         help="Seconds to sleep before replying in --mode slow (default 10).",
     )
+    parser.add_argument(
+        "--release-file",
+        default=None,
+        help="Path whose existence releases a --mode hold response (required with --mode hold).",
+    )
     parser.add_argument("--host", default="127.0.0.1", help="Bind host (default 127.0.0.1).")
     args = parser.parse_args()
+    if args.mode == "hold" and not args.release_file:
+        parser.error("--mode hold requires --release-file")
 
     _Handler.mode = args.mode
     _Handler.slow_seconds = args.slow_seconds
+    _Handler.release_file = args.release_file
 
+    # Bind first -- port 0 asks the OS for a free ephemeral port, so there is
+    # no free()-then-bind TOCTOU window between picking a port and this
+    # process owning it -- then read back whatever the OS actually assigned
+    # via the now-bound socket.
     server = ThreadingHTTPServer((args.host, args.port), _Handler)
+    actual_port = server.server_address[1]
     sys.stderr.write(
-        f"[mock_llm] listening on http://{args.host}:{args.port} "
-        f"mode={args.mode} slow_seconds={args.slow_seconds}\n"
+        f"[mock_llm] mock-llm listening on port {actual_port} "
+        f"(http://{args.host}:{actual_port} mode={args.mode} "
+        f"slow_seconds={args.slow_seconds})\n"
     )
     sys.stderr.flush()
     try:
