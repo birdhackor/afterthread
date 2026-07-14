@@ -215,21 +215,37 @@ function AiActionCard({
 // Read-only checklist of the enrichment gaps the backend still wants filled.
 // An empty list alone is not "done": the backend can legitimately return
 // checklist_complete:false with an empty gaps array (item stays at stage
-// "quick"), so the caller threads in the REFRESHED item's stage and only
-// stage "full" earns the green completion copy -- otherwise this pass simply
+// "quick"), so the caller threads in the CURRENT item's stage -- read live
+// off the item prop at render, never stored alongside gaps -- and only stage
+// "full" earns the green completion copy -- otherwise this pass simply
 // didn't list anything, worded as a neutral status rather than a false claim
-// of completion.
+// of completion. Reading stage live (instead of a snapshot taken when gaps
+// was set) means a stage change from the quick Select after this pass still
+// shows copy that matches the page, not what stage was at enrich time.
 function GapsChecklist({ gaps, stage }) {
 	if (gaps.length > 0) {
+		// Keyed by `${gap}-${occurrence}`, not a raw array index -- the backend
+		// can legitimately repeat a gap verbatim, and a bare-value key would
+		// collide silently on duplicates.
+		const gapOccurrence = new Map();
 		return (
 			<Stack gap="xs">
 				<Text fw={600} size="sm">
 					仍待補齊
 				</Text>
 				<Stack gap={4}>
-					{gaps.map((gap) => (
-						<Checkbox key={gap} checked={false} readOnly label={gap} />
-					))}
+					{gaps.map((gap) => {
+						const occurrence = gapOccurrence.get(gap) ?? 0;
+						gapOccurrence.set(gap, occurrence + 1);
+						return (
+							<Checkbox
+								key={`${gap}-${occurrence}`}
+								checked={false}
+								readOnly
+								label={gap}
+							/>
+						);
+					})}
 				</Stack>
 			</Stack>
 		);
@@ -265,6 +281,10 @@ export function ItemAiActions({
 }) {
 	const llm = useAtomValue(llmStatusAtom);
 	const configured = llm.configured;
+	// Only the gaps array from the last AI 補齊 call. The completion copy
+	// derived from it is NOT stored here -- GapsChecklist re-derives it from
+	// the live `item.stage` prop at render (see its doc comment), so this
+	// never goes stale relative to a later quick-Select stage change.
 	const [gaps, setGaps] = useState(null);
 
 	return (
@@ -284,23 +304,19 @@ export function ItemAiActions({
 					})
 				}
 				onSuccess={async (result) => {
-					// GapsChecklist's honest copy needs the REFRESHED item's stage --
-					// this closure's own `item` prop is still the pre-refresh value.
-					// onRefresh() is ItemDetailPage's refresh(), which resolves to the
-					// item it just fetched, so read the stage off that rather than off
-					// `item` here.
-					const refreshed = await onRefresh();
-					setGaps({
-						items: result?.gaps ?? [],
-						stage: refreshed?.stage ?? item.stage,
-					});
+					await onRefresh();
+					// Store only the gaps array -- GapsChecklist reads stage live off
+					// the `item` prop below, not off a snapshot taken here, so a later
+					// stage change from the quick Select can't leave this checklist's
+					// copy contradicting the page.
+					setGaps(result?.gaps ?? []);
 				}}
 				onRefresh={onRefresh}
 				pending={pending}
 				onMutationStart={onMutationStart}
 				onMutationEnd={onMutationEnd}
 			>
-				{gaps ? <GapsChecklist gaps={gaps.items} stage={gaps.stage} /> : null}
+				{gaps ? <GapsChecklist gaps={gaps} stage={item.stage} /> : null}
 			</AiActionCard>
 
 			<AiActionCard

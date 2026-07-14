@@ -19,9 +19,14 @@ export const llmStatusAtom = atom({
 
 // Write-only action: load /api/llm/status into llmStatusAtom. Idempotent -- it
 // no-ops while a request is in flight and after the first successful load,
-// unless called with { force: true } to refresh. On failure `configured` is
-// left true (a transport blip must not falsely claim the LLM is unconfigured);
-// only an explicit `configured: false` from the server shows the banner.
+// unless called with { force: true } to refresh. On failure, a prior
+// successful load's `configured`/`model` are preserved (a transport blip
+// during a recheck must not silently overwrite an already-KNOWN status --
+// e.g. flipping a known "not configured" back to the optimistic true would
+// silently re-enable AI buttons the backend already told us to disable);
+// only when status was NEVER successfully loaded does the optimistic
+// `configured: true` fallback apply, so the "not configured" banner never
+// flashes before the first response resolves.
 export const loadLlmStatusAtom = atom(null, async (get, set, options = {}) => {
 	const current = get(llmStatusAtom);
 	if (current.loading) {
@@ -42,12 +47,20 @@ export const loadLlmStatusAtom = atom(null, async (get, set, options = {}) => {
 			error: null,
 		});
 	} catch (error) {
-		set(llmStatusAtom, {
-			loaded: true,
-			loading: false,
-			configured: true,
-			model: null,
-			error: error?.message ?? "無法取得 AI 狀態",
-		});
+		const message = error?.message ?? "無法取得 AI 狀態";
+		if (current.loaded) {
+			// A previous load already resolved a real configured/model pair --
+			// keep it (see rationale above) instead of clobbering it with the
+			// never-loaded fallback below.
+			set(llmStatusAtom, { ...current, loading: false, error: message });
+		} else {
+			set(llmStatusAtom, {
+				loaded: true,
+				loading: false,
+				configured: true,
+				model: null,
+				error: message,
+			});
+		}
 	}
 });
