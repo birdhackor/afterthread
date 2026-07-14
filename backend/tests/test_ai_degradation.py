@@ -210,6 +210,62 @@ def test_capture_end_to_end_juxtaposed_objects_returns_502_no_rows(
     assert _total(client) == 0
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        f"[{json.dumps(_DRAFT, ensure_ascii=False)}, {{bad}}]",
+        f"[{json.dumps(_DRAFT, ensure_ascii=False)},]",
+        f"[{{bad}}, {json.dumps(_DRAFT, ensure_ascii=False)}]",
+    ],
+    ids=["garbled-second-element", "trailing-comma", "garbled-first-element"],
+)
+def test_capture_end_to_end_unparseable_array_element_returns_502_no_rows(
+    client: TestClient,
+    configure_llm: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+    content: str,
+) -> None:
+    """Finding 2 (end to end): an outer array that fails to parse as a whole --
+    a garbled multi-draft array ``[{valid}, {bad}]`` or a trailing-comma array
+    ``[{valid},]`` -- must not have its one parseable inner object promoted and
+    persisted. Pre-fix, the hand-rolled scanner skipped the unparseable outer
+    array as junk and returned the inner (fully valid) draft, writing a row
+    (201) for one arbitrary element of a garbled response. The real
+    generate_json runs here (only _get_client is stubbed), so this proves the
+    whole chain now rejects it: 502, no row written.
+    """
+    configure_llm(base_url=_SECRET_URL, model="m")
+    _install_client(monkeypatch, _StubClient(content=content))
+
+    response = client.post("/api/capture", json={"raw_text": "raw discussion"})
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "llm_upstream_error"
+    assert _total(client) == 0
+
+
+def test_capture_end_to_end_finding1_object_with_bracket_string_returns_201(
+    client: TestClient,
+    configure_llm: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 1 (end to end): a legitimate prose-wrapped draft whose string
+    field literally contains "[{}]" must flow through to 201. Pre-fix, the
+    hand-rolled scanner counted the "[" and "}" INSIDE that string as a phantom
+    array candidate -- a dict-bearing list -> false 502 on valid output. The
+    string-aware decoder consumes the brackets as part of the string, so the
+    object is recovered whole and one row is written.
+    """
+    configure_llm(base_url=_SECRET_URL, model="m")
+    draft = {**_DRAFT, "snapshot": "see the pattern [{}] in the logs"}
+    prose = f"Here is the draft: {json.dumps(draft, ensure_ascii=False)}\nHope this helps!"
+    _install_client(monkeypatch, _StubClient(content=prose))
+
+    response = client.post("/api/capture", json={"raw_text": "raw discussion"})
+    assert response.status_code == 201, response.text
+    assert response.json()["item"]["title"] == "端到端草稿"
+    assert _total(client) == 1
+
+
 def test_capture_end_to_end_prose_with_innocent_bracket_before_object_returns_201(
     client: TestClient,
     configure_llm: Callable[..., Settings],

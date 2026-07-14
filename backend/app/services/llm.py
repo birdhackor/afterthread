@@ -202,7 +202,7 @@ def _strip_code_fences(text: str) -> str:
     """Remove a leading/trailing Markdown code fence, if present.
 
     Models frequently wrap JSON in a ```json ... ``` block. Strip only the
-    outer fence lines; the balanced-brace pass below handles anything else
+    outer fence lines; the JSON-decoder fallback below handles anything else
     (prose around the object, trailing commentary).
     """
     stripped = text.strip()
@@ -215,113 +215,6 @@ def _strip_code_fences(text: str) -> str:
     if lines and lines[-1].strip().startswith("```"):
         lines = lines[:-1]
     return "\n".join(lines).strip()
-
-
-def _balanced_brace_slice(text: str) -> str | None:
-    """Return the first balanced ``{...}`` substring, or None if there is none.
-
-    Scans from the first ``{`` tracking brace depth, ignoring braces that sit
-    inside JSON string literals (respecting backslash escapes) so a ``}`` in a
-    value does not close the object early. This is what recovers a JSON object
-    embedded in surrounding prose ("Here is the draft: {..}. Hope this helps!").
-    """
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escaped = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : index + 1]
-    return None
-
-
-def _balanced_spans(text: str, open_char: str, close_char: str) -> list[tuple[int, int]]:
-    """Return every top-level ``open_char ... close_char`` span in ``text``.
-
-    Generalizes the depth-tracking scan above (ignore the OTHER bracket type
-    entirely, and anything inside a JSON string literal, exactly as
-    ``_balanced_brace_slice`` ignores ``[``/``]`` while hunting for ``{``/``}``)
-    to keep going after each span closes instead of stopping at the first, so
-    a single left-to-right pass locates all of them.
-
-    Each returned span is disjoint from the others this same call returns:
-    once depth returns to 0 the scan resets and only looks for the next
-    ``open_char`` from there on, so their combined length can never exceed
-    ``len(text)``. An ``open_char`` that never reaches a matching
-    ``close_char`` simply leaves depth above 0 for the rest of the text with
-    no span recorded for it -- the scan does NOT restart from the next
-    ``open_char`` and re-walk the remaining text, which is what would make a
-    text full of unmatched opens quadratic. This is always O(len(text)),
-    independent of how many spans it finds or how many opens never close.
-    """
-    spans: list[tuple[int, int]] = []
-    depth = 0
-    start = -1
-    in_string = False
-    escaped = False
-    for index, char in enumerate(text):
-        if depth == 0:
-            if char == open_char:
-                depth = 1
-                start = index
-                in_string = False
-                escaped = False
-            continue
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == open_char:
-            depth += 1
-        elif char == close_char:
-            depth -= 1
-            if depth == 0:
-                spans.append((start, index + 1))
-    return spans
-
-
-def _json_candidates(text: str) -> list[str]:
-    """Return every top-level ``{...}``/``[...]`` substring of ``text``, IN
-    ORDER OF APPEARANCE.
-
-    Combines the independent ``{``/``}`` and ``[``/``]`` passes from
-    ``_balanced_spans`` and sorts by start index. Because an enclosing span
-    always starts before anything nested inside it, this ordering alone
-    guarantees a wrapping array is considered -- and, if it hides a dict,
-    rejected -- before any object nested inside it is ever reached: exactly
-    what keeps a prose-wrapped ``[{"title": "A"}, {"title": "B"}]`` from being
-    reduced to just its first element the way scanning for ``{`` alone would.
-    Two O(len(text)) passes plus a sort over at most O(len(text)) spans whose
-    combined length is itself bounded by ``2 * len(text)`` (each pass's own
-    spans are mutually disjoint) -- bounded regardless of how many candidates
-    the text contains.
-    """
-    spans = _balanced_spans(text, "{", "}") + _balanced_spans(text, "[", "]")
-    spans.sort(key=lambda span: span[0])
-    return [text[start:end] for start, end in spans]
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
@@ -339,60 +232,65 @@ def _extract_json_object(text: str) -> dict[str, Any]:
 
     The fallback below (recovering an object embedded in surrounding prose,
     e.g. "Here is the draft: {..}. Hope this helps!") is only ever attempted
-    when the full text FAILS to parse as JSON at all -- and it is governed by
-    ONE closing rule, not a first-match grab: THE FALLBACK SUCCEEDS ONLY WHEN
-    THE SCAN FINDS EXACTLY ONE USABLE OBJECT. It walks every top-level
-    balanced ``{...}``/``[...]`` substring of the text, in order of appearance
-    (see ``_json_candidates``), classifying each candidate as it goes:
+    when the full text FAILS to parse as JSON at all. It does NOT hand-roll a
+    bracket scanner -- a depth counter that tracks ``{``/``[`` cannot tell a
+    real bracket from one sitting inside a JSON string literal, so a legitimate
+    object whose value contains ``"[{}]"`` once grew a phantom array candidate
+    and produced a false 502. Instead the walk asks the REAL parser: starting
+    at each ``{``/``[``, one reused ``json.JSONDecoder`` tries to ``raw_decode``
+    a value there; a ``JSONDecodeError`` means "no JSON begins here" (advance one
+    character), while success yields the value and the index just past it (jump
+    to ``end``, so nested brackets inside a decoded value are never rescanned).
+    Being string/escape-aware by construction, the decoder consumes a bracket
+    inside a string as part of that string -- the phantom-candidate bug cannot
+    recur.
 
-    * a dict-bearing list -- a list containing at least one dict -- is the
-      same "ambiguous multi-draft output" the top-level-array check above
-      guards against, just wrapped in prose (or interleaved with other
-      objects) instead of being the whole response (e.g. ``Here are two
-      drafts: [{"title": "A"}, {"title": "B"}]``). This raises
-      LLMUpstreamError THE INSTANT it is found -- regardless of how many
-      usable dicts were already collected or how many candidates remain --
-      rather than let a later candidate (or a naive single-object scan)
-      mistake one embedded element for the answer;
-    * a dict is USABLE: unlike a first-match scan, finding one does NOT stop
-      the walk. Returning on the first dict is exactly what let juxtaposed
-      objects (``{"title": "A"} {"title": "B"}``, two top-level values that
-      make the full-text parse fail as "extra data") silently keep the first
-      and drop the rest -- so every usable dict is collected and the scan
-      keeps going, which is what lets a second (or third) one be noticed at
-      all;
-    * anything else -- a list of scalars such as ``[1]``, a bare number or
-      string, or a candidate that does not even parse as JSON -- is
-      skippable junk: neither counted nor allowed to block the scan. This is
-      what lets an innocent scalar bracket before OR after the real object
-      (e.g. "Answer[1]: {...}") fall through to the object instead of being
-      mistaken for the answer or blocking the scan entirely.
+    Each decoded value is classified in order of appearance:
 
-    Once the walk finishes without an earlier dict-bearing-list raise, the
-    usable-dict count is the whole decision: zero raises UnparseableOutput
-    (the workflows require an object to map onto their pydantic models, and a
-    bare array/scalar/unparseable candidate is as unusable as no candidate at
-    all); exactly one returns it; more than one raises LLMUpstreamError
-    WrongShape ("multiple JSON objects") -- the juxtaposition case this rule
-    closes. This single count-based rule subsumes the earlier special cases
-    rather than sitting alongside them: a lone prose-wrapped object is simply
-    the count-of-one case, a prose-wrapped array is caught by the
-    dict-bearing-list short-circuit before any count is even taken, and
-    scalar-bracket noise around either was never counted in the first place.
+    * a dict-bearing list -- a list containing at least one dict -- is the same
+      "ambiguous multi-draft output" the top-level-array check above guards
+      against, just wrapped in prose (e.g. ``Here are two drafts: [{"title":
+      "A"}, {"title": "B"}]``). It raises LLMUpstreamError THE INSTANT it is
+      found, rather than let one of the array's own elements be mistaken for the
+      answer;
+    * a dict is USABLE, but its immediate left context is inspected first: if
+      the last non-whitespace character before it is ``[`` or ``,`` the object
+      is syntactically an ELEMENT of an array that -- since the full-text parse
+      failed -- did not parse as a whole (a garbled multi-draft array like
+      ``[{"title": "A"}, {bad}]``, or one with a trailing comma). Promoting the
+      single element that happens to parse would silently persist an arbitrary
+      draft, so this raises WrongShape too. DELIBERATE TRADEOFF: innocent prose
+      ending in ``,`` or ``[`` right before a lone object ("as shown, {json}")
+      also trips this and 502s -- accepted, because a 502 merely triggers a
+      retry while a silent element-pick misleads, and a conforming model emits a
+      bare single object anyway;
+    * any other dict is collected (not returned on sight) so a second or third
+      top-level object juxtaposed with it (``{"title": "A"} {"title": "B"}``,
+      which fails the full-text parse as "extra data") is noticed rather than
+      silently dropped;
+    * anything else -- a scalar, a scalar list such as ``[1]``, or a bracket
+      that begins no valid JSON at all -- is skippable junk, letting an innocent
+      scalar bracket before OR after the real object ("Answer[1]: {...}") fall
+      through to it.
 
-    Pathologically nested input (tens of thousands of ``[``) makes ``json.loads``
-    exhaust the interpreter's recursion limit and raise ``RecursionError`` rather
-    than ``JSONDecodeError``; that is caught alongside the ordinary parse errors
-    on the full-text attempt AND every candidate attempt below, and treated as
-    unparseable (502), never left to escape as an unhandled 500.
-    ``_json_candidates`` itself never recurses (its nesting tracking is a plain
-    counter, not Python call recursion) and never rescans a prefix, so a
-    pathological input -- deeply nested or simply full of unmatched brackets --
-    cannot make this scan quadratic. Walking every candidate to completion
-    (instead of stopping at the first usable dict) does not change that bound
-    either: the combined length of every candidate this scan ever parses is
-    already bounded by ``2 * len(text)`` regardless of where in the walk a
-    dict happens to be found (see ``_json_candidates``).
+    Once the walk finishes without an earlier raise, the usable-dict count is
+    the whole decision: zero raises UnparseableOutput (the workflows require an
+    object to map onto their pydantic models), exactly one returns it, and more
+    than one raises WrongShape ("multiple JSON objects") -- the juxtaposition
+    case this rule closes.
+
+    Pathologically nested input (tens of thousands of ``[``) makes the decoder
+    exhaust the interpreter's recursion limit and raise ``RecursionError``
+    rather than ``JSONDecodeError``; such nesting is never legitimate, so the
+    first time it happens -- on the full-text attempt (caught alongside the
+    ordinary parse errors) or on any ``raw_decode`` in the walk -- the whole
+    text is rejected as unparseable (502), never left to escape as an unhandled
+    500 and never allowed to drive an O(n*depth) re-descent. The walk is
+    otherwise linear: ``raw_decode`` fails at the first character of an unmatched
+    ``{`` (so a run of them is O(1) per position), jumps past every value it does
+    parse (so the parsed spans are mutually disjoint), and the left-context
+    lookback only scans the whitespace immediately before each object, itself
+    disjoint across objects.
     """
     cleaned = _strip_code_fences(text)
     try:
@@ -404,55 +302,81 @@ def _extract_json_object(text: str) -> dict[str, Any]:
             return parsed
         # Well-formed JSON, but not an object: this is the LLM's whole answer,
         # not prose wrapping an object, so it fails here and now rather than
-        # falling through to the candidate scan below (which could otherwise
+        # falling through to the candidate walk below (which could otherwise
         # extract and silently persist one embedded object out of a top-level
         # array).
         raise LLMUpstreamError("WrongShape: the LLM returned a non-object JSON value")
 
-    # Every usable dict the scan finds, in order of appearance. Collected
-    # rather than returned on first sight so a second (or third) top-level
-    # object -- juxtaposed with, not nested inside, the first -- is noticed
-    # instead of silently dropped; see the "exactly one" rule in the
-    # docstring above.
+    # Fallback: the full text is not valid JSON on its own, so an object may be
+    # embedded in surrounding prose. One decoder instance is reused across every
+    # attempt below (it holds no per-call state).
+    decoder = json.JSONDecoder()
+    # Every usable dict the walk finds, in order of appearance. Collected rather
+    # than returned on first sight so a second (or third) top-level object
+    # juxtaposed with the first is noticed instead of silently dropped; see the
+    # "exactly one" rule in the docstring above.
     usable_dicts: list[dict[str, Any]] = []
-    for candidate in _json_candidates(cleaned):
-        if candidate == cleaned:
-            # Only possible when the whole cleaned text is itself one
-            # top-level {...}/[...] span -- exactly what the full-text attempt
-            # above already tried and just failed to parse. json.loads is
-            # pure, so re-parsing the identical string here would
-            # deterministically fail again (paying to exhaust the recursion
-            # limit a second time, for the deeply nested case above) -- skip
-            # the guaranteed-redundant attempt.
+    index = 0
+    length = len(cleaned)
+    while index < length:
+        if cleaned[index] not in "{[":
+            index += 1
             continue
         try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError, ValueError, RecursionError:
+            value, end = decoder.raw_decode(cleaned, index)
+        except json.JSONDecodeError:
+            # No JSON value begins here (a bare "{" with no valid object after
+            # it, a bracket sitting in prose). Advance one character and keep
+            # scanning; because the decoder is string-aware, a bracket inside a
+            # string literal is never mistaken for a candidate of its own.
+            index += 1
             continue
-        if isinstance(parsed, dict):
-            usable_dicts.append(parsed)
-            continue
-        if isinstance(parsed, list) and any(isinstance(item, dict) for item in parsed):
+        except RecursionError:
+            # Pathologically nested input exhausted the recursion limit. Such
+            # nesting is never a legitimate answer, so reject the whole text at
+            # once rather than let a RecursionError escape as an unhandled 500
+            # or drive an O(n*depth) walk.
+            raise LLMUpstreamError(
+                "UnparseableOutput: could not parse a JSON object from the LLM output"
+            ) from None
+        if isinstance(value, dict):
+            # Array-element-context rule: an object whose last non-whitespace
+            # neighbour on the left is "[" or "," is syntactically an element of
+            # an array that -- since the full-text parse failed -- did not parse
+            # as a whole. Promoting the one element that happens to parse would
+            # silently persist an arbitrary draft, so reject the ambiguity.
+            # DELIBERATE TRADEOFF: innocent prose ending in "," or "[" right
+            # before a lone object ("as shown, {json}") also trips this and 502s
+            # -- accepted, because a 502 merely triggers a retry while a silent
+            # element-pick misleads, and a conforming model emits a bare single
+            # object anyway.
+            before = index - 1
+            while before >= 0 and cleaned[before].isspace():
+                before -= 1
+            if before >= 0 and cleaned[before] in "[,":
+                raise LLMUpstreamError(
+                    "WrongShape: the LLM returned an ambiguous array of draft objects"
+                )
+            usable_dicts.append(value)
+        elif isinstance(value, list) and any(isinstance(item, dict) for item in value):
             # Same "ambiguous multi-draft output" as the top-level-array check
-            # above -- just embedded in prose instead of being the whole
-            # response. Raise immediately rather than let a later candidate
-            # (e.g. one of this array's own elements) be mistaken for the
-            # answer, and regardless of how many usable dicts already sit in
-            # usable_dicts.
+            # above, just embedded in prose. Raise immediately rather than let
+            # one of the array's own elements be mistaken for the answer.
             raise LLMUpstreamError(
                 "WrongShape: the LLM returned an ambiguous array of draft objects"
             )
-        # Anything else -- a list with no dict in it (e.g. [1]), or a
-        # candidate that failed to parse at all -- is not usable. Skip it and
-        # keep scanning; this is what lets an innocent scalar bracket before
-        # or after the real object (e.g. "Answer[1]: {...}") fall through
-        # instead of being mistaken for the answer.
+        # Anything else -- a scalar, or a list with no dict in it (e.g. [1]) --
+        # is not usable. Jump past whatever was decoded and keep scanning; this
+        # is what lets an innocent scalar bracket before or after the real
+        # object (e.g. "Answer[1]: {...}") fall through instead of being
+        # mistaken for the answer.
+        index = end
 
     if len(usable_dicts) > 1:
         # The juxtaposition case this rule closes: more than one top-level
         # object was found and none of them is privileged over another, so
-        # silently picking the first would drop the rest exactly like the
-        # bug this replaces. Same safe WrongShape message family as the
+        # silently picking the first would drop the rest exactly like the bug
+        # this replaces. Same safe WrongShape message family as the
         # dict-bearing-list case above.
         raise LLMUpstreamError("WrongShape: the LLM returned multiple JSON objects")
     if usable_dicts:

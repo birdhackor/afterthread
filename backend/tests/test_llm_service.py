@@ -25,11 +25,9 @@ from app.services.llm import (
     _UPSTREAM_REASON,
     LLMNotConfiguredError,
     LLMUpstreamError,
-    _balanced_brace_slice,
     _build_client,
     _extract_json_object,
     _get_client,
-    _json_candidates,
     generate_json,
     llm_configured,
     normalized_model,
@@ -620,18 +618,11 @@ def test_configured_and_get_client_agree_on_whitespace_padded_url(
     assert " " not in rendered
 
 
-# --- pure extraction helpers ---------------------------------------------
-
-
-def test_balanced_brace_slice_ignores_braces_inside_strings() -> None:
-    text = 'prefix {"a": "has a } brace", "b": {"c": 1}} suffix'
-    sliced = _balanced_brace_slice(text)
-    assert sliced is not None
-    assert json.loads(sliced) == {"a": "has a } brace", "b": {"c": 1}}
-
-
-def test_balanced_brace_slice_none_without_object() -> None:
-    assert _balanced_brace_slice("no object here") is None
+# --- _extract_json_object: pure extraction (behavior-level) ---------------
+# The hand-rolled span scanner (_balanced_brace_slice / _balanced_spans /
+# _json_candidates) is gone; the fallback now walks the text with the real
+# json decoder. The unit tests that were pinned to those helpers are
+# re-expressed here as observable behaviour of _extract_json_object itself.
 
 
 def test_extract_json_object_nested(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -639,30 +630,57 @@ def test_extract_json_object_nested(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _extract_json_object(nested) == {"outer": {"inner": [1, 2]}, "flag": True}
 
 
-def test_json_candidates_orders_outer_array_before_nested_objects() -> None:
-    """An array's span starts before any object nested inside it (nesting
-    implies the outer bracket opens first), so ordering by start position
-    alone guarantees the outer array is the FIRST candidate considered --
-    this is what lets _extract_json_object reject the whole array before ever
-    reaching one of its own elements.
+def test_extract_json_object_recovers_object_with_brace_inside_string() -> None:
+    """A "}" inside a JSON string value must not end the object early: the real
+    decoder is string/escape-aware, so a prose-wrapped object whose value
+    contains a brace is still recovered whole. Behaviour-level replacement for
+    the deleted _balanced_brace_slice string-awareness test.
+    """
+    text = 'prefix {"a": "has a } brace", "b": {"c": 1}} suffix'
+    assert _extract_json_object(text) == {"a": "has a } brace", "b": {"c": 1}}
+
+
+def test_extract_json_object_no_object_raises_unparseable() -> None:
+    """Text with no JSON object at all yields no usable dict -> UnparseableOutput.
+    Behaviour-level replacement for the deleted "nothing found" helper tests
+    (_balanced_brace_slice returning None / _json_candidates returning []).
+    """
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        _extract_json_object("no object here at all")
+    assert "UnparseableOutput" in str(excinfo.value)
+
+
+def test_extract_json_object_outer_array_rejected_not_reduced_to_nested_object() -> None:
+    """A prose-wrapped array of objects is rejected as a whole (WrongShape),
+    never reduced to its first nested element: the decoder parses the whole
+    array first and classifies it as a dict-bearing list. Behaviour-level
+    replacement for the deleted _json_candidates ordering test.
     """
     array_json = json.dumps([{"title": "A"}, {"title": "B"}])
-    text = f"prose {array_json} more prose"
-    candidates = _json_candidates(text)
-    assert candidates[0] == array_json
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        _extract_json_object(f"prose {array_json} more prose")
+    assert "WrongShape" in str(excinfo.value)
 
 
-def test_json_candidates_finds_both_bracket_types_in_order_of_appearance() -> None:
-    """A scalar array and a later object are both found, in the order they
-    appear in the text -- regardless of bracket type -- so a caller scanning
-    candidates left to right reaches the object right after the array.
+def test_extract_json_object_finding1_prose_object_with_bracket_string_returns_object() -> None:
+    """Finding 1 regression: a legitimate prose-wrapped object whose string
+    field literally contains "[{}]" must be extracted as-is. The old bracket
+    scanner counted the "[" and "}" INSIDE that string and grew a phantom array
+    candidate -- a dict-bearing list -> false 502; the string-aware decoder
+    consumes the brackets as part of the string and returns the object.
     """
-    text = f"Answer[1]: {_SAMPLE_JSON}"
-    assert _json_candidates(text) == ["[1]", _SAMPLE_JSON]
+    text = 'Here is the draft: {"note": "[{}]"} Hope this helps!'
+    assert _extract_json_object(text) == {"note": "[{}]"}
 
 
-def test_json_candidates_none_without_brackets() -> None:
-    assert _json_candidates("no brackets here at all") == []
+def test_extract_json_object_finding1_object_with_nested_bracket_string_returns_object() -> None:
+    """Finding 1 regression, heavier bracket payload: a string value of
+    "[{},{}]" (which the old scanner would have mis-read as a two-element array
+    of objects and rejected) is just a string; the object is returned whole.
+    """
+    assert _extract_json_object('{"nested": "[{},{}]"}') == {"nested": "[{},{}]"}
+    prose = 'Result: {"nested": "[{},{}]"} done'
+    assert _extract_json_object(prose) == {"nested": "[{},{}]"}
 
 
 # --- _extract_json_object: non-object top level (finding 1) ---------------
@@ -707,6 +725,41 @@ def test_extract_json_object_prose_wrapped_array_raises_upstream_wrong_shape() -
     prose = f"Here are two drafts: {array_json} Take your pick!"
     with pytest.raises(LLMUpstreamError) as excinfo:
         _extract_json_object(prose)
+    assert "WrongShape" in str(excinfo.value)
+
+
+# --- _extract_json_object: unparseable array elements (finding 2) ----------
+
+
+@pytest.mark.parametrize(
+    "content",
+    ['[{"title": "A"}, {bad}]', '[{"title": "A"},]', '[{bad}, {"title": "A"}]'],
+    ids=["garbled-second-element", "trailing-comma", "garbled-first-element"],
+)
+def test_extract_json_object_unparseable_array_element_raises_wrong_shape(content: str) -> None:
+    """Finding 2: an outer array that fails to parse as a whole (a garbled
+    multi-draft array, or one with a trailing comma) must NOT have its one
+    parseable inner object promoted. The parseable object's last
+    non-whitespace left neighbour is "[" or "," -- syntactically an array
+    element -- so it is rejected as an ambiguous multi-draft response
+    (WrongShape), not silently persisted. Pre-fix, the hand-rolled scanner
+    skipped the unparseable outer array as junk and returned the inner object.
+    """
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        _extract_json_object(content)
+    assert "WrongShape" in str(excinfo.value)
+
+
+def test_extract_json_object_prose_comma_before_object_false_positives_by_design() -> None:
+    """DELIBERATE TRADEOFF (documented in _extract_json_object): prose whose
+    last non-whitespace character before a lone object is "," (or "[") is
+    indistinguishable from a garbled array element, so it 502s. Accepted -- a
+    502 triggers a retry, whereas silently picking an array element misleads,
+    and conforming models emit a bare single object anyway. Pinned so the
+    tradeoff is not "fixed" back into a silent element-pick by accident.
+    """
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        _extract_json_object('As shown, {"title": "A"}')
     assert "WrongShape" in str(excinfo.value)
 
 
@@ -780,11 +833,11 @@ def test_extract_json_object_deeply_nested_brackets_raises_upstream() -> None:
 
 def test_extract_json_object_bounded_with_many_unmatched_brace_opens() -> None:
     """A long run of unmatched ``{`` with no closing ``}`` at all must not
-    trigger an O(n^2) "retry every position independently" scan: the
-    candidate scan performs one linear pass per bracket type regardless of
-    how many opens never find a match, so this must stay fast even at a size
-    where a quadratic implementation would visibly stall (tens of seconds or
-    more, versus low milliseconds here).
+    trigger an O(n^2) "retry every position independently" scan: raw_decode
+    fails at the first character of each unmatched ``{`` (O(1) per position),
+    so the walk stays linear regardless of how many opens never find a match --
+    fast even at a size where a quadratic implementation would visibly stall
+    (tens of seconds or more, versus low milliseconds here).
     """
     text = "{" * 30000 + " not valid json, just noise"
     started = time.monotonic()
@@ -797,10 +850,10 @@ def test_extract_json_object_bounded_with_many_unmatched_brace_opens() -> None:
 
 def test_extract_json_object_bounded_with_many_skippable_candidates() -> None:
     """Many innocent scalar-array candidates ahead of the real object -- each
-    individually cheap to reject -- must not add up to quadratic work:
-    finding every candidate is two linear passes over the whole text (see
-    _json_candidates), so this must stay fast even with thousands of them
-    ahead of the object the scan is really looking for.
+    individually cheap to reject -- must not add up to quadratic work: the walk
+    decodes each candidate once and jumps past it (i = end), so the parsed
+    spans are mutually disjoint and total work stays linear in len(text), fast
+    even with thousands of them ahead of the object the scan is looking for.
     """
     noise = "".join(f"[{i}]" for i in range(5000))
     prose = f"{noise} {_SAMPLE_JSON}"
