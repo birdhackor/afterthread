@@ -17,6 +17,22 @@ export const llmStatusAtom = atom({
 	error: null,
 });
 
+// Module-level generation counter guarding writes to llmStatusAtom, mirroring
+// the requestId pattern ItemsListPage/HomePage use for their own fetches
+// (a monotonic counter captured at request-start and re-checked before the
+// response is applied). Two write paths OWN a state transition here -- a new
+// loadLlmStatusAtom probe starting, and markLlmUnconfiguredAtom's
+// authoritative 503 downgrade -- and both bump this counter. Every
+// loadLlmStatusAtom call captures the post-bump value before awaiting its
+// fetch, then re-checks it before writing the result: if the counter has
+// moved on by then, a newer write already claimed the atom and this call's
+// result (success or failure) is stale and must be dropped, INCLUDING the
+// `loading` flag, which the newer write already owns. Without this, an older
+// /api/llm/status response still in flight when a real AI call's 503
+// authoritatively downgrades the atom can resolve afterwards and flip
+// `configured` back to the optimistic true, re-enabling doomed AI buttons.
+let generation = 0;
+
 // Write-only action: load /api/llm/status into llmStatusAtom. Idempotent -- it
 // no-ops while a request is in flight and after the first successful load,
 // unless called with { force: true } to refresh. On failure, a prior
@@ -36,9 +52,20 @@ export const loadLlmStatusAtom = atom(null, async (get, set, options = {}) => {
 		return;
 	}
 
+	// Claim the current generation for this call (see `generation` above)
+	// before firing the request, exactly like `const id = ++requestId.current`
+	// in the page fetch effects.
+	const myGeneration = ++generation;
 	set(llmStatusAtom, { ...current, loading: true, error: null });
 	try {
 		const data = await apiGet("/api/llm/status");
+		if (myGeneration !== generation) {
+			// A newer load or markLlmUnconfiguredAtom's downgrade already claimed
+			// a later generation while this request was in flight -- that write
+			// owns the atom now, so drop this stale success instead of
+			// overwriting it (e.g. clobbering an authoritative 503 downgrade).
+			return;
+		}
 		set(llmStatusAtom, {
 			loaded: true,
 			loading: false,
@@ -47,6 +74,13 @@ export const loadLlmStatusAtom = atom(null, async (get, set, options = {}) => {
 			error: null,
 		});
 	} catch (error) {
+		if (myGeneration !== generation) {
+			// Same staleness check as the success branch above, applied to the
+			// failure path -- `current` here was captured before this call's
+			// await, so writing it now would also resurrect whatever
+			// configured/model pair was current back then.
+			return;
+		}
 		const message = error?.message ?? "無法取得 AI 狀態";
 		if (current.loaded) {
 			// A previous load already resolved a real configured/model pair --
@@ -77,7 +111,13 @@ export const loadLlmStatusAtom = atom(null, async (get, set, options = {}) => {
 // finding the AI buttons enabled. Callers still fire the force re-probe
 // afterwards so a since-fixed backend can flip this back to `true`; this
 // action only ever moves state to the disabled reading.
+//
+// Bumps `generation` first so any loadLlmStatusAtom probe already in flight
+// (e.g. the initial app-start probe, still unresolved when this 503 lands)
+// is stale by the time it resolves and discards its write instead of
+// clobbering this downgrade -- see `generation` above.
 export const markLlmUnconfiguredAtom = atom(null, (_get, set) => {
+	generation++;
 	set(llmStatusAtom, {
 		loaded: true,
 		loading: false,
