@@ -32,3 +32,10 @@ export const STAGE_OPTIONS = Object.entries(STAGE_META).map(
 		label: meta.label,
 	}),
 );
+
+// Shown wherever an AI action is unavailable because the backend has no LLM
+// endpoint configured: disabled-button tooltips, the shell banner, and the
+// capture-page fallback alert. Kept as one constant so the wording never
+// drifts between call sites.
+export const LLM_NOT_CONFIGURED_NOTICE =
+	"AI 功能尚未設定：請在 backend/.env 填入 OPENAI_BASE_URL 後重啟";

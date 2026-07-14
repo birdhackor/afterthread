@@ -19,25 +19,15 @@ import { useState } from "react";
 import { Controller, useForm } from "react-hook-form";
 import { apiPost } from "../api/client.js";
 import { llmStatusAtom } from "../atoms/llm.js";
+import { CharCounter } from "../components/CharCounter.jsx";
 import { StaleBadge } from "../components/StaleBadge.jsx";
 import { StatusBadge } from "../components/StatusBadge.jsx";
+import { LLM_NOT_CONFIGURED_NOTICE } from "../constants/labels.js";
 import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { usePageTitle } from "../hooks/usePageTitle.js";
 
 // The capture textarea shares the backend's per-field bound (20000 chars).
 const CAPTURE_MAX = SECTION_MAX_LENGTH;
-
-const DISABLED_TOOLTIP =
-	"AI 功能尚未設定：請在 backend/.env 填入 OPENAI_BASE_URL 後重啟";
-
-// Soft character counter rendered under the hero textarea.
-function Counter({ length, max }) {
-	return (
-		<Text size="xs" c={length > max ? "red" : "dimmed"} ta="right" mt={4}>
-			{length} / {max}
-		</Text>
-	);
-}
 
 // Summary of a freshly captured item plus the AI's follow-up questions. The
 // questions render as a read-only checklist the user should answer soon; the
@@ -113,9 +103,6 @@ export function CapturePage() {
 			return;
 		}
 		const value = values.raw_text.trim();
-		if (!value) {
-			return;
-		}
 		setError(null);
 		setResult(null);
 		try {
@@ -141,8 +128,7 @@ export function CapturePage() {
 				<Alert color="orange" title="AI 功能尚未設定">
 					<Stack gap="xs" align="flex-start">
 						<Text size="sm">
-							目前無法使用 AI 快速捕捉。請在 backend/.env 填入 OPENAI_BASE_URL
-							後重啟，或改用手動建立項目。
+							{LLM_NOT_CONFIGURED_NOTICE}，或改用手動建立項目。
 						</Text>
 						<Button component={Link} to="/items/new" size="xs" variant="light">
 							改用手動建立
@@ -173,6 +159,7 @@ export function CapturePage() {
 								value: CAPTURE_MAX,
 								message: `內容不可超過 ${CAPTURE_MAX} 字`,
 							},
+							validate: (value) => value.trim() !== "" || "請貼上要捕捉的內容",
 						}}
 						render={({ field, fieldState }) => (
 							<div>
@@ -186,7 +173,7 @@ export function CapturePage() {
 									disabled={isSubmitting}
 									error={fieldState.error?.message}
 								/>
-								<Counter length={field.value?.length ?? 0} max={CAPTURE_MAX} />
+								<CharCounter value={field.value} max={CAPTURE_MAX} />
 							</div>
 						)}
 					/>
@@ -195,7 +182,7 @@ export function CapturePage() {
 							改用手動建立
 						</Anchor>
 						<Tooltip
-							label={DISABLED_TOOLTIP}
+							label={LLM_NOT_CONFIGURED_NOTICE}
 							disabled={configured}
 							multiline
 							w={260}

@@ -17,10 +17,8 @@ import { useState } from "react";
 import { Controller, useForm } from "react-hook-form";
 import { apiPost } from "../api/client.js";
 import { llmStatusAtom } from "../atoms/llm.js";
+import { LLM_NOT_CONFIGURED_NOTICE } from "../constants/labels.js";
 import { SECTION_MAX_LENGTH } from "../constants/sections.js";
-
-const DISABLED_TOOLTIP =
-	"AI 功能尚未設定：請在 backend/.env 填入 OPENAI_BASE_URL 後重啟";
 
 // One AI action card: a textarea + submit button that POSTs to an LLM endpoint.
 // Handles the long-request loading state (double-submit is blocked while the
@@ -54,9 +52,6 @@ function AiActionCard({
 			return;
 		}
 		const value = values[fieldName].trim();
-		if (!value) {
-			return;
-		}
 		setConflict(false);
 		let result;
 		try {
@@ -127,6 +122,7 @@ function AiActionCard({
 									value: SECTION_MAX_LENGTH,
 									message: `內容不可超過 ${SECTION_MAX_LENGTH} 字`,
 								},
+								validate: (value) => value.trim() !== "" || "請輸入內容",
 							}}
 							render={({ field, fieldState }) => (
 								<Textarea
@@ -143,7 +139,7 @@ function AiActionCard({
 						/>
 						<Group justify="flex-end">
 							<Tooltip
-								label={DISABLED_TOOLTIP}
+								label={LLM_NOT_CONFIGURED_NOTICE}
 								disabled={configured}
 								multiline
 								w={260}

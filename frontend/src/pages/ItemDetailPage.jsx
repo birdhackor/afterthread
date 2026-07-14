@@ -117,9 +117,6 @@ function ProgressPanel({ itemId, progress, onAdded }) {
 
 	const submit = handleSubmit(async ({ note }) => {
 		const trimmed = note.trim();
-		if (!trimmed) {
-			return;
-		}
 		try {
 			const entry = await apiPost(`/api/items/${itemId}/progress`, {
 				note: trimmed,
@@ -169,6 +166,7 @@ function ProgressPanel({ itemId, progress, onAdded }) {
 								value: SECTION_MAX_LENGTH,
 								message: `內容不可超過 ${SECTION_MAX_LENGTH} 字`,
 							},
+							validate: (value) => value.trim() !== "" || "請輸入進度內容",
 						}}
 						render={({ field, fieldState }) => (
 							<Textarea

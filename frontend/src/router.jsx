@@ -16,6 +16,7 @@ import {
 import { useAtomValue, useSetAtom } from "jotai";
 import { useEffect, useState } from "react";
 import { llmStatusAtom, loadLlmStatusAtom } from "./atoms/llm.js";
+import { LLM_NOT_CONFIGURED_NOTICE } from "./constants/labels.js";
 import { CapturePage } from "./pages/CapturePage.jsx";
 import { HomePage } from "./pages/HomePage.jsx";
 import { ItemDetailPage } from "./pages/ItemDetailPage.jsx";
@@ -58,7 +59,7 @@ function LlmBanner() {
 			onClose={() => setDismissed(true)}
 			mb="md"
 		>
-			AI 功能未設定：請在 backend/.env 填入 OPENAI_BASE_URL 後重啟
+			{LLM_NOT_CONFIGURED_NOTICE}
 		</Alert>
 	);
 }
@@ -87,7 +88,7 @@ function RootLayout() {
 			<AppShell.Navbar p="md">
 				<NavItem to="/" label="總覽" exact />
 				<NavItem to="/capture" label="快速捕捉" />
-				<NavItem to="/items" label="記憶清單" />
+				<NavItem to="/items" label="記憶清單" exact />
 				<NavItem to="/items/new" label="新增項目" />
 			</AppShell.Navbar>
 			<AppShell.Main>

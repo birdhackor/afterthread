@@ -4,7 +4,6 @@ import {
 	Select,
 	Stack,
 	TagsInput,
-	Text,
 	Textarea,
 	TextInput,
 	Title,
@@ -17,6 +16,7 @@ import {
 	SECTION_GROUPS,
 	SECTION_MAX_LENGTH,
 } from "../constants/sections.js";
+import { CharCounter } from "./CharCounter.jsx";
 
 const TITLE_MAX = 300;
 const TAG_MAX = 100;
@@ -75,16 +75,6 @@ export function applyServerFieldErrors(error, setError) {
 	});
 }
 
-// Soft character counter rendered under a length-bounded field.
-function Counter({ value, max }) {
-	const length = value?.length ?? 0;
-	return (
-		<Text size="xs" c={length > max ? "red" : "dimmed"} ta="right" mt={4}>
-			{length} / {max}
-		</Text>
-	);
-}
-
 // Shared create/edit form. `onSubmit(values, { dirtyFields, setError, reset })`
 // lets the create page POST the whole payload while the edit page PATCHes only
 // the dirty fields. Client-side rules mirror the backend bounds; server 422s
@@ -115,6 +105,7 @@ export function ItemForm({ defaultValues, submitLabel, onSubmit, onCancel }) {
 								value: TITLE_MAX,
 								message: `標題不可超過 ${TITLE_MAX} 字`,
 							},
+							validate: (value) => value.trim() !== "" || "請輸入標題",
 						}}
 						render={({ field, fieldState }) => (
 							<div>
@@ -126,7 +117,7 @@ export function ItemForm({ defaultValues, submitLabel, onSubmit, onCancel }) {
 									placeholder="這個項目在追蹤什麼？"
 									error={fieldState.error?.message}
 								/>
-								<Counter value={field.value} max={TITLE_MAX} />
+								<CharCounter value={field.value} max={TITLE_MAX} />
 							</div>
 						)}
 					/>
@@ -165,6 +156,9 @@ export function ItemForm({ defaultValues, submitLabel, onSubmit, onCancel }) {
 							validate: (tags) => {
 								if (tags.length > MAX_TAGS) {
 									return `標籤最多 ${MAX_TAGS} 個`;
+								}
+								if (tags.some((tag) => tag.trim() === "")) {
+									return "標籤不可為空白";
 								}
 								if (tags.some((tag) => tag.length > TAG_MAX)) {
 									return `每個標籤不可超過 ${TAG_MAX} 字`;
@@ -213,7 +207,10 @@ export function ItemForm({ defaultValues, submitLabel, onSubmit, onCancel }) {
 												maxLength={SECTION_MAX_LENGTH}
 												error={fieldState.error?.message}
 											/>
-											<Counter value={field.value} max={SECTION_MAX_LENGTH} />
+											<CharCounter
+												value={field.value}
+												max={SECTION_MAX_LENGTH}
+											/>
 										</div>
 									)}
 								/>
