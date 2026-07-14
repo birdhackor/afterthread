@@ -21,6 +21,18 @@ export class ApiError extends Error {
 	}
 }
 
+// Same shape as a fetch()-throw transport failure (status 0, network_error,
+// zh-TW copy) -- also used when the connection drops mid-response, after
+// headers arrive but before the body finishes reading. Either way the
+// request never delivered a usable response, so it reads as one error kind.
+function networkError() {
+	return new ApiError({
+		status: 0,
+		code: "network_error",
+		message: "無法連線伺服器，請確認網路後再試",
+	});
+}
+
 // Build a `?a=1&b=2` query string from a plain object. null / undefined /
 // empty-string values are dropped so a page can hand over its whole filter
 // state without pruning cleared fields first. Returns "" when nothing is set.
@@ -111,19 +123,26 @@ export async function apiFetch(path, options = {}) {
 			},
 		});
 	} catch (_cause) {
-		throw new ApiError({
-			status: 0,
-			code: "network_error",
-			message: "無法連線伺服器，請確認網路後再試",
-		});
+		throw networkError();
 	}
 
 	if (response.status === 204) {
 		return null;
 	}
 
+	let text;
+	try {
+		text = await response.text();
+	} catch (_cause) {
+		// Headers arrived (response.ok / response.status are already known),
+		// but the connection dropped before the body finished streaming --
+		// still a transport failure from the caller's point of view, so it
+		// gets the same normalized shape as the fetch()-throw case above
+		// rather than surfacing a raw TypeError.
+		throw networkError();
+	}
+
 	let body = null;
-	const text = await response.text();
 	if (text) {
 		try {
 			body = JSON.parse(text);

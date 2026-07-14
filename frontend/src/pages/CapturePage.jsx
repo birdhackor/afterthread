@@ -25,6 +25,7 @@ import { StatusBadge } from "../components/StatusBadge.jsx";
 import { LLM_NOT_CONFIGURED_NOTICE } from "../constants/labels.js";
 import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { usePageTitle } from "../hooks/usePageTitle.js";
+import { codePointLength } from "../utils/text.js";
 
 // The capture textarea shares the backend's per-field bound (20000 chars).
 const CAPTURE_MAX = SECTION_MAX_LENGTH;
@@ -155,11 +156,15 @@ export function CapturePage() {
 						control={control}
 						rules={{
 							required: "請貼上要捕捉的內容",
-							maxLength: {
-								value: CAPTURE_MAX,
-								message: `內容不可超過 ${CAPTURE_MAX} 字`,
+							validate: (value) => {
+								if (value.trim() === "") {
+									return "請貼上要捕捉的內容";
+								}
+								if (codePointLength(value) > CAPTURE_MAX) {
+									return `內容不可超過 ${CAPTURE_MAX} 字`;
+								}
+								return true;
 							},
-							validate: (value) => value.trim() !== "" || "請貼上要捕捉的內容",
 						}}
 						render={({ field, fieldState }) => (
 							<div>
@@ -169,7 +174,6 @@ export function CapturePage() {
 									placeholder="貼上剛結束的討論、想法或決策……"
 									autosize
 									minRows={6}
-									maxLength={CAPTURE_MAX}
 									disabled={isSubmitting}
 									error={fieldState.error?.message}
 								/>

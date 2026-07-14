@@ -35,6 +35,7 @@ import {
 } from "../constants/labels.js";
 import { SECTION_GROUPS, SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { usePageTitle } from "../hooks/usePageTitle.js";
+import { codePointLength } from "../utils/text.js";
 
 // A section field counts as filled only when it holds non-whitespace text.
 function isFilled(value) {
@@ -200,11 +201,15 @@ function ProgressPanel({
 						control={control}
 						rules={{
 							required: "請輸入進度內容",
-							maxLength: {
-								value: SECTION_MAX_LENGTH,
-								message: `內容不可超過 ${SECTION_MAX_LENGTH} 字`,
+							validate: (value) => {
+								if (value.trim() === "") {
+									return "請輸入進度內容";
+								}
+								if (codePointLength(value) > SECTION_MAX_LENGTH) {
+									return `內容不可超過 ${SECTION_MAX_LENGTH} 字`;
+								}
+								return true;
 							},
-							validate: (value) => value.trim() !== "" || "請輸入進度內容",
 						}}
 						render={({ field, fieldState }) => (
 							<Textarea
@@ -213,7 +218,7 @@ function ProgressPanel({
 								placeholder="記錄一筆進度..."
 								autosize
 								minRows={2}
-								maxLength={SECTION_MAX_LENGTH}
+								disabled={isSubmitting || pending}
 								error={fieldState.error?.message}
 							/>
 						)}

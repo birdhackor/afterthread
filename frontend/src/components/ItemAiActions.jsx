@@ -19,6 +19,7 @@ import { apiPost } from "../api/client.js";
 import { llmStatusAtom } from "../atoms/llm.js";
 import { LLM_NOT_CONFIGURED_NOTICE } from "../constants/labels.js";
 import { SECTION_MAX_LENGTH } from "../constants/sections.js";
+import { codePointLength } from "../utils/text.js";
 
 // One AI action card: a textarea + submit button that POSTs to an LLM endpoint.
 // Handles the long-request loading state (double-submit is blocked while the
@@ -132,11 +133,15 @@ function AiActionCard({
 							control={control}
 							rules={{
 								required: "請輸入內容",
-								maxLength: {
-									value: SECTION_MAX_LENGTH,
-									message: `內容不可超過 ${SECTION_MAX_LENGTH} 字`,
+								validate: (value) => {
+									if (value.trim() === "") {
+										return "請輸入內容";
+									}
+									if (codePointLength(value) > SECTION_MAX_LENGTH) {
+										return `內容不可超過 ${SECTION_MAX_LENGTH} 字`;
+									}
+									return true;
 								},
-								validate: (value) => value.trim() !== "" || "請輸入內容",
 							}}
 							render={({ field, fieldState }) => (
 								<Textarea
@@ -145,7 +150,6 @@ function AiActionCard({
 									placeholder={placeholder}
 									autosize
 									minRows={3}
-									maxLength={SECTION_MAX_LENGTH}
 									disabled={isSubmitting}
 									error={fieldState.error?.message}
 								/>

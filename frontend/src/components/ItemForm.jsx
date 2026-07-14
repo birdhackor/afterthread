@@ -16,6 +16,7 @@ import {
 	SECTION_GROUPS,
 	SECTION_MAX_LENGTH,
 } from "../constants/sections.js";
+import { codePointLength } from "../utils/text.js";
 import { CharCounter } from "./CharCounter.jsx";
 
 const TITLE_MAX = 300;
@@ -146,7 +147,7 @@ export function ItemForm({
 								if (value.trim() === "") {
 									return "請輸入標題";
 								}
-								if (value.length > TITLE_MAX) {
+								if (codePointLength(value) > TITLE_MAX) {
 									return `標題不可超過 ${TITLE_MAX} 字`;
 								}
 								return true;
@@ -158,7 +159,6 @@ export function ItemForm({
 									{...field}
 									label="標題"
 									withAsterisk
-									maxLength={TITLE_MAX}
 									placeholder="這個項目在追蹤什麼？"
 									error={fieldState.error?.message}
 								/>
@@ -217,7 +217,7 @@ export function ItemForm({
 								if (tags.some((tag) => tag.trim() === "")) {
 									return "標籤不可為空白";
 								}
-								if (tags.some((tag) => tag.length > TAG_MAX)) {
+								if (tags.some((tag) => codePointLength(tag) > TAG_MAX)) {
 									return `每個標籤不可超過 ${TAG_MAX} 字`;
 								}
 								return true;
@@ -256,7 +256,7 @@ export function ItemForm({
 										rules={{
 											validate: (value) =>
 												untouchedInEdit ||
-												value.length <= SECTION_MAX_LENGTH ||
+												codePointLength(value) <= SECTION_MAX_LENGTH ||
 												`不可超過 ${SECTION_MAX_LENGTH} 字`,
 										}}
 										render={({ field, fieldState }) => (
@@ -269,7 +269,6 @@ export function ItemForm({
 													}
 													autosize
 													minRows={3}
-													maxLength={SECTION_MAX_LENGTH}
 													error={fieldState.error?.message}
 												/>
 												<CharCounter
