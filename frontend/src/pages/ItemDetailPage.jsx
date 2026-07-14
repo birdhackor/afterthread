@@ -313,7 +313,11 @@ export function ItemDetailPage() {
 	const retryLoad = () => {
 		setState((prev) => ({ ...prev, phase: "loading", error: null }));
 		refresh().catch((error) => {
-			setState({ phase: "error", item: null, error });
+			setState({
+				phase: error?.status === 404 ? "notfound" : "error",
+				item: null,
+				error,
+			});
 		});
 	};
 

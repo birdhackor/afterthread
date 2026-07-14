@@ -134,11 +134,17 @@ export function ItemsListPage() {
 		const id = ++requestId.current;
 		setState((prev) => ({ ...prev, phase: "loading", error: null }));
 
+		// Trimmed here only -- backend tags are stored trimmed and matched
+		// exactly, and q's whitespace would otherwise become part of the LIKE
+		// pattern, so whitespace-only input must mean "no filter" (buildQuery
+		// drops the resulting ""). The atoms/debounced values themselves stay
+		// untrimmed (see changeTag/changeQ) so the input's caret/typing is
+		// never fought.
 		const query = buildQuery({
 			status,
 			stage,
-			tag: debouncedTag,
-			q: debouncedQ,
+			tag: debouncedTag.trim(),
+			q: debouncedQ.trim(),
 			limit: DEFAULT_LIMIT,
 			offset,
 		});
@@ -303,7 +309,7 @@ export function ItemsListPage() {
 				/>
 				<TextInput
 					label="搜尋"
-					placeholder="標題或內容關鍵字"
+					placeholder="搜尋標題、快照或恢復關鍵字"
 					value={q}
 					onChange={changeQ}
 					w={200}

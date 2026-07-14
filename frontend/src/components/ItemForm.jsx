@@ -1,5 +1,6 @@
 import {
 	Button,
+	Fieldset,
 	Group,
 	Select,
 	Stack,
@@ -135,155 +136,169 @@ export function ItemForm({
 	return (
 		<form onSubmit={submit}>
 			<Stack gap="lg">
-				<Stack gap="md">
-					<Controller
-						name="title"
-						control={control}
-						rules={{
-							validate: (value) => {
-								if (titleUntouchedInEdit) {
-									return true;
-								}
-								if (value.trim() === "") {
-									return "請輸入標題";
-								}
-								if (codePointLength(value) > TITLE_MAX) {
-									return `標題不可超過 ${TITLE_MAX} 字`;
-								}
-								return true;
-							},
-						}}
-						render={({ field, fieldState }) => (
-							<div>
-								<TextInput
-									{...field}
-									label="標題"
-									withAsterisk
-									placeholder="這個項目在追蹤什麼？"
-									error={fieldState.error?.message}
-								/>
-								<CharCounter
-									value={field.value}
-									max={TITLE_MAX}
-									suppressOverLimit={titleUntouchedInEdit}
-								/>
-							</div>
-						)}
-					/>
-
-					<Group grow align="flex-start">
-						<Controller
-							name="status"
-							control={control}
-							render={({ field }) => (
-								<Select
-									{...field}
-									label="狀態"
-									data={STATUS_OPTIONS}
-									allowDeselect={false}
-								/>
-							)}
-						/>
-						<Controller
-							name="stage"
-							control={control}
-							render={({ field }) => (
-								<Select
-									{...field}
-									label="階段"
-									data={STAGE_OPTIONS}
-									allowDeselect={false}
-								/>
-							)}
-						/>
-					</Group>
-
-					<Controller
-						name="tags"
-						control={control}
-						rules={{
-							// Unlike title, "untouched" can't be hoisted from dirtyFields
-							// (tags dirtiness isn't reliably tracked by RHF -- see
-							// SCALAR_FIELD_KEYS above) so it's recomputed here from the
-							// live value against the original, exactly mirroring
-							// ItemEditPage's own sameTags-based PATCH decision.
-							validate: (tags) => {
-								if (isEdit && sameTags(tags, defaultValues.tags)) {
-									return true;
-								}
-								if (tags.length > MAX_TAGS) {
-									return `標籤最多 ${MAX_TAGS} 個`;
-								}
-								if (tags.some((tag) => tag.trim() === "")) {
-									return "標籤不可為空白";
-								}
-								if (tags.some((tag) => codePointLength(tag) > TAG_MAX)) {
-									return `每個標籤不可超過 ${TAG_MAX} 字`;
-								}
-								return true;
-							},
-						}}
-						render={({ field, fieldState }) => (
-							<TagsInput
-								label="標籤"
-								value={field.value}
-								onChange={field.onChange}
-								onBlur={field.onBlur}
-								maxTags={MAX_TAGS}
-								placeholder="輸入後按 Enter 新增"
-								error={fieldState.error?.message}
+				{/* A native <fieldset disabled> locks every input while a submit
+				is in flight, so edits typed during a slow POST/PATCH aren't
+				silently lost once the response lands and navigates away.
+				Reaches every Controller-driven input in one place (RHF's
+				`field` object carries no `disabled` prop to spread) and,
+				unlike passing `disabled` to each control individually, also
+				disables TagsInput's per-pill remove buttons -- Mantine
+				doesn't wire those to the input's own `disabled` prop, but
+				the browser disables them anyway as fieldset descendants.
+				variant="unstyled" keeps it visually a no-op. */}
+				<Fieldset variant="unstyled" disabled={isSubmitting}>
+					<Stack gap="lg">
+						<Stack gap="md">
+							<Controller
+								name="title"
+								control={control}
+								rules={{
+									validate: (value) => {
+										if (titleUntouchedInEdit) {
+											return true;
+										}
+										if (value.trim() === "") {
+											return "請輸入標題";
+										}
+										if (codePointLength(value) > TITLE_MAX) {
+											return `標題不可超過 ${TITLE_MAX} 字`;
+										}
+										return true;
+									},
+								}}
+								render={({ field, fieldState }) => (
+									<div>
+										<TextInput
+											{...field}
+											label="標題"
+											withAsterisk
+											placeholder="這個項目在追蹤什麼？"
+											error={fieldState.error?.message}
+										/>
+										<CharCounter
+											value={field.value}
+											max={TITLE_MAX}
+											suppressOverLimit={titleUntouchedInEdit}
+										/>
+									</div>
+								)}
 							/>
-						)}
-					/>
-				</Stack>
 
-				{SECTION_GROUPS.map((group) => {
-					const single = group.fields.length === 1;
-					return (
-						<Stack key={group.id} gap="sm">
-							<Title order={4}>{group.title}</Title>
-							{group.fields.map((sectionField) => {
-								// Never block submit over a field the user didn't touch --
-								// it isn't part of the dirty-only PATCH either way (see the
-								// module doc comment above).
-								const untouchedInEdit =
-									isEdit && !dirtyFields[sectionField.key];
-								return (
-									<Controller
-										key={sectionField.key}
-										name={sectionField.key}
-										control={control}
-										rules={{
-											validate: (value) =>
-												untouchedInEdit ||
-												codePointLength(value) <= SECTION_MAX_LENGTH ||
-												`不可超過 ${SECTION_MAX_LENGTH} 字`,
-										}}
-										render={({ field, fieldState }) => (
-											<div>
-												<Textarea
-													{...field}
-													label={single ? undefined : sectionField.label}
-													placeholder={
-														single ? group.title : sectionField.label
-													}
-													autosize
-													minRows={3}
-													error={fieldState.error?.message}
-												/>
-												<CharCounter
-													value={field.value}
-													max={SECTION_MAX_LENGTH}
-													suppressOverLimit={untouchedInEdit}
-												/>
-											</div>
-										)}
+							<Group grow align="flex-start">
+								<Controller
+									name="status"
+									control={control}
+									render={({ field }) => (
+										<Select
+											{...field}
+											label="狀態"
+											data={STATUS_OPTIONS}
+											allowDeselect={false}
+										/>
+									)}
+								/>
+								<Controller
+									name="stage"
+									control={control}
+									render={({ field }) => (
+										<Select
+											{...field}
+											label="階段"
+											data={STAGE_OPTIONS}
+											allowDeselect={false}
+										/>
+									)}
+								/>
+							</Group>
+
+							<Controller
+								name="tags"
+								control={control}
+								rules={{
+									// Unlike title, "untouched" can't be hoisted from dirtyFields
+									// (tags dirtiness isn't reliably tracked by RHF -- see
+									// SCALAR_FIELD_KEYS above) so it's recomputed here from the
+									// live value against the original, exactly mirroring
+									// ItemEditPage's own sameTags-based PATCH decision.
+									validate: (tags) => {
+										if (isEdit && sameTags(tags, defaultValues.tags)) {
+											return true;
+										}
+										if (tags.length > MAX_TAGS) {
+											return `標籤最多 ${MAX_TAGS} 個`;
+										}
+										if (tags.some((tag) => tag.trim() === "")) {
+											return "標籤不可為空白";
+										}
+										if (tags.some((tag) => codePointLength(tag) > TAG_MAX)) {
+											return `每個標籤不可超過 ${TAG_MAX} 字`;
+										}
+										return true;
+									},
+								}}
+								render={({ field, fieldState }) => (
+									<TagsInput
+										label="標籤"
+										value={field.value}
+										onChange={field.onChange}
+										onBlur={field.onBlur}
+										maxTags={MAX_TAGS}
+										placeholder="輸入後按 Enter 新增"
+										error={fieldState.error?.message}
 									/>
-								);
-							})}
+								)}
+							/>
 						</Stack>
-					);
-				})}
+
+						{SECTION_GROUPS.map((group) => {
+							const single = group.fields.length === 1;
+							return (
+								<Stack key={group.id} gap="sm">
+									<Title order={4}>{group.title}</Title>
+									{group.fields.map((sectionField) => {
+										// Never block submit over a field the user didn't touch --
+										// it isn't part of the dirty-only PATCH either way (see the
+										// module doc comment above).
+										const untouchedInEdit =
+											isEdit && !dirtyFields[sectionField.key];
+										return (
+											<Controller
+												key={sectionField.key}
+												name={sectionField.key}
+												control={control}
+												rules={{
+													validate: (value) =>
+														untouchedInEdit ||
+														codePointLength(value) <= SECTION_MAX_LENGTH ||
+														`不可超過 ${SECTION_MAX_LENGTH} 字`,
+												}}
+												render={({ field, fieldState }) => (
+													<div>
+														<Textarea
+															{...field}
+															label={single ? undefined : sectionField.label}
+															placeholder={
+																single ? group.title : sectionField.label
+															}
+															autosize
+															minRows={3}
+															error={fieldState.error?.message}
+														/>
+														<CharCounter
+															value={field.value}
+															max={SECTION_MAX_LENGTH}
+															suppressOverLimit={untouchedInEdit}
+														/>
+													</div>
+												)}
+											/>
+										);
+									})}
+								</Stack>
+							);
+						})}
+					</Stack>
+				</Fieldset>
 
 				<Group justify="flex-end">
 					<Button

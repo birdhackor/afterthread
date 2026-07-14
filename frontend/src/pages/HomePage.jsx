@@ -14,7 +14,7 @@ import {
 } from "@mantine/core";
 import { Link } from "@tanstack/react-router";
 import { useAtomValue, useSetAtom } from "jotai";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { apiGet } from "../api/client.js";
 import { llmStatusAtom, loadLlmStatusAtom } from "../atoms/llm.js";
 import { DateText } from "../components/DateText.jsx";
@@ -196,13 +196,25 @@ export function HomePage() {
 		error: null,
 	});
 
+	// Monotonic request id (same pattern as ItemsListPage/ItemDetailPage) so a
+	// superseded response can't win -- e.g. StrictMode's double-mount fires
+	// two /api/review requests, and without this guard the older one landing
+	// after the newer one would silently overwrite its state.
+	const requestId = useRef(0);
 	const load = useCallback(() => {
+		const id = ++requestId.current;
 		setState((prev) => ({ ...prev, phase: "loading", error: null }));
 		apiGet("/api/review")
 			.then((data) => {
+				if (id !== requestId.current) {
+					return;
+				}
 				setState({ phase: "success", data, error: null });
 			})
 			.catch((error) => {
+				if (id !== requestId.current) {
+					return;
+				}
 				setState({ phase: "error", data: null, error });
 			});
 	}, []);
