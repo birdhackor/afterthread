@@ -1,6 +1,7 @@
 import {
 	Alert,
 	Anchor,
+	Box,
 	Button,
 	Card,
 	Center,
@@ -15,6 +16,7 @@ import {
 	Textarea,
 	Timeline,
 	Title,
+	Tooltip,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
@@ -495,14 +497,27 @@ export function ItemDetailPage() {
 					disabled={mutationPending}
 					w={130}
 				/>
-				<Button
-					component={Link}
-					to="/items/$itemId/edit"
-					params={{ itemId: String(item.id) }}
-					variant="default"
-				>
-					編輯
-				</Button>
+				{/* Gated by mutationPending: the edit page loads a snapshot of the
+				item on mount, and its save is a plain PATCH with no version check
+				(by design -- only the AI paths own the 409 machinery). Reaching
+				it while an AI action, quick Select or progress submit is still in
+				flight would let that stale snapshot's later save silently
+				overwrite whatever this in-flight mutation just wrote, so the
+				entry itself must be unreachable -- not just dimmed -- for the
+				duration. */}
+				<Tooltip label="處理中…" disabled={!mutationPending} withArrow>
+					<Box display="inline-block">
+						<Button
+							component={Link}
+							to="/items/$itemId/edit"
+							params={{ itemId: String(item.id) }}
+							variant="default"
+							disabled={mutationPending}
+						>
+							編輯
+						</Button>
+					</Box>
+				</Tooltip>
 				<Button color="red" variant="light" onClick={confirm.open}>
 					刪除
 				</Button>

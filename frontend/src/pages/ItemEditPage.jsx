@@ -9,7 +9,7 @@ import {
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { apiGet, apiPatch } from "../api/client.js";
 import {
 	applyServerFieldErrors,
@@ -32,6 +32,20 @@ export function ItemEditPage() {
 		item: null,
 		error: null,
 	});
+
+	// If the user leaves via the navbar while the PATCH in onSubmit below is
+	// in flight, this page unmounts but the promise still resolves -- skip
+	// the success-path backToDetail() (a navigate()) in that case so it can't
+	// yank the user back to the item they just left. Separate from `active`
+	// in the load effect just below: that one guards a single fetch and
+	// resets on every itemId change, while this ref must stay false for the
+	// rest of the component's life once the page has actually unmounted.
+	const isMountedRef = useRef(true);
+	useEffect(() => {
+		return () => {
+			isMountedRef.current = false;
+		};
+	}, []);
 
 	useEffect(() => {
 		let active = true;
@@ -88,7 +102,9 @@ export function ItemEditPage() {
 				title: "已更新",
 				message: "項目已更新",
 			});
-			backToDetail();
+			if (isMountedRef.current) {
+				backToDetail();
+			}
 		} catch (error) {
 			applyServerFieldErrors(error, setError);
 		}

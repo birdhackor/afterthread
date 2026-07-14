@@ -1,7 +1,7 @@
 import { Stack, Title } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { useNavigate } from "@tanstack/react-router";
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { apiPost } from "../api/client.js";
 import {
 	applyServerFieldErrors,
@@ -16,6 +16,19 @@ export function ItemNewPage() {
 	usePageTitle("新增項目");
 	const navigate = useNavigate();
 	const defaults = useMemo(() => buildFormDefaults(), []);
+
+	// If the user leaves via the navbar while the POST below is in flight,
+	// this page unmounts but the promise still resolves -- skip the
+	// success-path navigate in that case so it can't yank the user back to
+	// the just-created item from wherever they navigated to instead. The
+	// toast still shows (it's still true, and no longer where anyone's
+	// looking makes it harmless).
+	const isMountedRef = useRef(true);
+	useEffect(() => {
+		return () => {
+			isMountedRef.current = false;
+		};
+	}, []);
 
 	const onSubmit = async (values, { setError }) => {
 		const payload = {
@@ -34,10 +47,12 @@ export function ItemNewPage() {
 				title: "已建立",
 				message: `已建立「${created.title}」`,
 			});
-			navigate({
-				to: "/items/$itemId",
-				params: { itemId: String(created.id) },
-			});
+			if (isMountedRef.current) {
+				navigate({
+					to: "/items/$itemId",
+					params: { itemId: String(created.id) },
+				});
+			}
 		} catch (error) {
 			applyServerFieldErrors(error, setError);
 		}
