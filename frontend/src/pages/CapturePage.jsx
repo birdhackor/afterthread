@@ -14,11 +14,11 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { Link } from "@tanstack/react-router";
-import { useAtomValue } from "jotai";
+import { useAtomValue, useSetAtom } from "jotai";
 import { useState } from "react";
 import { Controller, useForm } from "react-hook-form";
 import { apiPost } from "../api/client.js";
-import { llmStatusAtom } from "../atoms/llm.js";
+import { llmStatusAtom, loadLlmStatusAtom } from "../atoms/llm.js";
 import { CharCounter } from "../components/CharCounter.jsx";
 import { StaleBadge } from "../components/StaleBadge.jsx";
 import { StatusBadge } from "../components/StatusBadge.jsx";
@@ -97,6 +97,7 @@ export function CapturePage() {
 	usePageTitle("快速捕捉");
 	const llm = useAtomValue(llmStatusAtom);
 	const configured = llm.configured;
+	const loadLlmStatus = useSetAtom(loadLlmStatusAtom);
 	const [result, setResult] = useState(null);
 	const [error, setError] = useState(null);
 
@@ -121,6 +122,13 @@ export function CapturePage() {
 			reset({ raw_text: "" });
 		} catch (submitError) {
 			setError(submitError);
+			if (submitError?.code === "llm_not_configured") {
+				// Backend just told us AI is unavailable (503) -- re-probe so the
+				// shared atom (and therefore the shell banner and this page's own
+				// submit button) reflects this immediately instead of staying on a
+				// stale `configured: true` until the next full page load.
+				loadLlmStatus({ force: true });
+			}
 		}
 	});
 

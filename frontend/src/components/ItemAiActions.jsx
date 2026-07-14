@@ -12,11 +12,11 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import { useAtomValue } from "jotai";
+import { useAtomValue, useSetAtom } from "jotai";
 import { useState } from "react";
 import { Controller, useForm } from "react-hook-form";
 import { apiPost } from "../api/client.js";
-import { llmStatusAtom } from "../atoms/llm.js";
+import { llmStatusAtom, loadLlmStatusAtom } from "../atoms/llm.js";
 import { LLM_NOT_CONFIGURED_NOTICE } from "../constants/labels.js";
 import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { codePointLength } from "../utils/text.js";
@@ -54,6 +54,7 @@ function AiActionCard({
 	pending,
 	onMutationStart,
 	onMutationEnd,
+	onLlmNotConfigured,
 	children,
 }) {
 	const {
@@ -78,6 +79,13 @@ function AiActionCard({
 		} catch (error) {
 			if (error?.status === 409) {
 				setConflict(true);
+			}
+			if (error?.code === "llm_not_configured") {
+				// Backend just told us AI is unavailable (503) -- re-probe so the
+				// shared atom (and therefore the shell banner and every AI button)
+				// reflects this immediately instead of staying on a stale
+				// `configured: true` until the next full page load.
+				onLlmNotConfigured?.();
 			}
 			notifications.show({
 				color: "red",
@@ -281,6 +289,7 @@ export function ItemAiActions({
 }) {
 	const llm = useAtomValue(llmStatusAtom);
 	const configured = llm.configured;
+	const loadLlmStatus = useSetAtom(loadLlmStatusAtom);
 	// Only the gaps array from the last AI 補齊 call. The completion copy
 	// derived from it is NOT stored here -- GapsChecklist re-derives it from
 	// the live `item.stage` prop at render (see its doc comment), so this
@@ -315,6 +324,7 @@ export function ItemAiActions({
 				pending={pending}
 				onMutationStart={onMutationStart}
 				onMutationEnd={onMutationEnd}
+				onLlmNotConfigured={() => loadLlmStatus({ force: true })}
 			>
 				{gaps ? <GapsChecklist gaps={gaps} stage={item.stage} /> : null}
 			</AiActionCard>
@@ -343,6 +353,7 @@ export function ItemAiActions({
 				pending={pending}
 				onMutationStart={onMutationStart}
 				onMutationEnd={onMutationEnd}
+				onLlmNotConfigured={() => loadLlmStatus({ force: true })}
 			/>
 		</Stack>
 	);

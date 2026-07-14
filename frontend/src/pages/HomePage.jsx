@@ -174,8 +174,11 @@ function StatusFooter() {
 				honest "not configured" reading (llm.loaded && !llm.configured) --
 				e.g. after the user fixes backend/.env and restarts the backend,
 				this is the only way back to "已設定" short of a full page reload.
-				The two states are mutually exclusive (the atom forces configured
-				back to true on error), so one button covers both. */}
+				The two states can coexist -- a failed re-probe keeps the prior
+				configured:false instead of resetting it (see loadLlmStatusAtom) --
+				so the label below picks 重試 whenever there's an error and only
+				falls back to 重新檢查 for the plain not-configured-and-no-error
+				case. */}
 				{llm.error || (llm.loaded && !llm.configured) ? (
 					<Button
 						size="xs"
