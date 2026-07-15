@@ -61,12 +61,51 @@ if _STATIC_DIR.is_dir():
     app.frontend("/", directory=str(_STATIC_DIR), fallback="index.html")
 
 
+@app.middleware("http")
+async def _api_accept_normalization_middleware(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    """Pin the `/api` namespace to JSON: it never negotiates HTML.
+
+    The SPA fallback (`app.frontend()` above) serves index.html for any
+    unmatched GET/HEAD whose `Accept` does not rule HTML out -- and a bare
+    `*/*` (curl's default, a plain `fetch()`'s default) does not rule it
+    out. Without this middleware, a typo'd or removed `/api/...` path
+    answers 200 text/html to such clients instead of 404 JSON, turning
+    failures into fake successes for anyone scripting the API directly.
+    The app's own client (frontend/src/api/client.js) already sends
+    `Accept: application/json`; rewriting it here extends that same
+    contract to every caller, so the API's 404s survive any client.
+
+    A catch-all `/api/{path:path}` route was deliberately rejected: route
+    matching prefers the first FULL match over a PARTIAL (method-mismatch)
+    one, so a catch-all would convert every wrong-method request against a
+    real endpoint (e.g. DELETE /api/health) from its correct 405 into a
+    404. Rewriting `Accept` leaves route matching untouched. No endpoint
+    under /api content-negotiates on Accept, so the rewrite is observable
+    only in the unmatched-path case this exists for.
+    """
+    if request.url.path.startswith("/api/"):
+        request.scope["headers"] = [
+            (name, value) for name, value in request.scope["headers"] if name != b"accept"
+        ] + [(b"accept", b"application/json")]
+    return await call_next(request)
+
+
 def _cache_control_for(path: str, content_type: str, status_code: int) -> str | None:
     """Decide the `Cache-Control` value for an outgoing response, if any.
 
     Pulled out of the middleware below as a pure function so pytest exercises
     the decision itself, not the header-mutation plumbing around it.
 
+    - Anything served as `text/html` must never be cached -- regardless of
+      status OR path: it is the SPA shell (`/`, a deep-link fallback like
+      `/items/123`) or an error page, and a cached shell can outlive the
+      hashed assets it references. Checked FIRST because the two rules
+      overlap: an extensionless path under `/assets/` (e.g. a browser
+      navigating to `/assets/missing`) is answered by the SPA fallback with
+      200 index.html -- by path it looks like an asset, but it IS the shell,
+      and marking it immutable would pin an old shell for a year.
     - Vite content-hashes every filename it emits under `/assets/`
       (e.g. `index-a1B2c3.js`): a given URL's bytes never change, so caching
       it "forever" and skipping revalidation entirely is safe. Only for a
@@ -75,18 +114,14 @@ def _cache_control_for(path: str, content_type: str, status_code: int) -> str | 
       missing right now, a 405, ...) is a statement about the current moment
       -- caching it for a year would pin the failure long past the point a
       later deploy fixed it.
-    - Anything served as `text/html` is the SPA shell itself (`/`, or a
-      deep-link fallback like `/items/123`) and must never be cached --
-      regardless of status: an error page is even less worth keeping than a
-      stale shell.
     - Everything else (JSON API responses, asset 404s, ...) is left alone:
       FastAPI already does the right thing for those, and returning `None`
       tells the middleware not to touch the response at all.
     """
-    if path.startswith("/assets/") and status_code == 200:
-        return "public, max-age=31536000, immutable"
     if content_type.startswith("text/html"):
         return "no-cache"
+    if path.startswith("/assets/") and status_code == 200:
+        return "public, max-age=31536000, immutable"
     return None
 
 

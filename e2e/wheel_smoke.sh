@@ -335,25 +335,40 @@ ENVEOF
     fi
 
     # -- GET /api/nonexistent -> 404 JSON, not the SPA shell ------------------
-    # Requires an explicit `Accept: application/json` here: FastAPI's
-    # app.frontend() fallback (main.py) treats ANY request as
-    # "looks like a browser navigating" -- and so serves index.html instead
-    # of 404ing -- whenever Accept includes `text/html` OR is a bare `*/*`,
-    # which is curl's (and a browser fetch()'s) own default Accept header
-    # when none is set. A plain `curl $base/api/nonexistent` with no -H would
-    # therefore get a 200 index.html here, NOT a 404 -- confirmed against the
-    # installed fastapi.routing._is_frontend_navigation_request implementation
-    # during implementation. The app's own client (frontend/src/api/client.js)
-    # sends `Accept: application/json` on every request for exactly this
-    # reason; curl passes it explicitly here to SIMULATE that client-layer
-    # behavior (curl's default would not), so this assertion exercises the
-    # same request shape the real SPA produces.
+    # Two request shapes on purpose. FastAPI's app.frontend() fallback
+    # treats a request as "looks like a browser navigating" -- and so would
+    # serve index.html instead of 404ing -- whenever Accept includes
+    # `text/html` OR is a bare `*/*` (curl's own default when no -H is
+    # given). main.py closes that for the whole /api namespace with an
+    # Accept-normalization middleware (the API never negotiates HTML), so:
+    #   (1) the client-shaped request (explicit `Accept: application/json`,
+    #       exactly what frontend/src/api/client.js sends) must 404 JSON;
+    #   (2) a BARE curl with its default `Accept: */*` must ALSO 404 JSON --
+    #       this is the assertion that pins the middleware itself; before it,
+    #       this exact request returned 200 text/html (confirmed against the
+    #       installed fastapi.routing._is_frontend_navigation_request).
     local nf_body="$TMPDIR_E2E/nonexistent.json"
     code="$(req GET "$base/api/nonexistent" "$nf_body" "Accept: application/json")"
     local nf_ct
     nf_ct="$(header_value Content-Type)"
     assert_eq "GET /api/nonexistent -> 404" "$code" "404"
     assert_str_contains "GET /api/nonexistent Content-Type contains application/json" "$nf_ct" "application/json"
+
+    local nf_bare_body="$TMPDIR_E2E/nonexistent-bare.json"
+    code="$(req GET "$base/api/nonexistent" "$nf_bare_body")"
+    nf_ct="$(header_value Content-Type)"
+    assert_eq "GET /api/nonexistent (bare curl, Accept: */*) -> 404" "$code" "404"
+    assert_str_contains "GET /api/nonexistent (bare curl) Content-Type is JSON, not the SPA shell" \
+        "$nf_ct" "application/json"
+
+    # -- wrong method on a real endpoint stays a 405 ---------------------------
+    # Guards the deliberate design choice in main.py: /api's unknown-path
+    # handling is an Accept rewrite, NOT a catch-all route, precisely so a
+    # method mismatch on a REAL endpoint keeps its correct 405 (a catch-all
+    # would register a FULL match and turn this into a 404).
+    local mm_body="$TMPDIR_E2E/method-mismatch.json"
+    code="$(req DELETE "$base/api/health" "$mm_body")"
+    assert_eq "DELETE /api/health (wrong method on a real endpoint) -> 405" "$code" "405"
 
     # -- GET /api/llm/status -> unconfigured ---------------------------------
     # The pre-written $DATA_DIR/.env has no OPENAI_* keys, and start_server's

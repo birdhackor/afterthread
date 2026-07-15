@@ -48,18 +48,20 @@ def test_missing_content_type_gets_no_header() -> None:
     assert _cache_control_for("/api/health", "", 200) is None
 
 
-def test_assets_200_wins_even_with_html_content_type() -> None:
-    # Should not happen in practice (assets are never served as text/html),
-    # but a 200 under /assets/ is immutable by construction (Vite
-    # content-hashes the filename), so it must never fall through to the
-    # no-cache branch regardless of whatever content type ends up on the
-    # response.
-    assert _cache_control_for("/assets/weird.html", "text/html", 200) == _IMMUTABLE
+def test_html_wins_over_assets_immutable() -> None:
+    # The html branch is checked FIRST, even under /assets/: an extensionless
+    # path there (e.g. a browser navigating to /assets/missing) is answered by
+    # the SPA fallback with 200 index.html -- by path it looks like an asset,
+    # but the body is the shell, and marking the shell immutable would pin an
+    # old shell (and the dead hashed asset URLs it references) for a year.
+    # This inverts an earlier version of this test that pinned the opposite,
+    # wrong priority (phase-2 review round 2).
+    assert _cache_control_for("/assets/missing", "text/html; charset=utf-8", 200) == "no-cache"
 
 
 def test_assets_non_200_html_falls_to_no_cache() -> None:
-    # Composite of the two rules above: not a 200, so no immutable; text/html,
-    # so the status-blind html branch still applies.
+    # Not a 200, so no immutable either way; text/html, so the status-blind
+    # html branch applies.
     assert _cache_control_for("/assets/weird.html", "text/html", 404) == "no-cache"
 
 

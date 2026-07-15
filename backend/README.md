@@ -32,14 +32,15 @@ uv run ruff format .                           # 格式化
 uv run ruff format --check .                   # 只檢查格式（CI / gate 用）
 uv run ruff check .                            # lint
 uv run ty check                                # 型別檢查
-uv run pytest                                  # 386+ 個測試（目前 386 passed）
+uv run pytest                                  # 測試（應全數通過；精確數字隨版本演進，
+                                                # 以指令實際輸出為準）
 ```
 
 打包成內嵌前端 build 的可攜 wheel：見根目錄 `scripts/build-wheel.sh`；對應的
 packaged-mode e2e 驗證見 `e2e/wheel_smoke.sh`。
 
 以上指令皆已在本機實際執行過並確認通過（`uv sync` / format --check / check /
-ty check / pytest 386 passed；`uvicorn` 啟動後 `GET /api/health` 回
+ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 `{"status":"ok"}`，未設定 `.env` 時 DB 檔會自動建在
 `backend/context_memory.db`，`GET /api/llm/status` 回
 `{"configured":false,"model":null}`）。
