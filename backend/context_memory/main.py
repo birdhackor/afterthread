@@ -61,7 +61,7 @@ if _STATIC_DIR.is_dir():
     app.frontend("/", directory=str(_STATIC_DIR), fallback="index.html")
 
 
-def _cache_control_for(path: str, content_type: str) -> str | None:
+def _cache_control_for(path: str, content_type: str, status_code: int) -> str | None:
     """Decide the `Cache-Control` value for an outgoing response, if any.
 
     Pulled out of the middleware below as a pure function so pytest exercises
@@ -69,16 +69,21 @@ def _cache_control_for(path: str, content_type: str) -> str | None:
 
     - Vite content-hashes every filename it emits under `/assets/`
       (e.g. `index-a1B2c3.js`): a given URL's bytes never change, so caching
-      it "forever" and skipping revalidation entirely is safe.
+      it "forever" and skipping revalidation entirely is safe. Only for a
+      200, though: the hash's immutability promise is about the file's
+      CONTENT, and any non-200 under `/assets/` (a 404 for an asset that is
+      missing right now, a 405, ...) is a statement about the current moment
+      -- caching it for a year would pin the failure long past the point a
+      later deploy fixed it.
     - Anything served as `text/html` is the SPA shell itself (`/`, or a
-      deep-link fallback like `/items/123`) and must never be cached, or a
-      browser could keep an old shell around that references assets a newer
-      build no longer ships.
-    - Everything else (JSON API responses, 404s, ...) is left alone: FastAPI
-      already does the right thing for those, and returning `None` tells the
-      middleware not to touch the response at all.
+      deep-link fallback like `/items/123`) and must never be cached --
+      regardless of status: an error page is even less worth keeping than a
+      stale shell.
+    - Everything else (JSON API responses, asset 404s, ...) is left alone:
+      FastAPI already does the right thing for those, and returning `None`
+      tells the middleware not to touch the response at all.
     """
-    if path.startswith("/assets/"):
+    if path.startswith("/assets/") and status_code == 200:
         return "public, max-age=31536000, immutable"
     if content_type.startswith("text/html"):
         return "no-cache"
@@ -99,7 +104,9 @@ async def _cache_control_middleware(
     applied.
     """
     response = await call_next(request)
-    value = _cache_control_for(request.url.path, response.headers.get("content-type", ""))
+    value = _cache_control_for(
+        request.url.path, response.headers.get("content-type", ""), response.status_code
+    )
     if value is not None:
         response.headers.setdefault("Cache-Control", value)
     return response

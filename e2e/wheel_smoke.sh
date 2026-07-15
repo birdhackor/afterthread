@@ -187,9 +187,17 @@ wait_200() {
 # it, exactly as e2e/smoke.sh's start_backend relies on for the same
 # in-process `uvicorn.run()` call cli.py itself makes). The three OPENAI_*
 # vars are forced empty so `configured` reads false regardless of the
-# invoking shell's own environment (there is no .env in the fresh $DATA_DIR
-# either way, but this closes the same hole e2e/smoke.sh's start_backend
-# documents for its own env/dotenv precedence).
+# invoking shell's own environment (the .env main() pre-writes into
+# $DATA_DIR deliberately contains no OPENAI_* keys, and cli.py's dotenv
+# loading is override=False, so these explicit empties always win -- the
+# same hole e2e/smoke.sh's start_backend documents for its own env/dotenv
+# precedence).
+#
+# Launched with CWD=$TMPDIR_E2E, deliberately NOT $DATA_DIR: cli.py owns
+# chdir-ing into the data dir, and the relative-DATABASE_URL assertion in
+# main() only proves anything because the launch directory and the data dir
+# are different -- if the chdir were dropped, the relative sqlite path from
+# $DATA_DIR/.env would land the database HERE in $TMPDIR_E2E instead.
 #
 # ~60s cap on the startup log line: the FIRST `uvx` invocation in a given
 # environment resolves and installs the wheel's dependencies into a fresh
@@ -268,6 +276,18 @@ main() {
     WHEEL="$wheel"
     echo "Using wheel: $WHEEL"
 
+    # Pre-write a data-dir .env BEFORE the server starts: this run then also
+    # proves the packaged-mode config contract end-to-end -- cli.py must load
+    # <data-dir>/.env, and a RELATIVE sqlite path in it must be anchored to
+    # the data dir (cli.py chdirs there), not to the launch CWD (which
+    # start_server deliberately sets elsewhere -- see its comment). The file
+    # contains no OPENAI_* keys, so the llm/status configured=false assertion
+    # below still holds via start_server's explicit empty-string env vars.
+    cat >"$DATA_DIR/.env" <<'ENVEOF'
+# Written by e2e/wheel_smoke.sh (packaged-mode .env loading + anchoring test).
+DATABASE_URL=sqlite:///./from_envfile.db
+ENVEOF
+
     echo ""
     echo "========== SERVE (uvx --from <wheel> context-memory) =========="
     if ! start_server; then
@@ -323,14 +343,11 @@ main() {
     # when none is set. A plain `curl $base/api/nonexistent` with no -H would
     # therefore get a 200 index.html here, NOT a 404 -- confirmed against the
     # installed fastapi.routing._is_frontend_navigation_request implementation
-    # during implementation. Sending `Accept: application/json`, as a
-    # deliberate API caller should, avoids both cases and correctly reaches
-    # FastAPI's own JSON 404 for a route that matches nothing. This repo's own
-    # frontend (api/client.js) does not currently set that header either --
-    # harmless today only because frontend and backend always ship from the
-    # same wheel (D02), so the SPA never calls a path the backend doesn't
-    # actually serve -- but it is a real subtlety worth the extra e2e coverage
-    # and is called out in this phase's report as a risk observed, not fixed.
+    # during implementation. The app's own client (frontend/src/api/client.js)
+    # sends `Accept: application/json` on every request for exactly this
+    # reason; curl passes it explicitly here to SIMULATE that client-layer
+    # behavior (curl's default would not), so this assertion exercises the
+    # same request shape the real SPA produces.
     local nf_body="$TMPDIR_E2E/nonexistent.json"
     code="$(req GET "$base/api/nonexistent" "$nf_body" "Accept: application/json")"
     local nf_ct
@@ -338,20 +355,42 @@ main() {
     assert_eq "GET /api/nonexistent -> 404" "$code" "404"
     assert_str_contains "GET /api/nonexistent Content-Type contains application/json" "$nf_ct" "application/json"
 
-    # -- GET /api/llm/status -> unconfigured in a clean env -------------------
+    # -- GET /api/llm/status -> unconfigured ---------------------------------
+    # The pre-written $DATA_DIR/.env has no OPENAI_* keys, and start_server's
+    # explicit empty-string env vars win over any dotenv value anyway
+    # (override=False), so this must read unconfigured.
     local status_body="$TMPDIR_E2E/llm-status.json"
     code="$(req GET "$base/api/llm/status" "$status_body")"
     assert_eq "GET /api/llm/status -> 200" "$code" "200"
-    assert_true "GET /api/llm/status configured=false (clean env)" "$status_body" 'd["configured"] is False'
+    assert_true "GET /api/llm/status configured=false (no OPENAI_* anywhere)" "$status_body" \
+        'd["configured"] is False'
 
-    # -- POST /api/items -> data really lands in --data-dir -------------------
+    # -- POST /api/items -> the data-dir .env's relative DATABASE_URL is both
+    # loaded AND anchored to the data dir -------------------------------------
     local create_body="$TMPDIR_E2E/create.json"
     code="$(req POST "$base/api/items" "$create_body" "" '{"title":"測試項目","snapshot":"初始快照"}')"
     assert_eq "POST /api/items -> 201" "$code" "201"
-    if [ -f "$DATA_DIR/context_memory.db" ]; then
-        pass "data lands in --data-dir (context_memory.db exists)"
+    # The .env pre-written above sets DATABASE_URL=sqlite:///./from_envfile.db
+    # (relative), so the database must appear at $DATA_DIR/from_envfile.db:
+    # its existence proves the .env was loaded (otherwise the default
+    # context_memory.db name would be used) and that the relative path was
+    # anchored to the data dir by cli.py's chdir (otherwise it would land in
+    # the launch CWD, $TMPDIR_E2E). The two negative assertions pin each
+    # failure mode separately.
+    if [ -f "$DATA_DIR/from_envfile.db" ]; then
+        pass "data-dir .env's relative DATABASE_URL lands in --data-dir (from_envfile.db exists)"
     else
-        fail "data lands in --data-dir (context_memory.db exists)"
+        fail "data-dir .env's relative DATABASE_URL lands in --data-dir (from_envfile.db exists)"
+    fi
+    if [ ! -f "$DATA_DIR/context_memory.db" ]; then
+        pass "default db name unused (data-dir .env's DATABASE_URL was really loaded)"
+    else
+        fail "default db name unused (data-dir .env's DATABASE_URL was really loaded)"
+    fi
+    if [ ! -f "$TMPDIR_E2E/from_envfile.db" ]; then
+        pass "no database in the launch CWD (relative path anchored by cli.py's chdir)"
+    else
+        fail "no database in the launch CWD (relative path anchored by cli.py's chdir)"
     fi
 
     echo ""

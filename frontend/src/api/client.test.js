@@ -45,6 +45,27 @@ describe("apiFetch passive connectivity reporting", () => {
 		expect(store.get(backendStatusAtom)).toEqual({ reachable: true });
 	});
 
+	it("sends Accept and Content-Type: application/json on every request", async () => {
+		// Accept is load-bearing, not cosmetic: in packaged mode the backend's
+		// SPA fallback (app.frontend) reads fetch's default `Accept: */*` as a
+		// browser navigation, so without this header a call to an unknown API
+		// route would come back 200 text/html (index.html) instead of a 404
+		// JSON -- see the comment in client.js. Pinning it here means removing
+		// the header can never regress silently.
+		let seenOptions = null;
+		globalThis.fetch = async (_path, options) => {
+			seenOptions = options;
+			return {
+				ok: true,
+				status: 200,
+				text: async () => JSON.stringify({ status: "ok" }),
+			};
+		};
+		await expect(apiGet("/api/health")).resolves.toEqual({ status: "ok" });
+		expect(seenOptions.headers.Accept).toBe("application/json");
+		expect(seenOptions.headers["Content-Type"]).toBe("application/json");
+	});
+
 	it("throws ApiError(500) and reports nothing -- a 5xx may be an intermediary, not the backend", async () => {
 		globalThis.fetch = async () => ({
 			ok: false,

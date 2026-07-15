@@ -177,3 +177,15 @@
 
 - **決定**：phase 內不 push；**phase 完成（該 phase 範圍 codex review 通過）後 push**。每個 phase 的 codex review **只審該 phase 的 commit 範圍**；全部 phase 完成後，再對**本輪開發起始點**做一次全量 review。
 - **本輪起始點**：`4f1ab55`（origin/feat/web-app 於 2026-07-15 開工時的位置）。Phase 0+1（8c1be4c…194a9ca）已依此政策補推送。
+
+## D24（Phase 2 codex review 裁決）：八項發現全修
+
+- **背景**：Phase 2 首輪 codex review 判 needs changes（F1–F6 阻擋、F7/F8 低）。
+- **裁決（全修）與方案**：
+  - **F1 陌生 CWD .env 汙染 + F3 相對 DB 漂移**：cli.py 於載入設定前 `os.chdir(data_dir)`——把 packaged 模式所有 CWD 相對行為整類錨定到 data dir（選項「條件式停用 env_file」耦合 config 與 cli，棄）。.env.example 的 DATABASE_URL 改為註解掉+說明；wheel_smoke 加「data-dir .env 相對 URL 錨定」斷言。
+  - **F2 banner 洩漏 DATABASE_URL**：只印自建的 db 檔路徑；環境提供時僅說 from environment，URL 永不回顯（沿 db.py 遮蔽防線）。
+  - **F4 裸 uv build 靜默無前端**：hatch_build.py 驗證 hook（缺 static/index.html 即 fail、editable 豁免保 dev uv sync）；只驗證不建置，D02 保守立場不變。殘餘「舊 static」風險由 build-wheel.sh 的 rm+重拷保證，紀錄為已知界線。
+  - **F5 data dir 權限**：僅新建時 chmod 0700；既存目錄不動使用者權限。
+  - **F6 404 asset 被 immutable 快取**：`_cache_control_for` 增 status 參數，immutable 僅限 200；html no-cache 不看狀態。
+  - **F7 特殊字元路徑**：`_sqlite_url()` 用 `sqlalchemy.URL.create` 構造 + round-trip 測試。
+  - **F8 Accept 防護 false-pass**：unit 層（vitest）釘 fetch headers；wheel_smoke 過時註解修正。
