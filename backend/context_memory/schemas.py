@@ -12,8 +12,8 @@ from pydantic import (
     field_validator,
 )
 
-from app.config import get_settings
-from app.models import STALE_ELIGIBLE_STATUSES, MemoryStage, MemoryStatus
+from context_memory.config import get_settings
+from context_memory.models import STALE_ELIGIBLE_STATUSES, MemoryStage, MemoryStatus
 
 
 def _ensure_aware(value: datetime) -> datetime:
@@ -27,7 +27,7 @@ def _ensure_aware(value: datetime) -> datetime:
 # can set directly via POST/PATCH. Without them, a legitimate create/update
 # can write an item whose title/tags/sections are large enough that, once
 # serialized into an enrich/assist-update prompt header
-# (app.services.memory_ai._serialize_item_for_prompt, which renders title and
+# (context_memory.services.memory_ai._serialize_item_for_prompt, which renders title and
 # tags in full ahead of the per-section budgeting), the header alone crowds
 # out or exceeds llm_prompt_budget_chars. Declared here -- not on the shared
 # MemoryItemContent base -- so only MemoryItemCreate/Update enforce them;
@@ -271,7 +271,7 @@ class ReviewResponse(BaseModel):
 # Upper bound on every AI free-text request field. Stripped-non-empty is
 # enforced per field below; the length is validated on the raw input (a 20001
 # character body is 422) so an oversized payload is rejected before any LLM
-# call. Mirrors the per-section output cap in app.services.memory_ai.
+# call. Mirrors the per-section output cap in context_memory.services.memory_ai.
 _MAX_AI_INPUT_CHARS = 20000
 
 

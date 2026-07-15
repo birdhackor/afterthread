@@ -111,7 +111,7 @@ function SectionGroupsView({ item, showEmpty }) {
 // Progress timeline (dates ascending, as returned by the backend) plus a small
 // RHF note form that appends a new entry optimistically from the POST response,
 // then refetches (`onRefresh`) so the item's `updated`/is_stale -- bumped
-// server-side by the same POST, see add_progress in app/routers/items.py --
+// server-side by the same POST, see add_progress in context_memory/routers/items.py --
 // stay honest rather than frozen at their pre-post values.
 //
 // `pending` is the page-wide mutation gate from ItemDetailPage (true while

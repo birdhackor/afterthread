@@ -16,9 +16,9 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
 
-from app.config import Settings
-from app.services.llm import LLMUpstreamError
-from app.services.memory_ai import _coerce_str
+from context_memory.config import Settings
+from context_memory.services.llm import LLMUpstreamError
+from context_memory.services.memory_ai import _coerce_str
 
 # A full, well-formed draft. ``questions`` deliberately has 5 entries to prove
 # the server truncates to 3; ``suggested_status`` is one of the two allowed.
@@ -64,7 +64,7 @@ def _patch_generate_structured(
                 "InvalidStructuredOutput: the LLM did not return a valid structured result"
             ) from None
 
-    monkeypatch.setattr("app.services.memory_ai.generate_structured", _fake)
+    monkeypatch.setattr("context_memory.services.memory_ai.generate_structured", _fake)
 
 
 def _total(client: TestClient) -> int:

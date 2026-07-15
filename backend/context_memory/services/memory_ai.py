@@ -18,9 +18,9 @@ from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app.config import get_settings
-from app.models import MemoryStatus, utcnow
-from app.services.llm import generate_structured
+from context_memory.config import get_settings
+from context_memory.models import MemoryStatus, utcnow
+from context_memory.services.llm import generate_structured
 
 # --- caps (constraint: bound everything; LLM output is untrusted) ----------
 

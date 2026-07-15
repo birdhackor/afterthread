@@ -1,4 +1,4 @@
-"""Tests for Settings validation in app.config.
+"""Tests for Settings validation in context_memory.config.
 
 `stale_after_days` feeds `timedelta(days=...)` inside
 `schemas.MemoryItemRead.is_stale`. An unbounded value (e.g. a fat-fingered
@@ -11,7 +11,7 @@ via pydantic-settings, instead.
 import pytest
 from pydantic import ValidationError
 
-from app.config import Settings
+from context_memory.config import Settings
 
 
 def test_stale_after_days_lower_bound_accepted() -> None:
@@ -66,7 +66,7 @@ def test_openai_timeout_seconds_negative_rejected() -> None:
 
 
 # `llm_prompt_budget_chars` caps the serialized item snapshot in an enrich /
-# assist-update prompt (see app.services.memory_ai). Its Field(ge=4000,
+# assist-update prompt (see context_memory.services.memory_ai). Its Field(ge=4000,
 # le=200000) bound makes a nonsensical override fail at startup via
 # pydantic-settings, matching the openai_timeout_seconds / stale_after_days
 # convention, rather than only when the first AI prompt is built.

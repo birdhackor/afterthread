@@ -1,6 +1,6 @@
 """AI-assisted memory workflows: LLM status and quick capture.
 
-These endpoints wrap ``app.services.memory_ai``. The methodology rules
+These endpoints wrap ``context_memory.services.memory_ai``. The methodology rules
 (confidence honesty, supersede-not-delete, max-3-questions, bullets,
 language-follows-content) live in the service-layer prompts; this router owns
 the HTTP contract:
@@ -25,11 +25,11 @@ from sqlalchemy.orm.exc import StaleDataError
 from sqlmodel import Session, col
 from starlette.concurrency import run_in_threadpool
 
-from app.config import get_settings
-from app.db import get_session
-from app.models import MemoryItem, MemoryStage, MemoryStatus, ProgressEntry, utcnow
-from app.routers.items import _NOT_FOUND, _NOT_FOUND_RESPONSE, ItemId
-from app.schemas import (
+from context_memory.config import get_settings
+from context_memory.db import get_session
+from context_memory.models import MemoryItem, MemoryStage, MemoryStatus, ProgressEntry, utcnow
+from context_memory.routers.items import _NOT_FOUND, _NOT_FOUND_RESPONSE, ItemId
+from context_memory.schemas import (
     AssistUpdateRequest,
     AssistUpdateResponse,
     CaptureRequest,
@@ -39,14 +39,14 @@ from app.schemas import (
     LLMStatus,
     MemoryItemRead,
 )
-from app.services.llm import (
+from context_memory.services.llm import (
     _UPSTREAM_REASON,
     LLMNotConfiguredError,
     LLMUpstreamError,
     llm_configured,
     normalized_model,
 )
-from app.services.memory_ai import (
+from context_memory.services.memory_ai import (
     _PER_SECTION_CAP,
     HISTORY_SECTIONS,
     SECTION_FIELD_ORDER,
@@ -162,7 +162,7 @@ def _service_unavailable() -> HTTPException:
 
 
 def _bad_gateway(exc: LLMUpstreamError) -> HTTPException:
-    # str(exc) is safe by construction (see app.services.llm): an exception
+    # str(exc) is safe by construction (see context_memory.services.llm): an exception
     # category plus a short reason, never a config value or a response body.
     return HTTPException(
         status_code=502,

@@ -5,7 +5,7 @@ depend on (confidence honesty, max-3-questions, supersede-not-delete, bullets,
 language-follows-content).
 """
 
-from app.services.memory_ai import (
+from context_memory.services.memory_ai import (
     CAPTURE_SYSTEM_PROMPT,
     ENRICH_SYSTEM_PROMPT,
     UPDATE_SYSTEM_PROMPT,

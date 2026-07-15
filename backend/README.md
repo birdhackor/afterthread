@@ -22,8 +22,8 @@ client）呼叫。與 repo 根目錄既有的 file-based MVP（`.opencode/`、`m
 
 ```bash
 uv sync                                        # 安裝依賴（含 dev group）
-uv run uvicorn app.main:app --port 8000        # 啟動 API（DB 不存在會自動建立）
-uv run uvicorn app.main:app --port 8000 --reload   # 開發時加 --reload 自動重載
+uv run uvicorn context_memory.main:app --port 8000        # 啟動 API（DB 不存在會自動建立）
+uv run uvicorn context_memory.main:app --port 8000 --reload   # 開發時加 --reload 自動重載
 
 uv run ruff format .                           # 格式化
 uv run ruff format --check .                   # 只檢查格式（CI / gate 用）
@@ -40,7 +40,7 @@ ty check / pytest 386 passed；`uvicorn` 啟動後 `GET /api/health` 回
 
 ## 環境變數（`backend/.env`，範本見 `backend/.env.example`）
 
-所有數值型設定都在 `app/config.py` 用 pydantic-settings 的 `Field(..., ge=/le=/gt=)`
+所有數值型設定都在 `context_memory/config.py` 用 pydantic-settings 的 `Field(..., ge=/le=/gt=)`
 在**啟動時**驗證邊界；超出範圍會讓服務直接啟動失敗，而不是留到第一次呼叫才爆炸。
 
 | 變數 | 預設值 | 說明 |
@@ -55,14 +55,14 @@ ty check / pytest 386 passed；`uvicorn` 啟動後 `GET /api/health` 回
 
 ## API 概覽
 
-所有路由掛在 `/api` 前綴下（見 `app/main.py`）。完整 request/response schema
+所有路由掛在 `/api` 前綴下（見 `context_memory/main.py`）。完整 request/response schema
 以啟動後的 `GET /docs`（Swagger UI）／`GET /openapi.json` 為準；以下是各路由的
 用途摘要。
 
 **Health**
 - `GET /api/health` — liveness probe。
 
-**Items CRUD**（`app/routers/items.py`，前綴 `/api/items`）
+**Items CRUD**（`context_memory/routers/items.py`，前綴 `/api/items`）
 - `POST /api/items` — 建立項目，並自動寫入第一筆 progress entry。
 - `GET /api/items` — 分頁列表（`limit` 1–200，預設 50；`offset`），支援
   `status`／`stage`／`tag`（JSON array 精確比對，Unicode-safe）／`q`（對
@@ -73,12 +73,12 @@ ty check / pytest 386 passed；`uvicorn` 啟動後 `GET /api/health` 回
 - `DELETE /api/items/{id}` — 刪除項目；progress entries 透過 DB 層 FK cascade 一併刪除。
 - `POST /api/items/{id}/progress` — 追加一筆 append-only progress entry。
 
-**Review**（`app/routers/review.py`）
+**Review**（`context_memory/routers/review.py`）
 - `GET /api/review` — 把五種非終態項目分成
   `needs_enrichment`／`active`／`waiting`／`parked` 四組，各組依 `updated`
   舊到新排序（單一查詢一次性快照，避免分組間 race）。
 
-**AI workflows**（`app/routers/ai.py`）
+**AI workflows**（`context_memory/routers/ai.py`）
 - `GET /api/llm/status` — 是否已設定 LLM（`configured`）與 model 名稱；不回傳
   base URL／API key。
 - `POST /api/capture` — 把一段原始文字快速捕捉成結構化項目（LLM 呼叫在任何 DB
@@ -96,7 +96,7 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 
 ## 設計筆記
 
-- **SQLite-only guard + 存活探測（persistence probe）**：`app/db.py` 的
+- **SQLite-only guard + 存活探測（persistence probe）**：`context_memory/db.py` 的
   `create_db_engine` 只接受 dialect 為 `sqlite` 的 `DATABASE_URL`（tag 篩選依賴
   SQLite 專屬的 `json_each`，沒有可攜寫法），並在建立 engine 後立刻對
   `pragma_database_list` 送一次探測查詢——不管 in-memory URL 怎麼拼（`:memory:`、
@@ -104,7 +104,7 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   空的，藉此在啟動時就擋下任何不會落地存檔的設定，而不是留到執行期才發現資料不會
   持久化。
 - **FK pragma**：SQLite 預設不強制 foreign key 約束，且是 per-connection 設定。
-  `app/db.py` 在每個連線的 `connect` event 上送 `PRAGMA foreign_keys=ON`，避免例如
+  `context_memory/db.py` 在每個連線的 `connect` event 上送 `PRAGMA foreign_keys=ON`，避免例如
   `POST /items/{id}/progress` 與併發的 `DELETE /items/{id}` 競速時，插入一筆指向
   已刪除項目的孤兒 progress entry。同一個 event 也註冊了 `py_casefold`
   SQLite function，讓 `q` 搜尋能做全 Unicode 範圍的大小寫不分比對（SQLite 內建
@@ -116,11 +116,11 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   作廢，不會被悄悄覆蓋。
 - **supersede-not-delete**：`decisions`／`rationale`／`alternatives`／
   `consequences` 這幾個帶有歷史意義的欄位，enrich／assist-update 永遠不會直接覆
-  寫。`app/services/memory_ai.merge_with_supersede` 逐行比對：舊內容的每一行只要
+  寫。`context_memory/services/memory_ai.merge_with_supersede` 逐行比對：舊內容的每一行只要
   完整出現在新內容裡就視為保留；否則把舊內容整段接到新內容之後、掛上帶日期的
   `superseded` 標記，確保之前的決策脈絡不會無聲消失（合併結果另外有存量上限，超出
   時從最舊的一段開始截斷，並留下明顯的截斷標記）。
-- **schema-guided LLM 輸出 + 修正重試**：`app/services/llm.generate_structured`
+- **schema-guided LLM 輸出 + 修正重試**：`context_memory/services/llm.generate_structured`
   把呼叫方的 pydantic model 轉成 JSON Schema 注入 system prompt，要求 LLM 只回傳
   『完全符合 schema 的單一 JSON 物件』；解析失敗或驗證失敗時，把模型自己的錯誤回饋
   給它、給一次修正重試機會，第二次仍失敗才映射成 `502 llm_upstream_error`（固定、

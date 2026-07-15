@@ -13,7 +13,7 @@ single JSON string.
 
 Which JSON it returns is decided by inspecting the request's *system* message,
 whose text is one of the three workflow prompts defined verbatim in
-``app/services/memory_ai.py``. Each prompt carries a distinctive marker:
+``context_memory/services/memory_ai.py``. Each prompt carries a distinctive marker:
 
   * "quick-capture assistant" -> capture  -> a ``CaptureDraft`` object
   * "enrichment assistant"    -> enrich   -> an ``EnrichResult`` object
@@ -62,9 +62,9 @@ from typing import Any
 # --- workflow selection ----------------------------------------------------
 
 # Distinctive substrings from the three system prompts in
-# app/services/memory_ai.py (CAPTURE_/ENRICH_/UPDATE_SYSTEM_PROMPT). Matching on
+# context_memory/services/memory_ai.py (CAPTURE_/ENRICH_/UPDATE_SYSTEM_PROMPT). Matching on
 # these -- rather than the whole prompt -- keeps the mock robust to the schema
-# block and strict-output rule that app/services/llm.py appends after them.
+# block and strict-output rule that context_memory/services/llm.py appends after them.
 _CAPTURE_MARKER = "quick-capture assistant"
 _ENRICH_MARKER = "enrichment assistant"
 _UPDATE_MARKER = "update assistant"

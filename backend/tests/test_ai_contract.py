@@ -13,9 +13,9 @@ import openai
 import pytest
 from fastapi.testclient import TestClient
 
-from app.config import Settings
-from app.main import app
-from app.services.llm import _UPSTREAM_REASON
+from context_memory.config import Settings
+from context_memory.main import app
+from context_memory.services.llm import _UPSTREAM_REASON
 
 # The three AI workflow operations that call the LLM and can degrade.
 _THREE_AI_OPS = {
@@ -148,7 +148,7 @@ def test_runtime_502_message_and_declared_example_share_reason_constant(
             raise openai.APIConnectionError(request=request)
 
     stub = SimpleNamespace(chat=SimpleNamespace(completions=_FailingCompletions()))
-    monkeypatch.setattr("app.services.llm._get_client", lambda: stub)
+    monkeypatch.setattr("context_memory.services.llm._get_client", lambda: stub)
 
     runtime = client.post("/api/capture", json={"raw_text": "raw"})
     assert runtime.status_code == 502

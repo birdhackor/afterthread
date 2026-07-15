@@ -12,8 +12,8 @@ from pydantic import BaseModel, ValidationError
 from sqlalchemy import Engine, event
 from sqlmodel import Session
 
-from app.config import Settings
-from app.services.llm import LLMUpstreamError
+from context_memory.config import Settings
+from context_memory.services.llm import LLMUpstreamError
 
 
 def _create(client: TestClient, **fields: Any) -> dict[str, Any]:
@@ -69,7 +69,7 @@ def _patch_generate_structured(
                 "InvalidStructuredOutput: the LLM did not return a valid structured result"
             ) from None
 
-    monkeypatch.setattr("app.services.memory_ai.generate_structured", _fake)
+    monkeypatch.setattr("context_memory.services.memory_ai.generate_structured", _fake)
 
 
 def _progress_notes(client: TestClient, item_id: int) -> list[str]:

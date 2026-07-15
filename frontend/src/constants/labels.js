@@ -37,7 +37,7 @@ export const STAGE_OPTIONS = Object.entries(STAGE_META).map(
 // endpoint configured: disabled-button tooltips, the shell banner, and the
 // capture-page fallback alert. Kept as one constant so the wording never
 // drifts between call sites. Names BOTH env vars llm_configured() actually
-// requires (app/services/llm.py) -- a base URL alone is a half-configured
+// requires (context_memory/services/llm.py) -- a base URL alone is a half-configured
 // endpoint the backend still reports as unconfigured, so the notice must not
 // imply setting only OPENAI_BASE_URL is enough.
 export const LLM_NOT_CONFIGURED_NOTICE =

@@ -10,9 +10,9 @@ from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.sql.elements import ColumnElement
 from sqlmodel import Session, col, select
 
-from app.db import get_session
-from app.models import MemoryItem, MemoryStage, MemoryStatus, ProgressEntry, utcnow
-from app.schemas import (
+from context_memory.db import get_session
+from context_memory.models import MemoryItem, MemoryStage, MemoryStatus, ProgressEntry, utcnow
+from context_memory.schemas import (
     ItemListResponse,
     MemoryItemCreate,
     MemoryItemRead,
@@ -87,7 +87,7 @@ def _tag_filter(tag: str) -> ColumnElement[bool]:
     decoded element values instead: exact membership, Unicode-correct, and a
     tag like "工" cannot match an item tagged "工作".
     """
-    # json_each is SQLite-only; app.db.create_db_engine rejects any non-SQLite
+    # json_each is SQLite-only; context_memory.db.create_db_engine rejects any non-SQLite
     # database_url at engine creation, so that precondition is guaranteed here.
     element = func.json_each(col(MemoryItem.tags)).table_valued("value")
     return select(1).select_from(element).where(element.c.value == tag).exists()
@@ -146,7 +146,7 @@ def list_items(
         # SQLite's ilike() lowercases only ASCII, so a title of "École" would
         # not match a query of "école". Fold both the column and the (already
         # LIKE-escaped) pattern through py_casefold -- full Unicode case
-        # folding (see app/db.py) -- then match with a plain LIKE, keeping the
+        # folding (see context_memory/db.py) -- then match with a plain LIKE, keeping the
         # same escape char. The escape char and wildcards (\, %, _) are
         # uncased, so folding the pattern leaves the LIKE escaping intact.
         pattern = func.py_casefold(f"%{_like_escape(q)}%")

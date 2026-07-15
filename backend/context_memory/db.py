@@ -8,8 +8,8 @@ from sqlalchemy.engine.interfaces import DBAPIConnection
 from sqlalchemy.pool import ConnectionPoolEntry
 from sqlmodel import Session, SQLModel, create_engine
 
-from app import models  # noqa: F401  # ensure tables are registered on metadata
-from app.config import get_settings
+from context_memory import models  # noqa: F401  # ensure tables are registered on metadata
+from context_memory.config import get_settings
 
 
 def _url_database(url: str) -> str:
@@ -230,7 +230,7 @@ def get_engine() -> Engine:
     Deliberately NOT a module-level `engine = create_db_engine(...)`: that
     variant connects at IMPORT time, because `create_db_engine` runs its
     persistence probe immediately (see its docstring), and for a file-backed
-    URL that probe creates the database file. Importing `app.main`/`app.db`
+    URL that probe creates the database file. Importing `context_memory.main`/`context_memory.db`
     then had a filesystem side effect -- it materialised `./context_memory.db`
     in the process's cwd -- which broke read-only checkouts at test-collection
     time and left a real DB file behind even in tests that override
@@ -238,7 +238,7 @@ def get_engine() -> Engine:
 
     Deferring construction to the first call moves that probe to STARTUP:
     `init_db()`, invoked from the app lifespan, is the first caller (see
-    `app/main.py`), so the probe runs once, before any request is handled, and
+    `context_memory/main.py`), so the probe runs once, before any request is handled, and
     never at import. `lru_cache` makes this a per-process singleton -- the
     engine and its one-time probe are created exactly once and reused -- so the
     probe is a startup cost, NOT a per-request one. Tests that need an

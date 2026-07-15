@@ -128,7 +128,7 @@ class MemoryItem(MemoryItemBase, table=True):
         # references this item, and the parent DELETE hits the FK
         # constraint instead of silently dropping it (see
         # tests/test_items.py::test_delete_cascades_progress_entries and
-        # app/db.py::_set_sqlite_foreign_keys_pragma). Deferring to the
+        # context_memory/db.py::_set_sqlite_foreign_keys_pragma). Deferring to the
         # database's own cascade closes that window: the DELETE and the
         # removal of every row currently referencing it happen as one
         # statement. cascade="all, delete-orphan" is kept for the ORM-level

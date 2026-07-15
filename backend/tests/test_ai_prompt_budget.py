@@ -1,4 +1,4 @@
-"""Unit tests for the budgeted item serializer (app.services.memory_ai).
+"""Unit tests for the budgeted item serializer (context_memory.services.memory_ai).
 
 An enrich / assist-update prompt embeds a snapshot of the whole item. Serialized
 naively, an item with 19 sections of up to 20k characters each becomes a ~380k
@@ -12,8 +12,8 @@ rendered verbatim, and an oversized item is bounded with every non-empty section
 still represented and visibly marked as truncated.
 """
 
-from app.models import MemoryStage, MemoryStatus
-from app.services.memory_ai import (
+from context_memory.models import MemoryStage, MemoryStatus
+from context_memory.services.memory_ai import (
     _HEADER_TAGS_MAX,
     _TITLE_MAX,
     _TRUNCATION_MARKER,

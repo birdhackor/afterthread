@@ -328,7 +328,7 @@ start_backend() {
             exec setsid env -u OPENAI_TIMEOUT_SECONDS \
                 DATABASE_URL="sqlite:///$db" \
                 OPENAI_BASE_URL= OPENAI_API_KEY= OPENAI_MODEL= "$@" \
-                uv run uvicorn app.main:app --host 127.0.0.1 --port 0 >"$logf" 2>&1 &
+                uv run uvicorn context_memory.main:app --host 127.0.0.1 --port 0 >"$logf" 2>&1 &
         echo $! >"$TMPDIR_E2E/last.sid"
     )
     local sid
@@ -771,7 +771,7 @@ phase_c() {
     local enrich_pid=$!
 
     # Wait for a SIGNAL instead of a fixed sleep: _snapshot_item_for_ai
-    # (app/routers/ai.py) is awaited to completion BEFORE enrich_item ever
+    # (context_memory/routers/ai.py) is awaited to completion BEFORE enrich_item ever
     # posts to the mock, so the mock logging "holding response" -- written
     # the instant it has received and JSON-parsed the request, strictly
     # BEFORE it starts polling for the release file -- is proof the pre-await

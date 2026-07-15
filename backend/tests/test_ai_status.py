@@ -5,7 +5,7 @@ from collections.abc import Callable
 import pytest
 from fastapi.testclient import TestClient
 
-from app.config import Settings
+from context_memory.config import Settings
 
 _SECRET_KEY = "sk-do-not-leak"
 _SECRET_URL = "http://llm.internal.example/v1"

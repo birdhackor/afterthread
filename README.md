@@ -44,7 +44,7 @@ templates/
 scripts/
   context_memory.py                # 建立、索引、驗證記憶條目的小工具
 backend/
-  app/                              # FastAPI 應用（routers/services/models/schemas），細節見 backend/README.md
+  context_memory/                   # FastAPI 應用（routers/services/models/schemas），細節見 backend/README.md
   tests/                            # pytest 測試（386+）
   .env.example                      # 環境變數範本（複製為 .env 後填入）
 frontend/
@@ -100,7 +100,7 @@ MVP 並存**——彼此互不依賴，也互不取代，你可以只用其中�
 後端：
 
 ```bash
-cd backend && uv sync && uv run uvicorn app.main:app --port 8000
+cd backend && uv sync && uv run uvicorn context_memory.main:app --port 8000
 ```
 
 資料庫（SQLite）不存在時會在啟動時自動建立（預設 `backend/context_memory.db`）；

@@ -13,8 +13,8 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
 
-from app.services.llm import LLMUpstreamError
-from app.services.memory_ai import (
+from context_memory.services.llm import LLMUpstreamError
+from context_memory.services.memory_ai import (
     _HISTORY_STORE_CAP,
     HISTORY_SECTIONS,
     SECTION_FIELDS,
@@ -43,7 +43,7 @@ def _patch_generate_structured(monkeypatch: pytest.MonkeyPatch, result: dict[str
                 "InvalidStructuredOutput: the LLM did not return a valid structured result"
             ) from None
 
-    monkeypatch.setattr("app.services.memory_ai.generate_structured", _fake)
+    monkeypatch.setattr("context_memory.services.memory_ai.generate_structured", _fake)
 
 
 # --- pure helper ----------------------------------------------------------

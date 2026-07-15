@@ -40,7 +40,7 @@ from openai import AsyncOpenAI, OpenAIError
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import BaseModel, ValidationError
 
-from app.config import Settings, get_settings
+from context_memory.config import Settings, get_settings
 
 # Placeholder passed as the API key when the operator has not configured one.
 # Some OpenAI-compatible servers (e.g. a local gateway) require no key, but the
@@ -78,7 +78,7 @@ class LLMUpstreamError(RuntimeError):
 
 # The fixed, config-free reason embedded in every SDK-error-driven
 # LLMUpstreamError message ("<SDKClassName>: <reason>"). Shared with
-# app.routers.ai, whose OpenAPI 502 example is built from it, so the example's
+# context_memory.routers.ai, whose OpenAPI 502 example is built from it, so the example's
 # reason substring can never drift from what runtime messages actually carry
 # (the category prefix varies with the failing SDK error's class and is only
 # illustrative in the example).
@@ -110,7 +110,7 @@ def normalized_model(settings: Settings) -> str:
     The one normalization every caller must share, so none of them can ever
     disagree over a whitespace-padded override: ``llm_configured``'s gate, the
     actual request ``generate_structured`` sends, and (via
-    ``app.routers.ai.llm_status``) what ``/llm/status`` reports back to a
+    ``context_memory.routers.ai.llm_status``) what ``/llm/status`` reports back to a
     client all read the model through this single helper.
     """
     return settings.openai_model.strip()

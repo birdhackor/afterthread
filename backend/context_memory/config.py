@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     openai_model: str = ""
 
     # Per-request timeout (seconds) for the OpenAI-compatible endpoint, passed
-    # straight to AsyncOpenAI(timeout=...) in app/services/llm.py. Bounded at
+    # straight to AsyncOpenAI(timeout=...) in context_memory/services/llm.py. Bounded at
     # construction (0 < value <= 600) so a nonsensical override -- a zero/
     # negative timeout the SDK would reject, or an absurdly large one that
     # would hang a request for hours -- fails loudly at startup via
@@ -31,7 +31,7 @@ class Settings(BaseSettings):
 
     # Hard ceiling on the number of characters the serialized item snapshot may
     # occupy in an enrich / assist-update prompt (see
-    # app/services/memory_ai.py). Without it, an item with 19 sections of up to
+    # context_memory/services/memory_ai.py). Without it, an item with 19 sections of up to
     # 20k characters each serializes to a ~380k-character prompt that a
     # small-context model rejects on every call -- surfacing as a permanent 502
     # rather than a config error. Bounded to [4000, 200000] (startup-validated

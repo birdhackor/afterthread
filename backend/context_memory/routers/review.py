@@ -5,9 +5,9 @@ from typing import Annotated
 from fastapi import APIRouter, Depends
 from sqlmodel import Session, col, select
 
-from app.db import get_session
-from app.models import MemoryItem, MemoryStatus
-from app.schemas import MemoryItemRead, ReviewResponse
+from context_memory.db import get_session
+from context_memory.models import MemoryItem, MemoryStatus
+from context_memory.schemas import MemoryItemRead, ReviewResponse
 
 router = APIRouter(prefix="/review", tags=["review"])
 

@@ -15,10 +15,10 @@ from pydantic import BaseModel, ValidationError
 from sqlalchemy import Engine, event
 from sqlmodel import Session
 
-from app.config import Settings
-from app.models import MemoryItem
-from app.services.llm import LLMUpstreamError
-from app.services.memory_ai import SECTION_FIELDS
+from context_memory.config import Settings
+from context_memory.models import MemoryItem
+from context_memory.services.llm import LLMUpstreamError
+from context_memory.services.memory_ai import SECTION_FIELDS
 
 
 def _create(client: TestClient, **fields: Any) -> dict[str, Any]:
@@ -74,7 +74,7 @@ def _patch_generate_structured(
                 "InvalidStructuredOutput: the LLM did not return a valid structured result"
             ) from None
 
-    monkeypatch.setattr("app.services.memory_ai.generate_structured", _fake)
+    monkeypatch.setattr("context_memory.services.memory_ai.generate_structured", _fake)
 
 
 def _progress_notes(client: TestClient, item_id: int) -> list[str]:
@@ -235,10 +235,10 @@ def test_enrich_prompt_is_budgeted_for_a_huge_item(
         captured["user"] = user
         return model_cls.model_validate({"sections": {"snapshot": "s"}, "progress_note": "n"})
 
-    monkeypatch.setattr("app.services.memory_ai.generate_structured", _fake)
+    monkeypatch.setattr("context_memory.services.memory_ai.generate_structured", _fake)
     # Force a small budget so the bound is unmistakable.
     monkeypatch.setattr(
-        "app.services.memory_ai.get_settings",
+        "context_memory.services.memory_ai.get_settings",
         lambda: Settings(llm_prompt_budget_chars=4000),
     )
 

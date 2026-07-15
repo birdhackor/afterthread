@@ -6,8 +6,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.db import init_db
-from app.routers import ai, items, review
+from context_memory.db import init_db
+from context_memory.routers import ai, items, review
 
 
 @asynccontextmanager

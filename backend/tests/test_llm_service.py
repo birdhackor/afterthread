@@ -1,4 +1,4 @@
-"""Tests for the LLM client service (app.services.llm).
+"""Tests for the LLM client service (context_memory.services.llm).
 
 All network I/O is stubbed: a fake client whose ``chat.completions.create`` is
 driven per-test replaces the real ``_get_client`` (via monkeypatch), and
@@ -30,8 +30,8 @@ import openai
 import pytest
 from pydantic import BaseModel, ConfigDict
 
-from app.config import Settings
-from app.services.llm import (
+from context_memory.config import Settings
+from context_memory.services.llm import (
     _INVALID_STRUCTURED_OUTPUT,
     _STRICT_OUTPUT_RULE,
     _UPSTREAM_REASON,
@@ -43,7 +43,7 @@ from app.services.llm import (
     llm_configured,
     normalized_model,
 )
-from app.services.memory_ai import (
+from context_memory.services.memory_ai import (
     CAPTURE_SYSTEM_PROMPT,
     ENRICH_SYSTEM_PROMPT,
     UPDATE_SYSTEM_PROMPT,
@@ -131,8 +131,8 @@ def _settings(*, base_url: str, model: str, api_key: str = _CONFIGURED_KEY) -> S
 
 
 def _install(monkeypatch: pytest.MonkeyPatch, settings: Settings, stub: _StubClient) -> _StubClient:
-    monkeypatch.setattr("app.services.llm.get_settings", lambda: settings)
-    monkeypatch.setattr("app.services.llm._get_client", lambda: stub)
+    monkeypatch.setattr("context_memory.services.llm.get_settings", lambda: settings)
+    monkeypatch.setattr("context_memory.services.llm._get_client", lambda: stub)
     return stub
 
 
@@ -172,9 +172,9 @@ class _RawClient:
 
 def _install_raw(monkeypatch: pytest.MonkeyPatch, completion: Any) -> _RawClient:
     settings = _settings(base_url=_CONFIGURED_BASE_URL, model=_CONFIGURED_MODEL)
-    monkeypatch.setattr("app.services.llm.get_settings", lambda: settings)
+    monkeypatch.setattr("context_memory.services.llm.get_settings", lambda: settings)
     client = _RawClient(completion)
-    monkeypatch.setattr("app.services.llm._get_client", lambda: client)
+    monkeypatch.setattr("context_memory.services.llm._get_client", lambda: client)
     return client
 
 
@@ -206,7 +206,7 @@ _BAD_IDS = [name for name, _ in _BAD_SHAPES]
 
 def test_llm_configured_true_when_url_and_model_set(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "app.services.llm.get_settings",
+        "context_memory.services.llm.get_settings",
         lambda: _settings(base_url=_CONFIGURED_BASE_URL, model=_CONFIGURED_MODEL),
     )
     assert llm_configured() is True
@@ -214,7 +214,7 @@ def test_llm_configured_true_when_url_and_model_set(monkeypatch: pytest.MonkeyPa
 
 def test_llm_configured_false_when_base_url_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "app.services.llm.get_settings",
+        "context_memory.services.llm.get_settings",
         lambda: _settings(base_url="", model=_CONFIGURED_MODEL),
     )
     assert llm_configured() is False
@@ -222,7 +222,7 @@ def test_llm_configured_false_when_base_url_missing(monkeypatch: pytest.MonkeyPa
 
 def test_llm_configured_false_when_model_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "app.services.llm.get_settings",
+        "context_memory.services.llm.get_settings",
         lambda: _settings(base_url=_CONFIGURED_BASE_URL, model=""),
     )
     assert llm_configured() is False
@@ -230,7 +230,7 @@ def test_llm_configured_false_when_model_missing(monkeypatch: pytest.MonkeyPatch
 
 def test_llm_configured_false_when_whitespace_only(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "app.services.llm.get_settings",
+        "context_memory.services.llm.get_settings",
         lambda: _settings(base_url="   ", model="  "),
     )
     assert llm_configured() is False
@@ -240,7 +240,7 @@ def test_llm_configured_true_without_api_key(monkeypatch: pytest.MonkeyPatch) ->
     # A keyless OpenAI-compatible gateway is legitimate: config depends on
     # URL + model only, never on the key.
     monkeypatch.setattr(
-        "app.services.llm.get_settings",
+        "context_memory.services.llm.get_settings",
         lambda: _settings(base_url=_CONFIGURED_BASE_URL, model=_CONFIGURED_MODEL, api_key=""),
     )
     assert llm_configured() is True
@@ -254,7 +254,7 @@ def test_llm_configured_false_when_base_url_syntactically_invalid(
     # the SDK does, and reports unconfigured -- so the status endpoint agrees
     # with the 503 the workflows would raise for the identical config.
     monkeypatch.setattr(
-        "app.services.llm.get_settings",
+        "context_memory.services.llm.get_settings",
         lambda: _settings(base_url="http://h:8o80/v1", model=_CONFIGURED_MODEL),
     )
     assert llm_configured() is False
@@ -289,14 +289,14 @@ def test_generate_structured_unconfigured_raises_before_building_client(
 ) -> None:
     """The config gate runs first: no client is built and nothing is sent."""
     monkeypatch.setattr(
-        "app.services.llm.get_settings",
+        "context_memory.services.llm.get_settings",
         lambda: _settings(base_url="", model=""),
     )
 
     def _must_not_build() -> _StubClient:
         raise AssertionError("_get_client must not run when unconfigured")
 
-    monkeypatch.setattr("app.services.llm._get_client", _must_not_build)
+    monkeypatch.setattr("context_memory.services.llm._get_client", _must_not_build)
     with pytest.raises(LLMNotConfiguredError):
         _run()
 
@@ -716,7 +716,7 @@ def test_llm_configured_false_for_parseable_but_unusable_url(
     before any client is built or request sent.
     """
     monkeypatch.setattr(
-        "app.services.llm.get_settings",
+        "context_memory.services.llm.get_settings",
         lambda: _settings(base_url=base_url, model=_CONFIGURED_MODEL),
     )
     assert llm_configured() is False
@@ -724,7 +724,7 @@ def test_llm_configured_false_for_parseable_but_unusable_url(
     def _must_not_build() -> _StubClient:
         raise AssertionError("_get_client must not run when unconfigured")
 
-    monkeypatch.setattr("app.services.llm._get_client", _must_not_build)
+    monkeypatch.setattr("context_memory.services.llm._get_client", _must_not_build)
     with pytest.raises(LLMNotConfiguredError):
         _run()
 
@@ -738,7 +738,7 @@ def test_llm_configured_true_for_http_and_https_with_host(
     monkeypatch: pytest.MonkeyPatch, base_url: str
 ) -> None:
     monkeypatch.setattr(
-        "app.services.llm.get_settings",
+        "context_memory.services.llm.get_settings",
         lambda: _settings(base_url=base_url, model=_CONFIGURED_MODEL),
     )
     assert llm_configured() is True
@@ -758,7 +758,7 @@ def test_llm_configured_false_for_out_of_range_port(
     generate_structured gates to LLMNotConfiguredError (503) before any request.
     """
     monkeypatch.setattr(
-        "app.services.llm.get_settings",
+        "context_memory.services.llm.get_settings",
         lambda: _settings(base_url=base_url, model=_CONFIGURED_MODEL),
     )
     assert llm_configured() is False
@@ -766,7 +766,7 @@ def test_llm_configured_false_for_out_of_range_port(
     def _must_not_build() -> _StubClient:
         raise AssertionError("_get_client must not run when unconfigured")
 
-    monkeypatch.setattr("app.services.llm._get_client", _must_not_build)
+    monkeypatch.setattr("context_memory.services.llm._get_client", _must_not_build)
     with pytest.raises(LLMNotConfiguredError):
         _run()
 
@@ -775,7 +775,7 @@ def test_llm_configured_true_for_explicit_valid_port(monkeypatch: pytest.MonkeyP
     """A normal, in-range explicit port must remain configured -- the port check
     rejects only 0 and values above 65535, never an ordinary port."""
     monkeypatch.setattr(
-        "app.services.llm.get_settings",
+        "context_memory.services.llm.get_settings",
         lambda: _settings(base_url="http://host.example:8000/v1", model=_CONFIGURED_MODEL),
     )
     assert llm_configured() is True
@@ -789,7 +789,7 @@ def test_configured_and_get_client_agree_on_whitespace_padded_url(
     status and runtime never disagree over stray whitespace.
     """
     monkeypatch.setattr(
-        "app.services.llm.get_settings",
+        "context_memory.services.llm.get_settings",
         lambda: _settings(base_url="  http://spaced.example/v1  ", model=_CONFIGURED_MODEL),
     )
     assert llm_configured() is True
@@ -836,7 +836,7 @@ def test_generate_structured_malformed_endpoint_raises_not_configured(
     neither the URL fragment nor the key.
     """
     monkeypatch.setattr(
-        "app.services.llm.get_settings",
+        "context_memory.services.llm.get_settings",
         lambda: _settings(base_url="http://h:8o80/v1", model=_CONFIGURED_MODEL),
     )
     with pytest.raises(LLMNotConfiguredError) as excinfo:

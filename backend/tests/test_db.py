@@ -1,4 +1,4 @@
-"""Tests for engine construction in app.db: the SQLite-only guard and its
+"""Tests for engine construction in context_memory.db: the SQLite-only guard and its
 dialect-only (never host/database/query-string) rejection message -- including
 the fallback for a URL too malformed to parse at all -- the in-memory SQLite
 rejection via the runtime `pragma_database_list` probe (the sole gate on
@@ -24,9 +24,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, select
 
-from app.config import Settings
-from app.db import create_db_engine, get_engine
-from app.models import MemoryItem, ProgressEntry
+from context_memory.config import Settings
+from context_memory.db import create_db_engine, get_engine
+from context_memory.models import MemoryItem, ProgressEntry
 
 
 def test_non_sqlite_url_rejected() -> None:
@@ -327,8 +327,8 @@ def test_foreign_keys_enforced(tmp_path: Path) -> None:
 
 
 def test_importing_app_creates_no_database_file(tmp_path: Path) -> None:
-    """Importing app.main / app.db must have NO filesystem side effect. The
-    engine is created lazily (see app.db.get_engine), not at module import, so
+    """Importing context_memory.main / context_memory.db must have NO filesystem side effect. The
+    engine is created lazily (see context_memory.db.get_engine), not at module import, so
     a read-only checkout can be imported -- e.g. during pytest collection --
     without create_db_engine's persistence probe materialising a database file
     in the process cwd. Run in a subprocess whose cwd is an empty tmp_path, so
@@ -339,7 +339,7 @@ def test_importing_app_creates_no_database_file(tmp_path: Path) -> None:
     backend_dir = Path(__file__).resolve().parent.parent
     env = {**os.environ, "PYTHONPATH": str(backend_dir)}
     result = subprocess.run(
-        [sys.executable, "-c", "import app.main"],
+        [sys.executable, "-c", "import context_memory.main"],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -363,10 +363,10 @@ def test_app_lifespan_creates_configured_database_file(
     """
     db_path = tmp_path / "lifespan.db"
     settings = Settings(database_url=f"sqlite:///{db_path}")
-    monkeypatch.setattr("app.db.get_settings", lambda: settings)
+    monkeypatch.setattr("context_memory.db.get_settings", lambda: settings)
     get_engine.cache_clear()
     try:
-        from app.main import app
+        from context_memory.main import app
 
         # Importing/constructing the app must not have created the file yet.
         assert not db_path.exists()

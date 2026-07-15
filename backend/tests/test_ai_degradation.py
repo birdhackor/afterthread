@@ -27,7 +27,7 @@ import openai
 import pytest
 from fastapi.testclient import TestClient
 
-from app.config import Settings
+from context_memory.config import Settings
 
 _SECRET_URL = "http://llm.internal.example/v1"
 _SECRET_KEY = "sk-secret-do-not-leak"
@@ -94,7 +94,7 @@ class _StubClient:
 
 
 def _install_client(monkeypatch: pytest.MonkeyPatch, stub: _StubClient) -> _StubClient:
-    monkeypatch.setattr("app.services.llm._get_client", lambda: stub)
+    monkeypatch.setattr("context_memory.services.llm._get_client", lambda: stub)
     return stub
 
 

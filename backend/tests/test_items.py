@@ -10,9 +10,9 @@ from sqlalchemy import Engine, delete, event
 from sqlalchemy.orm.exc import StaleDataError
 from sqlmodel import Session, col, select
 
-from app.config import get_settings
-from app.models import MemoryItem, ProgressEntry
-from app.routers.items import _EMPTY_PAGE_MAX_RETRIES, SQLITE_MAX_INT
+from context_memory.config import get_settings
+from context_memory.models import MemoryItem, ProgressEntry
+from context_memory.routers.items import _EMPTY_PAGE_MAX_RETRIES, SQLITE_MAX_INT
 
 # One past SQLite's signed-64-bit INTEGER ceiling (2**63): FastAPI parses this
 # fine as a Python int, but binding it into a SQLite query raises OverflowError
@@ -39,7 +39,7 @@ def _hard_delete_item_via_raw_connection(session: Session, item_id: int | None) 
     `ondelete="CASCADE"` (see models.py) removes its progress entries too,
     since SQLite enforces that at the database level once `PRAGMA
     foreign_keys=ON` is active for the connection (see
-    `app.db.enable_sqlite_foreign_keys`), regardless of how the DELETE is
+    `context_memory.db.enable_sqlite_foreign_keys`), regardless of how the DELETE is
     issued.
 
     Used from `after_commit` session-event hooks below to simulate a

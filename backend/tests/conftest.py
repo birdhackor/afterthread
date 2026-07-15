@@ -7,9 +7,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
-from app.config import Settings
-from app.db import enable_sqlite_foreign_keys, get_session
-from app.main import app
+from context_memory.config import Settings
+from context_memory.db import enable_sqlite_foreign_keys, get_session
+from context_memory.main import app
 
 
 @pytest.fixture
@@ -51,8 +51,8 @@ def client(session: Session) -> Generator[TestClient]:
 def configure_llm(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Settings]:
     """Force the LLM configuration seen by both the service and the router.
 
-    ``llm_configured`` / ``generate_json`` read ``app.services.llm.get_settings``
-    while the status endpoint reads ``app.routers.ai.get_settings``; both module
+    ``llm_configured`` / ``generate_json`` read ``context_memory.services.llm.get_settings``
+    while the status endpoint reads ``context_memory.routers.ai.get_settings``; both module
     references are overridden together so their view of configuration never
     disagrees. Explicit empty defaults make "unconfigured" hermetic -- it never
     depends on ambient environment or a stray backend/.env.
@@ -71,7 +71,10 @@ def configure_llm(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Settings]:
             openai_model=model,
             openai_timeout_seconds=openai_timeout_seconds,
         )
-        for target in ("app.services.llm.get_settings", "app.routers.ai.get_settings"):
+        for target in (
+            "context_memory.services.llm.get_settings",
+            "context_memory.routers.ai.get_settings",
+        ):
             monkeypatch.setattr(target, lambda settings=settings: settings)
         return settings
 
