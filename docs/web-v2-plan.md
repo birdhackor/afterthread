@@ -2,23 +2,24 @@
 
 對應需求（原始六項）：
 
-1. 總覽頁下方 BE/AI 狀態不會隨後端斷線/恢復更新 → **Phase 1**
-2. README 改寫為網頁版優先、CLI 補充 → **Phase 5**
+1. 總覽頁下方 BE/AI 狀態不會隨後端斷線/恢復更新 → **Phase 1**（已完成）
+2. README 改寫為網頁版優先、CLI 補充 → **Phase 6**
 3. BE 打包成 wheel、內嵌 build 好的 FE dist、`uvx` 一鍵啟動 → **Phase 2**
-4. AI 目前只有單純呼叫，需要 tool-calling 基礎 + 內部知識庫（KB）串接架構與指南 → **Phase 4 + Phase 5（指南）**
-5. LLM 互動需要大量 log 方便除錯（FE 顯示 + BE 紀錄） → **Phase 3**
-6. 內部 LLM 為 GLM5.2（1M context），檢視需調整的組態假設 → **Phase 3**
+4. AI 需要 tool-calling 基礎 + KB「網頁安裝器」（貼 OpenAPI URL + 指示，LLM 自建工具；見 D21） → **Phase 5 + Phase 6（指南）**
+5. LLM 互動需要大量 log 方便除錯（FE 顯示 + BE 紀錄） → **Phase 4**
+6. 內部 LLM 為 GLM5.2（1M context），檢視需調整的組態假設 → **Phase 4**
+7. （2026-07-16 追加）FE 資料層重構為 TanStack Query，只有不適用的才手寫 → **Phase 3**（D22）
 
-決策細節與依據見 `docs/web-v2-decisions.md`（編號 D01–D16，隨進度追加）。
+決策細節與依據見 `docs/web-v2-decisions.md`（編號 D01–D23，隨進度追加）。
 
 ## 工作流程（每個 phase 相同）
 
-1. 主代理擬 spec → 派 subagent 實作。
-2. 主代理親自看 diff + 跑 gates（backend：`ruff check`／`ty check`／`pytest`；frontend：`biome lint`／`vite build`／（Phase 1 起）`vitest`；必要時 e2e smoke）。
+1. 主代理擬 spec → 派 subagent 實作（模型依難度分配：sonnet 標準實作／opus 高複雜度／haiku 瑣碎，D20）。
+2. 主代理親自看 diff + 跑 gates（backend：`ruff check`／`ty check`／`pytest`；frontend：`biome lint`／`vitest`／`vite build`；必要時 e2e smoke）。
 3. 自我審查修正（修「類」不修「例」，做 collateral 分析）。
 4. Commit。
-5. codex review（比對 origin/feat/web-app 的累積 diff）→ 合理意見就修、修完再 review，直到無新問題或僅剩已裁決的 won't-fix。
-6. 進下一個 phase。
+5. codex review（**只審該 phase 的 commit 範圍**，D23）→ 合理意見就修、修完再 review，直到無新問題或僅剩已裁決的 won't-fix。
+6. **push origin feat/web-app**，進下一個 phase。全部完成後對開發起始點 `4f1ab55` 做最終全量 review。
 
 ## Phase 1：BE 連線／LLM 狀態偵測修復
 
@@ -55,7 +56,17 @@
 
 **驗收**：wheel_smoke 通過、原 smoke.sh 通過、全 gates 綠、dev 流程（vite proxy）不變。
 
-## Phase 3：LLM 互動 logging + GLM5.2 組態
+## Phase 3：FE 資料層重構為 TanStack Query（D22）
+
+- 引入 `@tanstack/react-query`：QueryClient（retry: false、refetchOnWindowFocus: true）+ Provider。
+- useQuery：`/api/review`（HomePage）、`/api/items`（清單，filters 進 query key，300ms debounce 保留）、`/api/items/{id}`（詳情）。手寫 requestId stale-drop 由 query key 機制取代。
+- useMutation + invalidation：items CRUD、progress、AI capture/enrich/assist-update（503 downgrade 與 409 conflict 處理保留）。
+- **保留 jotai**：`connectivity.js`／`health.js`／`llm.js`（app 層級狀態、非 React 寫入者、剛過三輪 review 的 item-1 修復）——這就是「不適用」清單。
+- 後續新頁面（AI 日誌、工具/安裝頁）一律以 TanStack 模式寫成。
+
+**驗收**：所有頁面行為不變（含 StrictMode）、vitest 綠、全 gates 綠、smoke 通過。
+
+## Phase 4：LLM 互動 logging + GLM5.2 組態
 
 **Logging（item 5）**：
 
@@ -74,23 +85,31 @@
 
 **驗收**：新舊 pytest 全綠（含 caplog 防洩漏）、logs API + FE 頁可用、smoke 不變。
 
-## Phase 4：tool-calling 基礎 + 內部 KB 架構
+## Phase 5：tool-calling 基礎 + KB 網頁安裝器（D21，取代原 KB 靜態模板設計）
 
-- `llm.py`：`generate_structured` 增加選用 `tools` 參數（None 時行為 byte-identical，既有測試不動）。tool 迴圈：assistant 回 `tool_calls`（content=None 不再誤判 502）→ 執行 handler → 附加 tool 結果 → 續跑；上限 `llm_tool_rounds_max`（預設 4）；最終非 tool 回覆走既有 strict JSON 解析＋corrective retry；全程仍在同一個 asyncio.timeout 內。
-- 新 `services/kb.py`：`kb_configured()`（比照 `llm_configured` 的 URL 驗證紀律）、`kb_search(query, top_k)`（httpx AsyncClient）。設定：`kb_base_url`／`kb_api_key`／`kb_search_path`（預設 `/search`）／`kb_timeout_seconds`／`kb_top_k`。回應解析集中在單一 `_parse_response()` 適配點（公司 KB API 格式未知，做成模板，指南教改這一個函式）。**KB 失敗降級為空結果 + log，絕不讓工作流 502**；kb_api_key/base_url 不進 log/錯誤訊息。
-- 接線：KB 已設定時，三個 AI 工作流掛上 `kb_search` 工具 + 附加一段系統提示（可查內部術語）；**KB 未設定時 prompt byte-identical**（test_ai_prompts 與 mock_llm 標記路由、smoke 全部不受影響）。
-- `/api/llm/status` 增 `kb_configured` 欄位；FE footer 增「知識庫」badge。
-- Logging（Phase 3 的 recorder）延伸記錄 tool 回合。
-- 測試：pytest 覆蓋 tool 迴圈（stub client 回 tool_calls）、KB adapter（httpx mock）、降級行為；mock_llm.py 加 tool_calls 變體支援（e2e 覆蓋度視風險再決定，見 D14）。
+**5a — tool loop（機制核心，安裝器與工作流共用）**：
+- `llm.py`：`generate_structured` 增加選用 `tools` 參數（None 時行為 byte-identical，既有測試不動）。tool 迴圈：assistant 回 `tool_calls`（content=None 不再誤判 502）→ 執行 async handler → 附加 tool 結果 → 續跑；上限 `llm_tool_rounds_max`；最終非 tool 回覆走既有 strict JSON 解析＋corrective retry；tool 版工作有獨立的較長 timeout 設定。
 
-**驗收**：KB 關閉時全部既有測試/smoke 原樣通過；KB 開啟路徑有 pytest 覆蓋；全 gates 綠。
+**5b — 工具執行環境（runtime）**：
+- 工具包格式 `<data-dir>/tools/<name>/`（`tool.json` + 實作檔 + 可選 `.env`），執行契約見 D21。
+- `services/tools.py`：ToolRegistry 掃描/驗證/轉 OpenAI tools 陣列；subprocess 執行（cwd=工具目錄、strip OPENAI_*、注入工具 .env、timeout、stdout cap）。
+- 三個 AI 工作流在有啟用工具時附掛工具 + 系統提示段；無工具時 prompt byte-identical（test_ai_prompts 與 mock_llm 標記路由、smoke 全部不受影響）。
 
-## Phase 5：文件（README 網頁優先 + 指南）
+**5c — 安裝器**：
+- `services/tool_builder.py`：meta-tools（write_file/read_file/list_dir 限 staging；run_shell cwd=staging、timeout、輸出上限）+ 「工具建造者」system prompt + InstallResult 結構化收尾；staging 驗證後搬入 tools 目錄。
+- API：POST `/api/tools/install`（背景 job）、GET `/api/tools/install/{job_id}`、GET/PATCH/DELETE `/api/tools`。
+- FE：「工具」頁（清單/啟停/刪除）+「安裝」頁（OpenAPI URL + 指示 → 輪詢進度 → 結果），TanStack 模式。
+- 安裝過程全程進 Phase 4 的 LLM 日誌。
+- 測試：pytest 覆蓋 tool 迴圈（stub client 回 tool_calls）、registry/executor（含 timeout/cap）、meta-tools 邊界（staging 逃逸防護）、安裝 job 狀態機；mock_llm.py 加 tool_calls 變體。e2e 覆蓋度視實作後風險評估（D14）。
 
-- 根 README 改寫（zh-TW）：這是什麼 → 安裝與啟動（`uvx` 主軸、含升級說明）→ 首次設定（data dir、`.env`、GLM5.2 建議值）→ 網頁功能導覽（總覽/捕捉/清單/詳情/AI 功能/AI 日誌）→ 內部 KB 串接指南（改 `_parse_response` 的步驟、驗證方式、用 AI 日誌除錯）→ 開發模式 → CLI 與 OpenCode 補充 → 方法論連結。
+**驗收**：無工具時全部既有測試/smoke 原樣通過；安裝→執行 happy path 有 pytest 覆蓋；全 gates 綠。
+
+## Phase 6：文件（README 網頁優先 + 指南）
+
+- 根 README 改寫（zh-TW）：這是什麼 → 安裝與啟動（`uvx` 主軸、含升級說明）→ 首次設定（data dir、`.env`、GLM5.2 建議值）→ 網頁功能導覽（總覽/捕捉/清單/詳情/AI 功能/AI 日誌）→ **KB 工具安裝指南（安裝頁操作、instructions 撰寫要領、用 AI 日誌除錯、風險說明）** → 開發模式 → CLI 與 OpenCode 補充 → 方法論連結。
 - AGENTS.md 修正過時規則（file-based MVP 優先等），與新方向一致。
 - backend/frontend/e2e README 同步；重新驗證並更新「已驗證」宣稱。
-- 收尾：全分支 diff 最終 codex review + 全 gates + 總結報告。
+- 收尾：對開發起始點 `4f1ab55` 全量 codex review + 全 gates + 總結報告。
 
 ## 非目標（本輪不做）
 

@@ -149,3 +149,31 @@
 - **選項（針對 1）**：AbortController 主動取消被 supersede 的請求（取消會走 network-error 路徑，需防被動層把「刻意取消」誤報成 backend down，複雜）；**只加 timeout（與 health probe 共用 `PROBE_TIMEOUT_MS = 10s`，常數移到 client.js 共享）**——不取消但每個請求生命有上界，累積自然排空。
 - **決定**：timeout 方案；status 請求維持被動回報（它是真實證據；timeout 造成的 down 會被 30 秒內的權威 probe 校正）。plan 文件 Phase 1 節改寫為最終設計並標注 D17/D18 修訂。
 - **依據**：一致性（probe 同款 deadline）、簡潔（無取消協調）、無誤報疑慮。trivial endpoint 十秒答不出來，讀作 down 在語意上誠實。
+
+## D20（使用者指示 2026-07-16）：subagent 依任務難度分配模型
+
+- **背景**：使用者指示善用 haiku/sonnet/opus 節省 token，依難度分配。
+- **決定**：主代理（規劃/監督/裁決）維持 fable；實作 subagent 預設 **sonnet**（spec 已寫得極細的機械/標準實作）；invariant 密集或跨檔語意重構（llm.py recorder、tool loop、TanStack 重構、安裝器）用 **opus**；瑣碎掃描/驗證用 **haiku**；codex review 走 codex 不受影響。每次派工時在任務描述記錄所用模型。
+
+## D21（使用者指示 2026-07-16）：KB 連接改為「網頁安裝器 + 產生式工具」架構，取代 D12 靜態模板
+
+- **背景**：使用者要的是像 Claude Code 建 skill 的體驗：網頁安裝頁貼上 KB 的 OpenAPI JSON 網址 + 指示 prompt，系統讓 LLM 自己把可用的工具建起來放到定位。基礎設施需要檔案編輯與 shell 執行能力。**D12 的靜態 HTTP 模板 + 改 `_parse_response` 指南作廢（superseded）**。
+- **架構（簡單版 v1）**：
+  1. **工具包格式**（skill 的類比）：`<data-dir>/tools/<name>/` 內含 `tool.json`（name、description、參數 JSON Schema、entry 指令）+ 實作檔（如 `run.py`）+ 可選 `.env`（該工具自己的秘密，如 KB API key）。執行契約：runner 以 subprocess 執行 entry，JSON 參數走 argv/stdin，stdout 為結果（有長度上限與 timeout）。
+  2. **ToolRegistry**（`services/tools.py`）：啟動/變更時掃描 tools 目錄 → 轉成 OpenAI tools 陣列；執行時 subprocess（cwd=工具目錄、strip OPENAI_* 環境變數、注入工具自身 .env、timeout、stdout cap）。
+  3. **安裝器**（`services/tool_builder.py`）：POST /api/tools/install {openapi_url, instructions} → 背景 job。流程：httpx 抓 OpenAPI JSON → 以「工具建造者」system prompt 啟動 LLM tool-loop，給 meta-tools：`write_file`/`read_file`/`list_dir`（限 staging 目錄）與 `run_shell`（cwd=staging、timeout、輸出上限；可用 curl/python 實測 KB API）→ 最終回報結構化 InstallResult → 驗證 tool.json 合法 → staging 搬進 tools 目錄。GET /api/tools/install/{job_id} 輪詢進度；全程 LLM 互動進 Phase 4 的日誌（除錯即看得到）。
+  4. **工作流接線**：capture/enrich/assist-update 在有已安裝工具時附掛全部啟用工具 + 一段系統提示；無工具時 prompt byte-identical（既有測試/smoke 不受影響）。
+  5. **FE**：「工具」頁（清單/啟停/刪除）+「安裝」頁（URL + 指示 → 提交 → 輪詢進度 → 結果）。
+- **安全立場（v1）**：這是使用者本機的個人工具，shell 能力是明確需求（同 Claude Code 性質）；防護做到：staging/tools 目錄為寫入邊界、strip 我方 LLM 憑證、timeout 與輸出上限、README 明示風險。不做容器隔離（過度工程，v1 不值）。
+- **依據**：與既有 tool-loop 基礎共用同一套機制（安裝器只是「帶 meta-tools 的一次 tool-loop 呼叫」）；把「KB API 格式未知」問題交給 LLM 在安裝時解決，比靜態模板更貼需求；先簡單版，之後可進版（隔離、重試、多工具編排）。
+
+## D22（使用者指示 2026-07-16）：新增 TanStack Query 重構階段
+
+- **背景**：使用者裁定應善用 lib：優先 TanStack Query useQuery/useMutation，只有不適用的才手寫。
+- **決定**：插入獨立重構 phase（在打包之後、logging/安裝器之前，讓之後的新 FE 頁面直接以新模式寫成）。範圍：頁面資料抓取（review/items/item detail）與所有 mutations（CRUD、progress、AI 三動作、之後的安裝器）改 useQuery/useMutation + 失效（invalidation）；requestId 手寫防護由 query key 機制取代。**保留 jotai 的部分（「不適用」清單）**：`connectivity.js`/`health.js`/`llm.js`——app 層級狀態、寫入者是非 React 模組（client.js 被動回報、probe），且是剛硬化並過三輪 review 的 item-1 修復，改寫風險大於收益。QueryClient 預設：retry: false（保留一擊語意 + 連線偵測設計）、refetchOnWindowFocus: true（與連線監測的 focus 語意一致）。
+- **依據**：使用者明示偏好；query key/自動 GC 消掉手寫 stale-drop 的重複；jotai 保留範圍有明確技術理由並記錄在案。
+
+## D23（使用者指示 2026-07-16）：push 與 review 政策修訂（取代 D13）
+
+- **決定**：phase 內不 push；**phase 完成（該 phase 範圍 codex review 通過）後 push**。每個 phase 的 codex review **只審該 phase 的 commit 範圍**；全部 phase 完成後，再對**本輪開發起始點**做一次全量 review。
+- **本輪起始點**：`4f1ab55`（origin/feat/web-app 於 2026-07-15 開工時的位置）。Phase 0+1（8c1be4c…194a9ca）已依此政策補推送。
