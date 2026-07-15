@@ -212,9 +212,16 @@ export function ItemDetailPage() {
 	const queryClient = useQueryClient();
 	const [showEmpty, setShowEmpty] = useState(false);
 	const [confirmOpen, confirm] = useDisclosure(false);
-	// AI actions' combined busy flag, reported up from ItemAiActions (its two
-	// mutations + the conflict-refresh). This is the "plus AI actions' pending"
-	// half of the page-wide mutation gate derived below.
+	// AI actions' combined busy flag. ItemAiActions calls this setter
+	// SYNCHRONOUSLY -- onPendingChange(true) in the same click handler that
+	// starts an AI mutation or the conflict-refresh, BEFORE the request
+	// fires, and onPendingChange(false) in that mutation's onSettled -- so
+	// this state and the mutation's own isPending land in the SAME React
+	// batch/render as each other. An effect reacting to ItemAiActions' own
+	// isPending (the earlier design) would close this gate one render late,
+	// leaving a window where the Selects/progress/edit below are still
+	// enabled after an AI action has already started. This is the "plus AI
+	// actions' pending" half of the page-wide mutation gate derived below.
 	const [aiPending, setAiPending] = useState(false);
 
 	// If the user navigates away (e.g. browser back) while the delete mutation
@@ -251,12 +258,16 @@ export function ItemDetailPage() {
 	});
 
 	// Reflect the loaded item's title in the document title, falling back while
-	// loading or when the item is missing.
+	// loading or when the item is missing. A 404 wins even over a stale `item`
+	// still sitting in cache (see the 404 render branch below for why), so
+	// it's checked BEFORE `item` here too -- otherwise the tab would say
+	// "找不到項目" in the body but still show the old title in the browser
+	// tab/history.
 	let pageTitle = "項目詳情";
-	if (item) {
-		pageTitle = item.title;
-	} else if (error?.status === 404) {
+	if (error?.status === 404) {
 		pageTitle = "找不到項目";
+	} else if (item) {
+		pageTitle = item.title;
 	}
 	usePageTitle(pageTitle);
 
@@ -322,8 +333,16 @@ export function ItemDetailPage() {
 				title: "已刪除",
 				message: `已刪除「${item.title}」`,
 			});
-			// The item's own query is left to be GC'd; only the lists/review it
-			// dropped out of need refetching.
+			// Evict the exact entry rather than just invalidate it: invalidating
+			// only marks it stale for the NEXT mount, but a background refetch
+			// does not clear existing `data` in react-query -- so browser-back to
+			// this now-deleted item would still hand back its last snapshot from
+			// cache (while a 404 refetch runs silently underneath) instead of
+			// starting from nothing. removeQueries drops the entry outright, so
+			// back-navigation starts from `data: undefined` and genuinely
+			// refetches -- landing on the 404 branch below, not a ghost of this
+			// item.
+			queryClient.removeQueries({ queryKey: ["item", itemId], exact: true });
 			queryClient.invalidateQueries({ queryKey: ["items"] });
 			queryClient.invalidateQueries({ queryKey: ["review"] });
 			if (isMountedRef.current) {
@@ -373,7 +392,17 @@ export function ItemDetailPage() {
 		);
 	}
 
-	if (error?.status === 404 && item === undefined) {
+	// Authoritative regardless of a stale `item` already in cache: a 404 is
+	// the server saying this row is gone, and showing a stale snapshot would
+	// invite doomed writes (a quick-Select PATCH, progress POST or AI action
+	// against an id that no longer exists). This also covers a delete that
+	// happened in another tab/process -- that tab's cache was never touched,
+	// so `item` can still be defined here from an earlier successful fetch,
+	// but the next refetch (focus, revisit, an unrelated invalidation)
+	// landing a 404 must still win over it. The generic error branch below
+	// keeps its `item === undefined` guard -- only a definitive "this id
+	// doesn't exist" overrides stale data; a transient failure does not.
+	if (error?.status === 404) {
 		return (
 			<Stack gap="md" align="flex-start">
 				<Title order={2}>找不到項目</Title>
@@ -503,6 +532,13 @@ export function ItemDetailPage() {
 				item={item}
 				pending={pagePending}
 				onPendingChange={setAiPending}
+				// The exact useParams value this page's own ['item', itemId] query
+				// is keyed with -- NOT necessarily String(item.id). A non-canonical
+				// URL like /items/001 keys this page's query as ['item','001']
+				// while item.id is the canonical 1; ItemAiActions must invalidate/
+				// remove the SAME key this page actually queries, or a refresh
+				// silently no-ops against a cache entry that was never there.
+				queryItemId={itemId}
 			/>
 
 			<Divider />

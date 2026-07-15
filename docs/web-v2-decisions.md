@@ -191,3 +191,14 @@
   - **F8 Accept 防護 false-pass**：unit 層（vitest）釘 fetch headers；wheel_smoke 過時註解修正。
 - **第二輪追加（全修）**：HTML no-cache 判斷提到 `/assets/` immutable 之前（extensionless `/assets/missing` 的 SPA fallback 是 shell，被 immutable 會釘一年，原測試釘反了）；`/api/*` 掛 Accept 正規化 middleware（API 命名空間永不協商 HTML；不用 catch-all route——會把真端點的 405 誤變 404，wheel_smoke 同時釘住 bare-curl 404 與 DELETE 405 兩面）；backend README 移除易腐化的精確測試數。
 - **第三輪追加（修，免第四輪）**：`startswith("/api/")` 漏掉恰好 `/api`（無斜線）→ 條件補 `path == "/api"`，wheel_smoke 加 `GET /api` bare → 404 JSON 斷言（23 斷言）。單一述詞修正且由 e2e 直接驗證，裁決不再開整輪 review；期末全量 review 覆蓋。另註：第三輪 codex 於其 sandbox 無法執行需網路 socket 的 smoke（環境限制），本機 gates 結果有效。
+
+## D25（Phase 3 codex review 裁決）：五項發現全修
+
+- **背景**：TanStack 重構首輪 review：Medium ×2、Low ×3、無 High。
+- **裁決（全修）**：
+  1. **刪除後幽靈詳情頁**（M）：`removeQueries` 精確移除 + 404 分支權威化（有舊資料也顯示找不到——404 代表列已不存在）。實作中同類延伸：分頁標題同樣以 404 優先（核可）。
+  2. **編輯頁凍結舊快照**（M）：`refetchOnMount:"always"` + 該 query `refetchOnWindowFocus:false`；實作中發現快取會同步先回舊值、表單會在 fresh fetch 落地前就以舊值 mount——補 `formReadyRef` 閂鎖（render 期寫入，效果才來得及擋同一輪的分支），沒有它整個修正是裝飾（核可，屬同根因）。
+  3. **非 canonical URL 身分分裂**（L）：cache 身分一律用 route param（`queryItemId` prop）；`item.id` 只用於 server 資源路徑。
+  4. **clamp 過渡頁污染 lastGoodRef**（L）：抽共用 `needsPageClamp()` 述詞，兩處共享；placeholder 排除保持獨立 AND。
+  5. **AI gate 起始端 race**（L）：恢復同步 bracket（動作 handler 內先報 pending 再 mutate、onSettled 收尾、conflict refresh 同款）；刪除 effect 式回報。
+- **殘餘已知界線**：五項修正屬 UI 快取/時序行為，e2e（curl 級）無法直接驗，信心來自 lint/build + 逐場景追蹤；瀏覽器級自動化不在本輪範圍（非目標清單）。

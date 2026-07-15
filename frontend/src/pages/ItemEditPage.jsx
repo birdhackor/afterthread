@@ -43,13 +43,21 @@ export function ItemEditPage() {
 		};
 	}, []);
 
-	// Load the item to seed the form. staleTime: Infinity freezes this snapshot
-	// for the edit session -- refetchOnWindowFocus never fires (the query is
-	// never stale), so the dirty-field diff baseline (item.tags below) can't
-	// shift under the user mid-edit, preserving the old load-once behavior. The
-	// key is shared with the detail page's ['item', itemId] query, so arriving
-	// from there populates the form instantly; a save invalidates the key, so
-	// returning here later refetches fresh.
+	// Load the item to seed the form. One contract, three parts:
+	// - refetchOnMount: "always" -- entering the edit page ALWAYS fetches a
+	//   fresh snapshot, even though ['item', itemId] is shared with the detail
+	//   page and may already be cached (e.g. arriving here right after
+	//   viewing it) -- an edit session must never silently adopt a cache
+	//   entry that was seeded before this visit, no matter how "fresh" it
+	//   still looks under the default staleTime.
+	// - staleTime is NOT set (inherits the QueryClient default) -- Infinity
+	//   would suppress the ABOVE guarantee for every OTHER consumer of this
+	//   same key too (the detail page), since it disables react-query's own
+	//   staleness math wholesale, not just this query's refetch-on-mount
+	//   decision.
+	// - refetchOnWindowFocus: false (overriding the app-wide default of true)
+	//   -- once the form is up, a focus refetch must not fire mid-edit.
+	// fresh-on-entry, frozen-while-editing.
 	const {
 		data: item,
 		error,
@@ -58,8 +66,35 @@ export function ItemEditPage() {
 	} = useQuery({
 		queryKey: ["item", itemId],
 		queryFn: () => apiGet(`/api/items/${itemId}`),
-		staleTime: Number.POSITIVE_INFINITY,
+		refetchOnMount: "always",
+		refetchOnWindowFocus: false,
 	});
+
+	// refetchOnMount:"always" can still return an existing ['item', itemId]
+	// cache entry SYNCHRONOUSLY (as `item`) while that guaranteed fetch is
+	// still in flight (`isFetching`) -- e.g. arriving here right after
+	// viewing the detail page -- so `item` can be briefly defined-but-stale
+	// right after mount. react-hook-form's defaultValues (inside ItemForm) is
+	// captured ONCE at mount and never resynced from a later prop change, so
+	// mounting ItemForm against that transient stale value would freeze
+	// exactly the snapshot this fix removes. formReadyRef latches the itemId
+	// only once a result has actually settled (isFetching false) for it, so
+	// ItemForm always mounts from the first result that arrives AFTER mount
+	// -- and, once latched, never unlatches for that itemId, so a later
+	// background refetch (e.g. after a network reconnect; only window-focus
+	// refetching is disabled above) renders OVER the standing form instead of
+	// unmounting it back to a Loader mid-edit and losing in-progress input.
+	// Comparing against the CURRENT itemId (rather than a plain boolean) also
+	// resets this correctly if the route param ever changes without a full
+	// remount. This must run during render, not in an effect: a ref write
+	// doesn't itself trigger a re-render, so an effect-based version would
+	// only unlock formReady on the render AFTER this one -- one render too
+	// late to gate THIS render's Loader-vs-form branch below.
+	const formReadyRef = useRef(null);
+	if (!isFetching && item !== undefined) {
+		formReadyRef.current = itemId;
+	}
+	const formReady = formReadyRef.current === itemId;
 
 	const defaults = useMemo(
 		() => (item ? buildFormDefaults(item) : null),
@@ -112,7 +147,11 @@ export function ItemEditPage() {
 		}
 	};
 
-	if (item === undefined && isFetching) {
+	// Not just `item === undefined && isFetching`: a warm cache can hand back
+	// `item` immediately while the mount-triggered "always" refetch above is
+	// still settling (see formReadyRef above), and that value must not reach
+	// ItemForm. Keep showing the Loader until formReady latches.
+	if (!formReady && isFetching) {
 		return (
 			<Center py="xl">
 				<Loader />

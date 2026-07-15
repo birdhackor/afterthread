@@ -88,6 +88,30 @@ function SkeletonRows() {
 	));
 }
 
+// Whether `data` represents a page overshoot: a fetch that genuinely
+// completed for the CURRENT `page` (unlike react-query's own kept-previous
+// placeholder, which callers must exclude separately -- see needsClamp in
+// ItemsListPage below) but came back with zero rows while `total` says rows
+// exist elsewhere, i.e. `page` is past the actual last page for that total.
+// Shared by the clamp effect (decides whether to snap `page` back) AND the
+// lastGoodRef guard (decides whether `data` is safe to remember as the last
+// DISPLAYABLE result) -- both are plain effects that run every render with no
+// ordering guarantee between them, so a transitional overshoot response must
+// be recognized identically by both, or lastGoodRef could store it as "good"
+// moments before (or after) the clamp effect reacts to that SAME response by
+// moving away from it. Without a shared predicate, a subsequent failed
+// request for the corrected page would then fall back to this empty page
+// instead of the last real one.
+function needsPageClamp(data, page) {
+	if (data === undefined) {
+		return false;
+	}
+	const total = data.total ?? 0;
+	const itemsEmpty = (data.items?.length ?? 0) === 0;
+	const lastPage = Math.max(1, Math.ceil(total / DEFAULT_LIMIT));
+	return itemsEmpty && total > 0 && page > 1 && lastPage !== page;
+}
+
 export function ItemsListPage() {
 	usePageTitle("記憶清單");
 	const [status, setStatus] = useAtom(statusFilterAtom);
@@ -163,13 +187,16 @@ export function ItemsListPage() {
 	// ERRORED reload react-query drops back to data === undefined, which would
 	// blank the table. The original instead kept the previous rows visible with
 	// a "重新載入失敗" banner, so remember the last delivered page here and fall
-	// back to it when a reload fails.
+	// back to it when a reload fails. Guarded by needsPageClamp (see its doc
+	// comment above) so a transitional overshoot response -- one the clamp
+	// effect below is about to react to by moving `page` away from it -- is
+	// never the thing this falls back to.
 	const lastGoodRef = useRef(null);
 	useEffect(() => {
-		if (data !== undefined) {
+		if (data !== undefined && !needsPageClamp(data, page)) {
 			lastGoodRef.current = data;
 		}
-	}, [data]);
+	}, [data, page]);
 	const shown = data ?? lastGoodRef.current;
 	const items = shown?.items ?? [];
 	const total = shown?.total ?? 0;
@@ -180,20 +207,16 @@ export function ItemsListPage() {
 	// snap back to the last valid page; changing `page` moves `offset`, which
 	// changes the query key and refetches the correct page. This is the old
 	// in-response clamp re-expressed as an effect reacting to the query result.
-	// Guards: only act on real delivered data (not the kept-previous
-	// placeholder, and not an errored/undefined result) and only when the clamp
-	// target actually differs from the current page -- setPage() with the same
-	// value would be a no-op that never refetches, and rendering the empty page
-	// as a real state is exactly what we're avoiding.
+	// !isPlaceholderData is layered on here rather than folded into
+	// needsPageClamp itself: a kept-previous placeholder is still a genuinely
+	// displayable result (the lastGoodRef guard above does NOT exclude
+	// placeholders), it just isn't evidence about the page currently being
+	// requested, so it must never drive the clamp decision. clampTarget is
+	// computed separately (needsPageClamp only answers yes/no) since setPage
+	// needs an actual target, not just a boolean.
 	const freshTotal = data?.total ?? 0;
 	const clampTarget = Math.max(1, Math.ceil(freshTotal / DEFAULT_LIMIT));
-	const needsClamp =
-		data !== undefined &&
-		!isPlaceholderData &&
-		(data.items?.length ?? 0) === 0 &&
-		freshTotal > 0 &&
-		page > 1 &&
-		clampTarget !== page;
+	const needsClamp = !isPlaceholderData && needsPageClamp(data, page);
 	useEffect(() => {
 		if (needsClamp) {
 			setPage(clampTarget);

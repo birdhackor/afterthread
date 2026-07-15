@@ -14,7 +14,7 @@ import {
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useAtomValue, useSetAtom } from "jotai";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Controller, useForm } from "react-hook-form";
 import { apiPost } from "../api/client.js";
 import {
@@ -43,6 +43,15 @@ import { codePointLength } from "../utils/text.js";
 // with no round-trip lag, matching the old shared-gate behavior. The textarea
 // stays enabled unless THIS card's own action is in flight (`busy`), so the
 // user can keep typing while an unrelated control settles.
+//
+// `onPendingChange` is called directly here -- true in this submit handler
+// BEFORE mutate(), matched by ItemAiActions' onSettled calling it false once
+// the mutation (success or error) settles -- rather than via an effect
+// watching `mutation.isPending`. The gate must close in the SAME event that
+// opens the mutation: an effect only runs after that render commits, one
+// render later, leaving an interleaving window (the Selects/progress/edit on
+// the detail page staying enabled after this action already started) that
+// the old pre-react-query onMutationStart bracket never had.
 function AiActionCard({
 	title,
 	description,
@@ -56,6 +65,7 @@ function AiActionCard({
 	mutation,
 	refreshing,
 	onRefreshConflict,
+	onPendingChange,
 	children,
 }) {
 	const { control, handleSubmit, reset } = useForm({
@@ -69,6 +79,11 @@ function AiActionCard({
 			return;
 		}
 		const value = values[fieldName].trim();
+		// Only reached on the path that actually mutates (the guard above
+		// already returned on every other early-exit, including
+		// llm-not-configured), so this can never leave the gate stuck closed
+		// without a matching mutate() in flight to reopen it via onSettled.
+		onPendingChange(true);
 		// Clear the box only once the mutation actually succeeds (per-call
 		// onSuccess, which runs after the card's shared onSuccess in
 		// ItemAiActions), so a failed action keeps the typed text for a retry.
@@ -217,16 +232,27 @@ function GapsChecklist({ gaps, stage }) {
 
 // The two AI cards shown on the detail page: full enrichment (returns a gaps
 // checklist) and an assisted progress update. Each is a useMutation whose
-// onSuccess invalidates ['item', itemId] (+ ['items']/['review']) -- the item
-// refetch replaces the old manual onRefresh, so status/stage/section/progress
-// changes made server-side reappear on their own.
+// onSuccess invalidates ['item', queryItemId] (+ ['items']/['review']) -- the
+// item refetch replaces the old manual onRefresh, so status/stage/section/
+// progress changes made server-side reappear on their own.
 //
 // `pending` is ItemDetailPage's page-own mutation gate (patch/progress). This
-// component owns the AI half of the gate and reports it up via `onPendingChange`
-// so the page can disable ITS controls while an AI action (or the conflict
-// refresh) runs -- the "plus AI actions' pending, threaded to ItemAiActions"
-// part of the shared gate.
-export function ItemAiActions({ item, pending, onPendingChange }) {
+// component owns the AI half of the gate and reports it up via
+// `onPendingChange`, called SYNCHRONOUSLY (true before each mutate()/refresh,
+// false in onSettled -- see AiActionCard and refreshConflict below), so the
+// page can disable ITS controls the instant an AI action (or the conflict
+// refresh) starts, not one render later -- the "plus AI actions' pending,
+// threaded to ItemAiActions" part of the shared gate.
+//
+// `queryItemId` is the route param ItemDetailPage's own ['item', itemId] query
+// is keyed with -- NOT necessarily String(item.id). A non-canonical URL like
+// /items/001 keys the detail query as ['item','001'] while item.id is the
+// canonical 1; invalidating/removing ['item', String(item.id)] would target a
+// cache entry that was never there, silently no-op-ing the refresh. Every
+// invalidation/removal below uses this prop, never item.id -- the request
+// URLs (enrich/assist-update) still use item.id since those address the
+// server's resource path, a separate concern from the client cache key.
+export function ItemAiActions({ item, pending, onPendingChange, queryItemId }) {
 	const queryClient = useQueryClient();
 	const llm = useAtomValue(llmStatusAtom);
 	const configured = llm.configured;
@@ -248,6 +274,11 @@ export function ItemAiActions({ item, pending, onPendingChange }) {
 	// controls stay disabled for its duration too.
 	const [refreshing, setRefreshing] = useState(false);
 
+	// Used for the mutation request URLs below (enrich/assist-update) -- the
+	// server-side resource id, always canonical since it's read off the
+	// fetched `item`, not the possibly non-canonical route string. Cache
+	// operations must NOT use this -- see queryItemId above and invalidateAll
+	// below.
 	const itemId = String(item.id);
 
 	// Invalidate the item AND the lists/review it can affect; awaited by each
@@ -255,10 +286,12 @@ export function ItemAiActions({ item, pending, onPendingChange }) {
 	// closed until the item refetch lands. Errors are swallowed (no throwOnError)
 	// so a failed BACKGROUND refetch leaves the prior item on screen rather than
 	// turning the success into a failure -- see the report note on the old
-	// "AI 已完成，但重新載入失敗" secondary path.
+	// "AI 已完成，但重新載入失敗" secondary path. Keyed by queryItemId (the
+	// route param), matching the detail page's own query key exactly -- see
+	// the doc comment above.
 	const invalidateAll = () =>
 		Promise.all([
-			queryClient.invalidateQueries({ queryKey: ["item", itemId] }),
+			queryClient.invalidateQueries({ queryKey: ["item", queryItemId] }),
 			queryClient.invalidateQueries({ queryKey: ["items"] }),
 			queryClient.invalidateQueries({ queryKey: ["review"] }),
 		]);
@@ -287,6 +320,12 @@ export function ItemAiActions({ item, pending, onPendingChange }) {
 		});
 	};
 
+	// onSettled (not onSuccess/onError separately) closes the synchronous
+	// bracket AiActionCard's submit opens with onPendingChange(true): it fires
+	// after EITHER outcome, and -- since onSuccess here returns a promise --
+	// only after that promise (the invalidateAll awaited inside it) resolves,
+	// so the gate stays shut for exactly as long as isPending does, matching
+	// the "closed until the item refetch lands" contract noted above.
 	const enrichMutation = useMutation({
 		mutationFn: (value) =>
 			apiPost(`/api/items/${itemId}/enrich`, { additional_context: value }),
@@ -300,6 +339,7 @@ export function ItemAiActions({ item, pending, onPendingChange }) {
 			notifications.show({ color: "green", message: "AI 已補齊內容" });
 		},
 		onError: onActionError,
+		onSettled: () => onPendingChange(false),
 	});
 
 	const assistMutation = useMutation({
@@ -314,21 +354,28 @@ export function ItemAiActions({ item, pending, onPendingChange }) {
 			notifications.show({ color: "green", message: "AI 已更新進度" });
 		},
 		onError: onActionError,
+		onSettled: () => onPendingChange(false),
 	});
 
 	// Conflict banner's 重新整理: reload the item so the user can retry against
 	// fresh data. throwOnError makes a failed refetch reject (unlike the default
 	// swallow) so the failure path keeps the banner and toasts, exactly like the
 	// old manual GET; on success mutation.reset() clears the 409 error and hides
-	// the banner.
+	// the banner. Keyed by queryItemId, matching the detail page's own query
+	// key -- see the doc comment above ItemAiActions.
 	const refreshConflict = async (mutation) => {
 		if (refreshing) {
 			return;
 		}
+		// Synchronous bracket, same contract as AiActionCard's submit above:
+		// flips the shared AI-busy gate in THIS click event, before the first
+		// `await` yields control, so ItemDetailPage's Selects/progress/edit
+		// disable immediately instead of one render late.
 		setRefreshing(true);
+		onPendingChange(true);
 		try {
 			await queryClient.invalidateQueries(
-				{ queryKey: ["item", itemId] },
+				{ queryKey: ["item", queryItemId] },
 				{ throwOnError: true },
 			);
 			mutation.reset();
@@ -340,16 +387,22 @@ export function ItemAiActions({ item, pending, onPendingChange }) {
 			});
 		} finally {
 			setRefreshing(false);
+			onPendingChange(false);
 		}
 	};
 
-	// The AI half of the page-wide gate: either card's action or the conflict
-	// refresh. Reported up so ItemDetailPage can disable its own controls too.
+	// The AI half of the page-wide gate, used to cross-disable each AI card
+	// against the OTHER card's mutation or the conflict-refresh (see
+	// AiActionCard's disabled/tooltip props below) -- purely a same-component
+	// read of these mutations' own isPending, so it's already in step with
+	// their renders with no extra hop. Reporting THIS UP to ItemDetailPage is
+	// no longer done here: an effect keyed on this value would only fire
+	// after ItemAiActions' render commits, one render later than the click
+	// that started the mutation. Instead, onPendingChange is called directly
+	// (true/false) at each action's own start/settle -- see AiActionCard's
+	// submit, refreshConflict, and the two mutations' onSettled above.
 	const aiBusy =
 		enrichMutation.isPending || assistMutation.isPending || refreshing;
-	useEffect(() => {
-		onPendingChange(aiBusy);
-	}, [aiBusy, onPendingChange]);
 
 	return (
 		<Stack gap="md">
@@ -366,6 +419,7 @@ export function ItemAiActions({ item, pending, onPendingChange }) {
 				mutation={enrichMutation}
 				refreshing={refreshing}
 				onRefreshConflict={() => refreshConflict(enrichMutation)}
+				onPendingChange={onPendingChange}
 			>
 				{gaps ? <GapsChecklist gaps={gaps} stage={item.stage} /> : null}
 			</AiActionCard>
@@ -383,6 +437,7 @@ export function ItemAiActions({ item, pending, onPendingChange }) {
 				mutation={assistMutation}
 				refreshing={refreshing}
 				onRefreshConflict={() => refreshConflict(assistMutation)}
+				onPendingChange={onPendingChange}
 			/>
 		</Stack>
 	);
