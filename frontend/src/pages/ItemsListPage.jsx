@@ -16,9 +16,10 @@ import {
 } from "@mantine/core";
 import { useDebouncedValue } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useAtom, useSetAtom } from "jotai";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { apiGet, buildQuery } from "../api/client.js";
 import {
 	DEFAULT_LIMIT,
@@ -100,13 +101,6 @@ export function ItemsListPage() {
 	const [debouncedTag] = useDebouncedValue(tag, 300);
 	const [debouncedQ] = useDebouncedValue(q, 300);
 
-	const [state, setState] = useState({
-		phase: "loading",
-		items: [],
-		total: 0,
-		error: null,
-	});
-
 	const offset = (page - 1) * DEFAULT_LIMIT;
 
 	// Changing any filter jumps back to page 1; routing every control through
@@ -129,12 +123,8 @@ export function ItemsListPage() {
 		setPage(1);
 	};
 
-	// Fetch the current page. A monotonic request id drops stale responses when
-	// filters change faster than the network resolves.
-	const requestId = useRef(0);
-
-	// Trimmed once here, shared by both the query below and hasFilters --
-	// backend tags are stored trimmed and matched exactly, and q's whitespace
+	// Trimmed once here, shared by the query key, the request URL and hasFilters
+	// -- backend tags are stored trimmed and matched exactly, and q's whitespace
 	// would otherwise become part of the LIKE pattern, so whitespace-only
 	// input must mean "no filter" (buildQuery drops the resulting "", and
 	// hasFilters must agree or an empty DB would show 找不到符合條件的項目
@@ -144,101 +134,127 @@ export function ItemsListPage() {
 	const trimmedTag = debouncedTag.trim();
 	const trimmedQ = debouncedQ.trim();
 
-	const load = useCallback(() => {
-		const id = ++requestId.current;
-		setState((prev) => ({ ...prev, phase: "loading", error: null }));
+	// Normalized filter object feeding both the query key and the request URL.
+	// It IS the query key's payload, so any change (a debounced tag/q, a filter,
+	// a page) refetches -- and identical values reuse the cache. This replaces
+	// the old monotonic requestId guard: a superseded response is dropped by the
+	// query cache instead of a manual id re-check.
+	const filters = {
+		status,
+		stage,
+		tag: trimmedTag,
+		q: trimmedQ,
+		limit: DEFAULT_LIMIT,
+		offset,
+	};
 
-		const query = buildQuery({
-			status,
-			stage,
-			tag: trimmedTag,
-			q: trimmedQ,
-			limit: DEFAULT_LIMIT,
-			offset,
+	const { data, error, isError, isFetching, isPlaceholderData, refetch } =
+		useQuery({
+			queryKey: ["items", filters],
+			queryFn: () => apiGet(`/api/items${buildQuery(filters)}`),
+			// keepPreviousData keeps the prior page's rows on screen (under the
+			// LoadingOverlay below) while a filter/page change refetches, instead of
+			// flashing empty -- the react-query equivalent of the old "keep
+			// state.items until the new response lands" behavior.
+			placeholderData: keepPreviousData,
 		});
 
-		apiGet(`/api/items${query}`)
-			.then((data) => {
-				if (id !== requestId.current) {
-					return;
-				}
-				const items = data?.items ?? [];
-				const total = data?.total ?? 0;
-				// The persisted page can outlive its data (e.g. the last item on
-				// it was deleted elsewhere). Clamp back to the last valid page and
-				// let that refetch supply real state, instead of rendering the
-				// "no data" empty state for this transient, page-that-no-longer-
-				// exists response. Only do that when the clamp target actually
-				// differs from the current page: setPage() with the same value is
-				// a no-op that would never retrigger `load` (its deps, including
-				// `offset`, would all stay unchanged), sticking the UI in
-				// "loading" forever. When the target is already the current page,
-				// this response IS the coherent state for it, so fall through and
-				// render it honestly instead.
-				if (items.length === 0 && total > 0 && page > 1) {
-					const lastPage = Math.max(1, Math.ceil(total / DEFAULT_LIMIT));
-					if (lastPage !== page) {
-						setPage(lastPage);
-						return;
-					}
-				}
-				setState({
-					phase: "success",
-					items,
-					total,
-					error: null,
-				});
-			})
-			.catch((error) => {
-				if (id !== requestId.current) {
-					return;
-				}
-				setState((prev) => ({ ...prev, phase: "error", error }));
-				notifications.show({
-					color: "red",
-					title: "載入失敗",
-					message: error?.message ?? "無法載入記憶清單",
-				});
-			});
-	}, [status, stage, trimmedTag, trimmedQ, offset, page, setPage]);
-
+	// keepPreviousData covers the pending (successful) transition, but on an
+	// ERRORED reload react-query drops back to data === undefined, which would
+	// blank the table. The original instead kept the previous rows visible with
+	// a "重新載入失敗" banner, so remember the last delivered page here and fall
+	// back to it when a reload fails.
+	const lastGoodRef = useRef(null);
 	useEffect(() => {
-		load();
-	}, [load]);
+		if (data !== undefined) {
+			lastGoodRef.current = data;
+		}
+	}, [data]);
+	const shown = data ?? lastGoodRef.current;
+	const items = shown?.items ?? [];
+	const total = shown?.total ?? 0;
+
+	// The persisted page can outlive its data (e.g. the last item on it was
+	// deleted elsewhere, or a filter shrank the result set). When a FRESH,
+	// non-placeholder response for a page > 1 comes back empty while total > 0,
+	// snap back to the last valid page; changing `page` moves `offset`, which
+	// changes the query key and refetches the correct page. This is the old
+	// in-response clamp re-expressed as an effect reacting to the query result.
+	// Guards: only act on real delivered data (not the kept-previous
+	// placeholder, and not an errored/undefined result) and only when the clamp
+	// target actually differs from the current page -- setPage() with the same
+	// value would be a no-op that never refetches, and rendering the empty page
+	// as a real state is exactly what we're avoiding.
+	const freshTotal = data?.total ?? 0;
+	const clampTarget = Math.max(1, Math.ceil(freshTotal / DEFAULT_LIMIT));
+	const needsClamp =
+		data !== undefined &&
+		!isPlaceholderData &&
+		(data.items?.length ?? 0) === 0 &&
+		freshTotal > 0 &&
+		page > 1 &&
+		clampTarget !== page;
+	useEffect(() => {
+		if (needsClamp) {
+			setPage(clampTarget);
+		}
+	}, [needsClamp, clampTarget, setPage]);
+
+	// The old load().catch fired a red toast on every failed fetch (on top of
+	// the inline alert); mirror that off the query error. `error` keeps a stable
+	// identity until the next fetch, so this fires once per distinct failure
+	// rather than on every render.
+	useEffect(() => {
+		if (isError && error) {
+			notifications.show({
+				color: "red",
+				title: "載入失敗",
+				message: error?.message ?? "無法載入記憶清單",
+			});
+		}
+	}, [isError, error]);
 
 	const hasFilters = Boolean(status || stage || trimmedTag || trimmedQ);
-	const totalPages = Math.max(1, Math.ceil(state.total / DEFAULT_LIMIT));
+	const totalPages = Math.max(1, Math.ceil(total / DEFAULT_LIMIT));
+
+	const skeletonBody = (
+		<Table striped highlightOnHover verticalSpacing="sm">
+			<Table.Thead>
+				<Table.Tr>
+					<Table.Th>標題</Table.Th>
+					<Table.Th>狀態</Table.Th>
+					<Table.Th>階段</Table.Th>
+					<Table.Th>標籤</Table.Th>
+					<Table.Th>更新</Table.Th>
+				</Table.Tr>
+			</Table.Thead>
+			<Table.Tbody>
+				<SkeletonRows />
+			</Table.Tbody>
+		</Table>
+	);
 
 	let body;
-	if (state.phase === "loading" && state.items.length === 0) {
-		body = (
-			<Table striped highlightOnHover verticalSpacing="sm">
-				<Table.Thead>
-					<Table.Tr>
-						<Table.Th>標題</Table.Th>
-						<Table.Th>狀態</Table.Th>
-						<Table.Th>階段</Table.Th>
-						<Table.Th>標籤</Table.Th>
-						<Table.Th>更新</Table.Th>
-					</Table.Tr>
-				</Table.Thead>
-				<Table.Tbody>
-					<SkeletonRows />
-				</Table.Tbody>
-			</Table>
-		);
-	} else if (state.phase === "error" && state.items.length === 0) {
+	if (shown === null && isFetching) {
+		// First load: nothing delivered yet.
+		body = skeletonBody;
+	} else if (isError && items.length === 0) {
+		// Load failed with nothing to show.
 		body = (
 			<Alert color="red" title="載入失敗">
 				<Stack gap="sm" align="flex-start">
-					<Text size="sm">{state.error?.message ?? "無法載入記憶清單"}</Text>
-					<Button size="xs" onClick={load}>
+					<Text size="sm">{error?.message ?? "無法載入記憶清單"}</Text>
+					<Button size="xs" onClick={() => refetch()}>
 						重試
 					</Button>
 				</Stack>
 			</Alert>
 		);
-	} else if (state.items.length === 0) {
+	} else if (needsClamp) {
+		// Clamping to a valid page (see the effect above); show the skeleton
+		// rather than let the empty page flash before the clamp refetch lands.
+		body = skeletonBody;
+	} else if (items.length === 0 && !isFetching) {
 		body = hasFilters ? (
 			<EmptyState message="找不到符合條件的項目" align="flex-start">
 				<Button variant="light" size="xs" onClick={() => resetFilters()}>
@@ -258,16 +274,12 @@ export function ItemsListPage() {
 			</EmptyState>
 		);
 	} else {
-		// A page/filter reload keeps the previous rows on screen (only the
-		// first load shows the skeleton above) so the table doesn't flash
-		// empty, but that means a reload in flight is otherwise silent --
-		// this overlay is the only signal that the visible rows are stale
-		// and a new query is running.
+		// Rows present (fresh, or kept-previous during a reload). A reload in
+		// flight is otherwise silent, so this overlay is the only signal that the
+		// visible rows are stale and a new query is running.
 		body = (
 			<Box pos="relative">
-				<LoadingOverlay
-					visible={state.phase === "loading" && state.items.length > 0}
-				/>
+				<LoadingOverlay visible={isFetching} />
 				<Table.ScrollContainer minWidth={640}>
 					<Table striped highlightOnHover verticalSpacing="sm">
 						<Table.Thead>
@@ -280,7 +292,7 @@ export function ItemsListPage() {
 							</Table.Tr>
 						</Table.Thead>
 						<Table.Tbody>
-							{state.items.map((item) => (
+							{items.map((item) => (
 								<ItemRow key={item.id} item={item} />
 							))}
 						</Table.Tbody>
@@ -337,14 +349,14 @@ export function ItemsListPage() {
 				</Button>
 			</Group>
 
-			{state.phase === "error" && state.items.length > 0 ? (
+			{isError && items.length > 0 ? (
 				<Alert color="red" title="重新載入失敗" variant="light">
 					<Stack gap="sm" align="flex-start">
 						<Text size="sm">
-							{state.error?.message ?? "無法重新載入記憶清單"}
+							{error?.message ?? "無法重新載入記憶清單"}
 							，顯示的是先前的結果
 						</Text>
-						<Button size="xs" onClick={load}>
+						<Button size="xs" onClick={() => refetch()}>
 							重試
 						</Button>
 					</Stack>
@@ -353,11 +365,10 @@ export function ItemsListPage() {
 
 			{body}
 
-			{state.total > 0 ? (
+			{total > 0 ? (
 				<Group justify="space-between" align="center">
 					<Text size="sm" c="dimmed">
-						共 {state.total} 筆
-						{state.phase === "error" ? "（顯示先前結果）" : ""}
+						共 {total} 筆{isError ? "（顯示先前結果）" : ""}
 					</Text>
 					<Pagination total={totalPages} value={page} onChange={setPage} />
 				</Group>

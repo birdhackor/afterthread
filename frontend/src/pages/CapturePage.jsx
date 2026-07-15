@@ -13,6 +13,7 @@ import {
 	Title,
 	Tooltip,
 } from "@mantine/core";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useAtomValue, useSetAtom } from "jotai";
 import { useState } from "react";
@@ -109,29 +110,29 @@ export function CapturePage() {
 	// `loading`.
 	const loadLlmStatus = useSetAtom(loadLlmStatusAtom);
 	const markLlmUnconfigured = useSetAtom(markLlmUnconfiguredAtom);
+	const queryClient = useQueryClient();
 	const [result, setResult] = useState(null);
 	const [error, setError] = useState(null);
 
-	const {
-		control,
-		handleSubmit,
-		reset,
-		formState: { isSubmitting },
-	} = useForm({ defaultValues: { raw_text: "" } });
+	const { control, handleSubmit, reset } = useForm({
+		defaultValues: { raw_text: "" },
+	});
 
-	const submit = handleSubmit(async (values) => {
-		if (!configured || isSubmitting) {
-			return;
-		}
-		const value = values.raw_text.trim();
-		setError(null);
-		setResult(null);
-		try {
-			const data = await apiPost("/api/capture", { raw_text: value });
+	// Capture POST as a mutation. The button/textarea now read
+	// captureMutation.isPending (RHF's own isSubmitting would flip false the
+	// instant mutate() fires, since the submit handler no longer awaits).
+	const captureMutation = useMutation({
+		mutationFn: (value) => apiPost("/api/capture", { raw_text: value }),
+		onSuccess: (data) => {
 			setResult(data);
 			// Clear the box only on success; a failure keeps the text for retry.
 			reset({ raw_text: "" });
-		} catch (submitError) {
+			// The capture created an item -- refresh the list and review buckets so
+			// it shows up when the user navigates there.
+			queryClient.invalidateQueries({ queryKey: ["items"] });
+			queryClient.invalidateQueries({ queryKey: ["review"] });
+		},
+		onError: (submitError) => {
 			setError(submitError);
 			if (submitError?.code === "llm_not_configured") {
 				// Backend just told us (on THIS request) AI is unavailable (503) --
@@ -145,7 +146,16 @@ export function CapturePage() {
 				markLlmUnconfigured();
 				loadLlmStatus({ force: true });
 			}
+		},
+	});
+
+	const submit = handleSubmit((values) => {
+		if (!configured || captureMutation.isPending) {
+			return;
 		}
+		setError(null);
+		setResult(null);
+		captureMutation.mutate(values.raw_text.trim());
 	});
 
 	return (
@@ -210,7 +220,7 @@ export function CapturePage() {
 									placeholder="貼上剛結束的討論、想法或決策……"
 									autosize
 									minRows={6}
-									disabled={isSubmitting}
+									disabled={captureMutation.isPending}
 									error={fieldState.error?.message}
 								/>
 								<CharCounter value={field.value} max={CAPTURE_MAX} />
@@ -231,8 +241,8 @@ export function CapturePage() {
 							<Box display="inline-block">
 								<Button
 									type="submit"
-									loading={isSubmitting}
-									disabled={!configured || isSubmitting}
+									loading={captureMutation.isPending}
+									disabled={!configured || captureMutation.isPending}
 								>
 									AI 快速捕捉
 								</Button>

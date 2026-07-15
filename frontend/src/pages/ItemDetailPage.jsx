@@ -20,8 +20,9 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Controller, useForm } from "react-hook-form";
 import { apiDelete, apiGet, apiPatch, apiPost } from "../api/client.js";
 import { DateText } from "../components/DateText.jsx";
@@ -109,69 +110,28 @@ function SectionGroupsView({ item, showEmpty }) {
 }
 
 // Progress timeline (dates ascending, as returned by the backend) plus a small
-// RHF note form that appends a new entry optimistically from the POST response,
-// then refetches (`onRefresh`) so the item's `updated`/is_stale -- bumped
-// server-side by the same POST, see add_progress in context_memory/routers/items.py --
-// stay honest rather than frozen at their pre-post values.
+// RHF note form. On submit it calls `onSubmitNote`, which fires the page's
+// progress mutation; that mutation's onSuccess invalidates ['item', itemId],
+// refetching the item so the new entry AND the server-bumped `updated`/is_stale
+// (see add_progress in context_memory/routers/items.py) all land coherently --
+// no optimistic append or manual refresh needed anymore.
 //
-// `pending` is the page-wide mutation gate from ItemDetailPage (true while
-// this submit, a quick Select PATCH or an AI action is in flight elsewhere);
-// `onMutationStart`/`onMutationEnd` bracket this submit's own POST+refresh so
-// the Selects and AI actions are disabled for its duration too -- see
-// ItemDetailPage's `mutationGate` comment for why no two of these mutations
-// may ever overlap.
-function ProgressPanel({
-	itemId,
-	progress,
-	onAdded,
-	onRefresh,
-	pending,
-	onMutationStart,
-	onMutationEnd,
-}) {
-	const {
-		control,
-		handleSubmit,
-		reset,
-		formState: { isSubmitting },
-	} = useForm({ defaultValues: { note: "" } });
+// `isSubmitting` is the progress mutation's own isPending (button loading);
+// `pending` is ItemDetailPage's page-wide mutation gate (true while this
+// submit, a quick Select PATCH or an AI action is in flight) -- the gate is
+// derived from the mutations' isPending, so no two of them can overlap.
+function ProgressPanel({ progress, onSubmitNote, isSubmitting, pending }) {
+	const { control, handleSubmit, reset } = useForm({
+		defaultValues: { note: "" },
+	});
 
-	const submit = handleSubmit(async ({ note }) => {
+	const submit = handleSubmit(({ note }) => {
 		if (pending) {
 			return;
 		}
-		const trimmed = note.trim();
-		onMutationStart();
-		try {
-			const entry = await apiPost(`/api/items/${itemId}/progress`, {
-				note: trimmed,
-			});
-			onAdded(entry);
-			reset({ note: "" });
-			notifications.show({ color: "green", message: "已新增進度" });
-		} catch (error) {
-			notifications.show({
-				color: "red",
-				title: "新增進度失敗",
-				message: error?.message ?? "無法新增進度",
-			});
-			onMutationEnd();
-			return;
-		}
-		// Separate try/catch from the add above (mirrors ItemAiActions'
-		// onSuccess/onRefresh split): the add already succeeded, so a refresh
-		// failure here must read as "refresh failed", never as "add failed".
-		try {
-			await onRefresh();
-		} catch (_error) {
-			notifications.show({
-				color: "red",
-				title: "重新載入失敗",
-				message: "進度已新增，但重新載入失敗，請重新整理頁面",
-			});
-		} finally {
-			onMutationEnd();
-		}
+		// Clear the box only once the mutation actually succeeds (per-call
+		// onSuccess), so a failed submit keeps the typed note.
+		onSubmitNote(note.trim(), { onSuccess: () => reset({ note: "" }) });
 	});
 
 	return (
@@ -249,55 +209,22 @@ export function ItemDetailPage() {
 	const { itemId } = useParams({ strict: false });
 	const navigate = useNavigate();
 
-	const [state, setState] = useState({
-		phase: "loading",
-		item: null,
-		error: null,
-	});
+	const queryClient = useQueryClient();
 	const [showEmpty, setShowEmpty] = useState(false);
-	// Page-wide mutation gate: ONE shared flag for every control that can
-	// mutate this item -- both quick-update Selects, the progress-note
-	// submit and both AI action submits (via ItemAiActions, see its
-	// `pending`/`onMutationStart`/`onMutationEnd` props below) -- so at most
-	// one PATCH/POST is ever in flight at a time. Every initiator disables
-	// itself while `mutationPending` is true, so a second mutation can never
-	// start before the first settles; see patchField for why that
-	// serialization matters (a slower response's full-item snapshot would
-	// otherwise silently overwrite whatever a faster, later one just wrote).
-	// Delete is intentionally NOT gated by this -- it navigates away on
-	// success, so it can't race a snapshot-merge the way an in-place update
-	// can.
-	const [mutationPending, mutationGate] = useDisclosure(false);
-	const [deleting, setDeleting] = useState(false);
 	const [confirmOpen, confirm] = useDisclosure(false);
+	// AI actions' combined busy flag, reported up from ItemAiActions (its two
+	// mutations + the conflict-refresh). This is the "plus AI actions' pending"
+	// half of the page-wide mutation gate derived below.
+	const [aiPending, setAiPending] = useState(false);
 
-	// Reflect the loaded item's title in the document title, falling back while
-	// loading or when the item is missing.
-	let pageTitle = "項目詳情";
-	if (state.phase === "success" && state.item) {
-		pageTitle = state.item.title;
-	} else if (state.phase === "notfound") {
-		pageTitle = "找不到項目";
-	}
-	usePageTitle(pageTitle);
-
-	// Monotonic id so a slow initial fetch or refresh cannot clobber a newer
-	// one -- shared by both the initial-load effect below and refresh(), so
-	// every GET this page issues (mount/route-param load, retryLoad, both AI
-	// cards' post-success refresh and the conflict banner's manual refresh)
-	// is tagged from the same counter and a late, superseded response is
-	// discarded instead of overwriting state a faster, later request already
-	// applied.
-	const reqRef = useRef(0);
-
-	// If the user navigates away (e.g. browser back) while handleDelete's
-	// DELETE below is still in flight, this page unmounts but the promise
-	// still resolves -- skip the success-path navigate in that case so it
-	// can't yank the user back to the (now-deleted) item's list view from
-	// wherever they already navigated to instead. The toast still shows
-	// (it's still true, and no longer where anyone's looking makes it
-	// harmless). Same pattern as ItemNewPage: set true in effect setup, false
-	// in cleanup, so it's reset correctly under StrictMode's double-mount.
+	// If the user navigates away (e.g. browser back) while the delete mutation
+	// below is still in flight, this page unmounts but the mutation still
+	// resolves -- skip the success-path navigate in that case so it can't yank
+	// the user back to the (now-deleted) item's list view from wherever they
+	// already navigated to instead. The toast still shows (it's still true, and
+	// no longer where anyone's looking makes it harmless). Set true in effect
+	// setup, false in cleanup, so it resets correctly under StrictMode's
+	// double-mount.
 	const isMountedRef = useRef(true);
 	useEffect(() => {
 		isMountedRef.current = true;
@@ -306,123 +233,139 @@ export function ItemDetailPage() {
 		};
 	}, []);
 
-	// Replace the loaded item (accepts a value or an updater). Used by the quick
-	// status/stage controls and the progress form for in-place updates that must
-	// not trigger a full reload.
-	const setItem = useCallback((updater) => {
-		setState((prev) => ({
-			...prev,
-			item: typeof updater === "function" ? updater(prev.item) : updater,
-		}));
-	}, []);
+	// Item fetch. Query key ['item', itemId] owns staleness now -- the old shared
+	// monotonic reqRef guard (a manual re-check that dropped superseded GETs from
+	// the mount load, retryLoad, the AI cards' refresh and the conflict banner's
+	// refresh) is gone: the query cache drops superseded responses, and every
+	// mutation below invalidates this key to refetch a fresh FULL item (with
+	// progress) instead of merging partial responses by hand.
+	const {
+		data: item,
+		error,
+		isError,
+		isFetching,
+		refetch,
+	} = useQuery({
+		queryKey: ["item", itemId],
+		queryFn: () => apiGet(`/api/items/${itemId}`),
+	});
 
-	// Refetch the full item (with progress). Throws on failure so callers that
-	// refresh after a mutation surface the error themselves. Tags the request
-	// with the shared monotonic id (see reqRef above) and drops the response
-	// if a newer load/refresh has since superseded it.
-	const refresh = useCallback(async () => {
-		const id = ++reqRef.current;
-		const data = await apiGet(`/api/items/${itemId}`);
-		if (id === reqRef.current) {
-			setState({ phase: "success", item: data, error: null });
-		}
-		return data;
-	}, [itemId]);
+	// Reflect the loaded item's title in the document title, falling back while
+	// loading or when the item is missing.
+	let pageTitle = "項目詳情";
+	if (item) {
+		pageTitle = item.title;
+	} else if (error?.status === 404) {
+		pageTitle = "找不到項目";
+	}
+	usePageTitle(pageTitle);
 
-	// 重試 from the error state: show the loader while refetching, and land
-	// back on the error state with the new error on failure (never a silent
-	// no-op).
-	const retryLoad = () => {
-		setState((prev) => ({ ...prev, phase: "loading", error: null }));
-		refresh().catch((error) => {
-			setState({
-				phase: error?.status === 404 ? "notfound" : "error",
-				item: null,
-				error,
-			});
-		});
-	};
+	// Invalidate the item AND the lists/review it can affect. Awaited by the
+	// mutations' onSuccess so isPending (and thus the gate) stays closed until the
+	// item refetch lands -- the react-query equivalent of the old
+	// onMutationStart/onMutationEnd bracketing the POST *and* its refresh. Only
+	// ['item', itemId] is active here (mounted), so only its refetch is awaited;
+	// ['items']/['review'] are just marked stale and refetch when next visited.
+	const invalidateItemAndLists = () =>
+		Promise.all([
+			queryClient.invalidateQueries({ queryKey: ["item", itemId] }),
+			queryClient.invalidateQueries({ queryKey: ["items"] }),
+			queryClient.invalidateQueries({ queryKey: ["review"] }),
+		]);
 
-	// Initial load / reload when the route param changes.
-	useEffect(() => {
-		const id = ++reqRef.current;
-		setState({ phase: "loading", item: null, error: null });
-		apiGet(`/api/items/${itemId}`)
-			.then((data) => {
-				if (id === reqRef.current) {
-					setState({ phase: "success", item: data, error: null });
-				}
-			})
-			.catch((error) => {
-				if (id !== reqRef.current) {
-					return;
-				}
-				setState({
-					phase: error?.status === 404 ? "notfound" : "error",
-					item: null,
-					error,
-				});
-			});
-	}, [itemId]);
-
-	const item = state.item;
-
-	// PATCH a single scalar field (status or stage). The PATCH response is a
-	// full MemoryItemRead WITHOUT progress (so we merge the existing progress
-	// back in) -- and, being a full snapshot, applying it while a fresher
-	// state from another in-flight mutation (the other quick Select, the
-	// progress form or an AI action) is still landing would silently
-	// overwrite whatever that other mutation just wrote. Every mutating
-	// control shares `mutationPending` and disables itself while any one of
-	// them is in flight, so a second mutation can never start before the
-	// first settles -- no merge logic needed because the race is prevented,
-	// not resolved.
-	const patchField = async (field, value, successMessage) => {
-		if (!item || value === item[field]) {
-			return;
-		}
-		mutationGate.open();
-		try {
-			const updated = await apiPatch(`/api/items/${item.id}`, {
-				[field]: value,
-			});
-			setItem((prev) => ({ ...updated, progress: prev?.progress ?? [] }));
-			notifications.show({ color: "green", message: successMessage });
-		} catch (error) {
+	// PATCH a single scalar field (status or stage). The PATCH response is a full
+	// MemoryItemRead WITHOUT progress; rather than merge progress back in by hand
+	// (as the old code did), we invalidate and let the item refetch supply the
+	// coherent full snapshot. Serialization still matters -- a slower response
+	// applied after a faster, later one would be wrong -- so every mutating
+	// control shares the gate below and disables itself while any mutation is
+	// pending; a second mutation can never start before the first (and its
+	// refetch) settle.
+	const patchMutation = useMutation({
+		mutationFn: ({ field, value }) =>
+			apiPatch(`/api/items/${itemId}`, { [field]: value }),
+		onSuccess: async (_data, variables) => {
+			notifications.show({ color: "green", message: variables.successMessage });
+			await invalidateItemAndLists();
+		},
+		onError: (mutationError) => {
 			notifications.show({
 				color: "red",
 				title: "更新失敗",
-				message: error?.message ?? "無法更新項目",
+				message: mutationError?.message ?? "無法更新項目",
 			});
-		} finally {
-			mutationGate.close();
-		}
-	};
+		},
+	});
 
-	const handleDelete = async () => {
-		setDeleting(true);
-		try {
-			await apiDelete(`/api/items/${item.id}`);
+	const progressMutation = useMutation({
+		mutationFn: (note) => apiPost(`/api/items/${itemId}/progress`, { note }),
+		onSuccess: async () => {
+			notifications.show({ color: "green", message: "已新增進度" });
+			await invalidateItemAndLists();
+		},
+		onError: (mutationError) => {
+			notifications.show({
+				color: "red",
+				title: "新增進度失敗",
+				message: mutationError?.message ?? "無法新增進度",
+			});
+		},
+	});
+
+	// Delete is intentionally NOT part of the mutation gate: it navigates away on
+	// success, so it can't race an in-place update the way a PATCH/POST can.
+	const deleteMutation = useMutation({
+		mutationFn: () => apiDelete(`/api/items/${itemId}`),
+		onSuccess: () => {
 			notifications.show({
 				color: "green",
 				title: "已刪除",
 				message: `已刪除「${item.title}」`,
 			});
+			// The item's own query is left to be GC'd; only the lists/review it
+			// dropped out of need refetching.
+			queryClient.invalidateQueries({ queryKey: ["items"] });
+			queryClient.invalidateQueries({ queryKey: ["review"] });
 			if (isMountedRef.current) {
 				navigate({ to: "/items" });
 			}
-		} catch (error) {
-			setDeleting(false);
+		},
+		onError: (mutationError) => {
 			confirm.close();
 			notifications.show({
 				color: "red",
 				title: "刪除失敗",
-				message: error?.message ?? "無法刪除項目",
+				message: mutationError?.message ?? "無法刪除項目",
 			});
+		},
+	});
+
+	// Page-wide mutation gate derived from the mutations' isPending flags plus the
+	// AI actions' reported pending -- ONE guard for every control that can mutate
+	// this item, so at most one PATCH/POST is ever in flight at a time.
+	// `pagePending` is just this page's own two mutations; it is threaded down to
+	// ItemAiActions so its buttons disable while a quick Select or progress submit
+	// runs, and ItemAiActions ORs in its own local AI-busy (no round-trip lag).
+	// `mutationPending` adds aiPending back for this page's own controls.
+	const pagePending = patchMutation.isPending || progressMutation.isPending;
+	const mutationPending = pagePending || aiPending;
+
+	// Quick status/stage change. The disabled Select already blocks a second
+	// call, but re-check the gate defensively so the one-mutation-at-a-time
+	// invariant holds regardless of how the change was triggered.
+	const patchField = (field, value, successMessage) => {
+		if (!item || mutationPending || value === item[field]) {
+			return;
 		}
+		patchMutation.mutate({ field, value, successMessage });
 	};
 
-	if (state.phase === "loading") {
+	// Loader covers the first load AND a 重試 after a failure: react-query keeps
+	// status 'error' (not 'pending') while re-fetching after an error, so
+	// `item === undefined && isFetching` is what re-shows the Loader on retry
+	// (matching the old retryLoad), and a failed BACKGROUND refetch that still
+	// has data falls through to render the item rather than blanking.
+	if (item === undefined && isFetching) {
 		return (
 			<Center py="xl">
 				<Loader />
@@ -430,7 +373,7 @@ export function ItemDetailPage() {
 		);
 	}
 
-	if (state.phase === "notfound") {
+	if (error?.status === 404 && item === undefined) {
 		return (
 			<Stack gap="md" align="flex-start">
 				<Title order={2}>找不到項目</Title>
@@ -442,12 +385,12 @@ export function ItemDetailPage() {
 		);
 	}
 
-	if (state.phase === "error") {
+	if (isError && item === undefined) {
 		return (
 			<Alert color="red" title="載入失敗">
 				<Stack gap="sm" align="flex-start">
-					<Text size="sm">{state.error?.message ?? "無法載入項目"}</Text>
-					<Button size="xs" onClick={retryLoad}>
+					<Text size="sm">{error?.message ?? "無法載入項目"}</Text>
+					<Button size="xs" onClick={() => refetch()}>
 						重試
 					</Button>
 				</Stack>
@@ -558,27 +501,17 @@ export function ItemDetailPage() {
 			<Title order={3}>AI 協助</Title>
 			<ItemAiActions
 				item={item}
-				onRefresh={refresh}
-				pending={mutationPending}
-				onMutationStart={mutationGate.open}
-				onMutationEnd={mutationGate.close}
+				pending={pagePending}
+				onPendingChange={setAiPending}
 			/>
 
 			<Divider />
 
 			<ProgressPanel
-				itemId={item.id}
 				progress={progress}
-				onAdded={(entry) =>
-					setItem((prev) => ({
-						...prev,
-						progress: [...(prev.progress ?? []), entry],
-					}))
-				}
-				onRefresh={refresh}
+				onSubmitNote={(note, options) => progressMutation.mutate(note, options)}
+				isSubmitting={progressMutation.isPending}
 				pending={mutationPending}
-				onMutationStart={mutationGate.open}
-				onMutationEnd={mutationGate.close}
 			/>
 
 			<Modal
@@ -586,9 +519,9 @@ export function ItemDetailPage() {
 				onClose={confirm.close}
 				title="刪除項目"
 				centered
-				closeOnEscape={!deleting}
-				closeOnClickOutside={!deleting}
-				withCloseButton={!deleting}
+				closeOnEscape={!deleteMutation.isPending}
+				closeOnClickOutside={!deleteMutation.isPending}
+				withCloseButton={!deleteMutation.isPending}
 			>
 				<Stack gap="md">
 					<Text>確定要刪除「{item.title}」嗎？此動作無法復原。</Text>
@@ -596,11 +529,15 @@ export function ItemDetailPage() {
 						<Button
 							variant="default"
 							onClick={confirm.close}
-							disabled={deleting}
+							disabled={deleteMutation.isPending}
 						>
 							取消
 						</Button>
-						<Button color="red" loading={deleting} onClick={handleDelete}>
+						<Button
+							color="red"
+							loading={deleteMutation.isPending}
+							onClick={() => deleteMutation.mutate()}
+						>
 							刪除
 						</Button>
 					</Group>

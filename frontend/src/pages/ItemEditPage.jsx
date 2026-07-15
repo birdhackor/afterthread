@@ -8,8 +8,9 @@ import {
 	Title,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { apiGet, apiPatch } from "../api/client.js";
 import {
 	applyServerFieldErrors,
@@ -27,19 +28,13 @@ export function ItemEditPage() {
 	usePageTitle("編輯項目");
 	const { itemId } = useParams({ strict: false });
 	const navigate = useNavigate();
-	const [state, setState] = useState({
-		phase: "loading",
-		item: null,
-		error: null,
-	});
+	const queryClient = useQueryClient();
 
-	// If the user leaves via the navbar while the PATCH in onSubmit below is
-	// in flight, this page unmounts but the promise still resolves -- skip
-	// the success-path backToDetail() (a navigate()) in that case so it can't
-	// yank the user back to the item they just left. Separate from `active`
-	// in the load effect just below: that one guards a single fetch and
-	// resets on every itemId change, while this ref must stay false for the
-	// rest of the component's life once the page has actually unmounted.
+	// If the user leaves via the navbar while the update mutation below is in
+	// flight, this page unmounts but the mutation still resolves -- skip the
+	// success-path backToDetail() in that case so it can't yank the user back to
+	// the item they just left. Set true on mount, false on cleanup, so it resets
+	// correctly under StrictMode's double-mount.
 	const isMountedRef = useRef(true);
 	useEffect(() => {
 		isMountedRef.current = true;
@@ -48,36 +43,48 @@ export function ItemEditPage() {
 		};
 	}, []);
 
-	useEffect(() => {
-		let active = true;
-		setState({ phase: "loading", item: null, error: null });
-		apiGet(`/api/items/${itemId}`)
-			.then((data) => {
-				if (active) {
-					setState({ phase: "success", item: data, error: null });
-				}
-			})
-			.catch((error) => {
-				if (active) {
-					setState({
-						phase: error?.status === 404 ? "notfound" : "error",
-						item: null,
-						error,
-					});
-				}
-			});
-		return () => {
-			active = false;
-		};
-	}, [itemId]);
+	// Load the item to seed the form. staleTime: Infinity freezes this snapshot
+	// for the edit session -- refetchOnWindowFocus never fires (the query is
+	// never stale), so the dirty-field diff baseline (item.tags below) can't
+	// shift under the user mid-edit, preserving the old load-once behavior. The
+	// key is shared with the detail page's ['item', itemId] query, so arriving
+	// from there populates the form instantly; a save invalidates the key, so
+	// returning here later refetches fresh.
+	const {
+		data: item,
+		error,
+		isError,
+		isFetching,
+	} = useQuery({
+		queryKey: ["item", itemId],
+		queryFn: () => apiGet(`/api/items/${itemId}`),
+		staleTime: Number.POSITIVE_INFINITY,
+	});
 
 	const defaults = useMemo(
-		() => (state.item ? buildFormDefaults(state.item) : null),
-		[state.item],
+		() => (item ? buildFormDefaults(item) : null),
+		[item],
 	);
 
 	const backToDetail = () =>
 		navigate({ to: "/items/$itemId", params: { itemId } });
+
+	const updateMutation = useMutation({
+		mutationFn: (patch) => apiPatch(`/api/items/${itemId}`, patch),
+		onSuccess: () => {
+			notifications.show({
+				color: "green",
+				title: "已更新",
+				message: "項目已更新",
+			});
+			queryClient.invalidateQueries({ queryKey: ["item", itemId] });
+			queryClient.invalidateQueries({ queryKey: ["items"] });
+			queryClient.invalidateQueries({ queryKey: ["review"] });
+			if (isMountedRef.current) {
+				backToDetail();
+			}
+		},
+	});
 
 	const onSubmit = async (values, { dirtyFields, setError }) => {
 		const patch = {};
@@ -86,7 +93,7 @@ export function ItemEditPage() {
 				patch[key] = key === "title" ? values[key].trim() : values[key];
 			}
 		}
-		if (!sameTags(values.tags, state.item.tags ?? [])) {
+		if (!sameTags(values.tags, item.tags ?? [])) {
 			patch.tags = values.tags;
 		}
 
@@ -96,22 +103,16 @@ export function ItemEditPage() {
 			return;
 		}
 
+		// mutateAsync so RHF's isSubmitting tracks the request and a 422's field
+		// errors can be mapped onto the form exactly as before.
 		try {
-			await apiPatch(`/api/items/${itemId}`, patch);
-			notifications.show({
-				color: "green",
-				title: "已更新",
-				message: "項目已更新",
-			});
-			if (isMountedRef.current) {
-				backToDetail();
-			}
-		} catch (error) {
-			applyServerFieldErrors(error, setError);
+			await updateMutation.mutateAsync(patch);
+		} catch (submitError) {
+			applyServerFieldErrors(submitError, setError);
 		}
 	};
 
-	if (state.phase === "loading") {
+	if (item === undefined && isFetching) {
 		return (
 			<Center py="xl">
 				<Loader />
@@ -119,7 +120,7 @@ export function ItemEditPage() {
 		);
 	}
 
-	if (state.phase === "notfound") {
+	if (error?.status === 404 && item === undefined) {
 		return (
 			<Stack gap="md" align="flex-start">
 				<Title order={2}>找不到項目</Title>
@@ -131,10 +132,10 @@ export function ItemEditPage() {
 		);
 	}
 
-	if (state.phase === "error") {
+	if (isError && item === undefined) {
 		return (
 			<Alert color="red" title="載入失敗">
-				<Text size="sm">{state.error?.message ?? "無法載入項目"}</Text>
+				<Text size="sm">{error?.message ?? "無法載入項目"}</Text>
 			</Alert>
 		);
 	}

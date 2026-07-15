@@ -12,9 +12,9 @@ import {
 	Text,
 	Title,
 } from "@mantine/core";
+import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useAtomValue, useSetAtom } from "jotai";
-import { useCallback, useEffect, useRef, useState } from "react";
 import { apiGet } from "../api/client.js";
 import { backendStatusAtom } from "../atoms/connectivity.js";
 import { llmStatusAtom, loadLlmStatusAtom } from "../atoms/llm.js";
@@ -207,49 +207,33 @@ function StatusFooter() {
 // summary, quick actions, and a health/LLM footer.
 export function HomePage() {
 	usePageTitle("總覽");
-	const [state, setState] = useState({
-		phase: "loading",
-		data: null,
-		error: null,
+
+	// Query key ['review'] owns staleness now: this single useQuery replaces the
+	// old hand-rolled monotonic requestId guard (a superseded response, e.g.
+	// from StrictMode's double-mount, is dropped by the query cache instead of a
+	// manual id re-check), and 重試 below is just refetch().
+	const { data, error, isError, isFetching, refetch } = useQuery({
+		queryKey: ["review"],
+		queryFn: () => apiGet("/api/review"),
 	});
 
-	// Monotonic request id (same pattern as ItemsListPage/ItemDetailPage) so a
-	// superseded response can't win -- e.g. StrictMode's double-mount fires
-	// two /api/review requests, and without this guard the older one landing
-	// after the newer one would silently overwrite its state.
-	const requestId = useRef(0);
-	const load = useCallback(() => {
-		const id = ++requestId.current;
-		setState((prev) => ({ ...prev, phase: "loading", error: null }));
-		apiGet("/api/review")
-			.then((data) => {
-				if (id !== requestId.current) {
-					return;
-				}
-				setState({ phase: "success", data, error: null });
-			})
-			.catch((error) => {
-				if (id !== requestId.current) {
-					return;
-				}
-				setState({ phase: "error", data: null, error });
-			});
-	}, []);
+	// Loader condition covers both the first load and a 重試 after a failure:
+	// react-query keeps status 'error' (not 'pending') while re-fetching after
+	// an error, so `data === undefined && isFetching` -- rather than isPending --
+	// is what re-shows the Loader on retry, matching the old phase machine.
+	// A failed background refetch that still has prior data (data !== undefined)
+	// falls through to the buckets instead of blanking to the error Alert.
+	const loading = data === undefined && isFetching;
+	const showError = isError && data === undefined && !isFetching;
 
-	useEffect(() => {
-		load();
-	}, [load]);
-
-	const data = state.data;
-	const staleCount =
-		state.phase === "success"
-			? REVIEW_GROUPS.reduce(
-					(total, group) =>
-						total +
-						(data[group.key] ?? []).filter((item) => item.is_stale).length,
-					0,
-				)
-			: 0;
+	const staleCount = data
+		? REVIEW_GROUPS.reduce(
+				(total, group) =>
+					total +
+					(data[group.key] ?? []).filter((item) => item.is_stale).length,
+				0,
+			)
+		: 0;
 
 	return (
 		<Stack gap="lg">
@@ -265,28 +249,26 @@ export function HomePage() {
 				</Group>
 			</Group>
 
-			{state.phase === "success" ? (
-				<StaleSummary staleCount={staleCount} />
-			) : null}
+			{data ? <StaleSummary staleCount={staleCount} /> : null}
 
-			{state.phase === "loading" ? (
+			{loading ? (
 				<Center py="xl">
 					<Loader />
 				</Center>
 			) : null}
 
-			{state.phase === "error" ? (
+			{showError ? (
 				<Alert color="red" title="載入失敗">
 					<Stack gap="sm" align="flex-start">
-						<Text size="sm">{state.error?.message ?? "無法載入待辦總覽"}</Text>
-						<Button size="xs" onClick={load}>
+						<Text size="sm">{error?.message ?? "無法載入待辦總覽"}</Text>
+						<Button size="xs" onClick={() => refetch()}>
 							重試
 						</Button>
 					</Stack>
 				</Alert>
 			) : null}
 
-			{state.phase === "success" ? (
+			{data ? (
 				<Stack gap="md">
 					{REVIEW_GROUPS.map((group) => (
 						<ReviewSection
