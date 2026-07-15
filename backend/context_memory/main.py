@@ -84,8 +84,14 @@ async def _api_accept_normalization_middleware(
     404. Rewriting `Accept` leaves route matching untouched. No endpoint
     under /api content-negotiates on Accept, so the rewrite is observable
     only in the unmatched-path case this exists for.
+
+    The bare `/api` (no trailing slash) is matched explicitly: it is part
+    of the namespace but not of the `/api/` prefix, and without it a
+    `curl -f http://host/api` typo would exit 0 with the SPA shell -- the
+    exact fake-success this middleware exists to prevent.
     """
-    if request.url.path.startswith("/api/"):
+    path = request.url.path
+    if path == "/api" or path.startswith("/api/"):
         request.scope["headers"] = [
             (name, value) for name, value in request.scope["headers"] if name != b"accept"
         ] + [(b"accept", b"application/json")]

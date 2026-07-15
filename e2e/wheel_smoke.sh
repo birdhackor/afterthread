@@ -361,6 +361,15 @@ ENVEOF
     assert_str_contains "GET /api/nonexistent (bare curl) Content-Type is JSON, not the SPA shell" \
         "$nf_ct" "application/json"
 
+    # The bare namespace root itself: /api has no trailing slash, so a naive
+    # startswith("/api/") misses it -- a `curl -f $base/api` typo would then
+    # exit 0 with the SPA shell (phase-2 review round 3 finding).
+    local api_root_body="$TMPDIR_E2E/api-root.json"
+    code="$(req GET "$base/api" "$api_root_body")"
+    nf_ct="$(header_value Content-Type)"
+    assert_eq "GET /api (bare namespace root) -> 404" "$code" "404"
+    assert_str_contains "GET /api Content-Type is JSON, not the SPA shell" "$nf_ct" "application/json"
+
     # -- wrong method on a real endpoint stays a 405 ---------------------------
     # Guards the deliberate design choice in main.py: /api's unknown-path
     # handling is an Accept rewrite, NOT a catch-all route, precisely so a

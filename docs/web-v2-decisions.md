@@ -187,5 +187,7 @@
   - **F4 裸 uv build 靜默無前端**：hatch_build.py 驗證 hook（缺 static/index.html 即 fail、editable 豁免保 dev uv sync）；只驗證不建置，D02 保守立場不變。殘餘「舊 static」風險由 build-wheel.sh 的 rm+重拷保證，紀錄為已知界線。
   - **F5 data dir 權限**：僅新建時 chmod 0700；既存目錄不動使用者權限。
   - **F6 404 asset 被 immutable 快取**：`_cache_control_for` 增 status 參數，immutable 僅限 200；html no-cache 不看狀態。
-  - **F7 特殊字元路徑**：`_sqlite_url()` 用 `sqlalchemy.URL.create` 構造 + round-trip 測試。
+  - **F7 特殊字元路徑**：`_sqlite_url()` 用 `sqlalchemy.URL.create` 構造 + round-trip 測試。實作時發現裁決假設的機制對 `?` 不成立（`render_as_string` 不跳脫、`make_url` 當 query 分隔符），改為「plain 形式 round-trip 驗證，失敗 fallback 到 percent-encoded SQLite URI-filename 形式」，以 engine 層 `pragma_database_list` 實證取代字面斷言（比原裁決更強）。
   - **F8 Accept 防護 false-pass**：unit 層（vitest）釘 fetch headers；wheel_smoke 過時註解修正。
+- **第二輪追加（全修）**：HTML no-cache 判斷提到 `/assets/` immutable 之前（extensionless `/assets/missing` 的 SPA fallback 是 shell，被 immutable 會釘一年，原測試釘反了）；`/api/*` 掛 Accept 正規化 middleware（API 命名空間永不協商 HTML；不用 catch-all route——會把真端點的 405 誤變 404，wheel_smoke 同時釘住 bare-curl 404 與 DELETE 405 兩面）；backend README 移除易腐化的精確測試數。
+- **第三輪追加（修，免第四輪）**：`startswith("/api/")` 漏掉恰好 `/api`（無斜線）→ 條件補 `path == "/api"`，wheel_smoke 加 `GET /api` bare → 404 JSON 斷言（23 斷言）。單一述詞修正且由 e2e 直接驗證，裁決不再開整輪 review；期末全量 review 覆蓋。另註：第三輪 codex 於其 sandbox 無法執行需網路 socket 的 smoke（環境限制），本機 gates 結果有效。
