@@ -3,9 +3,26 @@
 //   - error normalization into a single ApiError shape {status, code,
 //     message, fieldErrors} following the shared UX rules, so callers only
 //     ever deal with one error type and already-localized (zh-TW) messages;
-//   - a query-string helper that skips empty filter values.
+//   - a query-string helper that skips empty filter values;
+//   - passive connectivity reporting: unambiguous call outcomes feed the
+//     shared backendStatusAtom (sub-5xx response = reachable, transport
+//     failure = unreachable; a 5xx reports NOTHING either way -- see the
+//     rationale inside apiFetch), so the badge tracks real traffic for free.
 // Every page/atom must go through this module rather than calling fetch
 // directly.
+
+import { getDefaultStore } from "jotai";
+import {
+	reportBackendDownAtom,
+	reportBackendUpAtom,
+} from "../atoms/connectivity.js";
+
+// The app renders without a jotai <Provider>, so components read atoms from
+// jotai's default store -- writing the connectivity reports to that same
+// store from this non-React module reaches exactly the atoms the UI renders.
+// (connectivity.js deliberately imports nothing from this module, keeping
+// the dependency edge one-way: client -> atoms, no cycle.)
+const store = getDefaultStore();
 
 // Normalized error thrown by every helper below. `status` is the HTTP status
 // (0 for a network/transport failure), `code` is the machine code from the
@@ -123,7 +140,26 @@ export async function apiFetch(path, options = {}) {
 			},
 		});
 	} catch (_cause) {
+		store.set(reportBackendDownAtom);
 		throw networkError();
+	}
+
+	// Only a sub-5xx response proves OUR application answered: 2xx/3xx/4xx
+	// bodies (including this call's own ApiError below -- a 404/422 is the
+	// backend talking) can only come from application logic. A 5xx, by
+	// contrast, may be an intermediary speaking FOR a dead upstream -- in
+	// dev, vite's /api proxy answers 500 itself when the backend is down --
+	// so on 5xx this passive layer abstains entirely: no up-report (that
+	// painted a dead dev backend green), and no down-report either, because
+	// a REAL backend also legitimately 5xxes (LLM upstream failures return
+	// 502/503) and treating those as outages would flap the badge during
+	// normal AI errors. The ambiguity is settled by the authoritative
+	// /api/health probe (api/health.js), which judges response SEMANTICS and
+	// rules in both directions; until it does, the badge simply keeps its
+	// last verdict. Reported before the 204 early-return and the body read
+	// so every qualifying settled-response path counts.
+	if (response.status < 500) {
+		store.set(reportBackendUpAtom);
 	}
 
 	if (response.status === 204) {
@@ -138,7 +174,11 @@ export async function apiFetch(path, options = {}) {
 		// but the connection dropped before the body finished streaming --
 		// still a transport failure from the caller's point of view, so it
 		// gets the same normalized shape as the fetch()-throw case above
-		// rather than surfacing a raw TypeError.
+		// rather than surfacing a raw TypeError. For a sub-5xx response the
+		// up-report above already fired for the headers; this down-report
+		// supersedes it, because a request that cannot deliver a usable
+		// response is exactly what "unreachable" means to the user.
+		store.set(reportBackendDownAtom);
 		throw networkError();
 	}
 

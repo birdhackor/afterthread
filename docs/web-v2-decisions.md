@@ -121,3 +121,13 @@
 ---
 
 （以下隨各 phase 進行追加：won't-fix 裁決、實作中的新決策）
+
+## D17（Phase 1 實作中）：被動訊號限縮為「無歧義證據」，health probe 語意判定成為雙向權威
+
+- **背景**：D07 初版規則「任何 HTTP 回應＝可達」在 dev 模式有假陽性——後端死掉時 vite proxy 自己回 500，fetch 有 resolve，badge 會誤報「連線正常」。使用者回報 bug 的場景正是 dev 模式；且「一開始就斷線」情境下新碼比舊碼（檢查 `data.status === "ok"`）更糟，屬退步，必修。
+- **選項**：
+  1. 嗅探 proxy 錯誤回應的特徵（content-type/body 文字）：脆弱，綁 vite 實作細節。
+  2. 只修 health probe、被動規則不動：真後端 LLM 502/503 與 proxy 500 在被動路徑仍不可分，錯誤分類殘留。
+  3. **被動 up 只認 status < 500（<500 證明我們的應用真的處理了請求）；5xx 不表態（可能出自替死 upstream 代答的中介層）；/api/health 由 probe 語意判定（body.status === "ok" → up，其餘一切 → down），雙向權威；probe 加 generation counter 防兩個 in-flight 亂序覆蓋**。
+- **決定**：選項 3。
+- **依據**：以「證據強度」分類訊號而非以來源特判，dev（proxy 500→down）與生產（同源、斷線是真 network error）兩種部署都正確；trivial 的 /api/health 對正常後端永遠 ok，對它的 5xx 必然代表「使用者視角的無法連線」。代價：真後端 5xx 不再被動報 up——不表態不等於報 down，poller 每 30 秒會校正，可接受。

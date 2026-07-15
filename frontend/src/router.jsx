@@ -20,6 +20,7 @@ import { useAtomValue, useSetAtom } from "jotai";
 import { useEffect, useState } from "react";
 import { llmStatusAtom, loadLlmStatusAtom } from "./atoms/llm.js";
 import { LLM_NOT_CONFIGURED_NOTICE } from "./constants/labels.js";
+import { useConnectivityMonitor } from "./hooks/useConnectivityMonitor.js";
 import { CapturePage } from "./pages/CapturePage.jsx";
 import { HomePage } from "./pages/HomePage.jsx";
 import { ItemDetailPage } from "./pages/ItemDetailPage.jsx";
@@ -84,9 +85,17 @@ function LlmBanner() {
 
 // Root layout shared by every route: Mantine AppShell with a header and a
 // navbar; page content is rendered into AppShell.Main via <Outlet />. Loads
-// the LLM status once on mount so the banner and AI buttons can react to it.
+// the LLM status once on mount so the banner and AI buttons can react to it,
+// and hosts the app-wide connectivity monitor -- RootLayout is the one
+// component that stays mounted for the whole session, so it is the only
+// place a mount-once poll/listener set belongs.
 function RootLayout() {
 	const loadLlmStatus = useSetAtom(loadLlmStatusAtom);
+
+	// 30s /api/health poll + focus/online/visibility pings feeding
+	// backendStatusAtom, plus the automatic LLM re-probe when the backend
+	// comes back up (see hooks/useConnectivityMonitor.js).
+	useConnectivityMonitor();
 
 	useEffect(() => {
 		loadLlmStatus();

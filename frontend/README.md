@@ -25,6 +25,7 @@ pnpm build         # production build 到 dist/
 pnpm preview       # 本機預覽 production build（見下方「已知限制」）
 pnpm lint          # biome check .
 pnpm format        # biome check --write .（自動修正）
+pnpm test          # vitest run（單元測試，node 環境、無 jsdom）
 ```
 
 以上指令皆已在本機實際執行過並確認通過：`pnpm install`、`pnpm lint`（30 個檔案，
