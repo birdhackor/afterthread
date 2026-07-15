@@ -1,18 +1,18 @@
 import { getDefaultStore } from "jotai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { backendStatusAtom } from "../atoms/connectivity.js";
-import { ApiError, apiGet } from "./client.js";
+import { ApiError, apiFetch } from "./client.js";
 import { probeBackendHealth } from "./health.js";
 
-// probeBackendHealth's contract is "interpret whatever apiGet settles
-// with", so apiGet is stubbed with test-controlled promises and the real
-// apiFetch -- with its own passive reporting, which would double-report
-// into the same atom mid-test -- stays out of the picture; client.test.js
-// covers that layer separately. Everything else from client.js (ApiError)
-// stays real.
+// probeBackendHealth's contract is "interpret whatever apiFetch settles
+// with", so apiFetch is stubbed with test-controlled promises -- the tests
+// dictate settle order directly and no real fetch machinery runs (probe
+// traffic opts out of passive reporting anyway via reportConnectivity:
+// false, which is asserted below). Everything else from client.js
+// (ApiError) stays real.
 vi.mock("./client.js", async (importOriginal) => {
 	const actual = await importOriginal();
-	return { ...actual, apiGet: vi.fn() };
+	return { ...actual, apiFetch: vi.fn() };
 });
 
 // health.js writes through jotai's default store (the app has no
@@ -41,15 +41,27 @@ beforeEach(() => {
 	// Reset the shared default-store state and the mock's queued results so
 	// no test depends on a predecessor's.
 	store.set(backendStatusAtom, { reachable: null });
-	apiGet.mockReset();
+	apiFetch.mockReset();
 });
 
 describe("probeBackendHealth", () => {
 	it("reports up when the health body says ok", async () => {
-		apiGet.mockResolvedValueOnce({ status: "ok" });
+		apiFetch.mockResolvedValueOnce({ status: "ok" });
 		probeBackendHealth();
 		await flush();
-		expect(apiGet).toHaveBeenCalledWith("/api/health");
+		// The probe must exempt itself from the passive layer (so its
+		// generation-guarded verdict is the only connectivity writer for
+		// probe traffic) and carry its own timeout signal (so a hung server
+		// cannot stack pending probes forever). The timeout VALUE is a
+		// tuning knob, not part of the contract.
+		expect(apiFetch).toHaveBeenCalledWith(
+			"/api/health",
+			expect.objectContaining({
+				method: "GET",
+				reportConnectivity: false,
+				signal: expect.any(AbortSignal),
+			}),
+		);
 		expect(store.get(backendStatusAtom)).toEqual({ reachable: true });
 	});
 
@@ -58,7 +70,7 @@ describe("probeBackendHealth", () => {
 		// trivial /api/health endpoint a 5xx is never a legitimate answer,
 		// only a middleman covering for a dead upstream, so the probe must
 		// rule it down.
-		apiGet.mockRejectedValueOnce(
+		apiFetch.mockRejectedValueOnce(
 			new ApiError({ status: 500, message: "proxy error" }),
 		);
 		store.set(backendStatusAtom, { reachable: true });
@@ -68,7 +80,9 @@ describe("probeBackendHealth", () => {
 	});
 
 	it("reports down on a transport failure (status 0 network_error)", async () => {
-		apiGet.mockRejectedValueOnce(
+		// Fetch rejections AND the probe's own AbortSignal timeout both land
+		// here: apiFetch's catch normalizes either into this ApiError shape.
+		apiFetch.mockRejectedValueOnce(
 			new ApiError({
 				status: 0,
 				code: "network_error",
@@ -84,7 +98,7 @@ describe("probeBackendHealth", () => {
 	it("reports down when the body resolves with the wrong shape", async () => {
 		// A 2xx whose body is not the health payload is not our backend
 		// talking (captive portal, misrouted proxy) -- it must read as down.
-		apiGet.mockResolvedValueOnce({ status: "weird" });
+		apiFetch.mockResolvedValueOnce({ status: "weird" });
 		store.set(backendStatusAtom, { reachable: true });
 		probeBackendHealth();
 		await flush();
@@ -98,8 +112,8 @@ describe("probeBackendHealth", () => {
 		// otherwise a pre-outage "ok" landing late would repaint a freshly
 		// confirmed-dead backend green until the next poll tick.
 		const slow = deferred();
-		apiGet.mockReturnValueOnce(slow.promise); // probe A
-		apiGet.mockRejectedValueOnce(
+		apiFetch.mockReturnValueOnce(slow.promise); // probe A
+		apiFetch.mockRejectedValueOnce(
 			new ApiError({ status: 500, message: "proxy error" }),
 		); // probe B
 		probeBackendHealth(); // A claims the older generation

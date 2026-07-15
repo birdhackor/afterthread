@@ -33,9 +33,13 @@ export const llmStatusAtom = atom({
 // `configured` back to the optimistic true, re-enabling doomed AI buttons.
 let generation = 0;
 
-// Write-only action: load /api/llm/status into llmStatusAtom. Idempotent -- it
-// no-ops while a request is in flight and after the first successful load,
-// unless called with { force: true } to refresh. On failure, a prior
+// Write-only action: load /api/llm/status into llmStatusAtom. Non-forced
+// calls are idempotent -- they no-op while a request is in flight and after
+// the first successful load. A `{ force: true }` call always starts a fresh
+// probe, INCLUDING while an older request is still in flight -- it claims a
+// newer generation, so the older in-flight response is discarded when it
+// settles (see the guard inside for why silently dropping a force instead
+// would strand the AI badge). On failure, a prior
 // successful load's `configured`/`model` are preserved (a transport blip
 // during a recheck must not silently overwrite an already-KNOWN status --
 // e.g. flipping a known "not configured" back to the optimistic true would
@@ -45,10 +49,18 @@ let generation = 0;
 // flashes before the first response resolves.
 export const loadLlmStatusAtom = atom(null, async (get, set, options = {}) => {
 	const current = get(llmStatusAtom);
-	if (current.loading) {
-		return;
-	}
-	if (current.loaded && !options.force) {
+	// Non-forced dedupe only: "already loading" and "already loaded" both
+	// yield to a force. A forced call must be able to supersede an IN-FLIGHT
+	// request too, not just a settled one: the connectivity monitor fires
+	// exactly one forced reload on the backend's false -> true recovery
+	// transition, and that moment can easily find a doomed pre-outage status
+	// request still pending -- dropping the force there would leave the AI
+	// badge stale until a manual retry, because the recovery transition does
+	// not come again. Letting it through is safe: the `++generation` below
+	// happens before the older call's response settles, so that response
+	// (success or failure) is discarded as stale and ownership of the atom
+	// transfers to this newest call.
+	if (!options.force && (current.loading || current.loaded)) {
 		return;
 	}
 

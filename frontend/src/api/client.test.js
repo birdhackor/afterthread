@@ -1,7 +1,7 @@
 import { getDefaultStore } from "jotai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { backendStatusAtom } from "../atoms/connectivity.js";
-import { ApiError, apiGet } from "./client.js";
+import { ApiError, apiDelete, apiFetch, apiGet } from "./client.js";
 
 // client.js reports connectivity through jotai's default store (the app has
 // no <Provider>), so assertions must read backendStatusAtom from that same
@@ -98,7 +98,7 @@ describe("apiFetch passive connectivity reporting", () => {
 		expect(store.get(backendStatusAtom)).toEqual({ reachable: false });
 	});
 
-	it("reports down when the connection drops mid-body (response.text() rejects)", async () => {
+	it("emits ONLY a down signal when the connection drops mid-body (no transient up)", async () => {
 		globalThis.fetch = async () => ({
 			ok: true,
 			status: 200,
@@ -106,14 +106,64 @@ describe("apiFetch passive connectivity reporting", () => {
 				throw new TypeError("body stream aborted");
 			},
 		});
-		store.set(backendStatusAtom, { reachable: true });
+		// Start from known-down and record every state transition: up-evidence
+		// requires the FULL body, so the 200 headers alone must never flash
+		// `true` -- while reachable is false, such a flash would spuriously
+		// trigger the monitor's false -> true LLM recovery reload and emit a
+		// contradictory up-then-down pair for one dead request.
+		store.set(backendStatusAtom, { reachable: false });
+		const seen = [];
+		const unsubscribe = store.sub(backendStatusAtom, () => {
+			seen.push(store.get(backendStatusAtom).reachable);
+		});
 		const error = await rejectionOf(apiGet("/api/health"));
+		unsubscribe();
 		expect(error).toBeInstanceOf(ApiError);
 		expect(error.status).toBe(0);
 		expect(error.code).toBe("network_error");
-		// The 200 headers arriving fired a transient (sub-5xx) up-report, but
-		// the settled state must be down: the request never delivered a
-		// usable response.
+		expect(seen).not.toContain(true);
 		expect(store.get(backendStatusAtom)).toEqual({ reachable: false });
+	});
+
+	it("returns null and reports up on a 204 -- a bodiless response is already fully delivered", async () => {
+		globalThis.fetch = async () => ({
+			ok: true,
+			status: 204,
+			text: async () => "",
+		});
+		// Start from known-down to prove the 204 itself flips the state up
+		// even though the body-read path (where the usual up-report lives) is
+		// skipped entirely.
+		store.set(backendStatusAtom, { reachable: false });
+		await expect(apiDelete("/api/items/1")).resolves.toBeNull();
+		expect(store.get(backendStatusAtom)).toEqual({ reachable: true });
+	});
+
+	it("skips every passive report when reportConnectivity is false", async () => {
+		// Success path: a fully delivered ok response must NOT report up --
+		// probe traffic (api/health.js) opts out so its generation-guarded
+		// semantic verdict stays the only connectivity writer for probes.
+		globalThis.fetch = async () => ({
+			ok: true,
+			status: 200,
+			text: async () => JSON.stringify({ status: "ok" }),
+		});
+		await expect(
+			apiFetch("/api/health", { method: "GET", reportConnectivity: false }),
+		).resolves.toEqual({ status: "ok" });
+		expect(store.get(backendStatusAtom)).toEqual({ reachable: null });
+
+		// Failure path: a transport failure must not report down either --
+		// opting out silences BOTH directions, not just the up-report.
+		globalThis.fetch = async () => {
+			throw new TypeError("Failed to fetch");
+		};
+		store.set(backendStatusAtom, { reachable: true });
+		const error = await rejectionOf(
+			apiFetch("/api/health", { method: "GET", reportConnectivity: false }),
+		);
+		expect(error).toBeInstanceOf(ApiError);
+		expect(error.status).toBe(0);
+		expect(store.get(backendStatusAtom)).toEqual({ reachable: true });
 	});
 });

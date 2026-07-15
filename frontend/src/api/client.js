@@ -5,9 +5,11 @@
 //     ever deal with one error type and already-localized (zh-TW) messages;
 //   - a query-string helper that skips empty filter values;
 //   - passive connectivity reporting: unambiguous call outcomes feed the
-//     shared backendStatusAtom (sub-5xx response = reachable, transport
-//     failure = unreachable; a 5xx reports NOTHING either way -- see the
-//     rationale inside apiFetch), so the badge tracks real traffic for free.
+//     shared backendStatusAtom (fully delivered sub-5xx response =
+//     reachable, transport failure = unreachable; a 5xx reports NOTHING
+//     either way -- see the rationale inside apiFetch; opt a call out
+//     entirely with `reportConnectivity: false`), so the badge tracks real
+//     traffic for free.
 // Every page/atom must go through this module rather than calling fetch
 // directly.
 
@@ -129,40 +131,36 @@ function normalizeError(status, body) {
 
 // Core request helper. Resolves to the parsed JSON body (or null for 204),
 // and throws an ApiError for transport failures and non-OK responses.
+// Options pass through to fetch(), except `reportConnectivity` (default
+// true): false keeps this call's outcome out of the passive connectivity
+// reports entirely, in both directions -- api/health.js sets it for probe
+// traffic so its generation-guarded semantic verdict is structurally the
+// only connectivity writer for probes.
 export async function apiFetch(path, options = {}) {
+	const { reportConnectivity = true, ...fetchOptions } = options;
 	let response;
 	try {
 		response = await fetch(path, {
-			...options,
+			...fetchOptions,
 			headers: {
 				"Content-Type": "application/json",
-				...(options.headers ?? {}),
+				...(fetchOptions.headers ?? {}),
 			},
 		});
 	} catch (_cause) {
-		store.set(reportBackendDownAtom);
+		if (reportConnectivity) {
+			store.set(reportBackendDownAtom);
+		}
 		throw networkError();
 	}
 
-	// Only a sub-5xx response proves OUR application answered: 2xx/3xx/4xx
-	// bodies (including this call's own ApiError below -- a 404/422 is the
-	// backend talking) can only come from application logic. A 5xx, by
-	// contrast, may be an intermediary speaking FOR a dead upstream -- in
-	// dev, vite's /api proxy answers 500 itself when the backend is down --
-	// so on 5xx this passive layer abstains entirely: no up-report (that
-	// painted a dead dev backend green), and no down-report either, because
-	// a REAL backend also legitimately 5xxes (LLM upstream failures return
-	// 502/503) and treating those as outages would flap the badge during
-	// normal AI errors. The ambiguity is settled by the authoritative
-	// /api/health probe (api/health.js), which judges response SEMANTICS and
-	// rules in both directions; until it does, the badge simply keeps its
-	// last verdict. Reported before the 204 early-return and the body read
-	// so every qualifying settled-response path counts.
-	if (response.status < 500) {
-		store.set(reportBackendUpAtom);
-	}
-
 	if (response.status === 204) {
+		// A 204 has no body to read: the response is already fully delivered,
+		// so it counts as complete up-evidence on its own (and a 204 is
+		// sub-5xx by definition -- see the rationale below the body read).
+		if (reportConnectivity) {
+			store.set(reportBackendUpAtom);
+		}
 		return null;
 	}
 
@@ -174,12 +172,36 @@ export async function apiFetch(path, options = {}) {
 		// but the connection dropped before the body finished streaming --
 		// still a transport failure from the caller's point of view, so it
 		// gets the same normalized shape as the fetch()-throw case above
-		// rather than surfacing a raw TypeError. For a sub-5xx response the
-		// up-report above already fired for the headers; this down-report
-		// supersedes it, because a request that cannot deliver a usable
-		// response is exactly what "unreachable" means to the user.
-		store.set(reportBackendDownAtom);
+		// rather than surfacing a raw TypeError. No up-report has fired for
+		// this request (up-evidence requires the FULL body, see below), so a
+		// request that dies mid-body emits a single, unambiguous down signal.
+		if (reportConnectivity) {
+			store.set(reportBackendDownAtom);
+		}
 		throw networkError();
+	}
+
+	// Passive up-evidence = a COMPLETELY delivered sub-5xx response, judged
+	// only now that the body has arrived:
+	//   - sub-5xx, because 2xx/3xx/4xx bodies (including this call's own
+	//     ApiError below -- a 404/422 is the backend talking) can only come
+	//     from application logic, while a 5xx may be an intermediary
+	//     speaking FOR a dead upstream (dev's vite proxy answers 500 itself
+	//     when the backend is down). On 5xx this layer abstains entirely: no
+	//     up-report (that painted a dead dev backend green), and no
+	//     down-report either, because a real backend also legitimately 5xxes
+	//     (LLM upstream failures return 502/503) and treating those as
+	//     outages would flap the badge during normal AI errors -- the
+	//     authoritative /api/health probe (api/health.js) settles what a 5xx
+	//     means, and until it rules the badge keeps its last verdict;
+	//   - only after the body, because reporting on headers alone let a
+	//     request that died mid-body emit a contradictory up-then-down pair,
+	//     and while `reachable` was false that transient up could spuriously
+	//     trigger the monitor's false -> true LLM recovery reload. A body
+	//     that fails JSON.parse below still counts as delivered: non-JSON
+	//     content is an application-shape problem, not a connectivity one.
+	if (reportConnectivity && response.status < 500) {
+		store.set(reportBackendUpAtom);
 	}
 
 	let body = null;

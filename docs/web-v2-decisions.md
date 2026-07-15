@@ -131,3 +131,14 @@
   3. **被動 up 只認 status < 500（<500 證明我們的應用真的處理了請求）；5xx 不表態（可能出自替死 upstream 代答的中介層）；/api/health 由 probe 語意判定（body.status === "ok" → up，其餘一切 → down），雙向權威；probe 加 generation counter 防兩個 in-flight 亂序覆蓋**。
 - **決定**：選項 3。
 - **依據**：以「證據強度」分類訊號而非以來源特判，dev（proxy 500→down）與生產（同源、斷線是真 network error）兩種部署都正確；trivial 的 /api/health 對正常後端永遠 ok，對它的 5xx 必然代表「使用者視角的無法連線」。代價：真後端 5xx 不再被動報 up——不表態不等於報 down，poller 每 30 秒會校正，可接受。
+
+## D18（Phase 1 codex review 裁決）：三項發現全修 + 兩項 won't-fix
+
+- **背景**：第一輪 codex review 判定 Safe with caveats：Medium ×2、Low ×1、測試盲點若干。
+- **裁決（修）**：
+  1. **force 穿透 in-flight**（Medium）：`loadLlmStatusAtom` 原本 `loading` 中丟棄一切呼叫，恢復觸發的 force 會啞火且再無 false→true 轉換可補救——自動恢復承諾破功，必修。修法用既有 generation 機制轉移所有權，不新增狀態。
+  2. **被動 up 證據升級 + probe 繞過被動層**（Medium）：headers 先到、body 才失敗（或語意不符）的單一請求會發出 up→down 矛盾判定，reachable=false 時 up flash 會誤觸 LLM 恢復重載。修法：up 改為「body 成功交付」才算證據；probe 流量 `reportConnectivity:false` 完全繞過被動層，「語意判定唯一權威」從結構上成立（消滅類，非縮小例）。
+  3. **probe timeout**（Low）：`AbortSignal.timeout(10s)`——掛死 server 下 pending probe 以每 30 秒一個累積，會吃滿瀏覽器同源連線上限，屬無上界資源累積類，值得 10 行修掉。
+- **裁決（won't-fix）**：
+  - hook 生命週期單元測試：需引入 jsdom/React 測試環境，D07 已刻意界定 vitest 只測純邏輯；hook 行為由 code review + StrictMode 手動追蹤覆蓋。
+  - 主動/被動整合競態測試：probe 繞過被動層後，兩層再無交互寫入，單元層分別覆蓋已足。
