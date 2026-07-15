@@ -1,16 +1,17 @@
 import { getDefaultStore } from "jotai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { ApiError, apiGet } from "../api/client.js";
+import { ApiError, apiFetch } from "../api/client.js";
 import { llmStatusAtom, loadLlmStatusAtom } from "./llm.js";
 
 // These tests need full control over settle ORDER (an old in-flight status
-// response landing after a forced retry already resolved), so apiGet is
-// stubbed with test-controlled promises; the real apiFetch (and its passive
-// connectivity reporting) stays out of the picture. Everything else from
-// client.js (ApiError) stays real.
+// response landing after a forced retry already resolved), so apiFetch is
+// stubbed with test-controlled promises (llm.js calls it directly to attach
+// its probe-timeout signal); the passive connectivity reporting inside the
+// real apiFetch stays out of the picture. Everything else from client.js
+// (ApiError) stays real.
 vi.mock("../api/client.js", async (importOriginal) => {
 	const actual = await importOriginal();
-	return { ...actual, apiGet: vi.fn() };
+	return { ...actual, apiFetch: vi.fn() };
 });
 
 // llm.js's action atoms run in whatever store invokes them; like the app
@@ -51,15 +52,15 @@ function deferred() {
 
 beforeEach(() => {
 	store.set(llmStatusAtom, { ...INITIAL_LLM_STATUS });
-	apiGet.mockReset();
+	apiFetch.mockReset();
 });
 
 describe("loadLlmStatusAtom", () => {
 	it("force during an in-flight load starts a second request and the stale response is discarded", async () => {
 		const oldProbe = deferred();
 		const forced = deferred();
-		apiGet.mockReturnValueOnce(oldProbe.promise);
-		apiGet.mockReturnValueOnce(forced.promise);
+		apiFetch.mockReturnValueOnce(oldProbe.promise);
+		apiFetch.mockReturnValueOnce(forced.promise);
 
 		// The app-start (non-forced) load fires into a dying backend and
 		// hangs.
@@ -72,7 +73,7 @@ describe("loadLlmStatusAtom", () => {
 		// comes again, so a dropped force would strand the AI badge on
 		// pre-outage data until a manual retry.
 		store.set(loadLlmStatusAtom, { force: true });
-		expect(apiGet).toHaveBeenCalledTimes(2);
+		expect(apiFetch).toHaveBeenCalledTimes(2);
 
 		// The forced (newer) request settles first and owns the atom.
 		forced.resolve({ configured: true, model: "glm-5.2" });
@@ -108,12 +109,22 @@ describe("loadLlmStatusAtom", () => {
 
 	it("a non-forced call during an in-flight load still no-ops", async () => {
 		const probe = deferred();
-		apiGet.mockReturnValueOnce(probe.promise);
+		apiFetch.mockReturnValueOnce(probe.promise);
 		store.set(loadLlmStatusAtom);
 		// Duplicate non-forced trigger (e.g. StrictMode's doubled mount
 		// effect) must coalesce into the one in-flight request.
 		store.set(loadLlmStatusAtom);
-		expect(apiGet).toHaveBeenCalledTimes(1);
+		expect(apiFetch).toHaveBeenCalledTimes(1);
+		// The status probe must carry its deadline (see PROBE_TIMEOUT_MS in
+		// client.js): superseded requests are dropped but never cancelled, so
+		// the signal is what bounds how long a hung one can hold a connection.
+		expect(apiFetch).toHaveBeenCalledWith(
+			"/api/llm/status",
+			expect.objectContaining({
+				method: "GET",
+				signal: expect.any(AbortSignal),
+			}),
+		);
 		probe.resolve({ configured: true, model: "glm-5.2" });
 		await flush();
 		expect(store.get(llmStatusAtom)).toEqual({

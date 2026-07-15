@@ -52,6 +52,19 @@ function networkError() {
 	});
 }
 
+// Shared deadline for the two lightweight status probes (the /api/health
+// connectivity probe in api/health.js and the /api/llm/status load in
+// atoms/llm.js). Both endpoints are trivial -- no DB, no LLM call -- so a
+// working backend answers them near-instantly and anything slower than this
+// generous bound is not usable. Bounding them matters beyond UX: probe-shaped
+// requests are re-fired by monitors/recovery transitions, so without a
+// deadline a server that accepts connections but never responds would let
+// pending requests accumulate without limit (superseded requests are dropped
+// via generation counters but never cancelled; the timeout is what puts a
+// hard ceiling on how long any of them can hold a connection). The abort
+// surfaces as a fetch rejection -> the ordinary networkError path.
+export const PROBE_TIMEOUT_MS = 10000;
+
 // Build a `?a=1&b=2` query string from a plain object. null / undefined /
 // empty-string values are dropped so a page can hand over its whole filter
 // state without pruning cleared fields first. Returns "" when nothing is set.

@@ -27,14 +27,15 @@
 - 後端 badge：`HomePage.jsx` `StatusFooter` 只在 mount 時打一次 `/api/health`（空依賴 `useEffect`），此後永不更新，也沒有重試按鈕 → 雙向凍結。
 - AI badge：`llmStatusAtom` 只在 RootLayout mount 載一次，`loaded` 後除 `force` 外一律 no-op；斷線時 transport error 刻意保留舊 `configured`，只設 `error`。
 
-**設計**：
+**設計**（初版；實作中經 D17/D18 修訂，以下為最終版）：
 
 - 新增 `atoms/connectivity.js`：`backendStatusAtom`（`reachable: null|bool`）+ 回報用 write atoms。此模組不 import client（避免循環依賴）。
-- `api/client.js`：每次 fetch 有拿到 HTTP 回應（不論狀態碼）→ 回報 up；丟 `networkError` → 回報 down。透過 jotai `getDefaultStore()` 寫入（app 未用 Provider，元件讀的就是 default store）。
-- 新 hook（掛在 RootLayout）：每 30 秒 ping `/api/health` 一次 + `visibilitychange`/`focus`/`online` 事件立即 ping；ping 本身不處理結果——被動回報機制會更新 atom。StrictMode 雙 mount 安全（cleanup 清 interval/listener）。
-- reachable 從 false→true 的轉換：自動 `loadLlmStatus({ force: true })`，讓 AI badge 一併恢復；不繞過 generation counter。
+- `api/client.js` 被動層——只回報**無歧義證據**：完整交付 body 的 <500 回應（含 204）→ up；transport 失敗 → down；**5xx 不表態**（dev 的 vite proxy 會替死掉的後端回 500，真後端也會為 LLM 錯誤回 502/503）。新增 `reportConnectivity` 選項供 probe 流量退出被動層。透過 jotai `getDefaultStore()` 寫入（app 未用 Provider）。
+- `api/health.js` 主動層——`probeBackendHealth()` 是**雙向權威**：`body.status === "ok"` → up，其餘一切（任何 ApiError、形狀不對的 body）→ down；generation counter 防亂序；`reportConnectivity:false` + `AbortSignal.timeout(10s)`（掛死的 server 不得累積 pending probe）。
+- 新 hook（掛在 RootLayout）：每 30 秒 probe 一次 + `visibilitychange`/`focus`/`online` 事件立即 probe。StrictMode 雙 mount 安全。
+- reachable 從 false→true 的轉換：自動 `loadLlmStatus({ force: true })`，讓 AI badge 一併恢復；force 可 supersede in-flight 請求（generation 轉移所有權），status 請求同樣帶 10s timeout 讓被 supersede 的請求有生命上界。
 - `StatusFooter`：後端 badge 改讀共用 atom；BE 不可達時 AI badge 顯示灰色「無法確認」（不動 `configured`）。
-- 引入 vitest（devDep）：測 connectivity atom 轉換與 client.js 被動回報（不含 jsdom/hook 測試）。建立 FE 單元測試地基供後續 phase 使用。
+- 引入 vitest（devDep）：測 connectivity atom 轉換、client.js 被動規則、probe 語意判定、llm atom 的 force 穿透（不含 jsdom/hook 測試）。建立 FE 單元測試地基供後續 phase 使用。
 
 **驗收**：模擬 BE 起停（e2e 手動或 smoke 內驗證 `/api/health` 行為不變）、vitest 綠、全 gates 綠。
 

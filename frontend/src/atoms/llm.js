@@ -4,7 +4,7 @@
 // AI buttons are disabled with an explanatory tooltip.
 
 import { atom } from "jotai";
-import { apiGet } from "../api/client.js";
+import { apiFetch, PROBE_TIMEOUT_MS } from "../api/client.js";
 
 // Shape: { loaded, loading, configured, model, error }.
 // `configured` starts true so the "not configured" banner never flashes before
@@ -70,7 +70,20 @@ export const loadLlmStatusAtom = atom(null, async (get, set, options = {}) => {
 	const myGeneration = ++generation;
 	set(llmStatusAtom, { ...current, loading: true, error: null });
 	try {
-		const data = await apiGet("/api/llm/status");
+		// Same PROBE_TIMEOUT_MS deadline as the health probe (see client.js):
+		// force-piercing means a superseded status request is DROPPED (via the
+		// generation check below) but never cancelled, so without a deadline a
+		// status endpoint that accepts the connection and then hangs would leak
+		// one pending request per recovery transition, without bound. The
+		// timeout caps every request's lifetime at one bound, turning that
+		// accumulation into a small, self-draining overlap. A timeout rejects
+		// through the ordinary network-error path below -- for a trivial
+		// no-DB/no-LLM endpoint, "can't answer within the bound" honestly reads
+		// as a failed check.
+		const data = await apiFetch("/api/llm/status", {
+			method: "GET",
+			signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+		});
 		if (myGeneration !== generation) {
 			// A newer load or markLlmUnconfiguredAtom's downgrade already claimed
 			// a later generation while this request was in flight -- that write

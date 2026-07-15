@@ -142,3 +142,10 @@
 - **裁決（won't-fix）**：
   - hook 生命週期單元測試：需引入 jsdom/React 測試環境，D07 已刻意界定 vitest 只測純邏輯；hook 行為由 code review + StrictMode 手動追蹤覆蓋。
   - 主動/被動整合競態測試：probe 繞過被動層後，兩層再無交互寫入，單元層分別覆蓋已足。
+
+## D19（Phase 1 codex review 第二輪裁決）：status 請求加 timeout；主動取消不採用
+
+- **背景**：第二輪 review 確認三項修正無誤，新增 Low ×2：(1) force 穿透後被 supersede 的 `/api/llm/status` 請求無 timeout、不取消，極端 flapping + 掛死 endpoint 下 pending 無上界累積（與剛修的 probe 同類）；(2) plan 文件仍描述被 D17/D18 推翻的初版設計。
+- **選項（針對 1）**：AbortController 主動取消被 supersede 的請求（取消會走 network-error 路徑，需防被動層把「刻意取消」誤報成 backend down，複雜）；**只加 timeout（與 health probe 共用 `PROBE_TIMEOUT_MS = 10s`，常數移到 client.js 共享）**——不取消但每個請求生命有上界，累積自然排空。
+- **決定**：timeout 方案；status 請求維持被動回報（它是真實證據；timeout 造成的 down 會被 30 秒內的權威 probe 校正）。plan 文件 Phase 1 節改寫為最終設計並標注 D17/D18 修訂。
+- **依據**：一致性（probe 同款 deadline）、簡潔（無取消協調）、無誤報疑慮。trivial endpoint 十秒答不出來，讀作 down 在語意上誠實。

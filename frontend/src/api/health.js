@@ -19,23 +19,22 @@ import {
 	reportBackendDownAtom,
 	reportBackendUpAtom,
 } from "../atoms/connectivity.js";
-import { apiFetch } from "./client.js";
+import { apiFetch, PROBE_TIMEOUT_MS } from "./client.js";
 
 // Same default-store rationale as client.js: the app renders without a
 // jotai <Provider>, so writes from this non-React module land in the exact
 // store the components read.
 const store = getDefaultStore();
 
-// Probes carry their own deadline: a hung server (accepts the TCP
-// connection but never sends headers, or stalls mid-body) would otherwise
-// leave every probe pending forever -- stacking one unresolved request per
-// poll tick while never reporting anything. The abort surfaces as a fetch
-// rejection, which apiFetch's existing catch normalizes into the
-// networkError ApiError (no dedicated branch needed), so a timed-out probe
-// lands in the rejection handler below and honestly reads as down: a
-// backend that cannot answer its trivial health endpoint within this
-// budget is not usable.
-const PROBE_TIMEOUT_MS = 10000;
+// Probes carry their own deadline (PROBE_TIMEOUT_MS, shared with the LLM
+// status probe -- see client.js): a hung server (accepts the TCP connection
+// but never sends headers, or stalls mid-body) would otherwise leave every
+// probe pending forever -- stacking one unresolved request per poll tick
+// while never reporting anything. The abort surfaces as a fetch rejection,
+// which apiFetch's existing catch normalizes into the networkError ApiError
+// (no dedicated branch needed), so a timed-out probe lands in the rejection
+// handler below and honestly reads as down: a backend that cannot answer
+// its trivial health endpoint within this budget is not usable.
 
 // Module-level generation counter, same pattern as atoms/llm.js: the
 // monitor's interval tick and its focus/online/visibility pings can put two
