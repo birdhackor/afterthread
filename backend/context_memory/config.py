@@ -1,18 +1,31 @@
-"""Application settings, loaded from backend/.env."""
+"""Application settings, loaded from a CWD-relative `.env`.
+
+Dev runs from `backend/`, so that `.env` is `backend/.env`. Packaged mode
+(see `context_memory/cli.py`) loads `<data-dir>/.env` into the process
+environment before this module is ever imported, so the CWD-relative lookup
+below simply finds nothing there and every setting falls back to its
+already-loaded env var / field default -- see D06 in docs/web-v2-decisions.md.
+"""
 
 from functools import lru_cache
-from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 
 class Settings(BaseSettings):
     """Runtime configuration for the Context Memory backend."""
 
-    model_config = SettingsConfigDict(env_file=_ENV_FILE, extra="ignore")
+    # CWD-relative, not `Path(__file__)`-relative: running dev from `backend/`
+    # (this repo's documented workflow) is byte-identical to the old
+    # behavior, since `backend/` is already the CWD. The old __file__-relative
+    # path broke once this package could be installed as a wheel: it resolved
+    # into site-packages, where a user's `.env` never lives, so a packaged
+    # install could never see it no matter what the user set. Packaged-mode
+    # config loading is `cli.py`'s job instead -- it loads `<data-dir>/.env`
+    # into the process environment (without overriding real env vars) before
+    # this class is ever instantiated; see D06 in docs/web-v2-decisions.md.
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # OpenAI-compatible endpoint. Intentionally left empty here; the user
     # will fill in the real URL later via backend/.env. Never invent one.

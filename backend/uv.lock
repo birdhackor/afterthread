@@ -63,14 +63,15 @@ wheels = [
 ]
 
 [[package]]
-name = "context-memory-backend"
+name = "context-memory"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "fastapi", extra = ["standard"] },
     { name = "openai" },
     { name = "pydantic-settings" },
     { name = "sqlmodel" },
+    { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
@@ -83,10 +84,11 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "fastapi", extras = ["standard"] },
+    { name = "fastapi", extras = ["standard"], specifier = ">=0.138" },
     { name = "openai" },
     { name = "pydantic-settings" },
     { name = "sqlmodel" },
+    { name = "uvicorn" },
 ]
 
 [package.metadata.requires-dev]

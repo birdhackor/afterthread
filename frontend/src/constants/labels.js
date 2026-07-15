@@ -39,6 +39,9 @@ export const STAGE_OPTIONS = Object.entries(STAGE_META).map(
 // drifts between call sites. Names BOTH env vars llm_configured() actually
 // requires (context_memory/services/llm.py) -- a base URL alone is a half-configured
 // endpoint the backend still reports as unconfigured, so the notice must not
-// imply setting only OPENAI_BASE_URL is enough.
+// imply setting only OPENAI_BASE_URL is enough. Deliberately deployment-agnostic
+// ("後端" / "見 README") rather than naming backend/.env specifically: which
+// file that is depends on dev vs packaged mode (see README) -- a packaged
+// install's settings live in `<data-dir>/.env`, not backend/.env.
 export const LLM_NOT_CONFIGURED_NOTICE =
-	"AI 功能尚未設定：請在 backend/.env 填入 OPENAI_BASE_URL 與 OPENAI_MODEL 後重啟";
+	"AI 功能尚未設定：請在後端設定 OPENAI_BASE_URL 與 OPENAI_MODEL 後重啟服務（設定位置見 README）";

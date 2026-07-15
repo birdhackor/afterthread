@@ -21,9 +21,12 @@ client）呼叫。與 repo 根目錄既有的 file-based MVP（`.opencode/`、`m
 全部從 `backend/` 目錄執行：
 
 ```bash
-uv sync                                        # 安裝依賴（含 dev group）
+uv sync                                        # 安裝依賴（含 dev group）；本專案自身也會被裝成
+                                                # editable（見 pyproject.toml，已移除 [tool.uv] package = false）
 uv run uvicorn context_memory.main:app --port 8000        # 啟動 API（DB 不存在會自動建立）
 uv run uvicorn context_memory.main:app --port 8000 --reload   # 開發時加 --reload 自動重載
+uv run context-memory --port 8000              # 打包模式的 console script；資料目錄/`.env`
+                                                # 邏輯見 context_memory/cli.py（`--help` 看完整選項）
 
 uv run ruff format .                           # 格式化
 uv run ruff format --check .                   # 只檢查格式（CI / gate 用）
@@ -31,6 +34,9 @@ uv run ruff check .                            # lint
 uv run ty check                                # 型別檢查
 uv run pytest                                  # 386+ 個測試（目前 386 passed）
 ```
+
+打包成內嵌前端 build 的可攜 wheel：見根目錄 `scripts/build-wheel.sh`；對應的
+packaged-mode e2e 驗證見 `e2e/wheel_smoke.sh`。
 
 以上指令皆已在本機實際執行過並確認通過（`uv sync` / format --check / check /
 ty check / pytest 386 passed；`uvicorn` 啟動後 `GET /api/health` 回

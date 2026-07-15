@@ -22,5 +22,12 @@ __pycache__/
 node_modules/
 dist/
 
+# Backend packaging output (scripts/build-wheel.sh: bundled frontend build +
+# uv build artifacts). backend/dist/ is already covered by the generic
+# dist/ rule above; listed explicitly anyway so intent is clear at the
+# source of the packaging step, not just inferred from a top-level rule.
+backend/context_memory/static/
+backend/dist/
+
 # OS
 .DS_Store

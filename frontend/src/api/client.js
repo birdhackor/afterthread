@@ -156,6 +156,15 @@ export async function apiFetch(path, options = {}) {
 		response = await fetch(path, {
 			...fetchOptions,
 			headers: {
+				// Accept matters beyond content negotiation here: in packaged
+				// mode the backend's SPA fallback (app.frontend) treats fetch's
+				// own default `Accept: */*` as a browser navigation, so a call
+				// to a route the backend doesn't serve would come back as
+				// 200 text/html (index.html) instead of a 404 -- and the HTML
+				// string would sail through as a "successful" body. Declaring
+				// JSON keeps unknown API routes answering 404 JSON, which
+				// normalizeError turns into a clean ApiError.
+				Accept: "application/json",
 				"Content-Type": "application/json",
 				...(fetchOptions.headers ?? {}),
 			},
