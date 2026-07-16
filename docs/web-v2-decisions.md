@@ -256,3 +256,15 @@
 - **迴圈全貌**：7 輪（前 6 輪 needs-changes → 第 7 輪 approve），嚴重度單調收斂——round-1（3 High：run_shell 宣稱/dotenv 插值/symlink 圈禁）→ round-2/3/4（各 4-5 Medium：資源上限、process 樹生命週期、TOCTOU）→ round-5（2 Medium：修正自身收尾）→ round-6（2 Medium：同一 class 漏網 site）→ round-7 approve。共 6 個修正 commit（`7230e1b`→`7e5e300`）疊在 2 個實作 commit（`f0dc649` tool loop、`5aea7e6` installer）之上。
 - **裁決原則回顧**：全程以「D21 信任邊界（只裝可信指示、無容器隔離）＋ 真正強制的 staging jail ＋ 不可信上游回覆」三準繩判定；唯一判界外者為 round-5 的 ancestor-symlink 主動競跑（純對抗式本地工具、修法昂貴且平台綁定），且此界外立場已被 review 端接受。其餘全修。
 - **本機 gates（最終）**：pytest 565、e2e smoke 76/76、vitest 37、ruff/format/ty 全過。依 D23 phase 通過即推送。
+
+## D28（Phase 6 文件 codex review 裁決）：文件準確性全修，4 輪收斂 Approve
+
+- **背景**：Phase 6 是網頁優先文件改寫（README/AGENTS.md/backend·frontend·e2e README），review 標準＝**對照程式碼的事實準確性**（非文筆）。
+- **迴圈**：4 輪（前 3 needs-changes → 第 4 approve），全部是「文件承諾超過程式碼實際」的 over-claim，且呈現與 Phase 5 相同的「修例不修類」教訓——每輪修掉 codex 指出的行，同一宣稱類卻在別處復現，逐輪才靠**全面 grep sweep** 清完：
+  - round-1（5 Medium）：安裝失敗前無 AI 摘要/日誌、日誌「完整」其實有 200 字元 preview + body 截斷、mutation gate 不含刪除、EXIT trap 不清 build 產物、`.staging` 非只有中斷才殘留。
+  - round-2（3 Medium）：同三個 class 在未改到的行復現（feature-tour 日誌行、`GET /logs/{id}`、root README `.staging`、摘要與連結耦合）→ 改為全 class sweep。
+  - round-3（1 Medium）：instructions 文字仍稱「完整記錄」，但 instructions（≤20000 字元）同受 `LLM_LOG_BODY_MAX_CHARS`（下限 1000）截斷 → 掃掉所有「原文/原樣/完整記錄」措辭，改為「受 body cap 截斷；一般長度 key/token 短於上限故仍完整記到」（安全警告不變）。
+  - round-4：Approve。
+- **修正另發現並改正監督者 spec 的兩處錯誤**：(1) 無 PyPI 發佈計畫（D15），故啟動指令為 `uvx --from backend/dist/*.whl context-memory`（對齊 wheel_smoke.sh）而非 bare `uvx context-memory`；(2) AI 動作 UI 名稱為「AI 進度更新」非「AI 協助更新」。另新增重要風險揭露：貼進安裝器的第三方 key 會同時進工具 `.env` 與 AI 日誌。
+- **backend/frontend/e2e README 過時宣稱同步修正**：OPENAI_TIMEOUT_SECONDS 60→120、LLM_PROMPT_BUDGET_CHARS 32000→200000、補齊 LLM_LOG_*/TOOLS_DIR/LLM_TOOL_*/TOOL_INSTALL_* 鍵與 /api/tools* 路由、補 /tools 與 /llm-logs 頁、修正 mutation-gate 與 AI 動作識別名、補 wheel_smoke.sh 章節。
+- **教訓沉澱**：「修類不修例」不只適用程式碼，文件的重複宣稱同樣要 grep 全掃 + 驗證殘留為零，否則 review 會逐行打轉。已成慣例。
