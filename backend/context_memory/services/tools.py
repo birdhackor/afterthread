@@ -57,10 +57,11 @@ import re
 import shutil
 import signal
 import subprocess
+import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 from dotenv import dotenv_values
 from starlette.concurrency import run_in_threadpool
@@ -110,11 +111,18 @@ _PARAMETERS_SCHEMA_MAX_BYTES = 16 * 1024
 # apart from a truncated item section or a truncated log body.
 _OUTPUT_TRUNCATION_MARKER = "…[工具輸出過長已截斷]"
 
-# How long ``communicate`` is given to drain pipes and reap AFTER the process
+# How long the bounded reader is given to drain pipes and reap AFTER the process
 # group has already been SIGKILLed on timeout. The group is dead, so this
 # returns effectively immediately; it exists only so a wedged pipe can never
 # turn cleanup itself into a hang.
 _REAP_TIMEOUT_SECONDS = 5.0
+
+# Chunk size for the bounded incremental pipe reads (see _communicate_bounded).
+# 64 KiB is large enough that draining a normal tool's output is one or two
+# reads, and small enough that a runaway stream is caught within roughly one
+# chunk past the cap -- so a stream far over the cap is stopped after buffering
+# at most ``cap + one chunk`` transiently, never the whole unbounded output.
+_READ_CHUNK_CHARS = 64 * 1024
 
 
 @dataclass(slots=True)
@@ -469,6 +477,149 @@ def _kill_process_group(proc: subprocess.Popen[str]) -> None:
             proc.kill()
 
 
+@dataclass(slots=True)
+class _BoundedOutput:
+    """One bounded subprocess read's result (see ``_communicate_bounded``).
+
+    ``stdout``/``stderr`` hold at most ``cap + 1`` chars each; the ``*_overflow``
+    flags say a stream ran PAST the cap (and so the process was killed for it),
+    which the callers use to decide between "here is the truncated output" and
+    "the tool failed". ``timed_out`` is the wall-clock expiry, kept distinct so
+    a caller can render the timeout message instead of an output.
+    """
+
+    stdout: str
+    stderr: str
+    stdout_overflow: bool
+    stderr_overflow: bool
+    timed_out: bool
+
+
+class _CappedReader:
+    """Drains ONE text pipe on its own thread, bounded to ``cap + 1`` chars.
+
+    The building block that replaces ``subprocess.communicate``'s unbounded
+    slurp: each output pipe gets one of these on its own thread (reading two
+    pipes sequentially would DEADLOCK -- a child that fills the OTHER pipe's
+    buffer blocks on write while we block reading the first). It reads in
+    ``_READ_CHUNK_CHARS`` chunks and, the moment the running total passes
+    ``cap``, marks ``overflow`` and calls ``kill``: the result is already
+    truncated, so there is nothing to gain by reading on -- kill the process
+    group at once (mirroring the timeout path's SIGKILL) and stop. Never raises
+    into its thread: a read on a killed/closed pipe just ends the drain.
+    """
+
+    __slots__ = ("_cap", "_kill", "_stream", "overflow", "text")
+
+    def __init__(self, stream: IO[str], cap: int, kill: Callable[[], None]) -> None:
+        self._stream = stream
+        self._cap = cap
+        self._kill = kill
+        self.text = ""
+        self.overflow = False
+
+    def run(self) -> None:
+        collected: list[str] = []
+        total = 0
+        try:
+            while True:
+                chunk = self._stream.read(_READ_CHUNK_CHARS)
+                if not chunk:
+                    break
+                collected.append(chunk)
+                total += len(chunk)
+                if total > self._cap:
+                    self.overflow = True
+                    self._kill()
+                    break
+        except Exception:
+            # A read on a pipe we just SIGKILLed (or one closed under us) must
+            # never crash the reader thread -- the partial text already collected
+            # is the truncated result, exactly as intended.
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                self._stream.close()
+        joined = "".join(collected)
+        # Retain at most cap+1 even if the final chunk overshot the cap by a whole
+        # chunk: the caller's _cap_output then trims cap+1 down to the marked cap.
+        self.text = joined[: self._cap + 1] if self.overflow else joined
+
+
+def _communicate_bounded(
+    proc: subprocess.Popen[str], *, input_text: str | None, cap: int, timeout: float
+) -> _BoundedOutput:
+    """``communicate`` with a hard per-stream memory cap and a wall-clock timeout.
+
+    ``subprocess.communicate`` reads stdout/stderr UNBOUNDED into memory before
+    any cap is applied -- a runaway tool could OOM the service before
+    ``_cap_output`` ever runs. This drains each present pipe with its own
+    ``_CappedReader`` thread (concurrent, so a full pipe can never deadlock the
+    other), writes ``input_text`` to stdin on ITS OWN thread (so a large stdin
+    can never deadlock against a child that writes before it reads), and bounds
+    the whole read+wait by ``timeout`` -- killing the process group on expiry,
+    the same contract the old ``communicate(timeout=...)`` carried. Every stream
+    is capped at ``cap + 1`` chars; a stream over the cap kills the group at once
+    (see ``_CappedReader``). Threads are the mechanism, not asyncio: this runs in
+    a ``run_in_threadpool`` worker, and ``file.read`` releases the GIL while it
+    blocks, so the reads and the ``wait`` genuinely proceed in parallel.
+    """
+    threads: list[threading.Thread] = []
+
+    def kill() -> None:
+        _kill_process_group(proc)
+
+    if input_text is not None and proc.stdin is not None:
+        stdin = proc.stdin
+
+        def _write_stdin() -> None:
+            # Best-effort: a child that exits or closes stdin early makes this
+            # raise BrokenPipeError -- not our failure. A SIGKILL later unblocks a
+            # write stalled on a full pipe, so this thread always ends.
+            with contextlib.suppress(Exception):
+                stdin.write(input_text)
+            with contextlib.suppress(Exception):
+                stdin.close()
+
+        writer = threading.Thread(target=_write_stdin)
+        writer.start()
+        threads.append(writer)
+
+    stdout_reader = _CappedReader(proc.stdout, cap, kill) if proc.stdout is not None else None
+    stderr_reader = _CappedReader(proc.stderr, cap, kill) if proc.stderr is not None else None
+    for reader in (stdout_reader, stderr_reader):
+        if reader is not None:
+            thread = threading.Thread(target=reader.run)
+            thread.start()
+            threads.append(thread)
+
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_process_group(proc)
+        # The group is SIGKILLed; reap so no zombie lingers. Bounded by the short
+        # reap timeout, exactly like the old timeout path.
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=_REAP_TIMEOUT_SECONDS)
+
+    # The process has exited (naturally, on an overflow kill, or on the timeout
+    # kill), so every pipe is at EOF and the reader/writer threads finish
+    # promptly. Join with the same short bound so a wedged thread can never hang
+    # cleanup.
+    for thread in threads:
+        thread.join(timeout=_REAP_TIMEOUT_SECONDS)
+
+    return _BoundedOutput(
+        stdout=stdout_reader.text if stdout_reader is not None else "",
+        stderr=stderr_reader.text if stderr_reader is not None else "",
+        stdout_overflow=stdout_reader.overflow if stdout_reader is not None else False,
+        stderr_overflow=stderr_reader.overflow if stderr_reader is not None else False,
+        timed_out=timed_out,
+    )
+
+
 def _run_tool_subprocess(
     entry: list[str],
     directory: Path,
@@ -491,7 +642,10 @@ def _run_tool_subprocess(
 
     ``shell=False`` (argv list, never a shell string) so nothing in the model's
     arguments or a tool name can be shell-injected. ``errors="replace"`` on the
-    text pipes keeps a tool that emits invalid UTF-8 from crashing ``communicate``.
+    text pipes keeps a tool that emits invalid UTF-8 from crashing the reader.
+    Output is drained by ``_communicate_bounded`` (NOT ``communicate``), which
+    caps each stream in memory as it reads rather than slurping it whole first --
+    a runaway tool is killed at the cap instead of OOMing the service.
     """
     try:
         proc = subprocess.Popen(
@@ -512,19 +666,19 @@ def _run_tool_subprocess(
         # bit), ... -- the tool never ran. Category only, no raw error string.
         return f"tool failed to start: {type(exc).__name__}"
 
-    try:
-        stdout, stderr = proc.communicate(input=args_json, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_process_group(proc)
-        # Reap so no zombie lingers. The group is already SIGKILLed, so this
-        # returns effectively at once; the short timeout only guards a wedged pipe.
-        with contextlib.suppress(Exception):
-            proc.communicate(timeout=_REAP_TIMEOUT_SECONDS)
+    output = _communicate_bounded(proc, input_text=args_json, cap=output_cap, timeout=timeout)
+    if output.timed_out:
         return f"tool timed out after {timeout:g} seconds"
-
+    # STDOUT over the cap is the success result, already truncated -- return it
+    # regardless of the (kill-induced, negative) exit code the overflow kill left
+    # behind: the tool produced its answer, we just stopped reading it. _cap_output
+    # trims the retained cap+1 chars down to the cap behind the marker.
+    if output.stdout_overflow:
+        return _cap_output(output.stdout, output_cap)
     if proc.returncode != 0:
-        return f"tool failed (exit {proc.returncode}): {_cap_output(stderr.strip(), output_cap)}"
-    return _cap_output(stdout, output_cap)
+        stderr = _cap_output(output.stderr.strip(), output_cap)
+        return f"tool failed (exit {proc.returncode}): {stderr}"
+    return _cap_output(output.stdout, output_cap)
 
 
 def _make_handler(directory: Path, entry: list[str]) -> Callable[[dict[str, Any]], Awaitable[str]]:
@@ -590,10 +744,26 @@ def set_enabled(name: str, enabled: bool) -> bool:
     """Flip a package's ``enabled`` flag in its ``tool.json``. Returns success.
 
     False when the name is unsafe (see ``_resolve_package_dir``), the package
-    or its ``tool.json`` is missing/unreadable, or the write fails -- so the
-    caller (a future PATCH route) maps a bad name and a missing package alike to
-    a clean "did not happen" rather than a 500.
+    directory is an alias (see below), the package or its ``tool.json`` is
+    missing/unreadable/oversized, or the write fails -- so the caller (a future
+    PATCH route) maps a bad name and a missing package alike to a clean "did not
+    happen" rather than a 500.
     """
+    base = tools_dir()
+    if base is None or not _NAME_RE.match(name):
+        return False
+    # INTERNAL-alias hard-block (H3), BEFORE resolve: an internal symlink
+    # ``tools/<name> -> tools/real`` RESOLVES inside the tools root, so the
+    # resolve-then-contain check below would PASS and this toggle would rewrite
+    # the REAL package's manifest THROUGH the alias. ``is_symlink`` does not
+    # follow the final component, so it detects the alias itself; refuse outright
+    # -- set_enabled has no safe action on an alias (reading or writing a manifest
+    # through it is exactly the escape we are stopping), unlike delete_tool which
+    # can at least drop just the dangling link. Checked before resolve precisely
+    # because ``resolve()`` erases the alias/real distinction. External-symlink
+    # escapes are still separately caught by the containment check further down.
+    if (base / name).is_symlink():
+        return False
     directory = _resolve_package_dir(name)
     if directory is None or not directory.is_dir():
         return False
@@ -608,6 +778,15 @@ def set_enabled(name: str, enabled: bool) -> bool:
     # trust that -- it is reached directly by the mutation API.
     if not _is_within(directory, tool_json.resolve()):
         return False
+    # Bound the manifest FILE size with stat() BEFORE reading it (N2), the SAME
+    # cap the scan enforces (_MANIFEST_MAX_BYTES): the cap must hold at EVERY
+    # read entry, not just the scan, so an oversized manifest is never loaded into
+    # memory through this path either -- refuse like every other failure here.
+    try:
+        if tool_json.stat().st_size > _MANIFEST_MAX_BYTES:
+            return False
+    except OSError:
+        return False
     try:
         raw = json.loads(tool_json.read_text(encoding="utf-8"))
     except OSError, ValueError:
@@ -615,21 +794,53 @@ def set_enabled(name: str, enabled: bool) -> bool:
     if not isinstance(raw, dict):
         return False
     raw["enabled"] = enabled
+    # Refuse to WRITE if the re-serialized manifest would exceed the cap (N2).
+    # ``indent=2`` pretty-prints, which EXPANDS a compact-but-legal manifest: a
+    # manifest that sat just under the cap in its compact on-disk form can cross
+    # it once pretty-printed, which would flip the tool ``valid=False`` on the very
+    # next scan after a mere enable/disable toggle. Measure the ENCODED size (the
+    # same UTF-8 byte unit the stat cap uses) and, when it would not fit, leave the
+    # file byte-for-byte untouched and report failure rather than corrupt the row.
+    new_text = json.dumps(raw, ensure_ascii=False, indent=2) + "\n"
+    if len(new_text.encode("utf-8")) > _MANIFEST_MAX_BYTES:
+        return False
     try:
-        tool_json.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tool_json.write_text(new_text, encoding="utf-8")
     except OSError:
         return False
     return True
 
 
 def delete_tool(name: str) -> bool:
-    """Delete a package directory (``rmtree``). Returns success.
+    """Delete a package (``rmtree``), or an alias (``unlink``). Returns success.
 
     Name-validated and containment-checked exactly like ``set_enabled`` (the
     traversal hard-block is what makes an ``rmtree`` here safe), so it can only
     ever remove a directory that genuinely sits inside ``tools_dir``. False when
     the name is unsafe, the package is absent, or the removal fails.
     """
+    base = tools_dir()
+    if base is None or not _NAME_RE.match(name):
+        return False
+    # INTERNAL-alias hard-block (H3), BEFORE resolve: an internal symlink
+    # ``tools/<name> -> tools/real`` RESOLVES inside the tools root, so the
+    # resolve-then-contain check below would PASS and ``rmtree`` would recurse
+    # through the alias and DELETE THE REAL PACKAGE -- user-triggerable data loss,
+    # since the scan lists the alias as an invalid row and the UI offers 刪除 on
+    # invalid rows. ``is_symlink`` does not follow the final component, so it
+    # detects the alias itself; ``unlink`` removes ONLY the link (its target,
+    # internal OR external, is never touched), so the phantom row disappears and
+    # the real package survives. This is a genuine deletion of what the user saw
+    # (the alias row), so it returns True. It runs before resolve precisely
+    # because ``resolve()`` would erase the alias/real distinction; the
+    # resolve-then-contain check below still guards a non-symlink external escape.
+    candidate = base / name
+    if candidate.is_symlink():
+        try:
+            candidate.unlink()
+        except OSError:
+            return False
+        return True
     directory = _resolve_package_dir(name)
     if directory is None or not directory.is_dir():
         return False

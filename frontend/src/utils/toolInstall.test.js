@@ -3,6 +3,7 @@ import {
 	INSTALL_POLL_MS,
 	installJobRefetchInterval,
 	isHttpUrl,
+	isInstallJobActive,
 	isTerminalInstallState,
 } from "./toolInstall.js";
 
@@ -64,6 +65,51 @@ describe("installJobRefetchInterval", () => {
 		expect(installJobRefetchInterval(queryWithState(null))).toBe(
 			INSTALL_POLL_MS,
 		);
+	});
+});
+
+describe("isInstallJobActive", () => {
+	it("is not active without a job id", () => {
+		expect(isInstallJobActive({ jobId: null })).toBe(false);
+		expect(isInstallJobActive({ jobId: undefined })).toBe(false);
+	});
+
+	it("is active with a job id before the first poll (no state, no error)", () => {
+		expect(isInstallJobActive({ jobId: "j1" })).toBe(true);
+		expect(
+			isInstallJobActive({
+				jobId: "j1",
+				state: undefined,
+				errorStatus: undefined,
+			}),
+		).toBe(true);
+	});
+
+	it("stays active while the job is queued or running", () => {
+		expect(isInstallJobActive({ jobId: "j1", state: "queued" })).toBe(true);
+		expect(isInstallJobActive({ jobId: "j1", state: "running" })).toBe(true);
+	});
+
+	it("releases once the job reaches a terminal state", () => {
+		expect(isInstallJobActive({ jobId: "j1", state: "succeeded" })).toBe(false);
+		expect(isInstallJobActive({ jobId: "j1", state: "failed" })).toBe(false);
+	});
+
+	it("releases on a 404 poll error (the job is gone after a restart)", () => {
+		expect(isInstallJobActive({ jobId: "j1", errorStatus: 404 })).toBe(false);
+		// Even with a stale non-terminal state cached, a 404 still releases.
+		expect(
+			isInstallJobActive({ jobId: "j1", state: "running", errorStatus: 404 }),
+		).toBe(false);
+	});
+
+	it("stays active on a non-404 poll error (transient -- keep the job tracked)", () => {
+		// A blip must not drop a live job: a resubmit would then 409 and orphan it.
+		expect(
+			isInstallJobActive({ jobId: "j1", state: "running", errorStatus: 500 }),
+		).toBe(true);
+		expect(isInstallJobActive({ jobId: "j1", errorStatus: 500 })).toBe(true);
+		expect(isInstallJobActive({ jobId: "j1", errorStatus: 0 })).toBe(true);
 	});
 });
 

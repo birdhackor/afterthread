@@ -157,18 +157,36 @@ def test_meta_write_rejects_oversized_content(
     assert not (staging / "big.txt").exists()
 
 
-def test_meta_read_output_capped(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_meta_read_refuses_oversized_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """read_file stat()s the size and REFUSES a file over the output cap rather
+    than reading the whole thing into memory to then truncate it (N5): reading
+    cap-bytes of a 10GB file would pull the whole file in first. The builder gets
+    an actionable error; nothing oversized is read."""
     _install_settings(
         monkeypatch, tools_dir=str(tmp_path / "tools"), llm_tool_output_max_chars=1000
     )
     staging = tmp_path / "staging"
     staging.mkdir()
-    (staging / "big.txt").write_text("a" * 5000)
+    (staging / "big.txt").write_text("a" * 5000)  # 5000 bytes > the 1000-char cap
     meta = _meta_by_name(staging)
 
     result = _call(meta["read_file"].handler, {"path": "big.txt"})
-    assert len(result) == 1000
-    assert result.endswith("…[工具輸出過長已截斷]")
+    assert result.startswith("read_file failed")
+    assert "too large" in result
+
+
+def test_meta_read_reads_file_at_cap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A file WITHIN the cap is still read back in full -- the N5 refusal is only
+    for files over the cap, never a regression for ordinary reads."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), llm_tool_output_max_chars=1000
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "ok.txt").write_text("a" * 1000)  # exactly at the cap
+    meta = _meta_by_name(staging)
+
+    assert _call(meta["read_file"].handler, {"path": "ok.txt"}) == "a" * 1000
 
 
 # --- meta-tools: run_shell -----------------------------------------------------
@@ -220,6 +238,30 @@ def test_run_shell_output_capped(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     result = _call(meta["run_shell"].handler, {"command": "printf 'a%.0s' {1..5000}"})
     assert len(result) == 1000
     assert result.endswith("…[工具輸出過長已截斷]")
+
+
+def test_run_shell_unbounded_output_killed_promptly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A command whose output NEVER ends (`yes` streams forever) is killed at the
+    cap (N5): the bounded reader hits cap+1 after ~one chunk and SIGKILLs the
+    process group, so the result is bounded and marked instead of the service
+    buffering an unbounded stream to exhaustion."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), llm_tool_output_max_chars=1000
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    meta = _meta_by_name(staging)
+
+    started = time.monotonic()
+    result = _call(meta["run_shell"].handler, {"command": "yes flood"})
+    elapsed = time.monotonic() - started
+
+    marker = "…[工具輸出過長已截斷]"
+    assert len(result) <= 1000 + len(marker)  # bounded, never the whole stream
+    assert result.endswith(marker)
+    assert elapsed < 5  # killed at the cap, not read forever
 
 
 def test_run_shell_env_scrubbed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

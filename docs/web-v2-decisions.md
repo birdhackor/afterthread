@@ -225,3 +225,10 @@
 - **M7 併發安裝無上限 — 修**：同時只允許一個安裝 job；已有 active job 時 POST 回 409 `install_in_progress`（單人本機工具，序列安裝是正確語意，整類消滅並附帶解除 _TASKS 無界成長）。
 - **L8 job 404 輪詢不止 — 修**：`installJobRefetchInterval` 對 404 錯誤也停止（後端重啟後 job 消失屬終局）；其他錯誤視為暫態繼續輪詢。
 - **L9 AI 日誌連結非 deep link — 修**：改 `/llm-logs?log=<id>`，日誌頁讀 search param 自動展開該筆（不在清單則靜默忽略）。
+- **第二輪複審（7230e1b 後）**：九項原修正全數確認成立；另出 5 個新 Medium，裁決全修：
+  1. **tool_calls 資源面未封口**：cap 只擋執行、超額 call 仍逐一建訊息（無界記憶體/prompt）→ 入口設 `_MAX_TOOL_CALLS_ACCEPTED=64`，超過即判協議濫用走既有 upstream-invalid 502 路徑，不進 tool round。
+  2. **PATCH 繞過 manifest 上限**：`set_enabled` 未 stat 就整檔讀、pretty 重寫可把合法 manifest 撐超限 → 讀前 stat、寫前驗序列化大小，超限拒絕且不動檔案（上限套滿所有出入口）。
+  3. **tools 根內部 symlink 別名 DELETE 刪到本體**：resolve 後仍在根內故 containment 放行、`rmtree` 砍真套件（掃描列 invalid 但 UI 可刪 → 可觸發資料遺失）→ mutation 入口先查未 resolve 路徑：DELETE 只 unlink 別名、PATCH 拒絕。round-1 修了 scan 層與 tool.json symlink，此為 mutation 層同類補洞。
+  4. **FE 暫態輪詢錯誤丟失 job 追蹤**：任何錯誤都當非 active、重送先清 jobId，撞 409 後執行中 job 永不再被輪詢 → jobId 只在 404 或新 202 時替換；409 保留舊 id 續輪詢並顯示衝突提示。
+  5. **輸出上限在完整緩衝後才套用**：`communicate()` 先吃整個 stdout 才截斷、builder read_file 整檔讀 → 改並行分塊讀、超限即殺 process group（比照 timeout 路徑）+ 截斷標記；read_file 讀前 stat 拒絕超大檔。
+- **流程備忘**：本輪 review 實際 15 分鐘完成，但 `task --wait` 串流中繼斷裂導致結果延遲半小時才被讀到；並發現多個歷史輪次的 codex sandbox 孤兒 process（TestClient 探測在 `--unshare-net` sandbox 下掛死不返回）佔著資源，已全數清除。後續 review 改由主代理直接輪詢 companion 的 status/result 取結果，不依賴 `--wait` 串流。

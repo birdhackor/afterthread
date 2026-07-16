@@ -327,6 +327,11 @@ def _run_shell_subprocess(staging: Path, command: str, timeout: float, cap: int)
     * NO tool ``.env`` injection -- the system prompt tells the model to source
       its own ``.env`` when testing, keeping this env identical for every
       command rather than varying with what the model wrote so far.
+
+    Output is drained by ``tools._communicate_bounded`` (NOT ``communicate``),
+    which caps the single merged pipe as it reads instead of slurping the whole
+    stream first: a command that spews far past the cap is killed at the cap, so a
+    runaway ``yes``/``cat`` can never OOM the service before the cap is applied.
     """
     env = {name: os.environ[name] for name in tools._PASSTHROUGH_ENV if name in os.environ}
     try:
@@ -344,16 +349,18 @@ def _run_shell_subprocess(staging: Path, command: str, timeout: float, cap: int)
         )
     except OSError as exc:
         return f"command failed to start: {type(exc).__name__}"
-    try:
-        output, _ = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        tools._kill_process_group(proc)
-        with contextlib.suppress(Exception):
-            proc.communicate(timeout=tools._REAP_TIMEOUT_SECONDS)
+    # One output pipe (stderr is merged into stdout); no stdin (DEVNULL).
+    output = tools._communicate_bounded(proc, input_text=None, cap=cap, timeout=timeout)
+    if output.timed_out:
         return f"command timed out after {timeout:g} seconds"
+    # Streamed past the cap: return the truncated (already marked) output whatever
+    # the kill-induced exit code, mirroring the runtime tool's over-cap handling.
+    if output.stdout_overflow:
+        return tools._cap_output(output.stdout, cap)
     if proc.returncode != 0:
-        return f"command failed (exit {proc.returncode}): {tools._cap_output(output.strip(), cap)}"
-    return tools._cap_output(output, cap)
+        body = tools._cap_output(output.stdout.strip(), cap)
+        return f"command failed (exit {proc.returncode}): {body}"
+    return tools._cap_output(output.stdout, cap)
 
 
 def _build_meta_tools(staging: Path) -> list[LlmTool]:
@@ -394,15 +401,31 @@ def _build_meta_tools(staging: Path) -> list[LlmTool]:
             return f"read_file {_PATH_REJECTED}"
 
         def _read() -> str:
+            cap = get_settings().llm_tool_output_max_chars
+            # Bound BEFORE reading (N5): read_text pulls the WHOLE file into memory
+            # before _cap_output could ever trim it, so reading a giant file (a
+            # 10GB blob the builder never meant to read whole) OOMs the service.
+            # stat() the size first and REFUSE anything over the output cap with an
+            # actionable error, rather than silently truncating it. A directory is
+            # handled first: its block-sized st_size could otherwise trip the cap
+            # gate below with the wrong message. Comparing bytes (st_size) against a
+            # CHAR cap is deliberately conservative -- UTF-8 chars <= bytes, so a
+            # file within the byte budget is guaranteed within the char cap too.
+            if target.is_dir():
+                return "read_file failed: path is a directory"
+            size = target.stat().st_size
+            if size > cap:
+                return (
+                    "read_file failed: file is too large "
+                    f"({size} bytes exceeds the {cap}-character output cap)"
+                )
             text = target.read_text(encoding="utf-8", errors="replace")
-            return tools._cap_output(text, get_settings().llm_tool_output_max_chars)
+            return tools._cap_output(text, cap)
 
         try:
             return await run_in_threadpool(_read)
         except FileNotFoundError:
             return "read_file failed: no such file"
-        except IsADirectoryError:
-            return "read_file failed: path is a directory"
         except Exception as exc:
             return f"read_file failed: {type(exc).__name__}"
 

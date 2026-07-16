@@ -30,6 +30,7 @@ import { codePointLength } from "../utils/text.js";
 import {
 	installJobRefetchInterval,
 	isHttpUrl,
+	isInstallJobActive,
 	isTerminalInstallState,
 } from "../utils/toolInstall.js";
 
@@ -339,7 +340,10 @@ function InstallPanel() {
 			}
 			// One install runs at a time (backend 409 install_in_progress): show
 			// the backend's zh-TW reason inline on the form so the user knows to
-			// wait for the running install, rather than a transient toast.
+			// wait for the running install, rather than a transient toast. jobId is
+			// deliberately NOT touched here (and submit no longer clears it), so the
+			// still-running job stays tracked and its progress card keeps polling --
+			// the conflict is only that a SECOND install cannot start yet.
 			if (submitError?.code === "install_in_progress") {
 				setConflictMessage(
 					submitError.message ?? "已有安裝正在進行中，請等待其完成",
@@ -371,14 +375,19 @@ function InstallPanel() {
 		}
 	}, [job?.state, queryClient]);
 
-	// One install at a time from this form: active = a job we started that has
-	// not yet reached a terminal state (including the pre-first-poll window,
-	// when data is still undefined). A poll error (e.g. 404 after a backend
-	// restart) unblocks the form so the user can simply resubmit.
-	const jobActive =
-		jobId !== null &&
-		!jobQuery.isError &&
-		(job === undefined || !isTerminalInstallState(job.state));
+	// One install at a time from this form: the job stays "active" -- form locked,
+	// progress card polling -- until it reaches a terminal state OR its poll 404s
+	// (the job is gone, e.g. after a backend restart). Crucially a NON-404 poll
+	// error (a transient 500, a network blip) keeps it active: releasing on such a
+	// blip would let a resubmit fire against a job that is still running on the
+	// backend, hit the 409, and orphan a job we can no longer poll. This mirrors
+	// installJobRefetchInterval's stop rule exactly (see isInstallJobActive), so
+	// the form-lock and the poll cadence never disagree.
+	const jobActive = isInstallJobActive({
+		jobId,
+		state: job?.state,
+		errorStatus: jobQuery.error?.status,
+	});
 
 	const submit = handleSubmit((values) => {
 		if (installMutation.isPending || jobActive) {
@@ -386,7 +395,11 @@ function InstallPanel() {
 		}
 		setNotConfigured(false);
 		setConflictMessage(null);
-		setJobId(null);
+		// Do NOT clear jobId here: if this POST comes back 409 (a job is still
+		// running), the old id must survive so its polling continues -- clearing it
+		// up front would orphan that live job. The id is replaced only when a new
+		// POST succeeds (onSuccess -> setJobId), so a 409 or 500 leaves the old job
+		// tracked and pollable; a fresh 202 swaps in the new job.
 		installMutation.mutate({
 			openapi_url: values.openapi_url.trim(),
 			instructions: values.instructions.trim(),

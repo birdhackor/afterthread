@@ -37,6 +37,7 @@ from pydantic import BaseModel, ConfigDict
 from context_memory.config import Settings
 from context_memory.services import llm_log
 from context_memory.services.llm import (
+    _MAX_TOOL_CALLS_ACCEPTED,
     _MAX_TOOL_CALLS_PER_REPLY,
     _TOO_MANY_TOOL_CALLS,
     _TOOL_BUDGET_EXHAUSTED,
@@ -340,15 +341,19 @@ def test_timeout_override_honored(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_tool_calls_capped_per_reply(monkeypatch: pytest.MonkeyPatch) -> None:
     """Only the first _MAX_TOOL_CALLS_PER_REPLY calls in one reply are EXECUTED;
-    the rest are rejected WITHOUT running but still get a role:tool result (so
-    every tool_call in the echoed assistant turn pairs with a result)."""
+    the rest -- up to _MAX_TOOL_CALLS_ACCEPTED, the whole-reply ceiling -- are
+    rejected WITHOUT running but still get a role:tool result (so every tool_call
+    in the echoed assistant turn pairs with a result). Driven AT the accepted
+    ceiling to pin the boundary: a reply of exactly _MAX_TOOL_CALLS_ACCEPTED calls
+    still enters the round; only 65+ is refused outright (see
+    test_tool_calls_flood_rejected_as_upstream_error)."""
     seen: list[dict[str, Any]] = []
 
     async def handler(args: dict[str, Any]) -> str:
         seen.append(args)
         return "ran"
 
-    over = _MAX_TOOL_CALLS_PER_REPLY + 4
+    over = _MAX_TOOL_CALLS_ACCEPTED  # the largest reply the round still enters
     many = [_tc("echo", "{}", tc_id=f"call_{i}") for i in range(over)]
     client = _install(
         monkeypatch,
@@ -364,21 +369,39 @@ def test_tool_calls_capped_per_reply(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(rejected) == over - _MAX_TOOL_CALLS_PER_REPLY
 
 
-def test_many_unknown_tool_calls_do_not_starve_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A reply packed with unknown-tool calls -- neither the unknown-tool path
-    nor the cap-reject path awaits I/O -- still yields to the event loop once
-    per call, so the wall-clock asyncio.timeout CAN fire instead of the tight
-    result-building loop starving it out (which it would without the sleep(0)
-    checkpoint: the loop would run to max_tool_rounds and 502 as empty content
-    rather than time out)."""
-    many = [_tc("nope", "{}", tc_id=f"c{i}") for i in range(5000)]
-    _install(monkeypatch, _ScriptedClient([_tool_calls_completion(*many)]))
+def test_tool_calls_flood_rejected_as_upstream_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reply carrying MORE than _MAX_TOOL_CALLS_ACCEPTED tool_calls is abusive:
+    the loop refuses to ENTER the tool round at all -- no summarize, no echoed
+    assistant turn, no per-call rejected results (each O(N)) -- and instead raises
+    on the SAME LLMUpstreamError (502) taxonomy an unparseable reply uses. NO
+    handler runs, and the recorder finalizes the interaction as a failure.
+
+    This supersedes the older sleep(0)-starvation test: the entry cap now bounds
+    the reply BEFORE the result-building loop, so a 5000-call reply can no longer
+    reach that loop to be timed out -- it is refused up front instead."""
+    seen: list[dict[str, Any]] = []
+
+    async def handler(args: dict[str, Any]) -> str:
+        seen.append(args)
+        return "ran"
+
+    flood = [_tc("echo", "{}", tc_id=f"c{i}") for i in range(_MAX_TOOL_CALLS_ACCEPTED + 1)]
+    _install(monkeypatch, _ScriptedClient([_tool_calls_completion(*flood)]))
 
     with pytest.raises(LLMUpstreamError) as excinfo:
-        _run(tools=[_echo_tool()], max_tool_rounds=5000, timeout_seconds=0.05)
-    assert str(excinfo.value).startswith("Timeout: ")
+        _run(tools=[LlmTool(spec=_tool_spec("echo"), handler=handler)])
+
+    assert str(excinfo.value).startswith("tool_calls flood")
+    assert seen == []  # the reply never entered the tool round -- no handler ran
+    # The recorder captured the failure: a generic upstream outcome carrying the
+    # safe flood category, at both the interaction and attempt level.
+    summaries = llm_log.list_summaries(10)
+    assert summaries
+    record = llm_log.get_record(summaries[0]["id"])
+    assert record is not None
+    assert record["outcome"] == "upstream_error"
+    assert (record["error"] or "").startswith("tool_calls flood")
+    assert (record["attempts"][0]["error"] or "").startswith("tool_calls flood")
 
 
 # --- runtime: real tool packages -------------------------------------------
@@ -469,6 +492,33 @@ def test_runtime_output_is_capped(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     result = asyncio.run(enabled_llm_tools()[0].handler({}))
     assert len(result) == 1000
     assert result.endswith("…[工具輸出過長已截斷]")
+
+
+def test_runtime_unbounded_output_killed_promptly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tool that streams FAR past the cap and never exits on its own is killed
+    at the cap (N5): the bounded incremental reader keeps at most ~cap chars and
+    SIGKILLs the process group on overflow, so the service never buffers the whole
+    runaway stream. The result is the truncated output with the marker."""
+    root = tmp_path / "tools"
+    # An unbounded writer -- flushes each block so the pipe fills at once, and
+    # never exits, so ONLY the overflow kill can stop it.
+    _make_tool(
+        root,
+        "flood",
+        "import sys\nwhile True:\n    sys.stdout.write('a' * 4096)\n    sys.stdout.flush()\n",
+    )
+    _install_tools(monkeypatch, root, llm_tool_output_max_chars=1000)
+
+    started = time.monotonic()
+    result = asyncio.run(enabled_llm_tools()[0].handler({}))
+    elapsed = time.monotonic() - started
+
+    marker = "…[工具輸出過長已截斷]"
+    assert len(result) <= 1000 + len(marker)  # bounded, never the whole stream
+    assert result.endswith(marker)
+    assert elapsed < 5  # killed at the cap, not read to exhaustion
 
 
 def test_description_capped_uniformly(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -643,10 +693,15 @@ def test_mutators_reject_bad_names(
     assert list_tools()[0]["name"] == "echo"  # the real package is untouched
 
 
-def test_delete_blocks_symlink_escape(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_delete_symlink_escape_unlinks_only_the_alias(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """A regex-valid package name whose directory is a SYMLINK escaping the tools
-    dir is stopped by the resolved-path containment check, so rmtree never
-    touches the target."""
+    dir is unlinked at the ALIAS itself (H3, N3), never followed: unlink drops
+    only the link, so rmtree can never recurse into the external target. Deleting
+    the alias the user saw succeeds (True) and the escaped target is untouched --
+    strictly safer than the old resolve-then-contain refusal, which left the
+    dangling alias in place."""
     root = tmp_path / "tools"
     root.mkdir()
     precious = tmp_path / "precious"
@@ -655,8 +710,10 @@ def test_delete_blocks_symlink_escape(monkeypatch: pytest.MonkeyPatch, tmp_path:
     (root / "evil").symlink_to(precious, target_is_directory=True)
     _install_tools(monkeypatch, root)
 
-    assert delete_tool("evil") is False
-    assert precious.exists()
+    assert delete_tool("evil") is True  # the alias row is removed...
+    assert not (root / "evil").exists()  # ...the link itself is gone...
+    assert not (root / "evil").is_symlink()
+    assert precious.exists()  # ...but the external target was never followed
     assert (precious / "keep.txt").exists()
 
 
@@ -731,6 +788,110 @@ def test_set_enabled_rejects_symlinked_manifest(
 
     assert set_enabled("echo", False) is False  # write refused
     assert outside.read_text() == original  # foreign file untouched (no rewrite)
+
+
+def test_delete_internal_alias_removes_only_link(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An INTERNAL alias tools/<alias> -> tools/<real> resolves INSIDE the root,
+    so resolve-then-contain would PASS and rmtree would recurse into and delete
+    the REAL package (data loss). delete_tool must unlink ONLY the alias link:
+    the real package survives intact and still lists valid, and only the phantom
+    alias row disappears."""
+    root = tmp_path / "tools"
+    _make_tool(root, "real", "import sys\nsys.stdout.write('x')\n")
+    (root / "alias").symlink_to(root / "real", target_is_directory=True)
+    _install_tools(monkeypatch, root)
+
+    assert delete_tool("alias") is True
+    assert not (root / "alias").exists()  # the alias link is gone
+    assert not (root / "alias").is_symlink()
+    # The real package was never followed: its files survive and it still lists.
+    assert (root / "real" / "tool.json").is_file()
+    assert (root / "real" / "run.py").is_file()
+    listed = {t["name"]: t for t in list_tools()}
+    assert listed["real"]["valid"] is True
+    assert "alias" not in listed  # the phantom invalid row is gone
+
+
+def test_set_enabled_refuses_internal_alias(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """set_enabled must never read or write a manifest THROUGH an internal alias:
+    tools/<alias> -> tools/<real> resolves inside the root, so absent the
+    pre-resolve symlink block a toggle on the alias would rewrite the REAL
+    package's tool.json. The alias PATCH is refused (False) and the real manifest
+    is left byte-for-byte untouched."""
+    root = tmp_path / "tools"
+    _make_tool(root, "real", "import sys\nsys.stdout.write('x')\n", enabled=True)
+    (root / "alias").symlink_to(root / "real", target_is_directory=True)
+    _install_tools(monkeypatch, root)
+
+    before = (root / "real" / "tool.json").read_bytes()
+    assert set_enabled("alias", False) is False
+    assert (root / "real" / "tool.json").read_bytes() == before  # real manifest untouched
+    real = {t["name"]: t for t in list_tools()}["real"]
+    assert real["enabled"] is True  # the real package's flag never flipped
+
+
+def test_set_enabled_refuses_oversized_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The manifest cap must hold at the WRITE entry too (N2): set_enabled
+    stat-checks tool.json against _MANIFEST_MAX_BYTES BEFORE reading it, so an
+    oversized manifest is refused (False) without being loaded into memory --
+    matching the scan, which already lists it invalid."""
+    root = tmp_path / "tools"
+    _make_tool(
+        root,
+        "big",
+        "import sys\nsys.stdout.write('x')\n",
+        tool_json={
+            "name": "big",
+            "description": "x" * (_MANIFEST_MAX_BYTES + 100),
+            "parameters": {"type": "object"},
+            "entry": [sys.executable, "run.py"],
+            "enabled": True,
+        },
+    )
+    _install_tools(monkeypatch, root)
+
+    before = (root / "big" / "tool.json").read_bytes()
+    assert set_enabled("big", False) is False
+    assert (root / "big" / "tool.json").read_bytes() == before  # untouched
+
+
+def test_set_enabled_refuses_when_pretty_form_would_exceed_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A manifest whose COMPACT on-disk form sits under the cap but whose
+    PRETTY (indent=2) re-serialization would cross it is refused, and the file is
+    left byte-identical (N2). Without the post-build size check, a mere
+    enable/disable toggle would EXPAND the manifest past the cap and flip the tool
+    invalid on the next scan."""
+    root = tmp_path / "tools"
+    manifest = {
+        "name": "swell",
+        "description": "d",
+        # A big array expands far more pretty-printed (a newline + 6-space indent
+        # per element) than compact, so it can straddle the cap between the two
+        # forms without any single field being individually oversized.
+        "parameters": {"type": "object", "filler": ["v"] * 12000},
+        "entry": [sys.executable, "run.py"],
+        "enabled": True,
+    }
+    # Pin the premise: the compact form (what _make_tool writes) fits under the
+    # cap, but the pretty form set_enabled would write does not.
+    compact = json.dumps(manifest)
+    assert len(compact.encode("utf-8")) < _MANIFEST_MAX_BYTES
+    pretty = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+    assert len(pretty.encode("utf-8")) > _MANIFEST_MAX_BYTES
+    _make_tool(root, "swell", "import sys\nsys.stdout.write('x')\n", tool_json=manifest)
+    _install_tools(monkeypatch, root)
+
+    before = (root / "swell" / "tool.json").read_bytes()
+    assert set_enabled("swell", False) is False  # pretty form would overflow the cap
+    assert (root / "swell" / "tool.json").read_bytes() == before  # byte-identical
 
 
 def test_manifest_over_size_limit_listed_invalid(

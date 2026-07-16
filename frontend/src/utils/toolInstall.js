@@ -34,6 +34,33 @@ export function installJobRefetchInterval(query) {
 	return INSTALL_POLL_MS;
 }
 
+// Whether an install job the form STARTED is still being tracked: while this
+// holds, the form stays locked and the progress card keeps polling. Deliberately
+// the mirror image of installJobRefetchInterval's stop rule, so the form-lock and
+// the poll cadence can never disagree about whether a job is still live: tracking
+// ends ONLY when the job reaches a terminal state OR its poll 404s (the job is
+// gone -- a backend restart forgot it). Any OTHER poll error (a transient 500, a
+// network blip -- `errorStatus` undefined/0) KEEPS the job tracked, because it can
+// clear on the next tick while the backend's job is still running; releasing
+// "active" on it would let a resubmit fire against that live job, hit the backend's
+// 409, and orphan a job we can no longer poll. The pre-first-poll window (a job id
+// but no state and no error yet) is active too -- we started a job and simply have
+// not heard back. `state` is the latest job state (undefined before the first
+// poll); `errorStatus` is the latest poll error's HTTP status (undefined when the
+// last poll succeeded).
+export function isInstallJobActive({ jobId, state, errorStatus }) {
+	if (jobId === null || jobId === undefined) {
+		return false;
+	}
+	if (isTerminalInstallState(state)) {
+		return false;
+	}
+	if (errorStatus === 404) {
+		return false;
+	}
+	return true;
+}
+
 // Submit-side URL pre-check: the backend's HttpUrl validation is authoritative
 // (422), but rejecting an obviously-not-http value client-side gives an
 // immediate field error instead of a round trip. Requires an http(s) scheme

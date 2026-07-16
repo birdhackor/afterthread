@@ -136,6 +136,29 @@ _MAX_TOOL_CALLS_PER_REPLY = 16
 # the assistant turn's tool_calls entry still has its matching result.
 _TOO_MANY_TOOL_CALLS = "tool call rejected: too many tool calls in one reply"
 
+# Hard ceiling on how many tool calls in ONE reply the loop will even ENTER the
+# tool round for. Distinct from _MAX_TOOL_CALLS_PER_REPLY above, which bounds
+# EXECUTION but NOT resource consumption: a reply carrying, say, 100k tool_calls
+# would still be fully summarized (_summarize_tool_calls), echoed verbatim in the
+# assistant turn, and answered with ~100k rejected-result messages -- unbounded
+# memory/prompt growth plus a long pre-yield synchronous stretch, all to service
+# one already-abusive reply. So a reply with MORE than this many calls is not
+# entered at all: it is treated as a malformed/abusive upstream reply and raised
+# on the SAME LLMUpstreamError (502) taxonomy an unparseable reply uses (see the
+# entry check in _run_structured). Calls 17..64 keep the existing
+# rejected-with-message behavior; only 65+ trips this whole-reply refusal. 64 is
+# comfortably above any legitimate burst of parallel calls a model makes in one
+# turn, and (being small) also bounds the per-round result-building loop so it can
+# never itself become the long synchronous stretch this exists to prevent.
+_MAX_TOOL_CALLS_ACCEPTED = 64
+
+# Prefix of the safe, config-free LLMUpstreamError message raised for a reply
+# whose tool_calls count exceeds _MAX_TOOL_CALLS_ACCEPTED. Built like the other
+# category messages (a short reason, no str(exc), no config value) and classified
+# as a generic upstream failure by _classify_upstream_outcome. The runtime message
+# appends the offending count -- "tool_calls flood: <N> calls in one reply".
+_TOOL_CALLS_FLOOD_PREFIX = "tool_calls flood"
+
 
 @dataclass(slots=True)
 class LlmTool:
@@ -836,6 +859,22 @@ async def _run_structured[ModelT: BaseModel](
                 if advertise_tools:
                     tool_calls = _extract_tool_calls(completion)
                     if tool_calls:
+                        # ENTRY bound (N1): a reply carrying more than
+                        # _MAX_TOOL_CALLS_ACCEPTED calls is abusive/malformed. Refuse
+                        # it here, BEFORE any O(N) work -- no _summarize_tool_calls,
+                        # no echoed assistant turn, no per-call rejected results (each
+                        # of which grows memory/prompt with N). Treat it exactly like
+                        # an unparseable upstream reply: record the safe category on
+                        # the in-flight attempt (its response stays None, as on the
+                        # empty-content 502 path above) and raise the SAME
+                        # LLMUpstreamError taxonomy, which the wrapper classifies as
+                        # an upstream failure and finalizes on the record. No handler
+                        # runs. `from None` severs context, like every other arm.
+                        count = len(tool_calls)
+                        if count > _MAX_TOOL_CALLS_ACCEPTED:
+                            flood = f"{_TOOL_CALLS_FLOOD_PREFIX}: {count} calls in one reply"
+                            recorder.fail_current_attempt(flood)
+                            raise LLMUpstreamError(flood) from None
                         # The synthetic trace is THIS attempt's recorded response;
                         # the tool RESULTS then appear inside the next attempt's
                         # request_messages naturally (no recorder schema change).
@@ -865,10 +904,14 @@ async def _run_structured[ModelT: BaseModel](
                                 messages.append(_rejected_tool_result_message(tool_call))
                             # Yield to the event loop once per processed call: the
                             # unknown-tool and the capped-reject paths never await
-                            # anything, so a reply packed with them would otherwise
-                            # run as one uninterruptible block and starve the
-                            # asyncio.timeout deadline (which fires only when the
-                            # coroutine yields). This checkpoint lets it fire.
+                            # anything, so a run of them would otherwise execute as
+                            # one uninterruptible block and starve the asyncio.timeout
+                            # deadline (which fires only when the coroutine yields).
+                            # The N1 entry cap already bounds this loop to at most
+                            # _MAX_TOOL_CALLS_ACCEPTED iterations, so this is now a
+                            # small, defensive checkpoint rather than the sole guard
+                            # against an unbounded synchronous stretch -- but it keeps
+                            # the round responsive to the deadline regardless.
                             await asyncio.sleep(0)
                         tool_rounds_used += 1
                         # If that spent the last permitted round, append the
