@@ -29,6 +29,7 @@ import { ItemNewPage } from "./pages/ItemNewPage.jsx";
 import { ItemsListPage } from "./pages/ItemsListPage.jsx";
 import { LlmLogsPage } from "./pages/LlmLogsPage.jsx";
 import { NotFoundPage } from "./pages/NotFoundPage.jsx";
+import { ToolsPage } from "./pages/ToolsPage.jsx";
 
 // Navbar entry rendered as a TanStack Link. Active highlighting is driven by
 // `activeProps` (data-active), which Mantine's NavLink styles via its
@@ -118,6 +119,7 @@ function RootLayout() {
 				<NavItem to="/capture" label="快速捕捉" />
 				<NavItem to="/items" label="記憶清單" exact />
 				<NavItem to="/items/new" label="新增項目" />
+				<NavItem to="/tools" label="工具" />
 				<NavItem to="/llm-logs" label="AI 日誌" />
 			</AppShell.Navbar>
 			<AppShell.Main>
@@ -164,6 +166,12 @@ const llmLogsRoute = createRoute({
 	component: LlmLogsPage,
 });
 
+const toolsRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/tools",
+	component: ToolsPage,
+});
+
 // Remount-per-id contract: TanStack Router reuses the matched route's
 // component instance across navigations that only change a path param (e.g.
 // /items/1 -> /items/2 stays the same ItemDetailPage instance, just
@@ -201,6 +209,7 @@ const routeTree = rootRoute.addChildren([
 	captureRoute,
 	itemsRoute,
 	itemNewRoute,
+	toolsRoute,
 	llmLogsRoute,
 	itemDetailRoute,
 	itemEditRoute,

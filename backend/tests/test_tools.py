@@ -591,6 +591,18 @@ def test_delete_blocks_symlink_escape(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert (precious / "keep.txt").exists()
 
 
+def test_hidden_directories_never_listed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A dot-directory is never a package: the installer stages in-progress
+    builds under <tools_dir>/.staging, and listing that as a broken package
+    would surface every install in flight as a phantom row."""
+    root = tmp_path / "tools"
+    _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    (root / ".staging" / "abc123").mkdir(parents=True)
+    _install_tools(monkeypatch, root)
+
+    assert [t["name"] for t in list_tools()] == ["echo"]
+
+
 def test_feature_off_when_tools_dir_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "context_memory.services.tools.get_settings", lambda: Settings(tools_dir="")

@@ -99,11 +99,12 @@ def test_only_by_id_routes_declare_404() -> None:
     generated clients and docs match runtime. That is the four item routes
     (GET/PATCH/DELETE /api/items/{item_id} and POST /api/items/{item_id}/progress),
     the two by-id AI routes (POST /api/items/{item_id}/enrich and /assist-update),
-    and the by-id LLM log route (GET /api/llm/logs/{log_id}, which 404s for an
-    unknown/evicted id). The collection, review, health, status, capture, and
-    log-list routes (POST/GET /api/items, GET /api/review, GET /api/health, GET
-    /api/llm/status, POST /api/capture, GET /api/llm/logs) cannot 404 and must not
-    declare it.
+    the by-id LLM log route (GET /api/llm/logs/{log_id}, which 404s for an
+    unknown/evicted id), and the three by-name/by-id tool routes (PATCH/DELETE
+    /api/tools/{name} for a missing package, GET /api/tools/install/{job_id}
+    for an unknown/evicted/post-restart job). The collection, review, health,
+    status, capture, log-list, tool-list and install-submit routes cannot 404
+    and must not declare it.
     """
     client = TestClient(app)
     schema = client.get("/openapi.json").json()
@@ -121,4 +122,7 @@ def test_only_by_id_routes_declare_404() -> None:
         ("/api/items/{item_id}/enrich", "post"),
         ("/api/items/{item_id}/assist-update", "post"),
         ("/api/llm/logs/{log_id}", "get"),
+        ("/api/tools/{name}", "patch"),
+        ("/api/tools/{name}", "delete"),
+        ("/api/tools/install/{job_id}", "get"),
     }

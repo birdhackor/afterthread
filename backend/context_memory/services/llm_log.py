@@ -676,3 +676,30 @@ def get_record(log_id: int) -> dict[str, Any] | None:
         if record.id == log_id:
             return _record_detail(record)
     return None
+
+
+def last_record_id_for_workflow(workflow: str) -> int | None:
+    """Id of the NEWEST finished record for ``workflow``, or None if there is none.
+
+    Exists for the tool installer (context_memory.services.tool_builder), which
+    wants to link its job result to the AI 日誌 record of the builder session it
+    just ran. ``generate_structured`` deliberately returns only the caller's
+    validated model -- threading a log id through its signature (or returning a
+    tuple) would rewrite the one boundary every workflow and test is built
+    against, for the benefit of a single consumer -- so that consumer instead
+    reads the newest record for its OWN workflow name immediately after its
+    call returns; ``generate_structured`` finalizes the record before
+    returning/raising, so the record is guaranteed to be in the ring by then.
+    Known, accepted imprecision: if TWO interactions of the same workflow
+    overlap, whichever finished last wins, so a concurrent install's job could
+    link the sibling install's log. That worst case is a debugging link to a
+    simultaneous builder session in this single-user local tool -- still
+    useful, never harmful -- and does not justify rewriting the
+    generate_structured contract.
+    """
+    with _LOCK:
+        records = list(_get_ring())
+    for record in reversed(records):
+        if record.workflow == workflow:
+            return record.id
+    return None

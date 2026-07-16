@@ -24,6 +24,15 @@ _THREE_AI_OPS = {
     ("/api/items/{item_id}/assist-update", "post"),
 }
 
+# The one NON-LLM operation that also declares a 503: the web installer's
+# submit, gated on TOOLS_DIR being configured (code `tools_not_configured`,
+# see routers/tools.py). A different feature being unconfigured, under its own
+# code -- the LLM-degradation contract this module pins (llm_not_configured /
+# llm_upstream_error on exactly the three workflow ops) is unchanged, so the
+# 503 enumeration below is extended rather than weakened, and a dedicated test
+# pins the new op's distinct code.
+_TOOLS_INSTALL_OP = ("/api/tools/install", "post")
+
 
 def _openapi() -> dict[str, Any]:
     return TestClient(app).get("/openapi.json").json()
@@ -44,12 +53,25 @@ def _allows_null(prop: dict[str, Any]) -> bool:
     return any(variant.get("type") == "null" for variant in prop.get("anyOf", []))
 
 
-def test_503_declared_on_exactly_the_three_ai_operations() -> None:
-    assert _declaring(_openapi(), 503) == _THREE_AI_OPS
+def test_503_declared_on_exactly_the_ai_operations_and_tools_install() -> None:
+    # Still an EXACT set: the three LLM workflows plus the installer submit,
+    # and nothing else, may declare 503 (see _TOOLS_INSTALL_OP above).
+    assert _declaring(_openapi(), 503) == _THREE_AI_OPS | {_TOOLS_INSTALL_OP}
 
 
 def test_502_declared_on_exactly_the_three_ai_operations() -> None:
     assert _declaring(_openapi(), 502) == _THREE_AI_OPS
+
+
+def test_tools_install_503_carries_its_own_code() -> None:
+    """The installer's 503 is `tools_not_configured` -- NOT `llm_not_configured`
+    -- so the two unconfigured features stay distinguishable to clients."""
+    path, method = _TOOLS_INSTALL_OP
+    example = _openapi()["paths"][path][method]["responses"]["503"]["content"]["application/json"][
+        "example"
+    ]
+    assert example["detail"]["code"] == "tools_not_configured"
+    assert "message" in example["detail"]
 
 
 def test_404_declared_on_the_two_by_id_ai_operations_only() -> None:

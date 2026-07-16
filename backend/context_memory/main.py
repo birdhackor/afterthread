@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from context_memory.db import init_db
-from context_memory.routers import ai, items, review
+from context_memory.routers import ai, items, review, tools
 
 
 def _configure_app_logging() -> None:
@@ -95,6 +95,7 @@ app.add_middleware(
 app.include_router(items.router, prefix="/api")
 app.include_router(review.router, prefix="/api")
 app.include_router(ai.router, prefix="/api")
+app.include_router(tools.router, prefix="/api")
 
 # Packaged mode only. `scripts/build-wheel.sh` copies the built frontend into
 # `context_memory/static/` before `uv build` runs, and that directory's

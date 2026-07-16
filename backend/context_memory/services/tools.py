@@ -179,14 +179,20 @@ def _entry_file_exists(directory: Path, entry: list[str]) -> bool:
     return False
 
 
-def _scan_package(directory: Path) -> _PackageScan:
+def _scan_package(directory: Path, expected_name: str | None = None) -> _PackageScan:
     """Validate one candidate directory into a ``_PackageScan``.
 
     Every failure path returns ``valid=False`` with a short, safe reason (never
     a raw filesystem error string), so a single broken package can never break
     the scan of the others and is never executable.
+
+    ``expected_name`` is the name the manifest's ``name`` field must equal; it
+    defaults to the directory's own name (the installed-package invariant). The
+    installer's staging validation passes the FUTURE name instead -- its staging
+    directory is a throwaway uuid, but the manifest must already carry the name
+    the package is about to be installed under (see ``validate_package``).
     """
-    name = directory.name
+    name = expected_name if expected_name is not None else directory.name
 
     def invalid(error: str, *, enabled: bool = True) -> _PackageScan:
         return _PackageScan(
@@ -221,7 +227,7 @@ def _scan_package(directory: Path) -> _PackageScan:
     if not isinstance(name_field, str) or not _NAME_RE.match(name_field):
         return invalid("name is missing or not a valid tool name", enabled=enabled)
     if name_field != name:
-        return invalid("name does not match the directory name", enabled=enabled)
+        return invalid("name does not match the package name", enabled=enabled)
 
     description = raw.get("description")
     if not isinstance(description, str) or not description.strip():
@@ -254,12 +260,33 @@ def _scan_all() -> list[_PackageScan]:
 
     A missing/unset dir yields [] (feature off, or nothing installed yet).
     Sorted so ``list_tools`` and ``enabled_llm_tools`` are deterministic. Stray
-    non-directory entries are skipped.
+    non-directory entries are skipped, and so are HIDDEN directories (a leading
+    "."): a dot can never begin a valid package name (see ``_NAME_RE``), and the
+    installer parks its in-progress builds under ``<tools_dir>/.staging/`` --
+    without this skip, every install in flight would surface in the tools list
+    as a phantom broken package named ".staging".
     """
     base = tools_dir()
     if base is None or not base.is_dir():
         return []
-    return [_scan_package(child) for child in sorted(base.iterdir()) if child.is_dir()]
+    return [
+        _scan_package(child)
+        for child in sorted(base.iterdir())
+        if child.is_dir() and not child.name.startswith(".")
+    ]
+
+
+def validate_package(directory: Path, expected_name: str) -> str | None:
+    """Validate a candidate package OUTSIDE the tools dir; None means valid.
+
+    The installer's pre-move gate: ``directory`` is its staging build (a uuid
+    directory name, hence the explicit ``expected_name`` -- the name the package
+    is about to be installed under, which the manifest must already carry).
+    Runs the exact same checks an installed package faces on every scan
+    (manifest shape, name regex + match, entry-file containment), so a package
+    that passes here can never turn up ``valid=False`` after the move.
+    """
+    return _scan_package(directory, expected_name=expected_name).error
 
 
 def list_tools() -> list[dict[str, Any]]:

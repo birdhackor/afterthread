@@ -186,6 +186,37 @@ class Settings(BaseSettings):
     # will be folded into. Default 50000 comfortably fits a realistic KB lookup.
     llm_tool_output_max_chars: int = Field(default=50_000, ge=1_000, le=500_000)
 
+    # Tool-round budget for ONE installer session (the web installer's
+    # "tool builder" LLM call in context_memory/services/tool_builder.py),
+    # passed as generate_structured's max_tool_rounds override. Building a tool
+    # legitimately takes many rounds -- write files, run a test, read the
+    # failure, fix, re-test -- so the default (24) is far above the workflows'
+    # llm_tool_rounds_max (8). Bounded to [4, 64]: under 4 rounds no
+    # write-test-fix cycle can complete even once, and the ceiling matches
+    # llm_tool_rounds_max's own so a hostile override cannot exceed what the
+    # loop itself permits anywhere else.
+    tool_install_max_rounds: int = Field(default=24, ge=4, le=64)
+
+    # Wall-clock budget (seconds) for ONE whole installer session, passed as
+    # generate_structured's timeout_seconds override -- the single
+    # asyncio.timeout around every builder round plus the final JSON. Default
+    # 900 (15 min): a session is dozens of model round-trips plus real shell
+    # runs against the target API, an order of magnitude beyond an ordinary
+    # workflow call's openai_timeout_seconds. Bounded to (0, 3600] so a runaway
+    # session still cannot pin its background job for more than an hour.
+    tool_install_timeout_seconds: float = Field(default=900, gt=0, le=3600)
+
+    # Wall-clock budget (seconds) for ONE run_shell meta-tool command inside an
+    # installer session (process-group-killed on expiry, exactly like
+    # llm_tool_timeout_seconds for installed tools). Deliberately FAR below
+    # tool_install_timeout_seconds: a hung shell command must burn one round,
+    # not the whole session budget -- per the stage-1 nested-timeout note, the
+    # outer deadline cancels the coroutine but cannot interrupt the threadpool
+    # thread the subprocess runs on, so this inner bound is what actually
+    # frees that thread. Bounded to (0, 600], mirroring
+    # llm_tool_timeout_seconds's convention.
+    tool_install_shell_timeout_seconds: float = Field(default=120, gt=0, le=600)
+
     database_url: str = "sqlite:///./context_memory.db"
 
     # An item in any stale-eligible status (models.STALE_ELIGIBLE_STATUSES --

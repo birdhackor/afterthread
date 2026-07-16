@@ -7,6 +7,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    HttpUrl,
     StringConstraints,
     computed_field,
     field_validator,
@@ -439,3 +440,84 @@ class LlmLogDetail(LlmLogBase):
     """A full log record: every attempt's request messages and response body."""
 
     attempts: list[LlmLogAttempt]
+
+
+# --- tools + installer (see context_memory.services.tools / tool_builder) ----
+#
+# These mirror the dicts tools.list_tools / tool_builder.get_job return. Like
+# the LLM log schemas above, they deliberately carry NO secret-shaped field:
+# a tool row is name/description/flags, and a job row is states, safe error
+# text, and the AI 日誌 link id -- a tool's own .env values never appear in
+# either service's output in the first place.
+
+
+class ToolSummary(BaseModel):
+    """One installed tool package as the 工具 page lists it.
+
+    ``valid=False`` rows carry the safe ``error`` reason from the registry scan
+    (bad manifest, name mismatch, missing entry file); such a package is listed
+    so it can be deleted, but is never advertised to the model or executable.
+    """
+
+    name: str
+    description: str
+    enabled: bool
+    valid: bool
+    error: str | None
+
+
+class ToolListResponse(BaseModel):
+    """Every installed tool package, in name order."""
+
+    tools: list[ToolSummary]
+
+
+class ToolUpdateRequest(BaseModel):
+    """PATCH payload for a tool: only the enabled toggle is mutable."""
+
+    enabled: bool
+
+
+class ToolInstallRequest(BaseModel):
+    """Payload for the web installer: where the API lives, and what to build.
+
+    ``openapi_url`` is a pydantic HttpUrl, so a non-http(s) scheme or a
+    hostless string is a 422 before any job starts. ``instructions`` shares the
+    AI input bound every other AI free-text field carries (20000 chars,
+    stripped-non-empty).
+    """
+
+    openapi_url: HttpUrl
+    instructions: str = Field(min_length=1, max_length=_MAX_AI_INPUT_CHARS)
+
+    @field_validator("instructions")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        return _stripped_non_empty(value, "instructions")
+
+
+class ToolInstallAccepted(BaseModel):
+    """202 body for a queued install: the id to poll."""
+
+    job_id: str
+
+
+class ToolInstallJobStatus(BaseModel):
+    """One install job's visible state, as polled by the 工具 page.
+
+    ``state`` walks queued -> running -> succeeded | failed. ``error`` is the
+    friendly zh-TW failure text (failed only); ``tool_name``/``summary`` are
+    what the builder reported; ``llm_log_id`` links to the builder session's
+    AI 日誌 record whenever a session actually ran, so both success and failure
+    are debuggable from the UI. Jobs are process-local and unpersisted: after a
+    backend restart every previous job id is a 404.
+    """
+
+    job_id: str
+    state: str
+    created_at: str
+    finished_at: str | None
+    error: str | None
+    tool_name: str | None
+    summary: str | None
+    llm_log_id: int | None
