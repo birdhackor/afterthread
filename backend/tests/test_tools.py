@@ -102,9 +102,13 @@ def _tc(name: str, arguments: str, *, tc_id: str = "call_1") -> SimpleNamespace:
     )
 
 
-def _tool_calls_completion(*tool_calls: SimpleNamespace) -> SimpleNamespace:
-    """A completion whose assistant message carries tool_calls and null content."""
-    message = SimpleNamespace(content=None, tool_calls=list(tool_calls))
+def _tool_calls_completion(
+    *tool_calls: SimpleNamespace, content: str | None = None
+) -> SimpleNamespace:
+    """A completion whose assistant message carries tool_calls (content is null
+    unless a test needs to also inject a ``content`` string, e.g. to exercise
+    the F4 byte cap's content-counts-too rule)."""
+    message = SimpleNamespace(content=content, tool_calls=list(tool_calls))
     return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
 
@@ -445,6 +449,43 @@ def test_tool_calls_oversized_rejected_as_upstream_error(monkeypatch: pytest.Mon
     assert (record["attempts"][0]["error"] or "").startswith("tool_calls oversized")
 
 
+def test_tool_calls_content_counts_toward_byte_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F4's byte cap must count the echoed assistant ``content`` too, not just
+    id+name+arguments. Before this test's fix, only _tool_call_fields' three
+    strings were summed, so a reply with a SINGLE tiny tool call (well under
+    both the count cap and, on tool-call fields alone, the byte cap) but a
+    GIANT ``content`` string sailed under total_bytes -- yet
+    _assistant_tool_call_message(_completion_content(completion), tool_calls)
+    still echoes that unbounded content into the next round's messages,
+    reintroducing the unbounded prompt/memory growth F4 exists to stop. Same
+    entry point, same taxonomy as test_tool_calls_oversized_rejected_as_upstream_error
+    -- only WHAT overflows differs (content instead of arguments)."""
+    seen: list[dict[str, Any]] = []
+
+    async def handler(args: dict[str, Any]) -> str:
+        seen.append(args)
+        return "ran"
+
+    huge_content = "a" * (_MAX_TOOL_CALLS_TOTAL_BYTES + 1)
+    tiny_call = _tc("echo", "{}", tc_id="c0")  # id+name+args are a few bytes
+    _install(
+        monkeypatch, _ScriptedClient([_tool_calls_completion(tiny_call, content=huge_content)])
+    )
+
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        _run(tools=[LlmTool(spec=_tool_spec("echo"), handler=handler)])
+
+    assert str(excinfo.value).startswith("tool_calls oversized")
+    assert seen == []  # the reply never entered the tool round -- no handler ran
+    summaries = llm_log.list_summaries(10)
+    assert summaries
+    record = llm_log.get_record(summaries[0]["id"])
+    assert record is not None
+    assert record["outcome"] == "upstream_error"
+    assert (record["error"] or "").startswith("tool_calls oversized")
+    assert (record["attempts"][0]["error"] or "").startswith("tool_calls oversized")
+
+
 # --- runtime: real tool packages -------------------------------------------
 
 
@@ -560,6 +601,39 @@ def test_runtime_unbounded_output_killed_promptly(
     assert len(result) <= 1000 + len(marker)  # bounded, never the whole stream
     assert result.endswith(marker)
     assert elapsed < 5  # killed at the cap, not read to exhaustion
+
+
+def test_runtime_overflow_output_with_exiting_leader_stays_clean(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression for the overflow-kill / reap race in _communicate_bounded:
+    _CappedReader.run calls its ``kill`` callback the INSTANT a stream passes
+    the cap, from its own thread, concurrently with the main thread's
+    natural-exit-triggered teardown+reap. Unlike
+    test_runtime_unbounded_output_killed_promptly's tool (an infinite loop,
+    which can ONLY ever be stopped by the overflow kill), this tool writes
+    past the cap and then exits ON ITS OWN -- so on every run there is a
+    genuine race between the reader thread's overflow kill and the main
+    thread's waitid-detected natural exit. test_runtime_output_is_capped has
+    this same write-then-exit shape but exercises it only once; repeating it
+    gives that race many more chances to land on either interleaving. This
+    test does not assert (or need) which one wins -- only that the result is
+    invariant either way: `_communicate_bounded`'s teardown_lock makes the
+    overflow callback a no-op once the main thread has started reaping,
+    instead of letting it call getpgid/killpg on a pid the reap may have just
+    freed (and the kernel could have reused)."""
+    root = tmp_path / "tools"
+    _make_tool(root, "big", "import sys\nsys.stdout.write('a' * 5000)\n")
+    _install_tools(monkeypatch, root, llm_tool_output_max_chars=1000)
+    handler = enabled_llm_tools()[0].handler
+
+    marker = "…[工具輸出過長已截斷]"
+    started = time.monotonic()
+    for _ in range(20):
+        result = asyncio.run(handler({}))
+        assert len(result) == 1000
+        assert result.endswith(marker)
+    assert time.monotonic() - started < 10  # 20 clean teardowns, never a hang
 
 
 def test_description_capped_uniformly(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

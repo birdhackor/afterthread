@@ -900,13 +900,20 @@ async def _run_structured[ModelT: BaseModel](
                         # the assistant turn, and fed to the next round -- unbounded
                         # outbound memory/prompt. Measure the serialized size the same
                         # strings that ride back on the wire contribute -- id + name +
-                        # arguments, exactly what _tool_call_fields extracts and
-                        # _assistant_tool_call_message echoes -- summed WITHOUT a
+                        # arguments (what _tool_call_fields extracts and
+                        # _assistant_tool_call_message echoes) PLUS the assistant
+                        # ``content`` string that same echo carries alongside them: a
+                        # reply with a small tool call but a GIANT content would
+                        # otherwise sail under this cap and still reintroduce the
+                        # unbounded outbound growth F4 exists to stop. ``content`` is
+                        # read ONCE here (never a second call to _completion_content)
+                        # and reused for the echo below. Summed WITHOUT a
                         # re-serialization pass. Over the cap is treated identically to
                         # the count flood: record the safe category and raise the SAME
                         # upstream 502 taxonomy, BEFORE any O(N) work and with no
                         # handler run. `from None` severs context, like every arm.
-                        total_bytes = sum(
+                        content = _completion_content(completion)
+                        total_bytes = (len(content) if content else 0) + sum(
                             len(tc_id) + len(name) + len(arguments)
                             for tc_id, name, arguments in (
                                 _tool_call_fields(tc) for tc in tool_calls
@@ -929,11 +936,7 @@ async def _run_structured[ModelT: BaseModel](
                         # `messages` after that point can never rewrite the recorded
                         # attempt. Aliasing is therefore safe, and the next round's
                         # begin_attempt copies the grown list afresh.
-                        messages.append(
-                            _assistant_tool_call_message(
-                                _completion_content(completion), tool_calls
-                            )
-                        )
+                        messages.append(_assistant_tool_call_message(content, tool_calls))
                         for index, tool_call in enumerate(tool_calls):
                             # Execute only the first _MAX_TOOL_CALLS_PER_REPLY calls;
                             # the rest are rejected WITHOUT execution but still get a

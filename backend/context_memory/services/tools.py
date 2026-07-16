@@ -681,9 +681,25 @@ def _communicate_bounded(
     blocks, so the reads and the ``wait`` genuinely proceed in parallel.
     """
     threads: list[threading.Thread] = []
+    # `teardown_lock` + `reaped` make the overflow-kill callback below and the
+    # teardown reap further down MUTUALLY EXCLUSIVE -- see `kill`'s comment for
+    # the reused-pid hazard this closes.
+    teardown_lock = threading.Lock()
+    reaped = False
 
     def kill() -> None:
-        _kill_process_group(proc)
+        # Called by a _CappedReader the instant its stream passes the cap. Guarded
+        # so it can NEVER run once the teardown below has begun reaping: after
+        # proc.wait() frees the leader's pid, os.getpgid(proc.pid) here could read a
+        # REUSED pid's group and _kill_process_group would signal the wrong group. The
+        # lock makes "kill" and "reap" mutually exclusive; the `reaped` flag makes a
+        # kill attempt after teardown a no-op. While NOT reaped (teardown not begun),
+        # the leader is un-reaped so proc.pid still names THIS group and the early
+        # overflow kill is valid.
+        with teardown_lock:
+            if reaped:
+                return
+            _kill_process_group(proc)
 
     if input_text is not None and proc.stdin is not None:
         stdin = proc.stdin
@@ -743,9 +759,13 @@ def _communicate_bounded(
             break
         time.sleep(_WAIT_POLL_SECONDS)
 
-    # Tear the WHOLE process group down UNCONDITIONALLY -- whether the leader exited
-    # on its own or we timed out. This is the fix for two holes the old
-    # "escalate only if a reader thread is still alive" teardown carried:
+    # Tear the WHOLE group down and reap, atomically w.r.t. the overflow-kill
+    # callback above (teardown_lock): setting `reaped` before releasing the lock
+    # guarantees no _CappedReader can call getpgid/killpg on the pid we are about
+    # to free below. Within the lock, the kill+reap still run UNCONDITIONALLY --
+    # whether the leader exited on its own or we timed out. This is the fix for
+    # two holes the old "escalate only if a reader thread is still alive"
+    # teardown carried:
     #  (a) a descendant that CLOSED its inherited stdout/stderr but kept running
     #      left the readers at EOF and their threads dead, so no escalation ever
     #      fired and the detached daemon LEAKED. An unconditional kill reaps it;
@@ -759,21 +779,28 @@ def _communicate_bounded(
     # still returns the tool's REAL exit code. A descendant that double-fork/setsid'd
     # OUT of the group escapes even this and is beyond v1's non-container stance
     # (D21); the daemon flag on every reader/writer thread is the honest backstop.
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(proc.pid, signal.SIGKILL)
+    with teardown_lock:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
 
-    # Reap the leader now that its group is SIGKILLed: this frees the zombie
-    # (releasing the pinned pid) and, on a natural exit, returns the tool's REAL
-    # returncode -- preserving exit-code semantics for ordinary tools. No timeout is
-    # needed: the group is dead, so a natural-exit zombie is collected at once and a
-    # timed-out leader was just killed (SIGKILL is uncatchable, so it dies promptly).
-    with contextlib.suppress(Exception):
-        proc.wait()
+        # Reap the leader now that its group is SIGKILLed: this frees the zombie
+        # (releasing the pinned pid) and, on a natural exit, returns the tool's REAL
+        # returncode -- preserving exit-code semantics for ordinary tools. No timeout
+        # is needed: the group is dead, so a natural-exit zombie is collected at once
+        # and a timed-out leader was just killed (SIGKILL is uncatchable, so it dies
+        # promptly).
+        with contextlib.suppress(Exception):
+            proc.wait()
+        reaped = True
 
     # The group is dead, so every inherited pipe write end is now closed and the
     # (daemon) reader/writer threads hit EOF and finish. Join them under the short
     # reap bound purely so a pathologically wedged pipe can never turn cleanup
     # itself into a hang; with the group gone this join is guaranteed to complete.
+    # OUTSIDE teardown_lock (released above): a reader thread still inside `kill`,
+    # blocked waiting on the lock, must be free to acquire it and no-op before this
+    # join can observe that thread finished -- joining while still holding the lock
+    # could deadlock against it.
     for thread in threads:
         thread.join(timeout=_REAP_TIMEOUT_SECONDS)
 
