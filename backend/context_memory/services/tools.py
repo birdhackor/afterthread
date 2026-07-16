@@ -51,13 +51,16 @@ the tool-less build.
 """
 
 import contextlib
+import io
 import json
 import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import threading
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,12 +92,14 @@ _PASSTHROUGH_ENV: tuple[str, ...] = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
 # an over-long description never bloats the tools array sent to the model.
 _DESCRIPTION_CAP = 1000
 
-# Hard ceiling on the tool.json FILE size, checked with stat() BEFORE the file is
-# read so an enormous manifest is never loaded into memory at all. tool.json is
-# re-read on EVERY registry scan (list_tools / enabled_llm_tools / every
-# mutation), so an unbounded one is a per-scan I/O + memory hazard; a manifest
-# over this is listed invalid rather than parsed. 64 KiB is orders of magnitude
-# above any sane manifest (name + description + a JSON-Schema parameters block).
+# Hard ceiling on the tool.json FILE size. tool.json is re-read on EVERY registry
+# scan (list_tools / enabled_llm_tools / every mutation), so an unbounded one is a
+# per-scan I/O + memory hazard; a manifest over this is listed invalid rather than
+# parsed. The scan enforces it through the bounded ``_read_regular_file_capped``
+# read (at most cap+1 chars ever enter memory, then a len check), while set_enabled
+# stat-gates it BEFORE reading -- either way an oversized manifest is never slurped
+# whole. 64 KiB is orders of magnitude above any sane manifest (name + description
+# + a JSON-Schema parameters block).
 _MANIFEST_MAX_BYTES = 64 * 1024
 
 # Tighter ceiling on the parameters JSON Schema specifically: unlike the rest of
@@ -105,16 +110,16 @@ _MANIFEST_MAX_BYTES = 64 * 1024
 # is listed invalid. 16 KiB comfortably fits a rich real-world argument schema.
 _PARAMETERS_SCHEMA_MAX_BYTES = 16 * 1024
 
-# Hard ceiling on a tool's optional ``.env`` FILE size, checked with stat() BEFORE
-# the file is parsed. Unlike the manifest, ``.env`` is re-read on EVERY tool call
-# (``_load_tool_dotenv`` runs inside the per-call ``_build_tool_env``), so an
-# unbounded one is a per-CALL memory hazard, not a per-scan one; and the parsed
-# dict becomes the child's environment BLOCK, where an enormous env can also hit
-# the kernel's E2BIG limit at exec. Over this cap the runtime degrades to "no
-# extra env" (``_load_tool_dotenv`` returns {}, the same contract a malformed
-# ``.env`` already gets) and the installer refuses the package outright
-# (``validate_package``). 64 KiB dwarfs any real secrets file (a handful of
-# KEY=VALUE lines).
+# Hard ceiling on a tool's optional ``.env`` FILE size. Unlike the manifest,
+# ``.env`` is re-read on EVERY tool call (``_load_tool_dotenv`` runs inside the
+# per-call ``_build_tool_env``), so an unbounded one is a per-CALL memory hazard,
+# not a per-scan one; and the parsed dict becomes the child's environment BLOCK,
+# where an enormous env can also hit the kernel's E2BIG limit at exec. At runtime
+# ``_load_tool_dotenv`` reads through the bounded ``_read_regular_file_capped``
+# (at most cap+1 chars, then a len check) and degrades to "no extra env" ({}, the
+# same contract a malformed ``.env`` gets); the installer stat-gates it and refuses
+# the package outright (``validate_package``). 64 KiB dwarfs any real secrets file
+# (a handful of KEY=VALUE lines).
 _ENV_FILE_MAX_BYTES = 64 * 1024
 
 # Appended when a tool's stdout (or a failure's stderr) is cut for size. Mirrors
@@ -128,6 +133,15 @@ _OUTPUT_TRUNCATION_MARKER = "…[工具輸出過長已截斷]"
 # returns effectively immediately; it exists only so a wedged pipe can never
 # turn cleanup itself into a hang.
 _REAP_TIMEOUT_SECONDS = 5.0
+
+# Poll interval for the NON-reaping wait that watches the tool leader for exit
+# (see _communicate_bounded). We cannot block in ``proc.wait`` there: reaping the
+# leader frees its pid and lets ``os.killpg(proc.pid)`` race a REUSED group, so we
+# instead poll ``os.waitid`` with WNOWAIT (detect exit WITHOUT reaping) under our
+# own deadline. The only cost of polling over blocking is up to ONE interval of
+# added latency detecting a natural exit; 25 ms is imperceptible for a local tool
+# call yet keeps the poll loop's CPU wake-ups negligible.
+_WAIT_POLL_SECONDS = 0.025
 
 # Chunk size for the bounded incremental pipe reads (see _communicate_bounded).
 # 64 KiB is large enough that draining a normal tool's output is one or two
@@ -220,6 +234,58 @@ def _entry_file_exists(directory: Path, entry: list[str]) -> bool:
     return False
 
 
+def _read_regular_file_capped(path: Path, cap: int) -> str | None:
+    """Read at most ``cap + 1`` chars of ``path``, but ONLY if it is a regular file.
+
+    The ONE bounded-regular-file read the whole tool subsystem funnels through --
+    ``read_file`` (tool_builder), ``.env`` loading, and the ``tool.json`` scan all
+    call it, so the jail-hardening below is enforced identically everywhere instead
+    of re-derived per call site. Returns the text (<= ``cap + 1`` chars, so the
+    caller can tell "over the cap" from a ``len > cap`` check) or None for EVERY
+    refusal/failure -- the caller maps None onto its own error or degrade.
+
+    Each open flag defends a distinct vector:
+
+    * ``O_NONBLOCK`` -- opening a FIFO for read normally BLOCKS until a writer
+      appears; a tool (or the builder via run_shell) could ``mkfifo`` a path in
+      place of a real file and wedge the reading threadpool worker FOREVER (the
+      outer asyncio timeout only cancels the await, never the wedged worker). With
+      O_NONBLOCK the open returns at once and the S_ISREG gate below rejects it.
+      For a regular file O_NONBLOCK is a no-op, so ordinary reads are unaffected;
+    * ``O_NOFOLLOW`` -- refuses a symlinked FINAL component (ELOOP -> None). This
+      is the enforced boundary of the staging jail (D21): even if a symlink is
+      swapped in AFTER a caller resolved the path (a TOCTOU race), the open itself
+      declines to follow it, so a link to a file outside the package/staging is
+      never read through.
+
+    The ``fstat`` after open is the HARD regular-file gate (S_ISREG): a socket,
+    device or directory is refused even though it opened. ``fdopen`` takes
+    OWNERSHIP of the fd, so once it succeeds its context manager owns the close;
+    ``fd_owned`` tracks the handoff so the ``finally`` closes the raw fd on exactly
+    the paths that never reached ``fdopen`` (never a double close).
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        # Missing (ENOENT), a symlinked leaf O_NOFOLLOW refused (ELOOP), a FIFO
+        # with no writer on some platforms, a permission error, ... -- every open
+        # failure degrades to None rather than raising into the caller.
+        return None
+    fd_owned = True  # we own the raw fd until fdopen takes it over
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        handle = os.fdopen(fd, encoding="utf-8", errors="replace")
+        fd_owned = False  # fdopen now owns fd; closing the handle closes it
+        with handle:
+            return handle.read(cap + 1)
+    except OSError:
+        return None
+    finally:
+        if fd_owned:
+            os.close(fd)
+
+
 def _scan_package(directory: Path, expected_name: str | None = None) -> _PackageScan:
     """Validate one candidate directory into a ``_PackageScan``.
 
@@ -264,19 +330,19 @@ def _scan_package(directory: Path, expected_name: str | None = None) -> _Package
         return invalid("tool.json must be a real file (not a symlink)")
     if not tool_json.is_file():
         return invalid("missing tool.json")
-    # Bound the manifest FILE size with stat() BEFORE reading it (see
-    # _MANIFEST_MAX_BYTES): an oversized tool.json is a per-scan memory/I/O
-    # hazard, so it is listed invalid rather than loaded into memory.
-    try:
-        manifest_size = tool_json.stat().st_size
-    except OSError:
-        return invalid("tool.json could not be read")
-    if manifest_size > _MANIFEST_MAX_BYTES:
+    # Read the manifest through the ONE bounded-regular-file helper (F3b): its
+    # fstat gate refuses a FIFO/socket/device swapped in for tool.json and its
+    # O_NOFOLLOW backstops the is_symlink() fast path above against a symlink
+    # raced in after it, while the cap+1 read means an oversized manifest is never
+    # slurped whole into memory (the per-scan hazard _MANIFEST_MAX_BYTES exists
+    # for). None is every refusal/read failure; a len past the cap is "too large".
+    text = _read_regular_file_capped(tool_json, _MANIFEST_MAX_BYTES)
+    if text is None:
+        return invalid("tool.json is not a readable regular file")
+    if len(text) > _MANIFEST_MAX_BYTES:
         return invalid("tool.json is too large")
     try:
-        raw = json.loads(tool_json.read_text(encoding="utf-8"))
-    except OSError:
-        return invalid("tool.json could not be read")
+        raw = json.loads(text)
     except ValueError:
         return invalid("tool.json is not valid JSON")
     if not isinstance(raw, dict):
@@ -456,21 +522,25 @@ def _load_tool_dotenv(directory: Path) -> dict[str, str]:
     generated tool can never exfiltrate a parent secret through its own manifest.
     """
     env_file = directory / ".env"
-    if not env_file.is_file():
+    # Read through the ONE bounded-regular-file helper (F3a): its O_NONBLOCK+S_ISREG
+    # gate refuses a FIFO an operator (or a post-install mutation) could `mkfifo` in
+    # place of .env -- which dotenv_values(path) would reopen and BLOCK on forever --
+    # its O_NOFOLLOW refuses a symlinked .env, and its cap+1 read bounds the per-CALL
+    # memory the parse would otherwise slurp whole into the child's exec env block.
+    # None (missing / FIFO / symlink / read error) and an over-cap length BOTH
+    # degrade to {} -- the SAME degrade-to-no-extra-env contract the malformed-.env
+    # fallback below gives -- so a runaway or mutated .env can never bloat per call.
+    text = _read_regular_file_capped(env_file, _ENV_FILE_MAX_BYTES)
+    if text is None or len(text) > _ENV_FILE_MAX_BYTES:
         return {}
-    # Bound the .env FILE size with stat() BEFORE dotenv_values reads it (see
-    # _ENV_FILE_MAX_BYTES): the parse slurps the whole file into memory on EVERY
-    # tool call, and the parsed dict becomes the child's exec env block. An
-    # oversized one degrades to "no extra env" -- the SAME degrade-to-{} contract
-    # as the malformed-.env fallback below -- so a runaway or post-install-mutated
-    # .env can never bloat memory per call or overflow the exec env.
+    # Parse from an IN-MEMORY stream, never dotenv_values(path): handing it the path
+    # would make python-dotenv REOPEN the file -- a second, UNBOUNDED read that also
+    # re-follows a symlink -- defeating the bounded, O_NOFOLLOW'd read above. Both
+    # reads must be the same bytes and the same regular-file decision.
+    # ``interpolate=False`` stays LOAD-BEARING (see the docstring): it keeps a
+    # ``${OPENAI_API_KEY}`` line literal instead of resolving it from our parent env.
     try:
-        if env_file.stat().st_size > _ENV_FILE_MAX_BYTES:
-            return {}
-    except OSError:
-        return {}
-    try:
-        values = dotenv_values(env_file, encoding="utf-8", interpolate=False)
+        values = dotenv_values(stream=io.StringIO(text), interpolate=False)
     except Exception:
         return {}
     return {key: value for key, value in values.items() if isinstance(value, str)}
@@ -628,10 +698,10 @@ def _communicate_bounded(
                 stdin.close()
 
         # daemon=True on every reader/writer thread is a BACKSTOP, not the
-        # mechanism: the group-kill escalation after the wait below is what
+        # mechanism: the unconditional group kill before the reap below is what
         # normally reaps a thread whose pipe is held open by a surviving
         # descendant. But should even that fail (a descendant that escaped the
-        # process group entirely -- see the escalation comment), a NON-daemon
+        # process group entirely -- see the teardown comment), a NON-daemon
         # thread stuck in a blocking read/write would keep the interpreter alive at
         # shutdown; daemon makes that impossible -- at worst one FD leaks until
         # process exit, never a hung interpreter.
@@ -648,46 +718,64 @@ def _communicate_bounded(
             thread.start()
             threads.append(thread)
 
+    # Watch the leader for exit WITHOUT reaping it, under the wall-clock deadline.
+    # We must NOT ``proc.wait`` here: reaping frees the leader's pid, and the
+    # UNCONDITIONAL group kill below (``os.killpg(proc.pid)``) would then race a
+    # kernel that had already REUSED that pid as another process's group id --
+    # signalling the wrong group. ``os.waitid(..., WEXITED | WNOWAIT | WNOHANG)``
+    # instead DETECTS the exit and leaves the leader a zombie; a zombie's pid (and
+    # therefore its process-GROUP id) is pinned un-reusable until we ``wait`` it,
+    # which is the load-bearing invariant that makes the kill race-free. WNOHANG
+    # makes each probe non-blocking so we poll under our own deadline.
     timed_out = False
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _kill_process_group(proc)
-        # The group is SIGKILLed; reap so no zombie lingers. Bounded by the short
-        # reap timeout, exactly like the old timeout path.
-        with contextlib.suppress(Exception):
-            proc.wait(timeout=_REAP_TIMEOUT_SECONDS)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            info = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+        except ChildProcessError:
+            # Already reaped somehow (we are the only waiter, so this is defensive):
+            # stop polling and fall through to the kill, which no-ops on a gone group.
+            break
+        if info is not None:
+            break  # leader exited; the zombie is retained, pinning the PGID
+        if time.monotonic() >= deadline:
+            timed_out = True
+            break
+        time.sleep(_WAIT_POLL_SECONDS)
 
-    # ``proc.wait()`` returning means the LEADER process exited -- NOT that the
-    # pipes are at EOF. A reader sees EOF only when the LAST holder of a pipe's
-    # write end closes it, and a tool whose entry spawned a background descendant
-    # that INHERITED stdout/stderr leaves those write ends open after the leader is
-    # gone: the readers would then block forever, this join would return with the
-    # (daemon) threads still alive, and we would leak the threads, their FDs, and
-    # the surviving descendant. So join with the short reap bound FIRST -- the
-    # common case (leader exit DID close the pipes: no such descendant, or the
-    # overflow/timeout paths already group-killed everything) finishes well inside
-    # it -- and escalate only if that is not enough.
+    # Tear the WHOLE process group down UNCONDITIONALLY -- whether the leader exited
+    # on its own or we timed out. This is the fix for two holes the old
+    # "escalate only if a reader thread is still alive" teardown carried:
+    #  (a) a descendant that CLOSED its inherited stdout/stderr but kept running
+    #      left the readers at EOF and their threads dead, so no escalation ever
+    #      fired and the detached daemon LEAKED. An unconditional kill reaps it;
+    #  (b) killing AFTER ``proc.wait`` reaped the leader targeted a pid the kernel
+    #      had already freed -- a REUSED-pgid hazard. Here the leader is still
+    #      un-reaped (a zombie on natural exit, or alive on timeout), so ``proc.pid``
+    #      provably still names THIS group (``start_new_session=True`` made the
+    #      leader its own group leader, so the group id EQUALS its pid).
+    # A leader that exited NATURALLY is already a dead zombie, so this SIGKILL is a
+    # no-op for it and cannot disturb its recorded exit status -- ``proc.wait`` below
+    # still returns the tool's REAL exit code. A descendant that double-fork/setsid'd
+    # OUT of the group escapes even this and is beyond v1's non-container stance
+    # (D21); the daemon flag on every reader/writer thread is the honest backstop.
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGKILL)
+
+    # Reap the leader now that its group is SIGKILLed: this frees the zombie
+    # (releasing the pinned pid) and, on a natural exit, returns the tool's REAL
+    # returncode -- preserving exit-code semantics for ordinary tools. No timeout is
+    # needed: the group is dead, so a natural-exit zombie is collected at once and a
+    # timed-out leader was just killed (SIGKILL is uncatchable, so it dies promptly).
+    with contextlib.suppress(Exception):
+        proc.wait()
+
+    # The group is dead, so every inherited pipe write end is now closed and the
+    # (daemon) reader/writer threads hit EOF and finish. Join them under the short
+    # reap bound purely so a pathologically wedged pipe can never turn cleanup
+    # itself into a hang; with the group gone this join is guaranteed to complete.
     for thread in threads:
         thread.join(timeout=_REAP_TIMEOUT_SECONDS)
-    # A thread still alive here means its pipe is held open by a descendant that
-    # outlived the leader. ``start_new_session=True`` put every ORDINARY descendant
-    # in the leader's process GROUP, so SIGKILLing the group closes their inherited
-    # write ends -> the readers hit EOF and finish. We target the group by
-    # ``proc.pid`` directly (a session leader's group id EQUALS its pid, and that id
-    # stays reserved by the kernel while any group member survives): ``_kill_process
-    # _group`` would be WRONG here because it derives the group via ``os.getpgid(
-    # proc.pid)``, which now raises -- ``proc.wait()`` above already reaped the
-    # leader -- and falls back to a no-op ``proc.kill`` that never reaches the
-    # descendant. A descendant that double-forked / setsid'd OUT of the group
-    # escapes even this and is beyond v1's non-container stance (D21); the daemon
-    # flag on every thread is the honest backstop for that residual case.
-    if any(thread.is_alive() for thread in threads):
-        with contextlib.suppress(Exception):
-            os.killpg(proc.pid, signal.SIGKILL)
-        for thread in threads:
-            thread.join(timeout=_REAP_TIMEOUT_SECONDS)
 
     return _BoundedOutput(
         stdout=stdout_reader.text if stdout_reader is not None else "",

@@ -43,6 +43,7 @@ from context_memory.services import llm_log, tools
 from context_memory.services.llm import (
     _MAX_TOOL_CALLS_ACCEPTED,
     _MAX_TOOL_CALLS_PER_REPLY,
+    _MAX_TOOL_CALLS_TOTAL_BYTES,
     _TOO_MANY_TOOL_CALLS,
     _TOOL_BUDGET_EXHAUSTED,
     LlmTool,
@@ -408,6 +409,42 @@ def test_tool_calls_flood_rejected_as_upstream_error(monkeypatch: pytest.MonkeyP
     assert (record["attempts"][0]["error"] or "").startswith("tool_calls flood")
 
 
+def test_tool_calls_oversized_rejected_as_upstream_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reply whose tool_calls COUNT is legal (<= _MAX_TOOL_CALLS_ACCEPTED) but whose
+    aggregate serialized SIZE exceeds _MAX_TOOL_CALLS_TOTAL_BYTES is refused at the
+    SAME entry point as the count flood (F4). The count cap alone would let a handful
+    of calls carrying huge ``arguments`` blobs through to be summarized, echoed in the
+    assistant turn and parsed -- unbounded OUTBOUND memory/prompt. Refused up front on
+    the SAME 502 taxonomy: no handler runs, and the recorder finalizes the interaction
+    as an upstream failure carrying the safe oversized category."""
+    seen: list[dict[str, Any]] = []
+
+    async def handler(args: dict[str, Any]) -> str:
+        seen.append(args)
+        return "ran"
+
+    # A FEW calls, each with a large arguments string, summing PAST the byte cap while
+    # the COUNT stays far under _MAX_TOOL_CALLS_ACCEPTED -- so it is the SIZE gate, not
+    # the count gate, that trips.
+    chunk = "a" * (_MAX_TOOL_CALLS_TOTAL_BYTES // 4 + 1)
+    big = [_tc("echo", chunk, tc_id=f"c{i}") for i in range(4)]
+    assert len(big) <= _MAX_TOOL_CALLS_ACCEPTED  # the count cap is NOT what trips
+    _install(monkeypatch, _ScriptedClient([_tool_calls_completion(*big)]))
+
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        _run(tools=[LlmTool(spec=_tool_spec("echo"), handler=handler)])
+
+    assert str(excinfo.value).startswith("tool_calls oversized")
+    assert seen == []  # the reply never entered the tool round -- no handler ran
+    summaries = llm_log.list_summaries(10)
+    assert summaries
+    record = llm_log.get_record(summaries[0]["id"])
+    assert record is not None
+    assert record["outcome"] == "upstream_error"
+    assert (record["error"] or "").startswith("tool_calls oversized")
+    assert (record["attempts"][0]["error"] or "").startswith("tool_calls oversized")
+
+
 # --- runtime: real tool packages -------------------------------------------
 
 
@@ -657,6 +694,59 @@ def test_runtime_background_descendant_reaped_no_thread_leak(
             subprocess.run(["pkill", "-9", "-f", marker], check=False)
 
 
+def test_runtime_detached_child_closing_pipes_is_killed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tool whose entry spawns a child that CLOSES the inherited stdout/stderr
+    (redirects both to /dev/null) and then sleeps, while the LEADER exits at once,
+    must still have that child killed (F1, the round-3 (a) hole). Because the child
+    holds NONE of the leader's pipes, the readers hit EOF the instant the leader
+    exits and their threads die -- so round-3's "escalate the group kill ONLY if a
+    reader thread is still alive" never fired and the detached child LEAKED,
+    sleeping on. The new teardown kills the whole process group UNCONDITIONALLY
+    (before reaping the leader, so proc.pid still pins the group), reaping the
+    child regardless of pipe/thread state. Conceptually this FAILS against the
+    round-3 logic: with the readers already at EOF, nothing there would signal the
+    surviving child.
+
+    Robust leak detection is a unique-argv marker + pgrep, NOT threading.active_count
+    (which the (a) hole doesn't even perturb -- the threads exit on EOF)."""
+    root = tmp_path / "tools"
+    marker = f"cm_f1_closed_{os.getpid()}_{time.monotonic_ns()}"
+    # The child silences BOTH its stdout and stderr (so it inherits neither of the
+    # leader's pipes) and sleeps 60s carrying the marker; the leader then exits
+    # IMMEDIATELY. 60s >> the reap window, so a survivor is unambiguously alive at
+    # the pgrep check rather than having exited on its own.
+    run_py = (
+        "import subprocess, sys\n"
+        "subprocess.Popen(\n"
+        f"    [sys.executable, '-c', 'import time; time.sleep(60)', {marker!r}],\n"
+        "    stdout=subprocess.DEVNULL,\n"
+        "    stderr=subprocess.DEVNULL,\n"
+        ")\n"
+        "sys.stdout.write('LEADER_DONE')\n"
+    )
+    pkg = _make_tool(root, "detached", run_py)
+    entry = [sys.executable, "run.py"]
+    env = tools._build_tool_env(pkg)
+
+    try:
+        started = time.monotonic()
+        result = tools._run_tool_subprocess(entry, pkg, env, "{}", 30.0, 1000)
+        elapsed = time.monotonic() - started
+
+        assert "LEADER_DONE" in result  # the leader's own output survived
+        assert elapsed < 20  # returned on the leader's prompt exit, not the 60s sleep
+        # The detached child shared the leader's process group; the unconditional
+        # pre-reap group kill SIGKILLed it. Round-3 would have left it sleeping.
+        if shutil.which("pgrep"):
+            found = subprocess.run(["pgrep", "-f", marker], capture_output=True, check=False)
+            assert found.returncode != 0, "the detached child survived (round-3 (a) hole)"
+    finally:
+        if shutil.which("pkill"):
+            subprocess.run(["pkill", "-9", "-f", marker], check=False)
+
+
 def test_runtime_oversized_dotenv_degrades_to_no_extra_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -679,6 +769,40 @@ def test_runtime_oversized_dotenv_degrades_to_no_extra_env(
     assert list_tools()[0]["valid"] is True  # scan does NOT reject an oversized .env
     result = asyncio.run(enabled_llm_tools()[0].handler({}))
     assert result == "SECRET=None"  # the oversized .env was dropped -> key absent
+
+
+def test_runtime_fifo_dotenv_degrades_without_hanging(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A FIFO swapped in for ``.env`` degrades to no-extra-env WITHOUT hanging (F3a):
+    ``dotenv_values(path)`` would REOPEN and read the path, and an ordinary open of a
+    writer-less FIFO BLOCKS FOREVER -- wedging the caller. The shared helper opens
+    O_NONBLOCK + S_ISREG-gates, so the FIFO is refused at once and the load degrades
+    to {} -- the same contract a malformed/oversized ``.env`` gets. The env build is
+    driven on a WATCHED daemon thread so a regression (a blocking reopen) fails
+    LOUDLY here instead of wedging the whole suite."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(
+        root,
+        "envtool",
+        "import os, sys\nsys.stdout.write('SECRET=' + str(os.environ.get('TOOL_SECRET')))\n",
+    )
+    os.mkfifo(pkg / ".env")  # a writer-less FIFO -- an ordinary read would block forever
+    _install_tools(monkeypatch, root)
+
+    box: dict[str, dict[str, str]] = {}
+    worker = threading.Thread(
+        target=lambda: box.__setitem__("env", tools._build_tool_env(pkg)), daemon=True
+    )
+    worker.start()
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "reading a FIFO .env hung (F3a regression)"
+    assert "TOOL_SECRET" not in box["env"]  # the FIFO .env degraded to no extra env
+
+    # End to end: the child's env carries no TOOL_SECRET (reaching here also proves
+    # the synchronous env build in the handler did not hang).
+    result = asyncio.run(enabled_llm_tools()[0].handler({}))
+    assert result == "SECRET=None"
 
 
 def test_validate_package_flags_oversized_dotenv(

@@ -402,41 +402,26 @@ def _build_meta_tools(staging: Path) -> list[LlmTool]:
 
         def _read() -> str:
             cap = get_settings().llm_tool_output_max_chars
-            # Two-layer size defense, cheap gate first, HARD gate second (N5):
-            #  (1) stat().st_size is the CHEAP first gate -- a file already known
-            #      huge is refused without opening it (comparing bytes against a
-            #      CHAR cap is conservative: UTF-8 chars <= bytes, so within the
-            #      byte budget guarantees within the char cap). A directory is
-            #      rejected first, since its block-sized st_size could otherwise
-            #      trip that gate with the wrong message; a missing path keeps the
-            #      "no such file" wording rather than being mislabeled below.
-            #  (2) require a REGULAR file, then read at most cap+1 chars -- the HARD
-            #      gate. stat() alone is NOT enough: a FIFO (the builder can
-            #      `mkfifo` one via run_shell) is neither a dir nor over-size
-            #      (st_size 0), and read_text() on it would BLOCK FOREVER -- the
-            #      outer asyncio timeout only cancels the await, leaving THIS
-            #      threadpool worker wedged for good (a permanent worker leak).
-            #      is_file() (S_ISREG) excludes FIFOs/sockets/devices outright, and
-            #      the bounded read means even a regular file that GREW past the cap
-            #      AFTER the stat (a TOCTOU race) can never buffer more than cap+1
-            #      chars before we refuse it.
+            # Cheap pre-gates for the DISTINCT model-facing wording, then the ONE
+            # shared bounded helper as the HARD gate (F2). exists()/is_dir() only
+            # PICK the right message; ``tools._read_regular_file_capped`` is what
+            # actually enforces the boundary -- its O_NONBLOCK+S_ISREG gate refuses
+            # a FIFO (the builder can `mkfifo` one via run_shell; read_text() on it
+            # would BLOCK FOREVER, wedging this threadpool worker since the outer
+            # asyncio timeout only cancels the await), its O_NOFOLLOW refuses a
+            # symlinked leaf swapped in after _resolve_in_staging resolved the path
+            # (a TOCTOU race the resolve alone cannot close), and its cap+1 read
+            # means even a file that GREW past the cap after any check buffers at
+            # most cap+1 chars before we refuse it. None => existed and is not a
+            # dir yet the helper declined => a non-regular/symlinked leaf.
             if not target.exists():
                 return "read_file failed: no such file"
             if target.is_dir():
                 return "read_file failed: path is a directory"
-            if not target.is_file():
+            text = tools._read_regular_file_capped(target, cap)
+            if text is None:
                 return "read_file failed: not a regular file"
-            size = target.stat().st_size
-            if size > cap:
-                return (
-                    "read_file failed: file is too large "
-                    f"({size} bytes exceeds the {cap}-character output cap)"
-                )
-            with open(target, encoding="utf-8", errors="replace") as handle:
-                text = handle.read(cap + 1)
             if len(text) > cap:
-                # Post-stat growth (or an st_size that under-reported the char
-                # length): the bounded read caught what the cheap stat did not.
                 return (
                     f"read_file failed: file is too large (exceeds the {cap}-character output cap)"
                 )

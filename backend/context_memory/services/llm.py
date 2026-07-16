@@ -159,6 +159,25 @@ _MAX_TOOL_CALLS_ACCEPTED = 64
 # appends the offending count -- "tool_calls flood: <N> calls in one reply".
 _TOOL_CALLS_FLOOD_PREFIX = "tool_calls flood"
 
+# Companion to _MAX_TOOL_CALLS_ACCEPTED that bounds SIZE, not COUNT. The count cap
+# alone is not enough: 64 calls (under the count cap) each carrying a huge
+# ``arguments`` string still get summarized, echoed verbatim in the assistant turn,
+# json.loads'd, and fed into the NEXT round's request -- unbounded OUTBOUND
+# memory/prompt growth for one reply. This caps the aggregate serialized size of a
+# single reply's tool_calls. Distinct from the tool RESULTS, which are separately
+# bounded by ``settings.llm_tool_output_max_chars``; that knob never sees the
+# model's outbound call payload, which is what this guards. 256 KiB is far above
+# any legitimate parallel-call burst (even 64 calls with rich arguments) yet small
+# enough that the echoed assistant turn and the recorded trace stay bounded.
+_MAX_TOOL_CALLS_TOTAL_BYTES = 256 * 1024
+
+# Prefix of the safe, config-free LLMUpstreamError message raised for a reply whose
+# tool_calls aggregate size exceeds _MAX_TOOL_CALLS_TOTAL_BYTES. Sibling to
+# _TOOL_CALLS_FLOOD_PREFIX -- same taxonomy, same _classify_upstream_outcome
+# "upstream_error" bucket; the runtime message appends the measured size --
+# "tool_calls oversized: <N> bytes in one reply".
+_TOOL_CALLS_OVERSIZED_PREFIX = "tool_calls oversized"
+
 
 @dataclass(slots=True)
 class LlmTool:
@@ -875,6 +894,30 @@ async def _run_structured[ModelT: BaseModel](
                             flood = f"{_TOOL_CALLS_FLOOD_PREFIX}: {count} calls in one reply"
                             recorder.fail_current_attempt(flood)
                             raise LLMUpstreamError(flood) from None
+                        # SIZE bound (F4), the sibling guard at the SAME entry point:
+                        # a reply UNDER the count cap can still carry a huge aggregate
+                        # ``arguments`` payload, which would be summarized, echoed in
+                        # the assistant turn, and fed to the next round -- unbounded
+                        # outbound memory/prompt. Measure the serialized size the same
+                        # strings that ride back on the wire contribute -- id + name +
+                        # arguments, exactly what _tool_call_fields extracts and
+                        # _assistant_tool_call_message echoes -- summed WITHOUT a
+                        # re-serialization pass. Over the cap is treated identically to
+                        # the count flood: record the safe category and raise the SAME
+                        # upstream 502 taxonomy, BEFORE any O(N) work and with no
+                        # handler run. `from None` severs context, like every arm.
+                        total_bytes = sum(
+                            len(tc_id) + len(name) + len(arguments)
+                            for tc_id, name, arguments in (
+                                _tool_call_fields(tc) for tc in tool_calls
+                            )
+                        )
+                        if total_bytes > _MAX_TOOL_CALLS_TOTAL_BYTES:
+                            oversized = (
+                                f"{_TOOL_CALLS_OVERSIZED_PREFIX}: {total_bytes} bytes in one reply"
+                            )
+                            recorder.fail_current_attempt(oversized)
+                            raise LLMUpstreamError(oversized) from None
                         # The synthetic trace is THIS attempt's recorded response;
                         # the tool RESULTS then appear inside the next attempt's
                         # request_messages naturally (no recorder schema change).
