@@ -55,10 +55,31 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 | `OPENAI_BASE_URL` | `""`（空） | OpenAI-compatible endpoint 的 base URL。留空＝AI 功能未設定，手動 CRUD 不受影響。 |
 | `OPENAI_API_KEY` | `""`（空） | 對應 endpoint 的 API key。**不是**判斷「是否已設定」的條件之一——有些相容 gateway 不需要 key。 |
 | `OPENAI_MODEL` | `""`（空） | 呼叫該 endpoint 時使用的 model 名稱。與 `OPENAI_BASE_URL` 兩者都非空、且 base URL 可被解析為合法 http/https URL，才算「已設定」。 |
-| `OPENAI_TIMEOUT_SECONDS` | `60` | 單次 LLM 請求的逾時秒數，邊界 `(0, 600]`。同時是「第一次呼叫 + 一次修正重試」整體的 wall-clock 上限（`asyncio.timeout` 包住整個嘗試迴圈）。 |
-| `LLM_PROMPT_BUDGET_CHARS` | `32000` | enrich / assist-update 組 prompt 時，項目快照序列化後的最大字元數，邊界 `[4000, 200000]`。避免超大項目撐爆小 context window 的模型。 |
+| `OPENAI_TIMEOUT_SECONDS` | `120` | 單次 LLM 請求的逾時秒數，邊界 `(0, 1800]`。同時是「第一次呼叫 + 一次修正重試」整體的 wall-clock 上限（`asyncio.timeout` 包住整個嘗試迴圈）。預設值已經是為長 context 模型調校過的（見下方 GLM5.2 備註），不是舊版小 context 模型的 60 秒。 |
+| `OPENAI_MAX_OUTPUT_TOKENS` | 未設定 | 選填，邊界 `[1, 1000000]`。設定時才以 `max_tokens` 送給 endpoint；留空＝完全不送這個參數（部分 reasoning endpoint 會拒絕顯式 `max_tokens`，但有些 gateway 預設完成長度太短，會截斷長回覆——這是給後者用的上調旋鈕）。 |
+| `LLM_PROMPT_BUDGET_CHARS` | `200000` | enrich / assist-update / 工具安裝組 prompt 時，內容序列化後的最大字元數，邊界 `[4000, 2000000]`。避免超大內容撐爆小 context window 的模型；預設值已經是為大 context 模型調校過的（見下方 GLM5.2 備註）。 |
+| `LLM_LOG_MAX_ENTRIES` | `50` | 「AI 日誌」頁／`GET /api/llm/logs` 顯示的最近互動筆數上限（記憶體內環狀緩衝，隨程序重啟清空），邊界 `[1, 1000]`。 |
+| `LLM_LOG_BODY_MAX_CHARS` | `200000` | 單次互動中，任一則請求/回應內容儲存時的字元數上限，邊界 `[1000, 2000000]`；與 `LLM_LOG_MAX_ENTRIES` 一起讓記憶體用量在兩個軸上都有界。 |
+| `LLM_LOG_FILE` | 未設定 | 選填。設定後，每次完整的 LLM 互動（含完整提示/回應內容）會額外追加寫入這個 JSONL 檔案；預設關閉——記錄含個人記憶內容，落不落地是使用者自己的隱私選擇。 |
+| `TOOLS_DIR` | dev 未設定／打包模式自動注入 `<data-dir>/tools` | 已安裝工具套件所在目錄；留空＝工具功能整個關閉（`GET /api/tools` 回空清單，AI workflow 不帶任何工具，prompt 與無工具版本逐字相同）。dev 模式要用工具功能，需自行在 `backend/.env` 設定這個變數。 |
+| `LLM_TOOL_ROUNDS_MAX` | `8` | 一次 AI workflow 呼叫最多允許幾輪工具呼叫，邊界 `[1, 64]`。 |
+| `LLM_TOOL_TIMEOUT_SECONDS` | `60` | 單次工具子行程的逾時秒數（到期整個 process group 被砍），邊界 `(0, 600]`。 |
+| `LLM_TOOL_OUTPUT_MAX_CHARS` | `50000` | 工具 stdout 餵回給模型的字元數上限，邊界 `[1000, 500000]`。 |
+| `TOOL_INSTALL_MAX_ROUNDS` | `24` | KB 網頁安裝器（見下方「工具（KB 網頁安裝器）」）單一安裝工作階段的工具輪數上限，邊界 `[4, 64]`。 |
+| `TOOL_INSTALL_TIMEOUT_SECONDS` | `900` | KB 網頁安裝器單一安裝工作階段的整體逾時秒數，邊界 `(0, 3600]`。 |
+| `TOOL_INSTALL_SHELL_TIMEOUT_SECONDS` | `120` | 安裝器內單一 `run_shell` 指令的逾時秒數，邊界 `(0, 600]`。 |
 | `DATABASE_URL` | `sqlite:///./context_memory.db` | SQLAlchemy URL。**只支援 SQLite**，且必須是檔案型（不可為 in-memory）——見下方設計筆記。 |
 | `STALE_AFTER_DAYS` | `14` | 非終態項目（`STALE_ELIGIBLE_STATUSES`：除 `done`／`superseded` 外的五種狀態）的 `updated` 超過這個天數，API 回應的 `is_stale` 會是 `true`。邊界 `[0, 36500]`。 |
+
+> **GLM5.2（或其他 1M-token context 模型）備註**：上面 `OPENAI_TIMEOUT_SECONDS`
+> （120）與 `LLM_PROMPT_BUDGET_CHARS`（200000）的預設值本身已經是為大 context
+> 模型調校過的數字。內部 LLM 若是 GLM5.2 這類 1M-token context 模型，
+> `backend/.env.example` 內建了進一步調高的建議（取代上方預設）：
+>
+> ```bash
+> LLM_PROMPT_BUDGET_CHARS=800000   # 讓超大項目也能整項進 prompt，不截斷
+> OPENAI_TIMEOUT_SECONDS=300       # 長 context 生成較慢，放寬逾時避免誤判 502
+> ```
 
 ## API 概覽
 
@@ -95,11 +116,74 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
   `active`。
 - `POST /api/items/{id}/assist-update` — 依一段近況文字追加 progress 並局部更新
   項目內容。
+- `GET /api/llm/logs` — 「AI 日誌」頁用：最近的 LLM 互動摘要清單（`limit`
+  1–500，預設 50），新到舊排序。
+- `GET /api/llm/logs/{log_id}` — 單筆互動的完整內容（每次嘗試的請求訊息與回應
+  全文）；記錄已被環狀緩衝擠出（見 `LLM_LOG_MAX_ENTRIES`）或程序重啟過則
+  404。
 
 AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 `502 llm_upstream_error`（上游呼叫失敗或輸出無法解析，即使重試一次後仍失敗）、
 `409 conflict`（enrich／assist-update 於 LLM 呼叫期間，項目被別的請求改動——樂觀
 並發偵測）。
+
+**Tools**（`context_memory/routers/tools.py`，前綴 `/api/tools`；即「工具」頁的
+後端）
+- `GET /api/tools` — 列出所有已安裝工具套件（含無效的），依名稱排序；`TOOLS_DIR`
+  未設定或尚無工具時回空清單（非錯誤）。
+- `PATCH /api/tools/{name}` — 切換某工具的 `enabled`；找不到回 404。
+- `DELETE /api/tools/{name}` — 刪除整個工具套件目錄；找不到回 404。
+- `POST /api/tools/install` — 送出 KB 網頁安裝器工作（見下方「工具（KB 網頁
+  安裝器）」）；202 + `job_id`，建置在背景執行。`TOOLS_DIR` 未設定回 `503
+  tools_not_configured`；已有安裝在跑時回 `409 install_in_progress`（同一時間
+  只允許一個安裝工作）。
+- `GET /api/tools/install/{job_id}` — 輪詢一個安裝工作的狀態
+  （`queued`／`running`／`succeeded`／`failed` + 完成後的 `tool_name`／
+  `summary`／`llm_log_id`）；工作已完成的清單被裁剪掉、或後端重啟過（工作只存在
+  記憶體）則回 404。
+
+## 工具（KB 網頁安裝器）
+
+- **工具套件格式**：`<TOOLS_DIR>/<name>/`，內含 `tool.json`（`name`／
+  `description`／`parameters`(JSON Schema)／`entry`(argv)／可選 `enabled`）、
+  `entry` 會執行的實作檔，以及可選的 `.env`（該工具自己的秘密，例如某個 KB 的
+  API key，啟動子行程時注入）。`name` 必須等於目錄名，且符合
+  `^[a-z0-9][a-z0-9_-]{0,63}$`。執行契約（`services/tools.py` 的
+  `_run_tool_subprocess`）：`cwd` = 工具目錄，參數 JSON 寫進子行程 STDIN，
+  STDOUT 當作結果（超過 `LLM_TOOL_OUTPUT_MAX_CHARS` 截斷）、非 0 結束碼視為
+  失敗，逾時（`LLM_TOOL_TIMEOUT_SECONDS`）整個 process group 被砍。子行程環境
+  是**從零打造**的（只透傳 `PATH`/`HOME`/`LANG`/`LC_ALL`/`TMPDIR` + 工具自己的
+  `.env`）——絕不整包繼承父行程環境，因為父行程環境帶著 `OPENAI_API_KEY`；這
+  防的是「不小心」外洩，不是對抗惡意子行程的沙箱（同 UID 的子行程理論上仍讀得
+  到 `/proc/<ppid>/environ`）。
+- **安裝器**（`services/tool_builder.py`，`/tools` 頁「安裝新工具」分頁的後端；
+  設計依據見 `docs/web-v2-decisions.md` D21/D27）：`POST /api/tools/install`
+  在背景跑一次帶有四個 meta-tool（`write_file`／`read_file`／`list_dir`／
+  `run_shell`）的 `generate_structured` 工具迴圈，讓「工具建造者」LLM 讀
+  OpenAPI 文件、在一個暫存目錄（`<TOOLS_DIR>/.staging/<uuid>`，隱藏目錄，
+  registry 掃描略過）裡寫檔、用 `run_shell` 實際呼叫目標 API 測試，反覆直到
+  判定完成或放棄；完成後以安裝套件的**同一套**驗證規則
+  （`tools.validate_package`）檢查暫存內容，通過才搬進 `<TOOLS_DIR>/<name>`。
+  全程互動記錄進 AI 日誌（`workflow="tool_install"`），失敗時這是主要除錯
+  入口。
+- **安全立場（v1）**：這是單人本機工具，shell 能力是明確需求（比照 Claude
+  Code 建 skill 的能力/風險模型）——`run_shell` 是以**本服務自身權限**執行的
+  真實 bash，只是預設從暫存目錄開始（工作慣例，不是圍籬），v1 刻意不做容器
+  隔離。唯一被強制圍住的邊界是 `write_file`／`read_file`／`list_dir` 三個
+  meta-tool：路徑一定會被限制在暫存目錄之內（絕對路徑、`..` traversal、
+  symlink 逃逸都會被擋下）。信任邊界因此是「只安裝你信任的 OpenAPI 文件與
+  指示」，不是程式碼在幫你圍出一個對抗式安全沙箱。安裝指示文字與工具呼叫的
+  完整參數都會進 AI 日誌（見上方 `LLM_LOG_FILE`）——貼給 AI 的任何第三方秘密
+  都要當作「會被記錄」處理。
+- **`.staging` 殘留**：正常結束（成功或失敗）都會清掉暫存目錄；只有後端在建置
+  途中被中斷（當掉、被砍、主機重開機）才會留下
+  `<TOOLS_DIR>/.staging/<uuid>`。這個目錄名稱以 `.` 開頭，registry 掃描
+  （`tools._scan_all`）會直接跳過隱藏目錄，不會被列成無效工具，可以安全地手動
+  刪除。
+- **同一時間只允許一個安裝工作**：`start_install_job` 在同一把鎖底下檢查「是否
+  已有 queued/running 的工作」並建立新工作；已有工作在跑時，第二個 submit 回
+  `409 install_in_progress`。工作狀態是 in-memory、不持久化，後端重啟後所有
+  工作（含仍在跑的）都會消失，FE 對舊 `job_id` 的輪詢會收到 404。
 
 ## 設計筆記
 
@@ -124,9 +208,10 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 - **supersede-not-delete**：`decisions`／`rationale`／`alternatives`／
   `consequences` 這幾個帶有歷史意義的欄位，enrich／assist-update 永遠不會直接覆
   寫。`context_memory/services/memory_ai.merge_with_supersede` 逐行比對：舊內容的每一行只要
-  完整出現在新內容裡就視為保留；否則把舊內容整段接到新內容之後、掛上帶日期的
-  `superseded` 標記，確保之前的決策脈絡不會無聲消失（合併結果另外有存量上限，超出
-  時從最舊的一段開始截斷，並留下明顯的截斷標記）。
+  完整出現在新內容裡就視為保留；否則把舊內容整段接到新內容之後、掛上
+  `--- (superseded YYYY-MM-DD) ---` 這樣帶日期的標記，確保之前的決策脈絡不會
+  無聲消失（合併結果另外有存量上限，超出時從最舊的一段開始截斷，並留下明顯的
+  截斷標記）。
 - **schema-guided LLM 輸出 + 修正重試**：`context_memory/services/llm.generate_structured`
   把呼叫方的 pydantic model 轉成 JSON Schema 注入 system prompt，要求 LLM 只回傳
   『完全符合 schema 的單一 JSON 物件』；解析失敗或驗證失敗時，把模型自己的錯誤回饋

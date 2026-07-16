@@ -28,8 +28,9 @@ pnpm format        # biome check --write .（自動修正）
 pnpm test          # vitest run（單元測試，node 環境、無 jsdom）
 ```
 
-以上指令皆已在本機實際執行過並確認通過：`pnpm install`、`pnpm lint`（30 個檔案，
-無錯誤）、`pnpm build`（成功，僅有 chunk size 提示，非錯誤）；`pnpm dev` 啟動後
+以上指令皆已在本機實際執行過並確認通過：`pnpm install`、`pnpm lint`（無錯誤，
+精確檔案數隨程式碼增減而變，以指令實際輸出為準）、`pnpm build`（成功，僅有
+chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnpm dev` 啟動後
 `http://localhost:5173/` 回 200，並實測 `GET /api/health`／`GET /api/llm/status`
 經由 `/api` 代理正確打到本機 8000 埠的後端。
 
@@ -46,13 +47,15 @@ pnpm test          # vitest run（單元測試，node 環境、無 jsdom）
 
 | 路徑 | 元件 | 用途 |
 | --- | --- | --- |
-| `/` | `HomePage` | 總覽／回顧儀表板：呼叫 `GET /api/review`，把非終態項目分成待補齊／進行中／等待中／擱置四組。 |
+| `/` | `HomePage` | 總覽／回顧儀表板：呼叫 `GET /api/review`，把非終態項目分成待補齊／進行中／等待中／擱置四組；同時是後端連線狀態／LLM 設定狀態的顯示位置（`StatusFooter`）。 |
 | `/capture` | `CapturePage` | 快速捕捉：貼上一段原始討論文字，呼叫 `POST /api/capture`，顯示 AI 產出的項目與追問問題；LLM 未設定時顯示提示、AI 動作停用。 |
 | `/items` | `ItemsListPage` | 項目列表：狀態／stage／tag／關鍵字篩選 + 分頁（篩選與分頁狀態存在 `atoms/filters.js`）。 |
 | `/items/new` | `ItemNewPage` | 手動新增項目的表單頁（沿用 `ItemForm` 元件）。 |
-| `/items/$itemId` | `ItemDetailPage` | 單筆項目詳情：完整欄位、progress 歷史、狀態/階段快速修改、AI 補齊（enrich）／AI 協助更新（assist-update）操作。 |
+| `/items/$itemId` | `ItemDetailPage` | 單筆項目詳情：完整欄位、progress 歷史（可追加一筆）、狀態/階段快速修改、`ItemAiActions` 提供的「AI 補齊」（enrich）／「AI 進度更新」（assist-update）兩個操作、刪除。 |
 | `/items/$itemId/edit` | `ItemEditPage` | 手動編輯項目的表單頁（沿用 `ItemForm` 元件）。 |
-| （其他） | `NotFoundPage` | 404 fallback。 |
+| `/tools` | `ToolsPage` | 「已安裝工具」（清單／啟停／刪除）與「安裝新工具」（貼 OpenAPI JSON 網址 + 指示，AI 背景建置、輪詢進度）兩個分頁；細節見根目錄 README「KB 工具安裝指南」。 |
+| `/llm-logs` | `LlmLogsPage` | AI 日誌：呼叫 `GET /api/llm/logs` 列出最近的 LLM 互動，每筆可展開讀取 `GET /api/llm/logs/{id}` 取得的完整請求/回應內容；支援 `?log=<id>` 深連結自動展開（`工具` 頁的安裝結果會連過來）。 |
+| （其他） | `NotFoundPage` | 404 fallback（router 的 `defaultNotFoundComponent`）。 |
 
 ## 慣例
 
@@ -81,8 +84,13 @@ pnpm test          # vitest run（單元測試，node 環境、無 jsdom）
   擴充字元會被算成 2；後端的 Pydantic 長度限制數的是 Python `len(str)`（Unicode
   code point），兩者必須用同一種數法比對，否則會提前擋下合法輸入，或用原生
   `maxLength` 在使用者輸入到上限前就把字元從中間切斷。
-- **Mutation gates**：`ItemDetailPage` 用單一共用旗標
-  （`mutationPending` / `mutationGate`，`@mantine/hooks` 的 `useDisclosure`）
-  同一時間只允許一個會改動該項目的操作進行中（狀態/階段快速修改、追加 progress
-  note、AI 補齊、AI 協助更新皆共用這個 gate）；任一操作進行中時，其餘會修改此項目
-  的控制項全部停用，避免兩個併發的 mutation 互相覆蓋對方剛寫入的結果。
+- **Mutation gates**：`ItemDetailPage` 用衍生旗標 `mutationPending`
+  （`pagePending` = `patchMutation.isPending || progressMutation.isPending`，
+  再疊加 `ItemAiActions` 透過 `onPendingChange` 同步回報的 `aiPending`）同一
+  時間只允許一個會改動該項目的操作進行中（狀態/階段快速修改、追加 progress
+  note、AI 補齊、AI 進度更新皆共用這個 gate）；任一操作進行中時，其餘會修改此
+  項目的控制項全部停用，避免兩個併發的 mutation 互相覆蓋對方剛寫入的結果。
+  `onPendingChange` 在動作送出／結束當下同步呼叫（不是透過 effect），gate 的
+  開關才會跟對應的 mutation 落在同一個 render，不晚一拍。（`@mantine/hooks` 的
+  `useDisclosure` 在這個頁面上是用來控制刪除確認 Modal 的開關，與這個
+  mutation gate 是兩回事。）
