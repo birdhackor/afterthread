@@ -44,14 +44,20 @@
 
 ## 最終驗證（全 gates 綠）
 
-- backend：ruff / ruff format / ty / **pytest 565 passed**
+- backend：ruff / ruff format / ty / **pytest 573 passed**
 - frontend：biome lint / **vitest 37 passed** / vite build
 - e2e：**smoke 76/76**、**wheel_smoke（打包 uvx 模式）23/23**
 
 ## 最終全量 review（對起始點 `4f1ab55`）
 
-<!-- FINAL_REVIEW_RESULT -->
-（待全量 codex review verdict 落地後填入。）
+對 `4f1ab55..HEAD`（整輪 31 commits）做全量 codex review，專攻 phase-scoped review 結構上看不到的**跨 phase 接縫與整體不變量**。抓到 **2 個 Medium**（D29），皆為 phase 4（LLM 邊界/recorder/config）與 phase 5（工具迴圈/安裝器）之間的接縫：
+
+1. **送出路徑對話無界**：round-3 只給了 recorder 總量預算，但**實際送模型的 `messages`** 沒有 → 加 `llm_tool_conversation_budget_chars`（預設 1M），超過即停 advertise tools 走 finalize。
+2. **外層 deadline 對 threadpool 工具不可搶占**：一輪循序 16 工具最壞 overrun 到 16× 內層 timeout → 每呼叫前檢查剩餘期限、過期不啟動，overrun 有界化到「一個進行中工具的自我 timeout」+ docstring 誠實化。
+
+兩項修正後**複審 Approve**。修正 commit `4217726`。全量 review 同時確認的整體不變量無回歸：`openai_base_url`/`openai_api_key` 全路徑不入 log/error、工具子行程 env 從零建構（後端秘密結構性缺席）、`generate_structured(tools=None)` byte-identical、recorder `finish()` 不拋。
+
+**最終狀態：全量 review Approve，所有 gates 綠，整輪收尾完成。**
 
 ## 提醒：CLAIDE.md
 
