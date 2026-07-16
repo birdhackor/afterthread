@@ -95,11 +95,12 @@ _DESCRIPTION_CAP = 1000
 # Hard ceiling on the tool.json FILE size. tool.json is re-read on EVERY registry
 # scan (list_tools / enabled_llm_tools / every mutation), so an unbounded one is a
 # per-scan I/O + memory hazard; a manifest over this is listed invalid rather than
-# parsed. The scan enforces it through the bounded ``_read_regular_file_capped``
-# read (at most cap+1 chars ever enter memory, then a len check), while set_enabled
-# stat-gates it BEFORE reading -- either way an oversized manifest is never slurped
-# whole. 64 KiB is orders of magnitude above any sane manifest (name + description
-# + a JSON-Schema parameters block).
+# parsed. BOTH the scan AND set_enabled enforce it through the bounded
+# ``_read_regular_file_capped`` read (at most cap+1 chars ever enter memory, then a
+# len check), so an oversized manifest is never slurped whole at ANY read entry --
+# and that same read's O_NONBLOCK+S_ISREG gate is what refuses a FIFO swapped in for
+# tool.json. 64 KiB is orders of magnitude above any sane manifest (name +
+# description + a JSON-Schema parameters block).
 _MANIFEST_MAX_BYTES = 64 * 1024
 
 # Tighter ceiling on the parameters JSON Schema specifically: unlike the rest of
@@ -281,6 +282,71 @@ def _read_regular_file_capped(path: Path, cap: int) -> str | None:
             return handle.read(cap + 1)
     except OSError:
         return None
+    finally:
+        if fd_owned:
+            os.close(fd)
+
+
+def _write_regular_file(path: Path, content: str) -> bool:
+    """Write ``content`` as utf-8 to ``path``, but ONLY if it is a regular file.
+
+    The WRITE-side mirror of ``_read_regular_file_capped`` -- ``write_file``
+    (tool_builder) and ``set_enabled``'s manifest write both funnel through it, so
+    the same jail-hardening holds on every write the tool subsystem does instead of
+    being re-derived per call site. Returns True on success; False (never raises)
+    on ANY ``OSError``, so a caller degrades cleanly onto its own error string /
+    False contract rather than 500ing.
+
+    Each open flag defends the write-side of a distinct vector:
+
+    * ``O_NONBLOCK`` -- opening a reader-less FIFO write-only returns ENXIO
+      IMMEDIATELY (POSIX) instead of BLOCKING until a reader appears; this is the
+      write-side of the exact hazard ``_read_regular_file_capped``'s O_NONBLOCK
+      closes on the read side (a tool, or the builder via run_shell, can
+      ``mkfifo`` a path in place of a real file and wedge the writing threadpool
+      worker FOREVER -- the outer asyncio timeout only cancels the await, never the
+      wedged worker). For a regular file O_NONBLOCK is a no-op, so ordinary writes
+      are unaffected;
+    * ``O_NOFOLLOW`` -- refuses a symlinked FINAL component (ELOOP -> False): a
+      generated symlink must never redirect a write OUT of staging / its package,
+      hardening the D21-enforced jail exactly as the read helper does on the read
+      side (a backstop against a symlink raced in AFTER a caller resolved the path);
+    * ``O_CREAT | O_TRUNC`` with mode ``0o600`` -- create-or-overwrite with
+      owner-only permissions (tool packages already run under the service uid, so
+      there is no reason to widen the mode on a file we author).
+
+    Parent directories are created BEFORE the open (the meta-tool contract
+    auto-creates them for ``write_file``; for ``set_enabled``'s manifest write the
+    parent already exists, so ``makedirs(exist_ok=True)`` is a no-op). The
+    ``fstat`` after open is the HARD regular-file gate (S_ISREG): a pre-existing
+    device/socket/FIFO that somehow opened is still refused before a single byte is
+    written. ``fdopen`` takes OWNERSHIP of the fd, so ``fd_owned`` tracks the
+    handoff and the ``finally`` closes the raw fd on exactly the paths that never
+    reached ``fdopen`` (never a double close) -- mirroring the read helper.
+    """
+    try:
+        os.makedirs(path.parent, exist_ok=True)
+        fd = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NONBLOCK | os.O_NOFOLLOW,
+            0o600,
+        )
+    except OSError:
+        # ENXIO (reader-less FIFO), ELOOP (symlinked leaf), EPERM, ENOTDIR (a parent
+        # component that is not a directory), ... -- every open/makedirs failure
+        # degrades to False rather than raising into the caller.
+        return False
+    fd_owned = True  # we own the raw fd until fdopen takes it over
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        handle = os.fdopen(fd, "w", encoding="utf-8")
+        fd_owned = False  # fdopen now owns fd; closing the handle closes it
+        with handle:
+            handle.write(content)
+        return True
+    except OSError:
+        return False
     finally:
         if fd_owned:
             os.close(fd)
@@ -971,18 +1037,24 @@ def set_enabled(name: str, enabled: bool) -> bool:
     # trust that -- it is reached directly by the mutation API.
     if not _is_within(directory, tool_json.resolve()):
         return False
-    # Bound the manifest FILE size with stat() BEFORE reading it (N2), the SAME
-    # cap the scan enforces (_MANIFEST_MAX_BYTES): the cap must hold at EVERY
-    # read entry, not just the scan, so an oversized manifest is never loaded into
-    # memory through this path either -- refuse like every other failure here.
-    try:
-        if tool_json.stat().st_size > _MANIFEST_MAX_BYTES:
-            return False
-    except OSError:
+    # Read the manifest through the ONE bounded-regular-file helper (F3b), exactly
+    # as the scan does -- this is the FIFO fix for the write path. A plain
+    # ``read_text()`` here would ``open(O_RDONLY)`` the manifest, and a FIFO
+    # ``mkfifo``'d in place of tool.json (a tool package can ship one; run_shell can
+    # create one) BLOCKS that open until a writer appears -- wedging the PATCH
+    # worker FOREVER. The helper's O_NONBLOCK+S_ISREG gate refuses the FIFO at once,
+    # its O_NOFOLLOW backstops the is_symlink() fast path above against a symlink
+    # raced in after it, and its cap+1 read SUBSUMES the old manual stat size-cap:
+    # an oversized manifest comes back longer than the cap and is refused here, the
+    # SAME observable refusal in the SAME char unit the scan uses -- so no separate
+    # stat is needed. None (every refusal/read failure) and an over-cap length BOTH
+    # map to set_enabled's "did not happen" False contract.
+    text = _read_regular_file_capped(tool_json, _MANIFEST_MAX_BYTES)
+    if text is None or len(text) > _MANIFEST_MAX_BYTES:
         return False
     try:
-        raw = json.loads(tool_json.read_text(encoding="utf-8"))
-    except OSError, ValueError:
+        raw = json.loads(text)
+    except ValueError:
         return False
     if not isinstance(raw, dict):
         return False
@@ -991,17 +1063,21 @@ def set_enabled(name: str, enabled: bool) -> bool:
     # ``indent=2`` pretty-prints, which EXPANDS a compact-but-legal manifest: a
     # manifest that sat just under the cap in its compact on-disk form can cross
     # it once pretty-printed, which would flip the tool ``valid=False`` on the very
-    # next scan after a mere enable/disable toggle. Measure the ENCODED size (the
-    # same UTF-8 byte unit the stat cap uses) and, when it would not fit, leave the
-    # file byte-for-byte untouched and report failure rather than corrupt the row.
+    # next scan after a mere enable/disable toggle. Measure the ENCODED size (UTF-8
+    # bytes, the on-disk unit _MANIFEST_MAX_BYTES bounds) and, when it would not fit,
+    # leave the file byte-for-byte untouched and report failure rather than corrupt
+    # the row.
     new_text = json.dumps(raw, ensure_ascii=False, indent=2) + "\n"
     if len(new_text.encode("utf-8")) > _MANIFEST_MAX_BYTES:
         return False
-    try:
-        tool_json.write_text(new_text, encoding="utf-8")
-    except OSError:
-        return False
-    return True
+    # Write the manifest back through the symmetric bounded WRITE helper (F3c). The
+    # read above just confirmed tool_json is a regular file, so the static FIFO
+    # hazard is already closed on this path; converting the WRITE too is symmetry +
+    # defense in depth -- its O_NONBLOCK makes a reader-less FIFO raced into the path
+    # fail with ENXIO instead of blocking, and its O_NOFOLLOW refuses a symlinked
+    # leaf, so this rewrite can never escape the package. Its bool (True written /
+    # False on any refusal) IS set_enabled's success/"did not happen" contract.
+    return _write_regular_file(tool_json, new_text)
 
 
 def delete_tool(name: str) -> bool:

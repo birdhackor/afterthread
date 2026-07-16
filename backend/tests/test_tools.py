@@ -1210,6 +1210,51 @@ def test_set_enabled_refuses_when_pretty_form_would_exceed_cap(
     assert (root / "swell" / "tool.json").read_bytes() == before  # byte-identical
 
 
+def test_set_enabled_fifo_manifest_refused_without_hanging(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A FIFO swapped in for tool.json makes set_enabled return False PROMPTLY,
+    never hanging (F3b): a plain read_text() would open(O_RDONLY) the FIFO and BLOCK
+    the PATCH worker FOREVER waiting for a writer. set_enabled now reads the manifest
+    through the shared O_NONBLOCK+S_ISREG helper, so the FIFO is refused at once and
+    the write is never reached. Driven on a WATCHED daemon thread so a regression (a
+    blocking reopen) fails LOUDLY here instead of wedging the whole suite."""
+    root = tmp_path / "tools"
+    pkg = root / "fifotool"
+    pkg.mkdir(parents=True)
+    (pkg / "run.py").write_text("import sys\nsys.stdout.write('x')\n", encoding="utf-8")
+    os.mkfifo(pkg / "tool.json")  # a writer-less FIFO -- read_text() would block forever
+    _install_tools(monkeypatch, root)
+
+    box: dict[str, bool] = {}
+    worker = threading.Thread(
+        target=lambda: box.__setitem__("ok", set_enabled("fifotool", False)), daemon=True
+    )
+    worker.start()
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "set_enabled on a FIFO tool.json hung (F3b regression)"
+    assert box["ok"] is False  # the FIFO manifest was refused, not rewritten
+    assert (pkg / "tool.json").is_fifo()  # still the FIFO, never overwritten
+
+
+def test_write_regular_file_refuses_symlink_leaf(tmp_path: Path) -> None:
+    """_write_regular_file's O_NOFOLLOW refuses a symlinked FINAL component
+    (ELOOP -> False), so a generated symlink can never redirect a write OUT of the
+    staging jail / a package: the write returns False and the external target is
+    left byte-for-byte untouched. This is the write-side of
+    _read_regular_file_capped's O_NOFOLLOW backstop -- the resolve-then-contain gate
+    (_resolve_in_staging / set_enabled) catches the non-race escape; this hardens
+    the leaf open itself against a symlink raced in after the resolve."""
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep", encoding="utf-8")
+    link = tmp_path / "link"
+    link.symlink_to(outside)
+
+    assert tools._write_regular_file(link, "clobber") is False
+    assert outside.read_text(encoding="utf-8") == "keep"  # target untouched, not followed
+    assert link.is_symlink()  # O_CREAT never replaced the link with a regular file
+
+
 def test_manifest_over_size_limit_listed_invalid(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

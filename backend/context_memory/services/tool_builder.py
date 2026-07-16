@@ -386,8 +386,20 @@ def _build_meta_tools(staging: Path) -> list[LlmTool]:
             )
 
         def _write() -> str:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
+            # Write through tools._write_regular_file (F3c), the WRITE-side mirror of
+            # the bounded read helper. A plain ``write_text()`` here does
+            # ``open(O_WRONLY)``, and a reader-less FIFO the builder ``mkfifo``'d in
+            # staging (run_shell can) BLOCKS that open FOREVER waiting for a reader --
+            # wedging this threadpool worker (the outer asyncio timeout only cancels
+            # the await, never the wedged worker). The helper's O_NONBLOCK makes that
+            # open fail with ENXIO at once, its O_NOFOLLOW refuses a symlinked leaf
+            # swapped in after _resolve_in_staging resolved the path (the TOCTOU the
+            # resolve alone cannot close, so a generated symlink can never redirect
+            # the write out of staging), and it creates parent dirs itself (this
+            # tool's auto-create-parents contract). False => a non-regular /
+            # symlinked / reader-less-FIFO target: the model-facing failure below.
+            if not tools._write_regular_file(target, content):
+                return "write_file failed: target is not a regular file"
             return f"wrote {target.relative_to(staging.resolve())} ({len(content)} characters)"
 
         try:

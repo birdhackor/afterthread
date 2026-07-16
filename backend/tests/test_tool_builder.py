@@ -214,6 +214,54 @@ def test_meta_read_refuses_fifo_without_hanging(
     assert result == "read_file failed: not a regular file"
 
 
+def test_meta_write_refuses_fifo_without_hanging(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A reader-less FIFO in staging makes write_file return its failure PROMPTLY,
+    never hanging (F3c). write_text() opens O_WRONLY, and a reader-less FIFO BLOCKS
+    that open FOREVER waiting for a reader -- wedging the threadpool worker, since
+    the outer asyncio timeout only cancels the await. tools._write_regular_file
+    opens O_NONBLOCK, so the reader-less FIFO fails with ENXIO at once. Bounded by
+    asyncio.wait_for so a regression (an actual hang) fails LOUDLY here instead of
+    stalling the suite."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    os.mkfifo(staging / "pipe")  # write_text() on this would block forever
+    meta = _meta_by_name(staging)
+
+    async def _run() -> str:
+        return await asyncio.wait_for(
+            meta["write_file"].handler({"path": "pipe", "content": "x"}), timeout=10
+        )
+
+    result = asyncio.run(_run())
+    assert result == "write_file failed: target is not a regular file"
+    assert (staging / "pipe").is_fifo()  # the FIFO was refused, never overwritten
+
+
+def test_meta_write_refuses_symlink_leaf_to_outside(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A symlink LEAF in staging pointing at an external file is refused and the
+    target is left byte-for-byte untouched (jail hardened, F3c): _resolve_in_staging
+    follows the leaf with resolve() and fails containment, and
+    tools._write_regular_file's O_NOFOLLOW is the write-boundary backstop should a
+    link be raced in after the resolve. Either way a generated symlink can never
+    redirect a write OUT of staging."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep")
+    (staging / "leaf").symlink_to(outside)
+    meta = _meta_by_name(staging)
+
+    result = _call(meta["write_file"].handler, {"path": "leaf", "content": "clobber"})
+    assert "rejected" in result  # _resolve_in_staging refuses the escaping leaf
+    assert outside.read_text() == "keep"  # external target never written through
+
+
 def test_list_dir_caps_entries_during_walk(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """list_dir enforces the entry cap DURING the walk (F3): a tree with far more
     than the cap returns promptly with at most cap entries plus a truncation
