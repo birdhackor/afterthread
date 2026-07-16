@@ -202,3 +202,4 @@
   4. **clamp 過渡頁污染 lastGoodRef**（L）：抽共用 `needsPageClamp()` 述詞，兩處共享；placeholder 排除保持獨立 AND。
   5. **AI gate 起始端 race**（L）：恢復同步 bracket（動作 handler 內先報 pending 再 mutate、onSettled 收尾、conflict refresh 同款）；刪除 effect 式回報。
 - **殘餘已知界線**：五項修正屬 UI 快取/時序行為，e2e（curl 級）無法直接驗，信心來自 lint/build + 逐場景追蹤；瀏覽器級自動化不在本輪範圍（非目標清單）。
+- **第二輪追加（全修）**：(1) 編輯頁凍結契約補完——`refetchOnReconnect:false`、latch 拒絕 errored settle（warm cache + mount fetch 404/失敗時不得掛出舊表單，錯誤分支以 `!formReady` 取代 `item===undefined`、404 全面權威）、**diff 基準改為 `formBaseRef` 快照**（表單只對「使用者看到的那份」一致，reconnect refetch 覆寫 tags 的新 Medium 隨之根治）；(2) lastGoodRef 規則升級為「只存 settled、非 placeholder（borrowed）、可顯示」——clamp 的 overshoot 空頁經 keepPreviousData 帶到目標頁時不再被誤存。codex 於 sandbox 無法跑 socket 類 gates 屬環境限制，本機全綠有效。

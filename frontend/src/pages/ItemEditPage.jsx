@@ -55,8 +55,13 @@ export function ItemEditPage() {
 	//   same key too (the detail page), since it disables react-query's own
 	//   staleness math wholesale, not just this query's refetch-on-mount
 	//   decision.
-	// - refetchOnWindowFocus: false (overriding the app-wide default of true)
-	//   -- once the form is up, a focus refetch must not fire mid-edit.
+	// - refetchOnWindowFocus: false AND refetchOnReconnect: false (overriding
+	//   the app-wide defaults) -- once the form is up, NO background refetch
+	//   may fire mid-edit: not on focus, not on network reconnect. A mid-edit
+	//   refetch updates the live cache under the standing form, and any code
+	//   that then compares form values against the LIVE item (the tags diff
+	//   used to) would misread "server moved" as "user changed it" and PATCH
+	//   stale values back over newer server state.
 	// fresh-on-entry, frozen-while-editing.
 	const {
 		data: item,
@@ -68,6 +73,7 @@ export function ItemEditPage() {
 		queryFn: () => apiGet(`/api/items/${itemId}`),
 		refetchOnMount: "always",
 		refetchOnWindowFocus: false,
+		refetchOnReconnect: false,
 	});
 
 	// refetchOnMount:"always" can still return an existing ['item', itemId]
@@ -90,15 +96,36 @@ export function ItemEditPage() {
 	// doesn't itself trigger a re-render, so an effect-based version would
 	// only unlock formReady on the render AFTER this one -- one render too
 	// late to gate THIS render's Loader-vs-form branch below.
+	//
+	// Two refinements over a bare "settled" latch (phase-3 review round 2):
+	// - `!isError`: a settled ERROR must not latch. With a warm cache, the
+	//   mount refetch 404ing (item deleted elsewhere) or failing leaves the
+	//   stale `item` in place and isFetching false -- latching there would
+	//   mount an editable form over a row that is gone (or unverified). The
+	//   error branches below render instead.
+	// - `formBaseRef` captures, ONCE per itemId at the latch moment, the exact
+	//   item the form is initialized from. Everything about the edit session
+	//   diffs against THIS snapshot -- never the live query data -- so even if
+	//   some future code path refreshes the cache mid-edit, "did the user
+	//   change tags?" keeps comparing the user's values to the values the
+	//   user was shown, not to whatever the server has moved to since.
 	const formReadyRef = useRef(null);
-	if (!isFetching && item !== undefined) {
+	const formBaseRef = useRef(null);
+	if (
+		!isFetching &&
+		!isError &&
+		item !== undefined &&
+		formReadyRef.current !== itemId
+	) {
 		formReadyRef.current = itemId;
+		formBaseRef.current = item;
 	}
 	const formReady = formReadyRef.current === itemId;
+	const formBase = formReady ? formBaseRef.current : null;
 
 	const defaults = useMemo(
-		() => (item ? buildFormDefaults(item) : null),
-		[item],
+		() => (formBase ? buildFormDefaults(formBase) : null),
+		[formBase],
 	);
 
 	const backToDetail = () =>
@@ -128,7 +155,9 @@ export function ItemEditPage() {
 				patch[key] = key === "title" ? values[key].trim() : values[key];
 			}
 		}
-		if (!sameTags(values.tags, item.tags ?? [])) {
+		// Diff against the form's OWN base snapshot (formBase), never the live
+		// query data: the user's edit is relative to what the user was shown.
+		if (!sameTags(values.tags, formBase?.tags ?? [])) {
 			patch.tags = values.tags;
 		}
 
@@ -159,7 +188,10 @@ export function ItemEditPage() {
 		);
 	}
 
-	if (error?.status === 404 && item === undefined) {
+	// 404 is authoritative even over a still-cached stale item (same rule as
+	// the detail page): the server just said the row is gone, and mounting an
+	// editable form over it only sets up a doomed PATCH.
+	if (error?.status === 404) {
 		return (
 			<Stack gap="md" align="flex-start">
 				<Title order={2}>找不到項目</Title>
@@ -171,11 +203,28 @@ export function ItemEditPage() {
 		);
 	}
 
-	if (isError && item === undefined) {
+	// Gated on !formReady (not item === undefined): with a warm cache a failed
+	// mount refetch leaves stale `item` defined, but the latch above refuses to
+	// set formReady on an errored settle -- so this branch (not a stale form)
+	// is what renders. Once the form IS up, a later error can no longer unmount
+	// it out from under in-progress edits (background refetches are disabled
+	// above anyway).
+	if (isError && !formReady) {
 		return (
 			<Alert color="red" title="載入失敗">
 				<Text size="sm">{error?.message ?? "無法載入項目"}</Text>
 			</Alert>
+		);
+	}
+
+	// Belt-and-braces: no error, not fetching, but nothing latched either
+	// (e.g. an empty cache in a transient pre-fetch render) -- keep the Loader
+	// rather than mounting ItemForm with null defaults.
+	if (!formBase) {
+		return (
+			<Center py="xl">
+				<Loader />
+			</Center>
 		);
 	}
 
