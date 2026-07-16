@@ -427,6 +427,19 @@ export function ItemDetailPage() {
 		);
 	}
 
+	// Belt-and-braces: the render below dereferences `item` freely, so no
+	// no-data state may ever fall past the branches above. With networkMode
+	// 'always' (main.jsx) every no-data state IS fetching or errored, but this
+	// guard keeps that a Loader rather than a crash if any future query-state
+	// combination (another networkMode, a new fetchStatus) slips through.
+	if (item === undefined) {
+		return (
+			<Center py="xl">
+				<Loader />
+			</Center>
+		);
+	}
+
 	const stageMeta = STAGE_META[item.stage] ?? { label: item.stage };
 	const progress = item.progress ?? [];
 

@@ -37,12 +37,27 @@ const queryClient = new QueryClient({
 			// meaningfully delaying freshness -- anything older than 5s still
 			// refetches on mount/focus.
 			staleTime: 5_000,
+			// networkMode 'always', not the default 'online': this app talks to a
+			// LOCALHOST backend, so navigator.onLine (WiFi off, airplane mode) says
+			// nothing about whether the loopback server is reachable. The default
+			// would PAUSE fetches while "offline" -- fetchStatus 'paused' with
+			// isFetching false and no error -- a limbo state the pages' loading/
+			// error branches don't (and shouldn't) model, and one that also
+			// silences the passive connectivity layer: a paused request never
+			// fails, so the 後端 badge would sit on stale green instead of probing
+			// red. 'always' fires every request for real; if the backend truly
+			// is unreachable it fails fast into the normal network-error path,
+			// which is exactly what the badges and error branches are built for.
+			networkMode: "always",
 		},
 		mutations: {
 			// retry:false for mutations too: these are user-triggered writes (CRUD,
 			// progress, the three AI actions); a silent retry could double-apply a
 			// side effect or mask a 409/503 the UI is built to react to.
 			retry: false,
+			// Same localhost rationale as queries: a paused mutation would hold
+			// the page's mutation gate closed indefinitely with no error surfaced.
+			networkMode: "always",
 		},
 	},
 });
