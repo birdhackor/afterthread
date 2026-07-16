@@ -178,6 +178,32 @@ _MAX_TOOL_CALLS_TOTAL_BYTES = 256 * 1024
 # "tool_calls oversized: <N> bytes in one reply".
 _TOOL_CALLS_OVERSIZED_PREFIX = "tool_calls oversized"
 
+# F2 -- the role:"tool" result content for a call NOT STARTED because the
+# interaction's wall-clock deadline is essentially spent (see the per-call check in
+# _run_structured's tool-execution loop). The outer asyncio.timeout is a genuine
+# end-to-end deadline for everything the loop AWAITS, but a tool handler runs its
+# subprocess in a Starlette run_in_threadpool worker whose AnyIO thread ignores
+# host cancellation until it finishes -- so asyncio.timeout cannot PREEMPT a tool
+# already in flight. Rather than let each new tool in a round start a fresh
+# subprocess that would then run PAST the deadline to its own
+# llm_tool_timeout_seconds (up to _MAX_TOOL_CALLS_PER_REPLY of them, sequentially --
+# a 16x overrun the deadline cannot stop), the loop STOPS STARTING tools once too
+# little time remains and hands back this fixed reason keyed to the call's id,
+# exactly like the too-many-calls rejection. Fed back so the model learns the call
+# did not run, and so the echoed assistant turn's tool_calls entry still has its
+# matching result. Carries no config value.
+_TOOL_DEADLINE_REACHED = "tool call skipped: interaction deadline reached"
+
+# The minimum seconds that must remain on the interaction deadline for the loop to
+# START another tool call (F2). Below this, starting a tool would almost certainly
+# let a threadpool worker run to its own subprocess timeout well PAST the deadline
+# (which asyncio.timeout cannot stop mid-flight), so the call is skipped with
+# _TOOL_DEADLINE_REACHED instead. A small positive floor rather than 0 because a
+# tool that starts with only a sliver of budget left is guaranteed to overrun; 1s
+# is comfortably below any real per-call tool timeout (llm_tool_timeout_seconds
+# defaults to 60) yet far above the sub-millisecond cost of the skip bookkeeping.
+_TOOL_DEADLINE_FLOOR_SECONDS = 1.0
+
 
 @dataclass(slots=True)
 class LlmTool:
@@ -606,22 +632,59 @@ async def _tool_result_message(
     return cast(ChatCompletionMessageParam, message)
 
 
-def _rejected_tool_result_message(tool_call: Any) -> ChatCompletionMessageParam:
-    """A role:"tool" result for a call REJECTED without execution (over the
-    _MAX_TOOL_CALLS_PER_REPLY cap), keyed to the call's own id.
+def _rejected_tool_result_message(tool_call: Any, content: str) -> ChatCompletionMessageParam:
+    """A role:"tool" result for a call REJECTED WITHOUT execution, keyed to the
+    call's own id and carrying ``content`` as the reason.
 
-    No handler runs -- the id pairing is the whole point: the assistant turn we
-    echo back carries EVERY tool_call from the reply, and the endpoint rejects
-    the follow-up unless each one has a matching result, so a capped call still
-    needs a result message (this fixed rejection text) even though nothing ran.
+    Two distinct rejections share this exact shape, differing only in ``content``:
+    a call past the _MAX_TOOL_CALLS_PER_REPLY cap (``_TOO_MANY_TOOL_CALLS``), and a
+    call the loop declines to START because the interaction deadline is spent
+    (``_TOOL_DEADLINE_REACHED``, F2). No handler runs on either path -- the id
+    pairing is the whole point: the assistant turn we echo back carries EVERY
+    tool_call from the reply, and the endpoint rejects the follow-up unless each
+    one has a matching result, so a rejected call still needs a result message
+    (this fixed reason text) even though nothing ran.
     """
     tc_id, _, _ = _tool_call_fields(tool_call)
     message: dict[str, Any] = {
         "role": "tool",
         "tool_call_id": tc_id,
-        "content": _TOO_MANY_TOOL_CALLS,
+        "content": content,
     }
     return cast(ChatCompletionMessageParam, message)
+
+
+def _conversation_chars(messages: list[ChatCompletionMessageParam]) -> int:
+    """A cheap O(n) proxy for the SERIALIZED size of the live tool-loop
+    conversation, used to bound what is actually SENT to the model each round (F1).
+
+    Sums ``len(content)`` across every message plus each tool call's ``arguments``
+    length. ``content`` is the dominant term by far: tool RESULTS (up to
+    llm_tool_output_max_chars each, up to _MAX_TOOL_CALLS_PER_REPLY per round) live
+    in the role:"tool" messages' ``content`` and accumulate across rounds. The
+    tool_call ``arguments`` are folded in too since they ride back verbatim in each
+    echoed assistant turn, but they are separately capped per reply
+    (_MAX_TOOL_CALLS_TOTAL_BYTES) and are the minor term. Deliberately NOT a real
+    json.dumps of the payload -- this only needs to be a robust proxy for deciding
+    when to stop advertising tools, and it must stay O(n) so recomputing it every
+    round can never itself become a cost. Each message is read as a plain dict (its
+    runtime shape) so a missing/None ``content`` (a pure tool-call assistant turn)
+    simply contributes nothing.
+    """
+    total = 0
+    for message in messages:
+        raw = cast(dict[str, Any], message)
+        content = raw.get("content")
+        if isinstance(content, str):
+            total += len(content)
+        tool_calls = raw.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tool_call in tool_calls:
+                function = tool_call.get("function") if isinstance(tool_call, dict) else None
+                arguments = function.get("arguments") if isinstance(function, dict) else None
+                if isinstance(arguments, str):
+                    total += len(arguments)
+    return total
 
 
 def _schema_guided_system_prompt(system_prompt: str, model_cls: type[BaseModel]) -> str:
@@ -792,6 +855,11 @@ async def _run_structured[ModelT: BaseModel](
     # a corrective turn can never re-open the tool phase and loop past the
     # single-retry contract.
     correction_used = False
+    # F1: guards the one-time finalize nudge appended when the SIZE budget (not the
+    # round budget) is what turns tool advertising off. Without it, every
+    # subsequent iteration -- each measuring an even larger conversation -- would
+    # re-append the same nudge.
+    conversation_budget_nudged = False
 
     try:
         # ONE asyncio.timeout spans the WHOLE loop -- every tool round plus the
@@ -799,18 +867,60 @@ async def _run_structured[ModelT: BaseModel](
         # ``timeout_seconds``; the installer uses a much larger one) bounds the
         # entire agentic interaction end to end, not each create() separately.
         # Unlike the client-level timeout (see _build_client), which only bounds
-        # per-phase inactivity, this is a genuine deadline on total duration.
+        # per-phase inactivity, this is a genuine deadline on total duration --
+        # with ONE honest caveat (F2): a tool handler's subprocess runs in a
+        # Starlette run_in_threadpool worker whose AnyIO thread ignores host
+        # cancellation until it returns, so asyncio.timeout cannot PREEMPT a tool
+        # already in flight; that one tool runs to its own llm_tool_timeout_seconds
+        # (self-terminating via its process-group SIGKILL, see tools.py). New tool
+        # calls are NOT STARTED once the deadline is essentially spent (the
+        # per-call _TOOL_DEADLINE_FLOOR_SECONDS check below), so the worst-case
+        # wall-clock is approximately this deadline PLUS a single
+        # llm_tool_timeout_seconds -- not the deadline plus _MAX_TOOL_CALLS_PER_REPLY
+        # of them running back to back.
         async with asyncio.timeout(timeout_seconds):
+            # Monotonic deadline on the SAME clock asyncio.timeout uses
+            # (loop.time()), so the per-call remaining-budget check in the
+            # tool-execution loop agrees with when the timeout will actually fire.
+            # Computed once here rather than re-derived per tool call.
+            deadline = asyncio.get_running_loop().time() + timeout_seconds
             while True:
-                # Advertise tools only while the round budget is unspent AND we
-                # are not finalizing (see `correction_used`). Once spent, the
-                # next create() is tools-free -- that is the "one final create()
-                # without tools" the budget-exhausted nudge below sets up.
+                # F1: the conversation ACTUALLY SENT each round has no aggregate
+                # cap of its own -- the D27 llm_log budget only bounds what is
+                # RECORDED. Measure it with the cheap proxy (dominated by
+                # tool-result bulk) so that, once it exceeds the budget, the next
+                # create() is the tools-free finalize. Composes with the round and
+                # correction gates below: ANY of them turning advertising off
+                # routes to the same finalize path.
+                conversation_over_budget = (
+                    _conversation_chars(messages) > settings.llm_tool_conversation_budget_chars
+                )
+                # Advertise tools only while the round budget is unspent, we are not
+                # finalizing (see `correction_used`), AND the live conversation is
+                # under the size budget (F1). Once any of these fails the next
+                # create() is tools-free -- that is the "one final create() without
+                # tools" the budget-exhausted nudge below sets up.
                 advertise_tools = (
                     tool_specs is not None
                     and tool_rounds_used < max_tool_rounds
                     and not correction_used
+                    and not conversation_over_budget
                 )
+                # F1: when the SIZE budget is specifically what turned advertising
+                # off (tools were otherwise still eligible -- rounds unspent, not
+                # yet finalizing), tell the model to answer now, exactly as the
+                # round-budget exhaustion path does at the bottom of the loop. The
+                # nudge rides into THIS iteration's tools-free create() (appended
+                # before begin_attempt below), and the flag keeps it to one append.
+                if (
+                    conversation_over_budget
+                    and tool_specs is not None
+                    and tool_rounds_used < max_tool_rounds
+                    and not correction_used
+                    and not conversation_budget_nudged
+                ):
+                    conversation_budget_nudged = True
+                    messages.append({"role": "user", "content": _TOOL_BUDGET_EXHAUSTED})
                 # Snapshot the messages ACTUALLY sent for this attempt (the
                 # recorder copies them, since `messages` is rebuilt each round /
                 # for the corrective retry below).
@@ -943,11 +1053,36 @@ async def _run_structured[ModelT: BaseModel](
                             # result (so every tool_call in the echoed assistant turn
                             # pairs with a role:"tool" message the endpoint requires).
                             if index < _MAX_TOOL_CALLS_PER_REPLY:
-                                messages.append(
-                                    await _tool_result_message(tool_call, tools_by_name)
-                                )
+                                # F2: before STARTING a handler, check the deadline.
+                                # A handler's subprocess runs in a threadpool worker
+                                # the outer asyncio.timeout cannot preempt (see the
+                                # async-with note above), so a tool started with too
+                                # little budget left would run PAST the deadline to
+                                # its own llm_tool_timeout_seconds. Once at most
+                                # _TOOL_DEADLINE_FLOOR_SECONDS remains, DON'T start
+                                # it -- reject with _TOOL_DEADLINE_REACHED instead
+                                # (id pairing preserved). This bounds the residual
+                                # overrun to at most ONE already-in-flight tool
+                                # rather than _MAX_TOOL_CALLS_PER_REPLY of them back
+                                # to back. Composes with the F1 size gate above: F1
+                                # stops advertising tools per ROUND, F2 stops
+                                # starting them per CALL within a round already in
+                                # progress.
+                                remaining = deadline - asyncio.get_running_loop().time()
+                                if remaining <= _TOOL_DEADLINE_FLOOR_SECONDS:
+                                    messages.append(
+                                        _rejected_tool_result_message(
+                                            tool_call, _TOOL_DEADLINE_REACHED
+                                        )
+                                    )
+                                else:
+                                    messages.append(
+                                        await _tool_result_message(tool_call, tools_by_name)
+                                    )
                             else:
-                                messages.append(_rejected_tool_result_message(tool_call))
+                                messages.append(
+                                    _rejected_tool_result_message(tool_call, _TOO_MANY_TOOL_CALLS)
+                                )
                             # Yield to the event loop once per processed call: the
                             # unknown-tool and the capped-reject paths never await
                             # anything, so a run of them would otherwise execute as

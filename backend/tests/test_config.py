@@ -162,3 +162,35 @@ def test_llm_log_max_entries_above_upper_bound_rejected() -> None:
 
 def test_llm_log_file_default_is_empty() -> None:
     assert Settings().llm_log_file == ""
+
+
+# `llm_tool_conversation_budget_chars` caps the SERIALIZED size of the live
+# tool-loop conversation actually SENT to the model each round (see
+# context_memory.services.llm) -- the SENT-side companion to the recorded-side
+# llm_log body budget. Its Field(ge=50_000, le=8_000_000) bound makes a nonsensical
+# override fail at startup via pydantic-settings, matching the other LLM knobs'
+# convention, rather than only when the tool loop first overruns.
+
+
+def test_llm_tool_conversation_budget_chars_default_is_one_million() -> None:
+    assert Settings().llm_tool_conversation_budget_chars == 1_000_000
+
+
+def test_llm_tool_conversation_budget_chars_lower_bound_accepted() -> None:
+    settings = Settings(llm_tool_conversation_budget_chars=50_000)
+    assert settings.llm_tool_conversation_budget_chars == 50_000
+
+
+def test_llm_tool_conversation_budget_chars_upper_bound_accepted() -> None:
+    settings = Settings(llm_tool_conversation_budget_chars=8_000_000)
+    assert settings.llm_tool_conversation_budget_chars == 8_000_000
+
+
+def test_llm_tool_conversation_budget_chars_below_lower_bound_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Settings(llm_tool_conversation_budget_chars=49_999)
+
+
+def test_llm_tool_conversation_budget_chars_above_upper_bound_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Settings(llm_tool_conversation_budget_chars=8_000_001)

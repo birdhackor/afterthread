@@ -46,6 +46,7 @@ from context_memory.services.llm import (
     _MAX_TOOL_CALLS_TOTAL_BYTES,
     _TOO_MANY_TOOL_CALLS,
     _TOOL_BUDGET_EXHAUSTED,
+    _TOOL_DEADLINE_REACHED,
     LlmTool,
     LLMUpstreamError,
     generate_structured,
@@ -484,6 +485,118 @@ def test_tool_calls_content_counts_toward_byte_cap(monkeypatch: pytest.MonkeyPat
     assert record["outcome"] == "upstream_error"
     assert (record["error"] or "").startswith("tool_calls oversized")
     assert (record["attempts"][0]["error"] or "").startswith("tool_calls oversized")
+
+
+def test_tool_conversation_budget_stops_advertising_and_finalizes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F1: once the live conversation ACTUALLY SENT to the model exceeds the
+    budget, the loop stops advertising tools and makes ONE final tools-free
+    completion -- it does NOT keep looping to max_tool_rounds. The D27 llm_log
+    budget bounds only what is RECORDED; this bounds what is SENT each round.
+
+    Each tool round returns a large result (30k chars); across two rounds the
+    accumulated conversation crosses a small 50k budget, so the THIRD create() is
+    the finalize (tools-free, budget-exhausted nudge appended), even though the
+    default round budget (8) is nowhere near spent."""
+    calls_seen = 0
+
+    async def handler(args: dict[str, Any]) -> str:
+        nonlocal calls_seen
+        calls_seen += 1
+        return "x" * 30_000
+
+    client = _install(
+        monkeypatch,
+        _ScriptedClient(
+            [
+                _tool_calls_completion(_tc("big", "{}")),
+                _tool_calls_completion(_tc("big", "{}")),
+                _content_completion(_SAMPLE_JSON),
+            ]
+        ),
+        settings=_settings(llm_tool_conversation_budget_chars=50_000),
+    )
+    result = _run(tools=[LlmTool(spec=_tool_spec("big"), handler=handler)])
+
+    assert result.title == "Draft"
+    calls = _calls(client)
+    # Two tool rounds accumulated ~60k > the 50k budget; the THIRD create is the
+    # tools-free finalize -- NOT a spin to the default max_tool_rounds (8).
+    assert len(calls) == 3
+    assert "tools" in calls[0] and "tools" in calls[1]
+    assert "tools" not in calls[2]
+    assert any(m.get("content") == _TOOL_BUDGET_EXHAUSTED for m in calls[2]["messages"])
+    assert calls_seen == 2  # exactly the two tool rounds ran before the budget tripped
+
+
+def test_tool_conversation_budget_default_does_not_trip_normal_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default budget (1_000_000) leaves an ordinary small-output tool loop
+    untouched: a modest result across a couple of rounds never trips F1, so tools
+    stay advertised until the model answers on its own."""
+    client = _install(
+        monkeypatch,
+        _ScriptedClient(
+            [
+                _tool_calls_completion(_tc("echo", "{}")),
+                _content_completion(_SAMPLE_JSON),
+            ]
+        ),
+    )
+    result = _run(tools=[_echo_tool()])
+
+    assert result.title == "Draft"
+    calls = _calls(client)
+    assert len(calls) == 2
+    assert "tools" in calls[0] and "tools" in calls[1]  # never stopped advertising
+
+
+def test_tool_deadline_skips_new_tool_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F2: with too little wall-clock budget left, the loop does NOT START tool
+    handlers -- each call in the reply gets the deadline-reached rejection and no
+    handler runs. asyncio.timeout cannot preempt a threadpool tool already in
+    flight, so declining to START new ones is what bounds the overrun.
+
+    Driven with a tiny timeout BELOW _TOOL_DEADLINE_FLOOR_SECONDS (1.0s), so from
+    the very first per-call check the remaining budget is already under the floor
+    and EVERY call in the reply is skipped -- a deterministic assertion of the
+    invariant (new tools not started once the deadline is spent) that never leans
+    on real elapsed time crossing a threshold mid-round. The 0.5s deadline is
+    still ample for the handler-free work here, so the interaction FINALIZES on
+    the scripted content reply rather than timing out."""
+    seen: list[dict[str, Any]] = []
+
+    async def handler(args: dict[str, Any]) -> str:
+        seen.append(args)
+        return "ran"
+
+    client = _install(
+        monkeypatch,
+        _ScriptedClient(
+            [
+                _tool_calls_completion(
+                    _tc("echo", "{}", tc_id="c0"),
+                    _tc("echo", "{}", tc_id="c1"),
+                    _tc("echo", "{}", tc_id="c2"),
+                ),
+                _content_completion(_SAMPLE_JSON),
+            ]
+        ),
+    )
+    result = _run(tools=[LlmTool(spec=_tool_spec("echo"), handler=handler)], timeout_seconds=0.5)
+
+    assert result.title == "Draft"
+    assert seen == []  # no handler was started once the deadline was spent
+    tool_msgs = _tool_messages(_calls(client)[1])
+    assert len(tool_msgs) == 3  # every call still paired with a result...
+    assert all(m["content"] == _TOOL_DEADLINE_REACHED for m in tool_msgs)  # ...a deadline rejection
+    # the round WAS entered: the assistant tool-call turn is still echoed back,
+    # so this is genuinely "tools skipped", not "the round never ran".
+    assert any(
+        m.get("role") == "assistant" and m.get("tool_calls") for m in _calls(client)[1]["messages"]
+    )
 
 
 # --- runtime: real tool packages -------------------------------------------

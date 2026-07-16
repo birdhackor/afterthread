@@ -186,6 +186,29 @@ class Settings(BaseSettings):
     # will be folded into. Default 50000 comfortably fits a realistic KB lookup.
     llm_tool_output_max_chars: int = Field(default=50_000, ge=1_000, le=500_000)
 
+    # Hard ceiling on the SERIALIZED size (in characters) of the LIVE tool-loop
+    # conversation actually SENT to the model on each round of a single
+    # ``generate_structured`` call (see context_memory/services/llm.py). This is
+    # the SENT-side companion to the D27 llm_log aggregate budget, which bounds
+    # only what is RECORDED, not what rides on the wire: each tool round appends up
+    # to _MAX_TOOL_CALLS_PER_REPLY (16) tool results of up to
+    # llm_tool_output_max_chars each, across up to llm_tool_rounds_max (or the
+    # installer's tool_install_max_rounds) rounds -- a rounds x calls x output
+    # product that, with maxed knobs, reaches hundreds of MB, risking a
+    # context-length rejection or a huge transient allocation. Once the running
+    # conversation exceeds this, the loop stops advertising tools and makes its
+    # final tools-free completion (the same finalize the round budget triggers).
+    # Default 1_000_000 chars is generous enough for a legitimate multi-round
+    # tool/installer build yet caps that pathological product. A conversation this
+    # large may still be rejected by the model for context length -- but that is a
+    # clean, handled 502, not an unbounded allocation, and bounding memory is the
+    # PRIMARY goal here. Bounded to [50_000, 8_000_000] (startup-validated via
+    # pydantic-settings, matching the other LLM knobs' convention): the floor keeps
+    # a deliberately small override from finalizing before even one real tool round
+    # can accumulate, and the ceiling keeps a hostile override from re-opening the
+    # unbounded growth this exists to cap.
+    llm_tool_conversation_budget_chars: int = Field(default=1_000_000, ge=50_000, le=8_000_000)
+
     # Tool-round budget for ONE installer session (the web installer's
     # "tool builder" LLM call in context_memory/services/tool_builder.py),
     # passed as generate_structured's max_tool_rounds override. Building a tool
