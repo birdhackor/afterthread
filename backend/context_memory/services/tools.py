@@ -105,6 +105,18 @@ _MANIFEST_MAX_BYTES = 64 * 1024
 # is listed invalid. 16 KiB comfortably fits a rich real-world argument schema.
 _PARAMETERS_SCHEMA_MAX_BYTES = 16 * 1024
 
+# Hard ceiling on a tool's optional ``.env`` FILE size, checked with stat() BEFORE
+# the file is parsed. Unlike the manifest, ``.env`` is re-read on EVERY tool call
+# (``_load_tool_dotenv`` runs inside the per-call ``_build_tool_env``), so an
+# unbounded one is a per-CALL memory hazard, not a per-scan one; and the parsed
+# dict becomes the child's environment BLOCK, where an enormous env can also hit
+# the kernel's E2BIG limit at exec. Over this cap the runtime degrades to "no
+# extra env" (``_load_tool_dotenv`` returns {}, the same contract a malformed
+# ``.env`` already gets) and the installer refuses the package outright
+# (``validate_package``). 64 KiB dwarfs any real secrets file (a handful of
+# KEY=VALUE lines).
+_ENV_FILE_MAX_BYTES = 64 * 1024
+
 # Appended when a tool's stdout (or a failure's stderr) is cut for size. Mirrors
 # the truncation markers in memory_ai / llm_log so an operator who has seen those
 # recognizes this one; the distinct wording ("工具輸出" = tool output) tells it
@@ -343,9 +355,32 @@ def validate_package(directory: Path, expected_name: str) -> str | None:
     is about to be installed under, which the manifest must already carry).
     Runs the exact same checks an installed package faces on every scan
     (manifest shape, name regex + match, entry-file containment), so a package
-    that passes here can never turn up ``valid=False`` after the move.
+    that passes here can never turn up ``valid=False`` after the move -- PLUS one
+    STRICTER install-only gate below.
+
+    The .env size gate is deliberately NOT part of ``_scan_package`` (which the
+    registry runs on every scan): an oversized ``.env`` must BLOCK a fresh install
+    here, but a package whose ``.env`` is MUTATED oversized AFTER install should
+    keep running under the runtime degrade (``_load_tool_dotenv`` -> {}), not
+    vanish from the registry as invalid. So this gate lives on the installer's
+    pre-move path only. Being stricter than the scan preserves the invariant above
+    (passing here still implies passing the scan); only the reverse loosens.
     """
-    return _scan_package(directory, expected_name=expected_name).error
+    error = _scan_package(directory, expected_name=expected_name).error
+    if error is not None:
+        return error
+    # Install-only .env size gate (see _ENV_FILE_MAX_BYTES). Mirrors
+    # _load_tool_dotenv's own is_file()-then-stat() shape; a stat failure is
+    # treated as "not oversized" (the scan above already vetted the package, and
+    # the runtime degrade remains the post-install defense).
+    env_file = directory / ".env"
+    try:
+        oversized = env_file.is_file() and env_file.stat().st_size > _ENV_FILE_MAX_BYTES
+    except OSError:
+        oversized = False
+    if oversized:
+        return "`.env` is too large"
+    return None
 
 
 def list_tools() -> list[dict[str, Any]]:
@@ -422,6 +457,17 @@ def _load_tool_dotenv(directory: Path) -> dict[str, str]:
     """
     env_file = directory / ".env"
     if not env_file.is_file():
+        return {}
+    # Bound the .env FILE size with stat() BEFORE dotenv_values reads it (see
+    # _ENV_FILE_MAX_BYTES): the parse slurps the whole file into memory on EVERY
+    # tool call, and the parsed dict becomes the child's exec env block. An
+    # oversized one degrades to "no extra env" -- the SAME degrade-to-{} contract
+    # as the malformed-.env fallback below -- so a runaway or post-install-mutated
+    # .env can never bloat memory per call or overflow the exec env.
+    try:
+        if env_file.stat().st_size > _ENV_FILE_MAX_BYTES:
+            return {}
+    except OSError:
         return {}
     try:
         values = dotenv_values(env_file, encoding="utf-8", interpolate=False)
@@ -581,7 +627,15 @@ def _communicate_bounded(
             with contextlib.suppress(Exception):
                 stdin.close()
 
-        writer = threading.Thread(target=_write_stdin)
+        # daemon=True on every reader/writer thread is a BACKSTOP, not the
+        # mechanism: the group-kill escalation after the wait below is what
+        # normally reaps a thread whose pipe is held open by a surviving
+        # descendant. But should even that fail (a descendant that escaped the
+        # process group entirely -- see the escalation comment), a NON-daemon
+        # thread stuck in a blocking read/write would keep the interpreter alive at
+        # shutdown; daemon makes that impossible -- at worst one FD leaks until
+        # process exit, never a hung interpreter.
+        writer = threading.Thread(target=_write_stdin, daemon=True)
         writer.start()
         threads.append(writer)
 
@@ -589,7 +643,8 @@ def _communicate_bounded(
     stderr_reader = _CappedReader(proc.stderr, cap, kill) if proc.stderr is not None else None
     for reader in (stdout_reader, stderr_reader):
         if reader is not None:
-            thread = threading.Thread(target=reader.run)
+            # daemon=True for the same backstop reason as the writer above.
+            thread = threading.Thread(target=reader.run, daemon=True)
             thread.start()
             threads.append(thread)
 
@@ -604,12 +659,35 @@ def _communicate_bounded(
         with contextlib.suppress(Exception):
             proc.wait(timeout=_REAP_TIMEOUT_SECONDS)
 
-    # The process has exited (naturally, on an overflow kill, or on the timeout
-    # kill), so every pipe is at EOF and the reader/writer threads finish
-    # promptly. Join with the same short bound so a wedged thread can never hang
-    # cleanup.
+    # ``proc.wait()`` returning means the LEADER process exited -- NOT that the
+    # pipes are at EOF. A reader sees EOF only when the LAST holder of a pipe's
+    # write end closes it, and a tool whose entry spawned a background descendant
+    # that INHERITED stdout/stderr leaves those write ends open after the leader is
+    # gone: the readers would then block forever, this join would return with the
+    # (daemon) threads still alive, and we would leak the threads, their FDs, and
+    # the surviving descendant. So join with the short reap bound FIRST -- the
+    # common case (leader exit DID close the pipes: no such descendant, or the
+    # overflow/timeout paths already group-killed everything) finishes well inside
+    # it -- and escalate only if that is not enough.
     for thread in threads:
         thread.join(timeout=_REAP_TIMEOUT_SECONDS)
+    # A thread still alive here means its pipe is held open by a descendant that
+    # outlived the leader. ``start_new_session=True`` put every ORDINARY descendant
+    # in the leader's process GROUP, so SIGKILLing the group closes their inherited
+    # write ends -> the readers hit EOF and finish. We target the group by
+    # ``proc.pid`` directly (a session leader's group id EQUALS its pid, and that id
+    # stays reserved by the kernel while any group member survives): ``_kill_process
+    # _group`` would be WRONG here because it derives the group via ``os.getpgid(
+    # proc.pid)``, which now raises -- ``proc.wait()`` above already reaped the
+    # leader -- and falls back to a no-op ``proc.kill`` that never reaches the
+    # descendant. A descendant that double-forked / setsid'd OUT of the group
+    # escapes even this and is beyond v1's non-container stance (D21); the daemon
+    # flag on every thread is the honest backstop for that residual case.
+    if any(thread.is_alive() for thread in threads):
+        with contextlib.suppress(Exception):
+            os.killpg(proc.pid, signal.SIGKILL)
+        for thread in threads:
+            thread.join(timeout=_REAP_TIMEOUT_SECONDS)
 
     return _BoundedOutput(
         stdout=stdout_reader.text if stdout_reader is not None else "",

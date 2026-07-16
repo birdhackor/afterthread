@@ -402,24 +402,44 @@ def _build_meta_tools(staging: Path) -> list[LlmTool]:
 
         def _read() -> str:
             cap = get_settings().llm_tool_output_max_chars
-            # Bound BEFORE reading (N5): read_text pulls the WHOLE file into memory
-            # before _cap_output could ever trim it, so reading a giant file (a
-            # 10GB blob the builder never meant to read whole) OOMs the service.
-            # stat() the size first and REFUSE anything over the output cap with an
-            # actionable error, rather than silently truncating it. A directory is
-            # handled first: its block-sized st_size could otherwise trip the cap
-            # gate below with the wrong message. Comparing bytes (st_size) against a
-            # CHAR cap is deliberately conservative -- UTF-8 chars <= bytes, so a
-            # file within the byte budget is guaranteed within the char cap too.
+            # Two-layer size defense, cheap gate first, HARD gate second (N5):
+            #  (1) stat().st_size is the CHEAP first gate -- a file already known
+            #      huge is refused without opening it (comparing bytes against a
+            #      CHAR cap is conservative: UTF-8 chars <= bytes, so within the
+            #      byte budget guarantees within the char cap). A directory is
+            #      rejected first, since its block-sized st_size could otherwise
+            #      trip that gate with the wrong message; a missing path keeps the
+            #      "no such file" wording rather than being mislabeled below.
+            #  (2) require a REGULAR file, then read at most cap+1 chars -- the HARD
+            #      gate. stat() alone is NOT enough: a FIFO (the builder can
+            #      `mkfifo` one via run_shell) is neither a dir nor over-size
+            #      (st_size 0), and read_text() on it would BLOCK FOREVER -- the
+            #      outer asyncio timeout only cancels the await, leaving THIS
+            #      threadpool worker wedged for good (a permanent worker leak).
+            #      is_file() (S_ISREG) excludes FIFOs/sockets/devices outright, and
+            #      the bounded read means even a regular file that GREW past the cap
+            #      AFTER the stat (a TOCTOU race) can never buffer more than cap+1
+            #      chars before we refuse it.
+            if not target.exists():
+                return "read_file failed: no such file"
             if target.is_dir():
                 return "read_file failed: path is a directory"
+            if not target.is_file():
+                return "read_file failed: not a regular file"
             size = target.stat().st_size
             if size > cap:
                 return (
                     "read_file failed: file is too large "
                     f"({size} bytes exceeds the {cap}-character output cap)"
                 )
-            text = target.read_text(encoding="utf-8", errors="replace")
+            with open(target, encoding="utf-8", errors="replace") as handle:
+                text = handle.read(cap + 1)
+            if len(text) > cap:
+                # Post-stat growth (or an st_size that under-reported the char
+                # length): the bounded read caught what the cheap stat did not.
+                return (
+                    f"read_file failed: file is too large (exceeds the {cap}-character output cap)"
+                )
             return tools._cap_output(text, cap)
 
         try:
@@ -445,15 +465,43 @@ def _build_meta_tools(staging: Path) -> list[LlmTool]:
             if not root.is_dir():
                 return "list_dir failed: not a directory"
             base = staging.resolve()
-            entries = sorted(
-                str(p.relative_to(base)) + ("/" if p.is_dir() else "") for p in root.rglob("*")
-            )
+            # Enforce the entry cap DURING the walk, not after. The previous
+            # sorted(root.rglob("*")) materialized AND sorted the ENTIRE subtree
+            # before slicing, so a pathological build (a run_shell that untarred
+            # thousands of files) meant unbounded memory and a long, uncancellable
+            # threadpool stretch -- all to then throw most of it away. os.walk with
+            # dirnames/filenames sorted IN PLACE yields a deterministic order while
+            # holding at most one directory's entries at a time; we stop the instant
+            # we have collected one MORE than the cap (that extra entry is only the
+            # "there is more" probe -- dropped below in favor of the notice).
+            entries: list[str] = []
+            truncated = False
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames.sort()
+                filenames.sort()
+                here = Path(dirpath)
+                # Directories (rendered with a trailing "/") then files, each in
+                # sorted order -- the same "/"-suffix convention rglob used.
+                level = [(name, True) for name in dirnames] + [(name, False) for name in filenames]
+                for name, is_dir in level:
+                    rel = str((here / name).relative_to(base))
+                    entries.append(rel + "/" if is_dir else rel)
+                    if len(entries) > _LIST_DIR_MAX_ENTRIES:
+                        truncated = True
+                        break
+                if truncated:
+                    break
             if not entries:
                 return "(empty directory)"
-            if len(entries) > _LIST_DIR_MAX_ENTRIES:
-                omitted = len(entries) - _LIST_DIR_MAX_ENTRIES
+            if truncated:
+                # The exact overflow count is unknowable without the full-tree
+                # enumeration this fix exists to avoid, so the notice keeps the
+                # "... (truncated)" presentation but drops the (now uncountable)
+                # number the old marker carried.
                 entries = entries[:_LIST_DIR_MAX_ENTRIES]
-                entries.append(f"... plus {omitted} more entries (truncated)")
+                entries.append(
+                    f"... (truncated at {_LIST_DIR_MAX_ENTRIES} entries; more not shown)"
+                )
             return "\n".join(entries)
 
         try:

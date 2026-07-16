@@ -23,6 +23,7 @@ an autouse fixture resets both around every test.
 
 import asyncio
 import json
+import os
 import socket
 import threading
 import time
@@ -187,6 +188,57 @@ def test_meta_read_reads_file_at_cap(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     meta = _meta_by_name(staging)
 
     assert _call(meta["read_file"].handler, {"path": "ok.txt"}) == "a" * 1000
+
+
+def test_meta_read_refuses_fifo_without_hanging(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A FIFO in staging is refused as a non-regular file (F2), never opened.
+    read_text() on a FIFO blocks FOREVER waiting for a writer, and the outer
+    asyncio timeout only cancels the await -- the threadpool worker would stay
+    wedged (a permanent leak). is_file() (S_ISREG) rejects it up front, so the
+    call returns at once. The whole thing is bounded by asyncio.wait_for so a
+    regression (an actual hang) fails LOUDLY here instead of stalling the suite."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), llm_tool_output_max_chars=1000
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    os.mkfifo(staging / "pipe")  # neither a dir nor over-size; read_text would block
+    meta = _meta_by_name(staging)
+
+    async def _run() -> str:
+        return await asyncio.wait_for(meta["read_file"].handler({"path": "pipe"}), timeout=10)
+
+    result = asyncio.run(_run())
+    assert result == "read_file failed: not a regular file"
+
+
+def test_list_dir_caps_entries_during_walk(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """list_dir enforces the entry cap DURING the walk (F3): a tree with far more
+    than the cap returns promptly with at most cap entries plus a truncation
+    notice, instead of materializing and sorting the ENTIRE subtree first. The
+    kept entries are the lexicographically smallest, in a deterministic order."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    cap = tool_builder._LIST_DIR_MAX_ENTRIES
+    for i in range(cap + 250):  # far more than the cap
+        (staging / f"f{i:05d}.txt").write_text("x")
+    meta = _meta_by_name(staging)
+
+    started = time.monotonic()
+    listing = _call(meta["list_dir"].handler, {"path": ""})
+    elapsed = time.monotonic() - started
+    lines = listing.splitlines()
+
+    assert len(lines) == cap + 1  # exactly cap entries + one truncation notice
+    assert "truncated" in lines[-1]
+    assert elapsed < 5  # a bounded walk, not a full-tree enumerate + sort
+    # Deterministic order: the kept entries are the lexicographically smallest.
+    kept = lines[:cap]
+    assert kept == sorted(kept)
+    assert kept[0] == "f00000.txt"
 
 
 # --- meta-tools: run_shell -----------------------------------------------------

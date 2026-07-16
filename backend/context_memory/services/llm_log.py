@@ -368,6 +368,76 @@ def _message_text(content: Any) -> tuple[str, bool]:
     return _stored_body(text)
 
 
+def _elision_marker(count: int) -> str:
+    """The synthetic leading entry's text when older messages are elided.
+
+    Distinct wording from ``_BODY_TRUNCATION_MARKER`` ("紀錄過長" -- a single body
+    was cut): here whole earlier MESSAGES were dropped, not one body trimmed, so a
+    reader of the AI 日誌 can tell "this attempt's oldest turns were summarized
+    away" apart from "one body was truncated". "較早 N 則訊息" = the earlier N
+    messages.
+    """
+    return f"…[較早 {count} 則訊息已省略以控制紀錄大小]"
+
+
+def _apply_total_budget(
+    stored: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], int, bool]:
+    """Bound ONE attempt's stored request_messages to a TOTAL char budget.
+
+    Each body is already per-message capped (``_stored_body`` at
+    ``llm_log_body_max_chars``), but that does NOT bound their SUM: an agentic
+    interaction records the FULL accumulated conversation on EVERY tool round, so
+    a record's size otherwise grows QUADRATICALLY with rounds (24 installer rounds
+    x up to 16 tool results x tens of KB each -> hundreds of MB in ONE of the
+    ring's 50 records). This applies the SAME knob (``llm_log_body_max_chars``) a
+    second time, now as an AGGREGATE ceiling per attempt.
+
+    Walk NEWEST -> OLDEST keeping messages verbatim while the running total stays
+    within budget -- the newest turns matter most for debugging the CURRENT
+    attempt, so they are the ones kept whole. The first message that would push
+    the total over budget, and every message OLDER than it, are collapsed into ONE
+    synthetic leading ``system`` marker (``_elision_marker``) naming how many were
+    dropped. Each stored body is itself <= budget (same knob), so the newest
+    message always fits and at least one real message is always kept.
+
+    The collapse is SKIPPED when it would not actually save space -- when the tail
+    being elided is no larger than the marker that would replace it, keeping those
+    messages verbatim is both smaller and simpler. That is what makes a typical
+    small conversation (nothing over budget) store EXACTLY as before, byte for
+    byte, and also stops a 2-message record whose one oversized body already fills
+    the budget from being "optimized" into a LARGER record by eliding a tiny
+    system prompt into a longer marker.
+
+    Returns ``(request_messages, elided_count, truncated)``; ``truncated`` is True
+    only when an elision actually happened, so the caller ORs it into the
+    attempt's existing flag and the FE badge lights up.
+    """
+    budget = get_settings().llm_log_body_max_chars
+    kept_reversed: list[dict[str, str]] = []
+    used = 0
+    cut_index: int | None = None  # index in `stored` of the first (newest) elided message
+    for i in range(len(stored) - 1, -1, -1):
+        length = len(stored[i]["content"])
+        if used + length <= budget:
+            kept_reversed.append(stored[i])
+            used += length
+        else:
+            # Budget exhausted here: this message and everything OLDER (0..i) is
+            # the elision tail. Stop -- we do NOT keep hunting for smaller older
+            # messages that might still fit, per "collapse ALL remaining older".
+            cut_index = i
+            break
+    if cut_index is None:
+        return stored, 0, False  # never exceeded budget -> unchanged
+    tail = stored[: cut_index + 1]
+    marker = _elision_marker(len(tail))
+    if sum(len(message["content"]) for message in tail) <= len(marker):
+        return stored, 0, False  # collapsing would not shrink the record
+    kept = list(reversed(kept_reversed))  # back to oldest-first
+    return [{"role": "system", "content": marker}, *kept], len(tail), True
+
+
 # --- the recorder ----------------------------------------------------------
 
 
@@ -409,24 +479,28 @@ class LlmInteractionRecorder:
         running message list for the corrective retry; without the copy a later
         rebuild could rewrite an attempt already recorded here. Each message's
         content goes through ``_message_text`` (UTF-8-safe, then size-capped),
-        so ``request_chars`` sums the STORED length actually kept -- not the
-        original -- and ``truncated`` is set the moment ANY message in this
-        attempt was cut; ``record_response`` below may OR a response-side cut
-        into the very same flag once the reply comes back.
+        then ``_apply_total_budget`` bounds their AGGREGATE size (the per-body cap
+        alone does not -- an agentic call records the whole accumulated
+        conversation every round, so a record would otherwise grow quadratically
+        with rounds; see ``_apply_total_budget``). ``request_chars`` sums the
+        STORED length actually kept -- of the FINAL messages, marker included, not
+        the originals -- and ``truncated`` is set the moment ANY message was cut
+        for size OR older messages were elided for the aggregate budget;
+        ``record_response`` below may OR a response-side cut into the same flag.
         """
-        request_messages: list[dict[str, str]] = []
-        request_chars = 0
+        stored: list[dict[str, str]] = []
         truncated = False
         for msg in messages:
             content, was_truncated = _message_text(msg.get("content"))
-            request_messages.append({"role": str(msg.get("role", "")), "content": content})
-            request_chars += len(content)
+            stored.append({"role": str(msg.get("role", "")), "content": content})
             truncated = truncated or was_truncated
+        request_messages, _elided, budget_truncated = _apply_total_budget(stored)
+        request_chars = sum(len(message["content"]) for message in request_messages)
         self._attempts.append(
             LlmAttempt(
                 request_messages=request_messages,
                 request_chars=request_chars,
-                truncated=truncated,
+                truncated=truncated or budget_truncated,
             )
         )
 

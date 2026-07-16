@@ -217,8 +217,82 @@ def test_oversized_request_and_response_are_truncated_and_flagged(
     assert attempt["response_content"].endswith(llm_log._BODY_TRUNCATION_MARKER)
     assert attempt["response_chars"] == 1000
     # request_chars sums the STORED length of every message: the untouched
-    # "sys" (3 chars) plus the capped user message (1000 chars).
+    # "sys" (3 chars) plus the capped user message (1000 chars). The aggregate
+    # budget (F5) leaves this untouched: collapsing the 3-char "sys" into a
+    # ~20-char marker would ENLARGE the record, so no elision happens.
     assert attempt["request_chars"] == len("sys") + 1000
+
+
+def test_begin_attempt_bounds_total_request_size_with_elision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The per-body cap does not bound the AGGREGATE, so begin_attempt applies the
+    same knob (llm_log_body_max_chars) as a TOTAL budget across an attempt's
+    request_messages (F5): an agentic call records the whole accumulated
+    conversation every round, which would otherwise grow the record quadratically.
+    Older messages past the budget collapse into ONE synthetic leading marker; the
+    newest message is kept verbatim and the attempt is flagged truncated."""
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_body_max_chars=1000, llm_log_max_entries=50),
+    )
+    llm_log._reset_for_tests()
+    # Six 400-char messages: sum 2400 >> the 1000 total budget, yet each is under
+    # the per-body cap, so ONLY the aggregate bound can catch this.
+    messages = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": chr(ord("a") + i) * 400}
+        for i in range(6)
+    ]
+    recorder = llm_log.LlmInteractionRecorder(workflow="capture", model="m")
+    recorder.begin_attempt(messages)
+    recorder.finish(outcome="ok", error=None)
+
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    attempt = record["attempts"][0]
+    rms = attempt["request_messages"]
+    # A single synthetic leading system marker replaces the elided older messages.
+    assert rms[0]["role"] == "system"
+    assert "省略" in rms[0]["content"]
+    # The newest message is kept verbatim (most useful for debugging THIS attempt).
+    assert rms[-1] == messages[-1]
+    # Aggregate stored size is bounded by the budget plus that one marker entry.
+    assert sum(len(message["content"]) for message in rms) <= 1000 + len(rms[0]["content"])
+    # The marker names how many messages it elided, and elision sets truncated.
+    elided = len(messages) - (len(rms) - 1)  # total minus (kept, excluding the marker)
+    assert str(elided) in rms[0]["content"]
+    assert attempt["truncated"] is True
+    assert attempt["request_chars"] == sum(len(message["content"]) for message in rms)
+
+
+def test_begin_attempt_small_conversation_stored_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A conversation whose stored bodies sum UNDER the total budget is stored
+    EXACTLY as before -- byte for byte, no marker, zero behavior change (F5). This
+    is the "budget untouched" case the quadratic-growth fix must never disturb."""
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_body_max_chars=1000, llm_log_max_entries=50),
+    )
+    llm_log._reset_for_tests()
+    messages = [
+        {"role": "system", "content": "S" * 100},
+        {"role": "user", "content": "U" * 100},
+        {"role": "assistant", "content": "A" * 100},
+    ]
+    recorder = llm_log.LlmInteractionRecorder(workflow="capture", model="m")
+    recorder.begin_attempt(messages)
+    recorder.finish(outcome="ok", error=None)
+
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    attempt = record["attempts"][0]
+    assert attempt["request_messages"] == messages  # byte-identical, no marker
+    assert attempt["request_chars"] == 300
+    assert attempt["truncated"] is False
 
 
 def test_file_sink_writes_valid_jsonl(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:

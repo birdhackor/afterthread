@@ -232,3 +232,9 @@
   4. **FE 暫態輪詢錯誤丟失 job 追蹤**：任何錯誤都當非 active、重送先清 jobId，撞 409 後執行中 job 永不再被輪詢 → jobId 只在 404 或新 202 時替換；409 保留舊 id 續輪詢並顯示衝突提示。
   5. **輸出上限在完整緩衝後才套用**：`communicate()` 先吃整個 stdout 才截斷、builder read_file 整檔讀 → 改並行分塊讀、超限即殺 process group（比照 timeout 路徑）+ 截斷標記；read_file 讀前 stat 拒絕超大檔。
 - **流程備忘**：本輪 review 實際 15 分鐘完成，但 `task --wait` 串流中繼斷裂導致結果延遲半小時才被讀到；並發現多個歷史輪次的 codex sandbox 孤兒 process（TestClient 探測在 `--unshare-net` sandbox 下掛死不返回）佔著資源，已全數清除。後續 review 改由主代理直接輪詢 companion 的 status/result 取結果，不依賴 `--wait` 串流。
+- **第三輪複審（ba6e750 後）**：round-2 五項中四項確認成立（entry cap 64 + recorder 結案、manifest 讀寫 cap、內部 alias mutation 行為、FE 500/404/409 狀態流），第五項（有界管線讀）被指出生命週期縫隙；另出 4 個新 Medium。裁決全修：
+  1. **`proc.wait()` 只等 leader**：背景後代繼承 stdout 時 pipe 永不 EOF，非 daemon reader thread 洩漏、shutdown 可被卡 → thread 改 daemon 作保險 + join 超時後補殺 process group（後代同組即死 → EOF → 收尾），修正「leader 退出＝EOF」的錯誤註解；setsid 雙重 fork 逃逸明載為 v1 界外。
+  2. **read_file stat gate 擋不住 FIFO/增長**：非 regular file 通過 size 檢查後 `read_text` 永久阻塞（asyncio timeout 取消不了 threadpool worker）→ 要求 `is_file()` + 改 open+read(cap+1) 有界讀（stat 是廉價的第一道 gate、bounded read 是硬 gate）。
+  3. **list_dir 先列舉整樹再套上限**：遍歷中計數、到頂即停 + 既有截斷標記，保留已列項目的確定性排序。
+  4. **工具 .env 無上限**：`_ENV_FILE_MAX_BYTES=64KiB` 讀前 stat，超限依既有 malformed-.env 慣例降級為 `{}`；installer `validate_package` 同步把超大 .env 列 invalid（裝不進來，runtime 降級只是裝後被改壞的防線）。
+  5. **紀錄體積隨輪數平方成長**：每輪記整段對話 × installer 24 輪 × 16×50k 工具結果 ≈ 單筆數百 MB → 在 begin_attempt choke point 對每次 attempt 的 request_messages 套總量預算（沿用 `llm_log_body_max_chars`，新→舊保留、超出者折疊為一則「較早 N 則訊息已省略」合成訊息 + truncated 旗標）；小對話儲存位元組不變。

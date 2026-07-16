@@ -24,7 +24,11 @@ ring is process-wide, so an autouse fixture resets it around every test.
 
 import asyncio
 import json
+import os
+import shutil
+import subprocess
 import sys
+import threading
 import time
 from collections.abc import Generator
 from pathlib import Path
@@ -35,7 +39,7 @@ import pytest
 from pydantic import BaseModel, ConfigDict
 
 from context_memory.config import Settings
-from context_memory.services import llm_log
+from context_memory.services import llm_log, tools
 from context_memory.services.llm import (
     _MAX_TOOL_CALLS_ACCEPTED,
     _MAX_TOOL_CALLS_PER_REPLY,
@@ -587,6 +591,120 @@ def test_runtime_dotenv_does_not_interpolate_parent_env(
     result = asyncio.run(enabled_llm_tools()[0].handler({}))
     assert result == "LEAK=${OPENAI_API_KEY}"  # literal, not the resolved key
     assert "sk-secret-should-not-leak" not in result
+
+
+def test_runtime_background_descendant_reaped_no_thread_leak(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tool that spawns a background descendant INHERITING stdout and exits at
+    once must not wedge the bounded reader (F1). ``proc.wait()`` returns on the
+    LEADER's exit, but the descendant still holds the stdout pipe's write end, so
+    the reader sees no EOF and would block forever -- leaking the (daemon) thread,
+    its FD and the descendant. The post-wait group-kill escalation SIGKILLs the
+    whole session, closing the inherited pipe so the reader hits EOF and finishes:
+    the call returns its output promptly, no reader thread leaks, and the
+    descendant's process group is dead afterwards."""
+    root = tmp_path / "tools"
+    # A marker UNIQUE to this process+moment, so a leak from a different run (or a
+    # deliberately-broken build) can never pollute this run's pgrep check.
+    marker = f"cm_f1_desc_{os.getpid()}_{time.monotonic_ns()}"
+    # Spawn a python descendant that sleeps 60s carrying that marker, inheriting
+    # our stdout (so it holds the pipe past our exit) with its own stderr silenced
+    # (so ONLY the stdout reader is left blocking). Then exit. 60s >> the ~5s reap
+    # join, so a survivor is unambiguously still alive at the pgrep check below
+    # rather than having exited on its own.
+    run_py = (
+        "import subprocess, sys\n"
+        "subprocess.Popen(\n"
+        f"    [sys.executable, '-c', 'import time; time.sleep(60)', {marker!r}],\n"
+        "    stderr=subprocess.DEVNULL,\n"
+        ")\n"
+        "sys.stdout.write('STARTED')\n"
+    )
+    pkg = _make_tool(root, "descendant", run_py)
+    entry = [sys.executable, "run.py"]
+    env = tools._build_tool_env(pkg)
+
+    before = threading.active_count()
+    try:
+        started = time.monotonic()
+        # Drive the blocking runner DIRECTLY (not via the threadpool handler) so
+        # the reader/writer threads run in this thread's context and
+        # active_count() is a clean before/after measure with no threadpool-worker
+        # confound.
+        result = tools._run_tool_subprocess(entry, pkg, env, "{}", 30.0, 1000)
+        elapsed = time.monotonic() - started
+
+        assert "STARTED" in result  # the leader's own output survived the escalation
+        # Bounded by the reap join + escalation, NOT waited out for the 60s sleep.
+        assert elapsed < 20
+        # No reader/writer thread leak: the group-kill unblocked the pipe-held
+        # reader, so every thread was joined before the call returned. Poll briefly
+        # to avoid racing the final join's own return.
+        for _ in range(200):
+            if threading.active_count() <= before:
+                break
+            time.sleep(0.01)
+        assert threading.active_count() <= before
+        # The descendant's process group is dead: no lingering marker process.
+        if shutil.which("pgrep"):
+            found = subprocess.run(["pgrep", "-f", marker], capture_output=True, check=False)
+            assert found.returncode != 0, "the background descendant survived the escalation"
+    finally:
+        # Insurance: if a regression ever DID leak the descendant, don't leave it
+        # sleeping for a minute polluting the host.
+        if shutil.which("pkill"):
+            subprocess.run(["pkill", "-9", "-f", marker], check=False)
+
+
+def test_runtime_oversized_dotenv_degrades_to_no_extra_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A .env larger than _ENV_FILE_MAX_BYTES is dropped at RUNTIME (F4): the
+    child sees NO extra env -- the same degrade-to-{} contract a malformed .env
+    already gets -- so a runaway or post-install-mutated .env can never bloat the
+    per-call exec env. The package still lists VALID: the registry scan
+    deliberately does NOT reject on .env size, leaving the runtime degrade as the
+    post-install defense."""
+    root = tmp_path / "tools"
+    oversized = "TOOL_SECRET=" + "x" * tools._ENV_FILE_MAX_BYTES + "\n"  # > the 64 KiB cap
+    _make_tool(
+        root,
+        "envtool",
+        "import os, sys\nsys.stdout.write('SECRET=' + str(os.environ.get('TOOL_SECRET')))\n",
+        dotenv=oversized,
+    )
+    _install_tools(monkeypatch, root)
+
+    assert list_tools()[0]["valid"] is True  # scan does NOT reject an oversized .env
+    result = asyncio.run(enabled_llm_tools()[0].handler({}))
+    assert result == "SECRET=None"  # the oversized .env was dropped -> key absent
+
+
+def test_validate_package_flags_oversized_dotenv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The installer refuses a package whose .env exceeds the cap (F4): an
+    otherwise-valid staged package is reported invalid so it can never be
+    INSTALLED in that state, even though the same package would still RUN
+    (degraded) if the .env were mutated oversized AFTER install."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(
+        root,
+        "big",
+        "import sys\nsys.stdout.write('x')\n",
+        dotenv="K=" + "y" * tools._ENV_FILE_MAX_BYTES + "\n",
+    )
+    _install_tools(monkeypatch, root)
+
+    # The scan-equivalent checks pass; it is the install-only .env gate that trips.
+    error = tools.validate_package(pkg, "big")
+    assert error is not None
+    assert "too large" in error
+    # With the .env removed the same package validates clean -- pinning that it
+    # was the .env size, not some other defect, that failed it.
+    (pkg / ".env").unlink()
+    assert tools.validate_package(pkg, "big") is None
 
 
 # --- runtime: validation / listing -----------------------------------------
