@@ -134,6 +134,93 @@ def test_get_record_unknown_id_returns_none() -> None:
     assert llm_log.get_record(999999) is None
 
 
+# --- stored-body size cap (_stored_body) ------------------------------------
+
+
+def test_stored_body_at_or_under_cap_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A body at or under llm_log_body_max_chars round-trips byte-for-byte,
+    untruncated -- the cap must never touch a body that already fits."""
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_body_max_chars=1000))
+    text = "x" * 1000
+    stored, truncated = llm_log._stored_body(text)
+    assert stored == text
+    assert truncated is False
+
+
+def test_stored_body_over_cap_is_hard_cut_with_marker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A body over the cap is cut to EXACTLY the cap, with the truncation
+    marker appended in place of the last characters (not merely a bare
+    slice), and reports truncated=True."""
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_body_max_chars=1000))
+    stored, truncated = llm_log._stored_body("y" * 5000)
+    assert truncated is True
+    assert len(stored) == 1000
+    assert stored.endswith(llm_log._BODY_TRUNCATION_MARKER)
+    assert stored.startswith("y")
+
+
+def test_stored_body_cap_smaller_than_marker_hard_cuts_without_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``llm_log_body_max_chars``'s own ge=1_000 floor makes a cap smaller than
+    the marker's length unreachable via a real ``Settings`` instance (it would
+    raise a pydantic ValidationError before ``_stored_body`` ever ran) -- so
+    this defensive branch is exercised here via a duck-typed stand-in (
+    ``_stored_body`` only ever reads the one attribute off whatever
+    ``get_settings()`` returns) rather than weakened by skipping the test.
+    Confirms the marker is DROPPED (not partially appended) and the result is
+    a bare hard cut to exactly ``cap`` chars."""
+    monkeypatch.setattr(llm_log, "get_settings", lambda: SimpleNamespace(llm_log_body_max_chars=5))
+    stored, truncated = llm_log._stored_body("z" * 100)
+    assert truncated is True
+    assert stored == "zzzzz"
+
+
+def test_oversized_request_and_response_are_truncated_and_flagged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An oversized request message AND an oversized response are each stored
+    hard-capped at llm_log_body_max_chars with the marker, the attempt's
+    `truncated` flag is set from EITHER side, and the ring holds only the
+    bounded (capped) bytes rather than the original oversized ones -- proving
+    a multi-MB gateway reply cannot inflate the ring regardless of
+    llm_log_max_entries."""
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_body_max_chars=1000, llm_log_max_entries=50),
+    )
+    llm_log._reset_for_tests()
+
+    huge_prompt = "u" * 5000
+    huge_response = "r" * 5000
+    recorder = llm_log.LlmInteractionRecorder(workflow="capture", model="m")
+    recorder.begin_attempt(
+        [{"role": "system", "content": "sys"}, {"role": "user", "content": huge_prompt}]
+    )
+    recorder.record_response(huge_response)
+    recorder.finish(outcome="ok", error=None)
+
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    attempt = record["attempts"][0]
+    assert attempt["truncated"] is True
+
+    # Both bodies land at EXACTLY the configured cap (1000), never the
+    # original 5000 -- the ring's per-body size is bounded regardless of how
+    # oversized the source text was, so the ring itself "stays small".
+    user_message = attempt["request_messages"][1]["content"]
+    assert len(user_message) == 1000
+    assert user_message.endswith(llm_log._BODY_TRUNCATION_MARKER)
+    assert attempt["response_content"] is not None
+    assert len(attempt["response_content"]) == 1000
+    assert attempt["response_content"].endswith(llm_log._BODY_TRUNCATION_MARKER)
+    assert attempt["response_chars"] == 1000
+    # request_chars sums the STORED length of every message: the untouched
+    # "sys" (3 chars) plus the capped user message (1000 chars).
+    assert attempt["request_chars"] == len("sys") + 1000
+
+
 def test_file_sink_writes_valid_jsonl(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """With llm_log_file set, every finished record is appended as one valid JSON
     line carrying the full bodies (ensure_ascii=False keeps CJK readable)."""
@@ -284,8 +371,16 @@ class _StubCompletions:
     """Scripted ``chat.completions`` returning content and an optional usage.
 
     ``content`` returns the same string every call; ``contents`` scripts a
-    per-call sequence (last element held once exhausted). ``usage`` (when given)
-    is attached to every returned completion so the recorder can capture it.
+    per-call sequence (last element held once exhausted). ``usage`` (when
+    given) is attached to EVERY returned completion, unchanged from before.
+    ``usages`` is the per-attempt sibling of ``contents`` -- a sequence
+    scripting a DIFFERENT usage object per call (also holding its last element
+    once exhausted) -- so a corrective-retry test can prove the recorder keeps
+    each attempt's OWN usage rather than the old "last completion wins"
+    number. A ``None`` entry in ``usages`` scripts "this completion reported no
+    usage object at all" for that specific call, distinct from omitting
+    ``usages``/``usage`` entirely (which never sets `.usage` on any
+    completion).
     """
 
     def __init__(
@@ -295,12 +390,14 @@ class _StubCompletions:
         contents: list[str] | None = None,
         exc: Exception | None = None,
         usage: Any = None,
+        usages: list[Any] | None = None,
         delay: float = 0.0,
     ) -> None:
         self._content = content
         self._contents = list(contents) if contents is not None else None
         self._exc = exc
         self._usage = usage
+        self._usages = list(usages) if usages is not None else None
         self._delay = delay
         self.calls: list[dict[str, Any]] = []
 
@@ -316,7 +413,11 @@ class _StubCompletions:
             content = self._content
         message = SimpleNamespace(content=content)
         completion = SimpleNamespace(choices=[SimpleNamespace(message=message)])
-        if self._usage is not None:
+        if self._usages is not None:
+            usage = self._usages[0] if len(self._usages) == 1 else self._usages.pop(0)
+            if usage is not None:
+                completion.usage = usage
+        elif self._usage is not None:
             completion.usage = self._usage
         return completion
 
@@ -378,6 +479,14 @@ def test_ok_path_records_usage_and_attempt(monkeypatch: pytest.MonkeyPatch) -> N
     assert attempt["request_messages"][0]["role"] == "system"
     assert "SYS" in attempt["request_messages"][0]["content"]  # schema-injected prompt
     assert attempt["request_messages"][1] == {"role": "user", "content": "USR"}
+    # A single-attempt interaction's own usage/chars equal the interaction-level
+    # aggregate above (nothing to sum with), and nothing here was oversized.
+    assert attempt["usage"] == {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+    assert attempt["response_chars"] == len(_SAMPLE_JSON)
+    assert attempt["request_chars"] == sum(
+        len(message["content"]) for message in attempt["request_messages"]
+    )
+    assert attempt["truncated"] is False
     # A single create() call was made (no spurious retry).
     assert len(stub.chat.completions.calls) == 1
 
@@ -385,24 +494,65 @@ def test_ok_path_records_usage_and_attempt(monkeypatch: pytest.MonkeyPatch) -> N
 def test_corrective_retry_records_two_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
     """Bad-then-good records both attempts: attempt 1 keeps its bad body and the
     parse error's class, attempt 2 the good body, and attempt 2's request echoes
-    the corrective turn."""
-    _install(monkeypatch, _StubClient(contents=["not json", _SAMPLE_JSON]))
+    the corrective turn. Each attempt also carries its OWN usage/chars, and the
+    interaction-level usage is the per-field SUM across both -- 150+260=410 --
+    proving the old "last completion wins" number (which would report only
+    260) no longer applies."""
+    usage_1 = SimpleNamespace(prompt_tokens=100, completion_tokens=50, total_tokens=150)
+    usage_2 = SimpleNamespace(prompt_tokens=200, completion_tokens=60, total_tokens=260)
+    stub = _install(
+        monkeypatch,
+        _StubClient(contents=["not json", _SAMPLE_JSON], usages=[usage_1, usage_2]),
+    )
     asyncio.run(generate_structured("SYS", "USR", _Sample, workflow="enrich"))
 
-    record = llm_log.get_record(_only_summary()["id"])
+    summary = _only_summary()
+    assert summary["usage"] == {
+        "prompt_tokens": 300,
+        "completion_tokens": 110,
+        "total_tokens": 410,
+    }
+
+    record = llm_log.get_record(summary["id"])
     assert record is not None
     assert record["outcome"] == "ok"
     assert len(record["attempts"]) == 2
-    assert record["attempts"][0]["response_content"] == "not json"
-    assert record["attempts"][0]["error"] == "JSONDecodeError"
-    assert record["attempts"][1]["response_content"] == _SAMPLE_JSON
-    assert record["attempts"][1]["error"] is None
+    attempt_1, attempt_2 = record["attempts"]
+    assert attempt_1["response_content"] == "not json"
+    assert attempt_1["error"] == "JSONDecodeError"
+    assert attempt_2["response_content"] == _SAMPLE_JSON
+    assert attempt_2["error"] is None
     # Attempt 2 sent system + user + the echoed bad reply + the corrective turn.
-    assert len(record["attempts"][1]["request_messages"]) == 4
-    assert record["attempts"][1]["request_messages"][2] == {
+    assert len(attempt_2["request_messages"]) == 4
+    assert attempt_2["request_messages"][2] == {
         "role": "assistant",
         "content": "not json",
     }
+
+    # Per-attempt usage: each attempt keeps its OWN completion's numbers, not
+    # the interaction-level aggregate computed above.
+    assert attempt_1["usage"] == {
+        "prompt_tokens": 100,
+        "completion_tokens": 50,
+        "total_tokens": 150,
+    }
+    assert attempt_2["usage"] == {
+        "prompt_tokens": 200,
+        "completion_tokens": 60,
+        "total_tokens": 260,
+    }
+    # Per-attempt chars are the STORED (post-_stored_body) length of the
+    # response, and neither attempt was actually oversized here, so neither
+    # is flagged truncated.
+    assert attempt_1["response_chars"] == len("not json")
+    assert attempt_2["response_chars"] == len(_SAMPLE_JSON)
+    assert attempt_1["request_chars"] > 0
+    # Attempt 2's request is strictly longer: it carries everything attempt 1
+    # did (system + user) PLUS the echoed bad reply and the corrective turn.
+    assert attempt_2["request_chars"] > attempt_1["request_chars"]
+    assert attempt_1["truncated"] is False
+    assert attempt_2["truncated"] is False
+    assert stub.chat.completions.calls[0]["model"] == _MODEL
 
 
 def test_timeout_outcome_recorded(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -162,6 +162,22 @@ function SummaryRow({ log }) {
 	);
 }
 
+// Compact, dimmed per-attempt stats line shown under the "嘗試 N" header:
+// chars are always the STORED (post-truncation) length the backend actually
+// kept (see llm_log._stored_body), and usage is THIS attempt's own reading --
+// distinct from the aggregate the list row's "tokens" column shows -- so a
+// corrective retry's two attempts can be told apart at a glance. "—" stands
+// in for any missing number: no response yet, or a gateway that omitted/
+// malformed that one usage field (see LlmLogUsage's per-field nullability).
+function formatAttemptStats(attempt) {
+	const responseChars = attempt.response_chars ?? "—";
+	const usage = attempt.usage;
+	const tokens = usage
+		? `${usage.prompt_tokens ?? "—"}/${usage.completion_tokens ?? "—"}/${usage.total_tokens ?? "—"}`
+		: "—";
+	return `字數：要求 ${attempt.request_chars} ・ 回應 ${responseChars} ・ tokens（提示/完成/總計）：${tokens}`;
+}
+
 // One attempt's request messages + response, each in a scrollable code block.
 function AttemptCard({ attempt, index }) {
 	return (
@@ -176,7 +192,15 @@ function AttemptCard({ attempt, index }) {
 							{attempt.error}
 						</Badge>
 					) : null}
+					{attempt.truncated ? (
+						<Badge size="sm" variant="light" color="orange">
+							已截斷
+						</Badge>
+					) : null}
 				</Group>
+				<Text size="xs" c="dimmed">
+					{formatAttemptStats(attempt)}
+				</Text>
 
 				<Text size="xs" fw={600} c="dimmed">
 					要求訊息

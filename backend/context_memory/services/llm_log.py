@@ -23,7 +23,12 @@ Three sinks, in decreasing durability, all fed from one finished record:
 
 1. a bounded in-memory ring (``deque(maxlen=settings.llm_log_max_entries)``),
    process-wide and dying with the process -- surfaced via ``list_summaries`` /
-   ``get_record`` for the "AI 日誌" page and for tests;
+   ``get_record`` for the "AI 日誌" page and for tests. Bounded on BOTH axes:
+   the ring caps entry COUNT, and each entry's own request/response bodies are
+   independently capped in SIZE at ``settings.llm_log_body_max_chars`` (see
+   ``_stored_body``) -- without the latter, a broken/hostile gateway returning
+   multi-MB bodies (kept per attempt, and echoed into a corrective retry's own
+   request) could inflate a "bounded" 50-entry ring to hundreds of MB;
 2. an OPTIONAL JSONL file (``settings.llm_log_file``), off by default because a
    record carries personal memory content and landing it on disk must be an
    operator choice, not a default;
@@ -57,6 +62,12 @@ from context_memory.config import get_settings
 # the test that asserts no secret ever reaches logging has a single, stable
 # target. It only ever emits the fixed INFO summary in `_log_summary` and the
 # file-sink WARNING in `_write_file_sink` -- never a body, never a config value.
+# This module deliberately does NOT attach a handler or set a level on it --
+# that is an APPLICATION decision, not a library one, and is made exactly once
+# for the whole "context_memory" namespace (this logger's parent) by
+# context_memory.main._configure_app_logging. This module only NAMES the
+# logger and picks what it emits; where those records end up is that other
+# module's job.
 logger = logging.getLogger("context_memory.llm")
 
 
@@ -68,18 +79,47 @@ class LlmAttempt:
     for this attempt (system prompt with the injected JSON Schema, the user
     prompt, and -- on the corrective retry -- the echoed bad reply plus the
     correction), snapshotted so a later rebuild of the running message list can
-    never rewrite an already-recorded attempt. ``response_content`` is the raw
-    completion text (or None when the attempt produced no usable content or
-    failed before one). ``error`` is a SAFE category string when the attempt
-    itself failed (a transport category, an empty-response category, or the
-    parse/validation error's class name) -- never a config value, and never the
-    full pydantic detail (the response body it was judged against is already
-    recorded above it).
+    never rewrite an already-recorded attempt. Every message's content here has
+    already passed through ``_stored_body`` (UTF-8-safe, then size-capped at
+    ``settings.llm_log_body_max_chars``), so ``request_messages`` is exactly
+    what a reader of the ring/JSONL/detail API sees -- never the raw original.
+
+    ``response_content`` is the raw completion text, likewise passed through
+    ``_stored_body`` (or None when the attempt produced no usable content or
+    failed before one). ``request_chars``/``response_chars`` are the STORED
+    (post-``_stored_body``) lengths, answering "how much does the record
+    actually hold" rather than "how much did the caller send" --
+    ``response_chars`` is None exactly when ``response_content`` is (no
+    response ever landed on this attempt), never 0 for that case, so the two
+    fields can never disagree about whether a response happened at all.
+
+    ``usage`` is THIS attempt's own ``{prompt_tokens, completion_tokens,
+    total_tokens}`` read defensively from ITS OWN completion (see
+    ``LlmInteractionRecorder.record_usage`` / ``_extract_usage``) -- None when
+    that completion reported no usage object, or when the attempt failed
+    before any completion came back. The interaction-level total in
+    ``LlmInteractionRecord.usage`` is the SUM of every attempt's usage here,
+    not any single attempt's number (see ``_aggregate_usage``).
+
+    ``error`` is a SAFE category string when the attempt itself failed (a
+    transport category, an empty-response category, or the parse/validation
+    error's class name) -- never a config value, and never the full pydantic
+    detail (the response body it was judged against is already recorded above
+    it).
+
+    ``truncated`` is True the moment ANY body on this attempt -- a request
+    message or the response -- was cut by ``_stored_body``, so a reader can
+    tell "this record is honest but incomplete" apart from "this is
+    everything" without diffing lengths against the configured cap by hand.
     """
 
     request_messages: list[dict[str, str]]
+    request_chars: int = 0
     response_content: str | None = None
+    response_chars: int | None = None
     error: str | None = None
+    usage: dict[str, int | None] | None = None
+    truncated: bool = False
 
 
 @dataclass(slots=True)
@@ -88,11 +128,14 @@ class LlmInteractionRecord:
 
     ``id`` is a monotonic per-process integer assigned when the interaction
     STARTS (so it is stable for the whole call), independent of the ring's
-    finish-ordered eviction. ``usage`` is ``{prompt_tokens, completion_tokens,
-    total_tokens}`` read defensively from the last completion that carried a
-    usage object (any field a merely-compatible gateway omits or malforms is
-    None), or None when no completion reported usage at all. ``error`` is the
-    SAFE terminal category for a failed outcome, or None on success.
+    finish-ordered eviction. ``usage`` is the INTERACTION-level total: the
+    per-field SUM of every attempt's own usage (see ``LlmAttempt.usage``) that
+    reported one at all (see ``_aggregate_usage``), or None when NO attempt
+    reported any usage. This is deliberately a SUM, not "whichever completion
+    reported last" -- a 150-token failed attempt followed by a 260-token
+    successful retry cost 410 tokens end to end, and reporting only 260 would
+    understate the real cost of the interaction. ``error`` is the SAFE
+    terminal category for a failed outcome, or None on success.
     """
 
     id: int
@@ -192,6 +235,45 @@ def _extract_usage(completion: Any) -> dict[str, int | None] | None:
     }
 
 
+_USAGE_FIELDS: tuple[str, ...] = ("prompt_tokens", "completion_tokens", "total_tokens")
+
+
+def _aggregate_usage(attempts: list[LlmAttempt]) -> dict[str, int | None] | None:
+    """Sum each usage field across every attempt that reported usage at all.
+
+    Replaces "last completion wins": a failed-then-retried interaction (a
+    150-token rejected attempt plus a 260-token successful retry) must report
+    the FULL cost of the call -- 410 -- not merely the winning attempt's 260,
+    so this sums ``LlmAttempt.usage`` over every attempt rather than reading
+    only the final one. A gateway may omit usage on some attempts entirely (a
+    transport failure never reaches a completion, a timeout aborts before
+    one, or a merely-compatible endpoint sometimes skips the usage object) --
+    the sum is over REPORTING attempts only, never padded with 0 for the
+    rest, so None here means NO attempt reported any usage, not "usage was
+    zero". Each field is summed independently and skips a per-attempt None
+    for THAT field (mirroring ``_extract_usage``'s own per-field
+    defensiveness), so one attempt's malformed ``total_tokens`` cannot blank
+    out another attempt's good ``prompt_tokens``; a field is None in the
+    result only when EVERY reporting attempt itself left that field None.
+    """
+    reporting = [attempt.usage for attempt in attempts if attempt.usage is not None]
+    if not reporting:
+        return None
+    aggregate: dict[str, int | None] = {}
+    # `field_name`, not `field`: this module also imports dataclasses.field for
+    # LlmInteractionRecord.attempts' default_factory, and shadowing that import
+    # with a loop variable in the very same module -- even function-local and
+    # harmless at runtime -- is exactly the kind of thing that makes a reader
+    # (or `ty`) do a double-take over which `field` is meant.
+    for field_name in _USAGE_FIELDS:
+        values = [usage[field_name] for usage in reporting if usage.get(field_name) is not None]
+        aggregate[field_name] = sum(values) if values else None
+    return aggregate
+
+
+# --- stored-body safety: UTF-8-safe THEN size-capped ------------------------
+
+
 def _utf8_safe(text: str) -> str:
     """Replace any lone (unpaired) Unicode surrogate in ``text`` with U+FFFD.
 
@@ -221,19 +303,69 @@ def _utf8_safe(text: str) -> str:
     return text.encode("utf-8", errors="surrogatepass").decode("utf-8", errors="replace")
 
 
-def _message_text(content: Any) -> str:
-    """Coerce a message ``content`` to UTF-8-safe text for the record.
+# Appended when ``_stored_body`` cuts a body for size. Mirrors the naming and
+# punctuation of memory_ai's own truncation markers (``_TRUNCATION_MARKER`` =
+# "…[內容過長已截斷]", ``_HISTORY_TRUNCATION_MARKER``) so an operator who has
+# already learned that convention from item content recognizes this one on
+# sight; the distinct wording ("紀錄" = record, vs "內容" = content) still lets
+# either marker be told apart from the other if both ever appear near each
+# other (e.g. an oversized item section echoed back verbatim inside a stored
+# LLM reply).
+_BODY_TRUNCATION_MARKER = "…[紀錄過長已截斷]"
+
+
+def _stored_body(text: str) -> tuple[str, bool]:
+    """Make ``text`` safe AND small enough to store; return (stored, truncated).
+
+    The single choke point every request-message/response body passes through
+    before it is written into an attempt: ``_utf8_safe`` FIRST, then a hard
+    cut to ``settings.llm_log_body_max_chars`` with ``_BODY_TRUNCATION_MARKER``
+    appended when a cut happens. Order matters -- ``_utf8_safe`` must run
+    before the slice, not after: it never enlarges the text (one surrogate
+    becomes one U+FFFD), and once it has run the string holds only valid
+    Unicode scalar values, so slicing it by Python's code-point-based indexing
+    can never land inside what used to be a lone surrogate. Truncating first
+    would risk cutting a bare surrogate at the boundary and handing
+    ``_utf8_safe`` a different (index-shifted) string than the one actually
+    stored.
+
+    Without this cap, a broken or hostile OpenAI-*compatible* gateway
+    returning a multi-MB body would be kept in full (per attempt, and echoed
+    into a corrective retry's OWN next request, compounding the size) --
+    multiplied by ``llm_log_max_entries``, that turns a "bounded" ring into
+    hundreds of MB from a single pathological interaction. Mirrors
+    ``memory_ai._truncate_to``'s edge case for a cap too small to even hold
+    the marker: the marker is dropped and the text hard-cut to exactly `cap`.
+    ``llm_log_body_max_chars``'s own ``ge=1_000`` floor makes that
+    unreachable in practice, but the guard keeps this function correct
+    independent of that floor rather than relying on it.
+    """
+    safe = _utf8_safe(text)
+    cap = get_settings().llm_log_body_max_chars
+    if len(safe) <= cap:
+        return safe, False
+    marker_len = len(_BODY_TRUNCATION_MARKER)
+    if cap <= marker_len:
+        return safe[:cap], True
+    return safe[: cap - marker_len] + _BODY_TRUNCATION_MARKER, True
+
+
+def _message_text(content: Any) -> tuple[str, bool]:
+    """Coerce a message ``content`` to its STORED (safe, size-capped) text.
 
     Every message this codebase sends carries a plain string content, so the
     isinstance branch is normally an identity; it coerces defensively only so
     a future non-string content can never make snapshotting an attempt raise
-    into the LLM call. ``_utf8_safe`` is applied unconditionally here because
-    an attempt's request_messages can themselves carry raw LLM output -- the
-    corrective retry echoes the model's own (possibly malformed) previous
-    reply back as an "assistant" message -- not just our own prompts.
+    into the LLM call. ``_stored_body`` is applied unconditionally here
+    because an attempt's request_messages can themselves carry raw LLM output
+    -- the corrective retry echoes the model's own (possibly malformed,
+    possibly oversized) previous reply back as an "assistant" message -- not
+    just our own prompts. Returns ``(stored_text, truncated)`` so the caller
+    (``LlmInteractionRecorder.begin_attempt``) can fold the per-message flag
+    into the attempt's own single ``truncated`` bit.
     """
     text = content if isinstance(content, str) else str(content)
-    return _utf8_safe(text)
+    return _stored_body(text)
 
 
 # --- the recorder ----------------------------------------------------------
@@ -258,7 +390,6 @@ class LlmInteractionRecorder:
         "_model",
         "_started_at",
         "_started_monotonic",
-        "_usage",
         "_workflow",
     )
 
@@ -269,7 +400,6 @@ class LlmInteractionRecorder:
         self._started_at = datetime.now(UTC).isoformat()
         self._started_monotonic = time.monotonic()
         self._attempts: list[LlmAttempt] = []
-        self._usage: dict[str, int | None] | None = None
         self._finished = False
 
     def begin_attempt(self, messages: list[Any]) -> None:
@@ -277,38 +407,64 @@ class LlmInteractionRecorder:
 
         Copied field-by-field (not aliased) because the caller rebuilds its
         running message list for the corrective retry; without the copy a later
-        rebuild could rewrite an attempt already recorded here.
+        rebuild could rewrite an attempt already recorded here. Each message's
+        content goes through ``_message_text`` (UTF-8-safe, then size-capped),
+        so ``request_chars`` sums the STORED length actually kept -- not the
+        original -- and ``truncated`` is set the moment ANY message in this
+        attempt was cut; ``record_response`` below may OR a response-side cut
+        into the very same flag once the reply comes back.
         """
+        request_messages: list[dict[str, str]] = []
+        request_chars = 0
+        truncated = False
+        for msg in messages:
+            content, was_truncated = _message_text(msg.get("content"))
+            request_messages.append({"role": str(msg.get("role", "")), "content": content})
+            request_chars += len(content)
+            truncated = truncated or was_truncated
         self._attempts.append(
             LlmAttempt(
-                request_messages=[
-                    {"role": str(msg.get("role", "")), "content": _message_text(msg.get("content"))}
-                    for msg in messages
-                ]
+                request_messages=request_messages,
+                request_chars=request_chars,
+                truncated=truncated,
             )
         )
 
     def record_usage(self, completion: Any) -> None:
-        """Capture token usage from ``completion`` when it reports any.
+        """Capture THIS ATTEMPT's own token usage, when the completion reports any.
 
-        Keeps the LAST completion that carried usage (a corrective retry's
-        completion supersedes the first attempt's), and leaves the prior value
-        untouched for a completion that reports none.
+        Usage is no longer interaction-level "last completion wins": each
+        attempt keeps only what ITS OWN completion reported (None when that
+        completion carried no usage object -- see ``_extract_usage``), and
+        ``finish`` sums these per-field across every reporting attempt into
+        the interaction-level total (see ``_aggregate_usage``). A failed
+        attempt (raised before a completion ever came back -- a transport
+        error or a timeout) never calls this method, so its ``usage`` stays
+        the dataclass default of None.
         """
-        usage = _extract_usage(completion)
-        if usage is not None:
-            self._usage = usage
+        if self._attempts:
+            self._attempts[-1].usage = _extract_usage(completion)
 
     def record_response(self, content: str) -> None:
-        """Record the raw completion text on the current attempt, UTF-8-safe.
+        """Record the raw completion text on the current attempt, safely stored.
 
         ``content`` is straight from the LLM (see ``_extract_content`` in
         context_memory.services.llm) and has not passed through any pydantic
-        sanitizer; ``_utf8_safe`` is this method's own choke point against the
-        same lone-surrogate hazard ``_message_text`` guards for request bodies.
+        sanitizer; ``_stored_body`` is this method's own choke point against
+        both the lone-surrogate hazard ``_message_text`` guards for request
+        bodies AND the oversized-body hazard a broken/hostile gateway can
+        return. ``response_chars`` mirrors the STORED length -- never 0 for
+        "no response" (that stays None, matching ``response_content``'s own
+        shape) -- and a cut here is OR'd into the attempt's ``truncated`` flag
+        rather than overwriting it, so a request-side cut already recorded by
+        ``begin_attempt`` is never lost.
         """
         if self._attempts:
-            self._attempts[-1].response_content = _utf8_safe(content)
+            attempt = self._attempts[-1]
+            stored, was_truncated = _stored_body(content)
+            attempt.response_content = stored
+            attempt.response_chars = len(stored)
+            attempt.truncated = attempt.truncated or was_truncated
 
     def fail_current_attempt(self, category: str) -> None:
         """Record a SAFE failure category on the current attempt."""
@@ -342,7 +498,11 @@ class LlmInteractionRecorder:
                 duration_ms=int((time.monotonic() - self._started_monotonic) * 1000),
                 outcome=outcome,
                 error=error,
-                usage=self._usage,
+                # Interaction-level usage is computed HERE, once, from every
+                # attempt's own reading -- not accumulated incrementally as
+                # attempts are recorded -- so it can never disagree with what
+                # `record.attempts` itself shows (see _aggregate_usage).
+                usage=_aggregate_usage(self._attempts),
                 attempts=self._attempts,
             )
             with _LOCK:
@@ -377,7 +537,10 @@ def _record_detail(record: LlmInteractionRecord) -> dict[str, Any]:
     """Full record as a JSON-ready dict, attempt bodies included.
 
     Shared by ``get_record`` (the detail API) and the JSONL sink, so the two can
-    never disagree on the on-the-wire shape.
+    never disagree on the on-the-wire shape. Per-attempt ``request_chars`` /
+    ``response_chars`` / ``usage`` / ``truncated`` are this attempt's OWN
+    figures (see ``LlmAttempt``) -- distinct from the top-level ``usage``
+    above, which is the INTERACTION-level sum across every attempt.
     """
     return {
         "id": record.id,
@@ -392,8 +555,12 @@ def _record_detail(record: LlmInteractionRecord) -> dict[str, Any]:
         "attempts": [
             {
                 "request_messages": attempt.request_messages,
+                "request_chars": attempt.request_chars,
                 "response_content": attempt.response_content,
+                "response_chars": attempt.response_chars,
                 "error": attempt.error,
+                "usage": attempt.usage,
+                "truncated": attempt.truncated,
             }
             for attempt in record.attempts
         ],
@@ -461,10 +628,14 @@ def _log_summary(record: LlmInteractionRecord) -> None:
 
     Every field here is a scalar that is safe by construction -- workflow,
     outcome, attempt count, duration, total tokens, and the non-secret model
-    name (the one ``/llm/status`` already reports). No message body and, because
-    none of these is derived from the endpoint config, no base URL or key can
-    ride along -- which is what keeps the caplog no-leak test passing now that
-    the app logs at all.
+    name (the one ``/llm/status`` already reports). ``tokens`` is the
+    AGGREGATE total across every attempt (``record.usage``, see
+    ``_aggregate_usage``), not any single attempt's number -- a corrective
+    retry's full cost, not just its winning attempt's. No message body and,
+    because none of these is derived from the endpoint config, no base URL or
+    key can ride along -- which is what keeps the caplog no-leak test passing
+    now that the app actually has a console handler configured for it (see
+    context_memory.main._configure_app_logging).
     """
     total_tokens = record.usage.get("total_tokens") if record.usage else None
     logger.info(

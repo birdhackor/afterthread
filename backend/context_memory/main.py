@@ -1,6 +1,8 @@
 """FastAPI application entrypoint for the Context Memory backend."""
 
 import importlib.resources
+import logging
+import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
@@ -9,6 +11,63 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from context_memory.db import init_db
 from context_memory.routers import ai, items, review
+
+
+def _configure_app_logging() -> None:
+    """Attach a console handler to the "context_memory" logger namespace, once.
+
+    context_memory.services.llm_log names its logger "context_memory.llm" but
+    deliberately never calls ``addHandler``/``setLevel`` on it (see that
+    module's comment) -- a LIBRARY-style module should not decide where its
+    records end up, only how they are categorized. An APPLICATION entrypoint
+    is exactly the layer that legitimately DOES make that call once, for the
+    whole "context_memory" namespace: this is that one place, run at import
+    time (before ``app = FastAPI(...)`` below) so it is in effect for every
+    request the process ever serves, including one triggered by uvicorn's own
+    import machinery before the ASGI app is even built.
+
+    Without this, "context_memory.llm" has no handler and inherits the stdlib
+    ROOT logger's default level (WARNING) -- so llm_log._log_summary's INFO
+    line is silently discarded before a LogRecord is even constructed
+    (``Logger.isEnabledFor`` fails first), and the "live console sink" that
+    module's docstring promises never actually fires under a bare `uvicorn
+    context_memory.main:app` run. Setting the level here, on the PARENT
+    "context_memory" logger rather than the leaf "context_memory.llm", also
+    means any future sibling module under this namespace (not just llm_log)
+    gets the same console sink for free without a second setup call.
+
+    ``sys.stderr`` (not stdout): uvicorn's own access/error logs already go to
+    stderr by default, so this keeps the whole process to ONE interleaved,
+    chronological console stream rather than splitting related lines across
+    two file descriptors a reader would have to interleave by hand.
+
+    ``propagate = False`` stops a record from continuing past this logger to
+    the stdlib ROOT logger. Without it, a future consumer that configures the
+    root logger (a different embedding, a test harness, uvicorn's own
+    `--log-config`) would print every "context_memory.*" line TWICE -- once
+    from the handler attached here, once from root's. Since this module is
+    the one place that attaches a handler for the whole namespace, nothing
+    upstream of it needs the record to keep traveling.
+
+    The `if logger.handlers: return` guard makes this call idempotent, which
+    matters for two real scenarios, not just hygiene: uvicorn's `--reload` /
+    multi-worker modes re-import this module in ways that can run it more
+    than once in the same process, and so can a test suite that imports
+    `context_memory.main` from multiple test modules. Without the guard, a
+    second call would attach a SECOND StreamHandler and every line would print
+    twice from then on -- silently, since duplicate handlers is not an error.
+    """
+    logger = logging.getLogger("context_memory")
+    if logger.handlers:
+        return
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(handler)
+    logger.propagate = False
+
+
+_configure_app_logging()
 
 
 @asynccontextmanager

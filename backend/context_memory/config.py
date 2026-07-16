@@ -91,10 +91,35 @@ class Settings(BaseSettings):
     # attempt, surfaced via GET /api/llm/logs for the "AI 日誌" page. The ring is
     # process-wide and dies with the process -- it holds personal memory content
     # (prompts and completions), so it is deliberately memory-only unless the
-    # operator opts into the file sink below. Bounded to [1, 1000]: a full ring
-    # of maximal records (two attempts x ~500k-char prompts) is bounded RAM, and
-    # this cap is what keeps it so.
+    # operator opts into the file sink below. Bounded to [1, 1000]: together
+    # with llm_log_body_max_chars below (which caps each STORED body's own
+    # size, independent of this count), a full ring of maximal records is
+    # bounded RAM on both axes, and these two caps are what keep it so.
     llm_log_max_entries: int = Field(default=50, ge=1, le=1000)
+
+    # Hard ceiling on how many characters ANY single stored request-message or
+    # response body may occupy (see context_memory/services/llm_log.py's
+    # _stored_body -- applied UTF-8-safe first, then cut, with a truncation
+    # marker appended). This bounds RAM the same way llm_log_max_entries does,
+    # but on the ORTHOGONAL axis: max_entries caps how many interactions the
+    # ring holds, this caps how large any ONE body within an entry may be.
+    # Without it, a broken or hostile OpenAI-*compatible* gateway returning a
+    # multi-MB body -- kept per attempt, and echoed into a corrective retry's
+    # OWN next request, compounding the size across attempts -- could inflate
+    # a "bounded" 50-entry ring to hundreds of MB from a single pathological
+    # interaction. The default (200000) deliberately matches the SAME scale as
+    # llm_prompt_budget_chars's own default: an ordinary interaction's prompt
+    # is already budget-capped to roughly that size before it is ever sent, so
+    # a normal request/response pair is never truncated by this independent
+    # cap -- only a genuinely oversized body (an echoed prior reply plus an
+    # oversized new one, or a misbehaving endpoint) is. Bounded to
+    # [1000, 2_000_000] (startup-validated via pydantic-settings, matching the
+    # llm_prompt_budget_chars convention): the floor keeps even a deliberately
+    # small override from truncating virtually every legitimate reply, and the
+    # ceiling matches llm_prompt_budget_chars's own ceiling since there is no
+    # reason this cap would ever need to exceed the prompt budget it is
+    # protecting bodies of the same scale as.
+    llm_log_body_max_chars: int = Field(default=200_000, ge=1_000, le=2_000_000)
 
     # Optional path to a JSONL file that every finished LLM interaction record is
     # appended to (one JSON object per line, full bodies, ensure_ascii=False).

@@ -355,7 +355,15 @@ class AssistUpdateResponse(BaseModel):
 # base-URL/key field: a record only ever carries the non-secret model name,
 # non-secret timing/outcome scalars, and the prompt/response bodies (which are
 # user content, not endpoint config). Each token count is nullable because a
-# merely-compatible gateway may omit or malform usage.
+# merely-compatible gateway may omit or malform usage. ``LlmLogBase.usage`` is
+# the INTERACTION-level total -- the per-field SUM across every attempt that
+# reported usage (see llm_log._aggregate_usage) -- while ``LlmLogAttempt.usage``
+# below is that SAME attempt's own, unaggregated reading; a corrective retry's
+# interaction-level total is therefore its attempts' SUM, not its last
+# attempt's number. Request/response bodies are the STORED form (UTF-8-safe,
+# then size-capped at llm_log_body_max_chars -- see llm_log._stored_body), and
+# ``LlmLogAttempt.truncated`` says whether that capping actually cut anything
+# on that attempt.
 
 
 class LlmLogUsage(BaseModel):
@@ -405,11 +413,26 @@ class LlmLogMessage(BaseModel):
 
 class LlmLogAttempt(BaseModel):
     """One request/response round: the full messages sent, the raw reply (or
-    null), and a SAFE failure category (or null) if that attempt failed."""
+    null), this attempt's OWN token usage, and a SAFE failure category (or
+    null) if that attempt failed.
+
+    ``request_chars``/``response_chars`` are the STORED (post ``_stored_body``:
+    UTF-8-safe, then size-capped) lengths, not the original size --
+    ``response_chars`` is null exactly when ``response_content`` is (no
+    response ever landed on this attempt), never 0 for that case. ``usage`` is
+    THIS attempt's own reading, distinct from ``LlmLogBase.usage``'s
+    interaction-level aggregate (see the module comment above). ``truncated``
+    is true the moment ANY body on this attempt -- a request message or the
+    response -- was cut for size; the FE shows a small badge for it.
+    """
 
     request_messages: list[LlmLogMessage]
+    request_chars: int
     response_content: str | None
+    response_chars: int | None
     error: str | None
+    usage: LlmLogUsage | None
+    truncated: bool
 
 
 class LlmLogDetail(LlmLogBase):
