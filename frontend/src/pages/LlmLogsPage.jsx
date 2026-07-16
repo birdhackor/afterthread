@@ -56,6 +56,17 @@ const COLUMNS = [
 	{ key: "attempts", label: "嘗試次數", width: 72 },
 ];
 
+// The columns above are wrap="nowrap" (see HeaderRow/SummaryRow), so their
+// combined natural width (~700px: the column widths, the "md"-token 16px gaps
+// between them, and the Accordion.Control's own padding + chevron) overflows a
+// narrow/mobile viewport. Used below as the scroll container's inner min-width
+// so that overflow is contained to this component -- a horizontal scrollbar on
+// the list itself -- rather than pushing the whole page body wider.
+const ROW_MIN_WIDTH =
+	COLUMNS.reduce((total, column) => total + column.width, 0) +
+	(COLUMNS.length - 1) * 16 +
+	48;
+
 // Scrollable, whitespace-preserving box for the (possibly tens-of-KB) prompt
 // and response bodies: pre-wrap keeps the model's own line breaks and spacing
 // while wrapping long lines, and the max-height + auto overflow bounds the
@@ -194,12 +205,21 @@ function AttemptCard({ attempt, index }) {
 }
 
 // The expanded detail for one log row. Fetched lazily (enabled: expanded) so a
-// collapsed row never pulls its (large) bodies, and keyed by log id so each
-// row's detail is cached independently once opened.
-function LogDetailPanel({ logId, expanded }) {
+// collapsed row never pulls its (large) bodies. The query key folds in
+// log.started_at (the instance discriminator carried on the summary row)
+// alongside log.id: the backend's id counter resets on restart, so id N today
+// and id N from a previous process lifetime are two unrelated interactions
+// that merely share a number. Keyed on id alone, react-query would treat them
+// as the SAME query and could hand back a STALE cached detail -- a new
+// record's row showing an old call's prompts/response. The fetch URL still
+// only ever has the id (the backend has no other way to address a record);
+// started_at is purely a client-side cache/staleness discriminator, doubly
+// enforced below by comparing the fetched detail's own started_at against the
+// row's before rendering any body.
+function LogDetailPanel({ log, expanded }) {
 	const { data, error, isError, isFetching, refetch } = useQuery({
-		queryKey: ["llm-log", logId],
-		queryFn: () => apiGet(`/api/llm/logs/${logId}`),
+		queryKey: ["llm-log", log.id, log.started_at],
+		queryFn: () => apiGet(`/api/llm/logs/${log.id}`),
 		enabled: expanded,
 	});
 
@@ -212,10 +232,19 @@ function LogDetailPanel({ logId, expanded }) {
 	}
 
 	if (isError && data === undefined) {
+		// A 404 here is a WRONG-RESOURCE case for the shared client's generic
+		// 找不到項目 mapping (that copy means "memory item", not this AI 互動
+		// record): most likely this id was evicted past llm_log_max_entries,
+		// or -- see the started_at race guarded below -- the ring was reset by
+		// a backend restart before any later interaction reallocated this id.
+		const message =
+			error?.status === 404
+				? "找不到這筆 AI 日誌：可能已被較新的紀錄擠出保留區，請重新整理清單"
+				: (error?.message ?? "無法載入互動詳情");
 		return (
 			<Alert color="red" title="載入失敗">
 				<Stack gap="sm" align="flex-start">
-					<Text size="sm">{error?.message ?? "無法載入互動詳情"}</Text>
+					<Text size="sm">{message}</Text>
 					<Button size="xs" onClick={() => refetch()}>
 						重試
 					</Button>
@@ -226,6 +255,20 @@ function LogDetailPanel({ logId, expanded }) {
 
 	if (!data) {
 		return null;
+	}
+
+	// Belt-and-suspenders for the same restart-id-reuse race the query key
+	// above already guards: if a NEWER interaction has since reclaimed this
+	// id (started_at no longer matches the row that was open when the fetch
+	// started), the fetched bodies belong to a different call entirely --
+	// show a neutral notice rather than render them as if they were this
+	// row's.
+	if (data.started_at !== log.started_at) {
+		return (
+			<Alert color="gray">
+				<Text size="sm">這筆紀錄已被較新的紀錄取代，請重新整理清單</Text>
+			</Alert>
+		);
 	}
 
 	return (
@@ -278,7 +321,8 @@ export function LlmLogsPage() {
 
 			<Text size="sm" c="dimmed">
 				記錄每次 AI
-				互動的提示與回應，方便除錯。紀錄僅存於後端記憶體，重啟後清空。
+				互動的提示與回應，方便除錯。預設僅存於後端記憶體，重啟後清空；若後端設定了
+				LLM_LOG_FILE，互動內容也會寫入該檔案。
 			</Text>
 
 			{loading ? (
@@ -303,29 +347,37 @@ export function LlmLogsPage() {
 			) : null}
 
 			{logs.length > 0 ? (
-				<Stack gap={0}>
-					<HeaderRow />
-					<Accordion
-						variant="separated"
-						value={openValue}
-						onChange={setOpenValue}
-						chevronPosition="right"
-					>
-						{logs.map((log) => (
-							<Accordion.Item key={log.id} value={String(log.id)}>
-								<Accordion.Control>
-									<SummaryRow log={log} />
-								</Accordion.Control>
-								<Accordion.Panel>
-									<LogDetailPanel
-										logId={log.id}
-										expanded={openValue === String(log.id)}
-									/>
-								</Accordion.Panel>
-							</Accordion.Item>
-						))}
-					</Accordion>
-				</Stack>
+				// Horizontal-scroll container: the header + rows below are fixed-
+				// width (ROW_MIN_WIDTH, nowrap columns) and can exceed a narrow
+				// viewport. overflowX:"auto" here -- with the min-width pinned on
+				// the inner Stack -- keeps that overflow scoped to this box, so a
+				// mobile viewport gets a local scrollbar rather than the page body
+				// itself growing wider.
+				<Box style={{ overflowX: "auto" }}>
+					<Stack gap={0} miw={ROW_MIN_WIDTH}>
+						<HeaderRow />
+						<Accordion
+							variant="separated"
+							value={openValue}
+							onChange={setOpenValue}
+							chevronPosition="right"
+						>
+							{logs.map((log) => (
+								<Accordion.Item key={log.id} value={String(log.id)}>
+									<Accordion.Control>
+										<SummaryRow log={log} />
+									</Accordion.Control>
+									<Accordion.Panel>
+										<LogDetailPanel
+											log={log}
+											expanded={openValue === String(log.id)}
+										/>
+									</Accordion.Panel>
+								</Accordion.Item>
+							))}
+						</Accordion>
+					</Stack>
+				</Box>
 			) : null}
 		</Stack>
 	);

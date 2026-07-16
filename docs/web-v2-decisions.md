@@ -204,3 +204,10 @@
 - **殘餘已知界線**：五項修正屬 UI 快取/時序行為，e2e（curl 級）無法直接驗，信心來自 lint/build + 逐場景追蹤；瀏覽器級自動化不在本輪範圍（非目標清單）。
 - **第二輪追加（全修）**：(1) 編輯頁凍結契約補完——`refetchOnReconnect:false`、latch 拒絕 errored settle（warm cache + mount fetch 404/失敗時不得掛出舊表單，錯誤分支以 `!formReady` 取代 `item===undefined`、404 全面權威）、**diff 基準改為 `formBaseRef` 快照**（表單只對「使用者看到的那份」一致，reconnect refetch 覆寫 tags 的新 Medium 隨之根治）；(2) lastGoodRef 規則升級為「只存 settled、非 placeholder（borrowed）、可顯示」——clamp 的 overshoot 空頁經 keepPreviousData 帶到目標頁時不再被誤存。codex 於 sandbox 無法跑 socket 類 gates 屬環境限制，本機全綠有效。
 - **第三輪追加（修，免第四輪）**：react-query 預設 `networkMode:'online'` 在 `navigator.onLine=false` 時把 fetch 變成 `paused`（isFetching false、無錯誤）——未快取詳情頁會空指標崩潰、warm 編輯頁 latch 誤收舊快照。根因裁決：**本 app 後端在 loopback，WiFi 斷線根本不代表後端不可達**，且 paused 會讓被動連線層失聲。修法：QueryClient `networkMode:'always'`（queries+mutations，附 rationale 註解）讓請求永遠實發、失敗走既有 network-error 路徑；詳情頁加 undefined-item Loader 兜底。paused 狀態從此不可能出現＝類消滅；期末全量 review 覆蓋，不再開輪。
+
+## D26（Phase 4 codex review 裁決）：High 判 won't-fix，3 Medium + 4 Low 修
+
+- **High「model 名與 log 檔路徑可能載有秘密」— won't-fix**：codex 的重現前提是操作者把 `OPENAI_MODEL` 設成自己的 API key、或把 `LLM_LOG_FILE` 路徑命名成 base URL——秘密被主動塞進非秘密欄位。model 名稱自 v1 起就由 `/llm/status` 公開（測試釘住的既有契約）；log 檔路徑為操作者自選設定、寫入失敗時回報路徑正是除錯所需。不變量的正確表述是「`openai_base_url`/`openai_api_key` 這兩個欄位的值永不進 log」，而非「任何可能被塞入秘密的字串都不得記錄」——後者推到極致連 workflow 名都不能記。
+- **修**：(M1) LLM body 是不可信輸入：儲存邊界加 `_utf8_safe`（lone surrogate→U+FFFD，比照 memory_ai 的 `_coerce_str` UTF-8 閘）+ JSONL sink catch 由 OSError 放寬為 Exception；(M2) `finish()` 絕對不可拋——最終保護為完全靜默（觀察者唯一的錯誤結局是影響被觀察的呼叫）；(M3) FE 詳情 cache 以 `started_at` 作實例判別子 + 不符時顯示已被取代（後端重啟 id 重用）；(L2) timeout 補標當前 attempt 的安全分類；(L3) 隱私文案改為有條件（LLM_LOG_FILE）；(L4) 日誌 404 專屬文案；(L5) 清單加水平 scroll 容器。
+- **L1 JSONL 半行 — won't-fix + 註解**：opt-in 除錯 sink，磁碟滿寫半行只壞該行，消費端跳過即可；交易式寫入不值。
+- **另**：實作代理誤診 `except A, B:` 為「無效 Python / ruff bug」——實為 PEP 758（3.14）合法語法、ruff 按 target 正規化；監督者已改正其註解為真實理由（拆兩個子句為求 formatter 穩定與可讀性），拆分本身保留。

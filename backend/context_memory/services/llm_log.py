@@ -39,6 +39,7 @@ the INFO log are done OUTSIDE that lock so a slow disk never serializes every
 concurrent interaction behind one writer.
 """
 
+import contextlib
 import json
 import logging
 import threading
@@ -191,14 +192,48 @@ def _extract_usage(completion: Any) -> dict[str, int | None] | None:
     }
 
 
-def _message_text(content: Any) -> str:
-    """Coerce a message ``content`` to text for the record.
+def _utf8_safe(text: str) -> str:
+    """Replace any lone (unpaired) Unicode surrogate in ``text`` with U+FFFD.
 
-    Every message this codebase sends carries a plain string content, so this
-    is normally an identity; it coerces defensively only so a future non-string
-    content can never make snapshotting an attempt raise into the LLM call.
+    Attempt bodies are RAW, untrusted LLM output that -- unlike every other
+    string this codebase stores -- never passes through a pydantic model's
+    sanitizers: context_memory.services.memory_ai's ``_coerce_str`` gates the
+    very same hazard (a lone surrogate is valid per ``json.loads`` but not
+    UTF-8 encodable) at the model-validation boundary, but it REJECTS there
+    (raises, folded into a 502) because that data has not been written
+    anywhere yet. An attempt here has already happened -- rejecting is not an
+    option, the interaction must be recorded regardless -- so this is the same
+    gate applied at a boundary where REPLACING is the only sound choice. Left
+    unfixed, the surrogate would sail into the ring/JSONL sink untouched and
+    only blow up LATER as an uncaught ``UnicodeEncodeError`` -- from the detail
+    API's response serialization (Starlette's ``JSONResponse.render`` calls a
+    strict ``.encode("utf-8")``) or the JSONL sink's file write -- far from
+    where the bad code point actually entered.
+
+    Plain ``text.encode("utf-8", errors="replace")`` does NOT yield U+FFFD:
+    Python's "replace" error handler substitutes an ASCII "?" on ENCODE, and
+    reserves U+FFFD for DECODE. Encoding with ``errors="surrogatepass"``
+    instead lets a lone surrogate through as its raw, invalid-UTF-8 byte
+    sequence, and decoding THAT back with ``errors="replace"`` is what
+    actually produces U+FFFD -- and can never raise, since decoding with
+    "replace" has no failure mode.
     """
-    return content if isinstance(content, str) else str(content)
+    return text.encode("utf-8", errors="surrogatepass").decode("utf-8", errors="replace")
+
+
+def _message_text(content: Any) -> str:
+    """Coerce a message ``content`` to UTF-8-safe text for the record.
+
+    Every message this codebase sends carries a plain string content, so the
+    isinstance branch is normally an identity; it coerces defensively only so
+    a future non-string content can never make snapshotting an attempt raise
+    into the LLM call. ``_utf8_safe`` is applied unconditionally here because
+    an attempt's request_messages can themselves carry raw LLM output -- the
+    corrective retry echoes the model's own (possibly malformed) previous
+    reply back as an "assistant" message -- not just our own prompts.
+    """
+    text = content if isinstance(content, str) else str(content)
+    return _utf8_safe(text)
 
 
 # --- the recorder ----------------------------------------------------------
@@ -265,9 +300,15 @@ class LlmInteractionRecorder:
             self._usage = usage
 
     def record_response(self, content: str) -> None:
-        """Record the raw completion text on the current attempt."""
+        """Record the raw completion text on the current attempt, UTF-8-safe.
+
+        ``content`` is straight from the LLM (see ``_extract_content`` in
+        context_memory.services.llm) and has not passed through any pydantic
+        sanitizer; ``_utf8_safe`` is this method's own choke point against the
+        same lone-surrogate hazard ``_message_text`` guards for request bodies.
+        """
         if self._attempts:
-            self._attempts[-1].response_content = content
+            self._attempts[-1].response_content = _utf8_safe(content)
 
     def fail_current_attempt(self, category: str) -> None:
         """Record a SAFE failure category on the current attempt."""
@@ -282,6 +323,11 @@ class LlmInteractionRecorder:
         legitimately-failed -- LLM call into a different exception. ``Exception``
         (not ``BaseException``) so an ``asyncio.CancelledError`` from the
         surrounding deadline still propagates and is never swallowed here.
+        ``finish`` must be UNCONDITIONALLY unable to raise, not merely unable
+        to raise from its happy path: the fallback WARNING log below is itself
+        wrapped in a second, unconditional ``contextlib.suppress(Exception)``
+        (see the comment there), so even a pathological logging Handler/Filter
+        that raises inside its own emit()/filter() cannot escape this method.
         """
         if self._finished:
             return
@@ -308,7 +354,20 @@ class LlmInteractionRecorder:
         except Exception:
             # Last-resort guard: the record is best-effort. Emit one safe line
             # (no bodies, no config) and drop it rather than surface anything.
-            logger.warning("llm interaction record finalization failed", exc_info=False)
+            # Absolute last resort, via a bare `contextlib.suppress(Exception)`
+            # (behaviourally an `except Exception: pass`; ruff's SIM105 prefers
+            # this spelling): even this WARNING can raise, if a pathological
+            # logging Handler/Filter does not protect its own emit()/filter()
+            # the way a well-behaved stdlib handler (e.g. StreamHandler)
+            # protects its own. Letting that escape would turn a successful --
+            # or legitimately failed -- LLM call into a logging crash purely
+            # because of how logging happens to be configured. The recorder is
+            # a pure OBSERVER of the call; the ONLY wrong outcome here is
+            # affecting the call it observes, so this one spot swallows
+            # literally everything and does nothing -- absolute silence is
+            # correct BECAUSE no safer action remains.
+            with contextlib.suppress(Exception):
+                logger.warning("llm interaction record finalization failed", exc_info=False)
 
 
 # --- sink helpers ----------------------------------------------------------
@@ -368,7 +427,12 @@ def _write_file_sink(record: LlmInteractionRecord) -> None:
     Off entirely when the setting is empty (the default). Opened/written/closed
     per record -- simple and robust against an operator truncating or rotating
     the file between calls. A write failure must NEVER break the LLM call, so
-    every filesystem error is caught and dropped with a one-line WARNING; the
+    the catch below is ``Exception``, not just ``OSError``: the stated contract
+    is "sink failures never break the LLM call", full stop, and an OSError-only
+    catch does not actually keep it -- e.g. a body that ever reached here
+    without going through ``_utf8_safe`` could raise ``UnicodeEncodeError`` (a
+    ``ValueError`` subclass, not an ``OSError``) on the ``.write`` below, and a
+    future non-JSON-safe field could raise from ``json.dumps`` itself. The
     filename is the operator's own config (not a secret) so naming it is fine
     and useful, but only its CATEGORY is logged, never ``str(exc)`` (which could
     carry additional path detail without adding diagnostic value). ``ensure_ascii
@@ -380,8 +444,15 @@ def _write_file_sink(record: LlmInteractionRecord) -> None:
     try:
         line = json.dumps(_record_detail(record), ensure_ascii=False)
         with open(path, "a", encoding="utf-8") as handle:
+            # A failure mid-write (e.g. disk full) can still leave a truncated,
+            # unparsable final line even though the whole write sits inside
+            # this try -- the OS may already have flushed a partial chunk.
+            # Adjudicated as acceptable for an opt-in debug sink: not worth a
+            # transactional write (temp file + atomic rename) here, so a JSONL
+            # consumer should tolerate/skip a trailing line that fails to
+            # json.loads rather than assume every line is well-formed.
             handle.write(line + "\n")
-    except OSError as exc:
+    except Exception as exc:
         logger.warning("llm log file sink write failed (%s): %s", path, type(exc).__name__)
 
 

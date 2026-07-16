@@ -156,6 +156,34 @@ def test_file_sink_writes_valid_jsonl(tmp_path: Any, monkeypatch: pytest.MonkeyP
     assert "回覆內容一" in lines[0]
 
 
+def test_lone_surrogate_response_round_trips_through_file_sink(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A response body carrying a lone (unpaired) surrogate -- as a merely-
+    compatible gateway emitting a malformed UTF-16 escape could produce -- is
+    replaced with U+FFFD by _utf8_safe at the point record_response stores it,
+    so the JSONL line the sink later writes is already surrogate-free: the
+    line is valid UTF-8 (the file write never raises) and valid JSON
+    (json.loads succeeds), and carries U+FFFD rather than the raw surrogate."""
+    log_file = tmp_path / "llm.jsonl"
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_file=str(log_file), llm_log_max_entries=50),
+    )
+    llm_log._reset_for_tests()
+    _record(workflow="capture", response="開頭正常\ud800結尾正常")
+
+    lines = log_file.read_text(encoding="utf-8").splitlines()  # must not raise
+    assert len(lines) == 1
+    parsed = json.loads(lines[0])  # must not raise
+    response_content = parsed["attempts"][0]["response_content"]
+    assert "\ufffd" in response_content
+    assert "\ud800" not in response_content
+    assert "開頭正常" in response_content
+    assert "結尾正常" in response_content
+
+
 def test_file_sink_write_failure_does_not_break_the_call(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -174,6 +202,79 @@ def test_file_sink_write_failure_does_not_break_the_call(
     assert len(llm_log.list_summaries(10)) == 1
     # A one-line warning naming the (non-secret) filename was emitted.
     assert "llm log file sink write failed" in caplog.text
+
+
+def test_file_sink_unicode_encode_error_does_not_break_the_call(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The sink's catch is Exception-wide, not OSError-only: a write-path
+    failure that raises UnicodeEncodeError -- the exact error a lone surrogate
+    would cause if one ever reached this far (see _utf8_safe, which normally
+    prevents that upstream, at the point a body is STORED into the record) --
+    is swallowed the same way an OSError is. This also proves the sink
+    recovers INTERNALLY rather than leaning on finish()'s own outer catch: the
+    specific per-sink warning fires (not the generic "finalization failed"
+    one), and the INFO summary for the interaction still logs, because control
+    returns to finish()'s try block afterward instead of skipping the rest of
+    it."""
+    log_file = tmp_path / "llm.jsonl"
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_file=str(log_file), llm_log_max_entries=50),
+    )
+    llm_log._reset_for_tests()
+
+    def _boom(*_args: Any, **_kwargs: Any) -> str:
+        raise UnicodeEncodeError("utf-8", "x", 0, 1, "simulated failure")
+
+    monkeypatch.setattr(llm_log.json, "dumps", _boom)
+
+    with caplog.at_level(logging.INFO):
+        _record(workflow="capture")  # must not raise
+    assert len(llm_log.list_summaries(10)) == 1
+    assert "llm log file sink write failed" in caplog.text
+    # _log_summary still ran: the failure was contained inside
+    # _write_file_sink rather than skipping the rest of finish()'s try block.
+    assert "llm interaction workflow=capture" in caplog.text
+
+
+class _RaisingHandler(logging.Handler):
+    """A pathological logging handler that raises straight out of emit().
+
+    Unlike a well-behaved stdlib handler (e.g. StreamHandler.emit, which wraps
+    its own body in ``except Exception: self.handleError(record)``), this
+    handler does no such thing, so a caller's ``logger.warning(...)`` really
+    does propagate whatever emit() raises -- the scenario finish()'s inner
+    ``contextlib.suppress(Exception)`` fallback exists to survive.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        raise RuntimeError("handler emit exploded")
+
+
+def test_finish_swallows_a_raising_logging_handler(monkeypatch: pytest.MonkeyPatch) -> None:
+    """finish() must be UNCONDITIONALLY unable to raise: even when its own
+    fallback WARNING log reaches a pathological logging Handler that raises
+    inside emit(), the call must complete without the caller (here, _record's
+    finish()) ever seeing an exception. Forces the main try block to fail
+    (via a broken _log_summary) so the fallback WARNING path -- and thus the
+    raising handler -- is actually exercised."""
+
+    def _boom_summary(_record: llm_log.LlmInteractionRecord) -> None:
+        raise RuntimeError("summary logging exploded")
+
+    monkeypatch.setattr(llm_log, "_log_summary", _boom_summary)
+
+    handler = _RaisingHandler()
+    llm_log.logger.addHandler(handler)
+    try:
+        _record(workflow="capture")  # must not raise
+    finally:
+        llm_log.logger.removeHandler(handler)
+    # The ring append happens before the (broken) summary log, so the record
+    # still survived despite finalization otherwise failing end to end.
+    assert len(llm_log.list_summaries(10)) == 1
 
 
 # --- recorder integration through generate_structured ----------------------
@@ -306,7 +407,14 @@ def test_corrective_retry_records_two_attempts(monkeypatch: pytest.MonkeyPatch) 
 
 def test_timeout_outcome_recorded(monkeypatch: pytest.MonkeyPatch) -> None:
     """A slow endpoint that trips the wall-clock deadline records outcome timeout
-    with the safe Timeout category as its error."""
+    with the safe Timeout category as its error, AND classifies the in-flight
+    attempt itself with the same "Timeout" category. Without the explicit
+    recorder.fail_current_attempt call in the TimeoutError handler, the attempt
+    would keep its error=None default forever: asyncio.timeout's deadline
+    expiry arrives as a CancelledError, a BaseException none of the attempt
+    loop's own except clauses catch, so control never reaches any of them --
+    it jumps straight past to the outer handler -- even though the record's
+    own outcome/error correctly reads timeout."""
     stub = _install(monkeypatch, _StubClient(content=_SAMPLE_JSON, delay=1.0), timeout=0.05)
     with pytest.raises(LLMUpstreamError):
         asyncio.run(generate_structured("s", "u", _Sample, workflow="capture"))
@@ -315,6 +423,11 @@ def test_timeout_outcome_recorded(monkeypatch: pytest.MonkeyPatch) -> None:
     assert summary["error"].startswith("Timeout: ")
     # The attempt was begun before the deadline cut it off.
     assert len(stub.chat.completions.calls) == 1
+    record = llm_log.get_record(summary["id"])
+    assert record is not None
+    assert len(record["attempts"]) == 1
+    assert record["attempts"][0]["error"] == "Timeout"
+    assert record["attempts"][0]["response_content"] is None
 
 
 def test_upstream_error_outcome_recorded(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -441,3 +554,22 @@ def test_router_detail_unknown_id_404(client: TestClient) -> None:
     response = client.get("/api/llm/logs/999999")
     assert response.status_code == 404
     assert response.json()["detail"] == "LLM log not found"
+
+
+def test_router_detail_sanitizes_lone_surrogate_in_response(client: TestClient) -> None:
+    """A response body carrying a lone (unpaired) surrogate must not 500 the
+    detail endpoint: Starlette's JSONResponse.render encodes strictly
+    (.encode("utf-8"), no errors= override), so an unsanitized surrogate would
+    raise UnicodeEncodeError while building the HTTP response. _utf8_safe
+    replaces it with U+FFFD at record_response time, well before this request
+    ever runs, so the fetch succeeds (200) and reads back the replacement
+    character rather than the raw surrogate."""
+    _record(workflow="capture", response="開頭正常\ud800結尾正常")
+    log_id = client.get("/api/llm/logs").json()["logs"][0]["id"]
+    detail = client.get(f"/api/llm/logs/{log_id}")
+    assert detail.status_code == 200
+    body = detail.json()["attempts"][0]["response_content"]
+    assert "\ufffd" in body
+    assert "\ud800" not in body
+    assert "開頭正常" in body
+    assert "結尾正常" in body

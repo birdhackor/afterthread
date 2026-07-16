@@ -548,7 +548,14 @@ async def _run_structured[ModelT: BaseModel](
         # asyncio.timeout's deadline expiry (converted from the CancelledError it
         # injects) OR a re-raised builtin TimeoutError from the SDK boundary --
         # both land here with the distinct "Timeout" category. `from None` severs
-        # the cause chain, same as every other arm.
+        # the cause chain, same as every other arm. The in-flight attempt (begun
+        # via recorder.begin_attempt above) never reaches any of the loop's own
+        # except clauses on THIS path -- asyncio.timeout's CancelledError is a
+        # BaseException none of them catch -- so without this call its error
+        # would stay None forever even though the record's own outcome/error
+        # correctly reads "timeout": every attempt in a finished record must
+        # carry a classification.
+        recorder.fail_current_attempt("Timeout")
         raise LLMUpstreamError(f"Timeout: {_UPSTREAM_REASON}") from None
 
     # Unreachable at runtime -- the loop always returns a validated instance or
