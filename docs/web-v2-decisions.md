@@ -249,3 +249,10 @@
   2. **F4 位元組上限漏算 assistant content**：byte cap 只計 id+name+arguments，但 echo 的 `_assistant_tool_call_message` 會原樣帶入未受限的 `_completion_content`——巨大 content 配小 tool call 仍過關並完整送回下一輪 → 把 content 長度一併計入 aggregate、超限走同一 upstream-invalid 502 taxonomy。
 - **第六輪複審（df20e6e 後）**：round-5 兩項確認正確完整（teardown kill/reap 互斥、join 在鎖外、`reaped` closure 可見性、F4 content 計量與 echo 同源）。另出 2 個 Medium，**皆為 round-4 有界讀 class-fix 漏掉的呼叫點**（同一 FIFO 永久阻塞類，codex 明標「無需 race」——真實 liveness bug，非對抗式 race）：`set_enabled()` 的 tool.json 仍 stat+read_text（round-4 只轉了 scan、漏了 mutation 讀取路徑）；builder `write_file` 對既存 FIFO 呼叫 write_text 永久阻塞、卡住 single-flight。
 - **裁決：不只補這兩處，做完整 sweep 終結此 class**。理由：round-4 的 sweep 不夠徹底才會漏兩個 site，只補報告的兩處等於再賭一次 straggler。做法：(a) `set_enabled` 讀取改走 `_read_regular_file_capped`（None→False，沿用「did not happen」契約）；(b) 新增對稱的寫入側 helper——`os.open(O_WRONLY|O_CREAT|O_TRUNC|O_NONBLOCK|O_NOFOLLOW)`：對無 reader 的 FIFO write-only nonblock 立即回 ENXIO 而非阻塞、O_NOFOLLOW 拒 symlink leaf（比照讀側加固 staging jail），供 `write_file` 使用；(c) 對 tools.py / tool_builder.py 全部 `read_text`/`write_text`/`open`/`stat` 呼叫點做完整清查，凡是存取「可被工具或 run_shell 影響的路徑」者一律走有界/驗證 regular file 的 helper，同批修掉任何殘餘。此後此 class 應為空。
+
+## D27 結案（Phase 5 review 迴圈收斂，2026-07-16）
+
+- **第七輪複審（7e5e300 後）：Approve，無 High/Medium finding**。codex 獨立重跑 sweep 確認 FIFO/檔案開啟類已空、寫入 helper 語意正確、set_enabled 讀寫轉換無回歸。
+- **迴圈全貌**：7 輪（前 6 輪 needs-changes → 第 7 輪 approve），嚴重度單調收斂——round-1（3 High：run_shell 宣稱/dotenv 插值/symlink 圈禁）→ round-2/3/4（各 4-5 Medium：資源上限、process 樹生命週期、TOCTOU）→ round-5（2 Medium：修正自身收尾）→ round-6（2 Medium：同一 class 漏網 site）→ round-7 approve。共 6 個修正 commit（`7230e1b`→`7e5e300`）疊在 2 個實作 commit（`f0dc649` tool loop、`5aea7e6` installer）之上。
+- **裁決原則回顧**：全程以「D21 信任邊界（只裝可信指示、無容器隔離）＋ 真正強制的 staging jail ＋ 不可信上游回覆」三準繩判定；唯一判界外者為 round-5 的 ancestor-symlink 主動競跑（純對抗式本地工具、修法昂貴且平台綁定），且此界外立場已被 review 端接受。其餘全修。
+- **本機 gates（最終）**：pytest 565、e2e smoke 76/76、vitest 37、ruff/format/ty 全過。依 D23 phase 通過即推送。
