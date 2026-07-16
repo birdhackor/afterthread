@@ -54,7 +54,7 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
 | `/items/$itemId` | `ItemDetailPage` | 單筆項目詳情：完整欄位、progress 歷史（可追加一筆）、狀態/階段快速修改、`ItemAiActions` 提供的「AI 補齊」（enrich）／「AI 進度更新」（assist-update）兩個操作、刪除。 |
 | `/items/$itemId/edit` | `ItemEditPage` | 手動編輯項目的表單頁（沿用 `ItemForm` 元件）。 |
 | `/tools` | `ToolsPage` | 「已安裝工具」（清單／啟停／刪除）與「安裝新工具」（貼 OpenAPI JSON 網址 + 指示，AI 背景建置、輪詢進度）兩個分頁；細節見根目錄 README「KB 工具安裝指南」。 |
-| `/llm-logs` | `LlmLogsPage` | AI 日誌：呼叫 `GET /api/llm/logs` 列出最近的 LLM 互動，每筆可展開讀取 `GET /api/llm/logs/{id}` 取得的完整請求/回應內容；支援 `?log=<id>` 深連結自動展開（`工具` 頁的安裝結果會連過來）。 |
+| `/llm-logs` | `LlmLogsPage` | AI 日誌：呼叫 `GET /api/llm/logs` 列出最近的 LLM 互動，每筆可展開讀取 `GET /api/llm/logs/{id}` 取得的請求/回應內容（每則受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；支援 `?log=<id>` 深連結自動展開（`工具` 頁的安裝結果會連過來）。 |
 | （其他） | `NotFoundPage` | 404 fallback（router 的 `defaultNotFoundComponent`）。 |
 
 ## 慣例
@@ -88,8 +88,11 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   （`pagePending` = `patchMutation.isPending || progressMutation.isPending`，
   再疊加 `ItemAiActions` 透過 `onPendingChange` 同步回報的 `aiPending`）同一
   時間只允許一個會改動該項目的操作進行中（狀態/階段快速修改、追加 progress
-  note、AI 補齊、AI 進度更新皆共用這個 gate）；任一操作進行中時，其餘會修改此
-  項目的控制項全部停用，避免兩個併發的 mutation 互相覆蓋對方剛寫入的結果。
+  note、AI 補齊、AI 進度更新皆共用這個 gate）；任一操作進行中時，其餘**共用此
+  gate** 的控制項才會停用，避免兩個併發的 mutation 互相覆蓋對方剛寫入的結果。
+  刪除**刻意不納入**這個 gate（它走獨立的確認 Modal，且結果是離開此頁而非改寫
+  欄位），所以刪除按鈕不受 `mutationPending` 影響、可與 PATCH／progress／AI
+  操作重疊。
   `onPendingChange` 在動作送出／結束當下同步呼叫（不是透過 effect），gate 的
   開關才會跟對應的 mutation 落在同一個 render，不晚一拍。（`@mantine/hooks` 的
   `useDisclosure` 在這個頁面上是用來控制刪除確認 Modal 的開關，與這個

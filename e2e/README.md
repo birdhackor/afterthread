@@ -103,8 +103,10 @@ README 安裝的方式完全一樣——然後用 `curl` 打這個打包後的�
 bash e2e/wheel_smoke.sh
 ```
 
-同樣是每項斷言印 `PASS`/`FAIL`，任何一項失敗就以非零狀態結束。伺服器與暫存
-目錄（wheel 的建置輸出、一個獨立的 `--data-dir`）都在 `EXIT` trap 裡清乾淨；
+同樣是每項斷言印 `PASS`/`FAIL`，任何一項失敗就以非零狀態結束。`EXIT` trap 會
+關掉伺服器，並清除它自己建立的暫存目錄與那個獨立的 `--data-dir`；但 build
+產物（`backend/dist/`、`frontend/dist/`、`backend/context_memory/static/`）**會
+保留**（本來就是可重用的建置輸出，不在 teardown 範圍內——要清就自己刪）。
 埠號用 `--port 0` 讓 uvicorn 自己選，再從啟動 log 解析出來，避免「先偵測空
 埠、後綁定」中間的 TOCTOU 空窗。
 

@@ -60,7 +60,7 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 | `LLM_PROMPT_BUDGET_CHARS` | `200000` | enrich / assist-update / 工具安裝組 prompt 時，內容序列化後的最大字元數，邊界 `[4000, 2000000]`。避免超大內容撐爆小 context window 的模型；預設值已經是為大 context 模型調校過的（見下方 GLM5.2 備註）。 |
 | `LLM_LOG_MAX_ENTRIES` | `50` | 「AI 日誌」頁／`GET /api/llm/logs` 顯示的最近互動筆數上限（記憶體內環狀緩衝，隨程序重啟清空），邊界 `[1, 1000]`。 |
 | `LLM_LOG_BODY_MAX_CHARS` | `200000` | 單次互動中，任一則請求/回應內容儲存時的字元數上限，邊界 `[1000, 2000000]`；與 `LLM_LOG_MAX_ENTRIES` 一起讓記憶體用量在兩個軸上都有界。 |
-| `LLM_LOG_FILE` | 未設定 | 選填。設定後，每次完整的 LLM 互動（含完整提示/回應內容）會額外追加寫入這個 JSONL 檔案；預設關閉——記錄含個人記憶內容，落不落地是使用者自己的隱私選擇。 |
+| `LLM_LOG_FILE` | 未設定 | 選填。設定後，每次 LLM 互動會額外追加寫入這個 JSONL 檔案（與記憶體環狀緩衝相同的紀錄，一樣受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；預設關閉——記錄含個人記憶內容，落不落地是使用者自己的隱私選擇。 |
 | `TOOLS_DIR` | dev 未設定／打包模式自動注入 `<data-dir>/tools` | 已安裝工具套件所在目錄；留空＝工具功能整個關閉（`GET /api/tools` 回空清單，AI workflow 不帶任何工具，prompt 與無工具版本逐字相同）。dev 模式要用工具功能，需自行在 `backend/.env` 設定這個變數。 |
 | `LLM_TOOL_ROUNDS_MAX` | `8` | 一次 AI workflow 呼叫最多允許幾輪工具呼叫，邊界 `[1, 64]`。 |
 | `LLM_TOOL_TIMEOUT_SECONDS` | `60` | 單次工具子行程的逾時秒數（到期整個 process group 被砍），邊界 `(0, 600]`。 |
@@ -172,11 +172,12 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   隔離。唯一被強制圍住的邊界是 `write_file`／`read_file`／`list_dir` 三個
   meta-tool：路徑一定會被限制在暫存目錄之內（絕對路徑、`..` traversal、
   symlink 逃逸都會被擋下）。信任邊界因此是「只安裝你信任的 OpenAPI 文件與
-  指示」，不是程式碼在幫你圍出一個對抗式安全沙箱。安裝指示文字與工具呼叫的
-  完整參數都會進 AI 日誌（見上方 `LLM_LOG_FILE`）——貼給 AI 的任何第三方秘密
-  都要當作「會被記錄」處理。
-- **`.staging` 殘留**：正常結束（成功或失敗）都會清掉暫存目錄；只有後端在建置
-  途中被中斷（當掉、被砍、主機重開機）才會留下
+  指示」，不是程式碼在幫你圍出一個對抗式安全沙箱。安裝指示文字（提示原文）與
+  工具呼叫參數的摘要／預覽（約前 200 字元）都會進 AI 日誌（見上方
+  `LLM_LOG_FILE`）——貼給 AI 的任何第三方秘密都要當作「會被記錄」處理。
+- **`.staging` 殘留**：清理是 best-effort（所有清理例外都被抑制），正常結束
+  時通常會清掉暫存目錄；但後端在建置途中被中斷（當掉、被砍、主機重開機），
+  **或清理本身失敗**（例如 `run_shell` 改了目錄權限）時，會留下
   `<TOOLS_DIR>/.staging/<uuid>`。這個目錄名稱以 `.` 開頭，registry 掃描
   （`tools._scan_all`）會直接跳過隱藏目錄，不會被列成無效工具，可以安全地手動
   刪除。
