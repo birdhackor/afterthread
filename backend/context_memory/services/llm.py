@@ -32,12 +32,14 @@ Two hard rules shape this file:
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any
+from typing import Any, cast
 
 import httpx
 from openai import AsyncOpenAI, OpenAIError
-from openai.types.chat import ChatCompletionMessageParam
+from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 from pydantic import BaseModel, ValidationError
 
 from context_memory.config import Settings, get_settings
@@ -49,12 +51,6 @@ from context_memory.services import llm_log
 # and raising OpenAIError if it finds nothing. A fixed non-secret placeholder
 # lets the client build; it is never a real credential and never logged.
 _UNSET_API_KEY_PLACEHOLDER = "not-required"
-
-# At most this many attempts per structured call: the first try plus ONE
-# corrective retry. Deliberately small -- an interactive tool would rather
-# surface a 502 the user can retry from the UI than silently burn several
-# upstream round-trips (and their latency) behind a single request.
-_MAX_ATTEMPTS = 2
 
 
 class LLMNotConfiguredError(RuntimeError):
@@ -103,6 +99,55 @@ _STRICT_OUTPUT_RULE = (
     "Respond with EXACTLY one JSON object and nothing else -- no prose, no code "
     "fences. It must conform to this JSON Schema:"
 )
+
+# The final user turn appended once the tool-round budget (llm_tool_rounds_max,
+# or a per-call override) is spent: the loop stops advertising tools and makes
+# ONE last tools-free completion, so a model that keeps asking to call tools is
+# forced to commit to its answer instead of spinning the interaction. Phrased so
+# the model knows the tool phase is over AND what it must produce now (the same
+# single JSON object the strict-output rule in the system prompt already
+# describes), rather than a bare "stop".
+_TOOL_BUDGET_EXHAUSTED = (
+    "The tool-call budget for this request is exhausted; do not request any more "
+    "tool calls. Produce your final answer now as the single JSON object required "
+    "by the system instructions."
+)
+
+# How many characters of a tool call's raw arguments JSON ride into the synthetic
+# response body recorded for a tool_calls attempt (see _summarize_tool_calls).
+# Small on purpose: the AI 日誌 only needs to show WHICH tools were called with
+# roughly what, not the full argument blob (which reappears verbatim inside the
+# very next attempt's request_messages anyway), and llm_log._stored_body caps the
+# whole synthetic line again regardless.
+_TOOL_ARGS_PREVIEW_CHARS = 200
+
+
+@dataclass(slots=True)
+class LlmTool:
+    """One tool ``generate_structured`` may let the model call mid-completion.
+
+    ``spec`` is the OpenAI tools-array entry verbatim -- ``{"type": "function",
+    "function": {"name", "description", "parameters"}}`` -- passed straight to
+    ``chat.completions.create(tools=[...])``. ``handler`` is an async callable
+    that receives the ALREADY-PARSED arguments object (a dict) the model emitted
+    and returns the tool-result STRING fed back to the model as that call's
+    result.
+
+    Contract on ``handler``: it must NOT raise for ordinary domain failures --
+    an unreachable KB, a 404, a bad query -- it returns descriptive error TEXT
+    instead, because that text is the most useful thing to hand the model (it
+    can adjust and try again). If it nonetheless raises, the loop catches
+    ``Exception`` and feeds a safe ``"tool execution failed: <ClassName>"``
+    string back as that call's result: one broken tool degrades to a failed
+    tool result the model can react to, never a 502 that sinks the whole
+    interaction. The arguments dict is produced by the loop's own defensive
+    ``json.loads`` (malformed arguments never reach the handler -- the model
+    gets an error string for that call instead), so a handler can assume it was
+    handed a real dict.
+    """
+
+    spec: dict[str, Any]
+    handler: Callable[[dict[str, Any]], Awaitable[str]]
 
 
 def normalized_model(settings: Settings) -> str:
@@ -327,6 +372,183 @@ def _extract_content(completion: Any) -> str:
     return content
 
 
+def _completion_content(completion: Any) -> str | None:
+    """Best-effort read of ``choices[0].message.content`` (a str), or None.
+
+    Distinct from ``_extract_content``: this NEVER raises and treats a
+    missing/None/non-str content as None, because it feeds the ``content`` field
+    of the assistant message we echo back alongside its ``tool_calls`` -- where
+    None is the ordinary, valid shape for a pure tool-call turn (a model that
+    only asked to call a tool sends no prose). ``_extract_content``'s 502 is for
+    the FINAL-answer path, where empty content genuinely is an unusable reply.
+    """
+    choices = getattr(completion, "choices", None)
+    if not isinstance(choices, list) or not choices:
+        return None
+    message = getattr(choices[0], "message", None)
+    if message is None:
+        return None
+    content = getattr(message, "content", None)
+    return content if isinstance(content, str) else None
+
+
+def _extract_tool_calls(completion: Any) -> list[Any]:
+    """Return ``choices[0].message.tool_calls`` as a list, or [] if there are none.
+
+    Defensive at every hop, exactly like ``_extract_content``: a merely
+    OpenAI-*compatible* gateway can shape ``choices`` / ``message`` / ``tool_calls``
+    in any broken way without the SDK objecting, and this must never raise
+    AttributeError/TypeError into the loop. Returning [] for anything that is not
+    a non-empty list routes the completion to the normal content-extraction path
+    (which then maps a genuinely empty/malformed body to its own 502) -- so a
+    broken body is never mistaken for "the model wanted to call a tool".
+    """
+    choices = getattr(completion, "choices", None)
+    if not isinstance(choices, list) or not choices:
+        return []
+    message = getattr(choices[0], "message", None)
+    if message is None:
+        return []
+    tool_calls = getattr(message, "tool_calls", None)
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return []
+    return tool_calls
+
+
+def _tool_call_fields(tool_call: Any) -> tuple[str, str, str]:
+    """Pull ``(id, function.name, function.arguments)`` from a tool-call object.
+
+    Every field is read defensively and falls back to "" so a malformed tool
+    call from a compatible gateway can never raise here: a missing name later
+    resolves to "no such tool", missing/blank arguments parse to an empty dict,
+    and the (possibly empty) id is used verbatim for BOTH the echoed assistant
+    ``tool_calls`` entry and the matching ``role:"tool"`` result, so the two
+    always pair up however degenerate the source was.
+    """
+    tc_id = getattr(tool_call, "id", None)
+    function = getattr(tool_call, "function", None)
+    name = getattr(function, "name", None)
+    arguments = getattr(function, "arguments", None)
+    return (
+        tc_id if isinstance(tc_id, str) else "",
+        name if isinstance(name, str) else "",
+        arguments if isinstance(arguments, str) else "",
+    )
+
+
+def _index_tools(tools: list[LlmTool]) -> dict[str, LlmTool]:
+    """Map each tool's advertised function name to the tool, for O(1) dispatch.
+
+    Reads the name out of the spec the same way the model sees it
+    (``spec["function"]["name"]``), defensively, so a spec missing that path is
+    simply not dispatchable (its name never enters the map) rather than a crash.
+    On a duplicate name the last wins -- registries upstream (tools.py) dedupe by
+    directory name, so this is only a last-resort tie-break.
+    """
+    indexed: dict[str, LlmTool] = {}
+    for tool in tools:
+        function = tool.spec.get("function") if isinstance(tool.spec, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if isinstance(name, str) and name:
+            indexed[name] = tool
+    return indexed
+
+
+def _summarize_tool_calls(tool_calls: list[Any]) -> str:
+    """Build the compact synthetic response body recorded for a tool_calls attempt.
+
+    Shape: ``[tool_calls] name1({args...}), name2({...})`` -- enough for the AI
+    日誌 to show the agentic trace (which tools were called, roughly with what)
+    without the full argument blobs, which reappear verbatim in the very next
+    attempt's request_messages. Arguments are previewed to
+    ``_TOOL_ARGS_PREVIEW_CHARS`` and the whole line is size-capped again by
+    llm_log's own ``_stored_body``.
+    """
+    parts: list[str] = []
+    for tool_call in tool_calls:
+        _, name, arguments = _tool_call_fields(tool_call)
+        preview = arguments[:_TOOL_ARGS_PREVIEW_CHARS]
+        if len(arguments) > _TOOL_ARGS_PREVIEW_CHARS:
+            preview += "…"
+        parts.append(f"{name or '<unnamed>'}({preview})")
+    return "[tool_calls] " + ", ".join(parts)
+
+
+def _assistant_tool_call_message(
+    content: str | None, tool_calls: list[Any]
+) -> ChatCompletionMessageParam:
+    """Rebuild the assistant turn (content + tool_calls) to echo back to the model.
+
+    The conversation MUST carry the assistant's tool-call request before the
+    matching ``role:"tool"`` results, or the endpoint rejects the follow-up
+    request. Rebuilt from scratch as the SDK's message-param dict shape (rather
+    than passing the response object through) so only the fields the API expects
+    travel back, each field defensively normalized via ``_tool_call_fields``.
+    ``content`` is None for a pure tool-call turn -- the valid, ordinary shape.
+    """
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [
+            {
+                "id": tc_id,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }
+            for tc_id, name, arguments in (_tool_call_fields(tc) for tc in tool_calls)
+        ],
+    }
+    return cast(ChatCompletionMessageParam, message)
+
+
+async def _invoke_tool_handler(tool: LlmTool, arguments_json: str) -> str:
+    """Parse the model's arguments and run one tool handler, never raising.
+
+    The two failure modes below both feed a descriptive string back as the tool
+    RESULT (the model can then correct itself), never an exception:
+
+    * malformed arguments -- ``json.loads`` fails, or the parsed value is not a
+      JSON object -- so the handler (which is promised a dict) is never called
+      with junk;
+    * the handler itself raising despite its no-raise contract -- caught here as
+      a safe category so one broken tool cannot 502 the whole interaction.
+
+    ``RecursionError`` is caught alongside the parse errors for the same reason
+    ``_parse_json_object`` catches it: pathologically nested arguments must
+    degrade to an error result, not an unhandled 500.
+    """
+    try:
+        parsed = json.loads(arguments_json) if arguments_json.strip() else {}
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+        return f"tool call rejected: arguments were not valid JSON ({exc})"
+    if not isinstance(parsed, dict):
+        return "tool call rejected: arguments were not a JSON object"
+    try:
+        result = await tool.handler(parsed)
+    except Exception as exc:
+        return f"tool execution failed: {type(exc).__name__}"
+    return result if isinstance(result, str) else str(result)
+
+
+async def _tool_result_message(
+    tool_call: Any, tools_by_name: dict[str, LlmTool]
+) -> ChatCompletionMessageParam:
+    """Execute one tool call and wrap its result as a ``role:"tool"`` message.
+
+    An unknown tool name (a model hallucinating a tool we never advertised)
+    yields an error result rather than a crash, keyed to the SAME tool_call_id
+    the assistant turn used so the endpoint can still pair request to result.
+    """
+    tc_id, name, arguments_json = _tool_call_fields(tool_call)
+    tool = tools_by_name.get(name)
+    if tool is None:
+        result = f"tool execution failed: no tool named {name!r} is available"
+    else:
+        result = await _invoke_tool_handler(tool, arguments_json)
+    message: dict[str, Any] = {"role": "tool", "tool_call_id": tc_id, "content": result}
+    return cast(ChatCompletionMessageParam, message)
+
+
 def _schema_guided_system_prompt(system_prompt: str, model_cls: type[BaseModel]) -> str:
     """Append the shared strict-output rule and ``model_cls``'s JSON Schema.
 
@@ -374,16 +596,20 @@ async def _create_completion(
     client: AsyncOpenAI,
     settings: Settings,
     messages: list[ChatCompletionMessageParam],
+    tool_specs: list[ChatCompletionToolParam] | None,
 ) -> Any:
-    """Send ONE chat-completion request, threading ``max_tokens`` only when set.
+    """Send ONE chat-completion request, threading ``max_tokens``/``tools`` only when set.
 
-    Two explicit call shapes rather than a spread ``**kwargs`` dict: the type
+    Four explicit call shapes rather than a spread ``**kwargs`` dict: the type
     checker can verify each keyword against the SDK's typed ``create`` (a spread
-    dict fails ``ty``'s overload match), and -- crucially -- the unset branch
-    OMITS ``max_tokens`` entirely, so the outgoing kwargs stay byte-identical to
-    the pre-existing call (the pinned llm-service tests assert the key is
-    absent). Sending the SDK's ``omit`` sentinel instead would still surface a
-    ``max_tokens`` key in a stubbed call's recorded kwargs.
+    dict fails ``ty``'s overload match), and -- crucially -- each unset branch
+    OMITS its keyword entirely. ``tool_specs=None`` (the tools-disabled path,
+    which is EVERY call in the tool-less build) sends no ``tools`` kwarg at all,
+    so the outgoing kwargs stay byte-identical to the pre-tool-loop call -- the
+    pinned llm-service tests assert ``tools`` (and ``max_tokens``) are absent.
+    Sending the SDK's ``omit`` sentinel instead would still surface those keys in
+    a stubbed call's recorded kwargs. The 2x2 (max_tokens set/unset x tools
+    set/unset) is spelled out flat for that byte-identity, not folded into a dict.
 
     ``openai_max_output_tokens`` defaults to None because some reasoning-style
     endpoints reject an explicit ``max_tokens`` (a 400 -> 502); an operator sets
@@ -393,10 +619,19 @@ async def _create_completion(
     ``/llm/status`` also use, so runtime and status can never disagree.
     """
     model = normalized_model(settings)
-    if settings.openai_max_output_tokens is None:
-        return await client.chat.completions.create(model=model, messages=messages)
+    max_tokens = settings.openai_max_output_tokens
+    if tool_specs is None:
+        if max_tokens is None:
+            return await client.chat.completions.create(model=model, messages=messages)
+        return await client.chat.completions.create(
+            model=model, messages=messages, max_tokens=max_tokens
+        )
+    if max_tokens is None:
+        return await client.chat.completions.create(
+            model=model, messages=messages, tools=tool_specs
+        )
     return await client.chat.completions.create(
-        model=model, messages=messages, max_tokens=settings.openai_max_output_tokens
+        model=model, messages=messages, max_tokens=max_tokens, tools=tool_specs
     )
 
 
@@ -422,15 +657,34 @@ async def _run_structured[ModelT: BaseModel](
     system_prompt: str,
     user_prompt: str,
     model_cls: type[ModelT],
+    *,
+    tools: list[LlmTool] | None,
+    max_tool_rounds: int,
+    timeout_seconds: float,
 ) -> ModelT:
-    """The config gate + attempt loop, feeding ``recorder`` as it goes.
+    """The config gate + agentic attempt loop, feeding ``recorder`` as it goes.
 
     Split out from ``generate_structured`` so ALL recorder finalization happens
     at the outer boundary, OUTSIDE this function's ``asyncio.timeout`` -- the
     sinks' I/O then never runs under the wall-clock deadline, and every exit (a
     return here, or any raise) maps to exactly one ``recorder.finish`` in the
-    wrapper. The control flow and the exact create() kwargs / message list are
-    otherwise unchanged from the pre-logging version.
+    wrapper.
+
+    Two phases share ONE deadline and ONE message list:
+
+    * a TOOL phase (only when ``tools`` is non-empty): while the model replies
+      with tool_calls and the round budget (``max_tool_rounds``) is unspent, its
+      calls are executed, their results appended, and the loop continues. Each
+      such round is one create()/recorder attempt whose recorded response is the
+      compact synthetic ``[tool_calls] ...`` trace;
+    * a FINAL-answer phase: the first completion that is NOT a tool round (the
+      model answered directly, or the tool budget ran out and the last create()
+      was made WITHOUT tools) goes through the exact same strict parse + ONE
+      corrective retry as the tool-less build.
+
+    With ``tools`` None/empty NOTHING about the tool phase runs and the create()
+    kwargs are byte-identical to the pre-tool-loop call, so the pinned
+    llm-service/llm-log tests are untouched.
     """
     if not llm_configured():
         # `from None` severs any context: this gate also fields a syntactically
@@ -441,27 +695,55 @@ async def _run_structured[ModelT: BaseModel](
 
     client = _get_client()
 
-    # The conversation accumulates across attempts: attempt 2 appends the
-    # assistant's rejected reply plus a corrective user turn (built below).
+    # Normalize the tool set ONCE. An empty list is treated exactly like None
+    # (no tools advertised on ANY create(), kwargs byte-identical to the
+    # tool-less call), so a caller passing `tools=[]` can never diverge from
+    # `tools=None`. `tool_specs` is what rides on create(); `tools_by_name`
+    # dispatches an executed call back to its handler.
+    tool_specs = [cast(ChatCompletionToolParam, tool.spec) for tool in tools] if tools else None
+    tools_by_name = _index_tools(tools) if tools else {}
+
+    # The conversation accumulates across the whole loop: tool rounds append the
+    # assistant tool-call turn plus one result per call; the final phase's
+    # corrective retry appends the rejected reply plus a corrective user turn.
     messages: list[ChatCompletionMessageParam] = [
         {"role": "system", "content": _schema_guided_system_prompt(system_prompt, model_cls)},
         {"role": "user", "content": user_prompt},
     ]
 
+    tool_rounds_used = 0
+    # The single corrective retry is a FINAL-answer mechanism; once it is spent
+    # (or once we are otherwise finalizing) tools are never advertised again, so
+    # a corrective turn can never re-open the tool phase and loop past the
+    # single-retry contract.
+    correction_used = False
+
     try:
-        # ONE asyncio.timeout spans the WHOLE attempt loop, so the R7 wall-clock
-        # contract now bounds first-try-plus-retry end to end, not each attempt
-        # separately -- a slow retry cannot quietly double the budget. Unlike the
-        # client-level timeout (see _build_client), which only bounds per-phase
-        # inactivity, this is a genuine deadline on total duration.
-        async with asyncio.timeout(settings.openai_timeout_seconds):
-            for attempt in range(_MAX_ATTEMPTS):
+        # ONE asyncio.timeout spans the WHOLE loop -- every tool round plus the
+        # final try-and-retry -- so the wall-clock budget (the possibly-overridden
+        # ``timeout_seconds``; the installer uses a much larger one) bounds the
+        # entire agentic interaction end to end, not each create() separately.
+        # Unlike the client-level timeout (see _build_client), which only bounds
+        # per-phase inactivity, this is a genuine deadline on total duration.
+        async with asyncio.timeout(timeout_seconds):
+            while True:
+                # Advertise tools only while the round budget is unspent AND we
+                # are not finalizing (see `correction_used`). Once spent, the
+                # next create() is tools-free -- that is the "one final create()
+                # without tools" the budget-exhausted nudge below sets up.
+                advertise_tools = (
+                    tool_specs is not None
+                    and tool_rounds_used < max_tool_rounds
+                    and not correction_used
+                )
                 # Snapshot the messages ACTUALLY sent for this attempt (the
-                # recorder copies them, since `messages` is rebuilt for the
-                # corrective retry below).
+                # recorder copies them, since `messages` is rebuilt each round /
+                # for the corrective retry below).
                 recorder.begin_attempt(messages)
                 try:
-                    completion = await _create_completion(client, settings, messages)
+                    completion = await _create_completion(
+                        client, settings, messages, tool_specs if advertise_tools else None
+                    )
                 except LLMNotConfiguredError:
                     # Our own taxonomy carries its own HTTP mapping (503 stays
                     # 503, an already-shaped 502 stays 502). Re-raise UNCHANGED so
@@ -508,8 +790,47 @@ async def _run_structured[ModelT: BaseModel](
                     recorder.fail_current_attempt(category)
                     raise LLMUpstreamError(category) from None
 
-                # Capture usage from whatever completion carried it (last wins).
+                # Capture usage from whatever completion carried it (per attempt).
                 recorder.record_usage(completion)
+
+                # TOOL BRANCH, CHECKED FIRST: a tool_calls reply legitimately
+                # carries content=None, which the final path's _extract_content
+                # (correctly, for a non-tool reply) 502s as empty -- so tool_calls
+                # must be resolved before any content extraction runs. Only
+                # consulted when tools were actually advertised this round; a
+                # stray tool_calls on a tools-free create() is ignored and falls
+                # through to the strict parse (the model was told not to).
+                if advertise_tools:
+                    tool_calls = _extract_tool_calls(completion)
+                    if tool_calls:
+                        # The synthetic trace is THIS attempt's recorded response;
+                        # the tool RESULTS then appear inside the next attempt's
+                        # request_messages naturally (no recorder schema change).
+                        recorder.record_response(_summarize_tool_calls(tool_calls))
+                        messages = [
+                            *messages,
+                            _assistant_tool_call_message(
+                                _completion_content(completion), tool_calls
+                            ),
+                        ]
+                        for tool_call in tool_calls:
+                            messages = [
+                                *messages,
+                                await _tool_result_message(tool_call, tools_by_name),
+                            ]
+                        tool_rounds_used += 1
+                        # If that spent the last permitted round, append the
+                        # finalize nudge NOW so the next (tools-free) create() is
+                        # explicitly told to stop calling tools and answer.
+                        if tool_rounds_used >= max_tool_rounds:
+                            messages = [
+                                *messages,
+                                {"role": "user", "content": _TOOL_BUDGET_EXHAUSTED},
+                            ]
+                        continue
+
+                # FINAL-ANSWER PATH: no tool round happened (tools not advertised,
+                # or advertised but the model answered directly). Parse strictly.
                 try:
                     content = _extract_content(completion)
                 except LLMUpstreamError as exc:
@@ -534,11 +855,12 @@ async def _run_structured[ModelT: BaseModel](
                     # ...). Record only the error's CLASS on the attempt (the
                     # rejected body is already recorded above it; the full
                     # pydantic detail goes to the LLM in the corrective turn,
-                    # never here). On the last attempt, fail with a FIXED,
-                    # config-free message.
+                    # never here). Once the single corrective retry is spent, fail
+                    # with a FIXED, config-free message.
                     recorder.fail_current_attempt(type(exc).__name__)
-                    if attempt + 1 >= _MAX_ATTEMPTS:
+                    if correction_used:
                         raise LLMUpstreamError(_INVALID_STRUCTURED_OUTPUT) from None
+                    correction_used = True
                     messages = [
                         *messages,
                         {"role": "assistant", "content": content},
@@ -560,7 +882,7 @@ async def _run_structured[ModelT: BaseModel](
 
     # Unreachable at runtime -- the loop always returns a validated instance or
     # raises -- but present so every path provably returns/raises (satisfying the
-    # type checker) and a future change to the loop bound cannot fall through to
+    # type checker) and a future change to the loop bounds cannot fall through to
     # an implicit `None`.
     raise LLMUpstreamError(_INVALID_STRUCTURED_OUTPUT)
 
@@ -571,6 +893,9 @@ async def generate_structured[ModelT: BaseModel](
     model_cls: type[ModelT],
     *,
     workflow: str = "unknown",
+    tools: list[LlmTool] | None = None,
+    max_tool_rounds: int | None = None,
+    timeout_seconds: float | None = None,
 ) -> ModelT:
     """Call the configured LLM under a strict, schema-guided contract and return
     a validated ``model_cls`` instance, with ONE corrective retry on bad output.
@@ -583,6 +908,17 @@ async def generate_structured[ModelT: BaseModel](
     output-shape failure -- a parse error or a ``ValidationError`` -- the model
     is shown its own reply plus a corrective note and asked once more; a second
     failure raises the fixed ``InvalidStructuredOutput`` 502.
+
+    ``tools`` (optional) enables an agentic TOOL phase before that final answer:
+    while the model replies with tool_calls and the round budget is unspent,
+    each call's handler runs and its result is fed back, then the model is asked
+    again (see ``_run_structured``). ``tools=None`` or ``[]`` disables the phase
+    entirely and keeps the create() kwargs byte-identical to the tool-less call,
+    so every existing caller and test is unaffected. ``max_tool_rounds`` (None ->
+    ``settings.llm_tool_rounds_max``) caps those rounds; ``timeout_seconds``
+    (None -> ``settings.openai_timeout_seconds``) overrides the ONE wall-clock
+    deadline wrapped around the whole interaction -- the installer (Phase 5c)
+    passes a much larger budget for its long tool-building session.
 
     ``workflow`` names the caller (``capture`` / ``enrich`` / ``assist_update``,
     or the default ``unknown`` for the direct test callers) and is recorded on
@@ -607,8 +943,24 @@ async def generate_structured[ModelT: BaseModel](
     """
     settings = get_settings()
     recorder = llm_log.LlmInteractionRecorder(workflow=workflow, model=normalized_model(settings))
+    # Resolve the two per-call overrides against settings here, at the recorder
+    # boundary, so _run_structured receives concrete values and the default path
+    # (both None) is exactly the pre-tool-loop behavior.
+    resolved_rounds = settings.llm_tool_rounds_max if max_tool_rounds is None else max_tool_rounds
+    resolved_timeout = (
+        settings.openai_timeout_seconds if timeout_seconds is None else timeout_seconds
+    )
     try:
-        result = await _run_structured(recorder, settings, system_prompt, user_prompt, model_cls)
+        result = await _run_structured(
+            recorder,
+            settings,
+            system_prompt,
+            user_prompt,
+            model_cls,
+            tools=tools,
+            max_tool_rounds=resolved_rounds,
+            timeout_seconds=resolved_timeout,
+        )
     except LLMNotConfiguredError as exc:
         recorder.finish(outcome="not_configured", error=str(exc))
         raise

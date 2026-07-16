@@ -20,7 +20,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from context_memory.config import get_settings
 from context_memory.models import MemoryStatus, utcnow
-from context_memory.services.llm import generate_structured
+from context_memory.services import tools
+from context_memory.services.llm import LlmTool, generate_structured
 
 # --- caps (constraint: bound everything; LLM output is untrusted) ----------
 
@@ -156,6 +157,32 @@ _RULE_LANGUAGE = (
     "JSON keys in English."
 )
 
+# Appended to a workflow's system prompt AT RUNTIME, and ONLY when at least one
+# tool is installed and enabled (see the three workflows below). Deliberately
+# NOT folded into any *_SYSTEM_PROMPT constant: with no tools the prompt sent is
+# byte-identical to the tool-less build, so test_ai_prompts' verbatim fragment
+# assertions and the e2e mock's marker routing (which keys off substrings of the
+# constants) are untouched, and smoke -- which runs with tools_dir unset -- never
+# sees this line. Kept generic (it names no specific tool) so it reads sensibly
+# for whatever set of tools happens to be installed; the concrete tool names and
+# argument schemas reach the model via the OpenAI tools array, not this text.
+_TOOLS_RULE = (
+    "You may call the provided tools to look up internal terminology, documents "
+    "or data before answering. Prefer calling a relevant tool when the user "
+    "content contains company-internal jargon you are unsure about."
+)
+
+
+def _with_tools_rule(system_prompt: str, active_tools: list[LlmTool]) -> str:
+    """Append ``_TOOLS_RULE`` to ``system_prompt`` iff any tool is active.
+
+    Returns the prompt UNCHANGED when ``active_tools`` is empty, so the tool-less
+    path stays byte-for-byte what it was before tools existed.
+    """
+    if not active_tools:
+        return system_prompt
+    return f"{system_prompt}\n{_TOOLS_RULE}"
+
 
 # --- quick capture ---------------------------------------------------------
 
@@ -255,9 +282,20 @@ def _capture_user_prompt(raw_text: str) -> str:
 
 
 async def capture_draft(raw_text: str) -> CaptureDraft:
-    """Run quick capture: prompt the LLM for a schema-guided, sanitized draft."""
+    """Run quick capture: prompt the LLM for a schema-guided, sanitized draft.
+
+    When any tool is installed and enabled, it is advertised to the model (which
+    may call it to resolve internal jargon before drafting) and the tools rule is
+    appended to the prompt. With no tools both are no-ops -- same prompt, same
+    create() kwargs as before.
+    """
+    active_tools = tools.enabled_llm_tools()
     return await generate_structured(
-        CAPTURE_SYSTEM_PROMPT, _capture_user_prompt(raw_text), CaptureDraft, workflow="capture"
+        _with_tools_rule(CAPTURE_SYSTEM_PROMPT, active_tools),
+        _capture_user_prompt(raw_text),
+        CaptureDraft,
+        workflow="capture",
+        tools=active_tools or None,
     )
 
 
@@ -716,12 +754,18 @@ def _enrich_user_prompt(item_fields: Mapping[str, Any], additional_context: str)
 
 
 async def enrich_item(item_fields: Mapping[str, Any], additional_context: str) -> EnrichResult:
-    """Run full enrichment: prompt the LLM for a schema-guided, sanitized result."""
+    """Run full enrichment: prompt the LLM for a schema-guided, sanitized result.
+
+    Advertises any installed+enabled tools (and appends the tools rule); a
+    no-op with no tools, keeping the prompt and create() kwargs byte-identical.
+    """
+    active_tools = tools.enabled_llm_tools()
     return await generate_structured(
-        ENRICH_SYSTEM_PROMPT,
+        _with_tools_rule(ENRICH_SYSTEM_PROMPT, active_tools),
         _enrich_user_prompt(item_fields, additional_context),
         EnrichResult,
         workflow="enrich",
+        tools=active_tools or None,
     )
 
 
@@ -793,10 +837,16 @@ def _update_user_prompt(item_fields: Mapping[str, Any], note: str) -> str:
 
 
 async def assist_update(item_fields: Mapping[str, Any], note: str) -> UpdateResult:
-    """Run assisted update: prompt the LLM for a schema-guided, sanitized result."""
+    """Run assisted update: prompt the LLM for a schema-guided, sanitized result.
+
+    Advertises any installed+enabled tools (and appends the tools rule); a
+    no-op with no tools, keeping the prompt and create() kwargs byte-identical.
+    """
+    active_tools = tools.enabled_llm_tools()
     return await generate_structured(
-        UPDATE_SYSTEM_PROMPT,
+        _with_tools_rule(UPDATE_SYSTEM_PROMPT, active_tools),
         _update_user_prompt(item_fields, note),
         UpdateResult,
         workflow="assist_update",
+        tools=active_tools or None,
     )

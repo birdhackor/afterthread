@@ -131,6 +131,61 @@ class Settings(BaseSettings):
     # that warning, unlike openai_base_url / openai_api_key which never do.
     llm_log_file: str = ""
 
+    # Hard ceiling on how many TOOL ROUNDS a single ``generate_structured`` call
+    # may take before it is forced to produce its final JSON (see
+    # context_memory/services/llm.py). One round == one create() whose reply
+    # carried tool_calls that were executed and fed back. Once this many rounds
+    # have run the loop stops advertising tools, nudges the model to finalize,
+    # and makes ONE last tools-free completion -- so a model that gets stuck
+    # calling tools forever cannot spin the interaction (each round is a real
+    # upstream round-trip, and its latency/cost is charged to the one request).
+    # Bounded to [1, 64] (startup-validated via pydantic-settings, matching the
+    # convention of the other LLM knobs): the floor guarantees at least one
+    # genuine tool round is possible, and the ceiling keeps even a hostile
+    # settings override from turning one interaction into 64+ upstream calls.
+    # Default 8 gives an agent room to look up several internal terms in one
+    # pass while staying well short of the ceiling; the KB installer (Phase 5c)
+    # overrides it (and the timeout) with a much larger budget of its own.
+    llm_tool_rounds_max: int = Field(default=8, ge=1, le=64)
+
+    # Directory holding installed tool packages, one per subdirectory
+    # (``<tools_dir>/<name>/`` with a tool.json + implementation files + an
+    # optional .env), scanned by context_memory/services/tools.py. Empty (the
+    # default) turns the whole tool feature OFF: list_tools() returns [],
+    # enabled_llm_tools() returns [], the three AI workflows pass NO tools, and
+    # their prompts stay byte-identical to the tool-less build (so the pinned
+    # prompt tests and the e2e mock's marker routing are untouched). Packaged
+    # mode's cli.py injects ``<data-dir>/tools`` when TOOLS_DIR is unset --
+    # mirroring the DATABASE_URL default-injection pattern -- so a uvx install
+    # gets a stable per-user tools location without the user configuring one;
+    # dev opts in explicitly via backend/.env. No env prefix is configured (see
+    # model_config), so the environment variable name is exactly ``TOOLS_DIR``.
+    tools_dir: str = ""
+
+    # Wall-clock budget (seconds) for a SINGLE tool subprocess invocation (see
+    # context_memory/services/tools.py). On expiry the tool's whole process
+    # GROUP is killed, so a hung or runaway tool cannot pin the interaction that
+    # called it. This is PER tool call, nested inside the interaction-level
+    # asyncio.timeout in generate_structured -- a tool round that overruns is
+    # reported back to the model as a failed tool result, not a crash. Bounded
+    # to (0, 600] (startup-validated, matching openai_timeout_seconds's own
+    # convention): the exclusive floor rejects a zero/negative value the
+    # subprocess machinery could not honor, and the ceiling stops one tool from
+    # holding a slot for more than ten minutes.
+    llm_tool_timeout_seconds: float = Field(default=60, gt=0, le=600)
+
+    # Hard cap on how many characters of a tool's STDOUT are used as its result
+    # (see context_memory/services/tools.py). The tool result is fed straight
+    # back into the conversation -- it rides into the NEXT create()'s prompt and
+    # into the LLM log -- so an unbounded dump would blow both the prompt budget
+    # and the bounded log ring. Output past the cap is truncated behind the
+    # marker "…[工具輸出過長已截斷]" (mirroring memory_ai/llm_log's own truncation
+    # markers). Bounded to [1000, 500000]: the floor keeps a deliberately small
+    # override from truncating virtually every useful tool reply, and the
+    # ceiling keeps a single tool result well under the default prompt budget it
+    # will be folded into. Default 50000 comfortably fits a realistic KB lookup.
+    llm_tool_output_max_chars: int = Field(default=50_000, ge=1_000, le=500_000)
+
     database_url: str = "sqlite:///./context_memory.db"
 
     # An item in any stale-eligible status (models.STALE_ELIGIBLE_STATUSES --

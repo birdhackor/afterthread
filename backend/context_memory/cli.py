@@ -218,6 +218,20 @@ def main(argv: list[str] | None = None) -> None:
     else:
         database_display = "(from DATABASE_URL environment variable)"
 
+    # Default the tool-package directory into the data dir, exactly as
+    # DATABASE_URL above -- a uvx install then has the tool feature ON at a
+    # stable per-user location (`<data-dir>/tools`) without the operator setting
+    # anything, while an explicit TOOLS_DIR always wins. Settings maps this with
+    # no env prefix (see context_memory/config.py's model_config), so the
+    # variable name is exactly TOOLS_DIR. Not created here: the directory is made
+    # when the first tool is installed, and context_memory/services/tools.py
+    # treats a missing dir as "nothing installed yet" (empty list), so injecting
+    # a not-yet-existing path is harmless. No secret is involved, so -- unlike
+    # DATABASE_URL -- there is nothing to withhold from the banner; it is simply
+    # left off to keep that line to the two facts it already prints.
+    if "TOOLS_DIR" not in os.environ:
+        os.environ["TOOLS_DIR"] = str(data_dir / "tools")
+
     # English; deliberately only ever these two facts -- where data lives,
     # and where the database is (see above). NEVER print OPENAI_* or any
     # other secret-shaped setting here. flush=True: stdout is fully

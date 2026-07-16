@@ -29,6 +29,14 @@ canned results on successive calls (the smoke uses this to drive the
 supersede-then-complete enrichment sequence). Without a directive the workflow's
 "default" variant is used. All content is realistic Traditional Chinese.
 
+One special directive, ``#variant:tool_roundtrip``, exercises the tool-calling
+loop (D14): the first reply (no tool result in the conversation yet) is a
+``tool_calls`` completion calling a tool named ``echo``, and the reply after the
+backend feeds that tool's result back is the workflow's normal good JSON. It is
+a CAPABILITY for manual / pytest-adjacent use and is NOT asserted by smoke.sh --
+with the smoke's tools_dir unset the backend advertises no tools, so nothing
+drives it there.
+
 Modes (``--mode``):
   * good    -> valid JSON for the matched workflow (the normal happy path).
   * garbage -> always a prose junk reply (no JSON object), for the 502 path.
@@ -201,6 +209,64 @@ def _completion(content: str, model: str) -> dict[str, Any]:
     }
 
 
+# --- tool_roundtrip capability (D14) ----------------------------------------
+
+# The tool the tool_roundtrip capability asks the backend to call. Any installed
+# tool package named "echo" satisfies it; the mock only needs the NAME to match
+# what such a package advertises. This is a CAPABILITY for manual / pytest-
+# adjacent use -- smoke.sh does not drive it (and with the smoke's tools_dir
+# unset the backend advertises no tools, so a tool_calls reply would go unused).
+_TOOL_ROUNDTRIP_TOOL = "echo"
+
+
+def _has_tool_result(messages: list[dict[str, Any]]) -> bool:
+    """True once a tool result rides in the conversation.
+
+    The backend appends a ``role:"tool"`` message for every executed tool call
+    before it calls us again, so this tells the FIRST tool_roundtrip request
+    (none yet -> reply with tool_calls) from the SECOND (present -> reply with
+    the workflow's normal good JSON).
+    """
+    return any(isinstance(m, dict) and m.get("role") == "tool" for m in messages)
+
+
+def _tool_calls_completion(model: str) -> dict[str, Any]:
+    """A chat.completion asking to call the ``echo`` tool (content null).
+
+    The exact shape a real endpoint returns for a tool-call turn -- content
+    None, one function tool_call, ``finish_reason="tool_calls"`` -- which the
+    backend's tool loop echoes back before executing the tool. The arguments are
+    a small JSON object so the installed echo tool has something to return.
+    """
+    return {
+        "id": "chatcmpl-mock-tool-0001",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model or "mock",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_mock_0001",
+                            "type": "function",
+                            "function": {
+                                "name": _TOOL_ROUNDTRIP_TOOL,
+                                "arguments": json.dumps({"text": "ping"}, ensure_ascii=False),
+                            },
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
 class _Handler(BaseHTTPRequestHandler):
     # Set on the class from CLI args before the server starts serving.
     mode: str = "good"
@@ -295,6 +361,18 @@ class _Handler(BaseHTTPRequestHandler):
         if self.mode == "garbage":
             workflow, variant, content, kind = "*", "-", _GARBAGE_PROSE, "garbage"
         else:
+            # tool_roundtrip capability (D14): a #variant:tool_roundtrip directive
+            # in the user text drives ONE agentic round -- the first reply (no
+            # tool result in the messages yet) is a tool_calls completion, and
+            # the second (once the backend has fed the tool result back) is the
+            # workflow's normal good JSON. Only meaningful when the backend has an
+            # "echo" tool installed and thus advertises tools; inert otherwise.
+            if _variant(user_text) == "tool_roundtrip" and not _has_tool_result(messages):
+                self._log(
+                    f"POST {self.path} mode={self.mode} variant=tool_roundtrip reply=tool_calls"
+                )
+                self._send_json(200, _tool_calls_completion(model))
+                return
             workflow, variant, content = _select(system_text, user_text)
             kind = "garbage" if workflow == "unknown" else "json"
 
