@@ -58,7 +58,9 @@ def _patch_generate_structured(
     (a validation failure maps to the same 502 upstream error).
     """
 
-    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
+    async def _fake(
+        system: str, user: str, model_cls: type[BaseModel], **_kwargs: object
+    ) -> BaseModel:
         if exc is not None:
             raise exc
         assert result is not None

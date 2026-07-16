@@ -41,6 +41,7 @@ from openai.types.chat import ChatCompletionMessageParam
 from pydantic import BaseModel, ValidationError
 
 from context_memory.config import Settings, get_settings
+from context_memory.services import llm_log
 
 # Placeholder passed as the API key when the operator has not configured one.
 # Some OpenAI-compatible servers (e.g. a local gateway) require no key, but the
@@ -369,29 +370,67 @@ def _corrective_user_message(exc: Exception) -> str:
     )
 
 
-async def generate_structured[ModelT: BaseModel](
-    system_prompt: str, user_prompt: str, model_cls: type[ModelT]
+async def _create_completion(
+    client: AsyncOpenAI,
+    settings: Settings,
+    messages: list[ChatCompletionMessageParam],
+) -> Any:
+    """Send ONE chat-completion request, threading ``max_tokens`` only when set.
+
+    Two explicit call shapes rather than a spread ``**kwargs`` dict: the type
+    checker can verify each keyword against the SDK's typed ``create`` (a spread
+    dict fails ``ty``'s overload match), and -- crucially -- the unset branch
+    OMITS ``max_tokens`` entirely, so the outgoing kwargs stay byte-identical to
+    the pre-existing call (the pinned llm-service tests assert the key is
+    absent). Sending the SDK's ``omit`` sentinel instead would still surface a
+    ``max_tokens`` key in a stubbed call's recorded kwargs.
+
+    ``openai_max_output_tokens`` defaults to None because some reasoning-style
+    endpoints reject an explicit ``max_tokens`` (a 400 -> 502); an operator sets
+    it only to raise a gateway's small default completion cap. No fixed
+    temperature is ever sent, for the same reason (some endpoints 400 on it). The
+    model is the shared ``normalized_model`` value ``llm_configured`` and
+    ``/llm/status`` also use, so runtime and status can never disagree.
+    """
+    model = normalized_model(settings)
+    if settings.openai_max_output_tokens is None:
+        return await client.chat.completions.create(model=model, messages=messages)
+    return await client.chat.completions.create(
+        model=model, messages=messages, max_tokens=settings.openai_max_output_tokens
+    )
+
+
+def _classify_upstream_outcome(exc: LLMUpstreamError) -> str:
+    """Map an ``LLMUpstreamError`` to the llm_log outcome vocabulary.
+
+    Reads only the SAFE message the service itself built (never a config value):
+    the fixed ``InvalidStructuredOutput`` literal is a bad-output failure, the
+    ``Timeout:`` category is the wall-clock deadline, and everything else (an SDK
+    category, an empty/malformed body) is a generic upstream failure.
+    """
+    message = str(exc)
+    if message == _INVALID_STRUCTURED_OUTPUT:
+        return "invalid_output"
+    if message.startswith("Timeout: "):
+        return "timeout"
+    return "upstream_error"
+
+
+async def _run_structured[ModelT: BaseModel](
+    recorder: llm_log.LlmInteractionRecorder,
+    settings: Settings,
+    system_prompt: str,
+    user_prompt: str,
+    model_cls: type[ModelT],
 ) -> ModelT:
-    """Call the configured LLM under a strict, schema-guided contract and return
-    a validated ``model_cls`` instance, with ONE corrective retry on bad output.
+    """The config gate + attempt loop, feeding ``recorder`` as it goes.
 
-    The system prompt is augmented with a fixed single-object rule and
-    ``model_cls``'s own JSON Schema (see ``_schema_guided_system_prompt``), so
-    the model is told the exact shape to emit. The completion is parsed as
-    EXACTLY one JSON object (``_parse_json_object``) and validated through
-    ``model_cls`` (whose before-validators sanitize the untrusted output). On an
-    output-shape failure -- a parse error or a ``ValidationError`` -- the model
-    is shown its own reply plus a corrective note and asked once more; a second
-    failure raises the fixed ``InvalidStructuredOutput`` 502.
-
-    Raises:
-        LLMNotConfiguredError: if no endpoint/model is configured (checked
-            first, before any client construction or network call). Maps to 503.
-        LLMUpstreamError: on any SDK/API error, empty completion, a timeout, or
-            output that fails parse+validation even after the corrective retry.
-            Maps to 502. The message is a safe category + short reason, or the
-            fixed InvalidStructuredOutput literal; it never contains the base
-            URL, API key, a full response body, or json/pydantic detail.
+    Split out from ``generate_structured`` so ALL recorder finalization happens
+    at the outer boundary, OUTSIDE this function's ``asyncio.timeout`` -- the
+    sinks' I/O then never runs under the wall-clock deadline, and every exit (a
+    return here, or any raise) maps to exactly one ``recorder.finish`` in the
+    wrapper. The control flow and the exact create() kwargs / message list are
+    otherwise unchanged from the pre-logging version.
     """
     if not llm_configured():
         # `from None` severs any context: this gate also fields a syntactically
@@ -400,7 +439,6 @@ async def generate_structured[ModelT: BaseModel](
         # fragment as the _get_client construction path already is.
         raise LLMNotConfiguredError("The LLM endpoint is not configured.") from None
 
-    settings = get_settings()
     client = _get_client()
 
     # The conversation accumulates across attempts: attempt 2 appends the
@@ -418,24 +456,27 @@ async def generate_structured[ModelT: BaseModel](
         # inactivity, this is a genuine deadline on total duration.
         async with asyncio.timeout(settings.openai_timeout_seconds):
             for attempt in range(_MAX_ATTEMPTS):
+                # Snapshot the messages ACTUALLY sent for this attempt (the
+                # recorder copies them, since `messages` is rebuilt for the
+                # corrective retry below).
+                recorder.begin_attempt(messages)
                 try:
-                    completion = await client.chat.completions.create(
-                        # Same normalized_model helper llm_configured and
-                        # /llm/status use, so the model sent at runtime is exactly
-                        # the one status validated and reported back to the client.
-                        model=normalized_model(settings),
-                        messages=messages,
-                        # No fixed temperature: some OpenAI-compatible endpoints --
-                        # reasoning-style models in particular -- reject the
-                        # parameter outright, turning every call into a 400 -> 502.
-                        # Omit it and let the model/endpoint apply its own default.
-                    )
-                except LLMNotConfiguredError, LLMUpstreamError:
+                    completion = await _create_completion(client, settings, messages)
+                except LLMNotConfiguredError:
                     # Our own taxonomy carries its own HTTP mapping (503 stays
                     # 503, an already-shaped 502 stays 502). Re-raise UNCHANGED so
                     # the broad handlers below can never rewrap one into a generic
                     # upstream 502. This is a TRANSPORT-boundary failure, not an
-                    # output-shape one, so it is never retried.
+                    # output-shape one, so it is never retried. NB: kept as two
+                    # single-type clauses rather than a multi-type clause: with
+                    # target-version 3.14 ruff-format normalizes
+                    # `except (A, B):` to PEP 758's unparenthesized
+                    # `except A, B:` (valid on this repo's >=3.14 floor, but a
+                    # trap for tooling/readers assuming older syntax rules);
+                    # two plain clauses read the same everywhere and are stable
+                    # under the formatter.
+                    raise
+                except LLMUpstreamError:
                     raise
                 except TimeoutError:
                     # A genuine builtin TimeoutError raised at the SDK boundary
@@ -451,8 +492,10 @@ async def generate_structured[ModelT: BaseModel](
                     # target URL, APIStatusError carries the response body. `from
                     # None` severs the cause chain so neither can ride along in
                     # __cause__ into a traceback-logging sink. Transport failure ->
-                    # no retry.
-                    raise LLMUpstreamError(f"{type(exc).__name__}: {_UPSTREAM_REASON}") from None
+                    # no retry. The same safe category is recorded on the attempt.
+                    category = f"{type(exc).__name__}: {_UPSTREAM_REASON}"
+                    recorder.fail_current_attempt(category)
+                    raise LLMUpstreamError(category) from None
                 except Exception as exc:
                     # Total boundary. A merely OpenAI-*compatible* endpoint can
                     # return a 2xx whose body is broken/empty JSON; the SDK parses
@@ -461,9 +504,21 @@ async def generate_structured[ModelT: BaseModel](
                     # such output escapes as an unhandled 500. Carry only the
                     # category (never str(exc), which could embed a response body)
                     # and sever the chain. Transport-shaped failure -> no retry.
-                    raise LLMUpstreamError(f"{type(exc).__name__}: {_UPSTREAM_REASON}") from None
+                    category = f"{type(exc).__name__}: {_UPSTREAM_REASON}"
+                    recorder.fail_current_attempt(category)
+                    raise LLMUpstreamError(category) from None
 
-                content = _extract_content(completion)
+                # Capture usage from whatever completion carried it (last wins).
+                recorder.record_usage(completion)
+                try:
+                    content = _extract_content(completion)
+                except LLMUpstreamError as exc:
+                    # An empty/malformed-but-200 body: transport-shaped, not
+                    # retried. Record the safe category on the attempt (its
+                    # response_content stays None) and re-raise the SAME object.
+                    recorder.fail_current_attempt(str(exc))
+                    raise
+                recorder.record_response(content)
 
                 try:
                     parsed = _parse_json_object(content)
@@ -476,9 +531,12 @@ async def generate_structured[ModelT: BaseModel](
                     # and json.loads' huge-integer rejection; RecursionError covers
                     # pathological nesting; ValidationError covers the model's own
                     # sanitizers (empty title, all-empty result, lone surrogate,
-                    # ...). On the last attempt, fail with a FIXED, config-free
-                    # message: the json/pydantic detail went to the LLM in the
-                    # corrective turn, never into our API error.
+                    # ...). Record only the error's CLASS on the attempt (the
+                    # rejected body is already recorded above it; the full
+                    # pydantic detail goes to the LLM in the corrective turn,
+                    # never here). On the last attempt, fail with a FIXED,
+                    # config-free message.
+                    recorder.fail_current_attempt(type(exc).__name__)
                     if attempt + 1 >= _MAX_ATTEMPTS:
                         raise LLMUpstreamError(_INVALID_STRUCTURED_OUTPUT) from None
                     messages = [
@@ -498,3 +556,58 @@ async def generate_structured[ModelT: BaseModel](
     # type checker) and a future change to the loop bound cannot fall through to
     # an implicit `None`.
     raise LLMUpstreamError(_INVALID_STRUCTURED_OUTPUT)
+
+
+async def generate_structured[ModelT: BaseModel](
+    system_prompt: str,
+    user_prompt: str,
+    model_cls: type[ModelT],
+    *,
+    workflow: str = "unknown",
+) -> ModelT:
+    """Call the configured LLM under a strict, schema-guided contract and return
+    a validated ``model_cls`` instance, with ONE corrective retry on bad output.
+
+    The system prompt is augmented with a fixed single-object rule and
+    ``model_cls``'s own JSON Schema (see ``_schema_guided_system_prompt``), so
+    the model is told the exact shape to emit. The completion is parsed as
+    EXACTLY one JSON object (``_parse_json_object``) and validated through
+    ``model_cls`` (whose before-validators sanitize the untrusted output). On an
+    output-shape failure -- a parse error or a ``ValidationError`` -- the model
+    is shown its own reply plus a corrective note and asked once more; a second
+    failure raises the fixed ``InvalidStructuredOutput`` 502.
+
+    ``workflow`` names the caller (``capture`` / ``enrich`` / ``assist_update``,
+    or the default ``unknown`` for the direct test callers) and is recorded on
+    the interaction log (context_memory.services.llm_log). An
+    ``LlmInteractionRecorder`` is built at the very START -- before the config
+    gate -- so EVERY exit path (ok, invalid output, upstream error, timeout, not
+    configured) finalizes exactly ONE record carrying its workflow: the
+    try/except below maps each outcome and calls ``finish`` once. The recorder is
+    side-effect-safe (``finish`` swallows its own failures), so logging can never
+    mask or replace the real LLM exception, and its ``model`` field is the
+    non-secret name ``/llm/status`` exposes -- the base URL and key are never
+    read into a record or a log line.
+
+    Raises:
+        LLMNotConfiguredError: if no endpoint/model is configured (checked
+            first, before any client construction or network call). Maps to 503.
+        LLMUpstreamError: on any SDK/API error, empty completion, a timeout, or
+            output that fails parse+validation even after the corrective retry.
+            Maps to 502. The message is a safe category + short reason, or the
+            fixed InvalidStructuredOutput literal; it never contains the base
+            URL, API key, a full response body, or json/pydantic detail.
+    """
+    settings = get_settings()
+    recorder = llm_log.LlmInteractionRecorder(workflow=workflow, model=normalized_model(settings))
+    try:
+        result = await _run_structured(recorder, settings, system_prompt, user_prompt, model_cls)
+    except LLMNotConfiguredError as exc:
+        recorder.finish(outcome="not_configured", error=str(exc))
+        raise
+    except LLMUpstreamError as exc:
+        recorder.finish(outcome=_classify_upstream_outcome(exc), error=str(exc))
+        raise
+    else:
+        recorder.finish(outcome="ok", error=None)
+        return result

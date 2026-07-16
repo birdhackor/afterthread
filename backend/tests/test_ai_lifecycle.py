@@ -27,7 +27,9 @@ def _patch_generate_structured(monkeypatch: pytest.MonkeyPatch, result: dict[str
     for a fixed canned result).
     """
 
-    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
+    async def _fake(
+        system: str, user: str, model_cls: type[BaseModel], **_kwargs: object
+    ) -> BaseModel:
         try:
             return model_cls.model_validate(result)
         except ValidationError:

@@ -257,7 +257,7 @@ def _capture_user_prompt(raw_text: str) -> str:
 async def capture_draft(raw_text: str) -> CaptureDraft:
     """Run quick capture: prompt the LLM for a schema-guided, sanitized draft."""
     return await generate_structured(
-        CAPTURE_SYSTEM_PROMPT, _capture_user_prompt(raw_text), CaptureDraft
+        CAPTURE_SYSTEM_PROMPT, _capture_user_prompt(raw_text), CaptureDraft, workflow="capture"
     )
 
 
@@ -718,7 +718,10 @@ def _enrich_user_prompt(item_fields: Mapping[str, Any], additional_context: str)
 async def enrich_item(item_fields: Mapping[str, Any], additional_context: str) -> EnrichResult:
     """Run full enrichment: prompt the LLM for a schema-guided, sanitized result."""
     return await generate_structured(
-        ENRICH_SYSTEM_PROMPT, _enrich_user_prompt(item_fields, additional_context), EnrichResult
+        ENRICH_SYSTEM_PROMPT,
+        _enrich_user_prompt(item_fields, additional_context),
+        EnrichResult,
+        workflow="enrich",
     )
 
 
@@ -792,5 +795,8 @@ def _update_user_prompt(item_fields: Mapping[str, Any], note: str) -> str:
 async def assist_update(item_fields: Mapping[str, Any], note: str) -> UpdateResult:
     """Run assisted update: prompt the LLM for a schema-guided, sanitized result."""
     return await generate_structured(
-        UPDATE_SYSTEM_PROMPT, _update_user_prompt(item_fields, note), UpdateResult
+        UPDATE_SYSTEM_PROMPT,
+        _update_user_prompt(item_fields, note),
+        UpdateResult,
+        workflow="assist_update",
     )

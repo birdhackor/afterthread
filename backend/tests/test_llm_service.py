@@ -352,6 +352,31 @@ def test_generate_structured_passes_model_omits_temperature_and_injects_schema(
     assert messages[1] == {"role": "user", "content": "USER PROMPT"}
 
 
+def test_generate_structured_omits_max_tokens_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """openai_max_output_tokens defaults to None, so no max_tokens is sent -- the
+    create() kwargs stay byte-identical to the pre-logging call (some reasoning
+    endpoints reject an explicit max_tokens)."""
+    stub = _configured(monkeypatch, content=_SAMPLE_JSON)
+    _run()
+    assert "max_tokens" not in _calls(stub)[0]
+
+
+def test_generate_structured_sends_max_tokens_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When openai_max_output_tokens is set, it rides as max_tokens on the call
+    (the operator knob for a gateway with a small default completion cap)."""
+    settings = Settings(
+        openai_base_url=_CONFIGURED_BASE_URL,
+        openai_api_key=_CONFIGURED_KEY,
+        openai_model=_CONFIGURED_MODEL,
+        openai_max_output_tokens=1234,
+    )
+    stub = _install(monkeypatch, settings, _StubClient(content=_SAMPLE_JSON))
+    _run()
+    assert _calls(stub)[0]["max_tokens"] == 1234
+
+
 # --- generate_structured: schema injection for the three workflows --------
 
 

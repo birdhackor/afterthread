@@ -18,7 +18,7 @@ the HTTP contract:
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.exc import StaleDataError
@@ -36,9 +36,12 @@ from context_memory.schemas import (
     CaptureResponse,
     EnrichRequest,
     EnrichResponse,
+    LlmLogDetail,
+    LlmLogListResponse,
     LLMStatus,
     MemoryItemRead,
 )
+from context_memory.services import llm_log
 from context_memory.services.llm import (
     _UPSTREAM_REASON,
     LLMNotConfiguredError,
@@ -217,6 +220,56 @@ def llm_status() -> LLMStatus:
     configured = llm_configured()
     model = normalized_model(settings) if configured else None
     return LLMStatus(configured=configured, model=model)
+
+
+# The read-only LLM interaction log (D09). Both endpoints stay in the /llm
+# namespace and deliberately declare NO 502/503: they never call the LLM, they
+# only read the in-memory ring, so the "exactly three AI operations declare
+# 502/503" contract (test_ai_contract) is untouched. The detail endpoint can
+# 404, declared below so generated clients know it.
+_LLM_LOG_NOT_FOUND = "LLM log not found"
+
+_LLM_LOG_NOT_FOUND_RESPONSE: dict[int | str, dict[str, Any]] = {
+    404: {
+        "description": "No LLM interaction log with that id",
+        "content": {"application/json": {"example": {"detail": _LLM_LOG_NOT_FOUND}}},
+    }
+}
+
+
+@router.get("/llm/logs", response_model=LlmLogListResponse)
+def llm_logs(limit: Annotated[int, Query(ge=1, le=500)] = 50) -> LlmLogListResponse:
+    """List recent LLM interaction summaries, newest first, WITHOUT bodies.
+
+    Each summary carries only non-secret scalars (workflow, model name, timing,
+    outcome, token usage) plus the attempt COUNT; the full prompt/response
+    bodies load lazily via the by-id endpoint below. ``limit`` is bounded to
+    [1, 500] at the query layer so an oversized page cannot be requested. The
+    ring is process-wide and dies with the process, so an empty list is the
+    normal state right after a restart.
+    """
+    return LlmLogListResponse.model_validate({"logs": llm_log.list_summaries(limit)})
+
+
+@router.get(
+    "/llm/logs/{log_id}",
+    response_model=LlmLogDetail,
+    responses=_LLM_LOG_NOT_FOUND_RESPONSE,
+)
+def llm_log_detail(log_id: int) -> LlmLogDetail:
+    """Return one full LLM interaction record, attempt bodies included.
+
+    404 (fixed, config-free ``{"detail": "LLM log not found"}``) when no record
+    with that id is in the ring -- it was evicted past ``llm_log_max_entries``,
+    the interaction is still in flight (recorded only on finish), or the id
+    never existed. The bodies here can run to tens of KB per attempt (the full
+    schema-injected prompt and the model's reply), which is why they are behind
+    this by-id fetch rather than in the list above.
+    """
+    record = llm_log.get_record(log_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=_LLM_LOG_NOT_FOUND)
+    return LlmLogDetail.model_validate(record)
 
 
 def _capture_persist(session: Session, item: MemoryItem) -> MemoryItemRead:

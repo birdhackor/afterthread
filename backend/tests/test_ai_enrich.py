@@ -63,7 +63,9 @@ def _patch_generate_structured(
     (a validation failure maps to the same 502 upstream error).
     """
 
-    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
+    async def _fake(
+        system: str, user: str, model_cls: type[BaseModel], **_kwargs: object
+    ) -> BaseModel:
         if exc is not None:
             raise exc
         assert result is not None
@@ -231,7 +233,9 @@ def test_enrich_prompt_is_budgeted_for_a_huge_item(
 
     captured: dict[str, str] = {}
 
-    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
+    async def _fake(
+        system: str, user: str, model_cls: type[BaseModel], **_kwargs: object
+    ) -> BaseModel:
         captured["user"] = user
         return model_cls.model_validate({"sections": {"snapshot": "s"}, "progress_note": "n"})
 

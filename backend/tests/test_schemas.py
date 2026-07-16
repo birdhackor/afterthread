@@ -97,11 +97,13 @@ def test_progress_entry_create_declares_note_length_bound() -> None:
 def test_only_by_id_routes_declare_404() -> None:
     """Every by-id route -- and only those -- must declare 404 in OpenAPI so
     generated clients and docs match runtime. That is the four item routes
-    (GET/PATCH/DELETE /api/items/{item_id} and POST /api/items/{item_id}/progress)
-    plus the two by-id AI routes (POST /api/items/{item_id}/enrich and
-    /assist-update). The collection, review, health, status, and capture routes
-    (POST/GET /api/items, GET /api/review, GET /api/health, GET /api/llm/status,
-    POST /api/capture) cannot 404 and must not declare it.
+    (GET/PATCH/DELETE /api/items/{item_id} and POST /api/items/{item_id}/progress),
+    the two by-id AI routes (POST /api/items/{item_id}/enrich and /assist-update),
+    and the by-id LLM log route (GET /api/llm/logs/{log_id}, which 404s for an
+    unknown/evicted id). The collection, review, health, status, capture, and
+    log-list routes (POST/GET /api/items, GET /api/review, GET /api/health, GET
+    /api/llm/status, POST /api/capture, GET /api/llm/logs) cannot 404 and must not
+    declare it.
     """
     client = TestClient(app)
     schema = client.get("/openapi.json").json()
@@ -118,4 +120,5 @@ def test_only_by_id_routes_declare_404() -> None:
         ("/api/items/{item_id}/progress", "post"),
         ("/api/items/{item_id}/enrich", "post"),
         ("/api/items/{item_id}/assist-update", "post"),
+        ("/api/llm/logs/{log_id}", "get"),
     }

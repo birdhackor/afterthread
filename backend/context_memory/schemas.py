@@ -346,3 +346,73 @@ class AssistUpdateResponse(BaseModel):
     """AI assisted-update result: the updated item."""
 
     item: MemoryItemRead
+
+
+# --- LLM interaction log (see context_memory.services.llm_log) --------------
+#
+# These mirror the dicts llm_log.list_summaries / get_record return, so the
+# "AI 日誌" page has a typed, documented contract. Deliberately WITHOUT any
+# base-URL/key field: a record only ever carries the non-secret model name,
+# non-secret timing/outcome scalars, and the prompt/response bodies (which are
+# user content, not endpoint config). Each token count is nullable because a
+# merely-compatible gateway may omit or malform usage.
+
+
+class LlmLogUsage(BaseModel):
+    """Token usage read defensively from a completion; any field may be null."""
+
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+
+
+class LlmLogBase(BaseModel):
+    """Fields shared by the list-summary and full-detail log views."""
+
+    id: int
+    workflow: str
+    model: str
+    started_at: str
+    finished_at: str | None
+    duration_ms: int | None
+    outcome: str | None
+    error: str | None
+    usage: LlmLogUsage | None
+
+
+class LlmLogSummary(LlmLogBase):
+    """One log row WITHOUT attempt bodies: ``attempts`` is the count only.
+
+    The list view shows how many attempts a call took; the full bodies (tens of
+    KB each) load only on row expansion via the detail endpoint.
+    """
+
+    attempts: int
+
+
+class LlmLogListResponse(BaseModel):
+    """Newest-first page of LLM interaction summaries."""
+
+    logs: list[LlmLogSummary]
+
+
+class LlmLogMessage(BaseModel):
+    """One request message exactly as sent (role + full content)."""
+
+    role: str
+    content: str
+
+
+class LlmLogAttempt(BaseModel):
+    """One request/response round: the full messages sent, the raw reply (or
+    null), and a SAFE failure category (or null) if that attempt failed."""
+
+    request_messages: list[LlmLogMessage]
+    response_content: str | None
+    error: str | None
+
+
+class LlmLogDetail(LlmLogBase):
+    """A full log record: every attempt's request messages and response body."""
+
+    attempts: list[LlmLogAttempt]

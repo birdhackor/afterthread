@@ -29,7 +29,9 @@ def _patch_generate_structured(monkeypatch: pytest.MonkeyPatch, result: dict[str
     (a validation failure maps to the same 502 upstream error).
     """
 
-    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
+    async def _fake(
+        system: str, user: str, model_cls: type[BaseModel], **_kwargs: object
+    ) -> BaseModel:
         try:
             return model_cls.model_validate(result)
         except ValidationError:

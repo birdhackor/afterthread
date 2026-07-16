@@ -85,7 +85,9 @@ def test_enrich_conflict_during_await_returns_409_and_writes_nothing(
     item = _create(client, snapshot="keep", decisions="原決策")
     item_id = item["id"]
 
-    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
+    async def _fake(
+        system: str, user: str, model_cls: type[BaseModel], **_kwargs: object
+    ) -> BaseModel:
         # A concurrent writer bumps `updated` while the model is "running".
         _bump_updated_via_raw_connection(session, item_id)
         return model_cls.model_validate(
@@ -112,7 +114,9 @@ def test_assist_update_conflict_during_await_returns_409_and_writes_nothing(
     item = _create(client, next_actions="keep")
     item_id = item["id"]
 
-    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
+    async def _fake(
+        system: str, user: str, model_cls: type[BaseModel], **_kwargs: object
+    ) -> BaseModel:
         _bump_updated_via_raw_connection(session, item_id)
         return model_cls.model_validate(
             {"sections": {"next_actions": "changed"}, "progress_note": "應被丟棄"}
@@ -134,7 +138,9 @@ def test_enrich_no_conflict_still_succeeds(
 ) -> None:
     item = _create(client)
 
-    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
+    async def _fake(
+        system: str, user: str, model_cls: type[BaseModel], **_kwargs: object
+    ) -> BaseModel:
         return model_cls.model_validate({"sections": {"decisions": "d"}, "progress_note": "n"})
 
     monkeypatch.setattr("context_memory.services.memory_ai.generate_structured", _fake)
@@ -148,7 +154,9 @@ def test_assist_update_no_conflict_still_succeeds(
 ) -> None:
     item = _create(client)
 
-    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
+    async def _fake(
+        system: str, user: str, model_cls: type[BaseModel], **_kwargs: object
+    ) -> BaseModel:
         return model_cls.model_validate(
             {"sections": {"next_actions": "n"}, "progress_note": "note"}
         )
@@ -164,7 +172,9 @@ def test_conflict_message_carries_no_config_or_item_content(
     item = _create(client, snapshot="secret-snapshot-value")
     item_id = item["id"]
 
-    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
+    async def _fake(
+        system: str, user: str, model_cls: type[BaseModel], **_kwargs: object
+    ) -> BaseModel:
         _bump_updated_via_raw_connection(session, item_id)
         return model_cls.model_validate({"sections": {"decisions": "x"}, "progress_note": "y"})
 
@@ -190,7 +200,9 @@ def test_enrich_conflict_between_guard_and_update_preserves_competing_write(
     item = _create(client, decisions="原決策")
     item_id = item["id"]
 
-    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
+    async def _fake(
+        system: str, user: str, model_cls: type[BaseModel], **_kwargs: object
+    ) -> BaseModel:
         return model_cls.model_validate(
             {"sections": {"decisions": "AI 決策"}, "progress_note": "AI note"}
         )
@@ -241,7 +253,9 @@ def test_assist_update_conflict_between_guard_and_update_preserves_competing_wri
     item = _create(client, next_actions="原下一步")
     item_id = item["id"]
 
-    async def _fake(system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
+    async def _fake(
+        system: str, user: str, model_cls: type[BaseModel], **_kwargs: object
+    ) -> BaseModel:
         return model_cls.model_validate(
             {"sections": {"next_actions": "AI 下一步"}, "progress_note": "AI note"}
         )
