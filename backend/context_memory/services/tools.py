@@ -30,7 +30,12 @@ v1 does NOT sandbox with a container. What it DOES guarantee:
   parent environment is NEVER inherited wholesale, because it carries
   ``OPENAI_API_KEY`` (and any other backend secret): a generated, possibly
   half-trusted tool must not be able to read our LLM credentials out of its own
-  ``os.environ``. This is the single most important guarantee in this module;
+  ``os.environ``. This is the single most important guarantee in this module.
+  Be honest about its reach, though: scrubbing prevents ACCIDENTAL leakage (the
+  key is simply not in the child's ``os.environ``), but a same-UID subprocess
+  can in principle read ``/proc/<ppid>/environ`` of the parent, so this is not
+  adversarial isolation -- the real trust boundary is the operator only
+  installing tool instructions they trust (D21), not the scrub;
 * every mutating entry point (``set_enabled`` / ``delete_tool``) validates the
   name against the package-name regex AND re-checks resolved-path containment
   under ``tools_dir`` before touching the filesystem, so a traversal name like
@@ -82,6 +87,22 @@ _PASSTHROUGH_ENV: tuple[str, ...] = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
 # description is still VALID -- only the stored/advertised copy is trimmed -- so
 # an over-long description never bloats the tools array sent to the model.
 _DESCRIPTION_CAP = 1000
+
+# Hard ceiling on the tool.json FILE size, checked with stat() BEFORE the file is
+# read so an enormous manifest is never loaded into memory at all. tool.json is
+# re-read on EVERY registry scan (list_tools / enabled_llm_tools / every
+# mutation), so an unbounded one is a per-scan I/O + memory hazard; a manifest
+# over this is listed invalid rather than parsed. 64 KiB is orders of magnitude
+# above any sane manifest (name + description + a JSON-Schema parameters block).
+_MANIFEST_MAX_BYTES = 64 * 1024
+
+# Tighter ceiling on the parameters JSON Schema specifically: unlike the rest of
+# the manifest, this block is re-serialized into the tools array of EVERY LLM
+# request of EVERY workflow that has this tool enabled (see _build_llm_tool), so
+# an oversized schema is a recurring token/prompt-bloat + DoS hazard, not just a
+# one-off read. Measured as ``len(json.dumps(parameters))``; a schema over this
+# is listed invalid. 16 KiB comfortably fits a rich real-world argument schema.
+_PARAMETERS_SCHEMA_MAX_BYTES = 16 * 1024
 
 # Appended when a tool's stdout (or a failure's stderr) is cut for size. Mirrors
 # the truncation markers in memory_ai / llm_log so an operator who has seen those
@@ -206,9 +227,32 @@ def _scan_package(directory: Path, expected_name: str | None = None) -> _Package
             entry=None,
         )
 
+    # A package directory that is itself a SYMLINK is refused (listed invalid,
+    # never executed): _scan_all's ``is_dir()`` filter FOLLOWS the link, so
+    # without this a symlink to any real directory would be scanned -- and
+    # potentially run -- as a package. Real directories only (H3 / D21). Staging
+    # validation is unaffected: its directory is a real ``mkdir``ed uuid dir.
+    if directory.is_symlink():
+        return invalid("package directory must be a real directory (not a symlink)")
+
     tool_json = directory / "tool.json"
+    # tool.json must be a REAL file too: a symlinked manifest is refused (listed
+    # invalid) so a scan can never READ -- and set_enabled can never REWRITE --
+    # a file outside the package through it (H3). Checked BEFORE ``is_file()``,
+    # which follows the link and would otherwise accept it.
+    if tool_json.is_symlink():
+        return invalid("tool.json must be a real file (not a symlink)")
     if not tool_json.is_file():
         return invalid("missing tool.json")
+    # Bound the manifest FILE size with stat() BEFORE reading it (see
+    # _MANIFEST_MAX_BYTES): an oversized tool.json is a per-scan memory/I/O
+    # hazard, so it is listed invalid rather than loaded into memory.
+    try:
+        manifest_size = tool_json.stat().st_size
+    except OSError:
+        return invalid("tool.json could not be read")
+    if manifest_size > _MANIFEST_MAX_BYTES:
+        return invalid("tool.json is too large")
     try:
         raw = json.loads(tool_json.read_text(encoding="utf-8"))
     except OSError:
@@ -236,6 +280,13 @@ def _scan_package(directory: Path, expected_name: str | None = None) -> _Package
     parameters = raw.get("parameters")
     if not isinstance(parameters, dict):
         return invalid("parameters is not a JSON Schema object", enabled=enabled)
+    # Bound the parameters schema (see _PARAMETERS_SCHEMA_MAX_BYTES): it is
+    # re-serialized into the tools array of EVERY LLM request that has this tool
+    # enabled, so an oversized one is a recurring token/prompt-bloat hazard, not
+    # just a big file. ``parameters`` came from json.loads, so json.dumps of it
+    # cannot raise.
+    if len(json.dumps(parameters)) > _PARAMETERS_SCHEMA_MAX_BYTES:
+        return invalid("parameters schema is too large", enabled=enabled)
 
     entry = raw.get("entry")
     if not _valid_entry(entry):
@@ -351,12 +402,21 @@ def _load_tool_dotenv(directory: Path) -> dict[str, str]:
     the child's environment, never ours. Bare keys (value None) and any parse
     failure are dropped defensively so a malformed ``.env`` degrades to "no extra
     env" rather than breaking the tool call.
+
+    ``interpolate=False`` is LOAD-BEARING, not a style choice: python-dotenv's
+    default POSIX-style interpolation resolves a ``${VAR}`` reference against the
+    PARENT process environment (see resolve_variables, which folds os.environ
+    into the lookup context). A tool ``.env`` line like ``LEAK=${OPENAI_API_KEY}``
+    would then resolve to our real backend key -- reinjecting into the child the
+    very credential the from-scratch env exists to EXCLUDE. With interpolation
+    off the value is kept as the literal string ``${OPENAI_API_KEY}``, so a
+    generated tool can never exfiltrate a parent secret through its own manifest.
     """
     env_file = directory / ".env"
     if not env_file.is_file():
         return {}
     try:
-        values = dotenv_values(env_file, encoding="utf-8")
+        values = dotenv_values(env_file, encoding="utf-8", interpolate=False)
     except Exception:
         return {}
     return {key: value for key, value in values.items() if isinstance(value, str)}
@@ -538,6 +598,16 @@ def set_enabled(name: str, enabled: bool) -> bool:
     if directory is None or not directory.is_dir():
         return False
     tool_json = directory / "tool.json"
+    # Re-verify containment at the WRITE boundary: ``directory`` is already the
+    # RESOLVED package dir, but ``tool.json`` could be a SYMLINK pointing outside
+    # it, and ``write_text`` follows symlinks -- so a symlinked manifest would
+    # otherwise let this rewrite an arbitrary file the service can reach. Require
+    # the RESOLVED manifest path to stay inside the resolved package dir before
+    # touching it (mirrors _resolve_package_dir's own resolve-then-contain, H3).
+    # The scan already lists such a package invalid, but set_enabled must not
+    # trust that -- it is reached directly by the mutation API.
+    if not _is_within(directory, tool_json.resolve()):
+        return False
     try:
         raw = json.loads(tool_json.read_text(encoding="utf-8"))
     except OSError, ValueError:

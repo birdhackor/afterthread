@@ -121,6 +121,21 @@ _TOOL_BUDGET_EXHAUSTED = (
 # whole synthetic line again regardless.
 _TOOL_ARGS_PREVIEW_CHARS = 200
 
+# Hard cap on how many tool calls from ONE assistant reply are actually EXECUTED.
+# A single reply can legitimately carry a handful of parallel calls, but a broken
+# or hostile model could emit thousands in one turn; executing them all would
+# fan out that many handler runs (subprocesses, network) for one round. Calls
+# past the cap are NOT executed -- each still gets a role:"tool" result (the
+# rejection text below) keyed to its own id, because the endpoint requires one
+# result per tool_call in the echoed assistant turn, so the pairing must hold
+# even for the rejected ones.
+_MAX_TOOL_CALLS_PER_REPLY = 16
+
+# The role:"tool" result content for a call rejected WITHOUT execution because it
+# was past _MAX_TOOL_CALLS_PER_REPLY. Fed back so the model learns why, and so
+# the assistant turn's tool_calls entry still has its matching result.
+_TOO_MANY_TOOL_CALLS = "tool call rejected: too many tool calls in one reply"
+
 
 @dataclass(slots=True)
 class LlmTool:
@@ -549,6 +564,24 @@ async def _tool_result_message(
     return cast(ChatCompletionMessageParam, message)
 
 
+def _rejected_tool_result_message(tool_call: Any) -> ChatCompletionMessageParam:
+    """A role:"tool" result for a call REJECTED without execution (over the
+    _MAX_TOOL_CALLS_PER_REPLY cap), keyed to the call's own id.
+
+    No handler runs -- the id pairing is the whole point: the assistant turn we
+    echo back carries EVERY tool_call from the reply, and the endpoint rejects
+    the follow-up unless each one has a matching result, so a capped call still
+    needs a result message (this fixed rejection text) even though nothing ran.
+    """
+    tc_id, _, _ = _tool_call_fields(tool_call)
+    message: dict[str, Any] = {
+        "role": "tool",
+        "tool_call_id": tc_id,
+        "content": _TOO_MANY_TOOL_CALLS,
+    }
+    return cast(ChatCompletionMessageParam, message)
+
+
 def _schema_guided_system_prompt(system_prompt: str, model_cls: type[BaseModel]) -> str:
     """Append the shared strict-output rule and ``model_cls``'s JSON Schema.
 
@@ -807,26 +840,42 @@ async def _run_structured[ModelT: BaseModel](
                         # the tool RESULTS then appear inside the next attempt's
                         # request_messages naturally (no recorder schema change).
                         recorder.record_response(_summarize_tool_calls(tool_calls))
-                        messages = [
-                            *messages,
+                        # In-place appends (not `messages = [*messages, ...]`): the
+                        # recorder ALREADY snapshotted this attempt's messages at
+                        # begin_attempt above -- it copies them field-by-field into
+                        # a fresh list (see llm_log.begin_attempt), so mutating
+                        # `messages` after that point can never rewrite the recorded
+                        # attempt. Aliasing is therefore safe, and the next round's
+                        # begin_attempt copies the grown list afresh.
+                        messages.append(
                             _assistant_tool_call_message(
                                 _completion_content(completion), tool_calls
-                            ),
-                        ]
-                        for tool_call in tool_calls:
-                            messages = [
-                                *messages,
-                                await _tool_result_message(tool_call, tools_by_name),
-                            ]
+                            )
+                        )
+                        for index, tool_call in enumerate(tool_calls):
+                            # Execute only the first _MAX_TOOL_CALLS_PER_REPLY calls;
+                            # the rest are rejected WITHOUT execution but still get a
+                            # result (so every tool_call in the echoed assistant turn
+                            # pairs with a role:"tool" message the endpoint requires).
+                            if index < _MAX_TOOL_CALLS_PER_REPLY:
+                                messages.append(
+                                    await _tool_result_message(tool_call, tools_by_name)
+                                )
+                            else:
+                                messages.append(_rejected_tool_result_message(tool_call))
+                            # Yield to the event loop once per processed call: the
+                            # unknown-tool and the capped-reject paths never await
+                            # anything, so a reply packed with them would otherwise
+                            # run as one uninterruptible block and starve the
+                            # asyncio.timeout deadline (which fires only when the
+                            # coroutine yields). This checkpoint lets it fire.
+                            await asyncio.sleep(0)
                         tool_rounds_used += 1
                         # If that spent the last permitted round, append the
                         # finalize nudge NOW so the next (tools-free) create() is
                         # explicitly told to stop calling tools and answer.
                         if tool_rounds_used >= max_tool_rounds:
-                            messages = [
-                                *messages,
-                                {"role": "user", "content": _TOOL_BUDGET_EXHAUSTED},
-                            ]
+                            messages.append({"role": "user", "content": _TOOL_BUDGET_EXHAUSTED})
                         continue
 
                 # FINAL-ANSWER PATH: no tool round happened (tools not advertised,

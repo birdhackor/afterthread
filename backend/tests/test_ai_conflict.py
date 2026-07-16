@@ -298,18 +298,38 @@ def test_assist_update_conflict_between_guard_and_update_preserves_competing_wri
 # --- OpenAPI contract -----------------------------------------------------
 
 
-def _declaring(schema: dict[str, Any], status: int) -> set[tuple[str, str]]:
-    return {
-        (path, method)
-        for path, operations in schema["paths"].items()
-        for method, operation in operations.items()
-        if str(status) in operation.get("responses", {})
-    }
+def _declaring(
+    schema: dict[str, Any], status: int, *, code: str | None = None
+) -> set[tuple[str, str]]:
+    """Every (path, method) declaring a ``status`` response.
+
+    When ``code`` is given, only operations whose declared example carries that
+    ``{detail: {code}}`` count -- so a same-status response with a DIFFERENT code
+    (e.g. the installer's ``install_in_progress`` 409, which is a single-flight
+    guard, NOT the AI optimistic-lock ``conflict``) is excluded.
+    """
+    result: set[tuple[str, str]] = set()
+    for path, operations in schema["paths"].items():
+        for method, operation in operations.items():
+            response = operation.get("responses", {}).get(str(status))
+            if response is None:
+                continue
+            if code is not None:
+                example = response.get("content", {}).get("application/json", {}).get("example", {})
+                detail = example.get("detail") if isinstance(example, dict) else None
+                if not (isinstance(detail, dict) and detail.get("code") == code):
+                    continue
+            result.add((path, method))
+    return result
 
 
 def test_409_declared_on_exactly_the_two_by_id_ai_operations() -> None:
     schema = TestClient(app).get("/openapi.json").json()
-    assert _declaring(schema, 409) == {
+    # The optimistic-lock CONFLICT 409 is declared on exactly the two by-id AI
+    # operations. The installer's /tools/install also declares a 409, but under a
+    # DIFFERENT code (install_in_progress, a single-flight guard), so scoping by
+    # code keeps this contract test focused on the conflict semantics it guards.
+    assert _declaring(schema, 409, code="conflict") == {
         ("/api/items/{item_id}/enrich", "post"),
         ("/api/items/{item_id}/assist-update", "post"),
     }

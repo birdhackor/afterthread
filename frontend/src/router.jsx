@@ -164,6 +164,15 @@ const llmLogsRoute = createRoute({
 	getParentRoute: () => rootRoute,
 	path: "/llm-logs",
 	component: LlmLogsPage,
+	// Optional deep-link target: /llm-logs?log=<id> auto-expands that record's
+	// row on load (see LlmLogsPage). Coerce to a positive integer or drop it --
+	// validateSearch must never throw on junk, so a malformed ?log= just resolves
+	// to "no target" rather than breaking navigation to the page.
+	validateSearch: (search) => {
+		const raw = search?.log;
+		const id = typeof raw === "number" ? raw : Number.parseInt(raw, 10);
+		return Number.isInteger(id) && id > 0 ? { log: id } : {};
+	},
 });
 
 const toolsRoute = createRoute({

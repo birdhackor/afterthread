@@ -19,9 +19,19 @@ export function isTerminalInstallState(state) {
 // reads its latest data). Falsy/unknown states (undefined data before the
 // first poll lands, or a state value a future backend might add) keep
 // polling -- stopping is only ever correct once the job is provably terminal.
+// A 404 is the other stopping condition: the job is GONE (a backend restart
+// forgot it -- jobs are process-local and unpersisted), so polling that dead id
+// forever is pure noise. Any OTHER error (500, a transient network blip) keeps
+// polling, since those can clear on the next tick.
 export function installJobRefetchInterval(query) {
 	const state = query?.state?.data?.state;
-	return isTerminalInstallState(state) ? false : INSTALL_POLL_MS;
+	if (isTerminalInstallState(state)) {
+		return false;
+	}
+	if (query?.state?.error?.status === 404) {
+		return false;
+	}
+	return INSTALL_POLL_MS;
 }
 
 // Submit-side URL pre-check: the backend's HttpUrl validation is authoritative

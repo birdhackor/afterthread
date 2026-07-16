@@ -531,6 +531,46 @@ def test_fetch_openapi_connection_failure() -> None:
     assert error is not None and error.startswith("OpenAPI 文件下載失敗")
 
 
+def test_fetch_openapi_total_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The whole fetch is bounded by a TOTAL wall-clock deadline
+    (_FETCH_TOTAL_TIMEOUT_SECONDS): a connection that hangs past it -- even one
+    that would never trip httpx's PER-PHASE inactivity timeout -- fails with the
+    friendly fetch outcome rather than hanging the background job forever. Driven
+    by a fake client whose stream never resolves, so the ONLY thing that can end
+    the call is the asyncio.timeout wiring under test."""
+
+    class _HangingStream:
+        async def __aenter__(self) -> Any:
+            await asyncio.sleep(3600)  # never resolves within the tiny deadline
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+    class _HangingClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+        def stream(self, *args: Any, **kwargs: Any) -> Any:
+            return _HangingStream()
+
+    monkeypatch.setattr(tool_builder.httpx, "AsyncClient", _HangingClient)
+    monkeypatch.setattr(tool_builder, "_FETCH_TOTAL_TIMEOUT_SECONDS", 0.2)
+
+    started = time.monotonic()
+    text, error = asyncio.run(tool_builder._fetch_openapi("http://kb.example/openapi.json"))
+    elapsed = time.monotonic() - started
+
+    assert text is None
+    assert error is not None and error.startswith("OpenAPI 文件下載失敗")
+    assert elapsed < 2.0  # bounded by the 0.2s total deadline, not the 3600s hang
+
+
 def test_run_install_fetch_failure_is_friendly(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -569,6 +609,7 @@ def test_job_state_machine_success(monkeypatch: pytest.MonkeyPatch) -> None:
 
         monkeypatch.setattr("context_memory.services.tool_builder.run_install", fake_run_install)
         job_id = tool_builder.start_install_job("http://x/openapi.json", "i")
+        assert job_id is not None  # empty table -> this first submit is admitted
         job = tool_builder.get_job(job_id)
         assert job is not None and job["state"] in ("queued", "running")
 
@@ -601,6 +642,7 @@ def test_job_state_machine_failure_outcome(monkeypatch: pytest.MonkeyPatch) -> N
 
         monkeypatch.setattr("context_memory.services.tool_builder.run_install", fake_run_install)
         job_id = tool_builder.start_install_job("http://x/openapi.json", "i")
+        assert job_id is not None  # empty table -> this first submit is admitted
         for _ in range(200):
             job = tool_builder.get_job(job_id)
             assert job is not None
@@ -625,6 +667,7 @@ def test_job_unexpected_exception_becomes_failed_category(
 
         monkeypatch.setattr("context_memory.services.tool_builder.run_install", exploding)
         job_id = tool_builder.start_install_job("http://x/openapi.json", "i")
+        assert job_id is not None  # empty table -> this first submit is admitted
         for _ in range(200):
             job = tool_builder.get_job(job_id)
             assert job is not None
@@ -639,23 +682,75 @@ def test_job_unexpected_exception_becomes_failed_category(
 
 
 def test_jobs_bounded_to_most_recent(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The table keeps only the newest _MAX_JOBS entries."""
+    """The table keeps only the newest _MAX_JOBS entries.
+
+    Installs are single-flight (M7), so a run of jobs accumulates SEQUENTIALLY:
+    each must reach a terminal state before the next is admitted. Drive
+    _MAX_JOBS + 5 to completion and assert the oldest five were evicted while the
+    newest stays pollable -- the eviction still matters for a long-lived process
+    that runs many installs over its lifetime."""
 
     async def scenario() -> None:
         async def instant(url: str, instructions: str) -> InstallOutcome:
             return InstallOutcome(ok=True, tool_name="t")
 
         monkeypatch.setattr("context_memory.services.tool_builder.run_install", instant)
-        ids = [
-            tool_builder.start_install_job("http://x/openapi.json", "i")
-            for _ in range(tool_builder._MAX_JOBS + 5)
-        ]
+        ids: list[str] = []
+        for _ in range(tool_builder._MAX_JOBS + 5):
+            job_id = tool_builder.start_install_job("http://x/openapi.json", "i")
+            assert job_id is not None  # the previous job has finished -> admitted
+            ids.append(job_id)
+            # Drain this job to terminal before the next submit (single-flight).
+            for _ in range(200):
+                job = tool_builder.get_job(job_id)
+                if job is None or job["state"] not in ("queued", "running"):
+                    break
+                await asyncio.sleep(0.01)
+
         with tool_builder._JOBS_LOCK:
             assert len(tool_builder._JOBS) == tool_builder._MAX_JOBS
         # The oldest five fell off; the newest are still pollable.
         assert tool_builder.get_job(ids[0]) is None
         assert tool_builder.get_job(ids[-1]) is not None
-        # Drain the spawned tasks so none outlives the test's loop.
+        # Drain any spawned tasks so none outlives the test's loop.
+        await asyncio.gather(*list(tool_builder._TASKS), return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_start_install_job_single_flight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only ONE install may be queued/running at a time (M7): a second start
+    while the first is active is refused (None), and a start is accepted again
+    once the first reaches a terminal state."""
+
+    async def scenario() -> None:
+        release = asyncio.Event()
+
+        async def fake_run_install(url: str, instructions: str) -> InstallOutcome:
+            await release.wait()
+            return InstallOutcome(ok=True, tool_name="kb")
+
+        monkeypatch.setattr("context_memory.services.tool_builder.run_install", fake_run_install)
+        first = tool_builder.start_install_job("http://x/openapi.json", "i")
+        assert first is not None
+        await asyncio.sleep(0)  # let the task reach its running update
+
+        # A second submit while the first is active is refused outright.
+        assert tool_builder.start_install_job("http://x/openapi.json", "i") is None
+
+        release.set()
+        job: dict[str, Any] | None = None
+        for _ in range(200):
+            job = tool_builder.get_job(first)
+            assert job is not None
+            if job["state"] != "running":
+                break
+            await asyncio.sleep(0.01)
+        assert job is not None and job["state"] == "succeeded"
+
+        # Now the first is terminal, so a fresh submit is accepted again.
+        second = tool_builder.start_install_job("http://x/openapi.json", "i")
+        assert second is not None and second != first
         await asyncio.gather(*list(tool_builder._TASKS), return_exceptions=True)
 
     asyncio.run(scenario())
@@ -787,6 +882,29 @@ def test_router_install_202_queues_job(
     assert response.json() == {"job_id": "job-abc"}
     assert seen["url"] == "http://kb.example/openapi.json"
     assert seen["instructions"] == "build it"  # request-layer strip applied
+
+
+def test_router_install_409_when_active(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A second install submit while one is already queued/running is a 409 with
+    the fixed install_in_progress detail (M7). Driven through the REAL
+    start_install_job with a pre-seeded active job, so the single-flight gate
+    itself produces the conflict. (The 'accepted again after it finishes' half
+    is covered by test_start_install_job_single_flight's real-gate transition.)"""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    with tool_builder._JOBS_LOCK:
+        tool_builder._JOBS["active"] = tool_builder.InstallJob(
+            job_id="active", state="running", created_at="2026-07-16T00:00:00+00:00"
+        )
+    response = client.post(
+        "/api/tools/install",
+        json={"openapi_url": "http://kb.example/openapi.json", "instructions": "build"},
+    )
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "install_in_progress"
+    assert "message" in detail
 
 
 @pytest.mark.parametrize(

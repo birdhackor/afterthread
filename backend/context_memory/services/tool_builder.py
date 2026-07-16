@@ -8,9 +8,10 @@ installs a tool package (see D21 in docs/web-v2-decisions.md, Phase 5c).
    hidden, so the registry scan never lists an in-progress build (see
    ``tools._scan_all``);
 3. run ONE ``generate_structured`` call (workflow ``tool_install``) armed with
-   four META-TOOLS -- ``write_file`` / ``read_file`` / ``list_dir`` /
-   ``run_shell`` -- every one confined to that staging directory, under the
-   installer's own (much larger) round and wall-clock budgets;
+   four META-TOOLS -- the file tools ``write_file`` / ``read_file`` /
+   ``list_dir`` (paths jailed inside staging) plus ``run_shell`` (a full shell
+   that merely STARTS in staging) -- under the installer's own (much larger)
+   round and wall-clock budgets;
 4. on a ``ready`` result, validate the staged package with the SAME checks the
    registry applies to installed packages (``tools.validate_package``) and move
    it into ``<tools_dir>/<name>``; on anything else, fail with a friendly
@@ -23,15 +24,27 @@ and therefore zh-TW, like the 409 conflict message. The exception is output
 truncation, which reuses ``tools._cap_output`` and thus its shared zh-TW
 marker -- one implementation, one marker, everywhere output is capped.
 
-SECURITY STANCE (D21 v1, same as tools.py): the builder LLM gets real file and
-shell capability -- that is the feature -- bounded by:
+SECURITY STANCE (D21 v1, same as tools.py). The builder LLM gets real file AND
+real shell capability -- that IS the feature: the operator asked for a
+Claude-Code-like builder. Be precise about what is and is not ENFORCED:
 
-* the staging directory as the WRITE boundary: every meta-tool path must be
-  relative and must RESOLVE inside staging (``_resolve_in_staging``; the
-  attacks and why resolve-then-contain stops them are documented there);
-* ``run_shell``'s environment built from scratch (the ``tools._PASSTHROUGH_ENV``
-  allowlist only) so the builder can ``curl``/``python3`` the real KB API but
-  can never read OUR ``OPENAI_API_KEY`` out of the process environment;
+* the FILE meta-tools (``write_file`` / ``read_file`` / ``list_dir``) ARE jailed:
+  every path must be relative and must RESOLVE inside staging
+  (``_resolve_in_staging``; the attacks and why resolve-then-contain stops them
+  are documented there). ``write_file``'s jail is the ONE hard write boundary
+  this module enforces;
+* ``run_shell`` is NOT jailed: it runs bash with the SERVICE'S OWN permissions
+  and merely STARTS in the staging directory (cwd is a working convention, not a
+  sandbox -- the command can read/write anywhere the service's uid can). There
+  is deliberately NO container isolation in v1: this is a single-user, local
+  tool (D21), so the trust boundary is the operator only installing API
+  descriptions and instructions they trust -- not a confinement the code
+  pretends to enforce. The system prompt still tells the model to treat staging
+  as its workspace, but as GUIDANCE, not a wall;
+* what run_shell DOES guarantee is a from-scratch environment (the
+  ``tools._PASSTHROUGH_ENV`` allowlist only) so the builder can ``curl``/
+  ``python3`` the real KB API but can never read OUR ``OPENAI_API_KEY`` out of
+  the process environment;
 * per-command timeout with a process-group kill, and output caps, so a hung or
   chatty command burns one round, never the session (see
   ``tool_install_shell_timeout_seconds`` in config.py for the nested-timeout
@@ -86,6 +99,16 @@ _STAGING_DIRNAME = ".staging"
 _FETCH_TIMEOUT_SECONDS = 30.0
 _FETCH_MAX_REDIRECTS = 5
 _OPENAPI_MAX_BYTES = 2 * 1024 * 1024
+
+# Total wall-clock deadline for the WHOLE fetch. Distinct from
+# _FETCH_TIMEOUT_SECONDS above, which httpx applies as a PER-PHASE (connect/
+# read/write) INACTIVITY timeout: a server that dribbles one byte just under the
+# read timeout resets that clock forever and could hold the stream open
+# indefinitely. This asyncio.timeout bounds the end-to-end duration regardless,
+# mirroring the outer-deadline-around-a-per-phase-client-timeout pattern in
+# llm.py (see _build_client / _run_structured). Expiry surfaces as TimeoutError,
+# which the total except below turns into the friendly fetch-failure outcome.
+_FETCH_TOTAL_TIMEOUT_SECONDS = 60
 
 # write_file's per-call content bound. REJECTED (not truncated) when exceeded:
 # a truncated source file is silently corrupt -- the builder would then test a
@@ -145,15 +168,17 @@ when testing: `set -a; . ./.env 2>/dev/null; set +a; ...`.
 - Prefer Python 3 with ONLY its standard library (urllib.request for HTTP), \
 so the tool runs anywhere without installing dependencies.
 
-Your meta-tools (all paths are RELATIVE to the workspace; you cannot touch \
-anything outside it):
+Your meta-tools (the file tools below take paths RELATIVE to the workspace and \
+cannot reach outside it):
 - write_file {path, content}: create/overwrite a file (parent directories are \
 created automatically).
 - read_file {path}: read a file back.
 - list_dir {path?}: recursively list the workspace (directories end with "/").
-- run_shell {command}: run a bash command in the workspace. It has a timeout \
-of a couple of minutes and capped output; it CAN reach the network, so use \
-curl or python3 to probe the real API and to test your tool end to end, e.g.: \
+- run_shell {command}: run a bash command. It runs with the service's own \
+permissions, starting in the staging directory -- treat the staging directory \
+as your workspace and keep all your work inside it. It has a timeout of a \
+couple of minutes and capped output; it CAN reach the network, so use curl or \
+python3 to probe the real API and to test your tool end to end, e.g.: \
 echo '{"query":"test"}' | python3 run.py
 
 Recommended flow:
@@ -482,8 +507,10 @@ def _build_meta_tools(staging: Path) -> list[LlmTool]:
 async def _fetch_openapi(url: str) -> tuple[str | None, str | None]:
     """Fetch the OpenAPI document; returns (text, None) or (None, user_error).
 
-    Bounded on every axis: total timeout, redirect count, and body SIZE -- the
-    Content-Length header is checked when present, and the streamed body is
+    Bounded on every axis: a TOTAL wall-clock deadline (asyncio.timeout, see
+    ``_FETCH_TOTAL_TIMEOUT_SECONDS``) wrapped around the whole fetch, the
+    per-phase httpx timeout inside it, the redirect count, and the body SIZE --
+    the Content-Length header is checked when present, and the streamed body is
     counted regardless (a server can lie about, or omit, the header). Over the
     cap fails OUTRIGHT (see ``_OPENAPI_MAX_BYTES``). Errors carry only the
     exception CATEGORY, never ``str(exc)`` -- an httpx error string embeds the
@@ -492,6 +519,7 @@ async def _fetch_openapi(url: str) -> tuple[str | None, str | None]:
     """
     try:
         async with (
+            asyncio.timeout(_FETCH_TOTAL_TIMEOUT_SECONDS),
             httpx.AsyncClient(
                 timeout=_FETCH_TIMEOUT_SECONDS,
                 follow_redirects=True,
@@ -512,10 +540,11 @@ async def _fetch_openapi(url: str) -> tuple[str | None, str | None]:
                     return None, _ERROR_OPENAPI_TOO_LARGE
                 chunks.append(chunk)
     except Exception as exc:
-        # httpx.HTTPError covers transport/timeout/redirect failures, but a
-        # malformed URL raises httpx.InvalidURL -- a ValueError, NOT an
-        # HTTPError -- so the catch must be total to keep every fetch failure
-        # on the friendly-outcome path rather than a background-job crash.
+        # httpx.HTTPError covers transport/timeout/redirect failures; a malformed
+        # URL raises httpx.InvalidURL (a ValueError, NOT an HTTPError); and the
+        # asyncio.timeout total-deadline expiry surfaces as TimeoutError. The
+        # catch is total so every one of them lands on the friendly-outcome path
+        # rather than crashing the background job.
         return None, f"OpenAPI 文件下載失敗（{type(exc).__name__}）。"  # noqa: RUF001
     return b"".join(chunks).decode("utf-8", errors="replace"), None
 
@@ -678,7 +707,10 @@ async def run_install(openapi_url: str, instructions: str) -> InstallOutcome:
 # In-memory, process-local, deliberately unpersisted (see the module
 # docstring). One lock guards the dict, matching llm_log's pattern; the task
 # set only holds strong references so a running install's Task is never
-# garbage-collected mid-flight (asyncio keeps only weak refs to tasks).
+# garbage-collected mid-flight (asyncio keeps only weak refs to tasks). Since
+# start_install_job now admits only ONE active install at a time (M7), _TASKS
+# holds at most that one in-flight task plus any not-yet-collected finished
+# ones -- it cannot grow without bound under rapid submits.
 _MAX_JOBS = 20
 _JOBS: dict[str, InstallJob] = {}
 _JOBS_LOCK = threading.Lock()
@@ -762,16 +794,26 @@ async def _run_job(job_id: str, openapi_url: str, instructions: str) -> None:
     )
 
 
-def start_install_job(openapi_url: str, instructions: str) -> str:
-    """Create a job and launch its background task; returns the job id.
+def start_install_job(openapi_url: str, instructions: str) -> str | None:
+    """Create a job and launch its background task; returns the job id, or None
+    when an install is ALREADY active (queued|running).
+
+    Only ONE install runs at a time (M7): the active-check and the insert happen
+    under the SAME lock, so there is no check-then-start race, and the router
+    maps a None return to a 409. This also structurally BOUNDS ``_TASKS`` -- at
+    most one install task is ever in flight, so the strong-ref set that keeps a
+    running Task alive can no longer grow without limit under rapid submits.
 
     Must be called with a running event loop (the async router handler is).
     Eviction keeps the newest ``_MAX_JOBS`` by creation time (job_id as a
-    deterministic tiebreak for identical timestamps); an evicted-but-running
-    job's task keeps running to completion, it just stops being pollable.
+    deterministic tiebreak for identical timestamps); a TERMINAL (succeeded/
+    failed) job stays pollable until evicted and never blocks a new submit.
     """
     job = InstallJob(job_id=uuid4().hex, state="queued", created_at=_now_iso())
     with _JOBS_LOCK:
+        # A terminal job never blocks a new submit -- only queued|running does.
+        if any(existing.state in ("queued", "running") for existing in _JOBS.values()):
+            return None
         _JOBS[job.job_id] = job
         while len(_JOBS) > _MAX_JOBS:
             oldest = min(_JOBS.values(), key=lambda j: (j.created_at, j.job_id))

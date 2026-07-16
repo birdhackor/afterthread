@@ -53,6 +53,13 @@ _JOB_NOT_FOUND = "Install job not found"
 _TOOLS_NOT_CONFIGURED_CODE = "tools_not_configured"
 _TOOLS_NOT_CONFIGURED_MESSAGE = "The tools directory is not configured."
 
+# Only one install may be queued/running at a time (M7); a second submit while
+# one is active is a 409 with this fixed {code, message}, mirroring the AI 409
+# conflict discipline. The message is USER-facing (rendered by the 工具 page),
+# hence zh-TW -- unlike the (operator-facing) tools_not_configured message above.
+_INSTALL_IN_PROGRESS_CODE = "install_in_progress"
+_INSTALL_IN_PROGRESS_MESSAGE = "已有安裝正在進行中，請等待其完成"  # noqa: RUF001
+
 _TOOL_NOT_FOUND_RESPONSE: dict[int | str, dict[str, Any]] = {
     404: {
         "description": _TOOL_NOT_FOUND,
@@ -76,6 +83,22 @@ _TOOLS_NOT_CONFIGURED_RESPONSE: dict[int | str, dict[str, Any]] = {
                     "detail": {
                         "code": _TOOLS_NOT_CONFIGURED_CODE,
                         "message": _TOOLS_NOT_CONFIGURED_MESSAGE,
+                    }
+                }
+            }
+        },
+    }
+}
+
+_INSTALL_IN_PROGRESS_RESPONSE: dict[int | str, dict[str, Any]] = {
+    409: {
+        "description": "Another install is already queued or running",
+        "content": {
+            "application/json": {
+                "example": {
+                    "detail": {
+                        "code": _INSTALL_IN_PROGRESS_CODE,
+                        "message": _INSTALL_IN_PROGRESS_MESSAGE,
                     }
                 }
             }
@@ -135,7 +158,7 @@ async def delete_installed_tool(name: ToolName) -> None:
     "/install",
     response_model=ToolInstallAccepted,
     status_code=202,
-    responses=_TOOLS_NOT_CONFIGURED_RESPONSE,
+    responses={**_TOOLS_NOT_CONFIGURED_RESPONSE, **_INSTALL_IN_PROGRESS_RESPONSE},
 )
 async def install_tool(payload: ToolInstallRequest) -> ToolInstallAccepted:
     """Queue a web-installer job; poll its state via the endpoint below.
@@ -149,6 +172,10 @@ async def install_tool(payload: ToolInstallRequest) -> ToolInstallAccepted:
     represented as a failed job with a friendly error (and its own AI 日誌
     record), and duplicating the gate here would just create two sources of
     truth for it.
+
+    409 when an install is already active: ``start_install_job`` admits only ONE
+    queued/running install at a time (M7) and returns None when one is in
+    flight, which maps to a fixed ``install_in_progress`` conflict here.
     """
     if tools_service.tools_dir() is None:
         raise HTTPException(
@@ -159,6 +186,14 @@ async def install_tool(payload: ToolInstallRequest) -> ToolInstallAccepted:
             },
         )
     job_id = tool_builder.start_install_job(str(payload.openapi_url), payload.instructions)
+    if job_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": _INSTALL_IN_PROGRESS_CODE,
+                "message": _INSTALL_IN_PROGRESS_MESSAGE,
+            },
+        )
     return ToolInstallAccepted(job_id=job_id)
 
 

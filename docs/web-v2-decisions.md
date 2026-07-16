@@ -212,3 +212,16 @@
 - **L1 JSONL 半行 — won't-fix + 註解**：opt-in 除錯 sink，磁碟滿寫半行只壞該行，消費端跳過即可；交易式寫入不值。
 - **另**：實作代理誤診 `except A, B:` 為「無效 Python / ruff bug」——實為 PEP 758（3.14）合法語法、ruff 按 target 正規化；監督者已改正其註解為真實理由（拆兩個子句為求 formatter 穩定與可讀性），拆分本身保留。
 - **第二輪追加（3 Medium 全修，免第三輪）**：(A) `context_memory.llm` logger 在預設 uvicorn 下無 handler、有效等級 WARNING——承諾的 INFO console sink 靜默失效 → main.py import 時做一次應用層 logger 組態（INFO + stderr StreamHandler + propagate=False + 冪等 guard），以真實 uvicorn 行程驗證 INFO 行輸出且不重複；(B) usage 由「最後一次覆蓋」改為 per-attempt 記錄 + finish 時逐欄位加總（150+260=410 測試釘住），attempt 增 request_chars/response_chars；(C) 新設定 `llm_log_body_max_chars`（預設 200k，與筆數上限正交的 RAM 界限）在 `_stored_body` choke point 截斷（先 utf8-safe 後切、`…[紀錄過長已截斷]` 標記、truncated 旗標 + FE 已截斷 badge）。三項皆行為測試釘住（445 tests），期末全量 review 覆蓋，不再開輪。
+
+## D27（Phase 5 codex review 裁決）：3 High 中兩項屬「文件與現實不符」以誠實化處理，其餘全修
+
+- **背景**：Phase 5 首輪 codex review 判 needs changes：High ×3（run_shell 無圈禁、dotenv 插值回注 `${OPENAI_API_KEY}`、symlink 圈禁缺口）、Medium ×4、Low ×2。codex 同時確認多項既有防線（名稱 traversal、write/read/list symlink 防護、DELETE 外部 symlink、輪詢終止、CORS）未被攻破。
+- **H1 run_shell 無檔案系統圈禁 — 修「宣稱」而非加圈禁**：shell 全能力是使用者的明確需求（比照 Claude Code 建 skill；D21 v1 明載不做容器隔離），bash 本身不可能只靠 cwd 圈禁——真正的缺陷是文案/系統提示宣稱「限工具目錄內」而實際只有 write_file 有強制邊界。修法：所有 overclaim 改為誠實描述（run_shell 以服務自身權限執行、staging 為工作目錄與行為慣例；write_file 的 staging jail 才是強制邊界），UI 安全註記同步改寫，信任邊界回歸 D21 的本義：只安裝你信任的指示。加真圈禁（bwrap/nsjail/chroot）判過度工程且平台綁定，v1 不做。
+- **H2 dotenv 插值回注憑證 — 修**：`dotenv_values()` 預設做 POSIX 變數展開且會從父行程 os.environ 解析——工具 `.env` 寫 `${OPENAI_API_KEY}` 就把 from-scratch env 刻意排除的憑證原樣注回（codex 以假 key 實證）。修法：`interpolate=False`（所有 dotenv 讀取點），並以「假 key + `${OPENAI_API_KEY}` 字面值必須原樣出現在子行程 env」測試釘住。**附帶誠實化**：同 UID 子行程原則上可讀 `/proc/<ppid>/environ`，env 清洗防的是「意外」洩漏而非對抗性隔離——此界線寫進模組文件，與 H1 同一個信任模型。
+- **H3 symlink 圈禁缺口 — 修**：(a) 套件目錄本身是 symlink → 列為 invalid（使用者看得到原因），杜絕掃描跟隨外部目錄；(b) `tool.json` 是 symlink → invalid；(c) `set_enabled` 寫入前 resolve manifest 路徑並要求落在 resolve 後的套件目錄內（否則 PATCH 可經 symlink 改寫 tools 目錄外任意檔案）。三者皆測試釘住。
+- **M4 單回覆 tool_calls 無上限 — 修**：上限 16（超出者不執行、每個 id 仍回「rejected: too many」的 tool result 保持配對）；每個呼叫處理後 `await asyncio.sleep(0)` 讓出（unknown-tool 路徑原本零 await，5000 個呼叫可讓 asyncio.timeout 永遠開不了火）；messages 改就地 append 消 O(n²) 複製（recorder 在 begin_attempt 已快照，無 aliasing 風險）。
+- **M5 manifest 無大小上限 — 修**：`tool.json` 讀取前 stat 上限 64 KiB、parameters schema 序列化上限 16 KiB，超限=invalid。理由：schema 會隨每一次 LLM 請求重送，無上限即 token/DoS 隱患。
+- **M6 OpenAPI 抓取可被慢滴規避 — 修**：httpx 的 timeout 是「無活動」計時（每 29 秒滴 1 byte 可無限跑），比照 llm.py 的外層牆鐘模式以 `asyncio.timeout(60)` 包整段抓取。
+- **M7 併發安裝無上限 — 修**：同時只允許一個安裝 job；已有 active job 時 POST 回 409 `install_in_progress`（單人本機工具，序列安裝是正確語意，整類消滅並附帶解除 _TASKS 無界成長）。
+- **L8 job 404 輪詢不止 — 修**：`installJobRefetchInterval` 對 404 錯誤也停止（後端重啟後 job 消失屬終局）；其他錯誤視為暫態繼續輪詢。
+- **L9 AI 日誌連結非 deep link — 修**：改 `/llm-logs?log=<id>`，日誌頁讀 search param 自動展開該筆（不在清單則靜默忽略）。

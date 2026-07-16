@@ -49,10 +49,17 @@ function toolErrorMessage(error, fallback) {
 
 // "查看 AI 日誌" link shown on both install outcomes: the builder session's
 // full prompt/response trace is the debugging surface for a failed (or
-// suspicious) install, and llm_log_id names the exact record to expand.
+// suspicious) install, and llm_log_id names the exact record to expand. The
+// link deep-links to that record via `?log=<id>` (LlmLogsPage reads it and
+// auto-expands the matching row on load); with no id it is a plain jump.
 function LogLink({ llmLogId }) {
 	return (
-		<Anchor component={Link} to="/llm-logs" size="sm">
+		<Anchor
+			component={Link}
+			to="/llm-logs"
+			search={llmLogId != null ? { log: llmLogId } : {}}
+			size="sm"
+		>
 			查看 AI 日誌{llmLogId != null ? `（紀錄 #${llmLogId}）` : ""}
 		</Anchor>
 	);
@@ -311,6 +318,7 @@ function InstallPanel() {
 	const queryClient = useQueryClient();
 	const [jobId, setJobId] = useState(null);
 	const [notConfigured, setNotConfigured] = useState(false);
+	const [conflictMessage, setConflictMessage] = useState(null);
 
 	const { control, handleSubmit } = useForm({
 		defaultValues: { openapi_url: "", instructions: "" },
@@ -327,6 +335,15 @@ function InstallPanel() {
 			// Alert below rather than a transient notification.
 			if (submitError?.code === "tools_not_configured") {
 				setNotConfigured(true);
+				return;
+			}
+			// One install runs at a time (backend 409 install_in_progress): show
+			// the backend's zh-TW reason inline on the form so the user knows to
+			// wait for the running install, rather than a transient toast.
+			if (submitError?.code === "install_in_progress") {
+				setConflictMessage(
+					submitError.message ?? "已有安裝正在進行中，請等待其完成",
+				);
 				return;
 			}
 			notifications.show({
@@ -368,6 +385,7 @@ function InstallPanel() {
 			return;
 		}
 		setNotConfigured(false);
+		setConflictMessage(null);
 		setJobId(null);
 		installMutation.mutate({
 			openapi_url: values.openapi_url.trim(),
@@ -384,6 +402,12 @@ function InstallPanel() {
 						安裝的版本會自動啟用；開發模式請在 backend/.env 設定 TOOLS_DIR
 						後重新啟動後端，詳見 README。
 					</Text>
+				</Alert>
+			) : null}
+
+			{conflictMessage ? (
+				<Alert color="orange" title="無法開始安裝">
+					<Text size="sm">{conflictMessage}</Text>
 				</Alert>
 			) : null}
 
@@ -493,8 +517,8 @@ export function ToolsPage() {
 			</Tabs>
 
 			<Text size="xs" c="dimmed">
-				安裝過程會由 AI
-				在伺服器上寫檔並執行指令（限工具目錄內），請只安裝你信任的 API
+				安裝過程會由 AI 在伺服器上寫檔（write_file
+				僅限工具暫存目錄）並以服務自身權限執行 shell 指令，請只安裝你信任的 API
 				描述與指示。
 			</Text>
 		</Stack>

@@ -14,6 +14,7 @@ import {
 	Title,
 } from "@mantine/core";
 import { useQuery } from "@tanstack/react-query";
+import { useSearch } from "@tanstack/react-router";
 import { useState } from "react";
 import { apiGet } from "../api/client.js";
 import { EmptyState } from "../components/EmptyState.jsx";
@@ -319,7 +320,16 @@ function LogDetailPanel({ log, expanded }) {
 // manual 重新整理, each row expandable to its full request/response bodies.
 export function LlmLogsPage() {
 	usePageTitle("AI 日誌");
-	const [openValue, setOpenValue] = useState(null);
+	// Optional deep-link target from /llm-logs?log=<id> (validated on the route):
+	// seed the open accordion item to that id so a link from the 工具 page
+	// auto-expands the matching builder-session record on load. If the id is not
+	// in the current list, `openValue` just points at no rendered item and
+	// nothing opens -- silently ignored, exactly as required. `strict: false`
+	// reads the search loosely so this page needs no route-object import.
+	const { log: targetLogId } = useSearch({ strict: false });
+	const [openValue, setOpenValue] = useState(
+		targetLogId != null ? String(targetLogId) : null,
+	);
 
 	const { data, error, isError, isFetching, refetch } = useQuery({
 		queryKey: ["llm-logs"],

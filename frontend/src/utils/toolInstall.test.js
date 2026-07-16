@@ -11,6 +11,11 @@ const queryWithState = (state) => ({
 	state: { data: state ? { state } : undefined },
 });
 
+// Same, but with the query's latest error carrying an HTTP status (no data yet).
+const queryWithError = (status) => ({
+	state: { data: undefined, error: { status } },
+});
+
 describe("isTerminalInstallState", () => {
 	it("treats succeeded and failed as terminal", () => {
 		expect(isTerminalInstallState("succeeded")).toBe(true);
@@ -45,6 +50,20 @@ describe("installJobRefetchInterval", () => {
 	it("stops polling once the job is terminal", () => {
 		expect(installJobRefetchInterval(queryWithState("succeeded"))).toBe(false);
 		expect(installJobRefetchInterval(queryWithState("failed"))).toBe(false);
+	});
+
+	it("stops polling when the latest error is a 404 (job gone after a restart)", () => {
+		expect(installJobRefetchInterval(queryWithError(404))).toBe(false);
+	});
+
+	it("keeps polling on other errors (transient) and before any data", () => {
+		expect(installJobRefetchInterval(queryWithError(500))).toBe(
+			INSTALL_POLL_MS,
+		);
+		expect(installJobRefetchInterval(queryWithError(0))).toBe(INSTALL_POLL_MS);
+		expect(installJobRefetchInterval(queryWithState(null))).toBe(
+			INSTALL_POLL_MS,
+		);
 	});
 });
 

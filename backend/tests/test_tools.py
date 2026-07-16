@@ -37,6 +37,8 @@ from pydantic import BaseModel, ConfigDict
 from context_memory.config import Settings
 from context_memory.services import llm_log
 from context_memory.services.llm import (
+    _MAX_TOOL_CALLS_PER_REPLY,
+    _TOO_MANY_TOOL_CALLS,
     _TOOL_BUDGET_EXHAUSTED,
     LlmTool,
     LLMUpstreamError,
@@ -52,6 +54,8 @@ from context_memory.services.memory_ai import (
     enrich_item,
 )
 from context_memory.services.tools import (
+    _MANIFEST_MAX_BYTES,
+    _PARAMETERS_SCHEMA_MAX_BYTES,
     delete_tool,
     enabled_llm_tools,
     list_tools,
@@ -334,6 +338,49 @@ def test_timeout_override_honored(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _calls(client)[0]["model"] == _MODEL  # the request was genuinely attempted
 
 
+def test_tool_calls_capped_per_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the first _MAX_TOOL_CALLS_PER_REPLY calls in one reply are EXECUTED;
+    the rest are rejected WITHOUT running but still get a role:tool result (so
+    every tool_call in the echoed assistant turn pairs with a result)."""
+    seen: list[dict[str, Any]] = []
+
+    async def handler(args: dict[str, Any]) -> str:
+        seen.append(args)
+        return "ran"
+
+    over = _MAX_TOOL_CALLS_PER_REPLY + 4
+    many = [_tc("echo", "{}", tc_id=f"call_{i}") for i in range(over)]
+    client = _install(
+        monkeypatch,
+        _ScriptedClient([_tool_calls_completion(*many), _content_completion(_SAMPLE_JSON)]),
+    )
+    result = _run(tools=[LlmTool(spec=_tool_spec("echo"), handler=handler)])
+
+    assert result.title == "Draft"
+    assert len(seen) == _MAX_TOOL_CALLS_PER_REPLY  # only the first N ran
+    tool_msgs = _tool_messages(_calls(client)[1])
+    assert len(tool_msgs) == over  # every call still paired with a result
+    rejected = [m for m in tool_msgs if m["content"] == _TOO_MANY_TOOL_CALLS]
+    assert len(rejected) == over - _MAX_TOOL_CALLS_PER_REPLY
+
+
+def test_many_unknown_tool_calls_do_not_starve_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reply packed with unknown-tool calls -- neither the unknown-tool path
+    nor the cap-reject path awaits I/O -- still yields to the event loop once
+    per call, so the wall-clock asyncio.timeout CAN fire instead of the tight
+    result-building loop starving it out (which it would without the sleep(0)
+    checkpoint: the loop would run to max_tool_rounds and 502 as empty content
+    rather than time out)."""
+    many = [_tc("nope", "{}", tc_id=f"c{i}") for i in range(5000)]
+    _install(monkeypatch, _ScriptedClient([_tool_calls_completion(*many)]))
+
+    with pytest.raises(LLMUpstreamError) as excinfo:
+        _run(tools=[_echo_tool()], max_tool_rounds=5000, timeout_seconds=0.05)
+    assert str(excinfo.value).startswith("Timeout: ")
+
+
 # --- runtime: real tool packages -------------------------------------------
 
 
@@ -470,6 +517,28 @@ def test_runtime_env_scrubbed_but_dotenv_present(
     assert "sk-secret-should-not-leak" not in result
 
 
+def test_runtime_dotenv_does_not_interpolate_parent_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tool .env value of ``${OPENAI_API_KEY}`` must reach the child as that
+    LITERAL string, NOT the real key: python-dotenv's default POSIX
+    interpolation would resolve it from the parent os.environ -- reinjecting the
+    very credential the from-scratch env exists to exclude (interpolate=False)."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret-should-not-leak")
+    root = tmp_path / "tools"
+    _make_tool(
+        root,
+        "envtool",
+        "import os, sys\nsys.stdout.write('LEAK=' + str(os.environ.get('LEAK')))\n",
+        dotenv="LEAK=${OPENAI_API_KEY}\n",
+    )
+    _install_tools(monkeypatch, root)
+
+    result = asyncio.run(enabled_llm_tools()[0].handler({}))
+    assert result == "LEAK=${OPENAI_API_KEY}"  # literal, not the resolved key
+    assert "sk-secret-should-not-leak" not in result
+
+
 # --- runtime: validation / listing -----------------------------------------
 
 
@@ -589,6 +658,137 @@ def test_delete_blocks_symlink_escape(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert delete_tool("evil") is False
     assert precious.exists()
     assert (precious / "keep.txt").exists()
+
+
+def test_symlinked_package_dir_listed_invalid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A package directory that is itself a SYMLINK (even to a real, otherwise-
+    valid package) is listed invalid and never executed -- _scan_all's is_dir()
+    filter follows the link, so this is the guard that keeps it out (H3)."""
+    root = tmp_path / "tools"
+    root.mkdir()
+    # A real, valid package OUTSIDE the tools dir, reached only via a symlink.
+    _make_tool(tmp_path, "real", "import sys\nsys.stdout.write('x')\n")
+    (root / "evil").symlink_to(tmp_path / "real", target_is_directory=True)
+    _install_tools(monkeypatch, root)
+
+    listed = {t["name"]: t for t in list_tools()}
+    assert listed["evil"]["valid"] is False
+    assert "real directory" in (listed["evil"]["error"] or "")
+    assert enabled_llm_tools() == []  # never advertised or executable
+
+
+def test_symlinked_manifest_listed_invalid(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A package whose tool.json is a SYMLINK is listed invalid: a scan must
+    never read a manifest through a link that could point outside the package."""
+    root = tmp_path / "tools"
+    pkg = root / "linky"
+    pkg.mkdir(parents=True)
+    (pkg / "run.py").write_text("import sys\nsys.stdout.write('x')\n")
+    real_manifest = tmp_path / "real_tool.json"
+    real_manifest.write_text(
+        json.dumps(
+            {
+                "name": "linky",
+                "description": "d",
+                "parameters": {"type": "object"},
+                "entry": [sys.executable, "run.py"],
+            }
+        )
+    )
+    (pkg / "tool.json").symlink_to(real_manifest)
+    _install_tools(monkeypatch, root)
+
+    listed = {t["name"]: t for t in list_tools()}
+    assert listed["linky"]["valid"] is False
+    assert "real file" in (listed["linky"]["error"] or "")
+
+
+def test_set_enabled_rejects_symlinked_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """set_enabled must not rewrite a file OUTSIDE the package through a
+    symlinked tool.json: the resolved-path containment check refuses the write,
+    and the foreign file is left byte-for-byte untouched (H3)."""
+    root = tmp_path / "tools"
+    pkg = root / "echo"
+    pkg.mkdir(parents=True)
+    (pkg / "run.py").write_text("import sys\nsys.stdout.write('x')\n")
+    outside = tmp_path / "outside.json"
+    original = json.dumps(
+        {
+            "name": "echo",
+            "description": "d",
+            "parameters": {"type": "object"},
+            "entry": [sys.executable, "run.py"],
+            "enabled": True,
+        }
+    )
+    outside.write_text(original)
+    (pkg / "tool.json").symlink_to(outside)
+    _install_tools(monkeypatch, root)
+
+    assert set_enabled("echo", False) is False  # write refused
+    assert outside.read_text() == original  # foreign file untouched (no rewrite)
+
+
+def test_manifest_over_size_limit_listed_invalid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tool.json larger than the file-size bound is listed invalid -- rejected
+    by stat() BEFORE the oversized file is ever read into memory."""
+    root = tmp_path / "tools"
+    _make_tool(
+        root,
+        "big",
+        "import sys\nsys.stdout.write('x')\n",
+        tool_json={
+            "name": "big",
+            # A huge description pushes the whole FILE past _MANIFEST_MAX_BYTES.
+            "description": "x" * (_MANIFEST_MAX_BYTES + 100),
+            "parameters": {"type": "object"},
+            "entry": [sys.executable, "run.py"],
+        },
+    )
+    _install_tools(monkeypatch, root)
+
+    listed = {t["name"]: t for t in list_tools()}
+    assert listed["big"]["valid"] is False
+    assert "too large" in (listed["big"]["error"] or "")
+    assert enabled_llm_tools() == []
+
+
+def test_parameters_schema_over_size_limit_listed_invalid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A parameters schema whose json.dumps exceeds the schema bound is listed
+    invalid, even though the whole manifest FILE stays well under the file bound
+    -- the schema is re-sent to the model on every request, so it is capped
+    tighter than the manifest as a whole."""
+    root = tmp_path / "tools"
+    big_schema = {
+        "type": "object",
+        "properties": {"q": {"description": "y" * (_PARAMETERS_SCHEMA_MAX_BYTES + 100)}},
+    }
+    _make_tool(
+        root,
+        "bigschema",
+        "import sys\nsys.stdout.write('x')\n",
+        tool_json={
+            "name": "bigschema",
+            "description": "d",
+            "parameters": big_schema,
+            "entry": [sys.executable, "run.py"],
+        },
+    )
+    _install_tools(monkeypatch, root)
+
+    listed = {t["name"]: t for t in list_tools()}
+    assert listed["bigschema"]["valid"] is False
+    assert "schema is too large" in (listed["bigschema"]["error"] or "")
+    # It's the SCHEMA bound that tripped, not the file bound: the file is small.
+    assert (root / "bigschema" / "tool.json").stat().st_size < _MANIFEST_MAX_BYTES
 
 
 def test_hidden_directories_never_listed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
