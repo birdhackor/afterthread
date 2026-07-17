@@ -69,3 +69,7 @@
   6. **尾端換行被 strip 而非 422 — won't-fix**：剪貼簿尾端換行是貼上偽影；strip-then-validate（內部換行仍 422）是刻意契約——正規化在 schema 單點發生、env 注入/.env 寫入/遮蔽集合看到同一值，無不一致風險。註解明示。
   7. **.env 只換第一個同名行**（dotenv last-wins 讓模型寫的重複行蓋掉真值）→ 移除全部同名行（含 `export ` 前綴與空白容忍）再附加唯一真值行。
   8. **rotation 秒級後綴 + 無序列化互相覆蓋 segment** → 專用 `_FILE_SINK_LOCK` 序列化整段 stat→rotate→append（刻意不用 ring lock，I/O 不進 ring 臨界區）+ rename 目標存在時遞增後綴。
+- **第三輪複審（900c04f 後）**：F2–F5/F7/F8 確認成立；出 3 High + 2 Medium，共同根因是**「截斷先於遮蔽」碎片類**與兩個獨立向量，全修：
+  1. **H1 reader 層 cap+1 截斷在遮蔽前**（跨界秘密留前綴碎片進 live 結果）＋ **H2 summary 2000 切片在 outcome 遮蔽前** ＋ **M4 args 200 預覽在 recorder 遮蔽前** → 修類：(a) 兩個遮蔽器（tools/llm_log）都加「尾端前綴碎片防護」——文字結尾若為任一秘密的 ≥6 字元前綴即遮（pre-truncated 輸入的通用兜底）；(b) `_sanitize` 遮蔽先於切片；(c) llm.py 增 `set_tool_args_redactor` hook（main.py 接線、llm 不 import tools 維持分層），args 於預覽切片**前**遮——內部碎片不形成。
+  2. **H3 builder 可把 `$SECRET` 展開進 tool.json description/parameters**（未遮、經 /api/tools 與未來每次 LLM tool spec 持久外流）→ `validate_package` 拒絕 raw manifest 含任何已知秘密值（≥6）的套件；拒絕優於遮蔽——嵌金鑰的 manifest 是畸形資料非待清理文字。
+  3. **M5 .env 寫入未引號、dotenv 解析可變形**（註冊的是 parsed 值、runtime 工具 echo raw 行可洩原始值）→ 寫入時安全引號 + **dotenv 往返驗證**（寫後 parse 比對不等即拒裝），整類消滅。

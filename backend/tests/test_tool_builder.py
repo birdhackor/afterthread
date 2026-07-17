@@ -413,6 +413,28 @@ def test_install_result_ready_is_strictly_coerced() -> None:
     assert InstallResult.model_validate({"ready": "true", "tool_name": "t"}).ready is True
 
 
+def test_install_result_redacts_secret_straddling_summary_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F1/H2: the summary is redacted BEFORE the 2000-char slice, so a secret straddling
+    the slice edge is masked while the summary is whole -- no unmatchable prefix fragment
+    survives the cut. A slice-FIRST sanitizer would keep the part of the secret sitting
+    inside the cap (this test's discriminator)."""
+    secret = "kb-live-secret-abcdef123456"
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+    cap = tool_builder._SUMMARY_CAP
+    # Secret spans [cap-10, cap-10+len), so a slice-first sanitizer keeps secret[:10].
+    summary = "x" * (cap - 10) + secret + "y" * 100
+    result = InstallResult.model_validate(
+        {"tool_name": "kbsearch", "summary": summary, "ready": True}
+    )
+
+    assert secret not in result.summary
+    assert secret[:10] not in result.summary  # the fragment a slice-first cut would keep
+    assert "•••" in result.summary  # a mask occurred before the cut (marker start survives)
+    assert len(result.summary) <= cap
+
+
 # --- run_install ---------------------------------------------------------------
 
 
@@ -896,6 +918,54 @@ def test_run_install_redacts_secret_from_not_ready_error(
     assert tools._REDACTION_MARKER in (outcome.error or "")
 
 
+def test_run_install_rejects_manifest_embedding_inflight_secret(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """H3 end-to-end: a builder that bakes the in-flight install secret into the staged
+    manifest is rejected at validation -- the secret is registered for the whole build,
+    so validate_package (which runs BEFORE the finally discard) catches it, the install
+    fails with the friendly reason, and nothing is promoted. The value is never echoed."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    secret_value = "topsecretvalue-abcdef123456"
+
+    async def fake(
+        system_prompt: str,
+        user_prompt: str,
+        model_cls: type[BaseModel],
+        *,
+        workflow: str = "unknown",
+        tools: Any = None,
+        max_tool_rounds: int | None = None,
+        timeout_seconds: float | None = None,
+    ) -> BaseModel:
+        by_name = {t.spec["function"]["name"]: t for t in tools or []}
+        # The builder DISOBEYS and bakes the secret into the manifest description.
+        manifest = _package_manifest("kbsearch")
+        manifest["description"] = f"searches using {secret_value} to authenticate"
+        await by_name["write_file"].handler({"path": "tool.json", "content": json.dumps(manifest)})
+        await by_name["write_file"].handler({"path": "run.py", "content": _GOOD_RUN_PY})
+        return model_cls.model_validate({"tool_name": "kbsearch", "summary": "s", "ready": True})
+
+    monkeypatch.setattr("context_memory.services.tool_builder.generate_structured", fake)
+    _no_fetch(monkeypatch)
+
+    outcome = asyncio.run(
+        run_install(
+            "http://kb.example/openapi.json",
+            "build",
+            secret_name="KB_API_KEY",
+            secret_value=secret_value,
+        )
+    )
+    assert outcome.ok is False
+    assert (outcome.error or "").startswith("工具包驗證失敗")
+    assert "不得包含秘密值" in (outcome.error or "")
+    assert secret_value not in (outcome.error or "")  # the value is never echoed
+    assert not (root / "kbsearch").exists()  # nothing promoted
+    assert not (root / ".staging").exists()  # staging cleaned
+
+
 def test_inject_secret_removes_all_duplicate_name_lines(tmp_path: Path) -> None:
     """F7: python-dotenv is LAST-occurrence-wins, so _inject_secret_into_env drops
     EVERY prior NAME= line (plain, spaced, or ``export ``-prefixed) and appends the
@@ -922,6 +992,97 @@ def test_inject_secret_removes_all_duplicate_name_lines(tmp_path: Path) -> None:
     assert resolved["KB_API_KEY"] == "real-secret-abcdef"  # the backend's value wins
     assert resolved["OTHER"] == "keep"  # unrelated lines preserved
     assert resolved["MIDDLE"] == "alsokeep"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "secret#value-abcdef",  # inline-comment char
+        "secret value abcdef",  # spaces
+        "secret'value-abcdef",  # single quote -> double-quoted path
+        'secret"value-abcdef',  # double quote -> single-quoted path
+        "secret$VALUE-abcdef",  # interpolation char (must stay literal)
+        "secret\\value-abcdef",  # backslash
+        '"quoted-value-abcdef"',  # leading/trailing quote
+        "mix'a\"b$c-#=`! def",  # a single/double/interp/space mix
+    ],
+    ids=[
+        "hash",
+        "spaces",
+        "single-quote",
+        "double-quote",
+        "dollar",
+        "backslash",
+        "quoted",
+        "mixed",
+    ],
+)
+def test_inject_secret_round_trips_tricky_values(tmp_path: Path, value: str) -> None:
+    """F5: a value with dotenv-significant characters is serialized so the runtime loader
+    parses it back BYTE-FOR-BYTE. Written into a real .env, then read back with the SAME
+    interpolate=False loader the runtime uses (tools._load_tool_dotenv) -- the value the
+    redaction registry ends up with is exactly what was submitted, no transform."""
+    env_file = tmp_path / ".env"
+    error = tool_builder._inject_secret_into_env(env_file, "KB_API_KEY", value)
+    assert error is None
+    loaded = tools._load_tool_dotenv(tmp_path)
+    assert loaded["KB_API_KEY"] == value
+
+
+def test_inject_secret_tricky_value_reaches_subprocess_env(tmp_path: Path) -> None:
+    """F5: the exact submitted value (special chars and all) is what a runtime tool's
+    subprocess environment receives, since _build_tool_env layers _load_tool_dotenv on
+    top of the passthrough allowlist."""
+    value = "tricky'$#-value \"abcdef"
+    env_file = tmp_path / ".env"
+    assert tool_builder._inject_secret_into_env(env_file, "KB_API_KEY", value) is None
+    env = tools._build_tool_env(tmp_path)
+    assert env["KB_API_KEY"] == value
+
+
+def test_inject_secret_refuses_non_round_trippable_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """F5: when serialization would produce a value the loader does NOT parse back
+    verbatim, the round-trip guard REFUSES the install rather than writing a divergent
+    value. Forced by stubbing the serializer to emit the RAW (unquoted) form for a value
+    dotenv transforms -- a leading double-quote is parsed as a quoted value, stripping
+    it. This proves the round-trip check, not the quoting rules, is the guarantee."""
+    monkeypatch.setattr(tool_builder, "_dotenv_serialize_value", lambda v: v)
+    env_file = tmp_path / ".env"
+    error = tool_builder._inject_secret_into_env(env_file, "KB_API_KEY", '"quoted-abcdef"')
+    assert error == tool_builder._ERROR_SECRET_ENV_UNSERIALIZABLE
+    assert not env_file.exists()  # a transformed value is never written
+
+
+def test_run_install_promotes_tricky_secret_round_trippable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """F5 end-to-end: an install whose form secret carries dotenv-significant characters
+    succeeds, and the promoted tool's ``.env`` parses the value back byte-for-byte with the
+    runtime loader -- so the redaction registry and the tool's subprocess both see exactly
+    what the user submitted."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    secret_value = "tricky'$#-value abcdef"  # single quote, $, #, space -- all significant
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built", "ready": True},
+        files={"tool.json": json.dumps(_package_manifest("kbsearch")), "run.py": _GOOD_RUN_PY},
+    )
+    _no_fetch(monkeypatch)
+
+    outcome = asyncio.run(
+        run_install(
+            "http://kb.example/openapi.json",
+            "build",
+            secret_name="KB_API_KEY",
+            secret_value=secret_value,
+        )
+    )
+    assert outcome.ok is True
+    loaded = tools._load_tool_dotenv(root / "kbsearch")
+    assert loaded["KB_API_KEY"] == secret_value  # exact, no dotenv transform
 
 
 def test_router_install_threads_secret_pair(

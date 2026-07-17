@@ -138,6 +138,11 @@ _ERROR_NAME_TAKEN = "同名工具已存在，請先刪除舊工具再重新安�
 # past the 64KiB cap, or when the .env cannot be written safely.
 _ERROR_SECRET_ENV_TOO_LARGE = "工具包 .env 加入秘密後將超過大小上限，安裝已取消。"  # noqa: RUF001
 _ERROR_SECRET_ENV_WRITE = "工具包 .env 無法寫入秘密值，安裝已取消。"  # noqa: RUF001
+# D36/F5: raised when the submitted secret value cannot be serialized into the staged
+# ``.env`` such that python-dotenv parses it back byte-for-byte (the post-write round-trip
+# check failed). Refusing beats writing a value the runtime would parse differently from
+# what the user submitted.
+_ERROR_SECRET_ENV_UNSERIALIZABLE = "秘密值含特殊字元，無法安全寫入工具包 .env，安裝已取消。"  # noqa: RUF001
 
 # The builder's system prompt. English, like every prompt in this codebase.
 # It must carry the ENTIRE package contract (tool.json fields, the name regex,
@@ -267,9 +272,21 @@ class InstallResult(BaseModel):
     def _sanitize(cls, data: Any) -> dict[str, Any]:
         if not isinstance(data, dict):
             raise ValueError("expected a JSON object")
+        # F1/D36: redact known secret values out of the summary BEFORE the 2000-char
+        # slice (redact->cap, the same order the whole pipeline uses). A secret
+        # straddling the slice edge must be masked while the summary is still WHOLE, or
+        # the cut would leave an unmatchable prefix fragment -- an INTERIOR fragment the
+        # trailing-fragment guard cannot catch. The in-flight install secret is
+        # registered for the whole build (run_install), so it is redactable here inside
+        # generate_structured's model_validate. run_install ALSO redacts the summary at
+        # outcome construction (the belt that additionally covers the non-_sanitize
+        # value used to build the not-ready error); double-redaction is a no-op on the
+        # already-masked marker.
         return {
             "tool_name": _coerce_str(data.get("tool_name")).strip()[:_TOOL_NAME_MAX],
-            "summary": _coerce_str(data.get("summary")).strip()[:_SUMMARY_CAP],
+            "summary": tools.redact_known_secrets(_coerce_str(data.get("summary")).strip())[
+                :_SUMMARY_CAP
+            ],
             "ready": _coerce_bool(data.get("ready")),
         }
 
@@ -744,6 +761,35 @@ def _env_line_key(line: str) -> str | None:
     return key or None
 
 
+# Characters that make an UNQUOTED dotenv value unsafe (interpolation, inline comments,
+# quotes, escapes, whitespace-trimming) -- any of them, or leading/trailing whitespace,
+# forces quoting in _dotenv_serialize_value. The round-trip check in
+# _inject_secret_into_env makes this set non-load-bearing: it is a conservative first cut,
+# and any value it mis-serializes is caught and refused rather than written wrong.
+_DOTENV_VALUE_NEEDS_QUOTING = frozenset(" \t#'\"\\=$`!")
+
+
+def _dotenv_serialize_value(value: str) -> str:
+    """Serialize ``value`` into a dotenv RHS that parses back to it verbatim (F5).
+
+    Values are single-line by contract (the schema rejects newlines and strips
+    surrounding whitespace). A value with none of the unsafe characters and no
+    leading/trailing whitespace is written UNQUOTED -- byte-identical to the pre-F5
+    behavior for the common alnum/``-_.`` key. Otherwise it is SINGLE-quoted when it holds
+    no single quote (python-dotenv parses single-quoted values literally -- no
+    interpolation, no escapes), else DOUBLE-quoted with backslash and double-quote escaped
+    (dotenv decodes those escapes back). Backslash is escaped BEFORE the double-quote so
+    the escape it adds is not itself doubled. This only has to be RIGHT for the common
+    cases and safe-ish for the rest: ``_inject_secret_into_env``'s round-trip check is the
+    actual guarantee.
+    """
+    if value and value == value.strip() and not (set(value) & _DOTENV_VALUE_NEEDS_QUOTING):
+        return value
+    if "'" not in value:
+        return f"'{value}'"
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def _inject_secret_into_env(env_file: Path, name: str, value: str) -> str | None:
     """Write ``name=value`` into the staged package's ``.env``; None = ok (D36).
 
@@ -766,6 +812,17 @@ def _inject_secret_into_env(env_file: Path, name: str, value: str) -> str | None
     against the same ``_ENV_FILE_MAX_BYTES`` cap ourselves and refuse the install
     (friendly error) rather than leave an oversized ``.env`` the runtime would
     silently drop to ``{}``.
+
+    The value is serialized safely (``_dotenv_serialize_value``) and then the FINAL
+    content is round-trip-checked (F5): we parse it back with the SAME interpolate=False
+    loader the runtime uses (``tools._parse_dotenv_text``) and refuse unless ``name``
+    parses back to the exact submitted value. Writing ``NAME=value`` raw let python-dotenv
+    transform values containing quotes/``#``/escapes/leading whitespace, so the redaction
+    registry -- which registers the PARSED value -- would diverge from the submitted one,
+    and a runtime tool echoing the raw line could expose the original. The round-trip
+    check is the load-bearing guarantee: it makes the quoting rules non-load-bearing (any
+    future dotenv parsing quirk becomes a CLEAN refusal, never a silent divergence) and
+    guarantees the runtime registry lands on the SAME value.
     """
     existing = ""
     if env_file.exists():
@@ -777,12 +834,18 @@ def _inject_secret_into_env(env_file: Path, name: str, value: str) -> str | None
             return _ERROR_SECRET_ENV_WRITE
         existing = text
     # Drop EVERY line assigning our NAME (any of the tolerated shapes), keep the rest
-    # verbatim, then append the single real line LAST so it is the effective value.
+    # verbatim, then append the single real (safely-serialized) line LAST so it is the
+    # effective value.
     kept = [line for line in existing.splitlines() if _env_line_key(line) != name]
-    kept.append(f"{name}={value}")
+    kept.append(f"{name}={_dotenv_serialize_value(value)}")
     new_content = "\n".join(kept) + "\n"
     if len(new_content.encode("utf-8")) > tools._ENV_FILE_MAX_BYTES:
         return _ERROR_SECRET_ENV_TOO_LARGE
+    # Round-trip guard (F5): refuse unless the runtime's own loader parses NAME back to the
+    # exact submitted value from the FINAL bytes. This is what makes the serialization
+    # correct-or-refused rather than correct-or-silently-divergent.
+    if tools._parse_dotenv_text(new_content).get(name) != value:
+        return _ERROR_SECRET_ENV_UNSERIALIZABLE
     if not tools._write_regular_file(env_file, new_content):
         return _ERROR_SECRET_ENV_WRITE
     return None

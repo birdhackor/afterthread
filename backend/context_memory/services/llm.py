@@ -121,6 +121,36 @@ _TOOL_BUDGET_EXHAUSTED = (
 # whole synthetic line again regardless.
 _TOOL_ARGS_PREVIEW_CHARS = 200
 
+
+def _identity_redactor(text: str) -> str:
+    return text
+
+
+# Redactor applied to each tool call's arguments BEFORE the preview slice (M4). A
+# module-level hook, NOT a direct import, because llm.py must not import the tool
+# subsystem: tools.py imports THIS module for LlmTool, so importing tools here would
+# cycle. main._configure_secret_redaction injects tools.redact_known_secrets once at
+# startup -- the SAME leaf/provider inversion llm_log uses for its secret provider. The
+# identity default keeps a build that never wires it byte-identical to the pre-M4 code.
+# WHY redact before the slice: the preview in _summarize_tool_calls truncates arguments
+# to _TOOL_ARGS_PREVIEW_CHARS BEFORE the recorder's own redaction choke point
+# (llm_log._stored_body) ever sees the synthetic line, so a secret straddling the preview
+# edge would leave an INTERIOR fragment the trailing-fragment guard cannot catch --
+# redacting the WHOLE arguments string first prevents the fragment from ever forming.
+_tool_args_redactor: Callable[[str], str] = _identity_redactor
+
+
+def set_tool_args_redactor(redactor: Callable[[str], str]) -> None:
+    """Install the callable that scrubs tool-call arguments before the log preview (M4).
+
+    Idempotent overwrite (last writer wins) -- main wires it once at startup, and a test
+    may swap in its own. The default is identity, so an unwired build previews arguments
+    exactly as before.
+    """
+    global _tool_args_redactor
+    _tool_args_redactor = redactor
+
+
 # Hard cap on how many tool calls from ONE assistant reply are actually EXECUTED.
 # A single reply can legitimately carry a handful of parallel calls, but a broken
 # or hostile model could emit thousands in one turn; executing them all would
@@ -550,9 +580,22 @@ def _summarize_tool_calls(tool_calls: list[Any]) -> str:
     parts: list[str] = []
     for tool_call in tool_calls:
         _, name, arguments = _tool_call_fields(tool_call)
-        preview = arguments[:_TOOL_ARGS_PREVIEW_CHARS]
-        if len(arguments) > _TOOL_ARGS_PREVIEW_CHARS:
-            preview += "…"
+        # M4: redact the WHOLE arguments string BEFORE slicing it to the preview length,
+        # so a secret straddling the slice edge is masked while the string is still whole
+        # (redact->cap, the pipeline's order everywhere). On redactor failure, fall back
+        # to a fixed placeholder -- NEVER the raw arguments: this synthetic line feeds the
+        # recorder, and while llm_log._redact would still scrub whole values at storage,
+        # a fragment left by this slice would slip past it, so passing the raw string
+        # through on failure could leak. Fail CLOSED (redact-or-nothing), matching the
+        # live-path redactors' direction.
+        try:
+            redacted = _tool_args_redactor(arguments)
+        except Exception:
+            preview = "(args preview unavailable)"
+        else:
+            preview = redacted[:_TOOL_ARGS_PREVIEW_CHARS]
+            if len(redacted) > _TOOL_ARGS_PREVIEW_CHARS:
+                preview += "…"
         parts.append(f"{name or '<unnamed>'}({preview})")
     return "[tool_calls] " + ", ".join(parts)
 

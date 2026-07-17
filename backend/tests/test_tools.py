@@ -1031,6 +1031,119 @@ def test_validate_package_flags_oversized_dotenv(
     assert tools.validate_package(pkg, "big") is None
 
 
+def _staged_pkg(parent: Path, *, tool_json: dict[str, Any], run_py: str) -> Path:
+    """A staging-style package (files at the package ROOT) for validate_package tests."""
+    pkg = parent / "staged"
+    pkg.mkdir(parents=True)
+    (pkg / "run.py").write_text(run_py, encoding="utf-8")
+    (pkg / "tool.json").write_text(json.dumps(tool_json), encoding="utf-8")
+    return pkg
+
+
+def _kbsearch_manifest(description: str = "searches the KB") -> dict[str, Any]:
+    return {
+        "name": "staged",
+        "description": description,
+        "parameters": {"type": "object", "properties": {}},
+        "entry": [sys.executable, "run.py"],
+    }
+
+
+def test_validate_package_rejects_manifest_with_secret_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """H3: a staged MANIFEST that embeds a known secret value is rejected at install
+    validation. The manifest is served via /api/tools and re-sent in every LLM tool
+    spec, so an embedded key is malformed by design -- rejected (naming the file),
+    never silently redacted. The offending VALUE is never echoed in the reason."""
+    root = tmp_path / "tools"
+    # An installed tool contributes its .env secret to known_secret_values.
+    secret = "another-tools-live-secret-abcdef"
+    _make_tool(root, "other", "import sys\nsys.stdout.write('x')\n", dotenv=f"OTHER_KEY={secret}\n")
+    _install_tools(monkeypatch, root)
+
+    pkg = _staged_pkg(
+        tmp_path / "stage",
+        tool_json=_kbsearch_manifest(description=f"uses {secret} to authenticate"),
+        run_py="import sys\nsys.stdout.write('x')\n",
+    )
+    error = tools.validate_package(pkg, "staged")
+    assert error is not None
+    assert error.startswith("tool.json ")
+    assert "不得包含秘密值" in error
+    assert secret not in error  # the value itself is never echoed back
+
+
+def test_validate_package_rejects_impl_file_with_secret_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """H3: the scan covers EVERY staged file, not just the manifest -- an implementation
+    file that hardcoded a known key is a persisted plaintext copy and is rejected too,
+    named by its relative path."""
+    root = tmp_path / "tools"
+    secret = "another-tools-live-secret-abcdef"
+    _make_tool(root, "other", "import sys\nsys.stdout.write('x')\n", dotenv=f"OTHER_KEY={secret}\n")
+    _install_tools(monkeypatch, root)
+
+    pkg = _staged_pkg(
+        tmp_path / "stage",
+        tool_json=_kbsearch_manifest(),  # manifest is clean
+        run_py=f"API_KEY = '{secret}'\nimport sys\nsys.stdout.write('x')\n",
+    )
+    error = tools.validate_package(pkg, "staged")
+    assert error is not None
+    assert error.startswith("run.py ")
+    assert "不得包含秘密值" in error
+    assert secret not in error
+
+
+def test_validate_package_clean_of_secrets_passes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """H3: a package embedding NO known secret validates clean -- the gate never trips
+    on an ordinary build even while other tools' secrets are registered."""
+    root = tmp_path / "tools"
+    _make_tool(
+        root,
+        "other",
+        "import sys\nsys.stdout.write('x')\n",
+        dotenv="OTHER_KEY=another-tools-live-secret-abcdef\n",
+    )
+    _install_tools(monkeypatch, root)
+
+    pkg = _staged_pkg(
+        tmp_path / "stage",
+        tool_json=_kbsearch_manifest(),
+        run_py="import os, sys\nsys.stdout.write(os.environ.get('OTHER_KEY', ''))\n",
+    )
+    assert tools.validate_package(pkg, "staged") is None
+
+
+def test_validate_package_rejection_never_echoes_secret_in_filename(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """H3: even when a secret is embedded in a FILE NAME (a builder that ran
+    `> "$SECRET.txt"` under run_shell) whose content also carries it, the rejection names
+    the file with the value REDACTED -- the reason never echoes the secret via the path."""
+    root = tmp_path / "tools"
+    secret = "another-tools-live-secret-abcdef"
+    _make_tool(root, "other", "import sys\nsys.stdout.write('x')\n", dotenv=f"OTHER_KEY={secret}\n")
+    _install_tools(monkeypatch, root)
+
+    pkg = _staged_pkg(
+        tmp_path / "stage",
+        tool_json=_kbsearch_manifest(),
+        run_py="import sys\nsys.stdout.write('x')\n",
+    )
+    # A stray file whose NAME and CONTENT both carry the secret (sorts first: 'a...').
+    (pkg / f"{secret}.txt").write_text(f"leaked {secret}", encoding="utf-8")
+    error = tools.validate_package(pkg, "staged")
+    assert error is not None
+    assert "不得包含秘密值" in error
+    assert secret not in error  # neither content nor filename echoes the value
+    assert tools._REDACTION_MARKER in error  # the offending path is named, masked
+
+
 # --- known-secret redaction (F1 / F4, D36) ---------------------------------
 
 
@@ -1063,6 +1176,42 @@ def test_redact_known_secrets_longest_first(monkeypatch: pytest.MonkeyPatch) -> 
     assert "abcdefXYZ789" not in out
     assert "XYZ789" not in out  # the suffix a shorter-first pass would have leaked
     assert out.count(tools._REDACTION_MARKER) == 1
+
+
+def test_redact_known_secrets_masks_trailing_prefix_fragment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F1: text ENDING with a >=6-char PREFIX of a known secret -- a secret cut by an
+    earlier truncation boundary (the bounded pipe reader's cap+1), so the full value
+    never appears -- is masked at the tail, even though the full-value replace can't
+    match it."""
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({"abcdefGHIJKLMN"}))
+    out = tools.redact_known_secrets("result=abcdefGHIJ")  # first 10 chars of the secret
+    assert "abcdefGHIJ" not in out
+    assert out.startswith("result=")
+    assert out.endswith(tools._REDACTION_MARKER)
+
+
+def test_redact_known_secrets_masks_longest_trailing_fragment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F1: the LONGEST secret prefix the text ends with is masked, so masking a short
+    fragment never leaves earlier secret bytes exposed."""
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({"abcdefGHIJKLMN"}))
+    out = tools.redact_known_secrets("x=abcdefGHIJKL")  # 12 of the 14 secret chars
+    assert "abcdefGH" not in out  # not just the last 6 masked -- the whole fragment is
+    assert out == "x=" + tools._REDACTION_MARKER
+
+
+def test_redact_known_secrets_ignores_short_trailing_fragment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F1: a trailing fragment UNDER the 6-char floor is left alone (same floor as full
+    values -- masking a <6-char tail would shred ordinary prose)."""
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({"abcdefGHIJKLMN"}))
+    out = tools.redact_known_secrets("value=abcde")  # only 5 chars of the secret prefix
+    assert out == "value=abcde"  # untouched
+    assert tools._REDACTION_MARKER not in out
 
 
 def test_runtime_tool_output_masks_known_env_secret(

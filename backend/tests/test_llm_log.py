@@ -457,6 +457,22 @@ def test_redaction_longest_first_leaves_no_suffix(monkeypatch: pytest.MonkeyPatc
     assert body.count(llm_log._REDACTION_MARKER) == 1
 
 
+def test_redaction_masks_trailing_prefix_fragment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F1: a stored body ENDING with a >=6-char prefix of a known secret -- a secret cut
+    by an upstream boundary before _redact runs, so the full value never appears -- is
+    masked at the tail, mirroring tools.redact_known_secrets."""
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {"abcdefGHIJKLMN"})
+    llm_log._reset_for_tests()
+
+    _record(response="body ends with abcdefGHIJ")  # first 10 chars of the secret
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    body = record["attempts"][0]["response_content"]
+    assert "abcdefGHIJ" not in body
+    assert body.endswith(llm_log._REDACTION_MARKER)
+
+
 def test_file_sink_writes_valid_jsonl(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """With llm_log_file set, every finished record is appended as one valid JSON
     line carrying the full bodies (ensure_ascii=False keeps CJK readable)."""

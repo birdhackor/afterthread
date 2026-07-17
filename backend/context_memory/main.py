@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 
 from context_memory.db import init_db
 from context_memory.routers import ai, items, review, tools
-from context_memory.services import llm_log
+from context_memory.services import llm, llm_log
 from context_memory.services import tools as tools_service
 
 
@@ -91,8 +91,16 @@ def _configure_secret_redaction() -> None:
     ``except Exception`` guard (the no-observer-failure invariant), so this
     wiring can only ever ADD redaction and never put the recorder at risk, even
     if ``known_secret_values`` were to fail.
+
+    The same inversion wires the tool-call ARGS redactor (M4): ``llm.py`` cannot import
+    the tool subsystem (tools.py imports llm for LlmTool -- a cycle), so it exposes
+    ``set_tool_args_redactor`` and this injects ``tools.redact_known_secrets``, which
+    ``_summarize_tool_calls`` runs over each call's arguments BEFORE the log preview
+    slice. Unlike the observer-direction llm_log provider, that redactor is on the
+    recorder-feeding preview path and fails CLOSED (redact-or-nothing).
     """
     llm_log.set_secret_provider(tools_service.known_secret_values)
+    llm.set_tool_args_redactor(tools_service.redact_known_secrets)
 
 
 _configure_app_logging()

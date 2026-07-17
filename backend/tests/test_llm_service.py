@@ -34,11 +34,13 @@ from context_memory.config import Settings
 from context_memory.services.llm import (
     _INVALID_STRUCTURED_OUTPUT,
     _STRICT_OUTPUT_RULE,
+    _TOOL_ARGS_PREVIEW_CHARS,
     _UPSTREAM_REASON,
     LLMNotConfiguredError,
     LLMUpstreamError,
     _build_client,
     _get_client,
+    _summarize_tool_calls,
     generate_structured,
     llm_configured,
     normalized_model,
@@ -890,3 +892,67 @@ def test_build_client_disables_automatic_retries() -> None:
     """
     client = _build_client("http://retry-policy.example/v1", "k", 1.0)
     assert client.max_retries == 0
+
+
+# --- tool-call args redaction before the log preview (M4) ------------------
+
+
+def _arg_tc(arguments: str, *, name: str = "echo", tc_id: str = "c0") -> SimpleNamespace:
+    """A response-side tool-call object carrying ``arguments`` (SDK-shaped)."""
+    return SimpleNamespace(
+        id=tc_id, type="function", function=SimpleNamespace(name=name, arguments=arguments)
+    )
+
+
+def test_summarize_tool_calls_redacts_args_before_preview(monkeypatch: pytest.MonkeyPatch) -> None:
+    """M4: each tool call's arguments run through the wired redactor BEFORE the
+    _TOOL_ARGS_PREVIEW_CHARS slice, so a secret STRADDLING the slice edge is masked
+    while the string is whole -- it never leaves an INTERIOR fragment (past the slice)
+    that the trailing-fragment guard cannot catch. A slice-first summary would keep the
+    part of the secret that sits inside the preview."""
+    secret = "kb-secret-value-abcdef123456"
+    monkeypatch.setattr(
+        "context_memory.services.llm._tool_args_redactor",
+        lambda s: s.replace(secret, "•••"),
+    )
+    # Position the secret so ~10 of its chars sit INSIDE the preview cap and the rest
+    # spill past it: a slice-first summary would show that inside-the-cap fragment.
+    prefix = "a" * (_TOOL_ARGS_PREVIEW_CHARS - 10 - len('{"q":"'))
+    arguments = '{"q":"' + prefix + secret + '"}'
+    out = _summarize_tool_calls([_arg_tc(arguments)])
+
+    assert secret not in out
+    assert secret[:10] not in out  # the fragment a slice-first preview would have kept
+    assert "•••" in out  # the redactor ran on the whole string before the cut
+
+
+def test_summarize_tool_calls_identity_default_is_byte_identical(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the identity default redactor (an unwired build), the summary is exactly the
+    pre-M4 shape: the arguments previewed verbatim, with the … marker when over-cap."""
+    monkeypatch.setattr("context_memory.services.llm._tool_args_redactor", lambda s: s)
+    out = _summarize_tool_calls([_arg_tc('{"q":"term"}', name="echo")])
+    assert out == '[tool_calls] echo({"q":"term"})'
+    # Over-cap arguments still get the … truncation marker.
+    long_args = "a" * (_TOOL_ARGS_PREVIEW_CHARS + 50)
+    over = _summarize_tool_calls([_arg_tc(long_args, name="big")])
+    assert over == "[tool_calls] big(" + "a" * _TOOL_ARGS_PREVIEW_CHARS + "…)"
+
+
+def test_summarize_tool_calls_redactor_failure_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M4: if the args redactor RAISES, the preview falls back to a fixed placeholder --
+    NEVER the raw arguments (which could carry the very secret the slice can't scrub).
+    Fail-closed, matching the live-path redactors' redact-or-nothing direction."""
+
+    def _boom(_s: str) -> str:
+        raise RuntimeError("redactor exploded")
+
+    monkeypatch.setattr("context_memory.services.llm._tool_args_redactor", _boom)
+    secret = "kb-secret-value-abcdef123456"
+    out = _summarize_tool_calls([_arg_tc(f'{{"k":"{secret}"}}')])
+
+    assert secret not in out
+    assert "(args preview unavailable)" in out

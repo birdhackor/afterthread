@@ -479,6 +479,47 @@ def _scan_all() -> list[_PackageScan]:
     ]
 
 
+def _find_embedded_secret_file(directory: Path) -> str | None:
+    """Relative path of the first staged file that embeds a known secret VALUE, or None.
+
+    The install-only H3 gate. A builder session has real shell capability (run_shell,
+    D21), so it could read another tool's ``.env`` -- or any file the service uid can --
+    and bake a live key into the package it is producing. The manifest is the
+    persistence-and-broadcast vector (served via /api/tools and re-sent in EVERY future
+    LLM tool spec), and every implementation file is a persisted plaintext copy, so
+    before promotion EVERY regular file is scanned for any known secret value (>=
+    _MIN_SECRET_LEN, the redactor floor). A hit REJECTS the install (the caller names the
+    offending relative path) rather than redacting: an embedded key is malformed by
+    design, and masking would silently alter the schema the model built. The in-flight
+    install secret is registered for the whole build (run_install), so it is covered here
+    too -- and validate runs BEFORE promote writes the secret into the package ``.env``,
+    so this never trips on the backend's own later injection.
+
+    Each file is read through the ONE bounded, FIFO/symlink-hardened helper (cap =
+    _MANIFEST_MAX_BYTES); a non-regular/unreadable file comes back None and is skipped.
+    ``os.walk`` does not follow directory symlinks and the read's O_NOFOLLOW refuses a
+    symlinked leaf, so the scan can never be walked out of the package. Files are visited
+    in a deterministic sorted order so the named offender is stable. Cost is one substring
+    pass per known secret per file -- fine for the few small files a package holds.
+    """
+    secrets = [value for value in known_secret_values() if len(value) >= _MIN_SECRET_LEN]
+    if not secrets:
+        return None
+    base = directory.resolve()
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames.sort()
+        filenames.sort()
+        here = Path(dirpath)
+        for filename in filenames:
+            path = here / filename
+            text = _read_regular_file_capped(path, _MANIFEST_MAX_BYTES)
+            if text is None:
+                continue
+            if any(secret in text for secret in secrets):
+                return str(path.relative_to(base))
+    return None
+
+
 def validate_package(directory: Path, expected_name: str) -> str | None:
     """Validate a candidate package OUTSIDE the tools dir; None means valid.
 
@@ -487,8 +528,8 @@ def validate_package(directory: Path, expected_name: str) -> str | None:
     is about to be installed under, which the manifest must already carry).
     Runs the exact same checks an installed package faces on every scan
     (manifest shape, name regex + match, entry-file containment), so a package
-    that passes here can never turn up ``valid=False`` after the move -- PLUS one
-    STRICTER install-only gate below.
+    that passes here can never turn up ``valid=False`` after the move -- PLUS the
+    STRICTER install-only gates below.
 
     The .env size gate is deliberately NOT part of ``_scan_package`` (which the
     registry runs on every scan): an oversized ``.env`` must BLOCK a fresh install
@@ -497,6 +538,10 @@ def validate_package(directory: Path, expected_name: str) -> str | None:
     vanish from the registry as invalid. So this gate lives on the installer's
     pre-move path only. Being stricter than the scan preserves the invariant above
     (passing here still implies passing the scan); only the reverse loosens.
+
+    The embedded-secret gate (H3) is likewise install-only: it must BLOCK a package
+    that baked a known key into any file, but is never re-run on installed packages
+    (whose ``.env`` legitimately holds the injected secret post-install).
     """
     error = _scan_package(directory, expected_name=expected_name).error
     if error is not None:
@@ -512,6 +557,14 @@ def validate_package(directory: Path, expected_name: str) -> str | None:
         oversized = False
     if oversized:
         return "`.env` is too large"
+    # Install-only embedded-secret gate (H3): reject a package that baked a known secret
+    # value into any file, naming the offending relative path (never the value itself).
+    # The path is itself run through the redactor before it lands in the message, in case
+    # a builder wrote a file whose very NAME embeds an expanded ``$SECRET`` -- so the
+    # rejection can never echo the value even via the path.
+    offender = _find_embedded_secret_file(directory)
+    if offender is not None:
+        return f"{redact_known_secrets(offender)} 不得包含秘密值（請改由環境變數讀取）"  # noqa: RUF001
     return None
 
 
@@ -727,17 +780,63 @@ def redact_known_secrets(text: str) -> str:
     it exists to hide. ``known_secret_values`` is itself defensive, and any surprise it
     did raise degrades upstream into a safe failed-tool-result string (the llm loop's
     and meta-tools' own ``except`` handlers), never a leak.
+
+    After the full-value pass, a TRAILING-PREFIX-FRAGMENT guard masks a secret cut by an
+    EARLIER truncation boundary (F1). The bounded pipe reader keeps only cap+1 chars
+    BEFORE this runs (``_CappedReader``), and other call sites hand us already-truncated
+    text, so a secret straddling such a boundary leaves a PREFIX fragment the full-value
+    replace can never match -- and a fragment at the END of the redaction unit is exactly
+    that boundary case. This guard handles only TEXT-FINAL fragments; INTERIOR fragments
+    are prevented at their sources (the summary slice in tool_builder and the tool-args
+    preview in llm.py both redact BEFORE they cut).
     """
+    secrets = sorted(known_secret_values(), key=len, reverse=True)
     redacted = text
-    for value in sorted(known_secret_values(), key=len, reverse=True):
+    for value in secrets:
         if len(value) < _MIN_SECRET_LEN:
             continue
         if value in redacted:
             redacted = redacted.replace(value, _REDACTION_MARKER)
+    # Trailing-prefix-fragment guard (F1): mask the LONGEST secret prefix (>=
+    # _MIN_SECRET_LEN) the text ENDS with. ``secrets`` is longest-first so ties in
+    # fragment length resolve to the longer secret; ``best`` only grows, so each secret
+    # is probed only for a fragment LONGER than the best found so far (the k range stops
+    # at ``best``). Cost is at most O(len(secret)) endswith probes per secret -- fine for
+    # a handful of secrets. A false positive (text coincidentally ending in a key prefix)
+    # only masks a tail of an already-truncated string, which is harmless.
+    best = 0
+    for value in secrets:
+        if len(value) < _MIN_SECRET_LEN:
+            continue
+        for k in range(min(len(value), len(redacted)), max(best, _MIN_SECRET_LEN - 1), -1):
+            if redacted.endswith(value[:k]):
+                best = k
+                break
+    if best >= _MIN_SECRET_LEN:
+        redacted = redacted[:-best] + _REDACTION_MARKER
     return redacted
 
 
 # --- execution -------------------------------------------------------------
+
+
+def _parse_dotenv_text(text: str) -> dict[str, str]:
+    """Parse already-read ``.env`` TEXT into a plain env dict, interpolation OFF.
+
+    The ONE dotenv parse the tool subsystem funnels through, so the runtime env load
+    (``_load_tool_dotenv``) and the installer's post-write round-trip check
+    (``tool_builder._inject_secret_into_env``) apply the IDENTICAL parser to the SAME
+    bytes -- which is what lets that round-trip check guarantee the value the runtime
+    later registers equals the value the user submitted. ``interpolate=False`` is
+    LOAD-BEARING (see ``_load_tool_dotenv``): it keeps a ``${OPENAI_API_KEY}`` line
+    literal instead of resolving it from our parent env. Bare keys (value None) and any
+    parse failure are dropped defensively so a malformed ``.env`` degrades to {}.
+    """
+    try:
+        values = dotenv_values(stream=io.StringIO(text), interpolate=False)
+    except Exception:
+        return {}
+    return {key: value for key, value in values.items() if isinstance(value, str)}
 
 
 def _load_tool_dotenv(directory: Path) -> dict[str, str]:
@@ -770,17 +869,12 @@ def _load_tool_dotenv(directory: Path) -> dict[str, str]:
     text = _read_regular_file_capped(env_file, _ENV_FILE_MAX_BYTES)
     if text is None or len(text) > _ENV_FILE_MAX_BYTES:
         return {}
-    # Parse from an IN-MEMORY stream, never dotenv_values(path): handing it the path
-    # would make python-dotenv REOPEN the file -- a second, UNBOUNDED read that also
-    # re-follows a symlink -- defeating the bounded, O_NOFOLLOW'd read above. Both
-    # reads must be the same bytes and the same regular-file decision.
-    # ``interpolate=False`` stays LOAD-BEARING (see the docstring): it keeps a
-    # ``${OPENAI_API_KEY}`` line literal instead of resolving it from our parent env.
-    try:
-        values = dotenv_values(stream=io.StringIO(text), interpolate=False)
-    except Exception:
-        return {}
-    return {key: value for key, value in values.items() if isinstance(value, str)}
+    # Parse the ALREADY-READ text (never dotenv_values(path)): handing python-dotenv the
+    # path would make it REOPEN the file -- a second, UNBOUNDED read that also re-follows a
+    # symlink -- defeating the bounded, O_NOFOLLOW'd read above. ``_parse_dotenv_text`` is
+    # the shared interpolate=False parser (see there); both reads must be the same bytes
+    # and the same regular-file decision.
+    return _parse_dotenv_text(text)
 
 
 def _build_tool_env(directory: Path) -> dict[str, str]:

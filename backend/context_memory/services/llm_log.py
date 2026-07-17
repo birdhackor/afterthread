@@ -349,11 +349,30 @@ def _redact(text: str) -> str:
     # F4: replace the LONGEST values first. With both "abcdef" and "abcdefXYZ"
     # registered, masking the shorter first would replace it INSIDE the longer one and
     # leave "XYZ" exposed; longest-first masks the superset value before its own prefix.
-    for value in sorted(values, key=len, reverse=True):
+    ordered = sorted(values, key=len, reverse=True)
+    for value in ordered:
         if not value or len(value) < _MIN_SECRET_LEN:
             continue
         if value in redacted:
             redacted = redacted.replace(value, _REDACTION_MARKER)
+    # Trailing-prefix-fragment guard (F1), mirroring tools.redact_known_secrets. The
+    # full-value pass above only matches a secret that survived WHOLE, but a body handed
+    # to this observer can already be truncated (a compatible gateway's own cut, or a
+    # secret straddling an upstream boundary before _redact runs), leaving a PREFIX
+    # fragment at the END. Mask the LONGEST secret prefix (>= _MIN_SECRET_LEN) the text
+    # ends with -- ``best`` only grows, so each secret is probed only for a fragment
+    # longer than the best found so far. Handles TEXT-FINAL fragments only; interior
+    # fragments are prevented at their sources (see tools.redact_known_secrets).
+    best = 0
+    for value in ordered:
+        if not value or len(value) < _MIN_SECRET_LEN:
+            continue
+        for k in range(min(len(value), len(redacted)), max(best, _MIN_SECRET_LEN - 1), -1):
+            if redacted.endswith(value[:k]):
+                best = k
+                break
+    if best >= _MIN_SECRET_LEN:
+        redacted = redacted[:-best] + _REDACTION_MARKER
     return redacted
 
 
