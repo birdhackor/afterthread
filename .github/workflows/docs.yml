@@ -1,0 +1,56 @@
+# Builds and deploys the Zensical documentation site (website/) to GitHub
+# Pages via the Actions artifact pipeline (actions/deploy-pages) -- NOT the
+# gh-pages branch approach (undocumented upstream, needs extra tooling).
+#
+# Trigger is intentionally push-to-main/master ONLY: committing this workflow
+# on a feature branch deploys nothing. Actual publication happens only after
+# the owner merges to main/master AND has completed the one-time manual
+# GitHub UI setup (Pages source = GitHub Actions, etc. -- see the project's
+# P7 handoff notes for the full checklist).
+#
+# No actions/cache step by design: Zensical's own docs advise against
+# caching its build (the on-disk cache format is expected to change, and
+# zensical/zensical#641 -- non-deterministic builds -- is still open).
+name: Documentation
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/configure-pages@v6
+
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Install Zensical
+        run: pip install zensical
+
+      - name: Build documentation site
+        # Config lives at website/zensical.toml (docs_dir/site_dir resolve
+        # relative to the config file, so this reads website/content/ and
+        # writes website/site/ regardless of the runner's cwd).
+        run: zensical build --clean -f website/zensical.toml
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: website/site
+
+      - uses: actions/deploy-pages@v5
+        id: deployment

@@ -29,6 +29,11 @@ dist/
 backend/context_memory/static/
 backend/dist/
 
+# Zensical docs site build output (website/zensical.toml site_dir = "site";
+# source content in website/content/ IS tracked, only the built HTML is not).
+website/site/
+website/.cache/
+
 # OS
 .DS_Store
 

@@ -61,6 +61,7 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 | `LLM_LOG_MAX_ENTRIES` | `50` | 「AI 日誌」頁／`GET /api/llm/logs` 顯示的最近互動筆數上限（記憶體內環狀緩衝，隨程序重啟清空），邊界 `[1, 1000]`。 |
 | `LLM_LOG_BODY_MAX_CHARS` | `200000` | 單次互動中，任一則請求/回應內容儲存時的字元數上限，邊界 `[1000, 2000000]`；與 `LLM_LOG_MAX_ENTRIES` 一起讓記憶體用量在兩個軸上都有界。 |
 | `LLM_LOG_FILE` | 未設定 | 選填。設定後，每次 LLM 互動會額外追加寫入這個 JSONL 檔案（與記憶體環狀緩衝相同的紀錄，一樣受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；預設關閉——記錄含個人記憶內容，落不落地是使用者自己的隱私選擇。 |
+| `LLM_LOG_FILE_MAX_BYTES` | `50000000` | 上述 JSONL sink 的輪替門檻（位元組）：檔案超過此大小就改名成帶 UTC 時間戳後綴、另開新檔（守磁碟；RAM 由環狀緩衝負責），邊界 `[1000000, 1000000000]`。僅在有設定 `LLM_LOG_FILE` 時有意義；輪替後的舊檔不會自動刪除，交由使用者自行清理。 |
 | `TOOLS_DIR` | dev 未設定／打包模式自動注入 `<data-dir>/tools` | 已安裝工具套件所在目錄；留空＝工具功能整個關閉（`GET /api/tools` 回空清單，AI workflow 不帶任何工具，prompt 與無工具版本逐字相同）。dev 模式要用工具功能，需自行在 `backend/.env` 設定這個變數。 |
 | `LLM_TOOL_ROUNDS_MAX` | `8` | 一次 AI workflow 呼叫最多允許幾輪工具呼叫，邊界 `[1, 64]`。 |
 | `LLM_TOOL_TIMEOUT_SECONDS` | `60` | 單次工具子行程的逾時秒數（到期整個 process group 被砍），邊界 `(0, 600]`。 |
