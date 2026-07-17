@@ -14,16 +14,16 @@
 
 ## Phase 順序與派工
 
-| Phase | 內容 | 模型 | 前置 |
+| Phase | 內容 | 模型 | 狀態 |
 |---|---|---|---|
-| P0 | 計畫/決策文件 + symlink 修正 + .gitignore | 主代理 | — |
-| P1 | CLI typer 重構 | sonnet | — |
-| P2 | 打包 uv_build 評估→遷移或記錄維持 | sonnet（研究已派） | 研究報告 |
-| P3 | 日誌金鑰遮蔽設計 + loguru 裁決/重構 | opus（設計敏感） | 研究報告 |
-| P4 | 動態 token-ratio 預算 | opus（LLM 邊界 invariant） | — |
-| P5 | tool-call 機制說明文件 + LangChain 裁決 | sonnet 文件（重構與否由裁決定） | 研究報告 |
-| P6 | zensical 文件站 + Pages/Actions | sonnet | 研究報告；P1-P5 落定後內容才穩定 |
-| P7 | 全量 review（vs `a5ac409`）+ 總結 + 手動設定清單 | 主代理 | 全部 |
+| P0 | 計畫/決策文件 + symlink 修正 + .gitignore | 主代理 | ✅ 推送 69483d8 |
+| P1 | CLI typer 重構 | sonnet | 實作中 |
+| P2 | 打包 uv_build 評估 → **裁決維持 hatchling（D32），無程式變更** | 研究+主代理 | ✅ 已裁決 |
+| P3 | 日誌金鑰遮蔽 + JSONL 輕量 rotation（**loguru 不採用，D34**） | opus（設計敏感） | 待 P1 |
+| P4 | 動態 token-ratio 預算 | opus（LLM 邊界 invariant） | 待 P3 |
+| P5 | tool-call 機制說明文件（**LangChain 不重構，D35**） | sonnet 文件 | 待 P4 |
+| P6 | zensical 文件站 + Actions artifact 部署（D33） | sonnet | 待 P5 |
+| P7 | 全量 review（vs `a5ac409`）+ 總結 + 手動設定清單 | 主代理 | 待全部 |
 
 ## 流程（沿 v2，D23/D27/D28 慣例）
 
