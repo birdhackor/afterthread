@@ -312,68 +312,117 @@ def set_secret_provider(provider: Callable[[], Iterable[str]] | None) -> None:
     _secret_provider = provider
 
 
+def _mask_known_secrets(text: str, secrets: list[str]) -> str:
+    """Mask every known-secret RANGE in ``text`` with one marker each (D36/H1).
+
+    The shared shape BOTH redactors run: ``tools.redact_known_secrets`` (the LIVE
+    conversation path) and ``llm_log._redact`` (the STORED-body path) call an IDENTICAL
+    copy of this. It is DUPLICATED in each module, not hoisted into a shared home, for
+    the same leaf/layering reason the marker is (see ``_REDACTION_MARKER``); the two
+    copies MUST stay byte-for-byte in LOCKSTEP so a value masked in a live tool result
+    and one masked in the log are indistinguishable. ``secrets`` are the known values
+    already filtered to ``>= _MIN_SECRET_LEN`` -- each caller produces that list under
+    its OWN failure direction (tools lets a provider error propagate/fail-closed; llm_log
+    swallows one and records unredacted), then hands the masking here.
+
+    Every mask range is computed against the PRISTINE ``text`` and only THEN applied,
+    which is load-bearing (H1). The older order -- full-value ``str.replace`` FIRST, then
+    inspect the MUTATED text for a trailing fragment -- let the full-value pass destroy
+    the evidence the fragment guard needed: with ``ABCDEFGHIJKLmnop`` and ``GHIJKL`` both
+    registered and a text ending ``ABCDEFGHIJKL`` (a 12-char prefix of the long secret),
+    masking the short ``GHIJKL`` occurrence rewrote the tail so the guard no longer saw
+    the long secret's prefix, leaking ``ABCDEF``. Computing all ranges up front on the
+    original text and merging them removes that ordering hazard: iteration order (kept
+    longest-first only for determinism) is NO LONGER load-bearing for correctness.
+
+    Three steps: (1) collect ranges -- every occurrence of each full value, plus the
+    single LONGEST trailing PREFIX fragment (>= _MIN_SECRET_LEN) the text ends with (a
+    secret cut by an EARLIER truncation boundary leaves a prefix the full-value match can
+    never catch; a false positive only masks a tail of already-truncated text, and
+    INTERIOR fragments are prevented at their sources -- the summary/openapi slices in
+    tool_builder and the tool-args preview in llm.py all redact BEFORE they cut); (2)
+    merge overlapping/adjacent ranges; (3) build the output in ONE pass, emitting exactly
+    one marker per merged range.
+    """
+    if not secrets:
+        return text
+    secrets = sorted(secrets, key=len, reverse=True)
+    # (1) ranges on the PRISTINE text -- every occurrence of every full value ...
+    ranges: list[tuple[int, int]] = []
+    for value in secrets:
+        start = text.find(value)
+        while start != -1:
+            ranges.append((start, start + len(value)))
+            start = text.find(value, start + 1)
+    # ... plus the LONGEST trailing prefix fragment (>= _MIN_SECRET_LEN) the text ends
+    # with. ``best`` only grows, so each secret is probed only for a fragment longer than
+    # the best found so far (the k range floor is ``best``).
+    best = 0
+    for value in secrets:
+        for k in range(min(len(value), len(text)), max(best, _MIN_SECRET_LEN - 1), -1):
+            if text.endswith(value[:k]):
+                best = k
+                break
+    if best >= _MIN_SECRET_LEN:
+        ranges.append((len(text) - best, len(text)))
+    if not ranges:
+        return text
+    # (2) merge overlapping/adjacent ranges (``<=`` folds a touching range into the
+    # previous one, so abutting occurrences collapse to a single marker).
+    ranges.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in ranges:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    # (3) one pass, one marker per merged range.
+    out: list[str] = []
+    prev = 0
+    for start, end in merged:
+        out.append(text[prev:start])
+        out.append(_REDACTION_MARKER)
+        prev = end
+    out.append(text[prev:])
+    return "".join(out)
+
+
 def _redact(text: str) -> str:
-    """Replace every exact occurrence of each known secret value in ``text``.
+    """Replace every known secret value in ``text`` with the redaction marker.
 
     The FIRST stage of `_stored_body` (before `_utf8_safe`, before the size cut):
     a secret must be scrubbed BEFORE truncation could split it, or half of a key
-    straddling the cap edge would survive in the record. Substring `str.replace`,
-    not a regex, so a value containing regex metacharacters is matched literally.
+    straddling the cap edge would survive in the record.
 
     The provider is called INSIDE a broad `except Exception` because of the
     no-observer-failure invariant: the recorder is a pure observer of the LLM
     call, so a broken/misconfigured secret provider must degrade to "record
     unredacted", never raise into `begin_attempt`/`record_response`/the sink and
-    turn a successful call into a logging crash. Guards per value: empty/None is
-    skipped (``str.replace("", m)`` would splice the marker between every
-    character), and anything under `_MIN_SECRET_LEN` is skipped (see that
-    constant). The `in` pre-check just avoids allocating a new string for a
-    secret that is not present (the common case: most known secrets appear in no
-    given body).
+    turn a successful call into a logging crash. The materialization+filter runs
+    INSIDE that guard (F5): the provider may be a LAZY iterable that raises at YIELD
+    time, and a non-str element would raise downstream, so we keep only ``str`` values
+    meeting ``_MIN_SECRET_LEN`` in the same guarded pass -- any failure (call,
+    iteration, or a bad element) still degrades to "record unredacted". The length
+    floor also drops the empty string (``str.replace("", m)`` would splice the marker
+    between every character) and a 1-5 char value (see that constant).
+
+    The masking itself is the shared ``_mask_known_secrets`` -- byte-identical to
+    ``tools``' copy (see that helper): it computes every mask range on the PRISTINE text
+    and merges them, which is what keeps a secret straddling an upstream boundary from
+    surviving (H1) and mirrors the live redactor exactly.
     """
     provider = _secret_provider
     if provider is None:
         return text
     try:
-        # Materialize the values INSIDE the guard (F5): the provider may be a lazy
-        # iterable that raises at YIELD time, not just at call time, so ``list()`` must
-        # be inside this try or such a failure would escape into the recorder. Keep
-        # only ``str`` values in the same pass -- a non-str would raise in the ``in`` /
-        # ``replace`` below -- so any failure (call, iteration, or a bad element) still
-        # degrades to "record unredacted", never raises (the no-observer-failure
-        # invariant).
-        values = [value for value in provider() if isinstance(value, str)]
+        secrets = [
+            value
+            for value in provider()
+            if isinstance(value, str) and len(value) >= _MIN_SECRET_LEN
+        ]
     except Exception:
         return text
-    redacted = text
-    # F4: replace the LONGEST values first. With both "abcdef" and "abcdefXYZ"
-    # registered, masking the shorter first would replace it INSIDE the longer one and
-    # leave "XYZ" exposed; longest-first masks the superset value before its own prefix.
-    ordered = sorted(values, key=len, reverse=True)
-    for value in ordered:
-        if not value or len(value) < _MIN_SECRET_LEN:
-            continue
-        if value in redacted:
-            redacted = redacted.replace(value, _REDACTION_MARKER)
-    # Trailing-prefix-fragment guard (F1), mirroring tools.redact_known_secrets. The
-    # full-value pass above only matches a secret that survived WHOLE, but a body handed
-    # to this observer can already be truncated (a compatible gateway's own cut, or a
-    # secret straddling an upstream boundary before _redact runs), leaving a PREFIX
-    # fragment at the END. Mask the LONGEST secret prefix (>= _MIN_SECRET_LEN) the text
-    # ends with -- ``best`` only grows, so each secret is probed only for a fragment
-    # longer than the best found so far. Handles TEXT-FINAL fragments only; interior
-    # fragments are prevented at their sources (see tools.redact_known_secrets).
-    best = 0
-    for value in ordered:
-        if not value or len(value) < _MIN_SECRET_LEN:
-            continue
-        for k in range(min(len(value), len(redacted)), max(best, _MIN_SECRET_LEN - 1), -1):
-            if redacted.endswith(value[:k]):
-                best = k
-                break
-    if best >= _MIN_SECRET_LEN:
-        redacted = redacted[:-best] + _REDACTION_MARKER
-    return redacted
+    return _mask_known_secrets(text, secrets)
 
 
 # --- stored-body safety: redact, THEN UTF-8-safe, THEN size-capped ----------

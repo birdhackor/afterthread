@@ -1214,6 +1214,39 @@ def test_redact_known_secrets_ignores_short_trailing_fragment(
     assert tools._REDACTION_MARKER not in out
 
 
+def test_redact_known_secrets_ranges_computed_on_original_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F1/H1: mask ranges are computed on the PRISTINE text, so the full-value pass can
+    never destroy the evidence the trailing-fragment guard needs. With a LONG secret and a
+    SHORT secret that is an interior substring of the long secret's truncated prefix, text
+    ending in a 12-char prefix of the LONG secret must not leak a 6+-char run: the old
+    replace-first order masked the ``GHIJKL`` occurrence and blinded the guard, stranding
+    ``ABCDEF``."""
+    monkeypatch.setattr(
+        tools,
+        "known_secret_values",
+        lambda: frozenset({"ABCDEFGHIJKLmnop", "GHIJKL"}),
+    )
+    out = tools.redact_known_secrets("tail=ABCDEFGHIJKL")  # 12-char prefix of the long secret
+    assert "ABCDEF" not in out  # no 6+-char run of the long secret's chars survives
+    assert tools._REDACTION_MARKER in out
+    assert out == "tail=" + tools._REDACTION_MARKER
+
+
+def test_redact_known_secrets_overlapping_occurrences_merge_one_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F1/H1: two DISTINCT secrets whose occurrences OVERLAP in the text collapse into a
+    single merged range -- one marker, with no secret bytes leaking between them."""
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({"abcXYZ", "XYZdef"}))
+    out = tools.redact_known_secrets("p abcXYZdef q")  # abcXYZ (0-6) overlaps XYZdef (3-9)
+    assert "abcXYZ" not in out
+    assert "XYZdef" not in out
+    assert out.count(tools._REDACTION_MARKER) == 1
+    assert out == "p " + tools._REDACTION_MARKER + " q"
+
+
 def test_runtime_tool_output_masks_known_env_secret(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

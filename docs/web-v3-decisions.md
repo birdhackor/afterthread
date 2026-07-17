@@ -73,3 +73,7 @@
   1. **H1 reader 層 cap+1 截斷在遮蔽前**（跨界秘密留前綴碎片進 live 結果）＋ **H2 summary 2000 切片在 outcome 遮蔽前** ＋ **M4 args 200 預覽在 recorder 遮蔽前** → 修類：(a) 兩個遮蔽器（tools/llm_log）都加「尾端前綴碎片防護」——文字結尾若為任一秘密的 ≥6 字元前綴即遮（pre-truncated 輸入的通用兜底）；(b) `_sanitize` 遮蔽先於切片；(c) llm.py 增 `set_tool_args_redactor` hook（main.py 接線、llm 不 import tools 維持分層），args 於預覽切片**前**遮——內部碎片不形成。
   2. **H3 builder 可把 `$SECRET` 展開進 tool.json description/parameters**（未遮、經 /api/tools 與未來每次 LLM tool spec 持久外流）→ `validate_package` 拒絕 raw manifest 含任何已知秘密值（≥6）的套件；拒絕優於遮蔽——嵌金鑰的 manifest 是畸形資料非待清理文字。
   3. **M5 .env 寫入未引號、dotenv 解析可變形**（註冊的是 parsed 值、runtime 工具 echo raw 行可洩原始值）→ 寫入時安全引號 + **dotenv 往返驗證**（寫後 parse 比對不等即拒裝），整類消滅。
+- **第四輪複審（ebf64e1 後）**：fix-4 覆蓋、.env 去重後往返、三個 failure direction 全數確認；出 1 High + 2 Medium（皆 round-3 修正自身邊角），全修：
+  1. **H 完整值替換先毀尾端碎片**（重疊秘密：短值先換 marker，長值前綴碎片遂不可見、漏 ≥6 字元）→ 兩個遮蔽器改「在原始文字上統一計算遮蔽範圍（完整值 + 尾端碎片）、合併重疊區間、一次套用」。
+  2. **M OpenAPI 文件 `_truncate_to` 先於遮蔽**（內部碎片、text-final guard 接不到）→ 遮蔽先於截斷（openapi 文件可能本身含金鑰，內部 API 文件常見）。
+  3. **M double-quote 轉義拼法未登錄**（`"ab'cd\"ef"` 的 escaped 拼法不含原值 substring，`cat .env` 可還原洩漏）→ 收窄 serializer：double-quote 分支實際觸發轉義（值含 `"` 或 `\` 且含 `'`）即拒裝；單引號路徑與未轉義路徑的 raw 拼法都含原值 verbatim、遮蔽可命中。往返檢查留為兜底。

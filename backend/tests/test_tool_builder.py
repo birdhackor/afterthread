@@ -435,6 +435,30 @@ def test_install_result_redacts_secret_straddling_summary_cap(
     assert len(result.summary) <= cap
 
 
+def test_builder_user_prompt_redacts_openapi_before_truncation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F1/D36: the OpenAPI doc is redacted BEFORE the budget cut, so a known secret
+    straddling the truncation edge is masked while the doc is whole -- a truncate-first
+    order would strand ``prefix + truncation marker``, an INTERIOR fragment neither
+    redaction pass could catch. An internal API doc can legitimately embed the very key
+    the operator just registered."""
+    secret = "kb-live-secret-abcdef123456"  # 27 chars
+    budget = 4000  # the settings floor for llm_prompt_budget_chars
+    _install_settings(monkeypatch, llm_prompt_budget_chars=budget)
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+    # Place the secret so it straddles the effective cut (budget - truncation marker): its
+    # first 8 chars sit inside the cap and the rest past it, so a truncate-first order would
+    # strand secret[:8] ahead of the truncation marker. Redact-first masks it whole (the
+    # 13-char marker is shorter than the 27-char secret, so the result fits with no cut).
+    openapi = "y" * (budget - 18) + secret
+    prompt = tool_builder._builder_user_prompt("do it", openapi)
+
+    assert secret not in prompt
+    assert secret[:6] not in prompt  # the 6-char fragment a truncate-first cut would strand
+    assert tools._REDACTION_MARKER in prompt
+
+
 # --- run_install ---------------------------------------------------------------
 
 
@@ -1004,7 +1028,7 @@ def test_inject_secret_removes_all_duplicate_name_lines(tmp_path: Path) -> None:
         "secret$VALUE-abcdef",  # interpolation char (must stay literal)
         "secret\\value-abcdef",  # backslash
         '"quoted-value-abcdef"',  # leading/trailing quote
-        "mix'a\"b$c-#=`! def",  # a single/double/interp/space mix
+        "mix'ab$c-#=`! def",  # single-quote + interp/comment/space mix (no ", now a refusal)
     ],
     ids=[
         "hash",
@@ -1030,10 +1054,11 @@ def test_inject_secret_round_trips_tricky_values(tmp_path: Path, value: str) -> 
 
 
 def test_inject_secret_tricky_value_reaches_subprocess_env(tmp_path: Path) -> None:
-    """F5: the exact submitted value (special chars and all) is what a runtime tool's
-    subprocess environment receives, since _build_tool_env layers _load_tool_dotenv on
-    top of the passthrough allowlist."""
-    value = "tricky'$#-value \"abcdef"
+    """F5: the exact submitted value (dotenv-significant chars and all) is what a runtime
+    tool's subprocess environment receives, since _build_tool_env layers _load_tool_dotenv
+    on top of the passthrough allowlist. Uses a single-quote-bearing value (no ``"``/``\\``
+    -- that combo is separately refused), so it serializes verbatim and round-trips."""
+    value = "tricky'$#-value abcdef"
     env_file = tmp_path / ".env"
     assert tool_builder._inject_secret_into_env(env_file, "KB_API_KEY", value) is None
     env = tools._build_tool_env(tmp_path)
@@ -1053,6 +1078,37 @@ def test_inject_secret_refuses_non_round_trippable_value(
     error = tool_builder._inject_secret_into_env(env_file, "KB_API_KEY", '"quoted-abcdef"')
     assert error == tool_builder._ERROR_SECRET_ENV_UNSERIALIZABLE
     assert not env_file.exists()  # a transformed value is never written
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["has'a\"quote-abcdef", "has'a\\slash-abcdef"],
+    ids=["single+double-quote", "single-quote+backslash"],
+)
+def test_inject_secret_refuses_escape_producing_value(tmp_path: Path, value: str) -> None:
+    """F5/D36: a value holding a single quote ALONGSIDE a ``"`` or ``\\`` can only be
+    double-quoted with an ESCAPE, and the escaped raw .env spelling (e.g. ``"ab'cd\\"ef"``)
+    no longer contains the ORIGINAL value as an exact substring -- a runtime tool catting
+    the .env would emit a reversible-but-unredactable form the registry (which holds the
+    original value) can never match. Serialization refuses up front: clean install cancel,
+    nothing written."""
+    env_file = tmp_path / ".env"
+    error = tool_builder._inject_secret_into_env(env_file, "KB_API_KEY", value)
+    assert error == tool_builder._ERROR_SECRET_ENV_UNSERIALIZABLE
+    assert not env_file.exists()
+
+
+def test_inject_secret_single_quote_value_stays_verbatim_in_raw_env(tmp_path: Path) -> None:
+    """F5/D36: a value with a single quote but no ``"``/``\\`` installs, and the RAW .env
+    line embeds it VERBATIM as an exact substring -- so if a runtime tool cats the .env,
+    the redactors (which register the original value) still match and mask it. This is the
+    property the escape-refusal above protects."""
+    value = "api'key-abcdef123"
+    env_file = tmp_path / ".env"
+    assert tool_builder._inject_secret_into_env(env_file, "KB_API_KEY", value) is None
+    raw = env_file.read_text(encoding="utf-8")
+    assert value in raw  # exact substring -> redactable
+    assert tools._load_tool_dotenv(tmp_path)["KB_API_KEY"] == value  # and round-trips
 
 
 def test_run_install_promotes_tricky_secret_round_trippable(

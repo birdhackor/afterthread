@@ -139,9 +139,11 @@ _ERROR_NAME_TAKEN = "同名工具已存在，請先刪除舊工具再重新安�
 _ERROR_SECRET_ENV_TOO_LARGE = "工具包 .env 加入秘密後將超過大小上限，安裝已取消。"  # noqa: RUF001
 _ERROR_SECRET_ENV_WRITE = "工具包 .env 無法寫入秘密值，安裝已取消。"  # noqa: RUF001
 # D36/F5: raised when the submitted secret value cannot be serialized into the staged
-# ``.env`` such that python-dotenv parses it back byte-for-byte (the post-write round-trip
-# check failed). Refusing beats writing a value the runtime would parse differently from
-# what the user submitted.
+# ``.env`` safely -- EITHER ``_dotenv_serialize_value`` refuses up front because the only
+# available quoting would ESCAPE a ``"``/``\`` and so leak a reversible-but-unredactable
+# spelling, OR the post-write round-trip check finds python-dotenv would parse the line
+# back to something other than the submitted value. Refusing beats writing a value the
+# runtime would parse differently from -- or expose more of than -- what the user submitted.
 _ERROR_SECRET_ENV_UNSERIALIZABLE = "秘密值含特殊字元，無法安全寫入工具包 .env，安裝已取消。"  # noqa: RUF001
 
 # The builder's system prompt. English, like every prompt in this codebase.
@@ -733,7 +735,13 @@ def _builder_user_prompt(instructions: str, openapi_text: str) -> str:
             "User instructions:",
             instructions,
             "OpenAPI document:",
-            _truncate_to(openapi_text, budget),
+            # F1/D36: redact known secrets BEFORE the budget cut (redact->cap, the same
+            # order every other prompt/live-text site uses). An internal API doc can
+            # legitimately contain the very key the user just registered, and a secret
+            # straddling THIS cut would become ``prefix + truncation marker`` -- an
+            # INTERIOR fragment neither redaction pass can catch -- so it must be masked
+            # while the document is still WHOLE.
+            _truncate_to(tools.redact_known_secrets(openapi_text), budget),
         ]
     )
 
@@ -769,25 +777,35 @@ def _env_line_key(line: str) -> str | None:
 _DOTENV_VALUE_NEEDS_QUOTING = frozenset(" \t#'\"\\=$`!")
 
 
-def _dotenv_serialize_value(value: str) -> str:
-    """Serialize ``value`` into a dotenv RHS that parses back to it verbatim (F5).
+def _dotenv_serialize_value(value: str) -> str | None:
+    r"""Serialize ``value`` into a dotenv RHS that parses back to it verbatim (F5); None
+    signals the value is unrepresentable here without a LEAKY escape (refuse instead).
 
     Values are single-line by contract (the schema rejects newlines and strips
     surrounding whitespace). A value with none of the unsafe characters and no
     leading/trailing whitespace is written UNQUOTED -- byte-identical to the pre-F5
     behavior for the common alnum/``-_.`` key. Otherwise it is SINGLE-quoted when it holds
     no single quote (python-dotenv parses single-quoted values literally -- no
-    interpolation, no escapes), else DOUBLE-quoted with backslash and double-quote escaped
-    (dotenv decodes those escapes back). Backslash is escaped BEFORE the double-quote so
-    the escape it adds is not itself doubled. This only has to be RIGHT for the common
-    cases and safe-ish for the rest: ``_inject_secret_into_env``'s round-trip check is the
-    actual guarantee.
+    interpolation, no escapes), so the raw line embeds the value VERBATIM.
+
+    The remaining case -- the value HOLDS a single quote -- would need DOUBLE quotes, and
+    there the escaping is the hazard: the instant an escape actually FIRES (the value also
+    contains ``"`` or ``\``), the raw .env spelling (e.g. ``"ab'cd\"ef"`` for ``ab'cd"ef``)
+    no longer contains the ORIGINAL value as an exact substring, so a runtime tool that
+    cats the .env would emit a fully reversible spelling the redactors -- which only ever
+    see the original value -- can NEVER match. So we REFUSE (None) a value that carries
+    both a single quote AND a ``"``/``\``. Only when NEITHER escape would fire do we
+    double-quote, which then embeds the value VERBATIM too (redactable). Every path that
+    returns a string keeps the original value as an exact substring of the raw line; the
+    round-trip check in ``_inject_secret_into_env`` remains the backstop for anything else.
     """
     if value and value == value.strip() and not (set(value) & _DOTENV_VALUE_NEEDS_QUOTING):
         return value
     if "'" not in value:
         return f"'{value}'"
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    if '"' in value or "\\" in value:
+        return None
+    return f'"{value}"'
 
 
 def _inject_secret_into_env(env_file: Path, name: str, value: str) -> str | None:
@@ -833,11 +851,17 @@ def _inject_secret_into_env(env_file: Path, name: str, value: str) -> str | None
             # package, so this is a defensive backstop, not the primary gate.
             return _ERROR_SECRET_ENV_WRITE
         existing = text
+    # Serialize the value FIRST: None means it cannot be written without a leaky escape
+    # (a single quote co-occurring with a ``"``/``\``), so refuse up front rather than
+    # emit a reversible-but-unredactable spelling (see _dotenv_serialize_value).
+    serialized = _dotenv_serialize_value(value)
+    if serialized is None:
+        return _ERROR_SECRET_ENV_UNSERIALIZABLE
     # Drop EVERY line assigning our NAME (any of the tolerated shapes), keep the rest
     # verbatim, then append the single real (safely-serialized) line LAST so it is the
     # effective value.
     kept = [line for line in existing.splitlines() if _env_line_key(line) != name]
-    kept.append(f"{name}={_dotenv_serialize_value(value)}")
+    kept.append(f"{name}={serialized}")
     new_content = "\n".join(kept) + "\n"
     if len(new_content.encode("utf-8")) > tools._ENV_FILE_MAX_BYTES:
         return _ERROR_SECRET_ENV_TOO_LARGE

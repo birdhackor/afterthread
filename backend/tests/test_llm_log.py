@@ -473,6 +473,24 @@ def test_redaction_masks_trailing_prefix_fragment(monkeypatch: pytest.MonkeyPatc
     assert body.endswith(llm_log._REDACTION_MARKER)
 
 
+def test_redaction_ranges_computed_on_original_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F1/H1: mask ranges are computed on the PRISTINE body (mirroring
+    tools.redact_known_secrets), so the full-value pass cannot blind the trailing-fragment
+    guard. With a SHORT secret sitting inside a LONG secret's truncated prefix, a body
+    ending in a 12-char prefix of the long secret must not leak a 6+-char run -- the old
+    replace-first order masked the ``GHIJKL`` occurrence and stranded ``ABCDEF``."""
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {"ABCDEFGHIJKLmnop", "GHIJKL"})
+    llm_log._reset_for_tests()
+
+    _record(response="tail=ABCDEFGHIJKL")  # 12-char prefix of the long secret
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    body = record["attempts"][0]["response_content"]
+    assert "ABCDEF" not in body  # no 6+-char run of the long secret's chars survives
+    assert body.endswith(llm_log._REDACTION_MARKER)
+
+
 def test_file_sink_writes_valid_jsonl(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """With llm_log_file set, every finished record is appended as one valid JSON
     line carrying the full bodies (ensure_ascii=False keeps CJK readable)."""
