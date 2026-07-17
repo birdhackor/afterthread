@@ -126,12 +126,16 @@ uv tool install --reinstall --from backend/dist/context_memory-*.whl context-mem
   手動新增、編輯、刪除、篩選、回顧完全不受影響。
 - **GLM5.2（或其他 1M-token context 模型）建議值**：後端目前的預設值本身就
   已經是為大 context 模型調校過的（`OPENAI_TIMEOUT_SECONDS` 預設 120 秒、
-  `LLM_PROMPT_BUDGET_CHARS` 預設 200000，上限到 2,000,000）；如果內部 LLM
-  是 GLM5.2 這類 1M-token context 的模型，`.env.example` 內建了進一步調高的
-  建議（取代上方預設）：
+  `LLM_PROMPT_BUDGET_TOKENS` 預設 200000，上限到 1,000,000）。prompt 預算以
+  **token** 計價（模型真正的限制是 token，不是字元）：系統會從近期每次 LLM
+  互動實際回報的 token 數，動態估一個「字元↔token 比值」，把 token 預算換算成
+  當下該套用的字元上限，冷啟動（樣本不足）時用保守比值 1.0，行為與舊的純字元
+  預算等價（細節見 [docs/tool-calling.md](docs/tool-calling.md)）。如果內部
+  LLM 是 GLM5.2 這類 1M-token context 的模型，`.env.example` 內建了進一步調高
+  的建議（取代上方預設）：
 
   ```bash
-  LLM_PROMPT_BUDGET_CHARS=800000   # 讓超大項目也能整項進 prompt 不截斷
+  LLM_PROMPT_BUDGET_TOKENS=800000  # 讓超大項目也能整項進 prompt 不截斷
   OPENAI_TIMEOUT_SECONDS=300       # 長 context 生成較慢，放寬逾時避免誤判 502
   ```
 
@@ -172,6 +176,9 @@ uv tool install --reinstall --from backend/dist/context_memory-*.whl context-mem
 貼上一個 API 的 OpenAPI JSON 網址 + 一段指示，讓 AI 自己讀文件、寫程式、
 測試、裝進工具目錄——裝好之後，AI 快速捕捉／AI 補齊／AI 進度更新都能呼叫這個
 新工具。
+
+想了解 AI 呼叫工具背後完整的運作機制（生命週期、安全邊界、為什麼不用
+LangChain），見 [docs/tool-calling.md](docs/tool-calling.md)。
 
 ### 操作步驟
 

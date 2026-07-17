@@ -57,7 +57,7 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 | `OPENAI_MODEL` | `""`（空） | 呼叫該 endpoint 時使用的 model 名稱。與 `OPENAI_BASE_URL` 兩者都非空、且 base URL 可被解析為合法 http/https URL，才算「已設定」。 |
 | `OPENAI_TIMEOUT_SECONDS` | `120` | 單次 LLM 請求的逾時秒數，邊界 `(0, 1800]`。同時是「第一次呼叫 + 一次修正重試」整體的 wall-clock 上限（`asyncio.timeout` 包住整個嘗試迴圈）。預設值已經是為長 context 模型調校過的（見下方 GLM5.2 備註），不是舊版小 context 模型的 60 秒。 |
 | `OPENAI_MAX_OUTPUT_TOKENS` | 未設定 | 選填，邊界 `[1, 1000000]`。設定時才以 `max_tokens` 送給 endpoint；留空＝完全不送這個參數（部分 reasoning endpoint 會拒絕顯式 `max_tokens`，但有些 gateway 預設完成長度太短，會截斷長回覆——這是給後者用的上調旋鈕）。 |
-| `LLM_PROMPT_BUDGET_CHARS` | `200000` | enrich / assist-update / 工具安裝組 prompt 時，內容序列化後的最大字元數，邊界 `[4000, 2000000]`。避免超大內容撐爆小 context window 的模型；預設值已經是為大 context 模型調校過的（見下方 GLM5.2 備註）。 |
+| `LLM_PROMPT_BUDGET_TOKENS` | `200000` | enrich / assist-update / 工具安裝組 prompt 時，內容序列化後的 **token** 預算，邊界 `[4000, 1000000]`。實際套用時經動態「字元↔token 比值」換算成字元上限（比值由近期互動的 usage 學得，冷啟動用保守值 1.0，比值下限 0.1 兼作絕對字元兜底——見 `services/token_budget.py`、`docs/tool-calling.md`）。改名自舊的 `LLM_PROMPT_BUDGET_CHARS`（舊鍵會被靜默忽略）。 |
 | `LLM_LOG_MAX_ENTRIES` | `50` | 「AI 日誌」頁／`GET /api/llm/logs` 顯示的最近互動筆數上限（記憶體內環狀緩衝，隨程序重啟清空），邊界 `[1, 1000]`。 |
 | `LLM_LOG_BODY_MAX_CHARS` | `200000` | 單次互動中，任一則請求/回應內容儲存時的字元數上限，邊界 `[1000, 2000000]`；與 `LLM_LOG_MAX_ENTRIES` 一起讓記憶體用量在兩個軸上都有界。 |
 | `LLM_LOG_FILE` | 未設定 | 選填。設定後，每次 LLM 互動會額外追加寫入這個 JSONL 檔案（與記憶體環狀緩衝相同的紀錄，一樣受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；預設關閉——記錄含個人記憶內容，落不落地是使用者自己的隱私選擇。 |
@@ -65,6 +65,7 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 | `LLM_TOOL_ROUNDS_MAX` | `8` | 一次 AI workflow 呼叫最多允許幾輪工具呼叫，邊界 `[1, 64]`。 |
 | `LLM_TOOL_TIMEOUT_SECONDS` | `60` | 單次工具子行程的逾時秒數（到期整個 process group 被砍），邊界 `(0, 600]`。 |
 | `LLM_TOOL_OUTPUT_MAX_CHARS` | `50000` | 工具 stdout 餵回給模型的字元數上限，邊界 `[1000, 500000]`。 |
+| `LLM_TOOL_CONVERSATION_BUDGET_TOKENS` | `500000` | 工具迴圈中「實際送給模型的對話」token 預算，邊界 `[50000, 1000000]`；超過即停止附掛工具、走 finalize（防多輪工具結果累積撐爆 context/記憶體）。同樣經字元↔token 比值換算成字元上限。改名自舊的 `LLM_TOOL_CONVERSATION_BUDGET_CHARS`（舊鍵會被靜默忽略）。 |
 | `TOOL_INSTALL_MAX_ROUNDS` | `24` | KB 網頁安裝器（見下方「工具（KB 網頁安裝器）」）單一安裝工作階段的工具輪數上限，邊界 `[4, 64]`。 |
 | `TOOL_INSTALL_TIMEOUT_SECONDS` | `900` | KB 網頁安裝器單一安裝工作階段的整體逾時秒數，邊界 `(0, 3600]`。 |
 | `TOOL_INSTALL_SHELL_TIMEOUT_SECONDS` | `120` | 安裝器內單一 `run_shell` 指令的逾時秒數，邊界 `(0, 600]`。 |
@@ -72,12 +73,12 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 | `STALE_AFTER_DAYS` | `14` | 非終態項目（`STALE_ELIGIBLE_STATUSES`：除 `done`／`superseded` 外的五種狀態）的 `updated` 超過這個天數，API 回應的 `is_stale` 會是 `true`。邊界 `[0, 36500]`。 |
 
 > **GLM5.2（或其他 1M-token context 模型）備註**：上面 `OPENAI_TIMEOUT_SECONDS`
-> （120）與 `LLM_PROMPT_BUDGET_CHARS`（200000）的預設值本身已經是為大 context
+> （120）與 `LLM_PROMPT_BUDGET_TOKENS`（200000）的預設值本身已經是為大 context
 > 模型調校過的數字。內部 LLM 若是 GLM5.2 這類 1M-token context 模型，
 > `backend/.env.example` 內建了進一步調高的建議（取代上方預設）：
 >
 > ```bash
-> LLM_PROMPT_BUDGET_CHARS=800000   # 讓超大項目也能整項進 prompt，不截斷
+> LLM_PROMPT_BUDGET_TOKENS=800000  # 讓超大項目也能整項進 prompt，不截斷
 > OPENAI_TIMEOUT_SECONDS=300       # 長 context 生成較慢，放寬逾時避免誤判 502
 > ```
 
