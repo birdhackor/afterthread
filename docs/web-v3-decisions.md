@@ -89,3 +89,10 @@
   3. 兩個字元預算改 token 計價：`llm_prompt_budget_chars`→`llm_prompt_budget_tokens`（預設 200k，冷啟動時行為與舊值等價）、`llm_tool_conversation_budget_chars`→`llm_tool_conversation_budget_tokens`（預設 500k——舊 1M chars 在 ratio 1.0 等於整個 1M context 視窗，500k 給回覆與修正輪留 headroom）。執行點以 `char_allowance(budget_tokens)`＝tokens÷ratio 換算字元允許量，機制（字元比較）不變、數字來源改為 token。
   4. estimator 絕不拋錯進 LLM 路徑（觀測者性質）；`/llm/status` 增 `token_ratio` 欄位供除錯。
 - **取捨**：不持久化視窗（重啟回到保守預設，方向安全）；舊 env 鍵被 pydantic 靜默忽略（單人工具可接受，.env.example 註明改名、P6 文件記載）。
+
+## v3 結案（全量 review Approve，2026-07-17）
+
+- **全量 codex review**（對起始點 `a5ac409`，16 commits）**Approve，無跨 phase / 全系統發現**。專攻 P3 遮蔽 × P4 token-ratio 在 llm.py 的接縫、typer CLI 的環境注入、token 設定改名殘留、from-scratch env + 安裝秘密 allowlist 的 OPENAI_* 缺席、遮蔽 observer 方向一致性、workflow 分支安全——皆過。
+- **七項需求全數交付**（對照見 `web-v3-summary.md`）。四個「評估型」需求以研究事實裁決：hatchling 維持（D32）、loguru 不採用（D34）、LangChain 不重構（D35）、zensical 採用（D33）；三個實作需求（typer/秘密處理/token-ratio）皆過各自 review 收斂。
+- **最終 gates**：pytest 681、e2e smoke 76/76、wheel_smoke 23/23、vitest 44、ruff/format/ty 全過。
+- **未併 main**；文件站發佈與否留待使用者（private repo Pages 付費 + 內容公開，見 summary 手動清單）。
