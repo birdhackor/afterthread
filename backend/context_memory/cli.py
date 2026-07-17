@@ -36,18 +36,24 @@ untouched by packaging:
      dev uses.
 """
 
-import argparse
 import os
 from importlib import metadata
 from pathlib import Path
+from typing import Annotated
 from urllib.parse import quote
 
+import typer
 import uvicorn
 from dotenv import load_dotenv
 from sqlalchemy import make_url
 from sqlalchemy.engine import URL
 
 _PACKAGE_NAME = "context-memory"
+
+# add_completion=False: this is a single-command server launcher, not a CLI
+# suite worth shell-completion machinery for -- it would only add
+# --install-completion/--show-completion noise to --help.
+app = typer.Typer(add_completion=False)
 
 
 def _package_version() -> str:
@@ -109,88 +115,94 @@ def _sqlite_url(db_path: Path) -> str:
     ).render_as_string(hide_password=False)
 
 
-def _int_env(name: str, default: int) -> int:
-    """Read an int-valued env var, falling back to `default` when unset/empty.
+def _version_callback(value: bool) -> None:
+    """Print the version and exit 0 -- typer's eager-option idiom for --version.
 
-    A non-integer value is a configuration mistake, not a runtime condition,
-    so it fails loudly right here -- a clear `SystemExit` naming the
-    offending variable -- rather than surfacing several frames later as a
-    bare `ValueError` out of argparse's own default handling.
+    `is_eager=True` on the `--version` option below (see `_serve`) makes this
+    callback run before any other option is converted/validated, matching the
+    old `argparse` `action="version"`: `--version` alone always works, even if
+    some other flag on the same command line would otherwise be invalid.
     """
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        raise SystemExit(f"{name}={raw!r} is not a valid integer") from None
+    if value:
+        typer.echo(f"{_PACKAGE_NAME} {_package_version()}")
+        raise typer.Exit()
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog=_PACKAGE_NAME,
-        description="Run the Context Memory web app (bundled API + SPA).",
-    )
-    parser.add_argument(
-        "--host",
-        default=os.environ.get("CONTEXT_MEMORY_HOST", "127.0.0.1"),
-        help=(
-            "Interface to bind (default: %(default)s; env CONTEXT_MEMORY_HOST). "
-            "Left at 127.0.0.1 by default: this is a local single-user tool, "
-            "not a service meant to be exposed on the LAN."
+@app.command(help="Run the Context Memory web app (bundled API + SPA).")
+def _serve(
+    host: Annotated[
+        str,
+        typer.Option(
+            "--host",
+            envvar="CONTEXT_MEMORY_HOST",
+            help=(
+                "Interface to bind. Left at 127.0.0.1 by default: this is a "
+                "local single-user tool, not a service meant to be exposed "
+                "on the LAN."
+            ),
         ),
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=_int_env("CONTEXT_MEMORY_PORT", 8000),
-        help="Port to bind (default: %(default)s; env CONTEXT_MEMORY_PORT).",
-    )
-    parser.add_argument(
-        "--data-dir",
-        default=os.environ.get("CONTEXT_MEMORY_DATA_DIR") or str(_default_data_dir()),
-        help=(
-            "Directory holding the SQLite database and an optional .env file "
-            "(default: %(default)s; env CONTEXT_MEMORY_DATA_DIR)."
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option(
+            "--port",
+            envvar="CONTEXT_MEMORY_PORT",
+            help="Port to bind.",
         ),
-    )
-    parser.add_argument(
-        "--version",
-        action="version",
-        version=f"{_PACKAGE_NAME} {_package_version()}",
-    )
-    return parser
-
-
-def main(argv: list[str] | None = None) -> None:
-    """Parse args, prepare the data directory/environment, then serve.
+    ] = 8000,
+    data_dir: Annotated[
+        str | None,
+        typer.Option(
+            "--data-dir",
+            envvar="CONTEXT_MEMORY_DATA_DIR",
+            show_default=False,
+            help=(
+                "Directory holding the SQLite database and an optional .env "
+                "file (default: an XDG-style per-user data directory)."
+            ),
+        ),
+    ] = None,
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            callback=_version_callback,
+            is_eager=True,
+            help="show program's version number and exit",
+        ),
+    ] = False,
+) -> None:
+    """Prepare the data directory/environment, then serve.
 
     See the module docstring for why this logic lives here rather than in
     `context_memory.config`.
     """
-    args = _build_parser().parse_args(argv)
-
+    # `data_dir` is None when neither --data-dir nor CONTEXT_MEMORY_DATA_DIR
+    # was given, and "" when CONTEXT_MEMORY_DATA_DIR is set but empty -- both
+    # fall back to the XDG-style default here, the same rule
+    # `_default_data_dir` itself applies to a set-but-empty XDG_DATA_HOME.
+    #
     # Resolve BEFORE the chdir below, so a relative --data-dir is anchored to
     # the directory the user launched from, as they would expect.
-    data_dir = Path(args.data_dir).expanduser().resolve()
-    created = not data_dir.exists()
-    data_dir.mkdir(parents=True, exist_ok=True)
+    data_dir_path = Path(data_dir or str(_default_data_dir())).expanduser().resolve()
+    created = not data_dir_path.exists()
+    data_dir_path.mkdir(parents=True, exist_ok=True)
     if created:
         # This directory holds personal memory content (the SQLite database)
         # and, via its .env, possibly an API key -- so a directory this tool
         # itself just created defaults to user-only. An already-existing
         # directory is left untouched: its permissions may be a deliberate
         # choice, and silently rewriting them is not this tool's call.
-        data_dir.chmod(0o700)
+        data_dir_path.chmod(0o700)
 
     # The data dir is packaged mode's home directory (see the module
     # docstring, step 2): from here on every CWD-relative behavior --
     # pydantic-settings' env_file=".env" lookup, any relative path in a
     # setting value -- resolves inside the data dir, not wherever the user
     # happened to launch from.
-    os.chdir(data_dir)
+    os.chdir(data_dir_path)
 
-    env_file = data_dir / ".env"
+    env_file = data_dir_path / ".env"
     if env_file.is_file():
         # After the chdir above, this is the very file pydantic-settings' own
         # CWD-relative env_file=".env" lookup (config.py) would already find.
@@ -212,7 +224,7 @@ def main(argv: list[str] | None = None) -> None:
     # is printed; when the environment already provides one, only its origin
     # is named, never its content.
     if "DATABASE_URL" not in os.environ:
-        db_path = data_dir / "context_memory.db"
+        db_path = data_dir_path / "context_memory.db"
         os.environ["DATABASE_URL"] = _sqlite_url(db_path)
         database_display = str(db_path)
     else:
@@ -230,7 +242,7 @@ def main(argv: list[str] | None = None) -> None:
     # DATABASE_URL -- there is nothing to withhold from the banner; it is simply
     # left off to keep that line to the two facts it already prints.
     if "TOOLS_DIR" not in os.environ:
-        os.environ["TOOLS_DIR"] = str(data_dir / "tools")
+        os.environ["TOOLS_DIR"] = str(data_dir_path / "tools")
 
     # English; deliberately only ever these two facts -- where data lives,
     # and where the database is (see above). NEVER print OPENAI_* or any
@@ -242,8 +254,20 @@ def main(argv: list[str] | None = None) -> None:
     # nudged the buffer, well after uvicorn's own (separately flushed)
     # startup lines. A startup banner that shows up late is as good as none.
     print(
-        f"Context Memory: data dir={data_dir} database={database_display}",
+        f"Context Memory: data dir={data_dir_path} database={database_display}",
         flush=True,
     )
 
-    uvicorn.run("context_memory.main:app", host=args.host, port=args.port)
+    uvicorn.run("context_memory.main:app", host=host, port=port)
+
+
+def main() -> None:
+    """Console-script entry point (see `[project.scripts]` in pyproject.toml).
+
+    Typer collapses a `Typer()` app with exactly one `@app.command()` (`_serve`
+    above, with no separate `@app.callback()`) into a single-command CLI with
+    no subcommand name required, so calling `app()` with no arguments here --
+    reading `sys.argv` exactly like the `argparse` parser this replaced --
+    is the whole shim.
+    """
+    app()

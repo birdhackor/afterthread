@@ -12,6 +12,7 @@ dependencies = [
     "sqlmodel",
     "pydantic-settings",
     "openai",
+    "typer>=0.26.8",
 ]
 
 [project.scripts]
