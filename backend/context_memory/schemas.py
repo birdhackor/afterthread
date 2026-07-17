@@ -486,11 +486,20 @@ class ToolUpdateRequest(BaseModel):
 # uppercase/digit/underscore, <=64 chars total -- the conventional env-var shape.
 _SECRET_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 
+# The redactor (llm_log._redact / tools.redact_known_secrets) SKIPS values shorter
+# than 6 chars -- masking a 1-5 char value would shred ordinary prose. Accepting a
+# shorter secret would therefore create one that can NEVER be masked out of the AI
+# 日誌 or a live tool result, so the schema rejects it up front. Mirrors
+# tools._MIN_SECRET_LEN, kept a plain literal here rather than importing the tool
+# subsystem into the schema layer.
+_SECRET_VALUE_MIN_LEN = 6
+
 # zh-TW 422 messages for the install-form secret pair (rendered by the 工具
 # page; pinned by tests). Fullwidth punctuation is authentic zh-TW typography.
 _SECRET_PAIR_INCOMPLETE = "秘密名稱與秘密值必須同時提供，或同時留空"  # noqa: RUF001
 _SECRET_NAME_INVALID = "秘密名稱須以大寫字母開頭，僅能包含大寫字母、數字與底線，且不超過 64 字"  # noqa: RUF001
 _SECRET_VALUE_MULTILINE = "秘密值不可包含換行字元"
+_SECRET_VALUE_TOO_SHORT = "秘密值長度至少 6 字元"
 
 
 class ToolInstallRequest(BaseModel):
@@ -527,13 +536,24 @@ class ToolInstallRequest(BaseModel):
         """Enforce both-or-neither + a valid env-var name, and normalize.
 
         Runs AFTER field validation so both raw values are present together (the
-        pair is inherently cross-field). A half-supplied pair, an invalid name,
-        or a multiline value each raises ValueError -> 422 with the zh-TW message
-        above. On success the stripped forms are written back (or None when
-        absent), so every downstream consumer sees a clean pair and never a stray
+        pair is inherently cross-field). A half-supplied pair, an invalid name, a
+        multiline value, or a too-short value each raises ValueError -> 422 with the
+        zh-TW message above. On success the stripped forms are written back (or None
+        when absent), so every downstream consumer sees a clean pair and never a stray
         ``""``/whitespace-only value -- and a newline in the value is rejected up
         front because it would otherwise corrupt the single-line ``KEY=VALUE``
         ``.env`` entry the value becomes.
+
+        Stripping the value's surrounding whitespace and validating the RESULT (rather
+        than 422-ing on a trailing newline) is the DELIBERATE contract, not an
+        oversight: it absorbs clipboard artifacts, and normalizing ONCE here means
+        every downstream consumer -- the run_shell live-test env, the ``.env`` write,
+        and the redaction registry -- sees the byte-identical value; only INTERIOR
+        newlines still 422 (they alone would break the single-line ``.env`` entry).
+
+        The >= 6-char floor mirrors the redactor's own skip threshold
+        (tools._MIN_SECRET_LEN): a shorter value could never be masked out of the AI
+        日誌 / live tool results, so accepting one would create an unredactable secret.
         """
         name = (self.secret_name or "").strip()
         value = (self.secret_value or "").strip()
@@ -543,6 +563,8 @@ class ToolInstallRequest(BaseModel):
             raise ValueError(_SECRET_NAME_INVALID)
         if value and ("\n" in value or "\r" in value):
             raise ValueError(_SECRET_VALUE_MULTILINE)
+        if value and len(value) < _SECRET_VALUE_MIN_LEN:
+            raise ValueError(_SECRET_VALUE_TOO_SHORT)
         self.secret_name = name or None
         self.secret_value = value or None
         return self

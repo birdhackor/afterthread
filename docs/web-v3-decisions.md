@@ -60,3 +60,12 @@
   3. **已知值遮蔽 + 安裝表單秘密欄位（採用）**：表單新增選填 `secret_name`/`secret_value`；值註冊進遮蔽集合（安裝中即生效）、注入 run_shell 子行程 env 供 LLM 實測 API（**LLM 全程看不到值**）、promote 時由後端直接寫進工具 `.env`（LLM 被明示不要自己寫/不要 echo）。金鑰從頭到尾不進 LLM 對話，遮蔽只是縱深防禦的第二層。
 - **決定**：選項 3 + JSONL rotation（D34 的 20 行方案，`llm_log_file_max_bytes` 預設 50MB、超限 rename 時間戳後綴）。分層紀律：llm_log 是觀測葉模組、不得 import tools——以 `set_secret_provider(callable)` 反轉依賴（main.py 接線），provider 失敗絕不破壞記錄（no-observer-failure 不變量）。遮蔽在儲存 choke point、於 utf8-safe 與截斷**之前**（跨截斷邊界的金鑰不得半存活）；長度 <6 的值不遮（避免碎化一般文字）。
 - **已記錄殘餘限制**：使用者若仍把 key 貼在 instructions（不用欄位），且該值不匹配任何已知秘密，仍會被記錄——文件引導用欄位是第一線，遮蔽是已知值的兜底。
+- **第二輪對抗式複審（fd5acba 後）**：1 High + 7 Medium，裁決 7 修 1 won't-fix：
+  1. **H1 秘密經 run_shell echo 進 live 對話再流入 summary/job state**（recorder 只遮快照不改 live messages）→ 修類：tools.py 共用 `redact_known_secrets()` 套在 runtime 工具輸出、builder 全部 meta-tool 輸出（進對話前遮，模型只看得到遮蔽標記）、InstallOutcome summary/error 存 job 前。
+  2. **422 經 Pydantic `input` 回射 secret_value** → app 層 RequestValidationError handler 全域遞迴剝除 `input`（防未來任何敏感欄位的整類修法）。
+  3. **schema 允許 <6 字元但遮蔽器跳過** → schema 對齊 ≥6 + FE 鏡像。
+  4. **重疊秘密遮蔽順序**（先短後長留尾巴）→ 長度遞減排序替換（兩處遮蔽器皆改）。
+  5. **provider no-raise 未涵蓋迭代/非字串** → `list(provider())` 進 try + isinstance 過濾。
+  6. **尾端換行被 strip 而非 422 — won't-fix**：剪貼簿尾端換行是貼上偽影；strip-then-validate（內部換行仍 422）是刻意契約——正規化在 schema 單點發生、env 注入/.env 寫入/遮蔽集合看到同一值，無不一致風險。註解明示。
+  7. **.env 只換第一個同名行**（dotenv last-wins 讓模型寫的重複行蓋掉真值）→ 移除全部同名行（含 `export ` 前綴與空白容忍）再附加唯一真值行。
+  8. **rotation 秒級後綴 + 無序列化互相覆蓋 segment** → 專用 `_FILE_SINK_LOCK` 序列化整段 stat→rotate→append（刻意不用 ring lock，I/O 不進 ring 臨界區）+ rename 目標存在時遞增後綴。

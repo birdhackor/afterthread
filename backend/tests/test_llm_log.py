@@ -398,6 +398,65 @@ def test_redaction_provider_failure_records_unredacted(monkeypatch: pytest.Monke
     assert record["attempts"][0]["response_content"] == "a normal body with sk-secret-value inside"
 
 
+def test_redaction_provider_iterator_raising_midyield_records_unredacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F5: the provider values are materialized INSIDE _redact's guard, so a LAZY
+    provider (a generator) that raises PARTWAY through iteration -- not at call time --
+    still degrades to 'record unredacted' rather than breaking the recording. Without
+    the list() being inside the try, iterating the generator would raise straight into
+    the recorder."""
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+
+    def _lazy() -> Any:
+        yield "first-secret-value-abcdef"
+        raise RuntimeError("iterator exploded mid-yield")
+
+    monkeypatch.setattr(llm_log, "_secret_provider", _lazy)
+    llm_log._reset_for_tests()
+
+    _record(response="body with first-secret-value-abcdef inside")  # must not raise
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    # Iteration raised before completing -> the whole redact degrades to raw text,
+    # so even the already-yielded value is left in place rather than half-masked.
+    assert record["attempts"][0]["response_content"] == "body with first-secret-value-abcdef inside"
+
+
+def test_redaction_filters_non_string_provider_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F5: a provider yielding non-str values (a misconfigured provider) must not raise
+    in the ``in``/``replace`` -- non-strings are filtered out, and the str values are
+    still masked."""
+    secret = "real-secret-value-abcdef"
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: [None, 123456, secret])
+    llm_log._reset_for_tests()
+
+    _record(response=f"body with {secret} inside")  # must not raise
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    body = record["attempts"][0]["response_content"]
+    assert secret not in body
+    assert llm_log._REDACTION_MARKER in body
+
+
+def test_redaction_longest_first_leaves_no_suffix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F4: overlapping secrets are replaced LONGEST-first, so masking the shorter one
+    (a prefix of the longer) never leaves the longer's suffix exposed. Had the shorter
+    run first, 'XYZ789' would survive after 'abcdef' was masked inside the longer."""
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {"abcdef", "abcdefXYZ789"})
+    llm_log._reset_for_tests()
+
+    _record(response="key=abcdefXYZ789 end")
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    body = record["attempts"][0]["response_content"]
+    assert "abcdefXYZ789" not in body
+    assert "XYZ789" not in body  # the suffix a shorter-first pass would have leaked
+    assert body.count(llm_log._REDACTION_MARKER) == 1
+
+
 def test_file_sink_writes_valid_jsonl(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """With llm_log_file set, every finished record is appended as one valid JSON
     line carrying the full bodies (ensure_ascii=False keeps CJK readable)."""
@@ -568,6 +627,43 @@ def test_file_sink_rotation_failure_still_appends(
     assert "appended despite rotation failure" in log_file.read_text(encoding="utf-8")
     # The record also survived in the ring.
     assert len(llm_log.list_summaries(10)) == 1
+
+
+def test_file_sink_rotation_same_second_uses_unique_targets(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F8(b): two rotations within the SAME second must not clobber each other. The
+    first renames to ``<stamp>``; the second finds that name taken and falls back to
+    ``<stamp>-1``. Driven deterministically by PINNING the timestamp (monkeypatching
+    _rotation_stamp), not by racing threads, so the uniqueness fallback is exercised
+    reliably. Two distinct rotated files result, holding the two DIFFERENT old
+    contents -- no clobber."""
+    log_file = tmp_path / "llm.jsonl"
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(
+            llm_log_file=str(log_file), llm_log_file_max_bytes=1_000_000, llm_log_max_entries=50
+        ),
+    )
+    monkeypatch.setattr(llm_log, "_rotation_stamp", lambda: "20260716-120000Z")
+    llm_log._reset_for_tests()
+
+    # First oversized file -> first rotation -> <stamp> (holds the "x" content).
+    log_file.write_text("x" * 1_000_050 + "\n", encoding="utf-8")
+    _record(workflow="capture", response="first fresh line")
+    # Make the fresh file oversized again -> second rotation at the SAME pinned
+    # stamp -> the -1 fallback (holds the "y" content).
+    log_file.write_text("y" * 1_000_050 + "\n", encoding="utf-8")
+    _record(workflow="enrich", response="second fresh line")
+
+    rotated = sorted(p.name for p in tmp_path.iterdir() if p.name.startswith("llm.jsonl."))
+    assert rotated == ["llm.jsonl.20260716-120000Z", "llm.jsonl.20260716-120000Z-1"]
+    # No clobber: each rotated segment kept its own distinct old content.
+    assert (tmp_path / "llm.jsonl.20260716-120000Z").read_text(encoding="utf-8").startswith("x")
+    assert (tmp_path / "llm.jsonl.20260716-120000Z-1").read_text(encoding="utf-8").startswith("y")
+    # The live file holds only the newest record.
+    assert "second fresh line" in log_file.read_text(encoding="utf-8")
 
 
 class _RaisingHandler(logging.Handler):

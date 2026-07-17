@@ -678,6 +678,65 @@ def known_secret_values() -> frozenset[str]:
     return frozenset(secrets)
 
 
+# The exact-match marker every redacted secret VALUE is replaced with, in BOTH the
+# LIVE tool/meta-tool results (``redact_known_secrets`` below) and the STORED AI 日誌
+# bodies (``llm_log._redact``). The two must render IDENTICALLY -- a secret masked in
+# a live tool result and one masked in the log have to be indistinguishable -- so this
+# is a byte-for-byte copy of ``llm_log._REDACTION_MARKER``.
+#
+# It is DUPLICATED here rather than imported, and NOT hoisted into a shared home that
+# both modules import, on purpose: ``llm_log`` is a leaf observability module (it must
+# not import this capability module), and making a shared constant live in THIS module
+# for llm_log to import would invert that layering; a third tiny module for one string
+# buys nothing over the marker-mirroring convention this codebase already follows
+# (see ``_OUTPUT_TRUNCATION_MARKER``'s "Mirrors ..." note, and llm_log's own
+# "Mirrors ... memory_ai's markers"). So each module owns an equal literal, and
+# ``tests/test_tools.py`` pins the two equal so they can never silently drift.
+_REDACTION_MARKER = "•••[秘密已遮蔽]•••"
+
+# Values shorter than this are NEVER redacted -- the SAME floor ``llm_log._redact``
+# uses: masking a 1-5 char value would shred ordinary prose (imagine redacting every
+# "1234"), and a real API key/token is never that short. F3 makes the install-form
+# secret schema reject a <6-char value up front precisely so a legitimately-supplied
+# secret is always long enough to be redactable here.
+_MIN_SECRET_LEN = 6
+
+
+def redact_known_secrets(text: str) -> str:
+    """Replace every known secret VALUE in ``text`` with the redaction marker (D36).
+
+    The LIVE-conversation counterpart of ``llm_log._redact``. llm_log scrubs secrets
+    out of the bodies it STORES, but a disobedient tool/builder (``echo "$KB_API_KEY"``)
+    can put a secret value into a tool RESULT, which the llm loop wraps VERBATIM into
+    the next round's ``role:"tool"`` message -- where the model can read it and copy it
+    onward (into an install ``summary``, another tool call, ...). Masking every known
+    value at each boundary where raw tool output enters the conversation/state closes
+    that class: the model only ever sees the marker, never the value.
+
+    Values come from ``known_secret_values`` (our key + every installed tool's .env
+    values + the in-flight install secret). Sorted LONGEST-FIRST before replacing (F4):
+    with both ``abcdef`` and ``abcdefXYZ`` registered, replacing the shorter first
+    would mask ``abcdef`` inside the longer one and leave ``XYZ`` exposed, so the
+    superset value must be masked before its own prefix. Values under
+    ``_MIN_SECRET_LEN`` are skipped (same guard as ``llm_log._redact``). Substring
+    ``str.replace`` (not a regex) so a value containing regex metacharacters matches
+    literally.
+
+    Unlike ``llm_log._redact``, this is on the LIVE path, so it does NOT swallow a
+    provider failure into "return the text unmasked" -- that would leak the very value
+    it exists to hide. ``known_secret_values`` is itself defensive, and any surprise it
+    did raise degrades upstream into a safe failed-tool-result string (the llm loop's
+    and meta-tools' own ``except`` handlers), never a leak.
+    """
+    redacted = text
+    for value in sorted(known_secret_values(), key=len, reverse=True):
+        if len(value) < _MIN_SECRET_LEN:
+            continue
+        if value in redacted:
+            redacted = redacted.replace(value, _REDACTION_MARKER)
+    return redacted
+
+
 # --- execution -------------------------------------------------------------
 
 
@@ -1040,16 +1099,24 @@ def _run_tool_subprocess(
     output = _communicate_bounded(proc, input_text=args_json, cap=output_cap, timeout=timeout)
     if output.timed_out:
         return f"tool timed out after {timeout:g} seconds"
+    # F1/D36: mask any known secret VALUE the child wrote to stdout/stderr BEFORE the
+    # size cap. Redact-before-truncate is load-bearing (the same order llm_log's stored
+    # -body pipeline uses): a secret straddling the cap edge must be replaced while the
+    # text is still whole, or half of it would survive the cut. This is the boundary
+    # where raw child output first enters the app -- the llm loop wraps this string
+    # VERBATIM into the next round's role:"tool" message -- so masking here keeps a
+    # disobedient tool's echoed secret out of the LIVE conversation, not just the log.
+    # Applied on the taken branch only, so ``known_secret_values`` is computed once.
     # STDOUT over the cap is the success result, already truncated -- return it
     # regardless of the (kill-induced, negative) exit code the overflow kill left
     # behind: the tool produced its answer, we just stopped reading it. _cap_output
     # trims the retained cap+1 chars down to the cap behind the marker.
     if output.stdout_overflow:
-        return _cap_output(output.stdout, output_cap)
+        return _cap_output(redact_known_secrets(output.stdout), output_cap)
     if proc.returncode != 0:
-        stderr = _cap_output(output.stderr.strip(), output_cap)
+        stderr = _cap_output(redact_known_secrets(output.stderr).strip(), output_cap)
         return f"tool failed (exit {proc.returncode}): {stderr}"
-    return _cap_output(output.stdout, output_cap)
+    return _cap_output(redact_known_secrets(output.stdout), output_cap)
 
 
 def _make_handler(directory: Path, entry: list[str]) -> Callable[[dict[str, Any]], Awaitable[str]]:

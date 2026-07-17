@@ -5,9 +5,13 @@ import logging
 import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from context_memory.db import init_db
 from context_memory.routers import ai, items, review, tools
@@ -116,6 +120,43 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _strip_input_keys(value: Any) -> Any:
+    """Return ``value`` with every ``input`` mapping key removed, recursively.
+
+    FastAPI's default RequestValidationError handler serializes each error with an
+    ``input`` field carrying the REJECTED value -- and for a model-level validator
+    (a pydantic ``model_validator``) that ``input`` is the WHOLE request body. So a
+    ToolInstallRequest whose secret pair fails validation would otherwise echo its
+    ``secret_value`` straight back in the 422 body. Removing every ``input`` key, at
+    every depth, strips that echo as a CLASS -- it protects any future sensitive
+    field, not just this one. A body field literally named ``input`` is unharmed: it
+    appears in an error's ``loc`` as a list ELEMENT, never as a mapping key.
+    """
+    if isinstance(value, dict):
+        return {key: _strip_input_keys(item) for key, item in value.items() if key != "input"}
+    if isinstance(value, list):
+        return [_strip_input_keys(item) for item in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(
+    _request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """422 handler that strips the secret-echoing ``input`` from each error (F2).
+
+    Mirrors FastAPI's default -- status 422, ``{"detail": [...errors...]}`` with the
+    errors ``jsonable_encoder``-serialized -- but with every ``input`` key removed
+    (see ``_strip_input_keys`` for the WHY: a model-level validator's ``input`` is
+    the whole body, so a rejected ToolInstallRequest would echo its ``secret_value``).
+    The rest of each error's shape (``loc`` / ``msg`` / ``type`` / ``ctx`` / ``url``)
+    is preserved, so existing FE error handling and the 422 tests are unaffected.
+    """
+    detail = _strip_input_keys(jsonable_encoder(exc.errors()))
+    return JSONResponse(status_code=422, content={"detail": detail})
+
 
 app.include_router(items.router, prefix="/api")
 app.include_router(review.router, prefix="/api")

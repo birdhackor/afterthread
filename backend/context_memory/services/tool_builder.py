@@ -413,14 +413,22 @@ def _run_shell_subprocess(
     output = tools._communicate_bounded(proc, input_text=None, cap=cap, timeout=timeout)
     if output.timed_out:
         return f"command timed out after {timeout:g} seconds"
+    # F1/D36: mask any known secret VALUE in the builder shell's output BEFORE the
+    # size cap (redact-before-truncate, the same order as tools._run_tool_subprocess
+    # and llm_log). run_shell is the EXACT vector D36 calls out -- a disobedient
+    # builder `echo "$KB_API_KEY"` puts the value on stdout, which the llm loop wraps
+    # VERBATIM into the next round's role:"tool" message -- so masking the result here
+    # keeps the value out of the LIVE builder conversation (the in-flight install
+    # secret is registered as known for the whole build; see run_install). Applied on
+    # the taken branch only, so known_secret_values is computed once.
     # Streamed past the cap: return the truncated (already marked) output whatever
     # the kill-induced exit code, mirroring the runtime tool's over-cap handling.
     if output.stdout_overflow:
-        return tools._cap_output(output.stdout, cap)
+        return tools._cap_output(tools.redact_known_secrets(output.stdout), cap)
     if proc.returncode != 0:
-        body = tools._cap_output(output.stdout.strip(), cap)
+        body = tools._cap_output(tools.redact_known_secrets(output.stdout).strip(), cap)
         return f"command failed (exit {proc.returncode}): {body}"
-    return tools._cap_output(output.stdout, cap)
+    return tools._cap_output(tools.redact_known_secrets(output.stdout), cap)
 
 
 def _build_meta_tools(staging: Path, secret_env: dict[str, str] | None = None) -> list[LlmTool]:
@@ -503,7 +511,12 @@ def _build_meta_tools(staging: Path, secret_env: dict[str, str] | None = None) -
                 return (
                     f"read_file failed: file is too large (exceeds the {cap}-character output cap)"
                 )
-            return tools._cap_output(text, cap)
+            # F1/D36: mask any known secret the file CONTENTS carry (e.g. a value the
+            # model piped into a staged file via run_shell) BEFORE the size cap, so a
+            # secret straddling the cut is fully masked (redact-before-truncate, same
+            # rationale as llm_log). read_file is a conversation-facing meta-tool
+            # result, so this keeps the value out of the LIVE builder conversation.
+            return tools._cap_output(tools.redact_known_secrets(text), cap)
 
         try:
             return await run_in_threadpool(_read)
@@ -565,7 +578,11 @@ def _build_meta_tools(staging: Path, secret_env: dict[str, str] | None = None) -
                 entries.append(
                     f"... (truncated at {_LIST_DIR_MAX_ENTRIES} entries; more not shown)"
                 )
-            return "\n".join(entries)
+            # F1/D36: a staged FILENAME could embed a known secret (e.g. the model ran
+            # `... > "$KB_API_KEY.txt"` in run_shell), so mask any such value out of the
+            # listing before it enters the LIVE builder conversation, uniformly with the
+            # other meta-tools.
+            return tools.redact_known_secrets("\n".join(entries))
 
         try:
             return await run_in_threadpool(_list)
@@ -707,15 +724,42 @@ def _builder_user_prompt(instructions: str, openapi_text: str) -> str:
 # --- staging promotion + cleanup ---------------------------------------------
 
 
+def _env_line_key(line: str) -> str | None:
+    """The KEY a ``.env`` line assigns, or None if it assigns nothing.
+
+    Tolerates the shapes python-dotenv itself accepts around a key: optional leading
+    whitespace, an optional ``export `` prefix, the key, optional whitespace, then the
+    ``=``. So ``NAME=v``, ``NAME =v``, ``  NAME=v``, and ``export NAME=v`` all yield
+    ``NAME``; a comment or blank line (no ``=``) yields None and is never mistaken for
+    the secret's key. Used by ``_inject_secret_into_env`` (F7) to drop EVERY prior line
+    assigning our NAME, since python-dotenv is LAST-occurrence-wins.
+    """
+    if "=" not in line:
+        return None
+    key = line.split("=", 1)[0].strip()
+    # An ``export `` prefix (dotenv accepts ``export FOO=bar``); require whitespace
+    # after the keyword so a literal key named ``exportFOO`` is not misparsed.
+    if key.startswith("export") and key[6:7].isspace():
+        key = key[6:].strip()
+    return key or None
+
+
 def _inject_secret_into_env(env_file: Path, name: str, value: str) -> str | None:
     """Write ``name=value`` into the staged package's ``.env``; None = ok (D36).
 
     Blocking (runs inside ``_promote_staging`` via ``run_in_threadpool``). Creates
-    the file when the LLM wrote none; if the LLM DISOBEYED and already wrote a
-    ``name=`` line, that line is REPLACED (never duplicated) so the real value
-    wins. Read and write both funnel through the bounded, FIFO/symlink-hardened
-    ``tools`` helpers (``.env`` files are small, so the manifest caps do not
-    apply, but the jail hardening still should).
+    the file when the LLM wrote none; if the LLM DISOBEYED and already wrote one or
+    more ``name=`` lines, EVERY such line is dropped and the single real line is
+    appended, so the backend's value is unambiguously the one that wins. Read and
+    write both funnel through the bounded, FIFO/symlink-hardened ``tools`` helpers
+    (``.env`` files are small, so the manifest caps do not apply, but the jail
+    hardening still should).
+
+    Dropping EVERY match, not just the first, is load-bearing (F7): python-dotenv is
+    LAST-occurrence-wins, so replacing only the first ``NAME=`` line would let a SECOND
+    (model-written) ``NAME=`` line further down OVERRIDE the backend's real value while
+    the install still succeeded. ``_env_line_key`` tolerates the ``NAME=`` / ``NAME =``
+    / ``export NAME=`` shapes dotenv accepts so none of them can slip past the drop.
 
     ``validate_package`` already vetted any pre-existing ``.env`` at <=64KiB, but
     it never saw THIS appended line, so we re-check the POST-append encoded size
@@ -732,20 +776,10 @@ def _inject_secret_into_env(env_file: Path, name: str, value: str) -> str | None
             # package, so this is a defensive backstop, not the primary gate.
             return _ERROR_SECRET_ENV_WRITE
         existing = text
-    line = f"{name}={value}"
-    replaced = False
-    kept: list[str] = []
-    for existing_line in existing.splitlines():
-        # Replace the plain ``NAME=`` / ``NAME =`` form the model would most
-        # likely have written; a comment or blank line never matches its key.
-        # Only the FIRST match is replaced (a well-formed .env has one line/key).
-        if not replaced and existing_line.split("=", 1)[0].strip() == name:
-            kept.append(line)
-            replaced = True
-        else:
-            kept.append(existing_line)
-    if not replaced:
-        kept.append(line)
+    # Drop EVERY line assigning our NAME (any of the tolerated shapes), keep the rest
+    # verbatim, then append the single real line LAST so it is the effective value.
+    kept = [line for line in existing.splitlines() if _env_line_key(line) != name]
+    kept.append(f"{name}={value}")
     new_content = "\n".join(kept) + "\n"
     if len(new_content.encode("utf-8")) > tools._ENV_FILE_MAX_BYTES:
         return _ERROR_SECRET_ENV_TOO_LARGE
@@ -897,11 +931,24 @@ async def run_install(
             return InstallOutcome(ok=False, error=llm_error, llm_log_id=llm_log_id)
         assert result is not None  # exactly one of result/llm_error is set above
 
+        # F1/D36: the model is told never to print the secret in its summary, but a
+        # disobedient builder could. Redact the summary ONCE here -- the single choke
+        # point for the outcome -- and derive every InstallOutcome below from the
+        # masked value. It MUST happen HERE, not at job-update time: run_install's
+        # finally (below) discards the in-flight secret before this function returns,
+        # and a FAILED install also deletes the staging .env, so by the time _run_job
+        # stores the outcome ``known_secret_values`` would no longer carry the value --
+        # redacting then would be a no-op that leaks. The other outcome ``error`` fields
+        # are safe by construction: the not-ready error is built from this masked
+        # summary, and the llm/promote errors are backend/category strings that never
+        # carry the value (str(exc) is category-only; promote errors are fixed zh-TW).
+        summary = tools.redact_known_secrets(result.summary) if result.summary else None
+
         if not result.ready:
-            reason = result.summary or "（AI 未說明原因）"  # noqa: RUF001
+            reason = summary or "（AI 未說明原因）"  # noqa: RUF001
             return InstallOutcome(
                 ok=False,
-                summary=result.summary or None,
+                summary=summary,
                 error=f"AI 判定工具尚未完成：{reason}",  # noqa: RUF001
                 llm_log_id=llm_log_id,
             )
@@ -913,14 +960,14 @@ async def run_install(
             return InstallOutcome(
                 ok=False,
                 tool_name=result.tool_name,
-                summary=result.summary or None,
+                summary=summary,
                 error=promote_error,
                 llm_log_id=llm_log_id,
             )
         return InstallOutcome(
             ok=True,
             tool_name=result.tool_name,
-            summary=result.summary or None,
+            summary=summary,
             llm_log_id=llm_log_id,
         )
     finally:

@@ -681,9 +681,14 @@ def test_run_install_secret_injected_into_shell_and_env_never_in_prompt(
     )
 
     assert outcome.ok is True
-    # run_shell DID see the secret (it could live-test the real API with it).
-    assert f"probe={secret_value}" in captured["shell"]
-    # The promoted tool's .env carries the secret, written by the backend.
+    # run_shell DID inject the secret into its env (the builder can live-test the real
+    # API with it), but F1 MASKS any known secret value out of the meta-tool RESULT
+    # before it re-enters the builder conversation -- so the raw value never rides
+    # back, only the redaction marker where it stood.
+    assert secret_value not in captured["shell"]
+    assert tools._REDACTION_MARKER in captured["shell"]
+    # The promoted tool's .env carries the secret, written by the backend (the .env
+    # file is not the conversation, so it holds the raw value).
     env_text = (root / "kbsearch" / ".env").read_text(encoding="utf-8")
     assert f"{secret_name}={secret_value}" in env_text
     # The system prompt names the secret but NEVER its value; neither does the
@@ -814,6 +819,109 @@ def test_run_install_secret_over_env_cap_refused(
     assert outcome.error == tool_builder._ERROR_SECRET_ENV_TOO_LARGE
     assert not (root / "kbsearch").exists()  # nothing promoted
     assert not (root / ".staging").exists()  # staging cleaned
+
+
+def test_run_install_redacts_secret_from_summary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """F1(c): a disobedient builder that prints the secret VALUE in its summary must
+    not leak it into the outcome (-> job state -> poll response). The summary is
+    redacted at the source, while the in-flight secret is still registered, so the
+    stored summary carries the marker, never the value."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    secret_value = "leaky-secret-value-abcdef123"
+
+    async def fake(
+        system_prompt: str,
+        user_prompt: str,
+        model_cls: type[BaseModel],
+        *,
+        workflow: str = "unknown",
+        tools: Any = None,
+        max_tool_rounds: int | None = None,
+        timeout_seconds: float | None = None,
+    ) -> BaseModel:
+        by_name = {t.spec["function"]["name"]: t for t in tools or []}
+        await by_name["write_file"].handler(
+            {"path": "tool.json", "content": json.dumps(_package_manifest("kbsearch"))}
+        )
+        await by_name["write_file"].handler({"path": "run.py", "content": _GOOD_RUN_PY})
+        # The model DISOBEYS and echoes the secret value in its summary.
+        return model_cls.model_validate(
+            {"tool_name": "kbsearch", "summary": f"done using {secret_value}", "ready": True}
+        )
+
+    monkeypatch.setattr("context_memory.services.tool_builder.generate_structured", fake)
+    _no_fetch(monkeypatch)
+
+    outcome = asyncio.run(
+        run_install(
+            "http://kb.example/openapi.json",
+            "build",
+            secret_name="KB_API_KEY",
+            secret_value=secret_value,
+        )
+    )
+    assert outcome.ok is True
+    assert secret_value not in (outcome.summary or "")
+    assert tools._REDACTION_MARKER in (outcome.summary or "")
+
+
+def test_run_install_redacts_secret_from_not_ready_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """F1(c): on a ready=false outcome the error is built FROM the summary, so the
+    single source redaction keeps the secret out of BOTH the summary and the error."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    secret_value = "leaky-secret-value-abcdef123"
+    _fake_generate(
+        monkeypatch,
+        result={"summary": f"blocked, saw {secret_value}", "ready": False},
+    )
+    _no_fetch(monkeypatch)
+
+    outcome = asyncio.run(
+        run_install(
+            "http://kb.example/openapi.json",
+            "build",
+            secret_name="KB_API_KEY",
+            secret_value=secret_value,
+        )
+    )
+    assert outcome.ok is False
+    assert secret_value not in (outcome.summary or "")
+    assert secret_value not in (outcome.error or "")
+    assert tools._REDACTION_MARKER in (outcome.error or "")
+
+
+def test_inject_secret_removes_all_duplicate_name_lines(tmp_path: Path) -> None:
+    """F7: python-dotenv is LAST-occurrence-wins, so _inject_secret_into_env drops
+    EVERY prior NAME= line (plain, spaced, or ``export ``-prefixed) and appends the
+    single real line -- a model-written second NAME= line can never override the
+    backend's value. The final .env has exactly one NAME= line and dotenv_values
+    resolves NAME to the backend's value; unrelated lines are preserved."""
+    from dotenv import dotenv_values
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "OTHER=keep\n"
+        "KB_API_KEY=first-model-placeholder\n"
+        "MIDDLE=alsokeep\n"
+        "export KB_API_KEY=second-model-placeholder\n",
+        encoding="utf-8",
+    )
+
+    error = tool_builder._inject_secret_into_env(env_file, "KB_API_KEY", "real-secret-abcdef")
+    assert error is None
+
+    text = env_file.read_text(encoding="utf-8")
+    assert text.count("KB_API_KEY=") == 1  # both model lines dropped, one real appended
+    resolved = dotenv_values(str(env_file))
+    assert resolved["KB_API_KEY"] == "real-secret-abcdef"  # the backend's value wins
+    assert resolved["OTHER"] == "keep"  # unrelated lines preserved
+    assert resolved["MIDDLE"] == "alsokeep"
 
 
 def test_router_install_threads_secret_pair(
@@ -1374,6 +1482,54 @@ def test_router_install_validates_request(
 ) -> None:
     _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
     assert client.post("/api/tools/install", json=payload).status_code == 422
+
+
+def test_router_install_422_rejects_short_secret_value(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """F3: a secret value under the 6-char redactor floor is a 422 with the fixed
+    zh-TW message -- accepting one would create a secret the redactor could never
+    mask (it skips <6-char values)."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    response = client.post(
+        "/api/tools/install",
+        json={
+            "openapi_url": "http://kb.example/openapi.json",
+            "instructions": "build",
+            "secret_name": "KB_API_KEY",
+            "secret_value": "abc",  # 3 chars, under the floor
+        },
+    )
+    assert response.status_code == 422
+    assert "秘密值長度至少 6 字元" in response.text
+
+
+def test_router_install_422_does_not_echo_secret_value(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """F2: a request whose secret pair fails validation must NOT echo secret_value
+    back in the 422 body. FastAPI's default handler puts the whole request body in
+    each error's ``input`` (a model-level validator's input IS the body); the
+    app-level handler strips every ``input`` key, so the value never rides back --
+    while loc/msg/type survive so FE error handling is unaffected."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    secret = "topsecret-should-not-echo-abcdef"
+    response = client.post(
+        "/api/tools/install",
+        json={
+            "openapi_url": "http://kb.example/openapi.json",
+            "instructions": "build",
+            "secret_name": "kb_key",  # invalid env-var name -> model validator 422
+            "secret_value": secret,
+        },
+    )
+    assert response.status_code == 422
+    assert secret not in response.text  # the value never echoed back
+    detail = response.json()["detail"]
+    assert isinstance(detail, list) and detail  # still the default list-of-errors shape
+    assert "input" not in json.dumps(detail)  # the echoing key is gone at every depth
+    # The rest of each error's shape is intact, so existing FE handling still works.
+    assert all("loc" in err and "msg" in err and "type" in err for err in detail)
 
 
 def test_router_job_status_and_404(client: TestClient) -> None:

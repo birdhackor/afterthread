@@ -128,6 +128,20 @@ def test_tool_install_request_empty_secret_strings_normalize_to_none() -> None:
     assert req.secret_value is None
 
 
+def test_tool_install_request_accepts_six_char_value() -> None:
+    """Exactly 6 chars is the floor (>= 6), so it is accepted (F3)."""
+    req = _install_req(secret_name="KB_API_KEY", secret_value="abcdef")
+    assert req.secret_value == "abcdef"
+
+
+def test_tool_install_request_rejects_short_value_with_message() -> None:
+    """F3: a value under the 6-char floor 422s with the fixed zh-TW message -- the
+    redactor skips <6-char values, so accepting one would be unredactable."""
+    with pytest.raises(ValidationError) as excinfo:
+        _install_req(secret_name="KB_API_KEY", secret_value="abc")
+    assert "秘密值長度至少 6 字元" in str(excinfo.value)
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -138,6 +152,7 @@ def test_tool_install_request_empty_secret_strings_normalize_to_none() -> None:
         {"secret_name": "A" * 65, "secret_value": "v"},  # over 64 chars
         {"secret_name": "KB KEY", "secret_value": "v"},  # space in name
         {"secret_name": "KB_KEY", "secret_value": "line1\nline2"},  # multiline value
+        {"secret_name": "KB_KEY", "secret_value": "abc"},  # under the 6-char floor (F3)
     ],
     ids=[
         "value-missing",
@@ -147,6 +162,7 @@ def test_tool_install_request_empty_secret_strings_normalize_to_none() -> None:
         "too-long",
         "space-in-name",
         "multiline-value",
+        "short-value",
     ],
 )
 def test_tool_install_request_rejects_bad_secret_pair(overrides: dict[str, Any]) -> None:

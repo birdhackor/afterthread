@@ -185,4 +185,19 @@ describe("secretNameError / secretValueError (both-or-neither pair)", () => {
 		expect(secretNameError("kb_key", "v")).toContain("大寫字母");
 		expect(secretNameError("1KEY", "v")).toContain("大寫字母");
 	});
+
+	it("flags a value under the 6-char redactor floor (F3)", () => {
+		// A complete pair with a short value: the value field errors.
+		expect(secretValueError("KB_API_KEY", "abc")).toBe("秘密值長度至少 6 字元");
+		// Exactly 6 is the floor (>= 6), so it is accepted.
+		expect(secretValueError("KB_API_KEY", "abcdef")).toBeNull();
+		// Trimmed before measuring, so surrounding spaces do not count.
+		expect(secretValueError("KB_API_KEY", "  ab  ")).toBe(
+			"秘密值長度至少 6 字元",
+		);
+		// A missing name is the half-pair error (on the name field); the value
+		// field stays clean even for a short value, mirroring the backend's
+		// pair-incomplete-before-length precedence.
+		expect(secretValueError("", "abc")).toBeNull();
+	});
 });

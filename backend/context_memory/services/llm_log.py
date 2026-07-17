@@ -278,7 +278,9 @@ def _aggregate_usage(attempts: list[LlmAttempt]) -> dict[str, int | None] | None
 # body ("秘密已遮蔽" = secret has been masked) and the •••…••• fence make a
 # redaction obvious to a reader of the AI 日誌 / JSONL sink, and distinct from
 # the truncation/elision markers above (those mean "cut for size", this means
-# "removed for secrecy").
+# "removed for secrecy"). ``tools._REDACTION_MARKER`` keeps a byte-for-byte equal
+# literal for the LIVE-conversation redactor (see the note there on why it is
+# duplicated rather than shared -- llm_log stays leaf); a test pins the two equal.
 _REDACTION_MARKER = "•••[秘密已遮蔽]•••"
 
 # Values shorter than this are NEVER redacted (see `_redact`): a 1-5 char value
@@ -333,11 +335,21 @@ def _redact(text: str) -> str:
     if provider is None:
         return text
     try:
-        values = provider()
+        # Materialize the values INSIDE the guard (F5): the provider may be a lazy
+        # iterable that raises at YIELD time, not just at call time, so ``list()`` must
+        # be inside this try or such a failure would escape into the recorder. Keep
+        # only ``str`` values in the same pass -- a non-str would raise in the ``in`` /
+        # ``replace`` below -- so any failure (call, iteration, or a bad element) still
+        # degrades to "record unredacted", never raises (the no-observer-failure
+        # invariant).
+        values = [value for value in provider() if isinstance(value, str)]
     except Exception:
         return text
     redacted = text
-    for value in values:
+    # F4: replace the LONGEST values first. With both "abcdef" and "abcdefXYZ"
+    # registered, masking the shorter first would replace it INSIDE the longer one and
+    # leave "XYZ" exposed; longest-first masks the superset value before its own prefix.
+    for value in sorted(values, key=len, reverse=True):
         if not value or len(value) < _MIN_SECRET_LEN:
             continue
         if value in redacted:
@@ -748,6 +760,28 @@ def _record_summary(record: LlmInteractionRecord) -> dict[str, Any]:
     }
 
 
+# Serializes the ENTIRE stat -> maybe-rotate -> append sequence of the JSONL sink
+# (F8). Deliberately NOT the ring's ``_LOCK``: the design keeps slow file I/O OUT of
+# the ring's critical section (see the module docstring -- both sinks run outside
+# ``_LOCK`` so a slow disk never serializes concurrent interactions behind the ring),
+# but rotation is a read-then-modify (stat the file, rename it aside, then append), so
+# two interactions finishing at once could both see the file oversized and both rename
+# it -- the second clobbering the first's rotated segment, or racing the fresh-file
+# append. Its OWN lock makes that sequence atomic w.r.t. other sink writers while
+# holding NONE of the ring lock, so the ring's fast path stays uncontended.
+_FILE_SINK_LOCK = threading.Lock()
+
+
+def _rotation_stamp() -> str:
+    """The UTC ``YYYYMMDD-HHMMSSZ`` suffix a rotated sink file is named with.
+
+    Factored out of ``_rotate_file_sink`` so a test can monkeypatch it to force two
+    rotations onto the SAME second and prove the uniqueness fallback (F8) picks
+    distinct targets, without racing wall-clock time.
+    """
+    return datetime.now(UTC).strftime("%Y%m%d-%H%M%SZ")
+
+
 def _rotate_file_sink(path: str) -> None:
     """Rename the sink file aside when it has outgrown ``llm_log_file_max_bytes``.
 
@@ -780,9 +814,24 @@ def _rotate_file_sink(path: str) -> None:
     except Exception:
         # Defensive: rotation is best-effort and must never raise into the sink.
         return
-    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%SZ")
+    stamp = _rotation_stamp()
     with contextlib.suppress(Exception):
-        os.rename(path, f"{path}.{stamp}")
+        # F8(b): two rotations within the SAME second would collide on the timestamped
+        # name (and, absent the _FILE_SINK_LOCK serialization, could clobber each
+        # other). Find a free target: ``<stamp>``, then ``<stamp>-1``, ``-2``, ... --
+        # ``lexists`` so a broken symlink or any pre-existing entry still counts as
+        # taken. Bounded: after 100 tries, GIVE UP rotating and return (the append that
+        # follows lands on the still-oversized file, one write past the cap, which the
+        # next write rotates) -- all inside the suppress, since rotation is best-effort
+        # and must never break the sink.
+        target = f"{path}.{stamp}"
+        suffix = 0
+        while os.path.lexists(target):
+            suffix += 1
+            if suffix > 100:
+                return
+            target = f"{path}.{stamp}-{suffix}"
+        os.rename(path, target)
 
 
 def _write_file_sink(record: LlmInteractionRecord) -> None:
@@ -808,20 +857,24 @@ def _write_file_sink(record: LlmInteractionRecord) -> None:
     path = get_settings().llm_log_file.strip()
     if not path:
         return
-    _rotate_file_sink(path)
-    try:
-        line = json.dumps(_record_detail(record), ensure_ascii=False)
-        with open(path, "a", encoding="utf-8") as handle:
-            # A failure mid-write (e.g. disk full) can still leave a truncated,
-            # unparsable final line even though the whole write sits inside
-            # this try -- the OS may already have flushed a partial chunk.
-            # Adjudicated as acceptable for an opt-in debug sink: not worth a
-            # transactional write (temp file + atomic rename) here, so a JSONL
-            # consumer should tolerate/skip a trailing line that fails to
-            # json.loads rather than assume every line is well-formed.
-            handle.write(line + "\n")
-    except Exception as exc:
-        logger.warning("llm log file sink write failed (%s): %s", path, type(exc).__name__)
+    # F8(a): serialize the ENTIRE rotate + append under the dedicated _FILE_SINK_LOCK
+    # (never the ring's _LOCK -- see that lock's comment) so two interactions
+    # finishing at once cannot both rotate-and-clobber or interleave their appends.
+    with _FILE_SINK_LOCK:
+        _rotate_file_sink(path)
+        try:
+            line = json.dumps(_record_detail(record), ensure_ascii=False)
+            with open(path, "a", encoding="utf-8") as handle:
+                # A failure mid-write (e.g. disk full) can still leave a truncated,
+                # unparsable final line even though the whole write sits inside
+                # this try -- the OS may already have flushed a partial chunk.
+                # Adjudicated as acceptable for an opt-in debug sink: not worth a
+                # transactional write (temp file + atomic rename) here, so a JSONL
+                # consumer should tolerate/skip a trailing line that fails to
+                # json.loads rather than assume every line is well-formed.
+                handle.write(line + "\n")
+        except Exception as exc:
+            logger.warning("llm log file sink write failed (%s): %s", path, type(exc).__name__)
 
 
 def _log_summary(record: LlmInteractionRecord) -> None:

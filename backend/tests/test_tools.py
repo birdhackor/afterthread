@@ -776,7 +776,9 @@ def test_runtime_env_scrubbed_but_dotenv_present(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The child sees the tool's own .env secret but NOT OPENAI_API_KEY -- the
-    parent environment is never inherited wholesale."""
+    parent environment is never inherited wholesale. The .env value IS injected
+    (so it is not "None"), but F1 masks any known secret VALUE out of the RESULT
+    before it reaches the conversation, so the raw value never rides back."""
     monkeypatch.setenv("OPENAI_API_KEY", "sk-secret-should-not-leak")
     root = tmp_path / "tools"
     _make_tool(
@@ -785,13 +787,17 @@ def test_runtime_env_scrubbed_but_dotenv_present(
         "import os, sys\n"
         "sys.stdout.write('OPENAI=' + str(os.environ.get('OPENAI_API_KEY')) + "
         "';SECRET=' + str(os.environ.get('TOOL_SECRET')))\n",
-        dotenv="TOOL_SECRET=from-dotenv\n",
+        dotenv="TOOL_SECRET=from-dotenv-abcdef\n",
     )
     _install_tools(monkeypatch, root)
 
     result = asyncio.run(enabled_llm_tools()[0].handler({}))
-    assert "OPENAI=None" in result
-    assert "SECRET=from-dotenv" in result
+    assert "OPENAI=None" in result  # our key was never in the child env
+    # The .env secret WAS injected -- "SECRET=None" would mean it was absent -- but
+    # F1 masks the known value in the result, so it comes back as the marker.
+    assert "SECRET=None" not in result
+    assert f"SECRET={tools._REDACTION_MARKER}" in result
+    assert "from-dotenv-abcdef" not in result  # the raw value never rides back
     assert "sk-secret-should-not-leak" not in result
 
 
@@ -799,12 +805,19 @@ def test_runtime_dotenv_does_not_interpolate_parent_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A tool .env value of ``${OPENAI_API_KEY}`` must reach the child as that
-    LITERAL string, NOT the real key: python-dotenv's default POSIX
-    interpolation would resolve it from the parent os.environ -- reinjecting the
-    very credential the from-scratch env exists to exclude (interpolate=False)."""
+    LITERAL string, NOT the real key: python-dotenv's default POSIX interpolation
+    would resolve it from the parent os.environ -- reinjecting the very credential
+    the from-scratch env exists to exclude (interpolate=False).
+
+    Asserted on the BUILT child env directly rather than through the subprocess
+    RESULT, because F1 now masks any known secret value out of that result -- and the
+    literal ``${OPENAI_API_KEY}`` is itself a registered .env value, so a
+    result-level check could no longer tell the literal from the resolved key (both
+    would come back masked). The env dict is the precise unit under test and is
+    unaffected by the result-side redaction."""
     monkeypatch.setenv("OPENAI_API_KEY", "sk-secret-should-not-leak")
     root = tmp_path / "tools"
-    _make_tool(
+    pkg = _make_tool(
         root,
         "envtool",
         "import os, sys\nsys.stdout.write('LEAK=' + str(os.environ.get('LEAK')))\n",
@@ -812,9 +825,9 @@ def test_runtime_dotenv_does_not_interpolate_parent_env(
     )
     _install_tools(monkeypatch, root)
 
-    result = asyncio.run(enabled_llm_tools()[0].handler({}))
-    assert result == "LEAK=${OPENAI_API_KEY}"  # literal, not the resolved key
-    assert "sk-secret-should-not-leak" not in result
+    env = tools._build_tool_env(pkg)
+    assert env["LEAK"] == "${OPENAI_API_KEY}"  # literal, not the resolved parent key
+    assert "sk-secret-should-not-leak" not in env.values()
 
 
 def test_runtime_background_descendant_reaped_no_thread_leak(
@@ -1016,6 +1029,61 @@ def test_validate_package_flags_oversized_dotenv(
     # was the .env size, not some other defect, that failed it.
     (pkg / ".env").unlink()
     assert tools.validate_package(pkg, "big") is None
+
+
+# --- known-secret redaction (F1 / F4, D36) ---------------------------------
+
+
+def test_redaction_marker_matches_llm_log() -> None:
+    """tools._REDACTION_MARKER and llm_log._REDACTION_MARKER MUST be byte-identical:
+    a secret masked in a live tool result and one masked in the AI 日誌 have to be
+    indistinguishable. They are deliberately duplicated (llm_log stays a leaf
+    observability module -- see the note on tools._REDACTION_MARKER), so this pins
+    them equal against silent drift."""
+    assert tools._REDACTION_MARKER == llm_log._REDACTION_MARKER
+
+
+def test_redact_known_secrets_masks_and_skips_short(monkeypatch: pytest.MonkeyPatch) -> None:
+    """redact_known_secrets masks every known value and SKIPS values under the
+    6-char floor (mirroring llm_log._redact), replacing with the shared marker."""
+    monkeypatch.setattr(
+        tools, "known_secret_values", lambda: frozenset({"live-secret-abcdef", "short"})
+    )
+    out = tools.redact_known_secrets("a live-secret-abcdef b short c")
+    assert "live-secret-abcdef" not in out
+    assert tools._REDACTION_MARKER in out
+    assert "short" in out  # < 6 chars -> never redacted (would shred prose)
+
+
+def test_redact_known_secrets_longest_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F4: overlapping values are replaced LONGEST-first, so masking a shorter value
+    that is a PREFIX of a longer one never leaves the longer's suffix exposed."""
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({"abcdef", "abcdefXYZ789"}))
+    out = tools.redact_known_secrets("key=abcdefXYZ789 end")
+    assert "abcdefXYZ789" not in out
+    assert "XYZ789" not in out  # the suffix a shorter-first pass would have leaked
+    assert out.count(tools._REDACTION_MARKER) == 1
+
+
+def test_runtime_tool_output_masks_known_env_secret(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """F1(a): a runtime tool that echoes its OWN .env secret to stdout has that value
+    masked in the RESULT the model sees -- the llm loop wraps this string verbatim
+    into the next round, so masking it here keeps the secret out of the LIVE
+    conversation, consistent with the AI 日誌 redaction."""
+    root = tmp_path / "tools"
+    _make_tool(
+        root,
+        "leak",
+        "import os, sys\nsys.stdout.write('key=' + str(os.environ.get('TOOL_SECRET')))\n",
+        dotenv="TOOL_SECRET=kb-live-key-abcdef123456\n",
+    )
+    _install_tools(monkeypatch, root)
+
+    result = asyncio.run(enabled_llm_tools()[0].handler({}))
+    assert "kb-live-key-abcdef123456" not in result
+    assert tools._REDACTION_MARKER in result
 
 
 # --- runtime: validation / listing -----------------------------------------

@@ -111,5 +111,15 @@ export function secretValueError(name, value) {
 	if (trimmedValue === "") {
 		return "請輸入秘密值，或清空秘密名稱";
 	}
+	// F3: mirror the backend's >= 6-char floor. The redactor skips values shorter
+	// than 6 chars, so a shorter secret could never be masked out of the AI 日誌 or
+	// a live tool result -- rejecting it up front gives an immediate field error.
+	// Only fires for a COMPLETE pair (a name is present): when the name is missing,
+	// secretNameError carries the half-pair error and the value field stays clean,
+	// mirroring the backend's pair-incomplete-before-length precedence. The backend
+	// re-validates authoritatively (422).
+	if (trimmedName !== "" && trimmedValue.length < 6) {
+		return "秘密值長度至少 6 字元";
+	}
 	return null;
 }
