@@ -83,6 +83,21 @@ _RATIO_CEIL = 2.0
 # -- so char_allowance never returns below this.
 _ALLOWANCE_FLOOR = 1000
 
+# The sanity ceiling on a single observation, applied to BOTH sides of the pair.
+# A completion against even a 1M-context model can never legitimately report
+# more than ten million prompt tokens; a report above that is a broken or
+# hostile gateway (``_extract_usage`` only checks "positive int", not
+# "plausible") and must be rejected before it ever reaches the window -- once
+# an astronomically large int sits in _WINDOW, Σtokens / Σchars can raise
+# OverflowError converting the ratio to a float (see _ratio_locked), which
+# would break every LLM completion and GET /llm/status on every call until the
+# offending samples age out -- and since the window only rolls forward on NEW
+# completions, a call that raises here can never produce one, so it would never
+# recover on its own. ``chars`` is guarded by the same constant belt-and-braces:
+# it comes from our own _conversation_chars and is budget-bounded in practice,
+# but the check is one comparison and costs nothing.
+_MAX_OBSERVED_TOKENS = 10_000_000
+
 
 def _ratio_locked() -> float | None:
     """The clamped observed ratio, or None below _MIN_SAMPLES. Caller holds _LOCK.
@@ -94,11 +109,40 @@ def _ratio_locked() -> float | None:
     the totals weight each observation by its size, which is exactly what a budget
     conversion cares about. Σchars is a sum of positive ints (``observe`` rejects
     non-positive), so at >= _MIN_SAMPLES it is never zero.
+
+    The ceiling/floor clamp is checked BEFORE the division, as plain integer
+    comparisons on the totals, rather than dividing first and clamping the
+    float result: Python promotes int/int true division to float, and float()
+    on an astronomically large quotient raises OverflowError. ``observe`` now
+    rejects any single observation above _MAX_OBSERVED_TOKENS, but this
+    ordering is defense in depth for a huge value that reaches the window by
+    some future path -- an OverflowError here would raise out of
+    tokens_per_char/snapshot on EVERY call while the bad samples sit in the
+    window (up to _WINDOW_MAXLEN calls, since the window only rolls forward on
+    NEW completions and a call that raises here can never produce one),
+    breaking every LLM completion and GET /llm/status until they age out on
+    their own. Comparing the plain ints first can never overflow.
     """
     if len(_WINDOW) < _MIN_SAMPLES:
         return None
     total_chars = sum(chars for chars, _ in _WINDOW)
     total_tokens = sum(tokens for _, tokens in _WINDOW)
+    # total_tokens / total_chars >= _RATIO_CEIL, i.e. total_tokens >=
+    # total_chars * 2 -- the "* 2" is only correct because _RATIO_CEIL == 2.0
+    # (pinned by test_ratio_ceil_and_floor_pin_the_integer_comparison_literals).
+    # >= matches the old min/max clamp's boundary: exactly-at-ceiling clamps too.
+    if total_tokens >= total_chars * 2:
+        return _RATIO_CEIL
+    # total_tokens / total_chars <= _RATIO_FLOOR, i.e. total_tokens * 10 <=
+    # total_chars -- the "* 10" is only correct because _RATIO_FLOOR == 0.1
+    # (same pinning test). <= matches the old clamp's boundary likewise.
+    if total_tokens * 10 <= total_chars:
+        return _RATIO_FLOOR
+    # Neither branch fired, so the true ratio lies strictly inside
+    # (_RATIO_FLOOR, _RATIO_CEIL): the two totals are within ~20x of each other,
+    # so the float division is safe (no realistic window sum overflows at that
+    # ratio). The min/max clamp is now a no-op given the two branches above;
+    # kept as a free extra safety net rather than a bare division.
     return min(max(total_tokens / total_chars, _RATIO_FLOOR), _RATIO_CEIL)
 
 
@@ -114,12 +158,17 @@ def observe(chars: int, tokens: int) -> None:
     llm_log recorder): a bad usage report must degrade to "contribute nothing",
     never turn a successful completion into a crash. Non-positive values are
     ignored defensively (they are not usable observations and would corrupt the
-    ratio), and the whole body is wrapped so even an unexpected input the
+    ratio); so is anything above _MAX_OBSERVED_TOKENS (an implausibly large
+    report from a broken/hostile gateway -- see that constant for why letting it
+    into the window is dangerous beyond just skewing the ratio), on either side
+    of the pair. The whole body is wrapped so even an unexpected input the
     annotation forbids -- a ``None`` slipping through, making ``None <= 0`` raise
     a TypeError -- is swallowed rather than propagated into the LLM path.
     """
     try:
         if chars <= 0 or tokens <= 0:
+            return
+        if chars > _MAX_OBSERVED_TOKENS or tokens > _MAX_OBSERVED_TOKENS:
             return
         with _LOCK:
             _WINDOW.append((chars, tokens))

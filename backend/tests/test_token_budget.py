@@ -56,11 +56,65 @@ def test_ratio_clamped_to_floor() -> None:
     assert token_budget.tokens_per_char() == 0.1
 
 
+def test_ratio_locked_handles_huge_tokens_without_raising() -> None:
+    # Simulates a future code path that bypasses observe()'s _MAX_OBSERVED_TOKENS
+    # guard and appends an astronomically large token count directly into the
+    # window. Dividing first and clamping after (the old code) raises
+    # OverflowError computing total_tokens / total_chars at this magnitude; the
+    # integer comparison in _ratio_locked must catch it BEFORE the division and
+    # return _RATIO_CEIL, never raising.
+    huge_tokens = 10**320
+    for _ in range(3):
+        token_budget._WINDOW.append((10, huge_tokens))
+    assert token_budget.tokens_per_char() == token_budget._RATIO_CEIL
+
+
+def test_ratio_locked_handles_huge_chars_without_raising() -> None:
+    # Symmetric case: astronomically large chars with small tokens must clamp
+    # to _RATIO_FLOOR via the same pre-division integer comparison, never
+    # raising (also bypasses observe(), simulating a future path).
+    huge_chars = 10**320
+    for _ in range(3):
+        token_budget._WINDOW.append((huge_chars, 10))
+    assert token_budget.tokens_per_char() == token_budget._RATIO_FLOOR
+
+
+def test_ratio_ceil_and_floor_pin_the_integer_comparison_literals() -> None:
+    # _ratio_locked compares totals as integers (total_tokens >= total_chars * 2
+    # for the ceiling, total_tokens * 10 <= total_chars for the floor) instead of
+    # dividing then clamping, to avoid OverflowError on astronomically large
+    # ints. The "* 2" and "* 10" literals are only correct because
+    # _RATIO_CEIL == 2.0 and _RATIO_FLOOR == 0.1; this pins that relationship so
+    # a future change to either constant can't silently desync the comparisons.
+    assert token_budget._RATIO_CEIL == 2.0
+    assert token_budget._RATIO_FLOOR == 0.1
+
+
 def test_non_positive_observations_are_ignored() -> None:
     token_budget.observe(0, 100)
     token_budget.observe(100, 0)
     token_budget.observe(-5, 100)
     token_budget.observe(100, -5)
+    assert list(token_budget._WINDOW) == []
+    assert token_budget.tokens_per_char() == 1.0
+
+
+def test_observe_ignores_absurdly_large_tokens() -> None:
+    # A merely-OpenAI-compatible gateway can report an implausible token count
+    # (_extract_usage only checks "positive int", not "plausible"); observe()
+    # must reject it before it ever reaches the window, the same silent-ignore
+    # treatment as a non-positive value, so good samples are never blocked from
+    # flushing a bad one out (there is no other way to recover: the window only
+    # rolls forward on new completions).
+    token_budget.observe(1000, 10**300)
+    assert list(token_budget._WINDOW) == []
+    assert token_budget.tokens_per_char() == 1.0
+
+
+def test_observe_ignores_absurdly_large_chars() -> None:
+    # Symmetric guard on the chars side (belt-and-braces: chars come from our
+    # own _conversation_chars, but the check is one comparison).
+    token_budget.observe(10**300, 100)
     assert list(token_budget._WINDOW) == []
     assert token_budget.tokens_per_char() == 1.0
 
