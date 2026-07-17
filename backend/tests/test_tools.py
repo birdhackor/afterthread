@@ -492,14 +492,18 @@ def test_tool_conversation_budget_stops_advertising_and_finalizes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """F1: once the live conversation ACTUALLY SENT to the model exceeds the
-    budget, the loop stops advertising tools and makes ONE final tools-free
-    completion -- it does NOT keep looping to max_tool_rounds. The D27 llm_log
-    budget bounds only what is RECORDED; this bounds what is SENT each round.
+    budget's char allowance, the loop stops advertising tools and makes ONE final
+    tools-free completion -- it does NOT keep looping to max_tool_rounds. The D27
+    llm_log budget bounds only what is RECORDED; this bounds what is SENT each
+    round.
 
-    Each tool round returns a large result (30k chars); across two rounds the
-    accumulated conversation crosses a small 50k budget, so the THIRD create() is
-    the finalize (tools-free, budget-exhausted nudge appended), even though the
-    default round budget (8) is nowhere near spent."""
+    The budget is now TOKEN-denominated (P4); the scripted completions carry no
+    usage, so the estimator stays at the cold-start ratio 1.0 and a 50k-token
+    budget yields a 50k-char allowance. Each tool round returns a large result
+    (30k chars); across two rounds the accumulated conversation crosses that 50k
+    allowance, so the THIRD create() is the finalize (tools-free, budget-exhausted
+    nudge appended), even though the default round budget (8) is nowhere near
+    spent."""
     calls_seen = 0
 
     async def handler(args: dict[str, Any]) -> str:
@@ -516,13 +520,13 @@ def test_tool_conversation_budget_stops_advertising_and_finalizes(
                 _content_completion(_SAMPLE_JSON),
             ]
         ),
-        settings=_settings(llm_tool_conversation_budget_chars=50_000),
+        settings=_settings(llm_tool_conversation_budget_tokens=50_000),
     )
     result = _run(tools=[LlmTool(spec=_tool_spec("big"), handler=handler)])
 
     assert result.title == "Draft"
     calls = _calls(client)
-    # Two tool rounds accumulated ~60k > the 50k budget; the THIRD create is the
+    # Two tool rounds accumulated ~60k > the 50k allowance; the THIRD create is the
     # tools-free finalize -- NOT a spin to the default max_tool_rounds (8).
     assert len(calls) == 3
     assert "tools" in calls[0] and "tools" in calls[1]
@@ -534,9 +538,10 @@ def test_tool_conversation_budget_stops_advertising_and_finalizes(
 def test_tool_conversation_budget_default_does_not_trip_normal_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The default budget (1_000_000) leaves an ordinary small-output tool loop
-    untouched: a modest result across a couple of rounds never trips F1, so tools
-    stay advertised until the model answers on its own."""
+    """The default budget (500_000 tokens -> a 500k-char allowance at the
+    cold-start ratio 1.0) leaves an ordinary small-output tool loop untouched: a
+    modest result across a couple of rounds never trips F1, so tools stay
+    advertised until the model answers on its own."""
     client = _install(
         monkeypatch,
         _ScriptedClient(

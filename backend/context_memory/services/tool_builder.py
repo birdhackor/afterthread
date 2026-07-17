@@ -73,7 +73,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from starlette.concurrency import run_in_threadpool
 
 from context_memory.config import get_settings
-from context_memory.services import llm_log, tools
+from context_memory.services import llm_log, token_budget, tools
 from context_memory.services.llm import (
     LLMNotConfiguredError,
     LlmTool,
@@ -723,12 +723,14 @@ async def _fetch_openapi(url: str) -> tuple[str | None, str | None]:
 def _builder_user_prompt(instructions: str, openapi_text: str) -> str:
     """The session's user turn: the operator's instructions + the document.
 
-    The OpenAPI text is bounded by the SAME ``llm_prompt_budget_chars`` knob
+    The OpenAPI text is bounded by the SAME ``llm_prompt_budget_tokens`` knob
     that bounds item serialization (one operator-facing "how much may ride in a
-    prompt" setting, not a second one), behind the shared truncation marker.
-    Instructions are already request-bounded (<=20000) at the API layer.
+    prompt" setting, not a second one), converted to a CHAR allowance via the
+    live chars<->tokens ratio (context_memory.services.token_budget), behind the
+    shared truncation marker. Instructions are already request-bounded (<=20000)
+    at the API layer.
     """
-    budget = get_settings().llm_prompt_budget_chars
+    budget = token_budget.char_allowance(get_settings().llm_prompt_budget_tokens)
     return "\n\n".join(
         [
             "Build the tool described below.",

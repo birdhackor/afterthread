@@ -126,10 +126,12 @@ def test_llm_status_model_is_honestly_nullable_and_required() -> None:
     props = schema["properties"]
     # `model` is genuinely null when unconfigured, so nullability is honest.
     assert _allows_null(props["model"])
-    # No phantom defaults; both fields are always present in the response.
+    # No phantom defaults; every field is always present in the response --
+    # including token_ratio (P4), which the estimator always has a state to report.
     assert "default" not in props["configured"]
     assert "default" not in props["model"]
-    assert set(schema.get("required", [])) == {"configured", "model"}
+    assert "default" not in props["token_ratio"]
+    assert set(schema.get("required", [])) == {"configured", "model", "token_ratio"}
 
 
 def test_ai_request_fields_declare_length_bounds() -> None:

@@ -444,8 +444,10 @@ def test_builder_user_prompt_redacts_openapi_before_truncation(
     redaction pass could catch. An internal API doc can legitimately embed the very key
     the operator just registered."""
     secret = "kb-live-secret-abcdef123456"  # 27 chars
-    budget = 4000  # the settings floor for llm_prompt_budget_chars
-    _install_settings(monkeypatch, llm_prompt_budget_chars=budget)
+    # At the cold-start ratio 1.0 the char allowance equals the token budget, so a
+    # 4000-token budget gives the same 4000-char cut this test relies on.
+    budget = 4000  # the settings floor for llm_prompt_budget_tokens
+    _install_settings(monkeypatch, llm_prompt_budget_tokens=budget)
     monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
     # Place the secret so it straddles the effective cut (budget - truncation marker): its
     # first 8 chars sit inside the cap and the rest past it, so a truncate-first order would

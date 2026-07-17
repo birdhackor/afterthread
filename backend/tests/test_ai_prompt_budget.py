@@ -12,12 +12,17 @@ rendered verbatim, and an oversized item is bounded with every non-empty section
 still represented and visibly marked as truncated.
 """
 
+import pytest
+
+from context_memory.config import Settings
 from context_memory.models import MemoryStage, MemoryStatus
+from context_memory.services import token_budget
 from context_memory.services.memory_ai import (
     _HEADER_TAGS_MAX,
     _TITLE_MAX,
     _TRUNCATION_MARKER,
     SECTION_FIELD_ORDER,
+    _enrich_user_prompt,
     _serialize_item_for_prompt,
 )
 
@@ -182,3 +187,37 @@ def test_oversized_header_still_leaves_sections_represented() -> None:
     out = _serialize_item_for_prompt(_oversized_header_item(), _BUDGET)
     for field in SECTION_FIELD_ORDER:
         assert len(_section_line(out, field)) > 0, field
+
+
+# --- P4: the char budget derives from the TOKEN budget / the live ratio -----
+
+
+def test_enrich_prompt_budget_derives_from_token_ratio(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The enrich/update prompt's char budget is the TOKEN budget
+    (llm_prompt_budget_tokens) divided by the live chars<->tokens ratio (P4).
+    Shifting the ratio via observed samples shifts the char allowance, so the SAME
+    token budget yields a SMALLER serialized snapshot once the endpoint is seen to
+    spend more tokens per char -- the two-layer story (token budget x dynamic ratio
+    -> char allowance) end to end.
+    """
+    big = "字" * 6000
+    item = {"title": "T", "snapshot": big, "known": big, "decisions": big}
+    monkeypatch.setattr(
+        "context_memory.services.memory_ai.get_settings",
+        lambda: Settings(llm_prompt_budget_tokens=8000),
+    )
+
+    # Cold start (window reset by the conftest autouse -> ratio 1.0): the 8000-token
+    # budget maps to an 8000-char allowance.
+    prompt_cold = _enrich_user_prompt(item, "ctx")
+    # Observe samples pushing tokens_per_char to 2.0 (600 tokens / 300 chars): the
+    # SAME 8000-token budget now maps to only a 4000-char allowance.
+    for _ in range(3):
+        token_budget.observe(100, 200)
+    prompt_hot = _enrich_user_prompt(item, "ctx")
+
+    # Higher tokens-per-char -> smaller char allowance -> a more truncated (shorter)
+    # snapshot, and each bounded by its allowance plus the small fixed preamble.
+    assert len(prompt_hot) < len(prompt_cold)
+    assert len(prompt_cold) <= 8000 + 200
+    assert len(prompt_hot) <= 4000 + 200

@@ -78,3 +78,14 @@
   2. **M OpenAPI 文件 `_truncate_to` 先於遮蔽**（內部碎片、text-final guard 接不到）→ 遮蔽先於截斷（openapi 文件可能本身含金鑰，內部 API 文件常見）。
   3. **M double-quote 轉義拼法未登錄**（`"ab'cd\"ef"` 的 escaped 拼法不含原值 substring，`cat .env` 可還原洩漏）→ 收窄 serializer：double-quote 分支實際觸發轉義（值含 `"` 或 `\` 且含 `'`）即拒裝；單引號路徑與未轉義路徑的 raw 拼法都含原值 verbatim、遮蔽可命中。往返檢查留為兜底。
 - **第五輪複審（d848c4e 後）**：1 Medium（兩子點，皆 range-merge 重寫自身邊角），修：(a) find-loop 逐字前進存每個重疊 occurrence——`aaaaaa` 秘密 × 2MiB 全 `a` 文件 ≈ 210 萬 range 的記憶體放大 → find 前進 `len(secret)`（同秘密重疊坍縮；殘餘 <6 字元低於碎片閾值、text-final 殘餘由 fragment guard 接）+ `_MAX_MASK_RANGES=10000` 上限，超過即整段換單一 marker（**過度遮蔽永遠安全**，把病態配置變 O(1)）；(b) `llm_log._redact` 的 helper 呼叫在 try 外，MemoryError 會逸出 recorder 違反 observer 不變量 → 移進 try、任何例外退化為未遮蔽；tools 側維持相反的 fail-closed 方向不變。
+- **D36 結案（第六輪 Approve，2026-07-17）**：P3 六輪收斂（5 needs-changes → approve）。發現軌跡單調收斂：round-2 live 路徑類（1H+7M）→ round-3 截斷碎片/持久化類（3H+2M）→ round-4 遮蔽器順序邊角（1H+2M）→ round-5 演算法資源邊界（1M）→ approve。五個 commit（fd5acba→69cfa9f）已推送。最終 gates：pytest 659、smoke 76/76、vitest 44。
+
+## D37（P4 設計）：動態 char↔token ratio，預算改 token 計價
+
+- **背景**：使用者 item 7——「引入 tokenizer 過重、純字元不準；API 互動有 token 紀錄，動態把近期互動的字元 vs token 比值記下來、算 token 等效值、改用 token 卡」。
+- **設計**：
+  1. 新模組 `services/token_budget.py`：滾動視窗（近 50 次 completion 的 `(chars_sent, prompt_tokens)`），`tokens_per_char()` = Σt/Σc 夾 `[0.1, 2.0]`；<3 樣本用冷啟動預設 **1.0**（CJK 最壞情形——高估 token 成本→少塞內容→安全方向；英文 ~0.25、程式碼 ~0.3-0.5、CJK ~0.6-1.2）。餵入點：llm.py 每次 completion 的 usage（實送 chars 配 endpoint 回報的 prompt_tokens，正是比值觀測的定義）。
+  2. **ratio 下限 0.1 是 load-bearing 的絕對字元兜底**：T token 預算最多放行 10×T 字元，舊字元上限的量級因此結構性保留，不管觀測多歪。上限 2.0 防荒謬 usage 回報把預算壓扁。
+  3. 兩個字元預算改 token 計價：`llm_prompt_budget_chars`→`llm_prompt_budget_tokens`（預設 200k，冷啟動時行為與舊值等價）、`llm_tool_conversation_budget_chars`→`llm_tool_conversation_budget_tokens`（預設 500k——舊 1M chars 在 ratio 1.0 等於整個 1M context 視窗，500k 給回覆與修正輪留 headroom）。執行點以 `char_allowance(budget_tokens)`＝tokens÷ratio 換算字元允許量，機制（字元比較）不變、數字來源改為 token。
+  4. estimator 絕不拋錯進 LLM 路徑（觀測者性質）；`/llm/status` 增 `token_ratio` 欄位供除錯。
+- **取捨**：不持久化視窗（重啟回到保守預設，方向安全）；舊 env 鍵被 pydantic 靜默忽略（單人工具可接受，.env.example 註明改名、P6 文件記載）。

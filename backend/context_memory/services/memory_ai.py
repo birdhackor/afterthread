@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from context_memory.config import get_settings
 from context_memory.models import MemoryStatus, utcnow
-from context_memory.services import tools
+from context_memory.services import token_budget, tools
 from context_memory.services.llm import LlmTool, generate_structured
 
 # --- caps (constraint: bound everything; LLM output is untrusted) ----------
@@ -742,7 +742,13 @@ class EnrichResult(BaseModel):
 
 
 def _enrich_user_prompt(item_fields: Mapping[str, Any], additional_context: str) -> str:
-    budget = get_settings().llm_prompt_budget_chars
+    # Two-layer budget: the operator sets a TOKEN budget
+    # (llm_prompt_budget_tokens), and token_budget converts it into a CHAR
+    # allowance via the live chars<->tokens ratio. The serializer below is
+    # unchanged -- it still caps serialized CONTENT in chars -- only the NUMBER now
+    # derives from tokens / ratio (cold start: ratio 1.0, so allowance == the
+    # token budget in chars, exactly the old behavior).
+    budget = token_budget.char_allowance(get_settings().llm_prompt_budget_tokens)
     return "\n\n".join(
         [
             "Existing memory item:",
@@ -825,7 +831,9 @@ class UpdateResult(BaseModel):
 
 
 def _update_user_prompt(item_fields: Mapping[str, Any], note: str) -> str:
-    budget = get_settings().llm_prompt_budget_chars
+    # Same two-layer budget as _enrich_user_prompt: a TOKEN budget divided by the
+    # live chars<->tokens ratio yields the CHAR allowance the serializer caps to.
+    budget = token_budget.char_allowance(get_settings().llm_prompt_budget_tokens)
     return "\n\n".join(
         [
             "Existing memory item:",

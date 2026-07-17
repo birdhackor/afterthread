@@ -97,35 +97,36 @@ def test_openai_max_output_tokens_above_upper_bound_rejected() -> None:
         Settings(openai_max_output_tokens=1_000_001)
 
 
-# `llm_prompt_budget_chars` caps the serialized item snapshot in an enrich /
-# assist-update prompt (see context_memory.services.memory_ai). Its Field(ge=4000,
-# le=2_000_000) bound makes a nonsensical override fail at startup via
-# pydantic-settings, matching the openai_timeout_seconds / stale_after_days
-# convention, rather than only when the first AI prompt is built. The default
-# (200000) and ceiling (2_000_000) are sized for a 1M-token-context model like
-# GLM5.2 (see D10 in docs/web-v2-decisions.md).
+# `llm_prompt_budget_tokens` is the TOKEN budget for the serialized item snapshot
+# in an enrich / assist-update prompt (and the OpenAPI doc in an installer
+# session); at runtime token_budget converts it into a char allowance via the live
+# chars<->tokens ratio (see context_memory.services.memory_ai / token_budget). Its
+# Field(ge=4_000, le=1_000_000) bound makes a nonsensical override fail at startup
+# via pydantic-settings, matching the other LLM knobs' convention. le=1M is the
+# 1M-token context window itself; the default (200000) equals the old 200000-char
+# budget at the cold-start ratio 1.0 (behavior-preserving on day one).
 
 
-def test_llm_prompt_budget_chars_default_is_200000() -> None:
-    assert Settings().llm_prompt_budget_chars == 200000
+def test_llm_prompt_budget_tokens_default_is_200000() -> None:
+    assert Settings().llm_prompt_budget_tokens == 200_000
 
 
-def test_llm_prompt_budget_chars_lower_bound_accepted() -> None:
-    assert Settings(llm_prompt_budget_chars=4000).llm_prompt_budget_chars == 4000
+def test_llm_prompt_budget_tokens_lower_bound_accepted() -> None:
+    assert Settings(llm_prompt_budget_tokens=4_000).llm_prompt_budget_tokens == 4_000
 
 
-def test_llm_prompt_budget_chars_upper_bound_accepted() -> None:
-    assert Settings(llm_prompt_budget_chars=2_000_000).llm_prompt_budget_chars == 2_000_000
+def test_llm_prompt_budget_tokens_upper_bound_accepted() -> None:
+    assert Settings(llm_prompt_budget_tokens=1_000_000).llm_prompt_budget_tokens == 1_000_000
 
 
-def test_llm_prompt_budget_chars_below_lower_bound_rejected() -> None:
+def test_llm_prompt_budget_tokens_below_lower_bound_rejected() -> None:
     with pytest.raises(ValidationError):
-        Settings(llm_prompt_budget_chars=3999)
+        Settings(llm_prompt_budget_tokens=3_999)
 
 
-def test_llm_prompt_budget_chars_above_upper_bound_rejected() -> None:
+def test_llm_prompt_budget_tokens_above_upper_bound_rejected() -> None:
     with pytest.raises(ValidationError):
-        Settings(llm_prompt_budget_chars=2_000_001)
+        Settings(llm_prompt_budget_tokens=1_000_001)
 
 
 # `llm_log_max_entries` sizes the in-memory LLM interaction ring (see
@@ -193,33 +194,35 @@ def test_llm_log_file_max_bytes_above_upper_bound_rejected() -> None:
         Settings(llm_log_file_max_bytes=1_000_000_001)
 
 
-# `llm_tool_conversation_budget_chars` caps the SERIALIZED size of the live
-# tool-loop conversation actually SENT to the model each round (see
+# `llm_tool_conversation_budget_tokens` is the TOKEN budget for the live tool-loop
+# conversation actually SENT to the model each round (see
 # context_memory.services.llm) -- the SENT-side companion to the recorded-side
-# llm_log body budget. Its Field(ge=50_000, le=8_000_000) bound makes a nonsensical
-# override fail at startup via pydantic-settings, matching the other LLM knobs'
-# convention, rather than only when the tool loop first overruns.
+# llm_log body budget; token_budget converts it into a char allowance at runtime.
+# Its Field(ge=50_000, le=1_000_000) bound makes a nonsensical override fail at
+# startup via pydantic-settings, matching the other LLM knobs' convention. le=1M is
+# the context window itself; the default (500000) is deliberately below 1M so that
+# at ratio 1.0 it leaves context headroom for the model's reply.
 
 
-def test_llm_tool_conversation_budget_chars_default_is_one_million() -> None:
-    assert Settings().llm_tool_conversation_budget_chars == 1_000_000
+def test_llm_tool_conversation_budget_tokens_default_is_five_hundred_thousand() -> None:
+    assert Settings().llm_tool_conversation_budget_tokens == 500_000
 
 
-def test_llm_tool_conversation_budget_chars_lower_bound_accepted() -> None:
-    settings = Settings(llm_tool_conversation_budget_chars=50_000)
-    assert settings.llm_tool_conversation_budget_chars == 50_000
+def test_llm_tool_conversation_budget_tokens_lower_bound_accepted() -> None:
+    settings = Settings(llm_tool_conversation_budget_tokens=50_000)
+    assert settings.llm_tool_conversation_budget_tokens == 50_000
 
 
-def test_llm_tool_conversation_budget_chars_upper_bound_accepted() -> None:
-    settings = Settings(llm_tool_conversation_budget_chars=8_000_000)
-    assert settings.llm_tool_conversation_budget_chars == 8_000_000
+def test_llm_tool_conversation_budget_tokens_upper_bound_accepted() -> None:
+    settings = Settings(llm_tool_conversation_budget_tokens=1_000_000)
+    assert settings.llm_tool_conversation_budget_tokens == 1_000_000
 
 
-def test_llm_tool_conversation_budget_chars_below_lower_bound_rejected() -> None:
+def test_llm_tool_conversation_budget_tokens_below_lower_bound_rejected() -> None:
     with pytest.raises(ValidationError):
-        Settings(llm_tool_conversation_budget_chars=49_999)
+        Settings(llm_tool_conversation_budget_tokens=49_999)
 
 
-def test_llm_tool_conversation_budget_chars_above_upper_bound_rejected() -> None:
+def test_llm_tool_conversation_budget_tokens_above_upper_bound_rejected() -> None:
     with pytest.raises(ValidationError):
-        Settings(llm_tool_conversation_budget_chars=8_000_001)
+        Settings(llm_tool_conversation_budget_tokens=1_000_001)

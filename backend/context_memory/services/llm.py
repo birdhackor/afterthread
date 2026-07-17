@@ -43,7 +43,7 @@ from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolPara
 from pydantic import BaseModel, ValidationError
 
 from context_memory.config import Settings, get_settings
-from context_memory.services import llm_log
+from context_memory.services import llm_log, token_budget
 
 # Placeholder passed as the API key when the operator has not configured one.
 # Some OpenAI-compatible servers (e.g. a local gateway) require no key, but the
@@ -931,13 +931,16 @@ async def _run_structured[ModelT: BaseModel](
                 # F1: the conversation ACTUALLY SENT each round has no aggregate
                 # cap of its own -- the D27 llm_log budget only bounds what is
                 # RECORDED. Measure it with the cheap proxy (dominated by
-                # tool-result bulk) so that, once it exceeds the budget, the next
-                # create() is the tools-free finalize. Composes with the round and
-                # correction gates below: ANY of them turning advertising off
-                # routes to the same finalize path.
-                conversation_over_budget = (
-                    _conversation_chars(messages) > settings.llm_tool_conversation_budget_chars
+                # tool-result bulk) and compare against the CHAR allowance derived
+                # from the TOKEN budget via the live chars<->tokens ratio (P4,
+                # token_budget) -- once it exceeds that, the next create() is the
+                # tools-free finalize. Composes with the round and correction gates
+                # below: ANY of them turning advertising off routes to the same
+                # finalize path.
+                conversation_allowance = token_budget.char_allowance(
+                    settings.llm_tool_conversation_budget_tokens
                 )
+                conversation_over_budget = _conversation_chars(messages) > conversation_allowance
                 # Advertise tools only while the round budget is unspent, we are not
                 # finalizing (see `correction_used`), AND the live conversation is
                 # under the size budget (F1). Once any of these fails the next
@@ -968,6 +971,14 @@ async def _run_structured[ModelT: BaseModel](
                 # recorder copies them, since `messages` is rebuilt each round /
                 # for the corrective retry below).
                 recorder.begin_attempt(messages)
+                # P4: capture the char size of what we are about to send, BEFORE the
+                # tool round / corrective retry below mutates `messages`, so it can
+                # be paired with THIS attempt's reported prompt_tokens as one
+                # chars<->tokens ratio observation (fed to token_budget after the
+                # completion returns). `messages` is not mutated between here and the
+                # observe call below -- the create() and its except arms never touch
+                # it -- so this is exactly the size the endpoint counted.
+                chars_sent = _conversation_chars(messages)
                 try:
                     completion = await _create_completion(
                         client, settings, messages, tool_specs if advertise_tools else None
@@ -1020,6 +1031,19 @@ async def _run_structured[ModelT: BaseModel](
 
                 # Capture usage from whatever completion carried it (per attempt).
                 recorder.record_usage(completion)
+
+                # P4: feed the char<->token estimator. The pair (chars we sent this
+                # attempt, tokens the endpoint counted for the prompt) is exactly one
+                # ratio observation. Read prompt_tokens through llm_log's own
+                # defensive usage extractor (handles both an SDK usage object and a
+                # dict from a merely-compatible gateway, and excludes bools/non-ints);
+                # a mock or absent usage yields None and contributes nothing, and
+                # token_budget.observe itself ignores non-positive values and never
+                # raises into this path.
+                attempt_usage = llm_log._extract_usage(completion)
+                prompt_tokens = attempt_usage.get("prompt_tokens") if attempt_usage else None
+                if prompt_tokens is not None:
+                    token_budget.observe(chars_sent, prompt_tokens)
 
                 # TOOL BRANCH, CHECKED FIRST: a tool_calls reply legitimately
                 # carries content=None, which the final path's _extract_content

@@ -10,6 +10,23 @@ from sqlmodel import Session, SQLModel, create_engine
 from context_memory.config import Settings
 from context_memory.db import enable_sqlite_foreign_keys, get_session
 from context_memory.main import app
+from context_memory.services import token_budget
+
+
+@pytest.fixture(autouse=True)
+def _reset_token_budget() -> Generator[None]:
+    """Clear the char<->token ratio window around every test.
+
+    token_budget's rolling window is module-level, process-wide state (like
+    llm_log's ring), so an observation fed by one test would otherwise leak into
+    another's ratio -- most visibly the /llm/status token_ratio the status tests
+    assert exactly, or the char allowance the budget-enforcement tests depend on.
+    Reset before AND after so every test starts from the cold-start default and
+    leaves nothing behind, independent of collection order.
+    """
+    token_budget._reset_for_tests()
+    yield
+    token_budget._reset_for_tests()
 
 
 @pytest.fixture

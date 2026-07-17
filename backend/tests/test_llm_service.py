@@ -31,6 +31,7 @@ import pytest
 from pydantic import BaseModel, ConfigDict
 
 from context_memory.config import Settings
+from context_memory.services import token_budget
 from context_memory.services.llm import (
     _INVALID_STRUCTURED_OUTPUT,
     _STRICT_OUTPUT_RULE,
@@ -39,7 +40,9 @@ from context_memory.services.llm import (
     LLMNotConfiguredError,
     LLMUpstreamError,
     _build_client,
+    _conversation_chars,
     _get_client,
+    _schema_guided_system_prompt,
     _summarize_tool_calls,
     generate_structured,
     llm_configured,
@@ -956,3 +959,64 @@ def test_summarize_tool_calls_redactor_failure_fails_closed(
 
     assert secret not in out
     assert "(args preview unavailable)" in out
+
+
+# --- P4: feeding the char<->token estimator from completion usage ---------
+
+
+def _completion_with_usage(content: str, *, prompt_tokens: int) -> SimpleNamespace:
+    """A conformant completion (valid content) that also reports prompt_tokens,
+    so a single-attempt generate_structured feeds token_budget exactly once."""
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+        usage=SimpleNamespace(
+            prompt_tokens=prompt_tokens, completion_tokens=0, total_tokens=prompt_tokens
+        ),
+    )
+
+
+def test_completion_usage_feeds_token_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """P4: after each completion that reports prompt_tokens, the tool loop records
+    one (chars_sent, prompt_tokens) observation. The pair is exactly the char size
+    of the messages actually sent and the endpoint's own prompt-token count, so
+    tokens_per_char moves toward N/M once at least _MIN_SAMPLES observations exist.
+    """
+    n = 50
+    _install_raw(monkeypatch, _completion_with_usage(_SAMPLE_JSON, prompt_tokens=n))
+
+    # M = the char size generate_structured actually sends for _Sample: the
+    # schema-augmented system prompt (see _schema_guided_system_prompt) plus the
+    # user turn -- _run drives system="system", user="user".
+    m = _conversation_chars(
+        [
+            {"role": "system", "content": _schema_guided_system_prompt("system", _Sample)},
+            {"role": "user", "content": "user"},
+        ]
+    )
+
+    # One interaction -> one (M, N) observation; below _MIN_SAMPLES the ratio is
+    # still the cold-start default (1.0), not yet the observed one.
+    assert _run().title == "Draft"
+    assert list(token_budget._WINDOW) == [(m, n)]
+    assert token_budget.tokens_per_char() == 1.0
+
+    # Two more -> three observations -> the aggregate ratio N/M is now in force
+    # (in-range for this M, so the clamp does not bind).
+    _run()
+    _run()
+    expected = min(max(n / m, 0.1), 2.0)
+    assert token_budget.tokens_per_char() == pytest.approx(expected)
+    snap = token_budget.snapshot()
+    assert snap["samples"] == 3
+    assert snap["tokens_per_char"] == pytest.approx(round(expected, 4))
+
+
+def test_absent_usage_contributes_nothing_to_token_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A completion carrying NO usage object (the ordinary stub shape, and a
+    merely-compatible gateway that omits usage) feeds the estimator nothing -- the
+    window stays empty, so the tools=None path is unchanged apart from the
+    budget-number derivation."""
+    _configured(monkeypatch, content=_SAMPLE_JSON)  # _StubClient never sets .usage
+    assert _run().title == "Draft"
+    assert list(token_budget._WINDOW) == []
+    assert token_budget.snapshot() == {"samples": 0, "tokens_per_char": None}

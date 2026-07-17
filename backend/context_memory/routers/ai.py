@@ -39,9 +39,10 @@ from context_memory.schemas import (
     LlmLogDetail,
     LlmLogListResponse,
     LLMStatus,
+    LLMTokenRatio,
     MemoryItemRead,
 )
-from context_memory.services import llm_log
+from context_memory.services import llm_log, token_budget
 from context_memory.services.llm import (
     _UPSTREAM_REASON,
     LLMNotConfiguredError,
@@ -208,18 +209,25 @@ def _conditional_update(
 
 @router.get("/llm/status", response_model=LLMStatus)
 def llm_status() -> LLMStatus:
-    """Report whether an LLM endpoint is configured, and the model name only.
+    """Report whether an LLM endpoint is configured, the model name, and the
+    char<->token ratio estimator's state.
 
-    Never returns the base URL or API key -- only the boolean and the
-    non-secret model name (null when unconfigured). The model is run through
-    the same `normalized_model` helper `generate_json` uses for the actual
-    request, so a whitespace-padded override is never echoed back padded
-    while the real call underneath sends the trimmed value.
+    Never returns the base URL or API key -- only the boolean, the non-secret
+    model name (null when unconfigured), and the ratio snapshot. The model is run
+    through the same `normalized_model` helper `generate_json` uses for the actual
+    request, so a whitespace-padded override is never echoed back padded while the
+    real call underneath sends the trimmed value. ``token_ratio`` is additive
+    observability (P4): the estimator's window size and learned ratio (see
+    context_memory.services.token_budget), carrying no config value.
     """
     settings = get_settings()
     configured = llm_configured()
     model = normalized_model(settings) if configured else None
-    return LLMStatus(configured=configured, model=model)
+    return LLMStatus(
+        configured=configured,
+        model=model,
+        token_ratio=LLMTokenRatio.model_validate(token_budget.snapshot()),
+    )
 
 
 # The read-only LLM interaction log (D09). Both endpoints stay in the /llm

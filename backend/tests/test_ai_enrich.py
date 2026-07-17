@@ -223,7 +223,9 @@ def test_enrich_prompt_is_budgeted_for_a_huge_item(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A huge item must not blow up the enrich prompt. The serialized item
-    snapshot is capped at llm_prompt_budget_chars, so the mocked LLM receives a
+    snapshot is capped at the char allowance derived from llm_prompt_budget_tokens
+    (token budget / the live chars<->tokens ratio -- here cold-start ratio 1.0, so
+    the allowance equals the token budget in chars), so the mocked LLM receives a
     bounded prompt instead of the ~unbounded one the raw sections would produce
     (which a small-context model would permanently 502 on).
     """
@@ -240,10 +242,12 @@ def test_enrich_prompt_is_budgeted_for_a_huge_item(
         return model_cls.model_validate({"sections": {"snapshot": "s"}, "progress_note": "n"})
 
     monkeypatch.setattr("context_memory.services.memory_ai.generate_structured", _fake)
-    # Force a small budget so the bound is unmistakable.
+    # Force a small budget so the bound is unmistakable. At the cold-start ratio
+    # 1.0 (the estimator window is reset around every test) the char allowance
+    # equals this token budget, so the <=4000-char bound below is unchanged.
     monkeypatch.setattr(
         "context_memory.services.memory_ai.get_settings",
-        lambda: Settings(llm_prompt_budget_chars=4000),
+        lambda: Settings(llm_prompt_budget_tokens=4000),
     )
 
     response = client.post(f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"})

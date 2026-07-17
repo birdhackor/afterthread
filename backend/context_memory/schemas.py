@@ -32,7 +32,8 @@ def _ensure_aware(value: datetime) -> datetime:
 # serialized into an enrich/assist-update prompt header
 # (context_memory.services.memory_ai._serialize_item_for_prompt, which renders title and
 # tags in full ahead of the per-section budgeting), the header alone crowds
-# out or exceeds llm_prompt_budget_chars. Declared here -- not on the shared
+# out or exceeds the prompt's char allowance (llm_prompt_budget_tokens divided by
+# the live chars<->tokens ratio). Declared here -- not on the shared
 # MemoryItemContent base -- so only MemoryItemCreate/Update enforce them;
 # MemoryItemRead stays unbounded so it can still honestly represent a
 # pre-existing row written before these bounds existed (that row is protected
@@ -285,17 +286,35 @@ def _stripped_non_empty(value: str, field: str) -> str:
     return stripped
 
 
-class LLMStatus(BaseModel):
-    """Whether an LLM endpoint is configured, and the model name only.
+class LLMTokenRatio(BaseModel):
+    """The live char<->token ratio estimator's public view (P4).
 
-    Deliberately excludes the base URL and API key -- only the boolean and the
-    non-secret model name are surfaced. ``model`` is genuinely null exactly
-    when unconfigured, so its nullability is honest rather than a schema
-    artifact.
+    Surfaced on ``LLMStatus.token_ratio`` from
+    context_memory.services.token_budget.snapshot(). ``samples`` is how many
+    recent (chars, tokens) observations the rolling window holds; and
+    ``tokens_per_char`` is the learned ratio rounded to 4dp, genuinely null while
+    the window is still below the minimum-sample threshold (the cold-start default
+    is in force and there is no observed ratio yet), so its nullability is honest.
+    Carries no config value -- purely the internal estimator state.
+    """
+
+    samples: int
+    tokens_per_char: float | None
+
+
+class LLMStatus(BaseModel):
+    """Whether an LLM endpoint is configured, the model name, and the ratio state.
+
+    Deliberately excludes the base URL and API key -- only the boolean, the
+    non-secret model name, and the char<->token ratio estimator's state are
+    surfaced. ``model`` is genuinely null exactly when unconfigured, so its
+    nullability is honest rather than a schema artifact. ``token_ratio`` is always
+    present (the estimator always has a state to report, even cold-started).
     """
 
     configured: bool
     model: str | None
+    token_ratio: LLMTokenRatio
 
 
 class CaptureRequest(BaseModel):
