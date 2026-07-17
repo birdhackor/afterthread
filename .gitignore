@@ -31,3 +31,6 @@ backend/dist/
 
 # OS
 .DS_Store
+
+# Personal Claude Code instructions symlink (see AGENTS.md); never commit
+CLAUDE.md
