@@ -11,10 +11,13 @@ knowledge vaporization**：討論當下腦中的理解、取捨、風險、下�
 恢復的記憶項目（memory item：一個決策、一個調查中的主題、一件擱置的任務……）。
 
 **主要介面是本機網頁應用**：FastAPI + SQLite 後端、React/Mantine 前端，打包成
-內嵌前端 build 的單一 wheel，一個 `context-memory` 指令就能啟動，資料留在本機
-SQLite；接上一顆 OpenAI-compatible 的 LLM 之後，還能用 AI 快速捕捉、AI 補齊、
-AI 進度更新，以及讓 AI 自己建立可呼叫外部 API 的工具。**沒有聊天視窗**——AI
-功能一律是針對「一則記憶項目」的結構化操作，不是對話介面。
+內嵌前端 build 的單一 wheel，一個 `context-memory` 指令就能啟動，資料儲存在
+本機 SQLite（無帳號、無自有雲端）；接上一顆 OpenAI-compatible 的 LLM 之後，
+還能用 AI 快速捕捉、AI 補齊、AI 進度更新，以及讓 AI 自己建立可呼叫外部 API
+的工具——**使用 AI 功能時，被處理的內容會送往你設定的那個 LLM endpoint**，
+若該 endpoint 在遠端，內容就會離開本機（「留在本機」精確講是指 SQLite 儲存
+層）。**沒有聊天視窗**——AI 功能一律是針對「一則記憶項目」的結構化操作，不是
+對話介面。
 
 repo 裡同時保留一套更早的檔案版介面：OpenCode skill（`.opencode/`）+
 `scripts/context_memory.py`，資料存成 `memory/**/*.md`。這套介面依然可用，
