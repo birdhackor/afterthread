@@ -23,6 +23,7 @@ ring is process-wide, so an autouse fixture resets it around every test.
 """
 
 import asyncio
+import inspect
 import json
 import os
 import shutil
@@ -1156,6 +1157,26 @@ def test_redaction_marker_matches_llm_log() -> None:
     assert tools._REDACTION_MARKER == llm_log._REDACTION_MARKER
 
 
+def test_max_mask_ranges_matches_llm_log() -> None:
+    """tools._MAX_MASK_RANGES and llm_log._MAX_MASK_RANGES MUST be the same value
+    (D36 round-5): ``_mask_known_secrets`` looks the cap up BY NAME from its own
+    module's globals, so even byte-for-byte identical function source would still
+    behave differently under a pathological input if the two modules disagreed on
+    where the cap kicks in."""
+    assert tools._MAX_MASK_RANGES == llm_log._MAX_MASK_RANGES
+
+
+def test_mask_known_secrets_source_identical_in_both_modules() -> None:
+    """tools._mask_known_secrets and llm_log._mask_known_secrets MUST be byte-for-byte
+    identical (see either docstring's LOCKSTEP note). Mirrors
+    test_redaction_marker_matches_llm_log's marker-only pin, but for the FULL function
+    body, so a future edit applied to one copy and not mirrored to the other fails
+    loudly here instead of silently drifting the two redactors apart."""
+    assert inspect.getsource(tools._mask_known_secrets) == inspect.getsource(
+        llm_log._mask_known_secrets
+    )
+
+
 def test_redact_known_secrets_masks_and_skips_short(monkeypatch: pytest.MonkeyPatch) -> None:
     """redact_known_secrets masks every known value and SKIPS values under the
     6-char floor (mirroring llm_log._redact), replacing with the shared marker."""
@@ -1245,6 +1266,44 @@ def test_redact_known_secrets_overlapping_occurrences_merge_one_marker(
     assert "XYZdef" not in out
     assert out.count(tools._REDACTION_MARKER) == 1
     assert out == "p " + tools._REDACTION_MARKER + " q"
+
+
+def test_redact_known_secrets_degenerate_repeated_secret_completes_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D36 round-5: a legitimate 6-char secret entirely composed of one repeated
+    character, matched against a large same-char document (an un-truncated OpenAPI
+    body that happens to look like this is exactly the reported memory-amplification
+    vector: the pre-fix find-loop stored one range per OVERLAPPING occurrence), must
+    not blow up. The stepping find-cursor collapses the run into a handful of merged
+    ranges, so this completes in well under a second, and -- bar a residual strictly
+    shorter than the secret at the very tail, itself under the redaction floor -- the
+    secret's repeated character never survives as a 6+ run anywhere in the output."""
+    secret = "aaaaaa"
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+    text = "a" * 100_000
+    start = time.perf_counter()
+    out = tools.redact_known_secrets(text)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 5.0
+    assert secret not in out  # no 6+ run of "a" survives anywhere in the output
+
+
+def test_redact_known_secrets_max_ranges_cap_replaces_whole_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D36 round-5: once collecting mask ranges would exceed _MAX_MASK_RANGES, the
+    function stops collecting immediately and gives up precision entirely -- the
+    WHOLE text is replaced by a single marker rather than merging a huge range list.
+    A separator between occurrences keeps the matches from touching/merging into one
+    contiguous range on their own, so a bare single marker here can ONLY come from the
+    cap firing, never from ordinary adjacent-range merging (over-redaction is always
+    safe, which is what makes giving up precision like this a safe fail-safe)."""
+    secret = "abcdef"
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+    text = (secret + "|") * (tools._MAX_MASK_RANGES + 1)
+    out = tools.redact_known_secrets(text)
+    assert out == tools._REDACTION_MARKER
 
 
 def test_runtime_tool_output_masks_known_env_secret(

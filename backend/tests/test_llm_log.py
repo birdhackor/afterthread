@@ -491,6 +491,28 @@ def test_redaction_ranges_computed_on_original_text(monkeypatch: pytest.MonkeyPa
     assert body.endswith(llm_log._REDACTION_MARKER)
 
 
+def test_redaction_helper_failure_records_unredacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """D36 round-5: ``_mask_known_secrets`` now runs INSIDE the same guard as the
+    provider call -- a MemoryError (or any other surprise) from the masking step
+    itself must still degrade to 'record unredacted', the SAME no-observer-failure
+    invariant the provider-failure tests above already cover for the provider side.
+    Before this fix the call sat OUTSIDE the try, so this exact failure would have
+    escaped straight into the recorder."""
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {"real-secret-value-abcdef"})
+
+    def _boom(text: str, secrets: list[str]) -> str:
+        raise MemoryError("mask blew up")
+
+    monkeypatch.setattr(llm_log, "_mask_known_secrets", _boom)
+    llm_log._reset_for_tests()
+
+    _record(response="a normal body, must not raise")  # must not raise
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    assert record["attempts"][0]["response_content"] == "a normal body, must not raise"
+
+
 def test_file_sink_writes_valid_jsonl(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """With llm_log_file set, every finished record is appended as one valid JSON
     line carrying the full bodies (ensure_ascii=False keeps CJK readable)."""

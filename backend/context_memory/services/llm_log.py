@@ -289,6 +289,21 @@ _REDACTION_MARKER = "•••[秘密已遮蔽]•••"
 # removing the false-positive hazard entirely.
 _MIN_SECRET_LEN = 6
 
+# Hard ceiling on how many mask ranges a single call collects before giving up on
+# precision and replacing the WHOLE body with the marker alone (D36 round-5). Without
+# it, a legitimate secret at the _MIN_SECRET_LEN floor (e.g. "aaaaaa") matched against
+# a large low-entropy stored body -- an un-truncated OpenAPI document echoed into a
+# request/response that happens to repeat that pattern -- still collects one range per
+# len(value)-char step even after the cursor fix below: a 2MiB same-char body divided
+# into 6-char steps is still ~350K ranges, hundreds of MB once multiplied across every
+# registered secret. Over-redaction is always SAFE (a body this saturated with secret
+# matches has no legitimate readable content worth preserving), so collection STOPS
+# the instant it would cross this cap and `_redact` returns the marker alone for the
+# entire body instead -- turning a pathological allocation into a fixed, O(1)-sized
+# result. Mirrors tools._MAX_MASK_RANGES (same value, same rationale; not shared for
+# the same leaf/layering reason as _REDACTION_MARKER -- a test pins the two equal).
+_MAX_MASK_RANGES = 10_000
+
 # The known-secret provider. A CALLABLE, deliberately not a static set, because
 # the secret set CHANGES at runtime: installing a tool adds its .env values, and
 # an in-flight install registers its form secret before that .env even exists
@@ -343,17 +358,47 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     tool_builder and the tool-args preview in llm.py all redact BEFORE they cut); (2)
     merge overlapping/adjacent ranges; (3) build the output in ONE pass, emitting exactly
     one marker per merged range.
+
+    Collecting every occurrence in step (1) is BOUNDED two ways (D36 round-5), because a
+    legitimate secret can itself be adversarial input to this search. First, the find
+    cursor advances by ``len(value)`` on every hit rather than by 1, so overlapping
+    occurrences of the SAME repeated secret text -- an ``"aaaaaa"``-style secret against
+    a same-character document, the reported vector once an un-truncated OpenAPI body
+    happens to look like that -- step past each other instead of registering one range
+    per shifted start. This can still leave a residual of up to ``len(value) - 1``
+    characters at a repeated run's tail (a strict remainder of the run length modulo
+    ``len(value)``); at the ``_MIN_SECRET_LEN`` floor -- the shortest value ever reaches
+    here, and exactly the reported case -- that residual is itself under the floor,
+    exactly as unredactable as any other short substring by the SAME rationale that
+    floor already encodes, and a residual landing at the very END of ``text`` is still
+    separately caught by the trailing-fragment guard above regardless of length. Second,
+    stepping is not sufficient by itself: a sufficiently large low-entropy document can
+    still cross ``_MAX_MASK_RANGES`` one ``len(value)``-sized step at a time, so
+    collection STOPS the instant it would and this returns the marker ALONE for the
+    entire text instead (see that constant) -- over-redaction is always safe, so the cap
+    turns a pathological allocation into a fixed-size O(1) result. With ``ranges`` bounded
+    before it is ever sorted, the merge in step (2) is O(n log n) on that bounded n
+    rather than on the size of ``text``, and step (3)'s output build remains the single
+    pass it always was.
     """
     if not secrets:
         return text
     secrets = sorted(secrets, key=len, reverse=True)
-    # (1) ranges on the PRISTINE text -- every occurrence of every full value ...
+    # (1) ranges on the PRISTINE text -- every occurrence of every full value, cursor
+    # STEPPING by len(value) on each hit (D36 round-5): overlapping occurrences of the
+    # SAME secret collapse into non-overlapping, stepping matches rather than one range
+    # per shifted start (see the docstring's residual/cap analysis).
     ranges: list[tuple[int, int]] = []
     for value in secrets:
-        start = text.find(value)
-        while start != -1:
-            ranges.append((start, start + len(value)))
-            start = text.find(value, start + 1)
+        step = len(value)
+        idx = text.find(value)
+        while idx != -1:
+            if len(ranges) >= _MAX_MASK_RANGES:
+                # Over-redaction is always safe; a text this saturated with secret
+                # matches has no legitimate readable content worth preserving.
+                return _REDACTION_MARKER
+            ranges.append((idx, idx + step))
+            idx = text.find(value, idx + step)
     # ... plus the LONGEST trailing prefix fragment (>= _MIN_SECRET_LEN) the text ends
     # with. ``best`` only grows, so each secret is probed only for a fragment longer than
     # the best found so far (the k range floor is ``best``).
@@ -364,11 +409,15 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
                 best = k
                 break
     if best >= _MIN_SECRET_LEN:
+        if len(ranges) >= _MAX_MASK_RANGES:
+            return _REDACTION_MARKER
         ranges.append((len(text) - best, len(text)))
     if not ranges:
         return text
     # (2) merge overlapping/adjacent ranges (``<=`` folds a touching range into the
-    # previous one, so abutting occurrences collapse to a single marker).
+    # previous one, so abutting occurrences collapse to a single marker). ``ranges`` is
+    # bounded by _MAX_MASK_RANGES above, so this sort is O(n log n) on a bounded n, never
+    # on the size of ``text``.
     ranges.sort()
     merged: list[tuple[int, int]] = []
     for start, end in ranges:
@@ -406,10 +455,17 @@ def _redact(text: str) -> str:
     floor also drops the empty string (``str.replace("", m)`` would splice the marker
     between every character) and a 1-5 char value (see that constant).
 
-    The masking itself is the shared ``_mask_known_secrets`` -- byte-identical to
-    ``tools``' copy (see that helper): it computes every mask range on the PRISTINE text
-    and merges them, which is what keeps a secret straddling an upstream boundary from
-    surviving (H1) and mirrors the live redactor exactly.
+    The masking itself -- the shared ``_mask_known_secrets`` (byte-identical to
+    ``tools``' copy, see that helper) -- now runs INSIDE the SAME guard too (D36
+    round-5): it computes every mask range on the PRISTINE text and merges them,
+    which is what keeps a secret straddling an upstream boundary from surviving (H1)
+    and mirrors the live redactor exactly, but it is still ordinary code that CAN
+    raise, and letting a failure there escape past the try below would violate the
+    exact no-observer-failure invariant this function exists to uphold.
+    ``tools.redact_known_secrets`` is the mirror-image case: it deliberately leaves
+    its OWN call to this same helper bare, because the LIVE path must fail CLOSED
+    (propagate) rather than risk leaking an unmasked secret -- see that function's
+    docstring.
     """
     provider = _secret_provider
     if provider is None:
@@ -420,9 +476,9 @@ def _redact(text: str) -> str:
             for value in provider()
             if isinstance(value, str) and len(value) >= _MIN_SECRET_LEN
         ]
+        return _mask_known_secrets(text, secrets)
     except Exception:
         return text
-    return _mask_known_secrets(text, secrets)
 
 
 # --- stored-body safety: redact, THEN UTF-8-safe, THEN size-capped ----------

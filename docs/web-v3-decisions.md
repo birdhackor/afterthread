@@ -77,3 +77,4 @@
   1. **H 完整值替換先毀尾端碎片**（重疊秘密：短值先換 marker，長值前綴碎片遂不可見、漏 ≥6 字元）→ 兩個遮蔽器改「在原始文字上統一計算遮蔽範圍（完整值 + 尾端碎片）、合併重疊區間、一次套用」。
   2. **M OpenAPI 文件 `_truncate_to` 先於遮蔽**（內部碎片、text-final guard 接不到）→ 遮蔽先於截斷（openapi 文件可能本身含金鑰，內部 API 文件常見）。
   3. **M double-quote 轉義拼法未登錄**（`"ab'cd\"ef"` 的 escaped 拼法不含原值 substring，`cat .env` 可還原洩漏）→ 收窄 serializer：double-quote 分支實際觸發轉義（值含 `"` 或 `\` 且含 `'`）即拒裝；單引號路徑與未轉義路徑的 raw 拼法都含原值 verbatim、遮蔽可命中。往返檢查留為兜底。
+- **第五輪複審（d848c4e 後）**：1 Medium（兩子點，皆 range-merge 重寫自身邊角），修：(a) find-loop 逐字前進存每個重疊 occurrence——`aaaaaa` 秘密 × 2MiB 全 `a` 文件 ≈ 210 萬 range 的記憶體放大 → find 前進 `len(secret)`（同秘密重疊坍縮；殘餘 <6 字元低於碎片閾值、text-final 殘餘由 fragment guard 接）+ `_MAX_MASK_RANGES=10000` 上限，超過即整段換單一 marker（**過度遮蔽永遠安全**，把病態配置變 O(1)）；(b) `llm_log._redact` 的 helper 呼叫在 try 外，MemoryError 會逸出 recorder 違反 observer 不變量 → 移進 try、任何例外退化為未遮蔽；tools 側維持相反的 fail-closed 方向不變。
