@@ -8,6 +8,7 @@ import {
 	Group,
 	Loader,
 	Modal,
+	PasswordInput,
 	Stack,
 	Switch,
 	Tabs,
@@ -32,6 +33,8 @@ import {
 	isHttpUrl,
 	isInstallJobActive,
 	isTerminalInstallState,
+	secretNameError,
+	secretValueError,
 } from "../utils/toolInstall.js";
 
 // The instructions textarea shares the backend's AI-input bound (20000 chars,
@@ -321,8 +324,13 @@ function InstallPanel() {
 	const [notConfigured, setNotConfigured] = useState(false);
 	const [conflictMessage, setConflictMessage] = useState(null);
 
-	const { control, handleSubmit } = useForm({
-		defaultValues: { openapi_url: "", instructions: "" },
+	const { control, handleSubmit, getValues } = useForm({
+		defaultValues: {
+			openapi_url: "",
+			instructions: "",
+			secret_name: "",
+			secret_value: "",
+		},
 	});
 
 	const installMutation = useMutation({
@@ -395,6 +403,12 @@ function InstallPanel() {
 		}
 		setNotConfigured(false);
 		setConflictMessage(null);
+		// The secret pair is optional and validated both-or-neither above, so by
+		// the time submit runs either both are set or both are empty. Include them
+		// only when supplied (D36); the VALUE rides in this POST body ONCE and is
+		// never kept in job state (see the backend's tool_builder / redaction).
+		const secretName = values.secret_name.trim();
+		const secretValue = values.secret_value.trim();
 		// Do NOT clear jobId here: if this POST comes back 409 (a job is still
 		// running), the old id must survive so its polling continues -- clearing it
 		// up front would orphan that live job. The id is replaced only when a new
@@ -403,6 +417,9 @@ function InstallPanel() {
 		installMutation.mutate({
 			openapi_url: values.openapi_url.trim(),
 			instructions: values.instructions.trim(),
+			...(secretName || secretValue
+				? { secret_name: secretName, secret_value: secretValue }
+				: {}),
 		});
 	});
 
@@ -473,8 +490,8 @@ function InstallPanel() {
 									{...field}
 									withAsterisk
 									label="給 AI 的指示"
-									description="描述要建立什麼工具：要查什麼資料、用哪個端點、認證方式與 API key（AI 會把金鑰放進工具自己的 .env）。"
-									placeholder="例如：建立一個用關鍵字搜尋內部知識庫的工具，使用 /search 端點；API key 是 xxxx，請放在 X-Api-Key 標頭。"
+									description="描述要建立什麼工具：要查什麼資料、用哪個端點、認證方式。金鑰請填在下方「秘密值」欄位，不要貼在這裡（貼在指示裡會被記錄）。"
+									placeholder="例如：建立一個用關鍵字搜尋內部知識庫的工具，使用 /search 端點；API key 放在 X-Api-Key 標頭（金鑰請填下方秘密欄位）。"
 									autosize
 									minRows={5}
 									error={fieldState.error?.message}
@@ -484,6 +501,48 @@ function InstallPanel() {
 							</div>
 						)}
 					/>
+					<Controller
+						name="secret_name"
+						control={control}
+						rules={{
+							// Cross-field (both-or-neither): reads the value too, and
+							// re-validates the value field when the name changes.
+							deps: ["secret_value"],
+							validate: (value) =>
+								secretNameError(value, getValues("secret_value")) ?? true,
+						}}
+						render={({ field, fieldState }) => (
+							<TextInput
+								{...field}
+								label="秘密名稱（選填，例：KB_API_KEY）"
+								placeholder="KB_API_KEY"
+								error={fieldState.error?.message}
+								disabled={installMutation.isPending || jobActive}
+							/>
+						)}
+					/>
+					<Controller
+						name="secret_value"
+						control={control}
+						rules={{
+							deps: ["secret_name"],
+							validate: (value) =>
+								secretValueError(getValues("secret_name"), value) ?? true,
+						}}
+						render={({ field, fieldState }) => (
+							<PasswordInput
+								{...field}
+								label="秘密值（選填）"
+								placeholder="貼上 API key……"
+								error={fieldState.error?.message}
+								disabled={installMutation.isPending || jobActive}
+							/>
+						)}
+					/>
+					<Text size="xs" c="dimmed">
+						在此輸入的金鑰會直接寫入工具自己的 .env 與即時測試環境，並會從 AI
+						日誌中遮蔽；若改把金鑰貼在上方指示文字裡，仍會被記錄（只有比對到已知秘密時才遮蔽）。
+					</Text>
 					<Group justify="flex-end">
 						<Button
 							type="submit"

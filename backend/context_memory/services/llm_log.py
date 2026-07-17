@@ -47,10 +47,11 @@ concurrent interaction behind one writer.
 import contextlib
 import json
 import logging
+import os
 import threading
 import time
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -271,7 +272,80 @@ def _aggregate_usage(attempts: list[LlmAttempt]) -> dict[str, int | None] | None
     return aggregate
 
 
-# --- stored-body safety: UTF-8-safe THEN size-capped ------------------------
+# --- known-value secret redaction (provider-injected, D36) ------------------
+
+# The exact-match marker every redacted secret value is replaced with. Its CJK
+# body ("秘密已遮蔽" = secret has been masked) and the •••…••• fence make a
+# redaction obvious to a reader of the AI 日誌 / JSONL sink, and distinct from
+# the truncation/elision markers above (those mean "cut for size", this means
+# "removed for secrecy").
+_REDACTION_MARKER = "•••[秘密已遮蔽]•••"
+
+# Values shorter than this are NEVER redacted (see `_redact`): a 1-5 char value
+# would shred ordinary prose (imagine redacting every "1234"), and a real API
+# key / token is never that short -- so the floor costs no real coverage while
+# removing the false-positive hazard entirely.
+_MIN_SECRET_LEN = 6
+
+# The known-secret provider. A CALLABLE, deliberately not a static set, because
+# the secret set CHANGES at runtime: installing a tool adds its .env values, and
+# an in-flight install registers its form secret before that .env even exists
+# (see tools.known_secret_values). llm_log is a leaf OBSERVABILITY module and
+# must not import the tool subsystem to learn where secrets come from, so it
+# takes this hook and the application entrypoint (main._configure_secret_
+# redaction) injects tools.known_secret_values once at startup -- the same
+# leaf/provider inversion _configure_app_logging uses for the log handler.
+_secret_provider: Callable[[], Iterable[str]] | None = None
+
+
+def set_secret_provider(provider: Callable[[], Iterable[str]] | None) -> None:
+    """Install the callable that yields the values `_redact` masks out.
+
+    Idempotent overwrite (last writer wins) -- main calls it once at startup, and
+    a test may swap in its own provider and restore it. Passing None disables
+    redaction entirely (the default state before wiring), which is exactly the
+    byte-identical "no known secrets" behavior every path had before D36.
+    """
+    global _secret_provider
+    _secret_provider = provider
+
+
+def _redact(text: str) -> str:
+    """Replace every exact occurrence of each known secret value in ``text``.
+
+    The FIRST stage of `_stored_body` (before `_utf8_safe`, before the size cut):
+    a secret must be scrubbed BEFORE truncation could split it, or half of a key
+    straddling the cap edge would survive in the record. Substring `str.replace`,
+    not a regex, so a value containing regex metacharacters is matched literally.
+
+    The provider is called INSIDE a broad `except Exception` because of the
+    no-observer-failure invariant: the recorder is a pure observer of the LLM
+    call, so a broken/misconfigured secret provider must degrade to "record
+    unredacted", never raise into `begin_attempt`/`record_response`/the sink and
+    turn a successful call into a logging crash. Guards per value: empty/None is
+    skipped (``str.replace("", m)`` would splice the marker between every
+    character), and anything under `_MIN_SECRET_LEN` is skipped (see that
+    constant). The `in` pre-check just avoids allocating a new string for a
+    secret that is not present (the common case: most known secrets appear in no
+    given body).
+    """
+    provider = _secret_provider
+    if provider is None:
+        return text
+    try:
+        values = provider()
+    except Exception:
+        return text
+    redacted = text
+    for value in values:
+        if not value or len(value) < _MIN_SECRET_LEN:
+            continue
+        if value in redacted:
+            redacted = redacted.replace(value, _REDACTION_MARKER)
+    return redacted
+
+
+# --- stored-body safety: redact, THEN UTF-8-safe, THEN size-capped ----------
 
 
 def _utf8_safe(text: str) -> str:
@@ -318,18 +392,30 @@ def _stored_body(text: str) -> tuple[str, bool]:
     """Make ``text`` safe AND small enough to store; return (stored, truncated).
 
     The single choke point every request-message/response body passes through
-    before it is written into an attempt: ``_utf8_safe`` FIRST, then a hard
-    cut to ``settings.llm_log_body_max_chars`` with ``_BODY_TRUNCATION_MARKER``
-    appended when a cut happens. Order matters -- ``_utf8_safe`` must run
-    before the slice, not after: it never enlarges the text (one surrogate
-    becomes one U+FFFD), and once it has run the string holds only valid
-    Unicode scalar values, so slicing it by Python's code-point-based indexing
-    can never land inside what used to be a lone surrogate. Truncating first
-    would risk cutting a bare surrogate at the boundary and handing
-    ``_utf8_safe`` a different (index-shifted) string than the one actually
-    stored.
+    before it is written into an attempt, in a THREE-stage order that each
+    guards a distinct hazard: ``_redact`` FIRST, then ``_utf8_safe``, then the
+    hard cut to ``settings.llm_log_body_max_chars`` (with
+    ``_BODY_TRUNCATION_MARKER`` appended when a cut happens).
 
-    Without this cap, a broken or hostile OpenAI-*compatible* gateway
+    Redaction MUST run first -- before both the UTF-8 pass and the size cut. The
+    size cut is the load-bearing reason: a secret value straddling the
+    truncation edge must not be half-scrubbed and half-survive, so it has to be
+    replaced while the body is still whole. (Against ``_utf8_safe`` the order is
+    harmless either way -- API keys/tokens are plain ASCII, which the surrogate
+    pass never alters -- but redact-first is the correct, edge-independent order
+    regardless.) Because this is the ONE choke point, redaction reaches ALL
+    stored bodies -- every request message and every response -- and both sinks
+    (the ring and the JSONL file) see the SAME already-redacted record.
+
+    ``_utf8_safe`` must in turn run before the slice: it never enlarges the text
+    (one surrogate becomes one U+FFFD), and once it has run the string holds
+    only valid Unicode scalar values, so slicing it by Python's
+    code-point-based indexing can never land inside what used to be a lone
+    surrogate. Truncating first would risk cutting a bare surrogate at the
+    boundary and handing ``_utf8_safe`` a different (index-shifted) string than
+    the one actually stored.
+
+    Without the size cap, a broken or hostile OpenAI-*compatible* gateway
     returning a multi-MB body would be kept in full (per attempt, and echoed
     into a corrective retry's OWN next request, compounding the size) --
     multiplied by ``llm_log_max_entries``, that turns a "bounded" ring into
@@ -340,7 +426,7 @@ def _stored_body(text: str) -> tuple[str, bool]:
     unreachable in practice, but the guard keeps this function correct
     independent of that floor rather than relying on it.
     """
-    safe = _utf8_safe(text)
+    safe = _utf8_safe(_redact(text))
     cap = get_settings().llm_log_body_max_chars
     if len(safe) <= cap:
         return safe, False
@@ -662,26 +748,67 @@ def _record_summary(record: LlmInteractionRecord) -> dict[str, Any]:
     }
 
 
+def _rotate_file_sink(path: str) -> None:
+    """Rename the sink file aside when it has outgrown ``llm_log_file_max_bytes``.
+
+    Run once before every append (see ``_write_file_sink``), so the JSONL sink
+    can never grow ONE file without bound (D34). The mechanics are deliberately
+    tiny and zero-dependency: stat the current file; if it is over the cap,
+    ``os.rename`` it to ``<path>.<UTC YYYYMMDD-HHMMSSZ>`` -- the next append then
+    opens a FRESH file at the original path. This keeps ``_write_file_sink``'s
+    per-write open/close semantics exactly as they were (that per-write reopen is
+    the deliberate operator-robustness choice, and rotation slots in AHEAD of it
+    rather than holding a long-lived handle).
+
+    Every failure is fully suppressed -- the same never-break-the-caller contract
+    the sink itself carries. A missing file (the first-ever write) makes
+    ``getsize`` raise ``OSError`` and simply means "nothing to rotate"; a failed
+    rename leaves the file in place and the append proceeds onto it (oversized,
+    but recorded), never surfacing an error. The broad final ``except Exception``
+    backstops even a pathological ``get_settings``/``strftime``, because this
+    helper runs OUTSIDE ``_write_file_sink``'s own try and MUST NOT be the thing
+    that breaks a recording. NO retention/deletion of the rotated segments is
+    done here: pruning old files is the operator's call (config comment says so).
+    """
+    try:
+        if os.path.getsize(path) <= get_settings().llm_log_file_max_bytes:
+            return
+    except OSError:
+        # Missing file (nothing written yet) or an unstattable path: nothing to
+        # rotate. Any other stat failure likewise degrades to "leave it alone".
+        return
+    except Exception:
+        # Defensive: rotation is best-effort and must never raise into the sink.
+        return
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%SZ")
+    with contextlib.suppress(Exception):
+        os.rename(path, f"{path}.{stamp}")
+
+
 def _write_file_sink(record: LlmInteractionRecord) -> None:
     """Append the full record as one JSON line to ``settings.llm_log_file``.
 
     Off entirely when the setting is empty (the default). Opened/written/closed
     per record -- simple and robust against an operator truncating or rotating
-    the file between calls. A write failure must NEVER break the LLM call, so
-    the catch below is ``Exception``, not just ``OSError``: the stated contract
-    is "sink failures never break the LLM call", full stop, and an OSError-only
-    catch does not actually keep it -- e.g. a body that ever reached here
-    without going through ``_utf8_safe`` could raise ``UnicodeEncodeError`` (a
-    ``ValueError`` subclass, not an ``OSError``) on the ``.write`` below, and a
-    future non-JSON-safe field could raise from ``json.dumps`` itself. The
-    filename is the operator's own config (not a secret) so naming it is fine
-    and useful, but only its CATEGORY is logged, never ``str(exc)`` (which could
-    carry additional path detail without adding diagnostic value). ``ensure_ascii
-    =False`` keeps CJK memory content readable in the file rather than escaped.
+    the file between calls. Before each append, ``_rotate_file_sink`` renames the
+    file aside if it has grown past ``llm_log_file_max_bytes`` (D34), so the
+    still-per-write open below lands on a fresh file after a rotation. A write
+    failure must NEVER break the LLM call, so the catch below is ``Exception``,
+    not just ``OSError``: the stated contract is "sink failures never break the
+    LLM call", full stop, and an OSError-only catch does not actually keep it --
+    e.g. a body that ever reached here without going through ``_utf8_safe`` could
+    raise ``UnicodeEncodeError`` (a ``ValueError`` subclass, not an ``OSError``)
+    on the ``.write`` below, and a future non-JSON-safe field could raise from
+    ``json.dumps`` itself. The filename is the operator's own config (not a
+    secret) so naming it is fine and useful, but only its CATEGORY is logged,
+    never ``str(exc)`` (which could carry additional path detail without adding
+    diagnostic value). ``ensure_ascii=False`` keeps CJK memory content readable
+    in the file rather than escaped.
     """
     path = get_settings().llm_log_file.strip()
     if not path:
         return
+    _rotate_file_sink(path)
     try:
         line = json.dumps(_record_detail(record), ensure_ascii=False)
         with open(path, "a", encoding="utf-8") as handle:

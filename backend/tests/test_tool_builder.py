@@ -52,12 +52,18 @@ from context_memory.services.tool_builder import (
 
 @pytest.fixture(autouse=True)
 def _reset_singletons() -> Generator[None]:
-    """Empty the job table and the llm_log ring around every test."""
+    """Empty the job table, the llm_log ring, and the process-wide known-secret
+    registries around every test (all module-level singletons the installer
+    touches)."""
     tool_builder._reset_jobs_for_tests()
     llm_log._reset_for_tests()
+    tools._INFLIGHT_SECRETS.clear()
+    tools._ENV_VALUE_CACHE.clear()
     yield
     tool_builder._reset_jobs_for_tests()
     llm_log._reset_for_tests()
+    tools._INFLIGHT_SECRETS.clear()
+    tools._ENV_VALUE_CACHE.clear()
 
 
 def _install_settings(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> Settings:
@@ -601,6 +607,250 @@ def test_run_install_feature_off(monkeypatch: pytest.MonkeyPatch) -> None:
     assert outcome.llm_log_id is None
 
 
+# --- install-form secret (D36) -------------------------------------------------
+
+
+def test_run_shell_receives_injected_secret(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``_build_meta_tools(secret_env=...)`` injects the secret ONLY into
+    run_shell's env: the builder can use $NAME to live-test the real API. Our own
+    OPENAI creds stay absent (the from-scratch base env is preserved)."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    meta = {
+        t.spec["function"]["name"]: t
+        for t in _build_meta_tools(staging, secret_env={"KB_API_KEY": "shell-secret-123456"})
+    }
+
+    result = _call(meta["run_shell"].handler, {"command": 'echo "K=$KB_API_KEY"'})
+    assert "K=shell-secret-123456" in result
+    scrubbed = _call(meta["run_shell"].handler, {"command": 'echo "O=${OPENAI_API_KEY:-none}"'})
+    assert "O=none" in scrubbed
+
+
+def test_run_install_secret_injected_into_shell_and_env_never_in_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """End-to-end (D36): the form secret reaches run_shell's env during the build
+    (so the builder can live-test the API) and is written into the promoted
+    tool's ``.env`` by the backend, yet the VALUE never appears in the builder
+    prompts or the outcome -- only the NAME reaches the system prompt."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    secret_name = "KB_API_KEY"
+    secret_value = "topsecretvalue-abcdef123456"
+    captured: dict[str, Any] = {}
+
+    async def fake(
+        system_prompt: str,
+        user_prompt: str,
+        model_cls: type[BaseModel],
+        *,
+        workflow: str = "unknown",
+        tools: Any = None,
+        max_tool_rounds: int | None = None,
+        timeout_seconds: float | None = None,
+    ) -> BaseModel:
+        captured["system_prompt"] = system_prompt
+        captured["user_prompt"] = user_prompt
+        by_name = {t.spec["function"]["name"]: t for t in tools or []}
+        await by_name["write_file"].handler(
+            {"path": "tool.json", "content": json.dumps(_package_manifest("kbsearch"))}
+        )
+        await by_name["write_file"].handler({"path": "run.py", "content": _GOOD_RUN_PY})
+        # The builder live-tests the API using the injected env var.
+        captured["shell"] = await by_name["run_shell"].handler(
+            {"command": 'echo "probe=$KB_API_KEY"'}
+        )
+        return model_cls.model_validate(
+            {"tool_name": "kbsearch", "summary": "built and tested", "ready": True}
+        )
+
+    monkeypatch.setattr("context_memory.services.tool_builder.generate_structured", fake)
+    _no_fetch(monkeypatch)
+
+    outcome = asyncio.run(
+        run_install(
+            "http://kb.example/openapi.json",
+            "build a search tool",
+            secret_name=secret_name,
+            secret_value=secret_value,
+        )
+    )
+
+    assert outcome.ok is True
+    # run_shell DID see the secret (it could live-test the real API with it).
+    assert f"probe={secret_value}" in captured["shell"]
+    # The promoted tool's .env carries the secret, written by the backend.
+    env_text = (root / "kbsearch" / ".env").read_text(encoding="utf-8")
+    assert f"{secret_name}={secret_value}" in env_text
+    # The system prompt names the secret but NEVER its value; neither does the
+    # user prompt or the outcome.
+    assert secret_name in captured["system_prompt"]
+    assert secret_value not in captured["system_prompt"]
+    assert secret_value not in captured["user_prompt"]
+    assert secret_value not in (outcome.summary or "")
+    assert secret_value not in (outcome.error or "")
+
+
+def test_run_install_registers_and_discards_inflight_secret(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The form secret is registered in the in-flight redaction set DURING the
+    build (so llm_log masks it from the session trace, before promote writes it
+    into the .env) and discarded afterwards."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    secret_value = "inflight-secret-value-123456"
+    seen: dict[str, bool] = {}
+    # Captured before the fake, whose ``tools`` parameter (the meta-tool list)
+    # shadows the module name inside its body.
+    known_secret_values = tools.known_secret_values
+
+    async def fake(
+        system_prompt: str,
+        user_prompt: str,
+        model_cls: type[BaseModel],
+        *,
+        workflow: str = "unknown",
+        tools: Any = None,
+        max_tool_rounds: int | None = None,
+        timeout_seconds: float | None = None,
+    ) -> BaseModel:
+        # During the session the value is redactable via the known-secret set.
+        seen["registered_during"] = secret_value in known_secret_values()
+        by_name = {t.spec["function"]["name"]: t for t in tools or []}
+        await by_name["write_file"].handler(
+            {"path": "tool.json", "content": json.dumps(_package_manifest("kbsearch"))}
+        )
+        await by_name["write_file"].handler({"path": "run.py", "content": _GOOD_RUN_PY})
+        return model_cls.model_validate({"tool_name": "kbsearch", "summary": "s", "ready": True})
+
+    monkeypatch.setattr("context_memory.services.tool_builder.generate_structured", fake)
+    _no_fetch(monkeypatch)
+    asyncio.run(
+        run_install(
+            "http://kb.example/openapi.json",
+            "build",
+            secret_name="KB_API_KEY",
+            secret_value=secret_value,
+        )
+    )
+
+    assert seen["registered_during"] is True
+    # The transient in-flight registration is gone after the install (the .env
+    # scan now covers the value instead).
+    with tools._INFLIGHT_LOCK:
+        assert secret_value not in tools._INFLIGHT_SECRETS
+
+
+def test_run_install_replaces_disobedient_secret_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If the model DISOBEYED and wrote its own ``KB_API_KEY`` line, promote
+    REPLACES it with the real value rather than duplicating (D36)."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "s", "ready": True},
+        files={
+            "tool.json": json.dumps(_package_manifest("kbsearch")),
+            "run.py": _GOOD_RUN_PY,
+            ".env": "OTHER=keep\nKB_API_KEY=placeholder-the-model-wrote\n",
+        },
+    )
+    _no_fetch(monkeypatch)
+
+    asyncio.run(
+        run_install(
+            "http://kb.example/openapi.json",
+            "build",
+            secret_name="KB_API_KEY",
+            secret_value="real-secret-value-123456",
+        )
+    )
+    env_text = (root / "kbsearch" / ".env").read_text(encoding="utf-8")
+    assert "KB_API_KEY=real-secret-value-123456" in env_text
+    assert "placeholder-the-model-wrote" not in env_text
+    assert "OTHER=keep" in env_text  # unrelated lines preserved
+    assert env_text.count("KB_API_KEY=") == 1  # replaced, not duplicated
+
+
+def test_run_install_secret_over_env_cap_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If writing the secret into the staged ``.env`` would push it past the
+    64KiB cap, the install is refused with a friendly error and nothing is
+    promoted -- validate_package passed the pre-secret ``.env``, so this is our
+    OWN post-append guard (D36)."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    # A .env just under the cap: passes validate_package, but appending the
+    # secret line pushes the total over _ENV_FILE_MAX_BYTES.
+    near_cap_env = "PAD=" + "y" * (tools._ENV_FILE_MAX_BYTES - 5)  # <= 64KiB, no newline
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "s", "ready": True},
+        files={
+            "tool.json": json.dumps(_package_manifest("kbsearch")),
+            "run.py": _GOOD_RUN_PY,
+            ".env": near_cap_env,
+        },
+    )
+    _no_fetch(monkeypatch)
+
+    outcome = asyncio.run(
+        run_install(
+            "http://kb.example/openapi.json",
+            "build",
+            secret_name="KB_API_KEY",
+            secret_value="v-abcdef",
+        )
+    )
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_SECRET_ENV_TOO_LARGE
+    assert not (root / "kbsearch").exists()  # nothing promoted
+    assert not (root / ".staging").exists()  # staging cleaned
+
+
+def test_router_install_threads_secret_pair(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A valid secret pair is stripped, threaded to start_install_job, and never
+    echoed back in the 202 response."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    seen: dict[str, Any] = {}
+
+    def fake_start(
+        openapi_url: str,
+        instructions: str,
+        *,
+        secret_name: str | None = None,
+        secret_value: str | None = None,
+    ) -> str:
+        seen["secret_name"] = secret_name
+        seen["secret_value"] = secret_value
+        return "job-xyz"
+
+    monkeypatch.setattr("context_memory.services.tool_builder.start_install_job", fake_start)
+    response = client.post(
+        "/api/tools/install",
+        json={
+            "openapi_url": "http://kb.example/openapi.json",
+            "instructions": "build",
+            "secret_name": "  KB_API_KEY  ",
+            "secret_value": "  the-secret-value  ",
+        },
+    )
+    assert response.status_code == 202
+    assert seen["secret_name"] == "KB_API_KEY"  # stripped
+    assert seen["secret_value"] == "the-secret-value"  # stripped
+    assert "the-secret-value" not in response.text  # never echoed back
+
+
 # --- the OpenAPI fetch (a real local HTTP server) ------------------------------
 
 
@@ -745,7 +995,13 @@ def test_job_state_machine_success(monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
         release = asyncio.Event()
 
-        async def fake_run_install(url: str, instructions: str) -> InstallOutcome:
+        async def fake_run_install(
+            url: str,
+            instructions: str,
+            *,
+            secret_name: str | None = None,
+            secret_value: str | None = None,
+        ) -> InstallOutcome:
             await release.wait()
             return InstallOutcome(ok=True, tool_name="kb", summary="done", llm_log_id=7)
 
@@ -779,7 +1035,13 @@ def test_job_state_machine_success(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_job_state_machine_failure_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
-        async def fake_run_install(url: str, instructions: str) -> InstallOutcome:
+        async def fake_run_install(
+            url: str,
+            instructions: str,
+            *,
+            secret_name: str | None = None,
+            secret_value: str | None = None,
+        ) -> InstallOutcome:
             return InstallOutcome(ok=False, error="工具包驗證失敗：missing tool.json")  # noqa: RUF001
 
         monkeypatch.setattr("context_memory.services.tool_builder.run_install", fake_run_install)
@@ -804,7 +1066,13 @@ def test_job_unexpected_exception_becomes_failed_category(
     the task backstop records a failed state with a category-only error."""
 
     async def scenario() -> None:
-        async def exploding(url: str, instructions: str) -> InstallOutcome:
+        async def exploding(
+            url: str,
+            instructions: str,
+            *,
+            secret_name: str | None = None,
+            secret_value: str | None = None,
+        ) -> InstallOutcome:
             raise RuntimeError("bug with secrets in str()")
 
         monkeypatch.setattr("context_memory.services.tool_builder.run_install", exploding)
@@ -833,7 +1101,13 @@ def test_jobs_bounded_to_most_recent(monkeypatch: pytest.MonkeyPatch) -> None:
     that runs many installs over its lifetime."""
 
     async def scenario() -> None:
-        async def instant(url: str, instructions: str) -> InstallOutcome:
+        async def instant(
+            url: str,
+            instructions: str,
+            *,
+            secret_name: str | None = None,
+            secret_value: str | None = None,
+        ) -> InstallOutcome:
             return InstallOutcome(ok=True, tool_name="t")
 
         monkeypatch.setattr("context_memory.services.tool_builder.run_install", instant)
@@ -868,7 +1142,13 @@ def test_start_install_job_single_flight(monkeypatch: pytest.MonkeyPatch) -> Non
     async def scenario() -> None:
         release = asyncio.Event()
 
-        async def fake_run_install(url: str, instructions: str) -> InstallOutcome:
+        async def fake_run_install(
+            url: str,
+            instructions: str,
+            *,
+            secret_name: str | None = None,
+            secret_value: str | None = None,
+        ) -> InstallOutcome:
             await release.wait()
             return InstallOutcome(ok=True, tool_name="kb")
 
@@ -1010,7 +1290,13 @@ def test_router_install_202_queues_job(
     _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
     seen: dict[str, str] = {}
 
-    def fake_start(openapi_url: str, instructions: str) -> str:
+    def fake_start(
+        openapi_url: str,
+        instructions: str,
+        *,
+        secret_name: str | None = None,
+        secret_value: str | None = None,
+    ) -> str:
         seen["url"] = openapi_url
         seen["instructions"] = instructions
         return "job-abc"
@@ -1057,8 +1343,28 @@ def test_router_install_409_when_active(
         {"openapi_url": "http://kb.example/openapi.json", "instructions": "   "},
         {"openapi_url": "http://kb.example/openapi.json", "instructions": "x" * 20001},
         {"openapi_url": "http://kb.example/openapi.json"},
+        # D36 secret pair: an invalid env-var name and a half-supplied pair both 422.
+        {
+            "openapi_url": "http://kb.example/openapi.json",
+            "instructions": "x",
+            "secret_name": "kb_key",
+            "secret_value": "v",
+        },
+        {
+            "openapi_url": "http://kb.example/openapi.json",
+            "instructions": "x",
+            "secret_name": "KB_KEY",
+        },
     ],
-    ids=["non-http-scheme", "not-a-url", "blank-instructions", "oversized", "missing-field"],
+    ids=[
+        "non-http-scheme",
+        "not-a-url",
+        "blank-instructions",
+        "oversized",
+        "missing-field",
+        "bad-secret-name",
+        "half-secret-pair",
+    ],
 )
 def test_router_install_validates_request(
     client: TestClient,

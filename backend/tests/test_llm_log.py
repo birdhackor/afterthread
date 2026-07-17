@@ -22,6 +22,7 @@ monkeypatching ``llm_log.get_settings`` where a test needs a specific value.
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Generator
 from types import SimpleNamespace
 from typing import Any
@@ -295,6 +296,108 @@ def test_begin_attempt_small_conversation_stored_verbatim(
     assert attempt["truncated"] is False
 
 
+# --- known-value secret redaction (_redact, provider-injected, D36) ---------
+
+
+def test_redaction_masks_known_secret_in_request_and_response(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A registered secret value is replaced by the redaction marker in BOTH a
+    request message and the response, in the ring AND on the way to the JSONL
+    sink: the ONE choke point (_stored_body) covers every stored body, and both
+    sinks share the same already-redacted record, so the secret never lands in
+    memory OR on disk."""
+    secret = "kb-live-key-abcdef123456"
+    log_file = tmp_path / "llm.jsonl"
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_file=str(log_file), llm_log_max_entries=50),
+    )
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {secret})
+    llm_log._reset_for_tests()
+
+    _record(
+        workflow="tool_install",
+        messages=[
+            {"role": "system", "content": "build a tool"},
+            {"role": "user", "content": f"the key is {secret} use it"},
+        ],
+        response=f"tested with {secret} and it worked",
+    )
+
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    attempt = record["attempts"][0]
+    user_message = attempt["request_messages"][1]["content"]
+    assert secret not in user_message
+    assert llm_log._REDACTION_MARKER in user_message
+    assert attempt["response_content"] is not None
+    assert secret not in attempt["response_content"]
+    assert llm_log._REDACTION_MARKER in attempt["response_content"]
+    # The JSONL sink wrote the SAME redacted record -- the secret never on disk.
+    file_text = log_file.read_text(encoding="utf-8")
+    assert secret not in file_text
+    assert llm_log._REDACTION_MARKER in file_text
+
+
+def test_redaction_skips_values_shorter_than_min(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A too-short (<6 char) provider value is NEVER redacted: masking a 1-5 char
+    value would shred ordinary prose, and a real key is never that short."""
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {"abc", "12345"})  # both < 6
+    llm_log._reset_for_tests()
+
+    _record(response="abc appears here and 12345 too")
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    body = record["attempts"][0]["response_content"]
+    assert body == "abc appears here and 12345 too"  # untouched
+    assert llm_log._REDACTION_MARKER not in body
+
+
+def test_redaction_runs_before_truncation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redaction runs BEFORE the size cut, so a secret straddling the truncation
+    edge is fully masked and never half-survives. Positioned so that -- had
+    truncation run first -- a recognizable 10-char prefix of the secret would sit
+    inside the cap and leak; redact-first removes the whole secret up front."""
+    secret = "SECRETABCDEFGHIJ"  # 16 chars; its first 10 = "SECRETABCD"
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_body_max_chars=1000, llm_log_max_entries=50),
+    )
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {secret})
+    llm_log._reset_for_tests()
+    # 990 filler + the 16-char secret + trailing: the secret spans indices
+    # 990..1006, so truncate-first would keep secret[:10] inside the 1000 cap.
+    _record(response="x" * 990 + secret + "y" * 500)
+
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    body = record["attempts"][0]["response_content"]
+    assert secret not in body
+    assert "SECRETABCD" not in body  # not even the prefix truncate-first would leak
+
+
+def test_redaction_provider_failure_records_unredacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A provider that RAISES must never break recording (the no-observer-failure
+    invariant): the interaction is still recorded, just unredacted."""
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+
+    def _boom() -> set[str]:
+        raise RuntimeError("secret provider exploded")
+
+    monkeypatch.setattr(llm_log, "_secret_provider", _boom)
+    llm_log._reset_for_tests()
+
+    _record(response="a normal body with sk-secret-value inside")  # must not raise
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    # Recorded, and unredacted (provider failed -> degrade to raw text).
+    assert record["attempts"][0]["response_content"] == "a normal body with sk-secret-value inside"
+
+
 def test_file_sink_writes_valid_jsonl(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """With llm_log_file set, every finished record is appended as one valid JSON
     line carrying the full bodies (ensure_ascii=False keeps CJK readable)."""
@@ -398,6 +501,73 @@ def test_file_sink_unicode_encode_error_does_not_break_the_call(
     # _log_summary still ran: the failure was contained inside
     # _write_file_sink rather than skipping the rest of finish()'s try block.
     assert "llm interaction workflow=capture" in caplog.text
+
+
+# --- JSONL file-sink rotation (D34) -----------------------------------------
+
+
+def test_file_sink_rotates_when_oversized(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Once the JSONL file exceeds llm_log_file_max_bytes, the next write renames
+    it aside with a UTC-timestamp suffix and appends the new record to a FRESH
+    file at the original path (D34)."""
+    log_file = tmp_path / "llm.jsonl"
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(
+            llm_log_file=str(log_file), llm_log_file_max_bytes=1_000_000, llm_log_max_entries=50
+        ),
+    )
+    llm_log._reset_for_tests()
+    # Pre-fill PAST the cap so the next append triggers exactly one rotation.
+    old_content = "x" * 1_000_050 + "\n"
+    log_file.write_text(old_content, encoding="utf-8")
+
+    _record(workflow="capture", response="fresh line after rotation")
+
+    # The original path now holds ONLY the new record (a fresh file).
+    fresh = log_file.read_text(encoding="utf-8").splitlines()
+    assert len(fresh) == 1
+    assert "fresh line after rotation" in fresh[0]
+    # Exactly one rotated segment exists, carrying the old oversized content...
+    rotated = [p for p in tmp_path.iterdir() if p.name.startswith("llm.jsonl.")]
+    assert len(rotated) == 1
+    assert rotated[0].read_text(encoding="utf-8") == old_content
+    # ...named with the UTC-timestamp suffix YYYYMMDD-HHMMSSZ.
+    suffix = rotated[0].name[len("llm.jsonl.") :]
+    assert re.fullmatch(r"\d{8}-\d{6}Z", suffix)
+
+
+def test_file_sink_rotation_failure_still_appends(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rotation whose rename fails is fully suppressed (same never-break-the-
+    caller contract as the sink): the record is still appended -- onto the
+    oversized file -- and no exception escapes."""
+    log_file = tmp_path / "llm.jsonl"
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(
+            llm_log_file=str(log_file), llm_log_file_max_bytes=1_000_000, llm_log_max_entries=50
+        ),
+    )
+    llm_log._reset_for_tests()
+    log_file.write_text("x" * 1_000_050 + "\n", encoding="utf-8")
+
+    def _boom_rename(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("rename not permitted")
+
+    monkeypatch.setattr(llm_log.os, "rename", _boom_rename)
+
+    _record(workflow="capture", response="appended despite rotation failure")  # must not raise
+
+    # No rotated file was created; the new line went onto the same file.
+    rotated = [p for p in tmp_path.iterdir() if p.name.startswith("llm.jsonl.")]
+    assert rotated == []
+    assert "appended despite rotation failure" in log_file.read_text(encoding="utf-8")
+    # The record also survived in the ring.
+    assert len(llm_log.list_summaries(10)) == 1
 
 
 class _RaisingHandler(logging.Handler):

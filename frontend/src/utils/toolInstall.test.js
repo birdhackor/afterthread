@@ -4,7 +4,10 @@ import {
 	installJobRefetchInterval,
 	isHttpUrl,
 	isInstallJobActive,
+	isSecretName,
 	isTerminalInstallState,
+	secretNameError,
+	secretValueError,
 } from "./toolInstall.js";
 
 // Minimal shape of the react-query Query object the interval fn receives.
@@ -127,5 +130,59 @@ describe("isHttpUrl", () => {
 		expect(isHttpUrl("")).toBe(false);
 		expect(isHttpUrl(null)).toBe(false);
 		expect(isHttpUrl(undefined)).toBe(false);
+	});
+});
+
+describe("isSecretName", () => {
+	it("accepts valid env-var names (uppercase-first, padded input)", () => {
+		expect(isSecretName("KB_API_KEY")).toBe(true);
+		expect(isSecretName("A")).toBe(true);
+		expect(isSecretName("X1_2_3")).toBe(true);
+		expect(isSecretName("  KB_API_KEY  ")).toBe(true); // trimmed
+		expect(isSecretName("A".repeat(64))).toBe(true); // max length
+	});
+
+	it("rejects lowercase-start, digit-start, spaces, too-long, and junk", () => {
+		expect(isSecretName("kb_key")).toBe(false);
+		expect(isSecretName("1KEY")).toBe(false);
+		expect(isSecretName("_KEY")).toBe(false);
+		expect(isSecretName("KB KEY")).toBe(false);
+		expect(isSecretName("A".repeat(65))).toBe(false); // over 64
+		expect(isSecretName("")).toBe(false);
+		expect(isSecretName(null)).toBe(false);
+		expect(isSecretName(undefined)).toBe(false);
+	});
+});
+
+describe("secretNameError / secretValueError (both-or-neither pair)", () => {
+	it("accepts an empty pair (the secret is optional)", () => {
+		expect(secretNameError("", "")).toBeNull();
+		expect(secretValueError("", "")).toBeNull();
+		// Whitespace-only counts as empty on both sides.
+		expect(secretNameError("  ", "  ")).toBeNull();
+		expect(secretValueError("  ", "  ")).toBeNull();
+	});
+
+	it("accepts a complete, valid pair", () => {
+		expect(secretNameError("KB_API_KEY", "the-value")).toBeNull();
+		expect(secretValueError("KB_API_KEY", "the-value")).toBeNull();
+	});
+
+	it("flags the missing half of a half-supplied pair", () => {
+		// Name given, value missing -> the VALUE field errors, the name does not.
+		expect(secretNameError("KB_API_KEY", "")).toBeNull();
+		expect(secretValueError("KB_API_KEY", "")).toBe(
+			"請輸入秘密值，或清空秘密名稱",
+		);
+		// Value given, name missing -> the NAME field errors, the value does not.
+		expect(secretValueError("", "the-value")).toBeNull();
+		expect(secretNameError("", "the-value")).toBe(
+			"請輸入秘密名稱，或清空秘密值",
+		);
+	});
+
+	it("flags an invalid name even when a value is present", () => {
+		expect(secretNameError("kb_key", "v")).toContain("大寫字母");
+		expect(secretNameError("1KEY", "v")).toContain("大寫字母");
 	});
 });

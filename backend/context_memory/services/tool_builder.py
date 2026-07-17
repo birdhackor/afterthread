@@ -134,6 +134,10 @@ _SUMMARY_CAP = 2000
 _ERROR_TOOLS_DISABLED = "工具功能未啟用（TOOLS_DIR 未設定）。"  # noqa: RUF001
 _ERROR_OPENAPI_TOO_LARGE = "OpenAPI 文件過大（超過 2MB 上限）。"  # noqa: RUF001
 _ERROR_NAME_TAKEN = "同名工具已存在，請先刪除舊工具再重新安裝。"  # noqa: RUF001
+# D36: raised when writing the form secret into the staged .env would push it
+# past the 64KiB cap, or when the .env cannot be written safely.
+_ERROR_SECRET_ENV_TOO_LARGE = "工具包 .env 加入秘密後將超過大小上限，安裝已取消。"  # noqa: RUF001
+_ERROR_SECRET_ENV_WRITE = "工具包 .env 無法寫入秘密值，安裝已取消。"  # noqa: RUF001
 
 # The builder's system prompt. English, like every prompt in this codebase.
 # It must carry the ENTIRE package contract (tool.json fields, the name regex,
@@ -197,6 +201,46 @@ short report of what you built and how you verified it (in the user's \
 language); set "ready" to true ONLY if your own run_shell test succeeded. If \
 you cannot make it work, set ready=false and explain the blocker in summary. \
 Never print or embed secrets in the summary."""
+
+
+# Appended to the builder system prompt ONLY when the install form supplied a
+# secret (D36). It names the secret and tells the model how to USE it without
+# ever revealing the value: the value is injected into run_shell's env under the
+# given NAME (so the model can live-test the real API), and the backend writes it
+# into the finished tool's .env at install time -- therefore the model must not
+# ask for it, must not write it (or a placeholder) into any file, must not echo
+# it, and the generated tool must read it from its OWN environment. English, like
+# the rest of the prompt. Only the NAME is ever interpolated (via a literal
+# ``{name}`` substring replace, which also turns each shell-style ``${name}``
+# into ``$<NAME>``); the VALUE never appears in the prompt text at all.
+_SECRET_PROMPT_ADDENDUM = """\
+
+
+A secret named {name} has been provided by the user for this install. You do NOT \
+know its value and must never try to discover or print it. Two facts about it:
+- It is already available as the environment variable {name} inside run_shell, \
+so you can live-test the real API with it directly (e.g. \
+`curl -H "Authorization: Bearer ${name}" ...`) -- the shell expands it; you \
+never see the value.
+- The backend will add it to the finished tool's .env automatically at install \
+time, under the name {name}.
+Therefore: do NOT ask the user for this secret; do NOT write it, or any \
+placeholder for it, into .env or any other file yourself; and do NOT echo it \
+(no `echo ${name}`, no printing it in run_shell output or in your summary). The \
+tool you generate must read {name} from its OWN environment at runtime (the \
+runtime injects the tool's .env into the process environment)."""
+
+
+def _builder_system_prompt(secret_name: str | None) -> str:
+    """The builder system prompt, plus the secret addendum when one was supplied.
+
+    Only the NAME is interpolated (never the value). ``str.replace`` (not
+    ``str.format``) so the many literal ``$``/``{`` characters in the shell
+    examples above are left untouched -- only the ``{name}`` token is swapped.
+    """
+    if not secret_name:
+        return _BUILDER_SYSTEM_PROMPT
+    return _BUILDER_SYSTEM_PROMPT + _SECRET_PROMPT_ADDENDUM.replace("{name}", secret_name)
 
 
 class InstallResult(BaseModel):
@@ -311,7 +355,13 @@ def _tool_spec(name: str, description: str, properties: dict[str, Any]) -> dict[
     }
 
 
-def _run_shell_subprocess(staging: Path, command: str, timeout: float, cap: int) -> str:
+def _run_shell_subprocess(
+    staging: Path,
+    command: str,
+    timeout: float,
+    cap: int,
+    extra_env: dict[str, str] | None = None,
+) -> str:
     """Run one builder shell command to completion (or timeout); returns text.
 
     Blocking (called via ``run_in_threadpool``). Mirrors
@@ -328,12 +378,22 @@ def _run_shell_subprocess(staging: Path, command: str, timeout: float, cap: int)
       its own ``.env`` when testing, keeping this env identical for every
       command rather than varying with what the model wrote so far.
 
+    ``extra_env`` is the ONE deliberate addition to the otherwise from-scratch
+    env: the install-form secret (D36), ``{<NAME>: <value>}``, present ONLY when
+    the user supplied one so the builder can live-test the real API with it. It
+    is layered on top of the passthrough allowlist -- our own ``OPENAI_*``
+    secrets stay absent because the BASE env is still built from the allowlist
+    alone -- and it never enters any prompt (only this process env), so the model
+    can use the key without ever seeing its value.
+
     Output is drained by ``tools._communicate_bounded`` (NOT ``communicate``),
     which caps the single merged pipe as it reads instead of slurping the whole
     stream first: a command that spews far past the cap is killed at the cap, so a
     runaway ``yes``/``cat`` can never OOM the service before the cap is applied.
     """
     env = {name: os.environ[name] for name in tools._PASSTHROUGH_ENV if name in os.environ}
+    if extra_env:
+        env.update(extra_env)
     try:
         proc = subprocess.Popen(
             ["bash", "-c", command],
@@ -363,13 +423,19 @@ def _run_shell_subprocess(staging: Path, command: str, timeout: float, cap: int)
     return tools._cap_output(output.stdout, cap)
 
 
-def _build_meta_tools(staging: Path) -> list[LlmTool]:
+def _build_meta_tools(staging: Path, secret_env: dict[str, str] | None = None) -> list[LlmTool]:
     """The four meta-tools, every handler a closure over this session's staging.
 
     All handlers follow the LlmTool no-raise contract: filesystem/subprocess
     failures come back as descriptive error TEXT the model can react to (the
     loop's own except is only the last backstop). Settings-bound limits are
     read at call time, mirroring the runtime tools' handlers.
+
+    ``secret_env`` (D36), when the install form supplied a secret, is the single
+    ``{<NAME>: <value>}`` addition injected into run_shell's environment so the
+    builder can live-test the real API -- passed straight to
+    ``_run_shell_subprocess``. It touches ONLY run_shell (the file meta-tools
+    never see it) and never any prompt.
     """
 
     async def write_file(args: dict[str, Any]) -> str:
@@ -517,6 +583,7 @@ def _build_meta_tools(staging: Path) -> list[LlmTool]:
             command,
             settings.tool_install_shell_timeout_seconds,
             settings.llm_tool_output_max_chars,
+            secret_env,
         )
 
     return [
@@ -640,7 +707,60 @@ def _builder_user_prompt(instructions: str, openapi_text: str) -> str:
 # --- staging promotion + cleanup ---------------------------------------------
 
 
-def _promote_staging(staging: Path, name: str, base: Path) -> str | None:
+def _inject_secret_into_env(env_file: Path, name: str, value: str) -> str | None:
+    """Write ``name=value`` into the staged package's ``.env``; None = ok (D36).
+
+    Blocking (runs inside ``_promote_staging`` via ``run_in_threadpool``). Creates
+    the file when the LLM wrote none; if the LLM DISOBEYED and already wrote a
+    ``name=`` line, that line is REPLACED (never duplicated) so the real value
+    wins. Read and write both funnel through the bounded, FIFO/symlink-hardened
+    ``tools`` helpers (``.env`` files are small, so the manifest caps do not
+    apply, but the jail hardening still should).
+
+    ``validate_package`` already vetted any pre-existing ``.env`` at <=64KiB, but
+    it never saw THIS appended line, so we re-check the POST-append encoded size
+    against the same ``_ENV_FILE_MAX_BYTES`` cap ourselves and refuse the install
+    (friendly error) rather than leave an oversized ``.env`` the runtime would
+    silently drop to ``{}``.
+    """
+    existing = ""
+    if env_file.exists():
+        text = tools._read_regular_file_capped(env_file, tools._ENV_FILE_MAX_BYTES)
+        if text is None:
+            # Non-regular / symlinked / unreadable .env: refuse rather than risk
+            # writing THROUGH it. validate_package would already fail such a
+            # package, so this is a defensive backstop, not the primary gate.
+            return _ERROR_SECRET_ENV_WRITE
+        existing = text
+    line = f"{name}={value}"
+    replaced = False
+    kept: list[str] = []
+    for existing_line in existing.splitlines():
+        # Replace the plain ``NAME=`` / ``NAME =`` form the model would most
+        # likely have written; a comment or blank line never matches its key.
+        # Only the FIRST match is replaced (a well-formed .env has one line/key).
+        if not replaced and existing_line.split("=", 1)[0].strip() == name:
+            kept.append(line)
+            replaced = True
+        else:
+            kept.append(existing_line)
+    if not replaced:
+        kept.append(line)
+    new_content = "\n".join(kept) + "\n"
+    if len(new_content.encode("utf-8")) > tools._ENV_FILE_MAX_BYTES:
+        return _ERROR_SECRET_ENV_TOO_LARGE
+    if not tools._write_regular_file(env_file, new_content):
+        return _ERROR_SECRET_ENV_WRITE
+    return None
+
+
+def _promote_staging(
+    staging: Path,
+    name: str,
+    base: Path,
+    secret_name: str | None = None,
+    secret_value: str | None = None,
+) -> str | None:
     """Validate the staged package and move it to ``<base>/<name>``; None = ok.
 
     Blocking (runs via ``run_in_threadpool``). Validation runs the SAME checks
@@ -652,6 +772,15 @@ def _promote_staging(staging: Path, name: str, base: Path) -> str | None:
     against a second concurrent install of the same name -- a single-user
     local tool's edge we accept, and the nested-dir result would still be an
     invalid package (name mismatch), never executable.
+
+    The form secret (D36) is written into the staged ``.env`` AFTER
+    ``validate_package`` (which judges exactly what the BUILDER produced) and
+    AFTER the name-free check (so we never touch a package we will not install),
+    but BEFORE the move -- with ``_inject_secret_into_env``'s own post-append
+    size guard, since ``validate_package`` never saw that line. This ordering is
+    what keeps ``validate_package``'s view consistent: it always vets the
+    LLM-authored package as-is, and the secret is a backend addition layered on
+    top and gated separately.
     """
     error = tools.validate_package(staging, expected_name=name)
     if error is not None:
@@ -659,6 +788,10 @@ def _promote_staging(staging: Path, name: str, base: Path) -> str | None:
     target = base / name
     if target.exists():
         return _ERROR_NAME_TAKEN
+    if secret_name and secret_value:
+        inject_error = _inject_secret_into_env(staging / ".env", secret_name, secret_value)
+        if inject_error is not None:
+            return inject_error
     try:
         base.mkdir(parents=True, exist_ok=True)
         shutil.move(str(staging), str(target))
@@ -687,7 +820,13 @@ def _cleanup_staging(staging: Path) -> None:
 # --- the install run ---------------------------------------------------------
 
 
-async def run_install(openapi_url: str, instructions: str) -> InstallOutcome:
+async def run_install(
+    openapi_url: str,
+    instructions: str,
+    *,
+    secret_name: str | None = None,
+    secret_value: str | None = None,
+) -> InstallOutcome:
     """Run one whole install: fetch, build in staging, validate, promote.
 
     Every failure is a FRIENDLY OUTCOME (zh-TW ``error``), never an exception:
@@ -695,6 +834,13 @@ async def run_install(openapi_url: str, instructions: str) -> InstallOutcome:
     the polling FE, so an exception here would just vanish into the task. The
     ``llm_log_id`` is captured immediately after the builder call -- success
     OR failure -- because a failed build is exactly when the trace matters.
+
+    ``secret_name``/``secret_value`` are the OPTIONAL install-form secret (D36),
+    already validated (both-or-neither + env-var name) by ``ToolInstallRequest``.
+    The value is registered as redactable for the whole build window, injected
+    into run_shell's env so the builder can live-test the real API, and written
+    into the promoted tool's ``.env`` -- but it NEVER enters any prompt text,
+    job/outcome field, or error message (only the NAME reaches the prompt).
     """
     base = tools.tools_dir()
     if base is None:
@@ -710,17 +856,28 @@ async def run_install(openapi_url: str, instructions: str) -> InstallOutcome:
     except OSError as exc:
         return InstallOutcome(ok=False, error=f"無法建立暫存工作區（{type(exc).__name__}）。")  # noqa: RUF001
 
+    # The single {<NAME>: <value>} addition injected into run_shell's env (only
+    # when both were supplied); None leaves the builder shell's env from-scratch.
+    secret_env = {secret_name: secret_value} if (secret_name and secret_value) else None
+    # Register the VALUE as redactable for the WHOLE build window (D36): llm_log
+    # then masks it out of every builder-session prompt/response it records --
+    # covering the gap BEFORE promote writes it into the package .env (after which
+    # the .env scan in known_secret_values keeps covering it; the discard in the
+    # finally just ends this transient window). Guarded by the try/finally below.
+    if secret_value:
+        tools.register_inflight_secret(secret_value)
+
     try:
         settings = get_settings()
         result: InstallResult | None = None
         llm_error: str | None = None
         try:
             result = await generate_structured(
-                _BUILDER_SYSTEM_PROMPT,
+                _builder_system_prompt(secret_name),
                 _builder_user_prompt(instructions, openapi_text),
                 InstallResult,
                 workflow=_WORKFLOW,
-                tools=_build_meta_tools(staging),
+                tools=_build_meta_tools(staging, secret_env=secret_env),
                 max_tool_rounds=settings.tool_install_max_rounds,
                 timeout_seconds=settings.tool_install_timeout_seconds,
             )
@@ -749,7 +906,9 @@ async def run_install(openapi_url: str, instructions: str) -> InstallOutcome:
                 llm_log_id=llm_log_id,
             )
 
-        promote_error = await run_in_threadpool(_promote_staging, staging, result.tool_name, base)
+        promote_error = await run_in_threadpool(
+            _promote_staging, staging, result.tool_name, base, secret_name, secret_value
+        )
         if promote_error is not None:
             return InstallOutcome(
                 ok=False,
@@ -765,8 +924,12 @@ async def run_install(openapi_url: str, instructions: str) -> InstallOutcome:
             llm_log_id=llm_log_id,
         )
     finally:
-        # A successful move consumed the staging dir; this then only drops the
+        # Discard the in-flight secret first (its .env now carries it post-move,
+        # so redaction continues via the .env scan), then clean staging. A
+        # successful move consumed the staging dir; cleanup then only drops the
         # (possibly empty) .staging shell. Every other exit removes the build.
+        if secret_value:
+            tools.discard_inflight_secret(secret_value)
         await run_in_threadpool(_cleanup_staging, staging)
 
 
@@ -831,18 +994,28 @@ def _update_job(job_id: str, **changes: Any) -> None:
             setattr(job, key, value)
 
 
-async def _run_job(job_id: str, openapi_url: str, instructions: str) -> None:
+async def _run_job(
+    job_id: str,
+    openapi_url: str,
+    instructions: str,
+    secret_name: str | None,
+    secret_value: str | None,
+) -> None:
     """The background task body: run the install, record the outcome.
 
     ``run_install`` already maps every EXPECTED failure to a friendly outcome;
     the except here is the total backstop for a genuine bug, because an
     exception escaping a fire-and-forget task would otherwise vanish (leaving
     the job stuck on "running" forever from the FE's point of view). Category
-    only -- a bug's str() could carry anything.
+    only -- a bug's str() could carry anything (and MUST NOT: the secret value
+    is threaded through here, so a leaky str(exc) is exactly why this is
+    category-only).
     """
     _update_job(job_id, state="running")
     try:
-        outcome = await run_install(openapi_url, instructions)
+        outcome = await run_install(
+            openapi_url, instructions, secret_name=secret_name, secret_value=secret_value
+        )
     except Exception as exc:
         _update_job(
             job_id,
@@ -862,7 +1035,13 @@ async def _run_job(job_id: str, openapi_url: str, instructions: str) -> None:
     )
 
 
-def start_install_job(openapi_url: str, instructions: str) -> str | None:
+def start_install_job(
+    openapi_url: str,
+    instructions: str,
+    *,
+    secret_name: str | None = None,
+    secret_value: str | None = None,
+) -> str | None:
     """Create a job and launch its background task; returns the job id, or None
     when an install is ALREADY active (queued|running).
 
@@ -871,6 +1050,10 @@ def start_install_job(openapi_url: str, instructions: str) -> str | None:
     maps a None return to a 409. This also structurally BOUNDS ``_TASKS`` -- at
     most one install task is ever in flight, so the strong-ref set that keeps a
     running Task alive can no longer grow without limit under rapid submits.
+
+    ``secret_name``/``secret_value`` (D36) are threaded straight to the task and
+    on to ``run_install``; they are DELIBERATELY not stored in ``InstallJob`` (so
+    the value can never surface in a job/poll response), only passed forward.
 
     Must be called with a running event loop (the async router handler is).
     Eviction keeps the newest ``_MAX_JOBS`` by creation time (job_id as a
@@ -886,7 +1069,9 @@ def start_install_job(openapi_url: str, instructions: str) -> str | None:
         while len(_JOBS) > _MAX_JOBS:
             oldest = min(_JOBS.values(), key=lambda j: (j.created_at, j.job_id))
             del _JOBS[oldest.job_id]
-    task = asyncio.create_task(_run_job(job.job_id, openapi_url, instructions))
+    task = asyncio.create_task(
+        _run_job(job.job_id, openapi_url, instructions, secret_name, secret_value)
+    )
     _TASKS.add(task)
     task.add_done_callback(_TASKS.discard)
     return job.job_id

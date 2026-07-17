@@ -185,7 +185,16 @@ async def install_tool(payload: ToolInstallRequest) -> ToolInstallAccepted:
                 "message": _TOOLS_NOT_CONFIGURED_MESSAGE,
             },
         )
-    job_id = tool_builder.start_install_job(str(payload.openapi_url), payload.instructions)
+    # The optional secret pair (D36) is threaded straight through to the builder;
+    # it is validated (both-or-neither + env-var name) by ToolInstallRequest, and
+    # secret_value never enters the LLM conversation, any job/poll response, or a
+    # log line (see tool_builder / llm_log redaction).
+    job_id = tool_builder.start_install_job(
+        str(payload.openapi_url),
+        payload.instructions,
+        secret_name=payload.secret_name,
+        secret_value=payload.secret_value,
+    )
     if job_id is None:
         raise HTTPException(
             status_code=409,

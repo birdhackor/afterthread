@@ -11,6 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from context_memory.db import init_db
 from context_memory.routers import ai, items, review, tools
+from context_memory.services import llm_log
+from context_memory.services import tools as tools_service
 
 
 def _configure_app_logging() -> None:
@@ -67,7 +69,30 @@ def _configure_app_logging() -> None:
     logger.propagate = False
 
 
+def _configure_secret_redaction() -> None:
+    """Wire llm_log's known-value redactor to the tools registry, once (D36).
+
+    llm_log is a leaf observability module: it scrubs every KNOWN secret value
+    out of the prompt/response bodies it stores, but it must NOT import the tool
+    subsystem to learn what those secrets are (that would couple the log store to
+    tools/tool_builder). Instead it exposes ``set_secret_provider`` and this --
+    the application entrypoint, the one place that already knows the whole
+    dependency graph -- injects ``tools.known_secret_values``. This mirrors
+    ``_configure_app_logging``'s stance exactly: a library-style module decides
+    only HOW it behaves; the app decides the wiring, here, once, at import time
+    (before ``app = FastAPI(...)``), so redaction is in effect for every
+    interaction the process ever records.
+
+    Safe by construction: llm_log calls the provider inside its own
+    ``except Exception`` guard (the no-observer-failure invariant), so this
+    wiring can only ever ADD redaction and never put the recorder at risk, even
+    if ``known_secret_values`` were to fail.
+    """
+    llm_log.set_secret_provider(tools_service.known_secret_values)
+
+
 _configure_app_logging()
+_configure_secret_redaction()
 
 
 @asynccontextmanager

@@ -131,6 +131,23 @@ class Settings(BaseSettings):
     # that warning, unlike openai_base_url / openai_api_key which never do.
     llm_log_file: str = ""
 
+    # Rotation threshold (BYTES) for the optional JSONL sink above (see
+    # context_memory/services/llm_log.py's _write_file_sink -> _rotate_file_sink,
+    # D34). Before each append the sink stats the file; once it exceeds this cap
+    # the current file is renamed aside with a UTC-timestamp suffix and a fresh
+    # one is started, so the sink can never grow one file without bound. This
+    # guards the DISK only -- RAM is the ring's job (llm_log_max_entries +
+    # llm_log_body_max_chars), a separate axis entirely -- and it is DELIBERATELY
+    # only relevant when llm_log_file is set (the sink is opt-in). No
+    # retention/deletion of the rotated segments is done: pruning old files is the
+    # operator's call, not ours. Bounded to [1_000_000, 1_000_000_000]
+    # (startup-validated via pydantic-settings, matching the other llm_log knobs'
+    # convention): the 1MB floor keeps a deliberately tiny override from rotating
+    # on essentially every write, and the 1GB ceiling keeps one segment's disk
+    # footprint sane. Default 50MB holds a long debugging session's worth of
+    # records before the first rotation.
+    llm_log_file_max_bytes: int = Field(default=50_000_000, ge=1_000_000, le=1_000_000_000)
+
     # Hard ceiling on how many TOOL ROUNDS a single ``generate_structured`` call
     # may take before it is forced to produce its final JSON (see
     # context_memory/services/llm.py). One round == one create() whose reply

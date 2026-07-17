@@ -1,5 +1,6 @@
 """Pydantic request/response schemas for the Context Memory API."""
 
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
@@ -11,6 +12,7 @@ from pydantic import (
     StringConstraints,
     computed_field,
     field_validator,
+    model_validator,
 )
 
 from context_memory.config import get_settings
@@ -478,6 +480,19 @@ class ToolUpdateRequest(BaseModel):
     enabled: bool
 
 
+# An install-form secret NAME must be a valid environment-variable name: it
+# becomes one, both in the run_shell live-test env and in the finished tool's
+# .env (see context_memory.services.tool_builder). Uppercase-first, then
+# uppercase/digit/underscore, <=64 chars total -- the conventional env-var shape.
+_SECRET_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+
+# zh-TW 422 messages for the install-form secret pair (rendered by the 工具
+# page; pinned by tests). Fullwidth punctuation is authentic zh-TW typography.
+_SECRET_PAIR_INCOMPLETE = "秘密名稱與秘密值必須同時提供，或同時留空"  # noqa: RUF001
+_SECRET_NAME_INVALID = "秘密名稱須以大寫字母開頭，僅能包含大寫字母、數字與底線，且不超過 64 字"  # noqa: RUF001
+_SECRET_VALUE_MULTILINE = "秘密值不可包含換行字元"
+
+
 class ToolInstallRequest(BaseModel):
     """Payload for the web installer: where the API lives, and what to build.
 
@@ -485,15 +500,52 @@ class ToolInstallRequest(BaseModel):
     hostless string is a 422 before any job starts. ``instructions`` shares the
     AI input bound every other AI free-text field carries (20000 chars,
     stripped-non-empty).
+
+    ``secret_name``/``secret_value`` are the OPTIONAL install-form secret (D36):
+    a credential the user would otherwise paste into ``instructions`` (where it
+    is recorded verbatim into the builder's AI-log prompts). Supplied HERE, the
+    VALUE never enters the LLM conversation at all -- the backend injects it into
+    run_shell's env so the builder can live-test the real API, and writes it into
+    the finished tool's ``.env`` at install time (see tool_builder); llm_log
+    redacts it besides. Both-or-neither, and the name must be a valid env-var
+    name (it becomes one). ``secret_value`` is NEVER echoed back in any response
+    (this is a request-only model, and no response schema carries the field).
     """
 
     openapi_url: HttpUrl
     instructions: str = Field(min_length=1, max_length=_MAX_AI_INPUT_CHARS)
+    secret_name: str | None = None
+    secret_value: str | None = None
 
     @field_validator("instructions")
     @classmethod
     def _not_blank(cls, value: str) -> str:
         return _stripped_non_empty(value, "instructions")
+
+    @model_validator(mode="after")
+    def _validate_secret_pair(self) -> ToolInstallRequest:
+        """Enforce both-or-neither + a valid env-var name, and normalize.
+
+        Runs AFTER field validation so both raw values are present together (the
+        pair is inherently cross-field). A half-supplied pair, an invalid name,
+        or a multiline value each raises ValueError -> 422 with the zh-TW message
+        above. On success the stripped forms are written back (or None when
+        absent), so every downstream consumer sees a clean pair and never a stray
+        ``""``/whitespace-only value -- and a newline in the value is rejected up
+        front because it would otherwise corrupt the single-line ``KEY=VALUE``
+        ``.env`` entry the value becomes.
+        """
+        name = (self.secret_name or "").strip()
+        value = (self.secret_value or "").strip()
+        if bool(name) != bool(value):
+            raise ValueError(_SECRET_PAIR_INCOMPLETE)
+        if name and not _SECRET_NAME_RE.match(name):
+            raise ValueError(_SECRET_NAME_INVALID)
+        if value and ("\n" in value or "\r" in value):
+            raise ValueError(_SECRET_VALUE_MULTILINE)
+        self.secret_name = name or None
+        self.secret_value = value or None
+        return self
 
 
 class ToolInstallAccepted(BaseModel):

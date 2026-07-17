@@ -50,3 +50,13 @@
   - **穩定度**：兩年內 agent API 換過兩個世代（AgentExecutor→create_agent），v1「no breaking until 2.0」承諾距今僅 ~9 個月。
 - **決定**：**不重構**。item 6 交付改為：現行機制的淺顯說明文件（OpenAI tool_calls 協定手作迴圈、各資源邊界的存在理由、recorder、subprocess runtime），收錄進 P6 文件站；本 D35 記錄評估全程。
 - **依據**：「更好更簡潔」在事實上不成立——是把量身打造的安全不變量換成框架不透明性；唯一重新考慮情境（第二個異協定 provider、LangSmith 可觀測性需求）出現時再另案評估。
+
+## D36（P3 設計）：金鑰處理三件套——已知值遮蔽 + 安裝表單秘密欄位 + JSONL rotation
+
+- **背景**：使用者要求「log 會記錄金鑰的部分，思考簡易的處理方式」。v2 P6 文件已誠實揭露的洩漏面：金鑰貼在安裝 instructions → 逐字進所有 attempt 的 prompt 紀錄；工具呼叫參數 200 字元預覽可含金鑰；裝好的工具 .env 值可能經工具輸出回聲進紀錄。
+- **選項**：
+  1. **只做 pattern 遮蔽（sk-.../Bearer...啟發式）**：實作最小，但任意格式的內部 KB key 攔不到，假陰性高。
+  2. **只做已知值遮蔽**：能遮自家 key 與已裝工具 .env 值，但「安裝當下貼在 instructions 的 key」在寫進 .env 之前不是已知值——主要洩漏面反而攔不到。
+  3. **已知值遮蔽 + 安裝表單秘密欄位（採用）**：表單新增選填 `secret_name`/`secret_value`；值註冊進遮蔽集合（安裝中即生效）、注入 run_shell 子行程 env 供 LLM 實測 API（**LLM 全程看不到值**）、promote 時由後端直接寫進工具 `.env`（LLM 被明示不要自己寫/不要 echo）。金鑰從頭到尾不進 LLM 對話，遮蔽只是縱深防禦的第二層。
+- **決定**：選項 3 + JSONL rotation（D34 的 20 行方案，`llm_log_file_max_bytes` 預設 50MB、超限 rename 時間戳後綴）。分層紀律：llm_log 是觀測葉模組、不得 import tools——以 `set_secret_provider(callable)` 反轉依賴（main.py 接線），provider 失敗絕不破壞記錄（no-observer-failure 不變量）。遮蔽在儲存 choke point、於 utf8-safe 與截斷**之前**（跨截斷邊界的金鑰不得半存活）；長度 <6 的值不遮（避免碎化一般文字）。
+- **已記錄殘餘限制**：使用者若仍把 key 貼在 instructions（不用欄位），且該值不匹配任何已知秘密，仍會被記錄——文件引導用欄位是第一線，遮蔽是已知值的兜底。

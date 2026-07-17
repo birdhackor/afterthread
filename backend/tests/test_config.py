@@ -164,6 +164,35 @@ def test_llm_log_file_default_is_empty() -> None:
     assert Settings().llm_log_file == ""
 
 
+# `llm_log_file_max_bytes` is the rotation threshold for the JSONL sink (D34):
+# once the file grows past it, the sink renames it aside with a UTC-timestamp
+# suffix and starts fresh. Its Field(ge=1_000_000, le=1_000_000_000) bound makes
+# a nonsensical override fail at startup via pydantic-settings, matching the
+# other llm_log knobs' convention. Default 50MB.
+
+
+def test_llm_log_file_max_bytes_default_is_fifty_million() -> None:
+    assert Settings().llm_log_file_max_bytes == 50_000_000
+
+
+def test_llm_log_file_max_bytes_lower_bound_accepted() -> None:
+    assert Settings(llm_log_file_max_bytes=1_000_000).llm_log_file_max_bytes == 1_000_000
+
+
+def test_llm_log_file_max_bytes_upper_bound_accepted() -> None:
+    assert Settings(llm_log_file_max_bytes=1_000_000_000).llm_log_file_max_bytes == 1_000_000_000
+
+
+def test_llm_log_file_max_bytes_below_lower_bound_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Settings(llm_log_file_max_bytes=999_999)
+
+
+def test_llm_log_file_max_bytes_above_upper_bound_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Settings(llm_log_file_max_bytes=1_000_000_001)
+
+
 # `llm_tool_conversation_budget_chars` caps the SERIALIZED size of the live
 # tool-loop conversation actually SENT to the model each round (see
 # context_memory.services.llm) -- the SENT-side companion to the recorded-side

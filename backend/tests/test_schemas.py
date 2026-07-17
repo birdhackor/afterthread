@@ -2,9 +2,12 @@
 
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from context_memory.main import app
+from context_memory.schemas import ToolInstallRequest
 from context_memory.services.memory_ai import SECTION_FIELD_ORDER
 
 
@@ -92,6 +95,63 @@ def test_progress_entry_create_declares_note_length_bound() -> None:
     schema = client.get("/openapi.json").json()
     prop = schema["components"]["schemas"]["ProgressEntryCreate"]["properties"]["note"]
     assert prop["maxLength"] == 20000
+
+
+# --- ToolInstallRequest install-form secret pair (D36) ----------------------
+
+
+def _install_req(**overrides: Any) -> ToolInstallRequest:
+    base: dict[str, Any] = {
+        "openapi_url": "http://kb.example/openapi.json",
+        "instructions": "build",
+    }
+    base.update(overrides)
+    return ToolInstallRequest.model_validate(base)
+
+
+def test_tool_install_request_accepts_no_secret() -> None:
+    req = _install_req()
+    assert req.secret_name is None
+    assert req.secret_value is None
+
+
+def test_tool_install_request_accepts_and_strips_valid_secret_pair() -> None:
+    req = _install_req(secret_name="  KB_API_KEY  ", secret_value="  the-value  ")
+    assert req.secret_name == "KB_API_KEY"
+    assert req.secret_value == "the-value"
+
+
+def test_tool_install_request_empty_secret_strings_normalize_to_none() -> None:
+    """Whitespace-only for BOTH is 'no secret' (None), not a half-pair error."""
+    req = _install_req(secret_name="   ", secret_value="")
+    assert req.secret_name is None
+    assert req.secret_value is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"secret_name": "KB_API_KEY"},  # value missing (half a pair)
+        {"secret_value": "v"},  # name missing (half a pair)
+        {"secret_name": "kb_key", "secret_value": "v"},  # lowercase-start name
+        {"secret_name": "1KEY", "secret_value": "v"},  # digit-start name
+        {"secret_name": "A" * 65, "secret_value": "v"},  # over 64 chars
+        {"secret_name": "KB KEY", "secret_value": "v"},  # space in name
+        {"secret_name": "KB_KEY", "secret_value": "line1\nline2"},  # multiline value
+    ],
+    ids=[
+        "value-missing",
+        "name-missing",
+        "lowercase-start",
+        "digit-start",
+        "too-long",
+        "space-in-name",
+        "multiline-value",
+    ],
+)
+def test_tool_install_request_rejects_bad_secret_pair(overrides: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        _install_req(**overrides)
 
 
 def test_only_by_id_routes_declare_404() -> None:

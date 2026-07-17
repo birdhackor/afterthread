@@ -69,3 +69,47 @@ export function isHttpUrl(value) {
 	const trimmed = (value ?? "").trim();
 	return /^https?:\/\/.+/i.test(trimmed);
 }
+
+// Client-side mirror of the backend's install-form secret NAME rule (D36): it
+// becomes an environment-variable name, so uppercase-first then
+// uppercase/digit/underscore, at most 64 chars. The backend re-validates
+// authoritatively (422); this just gives an immediate field error, exactly like
+// isHttpUrl above.
+export function isSecretName(value) {
+	return /^[A-Z][A-Z0-9_]{0,63}$/.test((value ?? "").trim());
+}
+
+// Presubmit error (a zh-TW string) for the secret NAME field, given BOTH raw
+// inputs, or null when acceptable. The pair is OPTIONAL but both-or-neither:
+// both empty is fine; otherwise a name is required and must be a valid env-var
+// name. Cross-field by design (it reads the value too), mirroring the backend's
+// both-or-neither validator so the two never disagree.
+export function secretNameError(name, value) {
+	const trimmedName = (name ?? "").trim();
+	const trimmedValue = (value ?? "").trim();
+	if (trimmedName === "" && trimmedValue === "") {
+		return null;
+	}
+	if (trimmedName === "") {
+		return "請輸入秘密名稱，或清空秘密值";
+	}
+	if (!isSecretName(trimmedName)) {
+		return "須以大寫字母開頭，僅能有大寫字母、數字與底線，最多 64 字";
+	}
+	return null;
+}
+
+// Presubmit error (a zh-TW string) for the secret VALUE field, given BOTH raw
+// inputs, or null when acceptable. The mirror image of secretNameError's
+// both-or-neither: a value is required exactly when a name was supplied.
+export function secretValueError(name, value) {
+	const trimmedName = (name ?? "").trim();
+	const trimmedValue = (value ?? "").trim();
+	if (trimmedName === "" && trimmedValue === "") {
+		return null;
+	}
+	if (trimmedValue === "") {
+		return "請輸入秘密值，或清空秘密名稱";
+	}
+	return null;
+}

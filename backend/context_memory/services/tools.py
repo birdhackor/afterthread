@@ -566,6 +566,118 @@ def enabled_llm_tools() -> list[LlmTool]:
     return [_build_llm_tool(scan) for scan in _scan_all() if scan.valid and scan.enabled]
 
 
+# --- known-secret registry (feeds llm_log's redactor, D36) ------------------
+#
+# llm_log redacts every KNOWN secret VALUE out of the prompt/response bodies it
+# stores, at its storage choke point. But llm_log is a leaf observability module
+# and must not import THIS one -- so it takes a provider CALLABLE and main wires
+# in ``known_secret_values`` below (the same leaf/provider inversion llm_log's
+# own logger config uses). The set is computed at CALL time, never cached as a
+# static value, because it genuinely CHANGES at runtime: an install writes a new
+# tool ``.env``, and an in-flight install registers its form secret before that
+# ``.env`` even exists.
+
+# In-flight install secrets. A web-installer form secret (secret_value) is
+# registered here for the DURATION of one install (tool_builder add/discards
+# around run_install), so it is already redactable during the builder session --
+# the window BEFORE promote writes it into the package ``.env``, after which the
+# per-package ``.env`` scan below is what covers it. This registry lives HERE,
+# not in tool_builder, on purpose: ``known_secret_values`` must read it, and
+# tool_builder already imports us, so putting it in tool_builder would force a
+# reverse import (a cycle) -- the SAME inversion llm_log applies to us. Its own
+# lock guards it because ``known_secret_values`` can run on a threadpool recorder
+# thread while an install mutates the set on the event loop.
+_INFLIGHT_SECRETS: set[str] = set()
+_INFLIGHT_LOCK = threading.Lock()
+
+# Cache of one package's parsed ``.env`` VALUES, keyed by the ``.env`` path and
+# tagged with the file's ``mtime_ns``, so ``known_secret_values`` re-parses a
+# package only when its ``.env`` actually changed. This matters because the
+# provider runs once PER STORED LOG BODY (every request message + every response
+# of every attempt), and a busy installer session records the whole GROWING
+# conversation on each of dozens of rounds -- without the cache, every one of
+# those records would re-read every installed tool's ``.env`` from disk.
+_ENV_VALUE_CACHE: dict[str, tuple[int, frozenset[str]]] = {}
+_ENV_VALUE_CACHE_LOCK = threading.Lock()
+
+
+def register_inflight_secret(value: str) -> None:
+    """Mark ``value`` redactable for the current install (see ``_INFLIGHT_SECRETS``)."""
+    if not value:
+        return
+    with _INFLIGHT_LOCK:
+        _INFLIGHT_SECRETS.add(value)
+
+
+def discard_inflight_secret(value: str) -> None:
+    """Drop ``value`` from the in-flight set once its install ends (try/finally)."""
+    with _INFLIGHT_LOCK:
+        _INFLIGHT_SECRETS.discard(value)
+
+
+def _cached_env_values(directory: Path) -> frozenset[str]:
+    """The redactable VALUES of one package's ``.env``, cached per (path, mtime).
+
+    Reuses the ONE bounded ``.env`` loader (``_load_tool_dotenv``) rather than
+    hand-rolling a second parser, so the FIFO/symlink/oversize hardening and the
+    drop-bare-keys behavior are inherited unchanged. Empty values are dropped so
+    a ``KEY=`` line contributes nothing (``_redact`` also guards empties, but not
+    seeding them keeps the set tidy).
+    """
+    env_file = directory / ".env"
+    key = str(env_file)
+    try:
+        mtime = env_file.stat().st_mtime_ns
+    except OSError:
+        # No ``.env`` (the common case) or an unstattable path: nothing to
+        # contribute. Forget any stale cache entry so a LATER-created ``.env`` is
+        # picked up fresh next time.
+        with _ENV_VALUE_CACHE_LOCK:
+            _ENV_VALUE_CACHE.pop(key, None)
+        return frozenset()
+    with _ENV_VALUE_CACHE_LOCK:
+        cached = _ENV_VALUE_CACHE.get(key)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+    # Parse OUTSIDE the lock (it does file I/O); the (path, mtime) key makes a
+    # concurrent double-parse harmless -- both produce the identical set.
+    values = frozenset(value for value in _load_tool_dotenv(directory).values() if value)
+    with _ENV_VALUE_CACHE_LOCK:
+        _ENV_VALUE_CACHE[key] = (mtime, values)
+    return values
+
+
+def known_secret_values() -> frozenset[str]:
+    """Every value llm_log should redact out of stored prompt/response bodies (D36).
+
+    The union of three sources:
+
+    * our own ``openai_api_key`` when set -- belt-and-braces: the secret-free
+      invariant already keeps it out of records STRUCTURALLY (llm.py never reads
+      it into a body), but redacting it too means even a tool that somehow echoed
+      it back cannot surface it in the log;
+    * every VALUE in every installed tool package's ``.env`` (a KB API key etc.),
+      cached per (path, mtime) so a call per record stays cheap;
+    * the in-flight install secrets registered above (the pre-promote window).
+
+    Wired as llm_log's secret provider by main. llm_log calls this INSIDE its own
+    ``except Exception`` guard (the no-observer-failure invariant), so a hiccup
+    here only ever degrades to "record unredacted", never breaks a recording.
+    """
+    secrets: set[str] = set()
+    api_key = get_settings().openai_api_key.strip()
+    if api_key:
+        secrets.add(api_key)
+    base = tools_dir()
+    if base is not None and base.is_dir():
+        for child in sorted(base.iterdir()):
+            if child.is_dir() and not child.name.startswith("."):
+                secrets |= _cached_env_values(child)
+    with _INFLIGHT_LOCK:
+        secrets |= set(_INFLIGHT_SECRETS)
+    return frozenset(secrets)
+
+
 # --- execution -------------------------------------------------------------
 
 
