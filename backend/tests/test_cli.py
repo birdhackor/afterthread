@@ -23,10 +23,17 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+import typer
 from sqlalchemy import create_engine, make_url, text
 from typer.testing import CliRunner
 
-from afterthread.cli import _default_data_dir, _package_version, _sqlite_url, app
+from afterthread.cli import (
+    _default_data_dir,
+    _migrate_legacy_db,
+    _package_version,
+    _sqlite_url,
+    app,
+)
 
 # --- _sqlite_url -----------------------------------------------------------
 
@@ -342,13 +349,15 @@ def test_default_dir_migration_skips_when_both_dirs_exist(
         os.chdir(original_cwd)
 
 
-def test_default_dir_migration_rename_failure_warns_and_continues(
+def test_default_dir_migration_rename_failure_aborts_startup(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # (FIX C, dir level) If the legacy-dir rename fails (Path.rename patched to
-    # raise OSError), startup does NOT abort: it warns, leaves the old dir
-    # untouched, and continues with a fresh empty new dir. The user's data is
-    # never silently destroyed -- they move it by hand.
+    # (FIX 1) If the legacy-dir rename fails (Path.rename patched to raise
+    # OSError), startup FAILS CLOSED: it prints an ERROR with the manual remedy
+    # and aborts (non-zero exit) BEFORE the mkdir below, rather than booting an
+    # empty app on a fresh empty data dir while the user's real data sits under
+    # the old name. Symmetric with the DB-file migration's abort. The old dir is
+    # left untouched and NO new data dir is created.
     base = tmp_path.resolve()
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("TOOLS_DIR", raising=False)
@@ -369,13 +378,12 @@ def test_default_dir_migration_rename_failure_warns_and_continues(
     original_cwd = os.getcwd()
     try:
         result = runner.invoke(app, [], prog_name="afterthread")
-        assert result.exit_code == 0, result.output
-        # Old dir untouched; new dir created fresh + empty; startup continued.
+        assert result.exit_code != 0
+        # Old dir untouched; NO new data dir created -- abort happens before mkdir.
         assert legacy_dir.is_dir()
         assert (legacy_dir / "keepme.txt").read_text() == "real single-user data"
-        assert new_dir.is_dir()
-        assert not (new_dir / "keepme.txt").exists()
-        assert "WARNING could not migrate legacy data dir" in result.stdout
+        assert not new_dir.exists()
+        assert "ERROR could not migrate legacy data dir" in result.stdout
     finally:
         os.chdir(original_cwd)
 
@@ -586,4 +594,114 @@ def test_db_file_untouched_when_database_url_set(
         assert os.environ["DATABASE_URL"] == "sqlite:///./operator-chosen.db"
         assert "migrated legacy database" not in result.stdout
     finally:
+        os.chdir(original_cwd)
+
+
+def test_migrate_legacy_db_missing_file_aborts_and_creates_nothing(tmp_path: Path) -> None:
+    # (FIX 2) The caller guards with is_file(), but the file can vanish before
+    # _migrate_legacy_db opens it. The recovery open uses mode=rw -- a URI open
+    # that CANNOT create the file -- so a legacy file missing at recovery time
+    # RAISES and aborts, instead of springing an empty DB into existence that
+    # would then be "migrated". Unit-called directly with a nonexistent legacy
+    # path (the exact is_file()-passed-then-vanished window).
+    missing = tmp_path / "context_memory.db"
+    db_path = tmp_path / "afterthread.db"
+    assert not missing.exists()
+
+    with pytest.raises(typer.Exit):
+        _migrate_legacy_db(missing, db_path)
+
+    # Neither path was created: mode=rw did not spring the legacy file into
+    # existence, and the move step was never reached.
+    assert not missing.exists()
+    assert not db_path.exists()
+
+
+def test_busy_checkpoint_aborts_and_leaves_legacy_set_untouched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # (FIX 3) Another process still holding the legacy DB open must ABORT the
+    # migration, not move a half-collapsed file set. Simulated by holding a
+    # second connection's open read transaction on a real WAL legacy db while
+    # migration runs: PRAGMA wal_checkpoint(TRUNCATE) then cannot reset the WAL,
+    # reporting busy / frames-remaining, which _migrate_legacy_db now reads and
+    # fails on. The legacy set is left in place and no afterthread.db is created.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("TOOLS_DIR", raising=False)
+    monkeypatch.setattr("afterthread.cli.uvicorn.run", lambda *a, **k: None)
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    legacy_db = data_dir / "context_memory.db"
+    _make_legacy_db(legacy_db, ["alpha", "beta"], wal=True)
+    # Precondition: committed rows still live in a non-empty -wal.
+    assert (data_dir / "context_memory.db-wal").stat().st_size > 0
+
+    # Hold an open read transaction on the legacy db from a second connection, so
+    # the migration's TRUNCATE checkpoint cannot reset the WAL. isolation_level
+    # =None puts this connection in manual-transaction mode: the explicit BEGIN +
+    # SELECT takes a read mark that stays held until we close in teardown.
+    holder = sqlite3.connect(legacy_db)
+    holder.isolation_level = None
+    holder.execute("BEGIN")
+    holder.execute("SELECT x FROM t").fetchall()
+
+    original_cwd = os.getcwd()
+    try:
+        result = runner.invoke(app, ["--data-dir", str(data_dir)], prog_name="afterthread")
+        assert result.exit_code != 0
+        # Legacy set left in place; nothing collapsed or moved; no empty db beside it.
+        assert legacy_db.exists()
+        assert (data_dir / "context_memory.db-wal").exists()
+        assert not (data_dir / "afterthread.db").exists()
+        assert "could not migrate legacy database" in result.stdout
+    finally:
+        holder.close()
+        os.chdir(original_cwd)
+
+
+def test_env_rewrite_write_failure_is_tolerated_and_env_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # (FIX 4) If the migrated .env cannot be rewritten (here: the data dir is made
+    # unwritable, so the atomic temp-file write / os.replace fails), the dir
+    # migration itself already succeeded and startup does NOT abort on it: it
+    # WARNS and leaves the .env byte-for-byte unchanged (the atomic write never
+    # truncates the good file). A stale .env would only fail later at DB connect,
+    # which is out of scope here since uvicorn.run is a no-op.
+    base = tmp_path.resolve()
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("TOOLS_DIR", raising=False)
+    monkeypatch.delenv("AFTERTHREAD_DATA_DIR", raising=False)
+    monkeypatch.setenv("XDG_DATA_HOME", str(base))
+    monkeypatch.setattr("afterthread.cli.uvicorn.run", lambda *a, **k: None)
+
+    legacy_dir = base / "context-memory"
+    legacy_dir.mkdir()
+    # An .env that DOES carry an absolute path back into the old dir, so the
+    # rewrite is actually attempted. DATABASE_URL is set here too so the DB-file
+    # migration is skipped -- startup never tries to open a db in the read-only
+    # dir, isolating the test on the .env-rewrite failure path.
+    env_before = f"DATABASE_URL={_sqlite_url(legacy_dir / 'context_memory.db')}\n"
+    (legacy_dir / ".env").write_text(env_before, encoding="utf-8")
+    new_dir = base / "afterthread"
+
+    # os.replace needs write permission on the containing DIR. chmod the legacy
+    # dir 0o500 before the run: the rename carries these perms onto the new data
+    # dir, so the rewrite's temp write / replace fails there. (Same-parent rename
+    # needs no perms on the dir itself, so the rename still succeeds.)
+    legacy_dir.chmod(0o500)
+
+    original_cwd = os.getcwd()
+    try:
+        result = runner.invoke(app, [], prog_name="afterthread")
+        # Startup continued past the rewrite (uvicorn.run mocked); the warning
+        # fired and the .env content is byte-for-byte unchanged.
+        assert "WARNING could not rewrite absolute paths" in result.stdout
+        assert (new_dir / ".env").read_text(encoding="utf-8") == env_before
+    finally:
+        # Restore write perms so tmp_path teardown can remove the tree.
+        for d in (new_dir, legacy_dir):
+            if d.exists():
+                d.chmod(0o700)
         os.chdir(original_cwd)
