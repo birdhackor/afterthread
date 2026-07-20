@@ -18,6 +18,8 @@ server.
 """
 
 import os
+import shutil
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -215,6 +217,62 @@ def test_explicit_port_flag_overrides_envvar(
 # them. The default-dir tests also pin XDG_DATA_HOME at a tmp_path and clear
 # AFTERTHREAD_DATA_DIR, so `_default_data_dir()` resolves to
 # `<tmp_path>/afterthread` and the pre-rename default is `<tmp_path>/context-memory`.
+#
+# The DB-migration tests build REAL SQLite databases (not write_text fakes):
+# FIX A opens + recovers + checkpoints the legacy db before moving it, so
+# garbage bytes now correctly ABORT rather than migrate. The one exception is
+# the DATABASE_URL-is-set test, where migration never even looks at the file.
+
+
+def _read_rows(db_path: Path) -> list[str]:
+    """Return the `t.x` column of a real SQLite db, opened fresh via sqlite3."""
+    connection = sqlite3.connect(db_path)
+    try:
+        return [row[0] for row in connection.execute("SELECT x FROM t ORDER BY x")]
+    finally:
+        connection.close()
+
+
+def _make_legacy_db(path: Path, rows: list[str], *, wal: bool = False) -> None:
+    """Create a REAL SQLite database at `path` holding `rows` in a table `t(x)`.
+
+    Plain mode (`wal=False`) leaves a single self-contained file. `wal=True`
+    instead snapshots a LIVE WAL file set (db + -wal + -shm) with automatic
+    checkpointing disabled and the committed rows still sitting in a non-empty
+    `-wal`, so the result genuinely needs WAL recovery before the main file
+    alone is complete -- exactly the integrity hazard FIX A guards. It is built
+    in a scratch location and copied into place while the connection is STILL
+    OPEN (the only way the -wal stays populated), after which the scratch set is
+    removed.
+    """
+    if not wal:
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute("CREATE TABLE t (x TEXT)")
+            connection.executemany("INSERT INTO t (x) VALUES (?)", [(r,) for r in rows])
+            connection.commit()
+        finally:
+            connection.close()
+        return
+
+    scratch = path.parent / f".{path.name}.building"
+    connection = sqlite3.connect(scratch)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA wal_autocheckpoint=0")
+        connection.execute("CREATE TABLE t (x TEXT)")
+        connection.executemany("INSERT INTO t (x) VALUES (?)", [(r,) for r in rows])
+        connection.commit()
+        # Snapshot the live set while the connection is OPEN, so the -wal still
+        # holds the committed rows (closing first would checkpoint them away).
+        for suffix in ("", "-wal", "-shm"):
+            src = scratch.with_name(scratch.name + suffix)
+            if src.exists():
+                shutil.copy(src, path.with_name(path.name + suffix))
+    finally:
+        connection.close()
+    for suffix in ("", "-wal", "-shm"):
+        scratch.with_name(scratch.name + suffix).unlink(missing_ok=True)
 
 
 def test_default_dir_migration_renames_legacy_dir_when_new_absent(
@@ -232,6 +290,8 @@ def test_default_dir_migration_renames_legacy_dir_when_new_absent(
     legacy_dir = tmp_path / "context-memory"
     legacy_dir.mkdir()
     (legacy_dir / "keepme.txt").write_text("real single-user data")
+    # An .env with no old-dir absolute path in it is carried across verbatim (the
+    # FIX B rewrite is a no-op when there is nothing pointing at the old dir).
     (legacy_dir / ".env").write_text("# legacy config\n")
     new_dir = tmp_path / "afterthread"
 
@@ -245,6 +305,7 @@ def test_default_dir_migration_renames_legacy_dir_when_new_absent(
         assert (new_dir / "keepme.txt").read_text() == "real single-user data"
         assert (new_dir / ".env").read_text() == "# legacy config\n"
         assert "migrated legacy data dir" in result.stdout
+        assert "rewrote absolute paths" not in result.stdout
     finally:
         os.chdir(original_cwd)
 
@@ -281,32 +342,132 @@ def test_default_dir_migration_skips_when_both_dirs_exist(
         os.chdir(original_cwd)
 
 
-def test_explicit_data_dir_never_triggers_dir_migration(
+def test_default_dir_migration_rename_failure_warns_and_continues(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # (iii) An explicit --data-dir skips the dir migration entirely, even when a
-    # pre-rename default dir sits right beside where the XDG default would land.
+    # (FIX C, dir level) If the legacy-dir rename fails (Path.rename patched to
+    # raise OSError), startup does NOT abort: it warns, leaves the old dir
+    # untouched, and continues with a fresh empty new dir. The user's data is
+    # never silently destroyed -- they move it by hand.
+    base = tmp_path.resolve()
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("TOOLS_DIR", raising=False)
     monkeypatch.delenv("AFTERTHREAD_DATA_DIR", raising=False)
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(base))
     monkeypatch.setattr("afterthread.cli.uvicorn.run", lambda *a, **k: None)
 
-    legacy_default = tmp_path / "context-memory"
+    legacy_dir = base / "context-memory"
+    legacy_dir.mkdir()
+    (legacy_dir / "keepme.txt").write_text("real single-user data")
+    new_dir = base / "afterthread"
+
+    def _boom(self: Path, target: object) -> None:
+        raise OSError("simulated rename failure")
+
+    monkeypatch.setattr(Path, "rename", _boom)
+
+    original_cwd = os.getcwd()
+    try:
+        result = runner.invoke(app, [], prog_name="afterthread")
+        assert result.exit_code == 0, result.output
+        # Old dir untouched; new dir created fresh + empty; startup continued.
+        assert legacy_dir.is_dir()
+        assert (legacy_dir / "keepme.txt").read_text() == "real single-user data"
+        assert new_dir.is_dir()
+        assert not (new_dir / "keepme.txt").exists()
+        assert "WARNING could not migrate legacy data dir" in result.stdout
+    finally:
+        os.chdir(original_cwd)
+
+
+def test_default_dir_migration_rewrites_absolute_paths_in_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # (FIX B) A legacy dir whose .env carries ABSOLUTE paths back into that old
+    # dir: after the rename, those paths are repointed into the new dir so
+    # nothing dangles. Both DATABASE_URL (an absolute sqlite URL) and a second
+    # var (TOOLS_DIR) are rewritten; the DB the URL names moved with the dir, so
+    # startup ends up pointed at a real file at the NEW location.
+    base = tmp_path.resolve()
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("TOOLS_DIR", raising=False)
+    monkeypatch.delenv("AFTERTHREAD_DATA_DIR", raising=False)
+    monkeypatch.setenv("XDG_DATA_HOME", str(base))
+    monkeypatch.setattr("afterthread.cli.uvicorn.run", lambda *a, **k: None)
+
+    legacy_dir = base / "context-memory"
+    legacy_dir.mkdir()
+    new_dir = base / "afterthread"
+    legacy_db = legacy_dir / "context_memory.db"
+    _make_legacy_db(legacy_db, ["row-1", "row-2"])
+    (legacy_dir / ".env").write_text(
+        f"DATABASE_URL={_sqlite_url(legacy_db)}\nTOOLS_DIR={legacy_dir / 'tools'}\n",
+        encoding="utf-8",
+    )
+
+    original_cwd = os.getcwd()
+    try:
+        result = runner.invoke(app, [], prog_name="afterthread")
+        assert result.exit_code == 0, result.output
+        assert not legacy_dir.exists()
+        assert new_dir.is_dir()
+        # The migrated .env text points into the NEW dir, not the old one.
+        env_text = (new_dir / ".env").read_text(encoding="utf-8")
+        assert str(legacy_dir) not in env_text
+        assert str(new_dir) in env_text
+        # DATABASE_URL loaded from that .env resolves to a real db at the new
+        # location (the file moved with the dir) -- no dangling path.
+        migrated_db_url = os.environ["DATABASE_URL"]
+        assert migrated_db_url == _sqlite_url(new_dir / "context_memory.db")
+        migrated_db = Path(make_url(migrated_db_url).database or "")
+        assert migrated_db == new_dir / "context_memory.db"
+        assert _read_rows(migrated_db) == ["row-1", "row-2"]
+        # The second absolute var was rewritten in the same pass.
+        assert os.environ["TOOLS_DIR"] == str(new_dir / "tools")
+        # The DB-file migration was skipped (DATABASE_URL came from the .env), so
+        # the db keeps its original filename at the new location.
+        assert not (new_dir / "afterthread.db").exists()
+        assert "rewrote absolute paths" in result.stdout
+    finally:
+        os.chdir(original_cwd)
+
+
+def test_explicit_data_dir_skips_dir_migration_but_still_migrates_db(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # (iii) An explicit --data-dir skips the DIR migration entirely -- even with
+    # a pre-rename default dir sitting right where the XDG default would land --
+    # but the DB-FILE migration STILL applies inside the explicit dir. That is
+    # the documented contract: the DB migration keys off "this module injects its
+    # own default DATABASE_URL", not off which dir was chosen, so
+    # `--data-dir <old dir>` still gets its context_memory.db renamed.
+    base = tmp_path.resolve()
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("TOOLS_DIR", raising=False)
+    monkeypatch.delenv("AFTERTHREAD_DATA_DIR", raising=False)
+    monkeypatch.setenv("XDG_DATA_HOME", str(base))
+    monkeypatch.setattr("afterthread.cli.uvicorn.run", lambda *a, **k: None)
+
+    legacy_default = base / "context-memory"
     legacy_default.mkdir()
     (legacy_default / "marker.txt").write_text("untouched")
-    explicit = tmp_path / "mydata"
+    explicit = base / "mydata"
+    explicit.mkdir()
+    _make_legacy_db(explicit / "context_memory.db", ["one", "two"])
 
     original_cwd = os.getcwd()
     try:
         result = runner.invoke(app, ["--data-dir", str(explicit)], prog_name="afterthread")
         assert result.exit_code == 0, result.output
-        # Legacy default left alone; the explicit dir is created and used.
+        # Dir migration skipped: the XDG-default legacy dir is left alone.
         assert legacy_default.is_dir()
         assert (legacy_default / "marker.txt").read_text() == "untouched"
-        assert explicit.is_dir()
-        assert os.getcwd() == str(explicit.resolve())
         assert "migrated legacy data dir" not in result.stdout
+        # DB migration applied inside the explicit dir.
+        assert not (explicit / "context_memory.db").exists()
+        assert _read_rows(explicit / "afterthread.db") == ["one", "two"]
+        assert os.getcwd() == str(explicit.resolve())
+        assert "migrated legacy database" in result.stdout
     finally:
         os.chdir(original_cwd)
 
@@ -314,23 +475,25 @@ def test_explicit_data_dir_never_triggers_dir_migration(
 def test_legacy_db_file_renamed_when_default_url_injected(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # (iv) When _serve injects its own default DATABASE_URL, a pre-rename
-    # context_memory.db in the data dir is renamed to afterthread.db (contents
-    # preserved) and the injected URL points at the new filename.
+    # (iv) When _serve injects its own default DATABASE_URL, a plain (real)
+    # pre-rename context_memory.db in the data dir is migrated to afterthread.db:
+    # every row is readable via sqlite3 at the new path, no old-name file is left
+    # behind, and the injected URL points at the new filename.
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("TOOLS_DIR", raising=False)
     monkeypatch.setattr("afterthread.cli.uvicorn.run", lambda *a, **k: None)
 
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    (data_dir / "context_memory.db").write_text("real sqlite bytes")
+    _make_legacy_db(data_dir / "context_memory.db", ["one", "two"])
 
     original_cwd = os.getcwd()
     try:
         result = runner.invoke(app, ["--data-dir", str(data_dir)], prog_name="afterthread")
         assert result.exit_code == 0, result.output
         assert not (data_dir / "context_memory.db").exists()
-        assert (data_dir / "afterthread.db").read_text() == "real sqlite bytes"
+        assert _read_rows(data_dir / "afterthread.db") == ["one", "two"]
+        assert not list(data_dir.glob("context_memory.db*"))
         db_url = os.environ["DATABASE_URL"]
         assert "afterthread.db" in db_url
         assert "context_memory.db" not in db_url
@@ -339,11 +502,72 @@ def test_legacy_db_file_renamed_when_default_url_injected(
         os.chdir(original_cwd)
 
 
+def test_wal_legacy_db_set_is_recovered_and_fully_migrated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # (FIX A, WAL) A legacy WAL file set (db + non-empty -wal + -shm) whose
+    # committed rows still live in the -wal: moving the main file ALONE would
+    # lose them. Recovery + checkpoint runs first, so every committed row lands
+    # at the new path and no context_memory.db* file is left behind.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("TOOLS_DIR", raising=False)
+    monkeypatch.setattr("afterthread.cli.uvicorn.run", lambda *a, **k: None)
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    rows = ["alpha", "beta", "gamma"]
+    _make_legacy_db(data_dir / "context_memory.db", rows, wal=True)
+    # Precondition: the committed rows are genuinely still in a non-empty -wal,
+    # i.e. this set really needs recovery.
+    assert (data_dir / "context_memory.db-wal").stat().st_size > 0
+
+    original_cwd = os.getcwd()
+    try:
+        result = runner.invoke(app, ["--data-dir", str(data_dir)], prog_name="afterthread")
+        assert result.exit_code == 0, result.output
+        # Every committed row survived recovery at the new path.
+        assert _read_rows(data_dir / "afterthread.db") == rows
+        # The whole legacy file set is gone -- main plus any -wal/-shm sidecars.
+        assert not list(data_dir.glob("context_memory.db*"))
+        assert "migrated legacy database" in result.stdout
+    finally:
+        os.chdir(original_cwd)
+
+
+def test_corrupt_legacy_db_aborts_startup_and_leaves_it_untouched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # (FIX A, corrupt) A legacy context_memory.db that is not a real SQLite file
+    # must ABORT startup (non-zero exit) rather than migrate garbage or -- worse
+    # -- create a fresh empty afterthread.db beside it. The legacy file is left
+    # byte-for-byte untouched so the user can recover or remove it by hand.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("TOOLS_DIR", raising=False)
+    monkeypatch.setattr("afterthread.cli.uvicorn.run", lambda *a, **k: None)
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    garbage = b"this is not a sqlite database at all\x00\x01\x02"
+    (data_dir / "context_memory.db").write_bytes(garbage)
+
+    original_cwd = os.getcwd()
+    try:
+        result = runner.invoke(app, ["--data-dir", str(data_dir)], prog_name="afterthread")
+        assert result.exit_code != 0
+        # Legacy file untouched byte-for-byte; no empty db created beside it.
+        assert (data_dir / "context_memory.db").read_bytes() == garbage
+        assert not (data_dir / "afterthread.db").exists()
+        assert "could not migrate legacy database" in result.stdout
+    finally:
+        os.chdir(original_cwd)
+
+
 def test_db_file_untouched_when_database_url_set(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # (v) When DATABASE_URL is already set (real env var or data-dir .env), the
-    # db-file migration is skipped: no file is touched and the URL is honored.
+    # db-file migration is skipped entirely -- it never even opens the file, so a
+    # write_text fake is fine here: no file is touched and the URL is honored.
     monkeypatch.delenv("TOOLS_DIR", raising=False)
     monkeypatch.setenv("DATABASE_URL", "sqlite:///./operator-chosen.db")
     monkeypatch.setattr("afterthread.cli.uvicorn.run", lambda *a, **k: None)

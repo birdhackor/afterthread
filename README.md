@@ -121,8 +121,10 @@ uv tool install --reinstall --from backend/dist/afterthread-*.whl afterthread
   存在會自動建立（權限設為僅該使用者可讀寫）；已存在的目錄則不會被動權限。
   SQLite 資料庫檔（預設 `afterthread.db`）與工具目錄（`tools/`，見下方
   「KB 工具安裝指南」）都會落在這裡。若偵測到舊名稱 `context-memory` 留下的
-  資料目錄（`~/.local/share/context-memory`）與資料庫檔，下次啟動時會自動
-  原地更名遷移，不需手動搬移。
+  資料目錄（`~/.local/share/context-memory`）與舊 DB 檔，下次啟動時會自動就地
+  更名遷移：更名舊 DB 檔前會先完成 SQLite recovery/checkpoint，並把 `.env` 內
+  指向舊目錄的絕對路徑（`DATABASE_URL`、`TOOLS_DIR` 等）一併改寫；極端情況
+  （DB 損毀或被鎖定）會中止啟動並提示手動處理，不會在你的資料旁邊建立空資料庫。
 - **設定檔（`.env`）**：把 `backend/.env.example` 複製一份到
   `<data-dir>/.env`（例如 `~/.local/share/afterthread/.env`），依需要
   填入下方變數。啟動時只有這個目錄下的 `.env` 會被讀取，不會去讀 checkout
