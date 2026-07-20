@@ -1,8 +1,8 @@
-"""Unit tests for the packaged-mode entry point helpers in context_memory.cli.
+"""Unit tests for the packaged-mode entry point helpers in afterthread.cli.
 
 `_sqlite_url` is the guard against a data-dir path corrupting the database
 URL: the string it returns is later re-parsed by `make_url` inside
-`create_db_engine` (context_memory/db.py), so every test here round-trips
+`create_db_engine` (afterthread/db.py), so every test here round-trips
 through that exact parser. The "?" case is the one a hand-rolled f-string
 gets wrong SILENTLY -- the parser reads "?" as the query-string separator
 and truncates the filename -- which is why it gets an engine-level test that
@@ -24,27 +24,27 @@ import pytest
 from sqlalchemy import create_engine, make_url, text
 from typer.testing import CliRunner
 
-from context_memory.cli import _default_data_dir, _package_version, _sqlite_url, app
+from afterthread.cli import _default_data_dir, _package_version, _sqlite_url, app
 
 # --- _sqlite_url -----------------------------------------------------------
 
 
 def test_sqlite_url_plain_absolute_path_round_trips() -> None:
-    path = Path("/data/context-memory/context_memory.db")
+    path = Path("/data/afterthread/afterthread.db")
     parsed = make_url(_sqlite_url(path))
     assert parsed.get_backend_name() == "sqlite"
     assert parsed.database == str(path)
 
 
 def test_sqlite_url_path_with_spaces_round_trips() -> None:
-    path = Path("/data/my context memory/context_memory.db")
+    path = Path("/data/my afterthread dir/afterthread.db")
     parsed = make_url(_sqlite_url(path))
     assert parsed.get_backend_name() == "sqlite"
     assert parsed.database == str(path)
 
 
 def test_sqlite_url_path_with_percent_and_hash_round_trips() -> None:
-    path = Path("/data/100% memory#1/context_memory.db")
+    path = Path("/data/100% memory#1/afterthread.db")
     parsed = make_url(_sqlite_url(path))
     assert parsed.get_backend_name() == "sqlite"
     assert parsed.database == str(path)
@@ -58,7 +58,7 @@ def test_sqlite_url_question_mark_path_parses_without_truncation() -> None:
     # sqlite3 driver to decode it. The parsed database is therefore the
     # file:-form -- NOT the raw path -- but it must be stable under
     # make_url (no truncation) and must not leak the "?" into the URL query.
-    path = Path("/data/we?ird/context_memory.db")
+    path = Path("/data/we?ird/afterthread.db")
     url = _sqlite_url(path)
     parsed = make_url(url)
     assert parsed.get_backend_name() == "sqlite"
@@ -76,7 +76,7 @@ def test_sqlite_url_question_mark_path_opens_the_intended_file(tmp_path: Path) -
     # decoded file it actually opened, the same probe create_db_engine uses.
     weird_dir = tmp_path / "we?ird dir"
     weird_dir.mkdir()
-    db_path = weird_dir / "context_memory.db"
+    db_path = weird_dir / "afterthread.db"
 
     engine = create_engine(_sqlite_url(db_path))
     try:
@@ -96,40 +96,40 @@ def test_sqlite_url_question_mark_path_opens_the_intended_file(tmp_path: Path) -
 
 def test_default_data_dir_honors_xdg_data_home(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("XDG_DATA_HOME", "/custom/xdg-data")
-    assert _default_data_dir() == Path("/custom/xdg-data/context-memory")
+    assert _default_data_dir() == Path("/custom/xdg-data/afterthread")
 
 
 def test_default_data_dir_falls_back_to_local_share(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
-    assert _default_data_dir() == Path.home() / ".local" / "share" / "context-memory"
+    assert _default_data_dir() == Path.home() / ".local" / "share" / "afterthread"
 
 
 def test_default_data_dir_treats_empty_xdg_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     # The XDG basedir spec: an empty XDG_DATA_HOME means "unset", so it must
     # fall back rather than produce a path under the filesystem root.
     monkeypatch.setenv("XDG_DATA_HOME", "")
-    assert _default_data_dir() == Path.home() / ".local" / "share" / "context-memory"
+    assert _default_data_dir() == Path.home() / ".local" / "share" / "afterthread"
 
 
 # --- CLI surface (typer) -----------------------------------------------------
 #
-# `prog_name="context-memory"` on every invoke(): without it, CliRunner
+# `prog_name="afterthread"` on every invoke(): without it, CliRunner
 # derives the usage line's program name from the command function itself
 # (`_serve` -> a stray "-serve"), since there is no real argv[0] to read
 # outside the installed console script. Passing it explicitly makes the
-# tests reflect the real `context-memory ...` invocation.
+# tests reflect the real `afterthread ...` invocation.
 
 runner = CliRunner()
 
 
 def test_version_flag_exits_zero_and_prints_version_line() -> None:
-    result = runner.invoke(app, ["--version"], prog_name="context-memory")
+    result = runner.invoke(app, ["--version"], prog_name="afterthread")
     assert result.exit_code == 0
-    assert result.stdout.strip() == f"context-memory {_package_version()}"
+    assert result.stdout.strip() == f"afterthread {_package_version()}"
 
 
 def test_help_flag_exits_zero_and_mentions_the_three_options() -> None:
-    result = runner.invoke(app, ["--help"], prog_name="context-memory")
+    result = runner.invoke(app, ["--help"], prog_name="afterthread")
     assert result.exit_code == 0
     assert "--host" in result.stdout
     assert "--port" in result.stdout
@@ -139,7 +139,7 @@ def test_help_flag_exits_zero_and_mentions_the_three_options() -> None:
 def test_invalid_port_cli_value_exits_nonzero() -> None:
     # Click converts --port's value to int before _serve ever runs, so this
     # never touches the filesystem/chdir -- no cwd restore needed.
-    result = runner.invoke(app, ["--port", "not-an-int"], prog_name="context-memory")
+    result = runner.invoke(app, ["--port", "not-an-int"], prog_name="afterthread")
     assert result.exit_code != 0
 
 
@@ -156,12 +156,12 @@ def test_invalid_port_envvar_exits_nonzero_and_never_starts_server(
     # uvicorn.run is never called below.
     calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
     monkeypatch.setattr(
-        "context_memory.cli.uvicorn.run",
+        "afterthread.cli.uvicorn.run",
         lambda *a, **k: calls.append((a, k)),
     )
-    monkeypatch.setenv("CONTEXT_MEMORY_PORT", "not-an-int")
+    monkeypatch.setenv("AFTERTHREAD_PORT", "not-an-int")
 
-    result = runner.invoke(app, ["--data-dir", str(tmp_path / "data")], prog_name="context-memory")
+    result = runner.invoke(app, ["--data-dir", str(tmp_path / "data")], prog_name="afterthread")
 
     assert result.exit_code != 0
     assert calls == []
@@ -179,7 +179,7 @@ def test_explicit_port_flag_overrides_envvar(
     # in between, but only for keys it was told about at least once.
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("TOOLS_DIR", raising=False)
-    monkeypatch.setenv("CONTEXT_MEMORY_PORT", "9999")
+    monkeypatch.setenv("AFTERTHREAD_PORT", "9999")
 
     captured: dict[str, object] = {}
 
@@ -188,7 +188,7 @@ def test_explicit_port_flag_overrides_envvar(
         captured["host"] = host
         captured["port"] = port
 
-    monkeypatch.setattr("context_memory.cli.uvicorn.run", fake_run)
+    monkeypatch.setattr("afterthread.cli.uvicorn.run", fake_run)
 
     data_dir = tmp_path / "data"
     original_cwd = os.getcwd()
@@ -196,12 +196,170 @@ def test_explicit_port_flag_overrides_envvar(
         result = runner.invoke(
             app,
             ["--port", "1234", "--data-dir", str(data_dir)],
-            prog_name="context-memory",
+            prog_name="afterthread",
         )
         assert result.exit_code == 0, result.output
-        assert captured["port"] == 1234  # explicit --port wins over CONTEXT_MEMORY_PORT=9999
+        assert captured["port"] == 1234  # explicit --port wins over AFTERTHREAD_PORT=9999
         assert captured["host"] == "127.0.0.1"
-        assert captured["app_path"] == "context_memory.main:app"
+        assert captured["app_path"] == "afterthread.main:app"
         assert os.getcwd() == str(data_dir.resolve())
+    finally:
+        os.chdir(original_cwd)
+
+
+# --- legacy auto-migration (old distribution name -> afterthread) ------------
+#
+# Every test here monkeypatches uvicorn.run to a no-op (no server, no DB
+# engine) and pre-clears DATABASE_URL/TOOLS_DIR so monkeypatch's teardown
+# restores the real environment even though _serve, not the test, is what sets
+# them. The default-dir tests also pin XDG_DATA_HOME at a tmp_path and clear
+# AFTERTHREAD_DATA_DIR, so `_default_data_dir()` resolves to
+# `<tmp_path>/afterthread` and the pre-rename default is `<tmp_path>/context-memory`.
+
+
+def test_default_dir_migration_renames_legacy_dir_when_new_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # (i) Old default dir present, new default absent, XDG default in play (no
+    # --data-dir / AFTERTHREAD_DATA_DIR): the old dir is renamed into place and
+    # its contents survive intact.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("TOOLS_DIR", raising=False)
+    monkeypatch.delenv("AFTERTHREAD_DATA_DIR", raising=False)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setattr("afterthread.cli.uvicorn.run", lambda *a, **k: None)
+
+    legacy_dir = tmp_path / "context-memory"
+    legacy_dir.mkdir()
+    (legacy_dir / "keepme.txt").write_text("real single-user data")
+    (legacy_dir / ".env").write_text("# legacy config\n")
+    new_dir = tmp_path / "afterthread"
+
+    original_cwd = os.getcwd()
+    try:
+        result = runner.invoke(app, [], prog_name="afterthread")
+        assert result.exit_code == 0, result.output
+        # Old dir moved into place as the new default; contents preserved.
+        assert not legacy_dir.exists()
+        assert new_dir.is_dir()
+        assert (new_dir / "keepme.txt").read_text() == "real single-user data"
+        assert (new_dir / ".env").read_text() == "# legacy config\n"
+        assert "migrated legacy data dir" in result.stdout
+    finally:
+        os.chdir(original_cwd)
+
+
+def test_default_dir_migration_skips_when_both_dirs_exist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # (ii) Both dirs exist: neither is touched (never merge/clobber) and the
+    # new default is the one actually used.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("TOOLS_DIR", raising=False)
+    monkeypatch.delenv("AFTERTHREAD_DATA_DIR", raising=False)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setattr("afterthread.cli.uvicorn.run", lambda *a, **k: None)
+
+    legacy_dir = tmp_path / "context-memory"
+    legacy_dir.mkdir()
+    (legacy_dir / "legacy-marker.txt").write_text("old")
+    new_dir = tmp_path / "afterthread"
+    new_dir.mkdir()
+    (new_dir / "new-marker.txt").write_text("new")
+
+    original_cwd = os.getcwd()
+    try:
+        result = runner.invoke(app, [], prog_name="afterthread")
+        assert result.exit_code == 0, result.output
+        # Both dirs untouched; the legacy one was not merged into the new one.
+        assert (legacy_dir / "legacy-marker.txt").read_text() == "old"
+        assert (new_dir / "new-marker.txt").read_text() == "new"
+        assert not (new_dir / "legacy-marker.txt").exists()
+        assert os.getcwd() == str(new_dir.resolve())
+        assert "migrated legacy data dir" not in result.stdout
+    finally:
+        os.chdir(original_cwd)
+
+
+def test_explicit_data_dir_never_triggers_dir_migration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # (iii) An explicit --data-dir skips the dir migration entirely, even when a
+    # pre-rename default dir sits right beside where the XDG default would land.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("TOOLS_DIR", raising=False)
+    monkeypatch.delenv("AFTERTHREAD_DATA_DIR", raising=False)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setattr("afterthread.cli.uvicorn.run", lambda *a, **k: None)
+
+    legacy_default = tmp_path / "context-memory"
+    legacy_default.mkdir()
+    (legacy_default / "marker.txt").write_text("untouched")
+    explicit = tmp_path / "mydata"
+
+    original_cwd = os.getcwd()
+    try:
+        result = runner.invoke(app, ["--data-dir", str(explicit)], prog_name="afterthread")
+        assert result.exit_code == 0, result.output
+        # Legacy default left alone; the explicit dir is created and used.
+        assert legacy_default.is_dir()
+        assert (legacy_default / "marker.txt").read_text() == "untouched"
+        assert explicit.is_dir()
+        assert os.getcwd() == str(explicit.resolve())
+        assert "migrated legacy data dir" not in result.stdout
+    finally:
+        os.chdir(original_cwd)
+
+
+def test_legacy_db_file_renamed_when_default_url_injected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # (iv) When _serve injects its own default DATABASE_URL, a pre-rename
+    # context_memory.db in the data dir is renamed to afterthread.db (contents
+    # preserved) and the injected URL points at the new filename.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("TOOLS_DIR", raising=False)
+    monkeypatch.setattr("afterthread.cli.uvicorn.run", lambda *a, **k: None)
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "context_memory.db").write_text("real sqlite bytes")
+
+    original_cwd = os.getcwd()
+    try:
+        result = runner.invoke(app, ["--data-dir", str(data_dir)], prog_name="afterthread")
+        assert result.exit_code == 0, result.output
+        assert not (data_dir / "context_memory.db").exists()
+        assert (data_dir / "afterthread.db").read_text() == "real sqlite bytes"
+        db_url = os.environ["DATABASE_URL"]
+        assert "afterthread.db" in db_url
+        assert "context_memory.db" not in db_url
+        assert "migrated legacy database" in result.stdout
+    finally:
+        os.chdir(original_cwd)
+
+
+def test_db_file_untouched_when_database_url_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # (v) When DATABASE_URL is already set (real env var or data-dir .env), the
+    # db-file migration is skipped: no file is touched and the URL is honored.
+    monkeypatch.delenv("TOOLS_DIR", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///./operator-chosen.db")
+    monkeypatch.setattr("afterthread.cli.uvicorn.run", lambda *a, **k: None)
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "context_memory.db").write_text("real sqlite bytes")
+
+    original_cwd = os.getcwd()
+    try:
+        result = runner.invoke(app, ["--data-dir", str(data_dir)], prog_name="afterthread")
+        assert result.exit_code == 0, result.output
+        # Old db left in place; no new-named db created; the URL is untouched.
+        assert (data_dir / "context_memory.db").read_text() == "real sqlite bytes"
+        assert not (data_dir / "afterthread.db").exists()
+        assert os.environ["DATABASE_URL"] == "sqlite:///./operator-chosen.db"
+        assert "migrated legacy database" not in result.stdout
     finally:
         os.chdir(original_cwd)

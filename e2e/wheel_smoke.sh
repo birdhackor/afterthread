@@ -7,7 +7,7 @@
 # and drives the packaged app's HTTP surface with curl. This is the only
 # harness that exercises the actual installed artifact: e2e/smoke.sh drives
 # the backend via `uv run uvicorn` from a checkout and never touches
-# packaging (wheel contents, the `context-memory` console script, SPA static
+# packaging (wheel contents, the `afterthread` console script, SPA static
 # serving, or the `cli.py` data-dir/`.env` wiring) at all.
 #
 # Run from the repo root:  bash e2e/wheel_smoke.sh
@@ -35,8 +35,8 @@ export PYTHONIOENCODING=utf-8
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-TMPDIR_E2E="$(mktemp -d "${TMPDIR:-/tmp}/cm-wheel-e2e.XXXXXX")"
-DATA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cm-wheel-data.XXXXXX")"
+TMPDIR_E2E="$(mktemp -d "${TMPDIR:-/tmp}/aft-wheel-e2e.XXXXXX")"
+DATA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aft-wheel-data.XXXXXX")"
 SERVER_LOG="$TMPDIR_E2E/server.log"
 HEADERS_FILE="$TMPDIR_E2E/last-headers.txt"
 
@@ -179,7 +179,7 @@ wait_200() {
     return 1
 }
 
-# start_server -> launches `uvx --from $WHEEL context-memory` in its own
+# start_server -> launches `uvx --from $WHEEL afterthread` in its own
 # session/process group (so the whole tree -- uvx, its managed venv's
 # python, uvicorn -- is reaped together on teardown regardless of how many
 # layers of subprocess sit in between), always with `--port 0` (no
@@ -201,14 +201,14 @@ wait_200() {
 #
 # ~60s cap on the startup log line: the FIRST `uvx` invocation in a given
 # environment resolves and installs the wheel's dependencies into a fresh
-# tool venv before context-memory's own "Context Memory: data dir=..." line
+# tool venv before afterthread's own "afterthread: data dir=..." line
 # (let alone uvicorn's) ever prints -- see the prerequisites note up top.
 start_server() {
     (
         cd "$TMPDIR_E2E" &&
             exec setsid env \
                 OPENAI_BASE_URL= OPENAI_API_KEY= OPENAI_MODEL= \
-                uvx --from "$WHEEL" context-memory \
+                uvx --from "$WHEEL" afterthread \
                     --host 127.0.0.1 --port 0 --data-dir "$DATA_DIR" \
                     >"$SERVER_LOG" 2>&1 &
         echo $! >"$TMPDIR_E2E/last.sid"
@@ -259,7 +259,7 @@ trap teardown EXIT
 # main
 # ===========================================================================
 main() {
-    echo "Context Memory wheel e2e smoke -- repo: $REPO_ROOT"
+    echo "afterthread wheel e2e smoke -- repo: $REPO_ROOT"
     echo "Scratch dir: $TMPDIR_E2E"
     echo "Data dir:    $DATA_DIR"
 
@@ -268,9 +268,9 @@ main() {
     bash "$REPO_ROOT/scripts/build-wheel.sh"
 
     local wheel
-    wheel="$(ls -t "$REPO_ROOT/backend/dist"/context_memory-*.whl 2>/dev/null | head -n1)"
+    wheel="$(ls -t "$REPO_ROOT/backend/dist"/afterthread-*.whl 2>/dev/null | head -n1)"
     if [ -z "$wheel" ]; then
-        echo "FATAL: no backend/dist/context_memory-*.whl found after build-wheel.sh" >&2
+        echo "FATAL: no backend/dist/afterthread-*.whl found after build-wheel.sh" >&2
         exit 1
     fi
     WHEEL="$wheel"
@@ -289,7 +289,7 @@ DATABASE_URL=sqlite:///./from_envfile.db
 ENVEOF
 
     echo ""
-    echo "========== SERVE (uvx --from <wheel> context-memory) =========="
+    echo "========== SERVE (uvx --from <wheel> afterthread) =========="
     if ! start_server; then
         echo "FATAL: packaged server did not start -- aborting before any assertions." >&2
         exit 1
@@ -397,7 +397,7 @@ ENVEOF
     # The .env pre-written above sets DATABASE_URL=sqlite:///./from_envfile.db
     # (relative), so the database must appear at $DATA_DIR/from_envfile.db:
     # its existence proves the .env was loaded (otherwise the default
-    # context_memory.db name would be used) and that the relative path was
+    # afterthread.db name would be used) and that the relative path was
     # anchored to the data dir by cli.py's chdir (otherwise it would land in
     # the launch CWD, $TMPDIR_E2E). The two negative assertions pin each
     # failure mode separately.
@@ -406,7 +406,7 @@ ENVEOF
     else
         fail "data-dir .env's relative DATABASE_URL lands in --data-dir (from_envfile.db exists)"
     fi
-    if [ ! -f "$DATA_DIR/context_memory.db" ]; then
+    if [ ! -f "$DATA_DIR/afterthread.db" ]; then
         pass "default db name unused (data-dir .env's DATABASE_URL was really loaded)"
     else
         fail "default db name unused (data-dir .env's DATABASE_URL was really loaded)"

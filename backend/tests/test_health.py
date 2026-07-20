@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-from context_memory.main import app
+from afterthread.main import app
 
 client = TestClient(app)
 

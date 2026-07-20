@@ -49,7 +49,7 @@
 
 | 變數 | 預設值 | 邊界 | 說明 |
 | --- | --- | --- | --- |
-| `DATABASE_URL` | `sqlite:///./context_memory.db` | — | SQLAlchemy URL。**只支援 SQLite**,且必須是檔案型(不可為 in-memory)。 |
+| `DATABASE_URL` | `sqlite:///./afterthread.db` | — | SQLAlchemy URL。**只支援 SQLite**,且必須是檔案型(不可為 in-memory)。 |
 | `STALE_AFTER_DAYS` | 14 | [0, 36500] | 非終態項目的 `updated` 超過這個天數,會被標記為陳舊。 |
 
 !!! tip "GLM5.2(或其他 1M-token context 模型)建議值"

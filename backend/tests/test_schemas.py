@@ -1,4 +1,4 @@
-"""Tests for schema-level contracts in context_memory.schemas."""
+"""Tests for schema-level contracts in afterthread.schemas."""
 
 from typing import Any
 
@@ -6,9 +6,9 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from context_memory.main import app
-from context_memory.schemas import ToolInstallRequest
-from context_memory.services.memory_ai import SECTION_FIELD_ORDER
+from afterthread.main import app
+from afterthread.schemas import ToolInstallRequest
+from afterthread.services.memory_ai import SECTION_FIELD_ORDER
 
 
 def _allows_null(prop: dict[str, Any]) -> bool:
@@ -65,8 +65,8 @@ def _assert_title_tags_section_bounds(props: dict[str, Any]) -> None:
     text field max_length 20000 -- the CRUD-side bound that keeps a
     legitimate POST/PATCH from writing an item whose title/tags/sections are
     large enough to blow the enrich/assist-update prompt header budget (see
-    context_memory.services.memory_ai._serialize_item_for_prompt and its _CRUD_* mirror
-    constants in context_memory.schemas).
+    afterthread.services.memory_ai._serialize_item_for_prompt and its _CRUD_* mirror
+    constants in afterthread.schemas).
     """
     assert props["title"]["maxLength"] == 300
     assert props["tags"]["maxItems"] == 20

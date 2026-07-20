@@ -1,10 +1,10 @@
 ---
-name: context-memory
-description: Capture, enrich, update, and review personal project memory records that preserve discussion context, decision rationale, tradeoffs, constraints, open questions, next actions, and recovery cues. Use when the user mentions context-memory, architectural knowledge vaporization, saving project/topic context, creating or updating memory items, quick capture, full enrichment, resuming old work, or reviewing parked/active topics.
+name: afterthread
+description: Capture, enrich, update, and review personal project memory records that preserve discussion context, decision rationale, tradeoffs, constraints, open questions, next actions, and recovery cues. Use when the user mentions afterthread, architectural knowledge vaporization, saving project/topic context, creating or updating memory items, quick capture, full enrichment, resuming old work, or reviewing parked/active topics.
 license: MIT
 ---
 
-# Context Memory
+# afterthread
 
 ## Purpose
 
@@ -18,7 +18,7 @@ Communicate with the user in Traditional Chinese unless they request another lan
 - Use `templates/memory-item.md` for the canonical item shape.
 - Use `docs/methodology.md` for detailed workflow rules when uncertain or changing the method.
 - Use `docs/research-notes.md` only when the user asks about the background, survey, or rationale for the method.
-- Use `scripts/context_memory.py` for deterministic create/list/index/validate operations.
+- Use `scripts/afterthread.py` for deterministic create/list/index/validate operations.
 
 ## Workflow Decision
 
@@ -38,7 +38,7 @@ Steps:
 3. Create the file:
 
    ```bash
-   python3 scripts/context_memory.py new --title "TITLE" --summary "ONE SENTENCE SNAPSHOT"
+   python3 scripts/afterthread.py new --title "TITLE" --summary "ONE SENTENCE SNAPSHOT"
    ```
 
 4. Edit the generated item with the available context.
@@ -47,8 +47,8 @@ Steps:
 7. Run:
 
    ```bash
-   python3 scripts/context_memory.py validate
-   python3 scripts/context_memory.py index
+   python3 scripts/afterthread.py validate
+   python3 scripts/afterthread.py index
    ```
 
 8. Tell the user the created path and the smallest useful enrichment prompt.
@@ -89,7 +89,7 @@ When materially complete, set `stage: full` and a suitable status such as `activ
 
 ## Review Memory
 
-1. Run `python3 scripts/context_memory.py list`.
+1. Run `python3 scripts/afterthread.py list`.
 2. Inspect `memory/INDEX.md` and relevant active/incomplete records.
 3. Group results into:
    - needs enrichment

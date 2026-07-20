@@ -1,8 +1,8 @@
 ---
-description: Fully enrich an existing context-memory item
+description: Fully enrich an existing afterthread item
 ---
 
-Use the `context-memory` skill to perform FULL ENRICHMENT for:
+Use the `afterthread` skill to perform FULL ENRICHMENT for:
 
 ```text
 $ARGUMENTS
@@ -15,8 +15,8 @@ Fill the anti-vaporization checklist: background, stakeholders, current state, d
 Preserve uncertainty with Known/Inferred/Unknown. Append to `Progress Log`, update frontmatter `updated`, set `stage: full` when the checklist is materially complete, and run:
 
 ```bash
-python3 scripts/context_memory.py validate
-python3 scripts/context_memory.py index
+python3 scripts/afterthread.py validate
+python3 scripts/afterthread.py index
 ```
 
 Reply in Traditional Chinese with what changed and any still-open questions.

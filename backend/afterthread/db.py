@@ -8,8 +8,8 @@ from sqlalchemy.engine.interfaces import DBAPIConnection
 from sqlalchemy.pool import ConnectionPoolEntry
 from sqlmodel import Session, SQLModel, create_engine
 
-from context_memory import models  # noqa: F401  # ensure tables are registered on metadata
-from context_memory.config import get_settings
+from afterthread import models  # noqa: F401  # ensure tables are registered on metadata
+from afterthread.config import get_settings
 
 
 def _url_database(url: str) -> str:
@@ -80,7 +80,7 @@ def _non_persistent_sqlite_error(database_url: str) -> RuntimeError:
         "In-memory SQLite database URLs are not supported "
         f"(got: {_url_database(database_url)}). This server requires a "
         "file-backed SQLite path so data survives restarts, e.g. "
-        "'sqlite:///./context_memory.db'. Tests that need an isolated, "
+        "'sqlite:///./afterthread.db'. Tests that need an isolated, "
         "ephemeral database may build their own engine directly instead "
         "of calling create_db_engine()."
     )
@@ -230,15 +230,15 @@ def get_engine() -> Engine:
     Deliberately NOT a module-level `engine = create_db_engine(...)`: that
     variant connects at IMPORT time, because `create_db_engine` runs its
     persistence probe immediately (see its docstring), and for a file-backed
-    URL that probe creates the database file. Importing `context_memory.main`/`context_memory.db`
-    then had a filesystem side effect -- it materialised `./context_memory.db`
+    URL that probe creates the database file. Importing `afterthread.main`/`afterthread.db`
+    then had a filesystem side effect -- it materialised `./afterthread.db`
     in the process's cwd -- which broke read-only checkouts at test-collection
     time and left a real DB file behind even in tests that override
     `get_session` and never run the app lifespan.
 
     Deferring construction to the first call moves that probe to STARTUP:
     `init_db()`, invoked from the app lifespan, is the first caller (see
-    `context_memory/main.py`), so the probe runs once, before any request is handled, and
+    `afterthread/main.py`), so the probe runs once, before any request is handled, and
     never at import. `lru_cache` makes this a per-process singleton -- the
     engine and its one-time probe are created exactly once and reused -- so the
     probe is a startup cost, NOT a per-request one. Tests that need an

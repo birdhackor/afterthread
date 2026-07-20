@@ -4,9 +4,9 @@
 The model's real constraint -- and the number the OpenAI-compatible endpoint
 reports back in ``usage.prompt_tokens`` -- is TOKENS, but this codebase bounds
 prompt content in CHARACTERS: the item snapshot in
-context_memory.services.memory_ai, the OpenAPI document in
-context_memory.services.tool_builder, and the live tool-loop conversation in
-context_memory.services.llm are all cut with char-denominated cutters. Chars were
+afterthread.services.memory_ai, the OpenAPI document in
+afterthread.services.tool_builder, and the live tool-loop conversation in
+afterthread.services.llm are all cut with char-denominated cutters. Chars were
 always a proxy for tokens; this module closes the gap WITHOUT a tokenizer
 dependency by keeping a rolling window of (chars we sent, tokens the endpoint
 counted) pairs from recent completions and deriving a live chars<->tokens ratio
@@ -18,7 +18,7 @@ family, add a heavy dependency, and STILL only estimate the endpoint's own
 counting. The endpoint already reports the ground truth (``prompt_tokens``) for
 free on every completion, so the ratio is LEARNED from that rather than modelled.
 
-Module style mirrors context_memory.services.llm_log: one module-level
+Module style mirrors afterthread.services.llm_log: one module-level
 ``threading.Lock`` guards the shared window -- the same process-wide "outlives
 any one request" lifetime the lru_cache'd client and the llm_log ring already
 have -- and ``_reset_for_tests`` drops the state so a test starts cold.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# End-to-end smoke harness for the Context Memory web stack.
+# End-to-end smoke harness for the afterthread web stack.
 #
 # Run from the repo root:   ./e2e/smoke.sh
 # Prerequisites:            uv (backend), pnpm (frontend), python3 (mock + JSON
@@ -52,7 +52,7 @@ BACKEND_DIR="$REPO_ROOT/backend"
 FRONTEND_DIR="$REPO_ROOT/frontend"
 MOCK="$E2E_DIR/mock_llm.py"
 
-TMPDIR_E2E="$(mktemp -d "${TMPDIR:-/tmp}/cm-e2e.XXXXXX")"
+TMPDIR_E2E="$(mktemp -d "${TMPDIR:-/tmp}/aft-e2e.XXXXXX")"
 
 # --- server bookkeeping (for teardown) -------------------------------------
 
@@ -328,7 +328,7 @@ start_backend() {
             exec setsid env -u OPENAI_TIMEOUT_SECONDS \
                 DATABASE_URL="sqlite:///$db" \
                 OPENAI_BASE_URL= OPENAI_API_KEY= OPENAI_MODEL= "$@" \
-                uv run uvicorn context_memory.main:app --host 127.0.0.1 --port 0 >"$logf" 2>&1 &
+                uv run uvicorn afterthread.main:app --host 127.0.0.1 --port 0 >"$logf" 2>&1 &
         echo $! >"$TMPDIR_E2E/last.sid"
     )
     local sid
@@ -771,7 +771,7 @@ phase_c() {
     local enrich_pid=$!
 
     # Wait for a SIGNAL instead of a fixed sleep: _snapshot_item_for_ai
-    # (context_memory/routers/ai.py) is awaited to completion BEFORE enrich_item ever
+    # (afterthread/routers/ai.py) is awaited to completion BEFORE enrich_item ever
     # posts to the mock, so the mock logging "holding response" -- written
     # the instant it has received and JSON-parsed the request, strictly
     # BEFORE it starts polling for the release file -- is proof the pre-await
@@ -857,7 +857,7 @@ phase_d() {
 # main
 # ===========================================================================
 main() {
-    echo "Context Memory e2e smoke -- repo: $REPO_ROOT"
+    echo "afterthread e2e smoke -- repo: $REPO_ROOT"
     echo "Temp dir: $TMPDIR_E2E"
 
     phase_a

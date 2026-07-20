@@ -1,8 +1,8 @@
 ---
-description: Quickly capture a context-memory item
+description: Quickly capture an afterthread item
 ---
 
-Use the `context-memory` skill to perform QUICK CAPTURE for this input:
+Use the `afterthread` skill to perform QUICK CAPTURE for this input:
 
 ```text
 $ARGUMENTS
@@ -14,8 +14,8 @@ Rules:
 
 - Ask at most three questions before writing, and only when the missing answer is likely to evaporate.
 - If the title is implicit, infer one.
-- Use `python3 scripts/context_memory.py new --title "..." --summary "..."` to create the file, then edit it with the captured details.
+- Use `python3 scripts/afterthread.py new --title "..." --summary "..."` to create the file, then edit it with the captured details.
 - Mark incomplete but important items as `needs-enrichment`; otherwise keep `capture-quick`.
-- Run `python3 scripts/context_memory.py validate` and `python3 scripts/context_memory.py index`.
+- Run `python3 scripts/afterthread.py validate` and `python3 scripts/afterthread.py index`.
 - Reply to the user in Traditional Chinese with the created path and remaining enrichment questions.
 

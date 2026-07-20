@@ -2,7 +2,7 @@
 
 ## Goal
 
-`context-memory` stores enough context for future-you or an AI agent to resume a topic without replaying the original discussion.
+`afterthread` stores enough context for future-you or an AI agent to resume a topic without replaying the original discussion.
 
 The unit is a **memory item**. A memory item can be a project, topic, decision, plan, investigation, risk, or deferred task. It does not need to be a final architecture decision.
 
@@ -84,6 +84,6 @@ When updating an item:
 - Update the current state and next actions.
 - Append to `Progress Log` instead of rewriting history away.
 - If a decision changes, preserve the old rationale and mark what superseded it.
-- Run `python3 scripts/context_memory.py validate`.
-- Run `python3 scripts/context_memory.py index`.
+- Run `python3 scripts/afterthread.py validate`.
+- Run `python3 scripts/afterthread.py index`.
 

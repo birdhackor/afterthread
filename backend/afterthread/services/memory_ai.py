@@ -1,7 +1,7 @@
 """AI memory workflows: prompts and untrusted-output sanitizers.
 
 Each workflow (``capture_draft`` / ``enrich_item`` / ``assist_update``) builds a
-system prompt that encodes the context-memory methodology and delegates to
+system prompt that encodes the afterthread methodology and delegates to
 ``generate_structured`` with the workflow's pydantic model. That model both
 guides the LLM (its JSON Schema is injected into the prompt) and validates the
 reply: its *sanitizers treat the LLM output as untrusted input* -- types are
@@ -18,10 +18,10 @@ from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from context_memory.config import get_settings
-from context_memory.models import MemoryStatus, utcnow
-from context_memory.services import token_budget, tools
-from context_memory.services.llm import LlmTool, generate_structured
+from afterthread.config import get_settings
+from afterthread.models import MemoryStatus, utcnow
+from afterthread.services import token_budget, tools
+from afterthread.services.llm import LlmTool, generate_structured
 
 # --- caps (constraint: bound everything; LLM output is untrusted) ----------
 
@@ -189,7 +189,7 @@ def _with_tools_rule(system_prompt: str, active_tools: list[LlmTool]) -> str:
 
 CAPTURE_SYSTEM_PROMPT = "\n".join(
     [
-        "You are the Context Memory quick-capture assistant. Turn a raw "
+        "You are the afterthread quick-capture assistant. Turn a raw "
         "discussion into a structured draft so that future readers, or an AI "
         "agent, can resume the topic without replaying the conversation. "
         "Capture with minimum friction; the first draft may be imperfect.",
@@ -652,7 +652,7 @@ _RULE_SUPERSEDE = (
 
 ENRICH_SYSTEM_PROMPT = "\n".join(
     [
-        "You are the Context Memory enrichment assistant. Given an existing "
+        "You are the afterthread enrichment assistant. Given an existing "
         "memory item and new context, fill the anti-vaporization checklist "
         "(background, stakeholders, current state, desired outcome, decisions, "
         "rationale, alternatives, constraints, assumptions, risks, evidence, "
@@ -780,7 +780,7 @@ async def enrich_item(item_fields: Mapping[str, Any], additional_context: str) -
 
 UPDATE_SYSTEM_PROMPT = "\n".join(
     [
-        "You are the Context Memory update assistant. Given an existing memory "
+        "You are the afterthread update assistant. Given an existing memory "
         "item and a progress note, refresh the current state, next actions, and "
         "open questions, and record what changed.",
         _RULE_HONESTY,

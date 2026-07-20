@@ -15,7 +15,7 @@
 - **選項**：
   1. **hatch `force-include` 指向 `../frontend/dist`**：不必複製。缺點：實測 `uv build` 走 sdist→wheel 兩段建置時，wheel 階段在解開的 sdist 裡找不到 `../frontend/dist`，直接 `FileNotFoundError`；sdist 永遠是壞的。
   2. **build hook／第三方插件（hatch-build-scripts、hatch-js）自動跑 pnpm build**：一鍵建置、git 直裝可用。缺點：建置機還是要有 Node（沒省環境）、第三方插件維護風險、隔離建置環境內呼叫 pnpm 失敗訊息難除錯。
-  3. **pre-build step：先 pnpm build、複製 dist → `backend/context_memory/static/`（gitignored），`artifacts` 把它收進 wheel/sdist**：透明、失敗點清楚、hatch 官方 `artifacts` 就是為 gitignored 產物設計；缺點：多一個腳本步驟，忘跑會包到舊 static（腳本內加新鮮度檢查防呆）。
+  3. **pre-build step：先 pnpm build、複製 dist → `backend/afterthread/static/`（gitignored），`artifacts` 把它收進 wheel/sdist**：透明、失敗點清楚、hatch 官方 `artifacts` 就是為 gitignored 產物設計；缺點：多一個腳本步驟，忘跑會包到舊 static（腳本內加新鮮度檢查防呆）。
 - **決定**：選項 3，配 `scripts/build-wheel.sh` 一鍵完成。
 - **依據**：研究代理對選項 1 的失敗與選項 3 的成功都做過本機實測；符合保守/簡潔原則。代價：git+subdirectory 直裝拿不到前端（僅內部 wheel 發布，可接受，README 註明）。
 
@@ -40,7 +40,7 @@
 - **選項**：
   1. **config.py 改預設到 XDG**：影響 dev 模式與既有測試，行為全域改變。
   2. **加 `platformdirs` 依賴**：跨平台正確，但多一個依賴。
-  3. **cli.py（只有打包入口走它）解析 `--data-dir`/`CONTEXT_MEMORY_DATA_DIR`，預設 `$XDG_DATA_HOME|~/.local/share`/context-memory；`DATABASE_URL` 未設才注入 `<data-dir>/context_memory.db`；dev 直接跑 uvicorn 不經 cli.py，行為不變**。
+  3. **cli.py（只有打包入口走它）解析 `--data-dir`/`AFTERTHREAD_DATA_DIR`，預設 `$XDG_DATA_HOME|~/.local/share`/afterthread；`DATABASE_URL` 未設才注入 `<data-dir>/afterthread.db`；dev 直接跑 uvicorn 不經 cli.py，行為不變**。
 - **決定**：選項 3，手寫 XDG（Linux/macOS 夠用，不加依賴）。
 - **依據**：關注點分離——「打包模式的預設值」屬於打包入口的職責；dev/test 零影響；顯式 `DATABASE_URL` 永遠優先。
 
@@ -211,7 +211,7 @@
 - **修**：(M1) LLM body 是不可信輸入：儲存邊界加 `_utf8_safe`（lone surrogate→U+FFFD，比照 memory_ai 的 `_coerce_str` UTF-8 閘）+ JSONL sink catch 由 OSError 放寬為 Exception；(M2) `finish()` 絕對不可拋——最終保護為完全靜默（觀察者唯一的錯誤結局是影響被觀察的呼叫）；(M3) FE 詳情 cache 以 `started_at` 作實例判別子 + 不符時顯示已被取代（後端重啟 id 重用）；(L2) timeout 補標當前 attempt 的安全分類；(L3) 隱私文案改為有條件（LLM_LOG_FILE）；(L4) 日誌 404 專屬文案；(L5) 清單加水平 scroll 容器。
 - **L1 JSONL 半行 — won't-fix + 註解**：opt-in 除錯 sink，磁碟滿寫半行只壞該行，消費端跳過即可；交易式寫入不值。
 - **另**：實作代理誤診 `except A, B:` 為「無效 Python / ruff bug」——實為 PEP 758（3.14）合法語法、ruff 按 target 正規化；監督者已改正其註解為真實理由（拆兩個子句為求 formatter 穩定與可讀性），拆分本身保留。
-- **第二輪追加（3 Medium 全修，免第三輪）**：(A) `context_memory.llm` logger 在預設 uvicorn 下無 handler、有效等級 WARNING——承諾的 INFO console sink 靜默失效 → main.py import 時做一次應用層 logger 組態（INFO + stderr StreamHandler + propagate=False + 冪等 guard），以真實 uvicorn 行程驗證 INFO 行輸出且不重複；(B) usage 由「最後一次覆蓋」改為 per-attempt 記錄 + finish 時逐欄位加總（150+260=410 測試釘住），attempt 增 request_chars/response_chars；(C) 新設定 `llm_log_body_max_chars`（預設 200k，與筆數上限正交的 RAM 界限）在 `_stored_body` choke point 截斷（先 utf8-safe 後切、`…[紀錄過長已截斷]` 標記、truncated 旗標 + FE 已截斷 badge）。三項皆行為測試釘住（445 tests），期末全量 review 覆蓋，不再開輪。
+- **第二輪追加（3 Medium 全修，免第三輪）**：(A) `afterthread.llm` logger 在預設 uvicorn 下無 handler、有效等級 WARNING——承諾的 INFO console sink 靜默失效 → main.py import 時做一次應用層 logger 組態（INFO + stderr StreamHandler + propagate=False + 冪等 guard），以真實 uvicorn 行程驗證 INFO 行輸出且不重複；(B) usage 由「最後一次覆蓋」改為 per-attempt 記錄 + finish 時逐欄位加總（150+260=410 測試釘住），attempt 增 request_chars/response_chars；(C) 新設定 `llm_log_body_max_chars`（預設 200k，與筆數上限正交的 RAM 界限）在 `_stored_body` choke point 截斷（先 utf8-safe 後切、`…[紀錄過長已截斷]` 標記、truncated 旗標 + FE 已截斷 badge）。三項皆行為測試釘住（445 tests），期末全量 review 覆蓋，不再開輪。
 
 ## D27（Phase 5 codex review 裁決）：3 High 中兩項屬「文件與現實不符」以誠實化處理，其餘全修
 
@@ -265,7 +265,7 @@
   - round-2（3 Medium）：同三個 class 在未改到的行復現（feature-tour 日誌行、`GET /logs/{id}`、root README `.staging`、摘要與連結耦合）→ 改為全 class sweep。
   - round-3（1 Medium）：instructions 文字仍稱「完整記錄」，但 instructions（≤20000 字元）同受 `LLM_LOG_BODY_MAX_CHARS`（下限 1000）截斷 → 掃掉所有「原文/原樣/完整記錄」措辭，改為「受 body cap 截斷；一般長度 key/token 短於上限故仍完整記到」（安全警告不變）。
   - round-4：Approve。
-- **修正另發現並改正監督者 spec 的兩處錯誤**：(1) 無 PyPI 發佈計畫（D15），故啟動指令為 `uvx --from backend/dist/*.whl context-memory`（對齊 wheel_smoke.sh）而非 bare `uvx context-memory`；(2) AI 動作 UI 名稱為「AI 進度更新」非「AI 協助更新」。另新增重要風險揭露：貼進安裝器的第三方 key 會同時進工具 `.env` 與 AI 日誌。
+- **修正另發現並改正監督者 spec 的兩處錯誤**：(1) 無 PyPI 發佈計畫（D15），故啟動指令為 `uvx --from backend/dist/*.whl afterthread`（對齊 wheel_smoke.sh）而非 bare `uvx afterthread`；(2) AI 動作 UI 名稱為「AI 進度更新」非「AI 協助更新」。另新增重要風險揭露：貼進安裝器的第三方 key 會同時進工具 `.env` 與 AI 日誌。
 - **backend/frontend/e2e README 過時宣稱同步修正**：OPENAI_TIMEOUT_SECONDS 60→120、LLM_PROMPT_BUDGET_CHARS 32000→200000、補齊 LLM_LOG_*/TOOLS_DIR/LLM_TOOL_*/TOOL_INSTALL_* 鍵與 /api/tools* 路由、補 /tools 與 /llm-logs 頁、修正 mutation-gate 與 AI 動作識別名、補 wheel_smoke.sh 章節。
 - **教訓沉澱**：「修類不修例」不只適用程式碼，文件的重複宣稱同樣要 grep 全掃 + 驗證殘留為零，否則 review 會逐行打轉。已成慣例。
 

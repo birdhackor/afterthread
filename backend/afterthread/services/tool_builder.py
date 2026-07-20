@@ -72,16 +72,16 @@ import httpx
 from pydantic import BaseModel, ConfigDict, model_validator
 from starlette.concurrency import run_in_threadpool
 
-from context_memory.config import get_settings
-from context_memory.services import llm_log, token_budget, tools
-from context_memory.services.llm import (
+from afterthread.config import get_settings
+from afterthread.services import llm_log, token_budget, tools
+from afterthread.services.llm import (
     LLMNotConfiguredError,
     LlmTool,
     LLMUpstreamError,
     generate_structured,
 )
-from context_memory.services.memory_ai import _coerce_bool, _coerce_str, _truncate_to
-from context_memory.services.tools import _NAME_RE
+from afterthread.services.memory_ai import _coerce_bool, _coerce_str, _truncate_to
+from afterthread.services.tools import _NAME_RE
 
 # The llm_log workflow name for every builder session -- what the AI 日誌 page
 # shows, and the key `last_record_id_for_workflow` looks the session up by.
@@ -726,7 +726,7 @@ def _builder_user_prompt(instructions: str, openapi_text: str) -> str:
     The OpenAPI text is bounded by the SAME ``llm_prompt_budget_tokens`` knob
     that bounds item serialization (one operator-facing "how much may ride in a
     prompt" setting, not a second one), converted to a CHAR allowance via the
-    live chars<->tokens ratio (context_memory.services.token_budget), behind the
+    live chars<->tokens ratio (afterthread.services.token_budget), behind the
     shared truncation marker. Instructions are already request-bounded (<=20000)
     at the API layer.
     """
@@ -1008,7 +1008,7 @@ async def run_install(
             llm_error = "LLM 尚未設定，無法執行安裝。"  # noqa: RUF001
         except LLMUpstreamError as exc:
             # str(exc) is safe by construction (category + fixed reason -- see
-            # context_memory.services.llm); surfacing it names WHICH failure
+            # afterthread.services.llm); surfacing it names WHICH failure
             # (timeout vs invalid output vs upstream) without config leakage.
             llm_error = f"AI 建置工具失敗（{exc}）。"  # noqa: RUF001
 

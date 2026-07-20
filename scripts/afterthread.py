@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small helper for context-memory markdown records."""
+"""Small helper for afterthread markdown records."""
 
 from __future__ import annotations
 
@@ -181,7 +181,7 @@ def list_records(_: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Manage context-memory records")
+    parser = argparse.ArgumentParser(description="Manage afterthread records")
     sub = parser.add_subparsers(dest="command", required=True)
 
     new = sub.add_parser("new", help="create a memory item from the template")

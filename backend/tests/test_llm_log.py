@@ -1,4 +1,4 @@
-"""Tests for the LLM interaction log (context_memory.services.llm_log) and its
+"""Tests for the LLM interaction log (afterthread.services.llm_log) and its
 integration into ``generate_structured``.
 
 Two layers:
@@ -32,9 +32,9 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ConfigDict
 
-from context_memory.config import Settings
-from context_memory.services import llm_log
-from context_memory.services.llm import (
+from afterthread.config import Settings
+from afterthread.services import llm_log
+from afterthread.services.llm import (
     LLMNotConfiguredError,
     LLMUpstreamError,
     generate_structured,
@@ -839,9 +839,9 @@ def _install(
         llm_log_file="",
         llm_log_max_entries=50,
     )
-    monkeypatch.setattr("context_memory.services.llm.get_settings", lambda: settings)
-    monkeypatch.setattr("context_memory.services.llm._get_client", lambda: stub)
-    monkeypatch.setattr("context_memory.services.llm_log.get_settings", lambda: settings)
+    monkeypatch.setattr("afterthread.services.llm.get_settings", lambda: settings)
+    monkeypatch.setattr("afterthread.services.llm._get_client", lambda: stub)
+    monkeypatch.setattr("afterthread.services.llm_log.get_settings", lambda: settings)
     return stub
 
 
@@ -1006,13 +1006,13 @@ def test_not_configured_outcome_recorded(monkeypatch: pytest.MonkeyPatch) -> Non
     """An unconfigured endpoint records outcome not_configured with the workflow
     and zero attempts -- no request was ever built or sent."""
     settings = Settings(openai_base_url="", openai_api_key="", openai_model="")
-    monkeypatch.setattr("context_memory.services.llm.get_settings", lambda: settings)
-    monkeypatch.setattr("context_memory.services.llm_log.get_settings", lambda: settings)
+    monkeypatch.setattr("afterthread.services.llm.get_settings", lambda: settings)
+    monkeypatch.setattr("afterthread.services.llm_log.get_settings", lambda: settings)
 
     def _must_not_build() -> Any:
         raise AssertionError("_get_client must not run when unconfigured")
 
-    monkeypatch.setattr("context_memory.services.llm._get_client", _must_not_build)
+    monkeypatch.setattr("afterthread.services.llm._get_client", _must_not_build)
     with pytest.raises(LLMNotConfiguredError):
         asyncio.run(generate_structured("s", "u", _Sample, workflow="capture"))
 

@@ -1,27 +1,27 @@
-"""Console entry point for packaged (`uvx context-memory` / `context-memory`) mode.
+"""Console entry point for packaged (`uvx afterthread` / `afterthread`) mode.
 
 Development never goes through this module: `backend/README.md`'s documented
-dev workflow runs `uv run uvicorn context_memory.main:app` directly, so dev
+dev workflow runs `uv run uvicorn afterthread.main:app` directly, so dev
 behavior -- CWD-relative `backend/.env`, CWD-relative default `DATABASE_URL`,
 no data directory at all -- is completely unchanged by anything below (see
-`context_memory/config.py` and D05/D06 in `docs/web-v2-decisions.md`).
+`afterthread/config.py` and D05/D06 in `docs/web-v2-decisions.md`).
 
 This module exists because a `uvx`-installed tool is launched from an
 arbitrary CWD, with no project checkout nearby to hold a `.env` or a
 CWD-relative SQLite file the way a dev checkout does -- there is no
 "correct" directory for either to default to. So packaged-mode defaults are
-decided in exactly one place, kept out of `context_memory.config` entirely so
+decided in exactly one place, kept out of `afterthread.config` entirely so
 `Settings`'s own defaults (and every existing test around them) are
 untouched by packaging:
 
-  1. Resolve a per-user data directory (`--data-dir` / `CONTEXT_MEMORY_DATA_DIR`
+  1. Resolve a per-user data directory (`--data-dir` / `AFTERTHREAD_DATA_DIR`
      / an XDG-style default) and make sure it exists (created user-only).
   2. `os.chdir` into it: the data dir is packaged mode's home directory.
      Every CWD-relative behavior downstream then resolves inside the data
      dir rather than whatever directory the user happened to launch from --
      pydantic-settings' CWD-relative `env_file=".env"` lookup (config.py),
      and any relative path in a setting value (e.g. a
-     `DATABASE_URL=sqlite:///./context_memory.db` copied straight from
+     `DATABASE_URL=sqlite:///./afterthread.db` copied straight from
      .env.example). That closes two whole classes of surprises: a stray
      `.env` sitting in an arbitrary launch CWD silently configuring the
      server, and relative DB paths scattering database files across launch
@@ -32,8 +32,18 @@ untouched by packaging:
      itself gives env vars over `backend/.env` in dev).
   4. Default `DATABASE_URL` to a file inside that data directory, unless the
      environment already supplies one.
-  5. Hand off to `uvicorn.run`, serving the same `context_memory.main:app`
+  5. Hand off to `uvicorn.run`, serving the same `afterthread.main:app`
      dev uses.
+
+On the XDG-default path (no --data-dir / AFTERTHREAD_DATA_DIR), this module
+also one-time auto-migrates real data left under the tool's previous
+distribution name: the old default data dir `<xdg base>/context-memory` is
+renamed to the new `<xdg base>/afterthread` (only when the new one does not
+yet exist), and inside the data dir a legacy `context_memory.db` is renamed to
+`afterthread.db` before the default `DATABASE_URL` is injected. Both are
+skipped once the destination exists, when the operator supplies an explicit
+data dir, or when `DATABASE_URL` is already set; each prints a one-line notice
+when it fires.
 """
 
 import os
@@ -48,7 +58,7 @@ from dotenv import load_dotenv
 from sqlalchemy import make_url
 from sqlalchemy.engine import URL
 
-_PACKAGE_NAME = "context-memory"
+_PACKAGE_NAME = "afterthread"
 
 # add_completion=False: this is a single-command server launcher, not a CLI
 # suite worth shell-completion machinery for -- it would only add
@@ -72,14 +82,14 @@ def _package_version() -> str:
 def _default_data_dir() -> Path:
     """The XDG-style default data directory.
 
-    `$XDG_DATA_HOME/context-memory`, falling back to
-    `~/.local/share/context-memory` when unset. Covers Linux and macOS
+    `$XDG_DATA_HOME/afterthread`, falling back to
+    `~/.local/share/afterthread` when unset. Covers Linux and macOS
     without adding a `platformdirs` dependency for a single-purpose lookup
     (see D05 in docs/web-v2-decisions.md).
     """
     xdg_data_home = os.environ.get("XDG_DATA_HOME")
     base = Path(xdg_data_home) if xdg_data_home else Path.home() / ".local" / "share"
-    return base / "context-memory"
+    return base / "afterthread"
 
 
 def _sqlite_url(db_path: Path) -> str:
@@ -87,7 +97,7 @@ def _sqlite_url(db_path: Path) -> str:
 
     Constructed via SQLAlchemy's own `URL.create` rather than a hand-rolled
     f-string, and verified against `make_url` -- the exact parser
-    `create_db_engine` (context_memory/db.py) later runs on it -- so a data
+    `create_db_engine` (afterthread/db.py) later runs on it -- so a data
     dir containing URL-significant characters can never silently truncate or
     corrupt the database filename.
 
@@ -128,13 +138,13 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
-@app.command(help="Run the Context Memory web app (bundled API + SPA).")
+@app.command(help="Run the afterthread web app (bundled API + SPA).")
 def _serve(
     host: Annotated[
         str,
         typer.Option(
             "--host",
-            envvar="CONTEXT_MEMORY_HOST",
+            envvar="AFTERTHREAD_HOST",
             help=(
                 "Interface to bind. Left at 127.0.0.1 by default: this is a "
                 "local single-user tool, not a service meant to be exposed "
@@ -146,7 +156,7 @@ def _serve(
         int,
         typer.Option(
             "--port",
-            envvar="CONTEXT_MEMORY_PORT",
+            envvar="AFTERTHREAD_PORT",
             help="Port to bind.",
         ),
     ] = 8000,
@@ -154,7 +164,7 @@ def _serve(
         str | None,
         typer.Option(
             "--data-dir",
-            envvar="CONTEXT_MEMORY_DATA_DIR",
+            envvar="AFTERTHREAD_DATA_DIR",
             show_default=False,
             help=(
                 "Directory holding the SQLite database and an optional .env "
@@ -175,16 +185,43 @@ def _serve(
     """Prepare the data directory/environment, then serve.
 
     See the module docstring for why this logic lives here rather than in
-    `context_memory.config`.
+    `afterthread.config`.
     """
-    # `data_dir` is None when neither --data-dir nor CONTEXT_MEMORY_DATA_DIR
-    # was given, and "" when CONTEXT_MEMORY_DATA_DIR is set but empty -- both
+    # `data_dir` is None when neither --data-dir nor AFTERTHREAD_DATA_DIR
+    # was given, and "" when AFTERTHREAD_DATA_DIR is set but empty -- both
     # fall back to the XDG-style default here, the same rule
     # `_default_data_dir` itself applies to a set-but-empty XDG_DATA_HOME.
     #
     # Resolve BEFORE the chdir below, so a relative --data-dir is anchored to
     # the directory the user launched from, as they would expect.
     data_dir_path = Path(data_dir or str(_default_data_dir())).expanduser().resolve()
+
+    # Legacy default-dir auto-migration (pre-rename distribution name ->
+    # afterthread). ONLY when the XDG default is in play -- i.e. neither
+    # --data-dir nor AFTERTHREAD_DATA_DIR was provided (`data_dir` falsy) -- and
+    # BEFORE the mkdir/chdir below: if the old default dir
+    # "<xdg base>/context-memory" still exists and the new default
+    # "<xdg base>/afterthread" does not, move the old into place so a user with
+    # real single-user data under the previous name keeps it with no manual
+    # step. If BOTH exist, touch nothing: never merge or clobber -- the new dir
+    # wins silently. An explicit data dir is skipped entirely (it is the user's
+    # own path, unrelated to the rename).
+    #
+    # Accepted, documented limitation: a "<old-data-dir>/.env" carrying an
+    # ABSOLUTE DATABASE_URL that points back into the old directory dangles
+    # after this rename -- the file moves with the dir, but the absolute path it
+    # names does not, and a set DATABASE_URL suppresses the db-file migration
+    # below. Acceptable for a single-user tool; a RELATIVE DATABASE_URL is
+    # unaffected, since its DB file moves along with the directory.
+    if not data_dir and not data_dir_path.exists():
+        legacy_data_dir = data_dir_path.parent / "context-memory"
+        if legacy_data_dir.is_dir():
+            legacy_data_dir.rename(data_dir_path)
+            print(
+                f"afterthread: migrated legacy data dir {legacy_data_dir} -> {data_dir_path}",
+                flush=True,
+            )
+
     created = not data_dir_path.exists()
     data_dir_path.mkdir(parents=True, exist_ok=True)
     if created:
@@ -216,7 +253,7 @@ def _serve(
         load_dotenv(env_file, override=False)
 
     # Never echo DATABASE_URL itself to stdout: a user-supplied URL can carry
-    # credentials (context_memory/db.py's rejection messages already follow
+    # credentials (afterthread/db.py's rejection messages already follow
     # this discipline -- see _url_dialect/_url_database there for the threat
     # model), and a startup banner is exactly the kind of line that ends up
     # in terminal scrollback and pasted logs. When this entry point injects
@@ -224,7 +261,22 @@ def _serve(
     # is printed; when the environment already provides one, only its origin
     # is named, never its content.
     if "DATABASE_URL" not in os.environ:
-        db_path = data_dir_path / "context_memory.db"
+        db_path = data_dir_path / "afterthread.db"
+        # Legacy DB-file auto-migration (pre-rename "context_memory.db" ->
+        # "afterthread.db"), only on the path that injects our OWN default URL
+        # below: if the old-named database still sits in this data dir and the
+        # new-named one does not, rename it so the default URL points at the
+        # user's real data instead of creating a fresh empty database beside it.
+        # When DATABASE_URL IS set (a real env var, or a data-dir .env), this
+        # whole branch is skipped and NO file is touched -- an operator-supplied
+        # URL is authoritative.
+        legacy_db_path = data_dir_path / "context_memory.db"
+        if legacy_db_path.is_file() and not db_path.exists():
+            legacy_db_path.rename(db_path)
+            print(
+                f"afterthread: migrated legacy database {legacy_db_path} -> {db_path}",
+                flush=True,
+            )
         os.environ["DATABASE_URL"] = _sqlite_url(db_path)
         database_display = str(db_path)
     else:
@@ -234,9 +286,9 @@ def _serve(
     # DATABASE_URL above -- a uvx install then has the tool feature ON at a
     # stable per-user location (`<data-dir>/tools`) without the operator setting
     # anything, while an explicit TOOLS_DIR always wins. Settings maps this with
-    # no env prefix (see context_memory/config.py's model_config), so the
+    # no env prefix (see afterthread/config.py's model_config), so the
     # variable name is exactly TOOLS_DIR. Not created here: the directory is made
-    # when the first tool is installed, and context_memory/services/tools.py
+    # when the first tool is installed, and afterthread/services/tools.py
     # treats a missing dir as "nothing installed yet" (empty list), so injecting
     # a not-yet-existing path is harmless. No secret is involved, so -- unlike
     # DATABASE_URL -- there is nothing to withhold from the banner; it is simply
@@ -254,11 +306,11 @@ def _serve(
     # nudged the buffer, well after uvicorn's own (separately flushed)
     # startup lines. A startup banner that shows up late is as good as none.
     print(
-        f"Context Memory: data dir={data_dir_path} database={database_display}",
+        f"afterthread: data dir={data_dir_path} database={database_display}",
         flush=True,
     )
 
-    uvicorn.run("context_memory.main:app", host=host, port=port)
+    uvicorn.run("afterthread.main:app", host=host, port=port)
 
 
 def main() -> None:

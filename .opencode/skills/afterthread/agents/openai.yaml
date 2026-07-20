@@ -1,0 +1,5 @@
+interface:
+  display_name: "afterthread"
+  short_description: "Capture durable project context"
+  default_prompt: "Use $afterthread to capture this project discussion as durable memory records."
+

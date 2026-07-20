@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 #
-# Build the context-memory wheel (+ sdist) with the frontend's production
+# Build the afterthread wheel (+ sdist) with the frontend's production
 # build baked in.
 #
 # Run from anywhere:    bash scripts/build-wheel.sh
 # Prerequisites:        pnpm (frontend build), uv (backend build)
-# Produces:             backend/dist/context_memory-*.whl and *.tar.gz
+# Produces:             backend/dist/afterthread-*.whl and *.tar.gz
 #
 # Why a pre-build-and-copy step rather than pointing hatch straight at
 # ../frontend/dist (see D02 in docs/web-v2-decisions.md): `uv build` builds
 # the sdist first and then builds the wheel FROM that sdist in an isolated,
 # unpacked copy -- `../frontend/dist` does not exist relative to that copy,
 # so a hatch `force-include` pointing there raises FileNotFoundError on every
-# build. Copying the built frontend inside `backend/context_memory/static/`
+# build. Copying the built frontend inside `backend/afterthread/static/`
 # (gitignored; see backend/pyproject.toml's `artifacts` entries) keeps it
 # inside the tree hatch actually packages, in both the sdist and the wheel.
 
@@ -22,7 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 FRONTEND_DIR="$REPO_ROOT/frontend"
 BACKEND_DIR="$REPO_ROOT/backend"
-STATIC_DIR="$BACKEND_DIR/context_memory/static"
+STATIC_DIR="$BACKEND_DIR/afterthread/static"
 
 echo "==> [1/5] Installing frontend dependencies (frozen lockfile)"
 pnpm --dir "$FRONTEND_DIR" install --frozen-lockfile
@@ -30,7 +30,7 @@ pnpm --dir "$FRONTEND_DIR" install --frozen-lockfile
 echo "==> [2/5] Building frontend production bundle"
 pnpm --dir "$FRONTEND_DIR" build
 
-echo "==> [3/5] Refreshing backend/context_memory/static/ from frontend/dist"
+echo "==> [3/5] Refreshing backend/afterthread/static/ from frontend/dist"
 rm -rf "$STATIC_DIR"
 cp -r "$FRONTEND_DIR/dist" "$STATIC_DIR"
 

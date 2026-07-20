@@ -1,12 +1,12 @@
 ---
-description: Review context-memory items and suggest next actions
+description: Review afterthread items and suggest next actions
 ---
 
-Use the `context-memory` skill to review current memory items.
+Use the `afterthread` skill to review current memory items.
 
 Current records:
 
-!`python3 scripts/context_memory.py list`
+!`python3 scripts/afterthread.py list`
 
 Inspect `memory/INDEX.md` and any item that appears active, waiting, capture-quick, or needs-enrichment.
 

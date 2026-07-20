@@ -1,7 +1,7 @@
 """Application settings, loaded from a CWD-relative `.env`.
 
 Dev runs from `backend/`, so that `.env` is `backend/.env`. Packaged mode
-(see `context_memory/cli.py`) chdirs into the data dir and loads
+(see `afterthread/cli.py`) chdirs into the data dir and loads
 `<data-dir>/.env` into the process environment before this module is ever
 imported, so the CWD-relative lookup below lands on that same data-dir file
 -- and since every value in it is already in the environment, which
@@ -16,7 +16,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Runtime configuration for the Context Memory backend."""
+    """Runtime configuration for the afterthread backend."""
 
     # CWD-relative, not `Path(__file__)`-relative: running dev from `backend/`
     # (this repo's documented workflow) is byte-identical to the old
@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     openai_model: str = ""
 
     # Per-request timeout (seconds) for the OpenAI-compatible endpoint, passed
-    # straight to AsyncOpenAI(timeout=...) in context_memory/services/llm.py. Bounded at
+    # straight to AsyncOpenAI(timeout=...) in afterthread/services/llm.py. Bounded at
     # construction (0 < value <= 1800) so a nonsensical override -- a zero/
     # negative timeout the SDK would reject, or an absurdly large one that
     # would hang a request for hours -- fails loudly at startup via
@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     openai_timeout_seconds: float = Field(default=120, gt=0, le=1800)
 
     # Optional hard cap on completion length, sent as `max_tokens` on the
-    # chat.completions.create call in context_memory/services/llm.py ONLY when set.
+    # chat.completions.create call in afterthread/services/llm.py ONLY when set.
     # None (the default) means the parameter is omitted entirely, preserving the
     # historical behavior byte-for-byte: some reasoning-style endpoints reject an
     # explicit max_tokens outright (turning every call into a 400 -> 502), so the
@@ -68,13 +68,13 @@ class Settings(BaseSettings):
     openai_max_output_tokens: int | None = Field(default=None, gt=0, le=1_000_000)
 
     # TOKEN budget for the serialized item snapshot embedded in an enrich /
-    # assist-update prompt (context_memory/services/memory_ai.py) and for the
+    # assist-update prompt (afterthread/services/memory_ai.py) and for the
     # OpenAPI document in an installer session
-    # (context_memory/services/tool_builder.py). TOKEN-denominated because the
+    # (afterthread/services/tool_builder.py). TOKEN-denominated because the
     # model's real constraint -- and the number the endpoint reports back in
     # usage.prompt_tokens -- is tokens; the char budget this replaces was always a
     # proxy. At runtime this budget is divided by the live chars<->tokens ratio
-    # (context_memory/services/token_budget.py, learned from recent completions
+    # (afterthread/services/token_budget.py, learned from recent completions
     # with NO tokenizer dependency) to get the actual CHAR allowance the
     # char-based serializer consumes. Without any budget, an item with 19 sections
     # of up to 20k characters each serializes to a ~380k-character prompt that a
@@ -90,7 +90,7 @@ class Settings(BaseSettings):
     llm_prompt_budget_tokens: int = Field(default=200_000, ge=4_000, le=1_000_000)
 
     # Bounded in-memory ring of the most recent LLM interaction records (see
-    # context_memory/services/llm_log.py): each carries the workflow, model,
+    # afterthread/services/llm_log.py): each carries the workflow, model,
     # timing, outcome, token usage and the FULL prompt/response bodies of every
     # attempt, surfaced via GET /api/llm/logs for the "AI 日誌" page. The ring is
     # process-wide and dies with the process -- it holds personal memory content
@@ -102,7 +102,7 @@ class Settings(BaseSettings):
     llm_log_max_entries: int = Field(default=50, ge=1, le=1000)
 
     # Hard ceiling on how many characters ANY single stored request-message or
-    # response body may occupy (see context_memory/services/llm_log.py's
+    # response body may occupy (see afterthread/services/llm_log.py's
     # _stored_body -- applied UTF-8-safe first, then cut, with a truncation
     # marker appended). This bounds RAM the same way llm_log_max_entries does,
     # but on the ORTHOGONAL axis: max_entries caps how many interactions the
@@ -135,7 +135,7 @@ class Settings(BaseSettings):
     llm_log_file: str = ""
 
     # Rotation threshold (BYTES) for the optional JSONL sink above (see
-    # context_memory/services/llm_log.py's _write_file_sink -> _rotate_file_sink,
+    # afterthread/services/llm_log.py's _write_file_sink -> _rotate_file_sink,
     # D34). Before each append the sink stats the file; once it exceeds this cap
     # the current file is renamed aside with a UTC-timestamp suffix and a fresh
     # one is started, so the sink can never grow one file without bound. This
@@ -153,7 +153,7 @@ class Settings(BaseSettings):
 
     # Hard ceiling on how many TOOL ROUNDS a single ``generate_structured`` call
     # may take before it is forced to produce its final JSON (see
-    # context_memory/services/llm.py). One round == one create() whose reply
+    # afterthread/services/llm.py). One round == one create() whose reply
     # carried tool_calls that were executed and fed back. Once this many rounds
     # have run the loop stops advertising tools, nudges the model to finalize,
     # and makes ONE last tools-free completion -- so a model that gets stuck
@@ -170,7 +170,7 @@ class Settings(BaseSettings):
 
     # Directory holding installed tool packages, one per subdirectory
     # (``<tools_dir>/<name>/`` with a tool.json + implementation files + an
-    # optional .env), scanned by context_memory/services/tools.py. Empty (the
+    # optional .env), scanned by afterthread/services/tools.py. Empty (the
     # default) turns the whole tool feature OFF: list_tools() returns [],
     # enabled_llm_tools() returns [], the three AI workflows pass NO tools, and
     # their prompts stay byte-identical to the tool-less build (so the pinned
@@ -183,7 +183,7 @@ class Settings(BaseSettings):
     tools_dir: str = ""
 
     # Wall-clock budget (seconds) for a SINGLE tool subprocess invocation (see
-    # context_memory/services/tools.py). On expiry the tool's whole process
+    # afterthread/services/tools.py). On expiry the tool's whole process
     # GROUP is killed, so a hung or runaway tool cannot pin the interaction that
     # called it. This is PER tool call, nested inside the interaction-level
     # asyncio.timeout in generate_structured -- a tool round that overruns is
@@ -195,7 +195,7 @@ class Settings(BaseSettings):
     llm_tool_timeout_seconds: float = Field(default=60, gt=0, le=600)
 
     # Hard cap on how many characters of a tool's STDOUT are used as its result
-    # (see context_memory/services/tools.py). The tool result is fed straight
+    # (see afterthread/services/tools.py). The tool result is fed straight
     # back into the conversation -- it rides into the NEXT create()'s prompt and
     # into the LLM log -- so an unbounded dump would blow both the prompt budget
     # and the bounded log ring. Output past the cap is truncated behind the
@@ -208,12 +208,12 @@ class Settings(BaseSettings):
 
     # TOKEN budget for the LIVE tool-loop conversation actually SENT to the model
     # on each round of a single ``generate_structured`` call (see
-    # context_memory/services/llm.py) -- the SENT-side companion to the D27 llm_log
+    # afterthread/services/llm.py) -- the SENT-side companion to the D27 llm_log
     # aggregate budget, which bounds only what is RECORDED, not what rides on the
     # wire. TOKEN-denominated for the same reason as llm_prompt_budget_tokens above
     # (tokens are the real constraint / the reported number); at runtime it is
     # divided by the live chars<->tokens ratio
-    # (context_memory/services/token_budget.py) to get the CHAR allowance the O(n)
+    # (afterthread/services/token_budget.py) to get the CHAR allowance the O(n)
     # _conversation_chars proxy is compared against. Each tool round appends up to
     # _MAX_TOOL_CALLS_PER_REPLY (16) tool results of up to llm_tool_output_max_chars
     # each, across up to llm_tool_rounds_max (or the installer's
@@ -233,7 +233,7 @@ class Settings(BaseSettings):
     llm_tool_conversation_budget_tokens: int = Field(default=500_000, ge=50_000, le=1_000_000)
 
     # Tool-round budget for ONE installer session (the web installer's
-    # "tool builder" LLM call in context_memory/services/tool_builder.py),
+    # "tool builder" LLM call in afterthread/services/tool_builder.py),
     # passed as generate_structured's max_tool_rounds override. Building a tool
     # legitimately takes many rounds -- write files, run a test, read the
     # failure, fix, re-test -- so the default (24) is far above the workflows'
@@ -263,7 +263,7 @@ class Settings(BaseSettings):
     # llm_tool_timeout_seconds's convention.
     tool_install_shell_timeout_seconds: float = Field(default=120, gt=0, le=600)
 
-    database_url: str = "sqlite:///./context_memory.db"
+    database_url: str = "sqlite:///./afterthread.db"
 
     # An item in any stale-eligible status (models.STALE_ELIGIBLE_STATUSES --
     # all five non-terminal statuses) is considered stale once its `updated`

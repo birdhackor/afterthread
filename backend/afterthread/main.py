@@ -1,4 +1,4 @@
-"""FastAPI application entrypoint for the Context Memory backend."""
+"""FastAPI application entrypoint for the afterthread backend."""
 
 import importlib.resources
 import logging
@@ -13,32 +13,32 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from context_memory.db import init_db
-from context_memory.routers import ai, items, review, tools
-from context_memory.services import llm, llm_log
-from context_memory.services import tools as tools_service
+from afterthread.db import init_db
+from afterthread.routers import ai, items, review, tools
+from afterthread.services import llm, llm_log
+from afterthread.services import tools as tools_service
 
 
 def _configure_app_logging() -> None:
-    """Attach a console handler to the "context_memory" logger namespace, once.
+    """Attach a console handler to the "afterthread" logger namespace, once.
 
-    context_memory.services.llm_log names its logger "context_memory.llm" but
+    afterthread.services.llm_log names its logger "afterthread.llm" but
     deliberately never calls ``addHandler``/``setLevel`` on it (see that
     module's comment) -- a LIBRARY-style module should not decide where its
     records end up, only how they are categorized. An APPLICATION entrypoint
     is exactly the layer that legitimately DOES make that call once, for the
-    whole "context_memory" namespace: this is that one place, run at import
+    whole "afterthread" namespace: this is that one place, run at import
     time (before ``app = FastAPI(...)`` below) so it is in effect for every
     request the process ever serves, including one triggered by uvicorn's own
     import machinery before the ASGI app is even built.
 
-    Without this, "context_memory.llm" has no handler and inherits the stdlib
+    Without this, "afterthread.llm" has no handler and inherits the stdlib
     ROOT logger's default level (WARNING) -- so llm_log._log_summary's INFO
     line is silently discarded before a LogRecord is even constructed
     (``Logger.isEnabledFor`` fails first), and the "live console sink" that
     module's docstring promises never actually fires under a bare `uvicorn
-    context_memory.main:app` run. Setting the level here, on the PARENT
-    "context_memory" logger rather than the leaf "context_memory.llm", also
+    afterthread.main:app` run. Setting the level here, on the PARENT
+    "afterthread" logger rather than the leaf "afterthread.llm", also
     means any future sibling module under this namespace (not just llm_log)
     gets the same console sink for free without a second setup call.
 
@@ -50,7 +50,7 @@ def _configure_app_logging() -> None:
     ``propagate = False`` stops a record from continuing past this logger to
     the stdlib ROOT logger. Without it, a future consumer that configures the
     root logger (a different embedding, a test harness, uvicorn's own
-    `--log-config`) would print every "context_memory.*" line TWICE -- once
+    `--log-config`) would print every "afterthread.*" line TWICE -- once
     from the handler attached here, once from root's. Since this module is
     the one place that attaches a handler for the whole namespace, nothing
     upstream of it needs the record to keep traveling.
@@ -59,11 +59,11 @@ def _configure_app_logging() -> None:
     matters for two real scenarios, not just hygiene: uvicorn's `--reload` /
     multi-worker modes re-import this module in ways that can run it more
     than once in the same process, and so can a test suite that imports
-    `context_memory.main` from multiple test modules. Without the guard, a
+    `afterthread.main` from multiple test modules. Without the guard, a
     second call would attach a SECOND StreamHandler and every line would print
     twice from then on -- silently, since duplicate handlers is not an error.
     """
-    logger = logging.getLogger("context_memory")
+    logger = logging.getLogger("afterthread")
     if logger.handlers:
         return
     logger.setLevel(logging.INFO)
@@ -114,7 +114,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     yield
 
 
-app = FastAPI(title="Context Memory API", lifespan=lifespan)
+app = FastAPI(title="afterthread API", lifespan=lifespan)
 
 # Dev-only: the vite dev server (localhost:5173) calls this API cross-origin,
 # so its responses need CORS headers to be readable by that page. Packaged
@@ -172,7 +172,7 @@ app.include_router(ai.router, prefix="/api")
 app.include_router(tools.router, prefix="/api")
 
 # Packaged mode only. `scripts/build-wheel.sh` copies the built frontend into
-# `context_memory/static/` before `uv build` runs, and that directory's
+# `afterthread/static/` before `uv build` runs, and that directory's
 # `artifacts` entry in pyproject.toml carries it into the installed wheel
 # (see D02 in docs/web-v2-decisions.md). In dev nothing ever populates this
 # directory, so `_STATIC_DIR.is_dir()` is False and the block below is a
@@ -190,7 +190,7 @@ app.include_router(tools.router, prefix="/api")
 # `Accept` that does not explicitly rule out HTML) -- a request for a
 # missing asset path (e.g. `/assets/does-not-exist.js`) still 404s instead of
 # silently getting index.html's bytes back under the wrong content type.
-_STATIC_DIR = importlib.resources.files("context_memory") / "static"
+_STATIC_DIR = importlib.resources.files("afterthread") / "static"
 if _STATIC_DIR.is_dir():
     app.frontend("/", directory=str(_STATIC_DIR), fallback="index.html")
 

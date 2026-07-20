@@ -4,13 +4,13 @@
 「`smoke.sh`（dev 模式全端煙霧測試）」一節）與 `wheel_smoke.sh`（**打包／
 `uvx` 模式**，見文末「`wheel_smoke.sh`（打包／`uvx` 模式端對端煙霧測試）」
 一節）。兩者互補、覆蓋範圍不同——`smoke.sh` 從原始碼跑 `uv run uvicorn`，從未
-碰過打包（wheel 內容、`context-memory` console script、SPA 靜態檔服務、
+碰過打包（wheel 內容、`afterthread` console script、SPA 靜態檔服務、
 `cli.py` 的 data-dir/`.env` 邏輯）；`wheel_smoke.sh` 才是真正跑過實際安裝
 產物的那一個。
 
 ## `smoke.sh`（dev 模式全端煙霧測試）
 
-針對 Context Memory 全端（FastAPI 後端 + Vite SPA 前端）的端到端煙霧測試。
+針對 afterthread 全端（FastAPI 後端 + Vite SPA 前端）的端到端煙霧測試。
 它會啟動**真實**的後端與一個純標準函式庫的 OpenAI 相容 mock 伺服器，直接打真實
 HTTP API，並在最後驗證前端 production build 能正常提供 SPA。
 
@@ -82,9 +82,9 @@ preview 走任何 API 呼叫。
 
 `smoke.sh` 從原始碼跑 `uv run uvicorn`，從未真正碰過打包這件事本身。
 `wheel_smoke.sh` 補上這一塊：它會先用 `scripts/build-wheel.sh` 建出真正的
-wheel，再用 `uvx --from <wheel> context-memory` 啟動——跟一般使用者照著根目錄
+wheel，再用 `uvx --from <wheel> afterthread` 啟動——跟一般使用者照著根目錄
 README 安裝的方式完全一樣——然後用 `curl` 打這個打包後的實例，是唯一真正跑過
-「安裝產物」本身（wheel 內容、`context-memory` console script、SPA 靜態檔
+「安裝產物」本身（wheel 內容、`afterthread` console script、SPA 靜態檔
 服務、`cli.py` 的 data-dir/`.env` 邏輯）的測試。
 
 ### 前置需求
@@ -105,7 +105,7 @@ bash e2e/wheel_smoke.sh
 
 同樣是每項斷言印 `PASS`/`FAIL`，任何一項失敗就以非零狀態結束。`EXIT` trap 會
 關掉伺服器，並清除它自己建立的暫存目錄與那個獨立的 `--data-dir`；但 build
-產物（`backend/dist/`、`frontend/dist/`、`backend/context_memory/static/`）**會
+產物（`backend/dist/`、`frontend/dist/`、`backend/afterthread/static/`）**會
 保留**（本來就是可重用的建置輸出，不在 teardown 範圍內——要清就自己刪）。
 埠號用 `--port 0` 讓 uvicorn 自己選，再從啟動 log 解析出來，避免「先偵測空
 埠、後綁定」中間的 TOCTOU 空窗。
@@ -113,7 +113,7 @@ bash e2e/wheel_smoke.sh
 ### 涵蓋範圍
 
 - **建置**：實際跑一次 `scripts/build-wheel.sh`，失敗就整個 fail-fast。
-- **啟動**：`uvx --from <wheel> context-memory --host 127.0.0.1 --port 0
+- **啟動**：`uvx --from <wheel> afterthread --host 127.0.0.1 --port 0
   --data-dir <tmp>`；`OPENAI_*` 三個環境變數強制清空，確保
   `configured:false` 的斷言不受執行環境影響。
 - **`.env` 載入 + 相對路徑錨定**：在啟動前於 `--data-dir` 裡預先寫入

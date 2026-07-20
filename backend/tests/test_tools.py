@@ -1,5 +1,5 @@
-"""Tests for the tool-calling loop (context_memory.services.llm) and the tool
-runtime (context_memory.services.tools), plus the memory_ai workflow wiring.
+"""Tests for the tool-calling loop (afterthread.services.llm) and the tool
+runtime (afterthread.services.tools), plus the memory_ai workflow wiring.
 
 Three layers:
 
@@ -39,9 +39,9 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, ConfigDict
 
-from context_memory.config import Settings
-from context_memory.services import llm_log, tools
-from context_memory.services.llm import (
+from afterthread.config import Settings
+from afterthread.services import llm_log, tools
+from afterthread.services.llm import (
     _MAX_TOOL_CALLS_ACCEPTED,
     _MAX_TOOL_CALLS_PER_REPLY,
     _MAX_TOOL_CALLS_TOTAL_BYTES,
@@ -52,7 +52,7 @@ from context_memory.services.llm import (
     LLMUpstreamError,
     generate_structured,
 )
-from context_memory.services.memory_ai import (
+from afterthread.services.memory_ai import (
     _TOOLS_RULE,
     CAPTURE_SYSTEM_PROMPT,
     ENRICH_SYSTEM_PROMPT,
@@ -61,7 +61,7 @@ from context_memory.services.memory_ai import (
     capture_draft,
     enrich_item,
 )
-from context_memory.services.tools import (
+from afterthread.services.tools import (
     _MANIFEST_MAX_BYTES,
     _PARAMETERS_SCHEMA_MAX_BYTES,
     delete_tool,
@@ -160,8 +160,8 @@ def _install(
     monkeypatch: pytest.MonkeyPatch, client: _ScriptedClient, *, settings: Settings | None = None
 ) -> _ScriptedClient:
     settings = settings or _settings()
-    monkeypatch.setattr("context_memory.services.llm.get_settings", lambda: settings)
-    monkeypatch.setattr("context_memory.services.llm._get_client", lambda: client)
+    monkeypatch.setattr("afterthread.services.llm.get_settings", lambda: settings)
+    monkeypatch.setattr("afterthread.services.llm._get_client", lambda: client)
     return client
 
 
@@ -644,7 +644,7 @@ def _make_tool(
 
 def _install_tools(monkeypatch: pytest.MonkeyPatch, tools_root: Path, **overrides: Any) -> Settings:
     settings = Settings(tools_dir=str(tools_root), **overrides)
-    monkeypatch.setattr("context_memory.services.tools.get_settings", lambda: settings)
+    monkeypatch.setattr("afterthread.services.tools.get_settings", lambda: settings)
     return settings
 
 
@@ -1753,9 +1753,7 @@ def test_hidden_directories_never_listed(monkeypatch: pytest.MonkeyPatch, tmp_pa
 
 
 def test_feature_off_when_tools_dir_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "context_memory.services.tools.get_settings", lambda: Settings(tools_dir="")
-    )
+    monkeypatch.setattr("afterthread.services.tools.get_settings", lambda: Settings(tools_dir=""))
     assert tools_dir() is None
     assert list_tools() == []
     assert enabled_llm_tools() == []
@@ -1808,7 +1806,7 @@ def _capture_generate_structured(
         captured["tools"] = tools
         return model_cls.model_validate(good)
 
-    monkeypatch.setattr("context_memory.services.memory_ai.generate_structured", _fake_gen)
+    monkeypatch.setattr("afterthread.services.memory_ai.generate_structured", _fake_gen)
     return captured
 
 
@@ -1820,7 +1818,7 @@ def test_workflow_appends_tools_rule_when_active(
     good: dict[str, Any],
 ) -> None:
     captured = _capture_generate_structured(monkeypatch, good)
-    monkeypatch.setattr("context_memory.services.tools.enabled_llm_tools", lambda: [_FAKE_TOOL])
+    monkeypatch.setattr("afterthread.services.tools.enabled_llm_tools", lambda: [_FAKE_TOOL])
     run_call()
 
     assert captured["system_prompt"] == base_prompt + "\n" + _TOOLS_RULE
@@ -1836,7 +1834,7 @@ def test_workflow_prompt_byte_identical_without_tools(
     good: dict[str, Any],
 ) -> None:
     captured = _capture_generate_structured(monkeypatch, good)
-    monkeypatch.setattr("context_memory.services.tools.enabled_llm_tools", lambda: [])
+    monkeypatch.setattr("afterthread.services.tools.enabled_llm_tools", lambda: [])
     run_call()
 
     assert captured["system_prompt"] == base_prompt  # byte-identical to the pinned constant

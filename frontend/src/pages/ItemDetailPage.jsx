@@ -113,7 +113,7 @@ function SectionGroupsView({ item, showEmpty }) {
 // RHF note form. On submit it calls `onSubmitNote`, which fires the page's
 // progress mutation; that mutation's onSuccess invalidates ['item', itemId],
 // refetching the item so the new entry AND the server-bumped `updated`/is_stale
-// (see add_progress in context_memory/routers/items.py) all land coherently --
+// (see add_progress in afterthread/routers/items.py) all land coherently --
 // no optimistic append or manual refresh needed anymore.
 //
 // `isSubmitting` is the progress mutation's own isPending (button loading);

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpenAI-compatible mock LLM server for the Context Memory e2e smoke harness.
+"""OpenAI-compatible mock LLM server for the afterthread e2e smoke harness.
 
 STDLIB ONLY (http.server / json / argparse / re / time / sys) so it runs under a
 bare ``python3`` with no venv, independent of the backend's uv environment.
@@ -13,7 +13,7 @@ single JSON string.
 
 Which JSON it returns is decided by inspecting the request's *system* message,
 whose text is one of the three workflow prompts defined verbatim in
-``context_memory/services/memory_ai.py``. Each prompt carries a distinctive marker:
+``afterthread/services/memory_ai.py``. Each prompt carries a distinctive marker:
 
   * "quick-capture assistant" -> capture  -> a ``CaptureDraft`` object
   * "enrichment assistant"    -> enrich   -> an ``EnrichResult`` object
@@ -70,9 +70,9 @@ from typing import Any
 # --- workflow selection ----------------------------------------------------
 
 # Distinctive substrings from the three system prompts in
-# context_memory/services/memory_ai.py (CAPTURE_/ENRICH_/UPDATE_SYSTEM_PROMPT). Matching on
+# afterthread/services/memory_ai.py (CAPTURE_/ENRICH_/UPDATE_SYSTEM_PROMPT). Matching on
 # these -- rather than the whole prompt -- keeps the mock robust to the schema
-# block and strict-output rule that context_memory/services/llm.py appends after them.
+# block and strict-output rule that afterthread/services/llm.py appends after them.
 _CAPTURE_MARKER = "quick-capture assistant"
 _ENRICH_MARKER = "enrichment assistant"
 _UPDATE_MARKER = "update assistant"
@@ -384,7 +384,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="OpenAI-compatible mock LLM for the e2e smoke.")
+    parser = argparse.ArgumentParser(description="OpenAI-compatible mock LLM for the afterthread e2e smoke.")
     parser.add_argument(
         "--port",
         type=int,

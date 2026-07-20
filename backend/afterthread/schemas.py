@@ -1,4 +1,4 @@
-"""Pydantic request/response schemas for the Context Memory API."""
+"""Pydantic request/response schemas for the afterthread API."""
 
 import re
 from datetime import UTC, datetime, timedelta
@@ -15,8 +15,8 @@ from pydantic import (
     model_validator,
 )
 
-from context_memory.config import get_settings
-from context_memory.models import STALE_ELIGIBLE_STATUSES, MemoryStage, MemoryStatus
+from afterthread.config import get_settings
+from afterthread.models import STALE_ELIGIBLE_STATUSES, MemoryStage, MemoryStatus
 
 
 def _ensure_aware(value: datetime) -> datetime:
@@ -30,7 +30,7 @@ def _ensure_aware(value: datetime) -> datetime:
 # can set directly via POST/PATCH. Without them, a legitimate create/update
 # can write an item whose title/tags/sections are large enough that, once
 # serialized into an enrich/assist-update prompt header
-# (context_memory.services.memory_ai._serialize_item_for_prompt, which renders title and
+# (afterthread.services.memory_ai._serialize_item_for_prompt, which renders title and
 # tags in full ahead of the per-section budgeting), the header alone crowds
 # out or exceeds the prompt's char allowance (llm_prompt_budget_tokens divided by
 # the live chars<->tokens ratio). Declared here -- not on the shared
@@ -275,7 +275,7 @@ class ReviewResponse(BaseModel):
 # Upper bound on every AI free-text request field. Stripped-non-empty is
 # enforced per field below; the length is validated on the raw input (a 20001
 # character body is 422) so an oversized payload is rejected before any LLM
-# call. Mirrors the per-section output cap in context_memory.services.memory_ai.
+# call. Mirrors the per-section output cap in afterthread.services.memory_ai.
 _MAX_AI_INPUT_CHARS = 20000
 
 
@@ -290,7 +290,7 @@ class LLMTokenRatio(BaseModel):
     """The live char<->token ratio estimator's public view (P4).
 
     Surfaced on ``LLMStatus.token_ratio`` from
-    context_memory.services.token_budget.snapshot(). ``samples`` is how many
+    afterthread.services.token_budget.snapshot(). ``samples`` is how many
     recent (chars, tokens) observations the rolling window holds; and
     ``tokens_per_char`` is the learned ratio rounded to 4dp, genuinely null while
     the window is still below the minimum-sample threshold (the cold-start default
@@ -370,7 +370,7 @@ class AssistUpdateResponse(BaseModel):
     item: MemoryItemRead
 
 
-# --- LLM interaction log (see context_memory.services.llm_log) --------------
+# --- LLM interaction log (see afterthread.services.llm_log) --------------
 #
 # These mirror the dicts llm_log.list_summaries / get_record return, so the
 # "AI 日誌" page has a typed, documented contract. Deliberately WITHOUT any
@@ -463,7 +463,7 @@ class LlmLogDetail(LlmLogBase):
     attempts: list[LlmLogAttempt]
 
 
-# --- tools + installer (see context_memory.services.tools / tool_builder) ----
+# --- tools + installer (see afterthread.services.tools / tool_builder) ----
 #
 # These mirror the dicts tools.list_tools / tool_builder.get_job return. Like
 # the LLM log schemas above, they deliberately carry NO secret-shaped field:
@@ -501,7 +501,7 @@ class ToolUpdateRequest(BaseModel):
 
 # An install-form secret NAME must be a valid environment-variable name: it
 # becomes one, both in the run_shell live-test env and in the finished tool's
-# .env (see context_memory.services.tool_builder). Uppercase-first, then
+# .env (see afterthread.services.tool_builder). Uppercase-first, then
 # uppercase/digit/underscore, <=64 chars total -- the conventional env-var shape.
 _SECRET_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 

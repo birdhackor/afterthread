@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from sqlalchemy import Engine, event
 from sqlmodel import Session
 
-from context_memory.main import app
+from afterthread.main import app
 
 
 def _create(client: TestClient, **fields: Any) -> dict[str, Any]:
@@ -94,7 +94,7 @@ def test_enrich_conflict_during_await_returns_409_and_writes_nothing(
             {"sections": {"decisions": "新決策"}, "progress_note": "應被丟棄"}
         )
 
-    monkeypatch.setattr("context_memory.services.memory_ai.generate_structured", _fake)
+    monkeypatch.setattr("afterthread.services.memory_ai.generate_structured", _fake)
 
     response = client.post(f"/api/items/{item_id}/enrich", json={"additional_context": "ctx"})
     assert response.status_code == 409
@@ -122,7 +122,7 @@ def test_assist_update_conflict_during_await_returns_409_and_writes_nothing(
             {"sections": {"next_actions": "changed"}, "progress_note": "應被丟棄"}
         )
 
-    monkeypatch.setattr("context_memory.services.memory_ai.generate_structured", _fake)
+    monkeypatch.setattr("afterthread.services.memory_ai.generate_structured", _fake)
 
     response = client.post(f"/api/items/{item_id}/assist-update", json={"note": "n"})
     assert response.status_code == 409
@@ -143,7 +143,7 @@ def test_enrich_no_conflict_still_succeeds(
     ) -> BaseModel:
         return model_cls.model_validate({"sections": {"decisions": "d"}, "progress_note": "n"})
 
-    monkeypatch.setattr("context_memory.services.memory_ai.generate_structured", _fake)
+    monkeypatch.setattr("afterthread.services.memory_ai.generate_structured", _fake)
     response = client.post(f"/api/items/{item['id']}/enrich", json={"additional_context": "ctx"})
     assert response.status_code == 200
     assert "d" in response.json()["item"]["decisions"]
@@ -161,7 +161,7 @@ def test_assist_update_no_conflict_still_succeeds(
             {"sections": {"next_actions": "n"}, "progress_note": "note"}
         )
 
-    monkeypatch.setattr("context_memory.services.memory_ai.generate_structured", _fake)
+    monkeypatch.setattr("afterthread.services.memory_ai.generate_structured", _fake)
     response = client.post(f"/api/items/{item['id']}/assist-update", json={"note": "n"})
     assert response.status_code == 200
 
@@ -178,7 +178,7 @@ def test_conflict_message_carries_no_config_or_item_content(
         _bump_updated_via_raw_connection(session, item_id)
         return model_cls.model_validate({"sections": {"decisions": "x"}, "progress_note": "y"})
 
-    monkeypatch.setattr("context_memory.services.memory_ai.generate_structured", _fake)
+    monkeypatch.setattr("afterthread.services.memory_ai.generate_structured", _fake)
     body = client.post(f"/api/items/{item_id}/enrich", json={"additional_context": "ctx"}).text
     # The 409 body must not echo item content (nor any config, which is never
     # in scope of this message at all).
@@ -207,7 +207,7 @@ def test_enrich_conflict_between_guard_and_update_preserves_competing_write(
             {"sections": {"decisions": "AI 決策"}, "progress_note": "AI note"}
         )
 
-    monkeypatch.setattr("context_memory.services.memory_ai.generate_structured", _fake)
+    monkeypatch.setattr("afterthread.services.memory_ai.generate_structured", _fake)
 
     bind = session.get_bind()
     assert isinstance(bind, Engine)
@@ -260,7 +260,7 @@ def test_assist_update_conflict_between_guard_and_update_preserves_competing_wri
             {"sections": {"next_actions": "AI 下一步"}, "progress_note": "AI note"}
         )
 
-    monkeypatch.setattr("context_memory.services.memory_ai.generate_structured", _fake)
+    monkeypatch.setattr("afterthread.services.memory_ai.generate_structured", _fake)
 
     bind = session.get_bind()
     assert isinstance(bind, Engine)

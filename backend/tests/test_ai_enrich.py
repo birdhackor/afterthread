@@ -15,10 +15,10 @@ from pydantic import BaseModel, ValidationError
 from sqlalchemy import Engine, event
 from sqlmodel import Session
 
-from context_memory.config import Settings
-from context_memory.models import MemoryItem
-from context_memory.services.llm import LLMUpstreamError
-from context_memory.services.memory_ai import SECTION_FIELDS
+from afterthread.config import Settings
+from afterthread.models import MemoryItem
+from afterthread.services.llm import LLMUpstreamError
+from afterthread.services.memory_ai import SECTION_FIELDS
 
 
 def _create(client: TestClient, **fields: Any) -> dict[str, Any]:
@@ -76,7 +76,7 @@ def _patch_generate_structured(
                 "InvalidStructuredOutput: the LLM did not return a valid structured result"
             ) from None
 
-    monkeypatch.setattr("context_memory.services.memory_ai.generate_structured", _fake)
+    monkeypatch.setattr("afterthread.services.memory_ai.generate_structured", _fake)
 
 
 def _progress_notes(client: TestClient, item_id: int) -> list[str]:
@@ -241,12 +241,12 @@ def test_enrich_prompt_is_budgeted_for_a_huge_item(
         captured["user"] = user
         return model_cls.model_validate({"sections": {"snapshot": "s"}, "progress_note": "n"})
 
-    monkeypatch.setattr("context_memory.services.memory_ai.generate_structured", _fake)
+    monkeypatch.setattr("afterthread.services.memory_ai.generate_structured", _fake)
     # Force a small budget so the bound is unmistakable. At the cold-start ratio
     # 1.0 (the estimator window is reset around every test) the char allowance
     # equals this token budget, so the <=4000-char bound below is unchanged.
     monkeypatch.setattr(
-        "context_memory.services.memory_ai.get_settings",
+        "afterthread.services.memory_ai.get_settings",
         lambda: Settings(llm_prompt_budget_tokens=4000),
     )
 

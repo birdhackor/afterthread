@@ -2,7 +2,7 @@
 description: Update progress or decisions in a memory item
 ---
 
-Use the `context-memory` skill to update an existing memory item with:
+Use the `afterthread` skill to update an existing memory item with:
 
 ```text
 $ARGUMENTS
@@ -13,8 +13,8 @@ Find the target item from the path/title/keywords. Preserve prior rationale; do 
 Run:
 
 ```bash
-python3 scripts/context_memory.py validate
-python3 scripts/context_memory.py index
+python3 scripts/afterthread.py validate
+python3 scripts/afterthread.py index
 ```
 
 Reply in Traditional Chinese with the updated path and the next action now recorded.

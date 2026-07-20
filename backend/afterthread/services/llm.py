@@ -42,8 +42,8 @@ from openai import AsyncOpenAI, OpenAIError
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 from pydantic import BaseModel, ValidationError
 
-from context_memory.config import Settings, get_settings
-from context_memory.services import llm_log, token_budget
+from afterthread.config import Settings, get_settings
+from afterthread.services import llm_log, token_budget
 
 # Placeholder passed as the API key when the operator has not configured one.
 # Some OpenAI-compatible servers (e.g. a local gateway) require no key, but the
@@ -75,7 +75,7 @@ class LLMUpstreamError(RuntimeError):
 
 # The fixed, config-free reason embedded in every SDK-error-driven
 # LLMUpstreamError message ("<SDKClassName>: <reason>"). Shared with
-# context_memory.routers.ai, whose OpenAPI 502 example is built from it, so the example's
+# afterthread.routers.ai, whose OpenAPI 502 example is built from it, so the example's
 # reason substring can never drift from what runtime messages actually carry
 # (the category prefix varies with the failing SDK error's class and is only
 # illustrative in the example).
@@ -269,7 +269,7 @@ def normalized_model(settings: Settings) -> str:
     The one normalization every caller must share, so none of them can ever
     disagree over a whitespace-padded override: ``llm_configured``'s gate, the
     actual request ``generate_structured`` sends, and (via
-    ``context_memory.routers.ai.llm_status``) what ``/llm/status`` reports back to a
+    ``afterthread.routers.ai.llm_status``) what ``/llm/status`` reports back to a
     client all read the model through this single helper.
     """
     return settings.openai_model.strip()
@@ -1262,7 +1262,7 @@ async def generate_structured[ModelT: BaseModel](
 
     ``workflow`` names the caller (``capture`` / ``enrich`` / ``assist_update``,
     or the default ``unknown`` for the direct test callers) and is recorded on
-    the interaction log (context_memory.services.llm_log). An
+    the interaction log (afterthread.services.llm_log). An
     ``LlmInteractionRecorder`` is built at the very START -- before the config
     gate -- so EVERY exit path (ok, invalid output, upstream error, timeout, not
     configured) finalizes exactly ONE record carrying its workflow: the

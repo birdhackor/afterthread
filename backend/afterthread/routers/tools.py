@@ -1,7 +1,7 @@
 """Tool management + web-installer endpoints (see D21, Phase 5c).
 
-Thin HTTP shell over ``context_memory.services.tools`` (the registry) and
-``context_memory.services.tool_builder`` (the installer). This router owns only
+Thin HTTP shell over ``afterthread.services.tools`` (the registry) and
+``afterthread.services.tool_builder`` (the installer). This router owns only
 the HTTP contract:
 
 * the tool NAME is validated at the PATH layer against the same regex the
@@ -25,7 +25,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi import Path as PathParam
 from starlette.concurrency import run_in_threadpool
 
-from context_memory.schemas import (
+from afterthread.schemas import (
     ToolInstallAccepted,
     ToolInstallJobStatus,
     ToolInstallRequest,
@@ -33,9 +33,9 @@ from context_memory.schemas import (
     ToolSummary,
     ToolUpdateRequest,
 )
-from context_memory.services import tool_builder
-from context_memory.services import tools as tools_service
-from context_memory.services.tools import _NAME_RE
+from afterthread.services import tool_builder
+from afterthread.services import tools as tools_service
+from afterthread.services.tools import _NAME_RE
 
 router = APIRouter(prefix="/tools", tags=["tools"])
 

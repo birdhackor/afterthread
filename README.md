@@ -1,6 +1,10 @@
-# context-memory
+# afterthread
 
-`context-memory` 是一個私人使用的工具，核心目的是抵抗 **architectural
+**Keep the thread after the conversation ends.**
+
+> 本專案原名 context-memory，已於 2026-07 更名為 afterthread。
+
+`afterthread` 是一個私人使用的工具，核心目的是抵抗 **architectural
 knowledge vaporization**：討論當下腦中的理解、取捨、風險、下一步都很清楚，但
 事後往往只剩關鍵字，脈絡全部蒸發。
 
@@ -11,7 +15,7 @@ knowledge vaporization**：討論當下腦中的理解、取捨、風險、下�
 恢復的記憶項目（memory item：一個決策、一個調查中的主題、一件擱置的任務……）。
 
 **主要介面是本機網頁應用**：FastAPI + SQLite 後端、React/Mantine 前端，打包成
-內嵌前端 build 的單一 wheel，一個 `context-memory` 指令就能啟動，資料儲存在
+內嵌前端 build 的單一 wheel，一個 `afterthread` 指令就能啟動，資料儲存在
 本機 SQLite（無帳號、無自有雲端）；接上一顆 OpenAI-compatible 的 LLM 之後，
 還能用 AI 快速捕捉、AI 補齊、AI 進度更新，以及讓 AI 自己建立可呼叫外部 API
 的工具——**使用 AI 功能時，被處理的內容會送往你設定的那個 LLM endpoint**，
@@ -20,7 +24,7 @@ knowledge vaporization**：討論當下腦中的理解、取捨、風險、下�
 對話介面。
 
 repo 裡同時保留一套更早的檔案版介面：OpenCode skill（`.opencode/`）+
-`scripts/context_memory.py`，資料存成 `memory/**/*.md`。這套介面依然可用，
+`scripts/afterthread.py`，資料存成 `memory/**/*.md`。這套介面依然可用，
 適合不想開網頁、只想在終端機或 agent 對話裡做快速記錄的情境；細節見下方
 「CLI 與 OpenCode skill 補充」。**兩套介面資料互不相通**——網頁版的項目存在
 SQLite 資料庫，CLI/skill 操作的是獨立的 Markdown 檔案，選一種或兩種一起用
@@ -29,22 +33,22 @@ SQLite 資料庫，CLI/skill 操作的是獨立的 Markdown 檔案，選一種�
 ### 專案結構（節錄）
 
 ```text
-backend/context_memory/   FastAPI 應用（routers/services/models/schemas）；細節見 backend/README.md
+backend/afterthread/      FastAPI 應用（routers/services/models/schemas）；細節見 backend/README.md
 backend/tests/            pytest 測試
 backend/.env.example      環境變數範本（複製到 data dir 或 backend/.env）
 frontend/src/             React + Mantine SPA（pages/components/atoms/api）；細節見 frontend/README.md
 e2e/smoke.sh              dev 模式全端煙霧測試（見 e2e/README.md）
 e2e/wheel_smoke.sh        打包（uvx）模式端對端煙霧測試（見 e2e/README.md）
 scripts/build-wheel.sh    建置內嵌前端 build 的可攜 wheel
-scripts/context_memory.py 檔案版 CLI（見下方「CLI 與 OpenCode skill 補充」）
-.opencode/skills/context-memory/SKILL.md   OpenCode skill
+scripts/afterthread.py    檔案版 CLI（見下方「CLI 與 OpenCode skill 補充」）
+.opencode/skills/afterthread/SKILL.md   OpenCode skill
 memory/YYYY/MM/*.md       檔案版記憶項目（CLI／skill 專用，與網頁版資料庫分開）
 docs/methodology.md       方法論
 ```
 
 ## 安裝與啟動
 
-`context-memory` 目前只以原始碼／wheel 檔的形式存在——這是私人 repo，沒有發佈
+`afterthread` 目前只以原始碼／wheel 檔的形式存在——這是私人 repo，沒有發佈
 到 PyPI，所以啟動前要先在這個 checkout 裡建置一次 wheel（已內嵌前端
 production build）：
 
@@ -53,40 +57,40 @@ bash scripts/build-wheel.sh
 ```
 
 前置需求：`pnpm`（前端 build）與 `uv`（後端 build／`uvx`）。完成後會在
-`backend/dist/` 產生 `context_memory-*.whl`（與對應的 sdist）。
+`backend/dist/` 產生 `afterthread-*.whl`（與對應的 sdist）。
 
 ### 直接執行（不安裝，`uvx`）
 
 ```bash
-uvx --from backend/dist/context_memory-*.whl context-memory
+uvx --from backend/dist/afterthread-*.whl afterthread
 ```
 
 `uvx` 會在自己管理的暫存虛擬環境裡解析依賴並啟動服務（同一環境第一次執行需要
-網路下載依賴，之後會用快取，離線也能跑）。終端機只會印一行 `Context Memory:
+網路下載依賴，之後會用快取，離線也能跑）。終端機只會印一行 `afterthread:
 data dir=... database=...`（見下方「首次設定」，絕不印出 API key 等機密），
 接著開瀏覽器連 <http://127.0.0.1:8000> 就是完整介面。
 
 ### 安裝成常駐指令（`uv tool install` / pipx）
 
 不想每次都打一長串 `uvx --from ...` 的話，可以裝成常駐指令，之後直接打
-`context-memory`：
+`afterthread`：
 
 ```bash
-uv tool install --from backend/dist/context_memory-*.whl context-memory
+uv tool install --from backend/dist/afterthread-*.whl afterthread
 # 或用 pipx：
-pipx install backend/dist/context_memory-*.whl
+pipx install backend/dist/afterthread-*.whl
 ```
 
 ### 常用旗標
 
-`context-memory --help` 看完整說明；旗標與對應環境變數（見
-`backend/context_memory/cli.py`）：
+`afterthread --help` 看完整說明；旗標與對應環境變數（見
+`backend/afterthread/cli.py`）：
 
 | 旗標 | 預設 | 環境變數 |
 | --- | --- | --- |
-| `--host` | `127.0.0.1`（只綁 loopback——這是單人本機工具，不是要曝露在區網上的服務） | `CONTEXT_MEMORY_HOST` |
-| `--port` | `8000` | `CONTEXT_MEMORY_PORT` |
-| `--data-dir` | 見下方「首次設定」 | `CONTEXT_MEMORY_DATA_DIR` |
+| `--host` | `127.0.0.1`（只綁 loopback——這是單人本機工具，不是要曝露在區網上的服務） | `AFTERTHREAD_HOST` |
+| `--port` | `8000` | `AFTERTHREAD_PORT` |
+| `--data-dir` | 見下方「首次設定」 | `AFTERTHREAD_DATA_DIR` |
 | `--version` | 印版本後結束 | — |
 
 ### 升級
@@ -97,7 +101,7 @@ pipx install backend/dist/context_memory-*.whl
 ```bash
 git pull
 bash scripts/build-wheel.sh
-uvx --refresh --from backend/dist/context_memory-*.whl context-memory
+uvx --refresh --from backend/dist/afterthread-*.whl afterthread
 ```
 
 `uvx` 對本機 wheel 檔會快取解析結果，一般重新 build 後直接重跑就會抓到新
@@ -106,19 +110,21 @@ install` 裝成常駐指令的話，改用 `--reinstall`（`--force` 是另一�
 來覆蓋「非 uv 安裝」的同名執行檔，不是這裡要的重裝）：
 
 ```bash
-uv tool install --reinstall --from backend/dist/context_memory-*.whl context-memory
+uv tool install --reinstall --from backend/dist/afterthread-*.whl afterthread
 ```
 
 ## 首次設定
 
-- **資料目錄（data dir）**：預設是 `$XDG_DATA_HOME/context-memory`，未設定
-  `XDG_DATA_HOME` 時退回 `~/.local/share/context-memory`。可用 `--data-dir
-  <path>` 或環境變數 `CONTEXT_MEMORY_DATA_DIR` 覆寫。第一次啟動時，若目錄不
+- **資料目錄（data dir）**：預設是 `$XDG_DATA_HOME/afterthread`，未設定
+  `XDG_DATA_HOME` 時退回 `~/.local/share/afterthread`。可用 `--data-dir
+  <path>` 或環境變數 `AFTERTHREAD_DATA_DIR` 覆寫。第一次啟動時，若目錄不
   存在會自動建立（權限設為僅該使用者可讀寫）；已存在的目錄則不會被動權限。
-  SQLite 資料庫檔（預設 `context_memory.db`）與工具目錄（`tools/`，見下方
-  「KB 工具安裝指南」）都會落在這裡。
+  SQLite 資料庫檔（預設 `afterthread.db`）與工具目錄（`tools/`，見下方
+  「KB 工具安裝指南」）都會落在這裡。若偵測到舊名稱 `context-memory` 留下的
+  資料目錄（`~/.local/share/context-memory`）與資料庫檔，下次啟動時會自動
+  原地更名遷移，不需手動搬移。
 - **設定檔（`.env`）**：把 `backend/.env.example` 複製一份到
-  `<data-dir>/.env`（例如 `~/.local/share/context-memory/.env`），依需要
+  `<data-dir>/.env`（例如 `~/.local/share/afterthread/.env`），依需要
   填入下方變數。啟動時只有這個目錄下的 `.env` 會被讀取，不會去讀 checkout
   裡的 `backend/.env`（那是 dev 模式專用，見下方「開發模式」）。
 - **啟用 AI 功能（必填）**：`OPENAI_BASE_URL` 與 `OPENAI_MODEL` 兩者都要填，
@@ -254,10 +260,10 @@ LangChain），見 [docs/tool-calling.md](docs/tool-calling.md)。
 
 ```bash
 cd backend && uv sync
-uv run uvicorn context_memory.main:app --reload --port 8000
+uv run uvicorn afterthread.main:app --reload --port 8000
 ```
 
-資料庫（SQLite）不存在時會在啟動時自動建立（預設 `backend/context_memory.db`）；
+資料庫（SQLite）不存在時會在啟動時自動建立（預設 `backend/afterthread.db`）；
 環境變數複製 `backend/.env.example` 為 `backend/.env` 後依需要填入——dev
 模式讀的是這個 checkout 裡的 `backend/.env`，跟打包模式讀
 `<data-dir>/.env` 是兩回事（見上方「首次設定」）。
@@ -282,7 +288,7 @@ cd frontend && pnpm install && pnpm dev
 agent 對話裡工作的情境。資料存成 `memory/**/*.md`，與網頁版的 SQLite 資料庫
 **完全分開，兩邊互不同步**。
 
-在 repo 根目錄啟動 OpenCode 就能使用 `.opencode/skills/context-memory/`
+在 repo 根目錄啟動 OpenCode 就能使用 `.opencode/skills/afterthread/`
 這個 skill（自動被 OpenCode 發現）：
 
 ```bash
@@ -292,22 +298,22 @@ opencode
 常用指令：
 
 ```text
-/cm-capture 剛剛跟同事討論了 xxx，關鍵字是 ...
-/cm-enrich memory/2026/07/2026-07-09-context-memory-project-vision.md
-/cm-update memory/2026/07/2026-07-09-context-memory-project-vision.md 今天決定先做 opencode skill MVP
-/cm-review
+/aft-capture 剛剛跟同事討論了 xxx，關鍵字是 ...
+/aft-enrich memory/2026/07/2026-07-09-context-memory-project-vision.md
+/aft-update memory/2026/07/2026-07-09-context-memory-project-vision.md 今天決定先做 opencode skill MVP
+/aft-review
 ```
 
-也可以直接對 OpenCode 說「Use the context-memory skill to capture this
+也可以直接對 OpenCode 說「Use the afterthread skill to capture this
 discussion.」。
 
-不用 OpenCode 時，`scripts/context_memory.py` 提供同一套操作的最小 CLI：
+不用 OpenCode 時，`scripts/afterthread.py` 提供同一套操作的最小 CLI：
 
 ```bash
-python3 scripts/context_memory.py new --title "Payment retry strategy" --summary "Discussed retry/backoff options with Alice."
-python3 scripts/context_memory.py validate   # 驗證條目格式
-python3 scripts/context_memory.py index      # 重新產生 memory/INDEX.md
-python3 scripts/context_memory.py list       # 列出條目
+python3 scripts/afterthread.py new --title "Payment retry strategy" --summary "Discussed retry/backoff options with Alice."
+python3 scripts/afterthread.py validate   # 驗證條目格式
+python3 scripts/afterthread.py index      # 重新產生 memory/INDEX.md
+python3 scripts/afterthread.py list       # 列出條目
 ```
 
 ## 方法論

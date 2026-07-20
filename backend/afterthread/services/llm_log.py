@@ -4,7 +4,7 @@ docs/web-v2-decisions.md).
 The backend otherwise does no logging at all, on purpose: the ONE hard,
 test-pinned invariant it inherits is that ``openai_base_url`` /
 ``openai_api_key`` never appear in a log line, an exception, or an API response
-(context_memory.services.llm builds every error message from a category, never a
+(afterthread.services.llm builds every error message from a category, never a
 config value). This module is the single place that logging is introduced, so
 it is written to keep that invariant by CONSTRUCTION rather than by luck:
 
@@ -39,7 +39,7 @@ Concurrency: async request handlers and ``run_in_threadpool`` DB segments both
 run in the same process, and ``generate_structured`` is awaited from either, so
 the shared ring + id counter are guarded by one module-level ``threading.Lock``
 -- the same "module-level, process-wide, outlives any one request" lifetime the
-lru_cache'd OpenAI client in context_memory.services.llm already has. File I/O and
+lru_cache'd OpenAI client in afterthread.services.llm already has. File I/O and
 the INFO log are done OUTSIDE that lock so a slow disk never serializes every
 concurrent interaction behind one writer.
 """
@@ -56,7 +56,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from context_memory.config import get_settings
+from afterthread.config import get_settings
 
 # The one logger the whole feature uses. Named under the app's package so an
 # operator can raise/lower just this feature's verbosity independently, and so
@@ -65,11 +65,11 @@ from context_memory.config import get_settings
 # file-sink WARNING in `_write_file_sink` -- never a body, never a config value.
 # This module deliberately does NOT attach a handler or set a level on it --
 # that is an APPLICATION decision, not a library one, and is made exactly once
-# for the whole "context_memory" namespace (this logger's parent) by
-# context_memory.main._configure_app_logging. This module only NAMES the
+# for the whole "afterthread" namespace (this logger's parent) by
+# afterthread.main._configure_app_logging. This module only NAMES the
 # logger and picks what it emits; where those records end up is that other
 # module's job.
-logger = logging.getLogger("context_memory.llm")
+logger = logging.getLogger("afterthread.llm")
 
 
 @dataclass(slots=True)
@@ -489,7 +489,7 @@ def _utf8_safe(text: str) -> str:
 
     Attempt bodies are RAW, untrusted LLM output that -- unlike every other
     string this codebase stores -- never passes through a pydantic model's
-    sanitizers: context_memory.services.memory_ai's ``_coerce_str`` gates the
+    sanitizers: afterthread.services.memory_ai's ``_coerce_str`` gates the
     very same hazard (a lone surrogate is valid per ``json.loads`` but not
     UTF-8 encodable) at the model-validation boundary, but it REJECTS there
     (raises, folded into a 502) because that data has not been written
@@ -745,7 +745,7 @@ class LlmInteractionRecorder:
         """Record the raw completion text on the current attempt, safely stored.
 
         ``content`` is straight from the LLM (see ``_extract_content`` in
-        context_memory.services.llm) and has not passed through any pydantic
+        afterthread.services.llm) and has not passed through any pydantic
         sanitizer; ``_stored_body`` is this method's own choke point against
         both the lone-surrogate hazard ``_message_text`` guards for request
         bodies AND the oversized-body hazard a broken/hostile gateway can
@@ -1013,7 +1013,7 @@ def _log_summary(record: LlmInteractionRecord) -> None:
     because none of these is derived from the endpoint config, no base URL or
     key can ride along -- which is what keeps the caplog no-leak test passing
     now that the app actually has a console handler configured for it (see
-    context_memory.main._configure_app_logging).
+    afterthread.main._configure_app_logging).
     """
     total_tokens = record.usage.get("total_tokens") if record.usage else None
     logger.info(
@@ -1059,7 +1059,7 @@ def get_record(log_id: int) -> dict[str, Any] | None:
 def last_record_id_for_workflow(workflow: str) -> int | None:
     """Id of the NEWEST finished record for ``workflow``, or None if there is none.
 
-    Exists for the tool installer (context_memory.services.tool_builder), which
+    Exists for the tool installer (afterthread.services.tool_builder), which
     wants to link its job result to the AI 日誌 record of the builder session it
     just ran. ``generate_structured`` deliberately returns only the caller's
     validated model -- threading a log id through its signature (or returning a

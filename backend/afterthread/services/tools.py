@@ -69,8 +69,8 @@ from typing import IO, Any
 from dotenv import dotenv_values
 from starlette.concurrency import run_in_threadpool
 
-from context_memory.config import get_settings
-from context_memory.services.llm import LlmTool
+from afterthread.config import get_settings
+from afterthread.services.llm import LlmTool
 
 # A package (and directory) name: lowercase alnum start, then up to 63 more of
 # alnum/underscore/hyphen. Admits no ".", "/", or whitespace, so a traversal

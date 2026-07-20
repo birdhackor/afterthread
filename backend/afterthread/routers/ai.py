@@ -1,6 +1,6 @@
 """AI-assisted memory workflows: LLM status and quick capture.
 
-These endpoints wrap ``context_memory.services.memory_ai``. The methodology rules
+These endpoints wrap ``afterthread.services.memory_ai``. The methodology rules
 (confidence honesty, supersede-not-delete, max-3-questions, bullets,
 language-follows-content) live in the service-layer prompts; this router owns
 the HTTP contract:
@@ -25,11 +25,11 @@ from sqlalchemy.orm.exc import StaleDataError
 from sqlmodel import Session, col
 from starlette.concurrency import run_in_threadpool
 
-from context_memory.config import get_settings
-from context_memory.db import get_session
-from context_memory.models import MemoryItem, MemoryStage, MemoryStatus, ProgressEntry, utcnow
-from context_memory.routers.items import _NOT_FOUND, _NOT_FOUND_RESPONSE, ItemId
-from context_memory.schemas import (
+from afterthread.config import get_settings
+from afterthread.db import get_session
+from afterthread.models import MemoryItem, MemoryStage, MemoryStatus, ProgressEntry, utcnow
+from afterthread.routers.items import _NOT_FOUND, _NOT_FOUND_RESPONSE, ItemId
+from afterthread.schemas import (
     AssistUpdateRequest,
     AssistUpdateResponse,
     CaptureRequest,
@@ -42,15 +42,15 @@ from context_memory.schemas import (
     LLMTokenRatio,
     MemoryItemRead,
 )
-from context_memory.services import llm_log, token_budget
-from context_memory.services.llm import (
+from afterthread.services import llm_log, token_budget
+from afterthread.services.llm import (
     _UPSTREAM_REASON,
     LLMNotConfiguredError,
     LLMUpstreamError,
     llm_configured,
     normalized_model,
 )
-from context_memory.services.memory_ai import (
+from afterthread.services.memory_ai import (
     _PER_SECTION_CAP,
     HISTORY_SECTIONS,
     SECTION_FIELD_ORDER,
@@ -166,7 +166,7 @@ def _service_unavailable() -> HTTPException:
 
 
 def _bad_gateway(exc: LLMUpstreamError) -> HTTPException:
-    # str(exc) is safe by construction (see context_memory.services.llm): an exception
+    # str(exc) is safe by construction (see afterthread.services.llm): an exception
     # category plus a short reason, never a config value or a response body.
     return HTTPException(
         status_code=502,
@@ -218,7 +218,7 @@ def llm_status() -> LLMStatus:
     request, so a whitespace-padded override is never echoed back padded while the
     real call underneath sends the trimmed value. ``token_ratio`` is additive
     observability (P4): the estimator's window size and learned ratio (see
-    context_memory.services.token_budget), carrying no config value.
+    afterthread.services.token_budget), carrying no config value.
     """
     settings = get_settings()
     configured = llm_configured()
