@@ -34,39 +34,9 @@ untouched by packaging:
      environment already supplies one.
   5. Hand off to `uvicorn.run`, serving the same `afterthread.main:app`
      dev uses.
-
-This module also one-time auto-migrates real data left under the tool's
-previous distribution name, as two INDEPENDENT steps with DIFFERENT triggers
-(a common miswording is that both skip under an explicit data dir -- only the
-first does):
-
-  * Data-dir rename (`<xdg base>/context-memory` -> `<xdg base>/afterthread`):
-    ONLY on the XDG-default path -- neither --data-dir nor AFTERTHREAD_DATA_DIR
-    given -- and ONLY when the new dir does not yet exist. If BOTH dirs exist
-    the old one is left untouched (never merged into the new one). A failed
-    rename ABORTS startup with a manual remedy, rather than mkdir-ing a fresh
-    empty data dir and booting an empty app while the user's real data sits
-    under the old name -- kept symmetric with the DB-file step's abort below.
-    On success, any absolute path inside the migrated `.env` that still names
-    the old directory is rewritten to the new one, so a `DATABASE_URL` /
-    `TOOLS_DIR` / `LLM_LOG_FILE` carrying that path does not dangle.
-  * Legacy DB-file rename (`context_memory.db` -> `afterthread.db`): runs
-    whenever this module injects its OWN default `DATABASE_URL` -- i.e. only
-    when `DATABASE_URL` is absent after the data-dir `.env` is loaded -- and
-    only when `afterthread.db` does not yet exist. Deliberately INDEPENDENT of
-    --data-dir: `--data-dir <old dir>` still gets its DB renamed. Because a
-    SQLite database is a file SET (main + -wal/-shm/-journal), the legacy file
-    is first opened to force WAL/journal recovery and checkpointed into the one
-    main file, then moved with a no-replace link; ANY failure (a corrupt or
-    locked DB, or a sidecar that will not collapse) ABORTS startup rather than
-    stranding the user's data beside a fresh empty database.
-
-Each step prints a one-line notice when it fires.
 """
 
-import contextlib
 import os
-import sqlite3
 from importlib import metadata
 from pathlib import Path
 from typing import Annotated
@@ -158,183 +128,6 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
-def _rewrite_env_absolute_paths(env_file: Path, old_dir: Path, new_dir: Path) -> None:
-    """Repoint absolute paths in a `.env` that moved with a data-dir rename.
-
-    The `.env` travels with the renamed directory, but any ABSOLUTE path inside
-    it -- `DATABASE_URL`, `TOOLS_DIR`, `LLM_LOG_FILE`, anything -- still names
-    the OLD directory and would dangle. Rewrite every occurrence of the old
-    dir's path string to the new one in a single pass, so all such variables
-    follow the data to its new home. A relative path needs no fixup: its target
-    moved along with the directory.
-
-    Both the plain and the percent-encoded form of the old path are rewritten:
-    `_sqlite_url` emits a `sqlite:///file:<percent-encoded path>?uri=true` URL
-    for a data dir whose path contains a "?", so a hand-written `.env` copied
-    from such a URL carries the old dir percent-encoded, never as the literal
-    string -- rewrite both so neither can be missed.
-
-    Failures do not crash: a read/decode failure, or a write failure, is a
-    warning -- the directory migration itself already succeeded, and a `.env`
-    this cannot rewrite is the operator's to check by hand. A stale `.env` then
-    fails loudly later at DB connect, which is acceptable for a local tool.
-    """
-    if not env_file.is_file():
-        return
-    try:
-        env_text = env_file.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        print(
-            f"afterthread: WARNING could not rewrite absolute paths in {env_file} "
-            f"({exc}); check it by hand if it still points at {old_dir}",
-            flush=True,
-        )
-        return
-    old_dir_str = str(old_dir)
-    new_dir_str = str(new_dir)
-    # The percent-encoded form only differs from the literal when the path holds
-    # URI-significant characters (e.g. "?"); when it does, cover it in the same
-    # pass -- a `sqlite:///file:...?uri=true` URL from _sqlite_url carries the
-    # old dir encoded, so a literal-only rewrite would leave that URL dangling.
-    old_enc = quote(old_dir_str, safe="/")
-    new_enc = quote(new_dir_str, safe="/")
-    encoded_differs = old_enc != old_dir_str
-    literal_present = old_dir_str in env_text
-    encoded_present = encoded_differs and old_enc in env_text
-    if not literal_present and not encoded_present:
-        return
-    new_text = env_text.replace(old_dir_str, new_dir_str)
-    if encoded_differs:
-        new_text = new_text.replace(old_enc, new_enc)
-    # Atomic replace: write a sibling temp file and os.replace() it over the
-    # .env, so a partial/failed write can never truncate a good .env. A write
-    # failure is warned, not fatal (see docstring): clean up the temp file
-    # best-effort and return, leaving the (unchanged) .env for the operator.
-    tmp = env_file.with_name(env_file.name + ".tmp-migrate")
-    try:
-        tmp.write_text(new_text, encoding="utf-8")
-        os.replace(tmp, env_file)
-    except OSError as exc:
-        print(
-            f"afterthread: WARNING could not rewrite absolute paths in {env_file} "
-            f"({exc}); check it by hand if it still points at {old_dir} -- a stale "
-            f".env will otherwise fail later at DB connect",
-            flush=True,
-        )
-        with contextlib.suppress(OSError):
-            tmp.unlink(missing_ok=True)
-        return
-    print(
-        f"afterthread: rewrote absolute paths in {env_file} ({old_dir} -> {new_dir})",
-        flush=True,
-    )
-
-
-def _migrate_legacy_db(legacy_db_path: Path, db_path: Path) -> None:
-    """Recover, then move, a pre-rename `context_memory.db` to `afterthread.db`.
-
-    A SQLite database is a FILE SET -- the main file plus transient
-    `-wal`/`-shm`/`-journal` sidecars -- so moving only the main file can drop
-    committed-but-uncheckpointed WAL transactions or strand a hot rollback
-    journal. This first opens the legacy database through the stdlib `sqlite3`
-    driver in `mode=rw` (a URI open that will NOT create the file, so a legacy
-    file that vanished since the caller's `is_file()` check raises rather than
-    springing an empty DB into existence), where a real read forces hot-journal
-    rollback / WAL replay, then `PRAGMA wal_checkpoint(TRUNCATE)` folds the WAL
-    back into the single main file. The checkpoint RESULT is read: a busy
-    checkpoint, or one that left frames behind, means another process still
-    holds the legacy DB open (e.g. a still-running old-name server) and the set
-    is not collapsed -- this fails rather than moving half of it. The post-close
-    `-wal`/`-journal` sidecar-size check backs that up. Only then is the main
-    file moved, via a no-replace `os.link` + `unlink` so an `afterthread.db`
-    that appeared since the caller's pre-check is never clobbered (a filesystem
-    without hard-link support falls back to the caller's exists()-guarded
-    rename).
-
-    ANY failure here -- a corrupt or locked database, or a sidecar that will
-    not collapse -- ABORTS startup with `typer.Exit(1)` and a manual remedy,
-    NEVER falling through to create a fresh empty `afterthread.db` beside the
-    stranded legacy data. This matches the codebase's fail-loudly-at-startup
-    convention (see config.py's validation comments).
-    """
-    try:
-        # mode=rw makes a legacy file that vanished between the caller's
-        # is_file() check and here RAISE, instead of silently creating an empty
-        # DB that would then be "migrated". quote() keeps a data-dir path with
-        # URI-significant characters intact inside the file: URI.
-        connection = sqlite3.connect(
-            f"file:{quote(str(legacy_db_path), safe='/')}?mode=rw", uri=True, timeout=5
-        )
-        try:
-            # A real read forces recovery: sqlite rolls back a hot journal and
-            # replays a WAL before it can answer. Result intentionally unused.
-            connection.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchall()
-            # Fold the WAL back into the main file and truncate it away, so the
-            # one file moved below is self-contained, then READ the result:
-            # (busy, log, checkpointed). A non-WAL DB returns (0, -1, -1) and
-            # passes; busy == 1 means another process (e.g. a still-running
-            # old-name server) still holds this legacy DB open, and log !=
-            # checkpointed means frames remain in the WAL -- either way the set
-            # is not collapsed into the single main file, so fail here rather
-            # than move half a database. This positively detects the
-            # live-old-server case at the checkpoint (the sidecar-size check
-            # below stays as the belt to this suspender).
-            row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-            if not (row[0] == 0 and row[1] == row[2]):
-                raise RuntimeError(
-                    f"WAL checkpoint did not complete cleanly (wal_checkpoint "
-                    f"returned {row}); the legacy database may still be open in "
-                    f"another process"
-                )
-        finally:
-            connection.close()
-        for suffix in ("-wal", "-journal"):
-            sidecar = legacy_db_path.with_name(legacy_db_path.name + suffix)
-            if sidecar.exists() and sidecar.stat().st_size > 0:
-                raise RuntimeError(
-                    f"{sidecar.name} still holds uncheckpointed data after checkpoint"
-                )
-        try:
-            # No-replace move: os.link never overwrites an existing target, so an
-            # afterthread.db that appeared between the caller's exists() pre-check
-            # and here is preserved, not clobbered.
-            os.link(legacy_db_path, db_path)
-        except FileExistsError:
-            # Another launch (or a freshly created db) won the race: afterthread.db
-            # now exists. Leave the legacy file in place and skip -- the new-named
-            # db is authoritative for this launch.
-            print(
-                f"afterthread: {db_path} already exists; left legacy database "
-                f"{legacy_db_path} in place (skipped migration this launch)",
-                flush=True,
-            )
-            return
-        except OSError:
-            # Hard links unsupported here (both paths share a directory, so this
-            # is never cross-device -- e.g. a filesystem without link support, or
-            # EPERM). Fall back to the caller's exists()-guarded rename.
-            legacy_db_path.rename(db_path)
-        else:
-            legacy_db_path.unlink()
-    except Exception as exc:
-        print(
-            f"afterthread: ERROR could not migrate legacy database {legacy_db_path} "
-            f"-> {db_path}: {exc}\n"
-            f"  A SQLite database is a file set (the .db plus any "
-            f"-wal/-shm/-journal sidecars). With the server stopped, move the whole "
-            f"set to {db_path} yourself, or -- if you do not need the old data -- "
-            f"delete {legacy_db_path} and its sidecars. afterthread will not start "
-            f"until the legacy file is dealt with, so it never creates an empty "
-            f"database beside your real data.",
-            flush=True,
-        )
-        raise typer.Exit(1) from exc
-    print(
-        f"afterthread: migrated legacy database {legacy_db_path} -> {db_path}",
-        flush=True,
-    )
-
-
 @app.command(help="Run the afterthread web app (bundled API + SPA).")
 def _serve(
     host: Annotated[
@@ -392,55 +185,6 @@ def _serve(
     # Resolve BEFORE the chdir below, so a relative --data-dir is anchored to
     # the directory the user launched from, as they would expect.
     data_dir_path = Path(data_dir or str(_default_data_dir())).expanduser().resolve()
-
-    # Legacy default-dir auto-migration (pre-rename distribution name ->
-    # afterthread). ONLY when the XDG default is in play -- i.e. neither
-    # --data-dir nor AFTERTHREAD_DATA_DIR was provided (`data_dir` falsy) -- and
-    # ONLY when the new default dir does not yet exist, BEFORE the mkdir/chdir
-    # below: if the old default dir "<xdg base>/context-memory" is present, move
-    # it into place so a user with real single-user data under the previous name
-    # keeps it with no manual step. An explicit data dir is skipped entirely (it
-    # is the user's own path, unrelated to the rename).
-    #
-    # No os.link no-clobber dance is needed here the way it is for the DB file
-    # below. The guard already requires the new dir to be ABSENT; and even under
-    # a TOCTOU race, POSIX rename cannot replace a NON-empty directory (it fails
-    # with ENOTEMPTY), so this can never merge into or clobber real data in a
-    # pre-existing new dir -- while replacing an empty, just-created new dir
-    # loses nothing. On failure (rename raised OSError -- cross-device,
-    # permissions, or that ENOTEMPTY) we ABORT startup rather than continue:
-    # continuing would mkdir a fresh empty data dir below and boot an empty app
-    # while the user's real data sits under the old name -- the exact
-    # silent-empty-database outcome the DB-file step refuses. Fail closed and
-    # tell the operator to move it (or point --data-dir at it) by hand, keeping
-    # this symmetric with _migrate_legacy_db's abort semantics.
-    if not data_dir and not data_dir_path.exists():
-        legacy_data_dir = data_dir_path.parent / "context-memory"
-        if legacy_data_dir.is_dir():
-            try:
-                legacy_data_dir.rename(data_dir_path)
-            except OSError as exc:
-                print(
-                    f"afterthread: ERROR could not migrate legacy data dir "
-                    f"{legacy_data_dir} -> {data_dir_path} ({exc})\n"
-                    f"  With the server stopped, move it there yourself "
-                    f"(mv {legacy_data_dir} {data_dir_path}), or launch with "
-                    f"--data-dir pointing at your existing data. afterthread will "
-                    f"not start until this is resolved, so it never creates a fresh "
-                    f"empty data dir and boots an empty app while your real data "
-                    f"sits under the old name.",
-                    flush=True,
-                )
-                raise typer.Exit(1) from exc
-            else:
-                print(
-                    f"afterthread: migrated legacy data dir {legacy_data_dir} -> {data_dir_path}",
-                    flush=True,
-                )
-                # The .env moved with the dir; repoint any absolute path inside
-                # it that still names the old directory (FIX B).
-                _rewrite_env_absolute_paths(data_dir_path / ".env", legacy_data_dir, data_dir_path)
-
     created = not data_dir_path.exists()
     data_dir_path.mkdir(parents=True, exist_ok=True)
     if created:
@@ -481,20 +225,6 @@ def _serve(
     # is named, never its content.
     if "DATABASE_URL" not in os.environ:
         db_path = data_dir_path / "afterthread.db"
-        legacy_db_path = data_dir_path / "context_memory.db"
-        # Legacy DB-file auto-migration (pre-rename "context_memory.db" ->
-        # "afterthread.db"), only on the path that injects our OWN default URL
-        # below: if the old-named database still sits in this data dir and the
-        # new-named one does not, migrate it so the default URL points at the
-        # user's real data instead of creating a fresh empty database beside it.
-        # This runs REGARDLESS of --data-dir; only DATABASE_URL already being set
-        # (a real env var, or a data-dir .env) suppresses it -- an
-        # operator-supplied URL is authoritative and no file is then touched. The
-        # `not db_path.exists()` check is only a fast path: _migrate_legacy_db
-        # recovers the SQLite file set and moves it with a no-replace link,
-        # aborting startup on any failure (see its docstring).
-        if legacy_db_path.is_file() and not db_path.exists():
-            _migrate_legacy_db(legacy_db_path, db_path)
         os.environ["DATABASE_URL"] = _sqlite_url(db_path)
         database_display = str(db_path)
     else:

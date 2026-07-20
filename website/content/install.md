@@ -63,7 +63,7 @@ uv tool install --reinstall --from backend/dist/afterthread-*.whl afterthread
 
 ## 首次設定
 
-- **資料目錄**:預設是 `$XDG_DATA_HOME/afterthread`,沒設定 `XDG_DATA_HOME` 時退回 `~/.local/share/afterthread`。可以用 `--data-dir <path>` 或環境變數 `AFTERTHREAD_DATA_DIR` 覆寫。第一次啟動時,若目錄不存在會自動建立(權限設為只有你自己能讀寫);已存在的目錄則不會被動權限。SQLite 資料庫檔與工具目錄(見 [KB 工具安裝指南](kb-tools.md))都會落在這裡。若偵測到專案舊名稱 `context-memory` 留下的資料目錄(`~/.local/share/context-memory`)與舊 DB 檔,下次啟動時會自動就地更名遷移:更名舊 DB 檔前會先完成 SQLite recovery/checkpoint,並把 `.env` 內指向舊目錄的絕對路徑(`DATABASE_URL`、`TOOLS_DIR` 等)一併改寫;極端情況(DB 損毀或被鎖定)會中止啟動並提示手動處理。目錄遷移只在使用預設資料目錄(未指定 `--data-dir` / `AFTERTHREAD_DATA_DIR`)且新目錄尚不存在時進行;DB 檔遷移只在未自行設定 `DATABASE_URL` 時進行。
+- **資料目錄**:預設是 `$XDG_DATA_HOME/afterthread`,沒設定 `XDG_DATA_HOME` 時退回 `~/.local/share/afterthread`。可以用 `--data-dir <path>` 或環境變數 `AFTERTHREAD_DATA_DIR` 覆寫。第一次啟動時,若目錄不存在會自動建立(權限設為只有你自己能讀寫);已存在的目錄則不會被動權限。SQLite 資料庫檔與工具目錄(見 [KB 工具安裝指南](kb-tools.md))都會落在這裡。
 - **設定檔 `.env`**:把 `backend/.env.example` 複製一份到 `<資料目錄>/.env`,依需要填入下面的變數。啟動時只有這個目錄下的 `.env` 會被讀取。
 - **啟用 AI 功能(必填)**:`OPENAI_BASE_URL` 與 `OPENAI_MODEL` 兩者都要填,且 base URL 需能解析為合法的 http/https 網址,才算「已設定」;`OPENAI_API_KEY` 是否需要則視該 endpoint 而定(不是判斷「已設定」的條件之一)。相容任何 OpenAI-compatible 的 chat completions endpoint。兩者留空時,AI 快速捕捉／AI 補齊／AI 進度更新／工具安裝都會顯示「尚未設定」,但手動新增、編輯、刪除、篩選、回顧完全不受影響。
 
