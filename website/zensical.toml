@@ -1,0 +1,62 @@
+# Zensical 設定檔(zh-Hant 文件站)。
+#
+# 文件內容放在 docs_dir 指定的 content/ 目錄;建置輸出到 site_dir 指定的
+# site/ 目錄(已加入 repo 根目錄的 .gitignore,不進版控——每次都是重新建置
+# 出來的產物)。
+#
+# 完整設定說明:https://zensical.org/docs/setup/basics/
+#
+# 註:admonitions(!!! note 這類提示框)、mermaid 圖表、程式碼高亮等本站用到
+# 的功能,是 Zensical 在「未顯式設定 markdown_extensions」時的預設行為,所以
+# 這裡不需要重複列出——見 https://zensical.org/docs/setup/extensions/about/
+
+[project]
+site_name = "Context Memory 文件"
+site_description = "context-memory:對抗架構知識蒸發的個人記憶工具——安裝、功能導覽、AI 工具呼叫機制與方法論說明。"
+site_url = "https://birdhackor.github.io/context-memory/"
+docs_dir = "content"
+site_dir = "site"
+
+copyright = "Copyright &copy; 2026 birdhackor"
+
+# 顯式導覽結構(而非讓 Zensical 從目錄結構推導),對應本站規劃的頁面順序。
+nav = [
+  { "這是什麼" = "index.md" },
+  { "安裝與啟動" = "install.md" },
+  { "網頁功能導覽" = "web-tour.md" },
+  { "KB 工具安裝指南" = "kb-tools.md" },
+  { "AI 工具呼叫是怎麼運作的" = "tool-calling.md" },
+  { "方法論" = "methodology.md" },
+  { "設定參考" = "config-reference.md" },
+]
+
+[project.theme]
+# 見 https://zensical.org/docs/setup/language/ ——已確認的語言代碼列表包含
+# "zh-Hant"(對應 Traditional Chinese 翻譯,狀態 Complete)。
+language = "zh-Hant"
+
+features = [
+    "content.code.copy",
+    "content.code.select",
+    "content.tooltips",
+    "content.footnote.tooltips",
+    "navigation.indexes",
+    "navigation.instant",
+    "navigation.instant.prefetch",
+    "navigation.sections",
+    "navigation.path",
+    "navigation.top",
+    "navigation.tracking",
+    "navigation.footer",
+    "search.highlight",
+]
+
+[[project.theme.palette]]
+scheme = "default"
+toggle.icon = "lucide/sun"
+toggle.name = "切換為深色模式"
+
+[[project.theme.palette]]
+scheme = "slate"
+toggle.icon = "lucide/moon"
+toggle.name = "切換為淺色模式"

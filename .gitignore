@@ -1,0 +1,41 @@
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+
+# Tool caches
+.ruff_cache/
+.pytest_cache/
+
+# Databases
+*.db
+*.sqlite3
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Node / frontend
+node_modules/
+dist/
+
+# Backend packaging output (scripts/build-wheel.sh: bundled frontend build +
+# uv build artifacts). backend/dist/ is already covered by the generic
+# dist/ rule above; listed explicitly anyway so intent is clear at the
+# source of the packaging step, not just inferred from a top-level rule.
+backend/context_memory/static/
+backend/dist/
+
+# Zensical docs site build output (website/zensical.toml site_dir = "site";
+# source content in website/content/ IS tracked, only the built HTML is not).
+website/site/
+website/.cache/
+
+# OS
+.DS_Store
+
+# Personal Claude Code instructions symlink (see AGENTS.md); never commit
+CLAUDE.md
