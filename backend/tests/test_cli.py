@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 
 import pytest
+from click import unstyle
 from sqlalchemy import create_engine, make_url, text
 from typer.testing import CliRunner
 
@@ -136,9 +137,13 @@ def test_version_flag_exits_zero_and_prints_version_line() -> None:
 def test_help_flag_exits_zero_and_mentions_the_three_options() -> None:
     result = runner.invoke(app, ["--help"], prog_name="afterthread")
     assert result.exit_code == 0
-    assert "--host" in result.stdout
-    assert "--port" in result.stdout
-    assert "--data-dir" in result.stdout
+    # Rich inserts ANSI style boundaries inside option names when TERM enables
+    # color (for example, between the two dashes in ``--host`` on CI runners).
+    # Assert the user-visible text rather than the terminal control stream.
+    help_text = unstyle(result.stdout)
+    assert "--host" in help_text
+    assert "--port" in help_text
+    assert "--data-dir" in help_text
 
 
 def test_invalid_port_cli_value_exits_nonzero() -> None:
