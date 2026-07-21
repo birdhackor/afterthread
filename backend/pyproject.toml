@@ -1,11 +1,34 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.31.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "afterthread"
 version = "0.1.0"
+description = "Preserve architectural decisions, trade-offs, and next actions in a local web app."
+readme = "PYPI_README.md"
 requires-python = ">=3.14"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "birdhackor" }]
+keywords = [
+    "architecture decisions",
+    "knowledge management",
+    "local-first",
+    "personal knowledge base",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Natural Language :: Chinese (Traditional)",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Documentation",
+]
 dependencies = [
     "fastapi[standard]>=0.138",
     "uvicorn",
@@ -14,6 +37,9 @@ dependencies = [
     "openai",
     "typer>=0.26.8",
 ]
+
+[project.urls]
+Documentation = "https://birdhackor.github.io/afterthread/"
 
 [project.scripts]
 afterthread = "afterthread.cli:main"
@@ -37,7 +63,14 @@ artifacts = ["afterthread/static/"]
 [tool.hatch.build.targets.sdist]
 # hatch_build.py must ship in the sdist: `uv build` builds the wheel FROM the
 # unpacked sdist, and the wheel hook below needs the script present there.
-include = ["afterthread", "pyproject.toml", "README.md", "hatch_build.py"]
+include = [
+    "afterthread",
+    "LICENSE",
+    "PYPI_README.md",
+    "pyproject.toml",
+    "README.md",
+    "hatch_build.py",
+]
 artifacts = ["afterthread/static/"]
 
 # Guard hook (see hatch_build.py): non-editable builds fail loudly when the

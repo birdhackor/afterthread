@@ -44,29 +44,22 @@ scripts/afterthread.py    檔案版 CLI（見下方「CLI 與 OpenCode skill 補
 .opencode/skills/afterthread/SKILL.md   OpenCode skill
 memory/YYYY/MM/*.md       檔案版記憶項目（CLI／skill 專用，與網頁版資料庫分開）
 docs/methodology.md       方法論
+docs/releasing.md         PyPI 發布與 Trusted Publishing 維運手冊
 ```
 
 ## 安裝與啟動
 
-`afterthread` 目前只以原始碼／wheel 檔的形式存在——這是私人 repo，沒有發佈
-到 PyPI，所以啟動前要先在這個 checkout 裡建置一次 wheel（已內嵌前端
-production build）：
+需求：Python `>=3.14`，支援 Linux 與 macOS（Windows 尚未列入支援範圍）。
+wheel 已內嵌 frontend production build，不需要另外安裝 Node.js 或 pnpm。
+
+### 直接執行（不常駐安裝）
 
 ```bash
-bash scripts/build-wheel.sh
+uvx afterthread
 ```
 
-前置需求：`pnpm`（前端 build）與 `uv`（後端 build／`uvx`）。完成後會在
-`backend/dist/` 產生 `afterthread-*.whl`（與對應的 sdist）。
-
-### 直接執行（不安裝，`uvx`）
-
-```bash
-uvx --from backend/dist/afterthread-*.whl afterthread
-```
-
-`uvx` 會在自己管理的暫存虛擬環境裡解析依賴並啟動服務（同一環境第一次執行需要
-網路下載依賴，之後會用快取，離線也能跑）。終端機只會印一行 `afterthread:
+`uvx` 會從 PyPI 取得套件，在自己管理的暫存虛擬環境裡解析依賴並啟動服務
+（同一環境第一次執行需要網路下載依賴，之後會用快取）。終端機只會印一行 `afterthread:
 data dir=... database=...`（見下方「首次設定」，絕不印出 API key 等機密），
 接著開瀏覽器連 <http://127.0.0.1:8000> 就是完整介面。
 
@@ -76,9 +69,9 @@ data dir=... database=...`（見下方「首次設定」，絕不印出 API key 
 `afterthread`：
 
 ```bash
-uv tool install --from backend/dist/afterthread-*.whl afterthread
+uv tool install afterthread
 # 或用 pipx：
-pipx install backend/dist/afterthread-*.whl
+pipx install afterthread
 ```
 
 ### 常用旗標
@@ -95,23 +88,27 @@ pipx install backend/dist/afterthread-*.whl
 
 ### 升級
 
-版號目前固定在 `0.1.0`（還沒決定對外發佈節奏），所以「升級」就是拉新程式碼後
-重新建置、重新執行：
+`uvx` 使用者可重新整理解析結果；常駐安裝則用對應工具的 upgrade 指令：
 
 ```bash
-git pull
+uvx --refresh afterthread
+uv tool upgrade afterthread
+# 或
+pipx upgrade afterthread
+```
+
+### 從原始碼建置
+
+開發者若要驗證尚未發布的 checkout，可從 repo 根目錄建置本機 wheel。前置需求是
+`pnpm` 與 `uv`：
+
+```bash
 bash scripts/build-wheel.sh
-uvx --refresh --from backend/dist/afterthread-*.whl afterthread
+uvx --from backend/dist/afterthread-*.whl afterthread
 ```
 
-`uvx` 對本機 wheel 檔會快取解析結果，一般重新 build 後直接重跑就會抓到新
-內容；不放心的話加 `--refresh` 強制重新解析、忽略快取。已用 `uv tool
-install` 裝成常駐指令的話，改用 `--reinstall`（`--force` 是另一件事：那是用
-來覆蓋「非 uv 安裝」的同名執行檔，不是這裡要的重裝）：
-
-```bash
-uv tool install --reinstall --from backend/dist/afterthread-*.whl afterthread
-```
+腳本會先移除 `backend/dist/` 內既有的 wheel／sdist，再產生且驗證唯一一組
+`afterthread-<version>.whl` 與 `.tar.gz`。
 
 ## 首次設定
 
@@ -121,10 +118,17 @@ uv tool install --reinstall --from backend/dist/afterthread-*.whl afterthread
   存在會自動建立（權限設為僅該使用者可讀寫）；已存在的目錄則不會被動權限。
   SQLite 資料庫檔（預設 `afterthread.db`）與工具目錄（`tools/`，見下方
   「KB 工具安裝指南」）都會落在這裡。
-- **設定檔（`.env`）**：把 `backend/.env.example` 複製一份到
-  `<data-dir>/.env`（例如 `~/.local/share/afterthread/.env`），依需要
-  填入下方變數。啟動時只有這個目錄下的 `.env` 會被讀取，不會去讀 checkout
-  裡的 `backend/.env`（那是 dev 模式專用，見下方「開發模式」）。
+- **設定檔（`.env`）**：在 `<data-dir>/.env`（例如
+  `~/.local/share/afterthread/.env`）建立設定檔；從原始碼開發時可複製
+  `backend/.env.example`。打包模式只讀 data dir 內的 `.env`，不會讀 checkout
+  裡的 `backend/.env`（那是 dev 模式專用，見下方「開發模式」）。啟用 AI 的
+  最小設定如下：
+
+  ```dotenv
+  OPENAI_BASE_URL=https://your-endpoint.example/v1
+  OPENAI_API_KEY=your-key-if-required
+  OPENAI_MODEL=your-model
+  ```
 - **啟用 AI 功能（必填）**：`OPENAI_BASE_URL` 與 `OPENAI_MODEL` 兩者都要填，
   且 base URL 需能解析為合法的 http/https 網址，才算「已設定」；
   `OPENAI_API_KEY` 是否需要則視該 endpoint 而定（不是判斷「已設定」的條件之
@@ -318,3 +322,7 @@ python3 scripts/afterthread.py list       # 列出條目
 
 快速捕捉／全面補充的完整規則、狀態值定義、confidence marker（Known／
 Inferred／Unknown）等方法論細節，見 [docs/methodology.md](docs/methodology.md)。
+
+## 授權
+
+本專案採用 [MIT License](LICENSE)。Copyright (c) 2026 birdhackor。

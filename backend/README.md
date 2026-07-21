@@ -36,8 +36,13 @@ uv run pytest                                  # 測試（應全數通過；精�
                                                 # 以指令實際輸出為準）
 ```
 
-打包成內嵌前端 build 的可攜 wheel：見根目錄 `scripts/build-wheel.sh`；對應的
-packaged-mode e2e 驗證見 `e2e/wheel_smoke.sh`。
+PyPI 使用者可直接以 `uvx afterthread` 啟動，或用 `uv tool install afterthread`
+常駐安裝。支援 Python 3.14 的 Linux／macOS；Windows 尚未列入支援範圍。
+
+從 checkout 打包內嵌前端 build 的可攜 wheel：見根目錄
+`scripts/build-wheel.sh`；對應的 packaged-mode e2e 驗證見
+`e2e/wheel_smoke.sh`。正式發布流程與一次性 Trusted Publishing 設定見
+`docs/releasing.md`。
 
 以上指令皆已在本機實際執行過並確認通過（`uv sync` / format --check / check /
 ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回

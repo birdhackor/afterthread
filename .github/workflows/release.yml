@@ -1,0 +1,204 @@
+name: Release to PyPI
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and verify distributions
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.13"
+          python-version: "3.14"
+          working-directory: backend
+          enable-cache: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
+        with:
+          package_json_file: frontend/package.json
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Backend quality gates
+        working-directory: backend
+        run: |
+          uv run --frozen ruff format --check .
+          uv run --frozen ruff check .
+          uv run --frozen ty check
+          uv run --frozen pytest
+
+      - name: Frontend quality gates
+        run: |
+          pnpm --dir frontend install --frozen-lockfile
+          pnpm --dir frontend lint
+          pnpm --dir frontend test
+
+      - name: Dev-mode end-to-end smoke test
+        run: bash e2e/smoke.sh
+
+      - name: Build and test the packaged application
+        run: bash e2e/wheel_smoke.sh
+
+      - name: Check release metadata
+        run: >-
+          uvx --from "twine==6.2.0" twine check --strict
+          backend/dist/afterthread-*.whl
+          backend/dist/afterthread-*.tar.gz
+
+      - name: Audit Python dependencies
+        run: uvx --from "pip-audit==2.10.1" pip-audit backend
+
+      - name: Upload immutable distribution artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: python-package-distributions
+          path: |
+            backend/dist/afterthread-*.whl
+            backend/dist/afterthread-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/afterthread
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distribution artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: python-package-distributions
+          path: dist
+
+      - name: Publish distributions to TestPyPI
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
+        with:
+          packages-dir: dist/
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+          print-hash: true
+
+  verify-testpypi:
+    name: Verify TestPyPI artifact
+    needs:
+      - build
+      - publish-testpypi
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - name: Download original distribution artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: python-package-distributions
+          path: dist
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+
+      - name: Download, compare, and run the TestPyPI wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_version="${RELEASE_TAG#v}"
+          local_wheels=(dist/afterthread-*.whl)
+          if [ "${#local_wheels[@]}" -ne 1 ]; then
+              echo "Expected exactly one local wheel, found ${#local_wheels[@]}." >&2
+              exit 1
+          fi
+
+          # Install dependencies from real PyPI using the locally built wheel's
+          # own metadata, then remove only afterthread. The TestPyPI download can
+          # therefore use --no-deps and never resolve dependencies from the test
+          # index.
+          python -m pip install "${local_wheels[0]}"
+          python -m pip uninstall -y afterthread
+
+          mkdir -p fetched
+          downloaded=false
+          for attempt in $(seq 1 12); do
+              if python -m pip download \
+                  --index-url https://test.pypi.org/simple/ \
+                  --only-binary=:all: \
+                  --no-deps \
+                  --dest fetched \
+                  "afterthread==$release_version"; then
+                  downloaded=true
+                  break
+              fi
+              echo "TestPyPI has not exposed the release yet (attempt $attempt/12)."
+              sleep 10
+          done
+          if [ "$downloaded" != true ]; then
+              echo "Could not download afterthread==$release_version from TestPyPI." >&2
+              exit 1
+          fi
+
+          fetched_wheels=(fetched/afterthread-*.whl)
+          if [ "${#fetched_wheels[@]}" -ne 1 ]; then
+              echo "Expected exactly one TestPyPI wheel, found ${#fetched_wheels[@]}." >&2
+              exit 1
+          fi
+          cmp "${local_wheels[0]}" "${fetched_wheels[0]}"
+
+          python -m pip install --no-deps "${fetched_wheels[0]}"
+          actual_version="$(afterthread --version)"
+          if [ "$actual_version" != "afterthread $release_version" ]; then
+              echo "Unexpected installed version: $actual_version" >&2
+              exit 1
+          fi
+
+  publish-pypi:
+    name: Publish verified artifact to PyPI
+    needs:
+      - build
+      - verify-testpypi
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/afterthread
+    permissions:
+      id-token: write
+    steps:
+      - name: Download verified distribution artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: python-package-distributions
+          path: dist
+
+      - name: Publish distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
+        with:
+          packages-dir: dist/
+          print-hash: true
