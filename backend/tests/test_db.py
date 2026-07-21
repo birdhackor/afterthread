@@ -1,4 +1,4 @@
-"""Tests for engine construction in context_memory.db: the SQLite-only guard and its
+"""Tests for engine construction in afterthread.db: the SQLite-only guard and its
 dialect-only (never host/database/query-string) rejection message -- including
 the fallback for a URL too malformed to parse at all -- the in-memory SQLite
 rejection via the runtime `pragma_database_list` probe (the sole gate on
@@ -24,9 +24,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, select
 
-from context_memory.config import Settings
-from context_memory.db import create_db_engine, get_engine
-from context_memory.models import MemoryItem, ProgressEntry
+from afterthread.config import Settings
+from afterthread.db import create_db_engine, get_engine
+from afterthread.models import MemoryItem, ProgressEntry
 
 
 def test_non_sqlite_url_rejected() -> None:
@@ -247,16 +247,16 @@ def test_default_style_relative_sqlite_url_is_allowed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The exact URL shape `Settings.database_url` defaults to --
-    `sqlite:///./context_memory.db`, a relative, non-URI path -- must be
+    `sqlite:///./afterthread.db`, a relative, non-URI path -- must be
     accepted end-to-end, including by the runtime probe: `pragma_database_list`
     must report a non-empty (absolute) path for it, not just "no exception
     was raised". cwd is redirected into `tmp_path` so the relative
-    `./context_memory.db` resolves there rather than into the repo.
+    `./afterthread.db` resolves there rather than into the repo.
     """
     monkeypatch.chdir(tmp_path)
-    engine = create_db_engine("sqlite:///./context_memory.db")
+    engine = create_db_engine("sqlite:///./afterthread.db")
     try:
-        assert (tmp_path / "context_memory.db").exists()
+        assert (tmp_path / "afterthread.db").exists()
     finally:
         engine.dispose()
 
@@ -327,8 +327,8 @@ def test_foreign_keys_enforced(tmp_path: Path) -> None:
 
 
 def test_importing_app_creates_no_database_file(tmp_path: Path) -> None:
-    """Importing context_memory.main / context_memory.db must have NO filesystem side effect. The
-    engine is created lazily (see context_memory.db.get_engine), not at module import, so
+    """Importing afterthread.main / afterthread.db must have NO filesystem side effect. The
+    engine is created lazily (see afterthread.db.get_engine), not at module import, so
     a read-only checkout can be imported -- e.g. during pytest collection --
     without create_db_engine's persistence probe materialising a database file
     in the process cwd. Run in a subprocess whose cwd is an empty tmp_path, so
@@ -339,7 +339,7 @@ def test_importing_app_creates_no_database_file(tmp_path: Path) -> None:
     backend_dir = Path(__file__).resolve().parent.parent
     env = {**os.environ, "PYTHONPATH": str(backend_dir)}
     result = subprocess.run(
-        [sys.executable, "-c", "import context_memory.main"],
+        [sys.executable, "-c", "import afterthread.main"],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -363,10 +363,10 @@ def test_app_lifespan_creates_configured_database_file(
     """
     db_path = tmp_path / "lifespan.db"
     settings = Settings(database_url=f"sqlite:///{db_path}")
-    monkeypatch.setattr("context_memory.db.get_settings", lambda: settings)
+    monkeypatch.setattr("afterthread.db.get_settings", lambda: settings)
     get_engine.cache_clear()
     try:
-        from context_memory.main import app
+        from afterthread.main import app
 
         # Importing/constructing the app must not have created the file yet.
         assert not db_path.exists()

@@ -1,4 +1,4 @@
-"""Unit tests for the budgeted item serializer (context_memory.services.memory_ai).
+"""Unit tests for the budgeted item serializer (afterthread.services.memory_ai).
 
 An enrich / assist-update prompt embeds a snapshot of the whole item. Serialized
 naively, an item with 19 sections of up to 20k characters each becomes a ~380k
@@ -14,10 +14,10 @@ still represented and visibly marked as truncated.
 
 import pytest
 
-from context_memory.config import Settings
-from context_memory.models import MemoryStage, MemoryStatus
-from context_memory.services import token_budget
-from context_memory.services.memory_ai import (
+from afterthread.config import Settings
+from afterthread.models import MemoryStage, MemoryStatus
+from afterthread.services import token_budget
+from afterthread.services.memory_ai import (
     _HEADER_TAGS_MAX,
     _TITLE_MAX,
     _TRUNCATION_MARKER,
@@ -203,7 +203,7 @@ def test_enrich_prompt_budget_derives_from_token_ratio(monkeypatch: pytest.Monke
     big = "字" * 6000
     item = {"title": "T", "snapshot": big, "known": big, "decisions": big}
     monkeypatch.setattr(
-        "context_memory.services.memory_ai.get_settings",
+        "afterthread.services.memory_ai.get_settings",
         lambda: Settings(llm_prompt_budget_tokens=8000),
     )
 

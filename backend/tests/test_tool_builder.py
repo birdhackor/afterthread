@@ -1,5 +1,5 @@
-"""Tests for the web installer (context_memory.services.tool_builder) and its
-router (context_memory.routers.tools).
+"""Tests for the web installer (afterthread.services.tool_builder) and its
+router (afterthread.routers.tools).
 
 Layers:
 
@@ -36,9 +36,9 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
 
-from context_memory.config import Settings
-from context_memory.services import llm_log, tool_builder, tools
-from context_memory.services.tool_builder import (
+from afterthread.config import Settings
+from afterthread.services import llm_log, tool_builder, tools
+from afterthread.services.tool_builder import (
     _ERROR_NAME_TAKEN,
     _ERROR_OPENAPI_TOO_LARGE,
     _ERROR_TOOLS_DISABLED,
@@ -69,8 +69,8 @@ def _reset_singletons() -> Generator[None]:
 def _install_settings(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> Settings:
     """Point BOTH settings readers (tools registry + installer) at one value."""
     settings = Settings(**overrides)
-    monkeypatch.setattr("context_memory.services.tools.get_settings", lambda: settings)
-    monkeypatch.setattr("context_memory.services.tool_builder.get_settings", lambda: settings)
+    monkeypatch.setattr("afterthread.services.tools.get_settings", lambda: settings)
+    monkeypatch.setattr("afterthread.services.tool_builder.get_settings", lambda: settings)
     return settings
 
 
@@ -519,7 +519,7 @@ def _fake_generate(
             recorder.finish(outcome="ok", error=None)
         return model_cls.model_validate(result)
 
-    monkeypatch.setattr("context_memory.services.tool_builder.generate_structured", fake)
+    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", fake)
     return captured
 
 
@@ -527,7 +527,7 @@ def _no_fetch(monkeypatch: pytest.MonkeyPatch, text: str = "{}") -> None:
     async def fake_fetch(url: str) -> tuple[str | None, str | None]:
         return text, None
 
-    monkeypatch.setattr("context_memory.services.tool_builder._fetch_openapi", fake_fetch)
+    monkeypatch.setattr("afterthread.services.tool_builder._fetch_openapi", fake_fetch)
 
 
 def test_run_install_happy_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -648,7 +648,7 @@ def test_run_install_feature_off(monkeypatch: pytest.MonkeyPatch) -> None:
     async def must_not_fetch(url: str) -> tuple[str | None, str | None]:
         raise AssertionError("fetch must not run when the feature is off")
 
-    monkeypatch.setattr("context_memory.services.tool_builder._fetch_openapi", must_not_fetch)
+    monkeypatch.setattr("afterthread.services.tool_builder._fetch_openapi", must_not_fetch)
     outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build"))
     assert outcome.ok is False
     assert outcome.error == _ERROR_TOOLS_DISABLED
@@ -716,7 +716,7 @@ def test_run_install_secret_injected_into_shell_and_env_never_in_prompt(
             {"tool_name": "kbsearch", "summary": "built and tested", "ready": True}
         )
 
-    monkeypatch.setattr("context_memory.services.tool_builder.generate_structured", fake)
+    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", fake)
     _no_fetch(monkeypatch)
 
     outcome = asyncio.run(
@@ -781,7 +781,7 @@ def test_run_install_registers_and_discards_inflight_secret(
         await by_name["write_file"].handler({"path": "run.py", "content": _GOOD_RUN_PY})
         return model_cls.model_validate({"tool_name": "kbsearch", "summary": "s", "ready": True})
 
-    monkeypatch.setattr("context_memory.services.tool_builder.generate_structured", fake)
+    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", fake)
     _no_fetch(monkeypatch)
     asyncio.run(
         run_install(
@@ -900,7 +900,7 @@ def test_run_install_redacts_secret_from_summary(
             {"tool_name": "kbsearch", "summary": f"done using {secret_value}", "ready": True}
         )
 
-    monkeypatch.setattr("context_memory.services.tool_builder.generate_structured", fake)
+    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", fake)
     _no_fetch(monkeypatch)
 
     outcome = asyncio.run(
@@ -973,7 +973,7 @@ def test_run_install_rejects_manifest_embedding_inflight_secret(
         await by_name["write_file"].handler({"path": "run.py", "content": _GOOD_RUN_PY})
         return model_cls.model_validate({"tool_name": "kbsearch", "summary": "s", "ready": True})
 
-    monkeypatch.setattr("context_memory.services.tool_builder.generate_structured", fake)
+    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", fake)
     _no_fetch(monkeypatch)
 
     outcome = asyncio.run(
@@ -1162,7 +1162,7 @@ def test_router_install_threads_secret_pair(
         seen["secret_value"] = secret_value
         return "job-xyz"
 
-    monkeypatch.setattr("context_memory.services.tool_builder.start_install_job", fake_start)
+    monkeypatch.setattr("afterthread.services.tool_builder.start_install_job", fake_start)
     response = client.post(
         "/api/tools/install",
         json={
@@ -1299,14 +1299,12 @@ def test_run_install_fetch_failure_is_friendly(
     async def fake_fetch(url: str) -> tuple[str | None, str | None]:
         return None, "OpenAPI 文件下載失敗（ConnectError）。"  # noqa: RUF001
 
-    monkeypatch.setattr("context_memory.services.tool_builder._fetch_openapi", fake_fetch)
+    monkeypatch.setattr("afterthread.services.tool_builder._fetch_openapi", fake_fetch)
 
     async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("the LLM must not be called when the fetch failed")
 
-    monkeypatch.setattr(
-        "context_memory.services.tool_builder.generate_structured", must_not_generate
-    )
+    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", must_not_generate)
     outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build"))
     assert outcome.ok is False
     assert "OpenAPI 文件下載失敗" in (outcome.error or "")
@@ -1332,7 +1330,7 @@ def test_job_state_machine_success(monkeypatch: pytest.MonkeyPatch) -> None:
             await release.wait()
             return InstallOutcome(ok=True, tool_name="kb", summary="done", llm_log_id=7)
 
-        monkeypatch.setattr("context_memory.services.tool_builder.run_install", fake_run_install)
+        monkeypatch.setattr("afterthread.services.tool_builder.run_install", fake_run_install)
         job_id = tool_builder.start_install_job("http://x/openapi.json", "i")
         assert job_id is not None  # empty table -> this first submit is admitted
         job = tool_builder.get_job(job_id)
@@ -1371,7 +1369,7 @@ def test_job_state_machine_failure_outcome(monkeypatch: pytest.MonkeyPatch) -> N
         ) -> InstallOutcome:
             return InstallOutcome(ok=False, error="工具包驗證失敗：missing tool.json")  # noqa: RUF001
 
-        monkeypatch.setattr("context_memory.services.tool_builder.run_install", fake_run_install)
+        monkeypatch.setattr("afterthread.services.tool_builder.run_install", fake_run_install)
         job_id = tool_builder.start_install_job("http://x/openapi.json", "i")
         assert job_id is not None  # empty table -> this first submit is admitted
         for _ in range(200):
@@ -1402,7 +1400,7 @@ def test_job_unexpected_exception_becomes_failed_category(
         ) -> InstallOutcome:
             raise RuntimeError("bug with secrets in str()")
 
-        monkeypatch.setattr("context_memory.services.tool_builder.run_install", exploding)
+        monkeypatch.setattr("afterthread.services.tool_builder.run_install", exploding)
         job_id = tool_builder.start_install_job("http://x/openapi.json", "i")
         assert job_id is not None  # empty table -> this first submit is admitted
         for _ in range(200):
@@ -1437,7 +1435,7 @@ def test_jobs_bounded_to_most_recent(monkeypatch: pytest.MonkeyPatch) -> None:
         ) -> InstallOutcome:
             return InstallOutcome(ok=True, tool_name="t")
 
-        monkeypatch.setattr("context_memory.services.tool_builder.run_install", instant)
+        monkeypatch.setattr("afterthread.services.tool_builder.run_install", instant)
         ids: list[str] = []
         for _ in range(tool_builder._MAX_JOBS + 5):
             job_id = tool_builder.start_install_job("http://x/openapi.json", "i")
@@ -1479,7 +1477,7 @@ def test_start_install_job_single_flight(monkeypatch: pytest.MonkeyPatch) -> Non
             await release.wait()
             return InstallOutcome(ok=True, tool_name="kb")
 
-        monkeypatch.setattr("context_memory.services.tool_builder.run_install", fake_run_install)
+        monkeypatch.setattr("afterthread.services.tool_builder.run_install", fake_run_install)
         first = tool_builder.start_install_job("http://x/openapi.json", "i")
         assert first is not None
         await asyncio.sleep(0)  # let the task reach its running update
@@ -1628,7 +1626,7 @@ def test_router_install_202_queues_job(
         seen["instructions"] = instructions
         return "job-abc"
 
-    monkeypatch.setattr("context_memory.services.tool_builder.start_install_job", fake_start)
+    monkeypatch.setattr("afterthread.services.tool_builder.start_install_job", fake_start)
     response = client.post(
         "/api/tools/install",
         json={"openapi_url": "http://kb.example/openapi.json", "instructions": "  build it  "},

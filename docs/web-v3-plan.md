@@ -37,8 +37,8 @@
 ## 各 phase 設計要點（隨研究/實作更新）
 
 ### P1 typer
-- 依賴：`typer`（不帶 rich extra，保持精簡）。console script 入口不變（`context_memory.cli:main`）。
-- 必須保留的行為契約（wheel_smoke 端對端釘住）：`--host`/`--port`/`--data-dir`/`--version`；env fallback `CONTEXT_MEMORY_HOST/PORT/DATA_DIR`（typer 原生 `envvar=` 支援，取代手寫 `_int_env`）；`--port 0`（uvicorn 自選埠）；data-dir 在 chdir 前 resolve；新建才 chmod 0700；chdir → load_dotenv(override=False) → DATABASE_URL/TOOLS_DIR 注入；banner 兩事實（data dir、db 路徑）+ flush、絕不印 DATABASE_URL/秘密。
+- 依賴：`typer`（不帶 rich extra，保持精簡）。console script 入口不變（`afterthread.cli:main`）。
+- 必須保留的行為契約（wheel_smoke 端對端釘住）：`--host`/`--port`/`--data-dir`/`--version`；env fallback `AFTERTHREAD_HOST/PORT/DATA_DIR`（typer 原生 `envvar=` 支援，取代手寫 `_int_env`）；`--port 0`（uvicorn 自選埠）；data-dir 在 chdir 前 resolve；新建才 chmod 0700；chdir → load_dotenv(override=False) → DATABASE_URL/TOOLS_DIR 注入；banner 兩事實（data dir、db 路徑）+ flush、絕不印 DATABASE_URL/秘密。
 - helper（`_sqlite_url`/`_default_data_dir`）與其測試不動。
 
 ### P2 uv_build（待研究裁決）

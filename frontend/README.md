@@ -1,4 +1,4 @@
-# Context Memory Frontend
+# afterthread Frontend
 
 `backend/` FastAPI API 的 SPA 前端：把 file-based MVP 的快速捕捉／全面補充／回顧
 方法論，做成可點擊操作的網頁介面。與 repo 根目錄既有的 file-based MVP 並存，兩者

@@ -1,4 +1,4 @@
-"""Unit tests for context_memory.main._cache_control_for.
+"""Unit tests for afterthread.main._cache_control_for.
 
 Only the pure decision function is tested here (immutable / no-cache / no
 header), per docs/web-v2-plan.md's Phase 2 brief -- the surrounding
@@ -6,7 +6,7 @@ middleware is just plumbing that calls it and is covered end-to-end by
 e2e/wheel_smoke.sh against a real packaged build.
 """
 
-from context_memory.main import _cache_control_for
+from afterthread.main import _cache_control_for
 
 _IMMUTABLE = "public, max-age=31536000, immutable"
 

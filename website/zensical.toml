@@ -11,9 +11,9 @@
 # 這裡不需要重複列出——見 https://zensical.org/docs/setup/extensions/about/
 
 [project]
-site_name = "Context Memory 文件"
-site_description = "context-memory:對抗架構知識蒸發的個人記憶工具——安裝、功能導覽、AI 工具呼叫機制與方法論說明。"
-site_url = "https://birdhackor.github.io/context-memory/"
+site_name = "afterthread 文件"
+site_description = "afterthread：對話冷掉之後，留住架構知識的線頭——安裝、功能導覽、AI 工具呼叫機制與方法論說明。"
+site_url = "https://birdhackor.github.io/afterthread/"
 docs_dir = "content"
 site_dir = "site"
 

@@ -12,8 +12,8 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
 
-from context_memory.services.llm import LLMUpstreamError
-from context_memory.services.memory_ai import EnrichResult, UpdateResult, _coerce_bool
+from afterthread.services.llm import LLMUpstreamError
+from afterthread.services.memory_ai import EnrichResult, UpdateResult, _coerce_bool
 
 
 def _create(client: TestClient, **fields: Any) -> dict[str, Any]:
@@ -39,7 +39,7 @@ def _patch_generate_structured(monkeypatch: pytest.MonkeyPatch, result: dict[str
                 "InvalidStructuredOutput: the LLM did not return a valid structured result"
             ) from None
 
-    monkeypatch.setattr("context_memory.services.memory_ai.generate_structured", _fake)
+    monkeypatch.setattr("afterthread.services.memory_ai.generate_structured", _fake)
 
 
 def _progress_notes(client: TestClient, item_id: int) -> list[str]:

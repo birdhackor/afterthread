@@ -5,8 +5,8 @@ from datetime import UTC, datetime, timedelta
 from fastapi.testclient import TestClient
 from sqlmodel import Session
 
-from context_memory.config import get_settings
-from context_memory.models import MemoryItem
+from afterthread.config import get_settings
+from afterthread.models import MemoryItem
 
 
 def _create(client: TestClient, title: str, status: str) -> dict:

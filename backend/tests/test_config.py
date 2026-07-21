@@ -1,4 +1,4 @@
-"""Tests for Settings validation in context_memory.config.
+"""Tests for Settings validation in afterthread.config.
 
 `stale_after_days` feeds `timedelta(days=...)` inside
 `schemas.MemoryItemRead.is_stale`. An unbounded value (e.g. a fat-fingered
@@ -11,7 +11,7 @@ via pydantic-settings, instead.
 import pytest
 from pydantic import ValidationError
 
-from context_memory.config import Settings
+from afterthread.config import Settings
 
 
 def test_stale_after_days_lower_bound_accepted() -> None:
@@ -100,7 +100,7 @@ def test_openai_max_output_tokens_above_upper_bound_rejected() -> None:
 # `llm_prompt_budget_tokens` is the TOKEN budget for the serialized item snapshot
 # in an enrich / assist-update prompt (and the OpenAPI doc in an installer
 # session); at runtime token_budget converts it into a char allowance via the live
-# chars<->tokens ratio (see context_memory.services.memory_ai / token_budget). Its
+# chars<->tokens ratio (see afterthread.services.memory_ai / token_budget). Its
 # Field(ge=4_000, le=1_000_000) bound makes a nonsensical override fail at startup
 # via pydantic-settings, matching the other LLM knobs' convention. le=1M is the
 # 1M-token context window itself; the default (200000) equals the old 200000-char
@@ -130,7 +130,7 @@ def test_llm_prompt_budget_tokens_above_upper_bound_rejected() -> None:
 
 
 # `llm_log_max_entries` sizes the in-memory LLM interaction ring (see
-# context_memory.services.llm_log). Bounded to [1, 1000] so the ring's worst-case
+# afterthread.services.llm_log). Bounded to [1, 1000] so the ring's worst-case
 # RAM (records carrying full prompt/response bodies) stays bounded.
 
 
@@ -196,7 +196,7 @@ def test_llm_log_file_max_bytes_above_upper_bound_rejected() -> None:
 
 # `llm_tool_conversation_budget_tokens` is the TOKEN budget for the live tool-loop
 # conversation actually SENT to the model each round (see
-# context_memory.services.llm) -- the SENT-side companion to the recorded-side
+# afterthread.services.llm) -- the SENT-side companion to the recorded-side
 # llm_log body budget; token_budget converts it into a char allowance at runtime.
 # Its Field(ge=50_000, le=1_000_000) bound makes a nonsensical override fail at
 # startup via pydantic-settings, matching the other LLM knobs' convention. le=1M is

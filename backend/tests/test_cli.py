@@ -1,8 +1,8 @@
-"""Unit tests for the packaged-mode entry point helpers in context_memory.cli.
+"""Unit tests for the packaged-mode entry point helpers in afterthread.cli.
 
 `_sqlite_url` is the guard against a data-dir path corrupting the database
 URL: the string it returns is later re-parsed by `make_url` inside
-`create_db_engine` (context_memory/db.py), so every test here round-trips
+`create_db_engine` (afterthread/db.py), so every test here round-trips
 through that exact parser. The "?" case is the one a hand-rolled f-string
 gets wrong SILENTLY -- the parser reads "?" as the query-string separator
 and truncates the filename -- which is why it gets an engine-level test that
@@ -21,30 +21,36 @@ import os
 from pathlib import Path
 
 import pytest
+from click import unstyle
 from sqlalchemy import create_engine, make_url, text
 from typer.testing import CliRunner
 
-from context_memory.cli import _default_data_dir, _package_version, _sqlite_url, app
+from afterthread.cli import (
+    _default_data_dir,
+    _package_version,
+    _sqlite_url,
+    app,
+)
 
 # --- _sqlite_url -----------------------------------------------------------
 
 
 def test_sqlite_url_plain_absolute_path_round_trips() -> None:
-    path = Path("/data/context-memory/context_memory.db")
+    path = Path("/data/afterthread/afterthread.db")
     parsed = make_url(_sqlite_url(path))
     assert parsed.get_backend_name() == "sqlite"
     assert parsed.database == str(path)
 
 
 def test_sqlite_url_path_with_spaces_round_trips() -> None:
-    path = Path("/data/my context memory/context_memory.db")
+    path = Path("/data/my afterthread dir/afterthread.db")
     parsed = make_url(_sqlite_url(path))
     assert parsed.get_backend_name() == "sqlite"
     assert parsed.database == str(path)
 
 
 def test_sqlite_url_path_with_percent_and_hash_round_trips() -> None:
-    path = Path("/data/100% memory#1/context_memory.db")
+    path = Path("/data/100% memory#1/afterthread.db")
     parsed = make_url(_sqlite_url(path))
     assert parsed.get_backend_name() == "sqlite"
     assert parsed.database == str(path)
@@ -58,7 +64,7 @@ def test_sqlite_url_question_mark_path_parses_without_truncation() -> None:
     # sqlite3 driver to decode it. The parsed database is therefore the
     # file:-form -- NOT the raw path -- but it must be stable under
     # make_url (no truncation) and must not leak the "?" into the URL query.
-    path = Path("/data/we?ird/context_memory.db")
+    path = Path("/data/we?ird/afterthread.db")
     url = _sqlite_url(path)
     parsed = make_url(url)
     assert parsed.get_backend_name() == "sqlite"
@@ -76,7 +82,7 @@ def test_sqlite_url_question_mark_path_opens_the_intended_file(tmp_path: Path) -
     # decoded file it actually opened, the same probe create_db_engine uses.
     weird_dir = tmp_path / "we?ird dir"
     weird_dir.mkdir()
-    db_path = weird_dir / "context_memory.db"
+    db_path = weird_dir / "afterthread.db"
 
     engine = create_engine(_sqlite_url(db_path))
     try:
@@ -96,50 +102,54 @@ def test_sqlite_url_question_mark_path_opens_the_intended_file(tmp_path: Path) -
 
 def test_default_data_dir_honors_xdg_data_home(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("XDG_DATA_HOME", "/custom/xdg-data")
-    assert _default_data_dir() == Path("/custom/xdg-data/context-memory")
+    assert _default_data_dir() == Path("/custom/xdg-data/afterthread")
 
 
 def test_default_data_dir_falls_back_to_local_share(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
-    assert _default_data_dir() == Path.home() / ".local" / "share" / "context-memory"
+    assert _default_data_dir() == Path.home() / ".local" / "share" / "afterthread"
 
 
 def test_default_data_dir_treats_empty_xdg_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     # The XDG basedir spec: an empty XDG_DATA_HOME means "unset", so it must
     # fall back rather than produce a path under the filesystem root.
     monkeypatch.setenv("XDG_DATA_HOME", "")
-    assert _default_data_dir() == Path.home() / ".local" / "share" / "context-memory"
+    assert _default_data_dir() == Path.home() / ".local" / "share" / "afterthread"
 
 
 # --- CLI surface (typer) -----------------------------------------------------
 #
-# `prog_name="context-memory"` on every invoke(): without it, CliRunner
+# `prog_name="afterthread"` on every invoke(): without it, CliRunner
 # derives the usage line's program name from the command function itself
 # (`_serve` -> a stray "-serve"), since there is no real argv[0] to read
 # outside the installed console script. Passing it explicitly makes the
-# tests reflect the real `context-memory ...` invocation.
+# tests reflect the real `afterthread ...` invocation.
 
 runner = CliRunner()
 
 
 def test_version_flag_exits_zero_and_prints_version_line() -> None:
-    result = runner.invoke(app, ["--version"], prog_name="context-memory")
+    result = runner.invoke(app, ["--version"], prog_name="afterthread")
     assert result.exit_code == 0
-    assert result.stdout.strip() == f"context-memory {_package_version()}"
+    assert result.stdout.strip() == f"afterthread {_package_version()}"
 
 
 def test_help_flag_exits_zero_and_mentions_the_three_options() -> None:
-    result = runner.invoke(app, ["--help"], prog_name="context-memory")
+    result = runner.invoke(app, ["--help"], prog_name="afterthread")
     assert result.exit_code == 0
-    assert "--host" in result.stdout
-    assert "--port" in result.stdout
-    assert "--data-dir" in result.stdout
+    # Rich inserts ANSI style boundaries inside option names when TERM enables
+    # color (for example, between the two dashes in ``--host`` on CI runners).
+    # Assert the user-visible text rather than the terminal control stream.
+    help_text = unstyle(result.stdout)
+    assert "--host" in help_text
+    assert "--port" in help_text
+    assert "--data-dir" in help_text
 
 
 def test_invalid_port_cli_value_exits_nonzero() -> None:
     # Click converts --port's value to int before _serve ever runs, so this
     # never touches the filesystem/chdir -- no cwd restore needed.
-    result = runner.invoke(app, ["--port", "not-an-int"], prog_name="context-memory")
+    result = runner.invoke(app, ["--port", "not-an-int"], prog_name="afterthread")
     assert result.exit_code != 0
 
 
@@ -156,12 +166,12 @@ def test_invalid_port_envvar_exits_nonzero_and_never_starts_server(
     # uvicorn.run is never called below.
     calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
     monkeypatch.setattr(
-        "context_memory.cli.uvicorn.run",
+        "afterthread.cli.uvicorn.run",
         lambda *a, **k: calls.append((a, k)),
     )
-    monkeypatch.setenv("CONTEXT_MEMORY_PORT", "not-an-int")
+    monkeypatch.setenv("AFTERTHREAD_PORT", "not-an-int")
 
-    result = runner.invoke(app, ["--data-dir", str(tmp_path / "data")], prog_name="context-memory")
+    result = runner.invoke(app, ["--data-dir", str(tmp_path / "data")], prog_name="afterthread")
 
     assert result.exit_code != 0
     assert calls == []
@@ -179,7 +189,7 @@ def test_explicit_port_flag_overrides_envvar(
     # in between, but only for keys it was told about at least once.
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("TOOLS_DIR", raising=False)
-    monkeypatch.setenv("CONTEXT_MEMORY_PORT", "9999")
+    monkeypatch.setenv("AFTERTHREAD_PORT", "9999")
 
     captured: dict[str, object] = {}
 
@@ -188,7 +198,7 @@ def test_explicit_port_flag_overrides_envvar(
         captured["host"] = host
         captured["port"] = port
 
-    monkeypatch.setattr("context_memory.cli.uvicorn.run", fake_run)
+    monkeypatch.setattr("afterthread.cli.uvicorn.run", fake_run)
 
     data_dir = tmp_path / "data"
     original_cwd = os.getcwd()
@@ -196,12 +206,12 @@ def test_explicit_port_flag_overrides_envvar(
         result = runner.invoke(
             app,
             ["--port", "1234", "--data-dir", str(data_dir)],
-            prog_name="context-memory",
+            prog_name="afterthread",
         )
         assert result.exit_code == 0, result.output
-        assert captured["port"] == 1234  # explicit --port wins over CONTEXT_MEMORY_PORT=9999
+        assert captured["port"] == 1234  # explicit --port wins over AFTERTHREAD_PORT=9999
         assert captured["host"] == "127.0.0.1"
-        assert captured["app_path"] == "context_memory.main:app"
+        assert captured["app_path"] == "afterthread.main:app"
         assert os.getcwd() == str(data_dir.resolve())
     finally:
         os.chdir(original_cwd)

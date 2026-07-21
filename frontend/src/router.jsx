@@ -111,7 +111,7 @@ function RootLayout() {
 		>
 			<AppShell.Header>
 				<Group h="100%" px="md">
-					<Title order={3}>Context Memory</Title>
+					<Title order={3}>afterthread</Title>
 				</Group>
 			</AppShell.Header>
 			<AppShell.Navbar p="md">

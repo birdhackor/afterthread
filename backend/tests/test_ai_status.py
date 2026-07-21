@@ -5,8 +5,8 @@ from collections.abc import Callable
 import pytest
 from fastapi.testclient import TestClient
 
-from context_memory.config import Settings
-from context_memory.services import token_budget
+from afterthread.config import Settings
+from afterthread.services import token_budget
 
 _SECRET_KEY = "sk-do-not-leak"
 _SECRET_URL = "http://llm.internal.example/v1"

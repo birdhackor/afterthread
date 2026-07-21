@@ -1,5 +1,5 @@
 """Unit tests for the char<->token ratio estimator
-(context_memory.services.token_budget).
+(afterthread.services.token_budget).
 
 The estimator keeps a bounded rolling window of (chars_sent, prompt_tokens)
 observations and derives a live tokens-per-char ratio used to convert the two
@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from context_memory.services import token_budget
+from afterthread.services import token_budget
 
 
 def test_cold_start_ratio_is_default_below_min_samples() -> None:

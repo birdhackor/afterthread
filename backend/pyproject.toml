@@ -1,11 +1,34 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.31.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "context-memory"
+name = "afterthread"
 version = "0.1.0"
+description = "Preserve architectural decisions, trade-offs, and next actions in a local web app."
+readme = "PYPI_README.md"
 requires-python = ">=3.14"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "birdhackor" }]
+keywords = [
+    "architecture decisions",
+    "knowledge management",
+    "local-first",
+    "personal knowledge base",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Natural Language :: Chinese (Traditional)",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Documentation",
+]
 dependencies = [
     "fastapi[standard]>=0.138",
     "uvicorn",
@@ -15,8 +38,11 @@ dependencies = [
     "typer>=0.26.8",
 ]
 
+[project.urls]
+Documentation = "https://birdhackor.github.io/afterthread/"
+
 [project.scripts]
-context-memory = "context_memory.cli:main"
+afterthread = "afterthread.cli:main"
 
 [dependency-groups]
 dev = [
@@ -31,17 +57,24 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["context_memory"]
-artifacts = ["context_memory/static/"]
+packages = ["afterthread"]
+artifacts = ["afterthread/static/"]
 
 [tool.hatch.build.targets.sdist]
 # hatch_build.py must ship in the sdist: `uv build` builds the wheel FROM the
 # unpacked sdist, and the wheel hook below needs the script present there.
-include = ["context_memory", "pyproject.toml", "README.md", "hatch_build.py"]
-artifacts = ["context_memory/static/"]
+include = [
+    "afterthread",
+    "LICENSE",
+    "PYPI_README.md",
+    "pyproject.toml",
+    "README.md",
+    "hatch_build.py",
+]
+artifacts = ["afterthread/static/"]
 
 # Guard hook (see hatch_build.py): non-editable builds fail loudly when the
-# frontend bundle has not been staged into context_memory/static/, instead of
+# frontend bundle has not been staged into afterthread/static/, instead of
 # silently producing a UI-less wheel. Editable installs (`uv sync`) are exempt.
 [tool.hatch.build.targets.wheel.hooks.custom]
 path = "hatch_build.py"

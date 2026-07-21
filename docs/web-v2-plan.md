@@ -46,12 +46,12 @@
 
 - **Commit A（純改名）**：`backend/app/` → `backend/context_memory/`，全部 `from app.` import 機械替換（約 65 處）、tests/conftest、e2e/smoke.sh、README 中 `app.main:app` 同步改。top-level 套件名 `app` 不可發佈。
 - **Commit B（打包）**：
-  - `pyproject.toml`：name=`context-memory`、hatchling build backend、`[project.scripts] context-memory = "context_memory.cli:main"`、wheel/sdist `artifacts = ["context_memory/static/"]`、移除 `[tool.uv] package = false`、`uvicorn` 明列 dependencies。
-  - 前端建置採 pre-build step（`scripts/build-wheel.sh`：pnpm build → 複製 dist → `context_memory/static/` → 驗證 index.html 存在 → `uv build`）；`static/` 進 .gitignore。不用 force-include 指到 `../frontend/dist`（uv build 的 sdist→wheel 流程實測會 FileNotFoundError）。
-  - `main.py`：在 routers 之後，`_STATIC_DIR = importlib.resources.files("context_memory") / "static"` 存在才 `app.frontend("/", directory=..., fallback="index.html")`（FastAPI 0.138+ 官方 SPA API，lock 已 0.139.0）；加 Cache-Control middleware（`/assets/*` immutable、HTML no-cache）。dev 模式無 static/ 自動略過。
-  - `cli.py`：argparse `--host`（預設 127.0.0.1）/`--port`（8000）/`--data-dir`；data dir 預設 XDG（`~/.local/share/context-memory`）；載入 `<data-dir>/.env`（不覆蓋既有環境變數）；`DATABASE_URL` 未設時指到 `<data-dir>/context_memory.db`；然後 `uvicorn.run("context_memory.main:app", ...)`。
+  - `pyproject.toml`：name=`afterthread`、hatchling build backend、`[project.scripts] afterthread = "afterthread.cli:main"`、wheel/sdist `artifacts = ["afterthread/static/"]`、移除 `[tool.uv] package = false`、`uvicorn` 明列 dependencies。
+  - 前端建置採 pre-build step（`scripts/build-wheel.sh`：pnpm build → 複製 dist → `afterthread/static/` → 驗證 index.html 存在 → `uv build`）；`static/` 進 .gitignore。不用 force-include 指到 `../frontend/dist`（uv build 的 sdist→wheel 流程實測會 FileNotFoundError）。
+  - `main.py`：在 routers 之後，`_STATIC_DIR = importlib.resources.files("afterthread") / "static"` 存在才 `app.frontend("/", directory=..., fallback="index.html")`（FastAPI 0.138+ 官方 SPA API，lock 已 0.139.0）；加 Cache-Control middleware（`/assets/*` immutable、HTML no-cache）。dev 模式無 static/ 自動略過。
+  - `cli.py`：argparse `--host`（預設 127.0.0.1）/`--port`（8000）/`--data-dir`；data dir 預設 XDG（`~/.local/share/afterthread`）；載入 `<data-dir>/.env`（不覆蓋既有環境變數）；`DATABASE_URL` 未設時指到 `<data-dir>/afterthread.db`；然後 `uvicorn.run("afterthread.main:app", ...)`。
   - `config.py`：`_ENV_FILE` 改為 CWD 相對 `.env`（dev 從 backend/ 啟動行為不變；wheel 安裝後不再指向 site-packages）。
-  - 新增 `e2e/wheel_smoke.sh`：build wheel → `uvx --from <wheel> context-memory` → 驗證 `/` 回 index.html、深層路由 fallback、`/api/health` 正常、`/api/nonexistent` 回 404 JSON（驗證 app.frontend 未吃掉 API 404）。
+  - 新增 `e2e/wheel_smoke.sh`：build wheel → `uvx --from <wheel> afterthread` → 驗證 `/` 回 index.html、深層路由 fallback、`/api/health` 正常、`/api/nonexistent` 回 404 JSON（驗證 app.frontend 未吃掉 API 404）。
 - FE 常數 `LLM_NOT_CONFIGURED_NOTICE` 措辭改為與部署方式無關的說法。
 
 **驗收**：wheel_smoke 通過、原 smoke.sh 通過、全 gates 綠、dev 流程（vite proxy）不變。
@@ -71,7 +71,7 @@
 **Logging（item 5）**：
 
 - 新 `services/llm_log.py`：每次 LLM 互動一筆結構化紀錄（id、時間、workflow 名、模型、每個 attempt 的 request/response 全文與字數、usage tokens、耗時、結局分類 ok/invalid_output/upstream_error/timeout/not_configured）。**絕不記 base_url/api_key**（沿用既有安全不變量；caplog 防洩漏測試必須續過）。
-- Sink 三層：in-memory ring（預設 50 筆，含全文）→ `GET /api/llm/logs`（摘要清單）+ `GET /api/llm/logs/{id}`（全文）；可選 `LLM_LOG_FILE` JSONL 追加檔（預設關）；stdlib logging `context_memory.llm` INFO 一行摘要（無內文、無設定值）→ uvicorn console 即時可見。
+- Sink 三層：in-memory ring（預設 50 筆，含全文）→ `GET /api/llm/logs`（摘要清單）+ `GET /api/llm/logs/{id}`（全文）；可選 `LLM_LOG_FILE` JSONL 追加檔（預設關）；stdlib logging `afterthread.llm` INFO 一行摘要（無內文、無設定值）→ uvicorn console 即時可見。
 - `generate_structured` 內建 recorder（含失敗路徑 finally 收尾）；`memory_ai` 各工作流傳入 workflow 名。
 - FE：新路由「AI 日誌」頁（nav 進入），清單 + 展開詳情，手動重新整理；沿用既有 fetch/requestId 模式與 zh-TW 文案。
 

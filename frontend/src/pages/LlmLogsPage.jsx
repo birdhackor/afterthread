@@ -25,7 +25,7 @@ import { usePageTitle } from "../hooks/usePageTitle.js";
 const LIST_LIMIT = 50;
 
 // Workflow -> zh-TW label. Mirrors the workflow names generate_structured is
-// called with (context_memory/services/memory_ai.py); an unrecognized value
+// called with (afterthread/services/memory_ai.py); an unrecognized value
 // falls back to 其他 rather than showing a raw English token.
 const WORKFLOW_LABELS = {
 	capture: "快速捕捉",
@@ -35,7 +35,7 @@ const WORKFLOW_LABELS = {
 };
 
 // Outcome -> badge label + color, matching the service's outcome vocabulary
-// (context_memory/services/llm.py). ok is the only success; timeout and
+// (afterthread/services/llm.py). ok is the only success; timeout and
 // upstream_error are both red (an upstream/deadline failure), invalid_output is
 // orange (the model replied but unusably), not_configured is a neutral gray.
 const OUTCOME_META = {
