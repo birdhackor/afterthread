@@ -223,14 +223,21 @@ wait_log_line() {
     return 1
 }
 
-# port_from_log FILE PATTERN -> prints the run of digits immediately after
-# PATTERN's first occurrence in FILE, else empty. Callers must wait_log_line
-# for PATTERN first (bounded wait) -- this performs one synchronous read of
-# an already-written line, never a poll of its own.
+# port_from_log FILE PATTERN -> prints the first run of digits after PATTERN's
+# first occurrence in FILE, else empty. ANSI CSI styling is removed first:
+# color-aware tools may wrap the port itself (for example ESC[1m46613ESC[22m),
+# whose style parameter would otherwise be mistaken for the bound port.
+# Callers must wait_log_line for PATTERN first (bounded wait) -- this performs
+# one synchronous read of an already-written line, never a poll of its own.
 port_from_log() {
     awk -v pat="$2" '
-        index($0, pat) {
-            rest = substr($0, index($0, pat) + length(pat))
+        BEGIN { ansi = sprintf("%c\\[[0-9;?]*[ -/]*[@-~]", 27) }
+        {
+            line = $0
+            gsub(ansi, "", line)
+        }
+        index(line, pat) {
+            rest = substr(line, index(line, pat) + length(pat))
             if (match(rest, /[0-9]+/)) { print substr(rest, RSTART, RLENGTH); exit }
         }
     ' "$1" 2>/dev/null
