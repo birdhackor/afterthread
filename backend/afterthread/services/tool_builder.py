@@ -704,24 +704,42 @@ async def _fetch_openapi(url: str) -> tuple[str | None, str | None]:
     private-CA deployment, see config.py); the default-off path constructs the
     client with EXACTLY the same arguments as before this flag existed -- no
     ``verify`` kwarg at all -- so ordinary behavior is byte-for-byte unchanged.
+
+    Client CONSTRUCTION -- not merely the request -- sits INSIDE the
+    asyncio.timeout scope on purpose, in BOTH branches above. Building an
+    httpx2.AsyncClient can do real synchronous work (TLS context / trust-store
+    initialization -- e.g. reading the system trust store or SSL_CERT_FILE),
+    and that cost must count against the SAME total deadline this function
+    promises its caller, never run for free before the clock starts. That is
+    why ``_client_cm`` below is a closure CALLED as with-item #2's expression
+    rather than a variable assigned before the ``async with``: with-item
+    expressions are evaluated left to right, each AFTER the previous item's
+    ``__aenter__`` returns, so calling it there -- instead of earlier --
+    defers ``httpx2.AsyncClient(...)`` itself until asyncio.timeout (with-item
+    #1) has already started its clock.
     """
-    try:
+
+    def _client_cm() -> httpx2.AsyncClient:
+        """Build the client for the current settings. Must stay a function
+        CALLED from within the ``async with`` below, not a variable computed
+        before it -- see the docstring above for why."""
         if get_settings().tls_no_verify:
-            client_cm = httpx2.AsyncClient(
+            return httpx2.AsyncClient(
                 timeout=_FETCH_TIMEOUT_SECONDS,
                 follow_redirects=True,
                 max_redirects=_FETCH_MAX_REDIRECTS,
                 verify=False,
             )
-        else:
-            client_cm = httpx2.AsyncClient(
-                timeout=_FETCH_TIMEOUT_SECONDS,
-                follow_redirects=True,
-                max_redirects=_FETCH_MAX_REDIRECTS,
-            )
+        return httpx2.AsyncClient(
+            timeout=_FETCH_TIMEOUT_SECONDS,
+            follow_redirects=True,
+            max_redirects=_FETCH_MAX_REDIRECTS,
+        )
+
+    try:
         async with (
             asyncio.timeout(_FETCH_TOTAL_TIMEOUT_SECONDS),
-            client_cm as client,
+            _client_cm() as client,
             client.stream("GET", url) as response,
         ):
             if response.status_code // 100 != 2:

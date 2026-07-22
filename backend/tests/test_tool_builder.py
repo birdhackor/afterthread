@@ -1318,6 +1318,64 @@ def test_fetch_openapi_total_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     assert elapsed < 2.0  # bounded by the 0.2s total deadline, not the 3600s hang
 
 
+def test_fetch_openapi_total_timeout_covers_client_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The total deadline (_FETCH_TOTAL_TIMEOUT_SECONDS) must bound client
+    CONSTRUCTION too, not just the request: httpx2.AsyncClient(...) can do real
+    synchronous work (TLS context / trust-store initialization), and a version
+    that builds the client BEFORE entering asyncio.timeout would let that work
+    run for free, silently extending the promised wall-clock bound. This is
+    NARROWER than test_fetch_openapi_total_timeout above, which uses a fake
+    whose __init__ is instant and so cannot tell "construction happened inside
+    the deadline" apart from "construction happened before it" -- entering
+    asyncio.timeout and then immediately calling client.__aenter__() looks
+    identical from that fake's point of view either way. Only the CONSTRUCTOR
+    call itself moved outside the timeout in the regression this pins, so the
+    fake here burns real wall-clock time in __init__ (a plain, blocking
+    time.sleep -- construction is ordinary synchronous code in production too,
+    exactly like the trust-store read it stands in for, so faking it with an
+    awaitable would test something asyncio.timeout never actually bounds)."""
+
+    class _HangingStream:
+        async def __aenter__(self) -> Any:
+            await asyncio.sleep(3600)  # never resolves within the tiny deadline
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+    class _SlowInitClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            # Stands in for synchronous TLS/trust-store setup cost. Real
+            # (blocking) time, on purpose -- see the docstring above.
+            time.sleep(0.2)
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+        def stream(self, *args: Any, **kwargs: Any) -> Any:
+            return _HangingStream()
+
+    monkeypatch.setattr(tool_builder.httpx2, "AsyncClient", _SlowInitClient)
+    monkeypatch.setattr(tool_builder, "_FETCH_TOTAL_TIMEOUT_SECONDS", 0.3)
+
+    started = time.monotonic()
+    text, error = asyncio.run(tool_builder._fetch_openapi("http://kb.example/openapi.json"))
+    elapsed = time.monotonic() - started
+
+    assert text is None
+    assert error is not None and error.startswith("OpenAPI 文件下載失敗")
+    # If construction runs INSIDE the timeout scope (fixed): the 0.2s __init__
+    # eats into the 0.3s budget, so the deadline still fires ~0.3s after this
+    # call started. If construction runs BEFORE asyncio.timeout is entered (the
+    # regression this pins): the deadline does not start counting until AFTER
+    # those 0.2s, so elapsed balloons to ~0.5s -- comfortably over this bound.
+    assert elapsed < 0.45
+
+
 def _capturing_async_client(captured: dict[str, Any]) -> type:
     """A fake httpx2.AsyncClient that records its constructor kwargs into
     ``captured`` and serves a canned ``{}`` 200 response -- exercises
