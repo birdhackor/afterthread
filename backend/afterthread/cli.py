@@ -693,6 +693,43 @@ def _write_env_tempfile(env_path: Path, content: bytes) -> Path:
     return tmp_path
 
 
+def _cleanup_published_tempfile(tmp_path: Path) -> None:
+    """Best-effort unlink of `tmp_path` for a publish that ALREADY succeeded.
+
+    Shared by `_publish_env_file_fresh`'s and `_publish_env_file_force`'s
+    success paths only -- a FAILED publish suppresses its own unlink error
+    inline instead, before its own exception/`typer.Exit` propagates (see
+    both callers' `except` blocks). This split is the fix for a confirmed
+    review finding: the old code unlinked `tmp_path` in one bare
+    `finally: tmp_path.unlink(missing_ok=True)` shared by success AND
+    failure alike, so a coincidental unlink error (permissions flipped on
+    the data dir, a transient filesystem error, ...) could do two different
+    kinds of damage depending on which side of the publish it landed on --
+    turn a genuinely SUCCESSFUL publish into a reported failure (the exact
+    scenario this function now owns), or replace whichever exception a
+    FAILED publish was already raising with an unrelated one, hiding the
+    real reason from the user.
+
+    By the time this runs, `env_path` already holds the published file --
+    for the fresh path, a second name for the same inode `tmp_path` names;
+    for `--force`, the rename target `tmp_path` was already renamed AWAY
+    from. Either way `tmp_path` itself is pure debris now, not data: a
+    leftover 0600 file sitting in the same private, user-only data
+    directory as `.env` is harmless, and never worth failing an
+    already-completed command over. So this never raises -- it prints one
+    zh-TW warning naming the leftover path, for the user to remove by hand,
+    and returns either way.
+    """
+    try:
+        tmp_path.unlink(missing_ok=True)
+    except OSError:
+        typer.echo(
+            f"警告：{tmp_path} 是 .env 發布後殘留的暫存檔，自動清理失敗，"  # noqa: RUF001
+            "請自行刪除；.env 本身已寫入成功，不受此警告影響。",  # noqa: RUF001
+            err=True,
+        )
+
+
 def _publish_env_file_fresh(tmp_path: Path, env_path: Path) -> None:
     """Publish `tmp_path` to `env_path` via a no-clobber hard link -- the no-`--force` path.
 
@@ -735,16 +772,36 @@ def _publish_env_file_fresh(tmp_path: Path, env_path: Path) -> None:
     command has no in-flight request to protect, so a Python traceback here
     is an acceptable, honest failure rather than something worth masking.
 
-    `tmp_path` is unlinked in a `finally` regardless of outcome: on success
-    it is a second name for the same inode `env_path` now also names, so
-    dropping it leaves that inode with exactly one name left (`env_path`)
-    and no debris; on refusal, `env_path` itself was never touched at all
-    (by construction of `link(2)`), so the temp file is the only cleanup
-    this function is ever responsible for.
+    Cleanup of `tmp_path` is asymmetric now, not one shared `finally` (see
+    `_cleanup_published_tempfile`'s docstring for the confirmed review
+    finding this closes): the `except` branch below suppresses its OWN
+    unlink error unconditionally, before either branch decides what to
+    raise -- `env_path` itself was never touched on this path (by
+    construction of `link(2)`), so the temp file is the only cleanup owed,
+    and a failure cleaning it up must never outrank the refusal, or the
+    original `OSError`, as what the user actually sees. The success path
+    instead routes through `_cleanup_published_tempfile`, which degrades a
+    cleanup failure to a stderr warning instead of an exit-code flip.
+
+    REVIEW RULING (durability vs. atomicity, adversarial review): `os.link`
+    above guarantees atomic VISIBILITY -- no reader ever observes a
+    half-written `.env` -- not durability of that directory entry across a
+    power loss. Neither this function nor `_publish_env_file_force` fsyncs
+    `env_path`'s parent directory afterward, deliberately: `init-env` is a
+    re-runnable bootstrap command, not a one-shot unrecoverable write, so a
+    crash in that narrow window costs nothing worse than running it again --
+    the same call `afterthread/services/tools.py`'s own hardened writer
+    already makes for every file IT writes (no directory fsync there
+    either).
     """
     try:
         os.link(tmp_path, env_path)
     except OSError as exc:
+        # The publish did not happen -- see above -- so a coincidental
+        # unlink failure here must never be allowed to outrank WHY: always
+        # suppressed, before either branch below decides what propagates.
+        with contextlib.suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
         if exc.errno == errno.EEXIST:
             # link(2)'s own EEXIST already proves SOMETHING sits at
             # env_path; this lstat only decides which refusal describes it.
@@ -763,8 +820,8 @@ def _publish_env_file_fresh(tmp_path: Path, env_path: Path) -> None:
             )
             raise typer.Exit(1) from exc
         raise
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    else:
+        _cleanup_published_tempfile(tmp_path)
 
 
 def _publish_env_file_force(tmp_path: Path, env_path: Path) -> None:
@@ -785,16 +842,29 @@ def _publish_env_file_force(tmp_path: Path, env_path: Path) -> None:
     is even consulted, precisely so this function is never even asked to
     touch one.)
 
-    `tmp_path.unlink(missing_ok=True)` in the `finally` is a safe no-op on
-    the success path (the file was already renamed away from that name by
-    `os.replace`) and the real cleanup on any failure `os.replace` itself
-    raises -- so a half-finished `--force` can never leave a stray temp file
-    sitting in the data dir.
+    Cleanup mirrors `_publish_env_file_fresh` exactly -- see its docstring,
+    and `_cleanup_published_tempfile`'s, for the full review finding and the
+    durability ruling both publishers share. On failure, `os.replace` never
+    renamed anything onto `env_path`, so the `tmp_path` unlink below is
+    best-effort, any error suppressed, before the original exception
+    propagates unchanged -- exactly like a half-finished `--force` always
+    left no stray temp file behind. On success, unlinking `tmp_path` is
+    ordinarily a pure no-op -- `os.replace` already renamed that name away,
+    onto `env_path`, so there is nothing left even for `missing_ok=True` to
+    swallow -- but routing it through `_cleanup_published_tempfile` costs
+    nothing and means an unlikely failure here (e.g. a directory permission
+    pulled out from under this call between the two syscalls) degrades to
+    the same one stderr warning instead of flipping an already-successful
+    `--force` publish to a nonzero exit.
     """
     try:
         os.replace(tmp_path, env_path)
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
+        raise
+    else:
+        _cleanup_published_tempfile(tmp_path)
 
 
 @app.command(

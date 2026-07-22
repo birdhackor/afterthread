@@ -836,6 +836,144 @@ def test_init_env_fresh_publish_never_deletes_a_concurrently_published_env_file(
     assert remaining == [".env"]
 
 
+# --- CLI surface (typer): publish cleanup must never mask the publish's own
+# outcome (P10 review) -------------------------------------------------------
+#
+# Regression coverage for the confirmed finding that both publish primitives'
+# old, bare `finally: tmp_path.unlink(missing_ok=True)` could go wrong in two
+# different directions depending on which side of the publish a coincidental
+# unlink failure landed on: (a) after a SUCCESSFUL `os.link`/`os.replace`, the
+# unlink's own `OSError` propagated out of a command that had already done its
+# one job -- reporting a genuinely successful publish as a failure; (b) after
+# a FAILED publish, the unlink's `OSError` replaced whichever exception (the
+# polite EEXIST refusal's `typer.Exit(1)`, or an original `OSError`) was
+# already propagating -- masking the real reason with an unrelated one. Both
+# publishers now route success-path cleanup through `_cleanup_published_
+# tempfile` (cli.py), which degrades a cleanup failure to one zh-TW stderr
+# warning instead of an exit-code flip, while failure-path cleanup suppresses
+# its own error inline, before the original outcome ever propagates.
+#
+# `Path.unlink` is patched narrowly below -- only for names matching
+# `_write_env_tempfile`'s own mkstemp pattern (`.env.<rand>.tmp`) -- via a
+# module-global `monkeypatch.setattr("afterthread.cli.Path.unlink", ...)`
+# (the SAME class object `pathlib.Path` itself is, exactly like the
+# `afterthread.cli.os.write`/`os.fsync` patches above target the one real
+# `os` module), so these tests cannot accidentally intercept an unrelated
+# unlink call elsewhere.
+
+
+def test_init_env_fresh_publish_warns_but_still_succeeds_when_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # THE bug this closes, half (a): empirically confirmed against the
+    # pre-fix code (unmodified, as a RED check before this fix landed) --
+    # exit_code came back 1, `.env` existed with the full template bytes
+    # regardless, and `result.exception` was the masking `PermissionError`,
+    # not the clean, successful return this test now pins.
+    real_unlink = Path.unlink
+
+    def failing_unlink(self: Path, missing_ok: bool = False) -> None:
+        if self.name.startswith(".env.") and self.name.endswith(".tmp"):
+            raise OSError(errno.EACCES, "simulated cleanup failure")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr("afterthread.cli.Path.unlink", failing_unlink)
+
+    data_dir = tmp_path / "data"
+    result = runner.invoke(app, ["init-env", "--data-dir", str(data_dir)], prog_name="afterthread")
+
+    assert result.exit_code == 0, result.output
+    assert result.exception is None
+    template_bytes = resources.files("afterthread").joinpath("env.example").read_bytes()
+    env_path = data_dir / ".env"
+    assert env_path.read_bytes() == template_bytes
+
+    # The leftover temp file really is still on disk -- cleanup genuinely
+    # failed, it was not silently swallowed -- and the one stderr warning
+    # names that exact path so the user knows what to remove by hand.
+    leftovers = [p for p in data_dir.iterdir() if p.name != ".env"]
+    assert len(leftovers) == 1
+    assert "警告" in result.output
+    assert str(leftovers[0]) in result.output
+
+
+def test_init_env_fresh_publish_refusal_is_not_masked_by_a_failing_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # THE bug this closes, half (b): empirically confirmed against the
+    # pre-fix code -- `result.exception` was the masking `PermissionError`
+    # raised by the `finally` block's own unlink, not the clean
+    # `typer.Exit(1)` the EEXIST refusal actually raised, even though the
+    # printed refusal text (echoed BEFORE the old `finally` ran) looked
+    # identical either way -- so only inspecting `result.exception`'s type,
+    # not just the output text, actually catches a masking regression here.
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    env_path = data_dir / ".env"
+    env_path.write_text("EXISTING=1\n", encoding="utf-8")
+    before = env_path.read_bytes()
+
+    real_unlink = Path.unlink
+
+    def failing_unlink(self: Path, missing_ok: bool = False) -> None:
+        if self.name.startswith(".env.") and self.name.endswith(".tmp"):
+            raise OSError(errno.EACCES, "simulated cleanup failure")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr("afterthread.cli.Path.unlink", failing_unlink)
+
+    result = runner.invoke(app, ["init-env", "--data-dir", str(data_dir)], prog_name="afterthread")
+
+    assert result.exit_code == 1
+    # The ORIGINAL outcome -- typer's own clean exit, not the cleanup
+    # failure's raw OSError -- is what actually propagated.
+    assert isinstance(result.exception, SystemExit)
+    assert str(env_path) in result.output
+    assert "已存在" in result.output
+    assert env_path.read_bytes() == before  # untouched
+
+
+def test_init_env_force_publish_warns_but_still_succeeds_when_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Same masking-protection guarantee, the --force path: `os.replace`
+    # already succeeded (the new content is what ends up at env_path either
+    # way -- unlike the fresh path, `tmp_path`'s OWN name is already gone by
+    # the time cleanup runs, renamed onto env_path by os.replace itself, so
+    # there is no leftover file left for this test to point at on disk; the
+    # coincidental failure below stands in for something like a directory
+    # permission pulled out from under the call in between the two
+    # syscalls), so a coincidental cleanup failure afterward must still
+    # exit 0 with one stderr warning -- never flip an already-successful
+    # `--force` publish to a nonzero exit.
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    env_path = data_dir / ".env"
+    env_path.write_text("OLD=1\n", encoding="utf-8")
+
+    real_unlink = Path.unlink
+
+    def failing_unlink(self: Path, missing_ok: bool = False) -> None:
+        if self.name.startswith(".env.") and self.name.endswith(".tmp"):
+            raise OSError(errno.EACCES, "simulated cleanup failure")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr("afterthread.cli.Path.unlink", failing_unlink)
+
+    result = runner.invoke(
+        app, ["init-env", "--data-dir", str(data_dir), "--force"], prog_name="afterthread"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.exception is None
+    template_bytes = resources.files("afterthread").joinpath("env.example").read_bytes()
+    assert env_path.read_bytes() == template_bytes
+    # tmp_path's own name is gone (renamed onto env_path), not left behind.
+    assert sorted(p.name for p in data_dir.iterdir()) == [".env"]
+    assert "警告" in result.output
+    assert ".tmp" in result.output  # names the (already-renamed-away) temp path
+
+
 # --- CLI surface (typer): serve-only AFTERTHREAD_PORT must never block a
 # subcommand that does not read it (FIX-3, adversarial review) ---------------
 
