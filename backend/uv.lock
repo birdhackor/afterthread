@@ -28,11 +28,11 @@ dev = [
 requires-dist = [
     { name = "fastapi", extras = ["standard"], specifier = ">=0.138" },
     { name = "httpx2", specifier = ">=2.5.0" },
-    { name = "openai" },
-    { name = "pydantic-settings" },
-    { name = "sqlmodel" },
+    { name = "openai", specifier = ">=2.45.0" },
+    { name = "pydantic-settings", specifier = ">=2.14.2" },
+    { name = "sqlmodel", specifier = ">=0.0.39" },
     { name = "typer", specifier = ">=0.26.8" },
-    { name = "uvicorn" },
+    { name = "uvicorn", specifier = ">=0.51.0" },
 ]
 
 [package.metadata.requires-dev]

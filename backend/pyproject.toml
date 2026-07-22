@@ -29,12 +29,38 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Documentation",
 ]
+# FLOOR POLICY -- every dependency below MUST carry a version floor. Each
+# floor is the version this project's own gates (backend ruff/ty/pytest, e2e
+# smoke, and wheel_smoke.sh's lowest-direct-resolution release leg) actually
+# ran against -- i.e. whatever uv.lock resolves today, at the time the floor
+# was set. A bare, floorless dependency is FORBIDDEN: `uv lock` always picks
+# the newest compatible release for THIS checkout, so a bare entry looks
+# fine here, but any constraint-controlled install elsewhere (a private
+# index, a pip constraints file, `--resolution lowest`/`lowest-direct`, a
+# stale sibling lockfile) is free to satisfy the bare name with an ancient
+# release that installs cleanly and then fails at IMPORT TIME or in some
+# untested runtime path -- not a resolution error, so nothing catches it
+# before an end user's `afterthread` dies on first launch, before any config
+# is even read. Raising a floor (to a version the gates have since run
+# against) is always safe; lowering one, or reintroducing a bare dependency,
+# is not.
+#
+# openai>=2.45.0 is also an SDK-BEHAVIOR floor, not just an import-surface
+# one: afterthread/services/llm.py imports `DefaultAsyncHttpxClient` from
+# `openai` at MODULE LOAD (not lazily) -- absent in older 1.x releases that
+# still satisfy a bare "openai" -- and `_build_client` relies on two
+# behaviors confirmed by reading the installed 2.45.0 source: the SDK
+# re-applies its `timeout` per request regardless of an explicitly-supplied
+# `http_client`, and `max_retries=0` is tracked independently of
+# `http_client`. Neither is part of openai's public compatibility contract,
+# so 2.45.0 is the lowest version those two reads are actually known to hold
+# for.
 dependencies = [
     "fastapi[standard]>=0.138",
-    "uvicorn",
-    "sqlmodel",
-    "pydantic-settings",
-    "openai",
+    "uvicorn>=0.51.0",
+    "sqlmodel>=0.0.39",
+    "pydantic-settings>=2.14.2",
+    "openai>=2.45.0",
     "typer>=0.26.8",
     "httpx2>=2.5.0",
 ]
