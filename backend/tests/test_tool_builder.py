@@ -390,6 +390,34 @@ def test_run_shell_env_scrubbed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     assert "sk-secret-do-not-leak" not in result
 
 
+def test_run_shell_passes_through_tls_no_verify_when_on(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TLS_NO_VERIFY=1 reaches run_shell's env when the settings flag is on, so a
+    builder-tested `curl`/`python3` invocation can honor it too."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"), tls_no_verify=True)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    meta = _meta_by_name(staging)
+
+    result = _call(meta["run_shell"].handler, {"command": 'echo "T=${TLS_NO_VERIFY:-unset}"'})
+    assert "T=1" in result
+
+
+def test_run_shell_omits_tls_no_verify_when_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Default (flag off): TLS_NO_VERIFY is absent from run_shell's env entirely
+    -- not "0", simply not set."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    meta = _meta_by_name(staging)
+
+    result = _call(meta["run_shell"].handler, {"command": 'echo "T=${TLS_NO_VERIFY:-unset}"'})
+    assert "T=unset" in result
+
+
 # --- InstallResult sanitizer ---------------------------------------------------
 
 
@@ -1288,6 +1316,78 @@ def test_fetch_openapi_total_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     assert text is None
     assert error is not None and error.startswith("OpenAPI 文件下載失敗")
     assert elapsed < 2.0  # bounded by the 0.2s total deadline, not the 3600s hang
+
+
+def _capturing_async_client(captured: dict[str, Any]) -> type:
+    """A fake httpx2.AsyncClient that records its constructor kwargs into
+    ``captured`` and serves a canned ``{}`` 200 response -- exercises
+    _fetch_openapi's TLS_NO_VERIFY wiring without a real network connection,
+    mirroring test_fetch_openapi_total_timeout's fake-client pattern above."""
+
+    class _FakeResponse:
+        def __init__(self) -> None:
+            self.status_code = 200
+            self.headers: dict[str, str] = {}
+
+        async def aiter_bytes(self) -> Any:
+            yield b"{}"
+
+    class _FakeResponseCM:
+        async def __aenter__(self) -> Any:
+            return _FakeResponse()
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+    class _FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+        def stream(self, *args: Any, **kwargs: Any) -> Any:
+            return _FakeResponseCM()
+
+    return _FakeClient
+
+
+def test_fetch_openapi_tls_no_verify_off_omits_verify_kwarg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default (flag off): the client is constructed with NO ``verify`` kwarg at
+    all -- byte-identical to the arguments used before this flag existed."""
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(tool_builder.httpx2, "AsyncClient", _capturing_async_client(captured))
+    _install_settings(monkeypatch, tls_no_verify=False)
+
+    text, error = asyncio.run(tool_builder._fetch_openapi("http://kb.example/openapi.json"))
+
+    assert error is None
+    assert text == "{}"
+    assert "verify" not in captured
+
+
+def test_fetch_openapi_tls_no_verify_on_passes_verify_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flag on: the client is constructed with verify=False, on top of the SAME
+    other arguments (timeout / follow_redirects / max_redirects) as always."""
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(tool_builder.httpx2, "AsyncClient", _capturing_async_client(captured))
+    _install_settings(monkeypatch, tls_no_verify=True)
+
+    text, error = asyncio.run(tool_builder._fetch_openapi("http://kb.example/openapi.json"))
+
+    assert error is None
+    assert text == "{}"
+    assert captured.get("verify") is False
+    assert captured.get("timeout") == tool_builder._FETCH_TIMEOUT_SECONDS
+    assert captured.get("follow_redirects") is True
+    assert captured.get("max_redirects") == tool_builder._FETCH_MAX_REDIRECTS
 
 
 def test_run_install_fetch_failure_is_friendly(

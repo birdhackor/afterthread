@@ -13,10 +13,17 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from afterthread.config import get_settings
 from afterthread.db import init_db
 from afterthread.routers import ai, items, review, tools
 from afterthread.services import llm, llm_log
 from afterthread.services import tools as tools_service
+
+# The child logger for THIS module's own startup diagnostics, under the
+# "afterthread" namespace `_configure_app_logging` below attaches a console
+# handler to -- so a line logged here inherits that same handler/level/stream
+# without a second setup call, exactly like llm_log's "afterthread.llm" logger.
+_logger = logging.getLogger("afterthread.main")
 
 
 def _configure_app_logging() -> None:
@@ -109,8 +116,20 @@ _configure_secret_redaction()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
-    """Create database tables on startup."""
+    """Create database tables on startup, and warn if TLS verification is off.
+
+    The warning is ONE line, emitted at most once per process (lifespan runs
+    once per app startup), so an operator scanning startup logs cannot miss
+    that ``TLS_NO_VERIFY`` -- a deliberate, security-relevant opt-in (see
+    config.py) -- is active for this run.
+    """
     init_db()
+    if get_settings().tls_no_verify:
+        _logger.warning(
+            "TLS_NO_VERIFY is set: outbound TLS certificate verification is "
+            "DISABLED for the OpenAPI-document fetch, the LLM endpoint, and "
+            "(where a tool honors it) installed tool subprocesses."
+        )
     yield
 
 

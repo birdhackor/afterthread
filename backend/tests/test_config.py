@@ -13,6 +13,28 @@ from pydantic import ValidationError
 
 from afterthread.config import Settings
 
+# `tls_no_verify` disables outbound TLS certificate/hostname verification for
+# every connection the backend itself makes (the OpenAPI fetch, the LLM
+# endpoint), and is passed through to tool subprocesses as TLS_NO_VERIFY=1. No
+# env_prefix is configured (see model_config), so the environment variable name
+# is exactly `TLS_NO_VERIFY`. Default False -- verification stays ON -- since
+# turning it off makes a man-in-the-middle attack possible against any of those
+# connections; it exists only for intranet self-signed/private-CA deployments.
+
+
+def test_tls_no_verify_default_is_false() -> None:
+    assert Settings().tls_no_verify is False
+
+
+def test_tls_no_verify_truthy_string_parses_true() -> None:
+    assert Settings(tls_no_verify="1").tls_no_verify is True
+
+
+def test_tls_no_verify_env_var_name_is_exact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No env_prefix is configured, so the env var is exactly TLS_NO_VERIFY."""
+    monkeypatch.setenv("TLS_NO_VERIFY", "1")
+    assert Settings().tls_no_verify is True
+
 
 def test_stale_after_days_lower_bound_accepted() -> None:
     assert Settings(stale_after_days=0).stale_after_days == 0

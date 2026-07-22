@@ -31,6 +31,29 @@ class Settings(BaseSettings):
     # docs/web-v2-decisions.md.
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    # DISABLES certificate AND hostname verification for every outbound TLS
+    # connection this backend itself makes: the OpenAPI-document fetch
+    # (afterthread/services/tool_builder.py's _fetch_openapi) and the LLM
+    # endpoint traffic (afterthread/services/llm.py's _build_client). It is ALSO
+    # passed through -- as the literal env var TLS_NO_VERIFY=1 -- into every tool
+    # SUBPROCESS this backend runs: an installed tool's own env (built by
+    # afterthread/services/tools.py's _build_tool_env) and the installer's
+    # run_shell meta-tool (tool_builder.py's _run_shell_subprocess) -- so a
+    # generated tool MAY honor it too (see the builder system prompt's urllib
+    # guidance), though nothing here forces a tool's own HTTP code to actually
+    # check it.
+    #
+    # Exists for INTRANET deployments sitting behind a self-signed or
+    # private-CA certificate this backend's trust store does not carry, where
+    # every connection above would otherwise fail closed with a certificate
+    # verification error. The default is False -- verification stays ON -- and
+    # this must NEVER be flipped on silently: turning it off makes a
+    # man-in-the-middle attack against ANY of the connections above possible,
+    # since refusing exactly that is the whole point of TLS verification. It is
+    # therefore a strict, explicit OPERATOR opt-in for a network they already
+    # trust, never a default this codebase would choose on the user's behalf.
+    tls_no_verify: bool = False
+
     # OpenAI-compatible endpoint. Intentionally left empty here; the user
     # will fill in the real URL later via backend/.env. Never invent one.
     openai_base_url: str = ""

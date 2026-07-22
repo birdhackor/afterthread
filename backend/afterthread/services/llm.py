@@ -43,9 +43,16 @@ from typing import Any, cast
 # ``_get_client`` below. This module's URL validation exists to MIRROR that
 # SDK behavior, so it must parse with the SDK's OWN library. httpx2 (this
 # project's HTTP client elsewhere -- see ``services/tool_builder.py``) must
-# NOT be substituted here, or the mirror guarantee silently breaks.
+# NOT be substituted here, or the mirror guarantee silently breaks. The one
+# other httpx-family object this file constructs -- ``DefaultAsyncHttpxClient``
+# (imported from ``openai``, NOT from ``httpx`` itself) in ``_build_client``,
+# used ONLY to pass ``verify=False`` when ``settings.tls_no_verify`` is on --
+# is the SDK's OWN wrapper around this SAME pinned transport (it exists so an
+# operator can override just the TLS behavior while keeping the SDK's other
+# transport defaults), so it carries no second httpx dependency and does not
+# violate this boundary either.
 import httpx
-from openai import AsyncOpenAI, OpenAIError
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient, OpenAIError
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 from pydantic import BaseModel, ValidationError
 
@@ -338,13 +345,18 @@ def llm_configured() -> bool:
 
 
 @lru_cache(maxsize=8)
-def _build_client(base_url: str, api_key: str, timeout: float) -> AsyncOpenAI:
-    """Construct (and cache) an AsyncOpenAI client for the given config triple.
+def _build_client(base_url: str, api_key: str, timeout: float, tls_no_verify: bool) -> AsyncOpenAI:
+    """Construct (and cache) an AsyncOpenAI client for the given config quadruple.
 
     Cached rather than rebuilt per call so the SDK's connection pool is reused,
     but keyed on the config values themselves so that changing configuration
     (in production via a restart, in tests via a settings override) yields a
-    fresh client instead of a stale one bound to the old endpoint.
+    fresh client instead of a stale one bound to the old endpoint. ``tls_no_verify``
+    is part of that key for the SAME reason: it decides whether an ``http_client``
+    with ``verify=False`` is handed to the SDK (see below), so without it in the
+    key a client already cached under one flag value would be silently REUSED
+    once a test (or any future settings-reload path) flips the flag -- keeping
+    verification off (or back on) longer than the caller intended.
 
     ``max_retries=0`` disables the SDK's automatic transport retries: a retry
     would silently wait out the whole per-attempt timeout again (plus
@@ -353,7 +365,10 @@ def _build_client(base_url: str, api_key: str, timeout: float) -> AsyncOpenAI:
     interactive tool where the user would rather retry from the UI. One request,
     one timeout, no hidden multiplier. This is deliberately distinct from
     ``generate_structured``'s ONE corrective retry, which re-prompts only on a
-    bad-SHAPE output, never on a transport error.
+    bad-SHAPE output, never on a transport error. This holds regardless of
+    ``tls_no_verify``: an explicitly-supplied ``http_client`` never touches
+    ``max_retries``, which is tracked by the SDK's OWN client-level attribute
+    (confirmed by reading the installed SDK source; see P9's decisions).
 
     That alone does NOT make ``openai_timeout_seconds`` an end-to-end
     wall-clock bound, though: the ``timeout`` passed here only configures the
@@ -364,8 +379,30 @@ def _build_client(base_url: str, api_key: str, timeout: float) -> AsyncOpenAI:
     end-to-end deadline is the ``asyncio.timeout`` wrapped around the whole
     attempt loop in ``generate_structured``; this client-level timeout stays in
     place alongside it as an inner belt that still fast-fails a dead
-    connect/read leg without waiting for the outer deadline.
+    connect/read leg without waiting for the outer deadline. This ALSO holds
+    regardless of ``tls_no_verify``: the SDK re-applies ``timeout`` (this
+    function's own parameter, resolved from ``openai_timeout_seconds``) as a
+    PER-REQUEST override on every call it builds, rather than trusting whatever
+    default timeout an explicitly-supplied ``http_client`` was constructed
+    with -- so passing our own ``http_client`` below never loosens this bound
+    (confirmed by reading the installed SDK source; see P9's decisions).
+
+    When ``tls_no_verify`` is on, the client is built with
+    ``http_client=DefaultAsyncHttpxClient(verify=False)`` -- the openai
+    package's OWN wrapper around its pinned httpx transport (see the
+    ``import httpx`` boundary comment above), used here ONLY to override TLS
+    verification while it still supplies the SDK's other transport defaults.
+    When off, NO ``http_client`` kwarg is passed at all, so the call is
+    byte-for-byte identical to before this flag existed.
     """
+    if tls_no_verify:
+        return AsyncOpenAI(
+            base_url=base_url,
+            api_key=api_key or _UNSET_API_KEY_PLACEHOLDER,
+            timeout=timeout,
+            max_retries=0,
+            http_client=DefaultAsyncHttpxClient(verify=False),
+        )
     return AsyncOpenAI(
         base_url=base_url,
         api_key=api_key or _UNSET_API_KEY_PLACEHOLDER,
@@ -403,6 +440,7 @@ def _get_client() -> AsyncOpenAI:
             settings.openai_base_url.strip(),
             settings.openai_api_key,
             settings.openai_timeout_seconds,
+            settings.tls_no_verify,
         )
     except Exception:
         raise LLMNotConfiguredError("the configured LLM endpoint is invalid") from None

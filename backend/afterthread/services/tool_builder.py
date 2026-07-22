@@ -177,7 +177,9 @@ workspace; at runtime those values are injected into the tool's environment. \
 They are NOT auto-loaded inside your run_shell tests -- source them yourself \
 when testing: `set -a; . ./.env 2>/dev/null; set +a; ...`.
 - Prefer Python 3 with ONLY its standard library (urllib.request for HTTP), \
-so the tool runs anywhere without installing dependencies.
+so the tool runs anywhere without installing dependencies. If the environment \
+variable TLS_NO_VERIFY is set to a truthy value, skip TLS certificate \
+verification (for urllib.request: pass context=ssl._create_unverified_context()).
 
 Your meta-tools (the file tools below take paths RELATIVE to the workspace and \
 cannot reach outside it):
@@ -405,12 +407,21 @@ def _run_shell_subprocess(
     alone -- and it never enters any prompt (only this process env), so the model
     can use the key without ever seeing its value.
 
+    A SECOND, settings-derived addition sits between the allowlist and
+    ``extra_env``: when ``settings.tls_no_verify`` is on, ``TLS_NO_VERIFY=1`` is
+    injected too, so a builder-tested ``curl``/``python3`` invocation can honor
+    the same TLS opt-out the backend's own outbound connections do (see
+    config.py); it is simply absent -- never ``"0"`` -- when the flag is off,
+    mirroring the passthrough allowlist's own "absent means not set" contract.
+
     Output is drained by ``tools._communicate_bounded`` (NOT ``communicate``),
     which caps the single merged pipe as it reads instead of slurping the whole
     stream first: a command that spews far past the cap is killed at the cap, so a
     runaway ``yes``/``cat`` can never OOM the service before the cap is applied.
     """
     env = {name: os.environ[name] for name in tools._PASSTHROUGH_ENV if name in os.environ}
+    if get_settings().tls_no_verify:
+        env["TLS_NO_VERIFY"] = "1"
     if extra_env:
         env.update(extra_env)
     try:
@@ -687,15 +698,30 @@ async def _fetch_openapi(url: str) -> tuple[str | None, str | None]:
     exception CATEGORY, never ``str(exc)`` -- an httpx2 error string embeds the
     full URL, and while the URL is the user's own input (not a secret), the
     category is what is diagnostic; the URL is already on the user's screen.
+
+    TLS verification stays ON by default. Only when ``settings.tls_no_verify``
+    is true is the client built with ``verify=False`` (an intranet self-signed/
+    private-CA deployment, see config.py); the default-off path constructs the
+    client with EXACTLY the same arguments as before this flag existed -- no
+    ``verify`` kwarg at all -- so ordinary behavior is byte-for-byte unchanged.
     """
     try:
-        async with (
-            asyncio.timeout(_FETCH_TOTAL_TIMEOUT_SECONDS),
-            httpx2.AsyncClient(
+        if get_settings().tls_no_verify:
+            client_cm = httpx2.AsyncClient(
                 timeout=_FETCH_TIMEOUT_SECONDS,
                 follow_redirects=True,
                 max_redirects=_FETCH_MAX_REDIRECTS,
-            ) as client,
+                verify=False,
+            )
+        else:
+            client_cm = httpx2.AsyncClient(
+                timeout=_FETCH_TIMEOUT_SECONDS,
+                follow_redirects=True,
+                max_redirects=_FETCH_MAX_REDIRECTS,
+            )
+        async with (
+            asyncio.timeout(_FETCH_TOTAL_TIMEOUT_SECONDS),
+            client_cm as client,
             client.stream("GET", url) as response,
         ):
             if response.status_code // 100 != 2:

@@ -57,6 +57,7 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 
 | 變數 | 預設值 | 說明 |
 | --- | --- | --- |
+| `TLS_NO_VERIFY` | `false` | 關閉本服務**所有**對外連線的 TLS 憑證／主機名稱驗證：OpenAPI 文件下載、LLM endpoint 呼叫，並以 `TLS_NO_VERIFY=1` 透傳進已安裝工具（與安裝器 `run_shell`）的子行程環境（工具是否遵守則看工具自身實作）。僅供內網自簽憑證／私有 CA 環境使用；打開後上述連線即可能遭中間人攻擊，是維運者主動的安全取捨，絕不會被靜默開啟。 |
 | `OPENAI_BASE_URL` | `""`（空） | OpenAI-compatible endpoint 的 base URL。留空＝AI 功能未設定，手動 CRUD 不受影響。 |
 | `OPENAI_API_KEY` | `""`（空） | 對應 endpoint 的 API key。**不是**判斷「是否已設定」的條件之一——有些相容 gateway 不需要 key。 |
 | `OPENAI_MODEL` | `""`（空） | 呼叫該 endpoint 時使用的 model 名稱。與 `OPENAI_BASE_URL` 兩者都非空、且 base URL 可被解析為合法 http/https URL，才算「已設定」。 |
