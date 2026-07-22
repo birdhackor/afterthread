@@ -54,7 +54,16 @@ from afterthread.services.tool_builder import (
 def _reset_singletons() -> Generator[None]:
     """Empty the job table, the llm_log ring, and the process-wide known-secret
     registries around every test (all module-level singletons the installer
-    touches)."""
+    touches), then DRAIN the single-flight client-construction worker.
+
+    The drain is what makes the timing/threading fetch tests deterministic under
+    any collection order: a prior test's still-running (or still-queued) fake
+    construction occupies the ONE construction worker, and left there it would
+    queue behind and skew the NEXT timing test (or make the repeated-timeout
+    thread-count assertion race). Draining in teardown guarantees the next test
+    starts with an idle worker, whatever ran before it. Tests that block the
+    constructor on purpose release it in their own finally, so this drain never
+    hangs (its own timeout would fail loudly if one forgot)."""
     tool_builder._reset_jobs_for_tests()
     llm_log._reset_for_tests()
     tools._INFLIGHT_SECRETS.clear()
@@ -64,6 +73,7 @@ def _reset_singletons() -> Generator[None]:
     llm_log._reset_for_tests()
     tools._INFLIGHT_SECRETS.clear()
     tools._ENV_VALUE_CACHE.clear()
+    tool_builder._drain_setup_worker_for_tests()
 
 
 def _install_settings(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> Settings:
@@ -1429,6 +1439,146 @@ def test_fetch_openapi_total_timeout_preempts_client_construction(
     # Bounded by the 0.2s deadline, comfortably below the 0.6s constructor --
     # proves setup itself, not just the request after it, is now preemptible.
     assert elapsed < 0.45
+
+
+def test_fetch_openapi_construction_timeout_is_single_threaded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Repeated construction timeouts must NOT grow threads without bound.
+
+    THE FINDING (empirically demonstrated): run_in_threadpool cancels only the
+    AWAITER on a construction timeout, never the blocked pool thread, so every
+    retry after a construction timeout grabbed a FRESH pool thread -- 5
+    consecutive timeouts left 5 live "AnyIO worker thread"s (45 attempts -> 44
+    workers, past the 40-token limiter). The single-flight construction worker
+    bounds that to ONE dedicated daemon thread for the whole process: a hung
+    constructor ties up exactly that worker, and each subsequent fetch QUEUES
+    behind it and times out at its own deadline -- zero extra threads.
+
+    Drives 5 consecutive _fetch_openapi calls whose fake client __init__ blocks
+    well past the (tiny) total deadline. Asserts every call still returns the
+    friendly timeout outcome on time AND that at most ONE new thread was created
+    across all of them -- the dedicated worker, identified by its distinctive
+    name prefix. THAT is the discriminator: under the reverted run_in_threadpool
+    shape this same drive spawns ~5 anonymous pool threads (RED, len==5); here it
+    spawns exactly one named worker (GREEN, len==1). The blocking __init__ is
+    released in a finally so the worker returns to idle for the autouse drain."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    release = threading.Event()
+
+    class _BlockingInitClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            # Blocks PAST the tiny total deadline so construction always times
+            # out; released in the finally below so the single worker frees.
+            release.wait(timeout=30)
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+        def stream(self, *args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("construction times out before stream is reached")
+
+    monkeypatch.setattr(tool_builder.httpx2, "AsyncClient", _BlockingInitClient)
+    monkeypatch.setattr(tool_builder, "_FETCH_TOTAL_TIMEOUT_SECONDS", 0.2)
+
+    prefix = tool_builder._SETUP_THREAD_NAME
+    before_idents = {t.ident for t in threading.enumerate()}
+
+    async def drive() -> list[tuple[str | None, str | None, float]]:
+        outcomes: list[tuple[str | None, str | None, float]] = []
+        for _ in range(5):
+            started = time.monotonic()
+            text, error = await tool_builder._fetch_openapi("http://kb.example/openapi.json")
+            outcomes.append((text, error, time.monotonic() - started))
+        return outcomes
+
+    try:
+        outcomes = asyncio.run(drive())
+        new_threads = [t for t in threading.enumerate() if t.ident not in before_idents]
+
+        # Every call returns the friendly timeout outcome, bounded by the 0.2s
+        # deadline -- never the 30s the constructor would otherwise block for.
+        for text, error, elapsed in outcomes:
+            assert text is None
+            assert error is not None and error.startswith("OpenAPI 文件下載失敗")
+            assert elapsed < 2.0
+
+        # THE BOUND: however many constructions timed out, at most ONE new thread
+        # was created, and it is the dedicated single-flight worker -- never the
+        # unbounded fan-out of pool workers the finding produced.
+        assert len(new_threads) <= 1, [t.name for t in new_threads]
+        assert all(t.name.startswith(prefix) for t in new_threads), [t.name for t in new_threads]
+    finally:
+        release.set()
+
+
+def test_fetch_openapi_queued_construction_cancelled_before_start_never_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A fetch whose construction is still QUEUED behind a stuck one when its
+    deadline fires has its future cancelled while PENDING, so the worker SKIPS it
+    -- the constructor is NEVER called for it (invariant 3). This is what keeps a
+    backlog of abandoned retries from constructing anything.
+
+    A construction COUNTER proves it: the first fetch's construction reaches the
+    worker and blocks (RUNNING, count 1); a second fetch queues behind it and
+    times out while still PENDING (its future cancelled). After releasing the
+    stuck one and draining the worker to the second (cancelled) job,
+    set_running_or_notify_cancel() returns False for it, so the counter stays 1 --
+    the second constructor was skipped, never run. (Under the reverted
+    run_in_threadpool shape the second fetch would get its OWN pool thread and
+    construct too, so the counter would reach 2: this asserts the queue-behind
+    semantics, not per-call fan-out.)"""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    release = threading.Event()
+    lock = threading.Lock()
+    constructions = 0
+
+    class _CountingBlockingClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            nonlocal constructions
+            with lock:
+                constructions += 1
+            # Only the FIRST (worker-occupying) construction runs __init__; the
+            # queued second one is skipped BEFORE __init__ is ever entered.
+            release.wait(timeout=30)
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+        def stream(self, *args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("construction times out before stream is reached")
+
+    monkeypatch.setattr(tool_builder.httpx2, "AsyncClient", _CountingBlockingClient)
+    monkeypatch.setattr(tool_builder, "_FETCH_TOTAL_TIMEOUT_SECONDS", 0.2)
+
+    async def drive_two() -> None:
+        # First: its construction reaches the worker and blocks (RUNNING).
+        first_text, _ = await tool_builder._fetch_openapi("http://kb.example/first.json")
+        # Second: its construction QUEUES behind the still-blocked first, and is
+        # cancelled while PENDING when its own 0.2s deadline fires.
+        second_text, _ = await tool_builder._fetch_openapi("http://kb.example/second.json")
+        assert first_text is None and second_text is None
+
+    try:
+        asyncio.run(drive_two())
+        with lock:
+            assert constructions == 1  # only the stuck one ran; second still queued
+        # Release the stuck construction and let the worker drain to the second
+        # (cancelled) job: set_running_or_notify_cancel() returns False for it, so
+        # it is SKIPPED -- the constructor count stays 1, never 2.
+        release.set()
+        tool_builder._drain_setup_worker_for_tests(timeout=5)
+        with lock:
+            assert constructions == 1
+    finally:
+        release.set()
 
 
 def _capturing_async_client(captured: dict[str, Any]) -> type:

@@ -57,15 +57,18 @@ the user re-runs the install). Bounded to the most recent ``_MAX_JOBS``.
 """
 
 import asyncio
+import concurrent.futures
 import contextlib
 import os
+import queue
 import shutil
 import subprocess
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import httpx2
@@ -683,6 +686,144 @@ def _build_meta_tools(staging: Path, secret_env: dict[str, str] | None = None) -
     ]
 
 
+# --- single-flight client construction --------------------------------------
+#
+# Building the OpenAPI-fetch client is routed through ONE dedicated daemon
+# thread, NOT starlette's run_in_threadpool. This is a hard invariant, not an
+# optimization -- the comments here and in _fetch_openapi are the contract.
+#
+# WHY NOT run_in_threadpool. asyncio.timeout preempts by cancelling the AWAIT,
+# never the worker: when the deadline fires mid-construction the pool waiter is
+# cancelled and its capacity token released, but the underlying pool thread
+# keeps running the blocked constructor to completion. Every retry after a
+# construction timeout therefore grabs ANOTHER fresh pool thread -- N
+# consecutive construction timeouts leave N live workers (empirically: 45
+# attempts spawned 44 threads, past the 40-token limiter). So "a hung
+# constructor ties up one bounded worker" was FALSE: threads and memory grew
+# without bound, and that non-daemon growth could also impede process exit.
+#
+# THE BOUND enforced instead (each numbered invariant is load-bearing):
+#  (1) AT MOST ONE construction thread exists for the whole process lifetime,
+#      started lazily, daemon=True -- a genuinely hung syscall then occupies
+#      exactly ONE daemon thread that can NEVER block interpreter exit (Python
+#      cannot kill a blocked thread, but a daemon one is abandoned at exit).
+#  (2) Callers submit (make_client, Future) onto _SETUP_QUEUE and await the
+#      future via asyncio.wrap_future INSIDE the caller's asyncio.timeout, so
+#      deadline preemption of SETUP works exactly as before -- wrap_future turns
+#      the deadline's task-cancellation into a prompt CancelledError at the
+#      await even while the constructor is already RUNNING on the worker.
+#  (3) A waiter whose deadline fires cancels its future; the worker gates every
+#      job on set_running_or_notify_cancel(), so a future cancelled BEFORE it
+#      starts is SKIPPED without ever calling the constructor -- a backlog of
+#      abandoned retries constructs nothing.
+#  (4) A construction that finishes AFTER its waiter gave up is dropped safely.
+#      cancel() on a RUNNING concurrent future returns False and leaves it
+#      RUNNING (it does NOT flip to CANCELLED), so the worker's later
+#      set_result() lands on a RUNNING->FINISHED transition, never the CANCELLED
+#      state that would raise InvalidStateError. wrap_future then finds its
+#      asyncio destination already cancelled and discards the result. The
+#      orphaned client was never __aenter__'d and httpx2 opens sockets lazily,
+#      so dropping it holds nothing open.
+#  (5) A truly stuck construction makes SUBSEQUENT fetches QUEUE behind it and
+#      time out honestly at their OWN deadline -- zero extra threads. THAT is
+#      the bounded promise, now true.
+
+# The single construction thread's name. Distinctive on purpose: it is the ONE
+# thread that may carry a hung client constructor, so the repeated-timeout test
+# identifies it by this prefix and asserts it never multiplies.
+_SETUP_THREAD_NAME = "afterthread-openapi-client-setup"
+
+# Each job is (callable, future-to-resolve-with-its-result). The worker is
+# deliberately heterogeneous -- it runs whatever callable it is handed and
+# resolves that job's own future -- so the test-only drain PING (a no-op job)
+# can ride the SAME FIFO queue to observe the worker has caught up. ``object``
+# is the honest element type; the sole production submitter
+# (_run_in_setup_worker) narrows its own result back to AsyncClient.
+_SetupJob = tuple[Callable[[], object], concurrent.futures.Future[object]]
+_SETUP_QUEUE: queue.SimpleQueue[_SetupJob] = queue.SimpleQueue()
+_SETUP_WORKER_LOCK = threading.Lock()
+_SETUP_WORKER: threading.Thread | None = None
+
+
+def _setup_worker_loop() -> None:
+    """The single construction thread: run queued jobs one at a time, forever.
+
+    Every job is gated on set_running_or_notify_cancel(): a job whose waiter
+    already gave up (future CANCELLED while it sat in the queue) returns False
+    and is SKIPPED -- the callable never runs (invariant 3). A job that DOES
+    start runs to completion even if its waiter later gives up; a RUNNING future
+    cannot transition to CANCELLED, so the terminating set_result/set_exception
+    can never race into InvalidStateError (invariant 4). Nothing the callable
+    raises escapes this loop, so one bad construction can never kill the worker;
+    a truly hung one blocks THIS thread (and queues everything behind it), the
+    bounded cost invariant (5) promises.
+    """
+    while True:
+        make, fut = _SETUP_QUEUE.get()
+        if not fut.set_running_or_notify_cancel():
+            continue
+        try:
+            result = make()
+        except Exception as exc:
+            fut.set_exception(exc)
+        else:
+            fut.set_result(result)
+
+
+def _ensure_setup_worker() -> None:
+    """Start the single construction thread on first use; a no-op thereafter.
+
+    Double-checked under _SETUP_WORKER_LOCK so concurrent first-callers create
+    exactly ONE thread (invariant 1). The is_alive() re-check also self-heals the
+    (practically impossible) case of the loop having died, and never runs two
+    workers at once.
+    """
+    global _SETUP_WORKER
+    if _SETUP_WORKER is not None and _SETUP_WORKER.is_alive():
+        return
+    with _SETUP_WORKER_LOCK:
+        if _SETUP_WORKER is not None and _SETUP_WORKER.is_alive():
+            return
+        worker = threading.Thread(target=_setup_worker_loop, name=_SETUP_THREAD_NAME, daemon=True)
+        worker.start()
+        _SETUP_WORKER = worker
+
+
+async def _run_in_setup_worker(make_client: Callable[[], httpx2.AsyncClient]) -> httpx2.AsyncClient:
+    """Build the client on the single construction thread, awaited under the
+    caller's asyncio.timeout so the deadline preempts SETUP exactly as before.
+
+    The (callable, future) pair is queued and the future awaited via
+    asyncio.wrap_future, which forwards the deadline's task-cancellation to the
+    concurrent future -- cancelling it if still queued (invariant 3) -- and
+    raises CancelledError at THIS await promptly even when the constructor is
+    already RUNNING on the worker (invariant 4). Replaces run_in_threadpool for
+    THIS one call so a hung constructor occupies at most the one bounded worker.
+    """
+    _ensure_setup_worker()
+    fut: concurrent.futures.Future[object] = concurrent.futures.Future()
+    _SETUP_QUEUE.put((make_client, fut))
+    return cast(httpx2.AsyncClient, await asyncio.wrap_future(fut))
+
+
+def _drain_setup_worker_for_tests(timeout: float = 10.0) -> None:
+    """Block until the construction worker has processed everything queued so
+    far and is idle again -- TEST-ONLY, called from the suite's autouse reset.
+
+    A prior test's still-running (or still-queued) fake construction occupies the
+    single worker; left there it would queue behind and skew the NEXT timing
+    test. A PING job (a no-op callable) rides the SAME FIFO queue: once its future
+    resolves, every job ahead of it -- including a formerly-blocked constructor
+    the test has since released -- has drained, so the worker is provably idle.
+    The timeout turns a test that forgot to release its block into a loud failure
+    here rather than a hang.
+    """
+    _ensure_setup_worker()
+    ping: concurrent.futures.Future[object] = concurrent.futures.Future()
+    _SETUP_QUEUE.put((lambda: None, ping))
+    ping.result(timeout=timeout)
+
+
 # --- the OpenAPI fetch -------------------------------------------------------
 
 
@@ -706,34 +847,40 @@ async def _fetch_openapi(url: str) -> tuple[str | None, str | None]:
     ``verify`` kwarg at all -- so ordinary behavior is byte-for-byte unchanged.
 
     Client CONSTRUCTION -- not merely the request -- sits INSIDE the
-    asyncio.timeout scope on purpose, in BOTH branches above, AND is called via
-    ``run_in_threadpool`` rather than directly (P9 review r2). Building an
-    httpx2.AsyncClient can do real synchronous work (TLS context / trust-store
-    initialization -- e.g. reading the system trust store or SSL_CERT_FILE),
-    and a synchronous call has no AWAIT point for asyncio.timeout's scheduled
-    cancellation to land on: the deadline could START counting before it, but
-    could never PREEMPT it mid-call, and the event loop sits blocked running it
-    -- for every other task too -- meanwhile. Routing it through
-    ``run_in_threadpool`` fixes both: the call becomes an awaited Future the
-    same clock CAN cancel, and the blocking work moves off the event loop
-    while it runs. That is why ``_client_cm`` below is a closure called (via
-    ``run_in_threadpool``) as with-item #2's expression rather than a variable
-    assigned before the ``async with``: with-item expressions are evaluated
-    left to right, each AFTER the previous item's ``__aenter__`` returns, so
-    calling it there -- instead of earlier -- defers ``httpx2.AsyncClient(...)``
-    itself until asyncio.timeout (with-item #1) has already started its clock,
-    AND makes the call one that same clock can interrupt. On expiry
-    mid-construction: the abandoned client was never entered (its
-    ``__aenter__`` never ran), so it holds no sockets (httpx2 opens
-    connections lazily) and is simply garbage-collected once the worker thread
-    returns it; the worker thread itself keeps running the blocked call to
-    completion in the background regardless -- one bounded thread tied up by a
-    truly hung syscall is accepted, since Python cannot kill a blocked thread.
+    asyncio.timeout scope on purpose, in BOTH branches above, AND runs on the
+    dedicated single-flight construction worker (``_run_in_setup_worker``, whose
+    contract is stated above) rather than starlette's ``run_in_threadpool``.
+    Building an httpx2.AsyncClient can do real synchronous work (TLS context /
+    trust-store initialization -- e.g. reading the system trust store or
+    SSL_CERT_FILE), and a synchronous call has no AWAIT point for
+    asyncio.timeout's scheduled cancellation to land on: the deadline could
+    START counting before it but could never PREEMPT it mid-call, and the event
+    loop would sit blocked running it -- for every other task too -- meanwhile.
+    Awaiting the worker's future fixes both: the call becomes an awaited Future
+    the same clock CAN cancel, and the blocking work runs off the event loop.
+    ``run_in_threadpool`` would ALSO give those two, but NOT the crucial third
+    property -- when the deadline preempts the await it cancels only the WAITER,
+    never the blocked pool thread, so each retry after a construction timeout
+    grabbed a FRESH pool thread and N timeouts leaked N live workers (the finding
+    this fix closes). ``_run_in_setup_worker`` bounds that to ONE daemon thread
+    for the whole process: a hung constructor ties up exactly that worker,
+    subsequent fetches QUEUE behind it and time out at their own deadline, and no
+    thread ever multiplies. That is also why ``_client_cm`` below is a closure
+    CALLED as with-item #2's expression rather than a variable assigned before
+    the ``async with``: with-item expressions are evaluated left to right, each
+    AFTER the previous item's ``__aenter__`` returns, so calling it there defers
+    the construction submission until asyncio.timeout (with-item #1) has already
+    started its clock. On expiry mid-construction the abandoned client was never
+    entered (its ``__aenter__`` never ran), so it holds no sockets (httpx2 opens
+    connections lazily) and is dropped safely once the worker returns it (the
+    worker's set_result lands on a still-RUNNING future, never a cancelled one,
+    so it cannot raise); the daemon worker keeps running the blocked call in the
+    background, which -- being daemon -- can never block interpreter exit.
     """
 
     def _client_cm() -> httpx2.AsyncClient:
         """Build the client for the current settings. Must stay a function
-        CALLED (via ``run_in_threadpool``) from within the ``async with``
+        CALLED (via ``_run_in_setup_worker``) from within the ``async with``
         below, not a variable computed before it -- see the docstring above
         for why."""
         if get_settings().tls_no_verify:
@@ -752,7 +899,7 @@ async def _fetch_openapi(url: str) -> tuple[str | None, str | None]:
     try:
         async with (
             asyncio.timeout(_FETCH_TOTAL_TIMEOUT_SECONDS),
-            await run_in_threadpool(_client_cm) as client,
+            await _run_in_setup_worker(_client_cm) as client,
             client.stream("GET", url) as response,
         ):
             if response.status_code // 100 != 2:
