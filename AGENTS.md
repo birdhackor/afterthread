@@ -21,6 +21,17 @@ This repo is a personal afterthread system for preventing architectural knowledg
 
 跨 0.2.0 / 0.3.0 兩次 release、十餘輪 codex review 修出來的**類別**教訓。寫碼與自審先過這份清單,別讓同類問題再進 review。
 
+### codex review loop 操作(本機環境實測,P8–P10 兩個 session 踩過)
+
+- **launcher 行程就是 turn 驅動器**:`adversarial-review --background` 的 node(codex-companion.mjs)行程一死,server 端 job 不會自己跑完——job log 直接凍結成孤兒(實例:一次凍在 starting、一次凍在 verifying 中的 pytest)。「--background」不代表 launcher 可以死。
+- **啟動方式**:Claude Code 的背景任務會被系統中止(同 session 內兩度殺掉 launcher),所以 review 一律用 `setsid nohup node <codex-companion.mjs> adversarial-review --background … > log 2>&1 < /dev/null &` 完全脫離行程樹啟動。
+- **等待方式**:不要用 `--wait` 串流(中繼不可靠,舊教訓)。輪詢 `status --all` 等 job 離開 running,並搭配 stall 偵測:job log(`plugins/data/codex-openai-codex/state/<repo>/jobs/*.log`)mtime 超過 240 秒仍 running 就是凍死,別再等。Claude Code 內用 Monitor 工具跑這個迴圈(前景 sleep 會被擋、背景 bash 會被殺)。
+- **取結果**:`result` 只對 finished job 有效;job 還在跑時會回「No job found」——那不是 job 不見了,是還沒完成。
+- **孤兒清理**:凍結的 job 用 `cancel <job-id>` 清;被取消的 job 可能留下 bwrap sandbox 行程(pytest 等卡在裡面),每輪結束後 `pgrep -af codex-linux-sandbox` 檢查、照 PID kill。
+- **review 期間**:以 committed HEAD 發動(先 commit 再 review),期間不要弄髒 working tree。
+- 一輪 adversarial review 約 5–15 分鐘;launch 指令本身可能同步準備超過 2 分鐘才回,是正常的。
+
+
 ### 非同步與取消
 
 - 重構比對父提交時,「建構參數 byte-identical」不夠——資源/期限的 **scope 巢狀順序**也是行為(client 建構曾被移出 `asyncio.timeout` 範圍而漏計時)。
