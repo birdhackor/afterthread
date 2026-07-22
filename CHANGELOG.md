@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-23
+
+- 新增 `afterthread init-env` 指令:把套件內建的 `env.example` 範本寫到資料目錄成 `.env`(已存在時拒絕覆寫,`--force` 可強制);範本自本版起隨 wheel 打包(原 `backend/.env.example` 移入套件成 `afterthread/env.example`)。
+- CLI 內部改為 callback+子指令結構:裸 `afterthread` 與 `--host`/`--port`/`--data-dir`/`--version` 行為皆不變;頂層選項誤放在子指令之前會直接報錯並提示正確位置,而不是被靜默忽略。
+
 ## [0.2.0] - 2026-07-22
 
 - HTTP client 遷移至 httpx2(Pydantic 接手維護的 httpx 後繼);openai SDK 邊界因其自身依賴 httpx<1,維持使用 httpx。
