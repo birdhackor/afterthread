@@ -42,8 +42,8 @@ pipx install afterthread
 
 ## AI 設定與隱私
 
-手動新增、編輯、刪除、篩選與回顧不需要 LLM。若要啟用 AI 功能，請在資料目錄
-建立 `.env`：
+手動新增、編輯、刪除、篩選與回顧不需要 LLM。若要啟用 AI 功能，請先執行
+`afterthread init-env` 在資料目錄建立 `.env` 範本，再編輯以下設定：
 
 ```dotenv
 OPENAI_BASE_URL=https://your-endpoint.example/v1

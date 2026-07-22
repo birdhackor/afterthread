@@ -4,11 +4,13 @@
 #
 # Builds the real wheel (scripts/build-wheel.sh), installs and runs it via
 # `uvx` -- exactly how an end user would, per README's `uvx` install story --
-# and drives the packaged app's HTTP surface with curl. This is the only
-# harness that exercises the actual installed artifact: e2e/smoke.sh drives
-# the backend via `uv run uvicorn` from a checkout and never touches
-# packaging (wheel contents, the `afterthread` console script, SPA static
-# serving, or the `cli.py` data-dir/`.env` wiring) at all.
+# and drives the packaged app's HTTP surface with curl, plus (INIT-ENV
+# section below) the `afterthread init-env` subcommand directly, no HTTP
+# involved. This is the only harness that exercises the actual installed
+# artifact: e2e/smoke.sh drives the backend via `uv run uvicorn` from a
+# checkout and never touches packaging (wheel contents, the `afterthread`
+# console script, SPA static serving, or the `cli.py` data-dir/`.env`
+# wiring) at all.
 #
 # Run from the repo root:  bash e2e/wheel_smoke.sh
 # Prerequisites:            uv (provides `uvx`), pnpm (frontend build), and
@@ -533,6 +535,109 @@ ENVEOF
         pass "no database in the launch CWD (relative path anchored by cli.py's chdir)"
     else
         fail "no database in the launch CWD (relative path anchored by cli.py's chdir)"
+    fi
+
+    echo ""
+    echo "========== INIT-ENV (afterthread init-env) =========="
+    # Independent of the SERVE leg above: its own fresh data dir under
+    # $TMPDIR_E2E (cleaned up for free by teardown's existing
+    # `rm -rf "$TMPDIR_E2E"`), so this leg can never interact with $DATA_DIR
+    # (already live with a bound DB/.env for the SERVE assertions above).
+    # Deliberately NOT pre-created: `afterthread init-env` must create it
+    # itself, user-only, exactly like `serve` does for a first-time
+    # --data-dir (see `_ensure_data_dir` in afterthread/cli.py) -- reusing
+    # the same already-resolved `uvx` tool environment start_server warmed
+    # up, so none of the calls below re-pay that first-run resolution cost.
+    local init_env_data_dir="$TMPDIR_E2E/init-env-data"
+    local init_env_log="$TMPDIR_E2E/init-env.log"
+    local template_file="$REPO_ROOT/backend/afterthread/env.example"
+    local env_path="$init_env_data_dir/.env"
+    local env_snapshot="$TMPDIR_E2E/init-env-snapshot.env"
+
+    if uvx --from "$WHEEL" afterthread init-env --data-dir "$init_env_data_dir" \
+        >"$init_env_log" 2>&1; then
+        pass "afterthread init-env (fresh data dir) exits 0"
+    else
+        fail "afterthread init-env (fresh data dir) exits 0"
+        echo "  (log:)"
+        sed 's/^/    /' "$init_env_log" || true
+    fi
+
+    if [ -f "$env_path" ]; then
+        pass "init-env created \$data-dir/.env"
+    else
+        fail "init-env created \$data-dir/.env"
+    fi
+
+    if cmp -s "$env_path" "$template_file" 2>/dev/null; then
+        pass "init-env's .env matches backend/afterthread/env.example byte-for-byte"
+    else
+        fail "init-env's .env matches backend/afterthread/env.example byte-for-byte"
+    fi
+
+    # FIX-2 (adversarial review, backend/afterthread/cli.py): every .env this
+    # command writes must carry its own 0600 mode, enforced by the write path
+    # itself (O_CREAT|O_EXCL|O_NOFOLLOW with mode 0o600 handed straight to
+    # os.open) rather than delegated to the data dir's own permissions --
+    # backend/tests/test_cli.py proves this at the unit level (including
+    # under a permissive umask); this re-confirms the observable file mode
+    # against the REAL packaged wheel/venv, not just the dev checkout.
+    if [ -f "$env_path" ]; then
+        assert_eq "init-env created .env has mode 600" "$(stat -c %a "$env_path")" "600"
+    else
+        fail "init-env created .env has mode 600 (file missing)"
+    fi
+
+    # FIX-3 (adversarial review, backend/afterthread/cli.py): AFTERTHREAD_PORT
+    # is serve-only configuration -- a malformed value must never be able to
+    # block a subcommand that never reads it (`port` is now converted from
+    # str to int ONLY on the confirmed bare-serve path; init-env's own
+    # parameter resolution never touches it). `init-env --help` never touches
+    # the filesystem, so this is safe to run here without disturbing
+    # $init_env_data_dir's state for the assertions around it.
+    if AFTERTHREAD_PORT=notanumber uvx --from "$WHEEL" afterthread init-env --help \
+        >"$init_env_log" 2>&1; then
+        pass "AFTERTHREAD_PORT=notanumber afterthread init-env --help exits 0"
+    else
+        fail "AFTERTHREAD_PORT=notanumber afterthread init-env --help exits 0"
+        echo "  (log:)"
+        sed 's/^/    /' "$init_env_log" || true
+    fi
+
+    # A second bare run (no --force) must refuse: non-zero exit, file left
+    # byte-for-byte unchanged. Snapshotted BEFORE and re-compared AFTER
+    # (rather than just re-diffing against $template_file again) so this
+    # assertion is really about "init-env touched nothing", independent of
+    # whether the template match above already held.
+    cp "$env_path" "$env_snapshot"
+    if uvx --from "$WHEEL" afterthread init-env --data-dir "$init_env_data_dir" \
+        >"$init_env_log" 2>&1; then
+        fail "second bare init-env (no --force) exits non-zero"
+    else
+        pass "second bare init-env (no --force) exits non-zero"
+    fi
+    if cmp -s "$env_path" "$env_snapshot" 2>/dev/null; then
+        pass "second bare init-env (no --force) leaves .env unchanged"
+    else
+        fail "second bare init-env (no --force) leaves .env unchanged"
+    fi
+
+    # --force must overwrite and exit 0. Clobber the file with different
+    # content first -- otherwise a broken --force that just silently no-ops
+    # would still pass a bare "does the content match" check by accident.
+    printf '# clobbered by e2e/wheel_smoke.sh -- must be replaced by --force\n' >"$env_path"
+    if uvx --from "$WHEEL" afterthread init-env --data-dir "$init_env_data_dir" --force \
+        >"$init_env_log" 2>&1; then
+        pass "afterthread init-env --force exits 0"
+    else
+        fail "afterthread init-env --force exits 0"
+        echo "  (log:)"
+        sed 's/^/    /' "$init_env_log" || true
+    fi
+    if cmp -s "$env_path" "$template_file" 2>/dev/null; then
+        pass "--force overwrite restores the packaged template byte-for-byte"
+    else
+        fail "--force overwrite restores the packaged template byte-for-byte"
     fi
 
     echo ""

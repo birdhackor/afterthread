@@ -35,7 +35,7 @@ SQLite 資料庫，CLI/skill 操作的是獨立的 Markdown 檔案，選一種�
 ```text
 backend/afterthread/      FastAPI 應用（routers/services/models/schemas）；細節見 backend/README.md
 backend/tests/            pytest 測試
-backend/.env.example      環境變數範本（複製到 data dir 或 backend/.env）
+backend/afterthread/env.example   環境變數範本（打包模式：afterthread init-env；開發複製為 backend/.env）
 frontend/src/             React + Mantine SPA（pages/components/atoms/api）；細節見 frontend/README.md
 e2e/smoke.sh              dev 模式全端煙霧測試（見 e2e/README.md）
 e2e/wheel_smoke.sh        打包（uvx）模式端對端煙霧測試（見 e2e/README.md）
@@ -119,10 +119,11 @@ uvx --from backend/dist/afterthread-*.whl afterthread
   SQLite 資料庫檔（預設 `afterthread.db`）與工具目錄（`tools/`，見下方
   「KB 工具安裝指南」）都會落在這裡。
 - **設定檔（`.env`）**：在 `<data-dir>/.env`（例如
-  `~/.local/share/afterthread/.env`）建立設定檔；從原始碼開發時可複製
-  `backend/.env.example`。打包模式只讀 data dir 內的 `.env`，不會讀 checkout
-  裡的 `backend/.env`（那是 dev 模式專用，見下方「開發模式」）。啟用 AI 的
-  最小設定如下：
+  `~/.local/share/afterthread/.env`）建立設定檔；打包安裝後可直接執行
+  `afterthread init-env` 產生這個檔案，從原始碼開發時則可複製
+  `backend/afterthread/env.example`。打包模式只讀 data dir 內的 `.env`，不會讀
+  checkout 裡的 `backend/.env`（那是 dev 模式專用，見下方「開發模式」）。啟用
+  AI 的最小設定如下：
 
   ```dotenv
   OPENAI_BASE_URL=https://your-endpoint.example/v1
@@ -142,8 +143,8 @@ uvx --from backend/dist/afterthread-*.whl afterthread
   互動實際回報的 token 數，動態估一個「字元↔token 比值」，把 token 預算換算成
   當下該套用的字元上限，冷啟動（樣本不足）時用保守比值 1.0，行為與舊的純字元
   預算等價（細節見 [docs/tool-calling.md](docs/tool-calling.md)）。如果內部
-  LLM 是 GLM5.2 這類 1M-token context 的模型，`.env.example` 內建了進一步調高
-  的建議（取代上方預設）：
+  LLM 是 GLM5.2 這類 1M-token context 的模型，
+  `backend/afterthread/env.example` 內建了進一步調高的建議（取代上方預設）：
 
   ```bash
   LLM_PROMPT_BUDGET_TOKENS=800000  # 讓超大項目也能整項進 prompt 不截斷
@@ -151,7 +152,7 @@ uvx --from backend/dist/afterthread-*.whl afterthread
   ```
 
   完整變數清單（含工具呼叫、AI 互動紀錄等其餘設定）見 `backend/README.md`
-  「環境變數」一節，或直接看 `backend/.env.example` 的註解。
+  「環境變數」一節，或直接看 `backend/afterthread/env.example` 的註解。
 
 ## 網頁功能導覽
 
@@ -266,7 +267,7 @@ uv run uvicorn afterthread.main:app --reload --port 8000
 ```
 
 資料庫（SQLite）不存在時會在啟動時自動建立（預設 `backend/afterthread.db`）；
-環境變數複製 `backend/.env.example` 為 `backend/.env` 後依需要填入——dev
+環境變數複製 `backend/afterthread/env.example` 為 `backend/.env` 後依需要填入——dev
 模式讀的是這個 checkout 裡的 `backend/.env`，跟打包模式讀
 `<data-dir>/.env` 是兩回事（見上方「首次設定」）。
 

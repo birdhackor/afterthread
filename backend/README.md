@@ -27,6 +27,7 @@ uv run uvicorn afterthread.main:app --port 8000        # 啟動 API（DB 不存�
 uv run uvicorn afterthread.main:app --port 8000 --reload   # 開發時加 --reload 自動重載
 uv run afterthread --port 8000              # 打包模式的 console script；資料目錄/`.env`
                                                 # 邏輯見 afterthread/cli.py（`--help` 看完整選項）
+uv run afterthread init-env                  # 將套件內 env.example 範本寫到資料目錄，存成 .env（可再編輯）
 
 uv run ruff format .                           # 格式化
 uv run ruff format --check .                   # 只檢查格式（CI / gate 用）
@@ -50,7 +51,7 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 `backend/afterthread.db`，`GET /api/llm/status` 回
 `{"configured":false,"model":null}`）。
 
-## 環境變數（`backend/.env`，範本見 `backend/.env.example`）
+## 環境變數（`backend/.env`，範本見 `backend/afterthread/env.example`）
 
 所有數值型設定都在 `afterthread/config.py` 用 pydantic-settings 的 `Field(..., ge=/le=/gt=)`
 在**啟動時**驗證邊界；超出範圍會讓服務直接啟動失敗，而不是留到第一次呼叫才爆炸。
@@ -82,7 +83,7 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 > **GLM5.2（或其他 1M-token context 模型）備註**：上面 `OPENAI_TIMEOUT_SECONDS`
 > （120）與 `LLM_PROMPT_BUDGET_TOKENS`（200000）的預設值本身已經是為大 context
 > 模型調校過的數字。內部 LLM 若是 GLM5.2 這類 1M-token context 模型，
-> `backend/.env.example` 內建了進一步調高的建議（取代上方預設）：
+> `backend/afterthread/env.example` 內建了進一步調高的建議（取代上方預設）：
 >
 > ```bash
 > LLM_PROMPT_BUDGET_TOKENS=800000  # 讓超大項目也能整項進 prompt，不截斷
