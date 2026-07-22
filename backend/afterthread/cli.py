@@ -551,6 +551,58 @@ def _refuse_symlinked_env(env_path: Path) -> NoReturn:
     raise typer.Exit(1)
 
 
+def _write_all(fd: int, content: bytes) -> None:
+    """Write every byte of `content` to `fd` (FIX-4): loop over `os.write`'s short-write contract.
+
+    `os.write(fd, data)` is a thin wrapper over the `write(2)` syscall, and
+    POSIX explicitly permits `write(2)` to transfer FEWER bytes than were
+    requested, returning that smaller count rather than raising -- this is
+    ordinary, expected behavior, not a rare edge case: a disk-full or
+    per-user-quota condition reached partway through, an EINTR retry the C
+    library resumes at a byte offset Python itself never sees, or the kernel
+    simply choosing to service one large write in more than one chunk under
+    I/O pressure can all produce a short return value on an entirely healthy
+    fd. A single, unchecked `os.write(fd, content)` call -- this helper's
+    entire reason to exist, and the exact shape of the empirically confirmed
+    bug it replaces -- silently treats a SHORT write as a COMPLETE one:
+    whatever runs next (`os.fsync`, `os.close`) still succeeds, so the caller
+    reports success while only a PREFIX of `content` actually reached the
+    file. For `.env` -- a file that can hold a real `OPENAI_API_KEY` -- a
+    silently truncated write is strictly worse than an honest failure, so
+    every call here loops, reissuing exactly the UNWRITTEN remainder (via a
+    `memoryview` slice -- no bytes are ever copied on a retry) until nothing
+    is left.
+
+    A single `os.write` call returning 0 while bytes still remain is NOT a
+    "keep looping" signal -- POSIX's `write(2)` returns 0 for a non-empty
+    request only when it could make NO progress whatsoever (a short POSITIVE
+    count, by contrast, always means SOME bytes genuinely landed, and is a
+    normal, expected iteration of this loop) -- so zero progress raises
+    immediately instead of spinning forever on a call that will never do any
+    better. The raised `OSError` is tagged `errno.EIO`: there is no more
+    specific errno for "the syscall itself reported zero progress without
+    raising", and EIO still round-trips cleanly through this module's
+    errno-keyed handling in `_init_env` (which only special-cases
+    EEXIST/ELOOP; anything else, including this, is an honest, uncaught
+    failure -- exactly this file's existing contract for any OTHER
+    unexpected OSError).
+    """
+    remaining = memoryview(content)
+    while remaining:
+        written = os.write(fd, remaining)
+        if not written:
+            # Zero-progress guard: without this check, a bare
+            # `while remaining: os.write(...)` loop would spin forever the
+            # moment the kernel legitimately returns 0 (e.g. a full or a
+            # read-only-remounted filesystem) -- this turns that into an
+            # immediate, honest OSError instead of a hung CLI process.
+            raise OSError(
+                errno.EIO,
+                f"os.write made no progress with {len(remaining)} byte(s) still unwritten",
+            )
+        remaining = remaining[written:]
+
+
 def _create_env_file_exclusive(env_path: Path, content: bytes) -> None:
     """Create `env_path` fresh via O_EXCL|O_NOFOLLOW -- the no-`--force` path (FIX-1b).
 
@@ -582,13 +634,44 @@ def _create_env_file_exclusive(env_path: Path, content: bytes) -> None:
     a response -- this is a single-shot CLI command, so any OTHER unexpected
     OSError (e.g. a permissions problem) propagating as a Python traceback is
     an acceptable, honest failure: there is no in-flight request to protect.
+
+    FIX-4/FIX-5 (adversarial review, HIGH -- both empirically confirmed
+    against the pre-fix code): the write below now goes through `_write_all`
+    rather than a bare `os.write` (FIX-4 -- an unchecked short write used to
+    sail straight through `os.fsync` to a "successful", silently truncated
+    `.env`), and the write/fsync/close sequence is now wrapped in an
+    `except OSError` that unlinks `env_path` before re-raising (FIX-5). At
+    that point the inode is unambiguously OURS: O_EXCL's entire contract is
+    "this call only succeeds if nobody else already owns this name", so the
+    create above having already succeeded IS the proof nothing else can be at
+    this path. Leaving a failed write's debris behind would be actively
+    harmful, not merely untidy: the caller's EEXIST branch above cannot tell
+    "a real pre-existing .env" apart from "our own half-written leftovers
+    from a previously failed run", so undoing our own create on failure is
+    what keeps a transient write error from permanently wedging every
+    SUBSEQUENT `init-env` behind a refusal the user never asked for.
     """
     fd = os.open(env_path, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY, 0o600)
     try:
-        os.write(fd, content)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+        # The inner try/finally is the ORIGINAL, unchanged contract: fd is
+        # closed exactly once on every exit from this block, success or
+        # failure -- so by the time the `except` below runs, the fd is
+        # already closed and there is no "is it still open" state to track.
+        try:
+            _write_all(fd, content)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        # FIX-5 -- see docstring: unlink the inode we just created, since a
+        # write/fsync failure past this point must not leave partial debris
+        # at env_path for the NEXT run to trip over. Best-effort: if the
+        # unlink itself also fails there is nothing further this function
+        # can safely do about it, and the ORIGINAL failure -- not a
+        # cleanup-time one -- is what the caller needs to see.
+        with contextlib.suppress(OSError):
+            os.unlink(env_path)
+        raise
 
 
 def _replace_env_file_atomically(env_path: Path, content: bytes) -> None:
@@ -634,13 +717,24 @@ def _replace_env_file_atomically(env_path: Path, content: bytes) -> None:
     from that name) and the real cleanup on any failure
     (write/fsync/chmod/replace) -- so a half-finished `--force` can never
     leave a stray temp file sitting in the data dir.
+
+    FIX-4 (adversarial review, HIGH): the write below now goes through
+    `_write_all` rather than a bare `os.write` -- see that helper's
+    docstring for why an unchecked short write is a real, empirically
+    confirmed hazard here too (a silently truncated temp file that this
+    function's own `os.replace` would then happily publish OVER the
+    caller's real `.env`). The `finally` below already unlinks the temp
+    file on ANY exception raised before `os.replace`, including the one
+    `_write_all` now raises on a short or zero-progress write, so no
+    further change to the cleanup path itself is needed -- only the write
+    call moves to the safe helper.
     """
     fd, tmp_name = tempfile.mkstemp(dir=env_path.parent, prefix=".env.", suffix=".tmp")
     tmp_path = Path(tmp_name)
     fd_open = True  # mirrors tools.py's fd_owned idiom: tracks whether `fd` still needs closing
     try:
         os.fchmod(fd, 0o600)
-        os.write(fd, content)
+        _write_all(fd, content)
         os.fsync(fd)
         os.close(fd)
         fd_open = False

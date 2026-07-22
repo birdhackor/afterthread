@@ -17,6 +17,7 @@ monkeypatched: no test here ever binds a real socket or starts a real
 server.
 """
 
+import errno
 import os
 import stat
 from importlib import resources
@@ -557,6 +558,126 @@ def test_init_env_force_leaves_no_stray_temp_file_in_the_data_dir(tmp_path: Path
     )
 
     assert result.exit_code == 0, result.output
+    remaining = sorted(p.name for p in data_dir.iterdir())
+    assert remaining == [".env"]
+
+
+# --- CLI surface (typer): init-env write helpers -- short-write / rollback --
+# (FIX-4/FIX-5, adversarial review, HIGH) -------------------------------------
+#
+# Regression coverage for the HIGH finding closed by `_write_all` (FIX-4) and
+# `_create_env_file_exclusive`'s except-driven rollback (FIX-5): the OLD
+# helpers called `os.write(fd, content)` exactly once and ignored its return
+# value, so a SHORT write (disk pressure, EINTR, ...) silently sailed through
+# `os.fsync` as a "successful", truncated `.env` -- and, on the no-`--force`
+# path, a write/fsync failure AFTER the O_EXCL create had already succeeded
+# left that partial inode behind, wedging every SUBSEQUENT `init-env` run
+# behind a spurious EEXIST refusal. Every `os.write`/`os.fsync` monkeypatch
+# below is scoped to `afterthread.cli.os` (the SAME module object `os` itself
+# is, so this also affects any other `os.write`/`os.fsync` caller for the
+# duration of the one `monkeypatch` fixture -- never an issue here, since
+# nothing else in the process performs a real write during these calls).
+
+
+def test_init_env_short_writes_still_produce_a_byte_complete_env_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # THE bug FIX-4 closes: patches `os.write` to perform a REAL short write
+    # -- at most 5 bytes actually land per call, the rest of the buffer is
+    # silently dropped by the patch, exactly like a genuine partial write(2)
+    # -- so producing a byte-complete `.env` (8KB+ template) is only possible
+    # if `_write_all` actually loops rather than trusting a single call.
+    real_write = os.write
+
+    def short_write(fd: int, data: bytes) -> int:
+        return real_write(fd, data[:5])
+
+    monkeypatch.setattr("afterthread.cli.os.write", short_write)
+
+    data_dir = tmp_path / "data"
+    result = runner.invoke(app, ["init-env", "--data-dir", str(data_dir)], prog_name="afterthread")
+
+    assert result.exit_code == 0, result.output
+    template_bytes = resources.files("afterthread").joinpath("env.example").read_bytes()
+    assert (data_dir / ".env").read_bytes() == template_bytes
+
+
+def test_init_env_zero_progress_write_raises_and_leaves_no_env_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The OTHER half of `_write_all`'s contract: a call that returns 0 while
+    # data still remains is NOT "keep looping" (that would spin forever) --
+    # it must raise immediately. Combined with FIX-5, the failed create must
+    # also leave no partial `.env` behind for the exclusive-create path.
+    def zero_write(fd: int, data: bytes) -> int:
+        return 0
+
+    monkeypatch.setattr("afterthread.cli.os.write", zero_write)
+
+    data_dir = tmp_path / "data"
+    result = runner.invoke(app, ["init-env", "--data-dir", str(data_dir)], prog_name="afterthread")
+
+    assert result.exit_code != 0
+    assert not (data_dir / ".env").exists()
+
+
+def test_init_env_fresh_create_rolls_back_on_fsync_failure_and_second_run_succeeds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # THE bug FIX-5 closes: the OLD `_create_env_file_exclusive` only closed
+    # the fd when write/fsync failed AFTER O_EXCL had already succeeded --
+    # the freshly-created, now-partial `.env` inode was left behind, and the
+    # NEXT run's O_EXCL then refused it via EEXIST as though it were the
+    # user's own pre-existing config. This proves both halves: the failed
+    # run leaves no `.env` behind, AND a second, unpatched run afterwards
+    # succeeds cleanly -- no spurious EEXIST debris from the first attempt.
+    data_dir = tmp_path / "data"
+    env_path = data_dir / ".env"
+
+    def failing_fsync(fd: int) -> None:
+        raise OSError(errno.EIO, "simulated fsync failure")
+
+    monkeypatch.setattr("afterthread.cli.os.fsync", failing_fsync)
+    result = runner.invoke(app, ["init-env", "--data-dir", str(data_dir)], prog_name="afterthread")
+    monkeypatch.undo()  # restore the real os.fsync before the second, unpatched run
+
+    assert result.exit_code != 0
+    assert not env_path.exists()  # FIX-5: no partial inode left behind
+
+    result_second = runner.invoke(
+        app, ["init-env", "--data-dir", str(data_dir)], prog_name="afterthread"
+    )
+
+    assert result_second.exit_code == 0, result_second.output  # no spurious EEXIST
+    template_bytes = resources.files("afterthread").joinpath("env.example").read_bytes()
+    assert env_path.read_bytes() == template_bytes
+
+
+def test_init_env_force_path_write_failure_leaves_original_env_byte_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `_replace_env_file_atomically`'s existing `finally` already unlinks its
+    # temp file on any failure raised before `os.replace` -- this confirms
+    # the FIX-4 `_write_all` swap did not disturb that guarantee: a mid-write
+    # failure on the --force path must still leave the ORIGINAL .env
+    # byte-unchanged, with no stray temp file left sitting in the data dir.
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    env_path = data_dir / ".env"
+    env_path.write_text("OLD=1\n", encoding="utf-8")
+    before = env_path.read_bytes()
+
+    def failing_write(fd: int, data: bytes) -> int:
+        raise OSError(errno.ENOSPC, "simulated disk full")
+
+    monkeypatch.setattr("afterthread.cli.os.write", failing_write)
+
+    result = runner.invoke(
+        app, ["init-env", "--data-dir", str(data_dir), "--force"], prog_name="afterthread"
+    )
+
+    assert result.exit_code != 0
+    assert env_path.read_bytes() == before
     remaining = sorted(p.name for p in data_dir.iterdir())
     assert remaining == [".env"]
 
