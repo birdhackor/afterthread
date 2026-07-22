@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-22
+
+- HTTP client 遷移至 httpx2(Pydantic 接手維護的 httpx 後繼);openai SDK 邊界因其自身依賴 httpx<1,維持使用 httpx。
+- 新增 `TLS_NO_VERIFY` 環境變數,預設關閉。開啟後停用後端對外連線(OpenAPI 文件抓取、LLM endpoint)的 TLS 憑證驗證,供內網自簽憑證部署使用;啟動時會記錄一則警告,並以 advisory 方式透過環境變數傳入已安裝工具的子行程。
+- OpenAPI 文件抓取的 client 建構步驟,現在也納入既有的總逾時範圍,並改到有界的單一背景執行緒執行,不再有機會卡住 event loop。
+
 ## [0.1.0] - 2026-07-22
 
 - 首次公開版本。

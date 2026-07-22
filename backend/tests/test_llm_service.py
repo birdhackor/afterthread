@@ -125,13 +125,16 @@ class _StubClient:
         self.chat = SimpleNamespace(completions=_StubCompletions(**completion_kwargs))
 
 
-def _settings(*, base_url: str, model: str, api_key: str = _CONFIGURED_KEY) -> Settings:
+def _settings(
+    *, base_url: str, model: str, api_key: str = _CONFIGURED_KEY, tls_no_verify: bool = False
+) -> Settings:
     # Every LLM field is set explicitly so the result never depends on ambient
     # environment or a stray backend/.env.
     return Settings(
         openai_base_url=base_url,
         openai_api_key=api_key,
         openai_model=model,
+        tls_no_verify=tls_no_verify,
     )
 
 
@@ -893,8 +896,97 @@ def test_build_client_disables_automatic_retries() -> None:
     generate_structured's ONE corrective retry, which re-prompts only on bad
     output. Asserted on the constructed client's own attribute, not via timing.
     """
-    client = _build_client("http://retry-policy.example/v1", "k", 1.0)
+    client = _build_client("http://retry-policy.example/v1", "k", 1.0, False)
     assert client.max_retries == 0
+
+
+# --- TLS_NO_VERIFY (P9) -----------------------------------------------------
+
+
+def test_build_client_tls_no_verify_off_omits_http_client_kwarg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default (flag off): AsyncOpenAI is constructed with NO http_client kwarg
+    at all -- byte-identical to before this flag existed. DefaultAsyncHttpxClient
+    is never even constructed on this path."""
+    openai_kwargs: dict[str, Any] = {}
+
+    class _CapturingAsyncOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            openai_kwargs.update(kwargs)
+
+    def _must_not_build_http_client(**kwargs: Any) -> Any:
+        raise AssertionError("DefaultAsyncHttpxClient must not be built when the flag is off")
+
+    monkeypatch.setattr("afterthread.services.llm.AsyncOpenAI", _CapturingAsyncOpenAI)
+    monkeypatch.setattr(
+        "afterthread.services.llm.DefaultAsyncHttpxClient", _must_not_build_http_client
+    )
+
+    _build_client("http://tls-kwarg-off.example/v1", "k", 1.0, False)
+
+    assert "http_client" not in openai_kwargs
+
+
+def test_build_client_tls_no_verify_on_constructs_verify_false_http_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flag on: AsyncOpenAI receives http_client=DefaultAsyncHttpxClient(verify=False)
+    -- and DefaultAsyncHttpxClient itself is called with EXACTLY verify=False,
+    nothing else."""
+    http_client_kwargs: dict[str, Any] = {}
+    openai_kwargs: dict[str, Any] = {}
+
+    class _FakeHttpxClient:
+        def __init__(self, **kwargs: Any) -> None:
+            http_client_kwargs.update(kwargs)
+
+    class _CapturingAsyncOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            openai_kwargs.update(kwargs)
+
+    monkeypatch.setattr("afterthread.services.llm.DefaultAsyncHttpxClient", _FakeHttpxClient)
+    monkeypatch.setattr("afterthread.services.llm.AsyncOpenAI", _CapturingAsyncOpenAI)
+
+    _build_client("http://tls-kwarg-on.example/v1", "k", 1.0, True)
+
+    assert http_client_kwargs == {"verify": False}
+    assert isinstance(openai_kwargs.get("http_client"), _FakeHttpxClient)
+
+
+def test_build_client_tls_no_verify_is_part_of_cache_key() -> None:
+    """The flag is part of the lru_cache key: two otherwise-identical calls that
+    differ ONLY in tls_no_verify must return DIFFERENT client objects -- otherwise
+    a client cached under one flag value would be silently reused once the flag
+    flips."""
+    off = _build_client("http://cache-key.example/v1", "k", 1.0, False)
+    on = _build_client("http://cache-key.example/v1", "k", 1.0, True)
+    assert off is not on
+
+
+def test_get_client_forwards_tls_no_verify_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_get_client reads settings.tls_no_verify and forwards it as _build_client's
+    4th (cache-key) argument, so the cache and the operator's configured value
+    can never disagree."""
+    captured: dict[str, Any] = {}
+
+    def _fake_build_client(base_url: str, api_key: str, timeout: float, tls_no_verify: bool) -> Any:
+        captured.update(
+            base_url=base_url, api_key=api_key, timeout=timeout, tls_no_verify=tls_no_verify
+        )
+        return SimpleNamespace()
+
+    monkeypatch.setattr("afterthread.services.llm._build_client", _fake_build_client)
+    monkeypatch.setattr(
+        "afterthread.services.llm.get_settings",
+        lambda: _settings(
+            base_url=_CONFIGURED_BASE_URL, model=_CONFIGURED_MODEL, tls_no_verify=True
+        ),
+    )
+
+    _get_client()
+
+    assert captured["tls_no_verify"] is True
 
 
 # --- tool-call args redaction before the log preview (M4) ------------------

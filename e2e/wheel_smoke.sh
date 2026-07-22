@@ -35,6 +35,11 @@ export PYTHONIOENCODING=utf-8
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Same interpreter this repo pins everywhere else (backend/.python-version),
+# read once here so the lowest-direct-resolution leg below never hardcodes
+# it twice. `cat` via command substitution strips the trailing newline.
+PYTHON_PIN="$(cat "$REPO_ROOT/backend/.python-version")"
+
 TMPDIR_E2E="$(mktemp -d "${TMPDIR:-/tmp}/aft-wheel-e2e.XXXXXX")"
 DATA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aft-wheel-data.XXXXXX")"
 SERVER_LOG="$TMPDIR_E2E/server.log"
@@ -255,6 +260,59 @@ teardown() {
 }
 trap teardown EXIT
 
+# --- lowest-direct release floor check ------------------------------------
+
+# lowest_direct_setup WHEEL VENV_DIR LOG_FILE -> creates a throwaway venv at
+# VENV_DIR (removed for free by teardown's TMPDIR_E2E cleanup, same as every
+# other scratch path in this script), installs afterthread's dependency
+# closure into it with every DIRECT dependency (the names actually listed in
+# backend/pyproject.toml's `dependencies`) pinned to its declared floor via
+# `--resolution lowest-direct` (transitive dependencies still resolve
+# highest-compatible as normal -- this is a floor check on this project's
+# own declared requirements, NOT a full lowest-resolution matrix of the
+# whole dependency tree), then installs WHEEL itself on top.
+#
+# TWO `uv pip install` calls, not one, and this is not incidental: `uv pip
+# install --resolution lowest-direct <path-to-wheel>` treats the WHEEL as
+# the one-and-only direct requirement and resolves everything IT depends on
+# (openai, uvicorn, sqlmodel, ...) as transitive, i.e. highest-compatible --
+# silently defeating the entire point of this leg. Confirmed empirically
+# while writing this check: installed that way, openai landed on 2.46.0 and
+# typer on 0.27.0 even with floors of 2.45.0/0.26.8 declared, because
+# lowest-direct never treated either name as direct in the first place.
+# Passing `-r backend/pyproject.toml` instead makes uv parse
+# `[project.dependencies]` itself, so THOSE names are what get treated as
+# direct and pinned to their floors; `afterthread` itself is then installed
+# from the just-built WHEEL on top with `--no-deps` (its dependency closure
+# is already satisfied by the first call, and `-r pyproject.toml` alone
+# never installs the project itself -- only what it depends on). Combined
+# stdout/stderr of all `uv` calls goes to LOG_FILE. Mirrors start_server's
+# set-e-shielded, log-on-failure convention (call as `if !
+# lowest_direct_setup ...; then`) so a genuinely broken floor combination --
+# e.g. two floors that do not install together -- fails loudly with the
+# real `uv` output, instead of a bare `set -e` abort that prints nothing.
+lowest_direct_setup() {
+    local wheel=$1 venv_dir=$2 log=$3
+    if ! uv venv --no-project --python "$PYTHON_PIN" "$venv_dir" >"$log" 2>&1; then
+        echo "  (uv venv failed; log:)"
+        sed 's/^/    /' "$log" || true
+        return 1
+    fi
+    if ! uv pip install --no-config --python "$venv_dir/bin/python" \
+        --resolution lowest-direct -r "$REPO_ROOT/backend/pyproject.toml" \
+        >>"$log" 2>&1; then
+        echo "  (uv pip install --resolution lowest-direct -r pyproject.toml failed; log:)"
+        sed 's/^/    /' "$log" || true
+        return 1
+    fi
+    if ! uv pip install --no-config --python "$venv_dir/bin/python" --no-deps \
+        "$wheel" >>"$log" 2>&1; then
+        echo "  (uv pip install --no-deps <wheel> failed; log:)"
+        sed 's/^/    /' "$log" || true
+        return 1
+    fi
+}
+
 # ===========================================================================
 # main
 # ===========================================================================
@@ -275,6 +333,66 @@ main() {
     fi
     WHEEL="$wheel"
     echo "Using wheel: $WHEEL"
+
+    echo ""
+    echo "========== LOWEST-DIRECT RESOLUTION (release floor check) =========="
+    # backend/pyproject.toml's FLOOR POLICY comment (above its `dependencies`
+    # list) says every runtime dependency's floor is a version this
+    # project's own gates actually ran against -- this leg is what makes
+    # that claim true at release time rather than aspirational. `uv lock`
+    # always resolves every dependency to the newest compatible release for
+    # THIS checkout, so a bare/floorless dependency (or a stated floor
+    # nobody actually installed) sails through every OTHER gate here and
+    # only surfaces once some constrained install elsewhere picks the true
+    # floor -- exactly the ImportError this leg exists to catch before a
+    # release ships it. See lowest_direct_setup's own comment for what
+    # `--resolution lowest-direct` does and does not pin.
+    local lowest_venv lowest_log
+    lowest_venv="$TMPDIR_E2E/lowest-direct-venv"
+    lowest_log="$TMPDIR_E2E/lowest-direct-setup.log"
+    if lowest_direct_setup "$WHEEL" "$lowest_venv" "$lowest_log"; then
+        pass "lowest-direct install: floor-pinned deps + wheel install"
+
+        # Expected version string: prefer RELEASE_TAG (already present in
+        # THIS script's own environment under the release-gate invocation
+        # documented in docs/releasing.md --
+        # `RELEASE_TAG=vX.Y.Z bash e2e/wheel_smoke.sh` -- and set at job
+        # level for release.yml's build job, which runs this script) with
+        # its leading 'v' stripped, the same convention release.yml's
+        # verify-testpypi job uses (`release_version="${RELEASE_TAG#v}"`).
+        # Falls back to the version baked into the wheel filename
+        # build-wheel.sh just produced (already known here as $WHEEL) for a
+        # plain `bash e2e/wheel_smoke.sh` run with no RELEASE_TAG set, e.g.
+        # ci.yml's non-release smoke test.
+        local expected_version
+        expected_version="${RELEASE_TAG:-}"
+        expected_version="${expected_version#v}"
+        if [ -z "$expected_version" ]; then
+            expected_version="$(basename "$WHEEL" | sed -E 's/^afterthread-(.+)-py3-none-any\.whl$/\1/')"
+        fi
+
+        local lowest_import_log="$TMPDIR_E2E/lowest-direct-import.log"
+        if "$lowest_venv/bin/python" -c "import afterthread.main" \
+            >"$lowest_import_log" 2>&1; then
+            pass "lowest-direct install: python -c 'import afterthread.main'"
+        else
+            fail "lowest-direct install: python -c 'import afterthread.main'"
+            echo "  (import failure; log:)"
+            sed 's/^/    /' "$lowest_import_log" || true
+        fi
+
+        local lowest_version_output
+        lowest_version_output="$("$lowest_venv/bin/afterthread" --version \
+            2>"$TMPDIR_E2E/lowest-direct-version.log" || true)"
+        assert_eq "lowest-direct install: afterthread --version" \
+            "$lowest_version_output" "afterthread $expected_version"
+    else
+        # Mirrors the extract_asset_js pattern below: one FAIL for the step
+        # that actually broke, the dependent checks simply do not run rather
+        # than reporting synthetic failures for assertions that never
+        # executed.
+        fail "lowest-direct install: floor-pinned deps + wheel install"
+    fi
 
     # Pre-write a data-dir .env BEFORE the server starts: this run then also
     # proves the packaged-mode config contract end-to-end -- cli.py must load

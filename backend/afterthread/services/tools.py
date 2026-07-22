@@ -79,11 +79,15 @@ from afterthread.services.llm import LlmTool
 # containment check in ``_resolve_package_dir``.
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
-# The ONLY parent-environment variables a tool subprocess inherits. Everything
-# else -- above all OPENAI_API_KEY / OPENAI_BASE_URL -- is withheld by building
-# the child env from scratch (see the module docstring's security stance). PATH
-# lets the child find its interpreter; HOME/LANG/LC_ALL/TMPDIR keep ordinary
-# tooling (python, locale-aware libs, temp files) behaving normally.
+# The ONLY parent-environment variables a tool subprocess inherits VERBATIM.
+# Everything else -- above all OPENAI_API_KEY / OPENAI_BASE_URL -- is withheld by
+# building the child env from scratch (see the module docstring's security
+# stance). PATH lets the child find its interpreter; HOME/LANG/LC_ALL/TMPDIR keep
+# ordinary tooling (python, locale-aware libs, temp files) behaving normally.
+# TLS_NO_VERIFY is DELIBERATELY NOT in this tuple: it is not a raw parent-env
+# passthrough but a settings-derived injection (see ``_build_tool_env``), so its
+# child-visible value is always the normalized ``"1"``/absent pair, never
+# whatever string the OPERATOR's own shell happened to export it as.
 _PASSTHROUGH_ENV: tuple[str, ...] = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
 
 # Uniform cap on a tool's description (applied once at scan time, so list_tools
@@ -979,8 +983,17 @@ def _build_tool_env(directory: Path) -> dict[str, str]:
     ``.env`` is layered on top (so a tool may set, and even override PATH for,
     its own needs), but our backend secrets (OPENAI_API_KEY, ...) are structurally
     absent because they were never copied in.
+
+    ``TLS_NO_VERIFY=1`` is injected between the two -- present ONLY when
+    ``settings.tls_no_verify`` is on, ABSENT (never ``"0"``) when it is off, and
+    itself still overridable by the tool's own ``.env`` -- so an installed tool
+    MAY skip TLS certificate verification the same way this backend's own
+    outbound connections do (see config.py), without that trust decision being
+    silently forced on every tool regardless of the operator's setting.
     """
     env = {name: os.environ[name] for name in _PASSTHROUGH_ENV if name in os.environ}
+    if get_settings().tls_no_verify:
+        env["TLS_NO_VERIFY"] = "1"
     env.update(_load_tool_dotenv(directory))
     return env
 

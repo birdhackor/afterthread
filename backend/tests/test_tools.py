@@ -836,6 +836,52 @@ def test_runtime_dotenv_does_not_interpolate_parent_env(
     assert "sk-secret-should-not-leak" not in env.values()
 
 
+def test_build_tool_env_passes_through_tls_no_verify_when_on(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TLS_NO_VERIFY=1 is injected into the from-scratch child env when the
+    settings flag is on, so an installed tool MAY skip TLS verification too."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "envtool", "import sys\nsys.stdout.write('ok')\n")
+    _install_tools(monkeypatch, root, tls_no_verify=True)
+
+    env = tools._build_tool_env(pkg)
+    assert env["TLS_NO_VERIFY"] == "1"
+
+
+def test_build_tool_env_omits_tls_no_verify_when_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Default (flag off): TLS_NO_VERIFY is absent from the child env entirely --
+    not "0", simply not a key -- matching the passthrough allowlist's own
+    "absent means not set" convention."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "envtool", "import sys\nsys.stdout.write('ok')\n")
+    _install_tools(monkeypatch, root)  # tls_no_verify defaults False
+
+    env = tools._build_tool_env(pkg)
+    assert "TLS_NO_VERIFY" not in env
+
+
+def test_build_tool_env_tool_dotenv_can_override_tls_no_verify(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The tool's own .env is layered ON TOP of the settings-derived injection
+    (same override convention as PATH/HOME/...), so a tool that explicitly wants
+    verification back on for its own calls can still set that in its .env."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(
+        root,
+        "envtool",
+        "import sys\nsys.stdout.write('ok')\n",
+        dotenv="TLS_NO_VERIFY=0\n",
+    )
+    _install_tools(monkeypatch, root, tls_no_verify=True)
+
+    env = tools._build_tool_env(pkg)
+    assert env["TLS_NO_VERIFY"] == "0"  # the tool's own .env wins
+
+
 def test_runtime_background_descendant_reaped_no_thread_leak(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

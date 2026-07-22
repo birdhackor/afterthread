@@ -54,7 +54,16 @@ from afterthread.services.tool_builder import (
 def _reset_singletons() -> Generator[None]:
     """Empty the job table, the llm_log ring, and the process-wide known-secret
     registries around every test (all module-level singletons the installer
-    touches)."""
+    touches), then DRAIN the single-flight client-construction worker.
+
+    The drain is what makes the timing/threading fetch tests deterministic under
+    any collection order: a prior test's still-running (or still-queued) fake
+    construction occupies the ONE construction worker, and left there it would
+    queue behind and skew the NEXT timing test (or make the repeated-timeout
+    thread-count assertion race). Draining in teardown guarantees the next test
+    starts with an idle worker, whatever ran before it. Tests that block the
+    constructor on purpose release it in their own finally, so this drain never
+    hangs (its own timeout would fail loudly if one forgot)."""
     tool_builder._reset_jobs_for_tests()
     llm_log._reset_for_tests()
     tools._INFLIGHT_SECRETS.clear()
@@ -64,6 +73,7 @@ def _reset_singletons() -> Generator[None]:
     llm_log._reset_for_tests()
     tools._INFLIGHT_SECRETS.clear()
     tools._ENV_VALUE_CACHE.clear()
+    tool_builder._drain_setup_worker_for_tests()
 
 
 def _install_settings(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> Settings:
@@ -388,6 +398,34 @@ def test_run_shell_env_scrubbed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     assert "U=none" in result
     assert "P=set" in result  # the allowlisted PATH did pass through
     assert "sk-secret-do-not-leak" not in result
+
+
+def test_run_shell_passes_through_tls_no_verify_when_on(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TLS_NO_VERIFY=1 reaches run_shell's env when the settings flag is on, so a
+    builder-tested `curl`/`python3` invocation can honor it too."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"), tls_no_verify=True)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    meta = _meta_by_name(staging)
+
+    result = _call(meta["run_shell"].handler, {"command": 'echo "T=${TLS_NO_VERIFY:-unset}"'})
+    assert "T=1" in result
+
+
+def test_run_shell_omits_tls_no_verify_when_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Default (flag off): TLS_NO_VERIFY is absent from run_shell's env entirely
+    -- not "0", simply not set."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    meta = _meta_by_name(staging)
+
+    result = _call(meta["run_shell"].handler, {"command": 'echo "T=${TLS_NO_VERIFY:-unset}"'})
+    assert "T=unset" in result
 
 
 # --- InstallResult sanitizer ---------------------------------------------------
@@ -1253,7 +1291,7 @@ def test_fetch_openapi_connection_failure() -> None:
 def test_fetch_openapi_total_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     """The whole fetch is bounded by a TOTAL wall-clock deadline
     (_FETCH_TOTAL_TIMEOUT_SECONDS): a connection that hangs past it -- even one
-    that would never trip httpx's PER-PHASE inactivity timeout -- fails with the
+    that would never trip httpx2's PER-PHASE inactivity timeout -- fails with the
     friendly fetch outcome rather than hanging the background job forever. Driven
     by a fake client whose stream never resolves, so the ONLY thing that can end
     the call is the asyncio.timeout wiring under test."""
@@ -1278,7 +1316,7 @@ def test_fetch_openapi_total_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
         def stream(self, *args: Any, **kwargs: Any) -> Any:
             return _HangingStream()
 
-    monkeypatch.setattr(tool_builder.httpx, "AsyncClient", _HangingClient)
+    monkeypatch.setattr(tool_builder.httpx2, "AsyncClient", _HangingClient)
     monkeypatch.setattr(tool_builder, "_FETCH_TOTAL_TIMEOUT_SECONDS", 0.2)
 
     started = time.monotonic()
@@ -1288,6 +1326,331 @@ def test_fetch_openapi_total_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     assert text is None
     assert error is not None and error.startswith("OpenAPI 文件下載失敗")
     assert elapsed < 2.0  # bounded by the 0.2s total deadline, not the 3600s hang
+
+
+def test_fetch_openapi_total_timeout_covers_client_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The total deadline (_FETCH_TOTAL_TIMEOUT_SECONDS) must bound client
+    CONSTRUCTION too, not just the request: httpx2.AsyncClient(...) can do real
+    synchronous work (TLS context / trust-store initialization), and a version
+    that builds the client BEFORE entering asyncio.timeout would let that work
+    run for free, silently extending the promised wall-clock bound. This is
+    NARROWER than test_fetch_openapi_total_timeout above, which uses a fake
+    whose __init__ is instant and so cannot tell "construction happened inside
+    the deadline" apart from "construction happened before it" -- entering
+    asyncio.timeout and then immediately calling client.__aenter__() looks
+    identical from that fake's point of view either way. Only the CONSTRUCTOR
+    call itself moved outside the timeout in the regression this pins, so the
+    fake here burns real wall-clock time in __init__ (a plain, blocking
+    time.sleep -- construction is ordinary synchronous code in production too,
+    exactly like the trust-store read it stands in for, so faking it with an
+    awaitable would test something asyncio.timeout never actually bounds)."""
+
+    class _HangingStream:
+        async def __aenter__(self) -> Any:
+            await asyncio.sleep(3600)  # never resolves within the tiny deadline
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+    class _SlowInitClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            # Stands in for synchronous TLS/trust-store setup cost. Real
+            # (blocking) time, on purpose -- see the docstring above.
+            time.sleep(0.2)
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+        def stream(self, *args: Any, **kwargs: Any) -> Any:
+            return _HangingStream()
+
+    monkeypatch.setattr(tool_builder.httpx2, "AsyncClient", _SlowInitClient)
+    monkeypatch.setattr(tool_builder, "_FETCH_TOTAL_TIMEOUT_SECONDS", 0.3)
+
+    started = time.monotonic()
+    text, error = asyncio.run(tool_builder._fetch_openapi("http://kb.example/openapi.json"))
+    elapsed = time.monotonic() - started
+
+    assert text is None
+    assert error is not None and error.startswith("OpenAPI 文件下載失敗")
+    # If construction runs INSIDE the timeout scope (fixed): the 0.2s __init__
+    # eats into the 0.3s budget, so the deadline still fires ~0.3s after this
+    # call started. If construction runs BEFORE asyncio.timeout is entered (the
+    # regression this pins): the deadline does not start counting until AFTER
+    # those 0.2s, so elapsed balloons to ~0.5s -- comfortably over this bound.
+    assert elapsed < 0.45
+
+
+def test_fetch_openapi_total_timeout_preempts_client_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P7 review r2: the deadline must be able to PREEMPT construction mid-call,
+    not merely start counting before it. A version that calls
+    ``httpx2.AsyncClient(...)`` SYNCHRONOUSLY (even inside the asyncio.timeout
+    scope) gives asyncio.timeout's scheduled cancellation no await point to
+    land on -- the event loop is stuck running the blocking constructor to
+    completion regardless of the deadline, so _fetch_openapi would only return
+    AFTER it. This is what test_fetch_openapi_total_timeout_covers_client_setup
+    above cannot distinguish: its 0.2s constructor is SHORTER than its 0.3s
+    deadline, so both a preemptible and a merely-timed construction land on the
+    same ~0.3s total. Here the constructor (0.6s, a plain blocking time.sleep --
+    real synchronous work, exactly like the trust-store read it stands in for)
+    is deliberately LONGER than the deadline (0.2s), so only a construction that
+    actually runs on a worker thread -- an awaited call the deadline can cancel
+    while the thread keeps blocking in the background -- can return before the
+    0.6s is up. The hanging stream is never reached: construction alone already
+    exceeds the deadline."""
+
+    class _HangingStream:
+        async def __aenter__(self) -> Any:
+            await asyncio.sleep(3600)  # never reached
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+    class _VerySlowInitClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            # Longer than the deadline, on purpose -- see the docstring above.
+            time.sleep(0.6)
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+        def stream(self, *args: Any, **kwargs: Any) -> Any:
+            return _HangingStream()
+
+    monkeypatch.setattr(tool_builder.httpx2, "AsyncClient", _VerySlowInitClient)
+    monkeypatch.setattr(tool_builder, "_FETCH_TOTAL_TIMEOUT_SECONDS", 0.2)
+
+    started = time.monotonic()
+    text, error = asyncio.run(tool_builder._fetch_openapi("http://kb.example/openapi.json"))
+    elapsed = time.monotonic() - started
+
+    assert text is None
+    assert error is not None and error.startswith("OpenAPI 文件下載失敗")
+    # Bounded by the 0.2s deadline, comfortably below the 0.6s constructor --
+    # proves setup itself, not just the request after it, is now preemptible.
+    assert elapsed < 0.45
+
+
+def test_fetch_openapi_construction_timeout_is_single_threaded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Repeated construction timeouts must NOT grow threads without bound.
+
+    THE FINDING (empirically demonstrated): run_in_threadpool cancels only the
+    AWAITER on a construction timeout, never the blocked pool thread, so every
+    retry after a construction timeout grabbed a FRESH pool thread -- 5
+    consecutive timeouts left 5 live "AnyIO worker thread"s (45 attempts -> 44
+    workers, past the 40-token limiter). The single-flight construction worker
+    bounds that to ONE dedicated daemon thread for the whole process: a hung
+    constructor ties up exactly that worker, and each subsequent fetch QUEUES
+    behind it and times out at its own deadline -- zero extra threads.
+
+    Drives 5 consecutive _fetch_openapi calls whose fake client __init__ blocks
+    well past the (tiny) total deadline. Asserts every call still returns the
+    friendly timeout outcome on time AND that at most ONE new thread was created
+    across all of them -- the dedicated worker, identified by its distinctive
+    name prefix. THAT is the discriminator: under the reverted run_in_threadpool
+    shape this same drive spawns ~5 anonymous pool threads (RED, len==5); here it
+    spawns exactly one named worker (GREEN, len==1). The blocking __init__ is
+    released in a finally so the worker returns to idle for the autouse drain."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    release = threading.Event()
+
+    class _BlockingInitClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            # Blocks PAST the tiny total deadline so construction always times
+            # out; released in the finally below so the single worker frees.
+            release.wait(timeout=30)
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+        def stream(self, *args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("construction times out before stream is reached")
+
+    monkeypatch.setattr(tool_builder.httpx2, "AsyncClient", _BlockingInitClient)
+    monkeypatch.setattr(tool_builder, "_FETCH_TOTAL_TIMEOUT_SECONDS", 0.2)
+
+    prefix = tool_builder._SETUP_THREAD_NAME
+    before_idents = {t.ident for t in threading.enumerate()}
+
+    async def drive() -> list[tuple[str | None, str | None, float]]:
+        outcomes: list[tuple[str | None, str | None, float]] = []
+        for _ in range(5):
+            started = time.monotonic()
+            text, error = await tool_builder._fetch_openapi("http://kb.example/openapi.json")
+            outcomes.append((text, error, time.monotonic() - started))
+        return outcomes
+
+    try:
+        outcomes = asyncio.run(drive())
+        new_threads = [t for t in threading.enumerate() if t.ident not in before_idents]
+
+        # Every call returns the friendly timeout outcome, bounded by the 0.2s
+        # deadline -- never the 30s the constructor would otherwise block for.
+        for text, error, elapsed in outcomes:
+            assert text is None
+            assert error is not None and error.startswith("OpenAPI 文件下載失敗")
+            assert elapsed < 2.0
+
+        # THE BOUND: however many constructions timed out, at most ONE new thread
+        # was created, and it is the dedicated single-flight worker -- never the
+        # unbounded fan-out of pool workers the finding produced.
+        assert len(new_threads) <= 1, [t.name for t in new_threads]
+        assert all(t.name.startswith(prefix) for t in new_threads), [t.name for t in new_threads]
+    finally:
+        release.set()
+
+
+def test_fetch_openapi_queued_construction_cancelled_before_start_never_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A fetch whose construction is still QUEUED behind a stuck one when its
+    deadline fires has its future cancelled while PENDING, so the worker SKIPS it
+    -- the constructor is NEVER called for it (invariant 3). This is what keeps a
+    backlog of abandoned retries from constructing anything.
+
+    A construction COUNTER proves it: the first fetch's construction reaches the
+    worker and blocks (RUNNING, count 1); a second fetch queues behind it and
+    times out while still PENDING (its future cancelled). After releasing the
+    stuck one and draining the worker to the second (cancelled) job,
+    set_running_or_notify_cancel() returns False for it, so the counter stays 1 --
+    the second constructor was skipped, never run. (Under the reverted
+    run_in_threadpool shape the second fetch would get its OWN pool thread and
+    construct too, so the counter would reach 2: this asserts the queue-behind
+    semantics, not per-call fan-out.)"""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    release = threading.Event()
+    lock = threading.Lock()
+    constructions = 0
+
+    class _CountingBlockingClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            nonlocal constructions
+            with lock:
+                constructions += 1
+            # Only the FIRST (worker-occupying) construction runs __init__; the
+            # queued second one is skipped BEFORE __init__ is ever entered.
+            release.wait(timeout=30)
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+        def stream(self, *args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("construction times out before stream is reached")
+
+    monkeypatch.setattr(tool_builder.httpx2, "AsyncClient", _CountingBlockingClient)
+    monkeypatch.setattr(tool_builder, "_FETCH_TOTAL_TIMEOUT_SECONDS", 0.2)
+
+    async def drive_two() -> None:
+        # First: its construction reaches the worker and blocks (RUNNING).
+        first_text, _ = await tool_builder._fetch_openapi("http://kb.example/first.json")
+        # Second: its construction QUEUES behind the still-blocked first, and is
+        # cancelled while PENDING when its own 0.2s deadline fires.
+        second_text, _ = await tool_builder._fetch_openapi("http://kb.example/second.json")
+        assert first_text is None and second_text is None
+
+    try:
+        asyncio.run(drive_two())
+        with lock:
+            assert constructions == 1  # only the stuck one ran; second still queued
+        # Release the stuck construction and let the worker drain to the second
+        # (cancelled) job: set_running_or_notify_cancel() returns False for it, so
+        # it is SKIPPED -- the constructor count stays 1, never 2.
+        release.set()
+        tool_builder._drain_setup_worker_for_tests(timeout=5)
+        with lock:
+            assert constructions == 1
+    finally:
+        release.set()
+
+
+def _capturing_async_client(captured: dict[str, Any]) -> type:
+    """A fake httpx2.AsyncClient that records its constructor kwargs into
+    ``captured`` and serves a canned ``{}`` 200 response -- exercises
+    _fetch_openapi's TLS_NO_VERIFY wiring without a real network connection,
+    mirroring test_fetch_openapi_total_timeout's fake-client pattern above."""
+
+    class _FakeResponse:
+        def __init__(self) -> None:
+            self.status_code = 200
+            self.headers: dict[str, str] = {}
+
+        async def aiter_bytes(self) -> Any:
+            yield b"{}"
+
+    class _FakeResponseCM:
+        async def __aenter__(self) -> Any:
+            return _FakeResponse()
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+    class _FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+        def stream(self, *args: Any, **kwargs: Any) -> Any:
+            return _FakeResponseCM()
+
+    return _FakeClient
+
+
+def test_fetch_openapi_tls_no_verify_off_omits_verify_kwarg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default (flag off): the client is constructed with NO ``verify`` kwarg at
+    all -- byte-identical to the arguments used before this flag existed."""
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(tool_builder.httpx2, "AsyncClient", _capturing_async_client(captured))
+    _install_settings(monkeypatch, tls_no_verify=False)
+
+    text, error = asyncio.run(tool_builder._fetch_openapi("http://kb.example/openapi.json"))
+
+    assert error is None
+    assert text == "{}"
+    assert "verify" not in captured
+
+
+def test_fetch_openapi_tls_no_verify_on_passes_verify_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flag on: the client is constructed with verify=False, on top of the SAME
+    other arguments (timeout / follow_redirects / max_redirects) as always."""
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(tool_builder.httpx2, "AsyncClient", _capturing_async_client(captured))
+    _install_settings(monkeypatch, tls_no_verify=True)
+
+    text, error = asyncio.run(tool_builder._fetch_openapi("http://kb.example/openapi.json"))
+
+    assert error is None
+    assert text == "{}"
+    assert captured.get("verify") is False
+    assert captured.get("timeout") == tool_builder._FETCH_TIMEOUT_SECONDS
+    assert captured.get("follow_redirects") is True
+    assert captured.get("max_redirects") == tool_builder._FETCH_MAX_REDIRECTS
 
 
 def test_run_install_fetch_failure_is_friendly(
