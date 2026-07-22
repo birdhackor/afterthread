@@ -51,6 +51,10 @@
 | --- | --- | --- | --- |
 | `DATABASE_URL` | `sqlite:///./afterthread.db` | — | SQLAlchemy URL。**只支援 SQLite**,且必須是檔案型(不可為 in-memory)。 |
 | `STALE_AFTER_DAYS` | 14 | [0, 36500] | 非終態項目的 `updated` 超過這個天數,會被標記為陳舊。 |
+| `TLS_NO_VERIFY` | 關閉(驗證維持開啟) | — | 停用「後端自己發起」之對外連線的 TLS 憑證與主機名稱驗證,範圍僅限 OpenAPI 文件抓取與 LLM endpoint 這兩條連線;同時會以 `TLS_NO_VERIFY=1` 傳入已安裝工具的子行程環境,但那只是 advisory——工具自身的 `.env` 可以覆寫、甚至直接忽略這個值。開啟時啟動階段會記錄一則 WARNING。 |
+
+!!! warning "只在你已信任的內網環境開啟"
+    關閉憑證與主機名稱驗證後,對上述連線發動中間人攻擊(MITM)在技術上就成為可能——這正是 TLS 驗證原本要擋下的攻擊。只有在自簽憑證或私有 CA 的內網部署、且你已信任該網路時,才考慮開啟 `TLS_NO_VERIFY`。
 
 !!! tip "GLM5.2(或其他 1M-token context 模型)建議值"
     ```bash
