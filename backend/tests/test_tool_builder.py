@@ -1376,6 +1376,61 @@ def test_fetch_openapi_total_timeout_covers_client_setup(
     assert elapsed < 0.45
 
 
+def test_fetch_openapi_total_timeout_preempts_client_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P7 review r2: the deadline must be able to PREEMPT construction mid-call,
+    not merely start counting before it. A version that calls
+    ``httpx2.AsyncClient(...)`` SYNCHRONOUSLY (even inside the asyncio.timeout
+    scope) gives asyncio.timeout's scheduled cancellation no await point to
+    land on -- the event loop is stuck running the blocking constructor to
+    completion regardless of the deadline, so _fetch_openapi would only return
+    AFTER it. This is what test_fetch_openapi_total_timeout_covers_client_setup
+    above cannot distinguish: its 0.2s constructor is SHORTER than its 0.3s
+    deadline, so both a preemptible and a merely-timed construction land on the
+    same ~0.3s total. Here the constructor (0.6s, a plain blocking time.sleep --
+    real synchronous work, exactly like the trust-store read it stands in for)
+    is deliberately LONGER than the deadline (0.2s), so only a construction that
+    actually runs on a worker thread -- an awaited call the deadline can cancel
+    while the thread keeps blocking in the background -- can return before the
+    0.6s is up. The hanging stream is never reached: construction alone already
+    exceeds the deadline."""
+
+    class _HangingStream:
+        async def __aenter__(self) -> Any:
+            await asyncio.sleep(3600)  # never reached
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+    class _VerySlowInitClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            # Longer than the deadline, on purpose -- see the docstring above.
+            time.sleep(0.6)
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+        def stream(self, *args: Any, **kwargs: Any) -> Any:
+            return _HangingStream()
+
+    monkeypatch.setattr(tool_builder.httpx2, "AsyncClient", _VerySlowInitClient)
+    monkeypatch.setattr(tool_builder, "_FETCH_TOTAL_TIMEOUT_SECONDS", 0.2)
+
+    started = time.monotonic()
+    text, error = asyncio.run(tool_builder._fetch_openapi("http://kb.example/openapi.json"))
+    elapsed = time.monotonic() - started
+
+    assert text is None
+    assert error is not None and error.startswith("OpenAPI 文件下載失敗")
+    # Bounded by the 0.2s deadline, comfortably below the 0.6s constructor --
+    # proves setup itself, not just the request after it, is now preemptible.
+    assert elapsed < 0.45
+
+
 def _capturing_async_client(captured: dict[str, Any]) -> type:
     """A fake httpx2.AsyncClient that records its constructor kwargs into
     ``captured`` and serves a canned ``{}`` 200 response -- exercises

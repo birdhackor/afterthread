@@ -706,23 +706,36 @@ async def _fetch_openapi(url: str) -> tuple[str | None, str | None]:
     ``verify`` kwarg at all -- so ordinary behavior is byte-for-byte unchanged.
 
     Client CONSTRUCTION -- not merely the request -- sits INSIDE the
-    asyncio.timeout scope on purpose, in BOTH branches above. Building an
+    asyncio.timeout scope on purpose, in BOTH branches above, AND is called via
+    ``run_in_threadpool`` rather than directly (P9 review r2). Building an
     httpx2.AsyncClient can do real synchronous work (TLS context / trust-store
     initialization -- e.g. reading the system trust store or SSL_CERT_FILE),
-    and that cost must count against the SAME total deadline this function
-    promises its caller, never run for free before the clock starts. That is
-    why ``_client_cm`` below is a closure CALLED as with-item #2's expression
-    rather than a variable assigned before the ``async with``: with-item
-    expressions are evaluated left to right, each AFTER the previous item's
-    ``__aenter__`` returns, so calling it there -- instead of earlier --
-    defers ``httpx2.AsyncClient(...)`` itself until asyncio.timeout (with-item
-    #1) has already started its clock.
+    and a synchronous call has no AWAIT point for asyncio.timeout's scheduled
+    cancellation to land on: the deadline could START counting before it, but
+    could never PREEMPT it mid-call, and the event loop sits blocked running it
+    -- for every other task too -- meanwhile. Routing it through
+    ``run_in_threadpool`` fixes both: the call becomes an awaited Future the
+    same clock CAN cancel, and the blocking work moves off the event loop
+    while it runs. That is why ``_client_cm`` below is a closure called (via
+    ``run_in_threadpool``) as with-item #2's expression rather than a variable
+    assigned before the ``async with``: with-item expressions are evaluated
+    left to right, each AFTER the previous item's ``__aenter__`` returns, so
+    calling it there -- instead of earlier -- defers ``httpx2.AsyncClient(...)``
+    itself until asyncio.timeout (with-item #1) has already started its clock,
+    AND makes the call one that same clock can interrupt. On expiry
+    mid-construction: the abandoned client was never entered (its
+    ``__aenter__`` never ran), so it holds no sockets (httpx2 opens
+    connections lazily) and is simply garbage-collected once the worker thread
+    returns it; the worker thread itself keeps running the blocked call to
+    completion in the background regardless -- one bounded thread tied up by a
+    truly hung syscall is accepted, since Python cannot kill a blocked thread.
     """
 
     def _client_cm() -> httpx2.AsyncClient:
         """Build the client for the current settings. Must stay a function
-        CALLED from within the ``async with`` below, not a variable computed
-        before it -- see the docstring above for why."""
+        CALLED (via ``run_in_threadpool``) from within the ``async with``
+        below, not a variable computed before it -- see the docstring above
+        for why."""
         if get_settings().tls_no_verify:
             return httpx2.AsyncClient(
                 timeout=_FETCH_TIMEOUT_SECONDS,
@@ -739,7 +752,7 @@ async def _fetch_openapi(url: str) -> tuple[str | None, str | None]:
     try:
         async with (
             asyncio.timeout(_FETCH_TOTAL_TIMEOUT_SECONDS),
-            _client_cm() as client,
+            await run_in_threadpool(_client_cm) as client,
             client.stream("GET", url) as response,
         ):
             if response.status_code // 100 != 2:
