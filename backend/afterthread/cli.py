@@ -152,12 +152,12 @@ def _ensure_data_dir(data_dir_path: Path) -> None:
         # choice, and silently rewriting them is not this tool's call.
         # FIX-2: this chmod is defense in depth, not the ONLY defense -- the
         # .env FILE itself also carries its own enforced 0600 mode (see
-        # `_create_env_file_exclusive` / `_replace_env_file_atomically`
-        # below), independent of whatever this directory's permissions end
-        # up being. So an already-existing, more permissive data dir (0755,
-        # say -- the "leave it alone" branch just above) still can never
-        # leave .env itself group/other-readable: that guarantee is never
-        # delegated to this directory chmod alone.
+        # `_write_env_tempfile`'s `os.fchmod` below, shared by both the
+        # fresh and --force publish paths), independent of whatever this
+        # directory's permissions end up being. So an already-existing, more
+        # permissive data dir (0755, say -- the "leave it alone" branch just
+        # above) still can never leave .env itself group/other-readable:
+        # that guarantee is never delegated to this directory chmod alone.
         data_dir_path.chmod(0o700)
 
 
@@ -529,11 +529,12 @@ def _run_serve(host: str, port: int, data_dir: str | None) -> None:
 def _refuse_symlinked_env(env_path: Path) -> NoReturn:
     """Print the symlink refusal and exit 1 (FIX-1a / FIX-1b's TOCTOU backstop).
 
-    The ONE outcome both call sites in `_init_env` resolve to -- the up-front
-    `env_path.is_symlink()` check (FIX-1a) and, for the rare TOCTOU race where
-    a symlink appears AFTER that check, the OSError-handling branches wrapped
-    around `_create_env_file_exclusive` (FIX-1b's backstop) -- so the two can
-    never drift into two differently-worded refusals for what is, to the
+    The ONE outcome both call sites resolve to -- the up-front
+    `env_path.is_symlink()` check in `_init_env` (FIX-1a; runs before either
+    publish primitive, force or not) and, for the rare TOCTOU race where a
+    symlink appears AFTER that check but the no-`--force` path is taken, the
+    `EEXIST`-handling branch inside `_publish_env_file_fresh` -- so the two
+    can never drift into two differently-worded refusals for what is, to the
     user, the exact same situation. Factored out rather than a shared string
     constant because both call sites also need the `typer.Exit(1)` control
     flow, not just the text.
@@ -582,9 +583,9 @@ def _write_all(fd: int, content: bytes) -> None:
     better. The raised `OSError` is tagged `errno.EIO`: there is no more
     specific errno for "the syscall itself reported zero progress without
     raising", and EIO still round-trips cleanly through this module's
-    errno-keyed handling in `_init_env` (which only special-cases
-    EEXIST/ELOOP; anything else, including this, is an honest, uncaught
-    failure -- exactly this file's existing contract for any OTHER
+    errno-keyed handling in `_publish_env_file_fresh` (which only
+    special-cases EEXIST; anything else, including this, is an honest,
+    uncaught failure -- exactly this file's existing contract for any OTHER
     unexpected OSError).
     """
     remaining = memoryview(content)
@@ -603,131 +604,72 @@ def _write_all(fd: int, content: bytes) -> None:
         remaining = remaining[written:]
 
 
-def _create_env_file_exclusive(env_path: Path, content: bytes) -> None:
-    """Create `env_path` fresh via O_EXCL|O_NOFOLLOW -- the no-`--force` path (FIX-1b).
+def _write_env_tempfile(env_path: Path, content: bytes) -> Path:
+    """Write `content` to a fresh, private temp file beside `env_path`; return it, closed.
 
-    Kin to `afterthread/services/tools.py`'s `_write_regular_file` /
-    `_read_regular_file_capped`: same reasoning, same O_NOFOLLOW discipline,
-    applied here to the one file this module ever writes. `O_EXCL` makes
-    "does .env already exist" and "create it" a SINGLE atomic kernel
-    operation -- exclusive creation IS the race-free refusal, closing the
-    check-then-write TOCTOU window a prior `env_path.exists()` guard followed
-    by a separate `write_text()` call left open (a `.env` that appeared
-    between the check and the write would have been silently clobbered).
-    `O_NOFOLLOW` is the same symlink backstop `tools.py` puts on every open it
-    does: `_init_env` already checks `is_symlink()` up front (FIX-1a), but a
-    symlink raced into `env_path` AFTER that check and BEFORE this call --
-    the TOCTOU window between two separate syscalls -- is still refused here,
-    at the one point that can be truly race-free. `0o600` handed directly to
-    `os.open` is this file's FIX-2 permission guarantee: umask can only ever
-    CLEAR bits from a requested mode, never add them, and 0o600 requests no
-    group/other bits in the first place, so the created file is 0600
-    regardless of the process umask or the data dir's own permissions.
+    The ONE writer shared by both publish primitives below --
+    `_publish_env_file_fresh` (no `--force`) and `_publish_env_file_force`
+    (`--force`) -- so `.env`'s byte-fidelity, permission, and fsync
+    discipline is expressed exactly once instead of twice, and the two
+    publish paths can never quietly drift apart on any of the three. This
+    unifies what used to be two independent writers -- one inlined into each
+    of the now-deleted `_create_env_file_exclusive` and
+    `_replace_env_file_atomically` -- that happened to agree by
+    construction, not by sharing code, which is exactly how the
+    restrictive-umask gap below went unnoticed on the fresh-create path for
+    as long as it did.
 
-    Raises the bare `OSError` (never swallowed): the caller, `_init_env`,
-    inspects `.errno` to choose the right zh-TW refusal (see the call site --
-    verified live on this platform that EEXIST, not ELOOP, is what a
-    pre-existing symlink actually raises here once O_EXCL is also set, so the
-    caller re-checks `is_symlink()` inside its EEXIST branch rather than
-    trusting ELOOP alone). Unlike `tools.py`'s helpers -- library code serving
-    many request-handling callers that must never let a filesystem hiccup 500
-    a response -- this is a single-shot CLI command, so any OTHER unexpected
-    OSError (e.g. a permissions problem) propagating as a Python traceback is
-    an acceptable, honest failure: there is no in-flight request to protect.
+    `mkstemp` in the SAME directory as `env_path` (never a system temp dir,
+    and never `env_path` itself) is what makes BOTH publish primitives below
+    atomic: `os.link`/`os.replace` are only atomic within one
+    filesystem/mount, and a temp file elsewhere risks a cross-device
+    link/rename (EXDEV) instead of an instant one. The name is also
+    unguessable, so nothing could pre-plant a symlink at it -- and, being a
+    brand-new name `mkstemp` itself invented, it can never collide with, or
+    need to reason about, whatever currently does or doesn't exist at
+    `env_path`.
 
-    FIX-4/FIX-5 (adversarial review, HIGH -- both empirically confirmed
-    against the pre-fix code): the write below now goes through `_write_all`
-    rather than a bare `os.write` (FIX-4 -- an unchecked short write used to
-    sail straight through `os.fsync` to a "successful", silently truncated
-    `.env`), and the write/fsync/close sequence is now wrapped in an
-    `except OSError` that unlinks `env_path` before re-raising (FIX-5). At
-    that point the inode is unambiguously OURS: O_EXCL's entire contract is
-    "this call only succeeds if nobody else already owns this name", so the
-    create above having already succeeded IS the proof nothing else can be at
-    this path. Leaving a failed write's debris behind would be actively
-    harmful, not merely untidy: the caller's EEXIST branch above cannot tell
-    "a real pre-existing .env" apart from "our own half-written leftovers
-    from a previously failed run", so undoing our own create on failure is
-    what keeps a transient write error from permanently wedging every
-    SUBSEQUENT `init-env` behind a refusal the user never asked for.
-    """
-    fd = os.open(env_path, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY, 0o600)
-    try:
-        # The inner try/finally is the ORIGINAL, unchanged contract: fd is
-        # closed exactly once on every exit from this block, success or
-        # failure -- so by the time the `except` below runs, the fd is
-        # already closed and there is no "is it still open" state to track.
-        try:
-            _write_all(fd, content)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except OSError:
-        # FIX-5 -- see docstring: unlink the inode we just created, since a
-        # write/fsync failure past this point must not leave partial debris
-        # at env_path for the NEXT run to trip over. Best-effort: if the
-        # unlink itself also fails there is nothing further this function
-        # can safely do about it, and the ORIGINAL failure -- not a
-        # cleanup-time one -- is what the caller needs to see.
-        with contextlib.suppress(OSError):
-            os.unlink(env_path)
-        raise
+    `os.fchmod(fd, 0o600)` runs immediately after open, before a single byte
+    of `content` is written -- and this is the actual fix for the confirmed
+    MEDIUM finding this function closes. The mode argument `os.open`/
+    `mkstemp` themselves accept (also 0o600) is masked by the process umask
+    like any other `open(2)` call: under a restrictive umask (0o777, the
+    legal-but-pathological extreme) a "0600" open request lands as mode 000
+    on disk -- created successfully, reported as success, yet unreadable and
+    unwritable by anyone, including the user who is about to be told to go
+    edit it. The OLD fresh-create path (`_create_env_file_exclusive`, now
+    deleted) requested its mode this way and ONLY this way, so despite its
+    own docstring's "regardless of the process umask" claim, it was exposed
+    to exactly this gap. `fchmod(2)`, by contrast, sets a file's mode
+    directly on an already-open descriptor and is NEVER masked by umask --
+    it is the sole mode guarantee this module now relies on, for both
+    publish paths alike. (tests/test_cli.py exercises the 0o777 direction
+    explicitly; a permissive-umask test alone -- the only kind that existed
+    before -- can never distinguish "genuinely umask-independent" from
+    "happened to pass because this run's umask was never restrictive enough
+    to matter".)
 
-
-def _replace_env_file_atomically(env_path: Path, content: bytes) -> None:
-    """Atomically (re)write `env_path` via a sibling temp file -- the `--force` path (FIX-1c/2).
-
-    Kin to `afterthread/services/tools.py`'s hardened writers: `set_enabled`
-    there create-or-overwrites `tool.json` in place because a manifest
-    rewrite has no meaningful "half-written" state a reader cares about, but
-    `.env` here is different -- `--force` exists PRECISELY to replace a file
-    that may already hold a real `OPENAI_API_KEY`, so an in-place `O_TRUNC`
-    write that then hit disk-full or got interrupted would leave an EMPTY or
-    partial `.env` on disk with no way back. `mkstemp` in the SAME directory
-    as `env_path` (never a system temp dir) is what makes the closing
-    `os.replace` atomic -- rename is only atomic within one filesystem/mount,
-    and a temp file elsewhere risks a cross-device rename (EXDEV) instead of
-    an instant rename -- and unguessable, so nothing could pre-plant a
-    symlink at its name.
-
-    `mkstemp` already creates with mode 0600, but the `os.fchmod` below is
-    NOT redundant decoration: FIX-2 wants THIS file's own 0600 guarantee
-    stated explicitly in code, not merely inherited from mkstemp's current
-    internal default, so a future stdlib change (or a platform whose default
-    ever differed) could never silently loosen it. `os.replace` is the
-    atomic swap -- `.env` is never observed half-written or truncated by a
-    concurrent reader -- and, being a rename onto an existing name, it
-    replaces the OLD file's inode (and therefore its mode) wholesale with the
-    temp file's: an existing world-readable `.env` being overwritten by
-    `--force` ends this call at 0600, never at its old, wider mode. (Verified
-    separately: a `rename`/`os.replace` onto a symlink destination replaces
-    the LINK itself, never writes through it to the target -- but `_init_env`
-    still refuses ANY symlinked `.env` up front, FIX-1a, before `force` is
-    even consulted, precisely so this function is never even asked to touch
-    one; a race landing a symlink at `env_path` in the narrow window between
-    that check and this call would -- at worst, per the same verified rename
-    semantics -- silently replace the operator's link rather than write
-    through it, a residual this project accepts as out of scope for a single
-    `rename` syscall with no atomic "unless it's now a symlink" primitive.)
-
-    The try/finally mirrors `tools.py`'s `fd_owned` handoff idiom (`fd_open`
-    here plays the same role) so the raw fd is closed exactly once, and
-    cleans up the temp file on EVERY exit path: `tmp_path.unlink(missing_ok=True)`
-    is a safe no-op on the success path (the file was already renamed away
-    from that name) and the real cleanup on any failure
-    (write/fsync/chmod/replace) -- so a half-finished `--force` can never
-    leave a stray temp file sitting in the data dir.
-
-    FIX-4 (adversarial review, HIGH): the write below now goes through
-    `_write_all` rather than a bare `os.write` -- see that helper's
-    docstring for why an unchecked short write is a real, empirically
-    confirmed hazard here too (a silently truncated temp file that this
-    function's own `os.replace` would then happily publish OVER the
-    caller's real `.env`). The `finally` below already unlinks the temp
-    file on ANY exception raised before `os.replace`, including the one
-    `_write_all` now raises on a short or zero-progress write, so no
-    further change to the cleanup path itself is needed -- only the write
-    call moves to the safe helper.
+    On ANY failure below -- `fchmod`, `_write_all`'s write loop, or `fsync`
+    -- the fd is closed if still open and OUR temp file is unlinked, both
+    best-effort (`contextlib.suppress(OSError)`: a cleanup-time failure must
+    never mask the original one), before re-raising the original `OSError`
+    unchanged. This doubles as the fix for the confirmed HIGH finding: the
+    path `mkstemp` returns is process-private and provably unique -- nothing
+    else on the system ever had, or will have, a reason to name it -- so
+    failure cleanup HERE can never remove anything another process placed at
+    `env_path` itself. The OLD fresh-create path's rollback instead deleted
+    `env_path` BY PATH after the fact, which was only ever safe as long as
+    O_EXCL's "we own this name" proof from open() time still held -- a
+    guarantee already stale by the time a LATER write/fsync failure
+    triggered that rollback: if this process stalled between the create and
+    the failure, and a CONCURRENT `init-env --force` (or a human editor)
+    atomically published a complete, correct `.env` into that same path in
+    the meantime, the old rollback would delete THEIR successful file --
+    silent loss of a config another process had already reported as
+    written. Writing to a private temp name first, and only ever touching
+    `env_path` via the atomic, all-or-nothing publish primitives below,
+    removes that window entirely: this function never creates, and
+    therefore never has to clean up, anything at `env_path` itself.
     """
     fd, tmp_name = tempfile.mkstemp(dir=env_path.parent, prefix=".env.", suffix=".tmp")
     tmp_path = Path(tmp_name)
@@ -738,11 +680,120 @@ def _replace_env_file_atomically(env_path: Path, content: bytes) -> None:
         os.fsync(fd)
         os.close(fd)
         fd_open = False
-        os.replace(tmp_path, env_path)
-    finally:
+    except OSError:
         if fd_open:
             with contextlib.suppress(OSError):
                 os.close(fd)
+        # Safe unconditionally: `tmp_path` is a name `mkstemp` invented for
+        # THIS call alone, never anything a caller passed in or another
+        # process could ever be relying on -- see the docstring above.
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        raise
+    return tmp_path
+
+
+def _publish_env_file_fresh(tmp_path: Path, env_path: Path) -> None:
+    """Publish `tmp_path` to `env_path` via a no-clobber hard link -- the no-`--force` path.
+
+    Replaces BOTH the old O_EXCL-based exclusive create in the now-deleted
+    `_create_env_file_exclusive` AND its except-driven, path-based rollback
+    (see `_write_env_tempfile`'s docstring for the race that rollback could
+    lose): here, `env_path` is never touched until `tmp_path` -- written by
+    `_write_env_tempfile` above -- already holds a complete, fsynced,
+    correctly-moded file. Nothing incomplete is EVER visible at `env_path`,
+    so there is nothing to roll back if anything below fails.
+
+    `os.link` is both atomic and no-clobber: it fails with `EEXIST` if
+    ANYTHING already has that name -- a regular file, a symlink, or a file
+    some other process raced into place a moment ago -- and, critically,
+    unlike a plain rename it never follows a symlink AT THE DESTINATION to
+    write through it (nor does an `EEXIST` on an existing symlink there
+    ever get silently "resolved" through the link first -- the directory
+    entry itself is what `link(2)` checks). So an `EEXIST` here is always a
+    CORRECT refusal, never a deletion hazard: at worst it costs the loser of
+    a race one polite "already exists, use --force" message, never someone
+    else's already-published file.
+
+    The up-front `env_path.is_symlink()` check in `_init_env` already ran
+    before this call, but a symlink raced into place in the TOCTOU window
+    between that check and this one is still attributed correctly here:
+    `EEXIST` itself already proves SOMETHING now occupies `env_path`, and
+    this `is_symlink()` recheck only decides which of the two zh-TW messages
+    describes it accurately (`_refuse_symlinked_env`'s vs. the generic
+    "already exists" below) -- it is not itself what makes the refusal
+    race-free; `os.link`'s own atomicity is. There is no separate ELOOP
+    backstop here the way the old O_NOFOLLOW-based create needed one:
+    `os.link` never follows a symlink at `env_path` to begin with, so there
+    is no O_NOFOLLOW-shaped errno quirk to special-case -- EEXIST is the
+    only outcome a pre-existing name of any kind can produce.
+
+    Any OTHER `OSError` (e.g. `EPERM` on a filesystem that refuses hard
+    links -- accepted as out of scope: every mainstream local filesystem on
+    Linux/macOS supports them, and this is a single-user tool, not worth a
+    fallback publish strategy for) propagates unchanged: a single-shot CLI
+    command has no in-flight request to protect, so a Python traceback here
+    is an acceptable, honest failure rather than something worth masking.
+
+    `tmp_path` is unlinked in a `finally` regardless of outcome: on success
+    it is a second name for the same inode `env_path` now also names, so
+    dropping it leaves that inode with exactly one name left (`env_path`)
+    and no debris; on refusal, `env_path` itself was never touched at all
+    (by construction of `link(2)`), so the temp file is the only cleanup
+    this function is ever responsible for.
+    """
+    try:
+        os.link(tmp_path, env_path)
+    except OSError as exc:
+        if exc.errno == errno.EEXIST:
+            # link(2)'s own EEXIST already proves SOMETHING sits at
+            # env_path; this lstat only decides which refusal describes it.
+            if env_path.is_symlink():
+                _refuse_symlinked_env(env_path)
+            # Refuse rather than silently overwrite: an existing .env may
+            # already hold a real OPENAI_API_KEY or other tuned setting, and
+            # clobbering it on a re-run (e.g. someone re-running init-env
+            # out of habit) would be a silent, unrecoverable data-loss
+            # footgun. --force is the explicit, deliberate opt-in to
+            # overwrite -- the file is left byte-for-byte untouched
+            # otherwise.
+            typer.echo(
+                f"錯誤：{env_path} 已存在，不會覆寫既有設定檔。如需覆寫請加上 --force。",  # noqa: RUF001
+                err=True,
+            )
+            raise typer.Exit(1) from exc
+        raise
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _publish_env_file_force(tmp_path: Path, env_path: Path) -> None:
+    """Publish `tmp_path` onto `env_path`, replacing whatever is there -- the `--force` path.
+
+    Unchanged in mechanism from the old `_replace_env_file_atomically`
+    (renamed here only to sit alongside `_publish_env_file_fresh` as the two
+    publish primitives sharing one writer, `_write_env_tempfile`, instead of
+    each inlining its own): `os.replace` is the atomic swap onto an existing
+    name -- `.env` is never observed half-written or truncated by a
+    concurrent reader -- and, being a rename onto an existing name, it
+    replaces the OLD file's inode (and therefore its mode) wholesale with
+    the temp file's: an existing world-readable `.env` being overwritten by
+    `--force` ends this call at 0600, never at its old, wider mode.
+    (Verified separately: a rename/`os.replace` onto a symlink destination
+    replaces the LINK itself, never writes through it to the target -- but
+    `_init_env` still refuses ANY symlinked `.env` up front, before `force`
+    is even consulted, precisely so this function is never even asked to
+    touch one.)
+
+    `tmp_path.unlink(missing_ok=True)` in the `finally` is a safe no-op on
+    the success path (the file was already renamed away from that name by
+    `os.replace`) and the real cleanup on any failure `os.replace` itself
+    raises -- so a half-finished `--force` can never leave a stray temp file
+    sitting in the data dir.
+    """
+    try:
+        os.replace(tmp_path, env_path)
+    finally:
         tmp_path.unlink(missing_ok=True)
 
 
@@ -787,13 +838,32 @@ def _init_env(
     ordinary regular file; (3) `write_text` truncates in place before writing
     the new bytes, so a disk-full condition or an interrupt mid-write could
     leave an EMPTY or partial `.env` parked at the real path. See
-    `_refuse_symlinked_env`, `_create_env_file_exclusive`, and
-    `_replace_env_file_atomically` above for how each hole is closed --
+    `_refuse_symlinked_env` above for how the symlink hole is closed --
     styled after, and citing the kinship with, the same hardened-write
     discipline `afterthread/services/tools.py` already applies to every file
     that module writes. None of this is hardening for its own sake: `.env`
     can hold a real `OPENAI_API_KEY`, so "write it correctly or refuse" is
     the only acceptable contract.
+
+    A LATER review round found the first fix for holes (2)/(3) -- separate
+    O_EXCL-based exclusive-create and mkstemp-based atomic-replace helpers,
+    one per branch below -- still had two gaps of its own, both closed by
+    UNIFYING the two branches behind one shared temp-file writer and two
+    atomic publish primitives (all three defined just above this command):
+    (a) HIGH -- the exclusive-create branch's failure cleanup unlinked
+    `env_path` BY PATH, which was safe only as long as O_EXCL's open-time
+    ownership proof still held; a slow write/fsync racing against a
+    concurrent successful `--force` (or a human editor) could make this
+    process delete a file ANOTHER process had already finished publishing;
+    (b) MEDIUM -- that same branch's `0o600` mode was an `os.open` argument
+    and therefore, unlike `_write_env_tempfile`'s `os.fchmod` (never
+    masked), silently narrowed by a restrictive process umask, so
+    "regardless of umask" was not actually true for it. See
+    `_write_env_tempfile`, `_publish_env_file_fresh`, and
+    `_publish_env_file_force` above for the closed design: a private temp
+    file is always fully written, fsynced, and mode-fixed BEFORE either
+    branch below ever touches `env_path`, so there is never anything
+    incomplete at `env_path` for a rollback to have to undo.
     """
     data_dir_path = _resolve_data_dir(data_dir)
     _ensure_data_dir(data_dir_path)
@@ -815,54 +885,18 @@ def _init_env(
     # and the file this command writes -- tests pin the two byte-for-byte.
     template_bytes = resources.files(_PACKAGE_NAME).joinpath(_ENV_TEMPLATE_RESOURCE).read_bytes()
 
+    # One pipeline, both branches: write once to a private temp file (never
+    # env_path itself -- see _write_env_tempfile), then hand off to whichever
+    # publish primitive matches --force. Neither primitive can ever observe
+    # or publish an incomplete file, so there is nothing left for _init_env
+    # itself to catch or roll back here -- each primitive owns its own
+    # errno handling (EEXIST -> the polite refusal, for the fresh path) and
+    # either returns having published `.env`, or raises/exits on its own.
+    tmp_path = _write_env_tempfile(env_path, template_bytes)
     if force:
-        _replace_env_file_atomically(env_path, template_bytes)
+        _publish_env_file_force(tmp_path, env_path)
     else:
-        try:
-            _create_env_file_exclusive(env_path, template_bytes)
-        except OSError as exc:
-            if exc.errno == errno.EEXIST:
-                # O_EXCL's own existence check treats ANY directory entry at
-                # this name as "already there" -- INCLUDING a symlink.
-                # Verified live on this platform: even with O_NOFOLLOW also
-                # set, a pre-existing symlink (valid OR broken) raises
-                # EEXIST here, never ELOOP -- O_EXCL's check runs first and
-                # wins. The is_symlink() guard above already ran before this
-                # call, so EEXIST overwhelmingly means an ordinary regular
-                # .env was already there the whole time -- but one more
-                # is_symlink() check (one cheap lstat) correctly attributes
-                # the rare TOCTOU case -- a symlink raced in between that
-                # guard and this call -- to the SAME symlink refusal instead
-                # of the generic one below. Either branch still refuses,
-                # exits 1, and leaves whatever was already there
-                # byte-unchanged, since nothing was ever written (O_EXCL
-                # failed before any write) -- this only changes which
-                # message the user sees, never the safety outcome.
-                if env_path.is_symlink():
-                    _refuse_symlinked_env(env_path)
-                # Refuse rather than silently overwrite: an existing .env may
-                # already hold a real OPENAI_API_KEY or other tuned setting,
-                # and clobbering it on a re-run (e.g. someone re-running
-                # init-env out of habit) would be a silent, unrecoverable
-                # data-loss footgun. --force is the explicit, deliberate
-                # opt-in to overwrite -- the file is left byte-for-byte
-                # untouched otherwise.
-                typer.echo(
-                    f"錯誤：{env_path} 已存在，不會覆寫既有設定檔。如需覆寫請加上 --force。",  # noqa: RUF001
-                    err=True,
-                )
-                raise typer.Exit(1) from exc
-            if exc.errno == errno.ELOOP:
-                # Not observed to fire alongside O_EXCL on this platform (see
-                # above -- EEXIST wins there), but O_NOFOLLOW alone (no
-                # O_EXCL) DOES raise exactly this for a symlinked leaf
-                # (verified live too), so this branch stays as an honest
-                # backstop rather than an assumption: if some platform/kernel
-                # ever resolves the combination differently, this still
-                # refuses correctly instead of falling through to the bare
-                # `raise` below.
-                _refuse_symlinked_env(env_path)
-            raise
+        _publish_env_file_fresh(tmp_path, env_path)
 
     typer.echo(f"已建立 {env_path}，可依需要編輯後再啟動 afterthread。")  # noqa: RUF001
 

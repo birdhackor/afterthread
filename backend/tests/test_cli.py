@@ -406,14 +406,19 @@ def test_top_level_option_envvars_are_not_flagged_as_a_trap_by_init_env(
 # --- CLI surface (typer): init-env hardened .env write (adversarial review) -
 #
 # Regression coverage for the FIX-1/FIX-2 hardening of `_init_env`'s actual
-# write (cli.py: `_refuse_symlinked_env` / `_create_env_file_exclusive` /
-# `_replace_env_file_atomically`), which replaced a plain `env_path.exists()`
-# guard followed by `write_text()`. See cli.py's FIX-1/FIX-2 comments for the
-# full rationale; these tests pin the OBSERVABLE contract: a symlinked .env
-# (valid or broken) is always refused, a pre-existing regular .env is refused
-# via the race-free exclusive create, every written .env ends at mode 0600
-# regardless of umask/data-dir permissions, and --force never leaves a stray
-# temp file behind.
+# write (cli.py: `_refuse_symlinked_env` / `_write_env_tempfile` /
+# `_publish_env_file_fresh` / `_publish_env_file_force`), which replaced a
+# plain `env_path.exists()` guard followed by `write_text()`, and was later
+# further unified -- one shared temp-file writer, two atomic publish
+# primitives -- to close two follow-up review findings (a path-based
+# rollback that could delete a concurrently-published file, and an os.open
+# mode argument silently narrowed by a restrictive umask). See cli.py's
+# comments on those functions for the full rationale; these tests pin the
+# OBSERVABLE contract: a symlinked .env (valid or broken) is always
+# refused, a pre-existing regular .env is refused via the no-clobber hard
+# link publish, every written .env ends at mode 0600 regardless of
+# umask/data-dir permissions, and --force never leaves a stray temp file
+# behind.
 
 
 @pytest.mark.parametrize(
@@ -469,15 +474,20 @@ def test_init_env_refuses_a_symlinked_env_file(kind: str, force: bool, tmp_path:
         assert not target.exists()  # broken symlink's target must stay absent
 
 
-def test_init_env_exclusive_create_refuses_pre_existing_regular_file(tmp_path: Path) -> None:
+def test_init_env_link_publish_refuses_pre_existing_regular_file(tmp_path: Path) -> None:
     # Pins the NEW mechanism specifically, not just old behavior parity: the
-    # refusal now comes from _create_env_file_exclusive's O_CREAT|O_EXCL open
-    # failing with EEXIST, not a separate env_path.exists() check followed by
-    # a write -- so the exclusive create must never have opened (let alone
-    # truncated) the pre-existing file. A distinctive pre-set mode (0640,
-    # deliberately neither the data dir's own 0700 default nor the file's own
-    # eventual 0600 target) proves the file was genuinely never touched, not
-    # merely left with byte-identical content by coincidence.
+    # refusal now comes from _publish_env_file_fresh's
+    # os.link(tmp_path, env_path) failing with EEXIST -- link(2) is atomic
+    # and no-clobber, so this refusal fires without env_path ever being
+    # opened, truncated, or otherwise touched (only a NEW directory entry
+    # pointing at the temp file's inode was attempted, and that attempt
+    # itself failed). A distinctive pre-set mode (0640, deliberately neither
+    # the data dir's own 0700 default nor the file's own eventual 0600
+    # target) proves the file was genuinely never touched, not merely left
+    # with byte-identical content by coincidence. No stray temp file from
+    # our own aborted publish attempt may remain either --
+    # _publish_env_file_fresh unlinks it in a `finally` regardless of
+    # outcome.
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     env_path = data_dir / ".env"
@@ -491,6 +501,8 @@ def test_init_env_exclusive_create_refuses_pre_existing_regular_file(tmp_path: P
     assert str(env_path) in result.output
     assert env_path.read_bytes() == before  # byte-unchanged
     assert stat.S_IMODE(env_path.stat().st_mode) == 0o640  # mode untouched too
+    remaining = sorted(p.name for p in data_dir.iterdir())
+    assert remaining == [".env"]  # no stray temp debris from the aborted publish
 
 
 def test_init_env_fresh_create_is_mode_0600_regardless_of_umask(tmp_path: Path) -> None:
@@ -507,6 +519,36 @@ def test_init_env_fresh_create_is_mode_0600_regardless_of_umask(tmp_path: Path) 
 
     assert result.exit_code == 0, result.output
     assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+
+
+def test_init_env_fresh_create_is_mode_0600_under_restrictive_umask(tmp_path: Path) -> None:
+    # THE MEDIUM finding this proves fixed: 0o600 handed directly to
+    # os.open (the pre-unification fresh-create path) is an ordinary
+    # open(2) mode argument, MASKED by the process umask like any other --
+    # a maximally restrictive umask (0o777) used to leave that request at
+    # mode 000 on disk, while init-env still reported success, even though
+    # the resulting file could then be neither read nor written by anyone,
+    # including the user it just told to go edit it. The permissive-umask
+    # test above alone could never catch this: it can only prove "0600
+    # survived umask 0", never "0600 survives umask 0o777" -- the direction
+    # that actually distinguishes os.fchmod (this file's real guarantee,
+    # see _write_env_tempfile) from a bare os.open mode argument (which
+    # never was one).
+    data_dir = tmp_path / "data"
+    env_path = data_dir / ".env"
+
+    old_umask = os.umask(0o777)  # maximally restrictive -- the untested direction
+    try:
+        result = runner.invoke(
+            app, ["init-env", "--data-dir", str(data_dir)], prog_name="afterthread"
+        )
+    finally:
+        os.umask(old_umask)
+
+    assert result.exit_code == 0, result.output
+    assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+    template_bytes = resources.files("afterthread").joinpath("env.example").read_bytes()
+    assert env_path.read_bytes() == template_bytes
 
 
 def test_init_env_force_overwrite_ends_at_mode_0600_even_in_permissive_dir(
@@ -541,11 +583,43 @@ def test_init_env_force_overwrite_ends_at_mode_0600_even_in_permissive_dir(
     assert env_path.read_bytes() == template_bytes
 
 
+def test_init_env_force_overwrite_is_mode_0600_under_restrictive_umask(
+    tmp_path: Path,
+) -> None:
+    # Companion to test_init_env_fresh_create_is_mode_0600_under_restrictive_umask
+    # above, for the --force path: proves os.fchmod's umask-independence in
+    # the shared _write_env_tempfile benefits BOTH publish primitives
+    # identically now that they go through one writer, instead of each
+    # requesting its own mode independently (which is exactly how the fresh
+    # path alone ended up with a masked-mode gap the force path never had).
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    data_dir.chmod(0o755)
+    env_path = data_dir / ".env"
+    env_path.write_text("OLD=1\n", encoding="utf-8")
+    env_path.chmod(0o644)
+
+    old_umask = os.umask(0o777)  # maximally restrictive -- the untested direction
+    try:
+        result = runner.invoke(
+            app,
+            ["init-env", "--data-dir", str(data_dir), "--force"],
+            prog_name="afterthread",
+        )
+    finally:
+        os.umask(old_umask)
+
+    assert result.exit_code == 0, result.output
+    assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+    template_bytes = resources.files("afterthread").joinpath("env.example").read_bytes()
+    assert env_path.read_bytes() == template_bytes
+
+
 def test_init_env_force_leaves_no_stray_temp_file_in_the_data_dir(tmp_path: Path) -> None:
-    # Atomicity smoke test for `_replace_env_file_atomically`'s mkstemp +
-    # os.replace pair: whatever happens along the way, the data dir must
-    # contain EXACTLY `.env` afterwards -- never a leftover `.env.<rand>.tmp`
-    # sibling from a half-finished write.
+    # Atomicity smoke test for `_write_env_tempfile` + `_publish_env_file_force`'s
+    # mkstemp + os.replace pair: whatever happens along the way, the data
+    # dir must contain EXACTLY `.env` afterwards -- never a leftover
+    # `.env.<rand>.tmp` sibling from a half-finished write.
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     env_path = data_dir / ".env"
@@ -562,21 +636,30 @@ def test_init_env_force_leaves_no_stray_temp_file_in_the_data_dir(tmp_path: Path
     assert remaining == [".env"]
 
 
-# --- CLI surface (typer): init-env write helpers -- short-write / rollback --
-# (FIX-4/FIX-5, adversarial review, HIGH) -------------------------------------
+# --- CLI surface (typer): init-env write helpers -- short-write / private- --
+# temp-file cleanup (originally FIX-4/FIX-5, adversarial review, HIGH; the
+# cleanup half was later replaced outright, not merely patched -- see below) -
 #
-# Regression coverage for the HIGH finding closed by `_write_all` (FIX-4) and
-# `_create_env_file_exclusive`'s except-driven rollback (FIX-5): the OLD
-# helpers called `os.write(fd, content)` exactly once and ignored its return
-# value, so a SHORT write (disk pressure, EINTR, ...) silently sailed through
-# `os.fsync` as a "successful", truncated `.env` -- and, on the no-`--force`
-# path, a write/fsync failure AFTER the O_EXCL create had already succeeded
-# left that partial inode behind, wedging every SUBSEQUENT `init-env` run
-# behind a spurious EEXIST refusal. Every `os.write`/`os.fsync` monkeypatch
-# below is scoped to `afterthread.cli.os` (the SAME module object `os` itself
-# is, so this also affects any other `os.write`/`os.fsync` caller for the
-# duration of the one `monkeypatch` fixture -- never an issue here, since
-# nothing else in the process performs a real write during these calls).
+# Regression coverage for the HIGH finding closed by `_write_all` (FIX-4,
+# unchanged since): the OLD write helpers called `os.write(fd, content)`
+# exactly once and ignored its return value, so a SHORT write (disk
+# pressure, EINTR, ...) silently sailed through `os.fsync` as a
+# "successful", truncated `.env`. FIX-5 originally closed a SECOND bug --
+# a write/fsync failure after the no-`--force` path's O_EXCL create had
+# already succeeded left that partial inode behind, wedging every
+# SUBSEQUENT `init-env` run behind a spurious EEXIST refusal -- via a
+# path-based rollback (`os.unlink(env_path)`). A LATER review found that
+# rollback itself unsafe under a race (see `_write_env_tempfile`'s
+# docstring in cli.py, and the dedicated race-survival test further below),
+# so it was replaced outright: the write below now always targets a
+# PRIVATE temp file, and `env_path` is never touched until an atomic
+# publish primitive runs on an already-complete file -- so a write/fsync
+# failure simply has nothing at `env_path` to roll back in the first place.
+# Every `os.write`/`os.fsync` monkeypatch below is scoped to
+# `afterthread.cli.os` (the SAME module object `os` itself is, so this also
+# affects any other `os.write`/`os.fsync` caller for the duration of the one
+# `monkeypatch` fixture -- never an issue here, since nothing else in the
+# process performs a real write during these calls).
 
 
 def test_init_env_short_writes_still_produce_a_byte_complete_env_file(
@@ -607,8 +690,10 @@ def test_init_env_zero_progress_write_raises_and_leaves_no_env_file(
 ) -> None:
     # The OTHER half of `_write_all`'s contract: a call that returns 0 while
     # data still remains is NOT "keep looping" (that would spin forever) --
-    # it must raise immediately. Combined with FIX-5, the failed create must
-    # also leave no partial `.env` behind for the exclusive-create path.
+    # it must raise immediately. The failure happens while
+    # `_write_env_tempfile` is still writing the PRIVATE temp file, before
+    # `env_path` is ever touched, so the fresh-publish primitive never even
+    # gets a complete file handed to it to link in.
     def zero_write(fd: int, data: bytes) -> int:
         return 0
 
@@ -621,16 +706,18 @@ def test_init_env_zero_progress_write_raises_and_leaves_no_env_file(
     assert not (data_dir / ".env").exists()
 
 
-def test_init_env_fresh_create_rolls_back_on_fsync_failure_and_second_run_succeeds(
+def test_init_env_fresh_write_failure_leaves_no_env_file_and_second_run_succeeds(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # THE bug FIX-5 closes: the OLD `_create_env_file_exclusive` only closed
-    # the fd when write/fsync failed AFTER O_EXCL had already succeeded --
-    # the freshly-created, now-partial `.env` inode was left behind, and the
-    # NEXT run's O_EXCL then refused it via EEXIST as though it were the
-    # user's own pre-existing config. This proves both halves: the failed
-    # run leaves no `.env` behind, AND a second, unpatched run afterwards
-    # succeeds cleanly -- no spurious EEXIST debris from the first attempt.
+    # Regression coverage for the ORIGINAL bug FIX-5 used to close via an
+    # explicit rollback -- now a structural non-issue instead: `env_path` is
+    # never touched until `_write_env_tempfile` has already produced a
+    # complete, fsynced temp file (see its docstring), so a failure here
+    # never creates `env_path` at all, and there is nothing to roll back or
+    # leave debris behind. This proves both halves: the failed run leaves no
+    # `.env` (and no stray temp file) behind, AND a second, unpatched run
+    # afterwards succeeds cleanly -- no spurious EEXIST from debris the
+    # first attempt might otherwise have left.
     data_dir = tmp_path / "data"
     env_path = data_dir / ".env"
 
@@ -642,7 +729,8 @@ def test_init_env_fresh_create_rolls_back_on_fsync_failure_and_second_run_succee
     monkeypatch.undo()  # restore the real os.fsync before the second, unpatched run
 
     assert result.exit_code != 0
-    assert not env_path.exists()  # FIX-5: no partial inode left behind
+    assert not env_path.exists()  # never created in the first place -- see above
+    assert sorted(p.name for p in data_dir.iterdir()) == []  # no stray temp file either
 
     result_second = runner.invoke(
         app, ["init-env", "--data-dir", str(data_dir)], prog_name="afterthread"
@@ -656,11 +744,14 @@ def test_init_env_fresh_create_rolls_back_on_fsync_failure_and_second_run_succee
 def test_init_env_force_path_write_failure_leaves_original_env_byte_unchanged(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # `_replace_env_file_atomically`'s existing `finally` already unlinks its
-    # temp file on any failure raised before `os.replace` -- this confirms
-    # the FIX-4 `_write_all` swap did not disturb that guarantee: a mid-write
-    # failure on the --force path must still leave the ORIGINAL .env
-    # byte-unchanged, with no stray temp file left sitting in the data dir.
+    # `_write_env_tempfile`'s own `except OSError` (shared by both publish
+    # paths -- see its docstring) already closes and unlinks its temp file
+    # on any failure raised before EITHER publish primitive ever runs -- this
+    # confirms that guarantee holds on the --force path too: a mid-write
+    # failure must still leave the ORIGINAL .env byte-unchanged, with no
+    # stray temp file left sitting in the data dir, since
+    # `_publish_env_file_force` (the only thing that would ever touch
+    # `env_path` on this path) never even gets called.
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     env_path = data_dir / ".env"
@@ -678,6 +769,69 @@ def test_init_env_force_path_write_failure_leaves_original_env_byte_unchanged(
 
     assert result.exit_code != 0
     assert env_path.read_bytes() == before
+    remaining = sorted(p.name for p in data_dir.iterdir())
+    assert remaining == [".env"]
+
+
+# --- CLI surface (typer): init-env concurrent-publish race survival --------
+# (write-unification review, HIGH) --------------------------------------------
+#
+# Regression coverage for the HIGH finding that motivated deleting the old
+# path-based rollback outright (see `_write_env_tempfile`'s docstring in
+# cli.py): the OLD fresh-create path unlinked `env_path` BY PATH when a
+# write/fsync failure struck AFTER its O_EXCL create had already succeeded --
+# safe only as long as O_EXCL's "we own this name" proof from open() time
+# still held. That proof goes stale the moment this process stalls and a
+# CONCURRENT `init-env --force` (or a human editor) atomically publishes a
+# complete, correct `.env` into the same path in the meantime: the old
+# rollback would then delete THAT process's successful file, not anything of
+# our own -- silent loss of a config another process had already reported as
+# written. The test below reproduces exactly that interleaving
+# deterministically, with no real second process needed.
+
+
+def test_init_env_fresh_publish_never_deletes_a_concurrently_published_env_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `os.fsync` (scoped to `afterthread.cli.os`, exactly like the
+    # short-write/zero-progress patches above) is patched so that -- while
+    # still operating on OUR OWN private temp file's fd, inside
+    # `_write_env_tempfile`, before `env_path` has been touched by us at all
+    # -- it first performs a REAL `os.replace` of a DIFFERENT, fully-formed
+    # "marker" file onto `env_path` (standing in for a concurrent process's
+    # own atomic publish winning the race) and THEN raises, exactly as a
+    # genuine fsync failure would. Nothing about this is a cheat: a real
+    # concurrent process could equally well complete its own publish at this
+    # exact instant, since `env_path` is not ours to have touched yet either
+    # way. The new design's failure cleanup only ever unlinks its OWN
+    # mkstemp-unique temp path (see `_write_env_tempfile`), never `env_path`,
+    # so the marker must survive completely untouched -- this is the crux of
+    # the fix.
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    env_path = data_dir / ".env"
+    assert not env_path.exists()  # the fresh (no --force) path requires this
+
+    marker_content = b"CONCURRENT-WINNER-ALREADY-PUBLISHED-THIS\n"
+    marker_src = tmp_path / "concurrent-winner.env"
+    marker_src.write_bytes(marker_content)
+
+    def fsync_then_concurrent_replace(fd: int) -> None:
+        os.replace(marker_src, env_path)
+        raise OSError(errno.EIO, "simulated fsync failure after a concurrent publish won the race")
+
+    monkeypatch.setattr("afterthread.cli.os.fsync", fsync_then_concurrent_replace)
+
+    result = runner.invoke(app, ["init-env", "--data-dir", str(data_dir)], prog_name="afterthread")
+
+    assert result.exit_code != 0
+    # THE assertion: the marker -- standing in for the concurrent winner's
+    # own successful publish -- must still be there, byte-unchanged. The
+    # pre-unification code deleted it here instead (empirically confirmed:
+    # this test was run against that code, unmodified, as a RED check before
+    # this fix landed, and it failed on exactly this line).
+    assert env_path.read_bytes() == marker_content
+    # And no debris from OUR failed attempt is left lying around either.
     remaining = sorted(p.name for p in data_dir.iterdir())
     assert remaining == [".env"]
 
