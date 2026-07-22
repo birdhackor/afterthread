@@ -275,7 +275,7 @@ OpenAI-compatible 端點、一個固定模型講話，沒有多供應商熱插�
 
 ## 7. 相關設定速查
 
-以下設定都在 `backend/.env.example` 裡（實際生效值與邊界以
+以下設定都在 `backend/afterthread/env.example` 裡（實際生效值與邊界以
 `backend/afterthread/config.py` 為準）：
 
 | 設定 | 預設值 | 說明 |

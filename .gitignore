@@ -13,10 +13,12 @@ __pycache__/
 *.db
 *.sqlite3
 
-# Environment variables
+# Environment variables. The packaged template now lives at
+# backend/afterthread/env.example (no leading dot, so it never matched
+# `.env.*` here in the first place and ships as a normal tracked package
+# file -- see backend/pyproject.toml's wheel-content notes).
 .env
 .env.*
-!.env.example
 
 # Node / frontend
 node_modules/

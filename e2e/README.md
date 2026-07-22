@@ -133,6 +133,11 @@ bash e2e/wheel_smoke.sh
 - **AI 未設定**：`GET /api/llm/status` 回 `configured:false`。
 - **CRUD 落地位置**：`POST /api/items` 成功建立項目，並確認資料庫檔案的位置
   （見上方「`.env` 載入 + 相對路徑錨定」）。
+- **`init-env`**：不碰上面伺服器用的 `--data-dir`，另外對一個全新的資料目錄
+  跑 `afterthread init-env`；驗證產生的 `.env` 與
+  `backend/afterthread/env.example` 逐位元組相同、資料目錄權限僅該使用者可讀
+  寫、不加 `--force` 重跑會以非零狀態結束且不動到既有檔案、加 `--force` 才會
+  覆寫。
 
 `smoke.sh` 與 `wheel_smoke.sh` 的行程/暫存清理都遵循同一套 hygiene：
 `setsid` 起一個獨立 process group，`EXIT` trap 對整個群組送信號，不管中間
