@@ -400,3 +400,244 @@ def test_top_level_option_envvars_are_not_flagged_as_a_trap_by_init_env(
 
     assert result.exit_code == 0, result.output
     assert (data_dir / ".env").is_file()
+
+
+# --- CLI surface (typer): init-env hardened .env write (adversarial review) -
+#
+# Regression coverage for the FIX-1/FIX-2 hardening of `_init_env`'s actual
+# write (cli.py: `_refuse_symlinked_env` / `_create_env_file_exclusive` /
+# `_replace_env_file_atomically`), which replaced a plain `env_path.exists()`
+# guard followed by `write_text()`. See cli.py's FIX-1/FIX-2 comments for the
+# full rationale; these tests pin the OBSERVABLE contract: a symlinked .env
+# (valid or broken) is always refused, a pre-existing regular .env is refused
+# via the race-free exclusive create, every written .env ends at mode 0600
+# regardless of umask/data-dir permissions, and --force never leaves a stray
+# temp file behind.
+
+
+@pytest.mark.parametrize(
+    "kind, force",
+    [
+        ("valid", False),
+        ("valid", True),
+        ("broken", False),
+        ("broken", True),
+    ],
+    ids=["valid-no-force", "valid-force", "broken-no-force", "broken-force"],
+)
+def test_init_env_refuses_a_symlinked_env_file(kind: str, force: bool, tmp_path: Path) -> None:
+    # THE bug FIX-1 closes: the old guard was `env_path.exists()`, which
+    # FOLLOWS a symlink and returns False for a BROKEN one -- so a broken
+    # symlink used to sail straight past the refusal and the write would have
+    # created the link's TARGET, outside the data dir entirely. A VALID
+    # symlink plus --force used to clobber whatever the link pointed at. This
+    # proves BOTH kinds are refused -- with or without --force, exit 1 -- and
+    # that neither the symlink itself nor whatever it points at (the "valid"
+    # case) is ever touched.
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    env_path = data_dir / ".env"
+
+    if kind == "valid":
+        target = tmp_path / "outside-target.txt"
+        target.write_bytes(b"ORIGINAL-EXTERNAL-CONTENT")
+        target_before = target.read_bytes()
+    else:
+        target = tmp_path / "does-not-exist-anywhere"
+        target_before = None
+    env_path.symlink_to(target)
+    link_target_before = os.readlink(env_path)
+
+    args = ["init-env", "--data-dir", str(data_dir)]
+    if force:
+        args.append("--force")
+    result = runner.invoke(app, args, prog_name="afterthread")
+
+    assert result.exit_code == 1
+    assert str(env_path) in result.output
+    assert "符號連結" in result.output  # the symlink-specific refusal, not the generic one
+
+    # The symlink itself is untouched: still a symlink, still pointing at the
+    # exact same (possibly nonexistent) target -- checksummed via a direct
+    # byte-content comparison, which is strictly stronger than a hash.
+    assert env_path.is_symlink()
+    assert os.readlink(env_path) == link_target_before
+    if kind == "valid":
+        assert target.read_bytes() == target_before
+    else:
+        assert not target.exists()  # broken symlink's target must stay absent
+
+
+def test_init_env_exclusive_create_refuses_pre_existing_regular_file(tmp_path: Path) -> None:
+    # Pins the NEW mechanism specifically, not just old behavior parity: the
+    # refusal now comes from _create_env_file_exclusive's O_CREAT|O_EXCL open
+    # failing with EEXIST, not a separate env_path.exists() check followed by
+    # a write -- so the exclusive create must never have opened (let alone
+    # truncated) the pre-existing file. A distinctive pre-set mode (0640,
+    # deliberately neither the data dir's own 0700 default nor the file's own
+    # eventual 0600 target) proves the file was genuinely never touched, not
+    # merely left with byte-identical content by coincidence.
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    env_path = data_dir / ".env"
+    env_path.write_text("EXISTING=1\n", encoding="utf-8")
+    env_path.chmod(0o640)
+    before = env_path.read_bytes()
+
+    result = runner.invoke(app, ["init-env", "--data-dir", str(data_dir)], prog_name="afterthread")
+
+    assert result.exit_code == 1
+    assert str(env_path) in result.output
+    assert env_path.read_bytes() == before  # byte-unchanged
+    assert stat.S_IMODE(env_path.stat().st_mode) == 0o640  # mode untouched too
+
+
+def test_init_env_fresh_create_is_mode_0600_regardless_of_umask(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    env_path = data_dir / ".env"
+
+    old_umask = os.umask(0o000)  # maximally permissive -- proves 0600 is not umask-dependent
+    try:
+        result = runner.invoke(
+            app, ["init-env", "--data-dir", str(data_dir)], prog_name="afterthread"
+        )
+    finally:
+        os.umask(old_umask)
+
+    assert result.exit_code == 0, result.output
+    assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+
+
+def test_init_env_force_overwrite_ends_at_mode_0600_even_in_permissive_dir(
+    tmp_path: Path,
+) -> None:
+    # FIX-2: the FILE carries its own 0600 guarantee, never delegated to the
+    # data dir's permissions -- a 0755 dir (world-traversable) and a 0644
+    # pre-existing .env (world-readable) must still end at 0600 with the NEW
+    # content after --force, proving the guarantee is not merely "whatever
+    # the directory happened to allow". The permissive umask (0) proves the
+    # same independence FIX-2 requires of the fresh-create path above.
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    data_dir.chmod(0o755)
+    env_path = data_dir / ".env"
+    env_path.write_text("OLD=1\n", encoding="utf-8")
+    env_path.chmod(0o644)
+
+    old_umask = os.umask(0o000)
+    try:
+        result = runner.invoke(
+            app,
+            ["init-env", "--data-dir", str(data_dir), "--force"],
+            prog_name="afterthread",
+        )
+    finally:
+        os.umask(old_umask)
+
+    assert result.exit_code == 0, result.output
+    assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+    template_bytes = resources.files("afterthread").joinpath("env.example").read_bytes()
+    assert env_path.read_bytes() == template_bytes
+
+
+def test_init_env_force_leaves_no_stray_temp_file_in_the_data_dir(tmp_path: Path) -> None:
+    # Atomicity smoke test for `_replace_env_file_atomically`'s mkstemp +
+    # os.replace pair: whatever happens along the way, the data dir must
+    # contain EXACTLY `.env` afterwards -- never a leftover `.env.<rand>.tmp`
+    # sibling from a half-finished write.
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    env_path = data_dir / ".env"
+    env_path.write_text("OLD=1\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["init-env", "--data-dir", str(data_dir), "--force"],
+        prog_name="afterthread",
+    )
+
+    assert result.exit_code == 0, result.output
+    remaining = sorted(p.name for p in data_dir.iterdir())
+    assert remaining == [".env"]
+
+
+# --- CLI surface (typer): serve-only AFTERTHREAD_PORT must never block a
+# subcommand that does not read it (FIX-3, adversarial review) ---------------
+
+
+def test_bad_port_envvar_does_not_block_init_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # THE bug FIX-3 closes: AFTERTHREAD_PORT is serve-only configuration, but
+    # used to be int-converted by Click BEFORE _callback's body ever ran --
+    # i.e. before Click even knew init-env (which never reads `port`) was the
+    # target -- so a bad value used to block EVERY invocation, subcommand or
+    # not.
+    monkeypatch.setenv("AFTERTHREAD_PORT", "bad")
+    data_dir = tmp_path / "data"
+
+    result = runner.invoke(app, ["init-env", "--data-dir", str(data_dir)], prog_name="afterthread")
+
+    assert result.exit_code == 0, result.output
+    assert (data_dir / ".env").is_file()
+
+
+def test_bad_port_envvar_does_not_block_init_env_help(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Same bug, the exact empirical repro named in the fix: `AFTERTHREAD_PORT=
+    # bad afterthread init-env --help` used to exit 2 without ever reaching
+    # init-env's own --help handling.
+    monkeypatch.setenv("AFTERTHREAD_PORT", "bad")
+
+    result = runner.invoke(app, ["init-env", "--help"], prog_name="afterthread")
+
+    assert result.exit_code == 0, result.output
+    assert "--force" in unstyle(result.stdout)
+
+
+def test_bare_serve_bad_port_envvar_still_exits_2_with_message(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The FLIP side of the two tests above: bare-serve (no subcommand) DOES
+    # read `port`, so a bad AFTERTHREAD_PORT must still fail it loudly --
+    # FIX-3 only moves WHEN the conversion happens, never removes it from the
+    # path that actually needs it.
+    def _fail_if_called(*args: object, **kwargs: object) -> None:
+        pytest.fail("uvicorn.run must not be called for a bad --port")
+
+    monkeypatch.setattr("afterthread.cli.uvicorn.run", _fail_if_called)
+    monkeypatch.setenv("AFTERTHREAD_PORT", "bad")
+
+    result = runner.invoke(app, ["--data-dir", str(tmp_path / "data")], prog_name="afterthread")
+
+    assert result.exit_code == 2
+    assert "not a valid integer" in unstyle(result.output)
+
+
+def test_bare_serve_honors_port_envvar_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Confirms the OTHER existing-coverage question FIX-3 raises: with no
+    # --port flag at all, AFTERTHREAD_PORT alone must still reach uvicorn.run
+    # as a real int (not just "does not crash"). Mirrors
+    # test_explicit_port_flag_overrides_envvar's monkeypatch/chdir-restore
+    # idiom, minus the competing --port flag.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("TOOLS_DIR", raising=False)
+    monkeypatch.setenv("AFTERTHREAD_PORT", "8123")
+
+    captured: dict[str, object] = {}
+
+    def fake_run(app_path: str, host: str, port: int) -> None:
+        captured["port"] = port
+
+    monkeypatch.setattr("afterthread.cli.uvicorn.run", fake_run)
+
+    data_dir = tmp_path / "data"
+    original_cwd = os.getcwd()
+    try:
+        result = runner.invoke(app, ["--data-dir", str(data_dir)], prog_name="afterthread")
+        assert result.exit_code == 0, result.output
+        assert captured["port"] == 8123
+        assert isinstance(captured["port"], int)
+    finally:
+        os.chdir(original_cwd)

@@ -575,6 +575,35 @@ ENVEOF
         fail "init-env's .env matches backend/afterthread/env.example byte-for-byte"
     fi
 
+    # FIX-2 (adversarial review, backend/afterthread/cli.py): every .env this
+    # command writes must carry its own 0600 mode, enforced by the write path
+    # itself (O_CREAT|O_EXCL|O_NOFOLLOW with mode 0o600 handed straight to
+    # os.open) rather than delegated to the data dir's own permissions --
+    # backend/tests/test_cli.py proves this at the unit level (including
+    # under a permissive umask); this re-confirms the observable file mode
+    # against the REAL packaged wheel/venv, not just the dev checkout.
+    if [ -f "$env_path" ]; then
+        assert_eq "init-env created .env has mode 600" "$(stat -c %a "$env_path")" "600"
+    else
+        fail "init-env created .env has mode 600 (file missing)"
+    fi
+
+    # FIX-3 (adversarial review, backend/afterthread/cli.py): AFTERTHREAD_PORT
+    # is serve-only configuration -- a malformed value must never be able to
+    # block a subcommand that never reads it (`port` is now converted from
+    # str to int ONLY on the confirmed bare-serve path; init-env's own
+    # parameter resolution never touches it). `init-env --help` never touches
+    # the filesystem, so this is safe to run here without disturbing
+    # $init_env_data_dir's state for the assertions around it.
+    if AFTERTHREAD_PORT=notanumber uvx --from "$WHEEL" afterthread init-env --help \
+        >"$init_env_log" 2>&1; then
+        pass "AFTERTHREAD_PORT=notanumber afterthread init-env --help exits 0"
+    else
+        fail "AFTERTHREAD_PORT=notanumber afterthread init-env --help exits 0"
+        echo "  (log:)"
+        sed 's/^/    /' "$init_env_log" || true
+    fi
+
     # A second bare run (no --force) must refuse: non-zero exit, file left
     # byte-for-byte unchanged. Snapshotted BEFORE and re-compared AFTER
     # (rather than just re-diffing against $template_file again) so this
