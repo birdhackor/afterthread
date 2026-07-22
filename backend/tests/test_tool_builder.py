@@ -1253,7 +1253,7 @@ def test_fetch_openapi_connection_failure() -> None:
 def test_fetch_openapi_total_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     """The whole fetch is bounded by a TOTAL wall-clock deadline
     (_FETCH_TOTAL_TIMEOUT_SECONDS): a connection that hangs past it -- even one
-    that would never trip httpx's PER-PHASE inactivity timeout -- fails with the
+    that would never trip httpx2's PER-PHASE inactivity timeout -- fails with the
     friendly fetch outcome rather than hanging the background job forever. Driven
     by a fake client whose stream never resolves, so the ONLY thing that can end
     the call is the asyncio.timeout wiring under test."""
@@ -1278,7 +1278,7 @@ def test_fetch_openapi_total_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
         def stream(self, *args: Any, **kwargs: Any) -> Any:
             return _HangingStream()
 
-    monkeypatch.setattr(tool_builder.httpx, "AsyncClient", _HangingClient)
+    monkeypatch.setattr(tool_builder.httpx2, "AsyncClient", _HangingClient)
     monkeypatch.setattr(tool_builder, "_FETCH_TOTAL_TIMEOUT_SECONDS", 0.2)
 
     started = time.monotonic()

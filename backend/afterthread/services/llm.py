@@ -37,6 +37,13 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, cast
 
+# The openai SDK pins its OWN httpx<1 as its transport layer: it parses
+# ``openai_base_url`` with ``httpx.URL`` and raises httpx exceptions (e.g.
+# ``httpx.InvalidURL``) at client construction -- see ``llm_configured`` /
+# ``_get_client`` below. This module's URL validation exists to MIRROR that
+# SDK behavior, so it must parse with the SDK's OWN library. httpx2 (this
+# project's HTTP client elsewhere -- see ``services/tool_builder.py``) must
+# NOT be substituted here, or the mirror guarantee silently breaks.
 import httpx
 from openai import AsyncOpenAI, OpenAIError
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam

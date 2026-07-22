@@ -68,7 +68,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-import httpx
+import httpx2
 from pydantic import BaseModel, ConfigDict, model_validator
 from starlette.concurrency import run_in_threadpool
 
@@ -101,7 +101,7 @@ _FETCH_MAX_REDIRECTS = 5
 _OPENAPI_MAX_BYTES = 2 * 1024 * 1024
 
 # Total wall-clock deadline for the WHOLE fetch. Distinct from
-# _FETCH_TIMEOUT_SECONDS above, which httpx applies as a PER-PHASE (connect/
+# _FETCH_TIMEOUT_SECONDS above, which httpx2 applies as a PER-PHASE (connect/
 # read/write) INACTIVITY timeout: a server that dribbles one byte just under the
 # read timeout resets that clock forever and could hold the stream open
 # indefinitely. This asyncio.timeout bounds the end-to-end duration regardless,
@@ -680,18 +680,18 @@ async def _fetch_openapi(url: str) -> tuple[str | None, str | None]:
 
     Bounded on every axis: a TOTAL wall-clock deadline (asyncio.timeout, see
     ``_FETCH_TOTAL_TIMEOUT_SECONDS``) wrapped around the whole fetch, the
-    per-phase httpx timeout inside it, the redirect count, and the body SIZE --
+    per-phase httpx2 timeout inside it, the redirect count, and the body SIZE --
     the Content-Length header is checked when present, and the streamed body is
     counted regardless (a server can lie about, or omit, the header). Over the
     cap fails OUTRIGHT (see ``_OPENAPI_MAX_BYTES``). Errors carry only the
-    exception CATEGORY, never ``str(exc)`` -- an httpx error string embeds the
+    exception CATEGORY, never ``str(exc)`` -- an httpx2 error string embeds the
     full URL, and while the URL is the user's own input (not a secret), the
     category is what is diagnostic; the URL is already on the user's screen.
     """
     try:
         async with (
             asyncio.timeout(_FETCH_TOTAL_TIMEOUT_SECONDS),
-            httpx.AsyncClient(
+            httpx2.AsyncClient(
                 timeout=_FETCH_TIMEOUT_SECONDS,
                 follow_redirects=True,
                 max_redirects=_FETCH_MAX_REDIRECTS,
@@ -711,11 +711,12 @@ async def _fetch_openapi(url: str) -> tuple[str | None, str | None]:
                     return None, _ERROR_OPENAPI_TOO_LARGE
                 chunks.append(chunk)
     except Exception as exc:
-        # httpx.HTTPError covers transport/timeout/redirect failures; a malformed
-        # URL raises httpx.InvalidURL (a ValueError, NOT an HTTPError); and the
-        # asyncio.timeout total-deadline expiry surfaces as TimeoutError. The
-        # catch is total so every one of them lands on the friendly-outcome path
-        # rather than crashing the background job.
+        # httpx2.HTTPError covers transport/timeout/redirect failures; a
+        # malformed URL raises httpx2.InvalidURL (a bare Exception -- NOT an
+        # HTTPError and NOT a ValueError); and the asyncio.timeout
+        # total-deadline expiry surfaces as TimeoutError. The catch is total so
+        # every one of them lands on the friendly-outcome path rather than
+        # crashing the background job.
         return None, f"OpenAPI 文件下載失敗（{type(exc).__name__}）。"  # noqa: RUF001
     return b"".join(chunks).decode("utf-8", errors="replace"), None
 

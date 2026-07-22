@@ -36,6 +36,7 @@ dependencies = [
     "pydantic-settings",
     "openai",
     "typer>=0.26.8",
+    "httpx2>=2.5.0",
 ]
 
 [project.urls]
@@ -49,7 +50,6 @@ dev = [
     "ruff",
     "ty",
     "pytest",
-    "httpx2>=2.5.0",
     # Not needed to RUN builds (uv provisions the build backend in an isolated
     # environment from [build-system].requires) -- present only so ruff/ty can
     # resolve the first-party build hook's imports (see hatch_build.py).
