@@ -22,7 +22,7 @@ push，全部完成後對 `fdff6166..HEAD` 跑 overall review。
 | P1 | 唯讀 Checkbox → 非互動清單（CapturePage、ItemAiActions） | sonnet | 進行中 |
 | P2 | llm_log 每 attempt 記 `tools_advertised`＋日誌頁顯示 | opus | 待開始 |
 | P3a | 工具總結後端（一）：sidecar `.ai_meta.json`、summary 生成、定版＋regenerate API | opus | 進行中 |
-| P3b | 工具總結後端（二）：revise job、promote replace、job 路由改名 | opus | 待開始 |
+| P3b | 工具總結後端（二）：revise job、promote replace、job 路由改名 | opus | 完成 |
 | P4 | 工具總結前端：ToolsPage 總結面板、意見迭代、定版 | sonnet | 待開始 |
 | Final | overall review（`fdff6166..HEAD`）＋全 gates＋總結 | — | 待開始 |
 

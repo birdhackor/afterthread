@@ -15,17 +15,20 @@ the HTTP contract:
   separately from the three LLM-degradable workflows);
 * every registry call runs via ``run_in_threadpool`` (filesystem scans and
   writes are blocking work that must not sit on the event loop -- the house
-  pattern), while ``start_install_job`` runs inline BECAUSE it needs the
-  running event loop to spawn its background task.
+  pattern), while ``start_install_job`` / ``start_revise_job`` run inline
+  BECAUSE they need the running event loop to spawn their background task.
 
-The AI-summary routes (D40) add one wrinkle to that taxonomy. They deliberately
-do NOT declare ``tools_not_configured``: with ``TOOLS_DIR`` unset every name
-resolves to None, so "the feature is off" and "no such tool" are already the
-same 404, and adding a second 503 for it would widen the contract for nothing.
-The synchronous regenerate DOES declare the LLM pair (503/502), whose codes,
-messages and helpers are IMPORTED from ``routers.ai`` rather than re-spelled --
-one definition of ``llm_not_configured`` / ``llm_upstream_error``, so a client
-handling the AI workflows' degradation handles this one identically.
+The AI-summary and revise routes (D40) add one wrinkle to that taxonomy. They
+deliberately do NOT declare ``tools_not_configured``: with ``TOOLS_DIR`` unset
+every name resolves to None, so "the feature is off" and "no such tool" are
+already the same 404, and adding a second 503 for it would widen the contract
+for nothing. The synchronous regenerate DOES declare the LLM pair (503/502),
+whose codes, messages and helpers are IMPORTED from ``routers.ai`` rather than
+re-spelled -- one definition of ``llm_not_configured`` / ``llm_upstream_error``,
+so a client handling the AI workflows' degradation handles this one identically.
+The revise submit declares NEITHER, for the same reason the install submit does
+not: it queues a background job, so its LLM failures are job state, not a
+response status.
 """
 
 from pathlib import Path
@@ -43,9 +46,10 @@ from afterthread.routers.ai import (
 )
 from afterthread.schemas import (
     ToolInstallAccepted,
-    ToolInstallJobStatus,
     ToolInstallRequest,
+    ToolJobStatus,
     ToolListResponse,
+    ToolReviseRequest,
     ToolSummary,
     ToolSummaryDetail,
     ToolSummaryStatusUpdate,
@@ -132,9 +136,9 @@ _INSTALL_IN_PROGRESS_RESPONSE: dict[int | str, dict[str, Any]] = {
 # * `summary_missing` -- PATCH tried to 定版 a tool that has no sidecar yet.
 #   Deliberately a 409, not a 404: the TOOL exists, there is just nothing to
 #   freeze, and the fix (產生總結) is a different action from "wrong tool";
-# * `tool_finalized` -- a regenerate (and, from P3b, a revise) on a 已定版
-#   package. Freezing AI iteration is exactly what 定版 means, so the answer is
-#   a conflict telling the user to unfreeze first, never a silent regeneration;
+# * `tool_finalized` -- a regenerate or a revise on a 已定版 package. Freezing
+#   AI iteration is exactly what 定版 means, so the answer is a conflict telling
+#   the user to unfreeze first, never a silent regeneration or revision;
 # * `tool_job_in_progress` -- an install/revise job is queued or running. A
 #   promote MOVES a package directory into place, so touching a package's
 #   sidecar across that swap races a directory being replaced. A NEW code
@@ -169,10 +173,13 @@ _SUMMARY_MISSING_RESPONSE = _conflict_response(
     _SUMMARY_MISSING_CODE, _SUMMARY_MISSING_MESSAGE, "The tool has no summary to finalize"
 )
 
-# ONE 409 slot in OpenAPI, two runtime codes: a regenerate can conflict either
-# way, and both examples cannot occupy the same status key -- so the declared
-# example names the finalized case and the description names both.
-_REGENERATE_CONFLICT_RESPONSE = _conflict_response(
+# ONE 409 slot in OpenAPI, two runtime codes: both AI-iteration operations
+# (regenerate and revise) can conflict either way, and both examples cannot
+# occupy the same status key -- so the declared example names the finalized case
+# and the description names both. Shared by the two routes because it is
+# literally the same pair of answers: "this tool is frozen" and "a tool job is
+# already running".
+_AI_ITERATION_CONFLICT_RESPONSE = _conflict_response(
     _TOOL_FINALIZED_CODE,
     _TOOL_FINALIZED_MESSAGE,
     "The summary is finalized (tool_finalized), or a tool job is running (tool_job_in_progress)",
@@ -278,13 +285,13 @@ async def install_tool(payload: ToolInstallRequest) -> ToolInstallAccepted:
     return ToolInstallAccepted(job_id=job_id)
 
 
-# --- AI summary (D40) --------------------------------------------------------
+# --- AI summary + revise (D40) -----------------------------------------------
 #
-# Declared BEFORE `GET /install/{job_id}` (which now sits at the BOTTOM of this
-# module for exactly that reason -- see the note there). "install" is itself a
-# legal package name, so with the job route first `/api/tools/install/summary`
-# matched IT, with job_id="summary", and a tool genuinely named "install" could
-# never have its summary read.
+# Declared BEFORE `GET /jobs/{job_id}` (which sits at the BOTTOM of this module
+# for exactly that reason -- see the note there). "jobs" is itself a legal
+# package name, so with the job route first `/api/tools/jobs/summary` would match
+# IT, with job_id="summary", and a tool genuinely named "jobs" could never have
+# its summary read.
 
 
 def _existing_package_dir(name: str) -> Path | None:
@@ -397,7 +404,7 @@ async def update_tool_summary_status(
     response_model=ToolSummaryDetail,
     responses={
         **_TOOL_NOT_FOUND_RESPONSE,
-        **_REGENERATE_CONFLICT_RESPONSE,
+        **_AI_ITERATION_CONFLICT_RESPONSE,
         **_LLM_UNCONFIGURED_RESPONSE,
         **_LLM_UPSTREAM_RESPONSE,
     },
@@ -473,31 +480,88 @@ async def regenerate_tool_summary(name: ToolName) -> ToolSummaryDetail:
     return _summary_detail(meta)
 
 
-# --- install job poll --------------------------------------------------------
+@router.post(
+    "/{name}/revise",
+    response_model=ToolInstallAccepted,
+    status_code=202,
+    responses={**_TOOL_NOT_FOUND_RESPONSE, **_AI_ITERATION_CONFLICT_RESPONSE},
+)
+async def revise_tool(name: ToolName, payload: ToolReviseRequest) -> ToolInstallAccepted:
+    """Queue an AI revise job for one installed tool; poll it via `/jobs/{id}`.
+
+    202 + job id, exactly like the installer's submit and for the same reason: a
+    revise IS a builder session (minutes of tool rounds and shell tests), so it
+    cannot live inside a request. It therefore declares NEITHER 502 NOR 503: an
+    LLM that is unconfigured or failing is represented as a FAILED job carrying a
+    friendly error and its own AI 日誌 link, so the submit itself has no LLM
+    outcome to report -- the same contract split test_ai_contract pins for the
+    install submit (which does declare a 503, but for TOOLS_DIR, not the LLM).
+    That 503 has no counterpart here: with TOOLS_DIR unset no name resolves, so
+    this route's existence gate already answers 404.
+
+    Three refusals, in the order that spends the least:
+
+    * 404 -- the tool does not exist, resolved through the SAME helper every
+      summary route uses, so an internal symlink alias is refused here too (a
+      revise addressed through an alias would REPLACE the real package);
+    * 409 ``tool_finalized`` -- 定版 freezes AI iteration on the tool by
+      definition, so a revise is refused until it is unfrozen, exactly as a
+      regenerate is. ``run_revise`` re-checks this itself: this gate is a
+      microsecond stale by the time the job starts;
+    * 409 ``tool_job_in_progress`` -- taken from ``start_revise_job`` returning
+      None rather than from an ``any_job_active()`` pre-check. Both express the
+      same rule (one tool job at a time), but the None return decides it INSIDE
+      the admission lock, so two simultaneous submits cannot both be admitted.
+    """
+    directory = await run_in_threadpool(_existing_package_dir, name)
+    if directory is None:
+        raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
+    if await run_in_threadpool(tools_service.summary_status, directory) == "final":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": _TOOL_FINALIZED_CODE, "message": _TOOL_FINALIZED_MESSAGE},
+        )
+    job_id = tool_builder.start_revise_job(name, payload.feedback)
+    if job_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": _TOOL_JOB_IN_PROGRESS_CODE, "message": _TOOL_JOB_IN_PROGRESS_MESSAGE},
+        )
+    return ToolInstallAccepted(job_id=job_id)
+
+
+# --- tool job poll -----------------------------------------------------------
 #
-# LAST on purpose, and it must STAY last. `GET /install/{job_id}` and
+# LAST on purpose, and it must STAY last. `GET /jobs/{job_id}` and
 # `GET /{name}/summary` are both two-segment GETs and FastAPI matches in
 # DECLARATION order, so whichever is declared first wins the strings that
 # satisfy both. Declaring the summary routes first is safe in BOTH directions:
 # a job id is ``uuid4().hex``, so the literal segment "summary" can never be
-# one (no job poll is stolen), while "install" IS a legal package name, so a
-# tool named "install" can now serve `/api/tools/install/summary` instead of
-# having it swallowed as a job poll with job_id="summary".
+# one (no job poll is stolen), while "jobs" IS a legal package name, so a tool
+# named "jobs" can still serve `/api/tools/jobs/summary` instead of having it
+# swallowed as a job poll with job_id="summary".
 #
-# P3b's planned `/jobs/{job_id}` rename removes the collision entirely -- but
-# until it lands, this ordering is what makes both routes reachable, so a
-# rename must preserve it rather than assume the placement was arbitrary.
+# D40's rename from `/install/{job_id}` MOVED this collision (it used to be a
+# tool named "install"); it did not remove it, because any literal first segment
+# is a name a package could have. So the ordering stays load-bearing.
 
 
 @router.get(
-    "/install/{job_id}",
-    response_model=ToolInstallJobStatus,
+    "/jobs/{job_id}",
+    response_model=ToolJobStatus,
     responses=_JOB_NOT_FOUND_RESPONSE,
 )
-async def install_job_status(job_id: str) -> ToolInstallJobStatus:
-    """One install job's state. 404: unknown id, evicted, or a backend restart
-    (jobs are process-local and unpersisted -- see tool_builder)."""
+async def tool_job_status(job_id: str) -> ToolJobStatus:
+    """One install/revise job's state. 404: unknown id, evicted, or a backend
+    restart (jobs are process-local and unpersisted -- see tool_builder).
+
+    ONE endpoint for both kinds (D40): they share a job table, a single-flight
+    admission and a response shape, so a second endpoint would only give the FE
+    two identical pollers to keep in sync. The old `/install/{job_id}` spelling
+    is REMOVED rather than aliased -- the FE and the backend ship in the same
+    wheel, so there is no version skew for an alias to protect.
+    """
     job = tool_builder.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=_JOB_NOT_FOUND)
-    return ToolInstallJobStatus.model_validate(job)
+    return ToolJobStatus.model_validate(job)

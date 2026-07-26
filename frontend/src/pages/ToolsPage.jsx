@@ -368,7 +368,7 @@ function InstallPanel() {
 
 	const jobQuery = useQuery({
 		queryKey: ["tool-install", jobId],
-		queryFn: () => apiGet(`/api/tools/install/${jobId}`),
+		queryFn: () => apiGet(`/api/tools/jobs/${jobId}`),
 		enabled: jobId !== null,
 		refetchInterval: installJobRefetchInterval,
 	});

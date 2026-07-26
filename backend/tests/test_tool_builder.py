@@ -24,6 +24,7 @@ an autouse fixture resets both around every test.
 import asyncio
 import json
 import os
+import shutil
 import socket
 import sys
 import threading
@@ -588,6 +589,7 @@ def _fake_generate(
     result: dict[str, Any],
     files: dict[str, str] | None = None,
     record_session: bool = True,
+    side_effect: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Install a fake generate_structured that builds ``files`` via the REAL
     meta-tools it receives (so containment/threadpool paths run), optionally
@@ -597,7 +599,14 @@ def _fake_generate(
 
     Also stubs the post-promote SUMMARY session (see ``_fake_summary_generate``)
     so every install here stays hermetic; a test that wants a different summary
-    outcome re-stubs it afterwards."""
+    outcome re-stubs it afterwards.
+
+    ``side_effect`` runs at the TOP of the session -- before the fake writes any
+    file -- which is the only place a test can observe the world as the builder
+    RECEIVED it: the staging workspace exactly as it was copied (a revise), the
+    secret registry mid-session, or a package being deleted under a running
+    build. The real thing is a multi-minute session, so this window is otherwise
+    unreachable from a test."""
     captured: dict[str, Any] = {}
 
     async def fake(
@@ -618,6 +627,8 @@ def _fake_generate(
             max_tool_rounds=max_tool_rounds,
             timeout_seconds=timeout_seconds,
         )
+        if side_effect is not None:
+            side_effect()
         by_name = {t.spec["function"]["name"]: t for t in tools or []}
         for path, content in (files or {}).items():
             wrote = await by_name["write_file"].handler({"path": path, "content": content})
@@ -2887,7 +2898,7 @@ def test_router_job_status_and_404(client: TestClient) -> None:
     with tool_builder._JOBS_LOCK:
         tool_builder._JOBS[job.job_id] = job
 
-    response = client.get("/api/tools/install/job-1")
+    response = client.get("/api/tools/jobs/job-1")
     assert response.status_code == 200
     assert response.json() == {
         "job_id": "job-1",
@@ -2900,9 +2911,14 @@ def test_router_job_status_and_404(client: TestClient) -> None:
         "llm_log_id": 3,
     }
 
-    missing = client.get("/api/tools/install/ghost")
+    missing = client.get("/api/tools/jobs/ghost")
     assert missing.status_code == 404
     assert missing.json() == {"detail": "Install job not found"}
+
+    # The pre-D40 spelling is GONE, not aliased (FE and backend ship in one
+    # wheel, so there is no version skew for an alias to protect): it matches no
+    # route at all now, hence Starlette's own 404 rather than the handler's.
+    assert client.get("/api/tools/install/job-1").status_code == 404
 
 
 # --- router: AI summary (D40) --------------------------------------------------
@@ -3321,11 +3337,12 @@ def test_router_summary_routes_refuse_an_internal_alias(
     """An INTERNAL alias tools/<alias> -> tools/<real> resolves INSIDE the tools
     root, so resolve-then-contain PASSES and every by-name summary operation
     would silently act on the REAL package -- a PATCH freezing its summary, a
-    regenerate spending an LLM session rewriting it. All three refuse (404) and
-    the real sidecar is left byte-for-byte as it was.
+    regenerate spending an LLM session rewriting it, a REVISE replacing it
+    wholesale. All four refuse (404) and the real sidecar is left byte-for-byte
+    as it was.
 
     This is the same hard-block set_enabled/delete_tool have carried since H3,
-    now shared by every summary path through one resolver."""
+    now shared by every summary/revise path through one resolver."""
     pkg = _seed_package(monkeypatch, tmp_path, "real")
     (pkg.parent / "alias").symlink_to(pkg, target_is_directory=True)
     _write_meta(pkg, summary="真的說明", status="draft")
@@ -3334,11 +3351,16 @@ def test_router_summary_routes_refuse_an_internal_alias(
     async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("no session may start for an aliased package")
 
+    def must_not_start(name: str, feedback: str) -> str:
+        raise AssertionError("no revise job may start for an aliased package")
+
     monkeypatch.setattr("afterthread.services.tool_meta.generate_structured", must_not_generate)
+    monkeypatch.setattr("afterthread.services.tool_builder.start_revise_job", must_not_start)
 
     assert client.get("/api/tools/alias/summary").status_code == 404
     assert client.patch("/api/tools/alias/summary", json={"status": "final"}).status_code == 404
     assert client.post("/api/tools/alias/summary/regenerate").status_code == 404
+    assert client.post("/api/tools/alias/revise", json={"feedback": "改"}).status_code == 404
 
     assert (pkg / tools._AI_META_FILENAME).read_bytes() == before
     assert _meta(pkg)["status"] == "draft"  # the real package was never finalized
@@ -3361,31 +3383,33 @@ def test_router_regenerate_summary_404_when_the_sidecar_write_is_refused(
     assert response.json() == {"detail": "Tool not found"}
 
 
-def test_router_a_tool_named_install_can_serve_its_summary(
+def test_router_a_tool_named_jobs_can_serve_its_summary(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """`install` is a legal package name, and `GET /install/{job_id}` used to be
-    declared first -- so `/api/tools/install/summary` matched the JOB route with
-    job_id="summary" and that tool's summary was unreachable.
+    """`jobs` is a legal package name, and the job poll is `GET /jobs/{job_id}`
+    -- so if it were declared FIRST, `/api/tools/jobs/summary` would match the
+    JOB route with job_id="summary" and that tool's summary would be unreachable.
 
-    Both routes now work: a job id is uuid4().hex, so the literal segment
-    "summary" can never be one, which is what makes the ordering safe in both
-    directions."""
-    pkg = _seed_package(monkeypatch, tmp_path, "install")
-    _write_meta(pkg, summary="名叫 install 的工具", status="draft")
+    D40's rename MOVED this collision from `install` to `jobs`; it did not remove
+    it, since any literal first segment is a name a package could have. The
+    summary routes are therefore still declared first, which is safe in both
+    directions: a job id is uuid4().hex, so the literal segment "summary" can
+    never be one."""
+    pkg = _seed_package(monkeypatch, tmp_path, "jobs")
+    _write_meta(pkg, summary="名叫 jobs 的工具", status="draft")
 
-    response = client.get("/api/tools/install/summary")
+    response = client.get("/api/tools/jobs/summary")
     assert response.status_code == 200
-    assert response.json()["summary"] == "名叫 install 的工具"
+    assert response.json()["summary"] == "名叫 jobs 的工具"
     assert response.json()["status"] == "draft"
 
     # ... and a real (uuid4().hex-shaped) job id still reaches the job handler.
-    poll = client.get("/api/tools/install/0123456789abcdef0123456789abcdef")
+    poll = client.get("/api/tools/jobs/0123456789abcdef0123456789abcdef")
     assert poll.status_code == 404
     assert poll.json() == {"detail": "Install job not found"}
 
     # The other two summary verbs address the same tool, not the job route.
-    assert client.patch("/api/tools/install/summary", json={"status": "final"}).status_code == 200
+    assert client.patch("/api/tools/jobs/summary", json={"status": "final"}).status_code == 200
     assert _meta(pkg)["status"] == "final"
 
 
@@ -3403,6 +3427,803 @@ def test_any_job_active_tracks_the_job_table() -> None:
             job_id="live", state="queued", created_at="2026-07-16T00:01:00+00:00"
         )
     assert tool_builder.any_job_active() is True
+
+
+# --- router: revise (D40) ------------------------------------------------------
+
+
+def test_router_revise_202_queues_job(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The submit is 202 + job id, like the installer's -- a revise IS a builder
+    session, so it cannot live inside a request. The feedback arrives stripped by
+    the request layer."""
+    _seed_package(monkeypatch, tmp_path)
+    seen: dict[str, str] = {}
+
+    def fake_start(name: str, feedback: str) -> str:
+        seen["name"] = name
+        seen["feedback"] = feedback
+        return "job-rev"
+
+    monkeypatch.setattr("afterthread.services.tool_builder.start_revise_job", fake_start)
+    response = client.post("/api/tools/kbsearch/revise", json={"feedback": "  加上分頁參數  "})
+
+    assert response.status_code == 202
+    assert response.json() == {"job_id": "job-rev"}
+    assert seen == {"name": "kbsearch", "feedback": "加上分頁參數"}
+
+
+def test_router_revise_404_for_unknown_tool(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    response = client.post("/api/tools/ghost/revise", json={"feedback": "改一下"})
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Tool not found"}
+
+
+def test_router_revise_409_when_finalized(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """定版 freezes AI iteration, so a revise is refused before any job is
+    created -- the same code and the same meaning the regenerate route uses."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _write_meta(pkg, summary="已定版的說明", status="final")
+
+    def must_not_start(name: str, feedback: str) -> str:
+        raise AssertionError("no revise job may start for a finalized tool")
+
+    monkeypatch.setattr("afterthread.services.tool_builder.start_revise_job", must_not_start)
+
+    response = client.post("/api/tools/kbsearch/revise", json={"feedback": "改一下"})
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "tool_finalized"
+    assert "message" in detail
+
+
+def test_router_revise_409_while_a_job_runs(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One tool job at a time: an active install refuses a revise submit. Driven
+    through the REAL start_revise_job with a pre-seeded active job, so the shared
+    admission gate itself produces the conflict."""
+    _seed_package(monkeypatch, tmp_path)
+    with tool_builder._JOBS_LOCK:
+        tool_builder._JOBS["active"] = tool_builder.InstallJob(
+            job_id="active", state="running", created_at="2026-07-16T00:00:00+00:00"
+        )
+
+    response = client.post("/api/tools/kbsearch/revise", json={"feedback": "改一下"})
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "tool_job_in_progress"
+    assert "message" in detail
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"feedback": "   "}, {"feedback": "x" * 20001}, {}],
+    ids=["blank", "oversized", "missing-field"],
+)
+def test_router_revise_validates_request(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    payload: dict[str, Any],
+) -> None:
+    """The feedback carries the same bound as every other AI free-text input."""
+    _seed_package(monkeypatch, tmp_path)
+    assert client.post("/api/tools/kbsearch/revise", json=payload).status_code == 422
+
+
+def test_router_revise_rejects_invalid_names_as_422(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    for bad_name in ("UPPER", "bad name", ".hidden"):
+        response = client.post(f"/api/tools/{bad_name}/revise", json={"feedback": "改"})
+        assert response.status_code == 422, bad_name
+
+
+def test_router_job_poll_serves_install_and_revise_jobs(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ONE endpoint for both kinds (D40): jobs created by the install path and by
+    the revise path are polled through the SAME renamed route, with the same
+    body. Both jobs here are REAL -- created through the real start_* functions
+    with stubbed runs on a real loop -- rather than hand-seeded records, so the
+    id the FE would poll is the id these produce."""
+
+    async def scenario() -> tuple[str, str]:
+        async def fake_run_install(
+            url: str,
+            instructions: str,
+            *,
+            secret_name: str | None = None,
+            secret_value: str | None = None,
+        ) -> InstallOutcome:
+            return InstallOutcome(ok=True, tool_name="kb", summary="裝好了", llm_log_id=1)
+
+        async def fake_run_revise(name: str, feedback: str) -> InstallOutcome:
+            return InstallOutcome(ok=True, tool_name=name, summary="改好了", llm_log_id=2)
+
+        monkeypatch.setattr("afterthread.services.tool_builder.run_install", fake_run_install)
+        monkeypatch.setattr("afterthread.services.tool_builder.run_revise", fake_run_revise)
+        ids: list[str] = []
+        for start in (
+            lambda: tool_builder.start_install_job("http://x/openapi.json", "i"),
+            lambda: tool_builder.start_revise_job("kb", "改一下"),
+        ):
+            job_id = start()
+            assert job_id is not None
+            ids.append(job_id)
+            # Single-flight: drain to terminal before the next submit.
+            for _ in range(200):
+                job = tool_builder.get_job(job_id)
+                assert job is not None
+                if job["state"] not in ("queued", "running"):
+                    break
+                await asyncio.sleep(0.01)
+        await asyncio.gather(*list(tool_builder._TASKS), return_exceptions=True)
+        return ids[0], ids[1]
+
+    install_id, revise_id = asyncio.run(scenario())
+
+    install_body = client.get(f"/api/tools/jobs/{install_id}")
+    assert install_body.status_code == 200
+    assert install_body.json()["summary"] == "裝好了"
+    assert install_body.json()["state"] == "succeeded"
+
+    revise_body = client.get(f"/api/tools/jobs/{revise_id}")
+    assert revise_body.status_code == 200
+    assert revise_body.json()["summary"] == "改好了"
+    assert revise_body.json()["tool_name"] == "kb"
+    assert set(revise_body.json()) == set(install_body.json())  # one shape, both kinds
+
+
+# --- run_revise (D40) ----------------------------------------------------------
+
+_REVISED_RUN_PY = "import sys, json\nprint('revised', json.load(sys.stdin))\n"
+
+# A ``.env`` whose raw TEXT is the point: an inline ``#``, both quote kinds, a
+# trailing space inside the quoted value, trailing whitespace after it, and a
+# comment line -- all of which a naive "parse then re-serialize" restore would
+# silently rewrite. The revise must put these exact bytes back.
+_TRICKY_ENV = "# the tool's own key\nKB_API_KEY=\"live-secret #value 'x' \"  \nOTHER=plain-value\n"
+_TRICKY_ENV_VALUE = "live-secret #value 'x' "
+
+
+def _tree(root: Path) -> set[str]:
+    """Every entry under ``root`` as a relative path (hidden names included)."""
+    found: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(root):
+        here = Path(dirpath)
+        for name in dirnames + filenames:
+            found.add(str((here / name).relative_to(root)))
+    return found
+
+
+def _file_bytes(root: Path) -> dict[str, bytes]:
+    """Every regular file under ``root``: relative path -> exact bytes."""
+    contents: dict[str, bytes] = {}
+    for dirpath, _dirnames, filenames in os.walk(root):
+        here = Path(dirpath)
+        for name in filenames:
+            path = here / name
+            if path.is_file() and not path.is_symlink():
+                contents[str(path.relative_to(root))] = path.read_bytes()
+    return contents
+
+
+def _staging_dir(root: Path) -> Path:
+    """The ONE in-flight staging directory (asserted unique)."""
+    staged = list((root / ".staging").iterdir())
+    assert len(staged) == 1, staged
+    return staged[0]
+
+
+def _leftovers(root: Path) -> list[str]:
+    """Hidden backup directories left behind by a swap (there must be none)."""
+    return sorted(child.name for child in root.iterdir() if ".bak-" in child.name)
+
+
+def _revise_result(name: str = "kbsearch", *, summary: str = "改好了") -> dict[str, Any]:
+    return {"tool_name": name, "summary": summary, "ready": True}
+
+
+def test_run_revise_copies_the_package_without_env_or_sidecars(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The staging copy is the installed package MINUS two namespaces, at every
+    depth, and identical otherwise.
+
+    The ``.env`` exclusion is not tidiness (D40): its values are in
+    ``known_secret_values``, so a copied one would make ``validate_package``'s
+    embedded-secret gate reject every revise of the tool. The sidecar namespace
+    is backend-authored and regenerated after the swap; a nested one is dropped
+    for the reason R7-1 gives -- matched case-INSENSITIVELY, so the ``.AI_META.JSON``
+    spelling that IS the same file on macOS cannot ride in either."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    root = pkg.parent
+    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    (pkg / "lib").mkdir()
+    (pkg / "lib" / "util.py").write_text("X = 1\n", encoding="utf-8")
+    (pkg / "sub").mkdir()
+    (pkg / "sub" / ".AI_META.JSON").write_text('{"summary": "forged"}', encoding="utf-8")
+    _write_meta(pkg, summary="舊的說明", status="draft")
+    seen: dict[str, set[str]] = {}
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY},
+        side_effect=lambda: seen.update(staged=_tree(_staging_dir(root))),
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    # The workspace the builder received: everything, minus the two namespaces.
+    # ``sub`` survives as an empty directory -- only the NAMES are excluded.
+    assert seen["staged"] == {"tool.json", "run.py", "lib", "lib/util.py", "sub"}
+
+
+def test_run_revise_preserves_the_env_byte_for_byte(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The installed ``.env`` is restored EXACTLY -- comments, quoting, inline
+    ``#`` and trailing whitespace included. The revise never re-serializes it: it
+    writes back the bytes it read before the build."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    before = (pkg / ".env").read_bytes()
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        # The builder disobeys and writes its own .env; the backend's restore wins.
+        files={"run.py": _REVISED_RUN_PY, ".env": "KB_API_KEY=made-up-by-the-model\n"},
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert (pkg / ".env").read_bytes() == before
+    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+
+
+def test_run_revise_registers_the_live_env_values_for_the_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every value of the existing ``.env`` is registered as an in-flight secret
+    for the whole revise, then discarded.
+
+    The registration -- not the on-disk scan -- is what matters: the scan already
+    covers the package while it sits there, but it skips dot-directories, and the
+    swap parks the old package in one (see the swap-window test below)."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    seen: dict[str, Any] = {}
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY},
+        side_effect=lambda: seen.update(
+            known=tools.known_secret_values(), inflight=set(tools._INFLIGHT_SECRETS)
+        ),
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert _TRICKY_ENV_VALUE in seen["known"]
+    assert seen["inflight"] == {_TRICKY_ENV_VALUE, "plain-value"}
+    # ... and the transient registration ends with the run (the restored .env is
+    # what keeps the values redactable afterwards, via the scan).
+    with tools._INFLIGHT_LOCK:
+        assert not tools._INFLIGHT_SECRETS
+
+
+def test_run_revise_keeps_the_env_redactable_across_the_backup_swap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The reason D40 requires the in-flight registration, pinned.
+
+    At the instant the swap runs, the old package has been renamed to a
+    DOT-prefixed backup -- which ``known_secret_values`` skips (it only reads
+    non-hidden package directories) and which ``_scan_all`` skips too -- and the
+    revision is not in place yet. Without the registration the tool's own
+    credentials would be UNKNOWN to the redactor for exactly that window, while
+    the builder session's records are still being written."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    seen: dict[str, Any] = {}
+    real_move = shutil.move
+
+    def recording_move(src: Any, dst: Any) -> Any:
+        # Called AFTER the old package became `.kbsearch.bak-<uuid>`.
+        seen["known"] = tools.known_secret_values()
+        seen["listed"] = [row["name"] for row in tools.list_tools()]
+        seen["backups"] = _leftovers(pkg.parent)
+        return real_move(src, dst)
+
+    monkeypatch.setattr(shutil, "move", recording_move)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert _TRICKY_ENV_VALUE in seen["known"]  # still redactable mid-swap
+    assert seen["backups"] and seen["backups"][0].startswith(".kbsearch.bak-")
+    assert seen["listed"] == []  # the hidden backup is invisible to the registry
+
+
+def test_run_revise_refuses_a_model_rename(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """``tool_name`` addresses WHICH package gets replaced, so a model that
+    renames the tool is refused: ``InstallResult`` only validates the SHAPE of
+    the name, and promoting under another name would overwrite whatever package
+    that name addresses. The original is left exactly as it was."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    before = _file_bytes(pkg)
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result("kbsearch2"),
+        files={"run.py": _REVISED_RUN_PY},
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.tool_name == "kbsearch"  # never the model's answer
+    assert "改名" in (outcome.error or "")
+    assert "kbsearch2" in (outcome.error or "")  # names what was attempted
+    assert outcome.llm_log_id is not None
+    assert _file_bytes(pkg) == before
+    assert not (pkg.parent / "kbsearch2").exists()
+    assert _leftovers(pkg.parent) == []
+
+
+def test_run_revise_replaces_the_installed_package(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The happy path end to end: the revision goes live under the SAME name, the
+    registry still sees exactly one valid package, and the swap leaves no hidden
+    backup or staging residue behind."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    root = pkg.parent
+    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    captured = _fake_generate(
+        monkeypatch,
+        result=_revise_result(summary="改好了並測過"),
+        files={"run.py": _REVISED_RUN_PY, "lib/helper.py": "Y = 2\n"},
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert outcome.tool_name == "kbsearch"
+    assert outcome.summary == "改好了並測過"
+    assert outcome.llm_log_id == llm_log.last_record_id_for_workflow("tool_install")
+    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert (pkg / "lib" / "helper.py").read_text(encoding="utf-8") == "Y = 2\n"
+    assert [(row["name"], row["valid"]) for row in tools.list_tools()] == [("kbsearch", True)]
+    assert _leftovers(root) == []
+    assert not (root / ".staging").exists()
+    # A revise session IS a builder session: same workflow name and same budgets.
+    settings = Settings(tools_dir=str(root))
+    assert captured["workflow"] == "tool_install"
+    assert captured["max_tool_rounds"] == settings.tool_install_max_rounds
+    assert captured["timeout_seconds"] == settings.tool_install_timeout_seconds
+
+
+def test_promote_replace_refuses_a_finalization_that_landed_mid_session(
+    tmp_path: Path,
+) -> None:
+    """A revise session runs for MINUTES, so a user finalizing DURING one is
+    ordinary. The entry gate cannot see that: it ran before the LLM call. Without
+    a last-moment re-check the swap would replace the whole package -- and since
+    the sidecar is excluded from staging and regenerated as a DRAFT afterwards,
+    定版 would be silently undone, frozen text and all, by a session that started
+    before it. Mirrors store_summary_meta's own store-time re-check (D40 r2)."""
+    base = tmp_path / "tools"
+    installed = base / "kbsearch"
+    installed.mkdir(parents=True)
+    (installed / "tool.json").write_text(
+        json.dumps(_package_manifest("kbsearch")), encoding="utf-8"
+    )
+    (installed / "run.py").write_text(_GOOD_RUN_PY, encoding="utf-8")
+    assert tools.write_tool_meta(
+        installed,
+        {"summary": "凍結的總結", "status": "final", "updated_at": "2026-07-27T00:00:00+00:00"},
+    )
+    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
+    staging.mkdir(parents=True)
+    (staging / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")), encoding="utf-8")
+    (staging / "run.py").write_text("print('revised')", encoding="utf-8")
+
+    error = tool_builder._promote_staging_replace(staging, "kbsearch", base, None)
+
+    assert error == tool_builder._ERROR_REVISE_FINALIZED
+    # the installed package -- and its frozen summary -- are untouched
+    assert (installed / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY
+    meta = tools.read_tool_meta(installed)
+    assert meta is not None
+    assert meta["summary"] == "凍結的總結"
+    assert meta["status"] == "final"
+    assert not any(entry.name.startswith(".kbsearch.bak-") for entry in base.iterdir())
+
+
+def test_run_revise_rolls_back_a_failed_move(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If the move fails AFTER the old package was renamed aside, the backup is
+    renamed home: the installed tool comes back byte-identical, the outcome says
+    so, and nothing hidden is left in the tools directory."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    before = _file_bytes(pkg)
+
+    def exploding_move(src: Any, dst: Any) -> Any:
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(shutil, "move", exploding_move)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert "置換失敗" in (outcome.error or "")
+    assert "已還原" in (outcome.error or "")
+    assert "OSError" in (outcome.error or "")  # category only, never str(exc)
+    assert "no space left" not in (outcome.error or "")
+    assert _file_bytes(pkg) == before  # every file back, byte for byte
+    assert _leftovers(pkg.parent) == []
+    assert [(row["name"], row["valid"]) for row in tools.list_tools()] == [("kbsearch", True)]
+
+
+def test_run_revise_reports_the_original_being_deleted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A delete landing during the build is answered honestly -- the revision is
+    NOT installed as a new tool, because 'replace' has nothing to replace."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    root = pkg.parent
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY},
+        side_effect=lambda: shutil.rmtree(pkg),
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_TARGET_MISSING
+    assert not pkg.exists()
+    assert tools.list_tools() == []
+    assert _leftovers(root) == []
+    assert not (root / ".staging").exists()
+
+
+def test_run_revise_never_replaces_on_a_validation_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A revision that no longer validates keeps the WORKING tool running: the
+    swap is downstream of the same gate a fresh install passes."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    before = _file_bytes(pkg)
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"tool.json": "{ not json at all"},
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert "驗證失敗" in (outcome.error or "")
+    assert _file_bytes(pkg) == before
+    assert _leftovers(pkg.parent) == []
+
+
+def test_run_revise_refuses_a_finalized_package(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """定版 is checked HERE too, not only at the route: the two are seconds apart
+    and freezing AI iteration is the whole meaning of 定版. No session starts."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _write_meta(pkg, summary="已定版", status="final")
+
+    async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("no builder session may start for a finalized tool")
+
+    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", must_not_generate)
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_FINALIZED
+    assert outcome.llm_log_id is None
+
+
+def test_run_revise_refuses_a_missing_tool_and_a_disabled_feature(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Both did-not-happen cases are friendly outcomes, never exceptions -- this
+    runs in a fire-and-forget task whose only consumer is the polling FE."""
+
+    async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("no builder session may start")
+
+    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", must_not_generate)
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    missing = asyncio.run(tool_builder.run_revise("ghost", "改一下"))
+    assert missing.ok is False
+    assert missing.error == tool_builder._ERROR_REVISE_NOT_FOUND
+
+    _install_settings(monkeypatch, tools_dir="")
+    off = asyncio.run(tool_builder.run_revise("kbsearch", "改一下"))
+    assert off.ok is False
+    assert off.error == _ERROR_TOOLS_DISABLED
+
+
+def test_run_revise_refuses_an_unreadable_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A ``.env`` that EXISTS but the bounded, O_NOFOLLOW'd reader declines (here
+    a symlink) stops the revise instead of degrading to 'no .env'.
+
+    The runtime loader degrades; this one must not. Preserving nothing would
+    replace a working tool with one whose credentials are simply GONE -- silent
+    breakage the operator did not ask for."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (tmp_path / "elsewhere.env").write_text("KB_API_KEY=live-secret-value\n", encoding="utf-8")
+    (pkg / ".env").symlink_to(tmp_path / "elsewhere.env")
+    before = _file_bytes(pkg)
+
+    async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("no builder session may start")
+
+    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", must_not_generate)
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNREADABLE
+    assert _file_bytes(pkg) == before
+    assert (pkg / ".env").is_symlink()  # left exactly as found
+
+
+def test_run_revise_prompts_carry_the_feedback_but_never_the_env_values(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """What the model is told, and what it is never told.
+
+    The system prompt names the package and states the identity rule and the
+    withheld ``.env``; the user prompt carries the feedback verbatim and the
+    current manifest. No ``.env`` VALUE appears in either -- the values reach the
+    build only through run_shell's environment."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    captured = _fake_generate(
+        monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "回傳結果要加上分頁參數"))
+
+    assert outcome.ok is True
+    system_prompt = captured["system_prompt"]
+    user_prompt = captured["user_prompt"]
+    assert "REVISION MODE" in system_prompt
+    assert '"tool_name" MUST be exactly kbsearch' in system_prompt
+    assert "回傳結果要加上分頁參數" in user_prompt
+    assert '"name": "kbsearch"' in user_prompt  # the current tool.json rides along
+    for value in (_TRICKY_ENV_VALUE, "plain-value"):
+        assert value not in system_prompt
+        assert value not in user_prompt
+
+
+def test_run_revise_exposes_the_env_to_run_shell_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The addendum's promise, verified: the withheld ``.env`` values ARE in
+    run_shell's environment (so the builder can still live-test the real API),
+    while the meta-tool RESULT that carries them back into the conversation is
+    masked -- the same F1 treatment the install-form secret gets."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / ".env").write_text("KB_API_KEY=live-secret-value-123456\n", encoding="utf-8")
+    captured: dict[str, Any] = {}
+
+    async def fake(
+        system_prompt: str,
+        user_prompt: str,
+        model_cls: type[BaseModel],
+        *,
+        workflow: str = "unknown",
+        tools: Any = None,
+        max_tool_rounds: int | None = None,
+        timeout_seconds: float | None = None,
+    ) -> BaseModel:
+        by_name = {t.spec["function"]["name"]: t for t in tools or []}
+        captured["shell"] = await by_name["run_shell"].handler(
+            {"command": 'echo "probe=$KB_API_KEY"; echo "ours=${OPENAI_API_KEY:-none}"'}
+        )
+        return model_cls.model_validate(_revise_result())
+
+    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", fake)
+    _fake_summary_generate(monkeypatch)
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert "probe=" in captured["shell"]
+    assert "live-secret-value-123456" not in captured["shell"]
+    assert tools._REDACTION_MARKER in captured["shell"]
+    assert "ours=none" in captured["shell"]  # the base env is still from scratch
+
+
+def test_run_revise_regenerates_the_summary_inheriting_the_origin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The sidecar was excluded from staging, so the revised package has none
+    until the post-swap hook writes one: a fresh DRAFT summary carrying the
+    ORIGIN of the original install, which lives nowhere else and is read before
+    the old package (and its sidecar) is destroyed."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _write_meta(
+        pkg,
+        summary="舊的說明",
+        status="draft",
+        origin={"openapi_url": "https://kb.example", "instructions": "原始安裝指示"},
+    )
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+    _fake_summary_generate(monkeypatch, summary="修訂後的說明")
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    meta = _meta(pkg)
+    assert meta["summary"] == "修訂後的說明"
+    assert meta["status"] == "draft"
+    assert meta["origin"] == {
+        "openapi_url": "https://kb.example",
+        "instructions": "原始安裝指示",
+    }
+    assert meta["llm_log_id"] == llm_log.last_record_id_for_workflow("tool_summary")
+
+
+def test_run_revise_survives_a_failing_summary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The revision is LIVE before the summary runs, so a summary failure can
+    never flip the outcome -- the same best-effort contract the install hook has."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+    _fake_summary_generate(monkeypatch, explode=LLMUpstreamError("APIConnectionError: nope"))
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+
+
+def test_run_revise_ready_false_keeps_the_package(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A builder that gives up reports the blocker; nothing is promoted."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    before = _file_bytes(pkg)
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "API 沒有分頁參數", "ready": False},
+        files={"run.py": _REVISED_RUN_PY},
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert "AI 判定修訂尚未完成" in (outcome.error or "")
+    assert "API 沒有分頁參數" in (outcome.error or "")
+    assert _file_bytes(pkg) == before
+
+
+def test_revise_job_records_its_outcome_and_backstops_bugs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A revise job walks the same state machine and copies out the same fields
+    as an install (one ``_run_job`` body drives both), and a bug escaping
+    ``run_revise`` lands as a category-only failure naming the REVISE action."""
+
+    async def scenario() -> None:
+        async def fake_run_revise(name: str, feedback: str) -> InstallOutcome:
+            return InstallOutcome(ok=True, tool_name=name, summary="改好了", llm_log_id=5)
+
+        monkeypatch.setattr("afterthread.services.tool_builder.run_revise", fake_run_revise)
+        job_id = tool_builder.start_revise_job("kbsearch", "加上分頁")
+        assert job_id is not None
+        for _ in range(200):
+            job = tool_builder.get_job(job_id)
+            assert job is not None
+            if job["state"] not in ("queued", "running"):
+                break
+            await asyncio.sleep(0.01)
+        assert job["state"] == "succeeded"
+        assert job["tool_name"] == "kbsearch"
+        assert job["summary"] == "改好了"
+        assert job["llm_log_id"] == 5
+        assert job["finished_at"] is not None
+
+        async def exploding(name: str, feedback: str) -> InstallOutcome:
+            raise RuntimeError("bug with secrets in str()")
+
+        monkeypatch.setattr("afterthread.services.tool_builder.run_revise", exploding)
+        bug_id = tool_builder.start_revise_job("kbsearch", "再改")
+        assert bug_id is not None
+        for _ in range(200):
+            job = tool_builder.get_job(bug_id)
+            assert job is not None
+            if job["state"] not in ("queued", "running"):
+                break
+            await asyncio.sleep(0.01)
+        assert job["state"] == "failed"
+        assert "修訂過程發生未預期錯誤" in (job["error"] or "")
+        assert "RuntimeError" in (job["error"] or "")
+        assert "secrets" not in (job["error"] or "")
+        await asyncio.gather(*list(tool_builder._TASKS), return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_install_and_revise_share_one_single_flight_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ONE tool job at a time, across BOTH kinds (D40): an active install refuses
+    a revise and an active revise refuses an install, because either one can be
+    moving a package directory into place."""
+
+    async def scenario() -> None:
+        release = asyncio.Event()
+
+        async def blocking_install(
+            url: str,
+            instructions: str,
+            *,
+            secret_name: str | None = None,
+            secret_value: str | None = None,
+        ) -> InstallOutcome:
+            await release.wait()
+            return InstallOutcome(ok=True, tool_name="kb")
+
+        async def blocking_revise(name: str, feedback: str) -> InstallOutcome:
+            await release.wait()
+            return InstallOutcome(ok=True, tool_name=name)
+
+        monkeypatch.setattr("afterthread.services.tool_builder.run_install", blocking_install)
+        monkeypatch.setattr("afterthread.services.tool_builder.run_revise", blocking_revise)
+
+        first = tool_builder.start_install_job("http://x/openapi.json", "i")
+        assert first is not None
+        await asyncio.sleep(0)
+        assert tool_builder.start_revise_job("kb", "改一下") is None  # install blocks revise
+
+        release.set()
+        for _ in range(200):
+            job = tool_builder.get_job(first)
+            assert job is not None
+            if job["state"] not in ("queued", "running"):
+                break
+            await asyncio.sleep(0.01)
+
+        release.clear()
+        second = tool_builder.start_revise_job("kb", "改一下")
+        assert second is not None
+        await asyncio.sleep(0)
+        assert tool_builder.start_install_job("http://x/openapi.json", "i") is None  # and back
+
+        release.set()
+        await asyncio.gather(*list(tool_builder._TASKS), return_exceptions=True)
+
+    asyncio.run(scenario())
 
 
 # --- llm_log lookup used by the outcome linkage --------------------------------

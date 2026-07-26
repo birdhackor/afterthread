@@ -635,14 +635,34 @@ class ToolInstallRequest(BaseModel):
         return self
 
 
+class ToolReviseRequest(BaseModel):
+    """Payload for an AI revise job (D40): what the user wants changed.
+
+    One free-text field, carrying the SAME bound every other AI free-text input
+    has (20000 chars, stripped-non-empty) -- it becomes the user turn of a
+    builder session exactly as ``ToolInstallRequest.instructions`` does. Which
+    tool is being revised is the PATH's job, not this body's: the name is
+    validated by the router's shared path regex and resolved by the same
+    existence gate the summary routes use, so it can never arrive as an
+    unvalidated field here.
+    """
+
+    feedback: str = Field(min_length=1, max_length=_MAX_AI_INPUT_CHARS)
+
+    @field_validator("feedback")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        return _stripped_non_empty(value, "feedback")
+
+
 class ToolInstallAccepted(BaseModel):
-    """202 body for a queued install: the id to poll."""
+    """202 body for a queued install or revise: the id to poll."""
 
     job_id: str
 
 
-class ToolInstallJobStatus(BaseModel):
-    """One install job's visible state, as polled by the 工具 page.
+class ToolJobStatus(BaseModel):
+    """One install/revise job's visible state, as polled by the 工具 page.
 
     ``state`` walks queued -> running -> succeeded | failed. ``error`` is the
     friendly zh-TW failure text (failed only); ``tool_name``/``summary`` are
@@ -650,6 +670,11 @@ class ToolInstallJobStatus(BaseModel):
     AI 日誌 record whenever a session actually ran, so both success and failure
     are debuggable from the UI. Jobs are process-local and unpersisted: after a
     backend restart every previous job id is a 404.
+
+    One model for BOTH job kinds (D40 renamed it from ``ToolInstallJobStatus``
+    without touching a field): an install and a revise both end in a package
+    being written into the tools directory, they share one job table and one
+    poll endpoint, and nothing in this shape would differ between them.
     """
 
     job_id: str

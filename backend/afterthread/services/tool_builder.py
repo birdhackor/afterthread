@@ -1,6 +1,14 @@
 """The KB web installer: one LLM "tool builder" session that writes, tests and
 installs a tool package (see D21 in docs/web-v2-decisions.md, Phase 5c).
 
+Two entry points, one builder session shape. ``run_install`` builds a NEW
+package from an OpenAPI document; ``run_revise`` (D40) hands the ALREADY
+INSTALLED package back to the same kind of session together with the user's
+feedback and REPLACES the installed copy with the result. They share the
+prompts, the meta-tools, the staging discipline, the friendly-outcome contract,
+the job table and the llm_log workflow name (``tool_install``: both are builder
+sessions, and the AI 日誌 shows them as one kind).
+
 ``run_install(openapi_url, instructions)`` is the whole feature:
 
 1. fetch the OpenAPI document (bounded: 30s, capped redirects, 2MB body);
@@ -24,6 +32,22 @@ installs a tool package (see D21 in docs/web-v2-decisions.md, Phase 5c).
    for its AI summary sidecar (D40). Strictly best-effort and it cannot raise:
    the install is already a success by then, so a failed summary must never
    flip the outcome.
+
+``run_revise(name, feedback)`` reuses steps 2-5 with three differences, each of
+which exists because the package it is editing is ALREADY LIVE (D40):
+
+* staging is populated by COPYING the installed package (no fetch), MINUS its
+  ``.env`` and MINUS the backend's own sidecar namespace. The ``.env`` exclusion
+  is not tidiness: its values are in ``known_secret_values``, so copying it in
+  would make ``validate_package``'s embedded-secret gate reject every revise.
+  The text is preserved in memory and written back after validation, exactly
+  where an install injects its form secret;
+* every value of that ``.env`` is registered as an in-flight secret for the
+  WHOLE revise window, because ``known_secret_values`` skips dot-directories and
+  the swap below parks the old package in one;
+* promotion REPLACES rather than creates (``_promote_staging_replace``), and the
+  model is not allowed to redirect it: ``tool_name`` must equal the package it
+  was handed.
 
 Language rule for the strings in this module: META-TOOL RESULTS (and the
 builder prompts) are MODEL-facing and therefore English, like every prompt in
@@ -72,7 +96,7 @@ import queue
 import shutil
 import subprocess
 import threading
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -169,6 +193,32 @@ _ERROR_SIDECAR_STRIP = "無法清除工具包內的 AI 總結側檔，安裝已�
 # TRUE sibling of ``_ERROR_SIDECAR_STRIP`` (same suffix, same category-only shape):
 # naming what staging turned OUT to be would be naming attacker-controlled content.
 _ERROR_STAGING_TAMPERED = "暫存工作區已被移動或替換，安裝已取消。"  # noqa: RUF001
+
+# D40 revise-only outcomes. Category-only by the same construction as the install
+# ones above: a fixed zh-TW string, never a path and never a value.
+_ERROR_REVISE_NOT_FOUND = "找不到要修訂的工具（可能已被刪除）。"  # noqa: RUF001
+_ERROR_REVISE_FINALIZED = "總結已定版，請先解除定版再送出修訂。"  # noqa: RUF001
+# The preserved ``.env`` is READ before the build and written back after
+# validation, so both failure modes have to refuse the whole revise: a `.env` we
+# cannot read is one we cannot restore, and a TRUNCATED one (the bounded reader
+# returns cap+1 chars) written back would silently corrupt the live tool's
+# credentials -- the one thing a revise must never do to a working package.
+_ERROR_REVISE_ENV_UNREADABLE = "無法讀取既有工具包的 .env，修訂已取消。"  # noqa: RUF001
+_ERROR_REVISE_ENV_TOO_LARGE = "既有工具包的 .env 超過大小上限，修訂已取消。"  # noqa: RUF001
+_ERROR_REVISE_ENV_RESTORE = "無法還原工具包的 .env，修訂已取消。"  # noqa: RUF001
+# The replace-mode promote's two "the package is no longer what we resolved"
+# refusals. Both are races against a concurrent delete/replace by an actor with
+# the service's uid -- the SAME accepted residual class ``_promote_staging``'s
+# docstring names for its own check-then-move window.
+_ERROR_REVISE_TARGET_MISSING = "原工具已被刪除，修訂結果未安裝。"  # noqa: RUF001
+_ERROR_REVISE_TARGET_ALIAS = "原工具目錄已被替換為連結，修訂已取消。"  # noqa: RUF001
+# The swap failed AND the roll-back failed too: the only state where the
+# operator has to act. It names the SHAPE of the rescue (a hidden backup
+# directory beside the tool) rather than the path, keeping the category-only
+# rule intact while still being actionable.
+_ERROR_REVISE_UNRECOVERABLE = (
+    "工具包置換失敗且無法還原，原工具已保留為工具目錄下的隱藏備份目錄，請手動處理。"  # noqa: RUF001
+)
 
 # The builder's system prompt. English, like every prompt in this codebase.
 # It must carry the ENTIRE package contract (tool.json fields, the name regex,
@@ -274,6 +324,59 @@ def _builder_system_prompt(secret_name: str | None) -> str:
     if not secret_name:
         return _BUILDER_SYSTEM_PROMPT
     return _BUILDER_SYSTEM_PROMPT + _SECRET_PROMPT_ADDENDUM.replace("{name}", secret_name)
+
+
+# Appended to the builder system prompt for a REVISE session (D40). Same shape
+# and same interpolation discipline as the secret addendum above -- English,
+# model-facing, and only the package NAME is ever substituted (a literal
+# ``{name}`` replace, so the base prompt's shell examples keep their ``$``/``{``).
+#
+# It has to correct three things the base prompt states for a FRESH build, or the
+# model works against the backend rather than with it:
+#
+# * the workspace is not empty and the goal is not "build a tool" -- it already
+#   holds the installed package, and untouched files must stay untouched;
+# * the base prompt tells the model to `. ./.env` when testing. There IS no
+#   ``.env`` in a revise workspace (it is withheld precisely because its values
+#   would trip the embedded-secret gate), so the addendum says where those values
+#   actually are: already exported into run_shell's environment under their own
+#   names. Without this the model reads the absence as "the tool has no
+#   credentials" and starts inventing them;
+# * ``tool_name`` is not a free choice here. It addresses WHICH installed package
+#   gets replaced, so a rename is refused rather than honored -- and saying so up
+#   front is cheaper than discarding a finished revision over it.
+_REVISE_PROMPT_ADDENDUM = """\
+
+
+REVISION MODE. The tool package {name} ALREADY EXISTS and its files are ALREADY \
+IN YOUR WORKSPACE. You are not building a new tool: revise THIS package to \
+address the user's feedback below, and leave everything the feedback does not \
+ask you to change exactly as you found it.
+
+Three facts about this workspace that differ from a fresh build:
+- The package's `.env` has been WITHHELD from your workspace and the backend \
+restores the original after you finish. Do not write one, do not invent \
+placeholder values, and do not make your changes depend on rewriting it -- if \
+this package has a `.env`, any you write is REPLACED by the preserved original. \
+Those values are \
+already exported into your run_shell environment under their own names, so you \
+can still live-test the real API (e.g. `echo '{"query":"test"}' | python3 \
+run.py`) without ever seeing them. If the user's feedback asks to CHANGE a \
+secret value, say so in your summary -- that is done by hand, not here.
+- Never write a secret value into any file. A package that embeds a known \
+secret is REFUSED, and that refusal discards your whole revision.
+- The AI summary file for this tool is written by the backend; do not create or \
+edit one.
+
+Finish exactly as described above, with one added rule: "tool_name" MUST be \
+exactly {name}, because it names the installed package this revision replaces \
+-- any other value is treated as an attempt to rename the tool and the revision \
+is discarded. "summary" reports what you CHANGED and how you verified it."""
+
+
+def _revise_system_prompt(name: str) -> str:
+    """The builder system prompt, reframed for revising the package ``name``."""
+    return _BUILDER_SYSTEM_PROMPT + _REVISE_PROMPT_ADDENDUM.replace("{name}", name)
 
 
 class InstallResult(BaseModel):
@@ -430,11 +533,13 @@ def _run_shell_subprocess(
 
     ``extra_env`` is the ONE deliberate addition to the otherwise from-scratch
     env: the install-form secret (D36), ``{<NAME>: <value>}``, present ONLY when
-    the user supplied one so the builder can live-test the real API with it. It
-    is layered on top of the passthrough allowlist -- our own ``OPENAI_*``
-    secrets stay absent because the BASE env is still built from the allowlist
-    alone -- and it never enters any prompt (only this process env), so the model
-    can use the key without ever seeing its value.
+    the user supplied one -- or, on a REVISE (D40), the whole existing package
+    ``.env``, which is withheld from staging and so has nowhere else to come
+    from. Either way it exists so the builder can live-test the real API. It is
+    layered on top of the passthrough allowlist -- our own ``OPENAI_*`` secrets
+    stay absent because the BASE env is still built from the allowlist alone --
+    and it never enters any prompt (only this process env), so the model can use
+    the keys without ever seeing their values.
 
     A SECOND, settings-derived addition sits between the allowlist and
     ``extra_env``: when ``settings.tls_no_verify`` is on, ``TLS_NO_VERIFY=1`` is
@@ -498,11 +603,11 @@ def _build_meta_tools(staging: Path, secret_env: dict[str, str] | None = None) -
     loop's own except is only the last backstop). Settings-bound limits are
     read at call time, mirroring the runtime tools' handlers.
 
-    ``secret_env`` (D36), when the install form supplied a secret, is the single
-    ``{<NAME>: <value>}`` addition injected into run_shell's environment so the
-    builder can live-test the real API -- passed straight to
-    ``_run_shell_subprocess``. It touches ONLY run_shell (the file meta-tools
-    never see it) and never any prompt.
+    ``secret_env`` is the env addition injected into run_shell's environment so
+    the builder can live-test the real API -- the install form's single
+    ``{<NAME>: <value>}`` (D36), or a revise's whole preserved package ``.env``
+    (D40) -- passed straight to ``_run_shell_subprocess``. It touches ONLY
+    run_shell (the file meta-tools never see it) and never any prompt.
     """
 
     async def write_file(args: dict[str, Any]) -> str:
@@ -979,6 +1084,43 @@ def _builder_user_prompt(instructions: str, openapi_text: str) -> str:
     )
 
 
+def _revise_user_prompt(feedback: str, manifest_text: str | None) -> str:
+    """The revise session's user turn: the feedback + the package's manifest.
+
+    Deliberately NOT a re-fetch of the OpenAPI document (D40): the revision is
+    driven by the user's words and by the code already in the workspace, the
+    original URL is kept only as provenance (and is reduced to a host on
+    capture), and re-fetching would spend a network round trip on a document the
+    model can no longer be told is current.
+
+    ``tool.json`` is quoted even though the model can `read_file` it, because it
+    is the ONE file whose shape the feedback is most often about (the
+    description and parameters an assistant sees) -- having it in the opening
+    turn saves a round and keeps the model from revising against a guess.
+
+    Both parts are redacted BEFORE the budget cut, the same redact-then-cap
+    order every prompt site here uses: a secret straddling the cut would become
+    an unmatchable interior fragment. The feedback is redacted where the
+    install's instructions are not -- it is written AFTER the tool has a live
+    ``.env``, so a user quoting their own key is a value we now genuinely know.
+    Each part carries the same per-part budget ``_builder_user_prompt`` gives the
+    document; both are separately request/manifest-bounded already, so the cut is
+    a backstop rather than the usual case.
+    """
+    budget = token_budget.char_allowance(get_settings().llm_prompt_budget_tokens)
+    parts = [
+        "Revise the existing tool package as described below.",
+        "User feedback:",
+        _truncate_to(tools.redact_known_secrets(feedback), budget),
+    ]
+    if manifest_text is not None:
+        parts += [
+            "The package's current tool.json:",
+            _truncate_to(tools.redact_known_secrets(manifest_text), budget),
+        ]
+    return "\n\n".join(parts)
+
+
 # --- staging promotion + cleanup ---------------------------------------------
 
 
@@ -1366,6 +1508,137 @@ def _promote_staging(
     return None
 
 
+def _promote_staging_replace(
+    staging: Path,
+    name: str,
+    base: Path,
+    preserved_env_text: str | None,
+) -> str | None:
+    """Swap a revised build in for the INSTALLED ``<base>/<name>``; None = ok (D40).
+
+    Blocking (runs via ``run_in_threadpool``). A SEPARATE function rather than a
+    flag on ``_promote_staging``, because the two have opposite preconditions on
+    the same path: install requires the target to be ABSENT (its exists-check is
+    load-bearing -- ``shutil.move`` onto an existing directory NESTS instead of
+    failing), revise requires it to be PRESENT (there is nothing to revise
+    otherwise, and creating it here would turn a racing delete into a silent
+    reinstall). Folding both into one function would mean a boolean deciding
+    which of two contradictory checks runs -- and the gates they share are shared
+    by CALLING them, which is what this does:
+
+    1. ``_verify_staging_root`` FIRST of all (R8-1), before any destructive
+       traversal -- the builder's run_shell is unjailed, so the same "staging
+       moved aside, symlink planted at its path" attack applies here;
+    2. ``_strip_builder_sidecars`` (R7-1) -- the sidecar is backend-authored, and
+       this path regenerates one moments later anyway;
+    3. ``tools.validate_package`` -- the revised package must clear exactly the
+       gates a fresh install does. A revision that no longer validates NEVER
+       reaches the swap below, so the installed tool keeps running.
+
+    Then the two checks that are specific to replacing something:
+
+    * the target must still be a DIRECTORY -- a delete landing during the build
+      is answered with ``_ERROR_REVISE_TARGET_MISSING``, never by installing the
+      revision as a new tool;
+    * and it must not be a SYMLINK. ``is_symlink`` does not follow the final
+      component, mirroring ``tools._resolve_package_dir_no_alias``'s refusal (the
+      resolve that admitted this name erases the alias/real distinction): the
+      rename below would otherwise move the LINK aside and leave the real
+      package orphaned under a name nothing addresses.
+
+    The preserved ``.env`` is restored AFTER validation and BEFORE the swap --
+    the same slot, for the same reason, as the install's
+    ``_inject_secret_into_env``: ``validate_package`` judges what the BUILDER
+    produced (and its embedded-secret gate would reject the live values on
+    sight), and the backend's own bytes are layered on top of a package that has
+    already passed. It overwrites whatever ``.env`` the builder wrote, which is
+    the prompt's stated contract. No size re-check is needed: these are the exact
+    bytes read back under ``_ENV_FILE_MAX_BYTES``, and the staged package's own
+    ``.env`` was just size-gated by validate.
+
+    ``preserved_env_text is None`` means the package HAD no ``.env``, and then a
+    builder-written one SHIPS -- deliberately, and identically to an install,
+    where writing ``.env`` from the user's instructions is part of the contract.
+    Deleting it instead would leave a revise unable to act on "store the key in
+    .env" feedback, and it is not a smuggling path: a value nobody registered is
+    a value the embedded-secret gate has nothing to compare against either way.
+
+    The swap itself is rename-aside, move-in, drop-the-backup:
+
+    * the old package is renamed to a DOT-prefixed sibling
+      ``.{name}.bak-<uuid>``. Dot-prefixed is load-bearing, not cosmetic:
+      ``tools._scan_all`` skips hidden entries, so the backup can never surface
+      in ``GET /api/tools`` as a phantom duplicate during the swap window (and
+      the same convention keeps ``known_secret_values`` from re-reading it --
+      which is exactly why ``run_revise`` registers those values in-flight);
+    * ``shutil.move`` then puts the revision at the now-free name;
+    * a move failure is ROLLED BACK by renaming the backup home. If even that
+      fails, the operator is told a hidden backup is what to rescue
+      (``_ERROR_REVISE_UNRECOVERABLE``) -- the one outcome that needs a human;
+    * success drops the backup with ``ignore_errors`` (the revision is live by
+      then; a leftover backup is litter, not a failure).
+
+    Every failure is a category-only zh-TW string -- never a path, never a value
+    -- like every other outcome error in this module. The check-then-act windows
+    (between the target checks and the rename, and between the two renames) are
+    the SAME accepted residual ``_promote_staging``'s docstring already names for
+    its exists-check: a race against a second actor holding the service's uid, on
+    a single-user local tool, and no new standard is invented for it here.
+    """
+    root_error = _verify_staging_root(staging, base)
+    if root_error is not None:
+        return root_error
+    strip_error = _strip_builder_sidecars(staging)
+    if strip_error is not None:
+        return strip_error
+    error = tools.validate_package(staging, expected_name=name)
+    if error is not None:
+        return f"工具包驗證失敗：{error}"  # noqa: RUF001
+    target = base / name
+    if target.is_symlink():
+        return _ERROR_REVISE_TARGET_ALIAS
+    if not target.is_dir():
+        return _ERROR_REVISE_TARGET_MISSING
+    # 定版 is re-checked HERE, at the last moment before the swap, not only at
+    # the entry gates -- the same store-time re-check ``tools.store_summary_meta``
+    # makes for regenerate (D40 r2), and for the same reason at a much longer
+    # timescale: a revise session runs for MINUTES, so a user finalizing during
+    # one is ordinary, not exotic. Without this the swap would replace the whole
+    # package -- including the finalized sidecar's frozen text, which the revise
+    # does not even carry forward (the sidecar is excluded from staging and
+    # regenerated as a draft afterwards), so 定版 would be silently undone by a
+    # session that started before it. The entry check stays where it is: it is
+    # what makes the ROUTE answer 409 without burning an LLM call.
+    if tools.summary_status(target) == "final":
+        return _ERROR_REVISE_FINALIZED
+    if preserved_env_text is not None and not tools._write_regular_file(
+        staging / ".env", preserved_env_text
+    ):
+        return _ERROR_REVISE_ENV_RESTORE
+    backup = base / f".{name}.bak-{uuid4().hex}"
+    try:
+        os.rename(target, backup)
+    except OSError as exc:
+        return f"工具包置換失敗（{type(exc).__name__}）。"  # noqa: RUF001
+    try:
+        shutil.move(str(staging), str(target))
+    except Exception as exc:
+        # TOTAL, unlike the OSError catches everywhere else in this module, and
+        # for one reason: between the rename above and this move the tool DOES
+        # NOT EXIST. Anything that escapes here leaves the operator's working
+        # tool gone with only a hidden backup to show for it, so the roll-back
+        # has to run for EVERY failure, not just the filesystem-shaped ones
+        # (``shutil.move``'s copy fallback can surface a foreign exception).
+        # str(exc) is never surfaced -- the message stays category-only.
+        try:
+            os.rename(backup, target)
+        except Exception:
+            return _ERROR_REVISE_UNRECOVERABLE
+        return f"工具包置換失敗（{type(exc).__name__}），原工具已還原。"  # noqa: RUF001
+    shutil.rmtree(backup, ignore_errors=True)
+    return None
+
+
 def _cleanup_staging(staging: Path, base: Path) -> None:
     """Remove the session's staging dir (if the move did not consume it) and
     drop the ``.staging`` shell when this was the last build in flight.
@@ -1558,24 +1831,321 @@ async def run_install(
         await run_in_threadpool(_cleanup_staging, staging, base)
 
 
+# --- the revise run -----------------------------------------------------------
+
+
+def _is_preserved_env_name(filename: str) -> bool:
+    """True for the ``.env`` name a revise must NOT copy into staging (D40).
+
+    Matched CASE-INSENSITIVELY for the same reason ``_is_reserved_sidecar_name``
+    is (R10-2): on the case-INSENSITIVE default macOS filesystem, ``.ENV`` IS the
+    file ``tools._load_tool_dotenv`` opens as ``.env``, so a case-sensitive
+    comparison would copy the LIVE credentials into staging on a supported
+    platform -- and ``validate_package``'s embedded-secret gate would then reject
+    every revise of that tool, permanently, naming a file the operator never
+    wrote. The exclusion must be at least as loose as the loosest filesystem this
+    can run on; on a case-sensitive one the only cost is dropping a ``.ENV`` the
+    runtime never loaded anyway.
+    """
+    return filename.casefold() == ".env"
+
+
+def _revise_copy_ignore(source_dir: Any, names: list[str]) -> set[str]:
+    """``copytree``'s ignore callback: the names a revise copy must leave behind.
+
+    Two namespaces, both at EVERY depth (this is called once per directory):
+
+    * ``.env`` -- MANDATORY. The installed package's values are in
+      ``known_secret_values``, so a copy would be rejected outright by
+      ``validate_package``'s embedded-secret gate. The backend restores the
+      original file after validation instead (``_promote_staging_replace``);
+    * the sidecar's reserved namespace -- the summary is regenerated through the
+      ``write_tool_meta`` choke point after the swap, and ``_strip_builder_sidecars``
+      would delete a copied one from staging anyway.
+
+    Nested copies of either name are dropped too, for the reason R7-1 gives for
+    stripping nested sidecars: the runtime only ever loads the package ROOT's
+    ``.env`` (``tools._load_tool_dotenv``) and only ever reads the ROOT sidecar,
+    so nothing the runtime uses is lost -- while a nested copy holding a
+    by-then-registered value would brick every future revise of the tool with a
+    rejection naming a file the operator never wrote.
+
+    ``source_dir`` is the directory being visited (shutil hands back whatever
+    path type it was given); the decision is per-NAME, so it is unused.
+    """
+    return {
+        name for name in names if _is_preserved_env_name(name) or _is_reserved_sidecar_name(name)
+    }
+
+
+def _copy_package_into_staging(source: Path, staging: Path) -> str | None:
+    """Copy the installed package into a fresh staging dir; None = ok (D40).
+
+    Blocking (runs via ``run_in_threadpool``). ``copytree`` creates ``staging``
+    (and the ``.staging`` shell above it) itself, so there is no separate mkdir
+    to race with.
+
+    ``symlinks=True`` copies links AS links rather than dereferencing them. Both
+    halves matter: it keeps the copy FAITHFUL (a package that shipped a symlink
+    still has one, and a dangling link stays dangling instead of aborting the
+    copy), and it refuses to slurp CONTENT from outside the package -- with the
+    default, a link to another tool's ``.env`` would materialize as a real file
+    full of live credentials inside staging, which the embedded-secret gate would
+    then reject with the operator having written no such file.
+
+    Any ``OSError`` -- including ``shutil.Error``, which subclasses it and is
+    what ``copytree`` raises for per-file failures collected during the walk --
+    becomes the friendly outcome. An unreadable subtree therefore FAILS the
+    revise loudly here (裁決紀錄 #4 noted this path would surface exactly that,
+    where the install-side ``os.walk`` gate stays as adjudicated).
+    """
+    try:
+        shutil.copytree(source, staging, symlinks=True, ignore=_revise_copy_ignore)
+    except OSError as exc:
+        return f"無法複製既有工具包到暫存工作區（{type(exc).__name__}）。"  # noqa: RUF001
+    return None
+
+
+def _read_env_for_preservation(directory: Path) -> tuple[str | None, str | None]:
+    """``(text, error)``: the package's ``.env`` VERBATIM, or why we refuse (D40).
+
+    Blocking. ``(None, None)`` means the package simply has no ``.env`` -- the
+    common case, and the one where there is nothing to preserve or restore.
+
+    The TEXT is what gets written back, so this is deliberately stricter than the
+    runtime's own loader, which degrades an unreadable or oversized ``.env`` to
+    "no extra env" and keeps the tool running. Here the same degrade would mean
+    replacing the live package with one whose ``.env`` is MISSING or TRUNCATED --
+    silent credential loss on a tool that was working a minute ago. So a ``.env``
+    that exists (``lstat``, which sees a symlink or a FIFO too) but that the
+    bounded, O_NOFOLLOW'd reader declines, or that comes back over the cap, stops
+    the revise instead.
+
+    Values are parsed FROM THIS TEXT by the caller (``tools._parse_dotenv_text``,
+    the one parser ``_load_tool_dotenv`` itself delegates to) rather than by a
+    second read of the file: the registered in-flight secrets must be exactly the
+    values in the bytes we are going to restore, and two reads could disagree.
+    """
+    env_file = directory / ".env"
+    try:
+        env_file.lstat()
+    except OSError:
+        return None, None
+    text = tools._read_regular_file_capped(env_file, tools._ENV_FILE_MAX_BYTES)
+    if text is None:
+        return None, _ERROR_REVISE_ENV_UNREADABLE
+    if len(text) > tools._ENV_FILE_MAX_BYTES:
+        return None, _ERROR_REVISE_ENV_TOO_LARGE
+    return text, None
+
+
+def _current_manifest_text(directory: Path) -> str | None:
+    """The installed package's ``tool.json`` text for the revise prompt, or None.
+
+    Blocking, and best-effort: a manifest we cannot read is a package the model
+    will simply have to ``read_file`` for itself (or that is already broken), not
+    a reason to refuse the revise the user asked for.
+    """
+    return tools._read_regular_file_capped(directory / "tool.json", tools._MANIFEST_MAX_BYTES)
+
+
+def _existing_origin(directory: Path) -> dict[str, Any] | None:
+    """The install ORIGIN recorded in the package's CURRENT sidecar, or None.
+
+    Blocking. Read BEFORE the swap, because the swap deletes the old package and
+    its sidecar with it -- and that sidecar is the ONLY copy of the OpenAPI url
+    and the operator's original instructions (nothing else persists them). The
+    post-revise summary inherits them so a revised tool keeps knowing what it was
+    originally built from. Narrowed and re-sanitized by ``tool_meta._stored_origin``,
+    the same reader the synchronous regenerate uses.
+    """
+    return tool_meta._stored_origin(tools.read_tool_meta(directory))
+
+
+async def run_revise(name: str, feedback: str) -> InstallOutcome:
+    """Run one whole revise: copy, build in staging, validate, REPLACE (D40).
+
+    Same contract as ``run_install`` in every externally visible way -- it runs
+    inside a fire-and-forget background job, so every failure is a FRIENDLY
+    OUTCOME (zh-TW ``error``) and never an exception, and ``llm_log_id`` is
+    captured right after the builder call on success and failure alike.
+
+    The two gates before any work: the package must resolve through
+    ``tools._resolve_package_dir_no_alias`` (the shared by-name resolver, so an
+    internal alias is refused here exactly as it is by every summary route), and
+    it must not be 已定版. The router checks both too; re-checking is defence in
+    depth against a 定版 that landed between the two, and it costs one sidecar
+    read. A 定版 landing LATER -- mid-session, after this check -- is NOT
+    re-checked at promote time: the swap then replaces the package (its sidecar
+    included) and the post-swap hook writes a fresh draft. That is the same
+    accepted check-then-act residual class D40 names for a concurrent delete, on
+    a single-user local tool where finalizing a tool whose own revise you just
+    started is the whole of the exposure -- unlike the regenerate route, where
+    the same window is closed at the store because there the loser would be a
+    frozen summary a request is actively overwriting.
+
+    The ``.env`` is read (and refused if unreadable/oversized) BEFORE anything
+    else, and every value in it is registered as an in-flight secret for the
+    WHOLE window, discarded value by value in the ``finally``. D40 requires this
+    for a window that install does not have: the swap parks the old package in a
+    DOT-prefixed backup, and ``known_secret_values`` skips dot-directories, so
+    for the length of that swap the tool's own credentials would otherwise be
+    unknown to the redactor -- while the builder conversation is still being
+    recorded. Registering them up front also makes them redactable in every
+    prompt/response of the session, and makes the embedded-secret gate refuse a
+    revision that copied them into a file.
+    """
+    base = tools.tools_dir()
+    if base is None:
+        return InstallOutcome(ok=False, error=_ERROR_TOOLS_DISABLED)
+
+    directory = await run_in_threadpool(tools._resolve_package_dir_no_alias, name)
+    if directory is None:
+        return InstallOutcome(ok=False, error=_ERROR_REVISE_NOT_FOUND)
+    if await run_in_threadpool(tools.summary_status, directory) == "final":
+        return InstallOutcome(ok=False, error=_ERROR_REVISE_FINALIZED)
+
+    env_text, env_error = await run_in_threadpool(_read_env_for_preservation, directory)
+    if env_error is not None:
+        return InstallOutcome(ok=False, error=env_error)
+    # Parsed from the SAME text we will restore (see _read_env_for_preservation).
+    # Empty values contribute nothing to redaction and are not registered, matching
+    # tools._cached_env_values' own "a KEY= line contributes nothing" rule.
+    env_values = tools._parse_dotenv_text(env_text) if env_text is not None else {}
+    registered = [value for value in env_values.values() if value]
+    for value in registered:
+        tools.register_inflight_secret(value)
+
+    staging = base / _STAGING_DIRNAME / uuid4().hex
+    try:
+        copy_error = await run_in_threadpool(_copy_package_into_staging, directory, staging)
+        if copy_error is not None:
+            return InstallOutcome(ok=False, error=copy_error)
+
+        settings = get_settings()
+        manifest_text = await run_in_threadpool(_current_manifest_text, directory)
+        result: InstallResult | None = None
+        llm_error: str | None = None
+        try:
+            result = await generate_structured(
+                _revise_system_prompt(name),
+                _revise_user_prompt(feedback, manifest_text),
+                InstallResult,
+                workflow=_WORKFLOW,
+                # The whole existing .env goes into run_shell's environment (never
+                # into a prompt), so the model can live-test the real API against
+                # the tool's own credentials without the file being in staging.
+                tools=_build_meta_tools(staging, secret_env=env_values or None),
+                max_tool_rounds=settings.tool_install_max_rounds,
+                timeout_seconds=settings.tool_install_timeout_seconds,
+            )
+        except LLMNotConfiguredError:
+            llm_error = "LLM 尚未設定，無法執行修訂。"  # noqa: RUF001
+        except LLMUpstreamError as exc:
+            # str(exc) is category + fixed reason by construction (see llm.py).
+            llm_error = f"AI 修訂工具失敗（{exc}）。"  # noqa: RUF001
+
+        llm_log_id = llm_log.last_record_id_for_workflow(_WORKFLOW)
+        if llm_error is not None:
+            return InstallOutcome(ok=False, error=llm_error, llm_log_id=llm_log_id)
+        assert result is not None  # exactly one of result/llm_error is set above
+
+        # The SAME single choke point run_install uses, and for the same reason:
+        # the finally below discards the in-flight secrets before this function
+        # returns, so redacting at job-update time would be a no-op that leaks.
+        summary = tools.redact_known_secrets(result.summary) if result.summary else None
+        # ``tool_name`` on these outcomes is the package the user addressed, never
+        # the model's answer: the job's tool_name is what the FE links to.
+        if not result.ready:
+            reason = summary or "（AI 未說明原因）"  # noqa: RUF001
+            return InstallOutcome(
+                ok=False,
+                tool_name=name,
+                summary=summary,
+                error=f"AI 判定修訂尚未完成：{reason}",  # noqa: RUF001
+                llm_log_id=llm_log_id,
+            )
+        if result.tool_name != name:
+            # D40: ``InstallResult._ready_requires_valid_name`` only checks the
+            # SHAPE of the name, never its identity -- so a model that decided to
+            # "fix" the name would otherwise have its work promoted over whatever
+            # package that other name addresses. Refuse, and say which name was
+            # attempted so the operator can see what the model tried; the attempted
+            # name is run through the redactor first, exactly as ``validate_package``
+            # does with the offending path it names, because it is model-authored
+            # text and a registered value CAN be a legal package name.
+            attempted = tools.redact_known_secrets(result.tool_name)
+            return InstallOutcome(
+                ok=False,
+                tool_name=name,
+                summary=summary,
+                error=f"AI 試圖將工具改名為「{attempted}」，修訂已取消。",  # noqa: RUF001
+                llm_log_id=llm_log_id,
+            )
+
+        # Read the origin while the OLD sidecar still exists (see _existing_origin).
+        origin = await run_in_threadpool(_existing_origin, directory)
+        promote_error = await run_in_threadpool(
+            _promote_staging_replace, staging, name, base, env_text
+        )
+        if promote_error is not None:
+            return InstallOutcome(
+                ok=False,
+                tool_name=name,
+                summary=summary,
+                error=promote_error,
+                llm_log_id=llm_log_id,
+            )
+        # The revision is LIVE as of the line above; everything after it is
+        # decoration and cannot fail the outcome (``generate_and_store_summary``
+        # never raises -- see tool_meta). The sidecar was excluded from staging, so
+        # the package has NO summary until this regenerates one: the same
+        # briefly-absent-sidecar window D40 already accepts right after an install,
+        # and the reason the origin above is carried across rather than re-derived.
+        await tool_meta.generate_and_store_summary(name, origin=origin, builder_summary=summary)
+        return InstallOutcome(ok=True, tool_name=name, summary=summary, llm_log_id=llm_log_id)
+    finally:
+        # Mirror run_install's order: drop the in-flight secrets first (the
+        # restored .env carries them again, so known_secret_values covers them
+        # through its own scan), then clean staging. A successful swap consumed
+        # the staging dir; every other exit removes the build.
+        for value in registered:
+            tools.discard_inflight_secret(value)
+        await run_in_threadpool(_cleanup_staging, staging, base)
+
+
 # --- background jobs ---------------------------------------------------------
 
 # In-memory, process-local, deliberately unpersisted (see the module
 # docstring). One lock guards the dict, matching llm_log's pattern; the task
-# set only holds strong references so a running install's Task is never
+# set only holds strong references so a running job's Task is never
 # garbage-collected mid-flight (asyncio keeps only weak refs to tasks). Since
-# start_install_job now admits only ONE active install at a time (M7), _TASKS
-# holds at most that one in-flight task plus any not-yet-collected finished
-# ones -- it cannot grow without bound under rapid submits.
+# admission allows only ONE active job at a time (M7, widened to install AND
+# revise by D40), _TASKS holds at most that one in-flight task plus any
+# not-yet-collected finished ones -- it cannot grow without bound under rapid
+# submits.
 _MAX_JOBS = 20
 _JOBS: dict[str, InstallJob] = {}
 _JOBS_LOCK = threading.Lock()
 _TASKS: set[asyncio.Task[None]] = set()
 
+# The zh-TW noun each job kind uses in the "unexpected error" backstop below.
+# Parameterizing the NOUN rather than the whole sentence keeps ONE backstop with
+# one shape for both kinds, while leaving the install's existing text (which its
+# tests and the FE see) byte-identical.
+_ACTION_INSTALL = "安裝"
+_ACTION_REVISE = "修訂"
+
 
 @dataclass(slots=True)
 class InstallJob:
-    """One install job's visible state, as polled by the FE."""
+    """One install/revise job's visible state, as polled by the FE.
+
+    Both kinds share this record (and the table it lives in) because they are
+    the same thing to a poller: a builder session that ends in a tool being
+    installed or replaced. The KIND is deliberately not a field -- nothing in the
+    contract branches on it, and the FE polls the same endpoint for both.
+    """
 
     job_id: str
     state: str  # queued | running | succeeded | failed
@@ -1621,31 +2191,33 @@ def _update_job(job_id: str, **changes: Any) -> None:
 
 async def _run_job(
     job_id: str,
-    openapi_url: str,
-    instructions: str,
-    secret_name: str | None,
-    secret_value: str | None,
+    run: Callable[[], Awaitable[InstallOutcome]],
+    action: str,
 ) -> None:
-    """The background task body: run the install, record the outcome.
+    """The background task body: run one builder session, record the outcome.
 
-    ``run_install`` already maps every EXPECTED failure to a friendly outcome;
-    the except here is the total backstop for a genuine bug, because an
-    exception escaping a fire-and-forget task would otherwise vanish (leaving
-    the job stuck on "running" forever from the FE's point of view). Category
-    only -- a bug's str() could carry anything (and MUST NOT: the secret value
-    is threaded through here, so a leaky str(exc) is exactly why this is
-    category-only).
+    ONE body for both job kinds, taking the run as a zero-argument factory (the
+    caller has already bound its own arguments). Sharing it is the point: the
+    state machine, the field copy-out and the backstop below must be identical
+    for an install and a revise, and a second near-copy is exactly where they
+    would drift.
+
+    ``run_install``/``run_revise`` already map every EXPECTED failure to a
+    friendly outcome; the except here is the total backstop for a genuine bug,
+    because an exception escaping a fire-and-forget task would otherwise vanish
+    (leaving the job stuck on "running" forever from the FE's point of view).
+    Category only -- a bug's str() could carry anything (and MUST NOT: secret
+    values are threaded through both runs, so a leaky str(exc) is exactly why
+    this is category-only).
     """
     _update_job(job_id, state="running")
     try:
-        outcome = await run_install(
-            openapi_url, instructions, secret_name=secret_name, secret_value=secret_value
-        )
+        outcome = await run()
     except Exception as exc:
         _update_job(
             job_id,
             state="failed",
-            error=f"安裝過程發生未預期錯誤（{type(exc).__name__}）。",  # noqa: RUF001
+            error=f"{action}過程發生未預期錯誤（{type(exc).__name__}）。",  # noqa: RUF001
             finished_at=_now_iso(),
         )
         return
@@ -1660,27 +2232,17 @@ async def _run_job(
     )
 
 
-def start_install_job(
-    openapi_url: str,
-    instructions: str,
-    *,
-    secret_name: str | None = None,
-    secret_value: str | None = None,
-) -> str | None:
-    """Create a job and launch its background task; returns the job id, or None
-    when an install is ALREADY active (queued|running).
+def _admit_job() -> InstallJob | None:
+    """Register one queued job, or None when another is already active (M7/D40).
 
-    Only ONE install runs at a time (M7): the active-check and the insert happen
-    under the SAME lock, so there is no check-then-start race, and the router
-    maps a None return to a 409. This also structurally BOUNDS ``_TASKS`` -- at
-    most one install task is ever in flight, so the strong-ref set that keeps a
-    running Task alive can no longer grow without limit under rapid submits.
+    The single-flight admission, written ONCE for both kinds: the active-check
+    and the insert happen under the SAME lock acquisition, so there is no
+    check-then-start race, and a caller maps None onto its route's 409. ANY
+    queued/running job blocks ANY new one -- an install and a revise both end in
+    a package directory being moved into place, so letting them overlap would
+    race a directory being replaced (and would make the two sessions'
+    same-workflow log records ambiguous to ``last_record_id_for_workflow``).
 
-    ``secret_name``/``secret_value`` (D36) are threaded straight to the task and
-    on to ``run_install``; they are DELIBERATELY not stored in ``InstallJob`` (so
-    the value can never surface in a job/poll response), only passed forward.
-
-    Must be called with a running event loop (the async router handler is).
     Eviction keeps the newest ``_MAX_JOBS`` by creation time (job_id as a
     deterministic tiebreak for identical timestamps); a TERMINAL (succeeded/
     failed) job stays pollable until evicted and never blocks a new submit.
@@ -1694,25 +2256,82 @@ def start_install_job(
         while len(_JOBS) > _MAX_JOBS:
             oldest = min(_JOBS.values(), key=lambda j: (j.created_at, j.job_id))
             del _JOBS[oldest.job_id]
-    task = asyncio.create_task(
-        _run_job(job.job_id, openapi_url, instructions, secret_name, secret_value)
-    )
+    return job
+
+
+def _launch_job(job: InstallJob, run: Callable[[], Awaitable[InstallOutcome]], action: str) -> str:
+    """Spawn an admitted job's background task and return its id.
+
+    Must be called with a running event loop (the async router handler is). The
+    strong reference in ``_TASKS`` is what keeps the Task from being
+    garbage-collected mid-flight; the done-callback drops it again.
+    """
+    task = asyncio.create_task(_run_job(job.job_id, run, action))
     _TASKS.add(task)
     task.add_done_callback(_TASKS.discard)
     return job.job_id
 
 
+def start_install_job(
+    openapi_url: str,
+    instructions: str,
+    *,
+    secret_name: str | None = None,
+    secret_value: str | None = None,
+) -> str | None:
+    """Create an install job and launch it; returns the job id, or None when a
+    job is ALREADY active (queued|running) -- which the router maps to a 409.
+
+    ``secret_name``/``secret_value`` (D36) are threaded straight to the task and
+    on to ``run_install``; they are DELIBERATELY not stored in ``InstallJob`` (so
+    the value can never surface in a job/poll response), only passed forward.
+
+    The run is bound as a closure over the module-level ``run_install`` NAME
+    (resolved when the task runs, not when this returns), which is also what
+    keeps the job tests' monkeypatched ``run_install`` reachable.
+    """
+    job = _admit_job()
+    if job is None:
+        return None
+    return _launch_job(
+        job,
+        lambda: run_install(
+            openapi_url, instructions, secret_name=secret_name, secret_value=secret_value
+        ),
+        _ACTION_INSTALL,
+    )
+
+
+def start_revise_job(name: str, feedback: str) -> str | None:
+    """Create a revise job and launch it; returns the job id, or None when a job
+    is ALREADY active (queued|running) -- which the router maps to a 409 (D40).
+
+    Same table, same single-flight admission and same task machinery as an
+    install: from here down the two kinds are indistinguishable, which is what
+    lets one poll endpoint serve both. ``name`` has already been validated
+    (path-layer regex) and resolved (the route's existence gate); ``run_revise``
+    re-resolves it anyway, because the route's check and this task are seconds
+    apart.
+    """
+    job = _admit_job()
+    if job is None:
+        return None
+    return _launch_job(job, lambda: run_revise(name, feedback), _ACTION_REVISE)
+
+
 def any_job_active() -> bool:
     """True while ANY job is queued or running (D40).
 
-    The single-flight predicate ``start_install_job`` enforces, exposed as a
-    plain question for callers OUTSIDE the job machinery -- the synchronous
-    summary-regenerate route, which must refuse to run while an install is in
+    The single-flight predicate ``_admit_job`` enforces, exposed as a plain
+    question for callers OUTSIDE the job machinery -- the synchronous
+    summary-regenerate route, which must refuse to run while any job is in
     flight: a promote MOVES a whole package directory into place, and a
     regenerate reading/writing that package's sidecar across the swap would race
-    a directory that is being replaced under it.
+    a directory that is being replaced under it. (The revise route does NOT use
+    this: it maps ``start_revise_job``'s None return instead, which decides the
+    same question inside the admission lock rather than one hop before it.)
 
-    The predicate is DUPLICATED in ``start_install_job`` rather than shared with
+    The predicate is DUPLICATED in ``_admit_job`` rather than shared with
     it, deliberately: that one must evaluate the check and the insert under the
     SAME lock acquisition to be race-free, and ``_JOBS_LOCK`` is a plain
     (non-reentrant) ``threading.Lock``, so calling this from inside it would
