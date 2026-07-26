@@ -206,6 +206,14 @@ _ERROR_REVISE_FINALIZED = "總結已定版，請先解除定版再送出修訂�
 _ERROR_REVISE_ENV_UNREADABLE = "無法讀取既有工具包的 .env，修訂已取消。"  # noqa: RUF001
 _ERROR_REVISE_ENV_TOO_LARGE = "既有工具包的 .env 超過大小上限，修訂已取消。"  # noqa: RUF001
 _ERROR_REVISE_ENV_RESTORE = "無法還原工具包的 .env，修訂已取消。"  # noqa: RUF001
+# A hand-edited ``.env`` holding a value BELOW the redactor's floor (R1-1). Names
+# the CONDITION and the two remedies, never the key and never the value -- the
+# whole point is that this value cannot be masked, so it must not be echoed by the
+# very message that refuses to expose it. See ``run_revise``'s own gate for why
+# refusing beats running.
+_ERROR_REVISE_ENV_UNMASKABLE = (
+    "既有工具包的 .env 內有值過短、無法遮蔽，修訂已取消：請加長該值，或將它從 .env 移除。"  # noqa: RUF001
+)
 # The replace-mode promote's two "the package is no longer what we resolved"
 # refusals. Both are races against a concurrent delete/replace by an actor with
 # the service's uid -- the SAME accepted residual class ``_promote_staging``'s
@@ -1552,9 +1560,13 @@ def _promote_staging_replace(
     produced (and its embedded-secret gate would reject the live values on
     sight), and the backend's own bytes are layered on top of a package that has
     already passed. It overwrites whatever ``.env`` the builder wrote, which is
-    the prompt's stated contract. No size re-check is needed: these are the exact
-    bytes read back under ``_ENV_FILE_MAX_BYTES``, and the staged package's own
-    ``.env`` was just size-gated by validate.
+    the prompt's stated contract. Restoration is at TEXT fidelity -- the utf-8
+    re-encoding of what the bounded reader decoded, see
+    ``_read_env_for_preservation`` for why that is the right fidelity here and not
+    a compromise. No size re-check is needed: this text came back under the SAME
+    ``_ENV_FILE_MAX_BYTES`` bound ``tools._load_tool_dotenv`` applies when it reads
+    the file back, so what we restore is exactly as loadable as what it replaces;
+    and the staged package's own ``.env`` was just size-gated by validate.
 
     ``preserved_env_text is None`` means the package HAD no ``.env``, and then a
     builder-written one SHIPS -- deliberately, and identically to an install,
@@ -1571,8 +1583,23 @@ def _promote_staging_replace(
       in ``GET /api/tools`` as a phantom duplicate during the swap window (and
       the same convention keeps ``known_secret_values`` from re-reading it --
       which is exactly why ``run_revise`` registers those values in-flight);
-    * ``shutil.move`` then puts the revision at the now-free name;
-    * a move failure is ROLLED BACK by renaming the backup home. If even that
+    * a plain ``os.rename`` then puts the revision at the now-free name.
+      DELIBERATELY not ``shutil.move`` (R1-2): move falls back to a
+      copytree-then-delete whenever ``os.rename`` raises -- not only across
+      devices, since it catches every ``OSError`` -- so the publish would not be
+      atomic. With the old package already parked in the backup, a partial copy
+      leaves a HALF-BUILT directory at the tool's name, and the roll-back's
+      ``os.rename(backup, target)`` then fails because the name is occupied: a
+      half-replaced tool plus a hidden backup, the exact state
+      ``_ERROR_REVISE_UNRECOVERABLE`` exists to make rare. The same-filesystem
+      assumption ``rename`` needs is STRUCTURAL here, not a hope: staging is
+      ``<tools_dir>/.staging/<uuid>`` and the target is ``<tools_dir>/<name>``,
+      and ``_verify_staging_root`` above has already PROVEN staging resolves
+      inside that same ``<tools_dir>`` shell -- so the two live under one root and
+      EXDEV cannot arise from the paths themselves (only from a mount an operator
+      planted inside their own tools directory, which fails loudly and rolls back
+      like any other error);
+    * a publish failure is ROLLED BACK by renaming the backup home. If even that
       fails, the operator is told a hidden backup is what to rescue
       (``_ERROR_REVISE_UNRECOVERABLE``) -- the one outcome that needs a human;
     * success drops the backup with ``ignore_errors`` (the revision is live by
@@ -1621,15 +1648,27 @@ def _promote_staging_replace(
     except OSError as exc:
         return f"工具包置換失敗（{type(exc).__name__}）。"  # noqa: RUF001
     try:
-        shutil.move(str(staging), str(target))
+        os.rename(staging, target)
     except Exception as exc:
         # TOTAL, unlike the OSError catches everywhere else in this module, and
-        # for one reason: between the rename above and this move the tool DOES
-        # NOT EXIST. Anything that escapes here leaves the operator's working
-        # tool gone with only a hidden backup to show for it, so the roll-back
-        # has to run for EVERY failure, not just the filesystem-shaped ones
-        # (``shutil.move``'s copy fallback can surface a foreign exception).
+        # for one reason: between the rename above and this one the tool DOES NOT
+        # EXIST. Anything that escapes here leaves the operator's working tool
+        # gone with only a hidden backup to show for it, so the roll-back has to
+        # run for EVERY failure shape, not just the filesystem-shaped ones.
         # str(exc) is never surfaced -- the message stays category-only.
+        #
+        # The roll-back does NOT clear ``target`` first, and that is a decision,
+        # not an omission (R1-2): a rename that RAISED moved nothing, so the name
+        # is free -- the half-written target that made clearing it look necessary
+        # was ``shutil.move``'s copy fallback, which is exactly what the line above
+        # no longer is. The ONLY way ``target`` exists here is that a concurrent
+        # actor with the service's uid created it in the instant since our own
+        # rename-aside, and then ``rmtree``-ing it would be a destructive traversal
+        # on a directory this function neither created nor verified (the
+        # ``_verify_staging_root`` gate proves things about STAGING, nothing about
+        # this path) -- destroying a third party's data to reclaim a name. The
+        # rename below fails with ENOTEMPTY instead and the operator is told where
+        # their backup is, which is the honest answer to "two writers, one name".
         try:
             os.rename(backup, target)
         except Exception:
@@ -1907,10 +1946,27 @@ def _copy_package_into_staging(source: Path, staging: Path) -> str | None:
 
 
 def _read_env_for_preservation(directory: Path) -> tuple[str | None, str | None]:
-    """``(text, error)``: the package's ``.env`` VERBATIM, or why we refuse (D40).
+    """``(text, error)``: the package's ``.env`` as TEXT, or why we refuse (D40).
 
     Blocking. ``(None, None)`` means the package simply has no ``.env`` -- the
     common case, and the one where there is nothing to preserve or restore.
+
+    Preservation is at TEXT fidelity, not byte fidelity, and the distinction is
+    stated rather than glossed (R1-4). This goes through the shared bounded reader,
+    which decodes utf-8 with ``errors="replace"`` and universal newlines, so a CRLF
+    ``.env`` comes back with LF endings and an invalid byte comes back as U+FFFD;
+    ``_promote_staging_replace`` then re-encodes that text. What IS preserved is
+    everything the file MEANS: every line, comment, quote, inline ``#``, trailing
+    space and the original ORDER -- none of which survives the "parse and
+    re-serialize" restore this deliberately is not.
+
+    Byte fidelity would buy nothing observable, which is why it is not worth a
+    second read path: EVERY consumer of this file reads it through the SAME lossy
+    decode (``tools._load_tool_dotenv`` for the runtime env, ``_cached_env_values``
+    for the redactor, and this function for the restore), so the values a tool
+    receives after a revise are byte-identical to the ones it received before it.
+    Only the file's on-disk spelling is normalized, and only for a file that was
+    not valid utf-8 with LF endings to begin with.
 
     The TEXT is what gets written back, so this is deliberately stricter than the
     runtime's own loader, which degrades an unreadable or oversized ``.env`` to
@@ -1994,6 +2050,22 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
     recorded. Registering them up front also makes them redactable in every
     prompt/response of the session, and makes the embedded-secret gate refuse a
     revision that copied them into a file.
+
+    A value TOO SHORT to be masked refuses the whole session (R1-1). Registration
+    is not protection on its own: ``redact_known_secrets`` and ``llm_log._redact``
+    both drop everything under ``tools._MIN_SECRET_LEN``, deliberately -- masking a
+    1-5 char value would shred ordinary prose. The install FORM already refuses a
+    short secret for exactly this reason (``schemas._SECRET_VALUE_MIN_LEN``), but a
+    revise inherits whatever a hand-edited ``.env`` holds, and this path hands
+    every one of those values to ``run_shell``, whose output is wrapped verbatim
+    into the next round's prompt, recorded into the AI 日誌 attempt bodies, and can
+    reach ``InstallResult.summary`` -> the job poll -> the sidecar. So the only two
+    honest options are "do not run" and "leak", because the redactor cannot mask a
+    value it is required to ignore. This is the SAME rule the install form applies,
+    at the other entry point. INSTALL is structurally clear of this: its staging is
+    built EMPTY (``staging.mkdir``) and ``_promote_staging`` refuses a name that
+    already exists, so it never inherits a pre-existing package's ``.env``, and the
+    only value it puts there is the form secret the schema already floored.
     """
     base = tools.tools_dir()
     if base is None:
@@ -2013,6 +2085,12 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
     # tools._cached_env_values' own "a KEY= line contributes nothing" rule.
     env_values = tools._parse_dotenv_text(env_text) if env_text is not None else {}
     registered = [value for value in env_values.values() if value]
+    # BEFORE the LLM call, and before anything is registered: a value we would be
+    # required to ignore cannot be protected by registering it (see the docstring).
+    # ``registered`` is already the non-empty values, so a ``KEY=`` line -- which
+    # contributes no secret to anything -- can never trip this.
+    if any(len(value) < tools._MIN_SECRET_LEN for value in registered):
+        return InstallOutcome(ok=False, error=_ERROR_REVISE_ENV_UNMASKABLE)
     for value in registered:
         tools.register_inflight_secret(value)
 
@@ -2024,12 +2102,22 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
 
         settings = get_settings()
         manifest_text = await run_in_threadpool(_current_manifest_text, directory)
+        # The prompt build is BLOCKING work, not the pure string join it looks like
+        # (R1-3): both of its parts go through ``tools.redact_known_secrets``, which
+        # calls ``known_secret_values`` -- an ``iterdir`` of the whole tools
+        # directory plus a ``stat`` per package and, on any cache miss, a full
+        # ``.env`` read. A revise runs from a BACKGROUND job that shares this loop
+        # with every HTTP request in the process, so it hops onto a worker for the
+        # same reason P3a moved ``tool_meta._summary_user_prompt`` off it. A
+        # fail-closed redactor failure still propagates out of the ``await``
+        # unchanged, into ``_run_job``'s backstop.
+        user_prompt = await run_in_threadpool(_revise_user_prompt, feedback, manifest_text)
         result: InstallResult | None = None
         llm_error: str | None = None
         try:
             result = await generate_structured(
                 _revise_system_prompt(name),
-                _revise_user_prompt(feedback, manifest_text),
+                user_prompt,
                 InstallResult,
                 workflow=_WORKFLOW,
                 # The whole existing .env goes into run_shell's environment (never
@@ -2053,7 +2141,15 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
         # The SAME single choke point run_install uses, and for the same reason:
         # the finally below discards the in-flight secrets before this function
         # returns, so redacting at job-update time would be a no-op that leaks.
-        summary = tools.redact_known_secrets(result.summary) if result.summary else None
+        # On a WORKER for the same reason the prompt build above is (R1-3) -- this
+        # is the identical tools-directory scan, just after the LLM call instead of
+        # before it. Every ``redact_known_secrets`` call this function makes is off
+        # the loop; the third one is in the rename refusal below.
+        summary = (
+            await run_in_threadpool(tools.redact_known_secrets, result.summary)
+            if result.summary
+            else None
+        )
         # ``tool_name`` on these outcomes is the package the user addressed, never
         # the model's answer: the job's tool_name is what the FE links to.
         if not result.ready:
@@ -2073,8 +2169,10 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
             # attempted so the operator can see what the model tried; the attempted
             # name is run through the redactor first, exactly as ``validate_package``
             # does with the offending path it names, because it is model-authored
-            # text and a registered value CAN be a legal package name.
-            attempted = tools.redact_known_secrets(result.tool_name)
+            # text and a registered value CAN be a legal package name. On a worker
+            # like the other two (R1-3): rare is not the same as free, and leaving
+            # one instance of the class behind is how it grows back.
+            attempted = await run_in_threadpool(tools.redact_known_secrets, result.tool_name)
             return InstallOutcome(
                 ok=False,
                 tool_name=name,

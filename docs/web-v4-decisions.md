@@ -348,3 +348,61 @@ sidecar 本來就被排除在 staging 外、換裝後才以 **draft** 重生：�
 `summary_status(target)`，`final` 即拒絕——與 `store_summary_meta` 對 regenerate 做的
 store-time 重檢（D40 r2 附錄）同一個模式、同一個理由，只是時間尺度大得多。入口檢查
 維持不變：它的價值是讓**路由**能在不燒 LLM 呼叫的情況下回 409。
+
+### D40 附錄（P3b review r1）：太短的 `.env` 值拒跑、換裝改純 rename、修訂全程不在 loop 上遮蔽、`.env` 保留改口徑為「文字」
+
+- **`.env` 內有無法遮蔽的值就整場拒絕（R1-1）**：遮蔽器（`tools.redact_known_secrets`
+  與 `llm_log._redact`）刻意略過 `_MIN_SECRET_LEN`（6）以下的值——遮一個 1–5 字元的值
+  會把散文洗爛。安裝**表單**因此本來就擋短秘密（`schemas._SECRET_VALUE_MIN_LEN`），
+  但**修訂繼承的是磁碟上的東西**：手編的 `PIN=1234` 照樣被 `register_inflight_secret`
+  登記，而登記對這種值等於沒登記；接著它進了 `run_shell` 的環境，builder 一句
+  `echo "$PIN"` 就讓 `1234` 原樣回到工具結果 → 下一輪提示 → AI 日誌 attempt bodies →
+  甚至 `InstallResult.summary` → job 輪詢 → sidecar。**裁決：`run_revise` 在 LLM 呼叫
+  之前檢查解析出來的既有 `.env` 值，只要有任何非空值短於 `_MIN_SECRET_LEN` 就回
+  category-only 的 zh-TW 失敗**（`_ERROR_REVISE_ENV_UNMASKABLE`），訊息只講**條件**與
+  兩條補救（加長，或把它移出 `.env`），**不提 key、不提值**——在一則因為「遮不掉」而
+  拒絕的訊息裡把值印出來，就是它要防的那個洩漏。誠實的選項只有「不要跑」與「洩漏」
+  兩個，這裡選前者，且這正是安裝表單那條規則套在另一個入口。空值（`KEY=`）不算秘密
+  （比照 `_cached_env_values` 的既有規則，本來就不登記），所以絕不會因此把一個套件
+  永久打死。**安裝路徑沒有同款風險**（已查證）：install 的 staging 是**空的**
+  （`staging.mkdir`）、`_promote_staging` 又拒絕已存在的名字，所以它從不繼承既有套件的
+  `.env`；它唯一寫進 `.env` 的值是表單秘密，schema 早就設過同一個下限。
+- **換裝的就位改成純 `os.rename`（R1-2）**：`shutil.move` 只要 `os.rename` 丟出
+  **任何** `OSError`（不只跨裝置的 EXDEV）就退化成 copytree＋刪除，所以原本的就位
+  **不是原子的**：舊包已經改名進隱藏備份、複製到一半失敗，工具的名字上就留下一個
+  半套目錄，接著回滾的 `os.rename(backup, target)` 因為名字被佔住而失敗——最後是
+  「半換好的工具＋一個隱藏備份」，正好是 `_ERROR_REVISE_UNRECOVERABLE` 存在要讓它
+  罕見的那個狀態。改成 `os.rename(staging, target)` 之後，失敗就代表**什麼都沒搬**，
+  名字仍然空著，備份一定回得去。同檔案系統的前提在這裡是**結構性成立**而不是祈禱：
+  staging 是 `<tools_dir>/.staging/<uuid>`、target 是 `<tools_dir>/<name>`，而
+  `_verify_staging_root`（r8）已經證明 staging resolve 後確實落在同一個 `<tools_dir>`
+  殼裡。就位外面那圈 `except Exception` 維持**全捕捉**：那個窗口裡工具不存在，任何形狀的
+  失敗都必須回滾。**回滾刻意不先清掉 `target`**：純 rename 失敗不會留下半成品，唯一能讓
+  `target` 存在的情況是有另一個持本服務 uid 的行為者在我們改名之後那一瞬間建了它，
+  而對一個本函式既沒建立也沒驗證過的目錄做 `rmtree` 是拿別人的資料換一個名字——
+  讓 rename 以 ENOTEMPTY 失敗、告訴操作者備份在哪裡，才是「兩個寫入者搶一個名字」的
+  誠實答案。安裝路徑的 `_promote_staging` 仍用 `shutil.move`（不同前提：target 必須
+  不存在），本輪不動。
+- **修訂全程不在 event loop 上遮蔽／組提示（R1-3）**：`_revise_user_prompt` 與事後的
+  summary 遮蔽都會呼叫 `redact_known_secrets` → `known_secret_values`，那是整個 tools
+  目錄的 `iterdir`＋每包一次 `stat`、cache miss 還要讀 `.env`。修訂跑在**背景 job**、
+  與所有 HTTP request 共用同一個 loop，理由與 P3a 把 `tool_meta._summary_user_prompt`
+  搬進 `run_in_threadpool` 完全相同。三處全搬（提示建置、summary 遮蔽、以及模型改名
+  拒絕分支裡的 `attempted` 遮蔽）——只修兩處會讓同一個類別從第三處長回來。
+  fail-closed 的傳播語意不變：遮蔽器丟出的例外照樣從 `await` 冒出來，落到 `_run_job`
+  的 backstop。**`run_install` 的同型別呼叫（`_builder_user_prompt`、summary 遮蔽）
+  本輪不動**：那是既有面（早於 P3b），與 `裁決紀錄.md` #2 記的 `InstallResult._sanitize`
+  validator 內遮蔽同一族；一併搬移屬 installer 的整體改造，記在這裡以免日後誤判為遺漏。
+- **`.env` 保留的口徑從「逐位元組」改成「文字」（R1-4）**：原本的說法在字面上不成立
+  ——`_read_regular_file_capped` 以 `errors="replace"` 與 universal newlines 解碼，CRLF
+  的 `.env` 讀回來是 LF、非法位元組變 U+FFFD，`_write_regular_file` 再重新編碼。
+  **選擇不改成 raw bytes**（(a) 案），理由不是省事：真正該問的是「有誰看得出差別」，
+  而**這個檔案的每一個消費者都走同一條有損解碼**——runtime 的 `_load_tool_dotenv`、
+  遮蔽器的 `_cached_env_values`、以及這裡的保留讀取——所以修訂前後工具實際載入到的值
+  本來就完全相同，保留位元組買不到任何可觀測的保真度，卻要嘛複製一整套 O_NOFOLLOW／
+  O_NONBLOCK／S_ISREG 的開檔加固，要嘛去動兩個最多人共用的檔案 helper 的契約（等於
+  多一條寫入路徑，正是本 finding 自己劃掉的選項）。**改的是說法，不是行為**：docstring、
+  README、tool-calling.md 與那個叫 byte-for-byte 的測試全部改口為「以文字保留：內容與
+  行序原樣，換行正規化與非法位元組替換沿用共用受限讀取器」，並新增一個測試釘住 CRLF
+  進去、LF 出來，**同時**釘住 `_load_tool_dotenv` 讀到的值不變——把 transform 寫下來，
+  而不是假裝它不存在。

@@ -3669,12 +3669,16 @@ def test_run_revise_copies_the_package_without_env_or_sidecars(
     assert seen["staged"] == {"tool.json", "run.py", "lib", "lib/util.py", "sub"}
 
 
-def test_run_revise_preserves_the_env_byte_for_byte(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The installed ``.env`` is restored EXACTLY -- comments, quoting, inline
-    ``#`` and trailing whitespace included. The revise never re-serializes it: it
-    writes back the bytes it read before the build."""
+def test_run_revise_preserves_the_env_text(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The installed ``.env`` is restored as TEXT -- comments, quoting, inline
+    ``#``, trailing whitespace and line ORDER included. The revise never
+    re-serializes it: it writes back what it read before the build.
+
+    This file is already valid utf-8 with LF endings, so the round trip is
+    byte-identical HERE. It is not byte-identical in general, and the test no
+    longer claims it is (R1-4): the shared bounded reader decodes with
+    ``errors="replace"`` and universal newlines -- see the CRLF test below, which
+    pins the one transform that does happen."""
     pkg = _seed_package(monkeypatch, tmp_path)
     (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
     before = (pkg / ".env").read_bytes()
@@ -3690,6 +3694,36 @@ def test_run_revise_preserves_the_env_byte_for_byte(
     assert outcome.ok is True
     assert (pkg / ".env").read_bytes() == before
     assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+
+
+def test_run_revise_normalizes_a_crlf_env_to_lf(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The transform the old "byte-for-byte" claim hid, documented instead of
+    denied (R1-4).
+
+    Preservation runs through ``tools._read_regular_file_capped``, which decodes
+    text with universal newlines, so a CRLF ``.env`` is restored with LF endings
+    (an invalid byte would likewise come back as U+FFFD). This is deliberate
+    rather than fixed with a second raw-bytes read path, because it changes
+    NOTHING a consumer can observe: ``_load_tool_dotenv`` (the runtime env) and
+    ``_cached_env_values`` (the redactor) read the file through that SAME decode,
+    so the values the tool receives are identical either way -- pinned below.
+    Only the file's on-disk spelling changes, and only for a file that was not
+    already utf-8 with LF endings."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / ".env").write_bytes(b"# comment\r\nKB_API_KEY=live-secret-value\r\n")
+    before_values = tools._load_tool_dotenv(pkg)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    # Content and ordering intact; the line endings are normalized.
+    assert (pkg / ".env").read_bytes() == b"# comment\nKB_API_KEY=live-secret-value\n"
+    # ... and what the tool actually LOADS is unchanged, which is the property
+    # that made the raw-bytes alternative not worth a second read/write path.
+    assert tools._load_tool_dotenv(pkg) == before_values
 
 
 def test_run_revise_registers_the_live_env_values_for_the_session(
@@ -3738,16 +3772,19 @@ def test_run_revise_keeps_the_env_redactable_across_the_backup_swap(
     pkg = _seed_package(monkeypatch, tmp_path)
     (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
     seen: dict[str, Any] = {}
-    real_move = shutil.move
+    real_rename = os.rename
 
-    def recording_move(src: Any, dst: Any) -> Any:
-        # Called AFTER the old package became `.kbsearch.bak-<uuid>`.
-        seen["known"] = tools.known_secret_values()
-        seen["listed"] = [row["name"] for row in tools.list_tools()]
-        seen["backups"] = _leftovers(pkg.parent)
-        return real_move(src, dst)
+    def recording_rename(src: Any, dst: Any) -> Any:
+        # The PUBLISH rename (its source is the staging dir) -- by which point the
+        # old package has already become `.kbsearch.bak-<uuid>` and the revision is
+        # not in place yet. The backup rename that precedes it is left alone.
+        if tool_builder._STAGING_DIRNAME in str(src):
+            seen["known"] = tools.known_secret_values()
+            seen["listed"] = [row["name"] for row in tools.list_tools()]
+            seen["backups"] = _leftovers(pkg.parent)
+        return real_rename(src, dst)
 
-    monkeypatch.setattr(shutil, "move", recording_move)
+    monkeypatch.setattr(os, "rename", recording_rename)
     _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
 
     outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
@@ -3853,20 +3890,29 @@ def test_promote_replace_refuses_a_finalization_that_landed_mid_session(
     assert not any(entry.name.startswith(".kbsearch.bak-") for entry in base.iterdir())
 
 
-def test_run_revise_rolls_back_a_failed_move(
+def test_run_revise_rolls_back_a_failed_publish(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """If the move fails AFTER the old package was renamed aside, the backup is
-    renamed home: the installed tool comes back byte-identical, the outcome says
-    so, and nothing hidden is left in the tools directory."""
+    """If the PUBLISH rename fails AFTER the old package was renamed aside, the
+    backup is renamed home: the installed tool comes back byte-identical, the
+    outcome says so, and nothing hidden is left in the tools directory.
+
+    Only the publish rename is broken here; the roll-back rename still works,
+    which is the whole point -- with the publish being a plain ``os.rename``
+    (R1-2) a failure moved NOTHING, so the target name is free and the backup can
+    always go home. That is what makes ``_ERROR_REVISE_UNRECOVERABLE`` the rare
+    outcome its docstring claims."""
     pkg = _seed_package(monkeypatch, tmp_path)
     (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
     before = _file_bytes(pkg)
+    real_rename = os.rename
 
-    def exploding_move(src: Any, dst: Any) -> Any:
-        raise OSError("no space left on device")
+    def exploding_publish(src: Any, dst: Any) -> Any:
+        if tool_builder._STAGING_DIRNAME in str(src):
+            raise OSError("no space left on device")
+        return real_rename(src, dst)
 
-    monkeypatch.setattr(shutil, "move", exploding_move)
+    monkeypatch.setattr(os, "rename", exploding_publish)
     _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
 
     outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
@@ -3879,6 +3925,38 @@ def test_run_revise_rolls_back_a_failed_move(
     assert _file_bytes(pkg) == before  # every file back, byte for byte
     assert _leftovers(pkg.parent) == []
     assert [(row["name"], row["valid"]) for row in tools.list_tools()] == [("kbsearch", True)]
+
+
+def test_run_revise_publish_is_a_rename_with_no_copy_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The swap NEVER goes through ``shutil.move`` (R1-2).
+
+    ``move`` falls back to copytree-then-delete whenever ``os.rename`` raises --
+    it catches every ``OSError``, not just EXDEV -- so a publish through it is not
+    atomic: with the old package already parked in the hidden backup, a partial
+    copy leaves a half-built directory AT the tool's name, and the roll-back's
+    ``os.rename(backup, target)`` then fails because that name is occupied. The
+    result is a half-replaced tool plus a hidden backup, which is exactly the
+    state the roll-back exists to prevent. Pinned by making any call fatal: this
+    passes only while the publish is a plain rename.
+
+    ``copytree`` (the staging copy) is untouched -- the pin is on ``move``
+    specifically, which is the only shutil entry point with that fallback."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+
+    def forbidden_move(src: Any, dst: Any) -> Any:
+        raise AssertionError("the revise publish must not use shutil.move")
+
+    monkeypatch.setattr(shutil, "move", forbidden_move)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert _leftovers(pkg.parent) == []
 
 
 def test_run_revise_reports_the_original_being_deleted(
@@ -3994,6 +4072,73 @@ def test_run_revise_refuses_an_unreadable_env(
     assert (pkg / ".env").is_symlink()  # left exactly as found
 
 
+def test_run_revise_refuses_an_env_value_too_short_to_mask(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A hand-edited ``.env`` holding a value UNDER the redactor's floor refuses
+    the whole session, before any LLM call (R1-1).
+
+    The floor is deliberate -- masking a 1-5 char value would shred ordinary prose
+    -- so registering ``1234`` in flight protects nothing: the redactor is required
+    to ignore it. A revise hands every ``.env`` value to ``run_shell``, whose
+    output rides verbatim into the next round's prompt, into the AI 日誌 attempt
+    bodies, and possibly into the summary -> job poll -> sidecar. So the only
+    honest options are "do not run" and "leak". The install FORM already refuses a
+    short secret for this exact reason; this is the same rule at the other entry
+    point.
+
+    The message names the CONDITION and the remedy and nothing else: naming the
+    key or the value in the very error that refuses to expose it would be the leak
+    it exists to prevent."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / ".env").write_text("PIN=1234\n", encoding="utf-8")
+    before = _file_bytes(pkg)
+    captured = _fake_generate(
+        monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMASKABLE
+    assert "PIN" not in (outcome.error or "")  # never the key
+    assert "1234" not in (outcome.error or "")  # never the value
+    assert captured == {}  # the builder session never started
+    assert outcome.llm_log_id is None
+    assert _file_bytes(pkg) == before  # the package is untouched
+    assert not (pkg.parent / tool_builder._STAGING_DIRNAME).exists()
+    with tools._INFLIGHT_LOCK:
+        assert not tools._INFLIGHT_SECRETS  # nothing was registered either
+
+
+def test_run_revise_allows_env_values_at_the_floor_and_ignores_empty_ones(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The refusal above is the redactor's floor EXACTLY, on both edges (R1-1).
+
+    A value at ``_MIN_SECRET_LEN`` is maskable, so it revises normally -- the gate
+    must not creep past the property it enforces. An EMPTY value is not a secret
+    at all: ``KEY=`` contributes nothing to ``known_secret_values`` (the same rule
+    ``tools._cached_env_values`` applies), so it is never registered and can never
+    make a package permanently unrevisable."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    assert tools._MIN_SECRET_LEN == 6  # the floor the fixture below is written to
+    (pkg / ".env").write_text("EXACT=abcdef\nEMPTY=\n", encoding="utf-8")
+    seen: dict[str, Any] = {}
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY},
+        side_effect=lambda: seen.update(inflight=set(tools._INFLIGHT_SECRETS)),
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert seen["inflight"] == {"abcdef"}  # the empty value was not registered
+    assert (pkg / ".env").read_text(encoding="utf-8") == "EXACT=abcdef\nEMPTY=\n"
+
+
 def test_run_revise_prompts_carry_the_feedback_but_never_the_env_values(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4021,6 +4166,72 @@ def test_run_revise_prompts_carry_the_feedback_but_never_the_env_values(
     for value in (_TRICKY_ENV_VALUE, "plain-value"):
         assert value not in system_prompt
         assert value not in user_prompt
+
+
+@pytest.mark.parametrize("model_name", ["kbsearch", "kbsearch2"])
+def test_run_revise_never_redacts_or_builds_its_prompt_on_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model_name: str
+) -> None:
+    """``run_revise``'s prompt build and every redaction it performs hop onto a
+    worker (R1-3).
+
+    Neither is the pure string work it looks like: ``redact_known_secrets`` calls
+    ``known_secret_values``, which ``iterdir``s the whole tools directory,
+    ``stat``s every package and READS every ``.env`` on a cache miss. A revise
+    runs from a BACKGROUND job that shares this loop with every HTTP request in
+    the process, so blocking there stalls all of them -- the same reason P3a moved
+    ``tool_meta._summary_user_prompt`` off it.
+
+    Asserted by THREAD, following that suite's pattern: ``asyncio.run`` drives the
+    loop on this thread, so a different one means the hop really happened. Both
+    outcome shapes are covered because the third redaction lives in the
+    model-renamed refusal branch.
+
+    Two calls are deliberately NOT asserted off-loop here: ``InstallResult``'s own
+    validator redaction (裁決紀錄 #2's consciously deferred instance, which runs
+    inside pydantic validation during ``generate_structured``), and the post-swap
+    summary hook, stubbed out below so the summary text's LAST redaction is
+    unambiguously ``run_revise``'s own."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    loop_thread = threading.current_thread()
+    seen: dict[str, Any] = {}
+    calls: list[tuple[str, threading.Thread]] = []
+    real_prompt = tool_builder._revise_user_prompt
+    real_redact = tools.redact_known_secrets
+
+    def prompt_spy(*args: Any, **kwargs: Any) -> str:
+        seen["prompt"] = threading.current_thread()
+        return real_prompt(*args, **kwargs)
+
+    def redact_spy(text: str) -> str:
+        calls.append((text, threading.current_thread()))
+        return real_redact(text)
+
+    async def no_summary_hook(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(tool_builder, "_revise_user_prompt", prompt_spy)
+    monkeypatch.setattr(tools, "redact_known_secrets", redact_spy)
+    monkeypatch.setattr(tool_meta, "generate_and_store_summary", no_summary_hook)
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(model_name, summary="改好了"),
+        files={"run.py": _REVISED_RUN_PY},
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is (model_name == "kbsearch")
+    assert seen["prompt"] is not loop_thread
+    summary_threads = [thread for text, thread in calls if text == "改好了"]
+    assert summary_threads[-1] is not loop_thread
+    if model_name != "kbsearch":
+        # The attempted-rename redaction, the third instance in this function.
+        # (Not compared to the summary's thread: the pool is free to hand out a
+        # different worker per hop -- "not the loop" is the whole property.)
+        rename_threads = [thread for text, thread in calls if text == model_name]
+        assert rename_threads and loop_thread not in rename_threads
 
 
 def test_run_revise_exposes_the_env_to_run_shell_only(
