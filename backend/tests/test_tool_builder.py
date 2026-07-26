@@ -25,6 +25,7 @@ import asyncio
 import json
 import os
 import socket
+import sys
 import threading
 import time
 from collections.abc import Callable, Generator
@@ -43,6 +44,7 @@ from afterthread.services.tool_builder import (
     _ERROR_NAME_TAKEN,
     _ERROR_OPENAPI_TOO_LARGE,
     _ERROR_SIDECAR_STRIP,
+    _ERROR_STAGING_TAMPERED,
     _ERROR_TOOLS_DISABLED,
     InstallOutcome,
     InstallResult,
@@ -1127,6 +1129,242 @@ def test_run_install_fails_closed_when_the_forged_sidecar_cannot_be_deleted(
     assert outcome.ok is False
     assert outcome.error == _ERROR_SIDECAR_STRIP
     assert not (root / "kbsearch").exists()  # nothing promoted
+
+
+# --- staging-root tamper guard (D40 r8 / R8-1) ----------------------------------
+#
+# _promote_staging is driven DIRECTLY here (not through run_install): the attack
+# these tests reproduce is run_shell mv-ing staging aside and planting a symlink at
+# its original path, and the meta-tools (the only thing a fake generate_structured
+# can drive) are jailed and cannot produce that shape -- only a real shell (or an
+# operator) can, exactly as test_strip_builder_sidecars_handles_links_and_directories
+# does for the sidecar-strip shapes above.
+
+
+def test_promote_staging_refuses_symlinked_staging_root(tmp_path: Path) -> None:
+    """The exact R8-1 attack: a symlink planted AT the staging leaf, pointing at an
+    unrelated directory that happens to hold a planted sidecar. Refused before the
+    strip ever runs, so the decoy's file is never touched -- proof the walk never
+    started, not just that it would have been harmless."""
+    base = tmp_path / "tools"
+    staging_parent = base / tool_builder._STAGING_DIRNAME
+    staging_parent.mkdir(parents=True)
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    decoy_meta = _forged_meta("decoy-should-never-be-touched")
+    (decoy / tools._AI_META_FILENAME).write_text(decoy_meta, encoding="utf-8")
+    staging = staging_parent / "buildid"
+    staging.symlink_to(decoy, target_is_directory=True)
+
+    error = tool_builder._promote_staging(staging, "kbsearch", base)
+
+    assert error == _ERROR_STAGING_TAMPERED
+    assert not (base / "kbsearch").exists()
+    assert (decoy / tools._AI_META_FILENAME).read_text(encoding="utf-8") == decoy_meta
+
+
+def test_promote_staging_refuses_staging_replaced_by_symlink_to_real_tools_dir(
+    tmp_path: Path,
+) -> None:
+    """The literal finding: staging renamed aside, and a symlink planted at its
+    ORIGINAL path pointing at ``base`` -- the real, live tools directory -- itself.
+    Unguarded, the strip's os.walk would land in ``base`` and delete every
+    installed package's sidecar; refused here before that walk ever starts, so an
+    existing package's finalized sidecar survives untouched."""
+    base = tmp_path / "tools"
+    base.mkdir()
+    existing_pkg = base / "existing-tool"
+    existing_pkg.mkdir()
+    existing_meta = json.dumps(
+        {
+            "summary": "already finalized, do not touch",
+            "status": "final",
+            "updated_at": "2026-01-01T00:00:00Z",
+        }
+    )
+    (existing_pkg / tools._AI_META_FILENAME).write_text(existing_meta, encoding="utf-8")
+    staging_parent = base / tool_builder._STAGING_DIRNAME
+    staging_parent.mkdir()
+    # Stands in for "run_shell mv'd the real staging dir aside" -- what matters for
+    # this check is only the END STATE at the original path, not how it got there.
+    staging = staging_parent / "buildid"
+    staging.symlink_to(base, target_is_directory=True)
+
+    error = tool_builder._promote_staging(staging, "kbsearch", base)
+
+    assert error == _ERROR_STAGING_TAMPERED
+    assert not (base / "kbsearch").exists()
+    assert (existing_pkg / tools._AI_META_FILENAME).read_text(encoding="utf-8") == existing_meta
+
+
+def test_promote_staging_refuses_ancestor_staging_shell_replaced_by_symlink(
+    tmp_path: Path,
+) -> None:
+    """The case the LEAF is_symlink() check alone cannot catch: the ``.staging``
+    SHELL itself (an ancestor of the staging path, not the leaf) is swapped for a
+    symlink pointing at ``base``. The leaf entry (matching this build's uuid) then
+    has to be an ordinary REAL directory sitting directly under ``base`` for the
+    path to resolve at all -- so ``is_symlink()`` on the full staging path reports
+    False (confirmed below) even though the fully-resolved path has escaped the
+    ``<base>/.staging`` shell entirely. Only the containment half of
+    ``_verify_staging_root`` catches this."""
+    base = tmp_path / "tools"
+    base.mkdir()
+    existing_pkg = base / "existing-tool"
+    existing_pkg.mkdir()
+    existing_meta = json.dumps(
+        {
+            "summary": "already finalized, do not touch",
+            "status": "final",
+            "updated_at": "2026-01-01T00:00:00Z",
+        }
+    )
+    (existing_pkg / tools._AI_META_FILENAME).write_text(existing_meta, encoding="utf-8")
+    (base / tool_builder._STAGING_DIRNAME).symlink_to(base, target_is_directory=True)
+    (base / "buildid").mkdir()  # the ordinary directory the swapped ancestor exposes
+    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
+
+    assert not staging.is_symlink()  # the leaf alone looks perfectly honest
+
+    error = tool_builder._promote_staging(staging, "kbsearch", base)
+
+    assert error == _ERROR_STAGING_TAMPERED
+    assert not (base / "kbsearch").exists()
+    assert (existing_pkg / tools._AI_META_FILENAME).read_text(encoding="utf-8") == existing_meta
+
+
+def test_promote_staging_allows_honest_staging(tmp_path: Path) -> None:
+    """Control for R8-1: an ordinary staging directory -- a real directory sitting
+    directly under a real ``<base>/.staging`` shell, no symlink anywhere in the
+    chain -- still promotes exactly as before. The new re-verification adds a
+    check, not a new way to refuse honest work."""
+    base = tmp_path / "tools"
+    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
+    staging.mkdir(parents=True)
+    (staging / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")), encoding="utf-8")
+    (staging / "run.py").write_text(_GOOD_RUN_PY, encoding="utf-8")
+
+    error = tool_builder._promote_staging(staging, "kbsearch", base)
+
+    assert error is None
+    assert (base / "kbsearch" / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY
+    assert not staging.exists()  # moved, not copied
+
+
+def test_cleanup_staging_does_not_follow_a_symlinked_staging(tmp_path: Path) -> None:
+    """Collateral (R8-1): a refused promote can now leave ``staging`` itself a
+    symlink -- exactly the tamper shape the checks above refuse -- and
+    run_install's ``finally`` calls ``_cleanup_staging`` on it unconditionally
+    either way. ``shutil.rmtree`` REFUSES to operate on a path that is itself a
+    symlink (raises "Cannot call rmtree on a symbolic link" -- CPython GH-46010 --
+    rather than deleting through it); with ``ignore_errors=True`` that refusal is
+    swallowed, so cleanup's rmtree call is a silent no-op: neither the symlink NOR
+    (crucially) its target is removed. The symlink is then left behind in
+    ``.staging`` (the parent's ``rmdir()`` finds it non-empty and the ENOTEMPTY is
+    suppressed) -- an untidy leftover, never a deletion through the link. Verified
+    directly against this repo's Python before writing this assertion; pinned here
+    because the alternative (rmtree quietly following the link) would be a real
+    vulnerability if a future Python or refactor ever changed it."""
+    base = tmp_path / "tools"
+    base.mkdir()
+    existing_pkg = base / "existing-tool"
+    existing_pkg.mkdir()
+    (existing_pkg / "keep.txt").write_text("do not delete", encoding="utf-8")
+    staging_parent = base / tool_builder._STAGING_DIRNAME
+    staging_parent.mkdir()
+    staging = staging_parent / "buildid"
+    staging.symlink_to(base, target_is_directory=True)  # the R8-1 tamper shape
+
+    tool_builder._cleanup_staging(staging)
+
+    assert (existing_pkg / "keep.txt").read_text(encoding="utf-8") == "do not delete"
+    assert staging.is_symlink()  # left behind, untidy but never destructive
+
+
+# --- sidecar-strip walk failures fail closed (D40 r8 / R8-2) --------------------
+
+
+def _permission_tests_unreliable() -> bool:
+    """True when POSIX permission bits cannot be trusted to block access: on
+    Windows ``chmod`` only toggles a read-only bit (never real POSIX modes), and
+    root bypasses permission checks entirely -- ``chmod 000`` would not actually
+    block the walk under either, which would make the tests below fail-negative
+    rather than exercise anything. ``sys.platform`` is checked FIRST so the ``or``
+    short-circuits before ``os.geteuid`` -- which does not exist on Windows -- is
+    ever called."""
+    return sys.platform == "win32" or os.geteuid() == 0
+
+
+@pytest.mark.skipif(
+    _permission_tests_unreliable(), reason="chmod 000 does not block access (root or non-POSIX)"
+)
+def test_promote_staging_fails_closed_on_unreadable_subtree_with_sidecar(tmp_path: Path) -> None:
+    """R8-2: ``os.walk`` SWALLOWS scandir errors by default (``onerror=None`` means
+    "skip silently and keep going"), so a builder that plants a nested sidecar and
+    then ``chmod 000``s its parent would otherwise sail through the walk with that
+    subtree unvisited -- the strip reports success, and the forged nested sidecar
+    ships. The stripper now passes an ``onerror`` that RE-RAISES, so the walk's own
+    failure joins the existing fail-closed ``OSError`` path and nothing is moved."""
+    base = tmp_path / "tools"
+    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
+    staging.mkdir(parents=True)
+    (staging / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")), encoding="utf-8")
+    (staging / "run.py").write_text(_GOOD_RUN_PY, encoding="utf-8")
+    sealed = staging / "sealed"
+    sealed.mkdir()
+    (sealed / tools._AI_META_FILENAME).write_text(_forged_meta("nested forgery"), encoding="utf-8")
+    sealed.chmod(0o000)
+    try:
+        error = tool_builder._promote_staging(staging, "kbsearch", base)
+    finally:
+        sealed.chmod(0o700)  # restore so tmp_path's own teardown can remove the tree
+
+    assert error == _ERROR_SIDECAR_STRIP
+    assert not (base / "kbsearch").exists()  # nothing promoted
+
+
+@pytest.mark.skipif(
+    _permission_tests_unreliable(), reason="chmod 000 does not block access (root or non-POSIX)"
+)
+def test_promote_staging_fails_closed_on_unreadable_subtree_without_sidecar(tmp_path: Path) -> None:
+    """Same refusal even though the sealed subtree carries NO sidecar at all: an
+    incomplete traversal cannot distinguish "nothing in there" from "something in
+    there we could not see", so fail-closed here is keyed on TRAVERSAL
+    COMPLETENESS, not on whether a sidecar was actually found. The one signal
+    available (permission denied) is exactly as alarming either way, so both must
+    refuse identically."""
+    base = tmp_path / "tools"
+    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
+    staging.mkdir(parents=True)
+    (staging / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")), encoding="utf-8")
+    (staging / "run.py").write_text(_GOOD_RUN_PY, encoding="utf-8")
+    sealed = staging / "sealed"
+    sealed.mkdir()  # deliberately empty -- no sidecar planted anywhere inside
+    sealed.chmod(0o000)
+    try:
+        error = tool_builder._promote_staging(staging, "kbsearch", base)
+    finally:
+        sealed.chmod(0o700)
+
+    assert error == _ERROR_SIDECAR_STRIP
+    assert not (base / "kbsearch").exists()
+
+
+def test_promote_staging_readable_package_unaffected_by_onerror_hook(tmp_path: Path) -> None:
+    """The R8-2 ``onerror`` hook only fires on an ACTUAL scandir failure: an
+    ordinary, fully readable staged package -- nested directories included --
+    promotes exactly as before."""
+    base = tmp_path / "tools"
+    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
+    (staging / "lib").mkdir(parents=True)
+    (staging / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")), encoding="utf-8")
+    (staging / "run.py").write_text(_GOOD_RUN_PY, encoding="utf-8")
+    (staging / "lib" / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    error = tool_builder._promote_staging(staging, "kbsearch", base)
+
+    assert error is None
+    assert (base / "kbsearch" / "lib" / "helper.py").read_text(encoding="utf-8") == "VALUE = 1\n"
 
 
 # --- install-form secret (D36) -------------------------------------------------

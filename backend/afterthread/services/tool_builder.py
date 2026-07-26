@@ -12,7 +12,9 @@ installs a tool package (see D21 in docs/web-v2-decisions.md, Phase 5c).
    ``list_dir`` (paths jailed inside staging) plus ``run_shell`` (a full shell
    that merely STARTS in staging) -- under the installer's own (much larger)
    round and wall-clock budgets;
-4. on a ``ready`` result, strip any builder-written AI sidecar from staging
+4. on a ``ready`` result, first re-verify staging itself has not been moved or
+   replaced by a symlink (``_verify_staging_root`` -- the builder's run_shell
+   runs unjailed, D21), then strip any builder-written AI sidecar from staging
    (``_strip_builder_sidecars`` -- that file is backend-authored, and a forged
    one bypasses the whole ``write_tool_meta`` choke point), validate the staged
    package with the SAME checks the registry applies to installed packages
@@ -161,6 +163,12 @@ _ERROR_SECRET_ENV_UNSERIALIZABLE = "秘密值含特殊字元，無法安全寫�
 # Category-only by construction: a fixed string, never a path or a value, since
 # the very name that failed to delete could have been chosen to embed a secret.
 _ERROR_SIDECAR_STRIP = "無法清除工具包內的 AI 總結側檔，安裝已取消。"  # noqa: RUF001
+# D40/R8-1: raised when staging itself fails ``_verify_staging_root``'s re-check --
+# either the path IS a symlink, or its RESOLVED location no longer sits inside the
+# resolved ``<tools_dir>/.staging`` shell (an ancestor swapped for a symlink). A
+# TRUE sibling of ``_ERROR_SIDECAR_STRIP`` (same suffix, same category-only shape):
+# naming what staging turned OUT to be would be naming attacker-controlled content.
+_ERROR_STAGING_TAMPERED = "暫存工作區已被移動或替換，安裝已取消。"  # noqa: RUF001
 
 # The builder's system prompt. English, like every prompt in this codebase.
 # It must carry the ENTIRE package contract (tool.json fields, the name regex,
@@ -1140,6 +1148,23 @@ def _remove_reserved_sidecar_path(path: Path) -> None:
     path.unlink(missing_ok=True)
 
 
+def _reraise_walk_error(exc: OSError) -> None:
+    """``os.walk``'s ``onerror`` callback, wired to make a scan failure FATAL (R8-2).
+
+    ``os.walk`` defaults to ``onerror=None``, which means "SWALLOW any
+    ``scandir``/``listdir`` failure and just skip that subtree" -- so a builder that
+    ``chmod 000``s a directory holding a nested sidecar would otherwise sail through
+    the walk with that subtree silently unvisited: the strip reports success, and
+    the forged nested sidecar rides into the installed package. Passing this
+    callback as ``onerror`` makes ``os.walk`` re-raise instead, so the surrounding
+    ``try``/``except OSError`` in ``_strip_builder_sidecars`` sees it and fails
+    closed. An unreadable subtree in a builder-produced package is either sabotage
+    or breakage -- both are install-stopping, and silence was the only wrong
+    answer.
+    """
+    raise exc
+
+
 def _strip_builder_sidecars(staging: Path) -> str | None:
     """Delete every builder-written AI sidecar from staging; None = ok (R7-1).
 
@@ -1185,10 +1210,18 @@ def _strip_builder_sidecars(staging: Path) -> str | None:
     Fail-closed: any ``OSError`` (weird perms, an immutable attribute, a
     directory that will not empty) cancels the install with a category-only
     zh-TW error. Shipping the forged file is the one unacceptable outcome, and
-    "we could not delete it" must never degrade into "so we kept it".
+    "we could not delete it" must never degrade into "so we kept it". This now
+    ALSO covers the WALK itself failing to scan a subtree (R8-2): ``os.walk``'s
+    default ``onerror=None`` swallows a ``scandir``/``listdir`` OSError and just
+    skips that subtree, so an unreadable directory (permissions, or anything
+    else that blocks listing it) would otherwise vanish from the walk entirely --
+    the loop finishes, this function returns None, and any sidecar hidden inside
+    ships unexamined. ``_reraise_walk_error`` turns that default silence into the
+    same fatal ``OSError`` a failed deletion already raises below, so incomplete
+    traversal and failed deletion share one fail-closed outcome.
     """
     try:
-        for dirpath, dirnames, filenames in os.walk(staging):
+        for dirpath, dirnames, filenames in os.walk(staging, onerror=_reraise_walk_error):
             here = Path(dirpath)
             # dirnames is walked over a COPY and pruned in place: a symlink-to-
             # directory at the reserved name lands here (os.walk classifies by a
@@ -1203,6 +1236,54 @@ def _strip_builder_sidecars(staging: Path) -> str | None:
                     _remove_reserved_sidecar_path(here / filename)
     except OSError:
         return _ERROR_SIDECAR_STRIP
+    return None
+
+
+def _verify_staging_root(staging: Path, base: Path) -> str | None:
+    """Re-verify ``staging`` is still the real, contained directory it was given;
+    None = ok (R8-1).
+
+    Called FIRST in ``_promote_staging``, before ANY destructive traversal --
+    including the sidecar strip's ``os.walk`` -- and therefore before validate and
+    move too. The builder's ``run_shell`` runs with the SERVICE'S OWN uid and
+    merely STARTS in staging (D21: deliberately unjailed, unlike the file
+    meta-tools), so between the LLM session ending and promote running, a builder
+    command can ``mv`` staging ASIDE and plant a SYMLINK at the original staging
+    path pointing at ``base`` (the real, live tools directory) itself.
+    ``_strip_builder_sidecars``'s ``os.walk`` never checked its OWN root for a
+    symlink -- R7-1 only prunes a symlink found DURING the walk -- so unchecked it
+    would walk every INSTALLED package and delete its ``.ai_meta.json``,
+    destroying finalized summaries and their only origin copies, before
+    ``validate_package`` ever ran.
+
+    Two independent layers, mirroring the resolve-then-contain house pattern
+    (``tools._resolve_package_dir_no_alias``'s is_symlink-before-resolve
+    composition):
+
+    * ``is_symlink()`` on the path ITSELF, no resolve: one cheap lstat catches
+      the attack above outright -- a symlink planted AT the staging leaf;
+    * containment under the RESOLVED ``<base>/.staging`` shell
+      (``tools._is_within``, the same predicate ``_resolve_in_staging`` and
+      ``tools._resolve_package_dir`` use): catches ANCESTOR substitution the leaf
+      check alone cannot -- e.g. ``.staging`` itself swapped for a symlink, which
+      leaves the staging LEAF a perfectly ordinary directory (so ``is_symlink()``
+      on the full path reports False) while the fully RESOLVED path lands outside
+      the shell entirely.
+
+    This narrows a window rather than closing one, and is the SAME accepted
+    residual class ``_promote_staging``'s own docstring names for its
+    check-then-move exists-check (a race against a second concurrent actor with
+    the service's uid) -- just one step earlier: check-then-WALK instead of
+    check-then-move. A swap landing in the instant between this check and the
+    strip's first ``os.walk`` syscall is still possible in principle; what this
+    closes is the window the finding actually reported -- the ENTIRE builder
+    session, start to finish -- down to that one syscall gap.
+    """
+    if staging.is_symlink():
+        return _ERROR_STAGING_TAMPERED
+    staging_root = base.resolve() / _STAGING_DIRNAME
+    if not tools._is_within(staging_root, staging.resolve()):
+        return _ERROR_STAGING_TAMPERED
     return None
 
 
@@ -1225,6 +1306,14 @@ def _promote_staging(
     local tool's edge we accept, and the nested-dir result would still be an
     invalid package (name mismatch), never executable.
 
+    ``staging`` is re-verified FIRST of all (``_verify_staging_root``, R8-1),
+    before even the sidecar strip: the builder's ``run_shell`` can rename staging
+    away and plant a symlink at its original path pointing at ``base`` itself, and
+    the strip's ``os.walk`` would then delete every installed package's sidecar
+    before validation ever ran. This is the SAME check-then-act residual this
+    docstring already accepts above for the exists-check -- see
+    ``_verify_staging_root`` -- just one step earlier.
+
     The form secret (D36) is written into the staged ``.env`` AFTER
     ``validate_package`` (which judges exactly what the BUILDER produced) and
     AFTER the name-free check (so we never touch a package we will not install),
@@ -1234,13 +1323,16 @@ def _promote_staging(
     LLM-authored package as-is, and the secret is a backend addition layered on
     top and gated separately.
 
-    The AI sidecar is stripped FIRST, ahead of validation (R7-1): it is
+    The AI sidecar is stripped NEXT, ahead of validation (R7-1): it is
     backend-authored metadata, so a builder-written one is a forgery that bypasses
     the ``write_tool_meta`` choke point entirely -- see ``_strip_builder_sidecars``
     for the full attack chain and for why validation must run on exactly what will
     ship. This is the ONLY file the promote removes; every other file the builder
     produced rides into the package untouched, exactly as before.
     """
+    root_error = _verify_staging_root(staging, base)
+    if root_error is not None:
+        return root_error
     strip_error = _strip_builder_sidecars(staging)
     if strip_error is not None:
         return strip_error
