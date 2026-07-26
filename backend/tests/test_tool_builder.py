@@ -1051,6 +1051,28 @@ def test_run_install_strips_forged_sidecars_at_every_depth(
     assert meta["summary"] == "這個工具會查 KB"
 
 
+def test_strip_builder_sidecars_matches_the_reserved_name_case_insensitively(
+    tmp_path: Path,
+) -> None:
+    """R10-2: on a case-INSENSITIVE filesystem (the macOS default, a supported
+    platform) a builder-written ``.AI_META.JSON`` IS the file ``read_tool_meta``
+    later opens as ``.ai_meta.json`` -- so a case-sensitive strip would promote
+    the forgery and reopen the choke-point bypass R7-1 closed. The match is
+    therefore case-insensitive everywhere; on a case-sensitive filesystem (this
+    test's own likely host) the only effect is that a differently-cased name the
+    builder had no business writing is removed too, which this pins directly."""
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / ".AI_META.JSON").write_text('{"status": "final"}', encoding="utf-8")
+    (staging / ".Ai_Meta.Json.abc123.TMP").write_text("{}", encoding="utf-8")
+    (staging / "run.py").write_text("print(1)", encoding="utf-8")
+
+    assert tool_builder._strip_builder_sidecars(staging) is None
+
+    remaining = sorted(entry.name for entry in staging.iterdir())
+    assert remaining == ["run.py"]
+
+
 def test_strip_builder_sidecars_handles_links_and_directories(tmp_path: Path) -> None:
     """The reserved name belongs to the backend in EVERY form it can take.
 

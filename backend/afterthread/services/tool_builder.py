@@ -1118,10 +1118,22 @@ def _is_reserved_sidecar_name(filename: str) -> bool:
     imitate. Matching the prefix+suffix pair (rather than the exact name only)
     means the strip covers the whole namespace the backend claims, not just the
     one filename an attacker would have to be naive enough to use.
+
+    Matched CASE-INSENSITIVELY (R10-2), which is not pedantry on a project that
+    supports macOS: the default macOS filesystem is case-INSENSITIVE, so a
+    builder writing ``.AI_META.JSON`` creates the very file a later
+    ``read_tool_meta`` opens as ``.ai_meta.json`` -- while a case-SENSITIVE
+    match here would sail right past it and promote the forgery, reopening the
+    exact choke-point bypass R7-1 closed. The comparison must therefore be at
+    least as loose as the loosest filesystem this can run on; on a
+    case-sensitive filesystem the only cost is deleting a differently-cased
+    name a builder had no business writing either. ``casefold`` (not ``lower``)
+    because it is the Unicode-correct full-case-folding operation, and these
+    names are compared, never displayed.
     """
-    return filename == tools._AI_META_FILENAME or (
-        filename.startswith(tools._AI_META_FILENAME) and filename.endswith(".tmp")
-    )
+    folded = filename.casefold()
+    reserved = tools._AI_META_FILENAME.casefold()
+    return folded == reserved or (folded.startswith(reserved) and folded.endswith(".tmp"))
 
 
 def _remove_reserved_sidecar_path(path: Path) -> None:

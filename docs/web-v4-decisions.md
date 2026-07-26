@@ -309,3 +309,16 @@ promote 同一個 `_verify_staging_root` 閘，拒絕時整個工作區（含 pa
 保留——被竄改的 workspace 是證據不是垃圾；留下的孤兒與 r8 已釘住的 refused-cleanup
 孤兒 symlink 屬同一接受殘餘類。check-to-rmtree 的瞬間窗口沿用既有 check-then-act
 accepted residual 準繩。
+
+### D40 附錄（P3a review r10）：reserved sidecar 名稱大小寫不敏感比對
+
+`_is_reserved_sidecar_name` 原為大小寫敏感比對。macOS 預設檔案系統
+**大小寫不敏感**（本專案支援 macOS），builder 寫的 `.AI_META.JSON` 在該平台
+**就是**日後 `read_tool_meta` 以 `.ai_meta.json` 開啟的同一個檔案——大小寫敏感的
+剷除器會直接放行，r7-1 關掉的 choke-point bypass 在受支援平台上整個重開。比對
+改為 `casefold()`（Unicode 正確的 full case folding，且這些名字只比對不顯示）：
+剷除的寬鬆度必須至少等於它可能執行的最寬鬆檔案系統；在大小寫敏感的檔案系統上，
+代價僅是順手刪掉一個 builder 本來就無權寫入的異體大小寫檔名。
+
+另記：同輪的「搬移整個 tools_dir 造成信任錨漂移」屬 D21 威脅模型範圍外，已駁回，
+理由見 `裁決紀錄.md` #5。
