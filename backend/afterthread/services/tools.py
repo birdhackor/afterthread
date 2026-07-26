@@ -148,10 +148,49 @@ _ENV_FILE_MAX_BYTES = 64 * 1024
 # * the summary generator skips every dot-file when it feeds the package to the
 #   model, so the sidecar never feeds itself back into its own next prompt.
 #
-# It is read with the SAME bounded reader (and the SAME manifest-grade cap) the
-# manifest gets: it is re-read on every ``list_tools`` scan, so an unbounded one
-# would be the same per-scan I/O hazard ``_MANIFEST_MAX_BYTES`` exists to bound.
+# It is read with the SAME bounded reader the manifest gets, but at its OWN cap
+# (``_AI_META_MAX_BYTES``) -- see there for why sharing the manifest's cap was a
+# read/write asymmetry rather than a saving.
 _AI_META_FILENAME = ".ai_meta.json"
+
+# Hard ceiling on the sidecar, enforced on BOTH sides: ``read_tool_meta`` refuses
+# anything longer, and ``write_tool_meta`` refuses to PRODUCE anything longer.
+# The symmetry is the whole point and it is a correctness property, not tidiness:
+# the sidecar used to be read at ``_MANIFEST_MAX_BYTES`` (64 KiB) while the writer
+# checked NOTHING, so a payload the writer happily produced could read back as
+# None forever -- the write reporting success while the summary silently vanished
+# from every later GET, with nothing anywhere reporting a failure.
+#
+# What overruns 64 KiB is worth stating precisely, because the obvious arithmetic
+# does not get there and a wrong number here would send the next reader hunting
+# the wrong thing. The reader's cap is compared against the DECODED text's
+# length, so raw CJK is not the problem: a max-length 20 000-char
+# ``origin.instructions`` plus an 8 000-char ``summary`` is ~30 000 CHARACTERS
+# however many bytes it occupies. SERIALIZATION is the problem. Control
+# characters are legal in that free-text install field (``str.strip`` does not
+# remove them and the schema only bounds length), and ``json.dumps`` escapes each
+# one to a 6-char ``\uXXXX`` -- so a legal payload serializes to six times its
+# length. Redaction is the second expander, on a different axis: each masked
+# value collapses to a 13-char / 35-byte marker, so text alternating 6-char
+# secrets with separators roughly doubles in chars and nearly triples in bytes.
+#
+# Sized off those, not off a round number: worst legal serialization is
+# ~120 KB (instructions) + ~48 KB (summary) + ~2 KB (URL) + keys ~= 170 KB, and
+# the redaction path lands in the same range rather than multiplying with it (a
+# marker is not itself escapable). 256 KiB clears that with headroom and still
+# bounds the per-scan cost -- ``list_tools`` reads one sidecar per package on
+# every scan, which is why an UNBOUNDED read was never an option either.
+#
+# NB the two sides count different UNITS and that is deliberate: the reader's
+# check is on CHARS (the bounded reader is a text read), the writer's is on the
+# serialized payload's UTF-8 BYTES. UTF-8 never encodes a char in less than one
+# byte, so ``bytes <= cap`` implies ``chars <= cap`` -- the writer is the
+# STRICTER side, which is the only direction that keeps the invariant true:
+# anything the writer accepts, the reader can read back. The cost of that slack
+# is bounded and accepted: a hand-written all-CJK file can make the reader buffer
+# up to ~3x the cap transiently before the length check rejects it, the same
+# property (at the same ratio) every other capped read in this module has.
+_AI_META_MAX_BYTES = 256 * 1024
 
 # The only two summary statuses that mean anything. "draft" is what generation
 # writes; "final" (定版) is the operator freezing AI iteration on this tool --
@@ -613,66 +652,111 @@ def read_tool_meta(directory: Path) -> dict[str, Any] | None:
     """Parse the package's ``.ai_meta.json`` sidecar, or None if there is none.
 
     Deliberately TOTAL: a missing sidecar, a FIFO/symlink swapped in for one, an
-    oversized one, invalid JSON, and a JSON value that is not an object ALL come
-    back None -- the one "no usable summary metadata" answer every caller already
-    has to handle, since a freshly installed tool legitimately has no sidecar
-    until its summary generation finishes. A corrupt sidecar therefore degrades
-    the summary panel to empty; it never breaks a tool listing or a mutation.
+    oversized one, invalid JSON, PATHOLOGICALLY NESTED JSON, and a JSON value
+    that is not an object ALL come back None -- the one "no usable summary
+    metadata" answer every caller already has to handle, since a freshly
+    installed tool legitimately has no sidecar until its summary generation
+    finishes. A corrupt sidecar therefore degrades the summary panel to empty; it
+    never breaks a tool listing or a mutation.
 
-    Reads through the ONE bounded, FIFO/symlink-hardened helper at the
-    manifest-grade cap, exactly as ``_scan_package`` reads ``tool.json`` -- the
-    cap+1 read plus the ``len > cap`` check is how an oversized sidecar is
-    refused without ever slurping it whole (see ``_AI_META_FILENAME``).
+    That totality is load-bearing well beyond the summary panel, which is why
+    ``RecursionError`` is caught next to ``ValueError`` rather than left to
+    escape (the same pairing ``llm._parse_json_object`` documents, for the same
+    reason): thousands of nested brackets exhaust the interpreter's recursion
+    limit INSIDE ``json.loads``, and ``summary_status`` runs this once per
+    package on every ``list_tools`` scan -- so a single hand-edited or malicious
+    sidecar escaping as an exception would 500 the whole 工具 page, not just its
+    own row.
+
+    Reads through the ONE bounded, FIFO/symlink-hardened helper -- the cap+1 read
+    plus the ``len > cap`` check is how an oversized sidecar is refused without
+    ever slurping it whole. The cap is the sidecar's OWN
+    ``_AI_META_MAX_BYTES``, and it is the same number ``write_tool_meta``
+    refuses to exceed: ANYTHING THE WRITER ACCEPTS, THIS READS BACK. Sharing the
+    manifest's 64 KiB cap while the writer checked nothing is exactly how a legal
+    sidecar became permanently unreadable (see ``_AI_META_MAX_BYTES``).
     """
-    text = _read_regular_file_capped(directory / _AI_META_FILENAME, _MANIFEST_MAX_BYTES)
-    if text is None or len(text) > _MANIFEST_MAX_BYTES:
+    text = _read_regular_file_capped(directory / _AI_META_FILENAME, _AI_META_MAX_BYTES)
+    if text is None or len(text) > _AI_META_MAX_BYTES:
         return None
     try:
         raw = json.loads(text)
-    except ValueError:
+    except ValueError, RecursionError:
         return None
     return raw if isinstance(raw, dict) else None
 
 
-def _redact_meta_tree(value: Any) -> Any:
-    """Every ``str`` in a sidecar structure, masked -- keys and values, at depth.
+def _meta_str(value: Any) -> str | None:
+    """One sidecar string field, narrowed: a ``str`` survives, anything else is None.
 
-    The sidecar is NOT a summary field with some metadata around it: ``origin``
-    alone carries the install ``openapi_url`` (an install URL is routinely
-    ``https://api.example/openapi.json?token=<the form secret>`` -- a value the
-    installer REGISTERS as an in-flight secret, so the redactor knows it) and
-    the operator's free-text ``instructions``. Redacting only ``summary`` would
-    persist those verbatim, which is precisely the D36/H3 plaintext-persistence
-    vector the redaction exists to close. So the whole structure is walked and
-    every string leaf is masked -- which also means a field ADDED to the sidecar
-    later is covered without its author having to remember this file.
+    Used only on the ``origin`` sub-fields, whose absence is meaningful (the
+    sidecar is the ONLY copy of the install's URL/instructions, and "we do not
+    have one" has to be representable). ``summary`` deliberately does NOT go
+    through here -- see ``write_tool_meta`` for why a non-string summary refuses
+    the write instead of degrading to None.
+    """
+    return value if isinstance(value, str) else None
 
-    Dict KEYS are masked too. A key is a string that lands on disk exactly like
-    a value, and ``set_summary_status`` round-trips whatever keys a hand-edited
-    sidecar happens to carry; two keys collapsing onto one marker is a
-    theoretical loss we accept, since a sidecar whose KEY is a live secret is
-    already broken. Non-string leaves (the ``llm_log_id`` int, None, bools) pass
-    through untouched -- they cannot carry a value and must keep their type.
+
+def _redacted(value: str | None) -> str | None:
+    """One sidecar string VALUE, masked; None passes through as None.
+
+    The whole redaction surface of the sidecar, now that ``write_tool_meta``
+    builds the file from a fixed schema instead of serializing a caller's dict:
+    exactly three string VALUES can carry operator/LLM text, and this is applied
+    to each of them by name.
 
     Raises whatever ``redact_known_secrets`` raises: the LIVE redactor
     deliberately propagates a provider failure rather than degrading to
     unmasked, and ``write_tool_meta`` turns that into its fail-closed refusal.
     """
-    if isinstance(value, str):
-        return redact_known_secrets(value)
-    if isinstance(value, dict):
-        return {_redact_meta_tree(key): _redact_meta_tree(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_redact_meta_tree(item) for item in value]
-    return value
+    return None if value is None else redact_known_secrets(value)
 
 
 def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
-    """Write the sidecar, redacting EVERY string in it FIRST. Returns success.
+    """Write the sidecar from the KNOWN SCHEMA, redacting its text. Returns success.
 
-    The redaction is FAIL-CLOSED and that is the load-bearing part of this
-    helper, not a formality. Two independent reasons a secret must never reach
-    this file:
+    This does NOT serialize ``meta``. It reads the five fields it understands out
+    of ``meta``, coerces each to the shape the sidecar's contract promises, and
+    writes THAT -- so every KEY on disk is a literal from this function and every
+    VALUE is one this function chose or refused:
+
+    * ``summary`` -- a ``str``; None becomes ``""`` (the placeholder a failed
+      generation leaves, and the shape a hand-edited ``"summary": null`` should
+      collapse to rather than sneaking past as "not a string, but not refused
+      either"). Any OTHER type refuses the write: ``summary`` is a string by
+      contract, the read path renders anything else as "no summary", and writing
+      one would make the file lie about whether a summary exists;
+    * ``status`` -- ``"draft"`` or ``"final"``, anything else ``"draft"``. An
+      unknown value must never survive a write; ``summary_status`` already
+      refuses to trust one on the read side, so persisting it would only keep a
+      dead value alive;
+    * ``updated_at`` -- a ``str``, else the write is REFUSED. Every caller stamps
+      its own (``_now_iso`` / ``datetime.now``), so a missing or out-of-shape one
+      is a caller bug, and inventing a timestamp on their behalf would put a
+      fact in the file that nothing actually observed;
+    * ``llm_log_id`` -- an ``int`` (``bool`` excluded, since it is an ``int``
+      subclass and a stray ``true`` would render as a link to log record 1), else
+      None;
+    * ``origin`` -- None, or the two fields we understand narrowed to ``str``/
+      None. It is the install's only record of where the package came from, so
+      it is kept; it is also free operator text, so it is kept NARROW.
+
+    Building rather than copying is the FIX for a real leak, not a tidiness
+    preference. The previous version redacted the whole caller structure with a
+    generic walk that masked dict KEYS as well as values, which turned the
+    redactor's own success into corruption: register a secret whose VALUE
+    happens to equal a schema key (``secret_value="summary"`` clears the 6-char
+    floor), and the write "succeeded" with the fixed key rewritten to the
+    redaction marker -- a file that no longer parses as our schema, so the
+    summary silently disappeared from every later read. The same walk also had
+    no case for a tuple, which JSON serializes as an array perfectly happily, so
+    a tuple of strings rode to disk UNMASKED. Both are gone by construction
+    here: there are no caller-supplied keys and no caller-supplied containers to
+    walk.
+
+    The redaction that remains is FAIL-CLOSED, and that is the load-bearing part
+    of this helper. Two independent reasons a secret must never reach this file:
 
     * the summary is LLM output about a package whose ``.env`` holds live
       values, and this file is served back to the UI -- the same class
@@ -684,25 +768,27 @@ def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
       revise of that tool fail validation -- bricking the feature for that
       package with a rejection naming a file the user never wrote.
 
-    ``summary`` was never the only operator/LLM-influenced text here, and
-    masking just that one field was a leak: ``origin.openapi_url`` and
-    ``origin.instructions`` are operator-supplied, arrive from the install form,
-    and landed on disk verbatim. The redaction therefore runs over the WHOLE
-    structure (``_redact_meta_tree``), so the guarantee is a property of the
-    FILE rather than of one field somebody remembered.
-
     So a redaction failure (``known_secret_values`` raising -- the LIVE path
     deliberately propagates rather than degrading to unmasked, see
-    ``redact_known_secrets``) writes NOTHING and returns False. A non-string
-    ``summary`` is still refused, now for a different reason than "it could not
-    be masked" (the walk masks it fine wherever it hides): the sidecar's
-    ``summary`` is a STRING by contract, the read path renders any other type as
-    "no summary", and writing one would make the file lie about whether a
-    summary exists. Every other failure (unserializable value, an unwritable
-    path, a symlinked/FIFO sidecar refused by ``_write_regular_file``'s
-    O_NOFOLLOW + O_NONBLOCK + S_ISREG gate) is False too, so callers get one
-    "did-not-happen" answer and never an exception -- summary metadata is
-    best-effort by design.
+    ``redact_known_secrets``) writes NOTHING and returns False. It is applied to
+    the three fields that can carry operator/LLM text and to nothing else,
+    because nothing else CAN: ``status`` is one of two literals chosen above,
+    ``llm_log_id`` is an int, and ``updated_at`` is a machine timestamp its
+    caller just produced (no on-disk one ever round-trips -- both callers
+    overwrite it).
+
+    The serialized payload is bounded by ``_AI_META_MAX_BYTES``, the SAME cap
+    ``read_tool_meta`` refuses past, so this can never produce a file that reads
+    back as None. Every other failure (an unwritable path, a symlinked/FIFO
+    sidecar refused by ``_write_regular_file``'s O_NOFOLLOW + O_NONBLOCK +
+    S_ISREG gate) is False too, so callers get one "did-not-happen" answer and
+    never an exception -- summary metadata is best-effort by design.
+
+    CONSEQUENCE, stated so it is not rediscovered as a bug: extra keys a
+    hand-edited sidecar carries are DROPPED by the next write. Round-tripping
+    them was never a contract -- it was a side effect of serializing the caller's
+    dict, and it is precisely what let a stray key/value carry unmasked text into
+    the file. The five fields above are the sidecar.
 
     The ``is_dir`` precondition matters more than it looks: ``_write_regular_file``
     CREATES missing parents (the meta-tool contract needs that), so without it a
@@ -716,15 +802,44 @@ def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
     if not directory.is_dir():
         return False
     summary = meta.get("summary")
-    if summary is not None and not isinstance(summary, str):
+    if summary is None:
+        summary = ""
+    if not isinstance(summary, str):
         return False
+    updated_at = meta.get("updated_at")
+    if not isinstance(updated_at, str):
+        return False
+    status = meta.get("status")
+    if not (isinstance(status, str) and status in _SUMMARY_STATUSES):
+        status = "draft"
+    log_id = meta.get("llm_log_id")
+    if not isinstance(log_id, int) or isinstance(log_id, bool):
+        log_id = None
+    origin_raw = meta.get("origin")
     try:
-        payload = _redact_meta_tree(meta)
+        payload: dict[str, Any] = {
+            "summary": redact_known_secrets(summary),
+            "status": status,
+            "updated_at": updated_at,
+            "llm_log_id": log_id,
+            "origin": (
+                {
+                    "openapi_url": _redacted(_meta_str(origin_raw.get("openapi_url"))),
+                    "instructions": _redacted(_meta_str(origin_raw.get("instructions"))),
+                }
+                if isinstance(origin_raw, dict)
+                else None
+            ),
+        }
     except Exception:
         return False
-    try:
-        text = json.dumps(payload, ensure_ascii=False)
-    except TypeError, ValueError:
+    # ensure_ascii=False keeps CJK readable in the file (and is what the byte cap
+    # below is measured against). Every value is a str/int/None we just built, so
+    # dumps cannot fail on an unserializable type -- but the cap is checked on the
+    # ENCODED length, because that is the unit the writer's half of the
+    # read/write symmetry is stated in (see _AI_META_MAX_BYTES).
+    text = json.dumps(payload, ensure_ascii=False)
+    if len(text.encode("utf-8")) > _AI_META_MAX_BYTES:
         return False
     return _write_regular_file(directory / _AI_META_FILENAME, text)
 
@@ -757,16 +872,29 @@ def set_summary_status(name: str, status: str) -> str:
       That last one is folded in DELIBERATELY, exactly as ``set_enabled`` folds
       every did-not-happen case into one False: from the caller's view the
       addressable resource did not (usably) change;
-    * ``"no_meta"`` -- the package exists but has no readable sidecar, so there
-      is no summary to freeze yet (a distinct 409, not a 404: the TOOL exists);
+    * ``"no_meta"`` -- there is nothing to freeze. TWO cases, deliberately one
+      answer: the package has no readable sidecar at all, OR it has one whose
+      ``summary`` is absent/empty/whitespace. 定版 means "freeze THIS
+      explanation"; freezing an absent explanation is the same "there is nothing
+      there" as having no sidecar, and it is not harmless -- a finalized empty
+      summary then blocks ``regenerate`` with ``tool_finalized``, so the one
+      action that could FILL it is refused until the user thinks to un-finalize.
+      A distinct 409 rather than a 404: the TOOL exists either way;
     * ``"ok"`` -- the sidecar was rewritten with the new status and a fresh
       ``updated_at``.
 
+    The emptiness gate applies ONLY when the target is ``"final"``. Setting
+    ``"draft"`` stays unconditional on purpose: 解除定版 is the escape hatch out
+    of a frozen state, and an escape hatch that can itself be refused is not one.
+
     ``status`` is trusted to be one of ``_SUMMARY_STATUSES``: the PATCH schema's
     ``Literal`` is the gate, the same way ``set_enabled`` trusts its bool. The
-    rewrite goes through ``write_tool_meta``, so the whole sidecar is re-redacted
-    on the way back out -- a status flip can never un-mask a value that a newly
-    registered secret would now match.
+    rewrite goes through ``write_tool_meta``, so the sidecar is rebuilt from the
+    known schema and re-redacted on the way back out -- a status flip can never
+    un-mask a value that a newly registered secret would now match. It also means
+    any EXTRA key a hand-edited sidecar carried is dropped by this write; see
+    ``write_tool_meta``'s consequence note (round-tripping them was never a
+    contract).
 
     Resolved through ``_resolve_package_dir_no_alias``: a 定版 addressed at
     ``tools/alias`` must not freeze the REAL package's summary (see that
@@ -778,6 +906,10 @@ def set_summary_status(name: str, status: str) -> str:
     meta = read_tool_meta(directory)
     if meta is None:
         return "no_meta"
+    if status == "final":
+        summary = meta.get("summary")
+        if not (isinstance(summary, str) and summary.strip()):
+            return "no_meta"
     meta["status"] = status
     meta["updated_at"] = datetime.now(UTC).isoformat()
     return "ok" if write_tool_meta(directory, meta) else "not_found"

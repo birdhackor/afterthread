@@ -368,6 +368,13 @@ async def update_tool_summary_status(
     reports exactly what the next GET would rather than an optimistic echo
     (mirroring ``update_tool``'s re-scan discipline, including its
     racing-delete 404).
+
+    "Nothing to freeze" covers BOTH no sidecar and a sidecar whose summary is
+    absent/empty -- one 409, because they are the same answer to the user.
+    Finalizing an empty summary is not a harmless no-op: it then blocks
+    ``regenerate`` with ``tool_finalized``, so the tool ends up frozen around
+    text that was never written. 解除定版 (``status: "draft"``) is never gated
+    this way; the escape hatch has to work unconditionally.
     """
     outcome = await run_in_threadpool(tools_service.set_summary_status, name, payload.status)
     if outcome == "not_found":
@@ -414,6 +421,13 @@ async def regenerate_tool_summary(name: ToolName) -> ToolSummaryDetail:
     (D21/D40): this is a single-user local tool, and the loser is one summary,
     never the package.
 
+    The finalize gate is NOT left at check-then-act, because there the loser
+    would be the frozen summary itself: a PATCH landing while the generation
+    awaits the LLM used to see its text overwritten anyway. ``_store_meta``
+    re-checks at write time and answers ``StoreRefusal.FINALIZED``, which maps
+    HERE to the SAME 409 ``tool_finalized`` -- one refusal, one code, whichever
+    side of the await the user's 定版 arrived on.
+
     A generation that produced text but STORED nothing (``regenerate_summary``
     -> None: the package vanished mid-request, or the sidecar write was refused)
     is a 404 rather than a 200, so this route can never report a summary that
@@ -439,6 +453,15 @@ async def regenerate_tool_summary(name: ToolName) -> ToolSummaryDetail:
         raise _service_unavailable() from None
     except LLMUpstreamError as exc:
         raise _bad_gateway(exc) from None
+    if meta is tool_meta.StoreRefusal.FINALIZED:
+        # 定版 landed while we were awaiting the LLM. The generated text was
+        # deliberately NOT written (see _store_meta), so the answer is the same
+        # conflict the up-front gate gives -- not the 404 below, which would tell
+        # the user their tool disappeared.
+        raise HTTPException(
+            status_code=409,
+            detail={"code": _TOOL_FINALIZED_CODE, "message": _TOOL_FINALIZED_MESSAGE},
+        )
     if meta is None:
         # The generation ran but nothing was stored: the package vanished under
         # us (a racing delete), or the sidecar write was refused (the ghost

@@ -159,13 +159,19 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   四個欄位皆為 `null` 的 200（不是錯誤），工具不存在（含 `TOOLS_DIR` 未設定）
   才回 404。
 - `PATCH /api/tools/{name}/summary` — body `{status: "draft"|"final"}`，定版／
-  解除定版；成功回更新後的總結。工具不存在回 404；還沒有總結可定版回
-  `409 summary_missing`。
+  解除定版；成功回更新後的總結。工具不存在回 404；**沒有東西可定版**回
+  `409 summary_missing`——包含「還沒有 sidecar」與「sidecar 的 `summary` 是空的
+  ／只有空白」兩種，因為對使用者是同一個答案（而且定版一個空總結不是無害的
+  no-op：之後重新產生會被 `tool_finalized` 擋住，唯一能補內容的動作反而被鎖
+  死）。反方向的 `draft`（解除定版）**永遠不設條件**——逃生門不能自己被擋住。
 - `POST /api/tools/{name}/summary/regenerate` — **同步**重新產生總結（不是背景
   工作），成功回新的總結。工具不存在回 404；已定版回 `409 tool_finalized`
   （要先解除定版）；有工具工作正在進行時回 `409 tool_job_in_progress`；LLM 未
   設定／上游失敗與捕捉、補齊等同步 AI 動作共用同一組錯誤（`503
   llm_not_configured`／`502 llm_upstream_error`），失敗時不會覆蓋既有總結。
+  `tool_finalized` 有**兩個發生點**、同一個代碼：呼叫前的檢查，以及等 LLM 回來
+  要寫檔時的再檢查——中途被 `PATCH` 定版的話，剛產生的文字**不會寫進去**，一樣
+  回 409。
   這三條總結路由都**不宣告** `503 tools_not_configured`：`TOOLS_DIR` 未設定時
   任何名稱都解析不到工具，404 已經是誠實答案。
 
@@ -200,13 +206,22 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   限制」的說明，寫進套件內的 `.ai_meta.json`（隱藏檔，registry 掃描看不到，
   `DELETE` 時隨整個目錄一起消失）。這一步是 **best-effort**：總結失敗（LLM 未
   設定、上游錯誤、任何例外）都被就地吞掉，絕不會把已經成功的安裝翻成失敗，只
-  會留下空總結的 sidecar 供之後 `regenerate`。sidecar 寫入前**整份結構的每個
-  字串**（總結、origin 的 URL 與安裝指示等）一律過
-  `redact_known_secrets` 且**遮蔽失敗就不寫**——sidecar 之後會被修訂流程複製進
-  暫存目錄接受「檔案不得內嵌秘密值」檢查，含密文等於讓這個工具再也修訂不了。
+  會留下空總結的 sidecar 供之後 `regenerate`。sidecar **不是把呼叫端的 dict 直接
+  序列化**，而是照固定 schema（`summary`／`status`／`updated_at`／`llm_log_id`／
+  `origin`）重建：檔案裡每一個 key 都是後端寫死的字面值，值也一律被收斂到約定的
+  型別（未知 `status` → `draft`、非 int 的 `llm_log_id` → `null`、`origin` 只留
+  看得懂的兩個字串欄位），手動加的多餘 key 下一次寫入就會被丟掉（這本來就不是
+  契約）。三個可能帶操作者／LLM 文字的**值**（`summary`、`origin.openapi_url`、
+  `origin.instructions`）一律過 `redact_known_secrets` 且**遮蔽失敗就不寫**——
+  sidecar 之後會被修訂流程複製進暫存目錄接受「檔案不得內嵌秘密值」檢查，含密文
+  等於讓這個工具再也修訂不了。檔案大小上下限**兩邊對齊**（`_AI_META_MAX_BYTES`，
+  256 KiB）：寫得進去的一定讀得回來，不會出現「寫入回報成功、之後每次讀都變成
+  沒有總結」；讀取端連 JSON 巢狀過深的 `RecursionError` 都吞成「沒有 sidecar」，
+  因為列表頁每一列都會讀它，一個壞檔不能拖垮整頁。
   總結有 `draft`／`final`（定版）兩種狀態；定版後 `regenerate` 一律
-  `409 tool_finalized`，要先解除定版。餵給模型的內容排除 `.env` 的**值**（只給
-  key 名）與 sidecar 自己。
+  `409 tool_finalized`，要先解除定版——而且**定版後的總結永遠不會被覆寫**，連
+  在 LLM 產生期間才被定版的那一次也會在寫檔前放棄。餵給模型的內容排除 `.env`
+  的**值**（只給 key 名）與 sidecar 自己。
 - **安全立場（v1）**：這是單人本機工具，shell 能力是明確需求（比照 Claude
   Code 建 skill 的能力/風險模型）——`run_shell` 是以**本服務自身權限**執行的
   真實 bash，只是預設從暫存目錄開始（工作慣例，不是圍籬），v1 刻意不做容器

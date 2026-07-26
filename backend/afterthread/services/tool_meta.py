@@ -39,10 +39,12 @@ rather than being swallowed into a silent no-op.
 
 import os
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, model_validator
+from starlette.concurrency import run_in_threadpool
 
 from afterthread.config import get_settings
 from afterthread.services import llm_log, token_budget, tools
@@ -54,6 +56,25 @@ from afterthread.services.memory_ai import _coerce_str, _truncate_to
 # last_record_id_for_workflow note; that separation is the whole reason this is
 # a named constant rather than an inline string.
 _SUMMARY_WORKFLOW = "tool_summary"
+
+
+class StoreRefusal(Enum):
+    """Why a sidecar store did not happen, when ``None`` would under-report it.
+
+    ``_store_meta`` (and therefore ``regenerate_summary``) already uses None for
+    "the write did not land" -- a racing delete, a refused sidecar -- which the
+    route folds into its did-not-happen 404. A store refused because the package
+    was FINALIZED underneath the generation is a different fact and deserves a
+    different answer (the 409 the up-front gate gives), so it gets its own value
+    rather than being flattened into that None.
+
+    An Enum rather than a bare sentinel string so the type checker can tell the
+    two apart in the return union: ``dict | StoreRefusal | None`` narrows, where
+    ``dict | str | None`` would quietly admit any string.
+    """
+
+    FINALIZED = "finalized"
+
 
 # Cap on the stored summary. Generous next to InstallResult's 2000-char progress
 # note (_SUMMARY_CAP) because this text is the tool's user-facing DOCUMENTATION
@@ -343,31 +364,58 @@ def _store_meta(
     summary: str,
     origin: dict[str, Any] | None,
     llm_log_id: int | None,
-) -> dict[str, Any] | None:
+) -> dict[str, Any] | StoreRefusal | None:
     """Merge the new summary into the package's sidecar and write it back.
 
-    Two fields are PRESERVED from whatever is already on disk rather than reset:
+    The FIRST thing it does is re-read the sidecar and refuse outright if the
+    status on disk is now ``final``. Both callers of a regeneration check 定版
+    UP FRONT, but that check happens before an ``await`` that lasts as long as an
+    LLM round trip, and a PATCH can finalize inside that window -- so the
+    up-front gate is a courtesy, and THIS is the one that holds. Preserving the
+    ``final`` status while still overwriting the summary TEXT (what this did
+    before) satisfied the letter of 定版 and broke its meaning: the operator
+    froze an explanation and got a different one. Nothing is written and
+    ``StoreRefusal.FINALIZED`` comes back, which the route answers with the SAME
+    409 its up-front gate raises. (Read-then-write is itself a narrow race, of
+    course; it shrinks the window from "an entire LLM session" to "two syscalls",
+    which is the same single-user local-tool edge install/delete already accepts
+    -- D21/D40.)
 
-    * ``status`` -- a regenerate on a 草稿 stays 草稿. (A finalized tool never
-      reaches here: both callers of a regeneration refuse a ``final`` package
-      up front, which is what 定版 MEANS. Preserving rather than forcing "draft"
-      is the safe direction if that gate is ever bypassed by a race.)
+    Past that gate, two fields are PRESERVED from whatever is already on disk
+    rather than reset:
+
+    * ``status`` -- a regenerate on a 草稿 stays 草稿. With ``final`` refused
+      above, ``"draft"`` is the only value that can actually survive today; the
+      preserve-known-else-draft shape is kept anyway so the function stays
+      correct if the vocabulary ever grows, and so an unknown value on disk can
+      never be persisted by us.
     * ``origin`` -- only the install captures the OpenAPI URL and instructions,
       so a caller with nothing to pass (``origin=None``) must inherit them
       instead of erasing the only copy. A regeneration normally passes the
       narrowed origin it just read back in, which lands on the same value; the
       inheritance is what covers the sidecar that has none we can use.
 
-    Returns the meta dict as composed WHEN THE WRITE LANDED, and None when
-    ``write_tool_meta`` refused it (a fail-closed redaction, the ghost guard on
-    a racing delete, a FIFO/symlink swapped in for the sidecar, an unwritable
-    directory). The None matters because the synchronous route answers WITH this
-    dict: returning the composed meta regardless would have it report a summary
-    that is nowhere on disk and vanishes on the next GET -- a wrong answer, not
-    a filesystem detail. The install hook ignores the distinction on purpose
-    (see its own call sites); the route folds it into its did-not-happen 404.
+    Returns the sidecar AS IT NOW READS BACK, and None when nothing usable is
+    there: ``write_tool_meta`` refused (a fail-closed redaction, the ghost guard
+    on a racing delete, a FIFO/symlink swapped in for the sidecar, an unwritable
+    directory, a payload past the sidecar size cap), or the write landed and the
+    re-read still found nothing (a delete racing in behind it). The None matters
+    because the synchronous route answers WITH this dict: reporting a summary
+    that is nowhere on disk would have it vanish on the user's next GET -- a
+    wrong answer, not a filesystem detail. The install hook ignores BOTH non-dict
+    answers on purpose (see its own call sites); the route maps None to its
+    did-not-happen 404 and the refusal to 409.
+
+    Re-reading rather than returning the composed dict is not belt-and-braces:
+    ``write_tool_meta`` rebuilds the file from its OWN schema (a narrowed
+    ``origin``, coerced scalars), so what we asked for and what landed genuinely
+    differ in shape. The route promises "what the next GET would show", so this
+    has to be the file, not the request -- the same re-read discipline the PATCH
+    route applies to its own rewrite.
     """
     existing = tools.read_tool_meta(directory) or {}
+    if existing.get("status") == "final":
+        return StoreRefusal.FINALIZED
     status = existing.get("status")
     if not (isinstance(status, str) and status in tools._SUMMARY_STATUSES):
         status = "draft"
@@ -378,7 +426,9 @@ def _store_meta(
         "llm_log_id": llm_log_id,
         "origin": origin if origin is not None else existing.get("origin"),
     }
-    return meta if tools.write_tool_meta(directory, meta) else None
+    if not tools.write_tool_meta(directory, meta):
+        return None
+    return tools.read_tool_meta(directory)
 
 
 async def _generate_summary(
@@ -390,6 +440,22 @@ async def _generate_summary(
 ) -> str:
     """Run ONE summary session and return its validated text.
 
+    The prompt is built on a THREADPOOL worker, not inline. ``_summary_user_prompt``
+    looks like a pure string builder, but it walks the whole package with
+    ``os.walk``, opens and reads every file it keeps, and parses the ``.env`` --
+    blocking filesystem work, which is exactly what ``run_in_threadpool`` is for
+    everywhere else in this codebase (the registry calls in ``routers.tools``,
+    the installer's promote/cleanup). The bound that is NOT there is the one
+    people assume: ``_MAX_FILES`` caps how many files are KEPT, not how many
+    ``os.walk`` must ENUMERATE, so a package directory a ``run_shell`` exploded a
+    ``node_modules`` into stalls the event loop -- and therefore every other
+    request in the process -- for the whole enumeration before the LLM call even
+    starts.
+
+    ``_summary_user_prompt`` itself stays synchronous and pure so its (many)
+    tests keep calling it directly; the hop belongs here, at the one async
+    boundary that has an event loop to protect.
+
     ``tools=None``: this session only reads the package we already handed it in
     the prompt -- it has no business calling the installed tools (or any other),
     and passing None keeps the request byte-identical to a plain structured call.
@@ -398,11 +464,20 @@ async def _generate_summary(
 
     Raises ``LLMNotConfiguredError`` / ``LLMUpstreamError`` unchanged; each
     caller decides whether that is swallowed (the install hook) or surfaced (the
-    synchronous regenerate route).
+    synchronous regenerate route). A failure inside the prompt build (the
+    fail-closed redactor, say) surfaces out of the ``await`` the same way it used
+    to surface out of the direct call.
     """
+    user_prompt = await run_in_threadpool(
+        _summary_user_prompt,
+        name,
+        directory,
+        origin=origin,
+        builder_summary=builder_summary,
+    )
     result = await generate_structured(
         _SUMMARY_SYSTEM_PROMPT,
-        _summary_user_prompt(name, directory, origin=origin, builder_summary=builder_summary),
+        user_prompt,
         ToolSummaryResult,
         workflow=_SUMMARY_WORKFLOW,
         tools=None,
@@ -432,6 +507,14 @@ async def generate_and_store_summary(
     trace. It writes that placeholder ONLY when no sidecar exists yet: on a
     later regeneration the previous, GOOD summary must survive a transient LLM
     failure rather than being blanked by it.
+
+    ``_store_meta``'s ``StoreRefusal.FINALIZED`` is a silent no-op here, like
+    every other store outcome: this path already ignores the write result
+    because it must never fail an install, and a package finalized between
+    promote and here is one whose summary the operator has explicitly frozen --
+    declining to overwrite it IS the right outcome, not an error to report. The
+    placeholder branch cannot hit it at all (it only writes when there is no
+    sidecar, and a sidecar is what carries a status).
     """
     try:
         # The alias-refusing resolve, shared with every other by-name summary
@@ -473,7 +556,7 @@ async def generate_and_store_summary(
         return
 
 
-async def regenerate_summary(name: str) -> dict[str, Any] | None:
+async def regenerate_summary(name: str) -> dict[str, Any] | StoreRefusal | None:
     """Regenerate one package's summary SYNCHRONOUSLY; returns the fresh meta.
 
     The user-driven counterpart of the install hook, and the deliberate mirror
@@ -488,6 +571,14 @@ async def regenerate_summary(name: str) -> dict[str, Any] | None:
     did-not-happen 404 exactly as ``set_summary_status`` folds its own failed
     rewrite into ``not_found``. Answering 200 with a summary that is nowhere on
     disk would leave the user reading text that disappears on their next visit.
+
+    ``StoreRefusal.FINALIZED`` is the third answer and is NOT folded into that
+    None, because "you cannot do this" and "it did not work" are different things
+    to tell a user: the package was finalized while this generation was in
+    flight, so the route answers the same 409 ``tool_finalized`` its up-front
+    gate does. That gate still runs (it is what keeps a finalized package from
+    burning an LLM call at all); this is what makes the refusal hold across the
+    await.
 
     What it does NOT change is the no-clobber rule -- the sidecar is only
     rewritten after a successful generation, so a failed regenerate leaves the

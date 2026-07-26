@@ -27,7 +27,7 @@ import os
 import socket
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -541,6 +541,7 @@ def _fake_summary_generate(
     *,
     summary: str = "這個工具會查 KB",
     explode: BaseException | None = None,
+    side_effect: Callable[[], None] | None = None,
 ) -> None:
     """Stub the SUMMARY session's generate_structured (D40).
 
@@ -549,7 +550,12 @@ def _fake_summary_generate(
     summary session calling the real thing. Every install that reaches promote
     now runs one, so ``_fake_generate`` installs this by default -- without it
     those tests would fall through to the real LLM path and depend on ambient
-    configuration for their (swallowed) failure."""
+    configuration for their (swallowed) failure.
+
+    ``side_effect`` runs INSIDE the stubbed call, which is the only place a test
+    can act "while the generation is in flight": the real thing awaits an LLM for
+    seconds, and the store-time races (above all a 定版 landing mid-regenerate)
+    live in exactly that window."""
 
     async def fake(
         system_prompt: str,
@@ -564,6 +570,8 @@ def _fake_summary_generate(
         recorder = llm_log.LlmInteractionRecorder(workflow=workflow, model="m")
         recorder.begin_attempt([{"role": "user", "content": "summarize"}])
         recorder.finish(outcome="ok" if explode is None else "error", error=None)
+        if side_effect is not None:
+            side_effect()
         if explode is not None:
             raise explode
         return model_cls.model_validate({"summary": summary})
@@ -2076,7 +2084,7 @@ def test_router_list_tools_carries_summary_status(
     (pkg / "run.py").write_text("print('x')\n")
     (pkg / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")))
     _install_settings(monkeypatch, tools_dir=str(root))
-    tools.write_tool_meta(pkg, {"summary": "說明", "status": "final"})
+    _write_meta(pkg, summary="說明", status="final")
 
     body = client.get("/api/tools").json()
     assert [(row["name"], row["summary_status"]) for row in body["tools"]] == [
@@ -2336,6 +2344,15 @@ def test_router_job_status_and_404(client: TestClient) -> None:
 # --- router: AI summary (D40) --------------------------------------------------
 
 
+def _write_meta(pkg: Path, **fields: Any) -> bool:
+    """``write_tool_meta`` with the ``updated_at`` every real caller supplies.
+
+    The writer refuses a meta without a string ``updated_at`` (it will not invent
+    a timestamp on a caller's behalf), so the route tests seed a sidecar through
+    here and state only the fields under test."""
+    return tools.write_tool_meta(pkg, {"updated_at": "2026-01-01T00:00:00+00:00", **fields})
+
+
 def _meta(pkg: Path) -> dict[str, Any]:
     """The package's sidecar, asserted present (it is what the test just wrote)."""
     meta = tools.read_tool_meta(pkg)
@@ -2440,7 +2457,7 @@ def test_router_patch_summary_finalizes_and_unfinalizes(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     pkg = _seed_package(monkeypatch, tmp_path)
-    tools.write_tool_meta(pkg, {"summary": "說明", "status": "draft", "llm_log_id": 4})
+    _write_meta(pkg, summary="說明", status="draft", llm_log_id=4)
 
     response = client.patch("/api/tools/kbsearch/summary", json={"status": "final"})
     assert response.status_code == 200
@@ -2466,6 +2483,39 @@ def test_router_patch_summary_409_without_a_sidecar(
     detail = response.json()["detail"]
     assert detail["code"] == "summary_missing"
     assert "message" in detail
+
+
+@pytest.mark.parametrize("summary", ["", "   ", None], ids=["empty", "blank", "null"])
+def test_router_patch_summary_409_when_the_summary_is_empty(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, summary: str | None
+) -> None:
+    """Freezing an absent explanation is the same "nothing there" as having no
+    sidecar, so it is the SAME 409 -- and it is not harmless: a finalized empty
+    summary then blocks 重新產生 with tool_finalized, so the one action that
+    could fill it is refused until the user thinks to un-finalize."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / tools._AI_META_FILENAME).write_text(
+        json.dumps({"summary": summary, "status": "draft"}), encoding="utf-8"
+    )
+
+    response = client.patch("/api/tools/kbsearch/summary", json={"status": "final"})
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "summary_missing"
+    assert client.get("/api/tools/kbsearch/summary").json()["status"] == "draft"
+
+
+def test_router_patch_summary_can_always_unfinalize(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """解除定版 is the escape hatch, so it is never gated on content -- including
+    for a sidecar finalized empty before that gate existed."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / tools._AI_META_FILENAME).write_text(
+        json.dumps({"summary": "", "status": "final"}), encoding="utf-8"
+    )
+
+    assert client.patch("/api/tools/kbsearch/summary", json={"status": "draft"}).status_code == 200
+    assert client.get("/api/tools/kbsearch/summary").json()["status"] == "draft"
 
 
 def test_router_patch_summary_404_for_unknown_tool(
@@ -2495,9 +2545,7 @@ def test_router_regenerate_summary_stores_and_returns_the_new_summary(
     is stubbed), so the whole synchronous path -- prompt, sanitize, sidecar
     write -- runs for this route."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    tools.write_tool_meta(
-        pkg, {"summary": "舊的", "status": "draft", "origin": {"instructions": "查 KB"}}
-    )
+    _write_meta(pkg, summary="舊的", status="draft", origin={"instructions": "查 KB"})
     _fake_summary_generate(monkeypatch, summary="新的說明")
 
     response = client.post("/api/tools/kbsearch/summary/regenerate")
@@ -2509,7 +2557,9 @@ def test_router_regenerate_summary_stores_and_returns_the_new_summary(
     stored = tools.read_tool_meta(pkg)
     assert stored is not None
     assert stored["summary"] == "新的說明"
-    assert stored["origin"] == {"instructions": "查 KB"}  # inherited from the install
+    # Inherited from the install, in the narrowed shape the writer stores (both
+    # known fields, the absent one an explicit null).
+    assert stored["origin"] == {"openapi_url": None, "instructions": "查 KB"}
 
 
 def test_router_regenerate_summary_409_when_finalized(
@@ -2518,7 +2568,7 @@ def test_router_regenerate_summary_409_when_finalized(
     """定版 means the AI stops iterating on this tool: the regenerate is refused
     before the LLM is ever touched."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    tools.write_tool_meta(pkg, {"summary": "定版的說明", "status": "final"})
+    _write_meta(pkg, summary="定版的說明", status="final")
 
     async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("a finalized tool must never reach the LLM")
@@ -2531,6 +2581,39 @@ def test_router_regenerate_summary_409_when_finalized(
     assert detail["code"] == "tool_finalized"
     assert "message" in detail
     assert _meta(pkg)["summary"] == "定版的說明"  # untouched
+
+
+def test_router_regenerate_summary_409_when_finalized_mid_generation(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The THIRD 409-able outcome, and the one the up-front gate cannot give.
+
+    That gate runs before an await that lasts as long as an LLM round trip; a
+    PATCH landing inside the window used to have its frozen summary overwritten
+    anyway (the status was preserved, the TEXT was not). The store re-checks and
+    refuses, and the route answers the SAME tool_finalized code -- one refusal,
+    whichever side of the await the 定版 arrived on.
+
+    The finalize is driven THROUGH THE ROUTE from inside the stubbed generation,
+    which is what a concurrent PATCH actually is."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _write_meta(pkg, summary="定版的說明", status="draft")
+    frozen: dict[str, bytes] = {}
+
+    def finalize_mid_call() -> None:
+        assert (
+            client.patch("/api/tools/kbsearch/summary", json={"status": "final"}).status_code == 200
+        )
+        frozen["bytes"] = (pkg / tools._AI_META_FILENAME).read_bytes()
+
+    _fake_summary_generate(monkeypatch, summary="新的說明", side_effect=finalize_mid_call)
+
+    response = client.post("/api/tools/kbsearch/summary/regenerate")
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "tool_finalized"
+    # Byte-for-byte what 定版 froze: the in-flight generation left no trace.
+    assert (pkg / tools._AI_META_FILENAME).read_bytes() == frozen["bytes"]
+    assert _meta(pkg)["summary"] == "定版的說明"
 
 
 def test_router_regenerate_summary_409_while_a_job_runs(
@@ -2572,7 +2655,7 @@ def test_router_regenerate_summary_503_when_llm_unconfigured(
     """Synchronous AI op, so it degrades like capture/enrich do -- the SHARED
     llm_not_configured 503, and the previous summary survives."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    tools.write_tool_meta(pkg, {"summary": "先前的好總結", "status": "draft"})
+    _write_meta(pkg, summary="先前的好總結", status="draft")
     _fake_summary_generate(monkeypatch, explode=LLMNotConfiguredError("off"))
 
     response = client.post("/api/tools/kbsearch/summary/regenerate")
@@ -2587,7 +2670,7 @@ def test_router_regenerate_summary_502_on_upstream_failure(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     pkg = _seed_package(monkeypatch, tmp_path)
-    tools.write_tool_meta(pkg, {"summary": "先前的好總結", "status": "draft"})
+    _write_meta(pkg, summary="先前的好總結", status="draft")
     _fake_summary_generate(
         monkeypatch,
         explode=LLMUpstreamError("APIConnectionError: could not reach the LLM endpoint"),
@@ -2628,7 +2711,7 @@ def test_router_summary_routes_refuse_an_internal_alias(
     now shared by every summary path through one resolver."""
     pkg = _seed_package(monkeypatch, tmp_path, "real")
     (pkg.parent / "alias").symlink_to(pkg, target_is_directory=True)
-    tools.write_tool_meta(pkg, {"summary": "真的說明", "status": "draft"})
+    _write_meta(pkg, summary="真的說明", status="draft")
     before = (pkg / tools._AI_META_FILENAME).read_bytes()
 
     async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
@@ -2652,7 +2735,7 @@ def test_router_regenerate_summary_404_when_the_sidecar_write_is_refused(
     unwritable directory) must not answer 200 with a summary the next GET will
     not find. Same did-not-happen fold the PATCH uses for its failed rewrite."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    tools.write_tool_meta(pkg, {"summary": "先前的好總結", "status": "draft"})
+    _write_meta(pkg, summary="先前的好總結", status="draft")
     _fake_summary_generate(monkeypatch, summary="新的說明")
     monkeypatch.setattr(tools, "write_tool_meta", lambda *args, **kwargs: False)
 
@@ -2672,7 +2755,7 @@ def test_router_a_tool_named_install_can_serve_its_summary(
     "summary" can never be one, which is what makes the ordering safe in both
     directions."""
     pkg = _seed_package(monkeypatch, tmp_path, "install")
-    tools.write_tool_meta(pkg, {"summary": "名叫 install 的工具", "status": "draft"})
+    _write_meta(pkg, summary="名叫 install 的工具", status="draft")
 
     response = client.get("/api/tools/install/summary")
     assert response.status_code == 200

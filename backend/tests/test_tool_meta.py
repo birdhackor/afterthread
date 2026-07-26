@@ -21,7 +21,8 @@ process-wide singletons, so an autouse fixture resets them around every test.
 import asyncio
 import json
 import sys
-from collections.abc import Generator
+import threading
+from collections.abc import Callable, Generator
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,15 @@ def _summary_settings(monkeypatch: pytest.MonkeyPatch, root: Path, **overrides: 
     return settings
 
 
+def _write_meta(pkg: Path, **fields: Any) -> bool:
+    """``write_tool_meta`` with the ``updated_at`` every real caller supplies.
+
+    The writer refuses a meta without a string ``updated_at`` (it will not invent
+    a timestamp on a caller's behalf), so tests seed a sidecar through here and
+    state only the fields under test."""
+    return tools.write_tool_meta(pkg, {"updated_at": "2026-01-01T00:00:00+00:00", **fields})
+
+
 def _package(
     root: Path,
     name: str = "kbsearch",
@@ -95,6 +105,7 @@ def _fake_generate(
     summary: str = "這個工具會查 KB",
     explode: BaseException | None = None,
     record_session: bool = True,
+    side_effect: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Stub the SUMMARY session's generate_structured and capture its kwargs.
 
@@ -102,6 +113,11 @@ def _fake_generate(
     reference the module actually calls. ``record_session`` writes a genuine
     llm_log record for the workflow it was called with, so the sidecar's
     llm_log_id wiring is exercised against the real ring rather than a stub id.
+
+    ``side_effect`` runs INSIDE the stubbed call, which is the only place a test
+    can act "while the generation is in flight": the real thing awaits an LLM for
+    seconds, and every store-time race (a concurrent 定版, a racing delete) lives
+    in exactly that window.
     """
     captured: dict[str, Any] = {}
 
@@ -128,6 +144,8 @@ def _fake_generate(
             recorder.begin_attempt([{"role": "user", "content": "summarize"}])
             recorder.record_response(summary)
             recorder.finish(outcome="ok" if explode is None else "error", error=None)
+        if side_effect is not None:
+            side_effect()
         if explode is not None:
             raise explode
         return model_cls.model_validate({"summary": summary})
@@ -225,7 +243,7 @@ def test_user_prompt_skips_the_sidecar_and_dot_files(
     root = tmp_path / "tools"
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
-    tools.write_tool_meta(pkg, {"summary": "PREVIOUS-SUMMARY-TEXT", "status": "draft"})
+    _write_meta(pkg, summary="PREVIOUS-SUMMARY-TEXT", status="draft")
     (pkg / ".hidden-note").write_text("HIDDEN-FILE-TEXT", encoding="utf-8")
 
     prompt = tool_meta._summary_user_prompt("kbsearch", pkg, origin=None, builder_summary=None)
@@ -417,7 +435,7 @@ def test_generate_and_store_summary_preserves_status_and_origin(
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
     origin = {"openapi_url": "http://kb.example/openapi.json", "instructions": "查 KB"}
-    tools.write_tool_meta(pkg, {"summary": "舊的", "status": "final", "origin": origin})
+    _write_meta(pkg, summary="舊的", status="draft", origin=origin)
 
     _fake_generate(monkeypatch, summary="新的")
     asyncio.run(generate_and_store_summary("kbsearch", origin=None))
@@ -425,8 +443,37 @@ def test_generate_and_store_summary_preserves_status_and_origin(
     meta = tools.read_tool_meta(pkg)
     assert meta is not None
     assert meta["summary"] == "新的"
-    assert meta["status"] == "final"  # preserved, never reset to draft
+    assert meta["status"] == "draft"  # preserved, never reset by the write
     assert meta["origin"] == origin  # inherited, never erased
+
+
+def test_store_meta_refuses_a_finalized_sidecar(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A finalized summary is never rewritten -- not even by the install hook.
+
+    _store_meta used to PRESERVE the "final" status while still overwriting the
+    summary TEXT, which satisfies the letter of 定版 and breaks its meaning: the
+    operator froze one explanation and would get a different one back. The store
+    re-reads the status and refuses outright."""
+    root = tmp_path / "tools"
+    pkg = _package(root)
+    _summary_settings(monkeypatch, root)
+    origin = {"openapi_url": "http://kb.example/openapi.json", "instructions": "查 KB"}
+    _write_meta(pkg, summary="定版的說明", status="final", origin=origin)
+    before = (pkg / tools._AI_META_FILENAME).read_bytes()
+
+    assert (
+        tool_meta._store_meta(pkg, summary="新的", origin=None, llm_log_id=9)
+        is tool_meta.StoreRefusal.FINALIZED
+    )
+    assert (pkg / tools._AI_META_FILENAME).read_bytes() == before  # byte-for-byte
+
+    # And the install hook swallows that refusal like every other store outcome:
+    # it must never fail an install that already succeeded.
+    _fake_generate(monkeypatch, summary="新的")
+    asyncio.run(generate_and_store_summary("kbsearch", origin=None))  # must not raise
+    assert (pkg / tools._AI_META_FILENAME).read_bytes() == before
 
 
 def test_generate_and_store_summary_writes_placeholder_when_no_sidecar_yet(
@@ -445,7 +492,8 @@ def test_generate_and_store_summary_writes_placeholder_when_no_sidecar_yet(
     assert meta is not None
     assert meta["summary"] == ""
     assert meta["status"] == "draft"
-    assert meta["origin"] == {"instructions": "查 KB"}
+    # Narrowed on the way to disk: both known fields, the absent one null.
+    assert meta["origin"] == {"openapi_url": None, "instructions": "查 KB"}
 
 
 def test_generate_and_store_summary_never_clobbers_a_good_summary(
@@ -456,7 +504,7 @@ def test_generate_and_store_summary_never_clobbers_a_good_summary(
     root = tmp_path / "tools"
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
-    tools.write_tool_meta(pkg, {"summary": "先前的好總結", "status": "draft"})
+    _write_meta(pkg, summary="先前的好總結", status="draft")
 
     _fake_generate(monkeypatch, explode=LLMUpstreamError("APIConnectionError: unreachable"))
     asyncio.run(generate_and_store_summary("kbsearch"))
@@ -565,18 +613,17 @@ def test_regenerate_summary_returns_the_fresh_meta(
     root = tmp_path / "tools"
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
-    tools.write_tool_meta(
-        pkg,
-        {"summary": "舊的", "status": "draft", "origin": {"instructions": "查 KB"}},
-    )
+    _write_meta(pkg, summary="舊的", status="draft", origin={"instructions": "查 KB"})
     _fake_generate(monkeypatch, summary="新的說明")
 
     meta = asyncio.run(regenerate_summary("kbsearch"))
 
-    assert meta is not None
+    assert isinstance(meta, dict)
     assert meta["summary"] == "新的說明"
     assert meta["status"] == "draft"
-    assert meta["origin"] == {"instructions": "查 KB"}  # carried back from the install
+    # Carried back from the install, in the narrowed shape the writer stores
+    # (both known fields, the absent one explicitly null).
+    assert meta["origin"] == {"openapi_url": None, "instructions": "查 KB"}
     assert tools.read_tool_meta(pkg) == meta  # what it returned IS what it stored
 
 
@@ -591,15 +638,13 @@ def test_regenerate_summary_feeds_the_stored_origin_back_into_the_prompt(
     secret = "kb-live-secret-abcdef"
     pkg = _package(root, dotenv=f"KB_API_KEY={secret}\n")
     _summary_settings(monkeypatch, root)
-    tools.write_tool_meta(
+    _write_meta(
         pkg,
-        {
-            "summary": "舊的",
-            "status": "draft",
-            "origin": {
-                "openapi_url": "http://kb.example/ORIGIN-URL-MARKER.json",
-                "instructions": "ORIGIN-INSTRUCTIONS-MARKER 只查內部 KB",
-            },
+        summary="舊的",
+        status="draft",
+        origin={
+            "openapi_url": "http://kb.example/ORIGIN-URL-MARKER.json",
+            "instructions": "ORIGIN-INSTRUCTIONS-MARKER 只查內部 KB",
         },
     )
     captured = _fake_generate(monkeypatch, summary="新的說明")
@@ -609,7 +654,7 @@ def test_regenerate_summary_feeds_the_stored_origin_back_into_the_prompt(
     assert "ORIGIN-INSTRUCTIONS-MARKER 只查內部 KB" in captured["user_prompt"]
     assert "ORIGIN-URL-MARKER" in captured["user_prompt"]
     assert secret not in captured["user_prompt"]
-    assert meta is not None
+    assert isinstance(meta, dict)
     assert meta["origin"]["instructions"] == "ORIGIN-INSTRUCTIONS-MARKER 只查內部 KB"
 
 
@@ -617,20 +662,29 @@ def test_regenerate_summary_ignores_an_unusable_stored_origin(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The sidecar is hand-editable, so an origin we cannot make sense of never
-    reaches the prompt as if the backend had written it -- and, crucially, is
-    never ERASED either: _store_meta's inheritance keeps the only copy."""
+    reaches the prompt as if the backend had written it -- and the regeneration
+    never ERASES what it could not read either: _store_meta's inheritance carries
+    the stored origin forward untouched.
+
+    Written by HAND here, because the writer itself narrows an origin now: an
+    unusable one only survives on disk if the operator put it there."""
     root = tmp_path / "tools"
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
     origin = {"openapi_url": 12, "junk": "JUNK-MARKER"}
-    tools.write_tool_meta(pkg, {"summary": "舊的", "status": "draft", "origin": origin})
+    (pkg / tools._AI_META_FILENAME).write_text(
+        json.dumps({"summary": "舊的", "status": "draft", "origin": origin}), encoding="utf-8"
+    )
     captured = _fake_generate(monkeypatch, summary="新的說明")
 
     meta = asyncio.run(regenerate_summary("kbsearch"))
 
     assert "JUNK-MARKER" not in captured["user_prompt"]
-    assert meta is not None
-    assert meta["origin"] == origin  # inherited untouched, never overwritten by {}
+    assert isinstance(meta, dict)
+    # Inherited (never overwritten by {}), then narrowed on the way to disk: the
+    # junk key is dropped and the unreadable field lands as an explicit null.
+    assert meta["origin"] == {"openapi_url": None, "instructions": None}
+    assert tools.read_tool_meta(pkg) == meta
 
 
 def test_regenerate_summary_refuses_an_internal_alias(
@@ -643,7 +697,7 @@ def test_regenerate_summary_refuses_an_internal_alias(
     pkg = _package(root, "real")
     (root / "alias").symlink_to(root / "real", target_is_directory=True)
     _summary_settings(monkeypatch, root)
-    tools.write_tool_meta(pkg, {"summary": "真的說明", "status": "draft"})
+    _write_meta(pkg, summary="真的說明", status="draft")
 
     async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("no session may start for an aliased package")
@@ -675,7 +729,7 @@ def test_regenerate_summary_propagates_llm_failures_without_clobbering(
     root = tmp_path / "tools"
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
-    tools.write_tool_meta(pkg, {"summary": "先前的好總結", "status": "draft"})
+    _write_meta(pkg, summary="先前的好總結", status="draft")
     _fake_generate(monkeypatch, explode=explode)
 
     with pytest.raises(expected):
@@ -714,8 +768,74 @@ def test_regenerate_summary_signals_nothing_stored_when_the_write_is_refused(
     root = tmp_path / "tools"
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
-    tools.write_tool_meta(pkg, {"summary": "先前的好總結", "status": "draft"})
+    _write_meta(pkg, summary="先前的好總結", status="draft")
     _fake_generate(monkeypatch, summary="新的說明")
     monkeypatch.setattr(tools, "write_tool_meta", lambda *args, **kwargs: False)
 
     assert asyncio.run(regenerate_summary("kbsearch")) is None
+
+
+def test_regenerate_summary_refuses_a_finalize_that_lands_mid_generation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The finalize TOCTOU: the route's 定版 gate runs BEFORE an await that lasts
+    as long as an LLM round trip, so a PATCH landing inside that window used to
+    have its frozen summary overwritten anyway (the status was preserved; the
+    TEXT was not). The generation flips the sidecar itself here, which is exactly
+    what a concurrent PATCH does.
+
+    The refusal is its own signal, NOT the None a failed write gives: "you cannot
+    do this" and "it did not work" are different answers to the user, and the
+    route turns them into a 409 and a 404 respectively."""
+    root = tmp_path / "tools"
+    pkg = _package(root)
+    _summary_settings(monkeypatch, root)
+    _write_meta(pkg, summary="定版的說明", status="draft")
+
+    frozen: dict[str, bytes] = {}
+
+    def finalize_mid_call() -> None:
+        assert tools.set_summary_status("kbsearch", "final") == "ok"
+        frozen["bytes"] = (pkg / tools._AI_META_FILENAME).read_bytes()
+
+    _fake_generate(monkeypatch, summary="新的說明", side_effect=finalize_mid_call)
+
+    assert asyncio.run(regenerate_summary("kbsearch")) is tool_meta.StoreRefusal.FINALIZED
+    # Byte-for-byte what 定版 froze -- the generation that was already in flight
+    # left no trace, not even a refreshed updated_at.
+    assert (pkg / tools._AI_META_FILENAME).read_bytes() == frozen["bytes"]
+    stored = tools.read_tool_meta(pkg)
+    assert stored is not None
+    assert stored["summary"] == "定版的說明"
+    assert stored["status"] == "final"
+
+
+def test_regenerate_summary_builds_the_prompt_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The prompt build walks the whole package, opens every file it keeps, and
+    parses the .env -- blocking filesystem work that used to run INLINE on the
+    event loop, stalling every other request in the process until it finished.
+
+    ``_MAX_FILES`` is not the bound people assume: it caps what is KEPT, not what
+    ``os.walk`` must ENUMERATE, so a package a run_shell exploded a node_modules
+    into is unbounded work. Asserted by THREAD, which is the actual property --
+    asyncio.run drives the loop on this thread, so a different one means the
+    threadpool hop really happened."""
+    root = tmp_path / "tools"
+    _package(root)
+    _summary_settings(monkeypatch, root)
+    loop_thread = threading.current_thread()
+    seen: dict[str, Any] = {}
+    real_prompt = tool_meta._summary_user_prompt
+
+    def spy(*args: Any, **kwargs: Any) -> str:
+        seen["thread"] = threading.current_thread()
+        return real_prompt(*args, **kwargs)
+
+    monkeypatch.setattr(tool_meta, "_summary_user_prompt", spy)
+    _fake_generate(monkeypatch, summary="新的說明")
+
+    asyncio.run(regenerate_summary("kbsearch"))
+
+    assert seen["thread"] is not loop_thread

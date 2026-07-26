@@ -62,6 +62,7 @@ from afterthread.services.memory_ai import (
     enrich_item,
 )
 from afterthread.services.tools import (
+    _AI_META_MAX_BYTES,
     _MANIFEST_MAX_BYTES,
     _PARAMETERS_SCHEMA_MAX_BYTES,
     delete_tool,
@@ -1829,6 +1830,18 @@ def _sidecar(pkg: Path) -> Path:
     return pkg / tools._AI_META_FILENAME
 
 
+def _write_meta(pkg: Path, **fields: Any) -> bool:
+    """``write_tool_meta`` with the ``updated_at`` every real caller supplies.
+
+    The writer REFUSES a meta without a string ``updated_at`` (it will not invent
+    a timestamp on a caller's behalf -- see write_tool_meta), and both production
+    callers stamp their own. So tests state the fields actually under test and
+    inherit a valid stamp here, instead of repeating a timestamp literal
+    everywhere or -- worse -- passing a shape no caller ever passes and getting a
+    False that hides the reason the test meant to exercise."""
+    return tools.write_tool_meta(pkg, {"updated_at": "2026-01-01T00:00:00+00:00", **fields})
+
+
 def test_tool_meta_round_trips(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """write_tool_meta -> read_tool_meta returns the same dict, and the sidecar
     is a real file inside the package (so delete_tool's rmtree takes it)."""
@@ -1865,9 +1878,41 @@ def test_read_tool_meta_degrades_on_missing_corrupt_and_non_object(tmp_path: Pat
 def test_read_tool_meta_refuses_oversized_sidecar(tmp_path: Path) -> None:
     pkg = tmp_path / "pkg"
     pkg.mkdir()
-    padding = "x" * (_MANIFEST_MAX_BYTES + 100)
+    padding = "x" * (_AI_META_MAX_BYTES + 100)
     _sidecar(pkg).write_text(json.dumps({"summary": padding}), encoding="utf-8")
     assert tools.read_tool_meta(pkg) is None
+
+
+def test_read_tool_meta_survives_pathological_nesting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A deeply nested sidecar exhausts the stack INSIDE json.loads, which raises
+    RecursionError -- not the ValueError the parse guard used to catch alone.
+
+    It is not the summary panel that pays for that: ``summary_status`` runs this
+    once per package on every ``list_tools`` scan, so one hand-edited (or
+    malicious) sidecar escaping as an exception 500s the whole 工具 page and
+    takes every OTHER tool's row down with it. Degrades to None like any other
+    unusable sidecar, and the row still lists."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    # The depth is ASSERTED, not assumed. CPython 3.14 raises on genuine stack
+    # exhaustion rather than at sys.getrecursionlimit() (setrecursionlimit does
+    # not move it), and shallower nesting simply PARSES -- which would leave this
+    # test green for the wrong reason: the result would degrade to None on the
+    # not-a-JSON-object check instead of on the guard under test.
+    depth = 120_000
+    nested = "[" * depth + "]" * depth
+    assert len(nested.encode("utf-8")) < _AI_META_MAX_BYTES  # not the size guard refusing it
+    with pytest.raises(RecursionError):
+        json.loads(nested)
+    _sidecar(pkg).write_text(nested, encoding="utf-8")
+
+    assert tools.read_tool_meta(pkg) is None
+    assert tools.summary_status(pkg) is None
+    listed = list_tools()
+    assert [(row["name"], row["summary_status"]) for row in listed] == [("echo", None)]
 
 
 def test_write_tool_meta_redacts_the_summary(
@@ -1882,7 +1927,7 @@ def test_write_tool_meta_redacts_the_summary(
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
 
-    assert tools.write_tool_meta(pkg, {"summary": f"it authenticates with {secret}"}) is True
+    assert _write_meta(pkg, summary=f"it authenticates with {secret}") is True
     stored = tools.read_tool_meta(pkg)
     assert stored is not None
     assert secret not in stored["summary"]
@@ -1898,25 +1943,20 @@ def test_write_tool_meta_redacts_every_string_not_just_the_summary(
     ``origin.openapi_url`` is the install form's URL, which routinely carries
     the form secret as a query token, and ``origin.instructions`` is free
     operator text -- both landed on disk verbatim while only ``summary`` was
-    masked. The walk covers nested dicts and lists so the guarantee is a
-    property of the FILE, not of the fields somebody remembered."""
+    masked. They are now masked BY NAME, which is the whole redaction surface:
+    every other field on disk is a literal or a number the writer chose."""
     secret = "install-form-secret-abcdef"
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
 
     assert (
-        tools.write_tool_meta(
+        _write_meta(
             pkg,
-            {
-                "summary": "沒有秘密的說明",
-                "origin": {
-                    "openapi_url": f"https://kb.example/openapi.json?token={secret}",
-                    "instructions": f"用 {secret} 認證",
-                },
-                # A shape nothing writes today: the walk must reach it anyway,
-                # which is what makes a future field safe by default.
-                "notes": ["plain", {"deep": secret}],
+            summary="沒有秘密的說明",
+            origin={
+                "openapi_url": f"https://kb.example/openapi.json?token={secret}",
+                "instructions": f"用 {secret} 認證",
             },
         )
         is True
@@ -1928,19 +1968,115 @@ def test_write_tool_meta_redacts_every_string_not_just_the_summary(
     assert stored is not None
     assert tools._REDACTION_MARKER in stored["origin"]["openapi_url"]
     assert tools._REDACTION_MARKER in stored["origin"]["instructions"]
-    assert tools._REDACTION_MARKER in stored["notes"][1]["deep"]
     # Only the secret is rewritten -- the rest of the URL survives, so the
     # sidecar stays useful as the install's only record of where it came from.
     assert "https://kb.example/openapi.json?token=" in stored["origin"]["openapi_url"]
-    assert stored["notes"][0] == "plain"
+
+
+def test_write_tool_meta_keys_survive_a_secret_that_equals_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The r1 whole-tree redaction masked dict KEYS as well as values, and that
+    turned the redactor's own success into corruption.
+
+    An install-form ``secret_value`` of ``"summary"`` clears the 6-char floor, so
+    it was a registered secret like any other -- and the walk duly rewrote the
+    KEY ``"summary"`` into the redaction marker. The write returned True, the
+    file was valid JSON, and every later read found no ``summary`` field at all:
+    the panel silently emptied with nothing reporting a failure. Keys are now
+    literals this module writes, so there is no key left to mask."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    for key in ("summary", "status", "origin", "instructions", "updated_at"):
+        monkeypatch.setattr(tools, "known_secret_values", lambda key=key: frozenset({key}))
+        assert (
+            _write_meta(
+                pkg,
+                summary="這個工具會查 KB",
+                status="final",
+                llm_log_id=7,
+                origin={"openapi_url": "http://kb.example/o.json", "instructions": "查 KB"},
+            )
+            is True
+        )
+        stored = tools.read_tool_meta(pkg)
+        assert stored is not None, f"a secret equal to the key {key!r} broke the schema"
+        assert stored["summary"] == "這個工具會查 KB"
+        assert stored["status"] == "final"
+        assert stored["llm_log_id"] == 7
+        assert stored["origin"]["openapi_url"] == "http://kb.example/o.json"
+        assert tools.summary_status(pkg) == "final"
+
+
+def test_write_tool_meta_drops_unknown_keys_and_containers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The sidecar IS the five schema fields; anything else a caller (or a
+    hand-edited file read back in) carries is dropped by the next write.
+
+    Round-tripping extra keys was never a contract -- it was a side effect of
+    serializing the caller's dict, and it is exactly what let unmasked text onto
+    disk: the r1 walk had no case for a TUPLE, which json serializes as an array
+    perfectly happily, so a tuple of strings rode through unredacted. Nothing
+    caller-shaped reaches the file now, so the whole class is gone rather than
+    one container type being added to a walk."""
+    secret = "tuple-borne-secret-abcdef"
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+
+    assert (
+        _write_meta(
+            pkg,
+            summary="沒有秘密的說明",
+            notes=("plain", secret),  # a tuple: JSON-serializable, never walked
+            deep={"nested": {"deeper": [secret]}},
+        )
+        is True
+    )
+
+    raw = _sidecar(pkg).read_text(encoding="utf-8")
+    assert secret not in raw
+    stored = tools.read_tool_meta(pkg)
+    assert stored is not None
+    assert set(stored) == {"summary", "status", "updated_at", "llm_log_id", "origin"}
+
+
+@pytest.mark.parametrize(
+    "origin, expected",
+    [
+        (None, None),
+        ("not a dict", None),
+        (("openapi_url", "http://x"), None),
+        ({}, {"openapi_url": None, "instructions": None}),
+        ({"openapi_url": 12, "junk": "dropped"}, {"openapi_url": None, "instructions": None}),
+        (
+            {"openapi_url": "http://kb.example/o.json", "instructions": "查 KB", "junk": "dropped"},
+            {"openapi_url": "http://kb.example/o.json", "instructions": "查 KB"},
+        ),
+    ],
+    ids=["none", "scalar", "tuple", "empty", "wrong-types", "narrowed"],
+)
+def test_write_tool_meta_narrows_the_origin(
+    tmp_path: Path, origin: Any, expected: dict[str, Any] | None
+) -> None:
+    """``origin`` is the install's ONLY record of where a package came from, so
+    it is kept -- and it is free operator text, so it is kept NARROW: the two
+    fields we understand, as strings or None, and nothing else."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    assert _write_meta(pkg, summary="s", origin=origin) is True
+    stored = tools.read_tool_meta(pkg)
+    assert stored is not None
+    assert stored["origin"] == expected
 
 
 def test_write_tool_meta_fails_closed_when_redaction_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The redaction is the gate, so a failing secret provider writes NOTHING
-    (rather than an unmasked sidecar) and reports failure -- for ANY field, not
-    just the summary: here the only string is in the origin."""
+    (rather than an unmasked sidecar) and reports failure -- for ANY of the three
+    text fields, not just the summary."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
 
@@ -1948,21 +2084,124 @@ def test_write_tool_meta_fails_closed_when_redaction_raises(
         raise RuntimeError("provider down")
 
     monkeypatch.setattr(tools, "known_secret_values", boom)
-    assert tools.write_tool_meta(pkg, {"summary": "anything"}) is False
+    assert _write_meta(pkg, summary="anything") is False
     assert not _sidecar(pkg).exists()
-    assert tools.write_tool_meta(pkg, {"origin": {"instructions": "anything"}}) is False
+    assert _write_meta(pkg, summary="", origin={"instructions": "anything"}) is False
+    assert not _sidecar(pkg).exists()
+    assert _write_meta(pkg, summary="", origin={"openapi_url": "http://x"}) is False
     assert not _sidecar(pkg).exists()
 
 
 def test_write_tool_meta_refuses_a_non_string_summary(tmp_path: Path) -> None:
-    """The recursive walk could mask a nested summary fine; it is refused for a
-    different reason -- ``summary`` is a STRING by contract, the read path
-    renders any other type as "no summary", and writing one would make the
-    sidecar lie about whether a summary exists."""
+    """``summary`` is a STRING by contract: the read path renders any other type
+    as "no summary", so writing one would make the sidecar lie about whether a
+    summary exists.
+
+    A JSON ``null`` is the ONE exception, and it is a coercion rather than a
+    refusal: it means the same thing as the empty placeholder a failed generation
+    writes, so it lands as ``""`` instead of slipping past the type check as
+    "not a string, but not refused either" (which is how a hand-written
+    ``{"summary": null}`` used to become a finalizable nothing)."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
-    assert tools.write_tool_meta(pkg, {"summary": {"nested": "object"}}) is False
+    for bad in ({"nested": "object"}, 12, ["a"], True):
+        assert _write_meta(pkg, summary=bad) is False
+        assert not _sidecar(pkg).exists()
+
+    assert _write_meta(pkg, summary=None) is True
+    stored = tools.read_tool_meta(pkg)
+    assert stored is not None
+    assert stored["summary"] == ""
+
+
+def test_write_tool_meta_requires_a_string_updated_at(tmp_path: Path) -> None:
+    """Every real caller stamps its own, so a missing/out-of-shape one is a
+    caller bug -- and inventing a timestamp on their behalf would put a fact in
+    the file that nothing actually observed."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    assert tools.write_tool_meta(pkg, {"summary": "s"}) is False
+    assert tools.write_tool_meta(pkg, {"summary": "s", "updated_at": 12}) is False
     assert not _sidecar(pkg).exists()
+
+
+@pytest.mark.parametrize(
+    "field, value, expected",
+    [
+        ("status", "published", "draft"),
+        ("status", ["draft"], "draft"),
+        ("status", None, "draft"),
+        ("status", "final", "final"),
+        ("llm_log_id", "three", None),
+        ("llm_log_id", True, None),  # bool is an int subclass; never a log link
+        ("llm_log_id", 7, 7),
+    ],
+    ids=[
+        "unknown-status",
+        "wrong-type-status",
+        "absent-status",
+        "final",
+        "str-id",
+        "bool-id",
+        "id",
+    ],
+)
+def test_write_tool_meta_coerces_the_scalar_fields(
+    tmp_path: Path, field: str, value: Any, expected: Any
+) -> None:
+    """An unknown status must never survive a write (``summary_status`` already
+    refuses to trust one, so persisting it only keeps a dead value alive), and a
+    non-int ``llm_log_id`` must never render as a link."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    assert _write_meta(pkg, summary="s", **{field: value}) is True
+    stored = tools.read_tool_meta(pkg)
+    assert stored is not None
+    assert stored[field] == expected
+
+
+def test_write_tool_meta_and_read_tool_meta_share_one_size_cap(tmp_path: Path) -> None:
+    """The asymmetry that made a LEGAL sidecar permanently unreadable.
+
+    The reader refused anything past the MANIFEST's cap while the writer checked
+    nothing at all, so a sidecar the writer happily produced could read back as
+    None forever -- the write reporting success while the summary silently
+    vanished from every later GET. Both sides now answer to the sidecar's own
+    _AI_META_MAX_BYTES: anything the writer accepts, the reader reads back.
+
+    The overrun is a JSON-SERIALIZATION effect, which is worth stating because
+    the raw character counts do not get you there: the reader's cap is compared
+    against the decoded text's LENGTH, and 20 000 chars of instructions (the
+    install form's own max_length) plus an 8 000-char summary is only ~30 000
+    characters however many bytes they occupy. What blows past it is escaping --
+    control characters are legal in that free-text field and each becomes a
+    6-char ``\\uXXXX`` escape, so a legal payload serializes to six times its
+    length."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+
+    # The worst payload the install schema admits: a max-length instructions of
+    # characters that each escape to 6, plus a max-length CJK summary.
+    legal = _write_meta(
+        pkg,
+        summary="說" * 8_000,
+        origin={"openapi_url": "http://kb.example/o.json", "instructions": "\x01" * 20_000},
+    )
+    assert legal is True
+    serialized = _sidecar(pkg).read_text(encoding="utf-8")
+    # Past the OLD cap on BOTH counts -- the bytes it is named for and the chars
+    # the reader actually compares -- so the old reader answered None for it.
+    assert len(serialized) > _MANIFEST_MAX_BYTES
+    assert len(serialized.encode("utf-8")) > _MANIFEST_MAX_BYTES
+    stored = tools.read_tool_meta(pkg)
+    assert stored is not None
+    assert stored["summary"] == "說" * 8_000
+    assert stored["origin"]["instructions"] == "\x01" * 20_000
+
+    # Past the shared cap the WRITER refuses, so the reader is never handed a
+    # file it would have to answer None for.
+    assert _write_meta(pkg, summary="x" * (_AI_META_MAX_BYTES + 10)) is False
+    assert tools.read_tool_meta(pkg) == stored  # the previous sidecar is untouched
 
 
 def test_write_tool_meta_refuses_to_resurrect_a_deleted_package(tmp_path: Path) -> None:
@@ -1971,7 +2210,7 @@ def test_write_tool_meta_refuses_to_resurrect_a_deleted_package(tmp_path: Path) 
     re-create the package as a directory holding only a sidecar, which the
     registry would then list as a ghost broken package."""
     gone = tmp_path / "nope" / "gone"
-    assert tools.write_tool_meta(gone, {"summary": "s"}) is False
+    assert _write_meta(gone, summary="s") is False
     assert not gone.exists()
     assert not gone.parent.exists()
 
@@ -1985,7 +2224,7 @@ def test_write_tool_meta_refuses_symlinked_sidecar(tmp_path: Path) -> None:
     outside.write_text("{}", encoding="utf-8")
     _sidecar(pkg).symlink_to(outside)
 
-    assert tools.write_tool_meta(pkg, {"summary": "s"}) is False
+    assert _write_meta(pkg, summary="s") is False
     assert outside.read_text(encoding="utf-8") == "{}"  # target untouched
 
 
@@ -2023,15 +2262,12 @@ def test_set_summary_status_finalizes_and_preserves_the_summary(
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
-    tools.write_tool_meta(
+    _write_meta(
         pkg,
-        {
-            "summary": "說明",
-            "status": "draft",
-            "updated_at": "2026-01-01T00:00:00+00:00",
-            "llm_log_id": 5,
-            "origin": {"openapi_url": "http://kb.example/o.json", "instructions": "i"},
-        },
+        summary="說明",
+        status="draft",
+        llm_log_id=5,
+        origin={"openapi_url": "http://kb.example/o.json", "instructions": "i"},
     )
 
     assert tools.set_summary_status("echo", "final") == "ok"
@@ -2056,6 +2292,45 @@ def test_set_summary_status_no_meta_when_sidecar_absent(
     _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
     assert tools.set_summary_status("echo", "final") == "no_meta"
+
+
+@pytest.mark.parametrize("summary", ["", "   ", None, 12], ids=["empty", "blank", "null", "int"])
+def test_set_summary_status_refuses_to_finalize_an_empty_summary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, summary: Any
+) -> None:
+    """定版 means "freeze THIS explanation", and there is none here.
+
+    Left alone, this was a trap rather than a harmless no-op: a hand-written
+    ``{"summary": null, "status": "draft"}`` finalized with a 200, and the
+    finalized nothing then blocked 重新產生 with ``tool_finalized`` -- the one
+    action that could have filled it. Same "nothing there to freeze" answer as a
+    package with no sidecar at all, so it reuses ``no_meta`` (the 409
+    ``summary_missing``)."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    # Written by hand: the WRITER coerces null->"" and refuses an int, so these
+    # shapes only ever reach the finalize gate from a hand-edited file.
+    _sidecar(pkg).write_text(json.dumps({"summary": summary, "status": "draft"}), encoding="utf-8")
+
+    assert tools.set_summary_status("echo", "final") == "no_meta"
+    assert tools.summary_status(pkg) == "draft"  # nothing was rewritten
+
+
+def test_set_summary_status_draft_is_never_gated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """解除定版 is the escape hatch out of a frozen state, and an escape hatch
+    that can itself be refused is not one -- so the emptiness gate above applies
+    ONLY to the "final" direction. This is what un-sticks a sidecar that was
+    finalized empty before the gate existed."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    _sidecar(pkg).write_text(json.dumps({"summary": "", "status": "final"}), encoding="utf-8")
+
+    assert tools.set_summary_status("echo", "draft") == "ok"
+    assert tools.summary_status(pkg) == "draft"
 
 
 @pytest.mark.parametrize(
@@ -2086,7 +2361,7 @@ def test_set_summary_status_refuses_internal_alias(
     real = _make_tool(root, "real", "import sys\nsys.stdout.write('x')\n")
     (root / "alias").symlink_to(root / "real", target_is_directory=True)
     _install_tools(monkeypatch, root)
-    tools.write_tool_meta(real, {"summary": "說明", "status": "draft"})
+    _write_meta(real, summary="說明", status="draft")
     before = (real / tools._AI_META_FILENAME).read_bytes()
 
     assert tools.set_summary_status("alias", "final") == "not_found"
@@ -2101,7 +2376,7 @@ def test_list_tools_reports_summary_status(monkeypatch: pytest.MonkeyPatch, tmp_
     finalized = _make_tool(root, "aaa", "import sys\nsys.stdout.write('x')\n")
     _make_tool(root, "bbb", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
-    tools.write_tool_meta(finalized, {"summary": "s", "status": "final"})
+    _write_meta(finalized, summary="s", status="final")
 
     listed = {row["name"]: row["summary_status"] for row in list_tools()}
     assert listed == {"aaa": "final", "bbb": None}
@@ -2113,7 +2388,7 @@ def test_sidecar_never_listed_as_a_package(monkeypatch: pytest.MonkeyPatch, tmp_
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
-    tools.write_tool_meta(pkg, {"summary": "s", "status": "draft"})
+    _write_meta(pkg, summary="s", status="draft")
 
     listed = list_tools()
     assert [row["name"] for row in listed] == ["echo"]
@@ -2128,7 +2403,7 @@ def test_delete_tool_takes_the_sidecar_with_it(
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
-    tools.write_tool_meta(pkg, {"summary": "s", "status": "final"})
+    _write_meta(pkg, summary="s", status="final")
     assert _sidecar(pkg).is_file()
 
     assert delete_tool("echo") is True
