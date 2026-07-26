@@ -1,6 +1,7 @@
 """OpenAPI contract tests for the AI routes: the declared responses must match
-runtime exactly -- 503/502 on precisely the three AI workflow operations (and
-nowhere else), the by-id AI operations declaring 404, honest error detail
+runtime exactly -- 503/502 on precisely the operations that can genuinely
+degrade (the three AI workflows plus the two tool operations enumerated below,
+and nowhere else), the by-id AI operations declaring 404, honest error detail
 shapes, an honestly-nullable status model, and declared request bounds.
 """
 
@@ -33,6 +34,16 @@ _THREE_AI_OPS = {
 # pins the new op's distinct code.
 _TOOLS_INSTALL_OP = ("/api/tools/install", "post")
 
+# The FOURTH operation that calls the LLM in-request and can therefore degrade
+# exactly like the three workflows: the synchronous tool-summary regenerate
+# (D40). It raises the SHARED llm_not_configured / llm_upstream_error details
+# (routers/tools.py imports both helpers from routers/ai.py), so it joins BOTH
+# exact sets rather than getting a taxonomy of its own -- unlike the installer's
+# submit above, whose 503 means a different feature is unconfigured. The
+# installer's own build is deliberately NOT here: its LLM failures are sealed
+# inside a job's state, so it declares neither 502 nor 503.
+_TOOLS_SUMMARY_REGENERATE_OP = ("/api/tools/{name}/summary/regenerate", "post")
+
 
 def _openapi() -> dict[str, Any]:
     return TestClient(app).get("/openapi.json").json()
@@ -53,14 +64,19 @@ def _allows_null(prop: dict[str, Any]) -> bool:
     return any(variant.get("type") == "null" for variant in prop.get("anyOf", []))
 
 
-def test_503_declared_on_exactly_the_ai_operations_and_tools_install() -> None:
-    # Still an EXACT set: the three LLM workflows plus the installer submit,
-    # and nothing else, may declare 503 (see _TOOLS_INSTALL_OP above).
-    assert _declaring(_openapi(), 503) == _THREE_AI_OPS | {_TOOLS_INSTALL_OP}
+def test_503_declared_on_exactly_the_ai_and_tool_operations() -> None:
+    # Still an EXACT set: the three LLM workflows, the installer submit, and the
+    # synchronous summary regenerate -- and nothing else -- may declare 503.
+    assert _declaring(_openapi(), 503) == _THREE_AI_OPS | {
+        _TOOLS_INSTALL_OP,
+        _TOOLS_SUMMARY_REGENERATE_OP,
+    }
 
 
-def test_502_declared_on_exactly_the_three_ai_operations() -> None:
-    assert _declaring(_openapi(), 502) == _THREE_AI_OPS
+def test_502_declared_on_exactly_the_ai_and_tool_operations() -> None:
+    # The installer submit is absent here on purpose: it queues a job, so its
+    # LLM failures never surface as a 502 on the submit itself.
+    assert _declaring(_openapi(), 502) == _THREE_AI_OPS | {_TOOLS_SUMMARY_REGENERATE_OP}
 
 
 def test_tools_install_503_carries_its_own_code() -> None:
@@ -90,7 +106,10 @@ def test_status_declares_no_error_responses() -> None:
 
 
 def test_declared_503_detail_shape() -> None:
-    for path, _method in _THREE_AI_OPS:
+    # The regenerate op is included: it raises routers.ai's OWN 503 helper, so
+    # its declared example must carry the identical code, not a tools-flavoured
+    # variant of it.
+    for path, _method in _THREE_AI_OPS | {_TOOLS_SUMMARY_REGENERATE_OP}:
         example = _openapi()["paths"][path]["post"]["responses"]["503"]["content"][
             "application/json"
         ]["example"]
@@ -99,7 +118,7 @@ def test_declared_503_detail_shape() -> None:
 
 
 def test_declared_502_detail_shape() -> None:
-    for path, _method in _THREE_AI_OPS:
+    for path, _method in _THREE_AI_OPS | {_TOOLS_SUMMARY_REGENERATE_OP}:
         example = _openapi()["paths"][path]["post"]["responses"]["502"]["content"][
             "application/json"
         ]["example"]

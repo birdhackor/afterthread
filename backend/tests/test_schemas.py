@@ -176,9 +176,11 @@ def test_only_by_id_routes_declare_404() -> None:
     (GET/PATCH/DELETE /api/items/{item_id} and POST /api/items/{item_id}/progress),
     the two by-id AI routes (POST /api/items/{item_id}/enrich and /assist-update),
     the by-id LLM log route (GET /api/llm/logs/{log_id}, which 404s for an
-    unknown/evicted id), and the three by-name/by-id tool routes (PATCH/DELETE
+    unknown/evicted id), and the six by-name/by-id tool routes (PATCH/DELETE
     /api/tools/{name} for a missing package, GET /api/tools/install/{job_id}
-    for an unknown/evicted/post-restart job). The collection, review, health,
+    for an unknown/evicted/post-restart job, and the three AI-summary routes
+    under /api/tools/{name}/summary -- D40 -- which 404 when the named tool does
+    not exist, TOOLS_DIR being unset included). The collection, review, health,
     status, capture, log-list, tool-list and install-submit routes cannot 404
     and must not declare it.
     """
@@ -201,4 +203,7 @@ def test_only_by_id_routes_declare_404() -> None:
         ("/api/tools/{name}", "patch"),
         ("/api/tools/{name}", "delete"),
         ("/api/tools/install/{job_id}", "get"),
+        ("/api/tools/{name}/summary", "get"),
+        ("/api/tools/{name}/summary", "patch"),
+        ("/api/tools/{name}/summary/regenerate", "post"),
     }

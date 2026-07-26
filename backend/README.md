@@ -141,7 +141,9 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 **Tools**（`afterthread/routers/tools.py`，前綴 `/api/tools`；即「工具」頁的
 後端）
 - `GET /api/tools` — 列出所有已安裝工具套件（含無效的），依名稱排序；`TOOLS_DIR`
-  未設定或尚無工具時回空清單（非錯誤）。
+  未設定或尚無工具時回空清單（非錯誤）。每一列附帶
+  `summary_status`（`"draft"`／`"final"`／`null`＝尚無可讀的總結 sidecar），
+  列表頁靠它直接標示每個工具的總結狀態，不必逐一再打一次總結 API。
 - `PATCH /api/tools/{name}` — 切換某工具的 `enabled`；找不到回 404。
 - `DELETE /api/tools/{name}` — 刪除整個工具套件目錄；找不到回 404。
 - `POST /api/tools/install` — 送出 KB 網頁安裝器工作（見下方「工具（KB 網頁
@@ -152,6 +154,20 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   （`queued`／`running`／`succeeded`／`failed` + 完成後的 `tool_name`／
   `summary`／`llm_log_id`）；工作已完成的清單被裁剪掉、或後端重啟過（工作只存在
   記憶體）則回 404。
+- `GET /api/tools/{name}/summary` — 該工具的 AI 總結（`summary`／`status`／
+  `updated_at`／`llm_log_id`，見下方「安裝後的 AI 總結與定版」）；尚無總結時
+  四個欄位皆為 `null` 的 200（不是錯誤），工具不存在（含 `TOOLS_DIR` 未設定）
+  才回 404。
+- `PATCH /api/tools/{name}/summary` — body `{status: "draft"|"final"}`，定版／
+  解除定版；成功回更新後的總結。工具不存在回 404；還沒有總結可定版回
+  `409 summary_missing`。
+- `POST /api/tools/{name}/summary/regenerate` — **同步**重新產生總結（不是背景
+  工作），成功回新的總結。工具不存在回 404；已定版回 `409 tool_finalized`
+  （要先解除定版）；有工具工作正在進行時回 `409 tool_job_in_progress`；LLM 未
+  設定／上游失敗與捕捉、補齊等同步 AI 動作共用同一組錯誤（`503
+  llm_not_configured`／`502 llm_upstream_error`），失敗時不會覆蓋既有總結。
+  這三條總結路由都**不宣告** `503 tools_not_configured`：`TOOLS_DIR` 未設定時
+  任何名稱都解析不到工具，404 已經是誠實答案。
 
 ## 工具（KB 網頁安裝器）
 
@@ -177,6 +193,19 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   （`tools.validate_package`）檢查暫存內容，通過才搬進 `<TOOLS_DIR>/<name>`。
   全程互動記錄進 AI 日誌（`workflow="tool_install"`），失敗時這是主要除錯
   入口。
+- **安裝後的 AI 總結與定版**（`services/tool_meta.py`，設計依據見
+  `docs/web-v4-decisions.md` D40）：搬進正式目錄之後，安裝工作會再跑一次**獨立
+  的**短 AI session（`workflow="tool_summary"`，與 `tool_install` 分開，
+  日誌連結才不會互相認錯）讀這個套件的檔案，產生「做了什麼／原理／輸入輸出／
+  限制」的說明，寫進套件內的 `.ai_meta.json`（隱藏檔，registry 掃描看不到，
+  `DELETE` 時隨整個目錄一起消失）。這一步是 **best-effort**：總結失敗（LLM 未
+  設定、上游錯誤、任何例外）都被就地吞掉，絕不會把已經成功的安裝翻成失敗，只
+  會留下空總結的 sidecar 供之後 `regenerate`。總結寫入前一律過
+  `redact_known_secrets` 且**遮蔽失敗就不寫**——sidecar 之後會被修訂流程複製進
+  暫存目錄接受「檔案不得內嵌秘密值」檢查，含密文等於讓這個工具再也修訂不了。
+  總結有 `draft`／`final`（定版）兩種狀態；定版後 `regenerate` 一律
+  `409 tool_finalized`，要先解除定版。餵給模型的內容排除 `.env` 的**值**（只給
+  key 名）與 sidecar 自己。
 - **安全立場（v1）**：這是單人本機工具，shell 能力是明確需求（比照 Claude
   Code 建 skill 的能力/風險模型）——`run_shell` 是以**本服務自身權限**執行的
   真實 bash，只是預設從暫存目錄開始（工作慣例，不是圍籬），v1 刻意不做容器

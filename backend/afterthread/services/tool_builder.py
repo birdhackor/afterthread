@@ -15,7 +15,11 @@ installs a tool package (see D21 in docs/web-v2-decisions.md, Phase 5c).
 4. on a ``ready`` result, validate the staged package with the SAME checks the
    registry applies to installed packages (``tools.validate_package``) and move
    it into ``<tools_dir>/<name>``; on anything else, fail with a friendly
-   error. Staging is always cleaned up.
+   error. Staging is always cleaned up;
+5. once installed, hand the package to ``tool_meta.generate_and_store_summary``
+   for its AI summary sidecar (D40). Strictly best-effort and it cannot raise:
+   the install is already a success by then, so a failed summary must never
+   flip the outcome.
 
 Language rule for the strings in this module: META-TOOL RESULTS (and the
 builder prompts) are MODEL-facing and therefore English, like every prompt in
@@ -76,7 +80,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from starlette.concurrency import run_in_threadpool
 
 from afterthread.config import get_settings
-from afterthread.services import llm_log, token_budget, tools
+from afterthread.services import llm_log, token_budget, tool_meta, tools
 from afterthread.services.llm import (
     LLMNotConfiguredError,
     LlmTool,
@@ -1258,6 +1262,19 @@ async def run_install(
                 error=promote_error,
                 llm_log_id=llm_log_id,
             )
+        # D40: the package is INSTALLED as of the line above -- everything from
+        # here on is decoration. Generate its AI summary sidecar while we still
+        # hold the install's context (the OpenAPI url and instructions are
+        # captured NOWHERE else, so this is the only chance to persist them for
+        # a later revise session), and while the in-flight secret is still
+        # registered, so the summary is redacted against it as well as against
+        # the now-installed .env. ``generate_and_store_summary`` cannot raise
+        # (see tool_meta): a summary that fails must never flip this outcome.
+        await tool_meta.generate_and_store_summary(
+            result.tool_name,
+            origin={"openapi_url": openapi_url, "instructions": instructions},
+            builder_summary=summary,
+        )
         return InstallOutcome(
             ok=True,
             tool_name=result.tool_name,
@@ -1416,6 +1433,26 @@ def start_install_job(
     _TASKS.add(task)
     task.add_done_callback(_TASKS.discard)
     return job.job_id
+
+
+def any_job_active() -> bool:
+    """True while ANY job is queued or running (D40).
+
+    The single-flight predicate ``start_install_job`` enforces, exposed as a
+    plain question for callers OUTSIDE the job machinery -- the synchronous
+    summary-regenerate route, which must refuse to run while an install is in
+    flight: a promote MOVES a whole package directory into place, and a
+    regenerate reading/writing that package's sidecar across the swap would race
+    a directory that is being replaced under it.
+
+    The predicate is DUPLICATED in ``start_install_job`` rather than shared with
+    it, deliberately: that one must evaluate the check and the insert under the
+    SAME lock acquisition to be race-free, and ``_JOBS_LOCK`` is a plain
+    (non-reentrant) ``threading.Lock``, so calling this from inside it would
+    deadlock. Two three-word copies is the honest price of that atomicity.
+    """
+    with _JOBS_LOCK:
+        return any(job.state in ("queued", "running") for job in _JOBS.values())
 
 
 def get_job(job_id: str) -> dict[str, Any] | None:

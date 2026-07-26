@@ -38,6 +38,7 @@ from pydantic import BaseModel, ValidationError
 
 from afterthread.config import Settings
 from afterthread.services import llm_log, tool_builder, tools
+from afterthread.services.llm import LLMNotConfiguredError, LLMUpstreamError
 from afterthread.services.tool_builder import (
     _ERROR_NAME_TAKEN,
     _ERROR_OPENAPI_TOO_LARGE,
@@ -77,10 +78,16 @@ def _reset_singletons() -> Generator[None]:
 
 
 def _install_settings(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> Settings:
-    """Point BOTH settings readers (tools registry + installer) at one value."""
+    """Point EVERY settings reader on the install path (tools registry,
+    installer, summary generator) at one value, so their view of the tools dir
+    and the prompt budget can never disagree mid-install."""
     settings = Settings(**overrides)
-    monkeypatch.setattr("afterthread.services.tools.get_settings", lambda: settings)
-    monkeypatch.setattr("afterthread.services.tool_builder.get_settings", lambda: settings)
+    for target in (
+        "afterthread.services.tools.get_settings",
+        "afterthread.services.tool_builder.get_settings",
+        "afterthread.services.tool_meta.get_settings",
+    ):
+        monkeypatch.setattr(target, lambda settings=settings: settings)
     return settings
 
 
@@ -514,6 +521,41 @@ def _package_manifest(name: str) -> dict[str, Any]:
     }
 
 
+def _fake_summary_generate(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    summary: str = "這個工具會查 KB",
+    explode: BaseException | None = None,
+) -> None:
+    """Stub the SUMMARY session's generate_structured (D40).
+
+    A SECOND patch is genuinely required: ``tool_meta`` imported the name into
+    its OWN module namespace, so patching tool_builder's reference leaves the
+    summary session calling the real thing. Every install that reaches promote
+    now runs one, so ``_fake_generate`` installs this by default -- without it
+    those tests would fall through to the real LLM path and depend on ambient
+    configuration for their (swallowed) failure."""
+
+    async def fake(
+        system_prompt: str,
+        user_prompt: str,
+        model_cls: type[BaseModel],
+        *,
+        workflow: str = "unknown",
+        tools: Any = None,
+        max_tool_rounds: int | None = None,
+        timeout_seconds: float | None = None,
+    ) -> BaseModel:
+        recorder = llm_log.LlmInteractionRecorder(workflow=workflow, model="m")
+        recorder.begin_attempt([{"role": "user", "content": "summarize"}])
+        recorder.finish(outcome="ok" if explode is None else "error", error=None)
+        if explode is not None:
+            raise explode
+        return model_cls.model_validate({"summary": summary})
+
+    monkeypatch.setattr("afterthread.services.tool_meta.generate_structured", fake)
+
+
 def _fake_generate(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -525,7 +567,11 @@ def _fake_generate(
     meta-tools it receives (so containment/threadpool paths run), optionally
     records a genuine tool_install llm_log record (so the outcome's
     llm_log_id wiring is exercised), and returns ``result`` validated through
-    the real model. Captures the call's kwargs for assertions."""
+    the real model. Captures the call's kwargs for assertions.
+
+    Also stubs the post-promote SUMMARY session (see ``_fake_summary_generate``)
+    so every install here stays hermetic; a test that wants a different summary
+    outcome re-stubs it afterwards."""
     captured: dict[str, Any] = {}
 
     async def fake(
@@ -558,6 +604,7 @@ def _fake_generate(
         return model_cls.model_validate(result)
 
     monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", fake)
+    _fake_summary_generate(monkeypatch)
     return captured
 
 
@@ -598,6 +645,112 @@ def test_run_install_happy_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     assert captured["timeout_seconds"] == settings.tool_install_timeout_seconds
     # The operator's instructions and the fetched document ride in the prompt.
     assert "build a search tool" in captured["user_prompt"]
+
+
+def test_run_install_writes_the_summary_sidecar(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """D40: a successful install summarizes what it just built into the
+    package's own sidecar, capturing the install ORIGIN (the OpenAPI url and the
+    user's instructions) -- which is persisted nowhere else, and is what a later
+    revise session needs for context."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built and tested", "ready": True},
+        files={"tool.json": json.dumps(_package_manifest("kbsearch")), "run.py": _GOOD_RUN_PY},
+    )
+    _fake_summary_generate(monkeypatch, summary="這個工具會查 KB")
+    _no_fetch(monkeypatch)
+
+    outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build a search tool"))
+
+    assert outcome.ok is True
+    meta = tools.read_tool_meta(root / "kbsearch")
+    assert meta is not None
+    assert meta["summary"] == "這個工具會查 KB"
+    assert meta["status"] == "draft"
+    assert meta["origin"] == {
+        "openapi_url": "http://kb.example/openapi.json",
+        "instructions": "build a search tool",
+    }
+    assert meta["llm_log_id"] == llm_log.last_record_id_for_workflow("tool_summary")
+    # The sidecar is invisible to the registry: still exactly one valid package.
+    assert [(t["name"], t["valid"]) for t in tools.list_tools()] == [("kbsearch", True)]
+    # ... and the install outcome still links the BUILDER session, not the
+    # summary one -- the two workflows are told apart by name.
+    assert outcome.llm_log_id == llm_log.last_record_id_for_workflow("tool_install")
+
+
+@pytest.mark.parametrize(
+    "explode",
+    [RuntimeError("bug"), LLMNotConfiguredError("off")],
+    ids=["bug", "llm-not-configured"],
+)
+def test_run_install_success_survives_a_failing_summary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, explode: BaseException
+) -> None:
+    """The package is INSTALLED before the summary runs, so a summary failure of
+    any kind must never flip the outcome -- it just leaves an empty-summary
+    sidecar for the operator to regenerate from."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built and tested", "ready": True},
+        files={"tool.json": json.dumps(_package_manifest("kbsearch")), "run.py": _GOOD_RUN_PY},
+    )
+    _fake_summary_generate(monkeypatch, explode=explode)
+    _no_fetch(monkeypatch)
+
+    outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build"))
+
+    assert outcome.ok is True
+    assert outcome.error is None
+    assert (root / "kbsearch" / "tool.json").is_file()
+    meta = tools.read_tool_meta(root / "kbsearch")
+    assert meta is not None
+    assert meta["summary"] == ""  # the placeholder a failed generation leaves
+
+
+def test_run_install_summary_sees_the_installed_package(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The summary prompt is built from the PROMOTED package (not from staging),
+    and the install secret is still masked while it runs."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built and tested", "ready": True},
+        files={"tool.json": json.dumps(_package_manifest("kbsearch")), "run.py": _GOOD_RUN_PY},
+    )
+    seen: dict[str, str] = {}
+
+    async def capture_summary(
+        system_prompt: str, user_prompt: str, model_cls: type[BaseModel], **kwargs: Any
+    ) -> BaseModel:
+        seen["user_prompt"] = user_prompt
+        return model_cls.model_validate({"summary": "ok"})
+
+    monkeypatch.setattr("afterthread.services.tool_meta.generate_structured", capture_summary)
+    _no_fetch(monkeypatch)
+
+    secret = "install-form-secret-abcdef"
+    outcome = asyncio.run(
+        run_install(
+            "http://kb.example/openapi.json",
+            "build",
+            secret_name="KB_API_KEY",
+            secret_value=secret,
+        )
+    )
+
+    assert outcome.ok is True
+    assert _GOOD_RUN_PY.strip() in seen["user_prompt"]  # the promoted run.py
+    assert "KB_API_KEY" in seen["user_prompt"]  # the .env KEY name
+    assert secret not in seen["user_prompt"]  # ... never its value
 
 
 def test_run_install_ready_false_fails_with_summary(
@@ -1889,9 +2042,31 @@ def test_router_list_tools(
                 "enabled": True,
                 "valid": True,
                 "error": None,
+                # D40: null here means "no readable summary sidecar" -- this
+                # hand-made package has none.
+                "summary_status": None,
             }
         ]
     }
+
+
+def test_router_list_tools_carries_summary_status(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The listing badges every row from its own sidecar, so the 工具 page needs
+    no per-tool summary request to render the list."""
+    root = tmp_path / "tools"
+    pkg = root / "kbsearch"
+    pkg.mkdir(parents=True)
+    (pkg / "run.py").write_text("print('x')\n")
+    (pkg / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")))
+    _install_settings(monkeypatch, tools_dir=str(root))
+    tools.write_tool_meta(pkg, {"summary": "說明", "status": "final"})
+
+    body = client.get("/api/tools").json()
+    assert [(row["name"], row["summary_status"]) for row in body["tools"]] == [
+        ("kbsearch", "final")
+    ]
 
 
 def test_router_list_tools_empty_when_unconfigured(
@@ -2141,6 +2316,304 @@ def test_router_job_status_and_404(client: TestClient) -> None:
     missing = client.get("/api/tools/install/ghost")
     assert missing.status_code == 404
     assert missing.json() == {"detail": "Install job not found"}
+
+
+# --- router: AI summary (D40) --------------------------------------------------
+
+
+def _meta(pkg: Path) -> dict[str, Any]:
+    """The package's sidecar, asserted present (it is what the test just wrote)."""
+    meta = tools.read_tool_meta(pkg)
+    assert meta is not None
+    return meta
+
+
+def _seed_package(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str = "kbsearch") -> Path:
+    """An installed package (no sidecar) with the settings pointed at it."""
+    root = tmp_path / "tools"
+    pkg = root / name
+    pkg.mkdir(parents=True)
+    (pkg / "run.py").write_text("print('x')\n")
+    (pkg / "tool.json").write_text(json.dumps(_package_manifest(name)))
+    _install_settings(monkeypatch, tools_dir=str(root))
+    return pkg
+
+
+def test_router_get_summary_all_null_without_a_sidecar(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tool with no summary yet is a 200 of nulls, not a 404: the TOOL exists,
+    it just has nothing to show, and the page renders 尚無總結 for it."""
+    _seed_package(monkeypatch, tmp_path)
+    response = client.get("/api/tools/kbsearch/summary")
+    assert response.status_code == 200
+    assert response.json() == {
+        "summary": None,
+        "status": None,
+        "updated_at": None,
+        "llm_log_id": None,
+    }
+
+
+def test_router_get_summary_returns_the_sidecar(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pkg = _seed_package(monkeypatch, tmp_path)
+    tools.write_tool_meta(
+        pkg,
+        {
+            "summary": "這個工具會查 KB",
+            "status": "draft",
+            "updated_at": "2026-07-26T00:00:00+00:00",
+            "llm_log_id": 7,
+            "origin": {"openapi_url": "http://kb.example/o.json", "instructions": "查 KB"},
+        },
+    )
+
+    response = client.get("/api/tools/kbsearch/summary")
+    assert response.status_code == 200
+    # The response carries the four display fields ONLY -- `origin` is install
+    # context for the next AI session, not something the UI shows.
+    assert response.json() == {
+        "summary": "這個工具會查 KB",
+        "status": "draft",
+        "updated_at": "2026-07-26T00:00:00+00:00",
+        "llm_log_id": 7,
+    }
+
+
+def test_router_get_summary_degrades_a_hand_edited_sidecar(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The sidecar sits in a package the operator may hand-edit, so out-of-shape
+    values render as nulls rather than 500ing the read."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / tools._AI_META_FILENAME).write_text(
+        json.dumps({"summary": 12, "status": "published", "updated_at": [], "llm_log_id": "three"}),
+        encoding="utf-8",
+    )
+
+    response = client.get("/api/tools/kbsearch/summary")
+    assert response.status_code == 200
+    assert response.json() == {
+        "summary": None,
+        "status": None,
+        "updated_at": None,
+        "llm_log_id": None,
+    }
+
+
+def test_router_get_summary_404_for_unknown_tool(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    response = client.get("/api/tools/ghost/summary")
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Tool not found"}
+
+
+def test_router_get_summary_404_when_feature_off(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TOOLS_DIR unset resolves every name to None, so the feature being off is
+    the SAME 404 -- which is why these routes declare no tools_not_configured."""
+    _install_settings(monkeypatch, tools_dir="")
+    assert client.get("/api/tools/kbsearch/summary").status_code == 404
+
+
+def test_router_patch_summary_finalizes_and_unfinalizes(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pkg = _seed_package(monkeypatch, tmp_path)
+    tools.write_tool_meta(pkg, {"summary": "說明", "status": "draft", "llm_log_id": 4})
+
+    response = client.patch("/api/tools/kbsearch/summary", json={"status": "final"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "final"
+    assert body["summary"] == "說明"  # the summary is preserved by the flip
+    assert body["llm_log_id"] == 4
+    # Persisted, not just echoed -- and visible on the listing too.
+    assert client.get("/api/tools/kbsearch/summary").json()["status"] == "final"
+    assert client.get("/api/tools").json()["tools"][0]["summary_status"] == "final"
+
+    assert client.patch("/api/tools/kbsearch/summary", json={"status": "draft"}).status_code == 200
+    assert client.get("/api/tools/kbsearch/summary").json()["status"] == "draft"
+
+
+def test_router_patch_summary_409_without_a_sidecar(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Nothing to freeze is a conflict, not a 404 -- the tool itself is fine."""
+    _seed_package(monkeypatch, tmp_path)
+    response = client.patch("/api/tools/kbsearch/summary", json={"status": "final"})
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "summary_missing"
+    assert "message" in detail
+
+
+def test_router_patch_summary_404_for_unknown_tool(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    response = client.patch("/api/tools/ghost/summary", json={"status": "final"})
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Tool not found"}
+
+
+@pytest.mark.parametrize(
+    "payload", [{"status": "published"}, {"status": ""}, {}], ids=["unknown", "empty", "missing"]
+)
+def test_router_patch_summary_422_on_bad_status(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, payload: dict[str, Any]
+) -> None:
+    """The Literal is the gate: an unknown status never reaches the registry."""
+    _seed_package(monkeypatch, tmp_path)
+    assert client.patch("/api/tools/kbsearch/summary", json=payload).status_code == 422
+
+
+def test_router_regenerate_summary_stores_and_returns_the_new_summary(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Driven through the REAL tool_meta.regenerate_summary (only the LLM call
+    is stubbed), so the whole synchronous path -- prompt, sanitize, sidecar
+    write -- runs for this route."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    tools.write_tool_meta(
+        pkg, {"summary": "舊的", "status": "draft", "origin": {"instructions": "查 KB"}}
+    )
+    _fake_summary_generate(monkeypatch, summary="新的說明")
+
+    response = client.post("/api/tools/kbsearch/summary/regenerate")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["summary"] == "新的說明"
+    assert body["status"] == "draft"
+    assert body["llm_log_id"] is not None
+    stored = tools.read_tool_meta(pkg)
+    assert stored is not None
+    assert stored["summary"] == "新的說明"
+    assert stored["origin"] == {"instructions": "查 KB"}  # inherited from the install
+
+
+def test_router_regenerate_summary_409_when_finalized(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """定版 means the AI stops iterating on this tool: the regenerate is refused
+    before the LLM is ever touched."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    tools.write_tool_meta(pkg, {"summary": "定版的說明", "status": "final"})
+
+    async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a finalized tool must never reach the LLM")
+
+    monkeypatch.setattr("afterthread.services.tool_meta.generate_structured", must_not_generate)
+
+    response = client.post("/api/tools/kbsearch/summary/regenerate")
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "tool_finalized"
+    assert "message" in detail
+    assert _meta(pkg)["summary"] == "定版的說明"  # untouched
+
+
+def test_router_regenerate_summary_409_while_a_job_runs(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A queued/running job may be moving a package directory into place, so a
+    regenerate is refused for the duration. Driven through the REAL
+    any_job_active with a pre-seeded active job."""
+    _seed_package(monkeypatch, tmp_path)
+    with tool_builder._JOBS_LOCK:
+        tool_builder._JOBS["active"] = tool_builder.InstallJob(
+            job_id="active", state="running", created_at="2026-07-16T00:00:00+00:00"
+        )
+
+    async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("no summary session may start while a job is active")
+
+    monkeypatch.setattr("afterthread.services.tool_meta.generate_structured", must_not_generate)
+
+    response = client.post("/api/tools/kbsearch/summary/regenerate")
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "tool_job_in_progress"
+    assert "message" in detail
+
+
+def test_router_regenerate_summary_404_for_unknown_tool(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    response = client.post("/api/tools/ghost/summary/regenerate")
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Tool not found"}
+
+
+def test_router_regenerate_summary_503_when_llm_unconfigured(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Synchronous AI op, so it degrades like capture/enrich do -- the SHARED
+    llm_not_configured 503, and the previous summary survives."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    tools.write_tool_meta(pkg, {"summary": "先前的好總結", "status": "draft"})
+    _fake_summary_generate(monkeypatch, explode=LLMNotConfiguredError("off"))
+
+    response = client.post("/api/tools/kbsearch/summary/regenerate")
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert detail["code"] == "llm_not_configured"
+    assert "message" in detail
+    assert _meta(pkg)["summary"] == "先前的好總結"  # never clobbered
+
+
+def test_router_regenerate_summary_502_on_upstream_failure(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pkg = _seed_package(monkeypatch, tmp_path)
+    tools.write_tool_meta(pkg, {"summary": "先前的好總結", "status": "draft"})
+    _fake_summary_generate(
+        monkeypatch,
+        explode=LLMUpstreamError("APIConnectionError: could not reach the LLM endpoint"),
+    )
+
+    response = client.post("/api/tools/kbsearch/summary/regenerate")
+    assert response.status_code == 502
+    detail = response.json()["detail"]
+    assert detail["code"] == "llm_upstream_error"
+    assert detail["message"].startswith("APIConnectionError: ")
+    assert _meta(pkg)["summary"] == "先前的好總結"  # never clobbered
+
+
+def test_router_summary_routes_reject_invalid_names_as_422(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The summary routes share the path-layer name regex with the rest."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    for bad_name in ("UPPER", "bad name", ".hidden"):
+        assert client.get(f"/api/tools/{bad_name}/summary").status_code == 422
+        assert (
+            client.patch(f"/api/tools/{bad_name}/summary", json={"status": "final"}).status_code
+            == 422
+        )
+        assert client.post(f"/api/tools/{bad_name}/summary/regenerate").status_code == 422
+
+
+def test_any_job_active_tracks_the_job_table() -> None:
+    """The predicate the regenerate route gates on: any queued/running job, and
+    a terminal one never blocks."""
+    assert tool_builder.any_job_active() is False
+    with tool_builder._JOBS_LOCK:
+        tool_builder._JOBS["done"] = tool_builder.InstallJob(
+            job_id="done", state="succeeded", created_at="2026-07-16T00:00:00+00:00"
+        )
+    assert tool_builder.any_job_active() is False
+    with tool_builder._JOBS_LOCK:
+        tool_builder._JOBS["live"] = tool_builder.InstallJob(
+            job_id="live", state="queued", created_at="2026-07-16T00:01:00+00:00"
+        )
+    assert tool_builder.any_job_active() is True
 
 
 # --- llm_log lookup used by the outcome linkage --------------------------------

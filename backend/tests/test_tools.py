@@ -1822,6 +1822,250 @@ def test_feature_off_when_tools_dir_unset(monkeypatch: pytest.MonkeyPatch) -> No
     assert delete_tool("x") is False
 
 
+# --- AI summary sidecar (D40) ----------------------------------------------
+
+
+def _sidecar(pkg: Path) -> Path:
+    return pkg / tools._AI_META_FILENAME
+
+
+def test_tool_meta_round_trips(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """write_tool_meta -> read_tool_meta returns the same dict, and the sidecar
+    is a real file inside the package (so delete_tool's rmtree takes it)."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+
+    meta = {
+        "summary": "這個工具會查 KB",
+        "status": "draft",
+        "updated_at": "2026-07-26T00:00:00+00:00",
+        "llm_log_id": 12,
+        "origin": {"openapi_url": "http://kb.example/openapi.json", "instructions": "build"},
+    }
+    assert tools.write_tool_meta(pkg, meta) is True
+    assert _sidecar(pkg).is_file()
+    assert tools.read_tool_meta(pkg) == meta
+
+
+def test_read_tool_meta_degrades_on_missing_corrupt_and_non_object(tmp_path: Path) -> None:
+    """Every unusable sidecar reads as "no metadata", never an exception: a
+    corrupt one must empty the summary panel, not break the tools list."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    assert tools.read_tool_meta(pkg) is None  # absent
+
+    _sidecar(pkg).write_text("{not json", encoding="utf-8")
+    assert tools.read_tool_meta(pkg) is None  # unparseable
+
+    _sidecar(pkg).write_text('["a list"]', encoding="utf-8")
+    assert tools.read_tool_meta(pkg) is None  # valid JSON, wrong shape
+
+
+def test_read_tool_meta_refuses_oversized_sidecar(tmp_path: Path) -> None:
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    padding = "x" * (_MANIFEST_MAX_BYTES + 100)
+    _sidecar(pkg).write_text(json.dumps({"summary": padding}), encoding="utf-8")
+    assert tools.read_tool_meta(pkg) is None
+
+
+def test_write_tool_meta_redacts_the_summary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A secret that reached the summary is masked BEFORE it lands on disk --
+    the sidecar rides into a later revise's staging copy, where the
+    embedded-secret gate would reject the whole package over it."""
+    root = tmp_path / "tools"
+    secret = "another-tools-live-secret-abcdef"
+    _make_tool(root, "other", "import sys\nsys.stdout.write('x')\n", dotenv=f"OTHER_KEY={secret}\n")
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+
+    assert tools.write_tool_meta(pkg, {"summary": f"it authenticates with {secret}"}) is True
+    stored = tools.read_tool_meta(pkg)
+    assert stored is not None
+    assert secret not in stored["summary"]
+    assert tools._REDACTION_MARKER in stored["summary"]
+    assert secret not in _sidecar(pkg).read_text(encoding="utf-8")
+
+
+def test_write_tool_meta_fails_closed_when_redaction_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The redaction is the gate, so a failing secret provider writes NOTHING
+    (rather than an unmasked summary) and reports failure."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+
+    def boom() -> frozenset[str]:
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr(tools, "known_secret_values", boom)
+    assert tools.write_tool_meta(pkg, {"summary": "anything"}) is False
+    assert not _sidecar(pkg).exists()
+
+
+def test_write_tool_meta_refuses_unmaskable_summary_type(tmp_path: Path) -> None:
+    """A non-string summary could not be run through the redactor, so it is
+    refused rather than written past the gate."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    assert tools.write_tool_meta(pkg, {"summary": {"nested": "object"}}) is False
+    assert not _sidecar(pkg).exists()
+
+
+def test_write_tool_meta_refuses_to_resurrect_a_deleted_package(tmp_path: Path) -> None:
+    """A write into a package directory that is not there is refused, and
+    creates NOTHING -- otherwise a summary landing after a racing delete would
+    re-create the package as a directory holding only a sidecar, which the
+    registry would then list as a ghost broken package."""
+    gone = tmp_path / "nope" / "gone"
+    assert tools.write_tool_meta(gone, {"summary": "s"}) is False
+    assert not gone.exists()
+    assert not gone.parent.exists()
+
+
+def test_write_tool_meta_refuses_symlinked_sidecar(tmp_path: Path) -> None:
+    """The bounded writer's O_NOFOLLOW refuses a symlinked sidecar, so a link
+    raced into the package can never redirect the write out of it."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+    _sidecar(pkg).symlink_to(outside)
+
+    assert tools.write_tool_meta(pkg, {"summary": "s"}) is False
+    assert outside.read_text(encoding="utf-8") == "{}"  # target untouched
+
+
+@pytest.mark.parametrize(
+    "meta, expected",
+    [
+        ({"summary": "s", "status": "draft"}, "draft"),
+        ({"summary": "s", "status": "final"}, "final"),
+        ({"summary": "s", "status": "published"}, None),
+        ({"summary": "s", "status": ["draft"]}, None),
+        ({"summary": "s"}, None),
+    ],
+    ids=["draft", "final", "unknown-value", "wrong-type", "absent"],
+)
+def test_summary_status_only_trusts_the_two_known_values(
+    tmp_path: Path, meta: dict[str, Any], expected: str | None
+) -> None:
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    _sidecar(pkg).write_text(json.dumps(meta), encoding="utf-8")
+    assert tools.summary_status(pkg) == expected
+
+
+def test_summary_status_none_without_sidecar(tmp_path: Path) -> None:
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    assert tools.summary_status(pkg) is None
+
+
+def test_set_summary_status_finalizes_and_preserves_the_summary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """定版 flips only status + updated_at; the summary and origin survive, and
+    the flip is reversible."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    tools.write_tool_meta(
+        pkg,
+        {
+            "summary": "說明",
+            "status": "draft",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "llm_log_id": 5,
+            "origin": {"openapi_url": "http://kb.example/o.json", "instructions": "i"},
+        },
+    )
+
+    assert tools.set_summary_status("echo", "final") == "ok"
+    stored = tools.read_tool_meta(pkg)
+    assert stored is not None
+    assert stored["status"] == "final"
+    assert stored["summary"] == "說明"
+    assert stored["llm_log_id"] == 5
+    assert stored["origin"]["instructions"] == "i"
+    assert stored["updated_at"] != "2026-01-01T00:00:00+00:00"  # refreshed
+    assert tools.summary_status(pkg) == "final"
+
+    # Reversible: 解除定版 puts it back to draft.
+    assert tools.set_summary_status("echo", "draft") == "ok"
+    assert tools.summary_status(pkg) == "draft"
+
+
+def test_set_summary_status_no_meta_when_sidecar_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    assert tools.set_summary_status("echo", "final") == "no_meta"
+
+
+@pytest.mark.parametrize(
+    "name", ["ghost", "../escape", "UPPER"], ids=["missing", "traversal", "regex"]
+)
+def test_set_summary_status_not_found_for_unknown_or_unsafe_names(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str
+) -> None:
+    root = tmp_path / "tools"
+    _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    assert tools.set_summary_status(name, "final") == "not_found"
+
+
+def test_set_summary_status_not_found_when_feature_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("afterthread.services.tools.get_settings", lambda: Settings(tools_dir=""))
+    assert tools.set_summary_status("echo", "final") == "not_found"
+
+
+def test_list_tools_reports_summary_status(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Every row carries the sidecar's status (null when there is none), so the
+    page badges the whole list from one request."""
+    root = tmp_path / "tools"
+    finalized = _make_tool(root, "aaa", "import sys\nsys.stdout.write('x')\n")
+    _make_tool(root, "bbb", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    tools.write_tool_meta(finalized, {"summary": "s", "status": "final"})
+
+    listed = {row["name"]: row["summary_status"] for row in list_tools()}
+    assert listed == {"aaa": "final", "bbb": None}
+
+
+def test_sidecar_never_listed_as_a_package(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The dot-prefixed sidecar is invisible to the registry scan: it is neither
+    a phantom row nor a reason for the real package to look broken."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    tools.write_tool_meta(pkg, {"summary": "s", "status": "draft"})
+
+    listed = list_tools()
+    assert [row["name"] for row in listed] == ["echo"]
+    assert listed[0]["valid"] is True
+
+
+def test_delete_tool_takes_the_sidecar_with_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Summary and tool share one lifetime -- the reason the metadata lives in
+    the package instead of in SQLite."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    tools.write_tool_meta(pkg, {"summary": "s", "status": "final"})
+    assert _sidecar(pkg).is_file()
+
+    assert delete_tool("echo") is True
+    assert not pkg.exists()
+
+
 # --- workflow wiring -------------------------------------------------------
 
 

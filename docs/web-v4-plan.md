@@ -21,7 +21,8 @@ push，全部完成後對 `fdff6166..HEAD` 跑 overall review。
 | --- | --- | --- | --- |
 | P1 | 唯讀 Checkbox → 非互動清單（CapturePage、ItemAiActions） | sonnet | 進行中 |
 | P2 | llm_log 每 attempt 記 `tools_advertised`＋日誌頁顯示 | opus | 待開始 |
-| P3 | 工具總結後端：sidecar `.ai_meta.json`、summary 生成、revise job、定版 API | opus | 待開始 |
+| P3a | 工具總結後端（一）：sidecar `.ai_meta.json`、summary 生成、定版＋regenerate API | opus | 進行中 |
+| P3b | 工具總結後端（二）：revise job、promote replace、job 路由改名 | opus | 待開始 |
 | P4 | 工具總結前端：ToolsPage 總結面板、意見迭代、定版 | sonnet | 待開始 |
 | Final | overall review（`fdff6166..HEAD`）＋全 gates＋總結 | — | 待開始 |
 
@@ -66,6 +67,12 @@ push，全部完成後對 `fdff6166..HEAD` 跑 overall review。
 - 文件：`docs/tool-calling.md` §5 加註記；backend README 若列了 attempt 欄位則同步。
 
 ### P3 工具總結後端
+
+**拆分為 P3a / P3b 兩個 commit＋review 範圍**（規模與風險面不同，分開審較收斂）：
+P3a＝sidecar 檔案 I/O、summary 生成（install hook）、定版 `PATCH`、同步
+`regenerate`、列表 `summary_status`；P3b＝revise job、promote replace 模式、
+`GET /api/tools/install/{job_id}` → `/api/tools/jobs/{job_id}` 改名與對應 FE 一行。
+以下設計要點依此分屬兩個 phase（revise 相關全屬 P3b）。
 
 儲存（sidecar，隨 package 生滅）：
 

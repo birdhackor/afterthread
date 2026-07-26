@@ -2,7 +2,7 @@
 
 import re
 from datetime import UTC, datetime, timedelta
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import (
     BaseModel,
@@ -484,6 +484,12 @@ class ToolSummary(BaseModel):
     ``valid=False`` rows carry the safe ``error`` reason from the registry scan
     (bad manifest, name mismatch, missing entry file); such a package is listed
     so it can be deleted, but is never advertised to the model or executable.
+
+    ``summary_status`` (D40) is the AI-summary sidecar's state -- ``"draft"``,
+    ``"final"`` (定版), or null when the package has no readable sidecar yet.
+    It rides on the LISTING so the page can badge every row without one summary
+    request per tool; the summary TEXT itself is fetched per tool on demand
+    (``ToolSummaryDetail``), since it is far too long for a list row.
     """
 
     name: str
@@ -491,12 +497,46 @@ class ToolSummary(BaseModel):
     enabled: bool
     valid: bool
     error: str | None
+    summary_status: str | None
 
 
 class ToolListResponse(BaseModel):
     """Every installed tool package, in name order."""
 
     tools: list[ToolSummary]
+
+
+class ToolSummaryDetail(BaseModel):
+    """One tool's AI summary sidecar (``.ai_meta.json``), as the 工具 page reads it.
+
+    EVERY field is nullable, and all four are null together for the common,
+    non-exceptional case of a tool with no sidecar: a hand-made package, or one
+    whose summary generation has not run (or failed) yet. That is a 200, not a
+    404 -- the TOOL exists, it just has no summary -- so the page renders 尚無
+    總結 plus a 重新產生 action rather than an error.
+
+    ``llm_log_id`` links to the summary session's AI 日誌 record (the
+    ``tool_summary`` workflow, distinct from the builder's ``tool_install``), so
+    a wrong or missing summary is debuggable from the UI.
+    """
+
+    summary: str | None
+    status: str | None
+    updated_at: str | None
+    llm_log_id: int | None
+
+
+class ToolSummaryStatusUpdate(BaseModel):
+    """PATCH payload for a tool's summary: 定版 / 解除定版.
+
+    A ``Literal`` rather than a free string: the two values are the whole
+    vocabulary, and the registry's writer trusts this schema to be the gate (the
+    same division of labour ``ToolUpdateRequest``'s bool has with
+    ``set_enabled``). Both directions are allowed -- finalizing freezes AI
+    iteration on the tool, and the user must be able to unfreeze it.
+    """
+
+    status: Literal["draft", "final"]
 
 
 class ToolUpdateRequest(BaseModel):

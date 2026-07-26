@@ -11,7 +11,11 @@ A tool package is a directory ``<tools_dir>/<name>/`` holding:
   true) gates whether the tool is advertised to the model;
 * the implementation files ``entry`` runs;
 * an OPTIONAL ``.env`` (``KEY=VALUE`` lines) holding THAT tool's own secrets
-  (e.g. a KB API key), which are injected into the subprocess environment.
+  (e.g. a KB API key), which are injected into the subprocess environment;
+* an OPTIONAL ``.ai_meta.json`` sidecar (D40) holding the AI-written summary of
+  the package and its draft/final status. It is backend-authored metadata, NOT
+  part of the executable contract: nothing in the runtime reads it, so a missing
+  or corrupt one only empties the summary panel (see ``_AI_META_FILENAME``).
 
 Execution contract (``_run_tool_subprocess``): the runner invokes ``entry`` with
 ``cwd`` = the tool directory, writes the arguments JSON to the child's STDIN,
@@ -63,6 +67,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any
 
@@ -126,6 +131,35 @@ _PARAMETERS_SCHEMA_MAX_BYTES = 16 * 1024
 # the package outright (``validate_package``). 64 KiB dwarfs any real secrets file
 # (a handful of KEY=VALUE lines).
 _ENV_FILE_MAX_BYTES = 64 * 1024
+
+# The per-package AI sidecar (D40): the summary an LLM writes about the package
+# after a successful install, plus its draft/final status. DOT-PREFIXED on
+# purpose -- that single leading character is what makes the sidecar fit the
+# EXISTING conventions instead of needing four new special cases:
+#
+# * ``_scan_all`` skips hidden DIRECTORIES, and ``_scan_package`` reads only
+#   ``tool.json``, so a sidecar can never surface as (or break) a registry row;
+# * ``known_secret_values`` and the installer's ``.staging`` shell already use
+#   "a leading dot means internal to the backend" (see ``_STAGING_DIRNAME``), so
+#   an operator browsing a package reads it the same way;
+# * ``delete_tool``'s ``rmtree`` takes it with the package -- summary and tool
+#   share one lifetime, which is exactly why this lives in the package rather
+#   than in SQLite;
+# * the summary generator skips every dot-file when it feeds the package to the
+#   model, so the sidecar never feeds itself back into its own next prompt.
+#
+# It is read with the SAME bounded reader (and the SAME manifest-grade cap) the
+# manifest gets: it is re-read on every ``list_tools`` scan, so an unbounded one
+# would be the same per-scan I/O hazard ``_MANIFEST_MAX_BYTES`` exists to bound.
+_AI_META_FILENAME = ".ai_meta.json"
+
+# The only two summary statuses that mean anything. "draft" is what generation
+# writes; "final" (定版) is the operator freezing AI iteration on this tool --
+# revise and regenerate both refuse a finalized package until it is un-finalized.
+# Anything else on disk (a hand-edited sidecar, a future/older shape) reads as
+# "no usable status" rather than being trusted, so the freeze can never be
+# bypassed by writing a garbage value into the file.
+_SUMMARY_STATUSES: tuple[str, ...] = ("draft", "final")
 
 # Appended when a tool's stdout (or a failure's stderr) is cut for size. Mirrors
 # the truncation markers in memory_ai / llm_log so an operator who has seen those
@@ -572,13 +606,150 @@ def validate_package(directory: Path, expected_name: str) -> str | None:
     return None
 
 
+# --- AI summary sidecar (D40) ------------------------------------------------
+
+
+def read_tool_meta(directory: Path) -> dict[str, Any] | None:
+    """Parse the package's ``.ai_meta.json`` sidecar, or None if there is none.
+
+    Deliberately TOTAL: a missing sidecar, a FIFO/symlink swapped in for one, an
+    oversized one, invalid JSON, and a JSON value that is not an object ALL come
+    back None -- the one "no usable summary metadata" answer every caller already
+    has to handle, since a freshly installed tool legitimately has no sidecar
+    until its summary generation finishes. A corrupt sidecar therefore degrades
+    the summary panel to empty; it never breaks a tool listing or a mutation.
+
+    Reads through the ONE bounded, FIFO/symlink-hardened helper at the
+    manifest-grade cap, exactly as ``_scan_package`` reads ``tool.json`` -- the
+    cap+1 read plus the ``len > cap`` check is how an oversized sidecar is
+    refused without ever slurping it whole (see ``_AI_META_FILENAME``).
+    """
+    text = _read_regular_file_capped(directory / _AI_META_FILENAME, _MANIFEST_MAX_BYTES)
+    if text is None or len(text) > _MANIFEST_MAX_BYTES:
+        return None
+    try:
+        raw = json.loads(text)
+    except ValueError:
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
+    """Write the sidecar, redacting its ``summary`` FIRST. Returns success.
+
+    The redaction is FAIL-CLOSED and that is the load-bearing part of this
+    helper, not a formality. Two independent reasons a secret must never reach
+    this file:
+
+    * the summary is LLM output about a package whose ``.env`` holds live
+      values, and this file is served back to the UI -- the same class
+      ``redact_known_secrets`` closes everywhere raw model/tool text enters
+      persisted state;
+    * a future revise (D40) copies the installed package into a staging build,
+      and ``validate_package``'s embedded-secret gate scans EVERY file there. A
+      sidecar carrying an unredacted value would therefore make every later
+      revise of that tool fail validation -- bricking the feature for that
+      package with a rejection naming a file the user never wrote.
+
+    So a redaction failure (``known_secret_values`` raising -- the LIVE path
+    deliberately propagates rather than degrading to unmasked, see
+    ``redact_known_secrets``) writes NOTHING and returns False, and a
+    non-string ``summary`` is refused for the same reason: it could not be
+    masked. Every other failure (unserializable value, an unwritable path, a
+    symlinked/FIFO sidecar refused by ``_write_regular_file``'s O_NOFOLLOW +
+    O_NONBLOCK + S_ISREG gate) is False too, so callers get one
+    "did-not-happen" answer and never an exception -- summary metadata is
+    best-effort by design.
+
+    The ``is_dir`` precondition matters more than it looks: ``_write_regular_file``
+    CREATES missing parents (the meta-tool contract needs that), so without it a
+    summary landing just after a racing ``delete_tool`` would re-create the
+    deleted package's directory holding nothing but a sidecar -- and the registry
+    would then list that ghost as a broken package named after the tool the user
+    just removed. It narrows, but cannot close, that window (the delete can still
+    land between this check and the open); the remaining race is the same
+    single-user local-tool edge install/delete already accepts (D21/D40).
+    """
+    if not directory.is_dir():
+        return False
+    payload = dict(meta)
+    summary = payload.get("summary")
+    if summary is not None:
+        if not isinstance(summary, str):
+            return False
+        try:
+            payload["summary"] = redact_known_secrets(summary)
+        except Exception:
+            return False
+    try:
+        text = json.dumps(payload, ensure_ascii=False)
+    except TypeError, ValueError:
+        return False
+    return _write_regular_file(directory / _AI_META_FILENAME, text)
+
+
+def summary_status(directory: Path) -> str | None:
+    """The package's summary status (``"draft"``/``"final"``), or None.
+
+    None covers every "no trustworthy status" case at once: no sidecar, an
+    unreadable/corrupt one, or a ``status`` that is not one of the two known
+    values (see ``_SUMMARY_STATUSES`` for why an unknown value must not be
+    trusted rather than passed through). Called once per package by
+    ``list_tools`` so the 工具 page can badge every row without an N+1 of
+    per-tool summary requests.
+    """
+    meta = read_tool_meta(directory)
+    if meta is None:
+        return None
+    status = meta.get("status")
+    return status if isinstance(status, str) and status in _SUMMARY_STATUSES else None
+
+
+def set_summary_status(name: str, status: str) -> str:
+    """Set the sidecar's ``status`` (定版 / 解除定版). Returns the outcome code.
+
+    Three outcomes, mapped by the router onto three HTTP answers:
+
+    * ``"not_found"`` -- the name is unsafe, the package is missing, the feature
+      is off (all of them ``_resolve_package_dir`` -> None), OR the rewrite
+      itself failed. That last one is folded in DELIBERATELY, exactly as
+      ``set_enabled`` folds every did-not-happen case into one False: from the
+      caller's view the addressable resource did not (usably) change;
+    * ``"no_meta"`` -- the package exists but has no readable sidecar, so there
+      is no summary to freeze yet (a distinct 409, not a 404: the TOOL exists);
+    * ``"ok"`` -- the sidecar was rewritten with the new status and a fresh
+      ``updated_at``.
+
+    ``status`` is trusted to be one of ``_SUMMARY_STATUSES``: the PATCH schema's
+    ``Literal`` is the gate, the same way ``set_enabled`` trusts its bool. The
+    rewrite goes through ``write_tool_meta``, so the summary is re-redacted on
+    the way back out -- a status flip can never un-mask a value that a newly
+    registered secret would now match.
+    """
+    directory = _resolve_package_dir(name)
+    if directory is None or not directory.is_dir():
+        return "not_found"
+    meta = read_tool_meta(directory)
+    if meta is None:
+        return "no_meta"
+    meta["status"] = status
+    meta["updated_at"] = datetime.now(UTC).isoformat()
+    return "ok" if write_tool_meta(directory, meta) else "not_found"
+
+
 def list_tools() -> list[dict[str, Any]]:
     """List every installed package as a UI-facing summary.
 
-    Each entry is ``{name, description, enabled, valid, error}``. A broken
-    package (bad JSON, name mismatch, bad schema shape, missing entry file) is
-    included with ``valid=False`` and a safe ``error`` reason, and is never
-    executable; a missing/unset tools dir yields [].
+    Each entry is ``{name, description, enabled, valid, error, summary_status}``.
+    A broken package (bad JSON, name mismatch, bad schema shape, missing entry
+    file) is included with ``valid=False`` and a safe ``error`` reason, and is
+    never executable; a missing/unset tools dir yields [].
+
+    ``summary_status`` (D40) is read from each package's sidecar HERE rather
+    than through a per-tool request, so the 工具 page can badge 草稿 / 已定版 on
+    every row from the one listing call it already makes. It costs one small
+    bounded read per package, on the same scan that already reads every
+    ``tool.json``; a package with no (or a corrupt) sidecar reports None.
     """
     return [
         {
@@ -587,6 +758,7 @@ def list_tools() -> list[dict[str, Any]]:
             "enabled": scan.enabled,
             "valid": scan.valid,
             "error": scan.error,
+            "summary_status": summary_status(scan.directory),
         }
         for scan in _scan_all()
     ]
