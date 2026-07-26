@@ -22,6 +22,7 @@ an autouse fixture resets both around every test.
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -3633,18 +3634,25 @@ def _revise_result(name: str = "kbsearch", *, summary: str = "改好了") -> dic
     return {"tool_name": name, "summary": summary, "ready": True}
 
 
-def test_run_revise_copies_the_package_without_env_or_sidecars(
+def test_run_revise_copies_the_package_without_the_root_env_or_any_sidecar(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The staging copy is the installed package MINUS two namespaces, at every
-    depth, and identical otherwise.
+    """The staging copy is the installed package MINUS the ROOT ``.env`` and MINUS
+    the sidecar namespace at every depth -- and identical otherwise.
 
-    The ``.env`` exclusion is not tidiness (D40): its values are in
+    The root ``.env`` exclusion is not tidiness (D40): its values are in
     ``known_secret_values``, so a copied one would make ``validate_package``'s
-    embedded-secret gate reject every revise of the tool. The sidecar namespace
-    is backend-authored and regenerated after the swap; a nested one is dropped
-    for the reason R7-1 gives -- matched case-INSENSITIVELY, so the ``.AI_META.JSON``
-    spelling that IS the same file on macOS cannot ride in either."""
+    embedded-secret gate reject every revise of the tool. The sidecar namespace is
+    backend-authored and regenerated after the swap; a nested one is dropped for
+    the reason R7-1 gives -- matched case-INSENSITIVELY, so the ``.AI_META.JSON``
+    spelling that IS the same file on macOS cannot ride in either.
+
+    A NESTED ``.env`` is ordinary package content and is COPIED (R2-2). The r1 rule
+    excluded every ``.env``-casefolded name at EVERY depth, so a tool that reads its
+    own ``config/.env`` -- its entry runs with the package directory as cwd, and
+    nothing stops it -- had that file silently DELETED by an unrelated revise, with
+    validation then passing on the mutilated package. Pinned on both sides here: the
+    builder sees it, and the revised INSTALLED package still has it, byte for byte."""
     pkg = _seed_package(monkeypatch, tmp_path)
     root = pkg.parent
     (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
@@ -3652,6 +3660,11 @@ def test_run_revise_copies_the_package_without_env_or_sidecars(
     (pkg / "lib" / "util.py").write_text("X = 1\n", encoding="utf-8")
     (pkg / "sub").mkdir()
     (pkg / "sub" / ".AI_META.JSON").write_text('{"summary": "forged"}', encoding="utf-8")
+    # A second, NESTED .env the tool reads for itself. Nothing in it is a registered
+    # secret, so it sails through the embedded-secret gate like any other file.
+    (pkg / "config").mkdir()
+    nested_env = b"# the tool's own nested config\r\nPAGE_SIZE=25\n"
+    (pkg / "config" / ".env").write_bytes(nested_env)
     _write_meta(pkg, summary="舊的說明", status="draft")
     seen: dict[str, set[str]] = {}
     _fake_generate(
@@ -3664,21 +3677,29 @@ def test_run_revise_copies_the_package_without_env_or_sidecars(
     outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
-    # The workspace the builder received: everything, minus the two namespaces.
-    # ``sub`` survives as an empty directory -- only the NAMES are excluded.
-    assert seen["staged"] == {"tool.json", "run.py", "lib", "lib/util.py", "sub"}
+    # The workspace the builder received: everything, minus the ROOT .env and every
+    # sidecar. ``sub`` survives as an empty directory -- only the NAMES are excluded.
+    assert seen["staged"] == {
+        "tool.json",
+        "run.py",
+        "lib",
+        "lib/util.py",
+        "sub",
+        "config",
+        "config/.env",
+    }
+    # ... and the file an unrelated revise used to delete is still there, untouched.
+    assert (pkg / "config" / ".env").read_bytes() == nested_env
 
 
-def test_run_revise_preserves_the_env_text(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """The installed ``.env`` is restored as TEXT -- comments, quoting, inline
-    ``#``, trailing whitespace and line ORDER included. The revise never
-    re-serializes it: it writes back what it read before the build.
+def test_run_revise_preserves_the_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The installed ``.env`` survives a revise unchanged -- comments, quoting,
+    inline ``#``, trailing whitespace and line ORDER included -- and a builder that
+    writes its own is overruled, which is the prompt's stated contract.
 
-    This file is already valid utf-8 with LF endings, so the round trip is
-    byte-identical HERE. It is not byte-identical in general, and the test no
-    longer claims it is (R1-4): the shared bounded reader decodes with
-    ``errors="replace"`` and universal newlines -- see the CRLF test below, which
-    pins the one transform that does happen."""
+    Byte-identity holds for ANY ``.env``, not just this utf-8/LF one: the file is
+    copied, never re-serialized and never even decoded (R2-1). The CRLF/invalid-byte
+    case that proves the general claim is pinned below."""
     pkg = _seed_package(monkeypatch, tmp_path)
     (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
     before = (pkg / ".env").read_bytes()
@@ -3696,34 +3717,35 @@ def test_run_revise_preserves_the_env_text(monkeypatch: pytest.MonkeyPatch, tmp_
     assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
 
 
-def test_run_revise_normalizes_a_crlf_env_to_lf(
+def test_run_revise_preserves_a_crlf_env_byte_for_byte(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The transform the old "byte-for-byte" claim hid, documented instead of
-    denied (R1-4).
+    """A ``.env`` that is neither LF-terminated nor valid utf-8 survives a revise
+    BYTE-IDENTICAL, hashed before and after (R2-1).
 
-    Preservation runs through ``tools._read_regular_file_capped``, which decodes
-    text with universal newlines, so a CRLF ``.env`` is restored with LF endings
-    (an invalid byte would likewise come back as U+FFFD). This is deliberate
-    rather than fixed with a second raw-bytes read path, because it changes
-    NOTHING a consumer can observe: ``_load_tool_dotenv`` (the runtime env) and
-    ``_cached_env_values`` (the redactor) read the file through that SAME decode,
-    so the values the tool receives are identical either way -- pinned below.
-    Only the file's on-disk spelling changes, and only for a file that was not
-    already utf-8 with LF endings."""
+    The r1 round-trip read this file to ``str`` through the shared bounded reader
+    (``errors="replace"``, universal newlines) and re-encoded it, so exactly this
+    file came back with its CRLFs flattened and its invalid bytes replaced by
+    U+FFFD. That was adjudicated harmless on the premise that every consumer goes
+    through the same lossy decode -- and the premise is false: the runtime invokes
+    a tool with its PACKAGE DIRECTORY as the working directory, so the tool's own
+    entry can open ``.env`` in BINARY and hash it, diff it or parse CRLF itself. A
+    revise about pagination must not rewrite it. ``_preserve_env_file``'s
+    ``shutil.copy2`` never decodes anything, and carries the MODE across too --
+    pinned below, because a plain ``copyfile`` would silently drop it."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / ".env").write_bytes(b"# comment\r\nKB_API_KEY=live-secret-value\r\n")
-    before_values = tools._load_tool_dotenv(pkg)
+    raw = b"# comment\r\nKB_API_KEY=live-secret-value\r\nBLOB=\xff\xfe-not-utf8\r\n"
+    (pkg / ".env").write_bytes(raw)
+    (pkg / ".env").chmod(0o640)
+    digest_before = hashlib.sha256(raw).hexdigest()
     _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
 
     outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
-    # Content and ordering intact; the line endings are normalized.
-    assert (pkg / ".env").read_bytes() == b"# comment\nKB_API_KEY=live-secret-value\n"
-    # ... and what the tool actually LOADS is unchanged, which is the property
-    # that made the raw-bytes alternative not worth a second read/write path.
-    assert tools._load_tool_dotenv(pkg) == before_values
+    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY  # it really ran
+    assert hashlib.sha256((pkg / ".env").read_bytes()).hexdigest() == digest_before
+    assert (pkg / ".env").stat().st_mode & 0o777 == 0o640
 
 
 def test_run_revise_registers_the_live_env_values_for_the_session(
@@ -3878,7 +3900,7 @@ def test_promote_replace_refuses_a_finalization_that_landed_mid_session(
     (staging / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")), encoding="utf-8")
     (staging / "run.py").write_text("print('revised')", encoding="utf-8")
 
-    error = tool_builder._promote_staging_replace(staging, "kbsearch", base, None)
+    error = tool_builder._promote_staging_replace(staging, "kbsearch", base)
 
     assert error == tool_builder._ERROR_REVISE_FINALIZED
     # the installed package -- and its frozen summary -- are untouched
@@ -4051,9 +4073,9 @@ def test_run_revise_refuses_an_unreadable_env(
     """A ``.env`` that EXISTS but the bounded, O_NOFOLLOW'd reader declines (here
     a symlink) stops the revise instead of degrading to 'no .env'.
 
-    The runtime loader degrades; this one must not. Preserving nothing would
-    replace a working tool with one whose credentials are simply GONE -- silent
-    breakage the operator did not ask for."""
+    The runtime loader degrades; this one must not. Running the session anyway
+    would hand ``run_shell`` a tool whose real credentials the redactor knows
+    nothing about, and then swap in a package built in that blind spot."""
     pkg = _seed_package(monkeypatch, tmp_path)
     (tmp_path / "elsewhere.env").write_text("KB_API_KEY=live-secret-value\n", encoding="utf-8")
     (pkg / ".env").symlink_to(tmp_path / "elsewhere.env")
@@ -4070,6 +4092,121 @@ def test_run_revise_refuses_an_unreadable_env(
     assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNREADABLE
     assert _file_bytes(pkg) == before
     assert (pkg / ".env").is_symlink()  # left exactly as found
+
+
+def test_run_revise_refuses_a_stat_failure_on_the_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only ``FileNotFoundError`` means "there is no ``.env``" (R2-3).
+
+    The existence probe used to swallow EVERY ``OSError``, so a transient EIO on a
+    failing disk, an ESTALE on an NFS mount, or an EACCES from a directory an
+    operator had just chmod'ed all read as ABSENCE -- and the revise then ran a
+    whole builder session with the tool's real credentials unregistered and
+    unexported, which is the degrade this gate exists to refuse. A failure to LOOK
+    is not evidence of absence, so it takes the same unreadable path a symlinked
+    ``.env`` takes above."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    before = _file_bytes(pkg)
+    real_lstat = Path.lstat
+    refusing = {"on": True}  # switched off before the package is inspected below
+
+    def flaky_lstat(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if refusing["on"] and self.name == ".env":
+            raise PermissionError(13, "Permission denied")
+        return real_lstat(self, *args, **kwargs)
+
+    async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("no builder session may start")
+
+    monkeypatch.setattr(Path, "lstat", flaky_lstat)
+    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", must_not_generate)
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    refusing["on"] = False
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNREADABLE
+    assert outcome.llm_log_id is None
+    assert _file_bytes(pkg) == before
+    with tools._INFLIGHT_LOCK:
+        assert not tools._INFLIGHT_SECRETS  # nothing was registered either
+
+
+def test_run_revise_refuses_a_live_env_that_stopped_being_a_regular_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The preserve step guards its SOURCE, and a refusal there aborts BEFORE the
+    swap (R2-1).
+
+    The entry read vetted a regular file, but the session runs for minutes and
+    ``run_shell`` is unjailed (D21), so the live ``.env`` can be a symlink or a
+    FIFO by the time the copy runs. ``shutil.copy2`` would happily read straight
+    through it; the ``lstat`` gate refuses instead, mirroring what the bounded
+    reader's ``O_NOFOLLOW`` refuses at the front door -- and because the copy is
+    the LAST thing before the rename-aside, the working tool is still the working
+    tool."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    (tmp_path / "elsewhere.env").write_text("KB_API_KEY=someone-elses\n", encoding="utf-8")
+
+    def swap_the_env_for_a_link() -> None:
+        (pkg / ".env").unlink()
+        (pkg / ".env").symlink_to(tmp_path / "elsewhere.env")
+
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY},
+        side_effect=swap_the_env_for_a_link,
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNREADABLE
+    assert (pkg / "run.py").read_text(encoding="utf-8") == "print('x')\n"  # never swapped
+    assert (pkg / ".env").is_symlink()  # and the raced-in link is left alone
+    assert _leftovers(pkg.parent) == []
+    assert not (pkg.parent / tool_builder._STAGING_DIRNAME).exists()
+
+
+def test_run_revise_refuses_to_copy_the_env_through_a_planted_link(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The preserve step guards its DESTINATION too, and that is load-bearing.
+
+    ``shutil.copy2`` FOLLOWS its destination, so a symlink planted at
+    ``<staging>/.env`` by the unjailed ``run_shell`` (D21) would take the LIVE
+    credentials through it and write them outside staging. The text write this
+    copy replaced refused that outright (``tools._write_regular_file`` opens
+    ``O_NOFOLLOW``), so the ``lstat`` gate is what keeps the refusal set identical
+    rather than quietly widened. The outside file must come back untouched."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    root = pkg.parent
+    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("not ours\n", encoding="utf-8")
+
+    def plant_a_link_at_the_staged_env() -> None:
+        os.symlink(outside, _staging_dir(root) / ".env")
+
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY},
+        side_effect=plant_a_link_at_the_staged_env,
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_ENV_RESTORE
+    assert outside.read_text(encoding="utf-8") == "not ours\n"  # nothing written through
+    assert (pkg / ".env").read_text(encoding="utf-8") == _TRICKY_ENV
+    assert (pkg / "run.py").read_text(encoding="utf-8") == "print('x')\n"  # never swapped
+    assert _leftovers(root) == []
 
 
 def test_run_revise_refuses_an_env_value_too_short_to_mask(
@@ -4168,15 +4305,42 @@ def test_run_revise_prompts_carry_the_feedback_but_never_the_env_values(
         assert value not in user_prompt
 
 
+def test_revise_system_prompt_redacts_the_name_but_not_its_own_text(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The revise system prompt redacts its INTERPOLATION and nothing else (R2-4).
+
+    The package name is operator/filesystem-derived, so a registered ``.env`` value
+    can equal it -- and unredacted it would ride into the request verbatim while
+    every other text in the session is masked. The constant text AROUND it is
+    backend-authored open-source prose and is deliberately left alone: masking it
+    would be useless (a value equal to published constant text is not something the
+    model learns from us) and destructive (a hand-edited ``TOKEN=secret`` clears the
+    6-char floor, and our own instructions say "secret" -- whole-prompt masking
+    would shred them). Both halves are asserted together, because it is the LINE
+    between them that is the decision."""
+    _seed_package(monkeypatch, tmp_path)
+    tools.register_inflight_secret("kbsearch")  # a .env value equal to the tool's NAME
+    tools.register_inflight_secret("secret")  # ... and one equal to a word WE wrote
+
+    prompt = tool_builder._revise_system_prompt("kbsearch")
+
+    assert "kbsearch" not in prompt  # the interpolation is masked
+    assert tools._REDACTION_MARKER in prompt
+    # ... while our own sentences containing that same value are untouched.
+    assert "Never write a secret value into any file." in prompt
+    assert "Never print or embed secrets in the summary." in prompt
+
+
 @pytest.mark.parametrize("model_name", ["kbsearch", "kbsearch2"])
 def test_run_revise_never_redacts_or_builds_its_prompt_on_the_event_loop(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model_name: str
 ) -> None:
-    """``run_revise``'s prompt build and every redaction it performs hop onto a
-    worker (R1-3).
+    """``run_revise``'s prompt builds and every redaction it performs hop onto a
+    worker (R1-3, R2-4).
 
-    Neither is the pure string work it looks like: ``redact_known_secrets`` calls
-    ``known_secret_values``, which ``iterdir``s the whole tools directory,
+    None of it is the pure string work it looks like: ``redact_known_secrets``
+    calls ``known_secret_values``, which ``iterdir``s the whole tools directory,
     ``stat``s every package and READS every ``.env`` on a cache miss. A revise
     runs from a BACKGROUND job that shares this loop with every HTTP request in
     the process, so blocking there stalls all of them -- the same reason P3a moved
@@ -4184,8 +4348,10 @@ def test_run_revise_never_redacts_or_builds_its_prompt_on_the_event_loop(
 
     Asserted by THREAD, following that suite's pattern: ``asyncio.run`` drives the
     loop on this thread, so a different one means the hop really happened. Both
-    outcome shapes are covered because the third redaction lives in the
-    model-renamed refusal branch.
+    outcome shapes are covered because the model-renamed refusal branch holds one
+    of the redactions. The SYSTEM prompt build joined this list when its
+    interpolated package name became redactable (R2-4): it was a pure join before,
+    and it is the tools-directory scan now.
 
     Two calls are deliberately NOT asserted off-loop here: ``InstallResult``'s own
     validator redaction (裁決紀錄 #2's consciously deferred instance, which runs
@@ -4224,6 +4390,10 @@ def test_run_revise_never_redacts_or_builds_its_prompt_on_the_event_loop(
 
     assert outcome.ok is (model_name == "kbsearch")
     assert seen["prompt"] is not loop_thread
+    # The system prompt's name redaction -- the only call whose text is the package
+    # name (the rename branch below passes the MODEL's name, which differs).
+    name_threads = [thread for text, thread in calls if text == "kbsearch"]
+    assert name_threads and loop_thread not in name_threads
     summary_threads = [thread for text, thread in calls if text == "改好了"]
     assert summary_threads[-1] is not loop_thread
     if model_name != "kbsearch":

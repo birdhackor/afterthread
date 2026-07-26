@@ -36,12 +36,13 @@ sessions, and the AI 日誌 shows them as one kind).
 ``run_revise(name, feedback)`` reuses steps 2-5 with three differences, each of
 which exists because the package it is editing is ALREADY LIVE (D40):
 
-* staging is populated by COPYING the installed package (no fetch), MINUS its
-  ``.env`` and MINUS the backend's own sidecar namespace. The ``.env`` exclusion
-  is not tidiness: its values are in ``known_secret_values``, so copying it in
-  would make ``validate_package``'s embedded-secret gate reject every revise.
-  The text is preserved in memory and written back after validation, exactly
-  where an install injects its form secret;
+* staging is populated by COPYING the installed package (no fetch), MINUS the
+  package ROOT's ``.env`` and MINUS the backend's own sidecar namespace. The
+  ``.env`` exclusion is not tidiness: its values are in ``known_secret_values``,
+  so copying it in would make ``validate_package``'s embedded-secret gate reject
+  every revise. The LIVE file is copied back into staging BYTE-FOR-BYTE after
+  validation (``_preserve_env_file``), exactly where an install injects its form
+  secret;
 * every value of that ``.env`` is registered as an in-flight secret for the
   WHOLE revise window, because ``known_secret_values`` skips dot-directories and
   the swap below parks the old package in one;
@@ -94,11 +95,13 @@ import contextlib
 import os
 import queue
 import shutil
+import stat
 import subprocess
 import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
@@ -198,11 +201,15 @@ _ERROR_STAGING_TAMPERED = "暫存工作區已被移動或替換，安裝已取�
 # ones above: a fixed zh-TW string, never a path and never a value.
 _ERROR_REVISE_NOT_FOUND = "找不到要修訂的工具（可能已被刪除）。"  # noqa: RUF001
 _ERROR_REVISE_FINALIZED = "總結已定版，請先解除定版再送出修訂。"  # noqa: RUF001
-# The preserved ``.env`` is READ before the build and written back after
-# validation, so both failure modes have to refuse the whole revise: a `.env` we
-# cannot read is one we cannot restore, and a TRUNCATED one (the bounded reader
-# returns cap+1 chars) written back would silently corrupt the live tool's
-# credentials -- the one thing a revise must never do to a working package.
+# The ``.env`` is READ before the build -- for its VALUES, which have to be
+# registered and exported -- and the FILE itself is copied back into staging after
+# validation (R2-1). Both failure modes refuse the whole revise. UNREADABLE: a
+# `.env` whose values we cannot enumerate is one whose secrets the redactor does
+# not know while ``run_shell`` is running, which is the leak R1-1 already refuses
+# to take. TOO_LARGE: the bounded reader returns cap+1 chars, so parsing it yields
+# a TRUNCATED set of values -- the ones past the cap would go unregistered while
+# the copied file still carries them. RESTORE: the byte copy into staging failed,
+# so the revision would ship without the credentials it inherited.
 _ERROR_REVISE_ENV_UNREADABLE = "無法讀取既有工具包的 .env，修訂已取消。"  # noqa: RUF001
 _ERROR_REVISE_ENV_TOO_LARGE = "既有工具包的 .env 超過大小上限，修訂已取消。"  # noqa: RUF001
 _ERROR_REVISE_ENV_RESTORE = "無法還原工具包的 .env，修訂已取消。"  # noqa: RUF001
@@ -383,8 +390,38 @@ is discarded. "summary" reports what you CHANGED and how you verified it."""
 
 
 def _revise_system_prompt(name: str) -> str:
-    """The builder system prompt, reframed for revising the package ``name``."""
-    return _BUILDER_SYSTEM_PROMPT + _REVISE_PROMPT_ADDENDUM.replace("{name}", name)
+    """The builder system prompt, reframed for revising the package ``name``.
+
+    Blocking, and called from a worker (R2-4): ``redact_known_secrets`` below is
+    the whole-tools-directory scan, the same reason ``_revise_user_prompt``
+    hops off the loop.
+
+    The INTERPOLATION is redacted, the PROMPT is not, and the line between them is
+    the point (R2-4). ``name`` is operator/filesystem-derived -- a directory name
+    the operator chose -- so a registered ``.env`` value can equal it, and without
+    this the system prompt would carry that value verbatim into the request while
+    every other text in this session is masked. The static prompt text around it
+    gets NO such treatment: it is backend-authored, open-source constant text, so
+    masking it would be both useless and destructive. Useless because a value that
+    happens to equal published constant text is not something the model learns
+    from us; destructive because the redactor matches any occurrence at or above
+    ``tools._MIN_SECRET_LEN`` (6) -- a hand-edited ``.env`` holding
+    ``TOKEN=secret`` would shred our own instructions ("Never write a secret value
+    into any file") into redaction markers and leave the model reading a prompt
+    with holes in it. Only operator/filesystem-derived interpolations are
+    redactable, and this addendum has exactly one.
+
+    The knock-on is accepted, not overlooked: if the package's own NAME is a
+    registered secret value, the model is told to answer with the MASKED name, its
+    answer cannot equal ``name``, and ``run_revise``'s identity check fails the
+    revise. That is the right outcome for a setup where the "secret" is also the
+    public tool name -- the value is already in the tools listing, the job poll and
+    the FE's URL, so the honest answer is that it cannot be kept out of a prompt
+    that must name the package.
+    """
+    return _BUILDER_SYSTEM_PROMPT + _REVISE_PROMPT_ADDENDUM.replace(
+        "{name}", tools.redact_known_secrets(name)
+    )
 
 
 class InstallResult(BaseModel):
@@ -1516,11 +1553,90 @@ def _promote_staging(
     return None
 
 
+def _preserve_env_file(target: Path, staging: Path) -> str | None:
+    """Copy the LIVE package's ``.env`` into ``staging`` BYTE-FOR-BYTE; None = ok (D40).
+
+    Blocking (runs inside ``_promote_staging_replace``). This IS the whole
+    preservation mechanism, and it is a FILE COPY rather than the text round-trip
+    r1 kept (R2-1). That round-trip's justification was that every consumer reads
+    this file through the same lossy decode, so the normalization it performed was
+    unobservable -- and that premise is simply FALSE: the runtime invokes a tool
+    with its PACKAGE DIRECTORY as the working directory, so the tool's own entry
+    can ``open(".env", "rb")`` and hash it, diff it, or parse CRLF itself. A revise
+    about pagination has no business rewriting a file it was never asked to touch.
+    ``shutil.copy2`` never decodes anything: the bytes, the mode and the mtime all
+    survive, so a CRLF-authored or non-utf-8 ``.env`` comes through unchanged.
+
+    The direction is LIVE -> staging, which is why this is cheap to be wrong
+    about: the live package is only READ here, so a swap that fails afterwards
+    costs nothing -- the original file is still the original file, not a rewrite of
+    it. And it must run AFTER the target existence/symlink/finalized checks for
+    the same reason: it reads through ``target``, so the caller has to have
+    established that ``target`` is the real installed directory first.
+
+    Both ends are guarded by an ``lstat``, mirroring the pre-write ``lstat``
+    ``tools._write_sidecar_atomic`` makes and the ``O_NOFOLLOW`` + ``S_ISREG`` gate
+    of the shared file helpers:
+
+    * SOURCE -- ``FileNotFoundError`` is the ONLY "there is no ``.env``" answer
+      (R2-3). Every other ``OSError`` (EIO, ESTALE, EACCES, ...) is a failure to
+      LOOK, not evidence of absence, and treating it as absence would ship a
+      revision whose credentials silently vanished. A non-regular source (a
+      symlink or FIFO raced in after the entry read vetted a regular file) is
+      refused rather than copied through, exactly as the bounded reader's
+      ``O_NOFOLLOW`` refuses it;
+    * DESTINATION -- ENOENT is the ordinary case (the copy excluded it) and a
+      regular file is the builder's own ``.env``, which the prompt's contract says
+      we overwrite. Anything else refuses, and that check is load-bearing rather
+      than symmetry: ``copy2`` FOLLOWS its destination, so a symlink planted at
+      ``<staging>/.env`` by the unjailed ``run_shell`` (D21) would take the live
+      credentials through it and out of staging, and a DIRECTORY there would send
+      the file to ``<staging>/.env/.env`` and ship a package with no ``.env`` at
+      all. This is exactly the refusal set ``tools._write_regular_file``'s
+      ``O_NOFOLLOW`` + ``S_ISREG`` gate gave the text write this replaces -- no
+      wider (a hardlink passes both, then and now, and is D21's accepted
+      same-uid residual), no narrower.
+
+    Every failure is a category-only string that aborts BEFORE the swap, so a
+    package we could not preserve the ``.env`` of is never published.
+
+    The file copied is the one on disk at THIS instant, not the snapshot the
+    session's entry read took. That is deliberate: an operator who edits the live
+    ``.env`` mid-session keeps their edit instead of having it reverted by a
+    revise. It cannot leak either -- only the entry-read values were registered and
+    exported into ``run_shell``, so a value added since then was never in the
+    conversation at all, and ``known_secret_values`` picks it up from the installed
+    ``.env`` again the moment the swap lands.
+    """
+    source = target / ".env"
+    try:
+        source_mode = os.lstat(source).st_mode
+    except FileNotFoundError:
+        return None  # no .env to preserve -- the common case, and not a failure
+    except OSError:
+        return _ERROR_REVISE_ENV_UNREADABLE
+    if not stat.S_ISREG(source_mode):
+        return _ERROR_REVISE_ENV_UNREADABLE
+    destination = staging / ".env"
+    try:
+        destination_mode: int | None = os.lstat(destination).st_mode
+    except FileNotFoundError:
+        destination_mode = None  # nothing there yet: the ordinary first-write case
+    except OSError:
+        return _ERROR_REVISE_ENV_RESTORE
+    if destination_mode is not None and not stat.S_ISREG(destination_mode):
+        return _ERROR_REVISE_ENV_RESTORE
+    try:
+        shutil.copy2(source, destination)
+    except OSError:
+        return _ERROR_REVISE_ENV_RESTORE
+    return None
+
+
 def _promote_staging_replace(
     staging: Path,
     name: str,
     base: Path,
-    preserved_env_text: str | None,
 ) -> str | None:
     """Swap a revised build in for the INSTALLED ``<base>/<name>``; None = ok (D40).
 
@@ -1554,26 +1670,26 @@ def _promote_staging_replace(
       rename below would otherwise move the LINK aside and leave the real
       package orphaned under a name nothing addresses.
 
-    The preserved ``.env`` is restored AFTER validation and BEFORE the swap --
-    the same slot, for the same reason, as the install's
-    ``_inject_secret_into_env``: ``validate_package`` judges what the BUILDER
-    produced (and its embedded-secret gate would reject the live values on
+    The live ``.env`` is then copied into staging (``_preserve_env_file``) AFTER
+    validation and BEFORE the swap -- the same slot, for the same reason, as the
+    install's ``_inject_secret_into_env``: ``validate_package`` judges what the
+    BUILDER produced (and its embedded-secret gate would reject the live values on
     sight), and the backend's own bytes are layered on top of a package that has
     already passed. It overwrites whatever ``.env`` the builder wrote, which is
-    the prompt's stated contract. Restoration is at TEXT fidelity -- the utf-8
-    re-encoding of what the bounded reader decoded, see
-    ``_read_env_for_preservation`` for why that is the right fidelity here and not
-    a compromise. No size re-check is needed: this text came back under the SAME
-    ``_ENV_FILE_MAX_BYTES`` bound ``tools._load_tool_dotenv`` applies when it reads
-    the file back, so what we restore is exactly as loadable as what it replaces;
-    and the staged package's own ``.env`` was just size-gated by validate.
+    the prompt's stated contract. It is a BYTE copy of the live file, not a
+    re-encoding of text read earlier (R2-1) -- see that helper for why the file's
+    exact bytes are observable and therefore not ours to normalize, and for why
+    reading from the live package here is safe. No size re-check is needed: the
+    bytes we copy in are the bytes the live package is running with right now, so
+    the revision's ``.env`` is exactly as loadable as the one it inherits; and the
+    staged package's own ``.env`` was just size-gated by validate.
 
-    ``preserved_env_text is None`` means the package HAD no ``.env``, and then a
-    builder-written one SHIPS -- deliberately, and identically to an install,
-    where writing ``.env`` from the user's instructions is part of the contract.
-    Deleting it instead would leave a revise unable to act on "store the key in
-    .env" feedback, and it is not a smuggling path: a value nobody registered is
-    a value the embedded-secret gate has nothing to compare against either way.
+    A package with NO ``.env`` preserves nothing, and then a builder-written one
+    SHIPS -- deliberately, and identically to an install, where writing ``.env``
+    from the user's instructions is part of the contract. Deleting it instead
+    would leave a revise unable to act on "store the key in .env" feedback, and it
+    is not a smuggling path: a value nobody registered is a value the
+    embedded-secret gate has nothing to compare against either way.
 
     The swap itself is rename-aside, move-in, drop-the-backup:
 
@@ -1638,10 +1754,12 @@ def _promote_staging_replace(
     # what makes the ROUTE answer 409 without burning an LLM call.
     if tools.summary_status(target) == "final":
         return _ERROR_REVISE_FINALIZED
-    if preserved_env_text is not None and not tools._write_regular_file(
-        staging / ".env", preserved_env_text
-    ):
-        return _ERROR_REVISE_ENV_RESTORE
+    # LAST of the pre-swap steps, because it is the only one that READS from the
+    # live package -- every check above had to establish that ``target`` is the
+    # real installed directory before this reaches through it (R2-1).
+    env_error = _preserve_env_file(target, staging)
+    if env_error is not None:
+        return env_error
     backup = base / f".{name}.bak-{uuid4().hex}"
     try:
         os.rename(target, backup)
@@ -1874,7 +1992,7 @@ async def run_install(
 
 
 def _is_preserved_env_name(filename: str) -> bool:
-    """True for the ``.env`` name a revise must NOT copy into staging (D40).
+    """True for the ROOT ``.env`` name a revise must NOT copy into staging (D40).
 
     Matched CASE-INSENSITIVELY for the same reason ``_is_reserved_sidecar_name``
     is (R10-2): on the case-INSENSITIVE default macOS filesystem, ``.ENV`` IS the
@@ -1883,37 +2001,54 @@ def _is_preserved_env_name(filename: str) -> bool:
     platform -- and ``validate_package``'s embedded-secret gate would then reject
     every revise of that tool, permanently, naming a file the operator never
     wrote. The exclusion must be at least as loose as the loosest filesystem this
-    can run on; on a case-sensitive one the only cost is dropping a ``.ENV`` the
-    runtime never loaded anyway.
+    can run on; on a case-sensitive one the only cost is dropping a root ``.ENV``
+    the runtime never loaded anyway -- and the backend copies the real one back
+    (``_preserve_env_file``), so nothing the runtime uses is lost.
+
+    Only the NAME is decided here; WHERE it counts is ``_revise_copy_ignore``'s
+    job, and it counts only at the package root (R2-2).
     """
     return filename.casefold() == ".env"
 
 
-def _revise_copy_ignore(source_dir: Any, names: list[str]) -> set[str]:
+def _revise_copy_ignore(root: Path, source_dir: Any, names: list[str]) -> set[str]:
     """``copytree``'s ignore callback: the names a revise copy must leave behind.
 
-    Two namespaces, both at EVERY depth (this is called once per directory):
+    Bound to the package ``root`` by the caller (``partial``), because the two
+    namespaces it drops have DIFFERENT depths:
 
-    * ``.env`` -- MANDATORY. The installed package's values are in
-      ``known_secret_values``, so a copy would be rejected outright by
-      ``validate_package``'s embedded-secret gate. The backend restores the
-      original file after validation instead (``_promote_staging_replace``);
-    * the sidecar's reserved namespace -- the summary is regenerated through the
-      ``write_tool_meta`` choke point after the swap, and ``_strip_builder_sidecars``
-      would delete a copied one from staging anyway.
+    * the ROOT ``.env`` only -- MANDATORY there. That one file's values are in
+      ``known_secret_values``, so copying it would be rejected outright by
+      ``validate_package``'s embedded-secret gate, and the backend copies the live
+      file back after validation instead (``_preserve_env_file``);
+    * the sidecar's reserved namespace at EVERY depth -- a backend-authored
+      namespace no package content may inhabit, regenerated through the
+      ``write_tool_meta`` choke point after the swap, and one
+      ``_strip_builder_sidecars`` would delete from staging anyway.
 
-    Nested copies of either name are dropped too, for the reason R7-1 gives for
-    stripping nested sidecars: the runtime only ever loads the package ROOT's
-    ``.env`` (``tools._load_tool_dotenv``) and only ever reads the ROOT sidecar,
-    so nothing the runtime uses is lost -- while a nested copy holding a
-    by-then-registered value would brick every future revise of the tool with a
-    rejection naming a file the operator never wrote.
+    A NESTED ``.env`` is ordinary package content and is COPIED (R2-2). The r1
+    rule dropped every ``.env``-casefolded name at every depth on the theory that
+    only the root one is ever loaded -- true of the RUNTIME's env injection, and
+    irrelevant to the tool's own code, which runs with the package directory as
+    its cwd and may perfectly well ``open("config/.env")`` for its own reasons. A
+    revise about pagination silently deleting that file, and then VALIDATING the
+    mutilated package as fine, is a worse failure than anything the rule bought.
+    The consequence is stated rather than hidden: if a nested file embeds a
+    REGISTERED secret value, the copy trips ``validate_package``'s embedded-secret
+    gate and the promote is refused with that gate's existing message naming the
+    file. That is the gate working -- an operator who put a live credential in a
+    second file learns about it -- and it is strictly better than shipping a
+    package with a file quietly removed.
 
-    ``source_dir`` is the directory being visited (shutil hands back whatever
-    path type it was given); the decision is per-NAME, so it is unused.
+    ``source_dir`` is the directory being visited; ``shutil`` passes it through
+    ``os.fspath``, so it arrives as a str and is compared as a ``Path`` (children
+    are built by joining onto ``root``, so only the top-level call can equal it).
     """
+    at_root = Path(source_dir) == root
     return {
-        name for name in names if _is_preserved_env_name(name) or _is_reserved_sidecar_name(name)
+        name
+        for name in names
+        if (at_root and _is_preserved_env_name(name)) or _is_reserved_sidecar_name(name)
     }
 
 
@@ -1939,54 +2074,52 @@ def _copy_package_into_staging(source: Path, staging: Path) -> str | None:
     where the install-side ``os.walk`` gate stays as adjudicated).
     """
     try:
-        shutil.copytree(source, staging, symlinks=True, ignore=_revise_copy_ignore)
+        shutil.copytree(source, staging, symlinks=True, ignore=partial(_revise_copy_ignore, source))
     except OSError as exc:
         return f"無法複製既有工具包到暫存工作區（{type(exc).__name__}）。"  # noqa: RUF001
     return None
 
 
-def _read_env_for_preservation(directory: Path) -> tuple[str | None, str | None]:
-    """``(text, error)``: the package's ``.env`` as TEXT, or why we refuse (D40).
+def _read_env_for_values(directory: Path) -> tuple[str | None, str | None]:
+    """``(text, error)``: the package's ``.env`` TEXT to parse VALUES from (D40).
 
     Blocking. ``(None, None)`` means the package simply has no ``.env`` -- the
-    common case, and the one where there is nothing to preserve or restore.
+    common case, and the one where there are no values to register or export.
 
-    Preservation is at TEXT fidelity, not byte fidelity, and the distinction is
-    stated rather than glossed (R1-4). This goes through the shared bounded reader,
-    which decodes utf-8 with ``errors="replace"`` and universal newlines, so a CRLF
-    ``.env`` comes back with LF endings and an invalid byte comes back as U+FFFD;
-    ``_promote_staging_replace`` then re-encodes that text. What IS preserved is
-    everything the file MEANS: every line, comment, quote, inline ``#``, trailing
-    space and the original ORDER -- none of which survives the "parse and
-    re-serialize" restore this deliberately is not.
+    This read is about VALUES ONLY, and that separation is deliberate (R2-1): the
+    FILE is never round-tripped through this text -- ``_preserve_env_file`` copies
+    it byte-for-byte at promote time -- so the lossy decode the shared bounded
+    reader performs (utf-8 with ``errors="replace"``, universal newlines) touches
+    nothing that lands on disk. What the text is FOR is the caller's
+    ``tools._parse_dotenv_text``, the one parser ``tools._load_tool_dotenv``
+    itself delegates to, so the values registered as in-flight secrets and exported
+    into ``run_shell`` are exactly the values the RUNTIME will hand the revised
+    tool. Values are parsed from this ONE read rather than from a second one for
+    the ordinary reason: two reads could disagree.
 
-    Byte fidelity would buy nothing observable, which is why it is not worth a
-    second read path: EVERY consumer of this file reads it through the SAME lossy
-    decode (``tools._load_tool_dotenv`` for the runtime env, ``_cached_env_values``
-    for the redactor, and this function for the restore), so the values a tool
-    receives after a revise are byte-identical to the ones it received before it.
-    Only the file's on-disk spelling is normalized, and only for a file that was
-    not valid utf-8 with LF endings to begin with.
+    Deliberately stricter than the runtime's own loader, which degrades an
+    unreadable or oversized ``.env`` to "no extra env" and keeps the tool running.
+    Here the same degrade would run a whole builder session -- ``run_shell``
+    included -- with the tool's real credentials UNKNOWN to the redactor, which is
+    the leak R1-1's floor check refuses to take by the other route. So a ``.env``
+    that exists but that the bounded, O_NOFOLLOW'd reader declines (a symlink, a
+    FIFO, an unreadable mode), or that comes back over the cap with its tail of
+    values cut off, stops the revise before the session starts.
 
-    The TEXT is what gets written back, so this is deliberately stricter than the
-    runtime's own loader, which degrades an unreadable or oversized ``.env`` to
-    "no extra env" and keeps the tool running. Here the same degrade would mean
-    replacing the live package with one whose ``.env`` is MISSING or TRUNCATED --
-    silent credential loss on a tool that was working a minute ago. So a ``.env``
-    that exists (``lstat``, which sees a symlink or a FIFO too) but that the
-    bounded, O_NOFOLLOW'd reader declines, or that comes back over the cap, stops
-    the revise instead.
-
-    Values are parsed FROM THIS TEXT by the caller (``tools._parse_dotenv_text``,
-    the one parser ``_load_tool_dotenv`` itself delegates to) rather than by a
-    second read of the file: the registered in-flight secrets must be exactly the
-    values in the bytes we are going to restore, and two reads could disagree.
+    The ``lstat`` answers exactly one question -- is there a ``.env`` here -- and
+    only ``FileNotFoundError`` answers "no" (R2-3). Every other ``OSError`` (EIO on
+    a failing disk, ESTALE on an NFS mount, EACCES on a directory an operator just
+    chmod'ed) is a failure to LOOK, and reading it as absence would start a session
+    whose ``.env`` values are unregistered while ``run_shell`` still receives
+    nothing at all -- the degrade this function exists to refuse.
     """
     env_file = directory / ".env"
     try:
         env_file.lstat()
-    except OSError:
+    except FileNotFoundError:
         return None, None
+    except OSError:
+        return None, _ERROR_REVISE_ENV_UNREADABLE
     text = tools._read_regular_file_capped(env_file, tools._ENV_FILE_MAX_BYTES)
     if text is None:
         return None, _ERROR_REVISE_ENV_UNREADABLE
@@ -2040,9 +2173,12 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
     the same window is closed at the store because there the loser would be a
     frozen summary a request is actively overwriting.
 
-    The ``.env`` is read (and refused if unreadable/oversized) BEFORE anything
-    else, and every value in it is registered as an in-flight secret for the
-    WHOLE window, discarded value by value in the ``finally``. D40 requires this
+    The ``.env`` is read for its VALUES (and refused if unreadable/oversized)
+    BEFORE anything else, and every value in it is registered as an in-flight
+    secret for the WHOLE window, discarded value by value in the ``finally``. That
+    read is NOT how the file is preserved -- the FILE is copied byte-for-byte at
+    promote time (``_preserve_env_file``, R2-1), and the two concerns stay apart:
+    values are parsed, the file is copied. D40 requires the registration
     for a window that install does not have: the swap parks the old package in a
     DOT-prefixed backup, and ``known_secret_values`` skips dot-directories, so
     for the length of that swap the tool's own credentials would otherwise be
@@ -2077,10 +2213,10 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
     if await run_in_threadpool(tools.summary_status, directory) == "final":
         return InstallOutcome(ok=False, error=_ERROR_REVISE_FINALIZED)
 
-    env_text, env_error = await run_in_threadpool(_read_env_for_preservation, directory)
+    env_text, env_error = await run_in_threadpool(_read_env_for_values, directory)
     if env_error is not None:
         return InstallOutcome(ok=False, error=env_error)
-    # Parsed from the SAME text we will restore (see _read_env_for_preservation).
+    # VALUES only -- the FILE is copied at promote time (see _read_env_for_values).
     # Empty values contribute nothing to redaction and are not registered, matching
     # tools._cached_env_values' own "a KEY= line contributes nothing" rule.
     env_values = tools._parse_dotenv_text(env_text) if env_text is not None else {}
@@ -2102,21 +2238,23 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
 
         settings = get_settings()
         manifest_text = await run_in_threadpool(_current_manifest_text, directory)
-        # The prompt build is BLOCKING work, not the pure string join it looks like
-        # (R1-3): both of its parts go through ``tools.redact_known_secrets``, which
-        # calls ``known_secret_values`` -- an ``iterdir`` of the whole tools
-        # directory plus a ``stat`` per package and, on any cache miss, a full
-        # ``.env`` read. A revise runs from a BACKGROUND job that shares this loop
-        # with every HTTP request in the process, so it hops onto a worker for the
-        # same reason P3a moved ``tool_meta._summary_user_prompt`` off it. A
-        # fail-closed redactor failure still propagates out of the ``await``
-        # unchanged, into ``_run_job``'s backstop.
+        # BOTH prompt builds are BLOCKING work, not the pure string joins they look
+        # like (R1-3): each goes through ``tools.redact_known_secrets``, which calls
+        # ``known_secret_values`` -- an ``iterdir`` of the whole tools directory plus
+        # a ``stat`` per package and, on any cache miss, a full ``.env`` read. A
+        # revise runs from a BACKGROUND job that shares this loop with every HTTP
+        # request in the process, so both hop onto a worker for the same reason P3a
+        # moved ``tool_meta._summary_user_prompt`` off it. A fail-closed redactor
+        # failure still propagates out of the ``await`` unchanged, into ``_run_job``'s
+        # backstop. The SYSTEM prompt joined them when its interpolated package name
+        # became redactable (R2-4) -- it was a pure join until then.
+        system_prompt = await run_in_threadpool(_revise_system_prompt, name)
         user_prompt = await run_in_threadpool(_revise_user_prompt, feedback, manifest_text)
         result: InstallResult | None = None
         llm_error: str | None = None
         try:
             result = await generate_structured(
-                _revise_system_prompt(name),
+                system_prompt,
                 user_prompt,
                 InstallResult,
                 workflow=_WORKFLOW,
@@ -2183,9 +2321,7 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
 
         # Read the origin while the OLD sidecar still exists (see _existing_origin).
         origin = await run_in_threadpool(_existing_origin, directory)
-        promote_error = await run_in_threadpool(
-            _promote_staging_replace, staging, name, base, env_text
-        )
+        promote_error = await run_in_threadpool(_promote_staging_replace, staging, name, base)
         if promote_error is not None:
             return InstallOutcome(
                 ok=False,
@@ -2204,7 +2340,7 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
         return InstallOutcome(ok=True, tool_name=name, summary=summary, llm_log_id=llm_log_id)
     finally:
         # Mirror run_install's order: drop the in-flight secrets first (the
-        # restored .env carries them again, so known_secret_values covers them
+        # preserved .env carries them again, so known_secret_values covers them
         # through its own scan), then clean staging. A successful swap consumed
         # the staging dir; every other exit removes the build.
         for value in registered:

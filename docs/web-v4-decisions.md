@@ -405,4 +405,68 @@ store-time 重檢（D40 r2 附錄）同一個模式、同一個理由，只是�
   README、tool-calling.md 與那個叫 byte-for-byte 的測試全部改口為「以文字保留：內容與
   行序原樣，換行正規化與非法位元組替換沿用共用受限讀取器」，並新增一個測試釘住 CRLF
   進去、LF 出來，**同時**釘住 `_load_tool_dotenv` 讀到的值不變——把 transform 寫下來，
-  而不是假裝它不存在。
+  而不是假裝它不存在。（**r2 推翻**：見下一節 R2-1，這條的前提事實上不成立。）
+
+### D40 附錄（P3b review r2）：`.env` 改成複製檔案、只排除根層 `.env`、stat 失敗不等於不存在、系統提示只遮動態插值
+
+- **`.env` 保留改成「複製檔案」，推翻 r1 的文字往返（R2-1）**：r1 之所以敢留下有損
+  往返，靠的是「**這個檔案的每一個消費者都走同一條有損解碼**」這個前提——而它是**假的**。
+  runtime 執行工具時以**套件目錄本身**當工作目錄（`_BUILDER_SYSTEM_PROMPT` 明文的執行
+  契約），所以工具自己的 entry 大可 `open(".env", "rb")` 去雜湊它、diff 它、自己處理
+  CRLF；維運者也可能用 checksum 盯著這個檔案。一次只想加分頁的修訂把 CRLF 壓成 LF、
+  把非法位元組換成 U+FFFD，就是在改一個沒人請它改的檔案。**修法**：`_promote_staging_replace`
+  在 `validate_package` 通過、且目標的存在／symlink／定版檢查全過之後、換裝之前，用
+  `shutil.copy2` 把**正式套件的 `.env` 複製進 staging**（新的 `_preserve_env_file`）。
+  copy2 全程不解碼，位元組連同 mode、mtime 一起過去；方向是「正式包 → staging」，正式包
+  只被**讀**，所以後面換裝失敗一點代價都沒有——原檔還是原檔，不是它的重寫版。它排在
+  所有目標檢查**之後**，因為它是唯一會伸手去讀正式包的步驟。
+  - **兩端都用 `lstat` 把關**，比照 `tools._write_sidecar_atomic` 的寫前 `lstat` 與共用
+    檔案 helper 的 `O_NOFOLLOW`＋`S_ISREG`：**來源**只有 `FileNotFoundError` 算「沒有
+    `.env`」（見 R2-3），非 regular 的來源（session 期間被換成 symlink／FIFO）拒絕而不是
+    穿過去讀；**目的地**（staging 的 `.env`）ENOENT 是常態、regular file 是模型自己寫的
+    那份（提示的契約就是覆蓋它），其餘一律拒絕。目的地那道**不是對稱美學**：`copy2` 會
+    **跟隨**目的地，未上鎖的 `run_shell`（D21）在 `<staging>/.env` 種一條 symlink，就會
+    把**正式的憑證**沿著它寫到 staging 外面（測試實測：不加這道，`_TRICKY_ENV` 的內容
+    整段落到 staging 外的檔案），目的地是目錄時則會寫成 `<staging>/.env/.env`、發佈出一個
+    根本沒有 `.env` 的套件。這道守的是**與被它取代的 `tools._write_regular_file` 完全同一組
+    拒絕**——不多（hardlink 兩者都放行，屬 D21 同 uid 的既有殘留），不少。
+  - **複製的是「換裝那一刻磁碟上的那個檔案」，不是開場讀到的快照**：維運者在 session
+    中途改了 `.env`，他的修改被**保留**而不是被修訂回捲。這也不會外洩：只有開場讀到的值
+    被登記／匯出到 `run_shell`，中途新增的值從來沒進過對話，換裝後 `known_secret_values`
+    再掃一次就重新認得。
+  - **兩件事在程式碼裡刻意分開**：`_read_env_for_values`（原 `_read_env_for_preservation`，
+    一併改名）只負責**解析值**——登記 in-flight 秘密、餵 `run_shell` 的 `secret_env`——那是
+    文字讀取，維持原樣；**檔案**由 `_preserve_env_file` 複製。`_promote_staging_replace` 的
+    `preserved_env_text` 參數因此消失。`_ERROR_REVISE_ENV_TOO_LARGE` 的理由也跟著改成成立的
+    版本：超過上限的 `.env` 解析出來是**被截斷的值集合**，尾巴那些值不會被登記，而複製過去
+    的檔案照樣帶著它們——不是原本說的「寫回截斷內容會毀掉憑證」（現在根本不寫回）。
+- **copytree 只排除「根層」的 `.env`（R2-2）**：r1 的 ignore 在**每一層**排除所有
+  casefold 等於 `.env` 的名字，於是一個工具自己會讀的 `config/.env`（它的 entry 就是以
+  套件目錄為 cwd 執行的）會被一次無關的修訂**靜默刪除**，而 `validate_package` 接著對這個
+  被截肢的套件**驗證通過**。根層那份仍然要排除（大小寫不敏感比對保留：case-insensitive
+  檔案系統上 `.ENV` 就是那個受管檔案），巢狀的則是**普通套件內容，必須複製**。誠實記下
+  代價：巢狀檔案若內嵌了**已登記**的秘密值，`validate_package` 的內嵌秘密閘會用它既有的
+  訊息擋下這次 promote——那是閘門在做它的工作（維運者因此知道自己把 live 憑證放進了第二個
+  檔案），而且嚴格優於「靜默出貨一個少了檔案的套件」。sidecar 的保留命名空間**維持每一層
+  都排除**（後端自有命名空間，不變）。順帶一提，巢狀 `.env` 從來就不是「已知秘密」
+  （`known_secret_values` 只讀每包**根層**的 `.env`），而 builder 本來就能用未上鎖的
+  `run_shell` 讀正式包裡的它——所以這條沒有打開任何新的暴露面；`tool_meta._package_files`
+  也在每一層跳過 dot-開頭的名字，總結提示照樣看不到它。
+- **`stat` 失敗不等於「沒有 `.env`」（R2-3）**：`_read_env_for_values` 原本 `except OSError`
+  一律當成「檔案不存在」，於是磁碟 EIO、NFS ESTALE、維運者剛 chmod 出來的 EACCES 都被讀成
+  **不存在**——接著整場修訂就在「工具的真實憑證沒被登記、也沒匯出」的狀態下跑完一次
+  builder session。**只有 `FileNotFoundError` 代表不存在**，其餘 `OSError` 一律走既有的
+  「讀不到就整場拒絕」路徑（R1 已定的規則：降級過的 `.env` 絕不出貨）。同一套判別也套用在
+  R2-1 新增的複製步驟上（來源不存在＝沒有 `.env`，其餘一律拒絕）。
+- **修訂的系統提示只遮「動態插值」（R2-4）**：系統提示原本整段未經遮蔽送出，而它會把
+  **套件名字**插進去；`.env` 裡若有一個值剛好等於那個名字，它就這樣搭便車進了請求。修法是
+  在代入前對 `name` 做 `redact_known_secrets`（且和其他兩處一樣**在 threadpool 裡**做，因為
+  它是整個 tools 目錄的掃描——R1-3 的同一條規則），**而不是遮整段提示**。理由要講精確：
+  我們的靜態提示文字是**後端自己寫的、開源的常數文字**，遮它既沒用也有害——沒用是因為
+  「一個剛好等於已公開常數文字的值」根本不是模型從我們這裡學到的；有害是因為遮蔽器對
+  `_MIN_SECRET_LEN`（6）以上的值一律比對，手編的 `TOKEN=secret` 會把我們自己那句
+  「Never write a secret value into any file」洗成一排遮蔽標記，模型讀到一份有破洞的指令。
+  **只有操作者／檔案系統來源的插值該遮**，這段 addendum 剛好只有一個。**連帶後果照單全收**：
+  套件的**名字本身**若就是已登記的秘密值，模型被要求回報的是**被遮過的**名字，於是後面的
+  同一性檢查必定失敗、整次修訂被拒——對一個「秘密同時也是公開工具名」的設定來說這是對的，
+  因為那個值本來就已經在工具列表、job 輪詢與前端網址裡了。
