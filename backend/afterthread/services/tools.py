@@ -634,8 +634,41 @@ def read_tool_meta(directory: Path) -> dict[str, Any] | None:
     return raw if isinstance(raw, dict) else None
 
 
+def _redact_meta_tree(value: Any) -> Any:
+    """Every ``str`` in a sidecar structure, masked -- keys and values, at depth.
+
+    The sidecar is NOT a summary field with some metadata around it: ``origin``
+    alone carries the install ``openapi_url`` (an install URL is routinely
+    ``https://api.example/openapi.json?token=<the form secret>`` -- a value the
+    installer REGISTERS as an in-flight secret, so the redactor knows it) and
+    the operator's free-text ``instructions``. Redacting only ``summary`` would
+    persist those verbatim, which is precisely the D36/H3 plaintext-persistence
+    vector the redaction exists to close. So the whole structure is walked and
+    every string leaf is masked -- which also means a field ADDED to the sidecar
+    later is covered without its author having to remember this file.
+
+    Dict KEYS are masked too. A key is a string that lands on disk exactly like
+    a value, and ``set_summary_status`` round-trips whatever keys a hand-edited
+    sidecar happens to carry; two keys collapsing onto one marker is a
+    theoretical loss we accept, since a sidecar whose KEY is a live secret is
+    already broken. Non-string leaves (the ``llm_log_id`` int, None, bools) pass
+    through untouched -- they cannot carry a value and must keep their type.
+
+    Raises whatever ``redact_known_secrets`` raises: the LIVE redactor
+    deliberately propagates a provider failure rather than degrading to
+    unmasked, and ``write_tool_meta`` turns that into its fail-closed refusal.
+    """
+    if isinstance(value, str):
+        return redact_known_secrets(value)
+    if isinstance(value, dict):
+        return {_redact_meta_tree(key): _redact_meta_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_meta_tree(item) for item in value]
+    return value
+
+
 def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
-    """Write the sidecar, redacting its ``summary`` FIRST. Returns success.
+    """Write the sidecar, redacting EVERY string in it FIRST. Returns success.
 
     The redaction is FAIL-CLOSED and that is the load-bearing part of this
     helper, not a formality. Two independent reasons a secret must never reach
@@ -651,13 +684,23 @@ def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
       revise of that tool fail validation -- bricking the feature for that
       package with a rejection naming a file the user never wrote.
 
+    ``summary`` was never the only operator/LLM-influenced text here, and
+    masking just that one field was a leak: ``origin.openapi_url`` and
+    ``origin.instructions`` are operator-supplied, arrive from the install form,
+    and landed on disk verbatim. The redaction therefore runs over the WHOLE
+    structure (``_redact_meta_tree``), so the guarantee is a property of the
+    FILE rather than of one field somebody remembered.
+
     So a redaction failure (``known_secret_values`` raising -- the LIVE path
     deliberately propagates rather than degrading to unmasked, see
-    ``redact_known_secrets``) writes NOTHING and returns False, and a
-    non-string ``summary`` is refused for the same reason: it could not be
-    masked. Every other failure (unserializable value, an unwritable path, a
-    symlinked/FIFO sidecar refused by ``_write_regular_file``'s O_NOFOLLOW +
-    O_NONBLOCK + S_ISREG gate) is False too, so callers get one
+    ``redact_known_secrets``) writes NOTHING and returns False. A non-string
+    ``summary`` is still refused, now for a different reason than "it could not
+    be masked" (the walk masks it fine wherever it hides): the sidecar's
+    ``summary`` is a STRING by contract, the read path renders any other type as
+    "no summary", and writing one would make the file lie about whether a
+    summary exists. Every other failure (unserializable value, an unwritable
+    path, a symlinked/FIFO sidecar refused by ``_write_regular_file``'s
+    O_NOFOLLOW + O_NONBLOCK + S_ISREG gate) is False too, so callers get one
     "did-not-happen" answer and never an exception -- summary metadata is
     best-effort by design.
 
@@ -672,15 +715,13 @@ def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
     """
     if not directory.is_dir():
         return False
-    payload = dict(meta)
-    summary = payload.get("summary")
-    if summary is not None:
-        if not isinstance(summary, str):
-            return False
-        try:
-            payload["summary"] = redact_known_secrets(summary)
-        except Exception:
-            return False
+    summary = meta.get("summary")
+    if summary is not None and not isinstance(summary, str):
+        return False
+    try:
+        payload = _redact_meta_tree(meta)
+    except Exception:
+        return False
     try:
         text = json.dumps(payload, ensure_ascii=False)
     except TypeError, ValueError:
@@ -710,11 +751,12 @@ def set_summary_status(name: str, status: str) -> str:
 
     Three outcomes, mapped by the router onto three HTTP answers:
 
-    * ``"not_found"`` -- the name is unsafe, the package is missing, the feature
-      is off (all of them ``_resolve_package_dir`` -> None), OR the rewrite
-      itself failed. That last one is folded in DELIBERATELY, exactly as
-      ``set_enabled`` folds every did-not-happen case into one False: from the
-      caller's view the addressable resource did not (usably) change;
+    * ``"not_found"`` -- the name is unsafe, the package is missing, the
+      directory is an internal ALIAS, the feature is off (all of them
+      ``_resolve_package_dir_no_alias`` -> None), OR the rewrite itself failed.
+      That last one is folded in DELIBERATELY, exactly as ``set_enabled`` folds
+      every did-not-happen case into one False: from the caller's view the
+      addressable resource did not (usably) change;
     * ``"no_meta"`` -- the package exists but has no readable sidecar, so there
       is no summary to freeze yet (a distinct 409, not a 404: the TOOL exists);
     * ``"ok"`` -- the sidecar was rewritten with the new status and a fresh
@@ -722,12 +764,16 @@ def set_summary_status(name: str, status: str) -> str:
 
     ``status`` is trusted to be one of ``_SUMMARY_STATUSES``: the PATCH schema's
     ``Literal`` is the gate, the same way ``set_enabled`` trusts its bool. The
-    rewrite goes through ``write_tool_meta``, so the summary is re-redacted on
-    the way back out -- a status flip can never un-mask a value that a newly
+    rewrite goes through ``write_tool_meta``, so the whole sidecar is re-redacted
+    on the way back out -- a status flip can never un-mask a value that a newly
     registered secret would now match.
+
+    Resolved through ``_resolve_package_dir_no_alias``: a 定版 addressed at
+    ``tools/alias`` must not freeze the REAL package's summary (see that
+    helper).
     """
-    directory = _resolve_package_dir(name)
-    if directory is None or not directory.is_dir():
+    directory = _resolve_package_dir_no_alias(name)
+    if directory is None:
         return "not_found"
     meta = read_tool_meta(directory)
     if meta is None:
@@ -1549,6 +1595,42 @@ def _resolve_package_dir(name: str) -> Path | None:
     if not _is_within(base.resolve(), candidate):
         return None
     return candidate
+
+
+def _resolve_package_dir_no_alias(name: str) -> Path | None:
+    """``_resolve_package_dir`` PLUS the INTERNAL-alias refusal, in one helper.
+
+    ``_resolve_package_dir`` resolves ``tools/<name>`` and then checks
+    containment -- which an INTERNAL symlink ``tools/alias -> tools/real``
+    PASSES, because it resolves to a path genuinely inside the tools root. The
+    alias/real distinction is erased by that ``resolve()``, so a caller handed
+    the result cannot tell it was addressed through an alias, and every
+    by-name operation on it silently acts on the REAL package instead
+    (``PATCH /api/tools/alias/summary`` finalizing REAL's sidecar, a regenerate
+    spending an LLM session rewriting REAL's summary). ``set_enabled`` calls
+    that out at length and hard-blocks it before its own resolve, for exactly
+    this reason (see its H3 comment); ``delete_tool`` carries its own variant
+    because it has a SAFE alias action (unlink just the link).
+
+    Every route/service that addresses a package BY NAME with no such special
+    case goes through here instead of composing the three steps itself, so the
+    hard-block cannot be forgotten by the next one added: name regex + tools_dir
+    gate, then ``is_symlink`` (which does NOT follow the final component, so it
+    sees the alias itself) BEFORE the resolve, then the containment resolve, and
+    finally the "is anything actually installed there" ``is_dir``. None is the
+    single did-not-happen answer for all four.
+
+    ``_resolve_package_dir`` is deliberately left alone: ``delete_tool`` must
+    keep reaching an alias to unlink it, so the refusal belongs in this
+    composition, not in the shared resolve.
+    """
+    base = tools_dir()
+    if base is None or not _NAME_RE.match(name):
+        return None
+    if (base / name).is_symlink():
+        return None
+    directory = _resolve_package_dir(name)
+    return directory if directory is not None and directory.is_dir() else None
 
 
 def set_enabled(name: str, enabled: bool) -> bool:

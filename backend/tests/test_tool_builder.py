@@ -480,6 +480,21 @@ def test_install_result_redacts_secret_straddling_summary_cap(
     assert len(result.summary) <= cap
 
 
+def test_install_result_redacts_before_stripping(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The same order one step earlier: the redactor matches the REGISTERED
+    value, so a secret carrying edge whitespace (a hand-edited .env with a
+    quoted " secret-token ") stops matching the moment strip eats that edge --
+    and a strip-FIRST sanitizer would then pass the body through unmasked (this
+    test's discriminator)."""
+    secret = " kb-live-secret-abcdef "
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+    result = InstallResult.model_validate(
+        {"tool_name": "kbsearch", "summary": secret, "ready": True}
+    )
+    assert "kb-live-secret-abcdef" not in result.summary
+    assert tools._REDACTION_MARKER in result.summary
+
+
 def test_builder_user_prompt_redacts_openapi_before_truncation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2598,6 +2613,80 @@ def test_router_summary_routes_reject_invalid_names_as_422(
             == 422
         )
         assert client.post(f"/api/tools/{bad_name}/summary/regenerate").status_code == 422
+
+
+def test_router_summary_routes_refuse_an_internal_alias(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An INTERNAL alias tools/<alias> -> tools/<real> resolves INSIDE the tools
+    root, so resolve-then-contain PASSES and every by-name summary operation
+    would silently act on the REAL package -- a PATCH freezing its summary, a
+    regenerate spending an LLM session rewriting it. All three refuse (404) and
+    the real sidecar is left byte-for-byte as it was.
+
+    This is the same hard-block set_enabled/delete_tool have carried since H3,
+    now shared by every summary path through one resolver."""
+    pkg = _seed_package(monkeypatch, tmp_path, "real")
+    (pkg.parent / "alias").symlink_to(pkg, target_is_directory=True)
+    tools.write_tool_meta(pkg, {"summary": "真的說明", "status": "draft"})
+    before = (pkg / tools._AI_META_FILENAME).read_bytes()
+
+    async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("no session may start for an aliased package")
+
+    monkeypatch.setattr("afterthread.services.tool_meta.generate_structured", must_not_generate)
+
+    assert client.get("/api/tools/alias/summary").status_code == 404
+    assert client.patch("/api/tools/alias/summary", json={"status": "final"}).status_code == 404
+    assert client.post("/api/tools/alias/summary/regenerate").status_code == 404
+
+    assert (pkg / tools._AI_META_FILENAME).read_bytes() == before
+    assert _meta(pkg)["status"] == "draft"  # the real package was never finalized
+
+
+def test_router_regenerate_summary_404_when_the_sidecar_write_is_refused(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A generation that produced text but persisted NOTHING (a racing delete
+    hitting the ghost guard, a FIFO/symlink swapped in for the sidecar, an
+    unwritable directory) must not answer 200 with a summary the next GET will
+    not find. Same did-not-happen fold the PATCH uses for its failed rewrite."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    tools.write_tool_meta(pkg, {"summary": "先前的好總結", "status": "draft"})
+    _fake_summary_generate(monkeypatch, summary="新的說明")
+    monkeypatch.setattr(tools, "write_tool_meta", lambda *args, **kwargs: False)
+
+    response = client.post("/api/tools/kbsearch/summary/regenerate")
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Tool not found"}
+
+
+def test_router_a_tool_named_install_can_serve_its_summary(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`install` is a legal package name, and `GET /install/{job_id}` used to be
+    declared first -- so `/api/tools/install/summary` matched the JOB route with
+    job_id="summary" and that tool's summary was unreachable.
+
+    Both routes now work: a job id is uuid4().hex, so the literal segment
+    "summary" can never be one, which is what makes the ordering safe in both
+    directions."""
+    pkg = _seed_package(monkeypatch, tmp_path, "install")
+    tools.write_tool_meta(pkg, {"summary": "名叫 install 的工具", "status": "draft"})
+
+    response = client.get("/api/tools/install/summary")
+    assert response.status_code == 200
+    assert response.json()["summary"] == "名叫 install 的工具"
+    assert response.json()["status"] == "draft"
+
+    # ... and a real (uuid4().hex-shaped) job id still reaches the job handler.
+    poll = client.get("/api/tools/install/0123456789abcdef0123456789abcdef")
+    assert poll.status_code == 404
+    assert poll.json() == {"detail": "Install job not found"}
+
+    # The other two summary verbs address the same tool, not the job route.
+    assert client.patch("/api/tools/install/summary", json={"status": "final"}).status_code == 200
+    assert _meta(pkg)["status"] == "final"
 
 
 def test_any_job_active_tracks_the_job_table() -> None:

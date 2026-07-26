@@ -293,9 +293,14 @@ class InstallResult(BaseModel):
         # outcome construction (the belt that additionally covers the non-_sanitize
         # value used to build the not-ready error); double-redaction is a no-op on the
         # already-masked marker.
+        # The STRIP likewise runs AFTER the mask, for the same reason one step earlier:
+        # a registered value carrying edge whitespace (a hand-edited .env with a quoted
+        # " secret-token") stops matching once strip eats that edge, so stripping first
+        # would hand the redactor a body it no longer recognizes. Untouched text in,
+        # redaction, THEN the cosmetic trim and the slice.
         return {
             "tool_name": _coerce_str(data.get("tool_name")).strip()[:_TOOL_NAME_MAX],
-            "summary": tools.redact_known_secrets(_coerce_str(data.get("summary")).strip())[
+            "summary": tools.redact_known_secrets(_coerce_str(data.get("summary"))).strip()[
                 :_SUMMARY_CAP
             ],
             "ready": _coerce_bool(data.get("ready")),

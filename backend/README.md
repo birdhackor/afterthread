@@ -200,7 +200,8 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   限制」的說明，寫進套件內的 `.ai_meta.json`（隱藏檔，registry 掃描看不到，
   `DELETE` 時隨整個目錄一起消失）。這一步是 **best-effort**：總結失敗（LLM 未
   設定、上游錯誤、任何例外）都被就地吞掉，絕不會把已經成功的安裝翻成失敗，只
-  會留下空總結的 sidecar 供之後 `regenerate`。總結寫入前一律過
+  會留下空總結的 sidecar 供之後 `regenerate`。sidecar 寫入前**整份結構的每個
+  字串**（總結、origin 的 URL 與安裝指示等）一律過
   `redact_known_secrets` 且**遮蔽失敗就不寫**——sidecar 之後會被修訂流程複製進
   暫存目錄接受「檔案不得內嵌秘密值」檢查，含密文等於讓這個工具再也修訂不了。
   總結有 `draft`／`final`（定版）兩種狀態；定版後 `regenerate` 一律

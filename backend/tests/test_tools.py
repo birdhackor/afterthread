@@ -1890,11 +1890,57 @@ def test_write_tool_meta_redacts_the_summary(
     assert secret not in _sidecar(pkg).read_text(encoding="utf-8")
 
 
+def test_write_tool_meta_redacts_every_string_not_just_the_summary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The summary was never the only operator/LLM-influenced text in here.
+
+    ``origin.openapi_url`` is the install form's URL, which routinely carries
+    the form secret as a query token, and ``origin.instructions`` is free
+    operator text -- both landed on disk verbatim while only ``summary`` was
+    masked. The walk covers nested dicts and lists so the guarantee is a
+    property of the FILE, not of the fields somebody remembered."""
+    secret = "install-form-secret-abcdef"
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+
+    assert (
+        tools.write_tool_meta(
+            pkg,
+            {
+                "summary": "沒有秘密的說明",
+                "origin": {
+                    "openapi_url": f"https://kb.example/openapi.json?token={secret}",
+                    "instructions": f"用 {secret} 認證",
+                },
+                # A shape nothing writes today: the walk must reach it anyway,
+                # which is what makes a future field safe by default.
+                "notes": ["plain", {"deep": secret}],
+            },
+        )
+        is True
+    )
+
+    raw = _sidecar(pkg).read_text(encoding="utf-8")
+    assert secret not in raw
+    stored = tools.read_tool_meta(pkg)
+    assert stored is not None
+    assert tools._REDACTION_MARKER in stored["origin"]["openapi_url"]
+    assert tools._REDACTION_MARKER in stored["origin"]["instructions"]
+    assert tools._REDACTION_MARKER in stored["notes"][1]["deep"]
+    # Only the secret is rewritten -- the rest of the URL survives, so the
+    # sidecar stays useful as the install's only record of where it came from.
+    assert "https://kb.example/openapi.json?token=" in stored["origin"]["openapi_url"]
+    assert stored["notes"][0] == "plain"
+
+
 def test_write_tool_meta_fails_closed_when_redaction_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The redaction is the gate, so a failing secret provider writes NOTHING
-    (rather than an unmasked summary) and reports failure."""
+    (rather than an unmasked sidecar) and reports failure -- for ANY field, not
+    just the summary: here the only string is in the origin."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
 
@@ -1904,11 +1950,15 @@ def test_write_tool_meta_fails_closed_when_redaction_raises(
     monkeypatch.setattr(tools, "known_secret_values", boom)
     assert tools.write_tool_meta(pkg, {"summary": "anything"}) is False
     assert not _sidecar(pkg).exists()
+    assert tools.write_tool_meta(pkg, {"origin": {"instructions": "anything"}}) is False
+    assert not _sidecar(pkg).exists()
 
 
-def test_write_tool_meta_refuses_unmaskable_summary_type(tmp_path: Path) -> None:
-    """A non-string summary could not be run through the redactor, so it is
-    refused rather than written past the gate."""
+def test_write_tool_meta_refuses_a_non_string_summary(tmp_path: Path) -> None:
+    """The recursive walk could mask a nested summary fine; it is refused for a
+    different reason -- ``summary`` is a STRING by contract, the read path
+    renders any other type as "no summary", and writing one would make the
+    sidecar lie about whether a summary exists."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     assert tools.write_tool_meta(pkg, {"summary": {"nested": "object"}}) is False
@@ -2023,6 +2073,25 @@ def test_set_summary_status_not_found_for_unknown_or_unsafe_names(
 def test_set_summary_status_not_found_when_feature_off(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("afterthread.services.tools.get_settings", lambda: Settings(tools_dir=""))
     assert tools.set_summary_status("echo", "final") == "not_found"
+
+
+def test_set_summary_status_refuses_internal_alias(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The same INTERNAL-alias hard-block set_enabled carries (H3), on the
+    summary path: tools/<alias> -> tools/<real> resolves inside the root, so
+    without it a 定版 addressed at the alias would freeze the REAL package's
+    summary. Refused, and the real sidecar is left exactly as it was."""
+    root = tmp_path / "tools"
+    real = _make_tool(root, "real", "import sys\nsys.stdout.write('x')\n")
+    (root / "alias").symlink_to(root / "real", target_is_directory=True)
+    _install_tools(monkeypatch, root)
+    tools.write_tool_meta(real, {"summary": "說明", "status": "draft"})
+    before = (real / tools._AI_META_FILENAME).read_bytes()
+
+    assert tools.set_summary_status("alias", "final") == "not_found"
+    assert (real / tools._AI_META_FILENAME).read_bytes() == before
+    assert tools.summary_status(real) == "draft"
 
 
 def test_list_tools_reports_summary_status(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

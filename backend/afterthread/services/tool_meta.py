@@ -25,8 +25,10 @@ Three properties are deliberate, and each has a failure mode behind it:
   including a package the operator later hand-edited (README documents editing
   a tool in place). ``.env`` VALUES never enter the prompt (only the key
   NAMES), the sidecar itself is skipped so a summary can never feed itself back
-  in, and every file is redacted BEFORE it is cut, the redact-then-cap order
-  the whole codebase uses.
+  in, and every piece -- files, paths, the operator's own install context --
+  is redacted BEFORE it is stripped or cut, behind one final pass over the
+  whole assembled prompt: the redact-then-cap order the codebase uses, closed
+  as a property of the PROMPT rather than of each field in it.
 
 ``regenerate_summary`` is the same generation behind the synchronous
 ``POST /api/tools/{name}/summary/regenerate`` route, and is the ONE entry point
@@ -127,6 +129,14 @@ class ToolSummaryResult(BaseModel):
     the text is still WHOLE, or the cut leaves an interior fragment no later
     pass can match.
 
+    The STRIP belongs after the redaction for the same "match the value while
+    the text is untouched" reason, one step earlier: a registered secret whose
+    value carries edge whitespace (a hand-edited ``.env`` with a quoted
+    ``" secret-token"``) stops matching the moment ``strip`` eats that edge, so
+    stripping first would hand the redactor a body it no longer recognizes and
+    leak the rest of the value. Untouched text in, redaction, THEN the cosmetic
+    trims and cuts.
+
     An EMPTY summary is rejected rather than stored. The model returning nothing
     usable is exactly what ``generate_structured``'s one corrective retry exists
     for, and an empty string is not a summary -- it is indistinguishable from the
@@ -144,7 +154,7 @@ class ToolSummaryResult(BaseModel):
         if not isinstance(data, dict):
             raise ValueError("expected a JSON object")
         return {
-            "summary": tools.redact_known_secrets(_coerce_str(data.get("summary")).strip())[
+            "summary": tools.redact_known_secrets(_coerce_str(data.get("summary"))).strip()[
                 :_TOOL_SUMMARY_CAP
             ]
         }
@@ -231,11 +241,21 @@ def _summary_user_prompt(
     single file may crowd out the inventory); this is the outer one (the whole
     prompt stays inside the operator's budget however many files there are).
 
-    Every piece is redacted BEFORE it is cut. ``origin`` is what the install
-    captured (the OpenAPI URL and the user's instructions -- neither is persisted
-    anywhere else), and ``builder_summary`` is the builder's own report of what
-    it did; both are CONTEXT for reading the files, capped tightly so they can
-    never displace the files themselves.
+    EVERY piece is redacted on its UNTOUCHED text, before any strip or cut.
+    ``origin`` is what the install captured (the OpenAPI URL and the user's
+    instructions -- neither is persisted anywhere else), and ``builder_summary``
+    is the builder's own report of what it did; both are CONTEXT for reading the
+    files, capped tightly so they can never displace the files themselves.
+
+    The origin fields are OPERATOR-supplied and were the hole here: an install
+    URL is routinely ``https://api.example/openapi.json?token=<the form
+    secret>``, and that value is registered as an in-flight secret at install
+    time -- so the redactor KNOWS it and simply was not asked. Same for a
+    relative path (a builder can create a file whose NAME embeds an expanded
+    ``$SECRET``, the vector ``tool_builder``'s list_dir already masks) and the
+    ``.env`` key-name line. And strip-before-redact is its own leak: a
+    registered value carrying edge whitespace stops matching once ``strip`` eats
+    that edge, so the strips run AFTER the mask, never before it.
     """
     budget = token_budget.char_allowance(get_settings().llm_prompt_budget_tokens)
     origin_data = origin or {}
@@ -244,17 +264,20 @@ def _summary_user_prompt(
     ]
     openapi_url = origin_data.get("openapi_url")
     if isinstance(openapi_url, str) and openapi_url.strip():
-        parts.append(f"It was built from this OpenAPI document: {openapi_url.strip()}")
+        parts.append(
+            "It was built from this OpenAPI document: "
+            + tools.redact_known_secrets(openapi_url).strip()
+        )
     instructions = origin_data.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
         parts.append(
             "The user's original install instructions:\n"
-            + _truncate_to(tools.redact_known_secrets(instructions.strip()), _CONTEXT_CAP)
+            + _truncate_to(tools.redact_known_secrets(instructions).strip(), _CONTEXT_CAP)
         )
     if builder_summary and builder_summary.strip():
         parts.append(
             "What the builder reported after building it:\n"
-            + _truncate_to(tools.redact_known_secrets(builder_summary.strip()), _CONTEXT_CAP)
+            + _truncate_to(tools.redact_known_secrets(builder_summary).strip(), _CONTEXT_CAP)
         )
     manifest = tools._read_regular_file_capped(directory / "tool.json", _FILE_CONTENT_CAP)
     if manifest is not None:
@@ -262,16 +285,56 @@ def _summary_user_prompt(
             "tool.json:\n" + _truncate_to(tools.redact_known_secrets(manifest), _FILE_CONTENT_CAP)
         )
     for relative_path, content in _package_files(directory):
-        parts.append(f"{relative_path}:\n{content}")
+        # The CONTENT is already masked by _package_files; the header carrying
+        # the path is not, and a filename can embed a value just as a file body can.
+        parts.append(f"{tools.redact_known_secrets(relative_path)}:\n{content}")
     keys = _env_key_names(directory)
     if keys:
         # NAMES only -- see _env_key_names. Stated as environment variables
         # because that is how the runtime hands them to the tool.
         parts.append(
             "The package has a .env providing these environment variables "
-            "(values withheld): " + ", ".join(keys)
+            "(values withheld): " + tools.redact_known_secrets(", ".join(keys))
         )
-    return _truncate_to("\n\n".join(parts), budget)
+    # One FINAL pass over the fully assembled text, and it is the class-closer:
+    # every field above is masked individually, but the next field somebody adds
+    # to this prompt will be masked whether or not its author remembers to. It
+    # runs BEFORE the budget cut for the usual redact-then-cap reason (a value
+    # straddling the cut must be masked while the text is whole), and is a no-op
+    # over everything already masked -- the marker carries no secret to match.
+    return _truncate_to(tools.redact_known_secrets("\n\n".join(parts)), budget)
+
+
+def _stored_origin(meta: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The sidecar's ``origin``, narrowed to the two fields we understand.
+
+    Only the INSTALL ever captures the OpenAPI URL and the operator's
+    instructions, so the sidecar is the only copy -- and it is exactly the
+    first-hand context a regeneration wants back in its prompt (why the tool was
+    built, from which document), which is why this is read rather than
+    regenerating from the files alone.
+
+    Defensive because the sidecar is a plain JSON file the operator is allowed
+    to hand-edit (the README says so): a non-dict ``origin``, a non-string
+    ``openapi_url``, an extra key -- none of them may reach the prompt as if the
+    backend had written it. What survives is the two known string fields.
+
+    Returning None when NOTHING survives is load-bearing, not tidiness: None is
+    ``_store_meta``'s "inherit whatever is on disk" signal, so a sidecar whose
+    origin we cannot make sense of keeps its only copy instead of having it
+    overwritten by an empty dict.
+    """
+    if meta is None:
+        return None
+    origin = meta.get("origin")
+    if not isinstance(origin, dict):
+        return None
+    kept = {
+        key: value
+        for key, value in origin.items()
+        if key in ("openapi_url", "instructions") and isinstance(value, str)
+    }
+    return kept or None
 
 
 def _store_meta(
@@ -280,7 +343,7 @@ def _store_meta(
     summary: str,
     origin: dict[str, Any] | None,
     llm_log_id: int | None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """Merge the new summary into the package's sidecar and write it back.
 
     Two fields are PRESERVED from whatever is already on disk rather than reset:
@@ -290,14 +353,19 @@ def _store_meta(
       up front, which is what 定版 MEANS. Preserving rather than forcing "draft"
       is the safe direction if that gate is ever bypassed by a race.)
     * ``origin`` -- only the install captures the OpenAPI URL and instructions,
-      so a later regeneration (which has no origin of its own to pass) must
-      inherit them instead of erasing the only copy.
+      so a caller with nothing to pass (``origin=None``) must inherit them
+      instead of erasing the only copy. A regeneration normally passes the
+      narrowed origin it just read back in, which lands on the same value; the
+      inheritance is what covers the sidecar that has none we can use.
 
-    Returns the meta dict as composed, so the synchronous route can answer with
-    exactly what it just stored. The write itself is best-effort
-    (``write_tool_meta`` returns False on a redaction/write refusal); the return
-    value is the intent either way, which is honest for the route -- an
-    unwritable sidecar is a filesystem problem, not a wrong answer.
+    Returns the meta dict as composed WHEN THE WRITE LANDED, and None when
+    ``write_tool_meta`` refused it (a fail-closed redaction, the ghost guard on
+    a racing delete, a FIFO/symlink swapped in for the sidecar, an unwritable
+    directory). The None matters because the synchronous route answers WITH this
+    dict: returning the composed meta regardless would have it report a summary
+    that is nowhere on disk and vanishes on the next GET -- a wrong answer, not
+    a filesystem detail. The install hook ignores the distinction on purpose
+    (see its own call sites); the route folds it into its did-not-happen 404.
     """
     existing = tools.read_tool_meta(directory) or {}
     status = existing.get("status")
@@ -310,8 +378,7 @@ def _store_meta(
         "llm_log_id": llm_log_id,
         "origin": origin if origin is not None else existing.get("origin"),
     }
-    tools.write_tool_meta(directory, meta)
-    return meta
+    return meta if tools.write_tool_meta(directory, meta) else None
 
 
 async def _generate_summary(
@@ -367,8 +434,14 @@ async def generate_and_store_summary(
     failure rather than being blanked by it.
     """
     try:
-        directory = tools._resolve_package_dir(name)
-        if directory is None or not directory.is_dir():
+        # The alias-refusing resolve, shared with every other by-name summary
+        # path (see tools._resolve_package_dir_no_alias). The install hook
+        # cannot actually reach an alias -- it was handed the name it just
+        # promoted -- but going through the ONE helper costs nothing and keeps
+        # "every summary path refuses an alias" true by construction rather
+        # than by inspection.
+        directory = tools._resolve_package_dir_no_alias(name)
+        if directory is None:
             # The package vanished (a racing delete) between promote and here.
             # Nothing to summarize and nowhere to write; silence is correct.
             return
@@ -378,6 +451,9 @@ async def generate_and_store_summary(
             )
         except Exception:
             if tools.read_tool_meta(directory) is None:
+                # Best-effort, so the write result is DELIBERATELY ignored here
+                # and below: a refused sidecar must never fail an install that
+                # already succeeded (see this function's contract).
                 _store_meta(
                     directory,
                     summary="",
@@ -397,7 +473,7 @@ async def generate_and_store_summary(
         return
 
 
-async def regenerate_summary(name: str) -> dict[str, Any]:
+async def regenerate_summary(name: str) -> dict[str, Any] | None:
     """Regenerate one package's summary SYNCHRONOUSLY; returns the fresh meta.
 
     The user-driven counterpart of the install hook, and the deliberate mirror
@@ -406,24 +482,39 @@ async def regenerate_summary(name: str) -> dict[str, Any]:
     request, and silently returning the old summary would be a lie about what
     just happened.
 
+    None is the SAME kind of honesty for the non-LLM failures: the package
+    vanished under us, or the sidecar write was refused. Both mean the
+    regeneration did not happen, and the route folds them into its
+    did-not-happen 404 exactly as ``set_summary_status`` folds its own failed
+    rewrite into ``not_found``. Answering 200 with a summary that is nowhere on
+    disk would leave the user reading text that disappears on their next visit.
+
     What it does NOT change is the no-clobber rule -- the sidecar is only
     rewritten after a successful generation, so a failed regenerate leaves the
-    previous summary exactly as it was. ``origin=None`` is passed on purpose:
-    ``_store_meta`` then inherits the origin the INSTALL captured, which is the
-    only copy that exists.
+    previous summary exactly as it was.
+
+    The STORED origin is read first and fed back into the prompt. The install's
+    OpenAPI URL and instructions are the first-hand account of what this package
+    was supposed to be, they exist nowhere but this sidecar, and a regeneration
+    that dropped them would explain the files with strictly less context than
+    the install did -- while ``_store_meta`` would separately have to inherit
+    them anyway. Passing the same narrowed origin back through the store keeps
+    the returned meta equal to what is on disk; a sidecar with no usable origin
+    yields None and the store's inheritance still covers it.
 
     The caller (the route) has already checked that the tool exists, is not
     finalized, and that no job is mid-promote; the resolve here is a race
-    backstop that answers with the all-null meta if the package vanished in
-    between rather than writing a sidecar into a deleted package's path.
+    backstop -- and, via the shared alias-refusing helper, the same hard-block
+    every other by-name summary path runs.
     """
-    directory = tools._resolve_package_dir(name)
-    if directory is None or not directory.is_dir():
-        return {}
-    summary = await _generate_summary(name, directory, origin=None, builder_summary=None)
+    directory = tools._resolve_package_dir_no_alias(name)
+    if directory is None:
+        return None
+    origin = _stored_origin(tools.read_tool_meta(directory))
+    summary = await _generate_summary(name, directory, origin=origin, builder_summary=None)
     return _store_meta(
         directory,
         summary=summary,
-        origin=None,
+        origin=origin,
         llm_log_id=llm_log.last_record_id_for_workflow(_SUMMARY_WORKFLOW),
     )

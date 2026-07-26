@@ -157,6 +157,18 @@ def test_summary_result_redacts_before_capping(monkeypatch: pytest.MonkeyPatch) 
     assert secret[:8] not in result.summary
 
 
+def test_summary_result_redacts_before_stripping(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redact-then-strip: the redactor matches the REGISTERED value, so a secret
+    carrying edge whitespace (a hand-edited .env with a quoted " secret-token ")
+    stops matching the moment strip eats that edge -- and the body would then
+    ride through unmasked."""
+    secret = " secret-token-abcdef "
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+    result = ToolSummaryResult.model_validate({"summary": secret})
+    assert "secret-token-abcdef" not in result.summary
+    assert tools._REDACTION_MARKER in result.summary
+
+
 @pytest.mark.parametrize("value", ["", "   ", None], ids=["empty", "blank", "missing"])
 def test_summary_result_rejects_empty_summary(value: str | None) -> None:
     """An empty summary is indistinguishable from the placeholder a FAILED
@@ -235,6 +247,76 @@ def test_user_prompt_redacts_known_secrets_in_files(
     _summary_settings(monkeypatch, root)
 
     prompt = tool_meta._summary_user_prompt("kbsearch", pkg, origin=None, builder_summary=None)
+    assert secret not in prompt
+    assert tools._REDACTION_MARKER in prompt
+
+
+def test_user_prompt_redacts_the_operator_supplied_origin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The install context is OPERATOR text and was riding in UNMASKED.
+
+    An install URL is routinely ``.../openapi.json?token=<the form secret>``,
+    and the installer REGISTERS that value for the duration of the build -- so
+    the redactor knows it and simply was not asked. Same for the instructions
+    the operator typed next to it."""
+    root = tmp_path / "tools"
+    secret = "install-form-secret-abcdef"
+    pkg = _package(root)
+    _summary_settings(monkeypatch, root)
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+
+    prompt = tool_meta._summary_user_prompt(
+        "kbsearch",
+        pkg,
+        origin={
+            "openapi_url": f"https://kb.example/openapi.json?token={secret}",
+            "instructions": f"用 {secret} 認證",
+        },
+        builder_summary=f"tested against {secret}",
+    )
+
+    assert secret not in prompt
+    assert tools._REDACTION_MARKER in prompt
+    # Masked, not dropped: the rest of the URL is still context for the model.
+    assert "https://kb.example/openapi.json?token=" in prompt
+
+
+def test_user_prompt_redacts_a_filename_carrying_a_secret(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A file's CONTENT was masked but the path header naming it was not -- and a
+    builder can create a file whose NAME embeds an expanded $SECRET (the vector
+    tool_builder's list_dir already masks)."""
+    root = tmp_path / "tools"
+    secret = "path-secret-abcdef"
+    pkg = _package(root)
+    (pkg / f"{secret}.py").write_text("print('x')\n", encoding="utf-8")
+    _summary_settings(monkeypatch, root)
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+
+    prompt = tool_meta._summary_user_prompt("kbsearch", pkg, origin=None, builder_summary=None)
+    assert secret not in prompt
+    assert tools._REDACTION_MARKER in prompt
+
+
+def test_user_prompt_final_pass_masks_a_field_no_call_site_redacts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The class-closer: the ASSEMBLED prompt is redacted once more, so a piece
+    that no individual call masks is covered anyway -- which is what makes the
+    next field added to this prompt safe even if its author forgets.
+
+    The package NAME is the live example: it is interpolated straight into the
+    opening line by no redaction at all, and it is a legal package name that a
+    registered value could equal."""
+    root = tmp_path / "tools"
+    secret = "kbsearch-abcdef"  # matches _NAME_RE, so it is a legal package name
+    pkg = _package(root, name=secret)
+    _summary_settings(monkeypatch, root)
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+
+    prompt = tool_meta._summary_user_prompt(secret, pkg, origin=None, builder_summary=None)
     assert secret not in prompt
     assert tools._REDACTION_MARKER in prompt
 
@@ -422,6 +504,22 @@ def test_generate_and_store_summary_never_raises_when_prompt_building_explodes(
     assert not (pkg / tools._AI_META_FILENAME).exists()
 
 
+def test_generate_and_store_summary_ignores_a_refused_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The install hook sees the same "did the write land?" signal the
+    synchronous route now acts on, and DELIBERATELY ignores it: it runs after
+    the package is already promoted, so a sidecar it could not write must not
+    escape and flip a successful install to failed."""
+    root = tmp_path / "tools"
+    _package(root)
+    _summary_settings(monkeypatch, root)
+    _fake_generate(monkeypatch, summary="這個工具會查 KB")
+    monkeypatch.setattr(tools, "write_tool_meta", lambda *args, **kwargs: False)
+
+    asyncio.run(generate_and_store_summary("kbsearch"))  # must not raise
+
+
 def test_generate_and_store_summary_silent_when_package_is_gone(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -475,10 +573,87 @@ def test_regenerate_summary_returns_the_fresh_meta(
 
     meta = asyncio.run(regenerate_summary("kbsearch"))
 
+    assert meta is not None
     assert meta["summary"] == "新的說明"
     assert meta["status"] == "draft"
-    assert meta["origin"] == {"instructions": "查 KB"}  # inherited from the install
+    assert meta["origin"] == {"instructions": "查 KB"}  # carried back from the install
     assert tools.read_tool_meta(pkg) == meta  # what it returned IS what it stored
+
+
+def test_regenerate_summary_feeds_the_stored_origin_back_into_the_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The install's URL and instructions are the first-hand account of what this
+    package was meant to be, and the sidecar is their only copy -- a regeneration
+    that dropped them would explain the files with strictly LESS context than the
+    install had. The .env values still never ride along."""
+    root = tmp_path / "tools"
+    secret = "kb-live-secret-abcdef"
+    pkg = _package(root, dotenv=f"KB_API_KEY={secret}\n")
+    _summary_settings(monkeypatch, root)
+    tools.write_tool_meta(
+        pkg,
+        {
+            "summary": "舊的",
+            "status": "draft",
+            "origin": {
+                "openapi_url": "http://kb.example/ORIGIN-URL-MARKER.json",
+                "instructions": "ORIGIN-INSTRUCTIONS-MARKER 只查內部 KB",
+            },
+        },
+    )
+    captured = _fake_generate(monkeypatch, summary="新的說明")
+
+    meta = asyncio.run(regenerate_summary("kbsearch"))
+
+    assert "ORIGIN-INSTRUCTIONS-MARKER 只查內部 KB" in captured["user_prompt"]
+    assert "ORIGIN-URL-MARKER" in captured["user_prompt"]
+    assert secret not in captured["user_prompt"]
+    assert meta is not None
+    assert meta["origin"]["instructions"] == "ORIGIN-INSTRUCTIONS-MARKER 只查內部 KB"
+
+
+def test_regenerate_summary_ignores_an_unusable_stored_origin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The sidecar is hand-editable, so an origin we cannot make sense of never
+    reaches the prompt as if the backend had written it -- and, crucially, is
+    never ERASED either: _store_meta's inheritance keeps the only copy."""
+    root = tmp_path / "tools"
+    pkg = _package(root)
+    _summary_settings(monkeypatch, root)
+    origin = {"openapi_url": 12, "junk": "JUNK-MARKER"}
+    tools.write_tool_meta(pkg, {"summary": "舊的", "status": "draft", "origin": origin})
+    captured = _fake_generate(monkeypatch, summary="新的說明")
+
+    meta = asyncio.run(regenerate_summary("kbsearch"))
+
+    assert "JUNK-MARKER" not in captured["user_prompt"]
+    assert meta is not None
+    assert meta["origin"] == origin  # inherited untouched, never overwritten by {}
+
+
+def test_regenerate_summary_refuses_an_internal_alias(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """tools/<alias> -> tools/<real> resolves inside the root, so without the
+    shared hard-block a regenerate addressed at the alias would spend an LLM
+    session rewriting the REAL package's sidecar."""
+    root = tmp_path / "tools"
+    pkg = _package(root, "real")
+    (root / "alias").symlink_to(root / "real", target_is_directory=True)
+    _summary_settings(monkeypatch, root)
+    tools.write_tool_meta(pkg, {"summary": "真的說明", "status": "draft"})
+
+    async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("no session may start for an aliased package")
+
+    monkeypatch.setattr("afterthread.services.tool_meta.generate_structured", must_not_generate)
+
+    assert asyncio.run(regenerate_summary("alias")) is None
+    meta = tools.read_tool_meta(pkg)
+    assert meta is not None
+    assert meta["summary"] == "真的說明"  # the real sidecar is untouched
 
 
 @pytest.mark.parametrize(
@@ -511,15 +686,36 @@ def test_regenerate_summary_propagates_llm_failures_without_clobbering(
     assert meta["summary"] == "先前的好總結"
 
 
-def test_regenerate_summary_empty_when_package_is_gone(
+def test_regenerate_summary_signals_nothing_stored_when_package_is_gone(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The route already 404s a missing tool; this is the race backstop, and it
-    must not write a sidecar into a deleted package's path."""
+    must not write a sidecar into a deleted package's path.
+
+    None, not ``{}``: the route turns "nothing was stored" into its 404, so the
+    signal has to be distinguishable from a meta dict that merely happens to be
+    empty."""
     root = tmp_path / "tools"
     root.mkdir()
     _summary_settings(monkeypatch, root)
     _fake_generate(monkeypatch)
 
-    assert asyncio.run(regenerate_summary("ghost")) == {}
+    assert asyncio.run(regenerate_summary("ghost")) is None
     assert list(root.iterdir()) == []
+
+
+def test_regenerate_summary_signals_nothing_stored_when_the_write_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A generation that produced text but could not persist it did NOT happen.
+
+    Returning the composed meta here would have the synchronous route answer 200
+    with a summary that is nowhere on disk and vanishes on the next GET."""
+    root = tmp_path / "tools"
+    pkg = _package(root)
+    _summary_settings(monkeypatch, root)
+    tools.write_tool_meta(pkg, {"summary": "先前的好總結", "status": "draft"})
+    _fake_generate(monkeypatch, summary="新的說明")
+    monkeypatch.setattr(tools, "write_tool_meta", lambda *args, **kwargs: False)
+
+    assert asyncio.run(regenerate_summary("kbsearch")) is None

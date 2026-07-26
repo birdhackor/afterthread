@@ -278,41 +278,28 @@ async def install_tool(payload: ToolInstallRequest) -> ToolInstallAccepted:
     return ToolInstallAccepted(job_id=job_id)
 
 
-@router.get(
-    "/install/{job_id}",
-    response_model=ToolInstallJobStatus,
-    responses=_JOB_NOT_FOUND_RESPONSE,
-)
-async def install_job_status(job_id: str) -> ToolInstallJobStatus:
-    """One install job's state. 404: unknown id, evicted, or a backend restart
-    (jobs are process-local and unpersisted -- see tool_builder)."""
-    job = tool_builder.get_job(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=_JOB_NOT_FOUND)
-    return ToolInstallJobStatus.model_validate(job)
-
-
 # --- AI summary (D40) --------------------------------------------------------
 #
-# Declared AFTER `/install/{job_id}` on purpose: both are two-segment GETs, and
-# FastAPI matches in declaration order, so leaving the older route first keeps
-# its behaviour byte-identical for the one string that could satisfy both
-# ("install" is itself a legal package name, so `/api/tools/install/summary`
-# stays the job poll it has always been).
+# Declared BEFORE `GET /install/{job_id}` (which now sits at the BOTTOM of this
+# module for exactly that reason -- see the note there). "install" is itself a
+# legal package name, so with the job route first `/api/tools/install/summary`
+# matched IT, with job_id="summary", and a tool genuinely named "install" could
+# never have its summary read.
 
 
 def _existing_package_dir(name: str) -> Path | None:
-    """The package's resolved directory, or None if it is not there.
+    """The package's resolved directory, or None if it is not (usably) there.
 
     One blocking helper for the "does this tool exist?" gate every summary route
-    opens with, so each route makes ONE threadpool hop instead of two.
-    ``_resolve_package_dir`` folds the name regex, the resolved-path containment
-    check and the feature-off case into its own None (see the registry), and the
-    ``is_dir`` here adds the only remaining question: is anything actually
-    installed under that path.
+    opens with, so each route makes ONE threadpool hop instead of two. It is a
+    thin pass-through to ``_resolve_package_dir_no_alias``, which folds the name
+    regex, the INTERNAL-alias refusal, the resolved-path containment check, the
+    feature-off case and "is anything actually installed there" into its own
+    None -- the same helper the registry's own summary mutations use, so a route
+    and the service it calls can never disagree about which directory a name
+    addresses.
     """
-    directory = tools_service._resolve_package_dir(name)
-    return directory if directory is not None and directory.is_dir() else None
+    return tools_service._resolve_package_dir_no_alias(name)
 
 
 def _summary_detail(meta: dict[str, Any] | None) -> ToolSummaryDetail:
@@ -353,7 +340,9 @@ async def get_tool_summary(name: ToolName) -> ToolSummaryDetail:
     ``ToolSummaryDetail``): the resource being addressed is the tool's summary,
     and "this tool has no summary yet" is a normal state with its own UI. The
     404 is reserved for the tool itself not existing -- which, with TOOLS_DIR
-    unset, is also what the whole feature being off looks like.
+    unset, is also what the whole feature being off looks like, and which an
+    internal symlink alias is deliberately folded into (a summary must be read
+    from the package it names, never from an aliased one).
     """
     directory = await run_in_threadpool(_existing_package_dir, name)
     if directory is None:
@@ -372,12 +361,13 @@ async def update_tool_summary_status(
     """定版 / 解除定版 one tool's summary; returns the updated sidecar.
 
     The three registry outcomes map straight onto the three answers:
-    ``not_found`` (bad name, missing package, feature off, or the rewrite
-    failed) -> the same fixed 404 every other tool route uses; ``no_meta`` ->
-    409 ``summary_missing``, since the tool exists but has nothing to freeze;
-    ``ok`` -> the sidecar re-read from disk, so the response reports exactly
-    what the next GET would rather than an optimistic echo (mirroring
-    ``update_tool``'s re-scan discipline, including its racing-delete 404).
+    ``not_found`` (bad name, missing package, an internal symlink alias, feature
+    off, or the rewrite failed) -> the same fixed 404 every other tool route
+    uses; ``no_meta`` -> 409 ``summary_missing``, since the tool exists but has
+    nothing to freeze; ``ok`` -> the sidecar re-read from disk, so the response
+    reports exactly what the next GET would rather than an optimistic echo
+    (mirroring ``update_tool``'s re-scan discipline, including its
+    racing-delete 404).
     """
     outcome = await run_in_threadpool(tools_service.set_summary_status, name, payload.status)
     if outcome == "not_found":
@@ -423,6 +413,12 @@ async def regenerate_tool_summary(name: ToolName) -> ToolSummaryDetail:
     later -- accepted, exactly as the installer accepts its own promote races
     (D21/D40): this is a single-user local tool, and the loser is one summary,
     never the package.
+
+    A generation that produced text but STORED nothing (``regenerate_summary``
+    -> None: the package vanished mid-request, or the sidecar write was refused)
+    is a 404 rather than a 200, so this route can never report a summary that
+    the next GET will not find. That is the same fold the PATCH above applies to
+    its own failed rewrite.
     """
     directory = await run_in_threadpool(_existing_package_dir, name)
     if directory is None:
@@ -443,4 +439,42 @@ async def regenerate_tool_summary(name: ToolName) -> ToolSummaryDetail:
         raise _service_unavailable() from None
     except LLMUpstreamError as exc:
         raise _bad_gateway(exc) from None
+    if meta is None:
+        # The generation ran but nothing was stored: the package vanished under
+        # us (a racing delete), or the sidecar write was refused (the ghost
+        # guard, a FIFO/symlink swapped in for it, an unwritable directory). The
+        # summary in hand exists nowhere on disk and would vanish on the next
+        # GET, so answering 200 with it would be a lie -- fold it into the same
+        # did-not-happen 404 the PATCH above uses for its own failed rewrite.
+        raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
     return _summary_detail(meta)
+
+
+# --- install job poll --------------------------------------------------------
+#
+# LAST on purpose, and it must STAY last. `GET /install/{job_id}` and
+# `GET /{name}/summary` are both two-segment GETs and FastAPI matches in
+# DECLARATION order, so whichever is declared first wins the strings that
+# satisfy both. Declaring the summary routes first is safe in BOTH directions:
+# a job id is ``uuid4().hex``, so the literal segment "summary" can never be
+# one (no job poll is stolen), while "install" IS a legal package name, so a
+# tool named "install" can now serve `/api/tools/install/summary` instead of
+# having it swallowed as a job poll with job_id="summary".
+#
+# P3b's planned `/jobs/{job_id}` rename removes the collision entirely -- but
+# until it lands, this ordering is what makes both routes reachable, so a
+# rename must preserve it rather than assume the placement was arbitrary.
+
+
+@router.get(
+    "/install/{job_id}",
+    response_model=ToolInstallJobStatus,
+    responses=_JOB_NOT_FOUND_RESPONSE,
+)
+async def install_job_status(job_id: str) -> ToolInstallJobStatus:
+    """One install job's state. 404: unknown id, evicted, or a backend restart
+    (jobs are process-local and unpersisted -- see tool_builder)."""
+    job = tool_builder.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=_JOB_NOT_FOUND)
+    return ToolInstallJobStatus.model_validate(job)
