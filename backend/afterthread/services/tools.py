@@ -193,6 +193,22 @@ _AI_META_FILENAME = ".ai_meta.json"
 # property (at the same ratio) every other capped read in this module has.
 _AI_META_MAX_BYTES = 256 * 1024
 
+# The mode floor every published sidecar carries (R11). The backend MUST be able
+# to read back what it just wrote -- that is the same writer-accepts-implies-
+# reader-reads-back invariant _AI_META_MAX_BYTES states for SIZE, now stated for
+# PERMISSIONS. Two holes made it not hold: mkstemp's 0o600 is masked by the
+# process umask, so a service started under a umask that strips owner bits (an
+# operator's 0o277, a wrapper's 0o777) published a sidecar the very next
+# read_tool_meta could not open -- write_tool_meta returning True while every
+# later GET answered "no summary", and every regenerate spending a whole LLM call
+# to rewrite a file it would then fail to read; and inheriting an existing file's
+# mode verbatim (R7-3) propagated the same hole once a sidecar had ever landed
+# without owner-read. So the fd is fchmod'd to (inherited | this) before publish:
+# the operator's GROUP/OTHER customization is honored exactly as R7-3 intended,
+# while owner read+write is not negotiable -- this file is backend-owned state,
+# not operator content.
+_OWNER_RW = 0o600
+
 # The only two summary statuses that mean anything. "draft" is what generation
 # writes; "final" (定版) is the operator freezing AI iteration on this tool --
 # revise and regenerate both refuse a finalized package until it is un-finalized.
@@ -924,9 +940,10 @@ def _write_sidecar_atomic(directory: Path, data: bytes) -> bool:
     back into its own next prompt.
     """
     path = directory / _AI_META_FILENAME
-    # The mode to carry onto the replacement, or None when there is no sidecar to
-    # inherit one from (mkstemp's default then stands -- see the docstring).
-    preserve_mode: int | None = None
+    # The mode to publish under. There is ALWAYS one now (R11): a fresh sidecar
+    # gets _OWNER_RW explicitly rather than mkstemp's umask-masked default, and an
+    # inherited mode is OR'd with it below.
+    preserve_mode: int = _OWNER_RW
     try:
         existing_mode = os.lstat(path).st_mode
     except FileNotFoundError:
@@ -940,7 +957,9 @@ def _write_sidecar_atomic(directory: Path, data: bytes) -> bool:
             return False
         # R7-3: the SAME lstat that refused a symlink supplies the bits to keep.
         # Low 9 only -- setuid/setgid/sticky are not inherited (see docstring).
-        preserve_mode = existing_mode & 0o777
+        # OR'd with _OWNER_RW (R11): the operator's group/other customization is
+        # honored, but OWNER read+write is not negotiable -- see that constant.
+        preserve_mode = (existing_mode & 0o777) | _OWNER_RW
     try:
         fd, tmp_name = tempfile.mkstemp(
             dir=directory, prefix=f"{_AI_META_FILENAME}.", suffix=".tmp"
@@ -952,11 +971,10 @@ def _write_sidecar_atomic(directory: Path, data: bytes) -> bool:
     tmp_path = Path(tmp_name)
     fd_owned = True  # we own the raw fd until fdopen takes it over
     try:
-        if preserve_mode is not None:
-            # On the FD, before publish: the replacement must already carry the
-            # operator's mode at the instant the name flips, so no reader ever
-            # sees the temp file's 0o600 under the sidecar's name.
-            os.fchmod(fd, preserve_mode)
+        # On the FD, before publish: the replacement must already carry its final
+        # mode at the instant the name flips, so no reader ever sees the temp
+        # file's umask-dependent creation mode under the sidecar's name.
+        os.fchmod(fd, preserve_mode)
         handle = os.fdopen(fd, "wb")
         fd_owned = False  # fdopen now owns fd; closing the handle closes it
         with handle:

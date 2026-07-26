@@ -322,3 +322,18 @@ accepted residual 準繩。
 
 另記：同輪的「搬移整個 tools_dir 造成信任錨漂移」屬 D21 威脅模型範圍外，已駁回，
 理由見 `裁決紀錄.md` #5。
+
+### D40 附錄（P3a review r11）：sidecar 權限下限——writer-accepts ⇒ reader-reads-back 也適用於權限
+
+`_AI_META_MAX_BYTES` 把「寫得進去的一定讀得回來」立成 **大小** 的不變量；r11 指出
+**權限** 上同一句話不成立：`mkstemp` 的 `0o600` 會被 process umask 遮罩，服務若在
+會遮掉 owner 位的 umask（維運者的 `0o277`、包裝腳本的 `0o777`）下啟動，發佈出來的
+sidecar 下一次 `read_tool_meta` 就打不開——`write_tool_meta` 回 True、之後每次 GET
+都說「沒有總結」、每次 regenerate 都花掉一次 LLM 呼叫改寫一個它讀不回來的檔案。
+r7-3 的「原樣繼承既有 mode」也會把這個狀態永久傳遞下去。
+
+修法：新增 `_OWNER_RW = 0o600` 下限，發佈前一律 `fchmod(fd, 繼承 | _OWNER_RW)`——
+維運者的 group/other 自訂完全照 r7-3 承諾保留，唯獨 owner 讀寫不可讓渡：sidecar 是
+**後端自有狀態**，不是維運者內容。這也修正了 r7-3 當時「不加 fchmod」的判斷：那時
+的理由是「別藉原子性修正夾帶行為變更」，現在有了明確的不變量理由，是有依據的
+重新裁決而非推翻。

@@ -2360,6 +2360,50 @@ def test_write_tool_meta_keeps_the_default_mode_for_a_fresh_sidecar(tmp_path: Pa
     assert stat.S_IMODE(os.stat(_sidecar(first)).st_mode) == default_mode
 
 
+def test_write_tool_meta_publishes_a_readable_sidecar_under_a_hostile_umask(
+    tmp_path: Path,
+) -> None:
+    """R11: writer-accepts must imply reader-reads-BACK for PERMISSIONS too.
+
+    ``mkstemp``'s ``0o600`` is masked by the process umask, so a service started
+    under a umask that strips owner bits published a sidecar the very next
+    ``read_tool_meta`` could not open: the write reported success, every later GET
+    answered "no summary", and every regenerate burned a whole LLM call rewriting
+    a file it would then fail to read. The explicit ``fchmod`` to ``_OWNER_RW``
+    makes the published mode independent of the umask. Simulated by actually
+    setting the process umask (restored in ``finally``), because that is the exact
+    mechanism -- a mocked mkstemp would test the mock."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    previous = os.umask(0o277)  # strips owner write AND every group/other bit
+    try:
+        assert _write_meta(pkg, summary="總結") is True
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE(os.stat(_sidecar(pkg)).st_mode) & 0o600 == 0o600
+    assert tools.read_tool_meta(pkg) is not None  # the invariant this exists for
+
+
+def test_write_tool_meta_adds_owner_rw_to_an_inherited_mode(tmp_path: Path) -> None:
+    """The same floor applies to an INHERITED mode (R7-3 + R11 composed): a
+    sidecar that ever landed without owner-read -- an operator's chmod, or one
+    published under a hostile umask before this floor existed -- must not
+    propagate that state forward forever. Group/other bits the operator chose are
+    still honored exactly as R7-3 promised; only the owner bits are forced."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    assert _write_meta(pkg, summary="舊的") is True
+    os.chmod(_sidecar(pkg), 0o040)  # group-read only: owner cannot read it back
+
+    assert _write_meta(pkg, summary="新的") is True
+
+    mode = stat.S_IMODE(os.stat(_sidecar(pkg)).st_mode)
+    assert mode & 0o600 == 0o600  # owner rw restored
+    assert mode & 0o040 == 0o040  # the operator's group-read choice survives
+    assert tools.read_tool_meta(pkg) is not None
+
+
 def test_write_tool_meta_replaces_a_read_only_sidecar(tmp_path: Path) -> None:
     """The one semantic the atomic publish deliberately CHANGED, pinned so it
     reads as a decision rather than being rediscovered as a regression.
@@ -2371,8 +2415,13 @@ def test_write_tool_meta_replaces_a_read_only_sidecar(tmp_path: Path) -> None:
     contract: the package DIRECTORY is the protection boundary this subsystem
     supports -- it is what ``delete_tool`` removes wholesale and what every
     containment check is stated against -- and a read-only file under a writable
-    package directory was never a promise we made (D40 r7 addendum). The
-    read-only mode still rides across, since that is the operator's setting."""
+    package directory was never a promise we made (D40 r7 addendum).
+
+    What the operator's read-only setting now yields is ``0o600``, not ``0o400``:
+    the R11 owner-rw floor (``_OWNER_RW``) is OR'd into every inherited mode,
+    because the backend must be able to read back the state it owns. Only the
+    OWNER bits are forced -- a group/other choice still rides across untouched
+    (pinned separately by the inherited-mode test above)."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     assert _write_meta(pkg, summary="舊的") is True
@@ -2381,7 +2430,7 @@ def test_write_tool_meta_replaces_a_read_only_sidecar(tmp_path: Path) -> None:
     assert _write_meta(pkg, summary="新的") is True
 
     assert json.loads(_sidecar(pkg).read_text(encoding="utf-8"))["summary"] == "新的"
-    assert stat.S_IMODE(os.stat(_sidecar(pkg)).st_mode) == 0o400
+    assert stat.S_IMODE(os.stat(_sidecar(pkg)).st_mode) == 0o600  # R11 floor
 
 
 # --- UTF-8 safety at both sidecar boundaries (D40 r3) ------------------------
