@@ -2316,6 +2316,74 @@ def test_write_tool_meta_publishes_atomically(
     assert json.loads(_sidecar(pkg).read_text(encoding="utf-8"))["summary"] == "新的"
 
 
+def test_write_tool_meta_preserves_an_operator_set_mode(tmp_path: Path) -> None:
+    """R7-3: an operator's ``chmod`` on the sidecar survives the atomic publish.
+
+    A regression the atomicity fix carried in silently: ``os.replace`` publishes
+    the TEMP file, so the temp file's mode becomes the sidecar's. An operator who
+    had widened theirs to ``0o640`` (their own group reads the summaries) got it
+    narrowed back to mkstemp's ``0o600`` on the next PATCH or regenerate, with
+    nothing reporting the change and nothing to notice until the group's reads
+    started failing. The pre-write ``lstat`` already has ``st_mode`` in hand for
+    the symlink refusal, so one ``fchmod`` on the temp fd carries it across."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    assert _write_meta(pkg, summary="舊的") is True
+    os.chmod(_sidecar(pkg), 0o640)
+
+    assert _write_meta(pkg, summary="新的") is True
+
+    assert stat.S_IMODE(os.stat(_sidecar(pkg)).st_mode) == 0o640
+    assert json.loads(_sidecar(pkg).read_text(encoding="utf-8"))["summary"] == "新的"
+
+
+def test_write_tool_meta_keeps_the_default_mode_for_a_fresh_sidecar(tmp_path: Path) -> None:
+    """Preserving means not silently CHANGING what an operator set -- so a
+    sidecar with no predecessor to inherit from keeps the writer's own default.
+
+    Pinned RELATIVELY (create one, compare against it) rather than against a
+    ``0o600`` literal: the process umask decides the exact bits, so a literal
+    would pin the test environment instead of the behavior. What this asserts is
+    the property the fix promises -- the fresh-file path is UNCHANGED, and a
+    rewrite of a sidecar nobody chmod'd does not drift away from it either."""
+    first = tmp_path / "first"
+    first.mkdir()
+    assert _write_meta(first, summary="s") is True
+    default_mode = stat.S_IMODE(os.stat(_sidecar(first)).st_mode)
+
+    second = tmp_path / "second"
+    second.mkdir()
+    assert _write_meta(second, summary="s") is True
+    assert stat.S_IMODE(os.stat(_sidecar(second)).st_mode) == default_mode
+
+    assert _write_meta(first, summary="s2") is True
+    assert stat.S_IMODE(os.stat(_sidecar(first)).st_mode) == default_mode
+
+
+def test_write_tool_meta_replaces_a_read_only_sidecar(tmp_path: Path) -> None:
+    """The one semantic the atomic publish deliberately CHANGED, pinned so it
+    reads as a decision rather than being rediscovered as a regression.
+
+    ``_write_regular_file``'s ``O_TRUNC`` open needed write permission on the
+    FILE, so a ``chmod 0o400`` sidecar refused the write with EACCES. Publishing
+    by ``os.replace`` needs write permission on the DIRECTORY, so it now
+    SUCCEEDS. That EACCES was incidental to the open rather than a designed
+    contract: the package DIRECTORY is the protection boundary this subsystem
+    supports -- it is what ``delete_tool`` removes wholesale and what every
+    containment check is stated against -- and a read-only file under a writable
+    package directory was never a promise we made (D40 r7 addendum). The
+    read-only mode still rides across, since that is the operator's setting."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    assert _write_meta(pkg, summary="舊的") is True
+    os.chmod(_sidecar(pkg), 0o400)
+
+    assert _write_meta(pkg, summary="新的") is True
+
+    assert json.loads(_sidecar(pkg).read_text(encoding="utf-8"))["summary"] == "新的"
+    assert stat.S_IMODE(os.stat(_sidecar(pkg)).st_mode) == 0o400
+
+
 # --- UTF-8 safety at both sidecar boundaries (D40 r3) ------------------------
 
 # What ONE lone surrogate scrubs to. Named rather than inlined because the
@@ -2826,6 +2894,96 @@ def test_set_summary_status_still_reports_not_found_on_a_real_write_failure(
     monkeypatch.setattr(tools, "write_tool_meta", lambda directory, meta: False)
 
     assert tools.set_summary_status("echo", "final") == "not_found"
+
+
+def test_set_summary_status_final_to_final_never_rewrites_the_frozen_text(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R7-2: a repeated 定版 is an idempotent RETRY, and must not touch the file.
+
+    The obvious way to get one is a lost response -- the client resends the same
+    PATCH. That used to run the whole rewrite: back through ``write_tool_meta``,
+    which re-redacts every text field against TODAY's known-secret set. And that
+    set GROWS: installing any other tool registers its ``.env`` values. So a
+    value that appears inside text an operator froze WEEKS ago starts matching,
+    and the retry silently replaces part of the frozen explanation with a
+    redaction marker -- "finalized text is immutable while finalized" broken by
+    the one request that asked for no change at all. Refreshing ``updated_at``
+    was the same lie in miniature.
+
+    Staged with a REAL second package rather than a stubbed registry, because the
+    registry's growth is the whole mechanism: the value only becomes a secret
+    because a later install put it in a ``.env``."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    frozen = "這個工具會查 KB，範例參數寫成 kb-live-token-abcdef"  # noqa: RUF001
+    assert _write_meta(pkg, summary=frozen, status="draft") is True
+    assert tools.set_summary_status("echo", "final") == "ok"
+    before = _sidecar(pkg).read_bytes()
+    assert frozen in before.decode("utf-8")  # frozen whole, nothing masked yet
+
+    # A LATER install registers that exact string: another tool's new .env value.
+    _make_tool(root, "kb", "import sys\n", dotenv="KB_API_KEY=kb-live-token-abcdef\n")
+    assert "kb-live-token-abcdef" in tools.known_secret_values()
+
+    assert tools.set_summary_status("echo", "final") == "ok"  # the retry is answered
+
+    assert _sidecar(pkg).read_bytes() == before  # ... byte-identical: no write at all
+    stored = tools.read_tool_meta(pkg)
+    assert stored is not None
+    assert stored["summary"] == frozen  # the frozen text was never re-redacted
+    assert tools._REDACTION_MARKER not in stored["summary"]
+    assert stored["updated_at"] == json.loads(before.decode("utf-8"))["updated_at"]
+
+
+def test_set_summary_status_draft_to_draft_is_a_no_op_but_a_transition_still_writes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The symmetry half of R7-2, and its boundary.
+
+    draft->draft is short-circuited too: a same-status rewrite has nothing
+    legitimate to do in EITHER direction (it only ever carries ``status``, which
+    already matches, and ``updated_at``, which nobody asked to change), and one
+    direction behaving differently from the other would be a rule nobody can
+    remember. The second half is the collateral that matters more: the
+    short-circuit fires on EXACT status equality only, so a real transition on
+    the very same sidecar still writes."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    assert _write_meta(pkg, summary="說明", status="draft") is True
+    before = _sidecar(pkg).read_bytes()
+
+    assert tools.set_summary_status("echo", "draft") == "ok"
+    assert _sidecar(pkg).read_bytes() == before
+
+    assert tools.set_summary_status("echo", "final") == "ok"  # a REAL transition
+    assert _sidecar(pkg).read_bytes() != before
+    assert tools.summary_status(pkg) == "final"
+
+
+@pytest.mark.parametrize(
+    "on_disk",
+    [{"summary": "說明"}, {"summary": "說明", "status": "frozen"}],
+    ids=["status-absent", "status-unknown"],
+)
+def test_set_summary_status_short_circuits_only_on_exact_equality(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, on_disk: dict[str, Any]
+) -> None:
+    """R7-2 collateral: nothing but an exact status match skips the write.
+
+    A hand-edited sidecar with no ``status`` at all, or one carrying a value
+    ``_SUMMARY_STATUSES`` does not recognize, must still be REWRITTEN into a
+    legal state by a PATCH -- those are exactly the files a status mutation
+    exists to repair, and folding them into the no-op would strand them."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    _sidecar(pkg).write_text(json.dumps(on_disk), encoding="utf-8")
+
+    assert tools.set_summary_status("echo", "draft") == "ok"
+    assert tools.summary_status(pkg) == "draft"  # rewritten, not short-circuited
 
 
 @pytest.mark.parametrize(

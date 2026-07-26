@@ -12,10 +12,12 @@ installs a tool package (see D21 in docs/web-v2-decisions.md, Phase 5c).
    ``list_dir`` (paths jailed inside staging) plus ``run_shell`` (a full shell
    that merely STARTS in staging) -- under the installer's own (much larger)
    round and wall-clock budgets;
-4. on a ``ready`` result, validate the staged package with the SAME checks the
-   registry applies to installed packages (``tools.validate_package``) and move
-   it into ``<tools_dir>/<name>``; on anything else, fail with a friendly
-   error. Staging is always cleaned up;
+4. on a ``ready`` result, strip any builder-written AI sidecar from staging
+   (``_strip_builder_sidecars`` -- that file is backend-authored, and a forged
+   one bypasses the whole ``write_tool_meta`` choke point), validate the staged
+   package with the SAME checks the registry applies to installed packages
+   (``tools.validate_package``) and move it into ``<tools_dir>/<name>``; on
+   anything else, fail with a friendly error. Staging is always cleaned up;
 5. once installed, hand the package to ``tool_meta.generate_and_store_summary``
    for its AI summary sidecar (D40). Strictly best-effort and it cannot raise:
    the install is already a success by then, so a failed summary must never
@@ -152,6 +154,13 @@ _ERROR_SECRET_ENV_WRITE = "工具包 .env 無法寫入秘密值，安裝已取�
 # back to something other than the submitted value. Refusing beats writing a value the
 # runtime would parse differently from -- or expose more of than -- what the user submitted.
 _ERROR_SECRET_ENV_UNSERIALIZABLE = "秘密值含特殊字元，無法安全寫入工具包 .env，安裝已取消。"  # noqa: RUF001
+# D40/R7-1: raised when a builder-written ``.ai_meta.json`` (or a file in that
+# reserved temp namespace) cannot be REMOVED from staging before validation. The
+# strip is fail-closed -- shipping a forged sidecar is the one unacceptable
+# outcome -- so a deletion the filesystem refuses cancels the whole install.
+# Category-only by construction: a fixed string, never a path or a value, since
+# the very name that failed to delete could have been chosen to embed a secret.
+_ERROR_SIDECAR_STRIP = "無法清除工具包內的 AI 總結側檔，安裝已取消。"  # noqa: RUF001
 
 # The builder's system prompt. English, like every prompt in this codebase.
 # It must carry the ENTIRE package contract (tool.json fields, the name regex,
@@ -1091,6 +1100,112 @@ def _inject_secret_into_env(env_file: Path, name: str, value: str) -> str | None
     return None
 
 
+def _is_reserved_sidecar_name(filename: str) -> bool:
+    """True for a filename inside the AI sidecar's RESERVED namespace (D40).
+
+    Two shapes, and the temp one is not padding: ``tools._write_sidecar_atomic``
+    publishes through ``mkstemp(prefix=f"{_AI_META_FILENAME}.", suffix=".tmp")``,
+    so a leftover from an interrupted publish is a legitimate inhabitant of this
+    namespace -- and therefore just as legitimate a thing for a builder to
+    imitate. Matching the prefix+suffix pair (rather than the exact name only)
+    means the strip covers the whole namespace the backend claims, not just the
+    one filename an attacker would have to be naive enough to use.
+    """
+    return filename == tools._AI_META_FILENAME or (
+        filename.startswith(tools._AI_META_FILENAME) and filename.endswith(".tmp")
+    )
+
+
+def _remove_reserved_sidecar_path(path: Path) -> None:
+    """Delete ONE reserved-name entry, whatever kind of thing it turned out to be.
+
+    ``unlink`` is the whole answer for the cases that matter (a regular file, a
+    symlink of any target) and it removes the LINK rather than following it, so a
+    ``.ai_meta.json -> /etc/passwd`` planted in staging costs its target nothing.
+    ``missing_ok`` covers the entry vanishing between the walk and here.
+
+    A real DIRECTORY at the reserved name needs ``rmtree`` (``unlink`` answers
+    EISDIR). It is not a forged sidecar -- ``read_tool_meta`` refuses a
+    non-regular file -- but it would permanently BRICK the package's summary:
+    ``_write_sidecar_atomic``'s lstat gate refuses to publish over anything
+    non-regular, so the install hook, every later regenerate, and 定版 would all
+    fail forever on a package the operator has no API path to repair. The name is
+    the backend's; nothing of the builder's may occupy it in any form.
+
+    Raises ``OSError`` on a refusal, which is what makes the caller fail-closed.
+    """
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+        return
+    path.unlink(missing_ok=True)
+
+
+def _strip_builder_sidecars(staging: Path) -> str | None:
+    """Delete every builder-written AI sidecar from staging; None = ok (R7-1).
+
+    Blocking (runs inside ``_promote_staging``). The sidecar is a BACKEND-AUTHORED
+    artifact whose only legitimate writer is ``tools.write_tool_meta``; a builder
+    session has real shell capability (D21), so it can write one too, and doing so
+    is a complete bypass of that choke point rather than a cosmetic liberty:
+
+    * the builder writes a staging ``.env`` holding a value NOBODY has registered
+      yet -- ``known_secret_values`` scans installed packages only (it skips the
+      dot-prefixed ``.staging`` shell), so the value is unknown for the whole
+      build window;
+    * it writes ``.ai_meta.json`` = ``{"summary": "<that same value>", "status":
+      "final"}``. ``validate_package``'s embedded-secret sweep cannot see a secret
+      it does not know, so the package passes;
+    * promote moves the whole staging directory, sidecar included;
+    * and then the install hook's OWN protections finish the job for the
+      attacker: ``store_summary_meta`` reads ``status == "final"``, honors 定版,
+      and declines to overwrite -- so the forged, finalized, secret-bearing
+      sidecar is what every later GET/list serves, verbatim, forever.
+
+    DELETION, not rejection, is the adjudicated answer, and the distinction is
+    real: the PACKAGE may be perfectly good work. The sidecar is decoration the
+    install hook regenerates through the proper choke point seconds later, so
+    dropping it costs the operator nothing, while failing the install would
+    punish them for something the model did unasked.
+
+    It runs BEFORE ``validate_package`` because validation must judge exactly what
+    will SHIP -- a gate that vets a file the promote then deletes (or, worse,
+    keeps) is describing a package that never existed.
+
+    EVERY DEPTH, via ``os.walk``, not just the package root. A nested
+    ``sub/.ai_meta.json`` is inert for ``read_tool_meta`` (which only ever reads
+    the package ROOT), so this is not the smuggling path -- but it still rides
+    into the installed package, where a future revise copies it into a fresh
+    staging build that ``validate_package``'s embedded-secret gate DOES scan
+    against the by-then-registered value: a planted nested copy would brick every
+    later revise of that tool with a rejection naming a file the operator never
+    wrote. The walk is a handful of stats over a small tree; the sidecar's name
+    belongs to the backend at every depth, and saying so once here is cheaper
+    than a caveat every future reader has to re-derive.
+
+    Fail-closed: any ``OSError`` (weird perms, an immutable attribute, a
+    directory that will not empty) cancels the install with a category-only
+    zh-TW error. Shipping the forged file is the one unacceptable outcome, and
+    "we could not delete it" must never degrade into "so we kept it".
+    """
+    try:
+        for dirpath, dirnames, filenames in os.walk(staging):
+            here = Path(dirpath)
+            # dirnames is walked over a COPY and pruned in place: a symlink-to-
+            # directory at the reserved name lands here (os.walk classifies by a
+            # following is_dir), and a pruned entry must not then be descended
+            # into after it has been removed.
+            for dirname in list(dirnames):
+                if _is_reserved_sidecar_name(dirname):
+                    dirnames.remove(dirname)
+                    _remove_reserved_sidecar_path(here / dirname)
+            for filename in filenames:
+                if _is_reserved_sidecar_name(filename):
+                    _remove_reserved_sidecar_path(here / filename)
+    except OSError:
+        return _ERROR_SIDECAR_STRIP
+    return None
+
+
 def _promote_staging(
     staging: Path,
     name: str,
@@ -1118,7 +1233,17 @@ def _promote_staging(
     what keeps ``validate_package``'s view consistent: it always vets the
     LLM-authored package as-is, and the secret is a backend addition layered on
     top and gated separately.
+
+    The AI sidecar is stripped FIRST, ahead of validation (R7-1): it is
+    backend-authored metadata, so a builder-written one is a forgery that bypasses
+    the ``write_tool_meta`` choke point entirely -- see ``_strip_builder_sidecars``
+    for the full attack chain and for why validation must run on exactly what will
+    ship. This is the ONLY file the promote removes; every other file the builder
+    produced rides into the package untouched, exactly as before.
     """
+    strip_error = _strip_builder_sidecars(staging)
+    if strip_error is not None:
+        return strip_error
     error = tools.validate_package(staging, expected_name=name)
     if error is not None:
         return f"工具包驗證失敗：{error}"  # noqa: RUF001

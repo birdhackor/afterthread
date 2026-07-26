@@ -872,16 +872,36 @@ def _write_sidecar_atomic(directory: Path, data: bytes) -> bool:
     ordering guarantee against failure, not a crash-consistency one -- and it is
     even easier to accept here, where the worst case is one regenerable summary.
 
-    PERMISSIONS are deliberately unchanged, and this was checked rather than
-    assumed: ``_write_regular_file`` requested ``0o600`` through ``os.open``,
-    which the process umask masks like any other ``open(2)``. ``mkstemp`` creates
-    with ``0o600`` through the same umask-masked ``os.open``, so an existing
-    sidecar and a new one get the IDENTICAL mode under any umask (verified at
-    both 0o077 and the pathological 0o777). No ``fchmod`` is added: cli.py needs
-    one because ``.env`` holds a real API key and must be readable by the human
-    who is told to go edit it, while this file is best-effort backend metadata --
-    silently STRENGTHENING its mode here would be a behavior change smuggled in
-    under an atomicity fix.
+    PERMISSIONS are PRESERVED across the publish (R7-3) -- which the plain
+    write-to-temp shape does NOT do on its own, and that was a real regression
+    hiding inside the atomicity fix. ``mkstemp`` creates the temp file at
+    ``0o600`` (umask-masked, like any ``open(2)``) and ``os.replace`` carries the
+    TEMP file's mode onto the published name, so an operator who had chmod'd
+    their sidecar ``0o640`` to let their own group read it got it silently
+    narrowed back to ``0o600`` on the next PATCH or regenerate, with nothing
+    anywhere reporting the change. The pre-write ``lstat`` below already holds
+    the existing ``st_mode`` for the symlink refusal, so carrying its permission
+    bits onto the temp fd costs one ``fchmod`` and not a single extra stat.
+
+    Only the low 9 bits are copied, deliberately NOT ``S_IMODE``'s 0o7777:
+    setuid/setgid/sticky are not bits a best-effort metadata file we author has
+    any business inheriting. When there is NO existing sidecar nothing is copied
+    and mkstemp's default stands -- preserving is about not silently CHANGING
+    what an operator set, so inventing a wider default for a fresh file would be
+    the opposite mistake (cli.py fchmods ``.env`` because a human is told to go
+    edit it; nobody is told to edit this).
+
+    A READ-ONLY sidecar is a semantic that DID change here, deliberately, and is
+    not being restored. ``_write_regular_file``'s ``O_TRUNC`` open needed write
+    permission on the FILE, so a ``0o400`` sidecar refused the write with EACCES;
+    publishing by ``os.replace`` needs write permission on the DIRECTORY, so it
+    now SUCCEEDS (and preserves the ``0o400`` on the new file). That EACCES was
+    incidental to the open rather than a designed contract: the package DIRECTORY
+    is the protection boundary this subsystem actually supports -- it is what
+    ``delete_tool`` removes wholesale and what every containment check is stated
+    against -- and a read-only file under a writable package directory was never
+    a promise we made. Recorded in the D40 r7 addendum so it is not re-derived
+    later as a regression.
 
     The pre-write ``lstat`` keeps the refusal semantics ``_write_regular_file``'s
     ``O_NOFOLLOW`` + ``S_ISREG`` gate gave us: an existing sidecar that is a
@@ -904,6 +924,9 @@ def _write_sidecar_atomic(directory: Path, data: bytes) -> bool:
     back into its own next prompt.
     """
     path = directory / _AI_META_FILENAME
+    # The mode to carry onto the replacement, or None when there is no sidecar to
+    # inherit one from (mkstemp's default then stands -- see the docstring).
+    preserve_mode: int | None = None
     try:
         existing_mode = os.lstat(path).st_mode
     except FileNotFoundError:
@@ -915,6 +938,9 @@ def _write_sidecar_atomic(directory: Path, data: bytes) -> bool:
         # up as one here (S_ISLNK), exactly as O_NOFOLLOW used to refuse it.
         if not stat.S_ISREG(existing_mode):
             return False
+        # R7-3: the SAME lstat that refused a symlink supplies the bits to keep.
+        # Low 9 only -- setuid/setgid/sticky are not inherited (see docstring).
+        preserve_mode = existing_mode & 0o777
     try:
         fd, tmp_name = tempfile.mkstemp(
             dir=directory, prefix=f"{_AI_META_FILENAME}.", suffix=".tmp"
@@ -926,6 +952,11 @@ def _write_sidecar_atomic(directory: Path, data: bytes) -> bool:
     tmp_path = Path(tmp_name)
     fd_owned = True  # we own the raw fd until fdopen takes it over
     try:
+        if preserve_mode is not None:
+            # On the FD, before publish: the replacement must already carry the
+            # operator's mode at the instant the name flips, so no reader ever
+            # sees the temp file's 0o600 under the sidecar's name.
+            os.fchmod(fd, preserve_mode)
         handle = os.fdopen(fd, "wb")
         fd_owned = False  # fdopen now owns fd; closing the handle closes it
         with handle:
@@ -1136,8 +1167,33 @@ def set_summary_status(name: str, status: str) -> str:
       summary then blocks ``regenerate`` with ``tool_finalized``, so the one
       action that could FILL it is refused until the user thinks to un-finalize.
       A distinct 409 rather than a 404: the TOOL exists either way;
-    * ``"ok"`` -- the sidecar was rewritten with the new status and a fresh
-      ``updated_at``.
+    * ``"ok"`` -- the sidecar now HAS the requested status. Either it was
+      rewritten (a real transition), or it already held that status and nothing
+      was written at all -- see the idempotent-retry rule below.
+
+    IDEMPOTENT RETRY (R7-2): a request whose target status is ALREADY the status
+    on disk returns ``"ok"`` without touching the file, in BOTH directions
+    (final->final and draft->draft). The client that resends a PATCH after a lost
+    response must not be punished for it, and a same-status rewrite has literally
+    nothing legitimate to do -- the write only ever carries ``status`` (already
+    equal) and ``updated_at`` (a fact nobody asked to change).
+
+    What it did instead was violate "finalized text is immutable while
+    finalized". The rewrite goes back through ``write_tool_meta``, which
+    re-redacts every text field against TODAY's secret set -- and that set GROWS
+    (another tool's install registers a new ``.env`` value). So a second
+    final->final PATCH could rewrite the frozen summary the moment some unrelated
+    value happened to appear inside it: the operator froze one explanation and a
+    retry silently replaced part of it with a redaction marker. Refreshing
+    ``updated_at`` on a no-op was the same lie in miniature. The write is
+    RESERVED for actual transitions; both directions are short-circuited for
+    symmetry, since draft->draft has exactly the same nothing to do.
+
+    Ordering is deliberate: the short-circuit sits AFTER the emptiness gate, so a
+    finalized-but-empty sidecar still answers ``"no_meta"`` to a repeat 定版
+    rather than being newly promoted to ``"ok"``. That answer is what this
+    function gives today (the gate already returns before any write), and this
+    fix is about removing a WRITE, not about relaxing a gate.
 
     The emptiness gate applies ONLY when the target is ``"final"``. Setting
     ``"draft"`` stays unconditional on purpose: 解除定版 is the escape hatch out
@@ -1199,6 +1255,13 @@ def set_summary_status(name: str, status: str) -> str:
             summary = meta.get("summary")
             if not (isinstance(summary, str) and summary.strip()):
                 return "no_meta"
+        # R7-2: the sidecar already holds the requested status, so this is an
+        # idempotent retry and there is nothing to write. Returning BEFORE the
+        # payload is built is the point: the rewrite would re-redact the frozen
+        # text against a secret set that has grown since finalization, and would
+        # refresh updated_at for a change nobody made (see the docstring).
+        if meta.get("status") == status:
+            return "ok"
         # R6-2: coerce a non-str summary to "" before it ever reaches
         # write_tool_meta, whose own contract refuses to write one. A no-op
         # on the "final" branch above (that check already forced summary to a

@@ -42,6 +42,7 @@ from afterthread.services.llm import LLMNotConfiguredError, LLMUpstreamError
 from afterthread.services.tool_builder import (
     _ERROR_NAME_TAKEN,
     _ERROR_OPENAPI_TOO_LARGE,
+    _ERROR_SIDECAR_STRIP,
     _ERROR_TOOLS_DISABLED,
     InstallOutcome,
     InstallResult,
@@ -920,6 +921,212 @@ def test_run_install_feature_off(monkeypatch: pytest.MonkeyPatch) -> None:
     assert outcome.ok is False
     assert outcome.error == _ERROR_TOOLS_DISABLED
     assert outcome.llm_log_id is None
+
+
+# --- the forged-sidecar strip (D40 r7 / R7-1) ----------------------------------
+
+
+def _forged_meta(value: str) -> str:
+    """A finalized sidecar carrying ``value`` as its summary -- the forgery."""
+    return json.dumps({"summary": value, "status": "final", "updated_at": "2026-01-01T00:00:00Z"})
+
+
+def test_run_install_strips_a_forged_finalized_sidecar(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R7-1, the whole attack chain: a builder session can smuggle a secret out
+    through a sidecar it writes itself, and every gate on the path HELPS it.
+
+    The builder (a half-trusted actor with a real shell, D21/H3) writes a staging
+    ``.env`` holding a value nobody has registered -- ``known_secret_values``
+    scans installed packages only and skips the dot-prefixed ``.staging`` shell,
+    so the value is unknown for the whole build. It then writes
+    ``.ai_meta.json`` = ``{"summary": "<that value>", "status": "final"}``:
+    ``validate_package``'s embedded-secret sweep cannot match a secret it does
+    not know, so the package passes; promote moves the staging directory whole;
+    and then the install hook's own 定版 protection finishes the job --
+    ``store_summary_meta`` sees ``final``, refuses to overwrite, and the forged
+    sidecar is what every later GET serves, verbatim.
+
+    The sidecar's only legitimate writer is ``write_tool_meta``, so promote now
+    deletes the builder's copy BEFORE validation. What must hold afterwards is
+    not "no sidecar" but "the BACKEND's sidecar": the hook regenerates one
+    through the proper choke point moments later, so the summary panel still
+    works and the forged text is nowhere on disk. The secret survives in exactly
+    one place -- the ``.env``, which is where a tool's own credential belongs."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    smuggled = "smuggled-kb-value-abcdef123456"
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built and tested", "ready": True},
+        files={
+            "tool.json": json.dumps(_package_manifest("kbsearch")),
+            "run.py": _GOOD_RUN_PY,
+            ".env": f"KB_API_KEY={smuggled}\n",
+            tools._AI_META_FILENAME: _forged_meta(smuggled),
+        },
+    )
+    _fake_summary_generate(monkeypatch, summary="這個工具會查 KB")
+    _no_fetch(monkeypatch)
+
+    outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build a search tool"))
+
+    # The PACKAGE is fine and installs: the sidecar was decoration, not grounds
+    # to punish the operator for something the model did unasked.
+    assert outcome.ok is True
+    pkg = root / "kbsearch"
+    assert (pkg / "tool.json").is_file()
+    assert (pkg / "run.py").is_file()
+    assert (pkg / ".env").is_file()
+
+    # A sidecar EXISTS -- and it is the hook's, written through write_tool_meta:
+    # draft (never the forged "final"), and the stubbed generation's text.
+    meta = tools.read_tool_meta(pkg)
+    assert meta is not None
+    assert meta["status"] == "draft"
+    assert meta["summary"] == "這個工具會查 KB"
+
+    # The forged content is nowhere in the installed package: walking every file,
+    # the smuggled value appears in the ``.env`` and in nothing else.
+    bearers = sorted(
+        str(path.relative_to(pkg))
+        for path in pkg.rglob("*")
+        if path.is_file() and smuggled in path.read_text(encoding="utf-8", errors="replace")
+    )
+    assert bearers == [".env"]
+    assert not (root / ".staging").exists()
+
+
+def test_run_install_strips_forged_sidecars_at_every_depth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The strip walks the whole staged tree, and covers the temp namespace too.
+
+    A NESTED ``lib/.ai_meta.json`` is inert for ``read_tool_meta`` (which only
+    ever reads the package root), so it is not the smuggling path -- but it still
+    rides into the installed package, where a later revise copies it into a fresh
+    staging build that ``validate_package``'s embedded-secret gate DOES scan
+    against the by-then-registered value: a planted nested copy would brick every
+    later revise with a rejection naming a file the operator never wrote.
+
+    ``.ai_meta.json.<x>.tmp`` is the namespace ``_write_sidecar_atomic``'s
+    ``mkstemp`` publishes through, so a leftover there is a legitimate artifact
+    -- and therefore just as legitimate a thing for a builder to imitate.
+
+    The collateral half of the same test: NOTHING else is touched. Every other
+    file the builder produced, at every depth, arrives in the package intact."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built and tested", "ready": True},
+        files={
+            "tool.json": json.dumps(_package_manifest("kbsearch")),
+            "run.py": _GOOD_RUN_PY,
+            "lib/helper.py": "VALUE = 1\n",
+            "lib/.ai_meta.json": _forged_meta("nested forgery"),
+            f"{tools._AI_META_FILENAME}.7f3a.tmp": _forged_meta("temp-namespace forgery"),
+        },
+    )
+    _fake_summary_generate(monkeypatch, summary="這個工具會查 KB")
+    _no_fetch(monkeypatch)
+
+    outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build a search tool"))
+
+    assert outcome.ok is True
+    pkg = root / "kbsearch"
+    assert not (pkg / "lib" / tools._AI_META_FILENAME).exists()
+    assert not list(pkg.glob(f"{tools._AI_META_FILENAME}*.tmp"))
+    # Everything the builder legitimately produced survived the walk untouched.
+    assert (pkg / "lib" / "helper.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert (pkg / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY
+    assert json.loads((pkg / "tool.json").read_text(encoding="utf-8"))["name"] == "kbsearch"
+    # ... and the ROOT sidecar is the hook's, not any of the plants.
+    meta = tools.read_tool_meta(pkg)
+    assert meta is not None
+    assert meta["status"] == "draft"
+    assert meta["summary"] == "這個工具會查 KB"
+
+
+def test_strip_builder_sidecars_handles_links_and_directories(tmp_path: Path) -> None:
+    """The reserved name belongs to the backend in EVERY form it can take.
+
+    A SYMLINK at the name is unlinked rather than followed, so a
+    ``.ai_meta.json -> <somewhere else>`` plant costs its target nothing. (One
+    pointing at a DIRECTORY is the awkward shape: ``os.walk`` classifies it as a
+    directory, so it has to be pruned from the walk as well as removed.)
+
+    A real DIRECTORY at the name is not a forged sidecar -- ``read_tool_meta``
+    refuses a non-regular file -- but leaving it would permanently BRICK the
+    package's summary: ``_write_sidecar_atomic``'s lstat gate refuses to publish
+    over anything non-regular, so the install hook, every later regenerate and
+    定版 would all fail forever, with no API path to repair it.
+
+    Driven directly rather than through ``run_install`` because the meta-tools
+    cannot produce these shapes -- only a ``run_shell`` (or an operator) can."""
+    staging = tmp_path / "staging"
+    (staging / "sub" / "deep").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "kept.txt").write_text("untouched", encoding="utf-8")
+
+    (staging / tools._AI_META_FILENAME).symlink_to(outside)  # walked as a DIRECTORY
+    nested_dir = staging / "sub" / tools._AI_META_FILENAME
+    nested_dir.mkdir()
+    (nested_dir / "payload.json").write_text("{}", encoding="utf-8")
+    (staging / "sub" / "deep" / tools._AI_META_FILENAME).write_text("{}", encoding="utf-8")
+    (staging / "sub" / "keep.py").write_text("K = 1\n", encoding="utf-8")
+
+    assert tool_builder._strip_builder_sidecars(staging) is None
+
+    assert not (staging / tools._AI_META_FILENAME).is_symlink()
+    assert (outside / "kept.txt").read_text(encoding="utf-8") == "untouched"  # never followed
+    assert not nested_dir.exists()
+    assert not (staging / "sub" / "deep" / tools._AI_META_FILENAME).exists()
+    assert (staging / "sub" / "keep.py").read_text(encoding="utf-8") == "K = 1\n"
+
+
+def test_run_install_fails_closed_when_the_forged_sidecar_cannot_be_deleted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A deletion the filesystem refuses CANCELS the install.
+
+    "We could not remove it" must never degrade into "so we shipped it": the
+    forged sidecar reaching the package is the one unacceptable outcome, and it
+    is unrecoverable once there (the hook's 定版 refusal makes it permanent). The
+    refusal is injected at ``Path.unlink`` -- the real syscall boundary, the same
+    style ``os.replace`` is failed at in test_tools -- because weird permissions
+    and immutable attributes are not reproducible in a tmp dir.
+
+    The error is category-only: a fixed zh-TW string, never the path that failed,
+    since a builder chooses its own filenames and could embed a secret in one."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built and tested", "ready": True},
+        files={
+            "tool.json": json.dumps(_package_manifest("kbsearch")),
+            "run.py": _GOOD_RUN_PY,
+            tools._AI_META_FILENAME: _forged_meta("undeletable forgery"),
+        },
+    )
+    _no_fetch(monkeypatch)
+    real_unlink = Path.unlink
+
+    def refuse(self: Path, *, missing_ok: bool = False) -> None:
+        if self.name == tools._AI_META_FILENAME:
+            raise PermissionError(1, "Operation not permitted")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+
+    outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build a search tool"))
+
+    assert outcome.ok is False
+    assert outcome.error == _ERROR_SIDECAR_STRIP
+    assert not (root / "kbsearch").exists()  # nothing promoted
 
 
 # --- install-form secret (D36) -------------------------------------------------
