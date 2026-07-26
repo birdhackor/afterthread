@@ -20,6 +20,7 @@ process-wide singletons, so an autouse fixture resets them around every test.
 
 import asyncio
 import json
+import os
 import sys
 import threading
 from collections.abc import Callable, Generator
@@ -264,11 +265,31 @@ def test_summary_result_rejects_non_object() -> None:
             "https://[::1]:8443/x",
             "https://[::1]:8443" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
         ),
+        # A real-world IPv6 literal with hex-letter groups and no IPv4-mapped
+        # tail -- R6-1's tightened bracket whitelist (hex digits, ":", ".")
+        # must keep admitting this shape, not just the degenerate "::1".
+        (
+            "https://[2001:db8::1]:8443/x",
+            "https://[2001:db8::1]:8443" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
+        ),
         # R5-2: urlsplit does not validate netloc characters, so this parses
         # to a non-empty netloc ("Bearer SECRET") exactly like a real host --
         # "it parsed" is not "it is a host", and the raw credential-shaped
         # string must never be the return value.
         ("https://Bearer SECRET/openapi", ""),
+        # R6-1: the SAME "it parsed" trap, one character class later. A
+        # balanced bracket pair is not by itself a shape check -- CPython's
+        # urlsplit tolerates RFC 3986's IPvFuture form without validating what
+        # follows "v1.", so this parsed into netloc "[v1.Bearer SECRET]" under
+        # the old any-non-"]" bracket branch exactly as readily as a real IPv6
+        # literal, carrying the credential-shaped text straight into the host
+        # slot.
+        ("https://[v1.Bearer SECRET]/openapi", ""),
+        # R6-1: an IPv6 zone ID (RFC 6874, "%25<zone>") is likewise excluded by
+        # the tightened whitelist -- vanishingly rare for an OpenAPI host, and
+        # the old bracket branch admitted it with the same "any non-']' char"
+        # laxity as the credential-shaped case above.
+        ("https://[fe80::1%25eth0]/x", ""),
         ("ftp://kb.example/x", ""),  # not http/https
         # A non-numeric port is now a netloc that fails the same shape check
         # as any other -- no longer waved through as "cosmetic" (r4's stance).
@@ -292,7 +313,10 @@ def test_summary_result_rejects_non_object() -> None:
         "root-path",
         "scheme-case",
         "ipv6-port",
+        "ipv6-hex-port",
         "netloc-not-a-host",
+        "bracket-netloc-not-a-host",
+        "ipv6-zone-id",
         "non-http-scheme",
         "odd-port",
         "unparseable",
@@ -521,6 +545,37 @@ def test_user_prompt_redacts_a_filename_carrying_a_secret(
     prompt = tool_meta._summary_user_prompt("kbsearch", pkg, origin=None, builder_summary=None)
     assert secret not in prompt
     assert tools._REDACTION_MARKER in prompt
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX filename byte-encoding only")
+def test_user_prompt_scrubs_a_non_utf8_filename_header(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R6-3: a filename that is not valid UTF-8 must not reach the LLM request as
+    a lone surrogate -- the SAME filesystem-boundary failure ``tools._utf8_safe``
+    closes for a hand-edited sidecar (r3), one boundary over. A builder's
+    ``run_shell`` can write a file under a name that is raw, non-UTF-8 bytes
+    (``b"note-\\xff.txt"``); ``os.walk`` decodes that name through the OS's own
+    surrogateescape convention into a ``str`` carrying a LONE surrogate, which no
+    substring-based mask touches and which a strict UTF-8 encode (what the LLM
+    request ultimately performs) refuses outright."""
+    root = tmp_path / "tools"
+    pkg = _package(root)
+    _summary_settings(monkeypatch, root)
+    raw_name = b"note-\xff.txt"
+    fd = os.open(os.fsencode(pkg) + b"/" + raw_name, os.O_WRONLY | os.O_CREAT, 0o600)
+    os.write(fd, b"hello\n")
+    os.close(fd)
+    decoded_name = os.fsdecode(raw_name)
+    assert "\udcff" in decoded_name  # sanity: this OS really does surrogateescape it
+
+    prompt = tool_meta._summary_user_prompt("kbsearch", pkg, origin=None, builder_summary=None)
+
+    prompt.encode("utf-8")  # the real proof: a lone surrogate would raise here
+    assert "\udcff" not in prompt
+    # The header shows the SAME text tools._utf8_safe would produce for this
+    # name -- U+FFFD standing in for the byte that was never valid UTF-8.
+    assert f"{tools._utf8_safe(decoded_name)}:\n" in prompt
 
 
 def test_user_prompt_final_pass_masks_a_field_no_call_site_redacts(

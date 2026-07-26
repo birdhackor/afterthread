@@ -2783,6 +2783,51 @@ def test_set_summary_status_draft_is_never_gated(
     assert tools.summary_status(pkg) == "draft"
 
 
+def test_set_summary_status_draft_survives_a_corrupt_typed_summary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R6-2: the escape hatch must survive a corruption ``write_tool_meta``
+    itself would refuse to write. A hand-edited ``{"summary": 123, ...}`` used
+    to ride unchanged into the rewrite, whose own non-str-summary refusal
+    returned False -- which this function folded into ``"not_found"``, 404ing
+    the ONE mutation (解除定版) that exists to recover from exactly this
+    corruption, with no other way to reach it through the API. The summary is
+    now coerced to "" before the write, so 解除定版 always succeeds; a
+    corrupt-typed summary still cannot be finalized afterward -- the emptiness
+    gate re-triggers ``no_meta`` on the very next 定版 attempt."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    _sidecar(pkg).write_text(json.dumps({"summary": 123, "status": "final"}), encoding="utf-8")
+
+    assert tools.set_summary_status("echo", "draft") == "ok"
+    stored = tools.read_tool_meta(pkg)
+    assert stored is not None
+    assert stored["status"] == "draft"
+    assert stored["summary"] == ""  # corrupt TYPE degrades to "no summary yet"
+
+    # The coercion cannot reopen 定版 as a back door: the emptiness gate still
+    # runs first and still refuses an (effectively) empty summary.
+    assert tools.set_summary_status("echo", "final") == "no_meta"
+
+
+def test_set_summary_status_still_reports_not_found_on_a_real_write_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R6-2 collateral: the new coercion only ever touches the INPUT payload
+    (a non-str ``summary``); it must not change what happens when
+    ``write_tool_meta`` fails for a genuine reason with a perfectly good ``str``
+    summary already on disk -- that must still read as ``"not_found"``, exactly
+    as before this fix."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    _write_meta(pkg, summary="說明", status="draft")
+    monkeypatch.setattr(tools, "write_tool_meta", lambda directory, meta: False)
+
+    assert tools.set_summary_status("echo", "final") == "not_found"
+
+
 @pytest.mark.parametrize(
     "name", ["ghost", "../escape", "UPPER"], ids=["missing", "traversal", "regex"]
 )

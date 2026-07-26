@@ -191,3 +191,35 @@ r2 的「寫檔前再讀一次狀態」與「prompt 建置移到 threadpool」�
   重現得出來，等於在描述另一個套件。改成 alias 列一律 `summary_status = None`
   （`_listed_summary_status`），與 by-name 路由的拒絕語意對齊；該列本身維持
   `valid=False`（`_scan_package` 本來就拒絕 symlink 套件目錄）不變。
+
+### D40 附錄（P3a review r6）：host 正規表示式再收斂、解除定版不受總結型別拖累、prompt 檔名過 UTF-8 洗白
+
+- **`_HOST_PORT_RE` 中括號分支再收斂**：r5 讓中括號內容放行任何非 `]` 字元
+  （`\[[^\]]+\]`），理由是「不平衡的括號已被 `urlsplit` 擋下」——但平衡的括號本身不是形狀
+  檢查，CPython 的 `urlsplit` 對 RFC 3986 IPvFuture 形式（`[v1.<任意字元>]`）同樣不驗證
+  內容，`https://[v1.Bearer SECRET]/openapi` 因此會 parse 成 netloc
+  `"[v1.Bearer SECRET]"`，跟真 IPv6 literal 一樣通過舊分支——與 R5-2 是同一個「parse
+  得成功不等於合法主機」的洞，換了字元類別重開。中括號內容改為白名單
+  `[0-9A-Fa-f:.]+`（IPv6 literal 實際會出現的字元，含 IPv4-mapped 尾段），zone ID
+  （`%25<zone>`）與 IPvFuture 都退成空字串——對 OpenAPI host 而言皆極罕見，安全地跟其他
+  不合形狀的輸入同一種拒絕，不在同一分支枚舉第二次。既有合法案例（`[::1]`、
+  `[2001:db8::1]:8443`）不受影響。
+- **解除定版不再被總結欄位的型別拖垮**：手改成 `{"summary": 123, "status": "final"}`
+  的 sidecar 過去無法解除定版——`write_tool_meta` 拒寫非字串 `summary`，這個 False 被
+  `set_summary_status` 摺進 `"not_found"`，404 掉唯一能修復這種手改損毀的操作，API 上
+  沒有第二條路。解除定版是使用者透過 API 修不了這個欄位時的最後手段，優先權高於型別
+  嚴格性：rewrite payload 送進 `write_tool_meta` 前，非字串 `summary` 先摺成 `""`
+  （degrade 成「尚無總結」）。此摺平只在非 final 分支生效——定版方向的空值檢查在它之前
+  就已擋下並回傳 `no_meta`，型別損毀的總結因此永遠無法被定版；`write_tool_meta` 因其他
+  原因（真實寫入失敗）回傳 False 時仍照舊摺進 `"not_found"`。
+- **prompt 的檔名 header 補 `_utf8_safe` 洗白**：非合法 UTF-8 的 POSIX 檔名（例如
+  builder 的 `run_shell` 以 raw bytes 寫出的檔案）經 `os.walk` 用作業系統自己的
+  surrogateescape 慣例解碼後帶著孤立 surrogate，遮蔽器（比對已知密文子字串）碰不到，卻在
+  LLM 請求做嚴格 UTF-8 序列化時炸掉——install hook 只能留佔位總結，之後每次
+  regenerate 都 502，直到操作者把檔案改名。這是 r3 `_utf8_safe` 處理的同一種檔案系統
+  邊界問題換了邊界重演：相對路徑 header 在既有 `redact_known_secrets` 之後、組進
+  prompt 之前再過一次 `tools._utf8_safe`（順序不變，洗白只替換 surrogate，不影響比對）。
+  查證兩個鄰接面：`_read_regular_file_capped` 讀檔案內容走 `errors="replace"`
+  文字解碼，非法位元組當場變 U+FFFD、從不產生 surrogate，內容路徑本就安全；
+  `_env_key_names` 的 key 同樣來自這條「內容」讀取路徑（`dotenv_values` 吃已解碼字串，
+  非原始 bytes），同樣不帶 surrogate，兩者都不需要另外洗白。

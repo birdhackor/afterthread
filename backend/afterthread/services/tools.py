@@ -1143,6 +1143,31 @@ def set_summary_status(name: str, status: str) -> str:
     ``"draft"`` stays unconditional on purpose: 解除定版 is the escape hatch out
     of a frozen state, and an escape hatch that can itself be refused is not one.
 
+    That unconditional-ness had a hole (R6-2): ``write_tool_meta`` refuses to
+    write ANY non-``str`` ``summary`` (its own contract), and a hand-corrupted
+    sidecar -- ``{"summary": 123, "status": "final"}``, the sidecar being a
+    plain JSON file the operator is explicitly allowed to hand-edit -- carried
+    that refusal straight through a 解除定版 attempt: the rewrite below got a
+    ``meta`` whose ``summary`` was still the bare ``int``, ``write_tool_meta``
+    returned False, and THIS function's own not-a-real-change fold turned
+    "un-finalize a broken sidecar" into ``"not_found"`` -- 404ing the one
+    mutation that exists to recover from exactly this corruption, with no
+    other way to reach it through the API at all. A non-``str`` summary is now
+    coerced to ``""`` in the rewrite payload before it ever reaches
+    ``write_tool_meta``: the sidecar is ours to rebuild, so a corrupt TYPE
+    degrades to "no summary yet" (the same shape a missing one gets) rather
+    than bricking the STATUS mutation. The escape hatch outranks type
+    strictness for the one field the user cannot repair through the API any
+    other way. This cannot reopen 定版 as a back door: the emptiness gate
+    above already requires a non-empty ``str`` summary BEFORE this coercion
+    ever runs (and returns ``"no_meta"`` first if that fails), so a
+    corrupt-typed summary coerced to ``""`` still cannot be finalized -- it
+    re-hits ``"no_meta"`` on the very next 定版 attempt -- only 解除定版 was
+    ever blocked, and only 解除定版 is fixed. The coercion is also a
+    structural no-op for every ALREADY-valid sidecar (a real ``str`` summary,
+    corrupt or not, is left exactly as read), so this changes nothing for the
+    byte-unchanged common case.
+
     ``status`` is trusted to be one of ``_SUMMARY_STATUSES``: the PATCH schema's
     ``Literal`` is the gate, the same way ``set_enabled`` trusts its bool. The
     rewrite goes through ``write_tool_meta``, so the sidecar is rebuilt from the
@@ -1174,6 +1199,14 @@ def set_summary_status(name: str, status: str) -> str:
             summary = meta.get("summary")
             if not (isinstance(summary, str) and summary.strip()):
                 return "no_meta"
+        # R6-2: coerce a non-str summary to "" before it ever reaches
+        # write_tool_meta, whose own contract refuses to write one. A no-op
+        # on the "final" branch above (that check already forced summary to a
+        # non-empty str, or returned "no_meta" first) -- see the docstring's
+        # escape-hatch note for why this must fire unconditionally on every
+        # other status rather than only when the write would otherwise fail.
+        if not isinstance(meta.get("summary"), str):
+            meta["summary"] = ""
         meta["status"] = status
         meta["updated_at"] = datetime.now(UTC).isoformat()
         return "ok" if write_tool_meta(directory, meta) else "not_found"

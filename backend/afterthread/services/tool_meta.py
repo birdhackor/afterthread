@@ -234,13 +234,32 @@ class ToolSummaryResult(BaseModel):
 # like "Bearer SECRET" parses into a non-empty netloc exactly as readily as a
 # real hostname does; "it parsed" and "it is a host" are different claims,
 # and only the second is safe to return. Two accepted shapes: an IPv6
-# literal in its RFC 3986 bracket form (contents unchecked -- urlsplit
-# already raised on an unbalanced bracket by the time this runs), or a label
-# built from the characters an actual DNS name / IPv4 literal can contain;
-# either may be followed by ":" and an all-digit port. Anything else -- a
-# space, a header-shaped token, an empty string -- fails the match, and the
-# caller returns "" rather than the raw text.
-_HOST_PORT_RE = re.compile(r"(?:\[[^\]]+\]|[A-Za-z0-9.-]+)(?::[0-9]+)?")
+# literal in its RFC 3986 bracket form, or a label built from the characters
+# an actual DNS name / IPv4 literal can contain; either may be followed by
+# ":" and an all-digit port. Anything else -- a space, a header-shaped
+# token, an empty string -- fails the match, and the caller returns ""
+# rather than the raw text.
+#
+# R6-1: the bracket branch used to accept ANY non-"]" character (``\[[^\]]+\]``)
+# on the theory that a balanced bracket pair was itself the shape check --
+# it is not. ``urlsplit`` raising on an UNBALANCED bracket says nothing about
+# what a BALANCED one contains, and CPython's ``urlsplit`` additionally
+# tolerates RFC 3986's IPvFuture shape (``"[" "v" 1*HEXDIG "." 1*(...)  "]"``)
+# without validating the part after the dot -- so
+# ``https://[v1.Bearer SECRET]/openapi`` parses into the netloc
+# ``"[v1.Bearer SECRET]"`` exactly as readily as a real IPv6 literal does.
+# That is the SAME "it parsed" trap R5-2 closed for the unbracketed branch,
+# reopened one character class later, and it reaches this function's caller
+# with the credential-shaped text sitting in the host slot. The inside must
+# be shape-checked like everything else, so the bracket branch is now a
+# WHITELIST of the characters an IPv6 literal (including an embedded
+# IPv4-mapped tail like "::ffff:1.2.3.4") actually contains: hex digits,
+# ":", ".". A zone ID (RFC 6874, "%25eth0") and IPvFuture are both excluded
+# by that whitelist -- both are vanishingly rare for an OpenAPI host, and
+# fail the match into the SAME "" refusal every other unrecognized shape
+# gets here, rather than risking a second hole in the same branch by trying
+# to enumerate what else to admit.
+_HOST_PORT_RE = re.compile(r"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(?::[0-9]+)?")
 
 
 def _sanitized_origin_url(url: str) -> str:
@@ -481,8 +500,22 @@ def _summary_user_prompt(
         )
     for relative_path, content in _package_files(directory):
         # The CONTENT is already masked by _package_files; the header carrying
-        # the path is not, and a filename can embed a value just as a file body can.
-        parts.append(f"{tools.redact_known_secrets(relative_path)}:\n{content}")
+        # the path is not, and a filename can embed a value just as a file body
+        # can. R6-3: the header can also carry something no MASK fixes -- a
+        # POSIX filename that is not valid UTF-8 (e.g. one a builder's
+        # run_shell wrote as raw bytes) is decoded by ``os.walk`` through the
+        # OS's own surrogateescape convention into a ``str`` carrying a LONE
+        # SURROGATE, which no substring-based redaction touches and which
+        # then dies at the LLM request's strict UTF-8 serialization -- the
+        # SAME filesystem-boundary failure r3's ``tools._utf8_safe`` exists to
+        # close (there, a hand-edited sidecar; here, a hand-edited/generated
+        # filename). Applied AFTER the redaction, mirroring ``tools._redacted``'s
+        # own order: the redactor matches a REGISTERED value against untouched
+        # text, and the scrub only ever replaces a surrogate with U+FFFD, which
+        # carries nothing to mask -- so running it second changes nothing the
+        # redaction pass would otherwise catch.
+        safe_relative_path = tools._utf8_safe(tools.redact_known_secrets(relative_path))
+        parts.append(f"{safe_relative_path}:\n{content}")
     keys = _env_key_names(directory)
     if keys:
         # NAMES only -- see _env_key_names. Stated as environment variables
