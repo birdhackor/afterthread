@@ -446,6 +446,11 @@ class LlmLogAttempt(BaseModel):
     interaction-level aggregate (see the module comment above). ``truncated``
     is true the moment ANY body on this attempt -- a request message or the
     response -- was cut for size; the FE shows a small badge for it.
+    ``tools_advertised`` is the NAMES of the tools this attempt offered the
+    model, or null when it sent no ``tools`` parameter at all (see
+    ``LlmAttempt`` in services/llm_log.py) -- declaring it here is what keeps it
+    on the wire, since pydantic's default ``extra="ignore"`` would otherwise
+    drop the key silently at the router's ``model_validate``.
     """
 
     request_messages: list[LlmLogMessage]
@@ -455,6 +460,7 @@ class LlmLogAttempt(BaseModel):
     error: str | None
     usage: LlmLogUsage | None
     truncated: bool
+    tools_advertised: list[str] | None = None
 
 
 class LlmLogDetail(LlmLogBase):

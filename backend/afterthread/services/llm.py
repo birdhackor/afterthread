@@ -929,6 +929,26 @@ async def _run_structured[ModelT: BaseModel](
     tool_specs = [cast(ChatCompletionToolParam, tool.spec) for tool in tools] if tools else None
     tools_by_name = _index_tools(tools) if tools else {}
 
+    # The tool NAMES a tools-carrying create() advertises, derived ONCE here for
+    # the recorder (see llm_log.LlmAttempt.tools_advertised). The specs ride as a
+    # create() PARAMETER, never inside `messages`, so without this the log cannot
+    # say which tools a given attempt offered the model. Names are read out of the
+    # spec exactly the way `_index_tools` reads them (`spec["function"]["name"]`,
+    # defensively) so a spec the dispatcher could not name is not named here
+    # either; read from `tools` rather than from `tools_by_name` because that map
+    # collapses a duplicate name to one entry, while BOTH specs really did ride on
+    # create(). None -- not [] -- whenever no tools ride at all, mirroring
+    # `tool_specs` so the two can never disagree about whether this is the
+    # tool-less build.
+    advertised_names: list[str] | None = None
+    if tools:
+        advertised_names = []
+        for tool in tools:
+            function = tool.spec.get("function") if isinstance(tool.spec, dict) else None
+            name = function.get("name") if isinstance(function, dict) else None
+            if isinstance(name, str) and name:
+                advertised_names.append(name)
+
     # The conversation accumulates across the whole loop: tool rounds append the
     # assistant tool-call turn plus one result per call; the final phase's
     # corrective retry appends the rejected reply plus a corrective user turn.
@@ -1014,8 +1034,14 @@ async def _run_structured[ModelT: BaseModel](
                     messages.append({"role": "user", "content": _TOOL_BUDGET_EXHAUSTED})
                 # Snapshot the messages ACTUALLY sent for this attempt (the
                 # recorder copies them, since `messages` is rebuilt each round /
-                # for the corrective retry below).
-                recorder.begin_attempt(messages)
+                # for the corrective retry below), together with the tool names
+                # riding alongside them. `advertise_tools` is the SAME gate the
+                # create() below is given, read here rather than re-derived, so
+                # the record can never claim tools an attempt did not send (the
+                # tools-free finalize and the corrective retry both record None).
+                recorder.begin_attempt(
+                    messages, tools_advertised=advertised_names if advertise_tools else None
+                )
                 # P4: capture the char size of what we are about to send, BEFORE the
                 # tool round / corrective retry below mutates `messages`, so it can
                 # be paired with THIS attempt's reported prompt_tokens as one

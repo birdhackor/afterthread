@@ -18,6 +18,7 @@ import { useSearch } from "@tanstack/react-router";
 import { useState } from "react";
 import { apiGet } from "../api/client.js";
 import { EmptyState } from "../components/EmptyState.jsx";
+import { TagList } from "../components/TagList.jsx";
 import { usePageTitle } from "../hooks/usePageTitle.js";
 
 // The list page reads at most this many recent interactions; the backend caps
@@ -202,6 +203,24 @@ function AttemptCard({ attempt, index }) {
 				<Text size="xs" c="dimmed">
 					{formatAttemptStats(attempt)}
 				</Text>
+
+				{/* The tools this round advertised (backend: tools_advertised).
+				    Specs ride as a create() parameter, not inside the messages
+				    below, so this is the only place the log can show what the
+				    model could see on this round. Null means the round sent no
+				    tools at all (a tool-less workflow, the tools-free finalize
+				    round, the corrective retry); absent means a record written
+				    before the field existed. Either of those -- and the empty
+				    list -- renders NOTHING at all, rather than an empty or
+				    "無" row, so old records look exactly as they did. */}
+				{attempt.tools_advertised?.length > 0 ? (
+					<>
+						<Text fw={600} c="dimmed" size="xs">
+							本輪可用工具
+						</Text>
+						<TagList tags={attempt.tools_advertised} />
+					</>
+				) : null}
 
 				<Text size="xs" fw={600} c="dimmed">
 					要求訊息

@@ -129,8 +129,9 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
   1–500，預設 50），新到舊排序。
 - `GET /api/llm/logs/{log_id}` — 單筆互動的內容（每次嘗試的請求訊息與回應，
   每則受 `LLM_LOG_BODY_MAX_CHARS` 截斷、超過每次嘗試總量預算的較早訊息會被
-  省略成一則標記、工具呼叫參數只保留約 200 字元預覽）；記錄已被環狀緩衝擠出
-  （見 `LLM_LOG_MAX_ENTRIES`）或程序重啟過則 404。
+  省略成一則標記、工具呼叫參數只保留約 200 字元預覽，並另記當輪廣告給模型的
+  工具名單）；記錄已被環狀緩衝擠出（見 `LLM_LOG_MAX_ENTRIES`）或程序重啟過則
+  404。
 
 AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 `502 llm_upstream_error`（上游呼叫失敗或輸出無法解析，即使重試一次後仍失敗）、

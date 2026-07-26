@@ -223,7 +223,9 @@ def test_tool_call_roundtrip_feeds_result_back_and_parses(monkeypatch: pytest.Mo
 
 def test_tool_round_records_synthetic_trace(monkeypatch: pytest.MonkeyPatch) -> None:
     """The tool_calls attempt's recorded response is the compact synthetic trace,
-    so the AI 日誌 shows the agentic step."""
+    so the AI 日誌 shows the agentic step -- and the same attempt names the tools
+    it advertised, which no message body could show (tool specs ride as a
+    create() parameter)."""
     _install(
         monkeypatch,
         _ScriptedClient(
@@ -240,6 +242,7 @@ def test_tool_round_records_synthetic_trace(monkeypatch: pytest.MonkeyPatch) -> 
     record = llm_log.get_record(summaries[0]["id"])
     assert record is not None
     assert record["attempts"][0]["response_content"].startswith("[tool_calls] echo(")
+    assert record["attempts"][0]["tools_advertised"] == ["echo"]
 
 
 def test_tool_handler_raise_feeds_safe_string(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -287,7 +290,11 @@ def test_tool_rounds_cap_forces_final_create_without_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Once the round budget is spent the loop stops advertising tools, appends
-    the budget-exhausted nudge, and makes ONE final tools-free create()."""
+    the budget-exhausted nudge, and makes ONE final tools-free create().
+
+    The AI 日誌 must be able to tell those rounds apart on its own, so each
+    attempt's ``tools_advertised`` is pinned alongside the create() kwargs: the
+    names on the two tool rounds, None on the forced finalize."""
     client = _install(
         monkeypatch,
         _ScriptedClient(
@@ -307,6 +314,10 @@ def test_tool_rounds_cap_forces_final_create_without_tools(
     # the forced final create carries NO tools and the budget-exhausted nudge
     assert "tools" not in calls[2]
     assert any(m.get("content") == _TOOL_BUDGET_EXHAUSTED for m in calls[2]["messages"])
+    # ...and the record says the same thing, attempt by attempt.
+    record = llm_log.get_record(llm_log.list_summaries(10)[0]["id"])
+    assert record is not None
+    assert [a["tools_advertised"] for a in record["attempts"]] == [["echo"], ["echo"], None]
 
 
 def test_tools_available_but_model_answers_directly(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -323,10 +334,14 @@ def test_tools_available_but_model_answers_directly(monkeypatch: pytest.MonkeyPa
 
 def test_tools_none_sends_no_tools_kwarg(monkeypatch: pytest.MonkeyPatch) -> None:
     """tools=None (the default) keeps the create() kwargs byte-identical to the
-    tool-less build: no ``tools`` key at all."""
+    tool-less build: no ``tools`` key at all -- and the attempt records None
+    (not []) for what it advertised, matching that absence."""
     client = _install(monkeypatch, _ScriptedClient([_content_completion(_SAMPLE_JSON)]))
     _run()
     assert "tools" not in _calls(client)[0]
+    record = llm_log.get_record(llm_log.list_summaries(10)[0]["id"])
+    assert record is not None
+    assert record["attempts"][0]["tools_advertised"] is None
 
 
 def test_tools_empty_list_sends_no_tools_kwarg(monkeypatch: pytest.MonkeyPatch) -> None:

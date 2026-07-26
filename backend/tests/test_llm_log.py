@@ -76,10 +76,20 @@ def _record(
     response: str | None = "out",
     outcome: str = "ok",
     error: str | None = None,
+    tools_advertised: list[str] | None = None,
 ) -> llm_log.LlmInteractionRecorder:
-    """Build, populate and finalize one record straight through the recorder."""
+    """Build, populate and finalize one record straight through the recorder.
+
+    ``tools_advertised`` None means the kwarg is NOT passed to ``begin_attempt``
+    at all (exercising the default every pre-existing caller relies on), rather
+    than passed explicitly as None.
+    """
     recorder = llm_log.LlmInteractionRecorder(workflow=workflow, model=model)
-    recorder.begin_attempt(messages or [{"role": "user", "content": "hi"}])
+    attempt_messages = messages or [{"role": "user", "content": "hi"}]
+    if tools_advertised is None:
+        recorder.begin_attempt(attempt_messages)
+    else:
+        recorder.begin_attempt(attempt_messages, tools_advertised=tools_advertised)
     if response is not None:
         recorder.record_response(response)
     recorder.finish(outcome=outcome, error=error)
@@ -133,6 +143,38 @@ def test_get_record_includes_full_bodies() -> None:
 def test_get_record_unknown_id_returns_none() -> None:
     _record()
     assert llm_log.get_record(999999) is None
+
+
+def test_attempt_without_tools_kwarg_records_none() -> None:
+    """An attempt begun the way every tool-less caller begins one -- no
+    ``tools_advertised`` kwarg at all -- carries None end to end, not [], so
+    "this round advertised nothing" stays distinguishable in the detail
+    payload."""
+    _record()
+    log_id = llm_log.list_summaries(1)[0]["id"]
+    record = llm_log.get_record(log_id)
+    assert record is not None
+    assert record["attempts"][0]["tools_advertised"] is None
+
+
+def test_attempt_tools_advertised_is_recorded_as_a_copy() -> None:
+    """The advertised names reach the detail payload, and the recorder holds a
+    COPY: the caller derives one list per interaction and reuses it across every
+    round, so mutating it afterwards must not rewrite an already-recorded
+    attempt."""
+    names = ["alpha", "beta"]
+    recorder = llm_log.LlmInteractionRecorder(workflow="capture", model="m")
+    recorder.begin_attempt([{"role": "user", "content": "hi"}], tools_advertised=names)
+    recorder.record_response("out")
+    recorder.finish(outcome="ok", error=None)
+
+    names.append("gamma")
+    names[0] = "MUTATED"
+
+    log_id = llm_log.list_summaries(1)[0]["id"]
+    record = llm_log.get_record(log_id)
+    assert record is not None
+    assert record["attempts"][0]["tools_advertised"] == ["alpha", "beta"]
 
 
 # --- stored-body size cap (_stored_body) ------------------------------------
@@ -1094,6 +1136,30 @@ def test_router_detail_returns_full_record(client: TestClient) -> None:
     assert body["id"] == log_id
     assert body["attempts"][0]["response_content"] == "the full body"
     assert body["attempts"][0]["request_messages"][0] == {"role": "system", "content": "SYS"}
+
+
+def test_router_detail_exposes_tools_advertised(client: TestClient) -> None:
+    """The per-attempt tool names survive the router's response model.
+
+    This is the guard on schemas.LlmLogAttempt: the detail route builds its
+    response with ``LlmLogDetail.model_validate(record)``, and pydantic's default
+    ``extra="ignore"`` would drop an undeclared key SILENTLY -- the store would
+    keep recording the names while the API quietly stopped serving them. Both
+    shapes are pinned: null for a round that advertised nothing, and the exact
+    list for one that did."""
+    _record(workflow="capture")
+    _record(workflow="enrich", tools_advertised=["alpha", "beta"])
+    logs = client.get("/api/llm/logs").json()["logs"]
+
+    with_tools = client.get(f"/api/llm/logs/{logs[0]['id']}")
+    assert with_tools.status_code == 200
+    assert with_tools.json()["attempts"][0]["tools_advertised"] == ["alpha", "beta"]
+
+    without_tools = client.get(f"/api/llm/logs/{logs[1]['id']}")
+    assert without_tools.status_code == 200
+    attempt = without_tools.json()["attempts"][0]
+    assert "tools_advertised" in attempt  # present as an explicit null, not omitted
+    assert attempt["tools_advertised"] is None
 
 
 def test_router_detail_unknown_id_404(client: TestClient) -> None:

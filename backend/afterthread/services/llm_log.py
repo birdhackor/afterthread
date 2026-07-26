@@ -112,6 +112,24 @@ class LlmAttempt:
     message or the response -- was cut by ``_stored_body``, so a reader can
     tell "this record is honest but incomplete" apart from "this is
     everything" without diffing lengths against the configured cap by hand.
+
+    ``tools_advertised`` is the list of tool NAMES this attempt actually
+    offered the model, or None when the attempt sent NO ``tools`` parameter at
+    all (a tool-less workflow, the tools-free finalize round after the round or
+    conversation-size budget is spent, the corrective retry). It exists because
+    tool specs ride as a SEPARATE ``chat.completions.create`` parameter and
+    never appear in ``request_messages``, so nothing else in a record can
+    answer "what could the model see on THIS round". NAMES only, never the
+    specs: one tool's parameters schema can run to 16KiB and would be
+    re-recorded verbatim on every attempt of every round, while the name alone
+    already answers that question -- the full spec is on disk in the tool's
+    tool.json. In practice a reader sees only None or a non-empty list: an
+    EMPTY tool set is normalized to "no tools parameter at all" upstream (see
+    ``_run_structured``), so ``tools=[]`` records None rather than []. A
+    literal [] stays possible for one degenerate reason, and means something
+    DIFFERENT from None -- a tools parameter WAS sent, but not one of its
+    entries carried a readable ``function.name`` (the same defensive read the
+    dispatcher makes, so none of them would have been callable either).
     """
 
     request_messages: list[dict[str, str]]
@@ -121,6 +139,7 @@ class LlmAttempt:
     error: str | None = None
     usage: dict[str, int | None] | None = None
     truncated: bool = False
+    tools_advertised: list[str] | None = None
 
 
 @dataclass(slots=True)
@@ -694,7 +713,9 @@ class LlmInteractionRecorder:
         self._attempts: list[LlmAttempt] = []
         self._finished = False
 
-    def begin_attempt(self, messages: list[Any]) -> None:
+    def begin_attempt(
+        self, messages: list[Any], *, tools_advertised: list[str] | None = None
+    ) -> None:
         """Snapshot the messages ACTUALLY sent for a new attempt.
 
         Copied field-by-field (not aliased) because the caller rebuilds its
@@ -709,6 +730,14 @@ class LlmInteractionRecorder:
         the originals -- and ``truncated`` is set the moment ANY message was cut
         for size OR older messages were elided for the aggregate budget;
         ``record_response`` below may OR a response-side cut into the same flag.
+
+        ``tools_advertised`` is the NAMES of the tools this attempt offers the
+        model (see ``LlmAttempt``); keyword-only with a default so every caller
+        that advertises none -- and every pre-existing one -- keeps recording
+        None without changing a line. It is stored as a COPY for the same
+        reason the messages are: the caller derives it once per interaction and
+        reuses that one list across every round, so an alias would let a later
+        mutation rewrite an attempt already recorded here.
         """
         stored: list[dict[str, str]] = []
         truncated = False
@@ -723,6 +752,7 @@ class LlmInteractionRecorder:
                 request_messages=request_messages,
                 request_chars=request_chars,
                 truncated=truncated or budget_truncated,
+                tools_advertised=(list(tools_advertised) if tools_advertised is not None else None),
             )
         )
 
@@ -857,6 +887,7 @@ def _record_detail(record: LlmInteractionRecord) -> dict[str, Any]:
                 "error": attempt.error,
                 "usage": attempt.usage,
                 "truncated": attempt.truncated,
+                "tools_advertised": attempt.tools_advertised,
             }
             for attempt in record.attempts
         ],
