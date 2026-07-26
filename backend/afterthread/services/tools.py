@@ -1149,6 +1149,22 @@ def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
     return _write_sidecar_atomic(directory, data)
 
 
+def _narrowed_summary_status(meta: dict[str, Any] | None) -> str | None:
+    """The trustworthy ``status`` inside an ALREADY-READ sidecar meta, or None.
+
+    Pure, and shared by both readers below so the narrowing exists ONCE: a meta we
+    could not read at all, one without a ``status``, and one whose ``status`` is
+    not in ``_SUMMARY_STATUSES`` all collapse to None here, and each reader then
+    decides what that None MEANS to it. Extracted (R4-2) so
+    ``summary_status_or_unknown`` can hand its caller the very meta it judged
+    without reading the file a second time to get it.
+    """
+    if meta is None:
+        return None
+    status = meta.get("status")
+    return status if isinstance(status, str) and status in _SUMMARY_STATUSES else None
+
+
 def summary_status(directory: Path) -> str | None:
     """The package's summary status (``"draft"``/``"final"``), or None.
 
@@ -1159,11 +1175,7 @@ def summary_status(directory: Path) -> str | None:
     ``list_tools`` so the 工具 page can badge every row without an N+1 of
     per-tool summary requests.
     """
-    meta = read_tool_meta(directory)
-    if meta is None:
-        return None
-    status = meta.get("status")
-    return status if isinstance(status, str) and status in _SUMMARY_STATUSES else None
+    return _narrowed_summary_status(read_tool_meta(directory))
 
 
 # ``summary_status_or_unknown``'s third answer: "there IS a sidecar and we could
@@ -1176,8 +1188,8 @@ def summary_status(directory: Path) -> str | None:
 _SUMMARY_STATUS_UNKNOWN = "unknown"
 
 
-def summary_status_or_unknown(directory: Path) -> str | None:
-    """``summary_status`` for the ONE caller that must not guess (R3-2).
+def summary_status_or_unknown(directory: Path) -> tuple[str | None, dict[str, Any] | None]:
+    """``(status, meta)`` for the ONE caller that must not guess (R3-2, R4-2).
 
     The same two real answers (``"draft"`` / ``"final"``), but the None that
     ``summary_status`` folds every failure into is SPLIT in two:
@@ -1212,15 +1224,34 @@ def summary_status_or_unknown(directory: Path) -> str | None:
     it takes a concurrent delete of the package to reach at all, and the opposite
     direction -- a sidecar created in between -- simply reports the real status.
     Both sit in the check-then-act residual class D40 already accepts.
+
+    The SECOND element is the meta this call actually parsed, and it exists so the
+    caller does not have to read the same file again to use its other contents
+    (R4-2). ``_promote_staging_replace`` needs the sidecar's ``origin`` -- the only
+    copy of the OpenAPI url and the operator's install instructions -- and it needs
+    it from a read it can TRUST: a second, total read (``read_tool_meta`` alone,
+    which answers None for absent and unreadable alike) turned a transient EIO into
+    ``origin=None``, after which the swap destroyed the sidecar and the
+    regenerated one carried the loss forever. Handing back what was just judged
+    makes that impossible by construction rather than by a second discrimination
+    kept in step with this one.
+
+    The meta is None on BOTH failure answers, deliberately: for ENOENT there is
+    nothing to hand back, and for UNKNOWN the whole verdict is "this file cannot be
+    trusted" -- returning its contents anyway would invite a caller to use what
+    this function just refused to believe.
     """
     try:
         os.lstat(directory / _AI_META_FILENAME)
     except FileNotFoundError:
-        return None
+        return None, None
     except OSError:
-        return _SUMMARY_STATUS_UNKNOWN
-    status = summary_status(directory)
-    return status if status is not None else _SUMMARY_STATUS_UNKNOWN
+        return _SUMMARY_STATUS_UNKNOWN, None
+    meta = read_tool_meta(directory)
+    status = _narrowed_summary_status(meta)
+    if status is None:
+        return _SUMMARY_STATUS_UNKNOWN, None
+    return status, meta
 
 
 def set_summary_status(name: str, status: str) -> str:

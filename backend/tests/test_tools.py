@@ -2836,11 +2836,15 @@ def test_summary_status_or_unknown_agrees_on_a_readable_sidecar(
     tmp_path: Path, meta: dict[str, Any], expected: str
 ) -> None:
     """A sidecar we CAN read gives the strict reader and the total one the same
-    answer -- the split is only about what the failures mean."""
+    answer -- the split is only about what the failures mean.
+
+    The strict reader also hands the meta it just parsed back (R4-2), which is how
+    its one caller gets the ``origin`` without reading the file a second time. The
+    meta is the WHOLE sidecar, not a re-read of it: asserted by content."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     _sidecar(pkg).write_text(json.dumps(meta), encoding="utf-8")
-    assert tools.summary_status_or_unknown(pkg) == expected
+    assert tools.summary_status_or_unknown(pkg) == (expected, meta)
     assert tools.summary_status(pkg) == expected
 
 
@@ -2848,10 +2852,11 @@ def test_summary_status_or_unknown_none_only_when_the_sidecar_is_really_absent(
     tmp_path: Path,
 ) -> None:
     """None means ENOENT and nothing else: the one case where "not finalized" is
-    a fact rather than a guess."""
+    a fact rather than a guess. There is no meta to hand back either -- an absent
+    sidecar has no origin to inherit, which is a fact and not a failed look."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
-    assert tools.summary_status_or_unknown(pkg) is None
+    assert tools.summary_status_or_unknown(pkg) == (None, None)
 
 
 def test_summary_status_or_unknown_reports_unknown_for_an_unreadable_sidecar(
@@ -2866,9 +2871,10 @@ def test_summary_status_or_unknown_reports_unknown_for_an_unreadable_sidecar(
     os.mkfifo(_sidecar(pkg))
 
     assert tools.summary_status(pkg) is None  # the total reader still degrades ...
-    assert (
-        tools.summary_status_or_unknown(pkg) == tools._SUMMARY_STATUS_UNKNOWN
-    )  # ... this does not
+    assert tools.summary_status_or_unknown(pkg) == (
+        tools._SUMMARY_STATUS_UNKNOWN,
+        None,  # ... this does not, and it hands back nothing it just refused to trust
+    )
 
 
 @pytest.mark.parametrize(
@@ -2883,13 +2889,16 @@ def test_summary_status_or_unknown_reports_unknown_for_a_corrupt_sidecar(
 
     ``write_tool_meta`` writes one of exactly two status literals into a JSON
     object every time, so each of these is a hand-edited or damaged file -- and a
-    status we refused to trust is not evidence that the summary is unfrozen."""
+    status we refused to trust is not evidence that the summary is unfrozen.
+
+    The meta is withheld on every one of them (R4-2): a file whose status we
+    refuse to believe must not have its other fields handed on as if we did."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     _sidecar(pkg).write_text(content, encoding="utf-8")
 
     assert tools.summary_status(pkg) is None
-    assert tools.summary_status_or_unknown(pkg) == tools._SUMMARY_STATUS_UNKNOWN
+    assert tools.summary_status_or_unknown(pkg) == (tools._SUMMARY_STATUS_UNKNOWN, None)
 
 
 def test_summary_status_or_unknown_reports_unknown_for_an_oversized_sidecar(
@@ -2903,7 +2912,7 @@ def test_summary_status_or_unknown_reports_unknown_for_an_oversized_sidecar(
     _sidecar(pkg).write_text(json.dumps({"summary": padding, "status": "final"}), encoding="utf-8")
 
     assert tools.summary_status(pkg) is None
-    assert tools.summary_status_or_unknown(pkg) == tools._SUMMARY_STATUS_UNKNOWN
+    assert tools.summary_status_or_unknown(pkg) == (tools._SUMMARY_STATUS_UNKNOWN, None)
 
 
 def test_summary_status_unknown_sentinel_is_not_a_real_status(tmp_path: Path) -> None:

@@ -3907,11 +3907,12 @@ def test_promote_replace_refuses_a_finalization_that_landed_mid_session(
         {"summary": "凍結的總結", "status": "final", "updated_at": "2026-07-27T00:00:00+00:00"},
     )
 
-    error = tool_builder._promote_staging_replace(
+    origin, error = tool_builder._promote_staging_replace(
         staging, "kbsearch", base, env_existed_at_start=False
     )
 
     assert error == tool_builder._ERROR_REVISE_FINALIZED
+    assert origin is None  # a refusal hands nothing back
     # the installed package -- and its frozen summary -- are untouched
     assert (installed / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY
     meta = tools.read_tool_meta(installed)
@@ -3948,7 +3949,7 @@ def test_promote_replace_refuses_when_the_sidecar_cannot_be_read(tmp_path: Path)
     sidecar.chmod(0o000)
     try:
         assert tools.summary_status(installed) is None  # the fail-OPEN input, pinned
-        error = tool_builder._promote_staging_replace(
+        _origin, error = tool_builder._promote_staging_replace(
             staging, "kbsearch", base, env_existed_at_start=False
         )
     finally:
@@ -3976,7 +3977,7 @@ def test_promote_replace_refuses_a_sidecar_that_is_not_a_regular_file(tmp_path: 
     installed, staging = _replace_fixture(base)
     os.mkfifo(installed / tools._AI_META_FILENAME)
 
-    error = tool_builder._promote_staging_replace(
+    _origin, error = tool_builder._promote_staging_replace(
         staging, "kbsearch", base, env_existed_at_start=False
     )
 
@@ -3991,21 +3992,135 @@ def test_promote_replace_proceeds_when_the_status_is_knowable(
 ) -> None:
     """Fail-closed must not become refuse-everything: a DRAFT sidecar and a
     genuinely ABSENT one are both definite answers of "not finalized", and both
-    still publish. ENOENT is the one case where "not finalized" is a fact."""
+    still publish. ENOENT is the one case where "not finalized" is a fact.
+
+    Both also pin what the gate HANDS BACK (R4-2): the draft's origin comes out of
+    the very read that cleared the swap, and a package with no sidecar at all has
+    nothing to inherit and says so with None -- the one place where "no origin" is
+    a fact rather than a failed look."""
     base = tmp_path / "tools"
     installed, staging = _replace_fixture(base)
     if status is not None:
         assert tools.write_tool_meta(
             installed,
-            {"summary": "草稿", "status": status, "updated_at": "2026-07-27T00:00:00+00:00"},
+            {
+                "summary": "草稿",
+                "status": status,
+                "origin": {"openapi_url": "https://kb.example", "instructions": "原始安裝指示"},
+                "updated_at": "2026-07-27T00:00:00+00:00",
+            },
         )
 
-    error = tool_builder._promote_staging_replace(
+    origin, error = tool_builder._promote_staging_replace(
         staging, "kbsearch", base, env_existed_at_start=False
     )
 
     assert error is None
     assert (installed / "run.py").read_text(encoding="utf-8") == "print('revised')"
+    assert _leftovers(base) == []
+    if status is None:
+        assert origin is None
+    else:
+        assert origin == {"openapi_url": "https://kb.example", "instructions": "原始安裝指示"}
+
+
+def test_promote_replace_refuses_a_finalization_that_lands_during_the_env_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The 定版 gate must be the LAST pre-swap step, not merely a late one (R4-1).
+
+    Every other pre-swap step finishes in a bounded moment; the ``.env`` copy does
+    not -- an operator chooses the file, so its duration is theirs, not ours. With
+    the copy AFTER the gate, a finalization landing while the bytes moved was
+    invisible to a check that had already passed, and the swap then replaced the
+    package, took the frozen text with it and regenerated a draft. That is not the
+    instants-wide check-then-act residual this module accepts; it is a window an
+    outside party sets the size of.
+
+    So the copy now runs FIRST (it only writes into staging, which nothing else
+    observes) and the gate runs last. Driven by finalizing from INSIDE the copy,
+    which is the exact window the finding names: under the old ordering this test
+    would swap and the frozen summary would be gone."""
+    base = tmp_path / "tools"
+    installed, staging = _replace_fixture(base)
+    (installed / ".env").write_text("KB_API_KEY=live-secret-value\n", encoding="utf-8")
+    real_copy2 = shutil.copy2
+    copies: list[str] = []
+
+    def finalize_while_copying(source: Any, destination: Any, **kwargs: Any) -> Any:
+        copies.append(str(source))
+        result = real_copy2(source, destination, **kwargs)
+        assert tools.write_tool_meta(
+            installed,
+            {"summary": "凍結的總結", "status": "final", "updated_at": "2026-07-27T00:00:00+00:00"},
+        )
+        return result
+
+    monkeypatch.setattr(shutil, "copy2", finalize_while_copying)
+
+    origin, error = tool_builder._promote_staging_replace(
+        staging, "kbsearch", base, env_existed_at_start=True
+    )
+
+    assert copies  # the window is real: the copy ran, and 定版 landed inside it
+    assert error == tool_builder._ERROR_REVISE_FINALIZED
+    assert origin is None
+    assert (installed / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY  # never swapped
+    meta = tools.read_tool_meta(installed)
+    assert meta is not None
+    assert meta["summary"] == "凍結的總結"  # the frozen text survived
+    assert meta["status"] == "final"
+    assert _leftovers(base) == []
+
+
+def test_promote_replace_refuses_an_oversized_live_env(tmp_path: Path) -> None:
+    """The copy is bounded by the SAME ceiling the rest of the system applies to a
+    ``.env`` (R4-1), and refuses BEFORE anything is moved.
+
+    Two reasons, and the second is why an unbounded copy was a defect rather than
+    a waste: over the cap the values were never parseable in the first place
+    (``_read_env_for_values`` refuses, ``tools._load_tool_dotenv`` degrades the
+    tool to no-env at runtime), so copying it would publish a file the rest of the
+    system rejects; and the copy is the last thing standing between the gates and
+    the swap, so its duration has to be ours to bound."""
+    base = tmp_path / "tools"
+    installed, staging = _replace_fixture(base)
+    (installed / ".env").write_bytes(b"K=" + b"v" * (tools._ENV_FILE_MAX_BYTES - 1))
+    assert (installed / ".env").stat().st_size == tools._ENV_FILE_MAX_BYTES + 1
+
+    origin, error = tool_builder._promote_staging_replace(
+        staging, "kbsearch", base, env_existed_at_start=True
+    )
+
+    assert error == tool_builder._ERROR_REVISE_ENV_TOO_LARGE
+    assert origin is None
+    assert not (staging / ".env").exists()  # refused BEFORE the copy, not after it
+    assert (installed / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY  # never swapped
+    assert _leftovers(base) == []
+
+
+def test_promote_replace_copies_a_live_env_at_the_ceiling_byte_for_byte(tmp_path: Path) -> None:
+    """The refusal above is the ceiling EXACTLY, and the ordinary path is
+    unchanged: a ``.env`` AT the cap still publishes, byte for byte.
+
+    The gate must not creep past the property it enforces -- a size check that
+    quietly refused ordinary files would make a package unrevisable forever, with
+    a message that names no key and no value to explain why."""
+    base = tmp_path / "tools"
+    installed, staging = _replace_fixture(base)
+    head = b"# CRLF \xff and a non-utf8 byte survive too\r\nK="
+    raw = head + b"v" * (tools._ENV_FILE_MAX_BYTES - len(head))
+    assert len(raw) == tools._ENV_FILE_MAX_BYTES  # the cap EXACTLY, on the allowed side
+    (installed / ".env").write_bytes(raw)
+
+    origin, error = tool_builder._promote_staging_replace(
+        staging, "kbsearch", base, env_existed_at_start=True
+    )
+
+    assert error is None
+    assert origin is None  # no sidecar in this fixture: nothing to inherit
+    assert (installed / "run.py").read_text(encoding="utf-8") == "print('revised')"  # it swapped
+    assert (installed / ".env").read_bytes() == raw  # ... and the credentials came across
     assert _leftovers(base) == []
 
 
@@ -4350,6 +4465,35 @@ def test_run_revise_ships_no_env_when_the_live_one_was_deleted_mid_session(
     assert not (root / tool_builder._STAGING_DIRNAME).exists()
 
 
+def test_run_revise_treats_a_valueless_env_as_having_existed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """ "It existed" comes from the READ, never from the parsed values (R4-3).
+
+    A comment-only ``.env`` parses to ``{}`` -- exactly what a package with NO
+    ``.env`` parses to -- yet the two mean opposite things when the file is gone by
+    promote time: one is an operator who pulled a credentials file mid-session, the
+    other is a package that may receive the builder's own. Now that the reader
+    hands back an existence BIT plus the values rather than the text the caller
+    tested for None, the bit has to be taken from the read; deriving it from the
+    values would silently collapse this case into the never-had-one branch and let
+    the placeholder ship."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / ".env").write_text("# only a comment, no values at all\n", encoding="utf-8")
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY, ".env": _MODEL_ENV},
+        side_effect=lambda: (pkg / ".env").unlink(),
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY  # it really swapped
+    assert not (pkg / ".env").exists()  # the deletion stands: no placeholder took its place
+
+
 def test_run_revise_ships_the_builder_env_when_the_package_never_had_one(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4573,6 +4717,14 @@ def test_run_revise_never_redacts_or_builds_its_prompt_on_the_event_loop(
     the process, so blocking there stalls all of them -- the same reason P3a moved
     ``tool_meta._summary_user_prompt`` off it.
 
+    The ``.env`` VALUE PARSE is asserted the same way and for the same reason
+    (R4-3). The READ was already on a worker, but ``python-dotenv`` was then handed
+    the text back on the LOOP -- and a near-64 KiB ``.env`` full of quoting is a
+    real parse, not a formality. It is pinned by IDENTITY, not merely by "not the
+    loop": the parse must happen on the SAME worker as the read, because "one hop
+    that reads and parses" is the fix, and a second hop would be a different (and
+    still wrong) design that a not-the-loop assertion alone would accept.
+
     Asserted by THREAD, following that suite's pattern: ``asyncio.run`` drives the
     loop on this thread, so a different one means the hop really happened. Both
     outcome shapes are covered because the model-renamed refusal branch holds one
@@ -4590,8 +4742,11 @@ def test_run_revise_never_redacts_or_builds_its_prompt_on_the_event_loop(
     loop_thread = threading.current_thread()
     seen: dict[str, Any] = {}
     calls: list[tuple[str, threading.Thread]] = []
+    parses: list[tuple[str, threading.Thread]] = []
     real_prompt = tool_builder._revise_user_prompt
     real_redact = tools.redact_known_secrets
+    real_env_read = tool_builder._read_env_for_values
+    real_parse = tools._parse_dotenv_text
 
     def prompt_spy(*args: Any, **kwargs: Any) -> str:
         seen["prompt"] = threading.current_thread()
@@ -4601,11 +4756,21 @@ def test_run_revise_never_redacts_or_builds_its_prompt_on_the_event_loop(
         calls.append((text, threading.current_thread()))
         return real_redact(text)
 
+    def env_read_spy(directory: Path) -> tuple[bool, dict[str, str], str | None]:
+        seen["env_read"] = threading.current_thread()
+        return real_env_read(directory)
+
+    def parse_spy(text: str) -> dict[str, str]:
+        parses.append((text, threading.current_thread()))
+        return real_parse(text)
+
     async def no_summary_hook(*args: Any, **kwargs: Any) -> None:
         return None
 
     monkeypatch.setattr(tool_builder, "_revise_user_prompt", prompt_spy)
     monkeypatch.setattr(tools, "redact_known_secrets", redact_spy)
+    monkeypatch.setattr(tool_builder, "_read_env_for_values", env_read_spy)
+    monkeypatch.setattr(tools, "_parse_dotenv_text", parse_spy)
     monkeypatch.setattr(tool_meta, "generate_and_store_summary", no_summary_hook)
     _fake_generate(
         monkeypatch,
@@ -4617,6 +4782,12 @@ def test_run_revise_never_redacts_or_builds_its_prompt_on_the_event_loop(
 
     assert outcome.ok is (model_name == "kbsearch")
     assert seen["prompt"] is not loop_thread
+    # The session's own ``.env`` read is the FIRST parse of the run (nothing before
+    # it touches dotenv), and it happens on the read's OWN worker -- one hop, no
+    # dotenv work left on the loop (R4-3).
+    assert seen["env_read"] is not loop_thread
+    assert parses and parses[0][0] == _TRICKY_ENV
+    assert parses[0][1] is seen["env_read"]
     # The system prompt's name redaction -- the only call whose text is the package
     # name (the rename branch below passes the MODEL's name, which differs).
     name_threads = [thread for text, thread in calls if text == "kbsearch"]
@@ -4698,6 +4869,58 @@ def test_run_revise_regenerates_the_summary_inheriting_the_origin(
         "instructions": "原始安裝指示",
     }
     assert meta["llm_log_id"] == llm_log.last_record_id_for_workflow("tool_summary")
+
+
+def test_run_revise_refuses_rather_than_losing_the_origin_to_one_bad_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A SINGLE transient sidecar read failure must not cost the origin (R4-2).
+
+    The origin -- the OpenAPI url and the operator's original install instructions
+    -- exists ONLY in this sidecar, and the swap destroys it. It used to be read
+    through the TOTAL ``read_tool_meta``, where every failure is None, while the
+    pre-swap gate re-read the same file through the STRICT one. So one EIO on the
+    first read said "no origin", the second read then said "draft", the swap went
+    ahead, and the regenerated sidecar carried the loss forever -- unrecoverably,
+    because nothing else persists either field.
+
+    Pinned by making exactly ONE read fail, armed once the session is under way.
+    That failure lands on whichever read comes first afterwards: under the old
+    code that was the separate origin read (silent loss, revise reports success),
+    and under the fix there is no such read -- the origin comes from the gate's own
+    parse -- so the failure lands on the GATE, which fails closed. The refusal
+    keeping the package AND the origin is the property; that only one read is left
+    to fail is how it is achieved."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    root = pkg.parent
+    origin = {"openapi_url": "https://kb.example", "instructions": "原始安裝指示"}
+    _write_meta(pkg, summary="舊的說明", status="draft", origin=origin)
+    before = _file_bytes(pkg)
+    real_read = tools.read_tool_meta
+    state = {"armed": False, "used": False}
+
+    def one_transient_failure(directory: Path) -> dict[str, Any] | None:
+        if state["armed"] and not state["used"]:
+            state["used"] = True
+            return None  # one EIO/ESTALE-shaped read, exactly once
+        return real_read(directory)
+
+    monkeypatch.setattr(tools, "read_tool_meta", one_transient_failure)
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY},
+        side_effect=lambda: state.update(armed=True),
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert state["used"] is True  # the transient failure really happened
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_SUMMARY_UNREADABLE
+    assert _file_bytes(pkg) == before  # the package never swapped ...
+    assert _meta(pkg)["origin"] == origin  # ... and its only copy of the origin stands
+    assert _leftovers(root) == []
 
 
 def test_run_revise_survives_a_failing_summary(

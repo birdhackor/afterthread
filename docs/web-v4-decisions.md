@@ -521,3 +521,47 @@ store-time 重檢（D40 r2 附錄）同一個模式、同一個理由，只是�
 - **順帶修掉一處 docstring 與程式碼的矛盾**：`run_revise` 的 docstring 仍寫著「中途定版
   **不會**在 promote 時重檢，屬既接受的 check-then-act 殘留」——那句話在 P3b 自我審查加上
   重檢的那一刻就不成立了，修復時漏改。本輪一併改正。
+
+### D40 附錄（P3b review r4）：定版閘真的排到最後、`.env` 複製加上限、origin 只讀一次、dotenv 解析進 threadpool
+
+- **`.env` 複製移到定版閘之前，複製本身也加大小上限（R4-1）**：r3 把重檢改成 fail-closed，
+  但它**不是最後一步**——`_preserve_env_file` 的 `copy2` 排在它後面，而那一步的**時間長度
+  是外面的人決定的**（維運者可以在 session 中途把 `.env` 換成一個任意大的普通檔案）。
+  於是「定版落在複製進行中」這件事，被一個**已經跑完**的閘門完全看不到，換裝照樣把
+  已定版的整包蓋掉。既有裁決接受的 check-then-act 殘留講的是**兩個 syscall 之間的瞬間**，
+  不是一段可以任意拉長的複製。**修法有兩半，缺一不可**：(a) **順序**——`.env` 複製提前到
+  目標存在／symlink 檢查之後、定版閘**之前**。這樣做零代價，因為它寫的東西全部落在
+  **staging**，沒有任何其他角色在看；閘門之後若拒絕，那份 staging `.env` 就跟著被丟棄的
+  build 一起消失。它依賴的前提（`target` 是真的已安裝目錄）由留在它前面的兩道檢查提供。
+  (b) **上限**——用本來就取的 `lstat` 的 `st_size`，來源大於 `tools._ENV_FILE_MAX_BYTES`
+  就以 category-only 的 `_ERROR_REVISE_ENV_TOO_LARGE` 拒絕。理由不是省時間：**超過上限的
+  `.env` 本來就解析不出值**（`_read_env_for_values` 開場就會拒絕、`tools._load_tool_dotenv`
+  在 runtime 直接降級成沒有 env），複製它等於發佈一個系統其他部分都不接受的檔案。
+  兩半合起來，換裝前剩下的窗口就只剩「`lstat` 與 `copy2` 之間」那個瞬間——與目標檢查
+  帶的那些同一種、同一個尺寸，正是既有裁決接受的那一類。順帶更正 `_promote_staging_replace`
+  docstring 裡「不需要再檢查大小」那句：它的前提是「複製的還是開場解析過的那個檔案」，
+  而中途被換掉正是這個函式必須撐住的情況。
+- **origin 改成「閘門讀到什麼就用什麼」，只讀一次（R4-2）**：`_existing_origin` 用的是
+  **total** 讀取器（所有錯誤 → None），而換裝前的閘門用的是 **strict** 那個。於是一次
+  暫時性 EIO 就會讓 origin 變成 None、strict 讀取隨後成功看到 `draft`、換裝照跑、舊
+  sidecar 隨舊包一起死、重生的 sidecar 帶著 `origin=None`——**OpenAPI URL 與原始安裝指示
+  的唯一副本就此永久消失**（沒有第二個地方存它們）。**修法採 (a) 案**：`tools.summary_status_or_unknown`
+  改回傳 `(status, meta)`，把它剛剛判讀過的 meta 一併交出；`_promote_staging_replace`
+  改回傳 `(origin, error)`（與 `_read_env_for_values` 同款的 `(value, error)` 形狀），
+  origin 由 `_existing_origin(meta)` 從**同一次**讀取收斂出來。`_existing_origin` 因此
+  改成吃 meta 的純函式。**兩個失敗答案都不交出 meta**：ENOENT 沒有東西可交，UNKNOWN 的
+  整個結論就是「這個檔案不可信」，把內容交出去等於邀請呼叫端使用它剛剛拒絕相信的東西。
+  **不再保留 unreadable 分支**：閘門已經對每一種讀不到的形狀拒絕過了，所以走到收斂
+  origin 那一行時，`meta is None` 只可能代表**確定沒有 sidecar**（本來就沒有東西可繼承，
+  照舊以 origin=None 繼續）——這一點寫進 docstring，而不是留一個沒有解釋的多餘分支。
+  `summary_status` 的 total 契約**仍然不動**（list_tools 的 badge、兩條 summary 路由的
+  409 判斷、`run_revise` 的入口閘），r3 的理由原封不動成立；narrow 的那三行抽成
+  `_narrowed_summary_status` 由兩個讀取器共用，好讓 strict 那個能一次讀完就交出 meta。
+- **`.env` 的值解析一併進 threadpool（R4-3）**：r1 把**讀檔**搬進 `run_in_threadpool`，
+  但 `python-dotenv` 的**解析**還留在 event loop 上——一份接近 64 KiB、引號很多的 `.env`
+  解析起來是真的工作，而 revise 跑在背景 job、與所有 HTTP request 共用同一個 loop，
+  理由與 R1-3 完全相同。`_read_env_for_values` 因此改成 `(existed, values, error)`：
+  讀與解析在**同一個** worker hop 內完成，loop 上不再有任何 dotenv 工作，呼叫端拿到的
+  仍然是「存在旗標＋值」這組既有契約。**`existed` 一律取自讀取、不取自解析結果**：
+  只有註解的 `.env` 解析出來是 `{}`，與「根本沒有 `.env`」的 `{}` 一模一樣，但兩者在
+  R3-1 的判斷裡意義相反——這條以測試釘住。

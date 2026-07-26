@@ -220,8 +220,11 @@ _ERROR_REVISE_SUMMARY_UNREADABLE = "無法確認總結是否已定版（AI 總�
 # not know while ``run_shell`` is running, which is the leak R1-1 already refuses
 # to take. TOO_LARGE: the bounded reader returns cap+1 chars, so parsing it yields
 # a TRUNCATED set of values -- the ones past the cap would go unregistered while
-# the copied file still carries them. RESTORE: the byte copy into staging failed,
-# so the revision would ship without the credentials it inherited.
+# the copied file still carries them; the COPY refuses on the same ceiling too
+# (R4-1), because an over-cap ``.env`` is one the runtime loader degrades to
+# nothing anyway and copying it would be the one unbounded step left before the
+# swap. RESTORE: the byte copy into staging failed, so the revision would ship
+# without the credentials it inherited.
 _ERROR_REVISE_ENV_UNREADABLE = "無法讀取既有工具包的 .env，修訂已取消。"  # noqa: RUF001
 _ERROR_REVISE_ENV_TOO_LARGE = "既有工具包的 .env 超過大小上限，修訂已取消。"  # noqa: RUF001
 _ERROR_REVISE_ENV_RESTORE = "無法還原工具包的 .env，修訂已取消。"  # noqa: RUF001
@@ -1586,11 +1589,20 @@ def _preserve_env_file(target: Path, staging: Path, *, existed_at_start: bool) -
     survive, so a CRLF-authored or non-utf-8 ``.env`` comes through unchanged.
 
     The direction is LIVE -> staging, which is why this is cheap to be wrong
-    about: the live package is only READ here, so a swap that fails afterwards
-    costs nothing -- the original file is still the original file, not a rewrite of
-    it. And it must run AFTER the target existence/symlink/finalized checks for
-    the same reason: it reads through ``target``, so the caller has to have
-    established that ``target`` is the real installed directory first.
+    about: the live package is only READ here, and everything it writes lands in
+    STAGING, which nothing outside this build observes -- so a swap that fails
+    afterwards costs nothing, and the original file is still the original file
+    rather than a rewrite of it. It must run AFTER the target existence/symlink
+    checks, because it reads through ``target`` and the caller has to have
+    established that ``target`` is the real installed directory first. It now runs
+    BEFORE the 定版 re-check, which is the point of R4-1: this copy is UNBOUNDED IN
+    TIME (an operator can put an arbitrarily large regular file at ``.env``
+    mid-session), so with it last, a finalization landing DURING the copy was
+    missed by a gate that had already run, and the swap then overwrote a finalized
+    package. The accepted check-then-act residual covers INSTANTS, not a copy of
+    unbounded duration -- moving this ahead of the gate is what keeps the two the
+    same size, and the size ceiling below is what keeps THIS step's own duration
+    bounded (see there).
 
     Both ends are guarded by an ``lstat``, mirroring the pre-write ``lstat``
     ``tools._write_sidecar_atomic`` makes and the ``O_NOFOLLOW`` + ``S_ISREG`` gate
@@ -1602,7 +1614,18 @@ def _preserve_env_file(target: Path, staging: Path, *, existed_at_start: bool) -
       revision whose credentials silently vanished. A non-regular source (a
       symlink or FIFO raced in after the entry read vetted a regular file) is
       refused rather than copied through, exactly as the bounded reader's
-      ``O_NOFOLLOW`` refuses it;
+      ``O_NOFOLLOW`` refuses it. The same ``lstat``'s ``st_size`` also CAPS the
+      copy at ``tools._ENV_FILE_MAX_BYTES`` (R4-1) -- the ceiling
+      ``_read_env_for_values`` already applies to this very file at the session's
+      start, and the one ``tools.validate_package`` applies to a staged ``.env``.
+      An over-cap ``.env`` could never have been parsed for its values anyway
+      (``tools._load_tool_dotenv`` degrades it to no-env at runtime, so the tool is
+      not even reading it), so copying it would publish a file the rest of the
+      system rejects, and would spend an unbounded stretch of the pre-swap window
+      doing it. Bounding it leaves only the instant between this ``lstat`` and the
+      ``copy2`` -- a swap-in of a bigger file right there is the ordinary
+      check-then-act residual the standing adjudication accepts, the same size as
+      the ones the target checks above carry;
     * DESTINATION -- ENOENT is the ordinary case (the copy excluded it) and a
       regular file is the builder's own ``.env``, which the prompt's contract says
       we overwrite. Anything else refuses, and that check is load-bearing rather
@@ -1653,14 +1676,14 @@ def _preserve_env_file(target: Path, staging: Path, *, existed_at_start: bool) -
     wins" rule the paragraph above states, applied in the other direction.
     """
     source = target / ".env"
-    source_mode: int | None
+    source_stat: os.stat_result | None
     try:
-        source_mode = os.lstat(source).st_mode
+        source_stat = os.lstat(source)
     except FileNotFoundError:
-        source_mode = None  # nothing to copy -- but WHY decides what happens next
+        source_stat = None  # nothing to copy -- but WHY decides what happens next
     except OSError:
         return _ERROR_REVISE_ENV_UNREADABLE
-    if source_mode is None:
+    if source_stat is None:
         if not existed_at_start:
             return None  # never had one: the builder's .env ships (see the docstring)
         try:
@@ -1674,8 +1697,13 @@ def _preserve_env_file(target: Path, staging: Path, *, existed_at_start: bool) -
             # neither created nor verified (the same rule the roll-back applies).
             return _ERROR_REVISE_ENV_DISCARD
         return None
-    if not stat.S_ISREG(source_mode):
+    if not stat.S_ISREG(source_stat.st_mode):
         return _ERROR_REVISE_ENV_UNREADABLE
+    if source_stat.st_size > tools._ENV_FILE_MAX_BYTES:
+        # Same ceiling, same file, same session (see the docstring): over it, the
+        # values were never parseable and the copy would be the one unbounded step
+        # left before the swap.
+        return _ERROR_REVISE_ENV_TOO_LARGE
     destination = staging / ".env"
     try:
         destination_mode: int | None = os.lstat(destination).st_mode
@@ -1698,8 +1726,17 @@ def _promote_staging_replace(
     base: Path,
     *,
     env_existed_at_start: bool,
-) -> str | None:
-    """Swap a revised build in for the INSTALLED ``<base>/<name>``; None = ok (D40).
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Swap a revised build in for the INSTALLED ``<base>/<name>`` (D40).
+
+    Returns ``(origin, error)``: the error is the usual category-only zh-TW string
+    (None = the revision is live), and the origin is the OLD sidecar's
+    ``origin`` block, read here rather than by the caller for the reason R4-2
+    gives -- see the 定版 gate below, which is the read it comes from. Both are
+    None on a refusal, and ``(None, None)`` on a success whose package simply had
+    no origin to inherit; the caller only consults the origin after the error is
+    None. The ``(value, error)`` shape mirrors ``_read_env_for_values``, the
+    module's other "do a thing, hand back what only that thing could learn".
 
     Blocking (runs via ``run_in_threadpool``). A SEPARATE function rather than a
     flag on ``_promote_staging``, because the two have opposite preconditions on
@@ -1732,18 +1769,30 @@ def _promote_staging_replace(
       package orphaned under a name nothing addresses.
 
     The live ``.env`` is then copied into staging (``_preserve_env_file``) AFTER
-    validation and BEFORE the swap -- the same slot, for the same reason, as the
-    install's ``_inject_secret_into_env``: ``validate_package`` judges what the
+    validation and BEFORE the 定版 gate -- the same slot, for the same reason, as
+    the install's ``_inject_secret_into_env``: ``validate_package`` judges what the
     BUILDER produced (and its embedded-secret gate would reject the live values on
     sight), and the backend's own bytes are layered on top of a package that has
     already passed. It overwrites whatever ``.env`` the builder wrote, which is
     the prompt's stated contract. It is a BYTE copy of the live file, not a
     re-encoding of text read earlier (R2-1) -- see that helper for why the file's
     exact bytes are observable and therefore not ours to normalize, and for why
-    reading from the live package here is safe. No size re-check is needed: the
-    bytes we copy in are the bytes the live package is running with right now, so
-    the revision's ``.env`` is exactly as loadable as the one it inherits; and the
-    staged package's own ``.env`` was just size-gated by validate.
+    reading from the live package here is safe. The copy is size-gated there
+    against the SAME ceiling the session's entry read and ``validate_package`` use
+    (R4-1); the earlier claim that no size check was needed rested on the live
+    ``.env`` still being the file whose values we parsed at the start, and a
+    mid-session replacement is exactly what this function must survive.
+
+    It runs BEFORE the 定版 gate rather than after it, and the order is the
+    decision (R4-1): the copy is the only pre-swap step whose duration is
+    UNBOUNDED FROM OUTSIDE -- the ceiling above bounds the bytes, but an operator
+    still chooses them -- so with it last, a finalization landing WHILE it ran was
+    invisible to a gate that had already passed, and the swap then destroyed a
+    finalized package. Putting it first costs nothing, because everything it does
+    lands in STAGING, which no other actor reads: if the gate refuses afterwards,
+    the staged ``.env`` dies with the abandoned build. What it depends on --
+    ``target`` being a real, non-symlink installed directory -- is established by
+    the two checks ABOVE it, which stay where they are.
 
     A package that NEVER had a ``.env`` preserves nothing, and then a
     builder-written one SHIPS -- deliberately, and identically to an install,
@@ -1789,22 +1838,34 @@ def _promote_staging_replace(
     (between the target checks and the rename, and between the two renames) are
     the SAME accepted residual ``_promote_staging``'s docstring already names for
     its exists-check: a race against a second actor holding the service's uid, on
-    a single-user local tool, and no new standard is invented for it here.
+    a single-user local tool, and no new standard is invented for it here. Every
+    one of them is an INSTANT between two syscalls, which is the property R4-1
+    restored by moving the one step that was not (the ``.env`` copy) off the end.
     """
     root_error = _verify_staging_root(staging, base)
     if root_error is not None:
-        return root_error
+        return None, root_error
     strip_error = _strip_builder_sidecars(staging)
     if strip_error is not None:
-        return strip_error
+        return None, strip_error
     error = tools.validate_package(staging, expected_name=name)
     if error is not None:
-        return f"工具包驗證失敗：{error}"  # noqa: RUF001
+        return None, f"工具包驗證失敗：{error}"  # noqa: RUF001
     target = base / name
     if target.is_symlink():
-        return _ERROR_REVISE_TARGET_ALIAS
+        return None, _ERROR_REVISE_TARGET_ALIAS
     if not target.is_dir():
-        return _ERROR_REVISE_TARGET_MISSING
+        return None, _ERROR_REVISE_TARGET_MISSING
+    # The live ``.env`` is copied into staging BEFORE the 定版 gate below, and the
+    # order is the fix R4-1 asked for: this is the only pre-swap step that can take
+    # an operator-chosen amount of TIME, and a gate that runs before it cannot see a
+    # finalization that lands during it. Everything it writes goes into STAGING, so
+    # running it early is free -- an abandoned build takes the staged ``.env`` with
+    # it. See ``_preserve_env_file`` for the size ceiling that bounds it and for
+    # why the target checks above are all it depends on.
+    env_error = _preserve_env_file(target, staging, existed_at_start=env_existed_at_start)
+    if env_error is not None:
+        return None, env_error
     # 定版 is re-checked HERE, at the last moment before the swap, not only at
     # the entry gates -- the same store-time re-check ``tools.store_summary_meta``
     # makes for regenerate (D40 r2), and for the same reason at a much longer
@@ -1824,22 +1885,35 @@ def _promote_staging_replace(
     # through and destroys the frozen text it exists to protect. UNKNOWN therefore
     # refuses exactly like "final". The two get DIFFERENT messages because their
     # remedies differ (see ``_ERROR_REVISE_SUMMARY_UNREADABLE``).
-    status = tools.summary_status_or_unknown(target)
+    #
+    # It is the LAST pre-swap step (R4-1): everything after it is a rename, so the
+    # window between deciding "not finalized" and acting on it is the instant
+    # between two syscalls -- the residual class this module already accepts, and
+    # the size a check-then-act gate has to be to mean anything.
+    #
+    # The SAME read also yields the origin (R4-2), which is why this reader hands
+    # its meta back. The origin -- the OpenAPI url and the operator's original
+    # install instructions -- lives ONLY in this sidecar, and the swap below
+    # destroys it; the post-swap summary inherits it so a revised tool still knows
+    # what it was built from. Reading it separately through the TOTAL
+    # ``read_tool_meta`` (all errors -> None) is what R4-2 found: a transient EIO
+    # answered "no origin", the strict gate then read the file fine, and the swap
+    # published a regenerated sidecar with the only copy of that context gone for
+    # good. One trusted read cannot disagree with itself. There is deliberately no
+    # unreadable-sidecar branch on the origin side either: this gate has already
+    # refused every shape in which the file could not be read, so by the line that
+    # narrows the origin there is nothing left to discriminate.
+    status, meta = tools.summary_status_or_unknown(target)
     if status == "final":
-        return _ERROR_REVISE_FINALIZED
+        return None, _ERROR_REVISE_FINALIZED
     if status == tools._SUMMARY_STATUS_UNKNOWN:
-        return _ERROR_REVISE_SUMMARY_UNREADABLE
-    # LAST of the pre-swap steps, because it is the only one that READS from the
-    # live package -- every check above had to establish that ``target`` is the
-    # real installed directory before this reaches through it (R2-1).
-    env_error = _preserve_env_file(target, staging, existed_at_start=env_existed_at_start)
-    if env_error is not None:
-        return env_error
+        return None, _ERROR_REVISE_SUMMARY_UNREADABLE
+    origin = _existing_origin(meta)
     backup = base / f".{name}.bak-{uuid4().hex}"
     try:
         os.rename(target, backup)
     except OSError as exc:
-        return f"工具包置換失敗（{type(exc).__name__}）。"  # noqa: RUF001
+        return None, f"工具包置換失敗（{type(exc).__name__}）。"  # noqa: RUF001
     try:
         os.rename(staging, target)
     except Exception as exc:
@@ -1865,10 +1939,10 @@ def _promote_staging_replace(
         try:
             os.rename(backup, target)
         except Exception:
-            return _ERROR_REVISE_UNRECOVERABLE
-        return f"工具包置換失敗（{type(exc).__name__}），原工具已還原。"  # noqa: RUF001
+            return None, _ERROR_REVISE_UNRECOVERABLE
+        return None, f"工具包置換失敗（{type(exc).__name__}），原工具已還原。"  # noqa: RUF001
     shutil.rmtree(backup, ignore_errors=True)
-    return None
+    return origin, None
 
 
 def _cleanup_staging(staging: Path, base: Path) -> None:
@@ -2155,29 +2229,39 @@ def _copy_package_into_staging(source: Path, staging: Path) -> str | None:
     return None
 
 
-def _read_env_for_values(directory: Path) -> tuple[str | None, str | None]:
-    """``(text, error)``: the package's ``.env`` TEXT to parse VALUES from (D40).
+def _read_env_for_values(directory: Path) -> tuple[bool, dict[str, str], str | None]:
+    """``(existed, values, error)``: the package's ``.env`` VALUES (D40).
 
-    Blocking. ``(None, None)`` means the package simply has no ``.env`` -- the
-    common case, and the one where there are no values to register or export.
-    A text of ``None`` with no error is therefore the OBSERVATION "this package
-    had no ``.env`` when the session started", and the caller carries exactly that
-    bit down to ``_preserve_env_file`` (R3-1): an EMPTY ``.env`` still comes back
-    as ``""``, so ``text is not None`` is a faithful "it existed", not a proxy for
-    "it had content". Written down here because that equivalence is now
-    LOAD-BEARING -- it decides whether a builder-written ``.env`` is allowed to
-    ship -- rather than an incidental property of the return shape.
+    Blocking, and the PARSE happens here rather than in the caller (R4-3). The
+    read was moved onto a threadpool worker long ago, but ``python-dotenv`` was
+    still handed the text back on the EVENT LOOP -- and a near-64 KiB ``.env``
+    full of quoting is a real parse, not a formality, while this runs from a
+    background job that shares the loop with every HTTP request in the process.
+    Read and parse are one worker hop now, so no dotenv work is left on the loop;
+    the caller still gets exactly what it needs, an existence bit and a values
+    dict.
+
+    ``existed`` is False with no error only when the package simply has no
+    ``.env`` -- the common case, and the one where there are no values to register
+    or export. It is the OBSERVATION "this package had no ``.env`` when the session
+    started", and the caller carries exactly that bit down to
+    ``_preserve_env_file`` (R3-1). It is taken from the READ, not from the parsed
+    values: an EMPTY ``.env`` (or one that is all comments) parses to ``{}`` and
+    must still count as EXISTING, because what it decides is whether a
+    builder-written ``.env`` may take a deleted one's place. On any error the
+    values are empty and the caller refuses the whole revise, so the bit is
+    meaningless there and is reported False.
 
     This read is about VALUES ONLY, and that separation is deliberate (R2-1): the
     FILE is never round-tripped through this text -- ``_preserve_env_file`` copies
     it byte-for-byte at promote time -- so the lossy decode the shared bounded
     reader performs (utf-8 with ``errors="replace"``, universal newlines) touches
-    nothing that lands on disk. What the text is FOR is the caller's
-    ``tools._parse_dotenv_text``, the one parser ``tools._load_tool_dotenv``
-    itself delegates to, so the values registered as in-flight secrets and exported
-    into ``run_shell`` are exactly the values the RUNTIME will hand the revised
-    tool. Values are parsed from this ONE read rather than from a second one for
-    the ordinary reason: two reads could disagree.
+    nothing that lands on disk. The parse is ``tools._parse_dotenv_text``, the one
+    parser ``tools._load_tool_dotenv`` itself delegates to, so the values
+    registered as in-flight secrets and exported into ``run_shell`` are exactly the
+    values the RUNTIME will hand the revised tool. Values are parsed from this ONE
+    read rather than from a second one for the ordinary reason: two reads could
+    disagree.
 
     Deliberately stricter than the runtime's own loader, which degrades an
     unreadable or oversized ``.env`` to "no extra env" and keeps the tool running.
@@ -2199,15 +2283,17 @@ def _read_env_for_values(directory: Path) -> tuple[str | None, str | None]:
     try:
         env_file.lstat()
     except FileNotFoundError:
-        return None, None
+        return False, {}, None
     except OSError:
-        return None, _ERROR_REVISE_ENV_UNREADABLE
+        return False, {}, _ERROR_REVISE_ENV_UNREADABLE
     text = tools._read_regular_file_capped(env_file, tools._ENV_FILE_MAX_BYTES)
     if text is None:
-        return None, _ERROR_REVISE_ENV_UNREADABLE
+        return False, {}, _ERROR_REVISE_ENV_UNREADABLE
     if len(text) > tools._ENV_FILE_MAX_BYTES:
-        return None, _ERROR_REVISE_ENV_TOO_LARGE
-    return text, None
+        return False, {}, _ERROR_REVISE_ENV_TOO_LARGE
+    # The parse stays on THIS worker (R4-3): handing the text back and calling
+    # python-dotenv from the caller put the whole parse back on the event loop.
+    return True, tools._parse_dotenv_text(text), None
 
 
 def _current_manifest_text(directory: Path) -> str | None:
@@ -2220,17 +2306,29 @@ def _current_manifest_text(directory: Path) -> str | None:
     return tools._read_regular_file_capped(directory / "tool.json", tools._MANIFEST_MAX_BYTES)
 
 
-def _existing_origin(directory: Path) -> dict[str, Any] | None:
-    """The install ORIGIN recorded in the package's CURRENT sidecar, or None.
+def _existing_origin(meta: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The install ORIGIN inside an ALREADY-READ sidecar meta, or None.
 
-    Blocking. Read BEFORE the swap, because the swap deletes the old package and
-    its sidecar with it -- and that sidecar is the ONLY copy of the OpenAPI url
-    and the operator's original instructions (nothing else persists them). The
-    post-revise summary inherits them so a revised tool keeps knowing what it was
-    originally built from. Narrowed and re-sanitized by ``tool_meta._stored_origin``,
-    the same reader the synchronous regenerate uses.
+    Pure. It takes the meta rather than a directory (R4-2) because the origin must
+    come from the SAME read that decided the package was not 已定版, not from a
+    second one of its own. That sidecar is the ONLY copy of the OpenAPI url and
+    the operator's original instructions (nothing else persists them), the swap
+    deletes it along with the old package, and the post-revise summary inherits it
+    so a revised tool keeps knowing what it was built from -- so a read that
+    answers "no origin" when it means "I could not look" loses that context
+    IRREVERSIBLY. The old shape did exactly that: ``tools.read_tool_meta`` folds
+    every failure into None, so one transient EIO was indistinguishable from a
+    package that never had an origin, while the strict gate's own read then
+    succeeded and let the swap proceed.
+
+    There is no unreadable-vs-absent branch HERE, and that is not an omission: the
+    caller's 定版 gate refuses on every unreadable shape before this is reached, so
+    a None meta arriving here can only mean the sidecar was definitively ABSENT --
+    a package with genuinely nothing to inherit, which proceeds with no origin.
+    Narrowed and re-sanitized by ``tool_meta._stored_origin``, the same reader the
+    synchronous regenerate uses.
     """
-    return tool_meta._stored_origin(tools.read_tool_meta(directory))
+    return tool_meta._stored_origin(meta)
 
 
 async def run_revise(name: str, feedback: str) -> InstallOutcome:
@@ -2294,21 +2392,21 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
     if await run_in_threadpool(tools.summary_status, directory) == "final":
         return InstallOutcome(ok=False, error=_ERROR_REVISE_FINALIZED)
 
-    env_text, env_error = await run_in_threadpool(_read_env_for_values, directory)
+    # ONE worker hop does the read AND the dotenv parse (R4-3): the parse is real
+    # work on a 64 KiB file and this job shares the loop with every request.
+    # ``env_existed_at_start`` is the READ's answer, not the parse's -- an empty or
+    # comment-only ``.env`` parses to {} and still EXISTED -- and it is carried down
+    # to the promote because "there is no ``.env`` now" is ambiguous by then: a
+    # package that never had one may ship the builder's, but one whose ``.env`` the
+    # operator DELETED mid-session must not have a placeholder put in its place
+    # (R3-1). VALUES only: the FILE is copied at promote time. Empty values
+    # contribute nothing to redaction and are not registered, matching
+    # tools._cached_env_values' own "a KEY= line contributes nothing" rule.
+    env_existed_at_start, env_values, env_error = await run_in_threadpool(
+        _read_env_for_values, directory
+    )
     if env_error is not None:
         return InstallOutcome(ok=False, error=env_error)
-    # Did this package HAVE a ``.env`` when the session started? The reader's
-    # ``(None, None)`` is exactly "there is none" -- an empty one still comes back
-    # as ``""`` -- and every other shape returned above. The bit is carried to the
-    # promote because "there is no ``.env`` now" is ambiguous by then: a package
-    # that never had one may ship the builder's, but one whose ``.env`` the
-    # operator DELETED mid-session must not have a placeholder put in its place
-    # (R3-1).
-    env_existed_at_start = env_text is not None
-    # VALUES only -- the FILE is copied at promote time (see _read_env_for_values).
-    # Empty values contribute nothing to redaction and are not registered, matching
-    # tools._cached_env_values' own "a KEY= line contributes nothing" rule.
-    env_values = tools._parse_dotenv_text(env_text) if env_text is not None else {}
     registered = [value for value in env_values.values() if value]
     # BEFORE the LLM call, and before anything is registered: a value we would be
     # required to ignore cannot be protected by registering it (see the docstring).
@@ -2408,9 +2506,11 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
                 llm_log_id=llm_log_id,
             )
 
-        # Read the origin while the OLD sidecar still exists (see _existing_origin).
-        origin = await run_in_threadpool(_existing_origin, directory)
-        promote_error = await run_in_threadpool(
+        # The origin comes back FROM the promote, not from a read of our own
+        # (R4-2): it has to be the sidecar the 定版 gate just vetted, because a
+        # separate total read turns a transient failure into "no origin" and the
+        # swap then destroys the only copy. See ``_existing_origin``.
+        origin, promote_error = await run_in_threadpool(
             _promote_staging_replace,
             staging,
             name,
