@@ -3,7 +3,6 @@ import {
 	Box,
 	Button,
 	Card,
-	Checkbox,
 	Group,
 	Stack,
 	Text,
@@ -25,6 +24,7 @@ import {
 import { LLM_NOT_CONFIGURED_NOTICE } from "../constants/labels.js";
 import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { codePointLength } from "../utils/text.js";
+import { BulletList } from "./BulletList.jsx";
 
 // One AI action card: a textarea + submit button whose submit fires the
 // `mutation` passed in from ItemAiActions. Handles the long-request loading
@@ -190,29 +190,12 @@ function AiActionCard({
 // shows copy that matches the page, not what stage was at enrich time.
 function GapsChecklist({ gaps, stage }) {
 	if (gaps.length > 0) {
-		// Keyed by `${gap}-${occurrence}`, not a raw array index -- the backend
-		// can legitimately repeat a gap verbatim, and a bare-value key would
-		// collide silently on duplicates.
-		const gapOccurrence = new Map();
 		return (
 			<Stack gap="xs">
 				<Text fw={600} size="sm">
 					仍待補齊
 				</Text>
-				<Stack gap={4}>
-					{gaps.map((gap) => {
-						const occurrence = gapOccurrence.get(gap) ?? 0;
-						gapOccurrence.set(gap, occurrence + 1);
-						return (
-							<Checkbox
-								key={`${gap}-${occurrence}`}
-								checked={false}
-								readOnly
-								label={gap}
-							/>
-						);
-					})}
-				</Stack>
+				<BulletList items={gaps} />
 			</Stack>
 		);
 	}

@@ -4,7 +4,6 @@ import {
 	Box,
 	Button,
 	Card,
-	Checkbox,
 	Divider,
 	Group,
 	Stack,
@@ -24,6 +23,7 @@ import {
 	loadLlmStatusAtom,
 	markLlmUnconfiguredAtom,
 } from "../atoms/llm.js";
+import { BulletList } from "../components/BulletList.jsx";
 import { CharCounter } from "../components/CharCounter.jsx";
 import { StaleBadge } from "../components/StaleBadge.jsx";
 import { StatusBadge } from "../components/StatusBadge.jsx";
@@ -36,15 +36,11 @@ import { codePointLength } from "../utils/text.js";
 const CAPTURE_MAX = SECTION_MAX_LENGTH;
 
 // Summary of a freshly captured item plus the AI's follow-up questions. The
-// questions render as a read-only checklist the user should answer soon; the
-// primary button carries them into the detail page's AI 補齊 card.
+// questions render as a non-interactive bullet list the user should answer
+// soon; the primary button carries them into the detail page's AI 補齊 card.
 function CaptureResult({ result }) {
 	const { item, questions } = result;
 	const detailTo = `/items/${item.id}`;
-	// Keyed by `${question}-${occurrence}`, not a raw array index -- the AI
-	// can legitimately repeat a question verbatim, and a bare-value key would
-	// collide silently on duplicates.
-	const questionOccurrence = new Map();
 	return (
 		<Card withBorder padding="md" radius="md">
 			<Stack gap="sm">
@@ -61,20 +57,7 @@ function CaptureResult({ result }) {
 						<Text fw={600} size="sm">
 							追問（建議盡快回答）
 						</Text>
-						<Stack gap={4}>
-							{questions.map((question) => {
-								const occurrence = questionOccurrence.get(question) ?? 0;
-								questionOccurrence.set(question, occurrence + 1);
-								return (
-									<Checkbox
-										key={`${question}-${occurrence}`}
-										checked={false}
-										readOnly
-										label={question}
-									/>
-								);
-							})}
-						</Stack>
+						<BulletList items={questions} />
 						<Button component={Link} to={detailTo} variant="light" mt="xs">
 							帶著這些問題去補齊
 						</Button>
