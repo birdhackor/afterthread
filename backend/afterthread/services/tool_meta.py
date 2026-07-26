@@ -817,10 +817,16 @@ async def regenerate_summary(name: str) -> dict[str, Any] | StoreRefusal | None:
     the returned meta equal to what is on disk; a sidecar with no usable origin
     yields None and the store's inheritance still covers it.
 
-    The caller (the route) has already checked that the tool exists, is not
-    finalized, and that no job is mid-promote; the resolve here is a race
-    backstop -- and, via the shared alias-refusing helper, the same hard-block
-    every other by-name summary path runs.
+    The caller (the route) has already checked that the tool exists and is not
+    finalized, and HOLDS a reservation in the job admission domain for the whole
+    of this call (R7-3) -- not merely a "no job is active" reading taken before
+    it. That distinction is what protects the store below: the read that builds
+    the prompt and the write that lands the result are separated by an LLM round
+    trip, and without the reservation a revise could be admitted inside that
+    window, replace the package and write its own sidecar, which this call would
+    then overwrite with a summary of a package that no longer exists. The resolve
+    here is still a race backstop -- and, via the shared alias-refusing helper,
+    the same hard-block every other by-name summary path runs.
 
     The three BLOCKING steps -- the resolve, the origin read, and the store --
     each hop through ``run_in_threadpool``, mirroring how ``routers.tools`` calls

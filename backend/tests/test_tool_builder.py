@@ -1958,6 +1958,48 @@ def test_an_env_this_system_wrote_always_passes_the_revise_spelling_gate(
     assert tool_builder._unmaskable_env_error(text, parsed) is None
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "plain-secret-abcdef",  # bare, single- and double-quoted are all safe
+        "secret#value-abcdef",  # needs quoting: bare is NOT vouched for
+        "secret value abcdef",  # ... nor is an unquoted value with spaces
+        "secret'value-abcdef",  # a single quote rules the single-quoted form out
+        'secret"value-abcdef',  # a double quote rules the double-quoted form out
+        "secret\\value-abcdef",  # ... and so does a backslash
+        '"quoted-value-abcdef"',
+        "mix'ab$c-#=`! def",
+        "  padded-abcdef  ",
+        "both'quotes\"here",  # ' AND " -> the serializer refuses to write it at all
+        "back\\slash'and-quote",  # ' AND \ -> likewise
+    ],
+)
+def test_the_vouchable_spellings_are_the_ones_the_serializer_calls_safe(value: str) -> None:
+    """``_dotenv_safe_spellings`` is the INSTALL serializer's own judgement, asked
+    as a set instead of a preference (R7-1).
+
+    Two properties, and together they are why the revise gate can demand EQUALITY
+    without ever refusing a package this system produced:
+
+    * whatever ``_dotenv_serialize_value`` would WRITE is in the set (so an
+      installed ``.env`` passes), and the set is EMPTY exactly when it refuses to
+      write the value at all (so a spelling install would never emit is never
+      vouched for);
+    * every admitted spelling parses BACK to the value through the runtime's own
+      loader -- which is the security property itself: the raw line a builder can
+      ``cat`` holds the registered value and nothing that decodes into it."""
+    serialized = tool_builder._dotenv_serialize_value(value)
+    spellings = tool_builder._dotenv_safe_spellings(value)
+
+    if serialized is None:
+        assert spellings == ()
+    else:
+        assert serialized in spellings
+    for spelling in spellings:
+        assert tools._parse_dotenv_text(f"K={spelling}\n") == {"K": value}
+        assert value in spelling  # verbatim, which is what a redactor needs
+
+
 def test_run_install_promotes_tricky_secret_round_trippable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2969,7 +3011,7 @@ def test_router_job_status_and_404(client: TestClient) -> None:
 
     missing = client.get("/api/tools/jobs/ghost")
     assert missing.status_code == 404
-    assert missing.json() == {"detail": "Install job not found"}
+    assert missing.json() == {"detail": "Tool job not found"}
 
     # The pre-D40 spelling is GONE, not aliased (FE and backend ship in one
     # wheel, so there is no version skew for an alias to protect): it matches no
@@ -3329,6 +3371,82 @@ def test_router_regenerate_summary_409_while_a_job_runs(
     assert "message" in detail
 
 
+def test_router_regenerate_summary_holds_the_single_flight_across_the_llm_call(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A regenerate in flight REFUSES a revise and an install for its duration
+    (R7-3), and gives the reservation back when it finishes.
+
+    The old gate read ``any_job_active()`` and then awaited a full LLM round trip
+    -- a check-then-act whose window is one LLM call wide. A revise admitted
+    inside it replaced the whole package and wrote its own fresh sidecar, which
+    this older generation then overwrote with a summary built from the REPLACED
+    package's contents: the newer, correct sidecar silently lost to the older
+    one. Now the route TAKES a reservation in the same lock ``_admit_job`` uses,
+    so nothing can be admitted while it runs.
+
+    Both submits are driven from INSIDE the stubbed generation, which is exactly
+    where the race lived; the assertions after the response pin the release, so
+    the reservation cannot wedge the single flight for the life of the process."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _write_meta(pkg, summary="舊的", status="draft")
+    refusals: dict[str, Any] = {}
+
+    def submit_work_mid_generation() -> None:
+        revise = client.post("/api/tools/kbsearch/revise", json={"feedback": "加上分頁"})
+        install = client.post(
+            "/api/tools/install",
+            json={"openapi_url": "https://kb.example/openapi.json", "instructions": "裝一個"},
+        )
+        refusals.update(
+            revise_status=revise.status_code,
+            revise_code=revise.json()["detail"]["code"],
+            install_status=install.status_code,
+            install_code=install.json()["detail"]["code"],
+        )
+
+    _fake_summary_generate(monkeypatch, summary="新的說明", side_effect=submit_work_mid_generation)
+
+    response = client.post("/api/tools/kbsearch/summary/regenerate")
+
+    assert response.status_code == 200
+    assert response.json()["summary"] == "新的說明"
+    assert refusals["revise_status"] == 409
+    assert refusals["revise_code"] == "tool_job_in_progress"
+    assert refusals["install_status"] == 409
+    assert refusals["install_code"] == "install_in_progress"
+    assert tool_builder._JOBS == {}  # neither submit left a job behind
+    # Released on the way out, so the next request is admitted normally.
+    assert tool_builder.any_job_active() is False
+    assert tool_builder._admit_job() is not None
+
+
+def test_router_regenerate_summary_releases_the_reservation_on_failure(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The reservation is released on the EXCEPTION paths too (R7-3).
+
+    An upstream LLM failure leaves the route raising a 502 from inside the ``try``
+    -- the one shape where a reservation released only on the happy path would be
+    held forever, wedging every install, revise and regenerate for the life of
+    the process. The ``finally`` covers it, and the follow-up regenerate below is
+    the proof: it is admitted, and it succeeds."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _write_meta(pkg, summary="先前的好總結", status="draft")
+    _fake_summary_generate(
+        monkeypatch, explode=LLMUpstreamError("APIConnectionError: could not reach the endpoint")
+    )
+
+    assert client.post("/api/tools/kbsearch/summary/regenerate").status_code == 502
+    assert tool_builder.any_job_active() is False
+
+    _fake_summary_generate(monkeypatch, summary="這次成功了")
+    retry = client.post("/api/tools/kbsearch/summary/regenerate")
+    assert retry.status_code == 200
+    assert retry.json()["summary"] == "這次成功了"
+    assert tool_builder.any_job_active() is False
+
+
 def test_router_regenerate_summary_404_for_unknown_tool(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3462,7 +3580,7 @@ def test_router_a_tool_named_jobs_can_serve_its_summary(
     # ... and a real (uuid4().hex-shaped) job id still reaches the job handler.
     poll = client.get("/api/tools/jobs/0123456789abcdef0123456789abcdef")
     assert poll.status_code == 404
-    assert poll.json() == {"detail": "Install job not found"}
+    assert poll.json() == {"detail": "Tool job not found"}
 
     # The other two summary verbs address the same tool, not the job route.
     assert client.patch("/api/tools/jobs/summary", json={"status": "final"}).status_code == 200
@@ -3470,7 +3588,7 @@ def test_router_a_tool_named_jobs_can_serve_its_summary(
 
 
 def test_any_job_active_tracks_the_job_table() -> None:
-    """The predicate the regenerate route gates on: any queued/running job, and
+    """The single-flight predicate over the job table: any queued/running job, and
     a terminal one never blocks."""
     assert tool_builder.any_job_active() is False
     with tool_builder._JOBS_LOCK:
@@ -3483,6 +3601,46 @@ def test_any_job_active_tracks_the_job_table() -> None:
             job_id="live", state="queued", created_at="2026-07-16T00:01:00+00:00"
         )
     assert tool_builder.any_job_active() is True
+
+
+def test_a_sync_reservation_occupies_the_same_single_flight() -> None:
+    """A held reservation is worth exactly one job, in BOTH directions (R7-3).
+
+    The synchronous regenerate is not a job, but it reads a package and then
+    writes that package's sidecar across a full LLM round trip, so it has to
+    occupy the same admission domain -- otherwise the two decide independently
+    and a revise admitted mid-generation replaces the very package the summary is
+    being written about. The check and the take happen under ONE acquisition of
+    ``_JOBS_LOCK`` (the reservation function does both), which is what makes this
+    a gate rather than a hint.
+
+    Release is by TOKEN and idempotent: a stale second release cannot free
+    somebody else's reservation."""
+    token = tool_builder.reserve_sync_operation()
+    assert token is not None
+    assert tool_builder.any_job_active() is True  # a reservation IS activity
+    assert tool_builder.reserve_sync_operation() is None  # no second one
+    assert tool_builder._admit_job() is None  # ... and no job either
+    assert tool_builder._JOBS == {}  # a refused admission records nothing
+
+    tool_builder.release_sync_operation(token)
+    tool_builder.release_sync_operation(token)  # idempotent
+    assert tool_builder.any_job_active() is False
+
+    job = tool_builder._admit_job()
+    assert job is not None
+    assert tool_builder.reserve_sync_operation() is None  # and now the reverse
+
+    # Both halves are MODULE state, so the suite's reset has to clear both or a
+    # test that ended mid-reservation would leave the next one unable to admit
+    # anything at all.
+    tool_builder._reset_jobs_for_tests()  # drops the job admitted above ...
+    assert tool_builder.reserve_sync_operation() is not None  # ... freeing the flight
+    tool_builder._reset_jobs_for_tests()  # ... and this one drops a HELD reservation
+    assert tool_builder.any_job_active() is False
+    # Left held on purpose: the fixture's teardown reset is what keeps it out of
+    # the next test, which is the property the two resets above pin.
+    assert tool_builder.reserve_sync_operation() is not None
 
 
 # --- router: revise (D40) ------------------------------------------------------
@@ -3963,7 +4121,7 @@ def test_promote_replace_refuses_a_finalization_that_landed_mid_session(
     )
 
     origin, error = tool_builder._promote_staging_replace(
-        staging, "kbsearch", base, env_existed_at_start=False
+        staging, "kbsearch", base, env_existed_at_start=False, registered=[]
     )
 
     assert error == tool_builder._ERROR_REVISE_FINALIZED
@@ -4005,7 +4163,7 @@ def test_promote_replace_refuses_when_the_sidecar_cannot_be_read(tmp_path: Path)
     try:
         assert tools.summary_status(installed) is None  # the fail-OPEN input, pinned
         _origin, error = tool_builder._promote_staging_replace(
-            staging, "kbsearch", base, env_existed_at_start=False
+            staging, "kbsearch", base, env_existed_at_start=False, registered=[]
         )
     finally:
         # Guarded so the ASSERTIONS report a regression: if the gate ever goes
@@ -4033,7 +4191,7 @@ def test_promote_replace_refuses_a_sidecar_that_is_not_a_regular_file(tmp_path: 
     os.mkfifo(installed / tools._AI_META_FILENAME)
 
     _origin, error = tool_builder._promote_staging_replace(
-        staging, "kbsearch", base, env_existed_at_start=False
+        staging, "kbsearch", base, env_existed_at_start=False, registered=[]
     )
 
     assert error == tool_builder._ERROR_REVISE_SUMMARY_UNREADABLE
@@ -4067,7 +4225,7 @@ def test_promote_replace_proceeds_when_the_status_is_knowable(
         )
 
     origin, error = tool_builder._promote_staging_replace(
-        staging, "kbsearch", base, env_existed_at_start=False
+        staging, "kbsearch", base, env_existed_at_start=False, registered=[]
     )
 
     assert error is None
@@ -4112,12 +4270,16 @@ def test_promote_replace_refuses_a_finalization_that_lands_during_the_env_copy(
         return result
 
     monkeypatch.setattr(shutil, "copy2", finalize_while_copying)
+    registered: list[str] = []
 
     origin, error = tool_builder._promote_staging_replace(
-        staging, "kbsearch", base, env_existed_at_start=True
+        staging, "kbsearch", base, env_existed_at_start=True, registered=registered
     )
 
     assert copies  # the window is real: the copy ran, and 定版 landed inside it
+    # The shipped bytes were vetted and their values registered BEFORE the copy
+    # (R7-2), so the refusal below happens with the credentials already redactable.
+    assert registered == ["live-secret-value"]
     assert error == tool_builder._ERROR_REVISE_FINALIZED
     assert origin is None
     assert (installed / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY  # never swapped
@@ -4142,13 +4304,15 @@ def test_promote_replace_refuses_an_oversized_live_env(tmp_path: Path) -> None:
     installed, staging = _replace_fixture(base)
     (installed / ".env").write_bytes(b"K=" + b"v" * (tools._ENV_FILE_MAX_BYTES - 1))
     assert (installed / ".env").stat().st_size == tools._ENV_FILE_MAX_BYTES + 1
+    registered: list[str] = []
 
     origin, error = tool_builder._promote_staging_replace(
-        staging, "kbsearch", base, env_existed_at_start=True
+        staging, "kbsearch", base, env_existed_at_start=True, registered=registered
     )
 
     assert error == tool_builder._ERROR_REVISE_ENV_TOO_LARGE
     assert origin is None
+    assert registered == []  # refused by SIZE before anything was read or registered
     assert not (staging / ".env").exists()  # refused BEFORE the copy, not after it
     assert (installed / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY  # never swapped
     assert _leftovers(base) == []
@@ -4167,12 +4331,16 @@ def test_promote_replace_copies_a_live_env_at_the_ceiling_byte_for_byte(tmp_path
     raw = head + b"v" * (tools._ENV_FILE_MAX_BYTES - len(head))
     assert len(raw) == tools._ENV_FILE_MAX_BYTES  # the cap EXACTLY, on the allowed side
     (installed / ".env").write_bytes(raw)
+    registered: list[str] = []
 
     origin, error = tool_builder._promote_staging_replace(
-        staging, "kbsearch", base, env_existed_at_start=True
+        staging, "kbsearch", base, env_existed_at_start=True, registered=registered
     )
 
     assert error is None
+    # A file AT the cap is READ and vetted too, not waved through: its one value
+    # is registered, and the promote-side policy re-run passed on it (R7-2).
+    assert registered == [raw.split(b"K=", 1)[1].decode("utf-8")]
     assert origin is None  # no sidecar in this fixture: nothing to inherit
     assert (installed / "run.py").read_text(encoding="utf-8") == "print('revised')"  # it swapped
     assert (installed / ".env").read_bytes() == raw  # ... and the credentials came across
@@ -4618,13 +4786,29 @@ def test_run_revise_keeps_an_env_the_operator_added_mid_session(
     """The MIRROR of the deletion case, and it needs no flag: a ``.env`` created
     on the live package DURING the session is copied like any other, because the
     file copied is the one on disk at the instant of the swap (R2-1). "Absent at
-    the start" only decides what happens when it is absent at the END too."""
+    the start" only decides what happens when it is absent at the END too.
+
+    It is also the COMPLIANT half of R7-2: the promote re-runs the whole ``.env``
+    policy on the bytes it is about to ship, so this file -- which no entry gate
+    ever saw, the package having had none -- is vetted, its value REGISTERED
+    before the copy, and then published byte for byte. The registration is
+    observed at ``copy2`` time because that is the only instant it is visible: the
+    session's ``finally`` discards it again, which the last assertion pins (a
+    registration made here and never dropped would outlive the request)."""
     pkg = _seed_package(monkeypatch, tmp_path)
     added = "OPERATOR_KEY=added-during-the-session\n"
+    real_copy2 = shutil.copy2
+    at_copy: dict[str, set[str]] = {}
 
     def add_an_env_mid_session() -> None:
         (pkg / ".env").write_text(added, encoding="utf-8")
 
+    def observe_while_copying(source: Any, destination: Any, **kwargs: Any) -> Any:
+        with tools._INFLIGHT_LOCK:
+            at_copy["inflight"] = set(tools._INFLIGHT_SECRETS)
+        return real_copy2(source, destination, **kwargs)
+
+    monkeypatch.setattr(shutil, "copy2", observe_while_copying)
     _fake_generate(
         monkeypatch,
         result=_revise_result(),
@@ -4635,7 +4819,56 @@ def test_run_revise_keeps_an_env_the_operator_added_mid_session(
     outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
-    assert (pkg / ".env").read_text(encoding="utf-8") == added  # the operator's file won
+    assert (pkg / ".env").read_bytes() == added.encode("utf-8")  # the operator's file won
+    # Registered BEFORE the bytes moved, so the post-promote summary/sidecar paths
+    # are redacted against a value nothing had ever registered (R7-2) ...
+    assert at_copy["inflight"] == {"added-during-the-session"}
+    with tools._INFLIGHT_LOCK:
+        assert not tools._INFLIGHT_SECRETS  # ... and discarded again by the finally
+
+
+def test_run_revise_refuses_to_ship_an_env_added_mid_session_that_fails_the_policy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The spelling/floor/size guards must answer for the bytes that SHIP, not
+    just for the snapshot the session opened with (R7-2).
+
+    This package has NO ``.env`` when the revise starts, so every entry gate
+    passes vacuously; the operator then creates a non-compliant one while the
+    builder session runs. Before this fix ``_preserve_env_file`` copied that
+    never-vetted file straight into the published package -- the guards had
+    checked a file that no longer existed. Now the promote re-reads the source it
+    is about to copy and re-runs the same policy on those exact bytes, so the
+    refusal is the same category-only error the entry gate would have given.
+
+    Refusing means the INSTALLED package keeps running unchanged: the revision is
+    discarded, the operator's own file is left exactly as they wrote it, and no
+    hidden ``.bak-`` backup is left behind, because nothing was ever renamed."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    hostile = 'TOKEN="abcd\\"efgh"\n'  # the reversible spelling, arriving mid-session
+
+    def add_an_unmaskable_env_mid_session() -> None:
+        (pkg / ".env").write_text(hostile, encoding="utf-8")
+
+    captured = _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY},
+        side_effect=add_an_unmaskable_env_mid_session,
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
+    assert "TOKEN" not in (outcome.error or "")  # category only, as ever
+    assert captured  # the session DID run: only the entry gate could have stopped it
+    assert (pkg / "run.py").read_text(encoding="utf-8") == "print('x')\n"  # never swapped
+    assert (pkg / ".env").read_bytes() == hostile.encode("utf-8")  # the operator's file, untouched
+    assert _leftovers(pkg.parent) == []  # nothing was renamed aside
+    assert not (pkg.parent / tool_builder._STAGING_DIRNAME).exists()
+    with tools._INFLIGHT_LOCK:
+        assert not tools._INFLIGHT_SECRETS
 
 
 def test_run_revise_refuses_when_the_staged_env_cannot_be_dropped(
@@ -4880,6 +5113,91 @@ def test_run_revise_refuses_a_value_only_an_unrelated_line_spells_literally(
     assert not (pkg.parent / tool_builder._STAGING_DIRNAME).exists()
     with tools._INFLIGHT_LOCK:
         assert not tools._INFLIGHT_SECRETS  # nothing was registered either
+
+
+def test_run_revise_refuses_a_value_a_comment_on_its_own_line_vouches_for(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The r6 finding again, moved ONTO the assignment line -- and refused (R7-1).
+
+    r5 searched the whole FILE, so a comment on the next line vouched for the
+    credential; r6 narrowed the search to the assignment's raw RHS, and the very
+    same trick fits there: a trailing comment repeating the value makes the parsed
+    string a substring of that RHS, while the part that actually assigns it still
+    spells it with an escape that FIRES. python-dotenv consumes the quoted value
+    and the comment separately, so the two halves of one line answer for each
+    other and the credential a ``cat`` prints is still unmatchable.
+
+    Partial matching has now been beaten twice at two scales, which is why the
+    gate stopped asking "is it in there" and started asking "is this a spelling we
+    could have written". ``parsed in rhs`` is asserted first, so this test would
+    have PASSED the r6 gate -- that is what makes it the regression."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    raw = 'TOKEN="abcd\\"efgh" # abcd"efgh"\n'
+    (pkg / ".env").write_text(raw, encoding="utf-8")
+    parsed = tools._parse_dotenv_text(raw)["TOKEN"]
+    assert len(parsed) >= tools._MIN_SECRET_LEN  # not the r1 floor: the SPELLING
+    rhs = tool_builder._env_assignment_rhs(raw)["TOKEN"]
+    assert parsed in rhs  # the r6 same-LINE containment check says "fine"
+    assert rhs not in tool_builder._dotenv_safe_spellings(parsed)  # equality says otherwise
+    before = _file_bytes(pkg)
+    captured = _fake_generate(
+        monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
+    assert "TOKEN" not in (outcome.error or "")  # never the key
+    assert parsed not in (outcome.error or "")  # never the value
+    assert captured == {}  # the builder session never started
+    assert outcome.llm_log_id is None
+    assert _file_bytes(pkg) == before  # the package is untouched
+    assert not (pkg.parent / tool_builder._STAGING_DIRNAME).exists()
+    with tools._INFLIGHT_LOCK:
+        assert not tools._INFLIGHT_SECRETS  # nothing was registered either
+
+
+def test_run_revise_refuses_a_plain_value_carrying_a_trailing_comment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``KEY=value # comment`` is legitimate dotenv, and this now REFUSES it
+    (R7-1). Pinned deliberately, because it is the accepted cost.
+
+    Nothing is wrong with this line: dotenv drops the comment, the value is
+    spelled plainly, and a ``cat`` would put the registered string in front of the
+    redactor. It refuses because the gate no longer accepts "the value is in
+    there somewhere on the line" -- a rule that admits adjacent text has now been
+    defeated twice by adjacent text, once per scale (r5 whole-file, r6 same-line).
+    The only spellings that survive are the ones this system can GENERATE, and a
+    trailing comment is not one of them; it is also indistinguishable, short of
+    re-implementing dotenv's tokenizer, from the escaped line above with a comment
+    stapled on.
+
+    The cost is bounded by construction: an install never writes this shape (its
+    line is ``KEY=<serialized>`` and nothing else), so no package this system
+    produced becomes unrevisable -- and the remedy the message names, write the
+    line plainly, is one edit."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    raw = "KEY=abcdef # 這一行結尾的註解\n"
+    (pkg / ".env").write_text(raw, encoding="utf-8")
+    parsed = tools._parse_dotenv_text(raw)["KEY"]
+    assert parsed == "abcdef"  # dotenv really does drop the comment
+    assert parsed in tool_builder._env_assignment_rhs(raw)["KEY"]  # r6 would have passed it
+    before = _file_bytes(pkg)
+    captured = _fake_generate(
+        monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
+    assert captured == {}  # refused before the session, like every other .env gate
+    assert _file_bytes(pkg) == before
+    with tools._INFLIGHT_LOCK:
+        assert not tools._INFLIGHT_SECRETS
 
 
 def test_run_revise_refuses_a_value_its_assignment_line_cannot_vouch_for(

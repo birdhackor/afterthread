@@ -242,21 +242,26 @@ _ERROR_REVISE_ENV_DISCARD = "無法移除修訂產生的 .env（原檔已於修�
 _ERROR_REVISE_ENV_UNMASKABLE = (
     "既有工具包的 .env 內有值過短、無法遮蔽，修訂已取消：請加長該值，或將它從 .env 移除。"  # noqa: RUF001
 )
-# A hand-edited ``.env`` whose RAW SPELLING of a value is REVERSIBLE rather than
-# literal (R5-1): ``KEY="ab'cd\"ef"`` parses to ``ab'cd"ef``, and every redactor we
-# have only ever sees the PARSED value, so the escaped spelling -- which the
-# builder's unjailed ``run_shell`` can ``cat`` straight out of the LIVE package,
-# which is outside staging but perfectly reachable -- matches nothing and rides
-# into the next round's prompt, the AI 日誌 and possibly the summary. A DISTINCT
-# string from ``_ERROR_REVISE_ENV_UNMASKABLE`` because the REMEDY differs (lengthen
-# the value vs. simplify its quoting/escaping), which is the same "same refusal
-# point, different actionable cause" split R3-2 made for the sidecar reads.
-# Category-only like the rest: the condition and the remedy, never the key and
-# never the value -- printing the value in the message that refuses to expose it
-# would BE the leak.
+# A hand-edited ``.env`` whose assignment line does not spell a value the way this
+# system itself would (R5-1, narrowed to that LINE by R6-1 and to EXACT equality by
+# R7-1): ``KEY="ab'cd\"ef"`` parses to ``ab'cd"ef``, and every redactor we have only
+# ever sees the PARSED value, so the escaped spelling -- which the builder's unjailed
+# ``run_shell`` can ``cat`` straight out of the LIVE package, which is outside
+# staging but perfectly reachable -- matches nothing and rides into the next round's
+# prompt, the AI 日誌 and possibly the summary. A DISTINCT string from
+# ``_ERROR_REVISE_ENV_UNMASKABLE`` because the REMEDY differs (lengthen the value vs.
+# write the line the plain way), which is the same "same refusal point, different
+# actionable cause" split R3-2 made for the sidecar reads. The remedy names the LINE
+# rather than only its quoting, because R7-1's equality rule also refuses shapes with
+# nothing wrong with their quotes -- a trailing comment, an unquoted value with
+# spaces -- and a remedy that sent the operator hunting for escapes they do not have
+# would be worse than the refusal. Category-only like the rest: the condition and the
+# remedy, never the key and never the value -- printing the value in the message that
+# refuses to expose it would BE the leak.
 _ERROR_REVISE_ENV_UNMATCHABLE = (
-    "既有工具包的 .env 內有值的寫法（引號或跳脫）與實際值不同、無法遮蔽，"  # noqa: RUF001
-    "修訂已取消：請簡化該值在 .env 裡的引號與跳脫寫法。"  # noqa: RUF001
+    "既有工具包的 .env 內有值的寫法無法對應到實際值、無法遮蔽，修訂已取消："  # noqa: RUF001
+    "請把該行的值寫成最單純的形式（原值直接寫，或整段用引號包住），"  # noqa: RUF001
+    "並移除行尾註解與多餘的跳脫。"
 )
 # The replace-mode promote's two "the package is no longer what we resolved"
 # refusals. Both are races against a concurrent delete/replace by an actor with
@@ -1590,7 +1595,9 @@ def _promote_staging(
     return None
 
 
-def _preserve_env_file(target: Path, staging: Path, *, existed_at_start: bool) -> str | None:
+def _preserve_env_file(
+    target: Path, staging: Path, *, existed_at_start: bool, registered: list[str]
+) -> str | None:
     """Copy the LIVE package's ``.env`` into ``staging`` BYTE-FOR-BYTE; None = ok (D40).
 
     Blocking (runs inside ``_promote_staging_replace``). This IS the whole
@@ -1660,10 +1667,38 @@ def _preserve_env_file(target: Path, staging: Path, *, existed_at_start: bool) -
     The file copied is the one on disk at THIS instant, not the snapshot the
     session's entry read took. That is deliberate: an operator who edits the live
     ``.env`` mid-session keeps their edit instead of having it reverted by a
-    revise. It cannot leak either -- only the entry-read values were registered and
-    exported into ``run_shell``, so a value added since then was never in the
-    conversation at all, and ``known_secret_values`` picks it up from the installed
-    ``.env`` again the moment the swap lands.
+    revise. But it also means the ENTRY gates -- the spelling policy, the
+    redactor's length floor, the byte ceiling -- vetted a file that may no longer
+    exist, so this re-reads the source and re-runs ``_unmaskable_env_error`` on
+    the bytes it is ACTUALLY about to ship (R7-2). Without it, a package with no
+    ``.env`` (or a compliant one) at the session's start could gain a
+    non-compliant one mid-session and we would PUBLISH it, having never applied
+    the policy to it at all: the entry gate answers for a file, not for a path,
+    and this is the second place the same question has to be asked because it is
+    the place the answer is acted on. A refusal here is the same category-only
+    string the entry gate returns, and it aborts before the swap like every other
+    failure below.
+
+    The values found by that re-read are REGISTERED as in-flight secrets before
+    the copy, and appended to ``registered`` -- the session's own list, whose
+    ``finally`` discards every value it holds. Registering at the point of
+    discovery and recording it in the SAME breath is what makes the registration
+    leak-proof: no return path, error or otherwise, can lose track of a value we
+    have made the process redact. A value the operator added mid-session was never
+    exported into ``run_shell`` BY US (only the entry-read values were) -- though a
+    builder that read the file for itself has already seen it, which is the
+    residual below -- but it IS about to be shipped, and everything after the swap --
+    the outcome summary, the regenerated sidecar, the AI 日誌 record of that
+    summary session -- is written while the old package sits in a DOT-prefixed
+    backup that ``known_secret_values`` skips. That is the same masking gap the
+    entry registration exists to cover, just entered from the other end.
+
+    What this does NOT fix is the IN-SESSION read: the builder's unjailed
+    ``run_shell`` (D21) can ``cat`` a credentials file the operator creates DURING
+    the session, and ``llm_log`` redacts at STORAGE time, so a value that becomes
+    known here cannot retroactively mask records already written. That is recorded
+    as an accepted, unpreventable residual (裁決紀錄 #6) rather than papered over:
+    the closable half is "never SHIP what the guards would refuse", and this is it.
 
     ``existed_at_start`` is what the session OBSERVED when it read the values
     (``_read_env_for_values``), and it is threaded all the way down here because
@@ -1720,6 +1755,33 @@ def _preserve_env_file(target: Path, staging: Path, *, existed_at_start: bool) -
         # values were never parseable and the copy would be the one unbounded step
         # left before the swap.
         return _ERROR_REVISE_ENV_TOO_LARGE
+    # The SAME policy the session's entry applied, re-asked of the bytes that are
+    # actually about to ship (R7-2). The reader, the cap and the non-empty filter
+    # are the entry read's, so the two gates cannot answer differently about one
+    # file; only the FILE can have changed. The read and the ``copy2`` below are
+    # two opens an instant apart -- the ordinary check-then-act residual this
+    # module accepts, the same one the ``lstat`` above already carries, and not
+    # something a single lossy decode could close (this text is decoded with
+    # ``errors="replace"``, so writing it back would not be a byte copy).
+    text = tools._read_regular_file_capped(source, tools._ENV_FILE_MAX_BYTES)
+    if text is None:
+        return _ERROR_REVISE_ENV_UNREADABLE
+    if len(text) > tools._ENV_FILE_MAX_BYTES:
+        # Grew between the ``lstat`` and this read -- the same miniature TOCTOU
+        # backstop ``_read_env_for_values`` keeps for the same reason.
+        return _ERROR_REVISE_ENV_TOO_LARGE
+    values = {key: value for key, value in tools._parse_dotenv_text(text).items() if value}
+    mask_error = _unmaskable_env_error(text, values)
+    if mask_error is not None:
+        return mask_error
+    # Registered BEFORE the copy and recorded in the session's own list in the
+    # same breath, so the ``finally`` that ends the revise discards exactly what
+    # was registered (see the docstring). ``register_inflight_secret`` and the
+    # discard are both idempotent, so a value the entry read already registered
+    # costs nothing here.
+    for value in values.values():
+        tools.register_inflight_secret(value)
+        registered.append(value)
     destination = staging / ".env"
     try:
         destination_mode: int | None = os.lstat(destination).st_mode
@@ -1742,6 +1804,7 @@ def _promote_staging_replace(
     base: Path,
     *,
     env_existed_at_start: bool,
+    registered: list[str],
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Swap a revised build in for the INSTALLED ``<base>/<name>`` (D40).
 
@@ -1797,7 +1860,14 @@ def _promote_staging_replace(
     against the SAME ceiling the session's entry read and ``validate_package`` use
     (R4-1); the earlier claim that no size check was needed rested on the live
     ``.env`` still being the file whose values we parsed at the start, and a
-    mid-session replacement is exactly what this function must survive.
+    mid-session replacement is exactly what this function must survive. That same
+    reasoning is why the helper now re-runs the WHOLE ``.env`` policy on the bytes
+    it is about to copy (R7-2): the entry gates answered for a file that may have
+    been replaced since, and this is the step that decides what SHIPS. It also
+    registers what it finds there, appending to ``registered`` -- the caller's own
+    in-flight list, which is why that list is threaded down instead of the values
+    being handed back: a value is made redactable and recorded in the same breath,
+    so no error path can leave one registered with nobody to discard it.
 
     It runs BEFORE the 定版 gate rather than after it, and the order is the
     decision (R4-1): the copy is the only pre-swap step whose duration is
@@ -1879,7 +1949,9 @@ def _promote_staging_replace(
     # running it early is free -- an abandoned build takes the staged ``.env`` with
     # it. See ``_preserve_env_file`` for the size ceiling that bounds it and for
     # why the target checks above are all it depends on.
-    env_error = _preserve_env_file(target, staging, existed_at_start=env_existed_at_start)
+    env_error = _preserve_env_file(
+        target, staging, existed_at_start=env_existed_at_start, registered=registered
+    )
     if env_error is not None:
         return None, env_error
     # 定版 is re-checked HERE, at the last moment before the swap, not only at
@@ -2449,6 +2521,40 @@ def _env_assignment_rhs(text: str) -> dict[str, str]:
     return spelled
 
 
+def _dotenv_safe_spellings(value: str) -> tuple[str, ...]:
+    r"""Every RHS spelling this system is willing to VOUCH for ``value`` with.
+
+    Pure. The set is EXACTLY the shapes ``_dotenv_serialize_value`` treats as
+    safe, which is why that function is called here rather than its rules being
+    restated: the bare value is admitted precisely when the serializer would have
+    WRITTEN it bare (its first, most-preferred branch, so ``serialize(v) == v``
+    holds for that case and no other -- a quoted result differs from the value by
+    its two delimiters and can never equal it). The two quoted forms carry the
+    serializer's own conditions verbatim: single quotes are literal to
+    python-dotenv, so ``'value'`` embeds the value whenever the value has no
+    single quote of its own; double quotes are safe only while NO escape can fire,
+    which is exactly the ``"``/``\`` exclusion the serializer's docstring gives.
+
+    The set is therefore a SUPERSET of what the serializer emits (it prefers one
+    spelling; a hand-written file may legitimately have chosen a more-quoted one
+    of the same three) and it is EMPTY exactly when the serializer returns None --
+    a value carrying a single quote AND a ``"``/``\`` cannot be spelled here at
+    all, which is the same verdict install reaches when it refuses to write one.
+
+    Deliberately a set of literals rather than a re-parse: the caller compares the
+    RAW right-hand side against these strings for EQUALITY, so a spelling we
+    cannot generate ourselves cannot slip in beside one we can.
+    """
+    spellings: list[str] = []
+    if _dotenv_serialize_value(value) == value:
+        spellings.append(value)
+    if "'" not in value:
+        spellings.append(f"'{value}'")
+    if '"' not in value and "\\" not in value:
+        spellings.append(f'"{value}"')
+    return tuple(spellings)
+
+
 def _unmaskable_env_error(text: str, values: dict[str, str]) -> str | None:
     """The whole "can we mask this package's ``.env`` values" policy; None = yes.
 
@@ -2484,21 +2590,48 @@ def _unmaskable_env_error(text: str, values: dict[str, str]) -> str | None:
       -> job body -> sidecar.
 
     That second gate is asked of the ASSIGNMENT LINE, not of the whole file
-    (R6-1). A whole-text search asks "does this string appear ANYWHERE", and the
-    answer can be yes for a reason that protects nothing::
+    (R6-1), and it demands EQUALITY with a spelling we could have written
+    ourselves, not mere containment (R7-1). PARTIAL matching has now been beaten
+    twice by the same trick at two scales -- r5 searched the whole FILE, so a
+    comment on the next line vouched for the assignment; r6 searched the raw RHS,
+    so a comment on the SAME line did::
 
         TOKEN="abcd\\"efgh"
-        # abcd"efgh
+        # abcd"efgh                      <- defeated the r5 whole-file search
+        TOKEN="abcd\\"efgh" # abcd"efgh" <- defeated the r6 same-line search
 
-    The comment vouches for the assignment. The parsed value is present in the
-    file, the r5 gate passed, and the line that actually holds the credential
-    still spelled it in a form no redactor matches -- so a ``cat`` of the file
-    emitted it and the live value was recoverable from the escape, which is the
-    entire leak this gate exists to stop. The only spelling that can vouch for a
-    value is the spelling of the assignment that DETERMINES it: the LAST line
-    whose key matches (``_env_assignment_rhs``), whose raw right-hand side must
-    contain the parsed value LITERALLY. ``KEY=abcdef`` and ``KEY="abcdef"`` pass;
-    ``KEY="ab\\"cd"`` does not.
+    Both times the line that actually holds the credential spelled it in a form no
+    redactor matches, so a ``cat`` of the file emitted it and the live value was
+    recoverable from the escape -- the entire leak this gate exists to stop --
+    while some adjacent text answered "yes, it's in there". The lesson is that no
+    substring rule can be vouched for by text sitting NEXT to it, so the gate now
+    admits only what it can generate: the stripped RHS of the LAST line whose key
+    matches (``_env_assignment_rhs``) must EQUAL one of ``_dotenv_safe_spellings``
+    -- the bare value, ``'value'``, or ``"value"``, each admitted exactly when
+    ``_dotenv_serialize_value`` considers it safe. ``KEY=abcdef``,
+    ``KEY="abcdef"`` and ``KEY='abcdef'`` pass; ``KEY="ab\\"cd"`` does not, and
+    neither does anything with something else on the line.
+
+    That REFUSES shapes which are legitimate dotenv and were not leaks, and the
+    cost is accepted deliberately:
+
+    * ``KEY=value # comment`` -- an ordinary trailing comment. dotenv drops it and
+      hands us ``value``, but the RHS is ``value # comment``, which is not a
+      spelling we could produce. It is also indistinguishable, by any rule short
+      of re-implementing dotenv's tokenizer, from the reversible line above with a
+      comment stapled on;
+    * ``KEY=two words`` or ``KEY=a#b`` -- values the serializer would have QUOTED.
+      They do embed the value literally, but a bare RHS is only admitted when the
+      serializer would have written it bare, so these ask for quotes instead;
+    * a value holding both ``'`` and ``"``/``\\`` -- ``_dotenv_safe_spellings`` is
+      empty for it, the same verdict install reaches when it refuses to WRITE such
+      a value at all.
+
+    Every one of them has the same one-line remedy the message already names
+    (simplify the quoting), and none of them is a shape this system produces --
+    which is the property that matters: an ``.env`` we wrote passes BY
+    CONSTRUCTION (see below), so the tightening cannot make an ordinary installed
+    package unrevisable.
 
     A key with NO locatable assignment line refuses too -- a value spanning lines,
     a continuation, any shape this line-based reading cannot account for. We
@@ -2524,8 +2657,9 @@ def _unmaskable_env_error(text: str, values: dict[str, str]) -> str | None:
     controls the spelling because install WRITES the file -- and every shape it
     can write passes here BY CONSTRUCTION: it drops every prior line assigning the
     name and APPENDS the serialized one, so its line is both the last one for that
-    key and one of the three spellings (bare, single-quoted, double-quoted with no
-    escape able to fire) that embed the value verbatim. A revise INHERITS whatever
+    key and one of the three spellings ``_dotenv_safe_spellings`` admits -- which
+    is not a coincidence to be maintained by hand, since that set is built by
+    ASKING the very serializer install writes with. A revise INHERITS whatever
     a hand-edit left there, and until now inherited it without that guarantee.
     This is the same rule at the other entry point -- the same shape as the floor
     check being the install FORM's ``schemas._SECRET_VALUE_MIN_LEN`` applied here.
@@ -2546,7 +2680,7 @@ def _unmaskable_env_error(text: str, values: dict[str, str]) -> str | None:
     spelled = _env_assignment_rhs(text)
     for key, value in values.items():
         rhs = spelled.get(key)
-        if rhs is None or value not in rhs:
+        if rhs is None or rhs not in _dotenv_safe_spellings(value):
             return _ERROR_REVISE_ENV_UNMATCHABLE
     return None
 
@@ -2632,10 +2766,19 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
     prompt/response of the session, and makes the embedded-secret gate refuse a
     revision that copied them into a file.
 
+    That same policy is re-applied at PROMOTE, to the bytes actually being
+    published (R7-2): this entry gate answers for the file it read, and an
+    operator can put a different one there while the session runs -- including on
+    a package that had no ``.env`` at all when it started. See
+    ``_preserve_env_file`` for the half of that hazard which IS closable, and
+    裁決紀錄 #6 for the half which is not.
+
     A value the redactors could not mask refuses the whole session, whether it is
     too SHORT for them to look at (R1-1) or SPELLED by its own assignment line in a
-    way that parses back to something else (R5-1, narrowed to that LINE by R6-1 --
-    a comment elsewhere in the file repeating the value vouched for nothing) --
+    way this system would not write (R5-1, narrowed to that LINE by R6-1 -- a
+    comment elsewhere in the file repeating the value vouched for nothing -- and to
+    EXACT equality with a spelling we can generate ourselves by R7-1, after a
+    comment on the SAME line vouched for one too) --
     one policy, one gate,
     ``_unmaskable_env_error``. Registration is not protection on its own, and this
     path hands every one of those values to ``run_shell``, whose output is wrapped
@@ -2817,6 +2960,12 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
             name,
             base,
             env_existed_at_start=env_existed_at_start,
+            # The promote re-vets the ``.env`` it is about to ship and registers
+            # whatever it finds there (R7-2). It appends to THIS list, so the
+            # ``finally`` below discards those values too -- the alternative,
+            # handing them back through the return, would leak a registration on
+            # any path that did not reach the return.
+            registered=registered,
         )
         if promote_error is not None:
             return InstallOutcome(
@@ -2838,7 +2987,10 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
         # Mirror run_install's order: drop the in-flight secrets first (the
         # preserved .env carries them again, so known_secret_values covers them
         # through its own scan), then clean staging. A successful swap consumed
-        # the staging dir; every other exit removes the build.
+        # the staging dir; every other exit removes the build. The list may have
+        # GROWN since it was built -- the promote appends whatever the shipped
+        # ``.env`` turned out to hold (R7-2) -- which is the point of passing it
+        # down rather than returning those values.
         for value in registered:
             tools.discard_inflight_secret(value)
         await run_in_threadpool(_cleanup_staging, staging, base)
@@ -2858,6 +3010,14 @@ _MAX_JOBS = 20
 _JOBS: dict[str, InstallJob] = {}
 _JOBS_LOCK = threading.Lock()
 _TASKS: set[asyncio.Task[None]] = set()
+
+# The SYNCHRONOUS side of the same single-flight (R7-3). A summary regenerate is
+# not a job -- it lives inside one request -- but it spans a full LLM round trip
+# during which it reads a package and then writes that package's sidecar, so it
+# occupies the admission domain for exactly the same reason a job does. A token
+# per holder rather than a flag: release names the reservation it took, so it can
+# never drop somebody else's, and the set needs no ``global`` to mutate.
+_SYNC_OPS: set[str] = set()
 
 # The zh-TW noun each job kind uses in the "unexpected error" backstop below.
 # Parameterizing the NOUN rather than the whole sentence keeps ONE backstop with
@@ -2962,6 +3122,22 @@ async def _run_job(
     )
 
 
+def _single_flight_held() -> bool:
+    """True when something already occupies the single flight. LOCK REQUIRED.
+
+    Callers MUST already hold ``_JOBS_LOCK``: every user of this predicate has to
+    evaluate it and ACT on the answer under one acquisition, or it is just a
+    check-then-act with a lock draped over half of it. ``_JOBS_LOCK`` is a plain
+    (non-reentrant) ``threading.Lock``, so this deliberately does not take it
+    itself -- that is what lets the three callers below inline it into their own
+    critical sections instead of keeping near-copies of it.
+
+    A TERMINAL job never blocks anything: only queued/running work, and a held
+    synchronous reservation, do.
+    """
+    return bool(_SYNC_OPS) or any(job.state in ("queued", "running") for job in _JOBS.values())
+
+
 def _admit_job() -> InstallJob | None:
     """Register one queued job, or None when another is already active (M7/D40).
 
@@ -2971,7 +3147,9 @@ def _admit_job() -> InstallJob | None:
     queued/running job blocks ANY new one -- an install and a revise both end in
     a package directory being moved into place, so letting them overlap would
     race a directory being replaced (and would make the two sessions'
-    same-workflow log records ambiguous to ``last_record_id_for_workflow``).
+    same-workflow log records ambiguous to ``last_record_id_for_workflow``). A
+    held SYNCHRONOUS reservation blocks one too (R7-3): a regenerate in flight is
+    about to write the sidecar of a package this job may be replacing.
 
     Eviction keeps the newest ``_MAX_JOBS`` by creation time (job_id as a
     deterministic tiebreak for identical timestamps); a TERMINAL (succeeded/
@@ -2979,8 +3157,7 @@ def _admit_job() -> InstallJob | None:
     """
     job = InstallJob(job_id=uuid4().hex, state="queued", created_at=_now_iso())
     with _JOBS_LOCK:
-        # A terminal job never blocks a new submit -- only queued|running does.
-        if any(existing.state in ("queued", "running") for existing in _JOBS.values()):
+        if _single_flight_held():
             return None
         _JOBS[job.job_id] = job
         while len(_JOBS) > _MAX_JOBS:
@@ -3050,25 +3227,59 @@ def start_revise_job(name: str, feedback: str) -> str | None:
 
 
 def any_job_active() -> bool:
-    """True while ANY job is queued or running (D40).
+    """True while ANY job is queued/running or a sync reservation is held (D40).
 
-    The single-flight predicate ``_admit_job`` enforces, exposed as a plain
-    question for callers OUTSIDE the job machinery -- the synchronous
-    summary-regenerate route, which must refuse to run while any job is in
-    flight: a promote MOVES a whole package directory into place, and a
-    regenerate reading/writing that package's sidecar across the swap would race
-    a directory that is being replaced under it. (The revise route does NOT use
-    this: it maps ``start_revise_job``'s None return instead, which decides the
-    same question inside the admission lock rather than one hop before it.)
+    The single-flight predicate as a plain QUESTION, for callers that only want
+    to describe the state rather than take it. Nothing on a request path asks it
+    any more: everything that ACTS on the answer goes through ``_admit_job`` or
+    ``reserve_sync_operation``, because those decide and take under one lock
+    acquisition, and asking here and acting afterwards is precisely the race
+    R7-3 removed from the regenerate route. What it remains is the module's
+    statement of what "the single flight is occupied" MEANS -- the one place both
+    halves are named together, and where the tests pin that a reservation counts
+    exactly as much as a job.
 
-    The predicate is DUPLICATED in ``_admit_job`` rather than shared with
-    it, deliberately: that one must evaluate the check and the insert under the
-    SAME lock acquisition to be race-free, and ``_JOBS_LOCK`` is a plain
-    (non-reentrant) ``threading.Lock``, so calling this from inside it would
-    deadlock. Two three-word copies is the honest price of that atomicity.
+    It reports True for a held reservation as well as for a job, since both mean
+    "a package directory or its sidecar is being written by something else".
     """
     with _JOBS_LOCK:
-        return any(job.state in ("queued", "running") for job in _JOBS.values())
+        return _single_flight_held()
+
+
+def reserve_sync_operation() -> str | None:
+    """Take the single flight for one SYNCHRONOUS operation; None = refused (R7-3).
+
+    The counterpart of ``_admit_job`` for work that is not a job: the summary
+    regenerate runs inside a request, but it spends a full LLM round trip between
+    reading a package and writing that package's sidecar. Its old gate was a bare
+    ``any_job_active()`` read, which is a check-then-act across an await that
+    lasts as long as an LLM call -- long enough for a revise to be admitted,
+    replace the whole package and write a fresh sidecar, which the older
+    regenerate then OVERWROTE with a summary describing the package that no
+    longer exists. Taking a reservation puts it in the same admission domain as
+    the jobs: while one is held ``_admit_job`` refuses, so the revise never
+    starts.
+
+    The test and the take happen under ONE acquisition of ``_JOBS_LOCK``, exactly
+    as ``_admit_job`` does, which is the whole reason this is a function and not
+    a pair of them. The caller MUST release in a ``finally``; the token it gets
+    back is what it releases, so a stale release from another path is a no-op
+    rather than a stolen reservation. Nothing is awaited while the lock is held
+    (it is taken and dropped inside this call), so a reservation can block work
+    but can never deadlock it.
+    """
+    token = uuid4().hex
+    with _JOBS_LOCK:
+        if _single_flight_held():
+            return None
+        _SYNC_OPS.add(token)
+    return token
+
+
+def release_sync_operation(token: str) -> None:
+    """Give back a reservation from ``reserve_sync_operation``; idempotent."""
+    with _JOBS_LOCK:
+        _SYNC_OPS.discard(token)
 
 
 def get_job(job_id: str) -> dict[str, Any] | None:
@@ -3079,6 +3290,12 @@ def get_job(job_id: str) -> dict[str, Any] | None:
 
 
 def _reset_jobs_for_tests() -> None:
-    """Drop all tracked jobs so a test starts clean (tasks, if any, run out)."""
+    """Drop all tracked jobs AND any held sync reservation so a test starts clean.
+
+    Both halves of the single flight are module state, so both have to be reset
+    here or a test that exercised a refusal path would leave the next one unable
+    to admit anything (tasks, if any, run out as before).
+    """
     with _JOBS_LOCK:
         _JOBS.clear()
+        _SYNC_OPS.clear()

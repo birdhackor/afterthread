@@ -71,7 +71,10 @@ ToolName = Annotated[str, PathParam(pattern=_NAME_RE.pattern)]
 # Fixed, config-free error details, following items.py's `_NOT_FOUND` pattern
 # (the OpenAPI examples derive from the same constants the handlers raise).
 _TOOL_NOT_FOUND = "Tool not found"
-_JOB_NOT_FOUND = "Install job not found"
+# "Tool job", not "Install job" (R7-4): ONE poll endpoint serves installs AND
+# revises (D40), so a revise whose id has been evicted was being told its INSTALL
+# was missing -- a message naming a workflow the caller never started.
+_JOB_NOT_FOUND = "Tool job not found"
 
 _TOOLS_NOT_CONFIGURED_CODE = "tools_not_configured"
 _TOOLS_NOT_CONFIGURED_MESSAGE = "The tools directory is not configured."
@@ -422,11 +425,17 @@ async def regenerate_tool_summary(name: ToolName) -> ToolSummaryDetail:
     Two gates run before the LLM is touched, both cheap and both refusing rather
     than doing something surprising: a 已定版 summary is frozen by definition
     (409 ``tool_finalized``), and a queued/running job means a package directory
-    may be swapped underneath us mid-promote (409 ``tool_job_in_progress``). The
-    job gate is a check-then-act against a job that could start a microsecond
-    later -- accepted, exactly as the installer accepts its own promote races
-    (D21/D40): this is a single-user local tool, and the loser is one summary,
-    never the package.
+    may be swapped underneath us mid-promote (409 ``tool_job_in_progress``).
+
+    The job gate TAKES a reservation rather than merely asking (R7-3), and the
+    difference is what makes it a gate at all: this handler then awaits a full
+    LLM round trip, and a bare ``any_job_active()`` read left that whole window
+    open -- a revise could be admitted inside it, replace the package, write its
+    own sidecar, and have this older generation overwrite it with a summary of
+    the package that no longer exists. ``reserve_sync_operation`` decides and
+    takes under the SAME lock ``_admit_job`` uses, so the revise is refused for
+    the duration instead; the reservation is released in the ``finally`` below on
+    every path, success or exception. The 409 the caller sees is unchanged.
 
     The finalize gate is NOT left at check-then-act, because there the loser
     would be the frozen summary itself: a PATCH landing while the generation
@@ -449,7 +458,8 @@ async def regenerate_tool_summary(name: ToolName) -> ToolSummaryDetail:
             status_code=409,
             detail={"code": _TOOL_FINALIZED_CODE, "message": _TOOL_FINALIZED_MESSAGE},
         )
-    if tool_builder.any_job_active():
+    reservation = tool_builder.reserve_sync_operation()
+    if reservation is None:
         raise HTTPException(
             status_code=409,
             detail={"code": _TOOL_JOB_IN_PROGRESS_CODE, "message": _TOOL_JOB_IN_PROGRESS_MESSAGE},
@@ -460,6 +470,11 @@ async def regenerate_tool_summary(name: ToolName) -> ToolSummaryDetail:
         raise _service_unavailable() from None
     except LLMUpstreamError as exc:
         raise _bad_gateway(exc) from None
+    finally:
+        # Held across the LLM round trip and the sidecar write, released on every
+        # exit including the two raises above -- a reservation that outlived its
+        # request would wedge the single flight for the life of the process.
+        tool_builder.release_sync_operation(reservation)
     if meta is tool_meta.StoreRefusal.FINALIZED:
         # 定版 landed while we were awaiting the LLM. The generated text was
         # deliberately NOT written (see _store_meta), so the answer is the same
@@ -512,6 +527,8 @@ async def revise_tool(name: ToolName, payload: ToolReviseRequest) -> ToolInstall
       None rather than from an ``any_job_active()`` pre-check. Both express the
       same rule (one tool job at a time), but the None return decides it INSIDE
       the admission lock, so two simultaneous submits cannot both be admitted.
+      An in-flight synchronous regenerate holds a reservation in that same lock
+      (R7-3), so it refuses a revise here exactly as a running job would.
     """
     directory = await run_in_threadpool(_existing_package_dir, name)
     if directory is None:
