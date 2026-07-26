@@ -122,3 +122,53 @@ r2 的「寫檔前再讀一次狀態」與「prompt 建置移到 threadpool」�
   截斷會切在 context 內，模型收到**零**套件內容，然後憑指示編造文件並被我們寫進 sidecar
   ——對一個系統提示核心規則是「只描述檔案裡看得到的事」的功能，這是最糟的失效。
   現在截斷先吃背景、最後才動到套件本身：截斷可以降低有用程度，但不能拿掉主體。
+
+### D40 附錄（P3a review r4）：URL 憑證改「不留」、遮蔽／截斷移出 validator、alias 列不讀真包狀態
+
+- **URL 裡的憑證用「不留」解，而不是「遮得更用力」**：`origin.openapi_url` 一律先過
+  `tool_meta._sanitized_origin_url` 收斂成 `scheme://host[:port]/path`，userinfo／query／
+  fragment 整段丟掉並補一個固定可見標記（`_ORIGIN_URL_TRIMMED_MARKER`——讀的人要能分辨
+  「本來就沒有 query」與「query 被拿掉了」）；無法解析、沒有 scheme 或沒有 host 則退成
+  空字串，**絕不回傳原值**。理由是值比對式遮蔽對 URL 有兩個結構性破口，而且都不是把
+  redactor 寫仔細一點能補的：(a) presigned 連結、使用者貼上但從未登記的 token——遮蔽器
+  根本不知道那個值；(b) **已登記**的秘密在 URL 裡是 percent-encoded（登記
+  `abc123+/XYZ`、URL 寫 `token=abc123%2B%2FXYZ`），exact substring 比對看到的是兩個不同
+  字串。D40 本來就裁定 revise／regenerate 都不會重新抓這個 URL（它是出處**顯示**用），
+  所以丟掉 query 與認證資訊不損失任何功能。
+  **三個套用點，主 choke point 選在 capture**：`tool_builder.run_install` 呼叫 install
+  hook 時就收斂，原始字串因此完全不離開那個函式（那份原值本來就只是拿去 fetch 的）；
+  另外兩處是 defense-in-depth——`_summary_user_prompt` 的 URL 行（先收斂再遮蔽）與
+  `_stored_origin` 讀回既有 sidecar 時（**r4 之前寫下的**或手改的檔案可能還帶著原始
+  query，regenerate 會把它讀進 prompt、再寫回磁碟）。**不做資料遷移**：舊 sidecar 照常
+  讀得出來，第一次 regenerate 就會順手把 origin 改寫成收斂後的樣子。重複套用是 no-op
+  （標記裡不含 `?`／`#`／`@`）。
+- **明說的接受邊界（不追編碼）**：安裝指示（`origin.instructions`）是自由文字，其中若出現
+  **經過編碼或變形**的秘密（percent-encoding、base64、中間插空白），值比對遮蔽同樣抓不到。
+  這裡**刻意不做編碼追逐**：percent／base64／雙重編碼是無底洞，而 URL 能被結構性解決，
+  正是因為它有「可以整段丟掉」的部位，散文沒有。指示欄位維持既有防線（登記值的原樣比對、
+  寫入端 fail-closed 遮蔽），這是已知且接受的限制。
+- **LLM 輸出的遮蔽與截斷移出 pydantic validator**：`ToolSummaryResult._sanitize` 原本在
+  `model_validate` 裡跑 `redact_known_secrets`——而 `generate_structured` 的 validate 跑在
+  **event loop 上**，那個遮蔽器每次都要掃 tools 目錄（`iterdir`＋每包一次 `stat`，cache
+  miss 還要讀 `.env`）：這是在 loop 上做阻塞 I/O，而同一個模組的其他每一步檔案操作都特地
+  丟去 threadpool。現在 validator 只驗 **shape**（`_coerce_str`＋非空檢查；lone surrogate
+  仍照裁決紀錄 #1 在此拒絕），redact→strip→cap 三步整組搬進 `tools.store_summary_meta`
+  （本來就在 threadpool worker 上、本來就持 `_META_LOCK`、本來就是寫檔路徑），順序原封不動。
+  **strip 必須一起搬**，這是關鍵而非順手：strip 排在遮蔽之後才對（登記值若自帶前後空白
+  ——手改 `.env` 寫成 `KEY=" secret-token "`，python-dotenv 會原樣保留——`strip` 一吃掉邊界
+  就再也比不中，剩下的值就裸奔了），把 strip 留在 validator 等於從另一邊把同一個洞打開。
+  `_TOOL_SUMMARY_CAP` 常數跟著移到 `tools`（tool_meta 是 importer，留在原處會是循環 import）。
+  `write_tool_meta` 對三個文字欄位的遮蔽**維持不動**，仍是其他呼叫端（`set_summary_status`
+  round-trip、未來程式化寫入）的最後一道；對已遮蔽文字重跑是 no-op（標記本身沒有可比中的值）。
+  遮蔽失敗維持 fail-closed：回 `("not_stored", None)` 而不是丟例外（route 是 map 這個回傳的，
+  丟例外會把 404 變 500），且**排在 finalize gate 之後**——「不能做」（409 `tool_finalized`）
+  不該被「做不成」（404）蓋過，而且已定版的套件連掃都不用掃。
+  `InstallResult._sanitize` 有同型別的 validator 內遮蔽，**有意識延後**不在本階段處理，
+  理由見 repo 根目錄 `裁決紀錄.md` #2。
+- **列表頁不再從 alias 讀真包的總結狀態**：`list_tools` 原本每一列都跑
+  `summary_status(scan.directory)`，而內部別名 `tools/alias -> tools/real` 的
+  `scan.directory` 會被 follow——於是 alias 那一列顯示的是 **real 的**「已定版」，但所有
+  by-name 總結路由（GET／PATCH／regenerate）對 alias 都回 404，這個 badge 沒有任何請求
+  重現得出來，等於在描述另一個套件。改成 alias 列一律 `summary_status = None`
+  （`_listed_summary_status`），與 by-name 路由的拒絕語意對齊；該列本身維持
+  `valid=False`（`_scan_package` 本來就拒絕 symlink 套件目錄）不變。

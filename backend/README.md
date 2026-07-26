@@ -143,7 +143,10 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 - `GET /api/tools` — 列出所有已安裝工具套件（含無效的），依名稱排序；`TOOLS_DIR`
   未設定或尚無工具時回空清單（非錯誤）。每一列附帶
   `summary_status`（`"draft"`／`"final"`／`null`＝尚無可讀的總結 sidecar），
-  列表頁靠它直接標示每個工具的總結狀態，不必逐一再打一次總結 API。
+  列表頁靠它直接標示每個工具的總結狀態，不必逐一再打一次總結 API。內部別名
+  （`tools/alias -> tools/real` 這種 symlink）那一列固定回 `null`，與 by-name 的三條
+  總結路由一致（它們對別名都回 404）——否則列表會標示**真包**的狀態，而那個標示
+  任何請求都重現不出來。
 - `PATCH /api/tools/{name}` — 切換某工具的 `enabled`；找不到回 404。
 - `DELETE /api/tools/{name}` — 刪除整個工具套件目錄；找不到回 404。
 - `POST /api/tools/install` — 送出 KB 網頁安裝器工作（見下方「工具（KB 網頁
@@ -214,7 +217,15 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   契約）。三個可能帶操作者／LLM 文字的**值**（`summary`、`origin.openapi_url`、
   `origin.instructions`）一律過 `redact_known_secrets` 且**遮蔽失敗就不寫**——
   sidecar 之後會被修訂流程複製進暫存目錄接受「檔案不得內嵌秘密值」檢查，含密文
-  等於讓這個工具再也修訂不了。檔案大小上下限**兩邊對齊**（`_AI_META_MAX_BYTES`，
+  等於讓這個工具再也修訂不了。`origin.openapi_url` 另外**先被收斂**成
+  `scheme://host[:port]/path`（userinfo／query／fragment 整段丟掉、補一個固定標記，
+  無法解析就留空）：URL 裡的憑證常常是遮蔽器沒登記過的（presigned 連結），或是登記
+  了但以 percent-encoding 出現（`abc+/` vs `abc%2B%2F`），值比對抓不到——而這個 URL
+  只是出處顯示、沒有任何流程會再抓一次，丟掉就不會有這個問題。收斂發生在
+  `run_install` 交給 summary hook 的那一刻（原值不離開 installer），prompt 與讀回舊
+  sidecar 時再各收斂一次（涵蓋手改與此修正之前寫下的檔案，不需要資料遷移）。
+  `summary` 的遮蔽／trim／截斷（`_TOOL_SUMMARY_CAP`）**在寫入端一次做完**，不在
+  pydantic validator 裡：validator 跑在 event loop 上，而遮蔽會掃整個 tools 目錄。檔案大小上下限**兩邊對齊**（`_AI_META_MAX_BYTES`，
   256 KiB）：寫得進去的一定讀得回來，不會出現「寫入回報成功、之後每次讀都變成
   沒有總結」；讀取端連 JSON 巢狀過深的 `RecursionError` 都吞成「沒有 sidecar」，
   因為列表頁每一列都會讀它，一個壞檔不能拖垮整頁。sidecar 的寫入是**原子的**

@@ -1275,9 +1275,24 @@ async def run_install(
         # registered, so the summary is redacted against it as well as against
         # the now-installed .env. ``generate_and_store_summary`` cannot raise
         # (see tool_meta): a summary that fails must never flip this outcome.
+        #
+        # The URL is sanitized HERE, at CAPTURE, so the credential-bearing form
+        # never leaves this function (D40 r4): the raw string is what we FETCHED
+        # with, and this call is the one place it would otherwise cross into a
+        # module whose whole job is composing prompts and persisting text. A
+        # presigned/unknown token in the query, or a known secret that appears
+        # percent-encoded, is unmatchable by redaction -- so the parts that carry
+        # credentials are dropped rather than masked (see
+        # ``tool_meta._sanitized_origin_url``; nothing downstream re-fetches this
+        # URL, it is provenance display). tool_meta sanitizes again on the prompt
+        # and on a sidecar read-back, which covers hand-edited and pre-fix files;
+        # this is what keeps the RAW value from ever being handed over at all.
         await tool_meta.generate_and_store_summary(
             result.tool_name,
-            origin={"openapi_url": openapi_url, "instructions": instructions},
+            origin={
+                "openapi_url": tool_meta._sanitized_origin_url(openapi_url),
+                "instructions": instructions,
+            },
             builder_summary=summary,
         )
         return InstallOutcome(

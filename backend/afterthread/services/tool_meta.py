@@ -31,7 +31,16 @@ Three properties are deliberate, and each has a failure mode behind it:
   in, and every piece -- files, paths, the operator's own install context --
   is redacted BEFORE it is stripped or cut, behind one final pass over the
   whole assembled prompt: the redact-then-cap order the codebase uses, closed
-  as a property of the PROMPT rather than of each field in it.
+  as a property of the PROMPT rather than of each field in it. The install
+  URL is the one piece redaction alone could not close, so it is STRUCTURALLY
+  reduced first (``_sanitized_origin_url``): a credential in a URL's query or
+  userinfo is routinely one we were never told about, or one we were told about
+  in a different encoding, and neither is matchable.
+
+The LLM's own reply is validated for SHAPE here and redacted/capped at the
+STORE (``tools.store_summary_meta``), not in the pydantic validator: that
+validator runs on the event loop, and redaction reads the filesystem. See
+``ToolSummaryResult``.
 
 ``regenerate_summary`` is the same generation behind the synchronous
 ``POST /api/tools/{name}/summary/regenerate`` route, and is the ONE entry point
@@ -44,6 +53,7 @@ import os
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, model_validator
 from starlette.concurrency import run_in_threadpool
@@ -78,11 +88,16 @@ class StoreRefusal(Enum):
     FINALIZED = "finalized"
 
 
-# Cap on the stored summary. Generous next to InstallResult's 2000-char progress
-# note (_SUMMARY_CAP) because this text is the tool's user-facing DOCUMENTATION
-# -- what it does, how it runs, its inputs/outputs and limits -- and it is
-# rendered on demand in one panel, not carried in any prompt or tool spec.
-_TOOL_SUMMARY_CAP = 8000
+# What a sanitized origin URL says INSTEAD of the parts it dropped (see
+# ``_sanitized_origin_url``). Fixed and visible on purpose: the sidecar is the
+# only record of where a package came from, so a silently shortened URL would
+# read as the whole truth -- an operator comparing it against the address they
+# typed has to be able to tell "this URL had no query" from "its query was
+# removed here". One marker for both dropped parts (userinfo and query/fragment)
+# because the reader's question is whether anything was removed, not which.
+# Worded like the module's other markers (…[…] , zh-TW), and deliberately free of
+# "?", "#" and "@" so re-sanitizing an already-sanitized URL is a no-op.
+_ORIGIN_URL_TRIMMED_MARKER = "…[查詢字串與認證資訊已移除]"
 
 # Per-FILE slice of the package that may ride in the prompt. A fixed cap (rather
 # than a proportional split) keeps the shape predictable and stops ONE huge
@@ -143,28 +158,46 @@ no code fences around the whole answer."""
 
 
 class ToolSummaryResult(BaseModel):
-    """The summary session's structured close: the explanation text, sanitized.
+    """The summary session's structured close: the explanation text, SHAPE-checked.
 
-    Sanitized exactly like every other LLM-facing model (untrusted output):
-    ``redact_known_secrets`` FIRST, then strip, then the cap -- the
-    redact-then-cap order ``InstallResult._sanitize`` documents at length, and
-    for the same reason: a secret straddling the slice edge must be masked while
-    the text is still WHOLE, or the cut leaves an interior fragment no later
-    pass can match.
+    What this validator does NOT do is the load-bearing part. It runs inside
+    ``generate_structured``'s ``model_validate``, which happens ON THE EVENT LOOP
+    -- so it coerces the value to a string and decides whether there is a summary
+    at all, and it touches NOTHING ELSE. It used to also call
+    ``tools.redact_known_secrets``, whose provider walks the tools directory
+    (``iterdir`` + a ``stat`` per package, and a ``.env`` read on every cache
+    miss): blocking filesystem work on the loop, in a module that hops every
+    other filesystem step onto a threadpool worker for exactly that reason.
 
-    The STRIP belongs after the redaction for the same "match the value while
-    the text is untouched" reason, one step earlier: a registered secret whose
-    value carries edge whitespace (a hand-edited ``.env`` with a quoted
-    ``" secret-token"``) stops matching the moment ``strip`` eats that edge, so
-    stripping first would hand the redactor a body it no longer recognizes and
-    leak the rest of the value. Untouched text in, redaction, THEN the cosmetic
-    trims and cuts.
+    Redaction and the ``_TOOL_SUMMARY_CAP`` cut are STORAGE-boundary concerns and
+    now live at the storage boundary -- ``tools.store_summary_meta``, already on a
+    worker, already under ``_META_LOCK``, already the sidecar's write path -- in
+    the SAME order they ran here (redact while the text is whole, then strip, then
+    slice). One choke point instead of two; see that function for why each step
+    sits where it does.
 
-    An EMPTY summary is rejected rather than stored. The model returning nothing
-    usable is exactly what ``generate_structured``'s one corrective retry exists
-    for, and an empty string is not a summary -- it is indistinguishable from the
-    placeholder a FAILED generation writes, so accepting it would make the
-    sidecar lie about whether a summary was ever produced.
+    The STRIP went with them rather than staying behind, and that is the subtle
+    half. It has to run AFTER the redaction: the redactor matches the REGISTERED
+    value against untouched text, so a secret whose value carries edge whitespace
+    (a hand-edited ``.env`` with a quoted ``" secret-token "``) stops matching the
+    moment ``strip`` eats that edge -- leaving the rest of the value to ride on
+    unmasked. Keeping a "harmless" strip here would therefore have quietly
+    reopened that leak from the other side. What is left is the EMPTINESS
+    decision, which reads ``.strip()`` without rewriting the value.
+
+    An EMPTY (or whitespace-only) summary is rejected rather than stored. The
+    model returning nothing usable is exactly what ``generate_structured``'s one
+    corrective retry exists for, and an empty string is not a summary -- it is
+    indistinguishable from the placeholder a FAILED generation writes, so
+    accepting it would make the sidecar lie about whether a summary was ever
+    produced.
+
+    A reply carrying a lone Unicode surrogate is REJECTED here too (``_coerce_str``
+    encodes strictly), and that stays deliberate: data that has not landed yet is
+    refused at validation -- one corrective retry, then a 502 -- while data that
+    has already happened is scrubbed at its recording/write boundary
+    (``llm_log._utf8_safe``, ``tools._redacted``). Same rule as every other
+    LLM-facing model in the repo; adjudicated, not incidental.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -176,17 +209,76 @@ class ToolSummaryResult(BaseModel):
     def _sanitize(cls, data: Any) -> dict[str, Any]:
         if not isinstance(data, dict):
             raise ValueError("expected a JSON object")
-        return {
-            "summary": tools.redact_known_secrets(_coerce_str(data.get("summary"))).strip()[
-                :_TOOL_SUMMARY_CAP
-            ]
-        }
+        # SHAPE only -- no redaction, no strip, no cap (see the class docstring):
+        # this runs on the event loop, and all three belong to the store step.
+        return {"summary": _coerce_str(data.get("summary"))}
 
     @model_validator(mode="after")
     def _summary_required(self) -> ToolSummaryResult:
-        if not self.summary:
+        if not self.summary.strip():
             raise ValueError("summary must be a non-empty explanation of the tool package")
         return self
+
+
+def _sanitized_origin_url(url: str) -> str:
+    """The install's OpenAPI URL cut down to PROVENANCE: ``scheme://host[:port]/path``.
+
+    Userinfo, query and fragment are DROPPED (a marker records that something
+    was), because those are where a credential lives and value-matching redaction
+    cannot be relied on to find it. Two independent failures, and neither is
+    fixable by redacting harder:
+
+    * the credential is UNKNOWN to us. A presigned document URL
+      (``?X-Amz-Signature=...``), a one-off share link, a token the operator
+      pasted but never registered as the install-form secret: no redactor can
+      mask a value nobody told it about, and this URL is persisted in the sidecar
+      AND replayed into every later regeneration's prompt;
+    * the credential is KNOWN but TRANSFORMED. A secret ``abc123+/XYZ`` is
+      registered verbatim while the URL carries it percent-encoded as
+      ``token=abc123%2B%2FXYZ`` -- an exact substring match sees two different
+      strings and passes it straight through. Chasing encodings inside the
+      redactor is a losing game (percent, base64url, double-encoding, ...), so
+      the fix is structural: do not carry the part that holds credentials.
+
+    Nothing FUNCTIONAL is lost, which is what makes dropping them the right
+    answer rather than a tradeoff: D40 already rules that revise and regenerate
+    never re-fetch this URL (the install fetched it once; everything after reads
+    the promoted FILES), so the stored value is provenance DISPLAY -- "this came
+    from kb.example's OpenAPI document" -- and the host and path say that in
+    full.
+
+    Refusals degrade to "" (the caller then simply has no URL to show or store),
+    never to the raw value:
+
+    * an unparseable URL (``urlsplit`` raises on a malformed IPv6 host), or one
+      with no scheme or no host -- a hand-edited sidecar can hold anything, and
+      echoing an unrecognizable string on the theory that it is "probably a URL"
+      is exactly what this function exists to stop;
+    * an empty/whitespace value, which is the ordinary "no URL captured" case.
+
+    The rebuild uses the netloc's own TEXT after the last ``@`` rather than
+    ``parts.hostname``/``parts.port``: it keeps IPv6 brackets and the original
+    host spelling intact, and ``.port`` raises on a non-numeric port, which would
+    turn a cosmetic oddity into a refusal. Applying this twice is a no-op (the
+    marker carries no URL delimiter), so the belt-and-braces call sites can run
+    over an already-sanitized value without stacking markers.
+    """
+    stripped = url.strip()
+    if not stripped:
+        return ""
+    try:
+        parts = urlsplit(stripped)
+    except ValueError:
+        return ""
+    # Everything after the LAST "@" is the host[:port]; a userinfo section (even a
+    # malformed one carrying its own "@") is left behind by construction.
+    host = parts.netloc.rpartition("@")[2]
+    if not parts.scheme or not host:
+        return ""
+    base = urlunsplit((parts.scheme, host, parts.path, "", ""))
+    if parts.netloc != host or parts.query or parts.fragment:
+        return base + _ORIGIN_URL_TRIMMED_MARKER
+    return base
 
 
 def _package_files(directory: Path) -> list[tuple[str, str]]:
@@ -293,6 +385,14 @@ def _summary_user_prompt(
     ``.env`` key-name line. And strip-before-redact is its own leak: a
     registered value carrying edge whitespace stops matching once ``strip`` eats
     that edge, so the strips run AFTER the mask, never before it.
+
+    Asking the redactor was necessary and not SUFFICIENT, which is why the URL
+    is reduced to ``scheme://host/path`` before it is masked: the query can hold
+    a credential the redactor was never told about (a presigned link), or one it
+    was told about in another encoding (``abc+/`` registered,
+    ``token=abc%2B%2F`` in the URL). See ``_sanitized_origin_url``. The same
+    limit still applies INSIDE the free-text instructions, and is accepted there
+    rather than chased: they are prose, not a structure with a droppable part.
     """
     budget = token_budget.char_allowance(get_settings().llm_prompt_budget_tokens)
     origin_data = origin or {}
@@ -319,11 +419,19 @@ def _summary_user_prompt(
         )
     # --- then the CONTEXT, which is what a budget cut is allowed to eat ---
     openapi_url = origin_data.get("openapi_url")
-    if isinstance(openapi_url, str) and openapi_url.strip():
-        parts.append(
-            "It was built from this OpenAPI document: "
-            + tools.redact_known_secrets(openapi_url).strip()
-        )
+    if isinstance(openapi_url, str):
+        # SANITIZE first, then redact (belt and braces): the sanitizer drops the
+        # credential-bearing parts no redactor could match -- an unregistered
+        # presigned token, a KNOWN secret that appears percent-encoded -- and the
+        # redactor still masks a registered value that survived in the host or
+        # path. The emptiness test is on the SANITIZED value, so an unparseable or
+        # absent URL simply contributes no line rather than an empty label.
+        sanitized_url = _sanitized_origin_url(openapi_url)
+        if sanitized_url:
+            parts.append(
+                "It was built from this OpenAPI document: "
+                + tools.redact_known_secrets(sanitized_url)
+            )
     instructions = origin_data.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
         parts.append(
@@ -362,17 +470,32 @@ def _stored_origin(meta: dict[str, Any] | None) -> dict[str, Any] | None:
     ``_store_meta``'s "inherit whatever is on disk" signal, so a sidecar whose
     origin we cannot make sense of keeps its only copy instead of having it
     overwritten by an empty dict.
+
+    The URL is re-sanitized on the way back IN, not merely trusted. Installs
+    sanitize at capture (``tool_builder`` hands us a URL with no userinfo, query
+    or fragment), but a sidecar written BEFORE that fix -- or hand-edited since --
+    can hold the raw ``?token=...`` form, and this is the door it would come back
+    through: into the regeneration's prompt, and then back onto disk when the
+    store rewrites the origin it was given. Sanitizing here closes both, and
+    heals the file in passing: the first regeneration of a legacy package
+    rewrites its origin in the reduced form. Re-sanitizing an already-sanitized
+    URL is a no-op, so this costs nothing on the normal path.
     """
     if meta is None:
         return None
     origin = meta.get("origin")
     if not isinstance(origin, dict):
         return None
-    kept = {
-        key: value
-        for key, value in origin.items()
-        if key in ("openapi_url", "instructions") and isinstance(value, str)
-    }
+    kept: dict[str, Any] = {}
+    for key, value in origin.items():
+        if not isinstance(value, str):
+            continue
+        if key == "openapi_url":
+            # ALWAYS the sanitized form, "" included: a legacy raw URL must be
+            # replaced by what we can safely keep, never inherited around this.
+            kept[key] = _sanitized_origin_url(value)
+        elif key == "instructions":
+            kept[key] = value
     return kept or None
 
 

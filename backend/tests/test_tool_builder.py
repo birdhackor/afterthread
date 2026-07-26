@@ -37,7 +37,7 @@ from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
 
 from afterthread.config import Settings
-from afterthread.services import llm_log, tool_builder, tools
+from afterthread.services import llm_log, tool_builder, tool_meta, tools
 from afterthread.services.llm import LLMNotConfiguredError, LLMUpstreamError
 from afterthread.services.tool_builder import (
     _ERROR_NAME_TAKEN,
@@ -704,6 +704,56 @@ def test_run_install_writes_the_summary_sidecar(
     # ... and the install outcome still links the BUILDER session, not the
     # summary one -- the two workflows are told apart by name.
     assert outcome.llm_log_id == llm_log.last_record_id_for_workflow("tool_install")
+
+
+def test_run_install_never_captures_url_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The install URL is reduced to provenance AT CAPTURE (D40 r4).
+
+    The address a user pastes into the install form routinely carries a
+    credential -- a presigned document link, HTTP basic userinfo -- that nothing
+    ever registered as a known secret, so redaction cannot mask it. It would
+    otherwise be persisted in the sidecar (the only copy, read back into every
+    later regeneration) and replayed into this very prompt. Sanitizing in the
+    hook call keeps the raw form inside ``run_install``, which is the one
+    function that legitimately holds it: it is what we FETCHED with, and D40
+    already rules nothing downstream re-fetches it."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built and tested", "ready": True},
+        files={"tool.json": json.dumps(_package_manifest("kbsearch")), "run.py": _GOOD_RUN_PY},
+    )
+    seen: dict[str, str] = {}
+
+    async def capture_summary(
+        system_prompt: str, user_prompt: str, model_cls: type[BaseModel], **kwargs: Any
+    ) -> BaseModel:
+        seen["user_prompt"] = user_prompt
+        return model_cls.model_validate({"summary": "這個工具會查 KB"})
+
+    monkeypatch.setattr("afterthread.services.tool_meta.generate_structured", capture_summary)
+    _no_fetch(monkeypatch)
+
+    outcome = asyncio.run(
+        run_install(
+            "https://ops:BASIC-CREDENTIAL@kb.example/openapi.json?X-Amz-Signature=PRESIGNED-abcdef",
+            "build a search tool",
+        )
+    )
+
+    assert outcome.ok is True
+    meta = tools.read_tool_meta(root / "kbsearch")
+    assert meta is not None
+    assert meta["origin"]["openapi_url"] == (
+        "https://kb.example/openapi.json" + tool_meta._ORIGIN_URL_TRIMMED_MARKER
+    )
+    sidecar = (root / "kbsearch" / tools._AI_META_FILENAME).read_text(encoding="utf-8")
+    for credential in ("PRESIGNED-abcdef", "BASIC-CREDENTIAL"):
+        assert credential not in sidecar
+        assert credential not in seen["user_prompt"]
 
 
 @pytest.mark.parametrize(

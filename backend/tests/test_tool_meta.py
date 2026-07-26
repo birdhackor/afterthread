@@ -157,34 +157,42 @@ def _fake_generate(
 # --- the result model ---------------------------------------------------------
 
 
-def test_summary_result_sanitizes_and_caps() -> None:
+def test_summary_result_validates_shape_and_keeps_the_text_verbatim() -> None:
+    """The validator coerces and checks; it does not REWRITE.
+
+    Redaction, the strip and the ``_TOOL_SUMMARY_CAP`` cut all moved to the store
+    step (see ``tools.store_summary_meta``), and they moved TOGETHER because they
+    are one ordered operation -- leaving the strip behind here would have run it
+    before the redaction, which is the leak the order exists to prevent."""
     result = ToolSummaryResult.model_validate({"summary": "  spaced  "})
-    assert result.summary == "spaced"
-    long = ToolSummaryResult.model_validate({"summary": "y" * (tool_meta._TOOL_SUMMARY_CAP + 500)})
-    assert len(long.summary) == tool_meta._TOOL_SUMMARY_CAP
+    assert result.summary == "  spaced  "
+    long_text = "y" * (tools._TOOL_SUMMARY_CAP + 500)
+    assert ToolSummaryResult.model_validate({"summary": long_text}).summary == long_text
+    # Still coerced to a string: a model that answered with a number is a shape
+    # this validator repairs rather than rejects.
+    assert ToolSummaryResult.model_validate({"summary": 12}).summary == "12"
 
 
-def test_summary_result_redacts_before_capping(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Redact-then-cap: a secret straddling the slice edge must be masked while
-    the text is still whole, or the cut leaves an unmatchable fragment."""
-    secret = "live-secret-abcdef"
-    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
-    padding = "y" * (tool_meta._TOOL_SUMMARY_CAP - 4)
-    result = ToolSummaryResult.model_validate({"summary": padding + secret})
-    assert secret not in result.summary
-    assert secret[:8] not in result.summary
+def test_summary_result_validation_touches_no_filesystem(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``model_validate`` runs on the EVENT LOOP, inside generate_structured.
 
+    It used to call ``redact_known_secrets`` there, whose provider sweeps the
+    tools directory -- an ``iterdir`` plus a ``stat`` per package, and a ``.env``
+    read on every cache miss -- so every summary generation did blocking
+    filesystem work on the loop that carries every other request in the process.
+    Both registry entry points are booby-trapped here: validation must not reach
+    either."""
 
-def test_summary_result_redacts_before_stripping(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Redact-then-strip: the redactor matches the REGISTERED value, so a secret
-    carrying edge whitespace (a hand-edited .env with a quoted " secret-token ")
-    stops matching the moment strip eats that edge -- and the body would then
-    ride through unmasked."""
-    secret = " secret-token-abcdef "
-    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
-    result = ToolSummaryResult.model_validate({"summary": secret})
-    assert "secret-token-abcdef" not in result.summary
-    assert tools._REDACTION_MARKER in result.summary
+    def explode() -> Any:
+        raise AssertionError("validation must not read the filesystem")
+
+    monkeypatch.setattr(tools, "known_secret_values", explode)
+    monkeypatch.setattr(tools, "tools_dir", explode)
+
+    assert (
+        ToolSummaryResult.model_validate({"summary": "這個工具會查 KB"}).summary
+        == "這個工具會查 KB"
+    )
 
 
 @pytest.mark.parametrize("value", ["", "   ", None], ids=["empty", "blank", "missing"])
@@ -199,6 +207,75 @@ def test_summary_result_rejects_empty_summary(value: str | None) -> None:
 def test_summary_result_rejects_non_object() -> None:
     with pytest.raises(ValidationError):
         ToolSummaryResult.model_validate(["not", "an", "object"])
+
+
+# --- the origin URL is reduced to provenance ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("https://kb.example/openapi.json", "https://kb.example/openapi.json"),
+        (
+            "https://kb.example/openapi.json?token=abc123",
+            "https://kb.example/openapi.json" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
+        ),
+        (
+            "https://user:pass@kb.example:8443/o.json",
+            "https://kb.example:8443/o.json" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
+        ),
+        (
+            "https://kb.example/o.json#section",
+            "https://kb.example/o.json" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
+        ),
+        (
+            "http://[::1]:8080/o.json?a=b",
+            "http://[::1]:8080/o.json" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
+        ),
+        # A non-numeric port is a cosmetic oddity, not a reason to refuse the
+        # whole URL (which reading parts.port instead of the netloc text would
+        # make it).
+        ("http://kb.example:notaport/o.json", "http://kb.example:notaport/o.json"),
+        ("http://[::1/o.json", ""),  # urlsplit raises: unparseable
+        ("kb.example/openapi.json", ""),  # no scheme
+        ("https:///o.json", ""),  # no host
+        ("not a url at all", ""),
+        ("", ""),
+        ("   ", ""),
+    ],
+    ids=[
+        "plain",
+        "query",
+        "userinfo",
+        "fragment",
+        "ipv6",
+        "odd-port",
+        "unparseable",
+        "no-scheme",
+        "no-host",
+        "garbage",
+        "empty",
+        "blank",
+    ],
+)
+def test_sanitized_origin_url(raw: str, expected: str) -> None:
+    """scheme://host[:port]/path survives; userinfo, query and fragment do not.
+
+    The stored URL is provenance DISPLAY (D40: nothing re-fetches it), so the
+    parts that carry credentials are dropped rather than masked -- redaction
+    cannot reach a presigned token nobody registered, nor a registered one the
+    URL carries percent-encoded. Anything unparseable degrades to "", never to
+    the raw value."""
+    assert tool_meta._sanitized_origin_url(raw) == expected
+
+
+def test_sanitized_origin_url_is_idempotent() -> None:
+    """Three call sites sanitize (capture, prompt, sidecar read-back), so a
+    value may pass through more than once -- the marker must not stack. It
+    carries no "?", "#" or "@", so a second pass finds nothing left to drop."""
+    once = tool_meta._sanitized_origin_url("https://u@kb.example/o.json?token=x#f")
+    assert tool_meta._sanitized_origin_url(once) == once
+    assert once.count(tool_meta._ORIGIN_URL_TRIMMED_MARKER) == 1
 
 
 # --- the prompt ---------------------------------------------------------------
@@ -296,8 +373,76 @@ def test_user_prompt_redacts_the_operator_supplied_origin(
 
     assert secret not in prompt
     assert tools._REDACTION_MARKER in prompt
-    # Masked, not dropped: the rest of the URL is still context for the model.
-    assert "https://kb.example/openapi.json?token=" in prompt
+    # The URL's SUBJECT survives -- the model still learns which document this
+    # was built from -- while the query that held the token is gone entirely
+    # (redaction alone would have left "?token=" plus a marker; see
+    # test_user_prompt_drops_url_credentials_redaction_cannot_reach for why that
+    # was not enough).
+    assert "https://kb.example/openapi.json" in prompt
+    assert "token=" not in prompt
+    assert tool_meta._ORIGIN_URL_TRIMMED_MARKER in prompt
+
+
+@pytest.mark.parametrize(
+    "url, needle",
+    [
+        (
+            "https://kb.example/openapi.json?X-Amz-Signature=UNREGISTERED-PRESIGNED-abcdef",
+            "UNREGISTERED-PRESIGNED-abcdef",
+        ),
+        ("https://kb.example/openapi.json?token=abc123%2B%2FXYZ", "abc123%2B%2FXYZ"),
+        ("https://ops:UNREGISTERED-BASIC-abcdef@kb.example/openapi.json", "UNREGISTERED-BASIC"),
+    ],
+    ids=["presigned-unknown", "known-but-percent-encoded", "userinfo"],
+)
+def test_user_prompt_drops_url_credentials_redaction_cannot_reach(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, url: str, needle: str
+) -> None:
+    """Value-matching redaction is necessary and NOT sufficient for a URL.
+
+    Two failures it cannot cover, both ordinary: a credential nobody registered
+    (a presigned document link, HTTP basic userinfo pasted into the address), and
+    a REGISTERED one the URL carries in another encoding -- ``abc123+/XYZ`` is
+    what the installer knows, ``abc123%2B%2FXYZ`` is what the URL says, and an
+    exact substring match sees two different strings. So the credential-bearing
+    parts are dropped structurally instead."""
+    root = tmp_path / "tools"
+    pkg = _package(root)
+    _summary_settings(monkeypatch, root)
+    # The registered form of the second case -- known to the redactor, and still
+    # unmatchable against the percent-encoded text in the URL.
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({"abc123+/XYZ"}))
+
+    prompt = tool_meta._summary_user_prompt(
+        "kbsearch", pkg, origin={"openapi_url": url}, builder_summary=None
+    )
+
+    assert needle not in prompt
+    assert "https://kb.example/openapi.json" in prompt  # the provenance survives
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["RAW-JUNK-not-a-url", "http://[::1/RAW-JUNK.json", "   "],
+    ids=["garbage", "unparseable", "blank"],
+)
+def test_user_prompt_omits_an_unusable_origin_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, url: str
+) -> None:
+    """A URL we cannot parse is not echoed on the theory that it is probably a
+    URL: the whole line is absent, rather than a label followed by the raw value
+    (or by nothing). The sidecar is hand-editable, so these shapes reach the
+    prompt for real."""
+    root = tmp_path / "tools"
+    pkg = _package(root)
+    _summary_settings(monkeypatch, root)
+
+    prompt = tool_meta._summary_user_prompt(
+        "kbsearch", pkg, origin={"openapi_url": url}, builder_summary=None
+    )
+
+    assert "It was built from this OpenAPI document" not in prompt
+    assert "RAW-JUNK" not in prompt
 
 
 def test_user_prompt_redacts_a_filename_carrying_a_secret(
@@ -698,6 +843,50 @@ def test_regenerate_summary_feeds_the_stored_origin_back_into_the_prompt(
     assert secret not in captured["user_prompt"]
     assert isinstance(meta, dict)
     assert meta["origin"]["instructions"] == "ORIGIN-INSTRUCTIONS-MARKER 只查內部 KB"
+
+
+def test_regenerate_summary_sanitizes_a_legacy_origin_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A sidecar written BEFORE the URL was reduced (or hand-edited since) is the
+    other door the credential comes back through.
+
+    The install sanitizes at capture, but the sidecar on disk is the only copy of
+    the origin and regenerate reads it back -- into the prompt, and then back onto
+    disk when the store rewrites the origin it was handed. Both are covered here,
+    which is also what heals the file: no migration, the first regeneration
+    rewrites the origin in the reduced form."""
+    root = tmp_path / "tools"
+    pkg = _package(root)
+    _summary_settings(monkeypatch, root)
+    # Written by hand: a legacy raw URL is exactly what our writer no longer
+    # produces, so this is the only way to get one onto disk.
+    (pkg / tools._AI_META_FILENAME).write_text(
+        json.dumps(
+            {
+                "summary": "舊的",
+                "status": "draft",
+                "origin": {
+                    "openapi_url": "https://ops:LEGACY-BASIC@kb.example/o.json?token=LEGACY-TOKEN",
+                    "instructions": "ORIGIN-INSTRUCTIONS-MARKER",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured = _fake_generate(monkeypatch, summary="新的說明")
+
+    meta = asyncio.run(regenerate_summary("kbsearch"))
+
+    assert "LEGACY-TOKEN" not in captured["user_prompt"]
+    assert "LEGACY-BASIC" not in captured["user_prompt"]
+    assert "https://kb.example/o.json" in captured["user_prompt"]
+    # ... and the rewritten sidecar carries the reduced URL, not the raw one.
+    assert isinstance(meta, dict)
+    stored_url = meta["origin"]["openapi_url"]
+    assert stored_url == "https://kb.example/o.json" + tool_meta._ORIGIN_URL_TRIMMED_MARKER
+    assert meta["origin"]["instructions"] == "ORIGIN-INSTRUCTIONS-MARKER"
+    assert "LEGACY-TOKEN" not in (pkg / tools._AI_META_FILENAME).read_text(encoding="utf-8")
 
 
 def test_regenerate_summary_ignores_an_unusable_stored_origin(

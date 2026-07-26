@@ -201,6 +201,22 @@ _AI_META_MAX_BYTES = 256 * 1024
 # bypassed by writing a garbage value into the file.
 _SUMMARY_STATUSES: tuple[str, ...] = ("draft", "final")
 
+# Cap on the STORED summary text (D40). Generous next to InstallResult's 2000-char
+# progress note because this text is the tool's user-facing DOCUMENTATION -- what
+# it does, how it runs, its inputs/outputs and limits -- and it is rendered on
+# demand in one panel, not carried in any prompt or tool spec.
+#
+# It lives HERE, next to the sidecar it bounds, rather than in ``tool_meta`` where
+# it started, because the CUT does (see ``store_summary_meta``): the LLM result
+# model used to redact-and-cap inside its pydantic validator, which runs on the
+# EVENT LOOP, and the redaction half of that pair reads the filesystem. Both
+# halves moved to the storage boundary together -- they are one ordered operation
+# (redact while the text is whole, THEN slice) and splitting them across two
+# modules would be splitting an invariant nobody can then verify by reading
+# either. tool_meta is the importer of this module, so the constant could not
+# live there and be used here without a cycle.
+_TOOL_SUMMARY_CAP = 8000
+
 # Appended when a tool's stdout (or a failure's stderr) is cut for size. Mirrors
 # the truncation markers in memory_ai / llm_log so an operator who has seen those
 # recognizes this one; the distinct wording ("工具輸出" = tool output) tells it
@@ -1214,11 +1230,50 @@ def store_summary_meta(
     * ``origin`` -- only the install captures the OpenAPI URL and instructions,
       so a caller with nothing to pass (``origin=None``) must inherit them
       instead of erasing the only copy.
+
+    ``summary`` is REDACTED, stripped and capped HERE, and this is the only place
+    that happens (D40 r4). It used to happen in ``ToolSummaryResult``'s pydantic
+    validator -- i.e. inside ``generate_structured``'s ``model_validate``, which
+    runs ON THE EVENT LOOP, while ``redact_known_secrets``'s provider sweeps the
+    tools directory (an ``iterdir`` + a ``stat`` per package, plus a ``.env`` read
+    on every cache miss). That is blocking filesystem work on the loop, in a
+    feature whose every other filesystem step is deliberately hopped onto a
+    threadpool worker; THIS function is already on one, and already the sidecar's
+    write path. The ORDER is preserved exactly as it was: redact while the text is
+    still WHOLE, then strip, then slice. Each step earns its place --
+    * redact first, because a value straddling the slice edge must be masked
+      before the cut, or the cut leaves an interior fragment no later pass can
+      match;
+    * strip after the redaction, not before, because the redactor matches the
+      REGISTERED value against untouched text: a secret whose value carries edge
+      whitespace (a hand-edited ``.env`` with a quoted ``" secret-token "``)
+      stops matching the moment ``strip`` eats that edge, and the rest of the
+      value would ride to disk unmasked;
+    * the cut last, a bare slice with no marker, exactly as before.
+
+    ``write_tool_meta`` still redacts every text value it writes and remains the
+    LAST choke point for other callers (``set_summary_status``'s round-trip, any
+    future programmatic write); running over already-masked text is a no-op, since
+    the marker carries nothing to match. A redaction FAILURE here is the same
+    fail-closed refusal it is there -- ``("not_stored", None)``, never an
+    exception -- because ``regenerate_summary``'s route maps this return, and a
+    raised provider error would turn a 404 into a 500.
     """
     with _META_LOCK:
         existing = read_tool_meta(directory) or {}
         if existing.get("status") == "final":
             return ("finalized", None)
+        # AFTER the finalize gate, so a refusal stays a refusal (the 409 outranks
+        # a redaction failure's 404) and a frozen package costs no sweep at all.
+        # Inside the hold introduces NO new locking property: write_tool_meta runs
+        # the identical redaction under this same lock a few lines down.
+        try:
+            summary = redact_known_secrets(summary).strip()[:_TOOL_SUMMARY_CAP]
+        except Exception:
+            # Fail-closed, matching write_tool_meta's own guard: nothing is
+            # written rather than something unmasked (see redact_known_secrets --
+            # the LIVE path propagates a provider failure instead of degrading).
+            return ("not_stored", None)
         status = existing.get("status")
         if not (isinstance(status, str) and status in _SUMMARY_STATUSES):
             status = "draft"
@@ -1235,6 +1290,29 @@ def store_summary_meta(
         return ("ok", stored) if stored is not None else ("not_stored", None)
 
 
+def _listed_summary_status(directory: Path) -> str | None:
+    """``summary_status`` for one LISTED row -- None when the row is an ALIAS.
+
+    ``tools/<alias> -> tools/<real>`` is an internal symlink, and every by-name
+    summary route refuses it (``_resolve_package_dir_no_alias``: a GET/PATCH/
+    regenerate addressed at the alias must not read or freeze the REAL package's
+    sidecar). The LISTING was the one place still reading through it: the scan
+    resolves nothing, so ``summary_status(scan.directory)`` followed the link and
+    reported REAL's status on the alias row -- a row whose 已定版 badge no summary
+    request can then reproduce, since every one of them 404s the name. The badge
+    was describing a different package than the row it sat on.
+
+    None instead, which is exactly what the row would report if the alias were an
+    ordinary package with no sidecar -- the same "nothing to show here" the
+    refusing routes give. The row itself is unaffected and stays ``valid=False``
+    (``_scan_package`` refuses a symlinked package directory outright), so this
+    only removes the read-through, not the row.
+    """
+    if directory.is_symlink():
+        return None
+    return summary_status(directory)
+
+
 def list_tools() -> list[dict[str, Any]]:
     """List every installed package as a UI-facing summary.
 
@@ -1247,7 +1325,8 @@ def list_tools() -> list[dict[str, Any]]:
     than through a per-tool request, so the 工具 page can badge 草稿 / 已定版 on
     every row from the one listing call it already makes. It costs one small
     bounded read per package, on the same scan that already reads every
-    ``tool.json``; a package with no (or a corrupt) sidecar reports None.
+    ``tool.json``; a package with no (or a corrupt) sidecar reports None, and so
+    does an internal ALIAS row (see ``_listed_summary_status``).
     """
     return [
         {
@@ -1256,7 +1335,7 @@ def list_tools() -> list[dict[str, Any]]:
             "enabled": scan.enabled,
             "valid": scan.valid,
             "error": scan.error,
-            "summary_status": summary_status(scan.directory),
+            "summary_status": _listed_summary_status(scan.directory),
         }
         for scan in _scan_all()
     ]

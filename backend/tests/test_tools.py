@@ -2558,6 +2558,126 @@ def test_store_summary_meta_outcomes(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert not gone.exists()
 
 
+# The SUMMARY's redact -> strip -> cap, at its one choke point (D40 r4). The
+# three properties below used to be pinned on ToolSummaryResult's pydantic
+# validator, which ran them on the EVENT LOOP (the redaction sweeps the tools
+# directory). They moved here as one ordered operation -- splitting them would
+# have put the strip before the redaction, which is itself a leak.
+
+
+def test_store_summary_meta_strips_and_caps_the_summary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The cosmetic half: edge whitespace goes, and an over-long summary is cut
+    to _TOOL_SUMMARY_CAP by a bare slice -- no truncation marker, exactly as the
+    validator did it before."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+
+    outcome, meta = tools.store_summary_meta(pkg, summary="  spaced  ", origin=None, llm_log_id=1)
+    assert outcome == "ok"
+    assert meta is not None
+    assert meta["summary"] == "spaced"
+
+    long_text = "y" * (tools._TOOL_SUMMARY_CAP + 500)
+    outcome, meta = tools.store_summary_meta(pkg, summary=long_text, origin=None, llm_log_id=1)
+    assert outcome == "ok"
+    assert meta is not None
+    assert meta["summary"] == "y" * tools._TOOL_SUMMARY_CAP
+
+
+def test_store_summary_meta_redacts_before_capping(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Redact while the text is WHOLE, then slice.
+
+    The discriminating case is a secret straddling the cap edge by FEWER than
+    ``_MIN_SECRET_LEN`` characters. Cutting first leaves a 4-char head that no
+    later pass will ever mask -- ``write_tool_meta``'s own redaction cannot match
+    a full value that is no longer there, and the trailing-fragment guard has a
+    6-char floor by design. Masking while the text is whole removes the value
+    before the slice can strand a piece of it."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    secret = "ZZTOP-live-secret-abcdef"
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+
+    padding = "y" * (tools._TOOL_SUMMARY_CAP - 4)
+    outcome, meta = tools.store_summary_meta(
+        pkg, summary=padding + secret, origin=None, llm_log_id=1
+    )
+
+    assert outcome == "ok"
+    assert meta is not None
+    assert secret not in meta["summary"]
+    # The 4 characters a cut-first order would strand past the redactor's floor.
+    assert secret[:4] not in meta["summary"]
+    assert secret[:4] not in _sidecar(pkg).read_text(encoding="utf-8")
+
+
+def test_store_summary_meta_redacts_before_stripping(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Redact BEFORE the strip, not after.
+
+    The redactor matches the REGISTERED value against untouched text, so a secret
+    carrying edge whitespace -- a hand-edited ``.env`` with a quoted
+    ``" secret-token "``, which python-dotenv keeps verbatim -- stops matching the
+    moment ``strip`` eats that edge, and the rest of the value rides to disk
+    unmasked. This is why the strip moved OUT of the result validator with the
+    redaction rather than staying behind as a harmless tidy-up."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    secret = " secret-token-abcdef "
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+
+    outcome, meta = tools.store_summary_meta(pkg, summary=secret, origin=None, llm_log_id=1)
+
+    assert outcome == "ok"
+    assert meta is not None
+    assert "secret-token-abcdef" not in meta["summary"]
+    assert tools._REDACTION_MARKER in meta["summary"]
+    assert "secret-token-abcdef" not in _sidecar(pkg).read_text(encoding="utf-8")
+
+
+def test_store_summary_meta_fails_closed_on_a_redaction_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A provider failure is the did-not-happen answer, never an exception: the
+    regenerate route MAPS this return, so a raised error would turn a 404 into a
+    500 -- and the previous sidecar must survive untouched either way."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    assert _write_meta(pkg, summary="舊的", status="draft") is True
+    before = _sidecar(pkg).read_bytes()
+
+    def explode() -> Any:
+        raise OSError("secret provider is down")
+
+    monkeypatch.setattr(tools, "known_secret_values", explode)
+
+    assert tools.store_summary_meta(pkg, summary="新的", origin=None, llm_log_id=1) == (
+        "not_stored",
+        None,
+    )
+    assert _sidecar(pkg).read_bytes() == before
+
+    # ... and a FINALIZED package still answers "finalized", not "not_stored":
+    # the redaction runs after the freeze gate, so "you cannot do this" (409)
+    # keeps outranking "it did not work" (404) even with the provider down.
+    monkeypatch.setattr(tools, "known_secret_values", frozenset)  # restore, to finalize
+    assert tools.set_summary_status("echo", "final") == "ok"
+    monkeypatch.setattr(tools, "known_secret_values", explode)
+    assert tools.store_summary_meta(pkg, summary="新的", origin=None, llm_log_id=1) == (
+        "finalized",
+        None,
+    )
+
+
 @pytest.mark.parametrize(
     "meta, expected",
     [
@@ -2710,6 +2830,29 @@ def test_list_tools_reports_summary_status(monkeypatch: pytest.MonkeyPatch, tmp_
 
     listed = {row["name"]: row["summary_status"] for row in list_tools()}
     assert listed == {"aaa": "final", "bbb": None}
+
+
+def test_list_tools_reports_no_summary_status_for_an_alias(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An internal alias row must not badge the REAL package's summary.
+
+    ``tools/alias -> tools/real`` is listed (invalid, so it can be deleted), and
+    the listing was the LAST place still reading through the link: the row showed
+    已定版 because REAL's sidecar says so, while every by-name summary route --
+    GET, PATCH, regenerate -- 404s the name. A badge no request can reproduce,
+    describing a different package than the row it sits on."""
+    root = tmp_path / "tools"
+    real = _make_tool(root, "real", "import sys\nsys.stdout.write('x')\n")
+    (root / "alias").symlink_to(root / "real", target_is_directory=True)
+    _install_tools(monkeypatch, root)
+    assert _write_meta(real, summary="說明", status="final") is True
+
+    rows = {row["name"]: row for row in list_tools()}
+
+    assert rows["alias"]["summary_status"] is None
+    assert rows["alias"]["valid"] is False  # unchanged: a symlinked package is refused
+    assert rows["real"]["summary_status"] == "final"
 
 
 def test_sidecar_never_listed_as_a_package(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
