@@ -1275,10 +1275,54 @@ def test_cleanup_staging_does_not_follow_a_symlinked_staging(tmp_path: Path) -> 
     staging = staging_parent / "buildid"
     staging.symlink_to(base, target_is_directory=True)  # the R8-1 tamper shape
 
-    tool_builder._cleanup_staging(staging)
+    tool_builder._cleanup_staging(staging, base)
 
     assert (existing_pkg / "keep.txt").read_text(encoding="utf-8") == "do not delete"
     assert staging.is_symlink()  # left behind, untidy but never destructive
+
+
+def test_cleanup_staging_refuses_a_symlinked_staging_ancestor(tmp_path: Path) -> None:
+    """R9-1: the ancestor-substitution shape the promote-side gate refuses must
+    be refused by CLEANUP too, because run_install's ``finally`` reaches it
+    unconditionally and rmtree's own protection does NOT cover it: with the
+    ``.staging`` shell swapped for a symlink to an EXTERNAL directory holding a
+    real ``<uuid>`` subdir, the rmtree LEAF is an ordinary directory (leaf
+    ``is_symlink()`` is False), so CPython would happily delete the external
+    directory straight through the link. ``_cleanup_staging`` therefore runs the
+    SAME ``_verify_staging_root`` gate as ``_promote_staging`` and, on refusal,
+    leaves the whole workspace in place -- tampering evidence, not garbage."""
+    base = tmp_path / "tools"
+    base.mkdir()
+    external = tmp_path / "external"
+    victim = external / "buildid"
+    victim.mkdir(parents=True)
+    (victim / "keep.txt").write_text("survive", encoding="utf-8")
+    # .staging ITSELF is the symlink; the staging leaf over in external/ is a
+    # perfectly real directory, so only resolved containment can catch this.
+    (base / tool_builder._STAGING_DIRNAME).symlink_to(external, target_is_directory=True)
+    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
+    assert staging.is_dir() and not staging.is_symlink()
+
+    tool_builder._cleanup_staging(staging, base)
+
+    assert victim.is_dir()
+    assert (victim / "keep.txt").read_text(encoding="utf-8") == "survive"
+
+
+def test_cleanup_staging_still_removes_an_honest_staging(tmp_path: Path) -> None:
+    """Control for the R9-1 gate: an untampered staging is still removed and the
+    empty ``.staging`` shell still dropped -- the gate must never turn routine
+    cleanup into an accumulating leak."""
+    base = tmp_path / "tools"
+    base.mkdir()
+    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
+    staging.mkdir(parents=True)
+    (staging / "junk.txt").write_text("x", encoding="utf-8")
+
+    tool_builder._cleanup_staging(staging, base)
+
+    assert not staging.exists()
+    assert not (base / tool_builder._STAGING_DIRNAME).exists()
 
 
 # --- sidecar-strip walk failures fail closed (D40 r8 / R8-2) --------------------

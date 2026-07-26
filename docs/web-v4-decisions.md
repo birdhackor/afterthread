@@ -297,3 +297,15 @@ r7 的剷除器留了兩個更底層的洞，同樣在 `_promote_staging`／`_st
   `os.walk` 傳入一個會**重新拋出**的 `onerror`，讓任何掃不完整的走訪都併入既有的
   fail-closed 路徑——讀不到的子樹不論是蓄意破壞還是單純損毀，兩者都足以中止安裝，沉默才是
   唯一錯誤的選擇。
+
+### D40 附錄（P3a review r9）：cleanup 同樣只在驗證過的 root 上做破壞性刪除
+
+r8 把「破壞性遍歷只能作用於已驗證、containment 約束內的 root」帶進 promote，但
+`run_install` 的 `finally` 對 `_cleanup_staging` 的呼叫是無條件的——包括 promote
+剛因竄改而拒絕的那條路。CPython rmtree 只拒絕「路徑自身是 symlink」；`.staging`
+**祖先**被換成指向外部目錄的 symlink、而外部真有同名 `<uuid>` 目錄時，rmtree 的
+leaf 是普通目錄，會穿透連結把外部目錄整個刪掉。修法：`_cleanup_staging` 套用與
+promote 同一個 `_verify_staging_root` 閘，拒絕時整個工作區（含 parent shell）原地
+保留——被竄改的 workspace 是證據不是垃圾；留下的孤兒與 r8 已釘住的 refused-cleanup
+孤兒 symlink 屬同一接受殘餘類。check-to-rmtree 的瞬間窗口沿用既有 check-then-act
+accepted residual 準繩。

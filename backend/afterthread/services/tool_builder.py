@@ -1354,7 +1354,7 @@ def _promote_staging(
     return None
 
 
-def _cleanup_staging(staging: Path) -> None:
+def _cleanup_staging(staging: Path, base: Path) -> None:
     """Remove the session's staging dir (if the move did not consume it) and
     drop the ``.staging`` shell when this was the last build in flight.
 
@@ -1363,8 +1363,26 @@ def _cleanup_staging(staging: Path) -> None:
     succeeds on an EMPTY directory, which is exactly the wanted semantics --
     a concurrent session's staging keeps the shell alive, and the suppressed
     OSError for that case is the mechanism, not an accident.
+
+    The rmtree is a DESTRUCTIVE traversal, so it runs ONLY on a root that
+    passes the SAME ``_verify_staging_root`` gate ``_promote_staging`` applies
+    (R9-1). This is load-bearing, not symmetry for its own sake: ``run_install``'s
+    ``finally`` reaches here UNCONDITIONALLY -- including after promote just
+    REFUSED the workspace as tampered -- and CPython's rmtree protection only
+    refuses a path that is ITSELF a symlink. With the ``.staging`` ANCESTOR
+    swapped for a symlink to an external directory holding a real ``<uuid>``
+    subdir, ``staging.is_dir()`` follows the link and the rmtree LEAF is an
+    ordinary directory, so without this gate the external directory would be
+    deleted straight through the link. A workspace that fails the gate is left
+    IN PLACE, parent shell included: it is evidence of tampering (or of a race
+    worth seeing), not garbage -- and the orphan it leaves is the same accepted
+    residue class as the refused-cleanup orphan symlink pinned by the r8 tests.
+    The check-to-rmtree instant remains the accepted check-then-act residual
+    window ``_verify_staging_root``'s own docstring names.
     """
     with contextlib.suppress(Exception):
+        if _verify_staging_root(staging, base) is not None:
+            return
         if staging.is_dir():
             shutil.rmtree(staging, ignore_errors=True)
     with contextlib.suppress(OSError):
@@ -1525,7 +1543,7 @@ async def run_install(
         # (possibly empty) .staging shell. Every other exit removes the build.
         if secret_value:
             tools.discard_inflight_secret(secret_value)
-        await run_in_threadpool(_cleanup_staging, staging)
+        await run_in_threadpool(_cleanup_staging, staging, base)
 
 
 # --- background jobs ---------------------------------------------------------
