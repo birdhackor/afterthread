@@ -470,3 +470,54 @@ store-time 重檢（D40 r2 附錄）同一個模式、同一個理由，只是�
   套件的**名字本身**若就是已登記的秘密值，模型被要求回報的是**被遮過的**名字，於是後面的
   同一性檢查必定失敗、整次修訂被拒——對一個「秘密同時也是公開工具名」的設定來說這是對的，
   因為那個值本來就已經在工具列表、job 輪詢與前端網址裡了。
+
+### D40 附錄（P3b review r3）：`.env` 中途被刪不補 placeholder、換裝前的定版重檢改 fail-closed
+
+- **開場有、換裝時沒有的 `.env`，不讓模型的 placeholder 頂替（R3-1）**：`_preserve_env_file`
+  原本把「來源不存在」一律當成「沒有東西要保留」直接回成功，於是 builder 寫在
+  `staging/.env` 的那份就這樣發佈出去。r2 立下的接受條款是「**從來沒有** `.env` 的套件
+  可以收下 builder 寫的那份」（比照 install，寫 `.env` 本來就是指示的一部分，否則
+  「把金鑰存進 .env」這種意見修訂根本做不到），它**不涵蓋**「開場明明有、session 中途被
+  刪掉」的情況——後者是維運者對**正式套件**的一個刻意動作（他把憑證撤掉了），而 builder
+  那份檔案是一個**叫它別寫 .env 的提示**底下產生的副產物；讓 placeholder 悄悄補上一個
+  被刪掉的憑證檔案的位置，正是這條 finding 指名的失效。**修法**：把 session 開場的觀察
+  一路傳下去。`run_revise` 讀值時（`_read_env_for_values`）本來就知道有沒有這個檔案
+  ——回傳 `(None, None)` 就是「沒有」，空檔案仍會回 `""`——把這個 bool
+  （`env_existed_at_start`）經 `_promote_staging_replace` 傳進 `_preserve_env_file`，三分支：
+  開場有＋現在有 → 照舊複製；開場有＋現在沒有 → **刪掉 staging 裡 builder 留下的
+  `.env`**，發佈出來的套件就沒有 `.env`，與那次刪除所要求的一致；開場沒有 → 完全不變。
+  刪不掉就回 category-only 錯誤（`_ERROR_REVISE_ENV_DISCARD`）並在換裝**之前**中止——
+  「我們沒辦法讓修訂結果符合維運者的要求」絕不能收斂成「那就照樣發佈 placeholder」。
+  `os.remove` 不跟隨 symlink（種在那裡的連結是被 unlink 而不是被穿過去），`.env` 是**目錄**
+  時則落到同一個拒絕分支：對一個本函式既沒建立也沒驗證過的路徑做破壞性遍歷，是回滾那段
+  已經拒絕過的事（R1-2 同一條理由）。**參數刻意設成必填的 keyword-only**：給它預設值，
+  就是替「以後有人忘了傳」預留一條走錯分支的靜默路徑。
+  **鏡像情況不需要旗標、也不改**：開場沒有、中途被維運者**新增**的 `.env` 照樣被複製——
+  這正是 r2「複製的是換裝那一刻磁碟上的那個檔案」的規則往另一個方向套；`existed_at_start`
+  只在「結尾也沒有」時才決定事情。
+- **換裝前的定版重檢改成 fail-closed（R3-2）**：P3b 自我審查加的那道重檢是
+  **fail-open** 的——`tools.summary_status()` 把「沒有 sidecar」與「有 sidecar 但讀不到／
+  壞掉／EIO／被換成 symlink」全部折成同一個 `None`，而閘門只在明確等於 `"final"` 時才拒絕。
+  於是：使用者在 session 中途定版、sidecar 隨後遇到一次暫時性讀取失敗 → 換裝照樣進行 →
+  整包被換掉、凍結的文字連同 sidecar 消失、事後 hook 再生一份 draft。**這道閘門存在的
+  理由，恰好被它自己的失敗方式繞過。** **修法**：在 `tools.py` `summary_status` 旁邊加一個
+  更嚴格的讀取器 `summary_status_or_unknown`，把 `FileNotFoundError` 與其餘所有失敗分開
+  （與 `_read_env_for_values` 的 R2-3 判別同一套），回 `"draft"`／`"final"`／`None`（**確定**
+  沒有 sidecar）／`_SUMMARY_STATUS_UNKNOWN`（有 sidecar 但讀不出可信狀態——讀取器拒絕、
+  超過上限、不是 JSON、不是物件、或 `status` 不在 `_SUMMARY_STATUSES` 內；`write_tool_meta`
+  這五種都寫不出來，所以每一種都代表手改或損壞）。`_promote_staging_replace` 對
+  `final` **與** `unknown` 一律拒絕。
+  **`summary_status` 自己的契約刻意不動**：`list_tools`（一列 badge，壞 sidecar 該降級一列
+  而不是 500 整個工具頁）與兩條 summary 路由（決定要不要燒一次 LLM 呼叫，猜「沒定版」的
+  代價是一次 regenerate，而它本來就會**覆蓋**那個讀不到的檔案）都真心需要那個 total 的行為。
+  新讀取器是**多一個**、更嚴格的讀取器，只給那一個猜錯會**毀資料**的呼叫端——它接下來要
+  刪掉 sidecar 所在的整個套件。
+  **拒絕訊息用新的一條而不是重用 `_ERROR_REVISE_FINALIZED`**：後者帶著一個**指示**
+  （請先解除定版），而在「讀不到」的情況下那個指示是錯的——可能根本沒有東西被定版，
+  照著做只會讓操作者一直切換一個不是問題的狀態，而每次重試都因為訊息從未講出的理由
+  再拒絕一次。兩者的補救方式不同（修好／移除損壞的 sidecar vs. 解除定版），訊息就必須不同，
+  這與 `_ERROR_REVISE_TARGET_MISSING`／`_ERROR_REVISE_TARGET_ALIAS` 是同一種「同一個拒絕點、
+  不同的可行動原因」的拆法。
+- **順帶修掉一處 docstring 與程式碼的矛盾**：`run_revise` 的 docstring 仍寫著「中途定版
+  **不會**在 promote 時重檢，屬既接受的 check-then-act 殘留」——那句話在 P3b 自我審查加上
+  重檢的那一刻就不成立了，修復時漏改。本輪一併改正。

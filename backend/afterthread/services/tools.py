@@ -1166,6 +1166,63 @@ def summary_status(directory: Path) -> str | None:
     return status if isinstance(status, str) and status in _SUMMARY_STATUSES else None
 
 
+# ``summary_status_or_unknown``'s third answer: "there IS a sidecar and we could
+# not get a trustworthy status out of it". Deliberately NOT a member of
+# ``_SUMMARY_STATUSES``, so it can never be mistaken for something a sidecar
+# actually holds -- every read path narrows to that tuple, so a hand-edited
+# ``"status": "unknown"`` is refused by the narrowing and reaches a caller as this
+# sentinel only because the file could not be trusted, never because it said so.
+# (The two therefore agree anyway: both mean "cannot tell".)
+_SUMMARY_STATUS_UNKNOWN = "unknown"
+
+
+def summary_status_or_unknown(directory: Path) -> str | None:
+    """``summary_status`` for the ONE caller that must not guess (R3-2).
+
+    The same two real answers (``"draft"`` / ``"final"``), but the None that
+    ``summary_status`` folds every failure into is SPLIT in two:
+
+    * None -- there is DEFINITIVELY no sidecar (the ``lstat`` said ENOENT). This
+      is the only case where "not finalized" is a fact rather than a guess;
+    * ``_SUMMARY_STATUS_UNKNOWN`` -- a sidecar IS there and we cannot trust what
+      it says: the bounded reader declined it (a symlink, a FIFO, ``chmod 000``,
+      EIO on a failing disk), it is over the cap, it is not JSON, it is not an
+      object, or its ``status`` is not one of ``_SUMMARY_STATUSES``.
+      ``write_tool_meta`` produces NONE of those shapes, so every one of them
+      means the file was hand-edited or damaged -- and "we could not read it" is
+      not evidence of "not finalized".
+
+    ``summary_status``'s own contract is deliberately UNCHANGED, and this is an
+    ADDITIONAL reader rather than a replacement. Its existing callers genuinely
+    want the total, degrade-to-None behaviour: ``list_tools`` badges a row (a
+    corrupt sidecar must degrade one badge, never 500 the whole 工具 page) and
+    the summary routes decide whether to answer 409 without burning an LLM call
+    (there, guessing "not finalized" costs a regenerate that would REPLACE the
+    unreadable file anyway). ``_promote_staging_replace`` is the one caller whose
+    wrong guess is DESTRUCTIVE -- it goes on to delete the very package the
+    sidecar lives in, frozen text included -- so it is the one caller that has to
+    fail CLOSED on uncertainty.
+
+    The ENOENT-vs-every-other-``OSError`` discrimination is the same one
+    ``tool_builder._read_env_for_values`` makes about the ``.env`` (R2-3), for the
+    same reason: a failure to LOOK is not evidence of absence.
+
+    The ``lstat`` and the read are two syscalls, so a sidecar deleted BETWEEN them
+    answers UNKNOWN rather than None. That direction is the safe one (it refuses),
+    it takes a concurrent delete of the package to reach at all, and the opposite
+    direction -- a sidecar created in between -- simply reports the real status.
+    Both sit in the check-then-act residual class D40 already accepts.
+    """
+    try:
+        os.lstat(directory / _AI_META_FILENAME)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return _SUMMARY_STATUS_UNKNOWN
+    status = summary_status(directory)
+    return status if status is not None else _SUMMARY_STATUS_UNKNOWN
+
+
 def set_summary_status(name: str, status: str) -> str:
     """Set the sidecar's ``status`` (定版 / 解除定版). Returns the outcome code.
 

@@ -3875,6 +3875,22 @@ def test_run_revise_replaces_the_installed_package(
     assert captured["timeout_seconds"] == settings.tool_install_timeout_seconds
 
 
+def _replace_fixture(base: Path) -> tuple[Path, Path]:
+    """``(installed, staging)`` for a direct ``_promote_staging_replace`` call: a
+    valid installed ``kbsearch`` and a valid staged revision of the same name."""
+    installed = base / "kbsearch"
+    installed.mkdir(parents=True)
+    (installed / "tool.json").write_text(
+        json.dumps(_package_manifest("kbsearch")), encoding="utf-8"
+    )
+    (installed / "run.py").write_text(_GOOD_RUN_PY, encoding="utf-8")
+    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
+    staging.mkdir(parents=True)
+    (staging / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")), encoding="utf-8")
+    (staging / "run.py").write_text("print('revised')", encoding="utf-8")
+    return installed, staging
+
+
 def test_promote_replace_refuses_a_finalization_that_landed_mid_session(
     tmp_path: Path,
 ) -> None:
@@ -3885,22 +3901,15 @@ def test_promote_replace_refuses_a_finalization_that_landed_mid_session(
     定版 would be silently undone, frozen text and all, by a session that started
     before it. Mirrors store_summary_meta's own store-time re-check (D40 r2)."""
     base = tmp_path / "tools"
-    installed = base / "kbsearch"
-    installed.mkdir(parents=True)
-    (installed / "tool.json").write_text(
-        json.dumps(_package_manifest("kbsearch")), encoding="utf-8"
-    )
-    (installed / "run.py").write_text(_GOOD_RUN_PY, encoding="utf-8")
+    installed, staging = _replace_fixture(base)
     assert tools.write_tool_meta(
         installed,
         {"summary": "凍結的總結", "status": "final", "updated_at": "2026-07-27T00:00:00+00:00"},
     )
-    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
-    staging.mkdir(parents=True)
-    (staging / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")), encoding="utf-8")
-    (staging / "run.py").write_text("print('revised')", encoding="utf-8")
 
-    error = tool_builder._promote_staging_replace(staging, "kbsearch", base)
+    error = tool_builder._promote_staging_replace(
+        staging, "kbsearch", base, env_existed_at_start=False
+    )
 
     assert error == tool_builder._ERROR_REVISE_FINALIZED
     # the installed package -- and its frozen summary -- are untouched
@@ -3910,6 +3919,94 @@ def test_promote_replace_refuses_a_finalization_that_landed_mid_session(
     assert meta["summary"] == "凍結的總結"
     assert meta["status"] == "final"
     assert not any(entry.name.startswith(".kbsearch.bak-") for entry in base.iterdir())
+
+
+@pytest.mark.skipif(
+    _permission_tests_unreliable(), reason="chmod 000 does not block access (root or non-POSIX)"
+)
+def test_promote_replace_refuses_when_the_sidecar_cannot_be_read(tmp_path: Path) -> None:
+    """R3-2: the pre-swap 定版 re-check must fail CLOSED on uncertainty.
+
+    ``tools.summary_status`` folds "no sidecar" and "there IS one but it could
+    not be read" into the SAME None, so a gate keyed on an explicit ``"final"``
+    was FAIL-OPEN: a user finalizes mid-session, the sidecar then hits a transient
+    read error (a chmod, an EIO, a symlink raced in), and the swap proceeded --
+    replacing the package, taking the frozen summary with it and regenerating a
+    draft. Exactly the destruction this gate exists to prevent, reached through
+    the failure of the check rather than around it.
+
+    The sidecar here IS finalized, and the point is that the gate never gets to
+    see that: it refuses on "cannot tell" alone. The message is its own, because
+    telling this operator to 解除定版 would send them after the wrong thing."""
+    base = tmp_path / "tools"
+    installed, staging = _replace_fixture(base)
+    assert tools.write_tool_meta(
+        installed,
+        {"summary": "凍結的總結", "status": "final", "updated_at": "2026-07-27T00:00:00+00:00"},
+    )
+    sidecar = installed / tools._AI_META_FILENAME
+    sidecar.chmod(0o000)
+    try:
+        assert tools.summary_status(installed) is None  # the fail-OPEN input, pinned
+        error = tool_builder._promote_staging_replace(
+            staging, "kbsearch", base, env_existed_at_start=False
+        )
+    finally:
+        # Guarded so the ASSERTIONS report a regression: if the gate ever goes
+        # fail-open again the swap consumes the package, the sidecar is gone, and
+        # an unguarded chmod would mask the real failure with a FileNotFoundError
+        # raised out of the teardown.
+        if sidecar.exists():
+            sidecar.chmod(0o600)
+
+    assert error == tool_builder._ERROR_REVISE_SUMMARY_UNREADABLE
+    assert error != tool_builder._ERROR_REVISE_FINALIZED  # a different remedy, a different message
+    assert (installed / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY  # never swapped
+    meta = tools.read_tool_meta(installed)
+    assert meta is not None
+    assert meta["summary"] == "凍結的總結"  # the frozen text survived
+    assert _leftovers(base) == []  # and no .bak- residue from a half-started swap
+
+
+def test_promote_replace_refuses_a_sidecar_that_is_not_a_regular_file(tmp_path: Path) -> None:
+    """The same refusal without any permission bits: a FIFO at the sidecar name is
+    refused by the bounded reader on EVERY platform, so "cannot tell" is reached
+    the way an unjailed ``run_shell`` (D21) could actually arrange it."""
+    base = tmp_path / "tools"
+    installed, staging = _replace_fixture(base)
+    os.mkfifo(installed / tools._AI_META_FILENAME)
+
+    error = tool_builder._promote_staging_replace(
+        staging, "kbsearch", base, env_existed_at_start=False
+    )
+
+    assert error == tool_builder._ERROR_REVISE_SUMMARY_UNREADABLE
+    assert (installed / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY
+    assert _leftovers(base) == []
+
+
+@pytest.mark.parametrize("status", ["draft", None], ids=["draft", "no-sidecar"])
+def test_promote_replace_proceeds_when_the_status_is_knowable(
+    tmp_path: Path, status: str | None
+) -> None:
+    """Fail-closed must not become refuse-everything: a DRAFT sidecar and a
+    genuinely ABSENT one are both definite answers of "not finalized", and both
+    still publish. ENOENT is the one case where "not finalized" is a fact."""
+    base = tmp_path / "tools"
+    installed, staging = _replace_fixture(base)
+    if status is not None:
+        assert tools.write_tool_meta(
+            installed,
+            {"summary": "草稿", "status": status, "updated_at": "2026-07-27T00:00:00+00:00"},
+        )
+
+    error = tool_builder._promote_staging_replace(
+        staging, "kbsearch", base, env_existed_at_start=False
+    )
+
+    assert error is None
+    assert (installed / "run.py").read_text(encoding="utf-8") == "print('revised')"
+    assert _leftovers(base) == []
 
 
 def test_run_revise_rolls_back_a_failed_publish(
@@ -4205,6 +4302,136 @@ def test_run_revise_refuses_to_copy_the_env_through_a_planted_link(
     assert outcome.error == tool_builder._ERROR_REVISE_ENV_RESTORE
     assert outside.read_text(encoding="utf-8") == "not ours\n"  # nothing written through
     assert (pkg / ".env").read_text(encoding="utf-8") == _TRICKY_ENV
+    assert (pkg / "run.py").read_text(encoding="utf-8") == "print('x')\n"  # never swapped
+    assert _leftovers(root) == []
+
+
+_MODEL_ENV = "KB_API_KEY=made-up-by-the-model\n"
+
+
+def test_run_revise_ships_no_env_when_the_live_one_was_deleted_mid_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R3-1: a live ``.env`` DELETED during the session must not be replaced by the
+    model's placeholder.
+
+    The preserve step treated a missing SOURCE as "nothing to preserve" and
+    returned success, so whatever the builder wrote at ``<staging>/.env`` shipped.
+    The standing acceptance ("a package with no prior ``.env`` may receive a
+    builder-written one") covers packages that NEVER had one; it says nothing
+    about one that existed when the session started and was removed during it.
+    That deletion is a deliberate act on the LIVE package -- the operator pulled
+    the credentials -- while the builder's file is an artifact of a prompt that
+    told it not to write one at all. So the staged ``.env`` is dropped and the
+    published package has none, which is what the deletion asked for.
+
+    Driven from the fake's side effect, which runs after the entry read observed
+    the real ``.env`` and before the promote -- the only window the real
+    multi-minute session leaves for this."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    root = pkg.parent
+    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY, ".env": _MODEL_ENV},
+        side_effect=lambda: (pkg / ".env").unlink(),
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True  # the revision itself is fine; only the .env is dropped
+    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY  # it really swapped
+    assert not (pkg / ".env").exists()  # the deletion stands
+    # ... and the model's placeholder is nowhere on disk, not in a leftover staging
+    # dir, not in a backup, not under any other name.
+    assert _MODEL_ENV.encode() not in b"".join(_file_bytes(root).values())
+    assert _leftovers(root) == []
+    assert not (root / tool_builder._STAGING_DIRNAME).exists()
+
+
+def test_run_revise_ships_the_builder_env_when_the_package_never_had_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The standing acceptance, unchanged (R3-1): a package with NO ``.env`` at
+    session start still gets the builder-written one, exactly as an install does
+    -- otherwise a revise could never act on "store the key in .env" feedback.
+
+    This is what makes the deletion case above a real discrimination rather than
+    a blanket "never ship a builder ``.env``"."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    assert not (pkg / ".env").exists()
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY, ".env": _MODEL_ENV},
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert (pkg / ".env").read_text(encoding="utf-8") == _MODEL_ENV
+    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+
+
+def test_run_revise_keeps_an_env_the_operator_added_mid_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The MIRROR of the deletion case, and it needs no flag: a ``.env`` created
+    on the live package DURING the session is copied like any other, because the
+    file copied is the one on disk at the instant of the swap (R2-1). "Absent at
+    the start" only decides what happens when it is absent at the END too."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    added = "OPERATOR_KEY=added-during-the-session\n"
+
+    def add_an_env_mid_session() -> None:
+        (pkg / ".env").write_text(added, encoding="utf-8")
+
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY, ".env": _MODEL_ENV},
+        side_effect=add_an_env_mid_session,
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert (pkg / ".env").read_text(encoding="utf-8") == added  # the operator's file won
+
+
+def test_run_revise_refuses_when_the_staged_env_cannot_be_dropped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If the staged ``.env`` cannot be REMOVED after a mid-session deletion, the
+    swap must not run (R3-1).
+
+    "We could not make the revision match what the operator asked for" must never
+    resolve to "publish the placeholder anyway". A DIRECTORY at ``<staging>/.env``
+    -- which ``os.remove`` will not take -- is the shape an unjailed ``run_shell``
+    (D21) can leave there, and refusing beats a destructive traversal on something
+    this function neither created nor verified."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    root = pkg.parent
+    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+
+    def delete_the_live_env_and_plant_a_directory() -> None:
+        (pkg / ".env").unlink()
+        (_staging_dir(root) / ".env").mkdir()
+
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY},
+        side_effect=delete_the_live_env_and_plant_a_directory,
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_ENV_DISCARD
+    assert str(root) not in (outcome.error or "")  # category only: no path ...
+    assert _TRICKY_ENV_VALUE not in (outcome.error or "")  # ... and no value
     assert (pkg / "run.py").read_text(encoding="utf-8") == "print('x')\n"  # never swapped
     assert _leftovers(root) == []
 

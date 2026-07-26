@@ -201,6 +201,18 @@ _ERROR_STAGING_TAMPERED = "暫存工作區已被移動或替換，安裝已取�
 # ones above: a fixed zh-TW string, never a path and never a value.
 _ERROR_REVISE_NOT_FOUND = "找不到要修訂的工具（可能已被刪除）。"  # noqa: RUF001
 _ERROR_REVISE_FINALIZED = "總結已定版，請先解除定版再送出修訂。"  # noqa: RUF001
+# The pre-swap 定版 re-check could not get an ANSWER out of the sidecar (R3-2).
+# A DISTINCT string rather than reusing ``_ERROR_REVISE_FINALIZED``, because that
+# one carries an INSTRUCTION -- 解除定版 -- which is exactly wrong here: nothing
+# may be finalized at all, so following it would leave the operator toggling a
+# state that is not the problem while every retry refuses again for a reason the
+# message never named. The two refusals have different remedies (repair or remove
+# a damaged sidecar vs. un-freeze a summary), so they need different messages;
+# this is the same "same refusal point, different actionable cause" split
+# ``_ERROR_REVISE_TARGET_MISSING`` and ``_ERROR_REVISE_TARGET_ALIAS`` already are.
+# Category-only like the rest: it names what could not be determined, never the
+# path and never what the file contained.
+_ERROR_REVISE_SUMMARY_UNREADABLE = "無法確認總結是否已定版（AI 總結側檔讀取失敗），修訂已取消。"  # noqa: RUF001
 # The ``.env`` is READ before the build -- for its VALUES, which have to be
 # registered and exported -- and the FILE itself is copied back into staging after
 # validation (R2-1). Both failure modes refuse the whole revise. UNREADABLE: a
@@ -213,6 +225,12 @@ _ERROR_REVISE_FINALIZED = "總結已定版，請先解除定版再送出修訂�
 _ERROR_REVISE_ENV_UNREADABLE = "無法讀取既有工具包的 .env，修訂已取消。"  # noqa: RUF001
 _ERROR_REVISE_ENV_TOO_LARGE = "既有工具包的 .env 超過大小上限，修訂已取消。"  # noqa: RUF001
 _ERROR_REVISE_ENV_RESTORE = "無法還原工具包的 .env，修訂已取消。"  # noqa: RUF001
+# DISCARD: the live ``.env`` was DELETED during the session, so the builder's own
+# ``.env`` must not ship in its place (R3-1) -- and removing it from staging
+# failed, so the revision cannot be published in the shape that deletion asked
+# for. Refusing keeps the operator's package as it is; publishing anyway would
+# put a placeholder where credentials used to be.
+_ERROR_REVISE_ENV_DISCARD = "無法移除修訂產生的 .env（原檔已於修訂期間刪除），修訂已取消。"  # noqa: RUF001
 # A hand-edited ``.env`` holding a value BELOW the redactor's floor (R1-1). Names
 # the CONDITION and the two remedies, never the key and never the value -- the
 # whole point is that this value cannot be masked, so it must not be echoed by the
@@ -1553,7 +1571,7 @@ def _promote_staging(
     return None
 
 
-def _preserve_env_file(target: Path, staging: Path) -> str | None:
+def _preserve_env_file(target: Path, staging: Path, *, existed_at_start: bool) -> str | None:
     """Copy the LIVE package's ``.env`` into ``staging`` BYTE-FOR-BYTE; None = ok (D40).
 
     Blocking (runs inside ``_promote_staging_replace``). This IS the whole
@@ -1607,14 +1625,55 @@ def _preserve_env_file(target: Path, staging: Path) -> str | None:
     exported into ``run_shell``, so a value added since then was never in the
     conversation at all, and ``known_secret_values`` picks it up from the installed
     ``.env`` again the moment the swap lands.
+
+    ``existed_at_start`` is what the session OBSERVED when it read the values
+    (``_read_env_for_values``), and it is threaded all the way down here because
+    "there is no ``.env`` right now" is TWO different situations (R3-1):
+
+    * it never had one -- the builder's own ``.env`` SHIPS, unchanged, exactly as
+      it does on an install where writing ``.env`` from the operator's
+      instructions is part of the contract. Deleting it would leave a revise
+      unable to act on "store the key in .env" feedback, and it smuggles nothing:
+      a value nobody registered is one the embedded-secret gate has nothing to
+      compare against either way. This is the standing acceptance, and it stays;
+    * it HAD one and it is gone now -- the operator deleted the credentials file
+      DURING the session. That deletion is a deliberate act on the live package,
+      while the builder's file is an artifact of a prompt that told it not to
+      write one at all; letting a placeholder silently take a deleted credential
+      file's place is precisely the failure this branch exists to stop. So the
+      staged ``.env`` is REMOVED and the published package has none, which is what
+      the deletion asked for. If that removal fails -- including a directory or
+      anything else ``os.remove`` will not take at that name -- this returns a
+      category-only error and the swap never runs, because "we could not make the
+      revision match" must not resolve to "publish the placeholder anyway".
+
+    The MIRROR case needs no flag and gets none: a ``.env`` that did NOT exist at
+    the start but is there now was created by the operator mid-session, and the
+    ordinary copy below preserves it -- the same "the file on disk at THIS instant
+    wins" rule the paragraph above states, applied in the other direction.
     """
     source = target / ".env"
+    source_mode: int | None
     try:
         source_mode = os.lstat(source).st_mode
     except FileNotFoundError:
-        return None  # no .env to preserve -- the common case, and not a failure
+        source_mode = None  # nothing to copy -- but WHY decides what happens next
     except OSError:
         return _ERROR_REVISE_ENV_UNREADABLE
+    if source_mode is None:
+        if not existed_at_start:
+            return None  # never had one: the builder's .env ships (see the docstring)
+        try:
+            os.remove(staging / ".env")
+        except FileNotFoundError:
+            return None  # the builder wrote none either -- nothing to undo
+        except OSError:
+            # ``os.remove`` never follows a symlink, so a planted link is unlinked
+            # rather than followed; a DIRECTORY at that name lands here instead,
+            # and refusing beats a destructive traversal on something this function
+            # neither created nor verified (the same rule the roll-back applies).
+            return _ERROR_REVISE_ENV_DISCARD
+        return None
     if not stat.S_ISREG(source_mode):
         return _ERROR_REVISE_ENV_UNREADABLE
     destination = staging / ".env"
@@ -1637,6 +1696,8 @@ def _promote_staging_replace(
     staging: Path,
     name: str,
     base: Path,
+    *,
+    env_existed_at_start: bool,
 ) -> str | None:
     """Swap a revised build in for the INSTALLED ``<base>/<name>``; None = ok (D40).
 
@@ -1684,12 +1745,14 @@ def _promote_staging_replace(
     the revision's ``.env`` is exactly as loadable as the one it inherits; and the
     staged package's own ``.env`` was just size-gated by validate.
 
-    A package with NO ``.env`` preserves nothing, and then a builder-written one
-    SHIPS -- deliberately, and identically to an install, where writing ``.env``
-    from the user's instructions is part of the contract. Deleting it instead
-    would leave a revise unable to act on "store the key in .env" feedback, and it
-    is not a smuggling path: a value nobody registered is a value the
-    embedded-secret gate has nothing to compare against either way.
+    A package that NEVER had a ``.env`` preserves nothing, and then a
+    builder-written one SHIPS -- deliberately, and identically to an install,
+    where writing ``.env`` from the user's instructions is part of the contract.
+    A package that HAD one which vanished mid-session is the opposite case and is
+    told apart by ``env_existed_at_start``, which the caller carries down from its
+    own entry read: there the staged ``.env`` is DROPPED instead, so a placeholder
+    never takes a deleted credential file's place (R3-1, see
+    ``_preserve_env_file``).
 
     The swap itself is rename-aside, move-in, drop-the-backup:
 
@@ -1752,12 +1815,24 @@ def _promote_staging_replace(
     # regenerated as a draft afterwards), so 定版 would be silently undone by a
     # session that started before it. The entry check stays where it is: it is
     # what makes the ROUTE answer 409 without burning an LLM call.
-    if tools.summary_status(target) == "final":
+    #
+    # Through ``summary_status_or_unknown``, not ``summary_status``, and the whole
+    # point is the difference (R3-2): ``summary_status`` folds "no sidecar" and
+    # "there IS one but it is unreadable/corrupt" into the SAME None, so a gate
+    # keyed on an explicit "final" is FAIL-OPEN -- a user finalizes mid-session,
+    # the sidecar then hits a transient read error, and this gate waves the swap
+    # through and destroys the frozen text it exists to protect. UNKNOWN therefore
+    # refuses exactly like "final". The two get DIFFERENT messages because their
+    # remedies differ (see ``_ERROR_REVISE_SUMMARY_UNREADABLE``).
+    status = tools.summary_status_or_unknown(target)
+    if status == "final":
         return _ERROR_REVISE_FINALIZED
+    if status == tools._SUMMARY_STATUS_UNKNOWN:
+        return _ERROR_REVISE_SUMMARY_UNREADABLE
     # LAST of the pre-swap steps, because it is the only one that READS from the
     # live package -- every check above had to establish that ``target`` is the
     # real installed directory before this reaches through it (R2-1).
-    env_error = _preserve_env_file(target, staging)
+    env_error = _preserve_env_file(target, staging, existed_at_start=env_existed_at_start)
     if env_error is not None:
         return env_error
     backup = base / f".{name}.bak-{uuid4().hex}"
@@ -2085,6 +2160,13 @@ def _read_env_for_values(directory: Path) -> tuple[str | None, str | None]:
 
     Blocking. ``(None, None)`` means the package simply has no ``.env`` -- the
     common case, and the one where there are no values to register or export.
+    A text of ``None`` with no error is therefore the OBSERVATION "this package
+    had no ``.env`` when the session started", and the caller carries exactly that
+    bit down to ``_preserve_env_file`` (R3-1): an EMPTY ``.env`` still comes back
+    as ``""``, so ``text is not None`` is a faithful "it existed", not a proxy for
+    "it had content". Written down here because that equivalence is now
+    LOAD-BEARING -- it decides whether a builder-written ``.env`` is allowed to
+    ship -- rather than an incidental property of the return shape.
 
     This read is about VALUES ONLY, and that separation is deliberate (R2-1): the
     FILE is never round-tripped through this text -- ``_preserve_env_file`` copies
@@ -2164,14 +2246,13 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
     internal alias is refused here exactly as it is by every summary route), and
     it must not be 已定版. The router checks both too; re-checking is defence in
     depth against a 定版 that landed between the two, and it costs one sidecar
-    read. A 定版 landing LATER -- mid-session, after this check -- is NOT
-    re-checked at promote time: the swap then replaces the package (its sidecar
-    included) and the post-swap hook writes a fresh draft. That is the same
-    accepted check-then-act residual class D40 names for a concurrent delete, on
-    a single-user local tool where finalizing a tool whose own revise you just
-    started is the whole of the exposure -- unlike the regenerate route, where
-    the same window is closed at the store because there the loser would be a
-    frozen summary a request is actively overwriting.
+    read. A 定版 landing LATER -- mid-session, after this check -- IS caught, by
+    ``_promote_staging_replace``'s own re-check at the last moment before the
+    swap; this entry gate's job is only to let the ROUTE answer 409 without
+    burning an LLM call. (This paragraph used to claim the opposite -- that a
+    mid-session 定版 was an accepted residual -- which stopped being true when the
+    P3b self-review added that re-check, and the stale text survived the fix.
+    Corrected here alongside R3-2, which makes the same re-check fail CLOSED.)
 
     The ``.env`` is read for its VALUES (and refused if unreadable/oversized)
     BEFORE anything else, and every value in it is registered as an in-flight
@@ -2216,6 +2297,14 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
     env_text, env_error = await run_in_threadpool(_read_env_for_values, directory)
     if env_error is not None:
         return InstallOutcome(ok=False, error=env_error)
+    # Did this package HAVE a ``.env`` when the session started? The reader's
+    # ``(None, None)`` is exactly "there is none" -- an empty one still comes back
+    # as ``""`` -- and every other shape returned above. The bit is carried to the
+    # promote because "there is no ``.env`` now" is ambiguous by then: a package
+    # that never had one may ship the builder's, but one whose ``.env`` the
+    # operator DELETED mid-session must not have a placeholder put in its place
+    # (R3-1).
+    env_existed_at_start = env_text is not None
     # VALUES only -- the FILE is copied at promote time (see _read_env_for_values).
     # Empty values contribute nothing to redaction and are not registered, matching
     # tools._cached_env_values' own "a KEY= line contributes nothing" rule.
@@ -2321,7 +2410,13 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
 
         # Read the origin while the OLD sidecar still exists (see _existing_origin).
         origin = await run_in_threadpool(_existing_origin, directory)
-        promote_error = await run_in_threadpool(_promote_staging_replace, staging, name, base)
+        promote_error = await run_in_threadpool(
+            _promote_staging_replace,
+            staging,
+            name,
+            base,
+            env_existed_at_start=env_existed_at_start,
+        )
         if promote_error is not None:
             return InstallOutcome(
                 ok=False,

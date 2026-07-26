@@ -2821,6 +2821,107 @@ def test_summary_status_none_without_sidecar(tmp_path: Path) -> None:
     assert tools.summary_status(pkg) is None
 
 
+# --- the strict reader: UNREADABLE is not ABSENT (D40 r3 / R3-2) ---------------
+
+
+@pytest.mark.parametrize(
+    "meta, expected",
+    [
+        ({"summary": "s", "status": "draft"}, "draft"),
+        ({"summary": "s", "status": "final"}, "final"),
+    ],
+    ids=["draft", "final"],
+)
+def test_summary_status_or_unknown_agrees_on_a_readable_sidecar(
+    tmp_path: Path, meta: dict[str, Any], expected: str
+) -> None:
+    """A sidecar we CAN read gives the strict reader and the total one the same
+    answer -- the split is only about what the failures mean."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    _sidecar(pkg).write_text(json.dumps(meta), encoding="utf-8")
+    assert tools.summary_status_or_unknown(pkg) == expected
+    assert tools.summary_status(pkg) == expected
+
+
+def test_summary_status_or_unknown_none_only_when_the_sidecar_is_really_absent(
+    tmp_path: Path,
+) -> None:
+    """None means ENOENT and nothing else: the one case where "not finalized" is
+    a fact rather than a guess."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    assert tools.summary_status_or_unknown(pkg) is None
+
+
+def test_summary_status_or_unknown_reports_unknown_for_an_unreadable_sidecar(
+    tmp_path: Path,
+) -> None:
+    """A FIFO at the sidecar name: it EXISTS, and the bounded reader refuses it
+    (O_NONBLOCK + the S_ISREG gate). ``summary_status`` folds that into the same
+    None a missing sidecar gives; the strict reader must not, because its caller
+    would read that None as "safe to destroy this package"."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    os.mkfifo(_sidecar(pkg))
+
+    assert tools.summary_status(pkg) is None  # the total reader still degrades ...
+    assert (
+        tools.summary_status_or_unknown(pkg) == tools._SUMMARY_STATUS_UNKNOWN
+    )  # ... this does not
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["not json at all", "[1, 2, 3]", '{"summary": "s"}', '{"summary": "s", "status": "published"}'],
+    ids=["invalid-json", "not-an-object", "no-status", "unknown-status"],
+)
+def test_summary_status_or_unknown_reports_unknown_for_a_corrupt_sidecar(
+    tmp_path: Path, content: str
+) -> None:
+    """Every "the file is there but says nothing we trust" shape is UNKNOWN too.
+
+    ``write_tool_meta`` writes one of exactly two status literals into a JSON
+    object every time, so each of these is a hand-edited or damaged file -- and a
+    status we refused to trust is not evidence that the summary is unfrozen."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    _sidecar(pkg).write_text(content, encoding="utf-8")
+
+    assert tools.summary_status(pkg) is None
+    assert tools.summary_status_or_unknown(pkg) == tools._SUMMARY_STATUS_UNKNOWN
+
+
+def test_summary_status_or_unknown_reports_unknown_for_an_oversized_sidecar(
+    tmp_path: Path,
+) -> None:
+    """Over the cap is refused by the reader, so it is UNKNOWN rather than absent
+    -- an oversized sidecar could hold a finalized summary just as easily."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    padding = "x" * tools._AI_META_MAX_BYTES
+    _sidecar(pkg).write_text(json.dumps({"summary": padding, "status": "final"}), encoding="utf-8")
+
+    assert tools.summary_status(pkg) is None
+    assert tools.summary_status_or_unknown(pkg) == tools._SUMMARY_STATUS_UNKNOWN
+
+
+def test_summary_status_unknown_sentinel_is_not_a_real_status(tmp_path: Path) -> None:
+    """The sentinel can never be confused with something a sidecar HOLDS: it is
+    outside ``_SUMMARY_STATUSES``, so the narrowing refuses it on the way in -- a
+    hand-edited ``"status": "unknown"`` reaches a caller as the sentinel only
+    because the file was not trustworthy, which is the same thing it means."""
+    assert tools._SUMMARY_STATUS_UNKNOWN not in tools._SUMMARY_STATUSES
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    _sidecar(pkg).write_text(
+        json.dumps({"summary": "s", "status": tools._SUMMARY_STATUS_UNKNOWN}), encoding="utf-8"
+    )
+    assert tools.summary_status(pkg) is None  # never passed through as a status
+    assert _write_meta(pkg, summary="s", status=tools._SUMMARY_STATUS_UNKNOWN) is True
+    assert tools.summary_status(pkg) == "draft"  # ... and the writer coerces it away too
+
+
 def test_set_summary_status_finalizes_and_preserves_the_summary(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
