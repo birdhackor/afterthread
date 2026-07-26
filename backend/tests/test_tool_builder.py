@@ -1903,6 +1903,61 @@ def test_inject_secret_single_quote_value_stays_verbatim_in_raw_env(tmp_path: Pa
     assert tools._load_tool_dotenv(tmp_path)["KB_API_KEY"] == value  # and round-trips
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "plain-secret-abcdef",  # the unquoted branch: no quoting needed at all
+        "secret#value-abcdef",  # inline-comment char -> single-quoted
+        "secret value abcdef",  # spaces
+        "secret'value-abcdef",  # single quote -> the DOUBLE-quoted branch
+        'secret"value-abcdef',  # double quote -> single-quoted
+        "secret$VALUE-abcdef",  # interpolation char (stays literal)
+        "secret\\value-abcdef",  # backslash
+        '"quoted-value-abcdef"',  # leading/trailing quote
+        "mix'ab$c-#=`! def",  # single-quote + an ``=`` INSIDE the value
+        "  padded-abcdef  ",  # not form-reachable (the schema strips) -- pins the RHS strip
+    ],
+)
+def test_an_env_this_system_wrote_always_passes_the_revise_spelling_gate(
+    tmp_path: Path, value: str
+) -> None:
+    """Every ``.env`` line the INSTALL path can write passes the revise spelling
+    gate -- by construction, and pinned here (R6-1).
+
+    The gate refuses a value its assignment line does not spell literally, so the
+    one thing it must never do is refuse a package this system itself produced.
+    Two properties of ``_inject_secret_into_env`` make that impossible rather than
+    lucky: it drops EVERY prior line assigning the name and APPENDS its own, so its
+    line is the LAST one for that key (which is the one the gate reads, dotenv
+    being last-wins), and ``_dotenv_serialize_value`` only ever emits spellings
+    that embed the value verbatim -- bare, single-quoted, or double-quoted with no
+    escape able to fire -- refusing the install outright when it cannot. The value
+    holding an ``=`` is deliberate: the RHS is everything after the FIRST one.
+
+    The rest of the file is not install's work -- those lines came from the model
+    or a hand edit -- and they are governed by the same rule: a reversible spelling
+    among them refuses the revise, which is the gate working, not a false positive.
+    Seeded here with the disobedient shapes install itself has to survive."""
+    env_file = tmp_path / ".env"
+    # Every value here clears ``_MIN_SECRET_LEN``: the OTHER gate in this policy is
+    # the r1 floor, and a short model-written value refuses for that reason instead.
+    env_file.write_text(
+        "OTHER=keep-this-one\nKB_API_KEY=first-model-placeholder\n"
+        "export KB_API_KEY=second-model-placeholder\n",
+        encoding="utf-8",
+    )
+
+    assert tool_builder._inject_secret_into_env(env_file, "KB_API_KEY", value) is None
+
+    # Exactly what a later revise would see: the same bounded reader, the same
+    # parser, the same non-empty filter.
+    text = tools._read_regular_file_capped(env_file, tools._ENV_FILE_MAX_BYTES)
+    assert text is not None
+    parsed = {key: parsed for key, parsed in tools._parse_dotenv_text(text).items() if parsed}
+    assert parsed["KB_API_KEY"] == value  # the backend's line is the one that won
+    assert tool_builder._unmaskable_env_error(text, parsed) is None
+
+
 def test_run_install_promotes_tricky_secret_round_trippable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4258,6 +4313,45 @@ def test_run_revise_refuses_a_finalized_package(
     assert outcome.llm_log_id is None
 
 
+def test_run_revise_refuses_an_unreadable_sidecar_before_the_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A sidecar that is ALREADY corrupt when the request arrives is refused at the
+    entry gate, not after a whole builder session (R6-3).
+
+    The gate used to read through the TOTAL ``summary_status``, where "no sidecar"
+    and "there IS one and it cannot be trusted" are the same None -- so this package
+    was admitted, spent a full multi-round session holding the global single-flight,
+    and was then refused by ``_promote_staging_replace``'s STRICT read at the very
+    end. The refusal was never in doubt; only the bill was, and every retry paid it
+    again. The job is the thing that ACTS, so the job is the thing that fails
+    closed; the ROUTE keeps the cheap total reader on purpose, because a route
+    answers about a resource's known state and guessing there costs at most this
+    outcome arriving as a job result instead of a 409.
+
+    The message is the one promote uses for the same condition, and it is NOT the
+    finalized one: the remedies differ (repair or remove a damaged sidecar vs.
+    解除定版), and following the wrong one would leave the operator toggling a state
+    that is not the problem."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / tools._AI_META_FILENAME).write_text("{ not json at all", encoding="utf-8")
+    before = _file_bytes(pkg)
+
+    async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("no builder session may start for an unreadable sidecar")
+
+    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", must_not_generate)
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_SUMMARY_UNREADABLE
+    assert outcome.error != tool_builder._ERROR_REVISE_FINALIZED  # two remedies, two messages
+    assert outcome.llm_log_id is None
+    assert _file_bytes(pkg) == before  # the damaged sidecar is left exactly as found
+    assert not (pkg.parent / tool_builder._STAGING_DIRNAME).exists()
+
+
 def test_run_revise_refuses_a_missing_tool_and_a_disabled_feature(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4710,18 +4804,24 @@ def test_run_revise_refuses_an_env_value_the_file_spells_reversibly(
 def test_run_revise_allows_env_values_the_file_spells_literally(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The refusal above is the LITERAL-substring property exactly, and ordinary
-    ``.env`` spellings keep revising (R5-1).
+    """The refusal above is the LITERAL-substring property exactly -- read off the
+    ASSIGNMENT LINE (R6-1) -- and ordinary ``.env`` spellings keep revising (R5-1).
 
-    Four shapes whose raw line embeds the value verbatim, so a ``cat`` of the file
-    puts in front of the redactor precisely the string that was registered:
+    Five shapes whose own raw line embeds the value verbatim, so a ``cat`` of the
+    file puts in front of the redactor precisely the string that was registered:
     unquoted, simply double-quoted, single-quoted around a ``"`` (dotenv reads
-    single quotes literally -- no escapes can fire), and a genuinely MULTI-LINE
-    quoted value, whose newlines are real newlines in the file too. A gate that
-    crept past the property it enforces would make ordinary packages permanently
-    unrevisable with a message naming no key and no value to explain why."""
+    single quotes literally -- no escapes can fire), an ``export`` prefix, and
+    whitespace around the ``=``. The last two are here because the RHS is taken by
+    splitting on the first ``=`` and stripping: a gate that crept past the property
+    it enforces would make ordinary packages permanently unrevisable with a message
+    naming no key and no value to explain why. A genuinely MULTI-LINE quoted value
+    used to be in this list and is now a refusal -- see
+    ``test_run_revise_refuses_a_value_its_assignment_line_cannot_vouch_for``."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    raw = 'PLAIN=abcdef\nQUOTED="ghijkl"\nSINGLE=\'mno"pqr\'\nSPAN="line-one\nline-two"\n'
+    raw = (
+        'PLAIN=abcdef\nQUOTED="ghijkl"\nSINGLE=\'mno"pqr\'\n'
+        "export EXPORTED=stuvwx\nSPACED = yzabcd \n"
+    )
     (pkg / ".env").write_text(raw, encoding="utf-8")
     seen: dict[str, Any] = {}
     _fake_generate(
@@ -4734,9 +4834,136 @@ def test_run_revise_allows_env_values_the_file_spells_literally(
     outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
-    assert seen["inflight"] == {"abcdef", "ghijkl", 'mno"pqr', "line-one\nline-two"}
+    assert seen["inflight"] == {"abcdef", "ghijkl", 'mno"pqr', "stuvwx", "yzabcd"}
     assert (pkg / ".env").read_text(encoding="utf-8") == raw
     assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+
+
+def test_run_revise_refuses_a_value_only_an_unrelated_line_spells_literally(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A COMMENT repeating the value cannot vouch for the assignment that holds it
+    (R6-1).
+
+    The r5 gate searched the WHOLE TEXT, which asks "does this string appear
+    anywhere" -- and here the answer is yes for a reason that protects nothing. The
+    assignment still spells the credential with an escape that FIRES, so the raw
+    line matches no registered value; a builder ``cat``-ing the LIVE package's
+    ``.env`` (outside staging, perfectly reachable -- D21 leaves ``run_shell``
+    unjailed) emits that spelling past every redactor, and the value is trivially
+    recoverable from it. The only spelling that can answer for a value is the one
+    on the line that DETERMINES it.
+
+    ``parsed in raw`` is asserted first, so this test would have PASSED the r5 gate
+    -- that is precisely what makes it the regression."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    raw = 'TOKEN="abcd\\"efgh"\n# abcd"efgh\n'
+    (pkg / ".env").write_text(raw, encoding="utf-8")
+    parsed = tools._parse_dotenv_text(raw)["TOKEN"]
+    assert len(parsed) >= tools._MIN_SECRET_LEN  # not the r1 floor: the SPELLING
+    assert parsed in raw  # the whole-text search the r5 gate did says "fine"
+    assert parsed not in raw.splitlines()[0]  # ... the assignment itself says otherwise
+    before = _file_bytes(pkg)
+    captured = _fake_generate(
+        monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
+    assert "TOKEN" not in (outcome.error or "")  # never the key
+    assert parsed not in (outcome.error or "")  # never the value
+    assert captured == {}  # the builder session never started
+    assert outcome.llm_log_id is None
+    assert _file_bytes(pkg) == before  # the package is untouched
+    assert not (pkg.parent / tool_builder._STAGING_DIRNAME).exists()
+    with tools._INFLIGHT_LOCK:
+        assert not tools._INFLIGHT_SECRETS  # nothing was registered either
+
+
+def test_run_revise_refuses_a_value_its_assignment_line_cannot_vouch_for(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A MULTI-LINE quoted value has no single assignment line to check, so it
+    refuses (R6-1).
+
+    Stated honestly: this one is not a demonstrated leak. The value's newlines are
+    real newlines in the file, so a ``cat`` really would put the registered string
+    in front of the redactor. It refuses because the check is line-based and a
+    single line can never contain a newline -- nothing here can tell this spelling
+    apart from one whose first fragment merely happens to sit on the opening line.
+    Verifying what we can READ and refusing what we cannot is the direction the
+    whole path takes (an unreadable ``.env`` stops the revise; an untrustworthy
+    sidecar stops the swap), and it is a deliberate narrowing of what r5 accepted.
+    The remedy the message names -- simplify the quoting -- is the right advice
+    here too."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    raw = 'SPAN="line-one\nline-two"\n'
+    (pkg / ".env").write_text(raw, encoding="utf-8")
+    parsed = tools._parse_dotenv_text(raw)["SPAN"]
+    assert parsed == "line-one\nline-two"  # dotenv really does span the two lines
+    before = _file_bytes(pkg)
+    captured = _fake_generate(
+        monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
+    assert captured == {}  # the builder session never started
+    assert _file_bytes(pkg) == before
+    with tools._INFLIGHT_LOCK:
+        assert not tools._INFLIGHT_SECRETS
+
+
+@pytest.mark.parametrize(
+    ("label", "raw", "refused"),
+    [
+        # dotenv is LAST-occurrence-wins, so the LAST line is the one that decides
+        # the value -- and a plainly-spelled last line is a package that revises.
+        ("last assignment is plain", 'KEY="ab\\"cdefg"\nKEY=abcdef\n', False),
+        # ... and the reverse: an earlier plain line does not excuse the one that wins.
+        ("last assignment is reversible", 'KEY=abcdef\nKEY="ab\\"cdefg"\n', True),
+    ],
+)
+def test_run_revise_checks_the_last_assignment_of_a_duplicated_env_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, label: str, raw: str, refused: bool
+) -> None:
+    """With a key assigned twice, the gate follows dotenv: the LAST line wins
+    (R6-1).
+
+    Both directions are pinned because both are wrong under a whole-text search --
+    it would pass the first case for the right reason and the second for the wrong
+    one (an earlier, dead line spelling something else literally). The registered
+    value comes from the LAST assignment, so that is the line whose spelling has to
+    be able to vouch for it; an earlier, shadowed line is ordinary file text with no
+    registered secret behind it. ``_env_line_key`` is the same key recognizer
+    ``_inject_secret_into_env`` uses to drop prior lines, for this identical
+    last-wins reason."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / ".env").write_text(raw, encoding="utf-8")
+    parsed = tools._parse_dotenv_text(raw)["KEY"]
+    assert len(parsed) >= tools._MIN_SECRET_LEN  # never the r1 floor, always the SPELLING
+    seen: dict[str, Any] = {}
+    captured = _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY},
+        side_effect=lambda: seen.update(inflight=set(tools._INFLIGHT_SECRETS)),
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    if refused:
+        assert outcome.ok is False
+        assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
+        assert captured == {}  # the builder session never started
+    else:
+        assert outcome.ok is True
+        assert seen["inflight"] == {parsed}  # the LAST line's value, registered
+        assert (pkg / ".env").read_text(encoding="utf-8") == raw
 
 
 def _case_sensitive_filesystem(root: Path) -> bool:
@@ -4797,24 +5024,38 @@ def test_run_revise_keeps_a_root_env_case_variant_that_is_a_different_file(
     assert (pkg / ".env").read_bytes() == live  # ... and the real one came back
 
 
-def test_run_revise_excludes_a_root_env_case_variant_that_is_the_same_file(
+def test_run_revise_keeps_a_hard_linked_root_env_case_variant(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The exclusion follows the INODE, so a ``.ENV`` that IS the managed ``.env``
-    is still withheld (R5-2).
+    """A HARD-LINKED ``.ENV`` is a second DIRECTORY ENTRY and survives the revise
+    (R6-2).
 
-    A HARD LINK reproduces on POSIX exactly the condition a case-INSENSITIVE
-    filesystem creates -- two names, one file -- which is the situation the r2
-    casefold rule was really aimed at, and the only one where dropping the variant
-    is right. Copying it in would put the live credentials in staging and make
-    ``validate_package``'s embedded-secret gate reject every revise of the tool,
-    permanently, naming a file the operator never wrote. Tested this way because
-    the macOS default filesystem is not available here and the property is about
-    file IDENTITY, not about the platform."""
+    This is the case the r5 inode rule got wrong. ``.env`` and ``.ENV`` here share
+    ``st_dev``/``st_ino``, so "same file" said yes and BOTH names were withheld from
+    the copy -- while ``_preserve_env_file`` restores only the exact ``.env``. After
+    a successful publish and the backup drop, ``.ENV`` was simply GONE: the very
+    failure R5-2 set out to remove, arriving through the test it chose. The
+    filesystem's own LISTING answers the real question: it carries BOTH names here,
+    so the variant is the package's content and is copied.
+
+    The ``.env`` deliberately holds no registered value. A hard link means the two
+    names have the SAME bytes, so a credential-bearing pair would put those
+    credentials in staging and be refused by ``validate_package``'s embedded-secret
+    gate -- R2-2's stated, accepted consequence for a second file holding a live
+    credential, and not the property under test here.
+
+    Both names come through with their bytes; they are independent files afterwards,
+    since ``copytree`` has never preserved hard-link identity."""
+    if not _case_sensitive_filesystem(tmp_path):
+        # There, the two names ARE one entry and ``os.link`` below cannot even be
+        # asked for; the branch that covers that world is the unit test after this.
+        pytest.skip("this filesystem folds .env and .ENV into one file")
     pkg = _seed_package(monkeypatch, tmp_path)
     root = pkg.parent
-    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    shared = "# two names, one inode, no credentials\nMODE=\n"
+    (pkg / ".env").write_text(shared, encoding="utf-8")
     os.link(pkg / ".env", pkg / ".ENV")  # one file, two names
+    assert (pkg / ".env").stat().st_ino == (pkg / ".ENV").stat().st_ino
     seen: dict[str, set[str]] = {}
     _fake_generate(
         monkeypatch,
@@ -4826,8 +5067,63 @@ def test_run_revise_excludes_a_root_env_case_variant_that_is_the_same_file(
     outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
-    assert seen["staged"] == {"tool.json", "run.py"}  # NEITHER name reached staging
-    assert (pkg / ".env").read_text(encoding="utf-8") == _TRICKY_ENV
+    assert ".ENV" in seen["staged"]  # a distinct entry: the builder sees it
+    assert ".env" not in seen["staged"]  # ... the managed one is still withheld
+    assert (pkg / ".ENV").read_text(encoding="utf-8") == shared  # PUBLISHED, not deleted
+    assert (pkg / ".env").read_text(encoding="utf-8") == shared  # ... and restored
+
+
+def test_is_preserved_env_name_excludes_the_variant_a_lone_listing_carries(
+    tmp_path: Path,
+) -> None:
+    """The one shape only a case-INSENSITIVE filesystem produces, tested directly
+    (R6-2).
+
+    ``run_revise`` cannot reach it on this host: a case-insensitive filesystem
+    carries ONE entry for the pair, which is a listing without ``.env`` where
+    ``<root>/.env`` still opens the variant -- and no case-sensitive host can
+    produce that combination end to end. Passing ``exact_present=False`` over a
+    hard-linked pair reproduces exactly what the callback would see there, so the
+    branch that keeps live credentials out of staging on macOS is pinned rather
+    than assumed.
+
+    The rest of the matrix goes with it, because the discriminator is the pair of
+    conditions and not either half: the exact name always excluded, the variant
+    NEVER excluded once the listing also carries ``.env`` (however the two are
+    linked), no ``.env`` at all meaning nothing to be the same entry as, and a
+    SYMLINK staying ordinary content -- the reason the identity test is ``lstat``
+    and not a following stat, since excluding a distinct entry that is never
+    restored is the deletion bug all over again."""
+    if not _case_sensitive_filesystem(tmp_path):
+        # The fixtures below need two entries to exist at once to SIMULATE the one
+        # this branch is about; a case-insensitive host cannot hold them.
+        pytest.skip("this filesystem folds .env and .ENV into one file")
+    root = tmp_path / "pkg"
+    root.mkdir()
+    (root / ".env").write_text("MODE=\n", encoding="utf-8")
+    os.link(root / ".env", root / ".ENV")
+
+    # The exact name is the managed file whatever else the listing holds.
+    assert tool_builder._is_preserved_env_name(root, ".env", exact_present=True) is True
+    assert tool_builder._is_preserved_env_name(root, ".env", exact_present=False) is True
+    # A listing WITHOUT the exact name = the case-insensitive one-entry world.
+    assert tool_builder._is_preserved_env_name(root, ".ENV", exact_present=False) is True
+    # A listing WITH it = two entries, so the variant is the package's own content.
+    assert tool_builder._is_preserved_env_name(root, ".ENV", exact_present=True) is False
+    # An unrelated name is never in question.
+    assert tool_builder._is_preserved_env_name(root, "env", exact_present=False) is False
+
+    (root / ".ENV").unlink()
+    (root / ".env").unlink()
+    # Nothing for the variant to BE the same entry as -> ordinary content.
+    (root / ".ENV").write_text("MODE=\n", encoding="utf-8")
+    assert tool_builder._is_preserved_env_name(root, ".ENV", exact_present=False) is False
+    (root / ".ENV").unlink()
+
+    # A SYMLINK is a distinct entry: lstat keeps it one, a following stat would not.
+    (root / ".env").write_text("MODE=\n", encoding="utf-8")
+    (root / ".ENV").symlink_to(".env")
+    assert tool_builder._is_preserved_env_name(root, ".ENV", exact_present=False) is False
 
 
 def test_run_revise_keeps_a_root_env_case_variant_that_is_a_symlink(
@@ -4836,12 +5132,16 @@ def test_run_revise_keeps_a_root_env_case_variant_that_is_a_symlink(
     """A ``.ENV`` SYMLINK to ``.env`` is a distinct directory entry and survives the
     revise as a link (R5-2).
 
-    This is why the identity test is ``os.lstat`` rather than ``os.stat`` /
-    ``os.path.samefile``: a following stat would call the link "the same file" and
-    exclude it, and since only the exact ``.env`` is ever restored, the link would
-    be silently deleted -- this finding's own bug in miniature. ``copytree`` copies
-    it AS a link (``symlinks=True``), so it is dangling inside staging and resolves
-    again the moment ``_preserve_env_file`` puts ``.env`` back."""
+    Two independent reasons keep it, and that is the point of still having this
+    test after R6-2: the LISTING carries both names here, so the variant is content
+    before any stat is reached, AND the identity test is ``os.lstat`` rather than
+    ``os.stat`` / ``os.path.samefile``, so the link is not conflated with its target
+    where the listing cannot help (a lone variant -- see the unit test above).
+    Either rule alone gets this right; a following stat plus the r5 inode rule got
+    it wrong, and since only the exact ``.env`` is ever restored, the link would
+    have been silently deleted. ``copytree`` copies it AS a link
+    (``symlinks=True``), so it is dangling inside staging and resolves again the
+    moment ``_preserve_env_file`` puts ``.env`` back."""
     if not _case_sensitive_filesystem(tmp_path):
         pytest.skip("this filesystem folds .env and .ENV into one file")
     pkg = _seed_package(monkeypatch, tmp_path)

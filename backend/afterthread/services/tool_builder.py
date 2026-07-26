@@ -1890,8 +1890,11 @@ def _promote_staging_replace(
     # package -- including the finalized sidecar's frozen text, which the revise
     # does not even carry forward (the sidecar is excluded from staging and
     # regenerated as a draft afterwards), so 定版 would be silently undone by a
-    # session that started before it. The entry check stays where it is: it is
-    # what makes the ROUTE answer 409 without burning an LLM call.
+    # session that started before it. The two earlier checks stay where they are:
+    # the ROUTE's (on the TOTAL reader) is what answers 409 without queueing a job
+    # at all, and ``run_revise``'s entry gate (on THIS strict one, R6-3) is what
+    # stops an already-corrupt sidecar from buying a whole session before arriving
+    # here to be refused anyway.
     #
     # Through ``summary_status_or_unknown``, not ``summary_status``, and the whole
     # point is the difference (R3-2): ``summary_status`` folds "no sidecar" and
@@ -2156,34 +2159,53 @@ async def run_install(
 # --- the revise run -----------------------------------------------------------
 
 
-def _is_preserved_env_name(root: Path, filename: str) -> bool:
+def _is_preserved_env_name(root: Path, filename: str, *, exact_present: bool) -> bool:
     """True when ``<root>/<filename>`` IS the managed ``<root>/.env`` (D40).
 
-    The exact name always is. A CASEFOLD variant (``.ENV``, ``.Env``) is only
-    excluded when it turns out to be the SAME FILE -- same ``st_dev``/``st_ino``
-    as ``<root>/.env`` -- which is exactly the question the r2 rule was really
-    asking and the wrong one it actually asked (R5-2). On the case-INSENSITIVE
-    default macOS filesystem ``.ENV`` IS the entry ``tools._load_tool_dotenv``
-    opens as ``.env``, so the inode test is TRUE there and the live credentials
-    still stay out of staging (copying them in would make
-    ``validate_package``'s embedded-secret gate reject every revise of that tool,
-    permanently, naming a file the operator never wrote). On a case-SENSITIVE one
-    ``.ENV`` is a DIFFERENT, ORDINARY package file -- a tool whose entry runs with
-    the package directory as its cwd may read it for its own reasons -- and the
-    test is FALSE, so it is copied like any other content. A blind casefold match
-    dropped it, and since ``_preserve_env_file`` only ever restores the exact
-    ``.env``, an unrelated revise DELETED it and then validated the mutilated
-    package as fine: the identical failure R2-2 removed for nested ``.env`` files,
-    surviving at the root under a different name.
+    The exact name always is. A CASEFOLD variant (``.ENV``, ``.Env``) is excluded
+    only when the DIRECTORY LISTING it came from does NOT also carry the exact
+    ``.env`` (``exact_present``) AND it is the same entry ``<root>/.env`` opens.
 
-    ``os.lstat`` rather than ``os.stat``/``os.path.samefile`` on purpose. The
-    inode test must answer "is this the same DIRECTORY ENTRY", and on a
-    case-insensitive filesystem it is: both names resolve to one entry, so lstat
-    reports one inode. A SYMLINK named ``.ENV`` pointing at ``.env`` would compare
-    EQUAL under a following stat, and excluding it would be the very bug above in
-    miniature -- a distinct package file silently deleted, never restored. lstat
+    The LISTING is the discriminator (R6-2), and the inode alone is NOT. The r5
+    rule asked only "same ``st_dev``/``st_ino`` as ``<root>/.env``", and on a
+    case-SENSITIVE filesystem ``.env`` and ``.ENV`` can be HARD LINKS: two
+    distinct directory entries sharing one inode. Both were then held back from
+    the copy while ``_preserve_env_file`` restores only the exact ``.env``, so
+    after a successful publish and the backup drop ``.ENV`` was simply GONE --
+    which is the very failure R5-2 set out to remove, reappearing through the test
+    it chose. The question was never "same inode"; it is "is this the same
+    DIRECTORY ENTRY", and the listing answers it outright:
+
+    * a case-INSENSITIVE filesystem cannot hold two entries differing only in
+      case, so its listing carries exactly ONE of them (in whatever case it is
+      stored) and ``<root>/.env`` opens that one. ``exact_present`` is False, the
+      same-entry test is True, and the live credentials stay out of staging --
+      copying them in would make ``validate_package``'s embedded-secret gate
+      reject every revise of that tool, permanently, naming a file the operator
+      never wrote;
+    * a case-SENSITIVE one holding both carries BOTH names in the listing, hard
+      link or not. ``exact_present`` is True, so the variant is ORDINARY package
+      content and is copied -- a tool whose entry runs with the package directory
+      as its cwd may read it for its own reasons -- while the exact ``.env`` is
+      still withheld by the branch above. A blind casefold match (r1) and the
+      inode test (r5) both dropped it, and since only the exact ``.env`` is ever
+      restored, an unrelated revise DELETED it and then validated the mutilated
+      package as fine: the failure R2-2 removed for nested ``.env`` files,
+      surviving at the root under a different name;
+    * a case-SENSITIVE one holding ONLY the variant has no ``<root>/.env`` to be
+      the same entry as, so it is copied and the package counts as having no
+      managed ``.env`` at all -- which is exactly what ``tools._load_tool_dotenv``
+      finds when it opens the exact name there.
+
+    ``os.lstat`` rather than ``os.stat``/``os.path.samefile`` on purpose, and it
+    stays that way (R5-2's reason survives R6-2's change): a SYMLINK named ``.ENV``
+    pointing at ``.env`` compares EQUAL under a FOLLOWING stat, and excluding a
+    distinct entry that is never restored is this whole finding in miniature. lstat
     keeps the link a link, ``copytree(symlinks=True)`` carries it across as one,
     and it resolves again the moment ``_preserve_env_file`` puts ``.env`` back.
+    What the stat still buys, now that the listing decides the case question, is
+    the confirmation that ``<root>/.env`` -- the exact path every other part of
+    this system opens -- really does resolve to THIS entry before we withhold it.
 
     Both stats are guarded: a name that vanished between ``scandir`` and here, or
     a root with no ``.env`` at all, is simply NOT the same file, so it is copied.
@@ -2191,12 +2213,16 @@ def _is_preserved_env_name(root: Path, filename: str) -> bool:
     the strength of a stat that failed -- and the credential file itself cannot
     slip through it, because the exact-name branch above never stats anything.
 
+    ``exact_present`` is a REQUIRED keyword-only argument for the same reason
+    ``_preserve_env_file``'s ``existed_at_start`` is (R3-1): a default would be a
+    silent wrong branch waiting for the first caller that forgets to pass it.
+
     Only IDENTITY is decided here; WHERE it counts is ``_revise_copy_ignore``'s
     job, and it counts only at the package root (R2-2).
     """
     if filename == ".env":
         return True
-    if filename.casefold() != ".env":
+    if exact_present or filename.casefold() != ".env":
         return False
     try:
         candidate = os.lstat(root / filename)
@@ -2212,8 +2238,9 @@ def _revise_copy_ignore(root: Path, source_dir: Any, names: list[str]) -> set[st
     Bound to the package ``root`` by the caller (``partial``), because the two
     namespaces it drops have DIFFERENT depths:
 
-    * the ROOT ``.env`` only -- MANDATORY there, and identified by INODE rather
-      than by spelling (``_is_preserved_env_name``, R5-2). That one file's values
+    * the ROOT ``.env`` only -- MANDATORY there, and identified by this very
+      LISTING plus a non-following same-entry test rather than by spelling
+      (``_is_preserved_env_name``, R6-2 narrowing R5-2). That one file's values
       are in ``known_secret_values``, so copying it would be rejected outright by
       ``validate_package``'s embedded-secret gate, and the backend copies the live
       file back after validation instead (``_preserve_env_file``);
@@ -2239,12 +2266,21 @@ def _revise_copy_ignore(root: Path, source_dir: Any, names: list[str]) -> set[st
     ``source_dir`` is the directory being visited; ``shutil`` passes it through
     ``os.fspath``, so it arrives as a str and is compared as a ``Path`` (children
     are built by joining onto ``root``, so only the top-level call can equal it).
+
+    ``names`` is not just the thing being filtered, it is EVIDENCE (R6-2): whether
+    the exact ``.env`` appears in this listing is what tells a case-INSENSITIVE
+    ``.ENV`` (one entry, ours, withhold it) from a case-SENSITIVE one (two
+    entries, the package's, copy it). It is computed ONCE per directory rather
+    than per name, because ``names`` is a list and a package root may hold many
+    files.
     """
     at_root = Path(source_dir) == root
+    exact_env_present = at_root and ".env" in names
     return {
         name
         for name in names
-        if (at_root and _is_preserved_env_name(root, name)) or _is_reserved_sidecar_name(name)
+        if (at_root and _is_preserved_env_name(root, name, exact_present=exact_env_present))
+        or _is_reserved_sidecar_name(name)
     }
 
 
@@ -2289,7 +2325,10 @@ def _read_env_for_values(directory: Path) -> tuple[bool, dict[str, str], str, st
     dict -- plus the RAW TEXT those values came out of.
 
     The text is returned so ``_unmaskable_env_error`` can compare each parsed value
-    against the spelling the FILE actually holds (R5-1). It has to come from THIS
+    against the spelling the FILE actually holds -- specifically the raw right-hand
+    side of the line that DETERMINED it (R5-1, narrowed by R6-1), which is why the
+    whole text rather than a per-value verdict crosses back: the guard has to be
+    able to find that line. It has to come from THIS
     read rather than a second one for the same reason the values do: a ``.env`` an
     unjailed ``run_shell`` can rewrite mid-session could read back differently, and
     a guard that vetted a different revision of the file than the one whose values
@@ -2375,20 +2414,57 @@ def _read_env_for_values(directory: Path) -> tuple[bool, dict[str, str], str, st
     return True, tools._parse_dotenv_text(text), text, None
 
 
-def _unmaskable_env_error(text: str, values: list[str]) -> str | None:
+def _env_assignment_rhs(text: str) -> dict[str, str]:
+    """Each key in a ``.env`` text mapped to the RAW RHS that DETERMINES its value.
+
+    Pure. One pass over the lines, later assignments overwriting earlier ones,
+    because python-dotenv is LAST-occurrence-wins: what survives per key is the
+    spelling that actually decided the parsed value. The key recognizer is
+    ``_env_line_key`` -- the same one ``_inject_secret_into_env`` uses to drop
+    EVERY prior line assigning its name, for that identical last-wins reason, so
+    the two sides of this module agree on what "the line that assigns K" means.
+    The RHS is everything after the FIRST ``=`` (a dotenv key cannot contain one),
+    whitespace-stripped.
+
+    Split on ``"\\n"`` rather than ``str.splitlines()``, and that is correctness
+    rather than habit: dotenv's own parser breaks lines on ``\\r\\n``/``\\n``/``\\r``
+    only, and the bounded reader that produced this text already normalized the
+    first two forms to ``\\n`` (universal newlines). ``splitlines()`` ALSO breaks on
+    ``\\v``, ``\\f``, ``\\x1c``-``\\x1e``, ``\\u2028`` and ``\\u2029`` -- characters
+    dotenv keeps INSIDE a value -- so it would invent assignment lines the parser
+    never saw and answer for a key off a line that does not exist.
+
+    Line-based, so a value that SPANS lines is deliberately not represented
+    faithfully: its continuation lines assign nothing (no ``=``, so
+    ``_env_line_key`` returns None) and the opening line's RHS holds only the first
+    fragment. The caller's rule -- the parsed value must appear LITERALLY in the
+    RHS -- therefore REFUSES those shapes instead of vouching for them, which is
+    the direction every guard on this path takes.
+    """
+    spelled: dict[str, str] = {}
+    for line in text.split("\n"):
+        key = _env_line_key(line)
+        if key is not None:
+            spelled[key] = line.split("=", 1)[1].strip()
+    return spelled
+
+
+def _unmaskable_env_error(text: str, values: dict[str, str]) -> str | None:
     """The whole "can we mask this package's ``.env`` values" policy; None = yes.
 
     Blocking, and it runs on a worker for the reason every other scan in this
-    module does (R1-3): a 64 KiB ``.env`` can hold thousands of values, and a
-    substring search of each against the whole text is hundreds of milliseconds of
-    real work on a background job that shares the event loop with every HTTP
+    module does (R1-3): a 64 KiB ``.env`` can hold thousands of values, and
+    walking the file plus a substring search per value is hundreds of milliseconds
+    of real work on a background job that shares the event loop with every HTTP
     request in the process. One extra hop on a session measured in MINUTES is not
     a cost worth arguing about; a loop stall is.
 
-    ``values`` is the already-filtered non-empty set the caller will register --
-    an empty value (``KEY=``) is not a secret, contributes nothing to
-    ``known_secret_values`` (``tools._cached_env_values``' own rule), and so can
-    never make a package permanently unrevisable through either gate below.
+    ``values`` is the already-filtered non-empty ``key -> value`` mapping the
+    caller will register -- an empty value (``KEY=``) is not a secret, contributes
+    nothing to ``known_secret_values`` (``tools._cached_env_values``' own rule),
+    and so can never make a package permanently unrevisable through either gate
+    below. The KEYS are needed, not just the values: the second gate is about the
+    line each value came from (R6-1).
 
     Both gates say the same thing -- a value the redactors cannot mask must not be
     handed to a builder session -- and they live together because they ARE one
@@ -2405,18 +2481,54 @@ def _unmaskable_env_error(text: str, values: list[str]) -> str | None:
       is outside staging but perfectly reachable, and that raw text equals no
       registered value, so neither the live redactor nor ``llm_log`` masks it: it
       lands in the next round's prompt, in the AI 日誌, and possibly in the summary
-      -> job body -> sidecar. So every value must appear LITERALLY in the text it
-      was parsed from, and one that does not refuses the whole revise.
+      -> job body -> sidecar.
+
+    That second gate is asked of the ASSIGNMENT LINE, not of the whole file
+    (R6-1). A whole-text search asks "does this string appear ANYWHERE", and the
+    answer can be yes for a reason that protects nothing::
+
+        TOKEN="abcd\\"efgh"
+        # abcd"efgh
+
+    The comment vouches for the assignment. The parsed value is present in the
+    file, the r5 gate passed, and the line that actually holds the credential
+    still spelled it in a form no redactor matches -- so a ``cat`` of the file
+    emitted it and the live value was recoverable from the escape, which is the
+    entire leak this gate exists to stop. The only spelling that can vouch for a
+    value is the spelling of the assignment that DETERMINES it: the LAST line
+    whose key matches (``_env_assignment_rhs``), whose raw right-hand side must
+    contain the parsed value LITERALLY. ``KEY=abcdef`` and ``KEY="abcdef"`` pass;
+    ``KEY="ab\\"cd"`` does not.
+
+    A key with NO locatable assignment line refuses too -- a value spanning lines,
+    a continuation, any shape this line-based reading cannot account for. We
+    verify what we can READ and refuse what we cannot, which is the direction
+    ``_read_env_for_values`` (an unreadable ``.env`` stops the revise) and the
+    pre-swap 定版 gate (an untrustworthy sidecar stops the swap) already take. It
+    narrows what r5 accepted -- a genuinely MULTI-LINE quoted value used to pass,
+    because its newlines are real newlines in the file and the whole value really
+    was a substring of the whole text -- and that narrowing is deliberate: a
+    single assignment line can never contain a newline, so nothing here can tell
+    such a spelling apart from one whose first fragment merely happens to sit on
+    the opening line.
+
+    An EARLIER, shadowed line may still spell something reversibly, and that is
+    not a hole: dotenv discarded it, so it is not a registered value at all -- it
+    is ordinary file text like any other string in the package, with no secret
+    behind it for a redactor to have missed.
 
     The INSTALL path already treats exactly this as a leak and refuses:
     ``_dotenv_serialize_value`` returns None for a value it could only write with
     a FIRING escape, and ``_inject_secret_into_env``'s round-trip check backstops
     it, precisely so the raw line keeps the value as an exact substring. Install
-    controls the spelling because install WRITES the file; a revise INHERITS
-    whatever a hand-edit left there, and until now inherited it without that
-    guarantee. This is the same rule at the other entry point -- the same shape as
-    the floor check being the install FORM's ``schemas._SECRET_VALUE_MIN_LEN``
-    applied here.
+    controls the spelling because install WRITES the file -- and every shape it
+    can write passes here BY CONSTRUCTION: it drops every prior line assigning the
+    name and APPENDS the serialized one, so its line is both the last one for that
+    key and one of the three spellings (bare, single-quoted, double-quoted with no
+    escape able to fire) that embed the value verbatim. A revise INHERITS whatever
+    a hand-edit left there, and until now inherited it without that guarantee.
+    This is the same rule at the other entry point -- the same shape as the floor
+    check being the install FORM's ``schemas._SECRET_VALUE_MIN_LEN`` applied here.
 
     The comparison text is what ``tools._read_regular_file_capped`` produced (utf-8
     with ``errors="replace"``, universal newlines), and that is the RIGHT
@@ -2429,10 +2541,13 @@ def _unmaskable_env_error(text: str, values: list[str]) -> str | None:
     check already chose), and the messages name the CONDITION and the REMEDY only
     -- never the key, never the value.
     """
-    if any(len(value) < tools._MIN_SECRET_LEN for value in values):
+    if any(len(value) < tools._MIN_SECRET_LEN for value in values.values()):
         return _ERROR_REVISE_ENV_UNMASKABLE
-    if any(value not in text for value in values):
-        return _ERROR_REVISE_ENV_UNMATCHABLE
+    spelled = _env_assignment_rhs(text)
+    for key, value in values.items():
+        rhs = spelled.get(key)
+        if rhs is None or value not in rhs:
+            return _ERROR_REVISE_ENV_UNMATCHABLE
     return None
 
 
@@ -2482,15 +2597,24 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
     The two gates before any work: the package must resolve through
     ``tools._resolve_package_dir_no_alias`` (the shared by-name resolver, so an
     internal alias is refused here exactly as it is by every summary route), and
-    it must not be 已定版. The router checks both too; re-checking is defence in
-    depth against a 定版 that landed between the two, and it costs one sidecar
-    read. A 定版 landing LATER -- mid-session, after this check -- IS caught, by
-    ``_promote_staging_replace``'s own re-check at the last moment before the
-    swap; this entry gate's job is only to let the ROUTE answer 409 without
-    burning an LLM call. (This paragraph used to claim the opposite -- that a
+    its sidecar must yield a TRUSTWORTHY status that is not 已定版 -- the STRICT
+    ``summary_status_or_unknown``, refusing an unreadable/corrupt sidecar exactly
+    as it refuses a finalized one (R6-3). The router checks the finalized case too;
+    re-checking is defence in depth against a 定版 that landed between the two, and
+    it costs one sidecar read. A 定版 landing LATER -- mid-session, after this check
+    -- IS caught, by ``_promote_staging_replace``'s own re-check at the last moment
+    before the swap. (This paragraph used to claim the opposite -- that a
     mid-session 定版 was an accepted residual -- which stopped being true when the
     P3b self-review added that re-check, and the stale text survived the fix.
-    Corrected here alongside R3-2, which makes the same re-check fail CLOSED.)
+    Corrected alongside R3-2, which makes the same re-check fail CLOSED.)
+
+    Strict HERE and total at the ROUTE is the whole point, not an inconsistency
+    (R6-3): a route answers about a resource's KNOWN state and may cheaply guess,
+    but this job is what ACTS -- it spends a multi-round builder session and holds
+    the single-flight while it does -- and an already-corrupt sidecar was certain to
+    be refused by the pre-swap gate at the END of that session anyway. Paying in
+    full for a foregone refusal, on every retry, is what the strict entry gate
+    removes; the refusal itself was never in doubt.
 
     The ``.env`` is read for its VALUES (and refused if unreadable, or over the
     BYTE ceiling promote itself applies -- R5-3, so a ``.env`` promote would refuse
@@ -2509,8 +2633,10 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
     revision that copied them into a file.
 
     A value the redactors could not mask refuses the whole session, whether it is
-    too SHORT for them to look at (R1-1) or SPELLED in the file in a way that
-    parses back to something else (R5-1) -- one policy, one gate,
+    too SHORT for them to look at (R1-1) or SPELLED by its own assignment line in a
+    way that parses back to something else (R5-1, narrowed to that LINE by R6-1 --
+    a comment elsewhere in the file repeating the value vouched for nothing) --
+    one policy, one gate,
     ``_unmaskable_env_error``. Registration is not protection on its own, and this
     path hands every one of those values to ``run_shell``, whose output is wrapped
     verbatim into the next round's prompt, recorded into the AI 日誌 attempt
@@ -2533,8 +2659,31 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
     directory = await run_in_threadpool(tools._resolve_package_dir_no_alias, name)
     if directory is None:
         return InstallOutcome(ok=False, error=_ERROR_REVISE_NOT_FOUND)
-    if await run_in_threadpool(tools.summary_status, directory) == "final":
+    # Through the STRICT reader, and refusing on UNKNOWN as well as on final
+    # (R6-3): a sidecar that is ALREADY corrupt when the request arrives used
+    # to pass this gate on ``summary_status``'s total None, burn a whole multi-round
+    # builder session, and then be refused by ``_promote_staging_replace``'s strict
+    # read at the end -- guaranteed-to-fail work charged in full, on every retry,
+    # while the global single-flight was held. This job is the thing that ACTS, so
+    # it is the thing that must fail closed; the two error strings are the SAME two
+    # promote uses, so the operator sees one refusal per remedy (repair/remove a
+    # damaged sidecar vs. 解除定版) wherever it was decided.
+    #
+    # The ROUTER's own admission gate deliberately STAYS on the total
+    # ``summary_status``: a route answers about the resource's KNOWN state, and
+    # guessing "not finalized" there costs at most this refusal, arriving as a job
+    # outcome instead of a 409. The authoritative, fail-closed check belongs to the
+    # job that is about to act -- here, and again at the last moment before the swap.
+    #
+    # The meta this read parsed is dropped on purpose: the origin must come from the
+    # read the PRE-SWAP gate makes, minutes later, because that is the one whose
+    # answer the swap acts on (R4-2). Carrying this one down would reintroduce the
+    # two-reads-can-disagree bug at a much longer timescale.
+    status, _ = await run_in_threadpool(tools.summary_status_or_unknown, directory)
+    if status == "final":
         return InstallOutcome(ok=False, error=_ERROR_REVISE_FINALIZED)
+    if status == tools._SUMMARY_STATUS_UNKNOWN:
+        return InstallOutcome(ok=False, error=_ERROR_REVISE_SUMMARY_UNREADABLE)
 
     # ONE worker hop does the read AND the dotenv parse (R4-3): the parse is real
     # work on a 64 KiB file and this job shares the loop with every request.
@@ -2551,15 +2700,19 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
     )
     if env_error is not None:
         return InstallOutcome(ok=False, error=env_error)
-    registered = [value for value in env_values.values() if value]
+    registered_by_key = {key: value for key, value in env_values.items() if value}
+    registered = list(registered_by_key.values())
     # BEFORE the LLM call, and before anything is registered: a value we would be
-    # required to ignore, or one the file spells so that no redactor can match what
-    # a ``cat`` of it prints, cannot be protected by registering it (see the
-    # docstring and ``_unmaskable_env_error``). ``registered`` is already the
-    # non-empty values, so a ``KEY=`` line -- which contributes no secret to
-    # anything -- can never trip either half. On a worker like every other scan in
-    # this function (R1-3): a 64 KiB ``.env`` is thousands of substring searches.
-    mask_error = await run_in_threadpool(_unmaskable_env_error, env_text, registered)
+    # required to ignore, or one whose own assignment line spells it so that no
+    # redactor can match what a ``cat`` of the file prints, cannot be protected by
+    # registering it (see the docstring and ``_unmaskable_env_error``). The KEYS go
+    # in too, because the spelling that has to vouch for a value is the one on the
+    # line that DETERMINES it, never some other line or a comment that merely
+    # repeats it (R6-1). Only the non-empty values are passed, so a ``KEY=`` line --
+    # which contributes no secret to anything -- can never trip either half. On a
+    # worker like every other scan in this function (R1-3): a 64 KiB ``.env`` is a
+    # full walk plus thousands of substring searches.
+    mask_error = await run_in_threadpool(_unmaskable_env_error, env_text, registered_by_key)
     if mask_error is not None:
         return InstallOutcome(ok=False, error=mask_error)
     for value in registered:

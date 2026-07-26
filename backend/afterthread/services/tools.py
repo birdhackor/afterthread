@@ -1189,7 +1189,7 @@ _SUMMARY_STATUS_UNKNOWN = "unknown"
 
 
 def summary_status_or_unknown(directory: Path) -> tuple[str | None, dict[str, Any] | None]:
-    """``(status, meta)`` for the ONE caller that must not guess (R3-2, R4-2).
+    """``(status, meta)`` for the callers that must not guess (R3-2, R4-2, R6-3).
 
     The same two real answers (``"draft"`` / ``"final"``), but the None that
     ``summary_status`` folds every failure into is SPLIT in two:
@@ -1205,15 +1205,23 @@ def summary_status_or_unknown(directory: Path) -> tuple[str | None, dict[str, An
       not evidence of "not finalized".
 
     ``summary_status``'s own contract is deliberately UNCHANGED, and this is an
-    ADDITIONAL reader rather than a replacement. Its existing callers genuinely
+    ADDITIONAL reader rather than a replacement. Its remaining callers genuinely
     want the total, degrade-to-None behaviour: ``list_tools`` badges a row (a
-    corrupt sidecar must degrade one badge, never 500 the whole 工具 page) and
-    the summary routes decide whether to answer 409 without burning an LLM call
-    (there, guessing "not finalized" costs a regenerate that would REPLACE the
-    unreadable file anyway). ``_promote_staging_replace`` is the one caller whose
-    wrong guess is DESTRUCTIVE -- it goes on to delete the very package the
-    sidecar lives in, frozen text included -- so it is the one caller that has to
-    fail CLOSED on uncertainty.
+    corrupt sidecar must degrade one badge, never 500 the whole 工具 page) and the
+    summary routes -- INCLUDING the revise submit -- decide whether to answer 409
+    without queueing anything (there, guessing "not finalized" costs a regenerate
+    that would REPLACE the unreadable file anyway, or a job that refuses itself).
+    A ROUTE answers about a resource's KNOWN state, and may cheaply guess.
+
+    The two callers here are the two that ACT on the answer:
+    ``_promote_staging_replace``, whose wrong guess is DESTRUCTIVE -- it goes on to
+    delete the very package the sidecar lives in, frozen text included -- and
+    ``tool_builder.run_revise``'s entry gate (R6-3), whose wrong guess is
+    EXPENSIVE: it admits a package whose already-corrupt sidecar makes the promote
+    refusal a foregone conclusion, then spends a full multi-round builder session
+    holding the global single-flight before collecting it, once per retry. Both
+    therefore fail CLOSED on uncertainty, and they report it with the SAME two
+    error strings so one condition never grows two vocabularies.
 
     The ENOENT-vs-every-other-``OSError`` discrimination is the same one
     ``tool_builder._read_env_for_values`` makes about the ``.env`` (R2-3), for the
@@ -1234,7 +1242,9 @@ def summary_status_or_unknown(directory: Path) -> tuple[str | None, dict[str, An
     ``origin=None``, after which the swap destroyed the sidecar and the
     regenerated one carried the loss forever. Handing back what was just judged
     makes that impossible by construction rather than by a second discrimination
-    kept in step with this one.
+    kept in step with this one. The entry gate DISCARDS it, and should: minutes
+    pass before the swap acts, so the origin must come from the read the swap
+    itself makes, not from this one.
 
     The meta is None on BOTH failure answers, deliberately: for ENOENT there is
     nothing to hand back, and for UNKNOWN the whole verdict is "this file cannot be
