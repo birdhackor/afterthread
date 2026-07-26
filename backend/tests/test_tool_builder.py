@@ -695,7 +695,7 @@ def test_run_install_writes_the_summary_sidecar(
     assert meta["summary"] == "這個工具會查 KB"
     assert meta["status"] == "draft"
     assert meta["origin"] == {
-        "openapi_url": "http://kb.example/openapi.json",
+        "openapi_url": "http://kb.example" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
         "instructions": "build a search tool",
     }
     assert meta["llm_log_id"] == llm_log.last_record_id_for_workflow("tool_summary")
@@ -709,7 +709,7 @@ def test_run_install_writes_the_summary_sidecar(
 def test_run_install_never_captures_url_credentials(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The install URL is reduced to provenance AT CAPTURE (D40 r4).
+    """The install URL is reduced to provenance AT CAPTURE (D40 r4/r5).
 
     The address a user pastes into the install form routinely carries a
     credential -- a presigned document link, HTTP basic userinfo -- that nothing
@@ -718,7 +718,9 @@ def test_run_install_never_captures_url_credentials(
     later regeneration) and replayed into this very prompt. Sanitizing in the
     hook call keeps the raw form inside ``run_install``, which is the one
     function that legitimately holds it: it is what we FETCHED with, and D40
-    already rules nothing downstream re-fetches it."""
+    already rules nothing downstream re-fetches it. r5 tightened the capture
+    further (path dropped too), which is why the assertions below check for
+    the PATH's absence as well as the credentials'."""
     root = tmp_path / "tools"
     _install_settings(monkeypatch, tools_dir=str(root))
     _fake_generate(
@@ -748,9 +750,10 @@ def test_run_install_never_captures_url_credentials(
     meta = tools.read_tool_meta(root / "kbsearch")
     assert meta is not None
     assert meta["origin"]["openapi_url"] == (
-        "https://kb.example/openapi.json" + tool_meta._ORIGIN_URL_TRIMMED_MARKER
+        "https://kb.example" + tool_meta._ORIGIN_URL_TRIMMED_MARKER
     )
     sidecar = (root / "kbsearch" / tools._AI_META_FILENAME).read_text(encoding="utf-8")
+    assert "openapi.json" not in sidecar  # r5: the path is gone, not just the query
     for credential in ("PRESIGNED-abcdef", "BASIC-CREDENTIAL"):
         assert credential not in sidecar
         assert credential not in seen["user_prompt"]

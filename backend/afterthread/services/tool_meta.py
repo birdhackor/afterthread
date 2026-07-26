@@ -33,9 +33,9 @@ Three properties are deliberate, and each has a failure mode behind it:
   whole assembled prompt: the redact-then-cap order the codebase uses, closed
   as a property of the PROMPT rather than of each field in it. The install
   URL is the one piece redaction alone could not close, so it is STRUCTURALLY
-  reduced first (``_sanitized_origin_url``): a credential in a URL's query or
-  userinfo is routinely one we were never told about, or one we were told about
-  in a different encoding, and neither is matchable.
+  reduced first (``_sanitized_origin_url``): a credential in a URL's path,
+  query or userinfo is routinely one we were never told about, or one we were
+  told about in a different encoding, and neither is matchable.
 
 The LLM's own reply is validated for SHAPE here and redacted/capped at the
 STORE (``tools.store_summary_meta``), not in the pydantic validator: that
@@ -50,6 +50,7 @@ rather than being swallowed into a silent no-op.
 """
 
 import os
+import re
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -92,11 +93,18 @@ class StoreRefusal(Enum):
 # ``_sanitized_origin_url``). Fixed and visible on purpose: the sidecar is the
 # only record of where a package came from, so a silently shortened URL would
 # read as the whole truth -- an operator comparing it against the address they
-# typed has to be able to tell "this URL had no query" from "its query was
-# removed here". One marker for both dropped parts (userinfo and query/fragment)
-# because the reader's question is whether anything was removed, not which.
-# Worded like the module's other markers (…[…] , zh-TW), and deliberately free of
-# "?", "#" and "@" so re-sanitizing an already-sanitized URL is a no-op.
+# typed has to be able to tell "this URL had nothing beyond its host" from
+# "something was removed". One marker for every dropped part (userinfo, path,
+# query, fragment) because the reader's question is whether anything was
+# removed, not which -- path joined the list in round 5, after round 4 shipped
+# with userinfo/query/fragment; the SAME marker is reused rather than a new
+# one, since the reader's question has not changed.
+# Worded like the module's other markers (…[…] , zh-TW). Idempotency no longer
+# rides on the marker's own text alone (see the function): with no path left
+# to glue it to, a plain textual re-application would land the marker
+# directly on the bare host, so the function peels a trailing marker off
+# before parsing rather than relying solely on the marker excluding
+# "?", "#", "@" and "/".
 _ORIGIN_URL_TRIMMED_MARKER = "…[查詢字串與認證資訊已移除]"
 
 # Per-FILE slice of the package that may ride in the prompt. A fixed cap (rather
@@ -220,65 +228,129 @@ class ToolSummaryResult(BaseModel):
         return self
 
 
-def _sanitized_origin_url(url: str) -> str:
-    """The install's OpenAPI URL cut down to PROVENANCE: ``scheme://host[:port]/path``.
+# The host[:port] text (userinfo already stripped) must match this SHAPE
+# before ``_sanitized_origin_url`` will emit it -- R5-2's fix. ``urlsplit``
+# performs no validation of netloc characters, so a credential-shaped string
+# like "Bearer SECRET" parses into a non-empty netloc exactly as readily as a
+# real hostname does; "it parsed" and "it is a host" are different claims,
+# and only the second is safe to return. Two accepted shapes: an IPv6
+# literal in its RFC 3986 bracket form (contents unchecked -- urlsplit
+# already raised on an unbalanced bracket by the time this runs), or a label
+# built from the characters an actual DNS name / IPv4 literal can contain;
+# either may be followed by ":" and an all-digit port. Anything else -- a
+# space, a header-shaped token, an empty string -- fails the match, and the
+# caller returns "" rather than the raw text.
+_HOST_PORT_RE = re.compile(r"(?:\[[^\]]+\]|[A-Za-z0-9.-]+)(?::[0-9]+)?")
 
-    Userinfo, query and fragment are DROPPED (a marker records that something
-    was), because those are where a credential lives and value-matching redaction
-    cannot be relied on to find it. Two independent failures, and neither is
-    fixable by redacting harder:
+
+def _sanitized_origin_url(url: str) -> str:
+    """The install's OpenAPI URL cut down to PROVENANCE: ``scheme://host[:port]``.
+
+    Userinfo, PATH, query and fragment are all dropped now (a marker records
+    that something was) -- path is round 5's addition to a list r4 started
+    with query/userinfo/fragment, because it turned out to be the same
+    structural failure in a new position. A URL is operator text, and any
+    part of it beyond the bare authority can carry a value nothing else here
+    can catch:
 
     * the credential is UNKNOWN to us. A presigned document URL
-      (``?X-Amz-Signature=...``), a one-off share link, a token the operator
-      pasted but never registered as the install-form secret: no redactor can
-      mask a value nobody told it about, and this URL is persisted in the sidecar
-      AND replayed into every later regeneration's prompt;
+      (``?X-Amz-Signature=...``), a matrix parameter
+      (``;jsessionid=<capability-token>`` -- ``urlsplit`` has no concept of
+      ``;params``, so this is just PATH to it, and r4's path-preserving
+      sanitizer let it straight through), a one-off share link, a token the
+      operator pasted but never registered as the install-form secret: no
+      redactor can mask a value nobody told it about, and this URL is
+      persisted in the sidecar AND replayed into every later regeneration's
+      prompt;
     * the credential is KNOWN but TRANSFORMED. A secret ``abc123+/XYZ`` is
-      registered verbatim while the URL carries it percent-encoded as
-      ``token=abc123%2B%2FXYZ`` -- an exact substring match sees two different
-      strings and passes it straight through. Chasing encodings inside the
-      redactor is a losing game (percent, base64url, double-encoding, ...), so
-      the fix is structural: do not carry the part that holds credentials.
+      registered verbatim while the URL carries it percent-encoded, in the
+      query OR in a path segment -- an exact substring match sees two
+      different strings and passes it straight through either way. Chasing
+      encodings inside the redactor is a losing game (percent, base64url,
+      double-encoding, ...), so the fix stays structural: do not carry a
+      part that can hold one.
 
-    Nothing FUNCTIONAL is lost, which is what makes dropping them the right
-    answer rather than a tradeoff: D40 already rules that revise and regenerate
-    never re-fetch this URL (the install fetched it once; everything after reads
-    the promoted FILES), so the stored value is provenance DISPLAY -- "this came
-    from kb.example's OpenAPI document" -- and the host and path say that in
-    full.
+    r4 kept the path on the theory that it is routing information, not a
+    credential; r5 is the correction, and closes the class rather than
+    patching this one shape -- there is no syntactic marker that tells a
+    general-purpose sanitizer "this path segment is safe, that one is a
+    capability token", so nothing past the host survives. Nothing
+    FUNCTIONAL is lost: D40 already rules that revise and regenerate never
+    re-fetch this URL (the install fetched it once; everything after reads
+    the promoted FILES), so the stored value is provenance DISPLAY -- "this
+    came from kb.example's OpenAPI document" -- and the host alone says that
+    in full. A bare ``scheme://host`` with nothing after it, or with only a
+    lone ``/`` (which carries no information of its own), needs no marker:
+    there was nothing to cut.
 
-    Refusals degrade to "" (the caller then simply has no URL to show or store),
-    never to the raw value:
+    Refusals degrade to "" (the caller then simply has no URL to show or
+    store), never to the raw value:
 
-    * an unparseable URL (``urlsplit`` raises on a malformed IPv6 host), or one
-      with no scheme or no host -- a hand-edited sidecar can hold anything, and
-      echoing an unrecognizable string on the theory that it is "probably a URL"
-      is exactly what this function exists to stop;
-    * an empty/whitespace value, which is the ordinary "no URL captured" case.
+    * unparseable (``urlsplit`` raises on a malformed IPv6 host), no scheme,
+      no host, or a scheme other than http/https (case-insensitive; the
+      surviving scheme is normalized to lower);
+    * a netloc that PARSES but is not a real host[:port] -- R5-2's finding:
+      ``urlsplit`` never validates netloc characters, so
+      ``https://Bearer SECRET/openapi`` yields a non-empty netloc
+      ("Bearer SECRET") exactly as if it were a hostname, and emitting it
+      unexamined would be indistinguishable from the raw-value leak this
+      function exists to close. ``_HOST_PORT_RE`` is the check "it parsed"
+      was standing in for;
+    * a port that is present but not all-digits -- still routing
+      information when it IS numeric (the one thing besides the host this
+      function keeps), but a non-numeric port is not a cosmetic oddity to
+      wave through (r4's stance); it is a netloc that fails the same shape
+      check as any other;
+    * empty/whitespace, the ordinary "no URL captured" case.
 
     The rebuild uses the netloc's own TEXT after the last ``@`` rather than
-    ``parts.hostname``/``parts.port``: it keeps IPv6 brackets and the original
-    host spelling intact, and ``.port`` raises on a non-numeric port, which would
-    turn a cosmetic oddity into a refusal. Applying this twice is a no-op (the
-    marker carries no URL delimiter), so the belt-and-braces call sites can run
-    over an already-sanitized value without stacking markers.
+    ``parts.hostname``/``parts.port``: it keeps IPv6 brackets and the
+    original host spelling intact, and ``.port`` raises on a non-numeric
+    port, which would turn a shape failure into an exception instead of the
+    plain "" every other refusal here degrades to.
+
+    Idempotent, so the three call sites (capture, prompt, sidecar
+    read-back) can run over an already-sanitized value without stacking
+    markers -- but a DIFFERENT mechanism from r4's, and this is the subtle
+    part. r4's marker always landed after a real path, so a re-parse read
+    it back as harmless path text. With the path gone, the marker would
+    glue directly onto the bare host with no ``/`` to separate them -- a
+    naive re-parse would read the marker's own characters as part of the
+    netloc and fail ``_HOST_PORT_RE``, turning a second pass into a refusal
+    instead of a no-op. So a trailing marker is peeled off the input
+    BEFORE parsing (and remembered, so it is always reattached to whatever
+    the now-clean remainder resolves to) -- which is what keeps a second,
+    third, or Nth pass equal to the first.
     """
     stripped = url.strip()
     if not stripped:
         return ""
+    already_marked = stripped.endswith(_ORIGIN_URL_TRIMMED_MARKER)
+    if already_marked:
+        stripped = stripped[: -len(_ORIGIN_URL_TRIMMED_MARKER)]
+        if not stripped:
+            return ""
     try:
         parts = urlsplit(stripped)
     except ValueError:
         return ""
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https"):
+        return ""
     # Everything after the LAST "@" is the host[:port]; a userinfo section (even a
     # malformed one carrying its own "@") is left behind by construction.
     host = parts.netloc.rpartition("@")[2]
-    if not parts.scheme or not host:
+    if not host or not _HOST_PORT_RE.fullmatch(host):
         return ""
-    base = urlunsplit((parts.scheme, host, parts.path, "", ""))
-    if parts.netloc != host or parts.query or parts.fragment:
-        return base + _ORIGIN_URL_TRIMMED_MARKER
-    return base
+    base = urlunsplit((scheme, host, "", "", ""))
+    trimmed = (
+        already_marked
+        or parts.netloc != host
+        or bool(parts.query)
+        or bool(parts.fragment)
+        or parts.path not in ("", "/")
+    )
+    return base + _ORIGIN_URL_TRIMMED_MARKER if trimmed else base
 
 
 def _package_files(directory: Path) -> list[tuple[str, str]]:
@@ -387,12 +459,14 @@ def _summary_user_prompt(
     that edge, so the strips run AFTER the mask, never before it.
 
     Asking the redactor was necessary and not SUFFICIENT, which is why the URL
-    is reduced to ``scheme://host/path`` before it is masked: the query can hold
-    a credential the redactor was never told about (a presigned link), or one it
+    is reduced to ``scheme://host[:port]`` before it is masked: the path or
+    the query can hold a credential the redactor was never told about (a
+    presigned link, a capability token riding in a path segment), or one it
     was told about in another encoding (``abc+/`` registered,
     ``token=abc%2B%2F`` in the URL). See ``_sanitized_origin_url``. The same
-    limit still applies INSIDE the free-text instructions, and is accepted there
-    rather than chased: they are prose, not a structure with a droppable part.
+    limit still applies INSIDE the free-text instructions, and is accepted
+    there rather than chased: they are prose, not a structure with a
+    droppable part.
     """
     budget = token_budget.char_allowance(get_settings().llm_prompt_budget_tokens)
     origin_data = origin or {}
@@ -472,14 +546,16 @@ def _stored_origin(meta: dict[str, Any] | None) -> dict[str, Any] | None:
     overwritten by an empty dict.
 
     The URL is re-sanitized on the way back IN, not merely trusted. Installs
-    sanitize at capture (``tool_builder`` hands us a URL with no userinfo, query
-    or fragment), but a sidecar written BEFORE that fix -- or hand-edited since --
-    can hold the raw ``?token=...`` form, and this is the door it would come back
-    through: into the regeneration's prompt, and then back onto disk when the
-    store rewrites the origin it was given. Sanitizing here closes both, and
-    heals the file in passing: the first regeneration of a legacy package
-    rewrites its origin in the reduced form. Re-sanitizing an already-sanitized
-    URL is a no-op, so this costs nothing on the normal path.
+    sanitize at capture (``tool_builder`` hands us a host-only URL: no path,
+    userinfo, query or fragment), but a sidecar written BEFORE r4/r5 -- or
+    hand-edited since -- can hold the raw ``?token=...`` form or a
+    path-borne capability token, and this is the door either would come
+    back through: into the regeneration's prompt, and then back onto disk
+    when the store rewrites the origin it was given. Sanitizing here closes
+    both, and heals the file in passing: the first regeneration of a legacy
+    package rewrites its origin in the reduced form. Re-sanitizing an
+    already-sanitized URL is a no-op, so this costs nothing on the normal
+    path.
     """
     if meta is None:
         return None

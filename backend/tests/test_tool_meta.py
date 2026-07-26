@@ -215,27 +215,64 @@ def test_summary_result_rejects_non_object() -> None:
 @pytest.mark.parametrize(
     "raw, expected",
     [
-        ("https://kb.example/openapi.json", "https://kb.example/openapi.json"),
+        (
+            "https://kb.example/openapi.json",
+            "https://kb.example" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
+        ),
         (
             "https://kb.example/openapi.json?token=abc123",
-            "https://kb.example/openapi.json" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
+            "https://kb.example" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
         ),
         (
             "https://user:pass@kb.example:8443/o.json",
-            "https://kb.example:8443/o.json" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
+            "https://kb.example:8443" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
         ),
         (
             "https://kb.example/o.json#section",
-            "https://kb.example/o.json" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
+            "https://kb.example" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
         ),
         (
             "http://[::1]:8080/o.json?a=b",
-            "http://[::1]:8080/o.json" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
+            "http://[::1]:8080" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
         ),
-        # A non-numeric port is a cosmetic oddity, not a reason to refuse the
-        # whole URL (which reading parts.port instead of the netloc text would
-        # make it).
-        ("http://kb.example:notaport/o.json", "http://kb.example:notaport/o.json"),
+        # R5-1: a matrix parameter is just PATH to urlsplit (it has no concept
+        # of ";params" -- that is urlparse's, and even there a historical
+        # HTTP-only convention), so a capability token riding there is exactly
+        # as unmatchable by redaction as one in the query.
+        (
+            "https://kb.example/openapi.json;jsessionid=CAPABILITY-TOKEN",
+            "https://kb.example" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
+        ),
+        # R5-1, same shape in a different position: a percent-encoded token
+        # living in a PATH segment rather than the query.
+        (
+            "https://kb.example/reports/token%3DCAPABILITY-abcdef/openapi.json",
+            "https://kb.example" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
+        ),
+        # No path at all: nothing to cut, so no marker either.
+        ("https://kb.example", "https://kb.example"),
+        # A lone "/" carries no information of its own -- pinned to the SAME
+        # no-marker bucket as no-path-at-all (see the function docstring),
+        # not the marker bucket a real path gets.
+        ("https://kb.example/", "https://kb.example"),
+        # Scheme is case-insensitive and normalized to lower on the way out.
+        (
+            "HTTPS://kb.example/x",
+            "https://kb.example" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
+        ),
+        (
+            "https://[::1]:8443/x",
+            "https://[::1]:8443" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
+        ),
+        # R5-2: urlsplit does not validate netloc characters, so this parses
+        # to a non-empty netloc ("Bearer SECRET") exactly like a real host --
+        # "it parsed" is not "it is a host", and the raw credential-shaped
+        # string must never be the return value.
+        ("https://Bearer SECRET/openapi", ""),
+        ("ftp://kb.example/x", ""),  # not http/https
+        # A non-numeric port is now a netloc that fails the same shape check
+        # as any other -- no longer waved through as "cosmetic" (r4's stance).
+        ("http://kb.example:notaport/o.json", ""),
         ("http://[::1/o.json", ""),  # urlsplit raises: unparseable
         ("kb.example/openapi.json", ""),  # no scheme
         ("https:///o.json", ""),  # no host
@@ -244,11 +281,19 @@ def test_summary_result_rejects_non_object() -> None:
         ("   ", ""),
     ],
     ids=[
-        "plain",
+        "path",
         "query",
         "userinfo",
         "fragment",
-        "ipv6",
+        "ipv6-query",
+        "jsessionid-path",
+        "percent-encoded-path",
+        "bare-host",
+        "root-path",
+        "scheme-case",
+        "ipv6-port",
+        "netloc-not-a-host",
+        "non-http-scheme",
         "odd-port",
         "unparseable",
         "no-scheme",
@@ -259,21 +304,35 @@ def test_summary_result_rejects_non_object() -> None:
     ],
 )
 def test_sanitized_origin_url(raw: str, expected: str) -> None:
-    """scheme://host[:port]/path survives; userinfo, query and fragment do not.
+    """scheme://host[:port] survives; userinfo, PATH, query and fragment do not.
 
-    The stored URL is provenance DISPLAY (D40: nothing re-fetches it), so the
-    parts that carry credentials are dropped rather than masked -- redaction
-    cannot reach a presigned token nobody registered, nor a registered one the
-    URL carries percent-encoded. Anything unparseable degrades to "", never to
-    the raw value."""
+    r5 closes the class r4 started: path joins userinfo/query/fragment on the
+    cut list (a matrix parameter or an unregistered token living in a path
+    segment is exactly as unmatchable by redaction as one in the query), and a
+    netloc that merely PARSES is validated before being emitted rather than
+    trusted (``urlsplit`` never checks its characters, so "Bearer SECRET"
+    parses into a netloc just as readily as a real host). Anything
+    unparseable, non-http(s), or not a real host[:port] degrades to "", never
+    to the raw value."""
     assert tool_meta._sanitized_origin_url(raw) == expected
+    # Idempotency, checked for every row rather than one illustrative case:
+    # the marker is glued directly onto the bare host now (no path left to
+    # provide a natural "/" delimiter the way r4 had), so this is the one
+    # property that would silently regress if a future edit moved the peel
+    # step to after validation instead of before parsing.
+    assert tool_meta._sanitized_origin_url(expected) == expected
 
 
 def test_sanitized_origin_url_is_idempotent() -> None:
     """Three call sites sanitize (capture, prompt, sidecar read-back), so a
-    value may pass through more than once -- the marker must not stack. It
-    carries no "?", "#" or "@", so a second pass finds nothing left to drop."""
+    value may pass through more than once. With the path gone, the marker
+    lands glued directly onto the bare host -- no "/" left to delimit it from
+    a real path the way r4 had -- so a naive re-parse would read the marker's
+    own text as part of the netloc and fail host validation. The function
+    peels a trailing marker off before parsing instead, which is what keeps
+    this a no-op rather than a refusal."""
     once = tool_meta._sanitized_origin_url("https://u@kb.example/o.json?token=x#f")
+    assert once == "https://kb.example" + tool_meta._ORIGIN_URL_TRIMMED_MARKER
     assert tool_meta._sanitized_origin_url(once) == once
     assert once.count(tool_meta._ORIGIN_URL_TRIMMED_MARKER) == 1
 
@@ -307,7 +366,7 @@ def test_user_prompt_carries_the_package_but_never_env_values(
     assert "os.environ['KB_API_KEY']" in prompt  # run.py content
     assert "KB_API_KEY" in prompt and "KB_BASE" in prompt  # .env KEY names
     assert secret not in prompt  # ... never its values
-    assert "http://kb.example/openapi.json" in prompt  # install origin
+    assert "http://kb.example" in prompt  # install origin (host-only, r5)
     assert "查 KB" in prompt
     assert "built and tested" in prompt
 
@@ -373,12 +432,13 @@ def test_user_prompt_redacts_the_operator_supplied_origin(
 
     assert secret not in prompt
     assert tools._REDACTION_MARKER in prompt
-    # The URL's SUBJECT survives -- the model still learns which document this
-    # was built from -- while the query that held the token is gone entirely
-    # (redaction alone would have left "?token=" plus a marker; see
-    # test_user_prompt_drops_url_credentials_redaction_cannot_reach for why that
-    # was not enough).
-    assert "https://kb.example/openapi.json" in prompt
+    # The URL's HOST survives -- the model still learns which host this was
+    # built from -- while the PATH and the query that held the token are both
+    # gone entirely (r4 kept the path; r5 drops it too, see
+    # test_user_prompt_drops_url_credentials_redaction_cannot_reach for the
+    # path-borne-token case that motivated it).
+    assert "https://kb.example" in prompt
+    assert "openapi.json" not in prompt
     assert "token=" not in prompt
     assert tool_meta._ORIGIN_URL_TRIMMED_MARKER in prompt
 
@@ -418,7 +478,7 @@ def test_user_prompt_drops_url_credentials_redaction_cannot_reach(
     )
 
     assert needle not in prompt
-    assert "https://kb.example/openapi.json" in prompt  # the provenance survives
+    assert "https://kb.example" in prompt  # the provenance survives (host-only, r5)
 
 
 @pytest.mark.parametrize(
@@ -820,7 +880,12 @@ def test_regenerate_summary_feeds_the_stored_origin_back_into_the_prompt(
     """The install's URL and instructions are the first-hand account of what this
     package was meant to be, and the sidecar is their only copy -- a regeneration
     that dropped them would explain the files with strictly LESS context than the
-    install had. The .env values still never ride along."""
+    install had. The .env values still never ride along.
+
+    The distinguishing marker lives in the HOST (a subdomain) rather than the
+    path this time: r5 drops the path entirely, so a marker placed there (as
+    this test used before r5) would never reach the prompt at all -- the host
+    is the only part of a stored URL guaranteed to survive."""
     root = tmp_path / "tools"
     secret = "kb-live-secret-abcdef"
     pkg = _package(root, dotenv=f"KB_API_KEY={secret}\n")
@@ -830,7 +895,7 @@ def test_regenerate_summary_feeds_the_stored_origin_back_into_the_prompt(
         summary="舊的",
         status="draft",
         origin={
-            "openapi_url": "http://kb.example/ORIGIN-URL-MARKER.json",
+            "openapi_url": "http://origin-url-marker.kb.example/o.json",
             "instructions": "ORIGIN-INSTRUCTIONS-MARKER 只查內部 KB",
         },
     )
@@ -839,7 +904,7 @@ def test_regenerate_summary_feeds_the_stored_origin_back_into_the_prompt(
     meta = asyncio.run(regenerate_summary("kbsearch"))
 
     assert "ORIGIN-INSTRUCTIONS-MARKER 只查內部 KB" in captured["user_prompt"]
-    assert "ORIGIN-URL-MARKER" in captured["user_prompt"]
+    assert "origin-url-marker.kb.example" in captured["user_prompt"]
     assert secret not in captured["user_prompt"]
     assert isinstance(meta, dict)
     assert meta["origin"]["instructions"] == "ORIGIN-INSTRUCTIONS-MARKER 只查內部 KB"
@@ -880,11 +945,12 @@ def test_regenerate_summary_sanitizes_a_legacy_origin_url(
 
     assert "LEGACY-TOKEN" not in captured["user_prompt"]
     assert "LEGACY-BASIC" not in captured["user_prompt"]
-    assert "https://kb.example/o.json" in captured["user_prompt"]
+    assert "https://kb.example" in captured["user_prompt"]
+    assert "o.json" not in captured["user_prompt"]  # r5: the path is gone too
     # ... and the rewritten sidecar carries the reduced URL, not the raw one.
     assert isinstance(meta, dict)
     stored_url = meta["origin"]["openapi_url"]
-    assert stored_url == "https://kb.example/o.json" + tool_meta._ORIGIN_URL_TRIMMED_MARKER
+    assert stored_url == "https://kb.example" + tool_meta._ORIGIN_URL_TRIMMED_MARKER
     assert meta["origin"]["instructions"] == "ORIGIN-INSTRUCTIONS-MARKER"
     assert "LEGACY-TOKEN" not in (pkg / tools._AI_META_FILENAME).read_text(encoding="utf-8")
 

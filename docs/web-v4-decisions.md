@@ -126,22 +126,41 @@ r2 的「寫檔前再讀一次狀態」與「prompt 建置移到 threadpool」�
 ### D40 附錄（P3a review r4）：URL 憑證改「不留」、遮蔽／截斷移出 validator、alias 列不讀真包狀態
 
 - **URL 裡的憑證用「不留」解，而不是「遮得更用力」**：`origin.openapi_url` 一律先過
-  `tool_meta._sanitized_origin_url` 收斂成 `scheme://host[:port]/path`，userinfo／query／
-  fragment 整段丟掉並補一個固定可見標記（`_ORIGIN_URL_TRIMMED_MARKER`——讀的人要能分辨
-  「本來就沒有 query」與「query 被拿掉了」）；無法解析、沒有 scheme 或沒有 host 則退成
-  空字串，**絕不回傳原值**。理由是值比對式遮蔽對 URL 有兩個結構性破口，而且都不是把
-  redactor 寫仔細一點能補的：(a) presigned 連結、使用者貼上但從未登記的 token——遮蔽器
-  根本不知道那個值；(b) **已登記**的秘密在 URL 裡是 percent-encoded（登記
-  `abc123+/XYZ`、URL 寫 `token=abc123%2B%2FXYZ`），exact substring 比對看到的是兩個不同
-  字串。D40 本來就裁定 revise／regenerate 都不會重新抓這個 URL（它是出處**顯示**用），
-  所以丟掉 query 與認證資訊不損失任何功能。
+  `tool_meta._sanitized_origin_url` 收斂成 `scheme://host[:port]`——**r5 再收斂一次，
+  path 也丟掉**。userinfo／path／query／fragment 只要存在任何一項就整段丟掉並補一個
+  固定可見標記（`_ORIGIN_URL_TRIMMED_MARKER`——讀的人要能分辨「本來就沒有東西可丟」
+  與「東西被拿掉了」）；無法解析、scheme 不是 http/https、或 host[:port] 驗不過形狀
+  （見下）則退成空字串，**絕不回傳原值**。r4 當時把 path 留下，理由是「這是路由資訊、
+  不是憑證」；r5 的 finding 戳破這個假設：矩陣參數（`;jsessionid=<token>`）與閘道／
+  代理塞進路徑的能力型 token，跟 query 裡的 token 是同一種操作者文字，只是換了個位置
+  ——值比對式遮蔽兩邊都抓不到，理由跟 r4 一致：(a) presigned 連結、閘道能力 token、
+  使用者貼上但從未登記的值，遮蔽器根本不知道那個值，不管它在 query 還是 path；
+  (b) **已登記**的秘密以 percent-encoding 出現在 URL 的任何部位（登記
+  `abc123+/XYZ`、URL 寫 `token=abc123%2B%2FXYZ`，不論這段在 query 還是 path），exact
+  substring 比對看到的都是兩個不同字串。D40 本來就裁定 revise／regenerate 都不會重新
+  抓這個 URL（它是出處**顯示**用，只要認得出是哪個 host 的文件就夠），所以連 path 一起
+  丟掉也不損失任何功能——這是這一類問題結構上收斂到底的終點：host 以外沒有任何使用者
+  可控的東西會留下來。
+  **host[:port] 本身也驗證形狀（r5，對應 R5-2）**：`urlsplit` 「parse 得成功」不等於
+  「netloc 是合法主機」——它完全不檢查 netloc 的字元，所以 `https://Bearer SECRET/openapi`
+  這種字串一樣會 parse 出一個非空 netloc（`"Bearer SECRET"`），照 r4 的邏輯會被原樣吐
+  回去，直接違背「絕不回傳原值」的保證。現在剝掉 userinfo 之後的 host[:port] 文字必須先
+  通過一個嚴格的正規表示式（IPv6 中括號形式，或是網域名／IPv4 合法字元組成的 label，
+  後面可選 `:數字` 的 port）才會被吐出，不合就整個退成空字串；scheme 也統一正規化成
+  小寫的 http/https，其他 scheme 一樣退成空字串。port 若存在但不是純數字，同樣視為
+  「這個 netloc 沒過形狀檢查」而整個退成空字串，不再像 r4 那樣把非數字 port 當成
+  「無害的怪東西」放行。
   **三個套用點，主 choke point 選在 capture**：`tool_builder.run_install` 呼叫 install
   hook 時就收斂，原始字串因此完全不離開那個函式（那份原值本來就只是拿去 fetch 的）；
   另外兩處是 defense-in-depth——`_summary_user_prompt` 的 URL 行（先收斂再遮蔽）與
-  `_stored_origin` 讀回既有 sidecar 時（**r4 之前寫下的**或手改的檔案可能還帶著原始
-  query，regenerate 會把它讀進 prompt、再寫回磁碟）。**不做資料遷移**：舊 sidecar 照常
-  讀得出來，第一次 regenerate 就會順手把 origin 改寫成收斂後的樣子。重複套用是 no-op
-  （標記裡不含 `?`／`#`／`@`）。
+  `_stored_origin` 讀回既有 sidecar 時（**r4／r5 之前寫下的**或手改的檔案可能還帶著
+  原始 query 或 path，regenerate 會把它讀進 prompt、再寫回磁碟）。**不做資料遷移**：
+  舊 sidecar 照常讀得出來，第一次 regenerate 就會順手把 origin 改寫成收斂後的樣子。
+  重複套用維持 no-op，但 r5 換了機制才撐得住：path 還在的時候標記接在真實路徑後面，
+  重新 parse 時仍落在 path 裡、原樣通過；path 整段消失後標記會直接黏在裸 host 後面、
+  中間沒有 `/` 分隔，若照原邏輯重新 parse 會被當成 netloc 的一部分吃掉、通不過上面的
+  host 形狀檢查——所以函式現在會先看字串結尾是不是這個標記、剝掉再解析，剝過就一定
+  記得補回去，這才是「重複套用是 no-op」在 host-only 下真正成立的原因。
 - **明說的接受邊界（不追編碼）**：安裝指示（`origin.instructions`）是自由文字，其中若出現
   **經過編碼或變形**的秘密（percent-encoding、base64、中間插空白），值比對遮蔽同樣抓不到。
   這裡**刻意不做編碼追逐**：percent／base64／雙重編碼是無底洞，而 URL 能被結構性解決，

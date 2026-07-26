@@ -218,12 +218,15 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `origin.instructions`）一律過 `redact_known_secrets` 且**遮蔽失敗就不寫**——
   sidecar 之後會被修訂流程複製進暫存目錄接受「檔案不得內嵌秘密值」檢查，含密文
   等於讓這個工具再也修訂不了。`origin.openapi_url` 另外**先被收斂**成
-  `scheme://host[:port]/path`（userinfo／query／fragment 整段丟掉、補一個固定標記，
-  無法解析就留空）：URL 裡的憑證常常是遮蔽器沒登記過的（presigned 連結），或是登記
-  了但以 percent-encoding 出現（`abc+/` vs `abc%2B%2F`），值比對抓不到——而這個 URL
-  只是出處顯示、沒有任何流程會再抓一次，丟掉就不會有這個問題。收斂發生在
-  `run_install` 交給 summary hook 的那一刻（原值不離開 installer），prompt 與讀回舊
-  sidecar 時再各收斂一次（涵蓋手改與此修正之前寫下的檔案，不需要資料遷移）。
+  `scheme://host[:port]`（userinfo／path／query／fragment 只要存在任何一項就整段丟
+  掉、補一個固定標記；host[:port] 另外驗證形狀——`urlsplit` parse 得出 netloc 不代表
+  它是合法主機，例如 `Bearer SECRET` 這種字串也會 parse 成功；無法解析、scheme 不是
+  http/https、或 host 形狀不合，都留空，絕不回傳原值）：URL 裡的憑證常常是遮蔽器沒
+  登記過的（presigned 連結、路徑裡的能力型 token），或是登記了但以 percent-encoding
+  出現（`abc+/` vs `abc%2B%2F`），值比對抓不到——而這個 URL 只是出處顯示、沒有任何
+  流程會再抓一次，連路徑一起丟掉也不會少任何功能。收斂發生在 `run_install` 交給
+  summary hook 的那一刻（原值不離開 installer），prompt 與讀回舊 sidecar 時再各收斂
+  一次（涵蓋手改與此修正之前寫下的檔案，不需要資料遷移）。
   `summary` 的遮蔽／trim／截斷（`_TOOL_SUMMARY_CAP`）**在寫入端一次做完**，不在
   pydantic validator 裡：validator 跑在 event loop 上，而遮蔽會掃整個 tools 目錄。檔案大小上下限**兩邊對齊**（`_AI_META_MAX_BYTES`，
   256 KiB）：寫得進去的一定讀得回來，不會出現「寫入回報成功、之後每次讀都變成
