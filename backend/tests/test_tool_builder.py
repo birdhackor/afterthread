@@ -4647,6 +4647,324 @@ def test_run_revise_allows_env_values_at_the_floor_and_ignores_empty_ones(
     assert (pkg / ".env").read_text(encoding="utf-8") == "EXACT=abcdef\nEMPTY=\n"
 
 
+@pytest.mark.parametrize(
+    ("label", "raw"),
+    [
+        # The finding's own example: the escape FIRES, so the raw line spells the
+        # value ``ab'cd\"ef`` while dotenv hands us ``ab'cd"ef``.
+        ("escaped quote", 'KEY="abcd\'ef\\"ghij"\n'),
+        # A ``\n`` escape: the file holds two characters, the value holds a newline.
+        ("newline escape", 'KEY="alpha\\nbravo"\n'),
+        # ... and a ``\t`` one, so the pin is the CLASS and not one escape.
+        ("tab escape", 'KEY="alpha\\tbravo"\n'),
+    ],
+)
+def test_run_revise_refuses_an_env_value_the_file_spells_reversibly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, label: str, raw: str
+) -> None:
+    """A ``.env`` whose RAW spelling of a value is not the value refuses the whole
+    session, before any LLM call (R5-1).
+
+    Registration registers what dotenv PARSED, and every redactor we have matches
+    that string and only that string. When the file spells it with escapes that
+    FIRE, the two diverge -- and the builder's unjailed ``run_shell`` (D21) can
+    ``cat`` the LIVE package's ``.env``, which is outside staging but perfectly
+    reachable, putting the raw spelling in front of a redactor that matches
+    nothing. From there it rides into the next round's prompt, the AI 日誌 attempt
+    bodies, and possibly the summary -> job body -> sidecar.
+
+    The INSTALL path already treats exactly this as a leak and refuses rather than
+    write such a spelling (``_dotenv_serialize_value`` returns None once a ``"`` or
+    ``\\`` co-occurs with a single quote, backstopped by
+    ``_inject_secret_into_env``'s round-trip check). Install controls the spelling
+    because it WRITES the file; a revise inherits whatever a hand-edit left, and
+    until now inherited it without the guarantee. Same direction as the r1 short-
+    value rule: "do not run" beats "leak".
+
+    The message names the CONDITION and the remedy and nothing else -- printing
+    the value in the error that refuses to expose it would be the leak itself."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / ".env").write_text(raw, encoding="utf-8")
+    parsed = tools._parse_dotenv_text(raw)["KEY"]
+    assert len(parsed) >= tools._MIN_SECRET_LEN  # not the r1 floor: the SPELLING, label
+    assert parsed not in raw  # ... and this is what "reversible" means, concretely
+    before = _file_bytes(pkg)
+    captured = _fake_generate(
+        monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
+    assert "KEY" not in (outcome.error or "")  # never the key
+    assert parsed not in (outcome.error or "")  # never the value
+    assert captured == {}  # the builder session never started
+    assert outcome.llm_log_id is None
+    assert _file_bytes(pkg) == before  # the package is untouched
+    assert not (pkg.parent / tool_builder._STAGING_DIRNAME).exists()
+    with tools._INFLIGHT_LOCK:
+        assert not tools._INFLIGHT_SECRETS  # nothing was registered either
+
+
+def test_run_revise_allows_env_values_the_file_spells_literally(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The refusal above is the LITERAL-substring property exactly, and ordinary
+    ``.env`` spellings keep revising (R5-1).
+
+    Four shapes whose raw line embeds the value verbatim, so a ``cat`` of the file
+    puts in front of the redactor precisely the string that was registered:
+    unquoted, simply double-quoted, single-quoted around a ``"`` (dotenv reads
+    single quotes literally -- no escapes can fire), and a genuinely MULTI-LINE
+    quoted value, whose newlines are real newlines in the file too. A gate that
+    crept past the property it enforces would make ordinary packages permanently
+    unrevisable with a message naming no key and no value to explain why."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    raw = 'PLAIN=abcdef\nQUOTED="ghijkl"\nSINGLE=\'mno"pqr\'\nSPAN="line-one\nline-two"\n'
+    (pkg / ".env").write_text(raw, encoding="utf-8")
+    seen: dict[str, Any] = {}
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY},
+        side_effect=lambda: seen.update(inflight=set(tools._INFLIGHT_SECRETS)),
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert seen["inflight"] == {"abcdef", "ghijkl", 'mno"pqr', "line-one\nline-two"}
+    assert (pkg / ".env").read_text(encoding="utf-8") == raw
+    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+
+
+def _case_sensitive_filesystem(root: Path) -> bool:
+    """True when ``root`` tells ``.env`` and ``.ENV`` apart.
+
+    PROBED rather than inferred from ``sys.platform``: a Linux host can mount a
+    case-insensitive filesystem and macOS can be formatted case-sensitive, and
+    what the R5-2 tests need is the behaviour of THIS ``tmp_path``, not the
+    platform's usual default."""
+    probe = root / ".case-probe"
+    probe.write_text("x", encoding="utf-8")
+    try:
+        return not (root / ".CASE-PROBE").exists()
+    finally:
+        probe.unlink()
+
+
+def test_run_revise_keeps_a_root_env_case_variant_that_is_a_different_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """On a case-SENSITIVE filesystem ``.ENV`` is an ORDINARY package file, so a
+    revise copies it and publishes it unchanged (R5-2).
+
+    The r2 rule excluded every root name that casefolded to ``.env``, which is the
+    right answer only where the two names ARE one file. Here they are two, and
+    ``_preserve_env_file`` only ever restores the exact ``.env`` -- so the variant
+    was copied nowhere, restored nowhere, and an unrelated revise DELETED it while
+    ``validate_package`` passed the mutilated package. That is the same failure
+    R2-2 removed for nested ``.env`` files, surviving at the root under a different
+    name. Both sides are pinned: the builder SEES the variant (it is content), the
+    managed ``.env`` is still withheld from it, and the published package has
+    both, byte for byte."""
+    if not _case_sensitive_filesystem(tmp_path):
+        pytest.skip("this filesystem folds .env and .ENV into one file")
+    pkg = _seed_package(monkeypatch, tmp_path)
+    root = pkg.parent
+    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    # Ordinary content, and deliberately NOT holding a registered value -- one that
+    # did would be refused by the embedded-secret gate, which is R2-2's stated and
+    # accepted consequence for any second file carrying a live credential.
+    variant = b"# the tool's own case-variant file\r\nMODE=verbose\n"
+    (pkg / ".ENV").write_bytes(variant)
+    live = (pkg / ".env").read_bytes()
+    seen: dict[str, set[str]] = {}
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY},
+        side_effect=lambda: seen.update(staged=_tree(_staging_dir(root))),
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert ".ENV" in seen["staged"]  # ordinary content: the builder gets to see it
+    assert ".env" not in seen["staged"]  # the managed credentials file is withheld
+    assert (pkg / ".ENV").read_bytes() == variant  # survived, byte for byte
+    assert (pkg / ".env").read_bytes() == live  # ... and the real one came back
+
+
+def test_run_revise_excludes_a_root_env_case_variant_that_is_the_same_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The exclusion follows the INODE, so a ``.ENV`` that IS the managed ``.env``
+    is still withheld (R5-2).
+
+    A HARD LINK reproduces on POSIX exactly the condition a case-INSENSITIVE
+    filesystem creates -- two names, one file -- which is the situation the r2
+    casefold rule was really aimed at, and the only one where dropping the variant
+    is right. Copying it in would put the live credentials in staging and make
+    ``validate_package``'s embedded-secret gate reject every revise of the tool,
+    permanently, naming a file the operator never wrote. Tested this way because
+    the macOS default filesystem is not available here and the property is about
+    file IDENTITY, not about the platform."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    root = pkg.parent
+    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    os.link(pkg / ".env", pkg / ".ENV")  # one file, two names
+    seen: dict[str, set[str]] = {}
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY},
+        side_effect=lambda: seen.update(staged=_tree(_staging_dir(root))),
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert seen["staged"] == {"tool.json", "run.py"}  # NEITHER name reached staging
+    assert (pkg / ".env").read_text(encoding="utf-8") == _TRICKY_ENV
+
+
+def test_run_revise_keeps_a_root_env_case_variant_that_is_a_symlink(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A ``.ENV`` SYMLINK to ``.env`` is a distinct directory entry and survives the
+    revise as a link (R5-2).
+
+    This is why the identity test is ``os.lstat`` rather than ``os.stat`` /
+    ``os.path.samefile``: a following stat would call the link "the same file" and
+    exclude it, and since only the exact ``.env`` is ever restored, the link would
+    be silently deleted -- this finding's own bug in miniature. ``copytree`` copies
+    it AS a link (``symlinks=True``), so it is dangling inside staging and resolves
+    again the moment ``_preserve_env_file`` puts ``.env`` back."""
+    if not _case_sensitive_filesystem(tmp_path):
+        pytest.skip("this filesystem folds .env and .ENV into one file")
+    pkg = _seed_package(monkeypatch, tmp_path)
+    root = pkg.parent
+    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    (pkg / ".ENV").symlink_to(".env")
+    seen: dict[str, set[str]] = {}
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY},
+        side_effect=lambda: seen.update(staged=_tree(_staging_dir(root))),
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert ".ENV" in seen["staged"]  # the link itself is package content
+    assert ".env" not in seen["staged"]
+    assert (pkg / ".ENV").is_symlink()  # still a link, not a materialized copy
+    assert (pkg / ".ENV").read_text(encoding="utf-8") == _TRICKY_ENV  # ... and it resolves
+
+
+def test_run_revise_treats_a_lone_env_case_variant_as_having_no_managed_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A package with ``.ENV`` and NO ``.env`` keeps the variant and counts as
+    having no managed ``.env`` at all (R5-2).
+
+    Nothing here is the credentials file: ``tools._load_tool_dotenv`` opens the
+    exact ``.env`` on this filesystem and finds none, so nothing was registered and
+    nothing has to be restored. The standing R3-1 acceptance therefore applies in
+    its "never had one" branch -- the builder's own ``.env`` ships, exactly as it
+    does on an install -- and it is asserted here because it is the observable
+    proof that the variant was not mistaken for the managed file."""
+    if not _case_sensitive_filesystem(tmp_path):
+        pytest.skip("this filesystem folds .env and .ENV into one file")
+    pkg = _seed_package(monkeypatch, tmp_path)
+    root = pkg.parent
+    variant = b"# ordinary content, no credentials\r\nMODE=verbose\n"
+    (pkg / ".ENV").write_bytes(variant)
+    seen: dict[str, set[str]] = {}
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY, ".env": "WRITTEN_BY_THE_MODEL=yes\n"},
+        side_effect=lambda: seen.update(staged=_tree(_staging_dir(root))),
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert ".ENV" in seen["staged"]  # copied like any other file
+    assert (pkg / ".ENV").read_bytes() == variant  # ... and published unchanged
+    # "never had one" -> the builder's .env ships, which is only true if the
+    # variant was NOT read as the managed file.
+    assert (pkg / ".env").read_text(encoding="utf-8") == "WRITTEN_BY_THE_MODEL=yes\n"
+
+
+def test_run_revise_refuses_an_env_over_the_byte_ceiling_that_fits_in_chars(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The ENTRY gate measures the ``.env`` in BYTES, the same unit promote does
+    (R5-3).
+
+    It used to measure decoded CHARS, and for a CJK-heavy ``.env`` the two answers
+    differ by a factor of three: ~30k characters is ~90 KB, so the file cleared the
+    entry gate, bought a full multi-round builder session, and was only then
+    refused by ``_preserve_env_file``'s byte check at promote -- guaranteed-to-fail
+    work, charged in full, on every single retry. Both measurements are asserted
+    here so the fixture cannot drift into proving something else."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    oversized = "# " + "測" * 30_000 + "\nKB_API_KEY=live-secret-value\n"
+    (pkg / ".env").write_text(oversized, encoding="utf-8")
+    assert len(oversized) <= tools._ENV_FILE_MAX_BYTES  # under the OLD char rule
+    assert (pkg / ".env").stat().st_size > tools._ENV_FILE_MAX_BYTES  # over the real one
+    before = _file_bytes(pkg)
+    captured = _fake_generate(
+        monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_ENV_TOO_LARGE
+    assert captured == {}  # no session was bought for a build promote would refuse
+    assert outcome.llm_log_id is None
+    assert _file_bytes(pkg) == before
+    assert not (pkg.parent / tool_builder._STAGING_DIRNAME).exists()
+    with tools._INFLIGHT_LOCK:
+        assert not tools._INFLIGHT_SECRETS
+
+
+def test_run_revise_accepts_an_env_at_the_byte_ceiling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The refusal above is the ceiling EXACTLY: a ``.env`` AT
+    ``_ENV_FILE_MAX_BYTES`` still revises, and its credentials come back.
+
+    The same edge the promote-side copy is pinned at, at the other end of the
+    session -- an entry gate that crept one byte past the property it enforces
+    would make a working package unrevisable with a message that names no key and
+    no value to explain why."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    tail = "KB_API_KEY=live-secret-value\n"
+    raw = "#" + "p" * (tools._ENV_FILE_MAX_BYTES - len(tail) - 2) + "\n" + tail
+    (pkg / ".env").write_text(raw, encoding="utf-8")
+    assert (pkg / ".env").stat().st_size == tools._ENV_FILE_MAX_BYTES  # the cap EXACTLY
+    seen: dict[str, Any] = {}
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY},
+        side_effect=lambda: seen.update(inflight=set(tools._INFLIGHT_SECRETS)),
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert seen["inflight"] == {"live-secret-value"}
+    assert (pkg / ".env").read_text(encoding="utf-8") == raw  # preserved across the swap
+
+
 def test_run_revise_prompts_carry_the_feedback_but_never_the_env_values(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4756,7 +5074,7 @@ def test_run_revise_never_redacts_or_builds_its_prompt_on_the_event_loop(
         calls.append((text, threading.current_thread()))
         return real_redact(text)
 
-    def env_read_spy(directory: Path) -> tuple[bool, dict[str, str], str | None]:
+    def env_read_spy(directory: Path) -> tuple[bool, dict[str, str], str, str | None]:
         seen["env_read"] = threading.current_thread()
         return real_env_read(directory)
 

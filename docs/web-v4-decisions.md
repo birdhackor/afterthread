@@ -444,7 +444,8 @@ store-time 重檢（D40 r2 附錄）同一個模式、同一個理由，只是�
   casefold 等於 `.env` 的名字，於是一個工具自己會讀的 `config/.env`（它的 entry 就是以
   套件目錄為 cwd 執行的）會被一次無關的修訂**靜默刪除**，而 `validate_package` 接著對這個
   被截肢的套件**驗證通過**。根層那份仍然要排除（大小寫不敏感比對保留：case-insensitive
-  檔案系統上 `.ENV` 就是那個受管檔案），巢狀的則是**普通套件內容，必須複製**。誠實記下
+  檔案系統上 `.ENV` 就是那個受管檔案——**r5 修正**：改成比對 inode 而非拼法，見下方
+  R5-2），巢狀的則是**普通套件內容，必須複製**。誠實記下
   代價：巢狀檔案若內嵌了**已登記**的秘密值，`validate_package` 的內嵌秘密閘會用它既有的
   訊息擋下這次 promote——那是閘門在做它的工作（維運者因此知道自己把 live 憑證放進了第二個
   檔案），而且嚴格優於「靜默出貨一個少了檔案的套件」。sidecar 的保留命名空間**維持每一層
@@ -564,4 +565,68 @@ store-time 重檢（D40 r2 附錄）同一個模式、同一個理由，只是�
   讀與解析在**同一個** worker hop 內完成，loop 上不再有任何 dotenv 工作，呼叫端拿到的
   仍然是「存在旗標＋值」這組既有契約。**`existed` 一律取自讀取、不取自解析結果**：
   只有註解的 `.env` 解析出來是 `{}`，與「根本沒有 `.env`」的 `{}` 一模一樣，但兩者在
-  R3-1 的判斷裡意義相反——這條以測試釘住。
+  R3-1 的判斷裡意義相反——這條以測試釘住。（**r5 微調**：同一個 hop 另外把**原始文字**
+  一併交出，供 R5-1 的拼法閘比對，見下節。）
+
+### D40 附錄（P3b review r5）：可逆拼法的 `.env` 值拒跑、根層 `.env` 改以 inode 認定、入口大小閘改用位元組
+
+- **`.env` 值的拼法若「可逆」就整場拒絕（R5-1）**：登記進遮蔽器的是 python-dotenv
+  **解析出來的值**，但磁碟上那一行可以用另一種拼法表達同一個值——`KEY="ab'cd\"ef"`
+  解析成 `ab'cd"ef`，而 raw 文字裡根本沒有這個子字串。builder 的 `run_shell` 未上鎖
+  （D21），可以直接 `cat` **正式套件**的 `.env`（它在 staging 外，但完全構得到），
+  於是那段 raw 文字對現場遮蔽器與 `llm_log._redact` 都**比對不到**，一路進下一輪提示、
+  AI 日誌 attempt bodies，甚至 summary → job body → sidecar。**安裝路徑早就把這件事
+  當成外洩並拒絕**：`_dotenv_serialize_value` 對「單引號同時碰上 `"`／`\`」的值回 None，
+  `_inject_secret_into_env` 的 round-trip 再兜底，目的就是讓 raw 那一行**逐字含有**
+  原值；差別在於 install **寫**這個檔案、掌握得了拼法，而 revise **繼承**手編的結果，
+  一直沒拿到同一個保證。**裁決**：解析完值之後、任何 LLM 呼叫與任何 `register_inflight_secret`
+  之前，逐一確認每個要登記的值**逐字出現在 raw `.env` 文字裡**；只要有一個不是，就以
+  新的 category-only zh-TW 錯誤（`_ERROR_REVISE_ENV_UNMATCHABLE`）拒絕整場修訂。方向
+  與 r1 的「太短就不跑」完全一樣：誠實的選項只有「不要跑」與「洩漏」。**訊息與
+  `_ERROR_REVISE_ENV_UNMASKABLE` 分開**，因為**補救不同**（那條是「加長」，這條是
+  「簡化該值的引號與跳脫寫法」），這正是 R3-2 立下的「同一個拒絕點、不同的可行動原因、
+  就要不同訊息」；一樣**只講條件與補救，不提 key、不提值**——在一則因為遮不掉而拒絕的
+  訊息裡把值印出來，就是它要防的那個外洩。
+  - **兩道入口閘合成一段政策**：`_unmaskable_env_error(text, values)` 同時做 r1 的下限
+    檢查與這道拼法檢查，`run_revise` 只留一行。它們說的是同一件事（遮不掉的值不能交給
+    builder session），只差在「為什麼遮不掉」。
+  - **比對用的文字就是 `tools._read_regular_file_capped` 產出的那份**（utf-8
+    `errors="replace"`、universal newlines），而這是**正確**的表示法而不是順手的：
+    `_run_shell_subprocess` 以**完全相同**的設定解碼它 merged 的輸出，所以在這裡是
+    逐字子字串的值，在 `cat` 的輸出裡也會是遮蔽器看得到的同一個字串。
+  - **在 worker 上做**（R1-3 同一條規則）：一份 64 KiB 的 `.env` 可以塞進數千個值，
+    每個值對全文做一次子字串搜尋是幾百毫秒的真工作，而 revise 跑在背景 job、與所有
+    HTTP request 共用同一個 loop。文字由**同一次讀取**交出（`_read_env_for_values` 改回
+    `(existed, values, text, error)`）——第二次讀可能讀到不同內容，那樣檢查的就不是
+    被登記的那一版。
+- **根層 `.env` 改以 inode 認定，不再看拼法（R5-2）**：copytree 的 ignore 原本排除
+  根層所有 casefold 等於 `.env` 的名字，但 `_preserve_env_file` **只還原正好叫 `.env`
+  的那個**。於是在 case-**SENSITIVE** 檔案系統上，`.ENV` 是一個**不同的、普通的**套件
+  檔案（工具的 entry 以套件目錄為 cwd，大可自己讀它），卻被一次無關的修訂**靜默刪除**，
+  而 `validate_package` 照樣**驗證通過**——與 R2-2 修掉的巢狀 `.env` 完全同一種失效，
+  只是換個名字活在根層。**裁決**：只有在它**就是**受管的那個檔案時才排除——保留精確
+  名稱比對，casefold 變體則要求與 `<root>/.env` **同一個 inode**（`st_dev`／`st_ino`），
+  這在 case-insensitive 檔案系統上恰好為真、在 case-sensitive 上恰好為假。sidecar 的
+  保留命名空間**每一層都排除，維持不變**。
+  - **用 `os.lstat` 而不是 `os.stat`／`os.path.samefile`**：要問的是「是不是同一個
+    **目錄項**」。case-insensitive 檔案系統上兩個名字就是一個目錄項，lstat 自然同 inode；
+    但一條指向 `.env` 的 `.ENV` **symlink** 在跟隨式 stat 下也會判成「同一個檔案」，
+    排除它就是把這個 finding 的 bug 縮小重演一次（一個不同的套件檔案被靜默刪除、
+    而且永遠不會被還原）。lstat 讓連結還是連結，`copytree(symlinks=True)` 原樣帶過去，
+    `_preserve_env_file` 放回 `.env` 之後它自然又解得開。
+  - **兩個 stat 都有防護**：檔案在 `scandir` 與此之間消失、或根本沒有 `.env`，都**不是
+    同一個檔案**，所以照樣複製。這是安全的方向（另一邊是「憑一次失敗的 stat 刪掉套件
+    內容」），而受管檔案本身不可能因此漏掉——精確名稱那條分支根本不 stat。
+- **入口的大小閘改用位元組（R5-3）**：入口量的是 `_read_regular_file_capped` 解碼後的
+  **字元數**，而 r4 的複製閘量的是 `lstat().st_size` 的**位元組**。CJK 很多的 `.env`
+  （約 3 萬字元 ≈ 90 KB）因此**過得了入口**、燒掉一整場多輪 builder session，然後才在
+  promote 被拒——保證失敗的工作卻付了全額，而且每次重試都再付一次。**裁決**：入口
+  沿用它本來就會做的那次 `lstat`，改用 `st_size` 套**同一把位元組尺**，讓 promote 會拒
+  的 `.env` 根本不會開場。**promote 的檢查照樣留著**：檔案可以在 session 中途被換掉，
+  那正是 R4-1 指出的危險，入口閘看不到它。**錯誤沿用 `_ERROR_REVISE_ENV_TOO_LARGE`
+  而不新增一條**：條件是同一個檔案的同一把尺，**補救也一模一樣**（把 `.env` 縮到上限
+  以下），而 R3-2 拆訊息的準繩恰恰是「補救不同才要不同訊息」——這裡不同的話反而是在
+  暗示一個操作者其實沒有的動作。讀取後的**字元檢查保留**，它現在的角色是防「lstat 與
+  read 之間檔案長大了」的同型 TOCTOU 殘留。**`tools._load_tool_dotenv` 自己那條以字元
+  計的上限是另一件事**：那是 **runtime** 願意載入多少的既有界線（而且是降級成 no-env
+  而非拒絕），本輪完全不動，docstring 裡寫明。
