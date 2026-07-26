@@ -2435,6 +2435,59 @@ def test_router_get_summary_degrades_a_hand_edited_sidecar(
     }
 
 
+def test_router_summary_survives_a_lone_surrogate_in_the_sidecar(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A hand-edited ``"\\ud800"`` broke BOTH summary verbs, and neither failure
+    was the fixed, honest answer the routes promise.
+
+    ``\\ud800`` is a legal JSON escape, so ``json.loads`` happily produces a
+    ``str`` for it -- one that is NOT UTF-8 encodable. On the GET that value rode
+    into ``ToolSummaryDetail`` and raised ``UnicodeEncodeError`` inside
+    Starlette's strict ``JSONResponse.render``: a 500 out of the one route whose
+    whole job is to DEGRADE a corrupt sidecar. On the PATCH the write path's
+    byte-size ``.encode("utf-8")`` sat outside the fail-closed try, so the same
+    value 500'd a request whose contract is False -> 404.
+
+    Both boundaries scrub now, so the GET renders U+FFFD and the PATCH behaves
+    like any other finalize. The read-side scrub is not redundant with the write
+    side: this file never passed through our writer."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / tools._AI_META_FILENAME).write_text(
+        json.dumps(
+            {
+                "summary": "a\ud800b",
+                "status": "draft",
+                "updated_at": "2026-07-26T00:00:00+00:00",
+                "llm_log_id": 7,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    response = client.get("/api/tools/kbsearch/summary")
+    assert response.status_code == 200
+    body = response.json()
+    # One surrogate scrubs to THREE U+FFFD (surrogatepass gives three bytes, the
+    # replace-decode substitutes per byte) -- asserted structurally rather than by
+    # a literal count, since the ratio is the helper's business, not the route's.
+    assert body["summary"].startswith("a")
+    assert body["summary"].endswith("b")
+    assert "�" in body["summary"]
+    assert "\ud800" not in body["summary"]
+    assert body["status"] == "draft"
+    assert body["llm_log_id"] == 7
+
+    # ... and the finalize path, whose summary is non-empty after the scrub, is a
+    # plain 200 rather than a 500 (or a 409 for a summary that is really there).
+    patched = client.patch("/api/tools/kbsearch/summary", json={"status": "final"})
+    assert patched.status_code == 200
+    assert patched.json()["status"] == "final"
+    assert client.get("/api/tools/kbsearch/summary").json()["status"] == "final"
+    # The sidecar the PATCH rewrote is now real UTF-8 on disk.
+    (pkg / tools._AI_META_FILENAME).read_text(encoding="utf-8").encode("utf-8")
+
+
 def test_router_get_summary_404_for_unknown_tool(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

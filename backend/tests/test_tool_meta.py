@@ -353,6 +353,48 @@ def test_user_prompt_bounded_by_the_prompt_budget(
     assert len(prompt) <= 4_000
 
 
+def test_user_prompt_budget_cut_eats_context_not_the_package(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The ORDER is the third bound, and the only one that decides WHAT survives.
+
+    4 000 is the LEGAL FLOOR of ``llm_prompt_budget_tokens`` (config's ``ge``),
+    and the install form admits 20 000 chars of instructions -- so this is an
+    ordinary configuration, not a pathological one. With the context emitted
+    FIRST (what this did before), the final whole-prompt truncation cut inside
+    the instructions and the model received ZERO package content, then invented
+    documentation from the instructions alone -- which we then persisted as the
+    tool's explanation, under a system prompt whose central rule is "describe
+    ONLY what the files actually show".
+
+    Subject first, context last: the cut now eats background and the package
+    truth survives. Both halves are asserted -- the tail that got cut AND the
+    head that did not -- so this fails if the order regresses in either
+    direction, rather than merely if the prompt got shorter."""
+    root = tmp_path / "tools"
+    pkg = _package(root, run_py="# RUNPY-BODY-MARKER\n" + "z" * 600)
+    _summary_settings(monkeypatch, root, llm_prompt_budget_tokens=4_000)
+    # Exactly _CONTEXT_CAP, so the inner per-field cap is NOT what removes the
+    # tail -- the whole-prompt budget cut is.
+    instructions = "B" * (tool_meta._CONTEXT_CAP - 24) + "INSTRUCTIONS-TAIL-MARKER"
+    assert len(instructions) == tool_meta._CONTEXT_CAP
+
+    prompt = tool_meta._summary_user_prompt(
+        "kbsearch",
+        pkg,
+        origin={"openapi_url": "http://kb.example/o.json", "instructions": instructions},
+        builder_summary=None,
+    )
+
+    assert len(prompt) <= 4_000  # the budget really did bite
+    # The SUBJECT survives: the manifest and the first implementation file.
+    assert "searches the KB" in prompt  # tool.json content
+    assert "RUNPY-BODY-MARKER" in prompt  # run.py content
+    # The CONTEXT is what got cut -- present, but truncated from the end.
+    assert "The user's original install instructions:" in prompt
+    assert "INSTRUCTIONS-TAIL-MARKER" not in prompt
+
+
 def test_user_prompt_bounds_the_file_count(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     root = tmp_path / "tools"
     pkg = _package(root)
@@ -810,6 +852,105 @@ def test_regenerate_summary_refuses_a_finalize_that_lands_mid_generation(
     assert stored["status"] == "final"
 
 
+class _ContendedLock:
+    """A ``threading.Lock`` that REPORTS when an acquirer finds it already held.
+
+    Substituted for ``tools._META_LOCK`` so the interleave test below can be
+    deterministic instead of sleep-timed: the ``blocked`` event fires at the
+    exact moment a second thread tries to enter the critical section and cannot,
+    which IS the mutual exclusion under test. It also makes the test fail loudly
+    (rather than flakily pass) if the lock is ever removed -- with no lock there
+    is no contention to observe, so ``blocked`` never fires and the parked
+    finalize times out."""
+
+    def __init__(self, blocked: threading.Event) -> None:
+        self._inner = threading.Lock()
+        self._blocked = blocked
+
+    def __enter__(self) -> _ContendedLock:
+        if not self._inner.acquire(blocking=False):
+            self._blocked.set()
+            self._inner.acquire()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._inner.release()
+
+
+def test_regenerate_summary_cannot_undo_a_finalize_holding_the_lock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The finalize re-check is a READ-then-WRITE, and by itself it guards nothing.
+
+    Both sequences run on THREADPOOL workers in production -- the PATCH's
+    ``set_summary_status`` on one, a regenerate's store on another -- so they
+    genuinely execute in parallel. Unserialized, both read ``"draft"``, the PATCH
+    writes ``"final"``, and the store then writes its OWN composed meta carrying
+    the stale ``"draft"`` plus the new summary: the operator's 定版 silently
+    undone, and the frozen text replaced by exactly the generation the freeze
+    existed to stop. The re-check only means something while nothing can land
+    between the read and the write.
+
+    Driven through the REAL lock with two real threads, sequenced by events
+    rather than sleeps: the finalize parks INSIDE its own hold until the store
+    has demonstrably contended for the lock, then completes. The store must
+    therefore observe ``final`` and refuse."""
+    root = tmp_path / "tools"
+    pkg = _package(root)
+    _summary_settings(monkeypatch, root)
+    _write_meta(pkg, summary="定版的說明", status="draft")
+
+    blocked = threading.Event()  # set when the store finds the lock already held
+    inside = threading.Event()  # set once the finalize is inside its hold
+    monkeypatch.setattr(tools, "_META_LOCK", _ContendedLock(blocked))
+
+    frozen: dict[str, bytes] = {}
+    failures: list[BaseException] = []
+    real_write = tools.write_tool_meta
+
+    def write_then_park(directory: Path, meta: dict[str, Any]) -> bool:
+        # Runs INSIDE set_summary_status's lock hold. Parking here is what forces
+        # the store to arrive while the finalize is mid-sequence -- the exact
+        # window the r2 code lost the race in.
+        if meta.get("status") == "final":
+            inside.set()
+            assert blocked.wait(timeout=5), "the store never contended for _META_LOCK"
+        return real_write(directory, meta)
+
+    monkeypatch.setattr(tools, "write_tool_meta", write_then_park)
+
+    def finalize() -> None:
+        try:
+            assert tools.set_summary_status("kbsearch", "final") == "ok"
+            frozen["bytes"] = (pkg / tools._AI_META_FILENAME).read_bytes()
+        except BaseException as exc:  # reported to the main thread, never swallowed
+            failures.append(exc)
+
+    finalizer = threading.Thread(target=finalize)
+
+    def start_finalize_mid_call() -> None:
+        # "While the generation is in flight" -- the only place a concurrent
+        # PATCH can actually land in production.
+        finalizer.start()
+        assert inside.wait(timeout=10), "the finalize never reached its lock hold"
+
+    _fake_generate(monkeypatch, summary="新的說明", side_effect=start_finalize_mid_call)
+
+    outcome = asyncio.run(regenerate_summary("kbsearch"))
+
+    finalizer.join(timeout=10)
+    assert not finalizer.is_alive()
+    assert not failures, failures
+    assert outcome is tool_meta.StoreRefusal.FINALIZED
+    # Byte-for-byte what 定版 froze: the in-flight generation left no trace, not
+    # even a refreshed updated_at.
+    assert (pkg / tools._AI_META_FILENAME).read_bytes() == frozen["bytes"]
+    stored = tools.read_tool_meta(pkg)
+    assert stored is not None
+    assert stored["summary"] == "定版的說明"
+    assert stored["status"] == "final"
+
+
 def test_regenerate_summary_builds_the_prompt_off_the_event_loop(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -839,3 +980,59 @@ def test_regenerate_summary_builds_the_prompt_off_the_event_loop(
     asyncio.run(regenerate_summary("kbsearch"))
 
     assert seen["thread"] is not loop_thread
+
+
+@pytest.mark.parametrize(
+    "entry_point",
+    ["regenerate", "install-hook"],
+)
+def test_sidecar_io_never_runs_on_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, entry_point: str
+) -> None:
+    """The resolve, the sidecar read and the STORE are blocking work, and both
+    entry points hop them onto a worker.
+
+    The store is the one that matters most now: it holds ``tools._META_LOCK``
+    across a read-write-read, and a lock taken on the event loop parks the WHOLE
+    process (every other request in flight) behind one package's sidecar I/O
+    rather than one threadpool worker. The install hook is included because it
+    runs from a background task that shares the same loop -- its blocking work is
+    exactly as unwelcome there as a route's.
+
+    Asserted by THREAD, like the prompt-build test above: asyncio.run drives the
+    loop on this thread, so a different one means the hop really happened."""
+    root = tmp_path / "tools"
+    pkg = _package(root)
+    _summary_settings(monkeypatch, root)
+    _write_meta(pkg, summary="舊的", status="draft")
+    loop_thread = threading.current_thread()
+    seen: dict[str, Any] = {}
+    real_store = tool_meta._store_meta
+    real_resolve = tools._resolve_package_dir_no_alias
+    real_read = tools.read_tool_meta
+
+    def store_spy(*args: Any, **kwargs: Any) -> Any:
+        seen["store"] = threading.current_thread()
+        return real_store(*args, **kwargs)
+
+    def resolve_spy(*args: Any, **kwargs: Any) -> Any:
+        seen["resolve"] = threading.current_thread()
+        return real_resolve(*args, **kwargs)
+
+    def read_spy(*args: Any, **kwargs: Any) -> Any:
+        seen["read"] = threading.current_thread()
+        return real_read(*args, **kwargs)
+
+    monkeypatch.setattr(tool_meta, "_store_meta", store_spy)
+    monkeypatch.setattr(tools, "_resolve_package_dir_no_alias", resolve_spy)
+    monkeypatch.setattr(tools, "read_tool_meta", read_spy)
+    _fake_generate(monkeypatch, summary="新的說明")
+
+    if entry_point == "regenerate":
+        asyncio.run(regenerate_summary("kbsearch"))
+    else:
+        asyncio.run(generate_and_store_summary("kbsearch"))
+
+    assert seen["resolve"] is not loop_thread
+    assert seen["read"] is not loop_thread
+    assert seen["store"] is not loop_thread

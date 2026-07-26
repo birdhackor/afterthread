@@ -3,8 +3,11 @@
 The installer (``tool_builder``) answers "did it build?"; this module answers
 "what did it build, and how does it work?" -- one short LLM session that READS
 the promoted package (manifest + implementation files) and writes a user-facing
-explanation into the package's own ``.ai_meta.json`` sidecar
-(``tools.read_tool_meta`` / ``tools.write_tool_meta``).
+explanation into the package's own ``.ai_meta.json`` sidecar. The sidecar itself
+belongs to ``tools``: this module composes the summary and hands it to
+``tools.store_summary_meta``, which owns the merge, the finalize refusal, the
+``_META_LOCK`` critical section and the atomic write. Nothing here touches the
+file directly.
 
 Three properties are deliberate, and each has a failure mode behind it:
 
@@ -38,7 +41,6 @@ rather than being swallowed into a silent no-op.
 """
 
 import os
-from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -187,10 +189,6 @@ class ToolSummaryResult(BaseModel):
         return self
 
 
-def _now_iso() -> str:
-    return datetime.now(UTC).isoformat()
-
-
 def _package_files(directory: Path) -> list[tuple[str, str]]:
     """Every readable implementation file as ``(relative path, content)``.
 
@@ -255,18 +253,36 @@ def _summary_user_prompt(
 ) -> str:
     """The session's user turn: the package itself, plus its install context.
 
-    Bounded the same way every other prompt in this codebase is: the operator's
-    ONE ``llm_prompt_budget_tokens`` knob, converted to a CHAR allowance through
-    the live chars<->tokens ratio, applied to the assembled text behind the
-    shared truncation marker. The per-file cap above is the inner bound (no
-    single file may crowd out the inventory); this is the outer one (the whole
-    prompt stays inside the operator's budget however many files there are).
+    Bounded THREE ways, and the third is the ORDER of the sections below.
+
+    The per-file cap above is the INNER bound (no single file may crowd the
+    others out of the inventory) and the operator's ONE
+    ``llm_prompt_budget_tokens`` knob -- converted to a CHAR allowance through
+    the live chars<->tokens ratio and applied to the assembled text behind the
+    shared truncation marker -- is the OUTER one (the whole prompt stays inside
+    the budget however many files there are).
+
+    Neither of those decides WHAT survives a cut, which is why the SUBJECT is
+    emitted before the CONTEXT: header, then ``tool.json``, then the
+    implementation files, then the ``.env`` key names, and only THEN the install
+    URL / instructions / builder report. A final truncation eats from the END, so
+    this order makes it eat background first and package truth last. With the
+    context leading (what this did before), a LEGAL floor budget --
+    ``llm_prompt_budget_tokens=4000`` is a valid setting, and instructions may be
+    20 000 chars by the install schema -- cut inside the context itself and the
+    model received ZERO package content, then dutifully invented documentation
+    from the instructions alone, which we persisted as the tool's explanation.
+    That is the worst possible failure for a summary whose system prompt's
+    central rule is "describe ONLY what the files show". Truncation may degrade
+    HELPFULNESS; it must never remove the subject.
 
     EVERY piece is redacted on its UNTOUCHED text, before any strip or cut.
     ``origin`` is what the install captured (the OpenAPI URL and the user's
     instructions -- neither is persisted anywhere else), and ``builder_summary``
     is the builder's own report of what it did; both are CONTEXT for reading the
-    files, capped tightly so they can never displace the files themselves.
+    files, capped tightly (``_CONTEXT_CAP``) so they can never displace the files
+    themselves -- the cap bounds their SIZE, the ordering bounds what they can
+    displace when the budget bites anyway.
 
     The origin fields are OPERATOR-supplied and were the hole here: an install
     URL is routinely ``https://api.example/openapi.json?token=<the form
@@ -283,23 +299,7 @@ def _summary_user_prompt(
     parts = [
         f"Explain the installed tool package `{name}`.",
     ]
-    openapi_url = origin_data.get("openapi_url")
-    if isinstance(openapi_url, str) and openapi_url.strip():
-        parts.append(
-            "It was built from this OpenAPI document: "
-            + tools.redact_known_secrets(openapi_url).strip()
-        )
-    instructions = origin_data.get("instructions")
-    if isinstance(instructions, str) and instructions.strip():
-        parts.append(
-            "The user's original install instructions:\n"
-            + _truncate_to(tools.redact_known_secrets(instructions).strip(), _CONTEXT_CAP)
-        )
-    if builder_summary and builder_summary.strip():
-        parts.append(
-            "What the builder reported after building it:\n"
-            + _truncate_to(tools.redact_known_secrets(builder_summary).strip(), _CONTEXT_CAP)
-        )
+    # --- the SUBJECT first (see the ordering note above) ---
     manifest = tools._read_regular_file_capped(directory / "tool.json", _FILE_CONTENT_CAP)
     if manifest is not None:
         parts.append(
@@ -316,6 +316,24 @@ def _summary_user_prompt(
         parts.append(
             "The package has a .env providing these environment variables "
             "(values withheld): " + tools.redact_known_secrets(", ".join(keys))
+        )
+    # --- then the CONTEXT, which is what a budget cut is allowed to eat ---
+    openapi_url = origin_data.get("openapi_url")
+    if isinstance(openapi_url, str) and openapi_url.strip():
+        parts.append(
+            "It was built from this OpenAPI document: "
+            + tools.redact_known_secrets(openapi_url).strip()
+        )
+    instructions = origin_data.get("instructions")
+    if isinstance(instructions, str) and instructions.strip():
+        parts.append(
+            "The user's original install instructions:\n"
+            + _truncate_to(tools.redact_known_secrets(instructions).strip(), _CONTEXT_CAP)
+        )
+    if builder_summary and builder_summary.strip():
+        parts.append(
+            "What the builder reported after building it:\n"
+            + _truncate_to(tools.redact_known_secrets(builder_summary).strip(), _CONTEXT_CAP)
         )
     # One FINAL pass over the fully assembled text, and it is the class-closer:
     # every field above is masked individually, but the next field somebody adds
@@ -365,70 +383,34 @@ def _store_meta(
     origin: dict[str, Any] | None,
     llm_log_id: int | None,
 ) -> dict[str, Any] | StoreRefusal | None:
-    """Merge the new summary into the package's sidecar and write it back.
+    """Store the new summary, mapping the registry's outcome onto this module's.
 
-    The FIRST thing it does is re-read the sidecar and refuse outright if the
-    status on disk is now ``final``. Both callers of a regeneration check 定版
-    UP FRONT, but that check happens before an ``await`` that lasts as long as an
-    LLM round trip, and a PATCH can finalize inside that window -- so the
-    up-front gate is a courtesy, and THIS is the one that holds. Preserving the
-    ``final`` status while still overwriting the summary TEXT (what this did
-    before) satisfied the letter of 定版 and broke its meaning: the operator
-    froze an explanation and got a different one. Nothing is written and
-    ``StoreRefusal.FINALIZED`` comes back, which the route answers with the SAME
-    409 its up-front gate raises. (Read-then-write is itself a narrow race, of
-    course; it shrinks the window from "an entire LLM session" to "two syscalls",
-    which is the same single-user local-tool edge install/delete already accepts
-    -- D21/D40.)
+    A thin wrapper, and thin ON PURPOSE. The merge itself -- re-read the sidecar,
+    refuse a finalized one, inherit status/origin, write, re-read what landed --
+    is ``tools.store_summary_meta``, which runs the whole sequence under
+    ``tools._META_LOCK``. It has to live over there: the lock and the file
+    helpers do, and a critical section split across two modules is one nobody can
+    verify by reading either.
 
-    Past that gate, two fields are PRESERVED from whatever is already on disk
-    rather than reset:
+    What is left here is the translation. The registry answers with an outcome
+    CODE (the same shape ``set_summary_status`` uses, since tools.py must not
+    import this module's ``StoreRefusal``), and this maps it onto the
+    ``dict | StoreRefusal | None`` union the route already branches on:
+    ``"finalized"`` -> ``StoreRefusal.FINALIZED`` (409 ``tool_finalized``),
+    ``"not_stored"`` -> None (the did-not-happen 404), ``"ok"`` -> the sidecar as
+    it now reads back.
 
-    * ``status`` -- a regenerate on a 草稿 stays 草稿. With ``final`` refused
-      above, ``"draft"`` is the only value that can actually survive today; the
-      preserve-known-else-draft shape is kept anyway so the function stays
-      correct if the vocabulary ever grows, and so an unknown value on disk can
-      never be persisted by us.
-    * ``origin`` -- only the install captures the OpenAPI URL and instructions,
-      so a caller with nothing to pass (``origin=None``) must inherit them
-      instead of erasing the only copy. A regeneration normally passes the
-      narrowed origin it just read back in, which lands on the same value; the
-      inheritance is what covers the sidecar that has none we can use.
-
-    Returns the sidecar AS IT NOW READS BACK, and None when nothing usable is
-    there: ``write_tool_meta`` refused (a fail-closed redaction, the ghost guard
-    on a racing delete, a FIFO/symlink swapped in for the sidecar, an unwritable
-    directory, a payload past the sidecar size cap), or the write landed and the
-    re-read still found nothing (a delete racing in behind it). The None matters
-    because the synchronous route answers WITH this dict: reporting a summary
-    that is nowhere on disk would have it vanish on the user's next GET -- a
-    wrong answer, not a filesystem detail. The install hook ignores BOTH non-dict
-    answers on purpose (see its own call sites); the route maps None to its
-    did-not-happen 404 and the refusal to 409.
-
-    Re-reading rather than returning the composed dict is not belt-and-braces:
-    ``write_tool_meta`` rebuilds the file from its OWN schema (a narrowed
-    ``origin``, coerced scalars), so what we asked for and what landed genuinely
-    differ in shape. The route promises "what the next GET would show", so this
-    has to be the file, not the request -- the same re-read discipline the PATCH
-    route applies to its own rewrite.
+    BLOCKING: this does filesystem I/O and takes a lock, so every caller reaches
+    it through ``run_in_threadpool`` -- never inline on the event loop.
     """
-    existing = tools.read_tool_meta(directory) or {}
-    if existing.get("status") == "final":
+    outcome, meta = tools.store_summary_meta(
+        directory, summary=summary, origin=origin, llm_log_id=llm_log_id
+    )
+    if outcome == "finalized":
         return StoreRefusal.FINALIZED
-    status = existing.get("status")
-    if not (isinstance(status, str) and status in tools._SUMMARY_STATUSES):
-        status = "draft"
-    meta: dict[str, Any] = {
-        "summary": summary,
-        "status": status,
-        "updated_at": _now_iso(),
-        "llm_log_id": llm_log_id,
-        "origin": origin if origin is not None else existing.get("origin"),
-    }
-    if not tools.write_tool_meta(directory, meta):
-        return None
-    return tools.read_tool_meta(directory)
+    # ``meta`` is None for every "not_stored" case and a dict for "ok" -- the two
+    # answers the route already tells apart, so no third branch is needed here.
+    return meta
 
 
 async def _generate_summary(
@@ -515,6 +497,14 @@ async def generate_and_store_summary(
     declining to overwrite it IS the right outcome, not an error to report. The
     placeholder branch cannot hit it at all (it only writes when there is no
     sidecar, and a sidecar is what carries a status).
+
+    Every filesystem step -- the resolve, the sidecar read, the store -- runs via
+    ``run_in_threadpool``. This is called from the install JOB's task, which
+    shares the event loop with every HTTP request in the process, so its blocking
+    work is exactly as unwelcome on the loop as a route's would be. Taking
+    ``tools._META_LOCK`` from a worker (never from the loop) is also what keeps
+    the hook incapable of deadlocking anything: the loop itself never waits on
+    that lock.
     """
     try:
         # The alias-refusing resolve, shared with every other by-name summary
@@ -523,7 +513,7 @@ async def generate_and_store_summary(
         # promoted -- but going through the ONE helper costs nothing and keeps
         # "every summary path refuses an alias" true by construction rather
         # than by inspection.
-        directory = tools._resolve_package_dir_no_alias(name)
+        directory = await run_in_threadpool(tools._resolve_package_dir_no_alias, name)
         if directory is None:
             # The package vanished (a racing delete) between promote and here.
             # Nothing to summarize and nowhere to write; silence is correct.
@@ -533,18 +523,20 @@ async def generate_and_store_summary(
                 name, directory, origin=origin, builder_summary=builder_summary
             )
         except Exception:
-            if tools.read_tool_meta(directory) is None:
+            if await run_in_threadpool(tools.read_tool_meta, directory) is None:
                 # Best-effort, so the write result is DELIBERATELY ignored here
                 # and below: a refused sidecar must never fail an install that
                 # already succeeded (see this function's contract).
-                _store_meta(
+                await run_in_threadpool(
+                    _store_meta,
                     directory,
                     summary="",
                     origin=origin,
                     llm_log_id=llm_log.last_record_id_for_workflow(_SUMMARY_WORKFLOW),
                 )
             return
-        _store_meta(
+        await run_in_threadpool(
+            _store_meta,
             directory,
             summary=summary,
             origin=origin,
@@ -597,13 +589,22 @@ async def regenerate_summary(name: str) -> dict[str, Any] | StoreRefusal | None:
     finalized, and that no job is mid-promote; the resolve here is a race
     backstop -- and, via the shared alias-refusing helper, the same hard-block
     every other by-name summary path runs.
+
+    The three BLOCKING steps -- the resolve, the origin read, and the store --
+    each hop through ``run_in_threadpool``, mirroring how ``routers.tools`` calls
+    every registry function. Only the LLM round trip stays on the loop, which is
+    the one thing there that is genuinely async. This matters twice over for the
+    store: it holds ``tools._META_LOCK`` for the length of a read-write-read, and
+    a lock held on the event loop would block the whole process rather than one
+    worker.
     """
-    directory = tools._resolve_package_dir_no_alias(name)
+    directory = await run_in_threadpool(tools._resolve_package_dir_no_alias, name)
     if directory is None:
         return None
-    origin = _stored_origin(tools.read_tool_meta(directory))
+    origin = _stored_origin(await run_in_threadpool(tools.read_tool_meta, directory))
     summary = await _generate_summary(name, directory, origin=origin, builder_summary=None)
-    return _store_meta(
+    return await run_in_threadpool(
+        _store_meta,
         directory,
         summary=summary,
         origin=origin,

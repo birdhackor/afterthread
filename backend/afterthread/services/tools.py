@@ -63,6 +63,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Awaitable, Callable
@@ -647,6 +648,99 @@ def validate_package(directory: Path, expected_name: str) -> str | None:
 
 # --- AI summary sidecar (D40) ------------------------------------------------
 
+# Serializes every COMPOUND sidecar operation -- the read-check-write sequences
+# ``set_summary_status`` and ``store_summary_meta`` run. Modeled on
+# ``llm_log._FILE_SINK_LOCK``: a lock whose ONLY job is making one
+# read-modify-write FILE sequence atomic w.r.t. other writers of that same file,
+# deliberately NOT any other lock in this module (``_INFLIGHT_LOCK`` /
+# ``_ENV_VALUE_CACHE_LOCK`` guard in-memory registries read on hot paths) and not
+# one borrowed from another module.
+#
+# The race it closes is not theoretical, and the finalize re-check inside
+# ``store_summary_meta`` does NOT close it on its own. Both compound operations
+# run on THREADPOOL workers (every route hops through ``run_in_threadpool``), so
+# a PATCH's ``set_summary_status`` genuinely runs in parallel with a regenerate's
+# store on another worker: both read ``"draft"``, the PATCH writes ``"final"``,
+# and the regenerate then writes its own composed meta carrying the STALE
+# ``"draft"`` plus the new summary -- 定版 silently undone, with the operator's
+# frozen text replaced by the very generation the freeze was meant to stop. Two
+# in-place writers interleaving on the same file is the second half of the same
+# hazard. Holding this lock across BOTH sequences is what makes the re-check
+# mean something: nothing can land between the read and the write.
+#
+# Two invariants keep it safe rather than merely present:
+#
+# * it is NEVER held across an ``await`` -- both acquirers are plain synchronous
+#   functions that callers reach through ``run_in_threadpool``, so the event loop
+#   is never parked on it;
+# * it NEVER nests. ``write_tool_meta`` / ``read_tool_meta`` stay lock-FREE and
+#   are called from INSIDE a hold; only the two compound entry points acquire, and
+#   neither calls the other.
+_META_LOCK = threading.Lock()
+
+
+def _utf8_safe(text: str) -> str:
+    """Replace any lone (unpaired) Unicode surrogate in ``text`` with U+FFFD.
+
+    A three-line duplicate of ``llm_log._utf8_safe``, which is the CANONICAL
+    twin -- read its docstring for why ``surrogatepass``-encode + ``replace``-
+    decode is the only pairing that actually yields U+FFFD. Duplicated rather
+    than imported for the SAME leaf/layering reason ``_REDACTION_MARKER`` is
+    (llm_log is a leaf observability module that must not import this capability
+    module, and the reverse edge would create exactly the coupling both modules'
+    docstrings forbid); ``tests/test_tools.py`` pins the two behaviorally equal
+    on a probe set so they cannot silently drift.
+
+    Why the sidecar needs it at all: ``.ai_meta.json`` is a plain JSON file the
+    operator is explicitly allowed to hand-edit, and ``"\\ud800"`` is a
+    JSON-LEGAL escape that ``json.loads`` accepts happily -- producing a ``str``
+    that is NOT UTF-8 encodable. Left alone it breaks both boundaries: on the
+    WRITE side ``json.dumps(...).encode("utf-8")`` raises ``UnicodeEncodeError``
+    (a 500 out of a PATCH that should have answered False -> 404), and on the
+    READ side it sails into the summary response and blows up in Starlette's
+    strict ``JSONResponse.render`` encode -- a 500 on a GET that exists to
+    DEGRADE a corrupt sidecar, not to die on one.
+    """
+    return text.encode("utf-8", errors="surrogatepass").decode("utf-8", errors="replace")
+
+
+def _utf8_safe_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    """Every string a sidecar read hands back, surrogate-scrubbed. Depth-bounded.
+
+    Applied to the parsed sidecar on the way OUT of ``read_tool_meta``, because a
+    hand-edited file bypasses our writer entirely: the write side can scrub what
+    IT produces, but only this covers a surrogate an operator typed straight into
+    the file. Without it a ``"\\ud800"`` in ``summary`` or ``updated_at`` reaches
+    ``ToolSummaryDetail`` and 500s the GET at response-encode time (see
+    ``_utf8_safe``).
+
+    Bounded at DEPTH 2 -- top-level values plus one level inside a dict value --
+    on purpose, not for lack of ambition. That is the entire sidecar schema (four
+    scalars plus ``origin``'s two strings), it covers every field any consumer
+    reads, and a general recursive walk would re-open precisely the hazard
+    ``read_tool_meta``'s ``RecursionError`` guard exists to close: a hand-edited
+    file that PARSES (json.loads recursing in C, on the C stack) can still be
+    nested far deeper than a Python-frame recursion can follow, which would turn
+    a corrupt sidecar back into a 500 for the whole 工具 page.
+
+    KEYS are deliberately left alone. A key carrying a surrogate can never equal
+    one of the five schema names, so it is dropped by every consumer AND by the
+    next ``write_tool_meta`` (which builds the file from its own literals) -- it
+    can therefore never reach a response or a re-serialization.
+    """
+    scrubbed: dict[str, Any] = {}
+    for key, value in meta.items():
+        if isinstance(value, str):
+            scrubbed[key] = _utf8_safe(value)
+        elif isinstance(value, dict):
+            scrubbed[key] = {
+                sub_key: _utf8_safe(sub_value) if isinstance(sub_value, str) else sub_value
+                for sub_key, sub_value in value.items()
+            }
+        else:
+            scrubbed[key] = value
+    return scrubbed
+
 
 def read_tool_meta(directory: Path) -> dict[str, Any] | None:
     """Parse the package's ``.ai_meta.json`` sidecar, or None if there is none.
@@ -675,6 +769,11 @@ def read_tool_meta(directory: Path) -> dict[str, Any] | None:
     refuses to exceed: ANYTHING THE WRITER ACCEPTS, THIS READS BACK. Sharing the
     manifest's 64 KiB cap while the writer checked nothing is exactly how a legal
     sidecar became permanently unreadable (see ``_AI_META_MAX_BYTES``).
+
+    Every string that survives is surrogate-scrubbed on the way out
+    (``_utf8_safe_meta``): a hand-edited ``"\\ud800"`` is JSON-legal but not
+    UTF-8 encodable, and this is the boundary where a file our writer never
+    touched becomes safe to serialize into a response.
     """
     text = _read_regular_file_capped(directory / _AI_META_FILENAME, _AI_META_MAX_BYTES)
     if text is None or len(text) > _AI_META_MAX_BYTES:
@@ -683,7 +782,7 @@ def read_tool_meta(directory: Path) -> dict[str, Any] | None:
         raw = json.loads(text)
     except ValueError, RecursionError:
         return None
-    return raw if isinstance(raw, dict) else None
+    return _utf8_safe_meta(raw) if isinstance(raw, dict) else None
 
 
 def _meta_str(value: Any) -> str | None:
@@ -699,18 +798,141 @@ def _meta_str(value: Any) -> str | None:
 
 
 def _redacted(value: str | None) -> str | None:
-    """One sidecar string VALUE, masked; None passes through as None.
+    """One sidecar string VALUE, masked THEN surrogate-scrubbed; None stays None.
 
     The whole redaction surface of the sidecar, now that ``write_tool_meta``
     builds the file from a fixed schema instead of serializing a caller's dict:
     exactly three string VALUES can carry operator/LLM text, and this is applied
     to each of them by name.
 
+    Redact BEFORE the scrub, the same order ``llm_log._stored_body`` runs its two
+    passes in: the redactor must match the REGISTERED value against untouched
+    text, and the scrub must not be undone afterwards (it only ever replaces a
+    lone surrogate with U+FFFD, which carries nothing to mask).
+
+    The scrub is what keeps the write path's own encode from raising: an LLM
+    reply or a hand-edited field can carry a lone surrogate, which is a legal
+    ``str`` that ``.encode("utf-8")`` refuses. Scrubbing rather than REFUSING is
+    the adjudicated choice -- one bad code point is a display-level defect in a
+    summary that is otherwise a genuine, useful explanation, and refusing would
+    lose the whole generation over it (and, on the install hook's placeholder
+    path, leave the operator with no sidecar and no 重新產生 button at all).
+    U+FFFD is exactly what the reader would show anyway, so scrubbing makes the
+    file agree with the render. The read side scrubs INDEPENDENTLY regardless
+    (see ``_utf8_safe_meta``), because a hand-edited file never passes here.
+
     Raises whatever ``redact_known_secrets`` raises: the LIVE redactor
     deliberately propagates a provider failure rather than degrading to
     unmasked, and ``write_tool_meta`` turns that into its fail-closed refusal.
     """
-    return None if value is None else redact_known_secrets(value)
+    return None if value is None else _utf8_safe(redact_known_secrets(value))
+
+
+def _write_sidecar_atomic(directory: Path, data: bytes) -> bool:
+    """Publish ``data`` as the package's sidecar ATOMICALLY. Returns success.
+
+    Why the sidecar does NOT ride ``_write_regular_file`` any more: that helper
+    opens the TARGET with ``O_CREAT | O_TRUNC``, so the previous file is
+    destroyed the instant the open succeeds and only THEN is the new content
+    written. Every failure past that point -- ENOSPC, a quota hit, an I/O error,
+    a UnicodeEncodeError partway through -- returns False with the sidecar
+    already truncated: the caller is told "did not happen" while a FINALIZED
+    summary the operator explicitly froze is gone. Nothing anywhere can restore
+    it, because the sidecar is the only copy of both the summary and the
+    install's ``origin``.
+
+    Write-to-temp + ``os.replace`` removes the whole class rather than the
+    reported instance: the old content survives EVERY failure mode, and the
+    sidecar is never observable half-written (``os.replace`` is atomic within one
+    filesystem, and the temp file is created in the SAME directory precisely so
+    it is one filesystem -- a system temp dir would risk EXDEV). House precedent
+    is ``cli.py``'s init-env publish path (``_write_env_tempfile`` +
+    ``_publish_env_file_force``); this mirrors its mechanics at the smaller scale
+    a best-effort sidecar needs.
+
+    What is deliberately NOT claimed, so nobody assumes it: the DIRECTORY is not
+    fsynced, so the rename is not durable against power loss (the file's own
+    contents are). That is the same ruling cli.py records for ``.env`` -- an
+    ordering guarantee against failure, not a crash-consistency one -- and it is
+    even easier to accept here, where the worst case is one regenerable summary.
+
+    PERMISSIONS are deliberately unchanged, and this was checked rather than
+    assumed: ``_write_regular_file`` requested ``0o600`` through ``os.open``,
+    which the process umask masks like any other ``open(2)``. ``mkstemp`` creates
+    with ``0o600`` through the same umask-masked ``os.open``, so an existing
+    sidecar and a new one get the IDENTICAL mode under any umask (verified at
+    both 0o077 and the pathological 0o777). No ``fchmod`` is added: cli.py needs
+    one because ``.env`` holds a real API key and must be readable by the human
+    who is told to go edit it, while this file is best-effort backend metadata --
+    silently STRENGTHENING its mode here would be a behavior change smuggled in
+    under an atomicity fix.
+
+    The pre-write ``lstat`` keeps the refusal semantics ``_write_regular_file``'s
+    ``O_NOFOLLOW`` + ``S_ISREG`` gate gave us: an existing sidecar that is a
+    SYMLINK (a link raced into the package, aimed out of it) or any non-regular
+    file (a FIFO/device/directory at that name) is refused outright rather than
+    replaced. ``os.replace`` would otherwise happily swap a link or a FIFO for
+    our regular file -- which is not an escape (a rename replaces the LINK, never
+    writes through it), but IS a silent change of the refusal contract those
+    tests pin. ENOENT is the ordinary first-write case and is not a refusal.
+
+    Every failure is False, never an exception: summary metadata is best-effort,
+    and the caller has exactly one "did-not-happen" answer to map. The temp file
+    is unlinked on every failure path (best-effort, suppressed -- a cleanup error
+    must not mask the original), so a failed write leaves nothing behind in the
+    package. That matters more here than for a generic temp file: a stray
+    ``.ai_meta.json.*.tmp`` sitting in a package would be scanned by every later
+    ``validate_package`` embedded-secret sweep. It is dot-prefixed for the same
+    family of reasons the sidecar itself is -- the summary prompt's file
+    inventory skips dot-files, so even a leftover temp can never feed a summary
+    back into its own next prompt.
+    """
+    path = directory / _AI_META_FILENAME
+    try:
+        existing_mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        pass  # no sidecar yet -- the ordinary first-write case, not a refusal
+    except OSError:
+        return False
+    else:
+        # lstat does NOT follow the final component, so a symlinked sidecar shows
+        # up as one here (S_ISLNK), exactly as O_NOFOLLOW used to refuse it.
+        if not stat.S_ISREG(existing_mode):
+            return False
+    try:
+        fd, tmp_name = tempfile.mkstemp(
+            dir=directory, prefix=f"{_AI_META_FILENAME}.", suffix=".tmp"
+        )
+    except OSError:
+        # A vanished/unwritable package directory (the ghost-guard race, EACCES,
+        # a read-only mount): nothing was created, nothing to clean up.
+        return False
+    tmp_path = Path(tmp_name)
+    fd_owned = True  # we own the raw fd until fdopen takes it over
+    try:
+        handle = os.fdopen(fd, "wb")
+        fd_owned = False  # fdopen now owns fd; closing the handle closes it
+        with handle:
+            # BINARY, and the bytes were encoded ONCE by the caller: the size
+            # check and the file must be measured on the identical payload, and a
+            # text handle would re-encode (and could raise) at flush time instead.
+            # BufferedWriter loops over short writes internally, so `write` +
+            # `flush` is the complete-write guarantee cli.py's `_write_all` spells
+            # out by hand over raw os.write.
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except OSError:
+        if fd_owned:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        # Safe unconditionally: tmp_path is a name mkstemp invented for THIS call
+        # alone, never a path a caller passed in (cli.py's same argument).
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        return False
+    return True
 
 
 def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
@@ -780,9 +1002,25 @@ def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
     The serialized payload is bounded by ``_AI_META_MAX_BYTES``, the SAME cap
     ``read_tool_meta`` refuses past, so this can never produce a file that reads
     back as None. Every other failure (an unwritable path, a symlinked/FIFO
-    sidecar refused by ``_write_regular_file``'s O_NOFOLLOW + O_NONBLOCK +
-    S_ISREG gate) is False too, so callers get one "did-not-happen" answer and
-    never an exception -- summary metadata is best-effort by design.
+    sidecar refused by ``_write_sidecar_atomic``'s lstat gate) is False too, so
+    callers get one "did-not-happen" answer and never an exception -- summary
+    metadata is best-effort by design.
+
+    The serialize + encode + size check live INSIDE the fail-closed ``try``, and
+    that placement is load-bearing rather than tidy. They used to sit outside it,
+    so a lone surrogate reaching any string field raised ``UnicodeEncodeError``
+    straight out of this function -- turning a PATCH that should have answered
+    False (-> 404) into a 500. ``_redacted`` now scrubs the three text fields
+    before ``dumps`` sees them, so the surrogate case is HANDLED rather than
+    merely caught; the guard still covers ``updated_at``, the one caller-supplied
+    string this function passes through verbatim (every real caller stamps a
+    machine timestamp, so scrubbing it would only paper over a caller bug -- a
+    refusal is the honest answer there).
+
+    The write itself is ATOMIC (``_write_sidecar_atomic``): the previous sidecar
+    survives every failure and the file is never observable half-written. See
+    that helper for why the truncate-then-write shape was a real data-loss
+    vector for a FINALIZED summary.
 
     CONSEQUENCE, stated so it is not rediscovered as a bug: extra keys a
     hand-edited sidecar carries are DROPPED by the next write. Round-tripping
@@ -818,7 +1056,7 @@ def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
     origin_raw = meta.get("origin")
     try:
         payload: dict[str, Any] = {
-            "summary": redact_known_secrets(summary),
+            "summary": _redacted(summary),
             "status": status,
             "updated_at": updated_at,
             "llm_log_id": log_id,
@@ -831,17 +1069,19 @@ def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
                 else None
             ),
         }
+        # ensure_ascii=False keeps CJK readable in the file (and is what the byte
+        # cap below is measured against). Every value is a str/int/None we just
+        # built, so dumps cannot fail on an unserializable type -- but the ENCODE
+        # can still raise on a surrogate-bearing ``updated_at``, which is why both
+        # steps sit inside this guard (see the docstring). The cap is checked on
+        # the ENCODED length, because that is the unit the writer's half of the
+        # read/write symmetry is stated in (see _AI_META_MAX_BYTES).
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     except Exception:
         return False
-    # ensure_ascii=False keeps CJK readable in the file (and is what the byte cap
-    # below is measured against). Every value is a str/int/None we just built, so
-    # dumps cannot fail on an unserializable type -- but the cap is checked on the
-    # ENCODED length, because that is the unit the writer's half of the
-    # read/write symmetry is stated in (see _AI_META_MAX_BYTES).
-    text = json.dumps(payload, ensure_ascii=False)
-    if len(text.encode("utf-8")) > _AI_META_MAX_BYTES:
+    if len(data) > _AI_META_MAX_BYTES:
         return False
-    return _write_regular_file(directory / _AI_META_FILENAME, text)
+    return _write_sidecar_atomic(directory, data)
 
 
 def summary_status(directory: Path) -> str | None:
@@ -899,20 +1139,100 @@ def set_summary_status(name: str, status: str) -> str:
     Resolved through ``_resolve_package_dir_no_alias``: a 定版 addressed at
     ``tools/alias`` must not freeze the REAL package's summary (see that
     helper).
+
+    The read-check-write runs entirely under ``_META_LOCK``, which is what makes
+    the emptiness gate and the flip one decision instead of two: this runs on a
+    threadpool worker, and a regenerate's store runs on ANOTHER one, so without
+    the hold the two interleave and one of them writes a state neither ever saw.
+    The RESOLVE stays outside the hold -- it is ordinary path work, not part of
+    the sidecar's read-modify-write, so there is no reason to serialize it.
     """
     directory = _resolve_package_dir_no_alias(name)
     if directory is None:
         return "not_found"
-    meta = read_tool_meta(directory)
-    if meta is None:
-        return "no_meta"
-    if status == "final":
-        summary = meta.get("summary")
-        if not (isinstance(summary, str) and summary.strip()):
+    with _META_LOCK:
+        meta = read_tool_meta(directory)
+        if meta is None:
             return "no_meta"
-    meta["status"] = status
-    meta["updated_at"] = datetime.now(UTC).isoformat()
-    return "ok" if write_tool_meta(directory, meta) else "not_found"
+        if status == "final":
+            summary = meta.get("summary")
+            if not (isinstance(summary, str) and summary.strip()):
+                return "no_meta"
+        meta["status"] = status
+        meta["updated_at"] = datetime.now(UTC).isoformat()
+        return "ok" if write_tool_meta(directory, meta) else "not_found"
+
+
+def store_summary_meta(
+    directory: Path,
+    *,
+    summary: str,
+    origin: dict[str, Any] | None,
+    llm_log_id: int | None,
+) -> tuple[str, dict[str, Any] | None]:
+    """Merge a freshly generated summary into the sidecar. Returns ``(outcome, meta)``.
+
+    The OTHER compound sidecar operation, and ``set_summary_status``'s
+    counterpart: the whole read (status/origin inheritance) + finalize refusal +
+    write + post-write re-read happens under ONE ``_META_LOCK`` hold, so a 定版
+    can neither land inside it nor be undone by it. It lives HERE rather than in
+    ``tool_meta`` because the lock and the sidecar helpers do
+    (``tool_meta._store_meta`` is now a thin mapping wrapper); putting the
+    critical section next to the file it protects is what keeps "every compound
+    sidecar operation is serialized" checkable by reading one module.
+
+    Three outcomes, so the caller can tell "you cannot do this" from "it did not
+    work" -- the distinction the route turns into a 409 vs a 404:
+
+    * ``("finalized", None)`` -- the status on disk is ``final``. NOTHING is
+      written. Both regeneration callers check 定版 UP FRONT, but that check
+      happens before an ``await`` that lasts as long as an LLM round trip and a
+      PATCH can finalize inside that window, so the up-front gate is a courtesy
+      and THIS is the one that holds. Preserving the ``final`` status while still
+      overwriting the summary TEXT (what this did before) satisfied the letter of
+      定版 and broke its meaning: the operator froze an explanation and got a
+      different one;
+    * ``("not_stored", None)`` -- the write was refused (a fail-closed redaction,
+      the ghost guard on a racing delete, a symlinked/non-regular sidecar, a
+      payload past the size cap), or it landed and the re-read still found
+      nothing (a delete racing in behind it). One did-not-happen answer, because
+      from the caller's view nothing usable is on disk either way;
+    * ``("ok", meta)`` -- the sidecar AS IT NOW READS BACK. Re-reading rather
+      than returning the composed dict is not belt-and-braces: ``write_tool_meta``
+      rebuilds the file from its OWN schema (a narrowed ``origin``, coerced
+      scalars, redacted text), so what we asked for and what landed genuinely
+      differ in shape, and the synchronous route promises "what the next GET
+      would show".
+
+    Past the finalize gate, two fields are PRESERVED from what is already on disk
+    rather than reset:
+
+    * ``status`` -- a regenerate on a 草稿 stays 草稿. With ``final`` refused
+      above, ``"draft"`` is the only value that can actually survive today; the
+      preserve-known-else-draft shape is kept anyway so this stays correct if the
+      vocabulary ever grows, and so an unknown value on disk is never persisted;
+    * ``origin`` -- only the install captures the OpenAPI URL and instructions,
+      so a caller with nothing to pass (``origin=None``) must inherit them
+      instead of erasing the only copy.
+    """
+    with _META_LOCK:
+        existing = read_tool_meta(directory) or {}
+        if existing.get("status") == "final":
+            return ("finalized", None)
+        status = existing.get("status")
+        if not (isinstance(status, str) and status in _SUMMARY_STATUSES):
+            status = "draft"
+        meta: dict[str, Any] = {
+            "summary": summary,
+            "status": status,
+            "updated_at": datetime.now(UTC).isoformat(),
+            "llm_log_id": llm_log_id,
+            "origin": origin if origin is not None else existing.get("origin"),
+        }
+        if not write_tool_meta(directory, meta):
+            return ("not_stored", None)
+        stored = read_tool_meta(directory)
+        return ("ok", stored) if stored is not None else ("not_stored", None)
 
 
 def list_tools() -> list[dict[str, Any]]:

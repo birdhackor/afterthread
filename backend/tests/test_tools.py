@@ -27,6 +27,7 @@ import inspect
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -2216,8 +2217,14 @@ def test_write_tool_meta_refuses_to_resurrect_a_deleted_package(tmp_path: Path) 
 
 
 def test_write_tool_meta_refuses_symlinked_sidecar(tmp_path: Path) -> None:
-    """The bounded writer's O_NOFOLLOW refuses a symlinked sidecar, so a link
-    raced into the package can never redirect the write out of it."""
+    """A symlinked sidecar is refused, so a link raced into the package can never
+    redirect the write out of it.
+
+    Enforced by the atomic writer's pre-write ``lstat`` since r3 (it does not
+    follow the final component, exactly as the old ``O_NOFOLLOW`` open did not).
+    The refusal had to be carried over deliberately: ``os.replace`` onto a
+    symlink would replace the LINK rather than write through it -- not an escape,
+    but a silent change to what this contract promises."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     outside = tmp_path / "outside.json"
@@ -2226,6 +2233,329 @@ def test_write_tool_meta_refuses_symlinked_sidecar(tmp_path: Path) -> None:
 
     assert _write_meta(pkg, summary="s") is False
     assert outside.read_text(encoding="utf-8") == "{}"  # target untouched
+    assert _sidecar(pkg).is_symlink()  # not silently replaced by a regular file
+    assert not list(pkg.glob(f"{tools._AI_META_FILENAME}.*"))  # no temp left behind
+
+
+def test_write_tool_meta_refuses_a_non_regular_sidecar(tmp_path: Path) -> None:
+    """The S_ISREG half of the same gate: a FIFO (or device/directory) sitting at
+    the sidecar name is refused rather than replaced.
+
+    ``_write_regular_file``'s ``fstat`` used to enforce this; the atomic path's
+    ``lstat`` is where it lives now. Without it a FIFO an operator (or a
+    ``run_shell``) put there would be silently swapped for a regular file."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    os.mkfifo(_sidecar(pkg))
+
+    assert _write_meta(pkg, summary="s") is False
+    assert stat.S_ISFIFO(os.lstat(_sidecar(pkg)).st_mode)  # still the FIFO
+    assert not list(pkg.glob(f"{tools._AI_META_FILENAME}.*"))
+
+
+def test_write_tool_meta_keeps_the_old_sidecar_when_the_publish_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The r2 writer opened the TARGET with O_TRUNC, so the previous sidecar was
+    already destroyed by the time any failure could be reported.
+
+    That is real data loss, not a lost update: on ENOSPC/quota/an I/O error the
+    caller was told False -- "nothing happened" -- while a FINALIZED summary the
+    operator explicitly froze had been truncated to nothing, and the sidecar is
+    the ONLY copy of both that summary and the install's ``origin``. Writing to a
+    temp file and publishing with ``os.replace`` means the old content survives
+    every failure mode, and the file is never observable half-written.
+
+    The failure is injected at ``os.replace`` -- the last step, after the temp
+    file is fully written and fsynced -- because that is the strictest version of
+    the claim: even a failure at the very END leaves the previous file intact."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    assert _write_meta(pkg, summary="定版的說明", status="final") is True
+    before = _sidecar(pkg).read_bytes()
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "replace", boom)
+    assert _write_meta(pkg, summary="新的說明") is False
+
+    assert _sidecar(pkg).read_bytes() == before  # byte-identical, not truncated
+    # ... and nothing was left lying around in the package: a stray temp file
+    # would be scanned by every later validate_package embedded-secret sweep.
+    assert not list(pkg.glob(f"{tools._AI_META_FILENAME}.*"))
+    assert sorted(child.name for child in pkg.iterdir()) == [tools._AI_META_FILENAME]
+
+
+def test_write_tool_meta_publishes_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A concurrent reader never observes a half-written sidecar.
+
+    The property ``os.replace`` buys over open-and-truncate, asserted at the
+    mechanism rather than by racing threads: the bytes are complete and fsynced
+    in the temp file BEFORE the name flips, so the sidecar path only ever holds
+    the old file or the whole new one."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    assert _write_meta(pkg, summary="舊的") is True
+    seen: dict[str, Any] = {}
+    real_replace = os.replace
+
+    def watched(src: Any, dst: Any, **kwargs: Any) -> None:
+        # At swap time the OLD file is still whole under the sidecar name, and
+        # the NEW content is already complete in a file of its own.
+        seen["old"] = json.loads(Path(dst).read_text(encoding="utf-8"))["summary"]
+        seen["new"] = json.loads(Path(src).read_text(encoding="utf-8"))["summary"]
+        real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "replace", watched)
+    assert _write_meta(pkg, summary="新的") is True
+
+    assert seen == {"old": "舊的", "new": "新的"}
+    assert json.loads(_sidecar(pkg).read_text(encoding="utf-8"))["summary"] == "新的"
+
+
+# --- UTF-8 safety at both sidecar boundaries (D40 r3) ------------------------
+
+# What ONE lone surrogate scrubs to. Named rather than inlined because the
+# arithmetic is counter-intuitive: `surrogatepass` encodes a lone surrogate to
+# THREE bytes, and decoding those back with `errors="replace"` substitutes one
+# U+FFFD per undecodable BYTE -- so the scrub is 1 char in, 3 out, not 1-for-1.
+_SURROGATE_FFFD = "�" * 3
+
+
+def test_utf8_safe_matches_llm_log() -> None:
+    """tools._utf8_safe and llm_log._utf8_safe MUST agree on every input.
+
+    Deliberately duplicated rather than imported (llm_log stays a leaf
+    observability module that must not import the tool runtime, and the reverse
+    edge would create exactly the coupling both docstrings forbid -- the same
+    duplication-with-rationale the redaction marker carries). Pinned equal on a
+    probe set, mirroring test_redaction_marker_matches_llm_log, so the two can
+    never silently drift into disagreeing about what a corrupt code point
+    becomes."""
+    probes = [
+        "",
+        "plain ascii",
+        "說明 with CJK",
+        "\ud800",  # a lone HIGH surrogate
+        "\udfff",  # a lone LOW surrogate
+        "a\ud800b\udc00c",
+        "emoji 🙂 and a surrogate \ud800",
+        "\U0001f600",  # a legitimate astral char (an ENCODED surrogate PAIR)
+    ]
+    for probe in probes:
+        assert tools._utf8_safe(probe) == llm_log._utf8_safe(probe), probe
+    # ONE lone surrogate becomes THREE U+FFFD, not one: surrogatepass encodes it
+    # to three bytes and the replace-decode substitutes per undecodable BYTE.
+    # Pinned literally, because "one bad char in, one out" is the natural (wrong)
+    # assumption and every expectation below is built on the real ratio.
+    assert tools._utf8_safe("a\ud800b") == "a" + _SURROGATE_FFFD + "b"
+    # ... and the point of it: what comes out is always UTF-8 encodable.
+    for probe in probes:
+        tools._utf8_safe(probe).encode("utf-8")
+
+
+def test_read_tool_meta_scrubs_lone_surrogates(tmp_path: Path) -> None:
+    """A hand-edited sidecar can carry ``"\\ud800"`` -- a JSON-LEGAL escape that
+    json.loads accepts and produces a str for, which is NOT UTF-8 encodable.
+
+    Left unscrubbed it reached the GET response and blew up in Starlette's strict
+    render encode: a 500 out of the one route whose entire job is to DEGRADE a
+    corrupt sidecar. The write side cannot cover this -- the file never passed
+    through our writer -- so the read is its own boundary."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    # ensure_ascii=True: this is what a hand-edit looks like on disk -- six ASCII
+    # characters, a perfectly valid JSON file.
+    _sidecar(pkg).write_text(
+        json.dumps(
+            {
+                "summary": "a\ud800b",
+                "status": "draft",
+                "updated_at": "2026-01-01T00:00:00+00:00\udfff",
+                "llm_log_id": 3,
+                "origin": {"openapi_url": "http://kb.example/\ud800.json", "instructions": None},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    meta = tools.read_tool_meta(pkg)
+    assert meta is not None
+    assert meta["summary"] == "a" + _SURROGATE_FFFD + "b"
+    assert meta["updated_at"].endswith(_SURROGATE_FFFD)
+    assert meta["origin"]["openapi_url"] == "http://kb.example/" + _SURROGATE_FFFD + ".json"
+    assert meta["origin"]["instructions"] is None  # non-strings pass through
+    assert meta["llm_log_id"] == 3
+    # The property that matters: every string it hands back can be serialized.
+    json.dumps(meta).encode("utf-8")
+    for value in (meta["summary"], meta["updated_at"], meta["origin"]["openapi_url"]):
+        value.encode("utf-8")
+
+
+def test_write_tool_meta_scrubs_a_surrogate_bearing_summary(tmp_path: Path) -> None:
+    """A surrogate in the three redacted TEXT fields is scrubbed, not refused.
+
+    Adjudicated in that direction on purpose (see ``_redacted``): one bad code
+    point is a display-level defect in a summary that is otherwise a genuine
+    explanation, and refusing would throw the whole generation away -- or, on the
+    install hook's placeholder path, leave the operator with no sidecar and no
+    重新產生 button. U+FFFD is what the reader renders anyway."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+
+    assert (
+        _write_meta(
+            pkg,
+            summary="這個工具會查 KB\ud800",
+            origin={"openapi_url": "http://kb.example/o.json\ud800", "instructions": "查 KB\udfff"},
+        )
+        is True
+    )
+
+    stored = tools.read_tool_meta(pkg)
+    assert stored is not None
+    assert stored["summary"] == "這個工具會查 KB" + _SURROGATE_FFFD
+    assert stored["origin"]["openapi_url"] == "http://kb.example/o.json" + _SURROGATE_FFFD
+    assert stored["origin"]["instructions"] == "查 KB" + _SURROGATE_FFFD
+    # On disk as real UTF-8, so the file round-trips through any reader.
+    assert _SURROGATE_FFFD in _sidecar(pkg).read_text(encoding="utf-8")
+
+
+def test_write_tool_meta_refuses_a_surrogate_bearing_updated_at(tmp_path: Path) -> None:
+    """``updated_at`` is the one caller string that rides through verbatim, so it
+    is the field the fail-closed guard still has to cover.
+
+    The serialize+encode used to sit OUTSIDE that try, so this raised
+    UnicodeEncodeError straight out of write_tool_meta -- a PATCH answering 500
+    where its contract says False (-> 404). Scrubbing it would only paper over a
+    caller bug (every real caller stamps a machine timestamp), so the refusal is
+    the honest answer -- and the previous sidecar survives it."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    assert _write_meta(pkg, summary="好的說明") is True
+    before = _sidecar(pkg).read_bytes()
+
+    assert tools.write_tool_meta(pkg, {"summary": "s", "updated_at": "2026\ud800"}) is False
+
+    assert _sidecar(pkg).read_bytes() == before
+    assert not list(pkg.glob(f"{tools._AI_META_FILENAME}.*"))
+
+
+# --- compound sidecar operations are serialized (_META_LOCK, D40 r3) ----------
+
+
+def test_set_summary_status_and_store_summary_meta_serialize(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A thread hammer over the two compound sidecar operations.
+
+    Both are read-check-write sequences and both run on THREADPOOL workers in
+    production (every route hops through run_in_threadpool), so they genuinely
+    execute in parallel here too. What this pins is the OBSERVABLE file: under
+    real contention the sidecar is always a complete, legal sidecar with a legal
+    status, every operation returns rather than raising, and no temp file is left
+    behind.
+
+    Scope, stated precisely because the two guarantees are easy to conflate: the
+    watcher thread is a TORN-WRITE detector and it is the ATOMIC publish
+    (``os.replace``) that satisfies it -- reverting to the old truncate-in-place
+    writer makes this fail with a JSONDecodeError on an empty read, verified.
+    It does NOT by itself prove mutual exclusion; a lost update leaves a
+    perfectly legal file. The deterministic proof that ``_META_LOCK`` serializes
+    a finalize against a store lives in test_tool_meta.py
+    (``test_regenerate_summary_cannot_undo_a_finalize_holding_the_lock``)."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    assert _write_meta(pkg, summary="說明", status="draft") is True
+
+    errors: list[BaseException] = []
+    stop = threading.Event()
+
+    def flipper() -> None:
+        try:
+            for index in range(20):
+                tools.set_summary_status("echo", "final" if index % 2 else "draft")
+        except BaseException as exc:  # reported to the main thread, never swallowed
+            errors.append(exc)
+
+    def storer() -> None:
+        try:
+            for index in range(20):
+                tools.store_summary_meta(
+                    pkg, summary=f"生成 {index}", origin=None, llm_log_id=index
+                )
+        except BaseException as exc:  # reported to the main thread, never swallowed
+            errors.append(exc)
+
+    def reader() -> None:
+        # The torn-write detector: every observation of the sidecar must be a
+        # complete, parseable file with a legal status -- never a prefix.
+        try:
+            while not stop.is_set():
+                raw = _sidecar(pkg).read_text(encoding="utf-8")
+                parsed = json.loads(raw)
+                assert parsed["status"] in tools._SUMMARY_STATUSES
+                assert isinstance(parsed["summary"], str)
+        except BaseException as exc:  # reported to the main thread, never swallowed
+            errors.append(exc)
+
+    workers = [threading.Thread(target=flipper), threading.Thread(target=storer)]
+    watcher = threading.Thread(target=reader)
+    watcher.start()
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=30)
+        assert not worker.is_alive()
+    stop.set()
+    watcher.join(timeout=30)
+    assert not watcher.is_alive()
+    assert not errors, errors
+
+    # Whatever order they landed in, the file is a legal sidecar.
+    final = tools.read_tool_meta(pkg)
+    assert final is not None
+    assert final["status"] in tools._SUMMARY_STATUSES
+    assert not list(pkg.glob(f"{tools._AI_META_FILENAME}.*"))
+
+
+def test_store_summary_meta_outcomes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The three outcome codes tool_meta maps onto dict / StoreRefusal / None."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+
+    # ok: status and origin inherited from disk, the summary replaced.
+    origin = {"openapi_url": "http://kb.example/o.json", "instructions": "查 KB"}
+    assert _write_meta(pkg, summary="舊的", status="draft", origin=origin) is True
+    outcome, meta = tools.store_summary_meta(pkg, summary="新的", origin=None, llm_log_id=9)
+    assert outcome == "ok"
+    assert meta is not None
+    assert meta["summary"] == "新的"
+    assert meta["status"] == "draft"
+    assert meta["origin"] == origin
+    assert tools.read_tool_meta(pkg) == meta  # what it returned IS what it stored
+
+    # finalized: nothing is written, and the answer is NOT the failure code.
+    assert tools.set_summary_status("echo", "final") == "ok"
+    before = _sidecar(pkg).read_bytes()
+    assert tools.store_summary_meta(pkg, summary="更新的", origin=None, llm_log_id=1) == (
+        "finalized",
+        None,
+    )
+    assert _sidecar(pkg).read_bytes() == before
+
+    # not_stored: the write was refused (here, the ghost guard on a missing dir).
+    gone = tmp_path / "nope" / "gone"
+    assert tools.store_summary_meta(gone, summary="s", origin=None, llm_log_id=None) == (
+        "not_stored",
+        None,
+    )
+    assert not gone.exists()
 
 
 @pytest.mark.parametrize(

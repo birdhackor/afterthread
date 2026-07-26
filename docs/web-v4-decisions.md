@@ -78,3 +78,47 @@ exact-set 同步納入此 op；比照 capture 的同步 AI op 慣例）。
 schema 改名 `ToolJobStatus` 欄位不變。summary 相關路由不宣告 503
 `tools_not_configured`：tools_dir 未設時 `_resolve_package_dir` 回 None → 404 已足，
 不動 503 exact-set。`GET /api/tools` 每項加 `summary_status`（列表頁免 N+1）。
+
+### D40 附錄（P3a review r3）：sidecar 的並行、原子性與 UTF-8 邊界
+
+r2 的「寫檔前再讀一次狀態」與「prompt 建置移到 threadpool」都只做了一半，r3 補齊：
+
+- **互斥**：新增 `tools._META_LOCK`（比照 `llm_log._FILE_SINK_LOCK`：專責一段
+  read-modify-write **檔案**序列的鎖），`set_summary_status` 與新的
+  `tools.store_summary_meta` 兩個 compound 操作**全程**持鎖。原因是 r2 的
+  re-check 本身是 read-then-write：兩者都跑在 threadpool worker 上，PATCH 與
+  regenerate 的 store 會真的並行，各自讀到 `draft`、PATCH 寫入 `final`、store 再
+  以過期的 `draft` 覆寫——定版被靜默解除，而且凍結的文字正好被它要擋的那次生成
+  取代。鎖**不巢狀**（`write_tool_meta`／`read_tool_meta` 維持無鎖，只有兩個入口
+  取鎖）、**不跨 await**（兩者皆為同步函式，一律由 `run_in_threadpool` 進入）。
+- **不阻塞 event loop**：`regenerate_summary` 與 `generate_and_store_summary` 的
+  resolve／read origin／store 三步各自走 `run_in_threadpool`，比照 `routers.tools`
+  呼叫 registry 的既有慣例；只有 LLM 往返留在 loop 上。install hook 也照辦——它跑在
+  背景 task，與所有 HTTP request 共用同一個 loop，且從 worker 取鎖才不會讓 loop 卡在
+  某個套件的 sidecar I/O 上。
+- **原子寫入**：sidecar 改為 mkstemp（同目錄）→ write+fsync → `os.replace`
+  發佈，比照 `cli.py` init-env 的寫檔路徑。原本走 `_write_regular_file`，它以
+  `O_TRUNC` 開**目標檔**，ENOSPC／配額／I/O 失敗時回傳 False 但舊檔已被截斷——
+  對**已定版**的總結就是無可回復的資料遺失（sidecar 是 summary 與 origin 的唯一
+  副本）。權限刻意不變：`mkstemp` 與原本的 `os.open(…, 0o600)` 同樣受 umask 遮罩，
+  兩者在任何 umask 下產生相同 mode（0o077／0o777 皆已驗證），因此**不加** `fchmod`
+  ——那會是藉原子性修正夾帶的行為變更。symlink／非 regular file 的拒絕語意以
+  寫入前 `lstat` 保留。
+  **`set_enabled` 的 manifest 改寫仍維持原本的 in-place 寫入**，這是本階段範圍外的
+  既有樣式，屬**有意識延後**而非遺漏：manifest 只帶 `enabled` 一個布林狀態，可由使用者
+  重新切換復原，與 sidecar 那份「毀了就沒有第二份」的 LLM 產物不同。
+- **UTF-8 兩端防護**：`.ai_meta.json` 可被手動編輯，而 `"\ud800"` 是**合法 JSON**、
+  `json.loads` 會產生一個**不可 UTF-8 編碼**的 str。寫入端把 serialize+encode+size
+  檢查移進 fail-closed 的 try（原本在外面，PATCH 會 500 而非 False→404），三個文字欄位
+  在 dumps 前先 surrogate 洗白（**洗白而非拒絕**：一個壞碼位不該賠掉整份總結，
+  U+FFFD 本來就是讀取端會顯示的樣子）；讀取端 `read_tool_meta` 對回傳的每個字串同樣
+  洗白（手改的檔案根本沒經過我們的寫入端，否則 GET 會在 Starlette 嚴格 encode 時 500）。
+  helper `_utf8_safe` 與 `llm_log._utf8_safe` **重複而不共用**，理由同
+  `_REDACTION_MARKER`（llm_log 是 leaf，反向 import 會造成兩邊 docstring 都禁止的耦合），
+  以測試釘住兩者行為一致。
+- **prompt 順序**：`_summary_user_prompt` 改為「標題→`tool.json`→實作檔→`.env` key
+  名→origin/指示/builder 回報」。`llm_prompt_budget_tokens` 的**合法下限就是 4000**，
+  而安裝指示可達 20000 字元：舊順序（context 在前）在這組完全合法的設定下，最後的整份
+  截斷會切在 context 內，模型收到**零**套件內容，然後憑指示編造文件並被我們寫進 sidecar
+  ——對一個系統提示核心規則是「只描述檔案裡看得到的事」的功能，這是最糟的失效。
+  現在截斷先吃背景、最後才動到套件本身：截斷可以降低有用程度，但不能拿掉主體。
