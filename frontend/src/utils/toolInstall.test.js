@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
-	INSTALL_POLL_MS,
-	installJobRefetchInterval,
 	isHttpUrl,
-	isInstallJobActive,
 	isSecretName,
-	isTerminalInstallState,
+	isTerminalToolJobState,
+	isToolJobActive,
 	secretNameError,
 	secretValueError,
+	TOOL_JOB_POLL_MS,
+	toolJobRefetchInterval,
 } from "./toolInstall.js";
 
 // Minimal shape of the react-query Query object the interval fn receives.
@@ -20,67 +20,65 @@ const queryWithError = (status) => ({
 	state: { data: undefined, error: { status } },
 });
 
-describe("isTerminalInstallState", () => {
+// These pins cover BOTH job kinds the renamed helpers now serve (D40: install
+// and revise share one job table, route, and state machine) -- the fixtures
+// above are deliberately job-kind-agnostic (just {state}/{errorStatus}), so
+// there is nothing install- or revise-specific to vary between them.
+describe("isTerminalToolJobState", () => {
 	it("treats succeeded and failed as terminal", () => {
-		expect(isTerminalInstallState("succeeded")).toBe(true);
-		expect(isTerminalInstallState("failed")).toBe(true);
+		expect(isTerminalToolJobState("succeeded")).toBe(true);
+		expect(isTerminalToolJobState("failed")).toBe(true);
 	});
 
 	it("treats in-flight and unknown states as non-terminal", () => {
-		expect(isTerminalInstallState("queued")).toBe(false);
-		expect(isTerminalInstallState("running")).toBe(false);
-		expect(isTerminalInstallState(undefined)).toBe(false);
-		expect(isTerminalInstallState("some-future-state")).toBe(false);
+		expect(isTerminalToolJobState("queued")).toBe(false);
+		expect(isTerminalToolJobState("running")).toBe(false);
+		expect(isTerminalToolJobState(undefined)).toBe(false);
+		expect(isTerminalToolJobState("some-future-state")).toBe(false);
 	});
 });
 
-describe("installJobRefetchInterval", () => {
+describe("toolJobRefetchInterval", () => {
 	it("keeps polling while the job is queued or running", () => {
-		expect(installJobRefetchInterval(queryWithState("queued"))).toBe(
-			INSTALL_POLL_MS,
+		expect(toolJobRefetchInterval(queryWithState("queued"))).toBe(
+			TOOL_JOB_POLL_MS,
 		);
-		expect(installJobRefetchInterval(queryWithState("running"))).toBe(
-			INSTALL_POLL_MS,
+		expect(toolJobRefetchInterval(queryWithState("running"))).toBe(
+			TOOL_JOB_POLL_MS,
 		);
 	});
 
 	it("keeps polling before the first response lands (no data yet)", () => {
-		expect(installJobRefetchInterval(queryWithState(null))).toBe(
-			INSTALL_POLL_MS,
-		);
-		expect(installJobRefetchInterval(undefined)).toBe(INSTALL_POLL_MS);
+		expect(toolJobRefetchInterval(queryWithState(null))).toBe(TOOL_JOB_POLL_MS);
+		expect(toolJobRefetchInterval(undefined)).toBe(TOOL_JOB_POLL_MS);
 	});
 
 	it("stops polling once the job is terminal", () => {
-		expect(installJobRefetchInterval(queryWithState("succeeded"))).toBe(false);
-		expect(installJobRefetchInterval(queryWithState("failed"))).toBe(false);
+		expect(toolJobRefetchInterval(queryWithState("succeeded"))).toBe(false);
+		expect(toolJobRefetchInterval(queryWithState("failed"))).toBe(false);
 	});
 
 	it("stops polling when the latest error is a 404 (job gone after a restart)", () => {
-		expect(installJobRefetchInterval(queryWithError(404))).toBe(false);
+		expect(toolJobRefetchInterval(queryWithError(404))).toBe(false);
 	});
 
 	it("keeps polling on other errors (transient) and before any data", () => {
-		expect(installJobRefetchInterval(queryWithError(500))).toBe(
-			INSTALL_POLL_MS,
-		);
-		expect(installJobRefetchInterval(queryWithError(0))).toBe(INSTALL_POLL_MS);
-		expect(installJobRefetchInterval(queryWithState(null))).toBe(
-			INSTALL_POLL_MS,
-		);
+		expect(toolJobRefetchInterval(queryWithError(500))).toBe(TOOL_JOB_POLL_MS);
+		expect(toolJobRefetchInterval(queryWithError(0))).toBe(TOOL_JOB_POLL_MS);
+		expect(toolJobRefetchInterval(queryWithState(null))).toBe(TOOL_JOB_POLL_MS);
 	});
 });
 
-describe("isInstallJobActive", () => {
+describe("isToolJobActive", () => {
 	it("is not active without a job id", () => {
-		expect(isInstallJobActive({ jobId: null })).toBe(false);
-		expect(isInstallJobActive({ jobId: undefined })).toBe(false);
+		expect(isToolJobActive({ jobId: null })).toBe(false);
+		expect(isToolJobActive({ jobId: undefined })).toBe(false);
 	});
 
 	it("is active with a job id before the first poll (no state, no error)", () => {
-		expect(isInstallJobActive({ jobId: "j1" })).toBe(true);
+		expect(isToolJobActive({ jobId: "j1" })).toBe(true);
 		expect(
-			isInstallJobActive({
+			isToolJobActive({
 				jobId: "j1",
 				state: undefined,
 				errorStatus: undefined,
@@ -89,30 +87,30 @@ describe("isInstallJobActive", () => {
 	});
 
 	it("stays active while the job is queued or running", () => {
-		expect(isInstallJobActive({ jobId: "j1", state: "queued" })).toBe(true);
-		expect(isInstallJobActive({ jobId: "j1", state: "running" })).toBe(true);
+		expect(isToolJobActive({ jobId: "j1", state: "queued" })).toBe(true);
+		expect(isToolJobActive({ jobId: "j1", state: "running" })).toBe(true);
 	});
 
 	it("releases once the job reaches a terminal state", () => {
-		expect(isInstallJobActive({ jobId: "j1", state: "succeeded" })).toBe(false);
-		expect(isInstallJobActive({ jobId: "j1", state: "failed" })).toBe(false);
+		expect(isToolJobActive({ jobId: "j1", state: "succeeded" })).toBe(false);
+		expect(isToolJobActive({ jobId: "j1", state: "failed" })).toBe(false);
 	});
 
 	it("releases on a 404 poll error (the job is gone after a restart)", () => {
-		expect(isInstallJobActive({ jobId: "j1", errorStatus: 404 })).toBe(false);
+		expect(isToolJobActive({ jobId: "j1", errorStatus: 404 })).toBe(false);
 		// Even with a stale non-terminal state cached, a 404 still releases.
 		expect(
-			isInstallJobActive({ jobId: "j1", state: "running", errorStatus: 404 }),
+			isToolJobActive({ jobId: "j1", state: "running", errorStatus: 404 }),
 		).toBe(false);
 	});
 
 	it("stays active on a non-404 poll error (transient -- keep the job tracked)", () => {
 		// A blip must not drop a live job: a resubmit would then 409 and orphan it.
 		expect(
-			isInstallJobActive({ jobId: "j1", state: "running", errorStatus: 500 }),
+			isToolJobActive({ jobId: "j1", state: "running", errorStatus: 500 }),
 		).toBe(true);
-		expect(isInstallJobActive({ jobId: "j1", errorStatus: 500 })).toBe(true);
-		expect(isInstallJobActive({ jobId: "j1", errorStatus: 0 })).toBe(true);
+		expect(isToolJobActive({ jobId: "j1", errorStatus: 500 })).toBe(true);
+		expect(isToolJobActive({ jobId: "j1", errorStatus: 0 })).toBe(true);
 	});
 });
 

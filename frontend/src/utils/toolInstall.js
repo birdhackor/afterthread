@@ -1,17 +1,29 @@
-// Pure helpers for the 工具 page's install flow. Kept out of the component so
-// the poll-stop rule and the URL pre-check are unit-testable without jsdom
-// (the vitest ground rule from D07: pure logic only).
+// Pure helpers for the 工具 page's install + AI-revise flows. Kept out of the
+// component so the poll-stop rule and the URL pre-check are unit-testable
+// without jsdom (the vitest ground rule from D07: pure logic only).
+//
+// The job-state trio right below this comment used to be install-only. D40
+// added a second job kind -- an AI revise -- that shares the SAME
+// `/api/tools/jobs/{id}` route, job table, and queued/running/succeeded/failed
+// state machine (backend tool_builder.JobRecord serves both), so an
+// "install"-specific name on shared polling logic would now describe only
+// half of what it does. Renamed to generic "tool job" names and reused as-is
+// (not forked) by both ToolsPage pollers -- InstallPanel's install job and
+// InstalledToolsPanel's revise job. The install-only helpers further down
+// (URL/secret validation -- a revise has neither field) keep their original
+// names.
 
-// Poll cadence while an install job is still in flight. 2s: an install runs
-// for minutes, so this is frequent enough to feel live without hammering a
-// backend that is already busy running the builder session.
-export const INSTALL_POLL_MS = 2000;
+// Poll cadence while a tool job (install or revise) is still in flight. 2s:
+// both kinds run for minutes, so this is frequent enough to feel live without
+// hammering a backend that is already busy running the builder session.
+export const TOOL_JOB_POLL_MS = 2000;
 
-// The two states a job can never leave (see backend tool_builder.InstallJob):
-// once reached, polling must stop.
+// The two states a job can never leave (see backend tool_builder.JobRecord):
+// once reached, polling must stop. True of an install job and a revise job
+// alike -- they share one state machine.
 const TERMINAL_STATES = new Set(["succeeded", "failed"]);
 
-export function isTerminalInstallState(state) {
+export function isTerminalToolJobState(state) {
 	return TERMINAL_STATES.has(state);
 }
 
@@ -23,36 +35,37 @@ export function isTerminalInstallState(state) {
 // forgot it -- jobs are process-local and unpersisted), so polling that dead id
 // forever is pure noise. Any OTHER error (500, a transient network blip) keeps
 // polling, since those can clear on the next tick.
-export function installJobRefetchInterval(query) {
+export function toolJobRefetchInterval(query) {
 	const state = query?.state?.data?.state;
-	if (isTerminalInstallState(state)) {
+	if (isTerminalToolJobState(state)) {
 		return false;
 	}
 	if (query?.state?.error?.status === 404) {
 		return false;
 	}
-	return INSTALL_POLL_MS;
+	return TOOL_JOB_POLL_MS;
 }
 
-// Whether an install job the form STARTED is still being tracked: while this
-// holds, the form stays locked and the progress card keeps polling. Deliberately
-// the mirror image of installJobRefetchInterval's stop rule, so the form-lock and
-// the poll cadence can never disagree about whether a job is still live: tracking
-// ends ONLY when the job reaches a terminal state OR its poll 404s (the job is
-// gone -- a backend restart forgot it). Any OTHER poll error (a transient 500, a
-// network blip -- `errorStatus` undefined/0) KEEPS the job tracked, because it can
-// clear on the next tick while the backend's job is still running; releasing
-// "active" on it would let a resubmit fire against that live job, hit the backend's
-// 409, and orphan a job we can no longer poll. The pre-first-poll window (a job id
-// but no state and no error yet) is active too -- we started a job and simply have
-// not heard back. `state` is the latest job state (undefined before the first
-// poll); `errorStatus` is the latest poll error's HTTP status (undefined when the
-// last poll succeeded).
-export function isInstallJobActive({ jobId, state, errorStatus }) {
+// Whether a tool job (install or revise) the caller STARTED is still being
+// tracked: while this holds, its controls stay locked and its progress card
+// keeps polling. Deliberately the mirror image of toolJobRefetchInterval's
+// stop rule, so a form/panel's lock and the poll cadence can never disagree
+// about whether a job is still live: tracking ends ONLY when the job reaches a
+// terminal state OR its poll 404s (the job is gone -- a backend restart forgot
+// it). Any OTHER poll error (a transient 500, a network blip -- `errorStatus`
+// undefined/0) KEEPS the job tracked, because it can clear on the next tick
+// while the backend's job is still running; releasing "active" on it would let
+// a resubmit fire against that live job, hit the backend's 409, and orphan a
+// job that can no longer be polled. The pre-first-poll window (a job id but no
+// state and no error yet) is active too -- a job was started and there is
+// simply no word back yet. `state` is the latest job state (undefined before
+// the first poll); `errorStatus` is the latest poll error's HTTP status
+// (undefined when the last poll succeeded).
+export function isToolJobActive({ jobId, state, errorStatus }) {
 	if (jobId === null || jobId === undefined) {
 		return false;
 	}
-	if (isTerminalInstallState(state)) {
+	if (isTerminalToolJobState(state)) {
 		return false;
 	}
 	if (errorStatus === 404) {

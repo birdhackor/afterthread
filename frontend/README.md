@@ -53,7 +53,7 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
 | `/items/new` | `ItemNewPage` | 手動新增項目的表單頁（沿用 `ItemForm` 元件）。 |
 | `/items/$itemId` | `ItemDetailPage` | 單筆項目詳情：完整欄位、progress 歷史（可追加一筆）、狀態/階段快速修改、`ItemAiActions` 提供的「AI 補齊」（enrich）／「AI 進度更新」（assist-update）兩個操作、刪除。 |
 | `/items/$itemId/edit` | `ItemEditPage` | 手動編輯項目的表單頁（沿用 `ItemForm` 元件）。 |
-| `/tools` | `ToolsPage` | 「已安裝工具」（清單／啟停／刪除）與「安裝新工具」（貼 OpenAPI JSON 網址 + 指示，AI 背景建置、輪詢進度）兩個分頁；細節見根目錄 README「KB 工具安裝指南」。 |
+| `/tools` | `ToolsPage` | 「已安裝工具」（清單／啟停／刪除，每列可展開讀取／重新產生／定版／解除定版 AI 總結，並可提意見送出 AI 修訂）與「安裝新工具」（貼 OpenAPI JSON 網址 + 指示，AI 背景建置、輪詢進度）兩個分頁；細節見根目錄 README「KB 工具安裝指南」。 |
 | `/llm-logs` | `LlmLogsPage` | AI 日誌：呼叫 `GET /api/llm/logs` 列出最近的 LLM 互動，每筆可展開讀取 `GET /api/llm/logs/{id}` 取得的請求/回應內容（每則受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；支援 `?log=<id>` 深連結自動展開（`工具` 頁的安裝結果會連過來）。 |
 | （其他） | `NotFoundPage` | 404 fallback（router 的 `defaultNotFoundComponent`）。 |
 
@@ -97,3 +97,29 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   開關才會跟對應的 mutation 落在同一個 render，不晚一拍。（`@mantine/hooks` 的
   `useDisclosure` 在這個頁面上是用來控制刪除確認 Modal 的開關，與這個
   mutation gate 是兩回事。）
+- **`ToolsPage` 的跨分頁 busy gate（D40）**：後端的工具任務（安裝、AI
+  修訂）與同步的「重新產生總結」共用同一個全域 single-flight，任一個進行中都會
+  讓其他兩者收到 409。`ToolsPage` 的兩個分頁（`InstalledToolsPanel`／
+  `InstallPanel`）常駐掛載（Tabs 預設行為），各自把自己算出的忙碌旗標經
+  `onBusyChange` 回報給 `ToolsPage`，再以 `externalBusy` 傳回給對方，讓一個分頁
+  的任務進行中時，另一分頁的送出控制項也會停用——純粹是本地端對後端那個
+  single-flight 的樂觀鏡像（只涵蓋這個分頁實例自己送出/得知的任務），後端仍是
+  權威，鏡像沒接住的競態（例如另一個瀏覽分頁送出的任務）一樣會用既有的
+  409（`tool_job_in_progress`）錯誤處理接住。每個工具列的 AI 總結面板走 inline
+  展開（`@mantine/core` 的 `Collapse` + `useDisclosure`，零新依賴，比照 D38
+  選用 Mantine 內建元件的理由；每列獨立展開，不像 `LlmLogsPage` 的 Accordion
+  同時間只開一項），總結內容以 `enabled: expanded` 延遲讀取（比照
+  `LlmLogsPage.LogDetailPanel`，收合的列從不打 API）。定版／解除定版
+  （`PATCH .../summary`）刻意**不**受這個 busy gate 管制：後端這個端點本來就
+  沒有查 single-flight，且刻意支援「AI 修訂進行中先定版，換裝前重新檢查會擋下
+  取代」這種中途操作，在前端補一個它不需要的鎖只會擋掉後端特地支援的動作。
+- **`utils/toolInstall.js` 與 `utils/toolSummary.js` 的分工**：前者是安裝表單
+  驗證（URL／秘密名稱與值）＋工具任務輪詢共用的純函式
+  （`isToolJobActive`／`toolJobRefetchInterval`／`isTerminalToolJobState`——
+  D40 之前只服務安裝工作，現在安裝與修訂共用同一張後端 job 表與同一個輪詢
+  路由，因此改用不含「install」字樣的名稱，並更新了每個呼叫點與測試）；後者
+  是 AI 總結網域的純邏輯（狀態→badge 對映 `summaryStatusMeta`、是否可定版
+  `canFinalizeSummary`），因為那與「安裝」無關，硬塞進前者的檔名只會誤導
+  之後的讀者——這個專案的 vitest 在 node 環境跑、沒有 jsdom，元件本身測不到，
+  抽出的純函式是唯一能自動化驗證的介面，所以新邏輯一律先問「這算安裝，還是
+  總結」再決定放哪個檔案。
