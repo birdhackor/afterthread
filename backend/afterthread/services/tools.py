@@ -76,6 +76,7 @@ from dotenv import dotenv_values
 from starlette.concurrency import run_in_threadpool
 
 from afterthread.config import get_settings
+from afterthread.services import llm_log
 from afterthread.services.llm import LlmTool
 
 # A package (and directory) name: lowercase alnum start, then up to 63 more of
@@ -1003,7 +1004,7 @@ def _write_sidecar_atomic(directory: Path, data: bytes) -> bool:
 def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
     """Write the sidecar from the KNOWN SCHEMA, redacting its text. Returns success.
 
-    This does NOT serialize ``meta``. It reads the five fields it understands out
+    This does NOT serialize ``meta``. It reads the six fields it understands out
     of ``meta``, coerces each to the shape the sidecar's contract promises, and
     writes THAT -- so every KEY on disk is a literal from this function and every
     VALUE is one this function chose or refused:
@@ -1025,6 +1026,15 @@ def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
     * ``llm_log_id`` -- an ``int`` (``bool`` excluded, since it is an ``int``
       subclass and a stray ``true`` would render as a link to log record 1), else
       None;
+    * ``llm_log_process`` -- a ``str``, else None: the ``llm_log.process_token()``
+      of the process that MINTED the id above. The AI log's ids are a per-process
+      counter and its ring dies with the process, while this file keeps the
+      integer forever -- so after a restart a stored id resolves to whatever
+      interaction now holds it, a different tool's summary or a different workflow
+      altogether, and nothing downstream can tell (the row really was selected by
+      that id). The token is what lets a reader ask "is this id still mine?"; see
+      ``store_summary_meta`` for why it is minted next to the id rather than here,
+      and ``routers.tools._summary_detail`` for what a foreign or absent one costs;
     * ``origin`` -- None, or the two fields we understand narrowed to ``str``/
       None. It is the install's only record of where the package came from, so
       it is kept; it is also free operator text, so it is kept NARROW.
@@ -1066,9 +1076,9 @@ def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
     ``redact_known_secrets``) writes NOTHING and returns False. It is applied to
     the three fields that can carry operator/LLM text and to nothing else,
     because nothing else CAN: ``status`` is one of two literals chosen above,
-    ``llm_log_id`` is an int, and ``updated_at`` is a machine timestamp its
-    caller just produced (no on-disk one ever round-trips -- both callers
-    overwrite it).
+    ``llm_log_id`` is an int, ``llm_log_process`` is an opaque token this backend
+    generated for itself, and ``updated_at`` is a machine timestamp its caller
+    just produced (no on-disk one ever round-trips -- both callers overwrite it).
 
     The serialized payload is bounded by ``_AI_META_MAX_BYTES``, the SAME cap
     ``read_tool_meta`` refuses past, so this can never produce a file that reads
@@ -1097,7 +1107,15 @@ def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
     hand-edited sidecar carries are DROPPED by the next write. Round-tripping
     them was never a contract -- it was a side effect of serializing the caller's
     dict, and it is precisely what let a stray key/value carry unmasked text into
-    the file. The five fields above are the sidecar.
+    the file. The six fields above are the sidecar.
+
+    ``llm_log_id`` and ``llm_log_process`` are carried through from ``meta``
+    rather than re-derived, and that is load-bearing for ``set_summary_status``:
+    its round-trip hands back what it just READ, so a 定版 in a LATER process must
+    keep the id's original (now foreign) token. Stamping the current token here
+    would forge freshness onto a stale id -- precisely the confusion the token
+    exists to prevent -- so minting happens at exactly one call site, next to the
+    id itself (``store_summary_meta``).
 
     The ``is_dir`` precondition is kept as the EXPLICIT answer to a racing
     ``delete_tool``: a summary landing just after one must not re-create the
@@ -1127,6 +1145,9 @@ def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
     log_id = meta.get("llm_log_id")
     if not isinstance(log_id, int) or isinstance(log_id, bool):
         log_id = None
+    log_process = meta.get("llm_log_process")
+    if not isinstance(log_process, str):
+        log_process = None
     origin_raw = meta.get("origin")
     try:
         payload: dict[str, Any] = {
@@ -1134,6 +1155,7 @@ def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
             "status": status,
             "updated_at": updated_at,
             "llm_log_id": log_id,
+            "llm_log_process": log_process,
             "origin": (
                 {
                     "openapi_url": _redacted(_meta_str(origin_raw.get("openapi_url"))),
@@ -1479,6 +1501,16 @@ def store_summary_meta(
     fail-closed refusal it is there -- ``("not_stored", None)``, never an
     exception -- because ``regenerate_summary``'s route maps this return, and a
     raised provider error would turn a 404 into a 500.
+
+    ``llm_log_process`` is stamped HERE, and only here, from
+    ``llm_log.process_token()``. It is the token of the process whose id space
+    ``llm_log_id`` was drawn from, and taking it at the store rather than
+    accepting it as a parameter is what makes that structurally true instead of
+    merely conventional: the caller read the id from ``last_record_id_for_workflow``
+    microseconds ago, in THIS process, so there is no arrangement of arguments
+    that can pair an id with someone else's token. It is stored only WITH an id
+    -- no id, no token -- so the two fields can never disagree about whether
+    there is a link to vouch for.
     """
     with _META_LOCK:
         existing = read_tool_meta(directory) or {}
@@ -1503,6 +1535,7 @@ def store_summary_meta(
             "status": status,
             "updated_at": datetime.now(UTC).isoformat(),
             "llm_log_id": llm_log_id,
+            "llm_log_process": llm_log.process_token() if llm_log_id is not None else None,
             "origin": origin if origin is not None else existing.get("origin"),
         }
         if not write_tool_meta(directory, meta):
@@ -1562,12 +1595,75 @@ def list_tools() -> list[dict[str, Any]]:
     ]
 
 
+def package_identity(directory: Path) -> tuple[int, int, int] | None:
+    """The package's MANIFEST identity: ``(st_dev, st_ino, st_ctime_ns)`` of its
+    ``tool.json``, or None when it cannot be read.
+
+    ONE definition with TWO callers, both asking the same question -- "is the
+    package at this path still the one I looked at?" -- across a window they do
+    not hold a lock over:
+
+    * ``tool_builder.run_revise`` takes it when the session reads the package and
+      again immediately before the swap, so a multi-minute build cannot publish
+      itself over a package the operator replaced meanwhile;
+    * ``_make_handler`` takes it when a package is turned into an ``LlmTool``
+      (i.e. when its schema is ADVERTISED to the model) and again before the
+      subprocess starts, so a revise that replaced the package mid-conversation
+      cannot have the model answer against the old schema while the NEW entry
+      runs.
+
+    Two spellings of the same tuple would be two chances to drift, which is why
+    this lives here (``tool_builder`` already imports this module, so this is the
+    direction that does not create a cycle) rather than being restated per caller.
+
+    The MANIFEST rather than the directory, and that choice is the whole design.
+    Two weaker readings were measured and discarded:
+
+    * the directory's inode alone does not answer "is this the same package": a
+      delete-and-reinstall of the same name REUSES the inode on an ordinary Linux
+      filesystem (measured here, not assumed -- the first version of this check
+      was written against the opposite assumption and silently passed the exact
+      scenario it exists to refuse);
+    * the directory's inode plus its ctime/mtime DOES catch the reinstall, but it
+      also fires on any change to the directory's CONTENTS -- and that contradicts
+      an earlier adjudication the revise flow already implements: an operator
+      deleting the package's ``.env`` mid-session is HONORED (D40 r3), not
+      refused. A check that cannot tell "replaced" from "edited" would have to
+      break one of the two.
+
+    ``tool.json`` separates them cleanly: every install and reinstall WRITES it (it
+    is the one file ``validate_package`` requires), so a package that was replaced
+    carries a different one; deleting or editing some OTHER file in the package
+    leaves it untouched. Editing the manifest ITSELF in place is then treated as a
+    replacement, which is the right side to err on -- that is the file a revision
+    rewrites, and the file ``set_enabled`` rewrites for the enabled toggle (see
+    ``_make_handler`` for what that costs an in-flight conversation).
+
+    ``lstat``, so a manifest swapped for a symlink compares different rather than
+    reporting on its target. None on any error: every caller treats "cannot say"
+    as "this check cannot speak", never as "identity matches".
+    """
+    try:
+        info = os.lstat(directory / "tool.json")
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino, info.st_ctime_ns)
+
+
 def _build_llm_tool(scan: _PackageScan) -> LlmTool:
     """Turn a valid ``_PackageScan`` into an executable ``LlmTool``.
 
     Callers pass only ``valid`` scans, so ``parameters`` / ``entry`` are present;
     the assertions document that precondition and keep the type checker happy
     without an ``Any`` escape hatch.
+
+    The package's manifest identity is captured HERE, in the same call that
+    freezes the spec, because this is the moment the schema below becomes a
+    PROMISE to the model -- see ``_make_handler`` for what is done with it. The
+    instant between ``_scan_package``'s READ of ``tool.json`` and this ``lstat``
+    of it is the one thing the pairing cannot cover (a swap landing exactly there
+    pins the NEW identity against the OLD spec); that is one syscall pair wide and
+    the same check-then-act residual this subsystem accepts throughout.
     """
     assert scan.parameters is not None
     assert scan.entry is not None
@@ -1580,7 +1676,10 @@ def _build_llm_tool(scan: _PackageScan) -> LlmTool:
             "parameters": scan.parameters,
         },
     }
-    return LlmTool(spec=spec, handler=_make_handler(scan.directory, scan.entry))
+    return LlmTool(
+        spec=spec,
+        handler=_make_handler(scan.directory, scan.entry, package_identity(scan.directory)),
+    )
 
 
 def enabled_llm_tools() -> list[LlmTool]:
@@ -1599,7 +1698,10 @@ def enabled_llm_tools() -> list[LlmTool]:
 # stores, at its storage choke point. But llm_log is a leaf observability module
 # and must not import THIS one -- so it takes a provider CALLABLE and main wires
 # in ``known_secret_values`` below (the same leaf/provider inversion llm_log's
-# own logger config uses). The set is computed at CALL time, never cached as a
+# own logger config uses). The inversion is about THAT direction only: this
+# module imports llm_log directly (for ``process_token``, see
+# ``store_summary_meta``), which is the direction that keeps llm_log a leaf.
+# The set is computed at CALL time, never cached as a
 # static value, because it genuinely CHANGES at runtime: an install writes a new
 # tool ``.env``, and an in-flight install registers its form secret before that
 # ``.env`` even exists.
@@ -2332,7 +2434,17 @@ def _run_tool_subprocess(
     return _cap_output(redact_known_secrets(output.stdout), output_cap)
 
 
-def _make_handler(directory: Path, entry: list[str]) -> Callable[[dict[str, Any]], Awaitable[str]]:
+# Returned INSTEAD of running anything when the package is no longer the one
+# whose schema was advertised (see ``_make_handler``). Category only -- no name,
+# no path, no identity values -- because this string goes straight into the
+# conversation as a role:"tool" message, the same discipline every other outcome
+# string in this module follows.
+_TOOL_REPLACED_RESULT = "tool not run: this tool's package changed after it was offered"
+
+
+def _make_handler(
+    directory: Path, entry: list[str], identity: tuple[int, int, int] | None
+) -> Callable[[dict[str, Any]], Awaitable[str]]:
     """Build the async handler an ``LlmTool`` runs, closing over its package.
 
     Settings (timeout, output cap) and the child environment are read at CALL
@@ -2342,9 +2454,61 @@ def _make_handler(directory: Path, entry: list[str]) -> Callable[[dict[str, Any]
     The handler honors ``LlmTool``'s no-raise contract: ``_run_tool_subprocess``
     turns every failure into a string, and the llm loop's own ``except`` is the
     final backstop.
+
+    ``identity`` is that package's manifest identity as of the moment its schema
+    was advertised (``_build_llm_tool`` -> ``package_identity``), and the FIRST
+    thing this handler does is take it again and REFUSE on any difference. What
+    that closes: ``enabled_llm_tools()`` snapshots each tool's name, description,
+    parameters and entry at the START of a capture / enrich / assist-update, but
+    resolution and execution happen from the PATH, minutes later, when the model
+    finally calls it -- and the ordinary AI workflows are not inside the tool
+    job's single-flight, so a revise can replace the package underneath a
+    conversation that already advertised the old one. The model would then be
+    answering against a schema the running entry no longer implements, and the
+    replace-mode promote's backup cleanup could delete files the process it just
+    started is still reading. Neither is visible after the fact: an attempt's
+    ``tools_advertised`` records NAMES, and the name did not change.
+
+    Refusing is the only honest answer, and a refusal STRING is the only shape
+    allowed here (``LlmTool``'s handler contract is no-raise): the model gets a
+    category-only sentence, is free to try something else, and nothing runs.
+
+    The check sits BEFORE ``_build_tool_env`` deliberately. That read pulls the
+    package's ``.env`` -- live credentials -- and there is no reason to load a
+    replaced package's secrets into a call we are about to refuse; putting the
+    one check first also means the ``.env`` this handler exports belongs to the
+    package the check just accepted. A SECOND check after the read was considered
+    and rejected: it would narrow the window by exactly the width of one bounded
+    file read while adding a second refusal path, and the window it cannot narrow
+    -- between the last check and ``Popen`` -- is the same check-then-act instant
+    ``_promote_staging`` and the revise flow already accept by name. Both this
+    ``lstat`` and the (pre-existing) ``.env`` read run on the event loop, matching
+    the shape this handler already had; the check is strictly the smaller of the
+    two.
+
+    A None ``identity`` -- the manifest could not be lstat'ed when the tool was
+    advertised -- is a REFUSAL, never a pass, matching the revise flow's own
+    "cannot establish identity" rule (D40 P3b r11): a check that cannot speak
+    must not vouch.
+
+    FALSE POSITIVES, stated rather than discovered later: ``set_enabled`` rewrites
+    ``tool.json`` IN PLACE to flip ``enabled``, which moves its ctime. So toggling
+    a tool during a conversation that already advertised it makes every later call
+    to that tool in that conversation refuse -- including a toggle OFF-then-ON that
+    leaves the bytes identical. That is the conservative direction and it is
+    cheap: an AI workflow is one request, the operator can re-run it, and the
+    alternative reading ("the manifest was only rewritten, carry on") is exactly
+    the one that cannot tell an enabled-flip from a wholesale replacement. Toggling
+    a tool OFF mid-conversation and having it then refuse is arguably the more
+    correct behaviour anyway -- today the snapshot happily runs a tool the operator
+    just disabled. Writes that do NOT trip it: the summary sidecar
+    (``.ai_meta.json`` is a different file, so the manifest's own ctime is
+    untouched) and anything the tool itself writes into its package.
     """
 
     async def _handler(arguments: dict[str, Any]) -> str:
+        if identity is None or package_identity(directory) != identity:
+            return _TOOL_REPLACED_RESULT
         settings = get_settings()
         env = _build_tool_env(directory)
         args_json = json.dumps(arguments, ensure_ascii=False)

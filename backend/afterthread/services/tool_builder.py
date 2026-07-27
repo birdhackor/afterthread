@@ -289,44 +289,16 @@ _ERROR_REVISE_TARGET_REPLACED = "原工具在修訂期間被改動或重新安�
 _ERROR_REVISE_IDENTITY_UNKNOWN = "無法確認原工具的內容（`tool.json` 讀取失敗），修訂已取消。"  # noqa: RUF001
 
 
-def _package_identity(directory: Path) -> tuple[int, int, int] | None:
-    """The package's MANIFEST identity: ``(st_dev, st_ino, st_ctime_ns)`` of its
-    ``tool.json``, or None when it cannot be read.
-
-    Taken TWICE per revise -- once when the session reads the package, once before
-    the swap -- so both calls must mean the same thing; that is why it is one
-    helper rather than two inline ``lstat`` calls.
-
-    The MANIFEST rather than the directory, and that choice is the whole design.
-    Two weaker readings were measured and discarded:
-
-    * the directory's inode alone does not answer "is this the same package": a
-      delete-and-reinstall of the same name REUSES the inode on an ordinary Linux
-      filesystem (measured here, not assumed -- the first version of this check
-      was written against the opposite assumption and silently passed the exact
-      scenario it exists to refuse);
-    * the directory's inode plus its ctime/mtime DOES catch the reinstall, but it
-      also fires on any change to the directory's CONTENTS -- and that contradicts
-      an earlier adjudication this module already implements: an operator deleting
-      the package's ``.env`` mid-session is HONORED (D40 r3), not refused. A check
-      that cannot tell "replaced" from "edited" would have to break one of the two.
-
-    ``tool.json`` separates them cleanly: every install and reinstall WRITES it (it
-    is the one file ``validate_package`` requires), so a package that was replaced
-    carries a different one; deleting or editing some OTHER file in the package
-    leaves it untouched. Editing the manifest ITSELF in place during a revise is
-    then treated as a replacement, which is the right side to err on -- that is
-    the file whose contents the revision is rewriting.
-
-    ``lstat``, so a manifest swapped for a symlink compares different rather than
-    reporting on its target. None on any error: the caller treats "cannot say" as
-    "this check cannot speak", never as "identity matches".
-    """
-    try:
-        info = os.lstat(directory / "tool.json")
-    except OSError:
-        return None
-    return (info.st_dev, info.st_ino, info.st_ctime_ns)
+# The manifest-identity helper this module's pre-swap check uses. It LIVES in
+# ``tools`` (which this module already imports, so that is the direction with no
+# cycle) because the runtime asks the identical question on the identical tuple:
+# ``tools._make_handler`` pins a package's identity when its schema is advertised
+# to the model and re-checks it before executing, exactly as ``run_revise`` pins
+# it at session start and re-checks it before the swap. Two spellings would be two
+# chances to drift, so there is one definition and this alias keeps the private
+# name this module's three call sites already read as "the revise's identity".
+# See ``tools.package_identity`` for why it is ``tool.json`` and not the directory.
+_package_identity = tools.package_identity
 
 
 # The swap failed AND the roll-back failed too: the only state where the

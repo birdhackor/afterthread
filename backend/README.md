@@ -167,7 +167,8 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 - `GET /api/tools/{name}/summary` — 該工具的 AI 總結（`summary`／`status`／
   `updated_at`／`llm_log_id`，見下方「安裝後的 AI 總結與定版」）；尚無總結時
   四個欄位皆為 `null` 的 200（不是錯誤），工具不存在（含 `TOOLS_DIR` 未設定）
-  才回 404。
+  才回 404。`llm_log_id` 另外在**後端重啟過**（側檔記的是前一個行程的 id）時
+  一律回 `null`，理由見下方同一節。
 - `PATCH /api/tools/{name}/summary` — body `{status: "draft"|"final"}`，定版／
   解除定版；成功回更新後的總結。工具不存在回 404；**沒有東西可定版**回
   `409 summary_missing`——包含「還沒有 sidecar」與「sidecar 的 `summary` 是空的
@@ -227,10 +228,16 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   設定、上游錯誤、任何例外）都被就地吞掉，絕不會把已經成功的安裝翻成失敗，只
   會留下空總結的 sidecar 供之後 `regenerate`。sidecar **不是把呼叫端的 dict 直接
   序列化**，而是照固定 schema（`summary`／`status`／`updated_at`／`llm_log_id`／
-  `origin`）重建：檔案裡每一個 key 都是後端寫死的字面值，值也一律被收斂到約定的
-  型別（未知 `status` → `draft`、非 int 的 `llm_log_id` → `null`、`origin` 只留
-  看得懂的兩個字串欄位），手動加的多餘 key 下一次寫入就會被丟掉（這本來就不是
-  契約）。三個可能帶操作者／LLM 文字的**值**（`summary`、`origin.openapi_url`、
+  `llm_log_process`／`origin`）重建：檔案裡每一個 key 都是後端寫死的字面值，值也
+  一律被收斂到約定的型別（未知 `status` → `draft`、非 int 的 `llm_log_id` →
+  `null`、`origin` 只留看得懂的兩個字串欄位），手動加的多餘 key 下一次寫入就會被
+  丟掉（這本來就不是契約）。`llm_log_process` 是**寫下那個 `llm_log_id` 的行程**
+  的識別碼：AI 日誌的 id 是每個行程各自從 0 開始的計數器、環狀緩衝重啟即空，而
+  這個檔案會把整數永久留著，所以重啟之後同一個 id 指到的是**現在**佔著它的那次
+  互動（別的工具的總結，甚至別的 workflow）。`GET .../summary` 因此只在 token 等
+  於當前行程時才把 `llm_log_id` 交出去，否則回 `null`（＝沒有可連的紀錄，前端本來
+  就是這樣渲染的）；token 由 `store_summary_meta` 在寫下 id 的同一個動作裡蓋章，
+  定版／解除定版的重寫則**原樣沿用**磁碟上的那一組，絕不重新蓋章。三個可能帶操作者／LLM 文字的**值**（`summary`、`origin.openapi_url`、
   `origin.instructions`）一律過 `redact_known_secrets` 且**遮蔽失敗就不寫**——
   而這道遮蔽是這個檔案**唯一**的防線，不是「反正後面還有一關」。（舊版本這裡寫
   「sidecar 之後會被修訂流程複製進暫存目錄接受『檔案不得內嵌秘密值』檢查」——那不

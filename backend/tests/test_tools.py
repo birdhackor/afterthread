@@ -772,6 +772,119 @@ def test_runtime_overflow_output_with_exiting_leader_stays_clean(
     assert time.monotonic() - started < 10  # 20 clean teardowns, never a hang
 
 
+def test_runtime_refuses_a_package_replaced_after_it_was_advertised(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tool whose package was REPLACED between being advertised and being called
+    refuses instead of running, and the unchanged package still runs normally.
+
+    ``enabled_llm_tools()`` snapshots each tool's schema at the START of an AI
+    workflow, but the handler resolves and executes from the PATH minutes later --
+    and an ordinary capture/enrich is NOT inside the tool job's single-flight, so a
+    revise can swap the package underneath a conversation that already advertised
+    the old one. The model would then be answering against a schema the running
+    entry no longer implements.
+
+    The swap here is revise-shaped: a fresh ``tool.json`` written into place (a
+    different inode, and a different ctime even if it were not), leaving the name
+    and the entry file alone -- so nothing but the manifest identity can tell.
+    The sentinel is what proves the refusal happened INSTEAD of a run rather than
+    alongside it: the entry writes that file the moment it executes."""
+    root = tmp_path / "tools"
+    sentinel = tmp_path / "ran"
+    pkg = _make_tool(
+        root,
+        "swapped",
+        f"import sys\nopen({str(sentinel)!r}, 'w').write('x')\nsys.stdout.write('ok')\n",
+    )
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler
+
+    # Unchanged package: executes exactly as before.
+    assert asyncio.run(handler({})) == "ok"
+    assert sentinel.exists()
+    sentinel.unlink()
+
+    manifest = json.loads((pkg / "tool.json").read_text(encoding="utf-8"))
+    replacement = pkg / "tool.json.new"
+    replacement.write_text(json.dumps(manifest), encoding="utf-8")
+    os.replace(replacement, pkg / "tool.json")
+
+    assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
+    assert not sentinel.exists()  # nothing was started
+
+
+def test_runtime_refuses_when_the_advertised_identity_could_not_be_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """ "Cannot say" is a REFUSAL, never a pass.
+
+    ``package_identity`` answers None on any lstat failure, and ``None == None``
+    would otherwise read as "identity matches" -- the exact hole the revise flow
+    closed by refusing up front when it cannot establish an identity (D40 P3b
+    r11). Patched at the helper so BOTH the advertise-time capture and the
+    execute-time check return None, which is the state a transient stat failure
+    produces."""
+    root = tmp_path / "tools"
+    sentinel = tmp_path / "ran"
+    _make_tool(
+        root,
+        "unknown",
+        f"import sys\nopen({str(sentinel)!r}, 'w').write('x')\nsys.stdout.write('ok')\n",
+    )
+    _install_tools(monkeypatch, root)
+    monkeypatch.setattr(tools, "package_identity", lambda _directory: None)
+
+    assert asyncio.run(enabled_llm_tools()[0].handler({})) == tools._TOOL_REPLACED_RESULT
+    assert not sentinel.exists()
+
+
+def test_runtime_refuses_after_the_enabled_toggle_rewrites_the_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The documented FALSE POSITIVE, pinned so it is not rediscovered as a bug.
+
+    ``set_enabled`` rewrites ``tool.json`` IN PLACE, which moves its ctime -- so
+    toggling a tool during a conversation that already advertised it makes every
+    later call to that tool in that conversation refuse, even for an
+    off-then-on that leaves the bytes identical. That is the conservative
+    direction: the only reading that would let this through ("the manifest was
+    merely rewritten, carry on") is the one that cannot tell an enabled-flip from
+    a wholesale replacement. The cost is one re-run of a single AI request."""
+    root = tmp_path / "tools"
+    _make_tool(root, "toggled", "import sys\nsys.stdout.write('ok')\n")
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler
+    assert asyncio.run(handler({})) == "ok"
+
+    assert set_enabled("toggled", False) is True
+    assert set_enabled("toggled", True) is True
+
+    assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
+
+
+def test_runtime_identity_survives_a_summary_sidecar_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Writing the AI summary sidecar does NOT trip the identity check.
+
+    ``.ai_meta.json`` is a different file, so the manifest's own ctime is
+    untouched -- which matters because a summary is generated (and regenerated)
+    while conversations are live, and a check that fired on it would refuse every
+    tool in the vicinity of an unrelated feature."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "summarized", "import sys\nsys.stdout.write('ok')\n")
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler
+
+    assert tools.write_tool_meta(
+        pkg,
+        {"summary": "what it does", "status": "draft", "updated_at": "2026-07-27T00:00:00+00:00"},
+    )
+
+    assert asyncio.run(handler({})) == "ok"
+
+
 def test_description_capped_uniformly(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """An over-long description keeps the package VALID but is capped to 1000
     chars in BOTH the list view and the advertised OpenAI spec."""
@@ -1920,6 +2033,10 @@ def test_tool_meta_round_trips(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
         "status": "draft",
         "updated_at": "2026-07-26T00:00:00+00:00",
         "llm_log_id": 12,
+        # Carried through verbatim, never re-derived: set_summary_status's
+        # round-trip must keep a token minted by an EARLIER process (see
+        # write_tool_meta).
+        "llm_log_process": "process-token-from-whoever-wrote-this",
         "origin": {"openapi_url": "http://kb.example/openapi.json", "instructions": "build"},
     }
     assert tools.write_tool_meta(pkg, meta) is True
@@ -2077,7 +2194,7 @@ def test_write_tool_meta_keys_survive_a_secret_that_equals_one(
 def test_write_tool_meta_drops_unknown_keys_and_containers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The sidecar IS the five schema fields; anything else a caller (or a
+    """The sidecar IS the six schema fields; anything else a caller (or a
     hand-edited file read back in) carries is dropped by the next write.
 
     Round-tripping extra keys was never a contract -- it was a side effect of
@@ -2105,7 +2222,14 @@ def test_write_tool_meta_drops_unknown_keys_and_containers(
     assert secret not in raw
     stored = tools.read_tool_meta(pkg)
     assert stored is not None
-    assert set(stored) == {"summary", "status", "updated_at", "llm_log_id", "origin"}
+    assert set(stored) == {
+        "summary",
+        "status",
+        "updated_at",
+        "llm_log_id",
+        "llm_log_process",
+        "origin",
+    }
 
 
 @pytest.mark.parametrize(
@@ -2738,6 +2862,63 @@ def test_store_summary_meta_outcomes(monkeypatch: pytest.MonkeyPatch, tmp_path: 
         None,
     )
     assert not gone.exists()
+
+
+def test_store_summary_meta_stamps_the_minting_process_beside_the_log_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A stored ``llm_log_id`` always carries the token of the process that minted
+    it, and an absent id carries no token.
+
+    The id is a per-process counter over a ring that dies with the process, but
+    the sidecar keeps the integer forever -- so the token is the only thing that
+    can later say whether the id still names the interaction it was written for.
+    Stamped at the store (never passed in), so no arrangement of arguments can
+    pair an id with someone else's token."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+
+    outcome, meta = tools.store_summary_meta(pkg, summary="說明", origin=None, llm_log_id=7)
+    assert outcome == "ok"
+    assert meta is not None
+    assert meta["llm_log_id"] == 7
+    assert meta["llm_log_process"] == llm_log.process_token()
+
+    outcome, meta = tools.store_summary_meta(pkg, summary="說明", origin=None, llm_log_id=None)
+    assert outcome == "ok"
+    assert meta is not None
+    assert meta["llm_log_id"] is None
+    assert meta["llm_log_process"] is None  # no id, nothing to vouch for
+
+
+def test_set_summary_status_keeps_a_foreign_process_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """定版 / 解除定版 carries the id AND its token through untouched.
+
+    The round-trip rebuilds the sidecar from what it just READ, so a summary
+    generated before a restart keeps its (now foreign) token instead of being
+    re-stamped as current -- re-stamping would forge freshness onto a stale id,
+    which is precisely the confusion the token exists to prevent."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    monkeypatch.setattr(tools, "_resolve_package_dir_no_alias", lambda _name: pkg)
+
+    assert (
+        _write_meta(pkg, summary="上一個行程寫的", llm_log_id=4, llm_log_process="an-older-process")
+        is True
+    )
+
+    assert tools.set_summary_status("echo", "final") == "ok"
+
+    stored = tools.read_tool_meta(pkg)
+    assert stored is not None
+    assert stored["status"] == "final"
+    assert stored["llm_log_id"] == 4
+    assert stored["llm_log_process"] == "an-older-process"
+    assert stored["llm_log_process"] != llm_log.process_token()
 
 
 # The SUMMARY's redact -> strip -> cap, at its one choke point (D40 r4). The

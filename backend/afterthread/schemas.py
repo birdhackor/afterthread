@@ -444,13 +444,16 @@ class LlmLogAttempt(BaseModel):
     response ever landed on this attempt), never 0 for that case. ``usage`` is
     THIS attempt's own reading, distinct from ``LlmLogBase.usage``'s
     interaction-level aggregate (see the module comment above). ``truncated``
-    is true the moment ANY body on this attempt -- a request message or the
-    response -- was cut for size; the FE shows a small badge for it.
+    is true the moment ANY stored text on this attempt -- a request message, the
+    response, or an advertised tool name -- was cut for size; the FE shows a
+    small badge for it.
     ``tools_advertised`` is the NAMES of the tools this attempt offered the
     model, or null when it sent no ``tools`` parameter at all (see
     ``LlmAttempt`` in services/llm_log.py) -- declaring it here is what keeps it
     on the wire, since pydantic's default ``extra="ignore"`` would otherwise
-    drop the key silently at the router's ``model_validate``.
+    drop the key silently at the router's ``model_validate``. Like every other
+    stored text here it has been through the log's redaction choke point, since
+    a tool NAME can itself equal a registered secret value.
     """
 
     request_messages: list[LlmLogMessage]
@@ -517,7 +520,12 @@ class ToolSummaryDetail(BaseModel):
 
     ``llm_log_id`` links to the summary session's AI 日誌 record (the
     ``tool_summary`` workflow, distinct from the builder's ``tool_install``), so
-    a wrong or missing summary is debuggable from the UI.
+    a wrong or missing summary is debuggable from the UI. It is null whenever the
+    id on disk was minted by a PREVIOUS process: log ids are a per-process counter
+    over a ring that is wiped on restart, so a persisted id only means something
+    while that process lives (see ``routers.tools._summary_detail``, which nulls
+    it rather than adding a fifth field -- a null here already means "no record to
+    link", and the FE already renders exactly that).
     """
 
     summary: str | None

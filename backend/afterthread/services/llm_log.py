@@ -55,6 +55,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 from afterthread.config import get_settings
 
@@ -108,10 +109,11 @@ class LlmAttempt:
     detail (the response body it was judged against is already recorded above
     it).
 
-    ``truncated`` is True the moment ANY body on this attempt -- a request
-    message or the response -- was cut by ``_stored_body``, so a reader can
-    tell "this record is honest but incomplete" apart from "this is
-    everything" without diffing lengths against the configured cap by hand.
+    ``truncated`` is True the moment ANY stored text on this attempt -- a
+    request message, the response, or an advertised tool name -- was cut by
+    ``_stored_body``, so a reader can tell "this record is honest but
+    incomplete" apart from "this is everything" without diffing lengths against
+    the configured cap by hand.
 
     ``tools_advertised`` is the list of tool NAMES this attempt actually
     offered the model, or None when the attempt sent NO ``tools`` parameter at
@@ -123,7 +125,11 @@ class LlmAttempt:
     specs: one tool's parameters schema can run to 16KiB and would be
     re-recorded verbatim on every attempt of every round, while the name alone
     already answers that question -- the full spec is on disk in the tool's
-    tool.json. In practice a reader sees only None or a non-empty list: an
+    tool.json. Each name is STORED through ``_stored_body`` like every other
+    caller-derived text in this record -- a tool name can equal a registered
+    secret value, so it does not get to skip the redaction choke point (see
+    ``LlmInteractionRecorder.begin_attempt``). In practice a reader sees only
+    None or a non-empty list: an
     EMPTY tool set is normalized to "no tools parameter at all" upstream (see
     ``_run_structured``), so ``tools=[]`` records None rather than []. A
     literal [] stays possible for one degenerate reason, and means something
@@ -182,6 +188,25 @@ _LOCK = threading.Lock()
 _ring: deque[LlmInteractionRecord] | None = None
 _last_id = 0
 
+# This process's opaque identity for the id space above, minted once at import.
+#
+# ``id`` is a per-process counter starting at 0 and the ring dies with the
+# process -- so an id is only meaningful ALONGSIDE the identity of the process
+# that minted it. Anything that PERSISTS an id outlives that: the tool summary
+# sidecar (``tools.write_tool_meta``'s ``llm_log_id``) keeps the integer on disk
+# forever, and after a restart that integer resolves to whatever interaction now
+# holds it -- a DIFFERENT tool's summary session, possibly a different workflow
+# entirely. Nothing downstream can notice: ``get_record`` finds a real record and
+# the detail agrees with itself, because the row WAS selected by that id.
+#
+# So a persisted id is stored next to this token and the reader compares first
+# (see ``routers.tools._summary_detail``). Opaque and random rather than pid +
+# start time: a pid is reused, and this only ever has to answer "same process or
+# not", never "which process". A token that is merely ABSENT (every sidecar
+# written before this existed) reads as "not this process", which is the
+# conservative answer -- see that reader.
+_PROCESS_TOKEN = uuid4().hex
+
 
 def _get_ring() -> deque[LlmInteractionRecord]:
     """Return the process-wide ring, building it once from current settings.
@@ -205,17 +230,36 @@ def _allocate_id() -> int:
         return _last_id
 
 
+def process_token() -> str:
+    """This process's opaque identity for the log-id space (``_PROCESS_TOKEN``).
+
+    An accessor rather than the constant itself so every caller reads it at the
+    moment it acts -- which is what lets ``_reset_for_tests`` model a RESTART, and
+    what keeps a module-level ``from ... import`` from freezing a stale copy of a
+    value whose whole job is to differ between processes.
+    """
+    return _PROCESS_TOKEN
+
+
 def _reset_for_tests() -> None:
     """Drop the ring and id counter so a test starts from an empty log.
 
     Not used at runtime. Lets a test pick a fresh ``llm_log_max_entries`` (via a
     settings override) and have the next ``_get_ring()`` build a ring of that
     size, and keeps the monotonic id space from leaking assertions across tests.
+
+    The process token is re-minted here for a CORRECTNESS reason, not for tidiness:
+    it exists to vouch for THIS id space, and this function restarts that id space
+    at 0. Leaving the old token in place would have it vouch for ids it no longer
+    describes -- exactly the confusion it was added to prevent. It also makes a
+    restart something a test can produce honestly (reset, and every previously
+    persisted id is correctly foreign) instead of mocking the reader.
     """
-    global _ring, _last_id
+    global _ring, _last_id, _PROCESS_TOKEN
     with _LOCK:
         _ring = None
         _last_id = 0
+        _PROCESS_TOKEN = uuid4().hex
 
 
 # --- defensive usage extraction -------------------------------------------
@@ -550,7 +594,15 @@ def _stored_body(text: str) -> tuple[str, bool]:
     before it is written into an attempt, in a THREE-stage order that each
     guards a distinct hazard: ``_redact`` FIRST, then ``_utf8_safe``, then the
     hard cut to ``settings.llm_log_body_max_chars`` (with
-    ``_BODY_TRUNCATION_MARKER`` appended when a cut happens).
+    ``_BODY_TRUNCATION_MARKER`` appended when a cut happens). "Body" is its
+    origin, not its scope: an attempt's advertised tool NAMES run through it too
+    (see ``LlmInteractionRecorder.begin_attempt``), so that every stored string a
+    record holds that could carry operator/LLM/filesystem text reaches its sinks
+    through here. The one string that does not is a message's ``role``, and that
+    is deliberate: it is a closed vocabulary this codebase writes itself
+    ("system"/"user"/"assistant"/"tool", plus the synthetic elision entry below),
+    never operator text, and masking it would break rendering-by-role for a value
+    that cannot carry a secret.
 
     Redaction MUST run first -- before both the UTF-8 pass and the size cut. The
     size cut is the load-bearing reason: a secret value straddling the
@@ -734,10 +786,36 @@ class LlmInteractionRecorder:
         ``tools_advertised`` is the NAMES of the tools this attempt offers the
         model (see ``LlmAttempt``); keyword-only with a default so every caller
         that advertises none -- and every pre-existing one -- keeps recording
-        None without changing a line. It is stored as a COPY for the same
-        reason the messages are: the caller derives it once per interaction and
-        reuses that one list across every round, so an alias would let a later
-        mutation rewrite an attempt already recorded here.
+        None without changing a line. Each name goes through ``_stored_body``,
+        the SAME choke point every message and response passes, which is also why
+        the result is a new list rather than an alias of the caller's (that list
+        is derived once per interaction and reused across every round, so an alias
+        would let a later mutation rewrite an attempt already recorded here).
+
+        Putting the names through that choke point closes the one field of a
+        record that used to bypass it. A tool name can legitimately EQUAL a
+        registered secret VALUE -- a hand-edited ``.env`` holding
+        ``TOKEN=kbsearch`` while ``kbsearch`` is an installed tool -- and these
+        names were copied straight into the record, out to the detail API and into
+        the JSONL sink. It is the same class the revise prompt's name
+        interpolation already handles by redacting the interpolated name.
+
+        The FULL pipeline, not just its ``_redact`` stage, and that is a decision
+        rather than reflex: a name lands in the same two sinks and the same strict
+        UTF-8 serialization as a body, so ``_utf8_safe`` earns its place on
+        exactly the grounds it earns it there, while the ONE stage that might look
+        like dead weight -- the size cut -- is structurally unreachable for a name
+        (``tools._NAME_RE`` bounds one to 64 chars; ``llm_log_body_max_chars``
+        cannot go below 1000, and redaction can at most inflate 64 chars to ~120).
+        Unreachable is not the same as impossible, so its truncation flag is OR'd
+        into the attempt's own rather than dropped: silently discarding a signal
+        because it "cannot fire" is how it later fires unnoticed. Spelling out two
+        thirds of ``_stored_body`` instead would be a second, partial copy of the
+        choke point for no gain.
+
+        None-vs-``[]`` survives exactly: None short-circuits (no tools parameter
+        was sent at all), and an empty list maps to an empty list (see
+        ``LlmAttempt`` for why those mean different things).
         """
         stored: list[dict[str, str]] = []
         truncated = False
@@ -745,6 +823,13 @@ class LlmInteractionRecorder:
             content, was_truncated = _message_text(msg.get("content"))
             stored.append({"role": str(msg.get("role", "")), "content": content})
             truncated = truncated or was_truncated
+        stored_names: list[str] | None = None
+        if tools_advertised is not None:
+            stored_names = []
+            for name in tools_advertised:
+                stored_name, name_truncated = _stored_body(name)
+                stored_names.append(stored_name)
+                truncated = truncated or name_truncated
         request_messages, _elided, budget_truncated = _apply_total_budget(stored)
         request_chars = sum(len(message["content"]) for message in request_messages)
         self._attempts.append(
@@ -752,7 +837,7 @@ class LlmInteractionRecorder:
                 request_messages=request_messages,
                 request_chars=request_chars,
                 truncated=truncated or budget_truncated,
-                tools_advertised=(list(tools_advertised) if tools_advertised is not None else None),
+                tools_advertised=stored_names,
             )
         )
 

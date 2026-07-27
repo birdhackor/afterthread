@@ -249,12 +249,15 @@ function SummaryStatusBadge({ status }) {
 // stayed on screen indefinitely with nothing saying so. The banner is what
 // removes that silence.
 //
-// `writesBlocked` is every reason the two name-addressed AI WRITES (重新產生,
-// 送出修訂) must not be issued right now: the panel-wide single-flight mirror
-// AND a known-stale tool list (see InstalledToolsPanel's summaryWritesBlocked
-// for both halves). It deliberately does NOT gate the 定版/解除定版 button --
-// see that button's own disabled comment below for why. `isTogglingThisTool` is
-// a SEPARATE gate with a different cause; see the revise submit for the causal
+// `writesBlocked` carries the reasons the two name-addressed AI WRITES
+// (重新產生, 送出修訂) must not be issued that this panel cannot see for itself:
+// the panel-wide single-flight mirror, a known-stale tool list, and a just-ended
+// job whose re-read has not landed (see InstalledToolsPanel's
+// summaryWritesBlocked for all three). It deliberately does NOT gate the
+// 定版/解除定版 button -- see that button's own disabled comment below for why.
+// 送出修訂 additionally answers to `displayedMayBeStale`, which is what this
+// panel knows first-hand about its OWN summary query; `isTogglingThisTool` is a
+// third gate with a different cause again; see the revise submit for the causal
 // chain.
 function ToolSummaryPanel({
 	name,
@@ -310,8 +313,33 @@ function ToolSummaryPanel({
 	};
 	const isFinal = detail.status === "final";
 
+	// The three ways "what is on screen may not be current" can be true, named
+	// once because TWO controls need the same answer: `settlingJobEnd` (a finished
+	// job's re-read is still in flight), `isFetching` (any background refresh is),
+	// and `isError` (the refresh FAILED and left the previous copy rendered --
+	// react-query keeps `data` and only flips status, so `isFetching` is back to
+	// false while the content is stale).
+	//
+	// The rule this expresses, because it is now bigger than 定版 (R2-4):
+	// AUTHORING FEEDBACK ABOUT DISPLAYED CONTENT IS THE SAME HAZARD AS FREEZING
+	// DISPLAYED CONTENT. 定版 has been gated on it since R10/R11; the revise form
+	// is the other half. Concretely: while this row was COLLAPSED its summary
+	// query was disabled, so the revalidation a finished revise fired resolved
+	// without issuing a GET and cleared the settling gate anyway; re-expanding
+	// then renders the CACHED pre-revise summary (data present, so no Loader)
+	// while a refetch is in flight or has failed. Writing 修訂意見 about that text
+	// and pressing 送出修訂 sends feedback describing the OLD implementation to a
+	// builder session that will apply it to code that has already changed -- and
+	// unlike a mistaken 定版 (one enum field, reversible by pressing the other
+	// direction), that spends minutes of LLM time rewriting a package.
+	//
+	// 解除定版 stays OUT of this, exactly as before (R11-1): freezing needs to see
+	// the current state, RELEASING does not, and a persistent read failure must
+	// never strand an operator on a finalized tool with no way back.
+	const displayedMayBeStale = settlingJobEnd || isFetching || isError;
+
 	const submitRevise = handleSubmit((values) => {
-		if (writesBlocked || isFinal || isTogglingThisTool) {
+		if (writesBlocked || isFinal || isTogglingThisTool || displayedMayBeStale) {
 			return;
 		}
 		const feedback = values.feedback.trim();
@@ -418,41 +446,24 @@ function ToolSummaryPanel({
 					// Only the 定版 direction needs a content gate (nothing to freeze
 					// without text); 解除定版 stays unconditional.
 					//
-					// `settlingJobEnd` DOES gate it, and that is not a contradiction of
-					// the paragraph above (R8-1). staleList is a persistent condition --
-					// gating on it could strand an operator with no action at all --
-					// while this is one round trip that clears itself. And what it
-					// protects is specific: a revise just rewrote the summary, so the
-					// text on screen is the PREVIOUS one; freezing during that window
-					// would finalize content the user has never seen.
-					// `isFetching` belongs here for the same reason `settlingJobEnd`
-					// does, and it covers a case that one cannot (R10-1): while this
-					// row was COLLAPSED its query was disabled, so the revalidation a
-					// finished revise fired never issued a GET and the job was still
-					// recorded as settled. Re-expanding then renders the CACHED
-					// pre-revise summary while a background refetch is in flight --
-					// data is present, so no Loader -- and 定版 freezes whatever is on
-					// screen. An action whose whole meaning is "freeze what I am
-					// looking at" must not run while what is on screen is already
-					// known to be superseded.
-					// Everything that means "what is on screen may not be current" gates
-					// the 定版 DIRECTION only, never 解除定版 (R11-1). The asymmetry is
-					// the point: 定版 freezes what is displayed, so it must not run over
-					// content we know is superseded -- `settlingJobEnd` while a finished
-					// job's re-read is in flight, `isFetching` while any refresh is,
-					// and `isError` when that refresh FAILED and left the stale copy on
-					// screen (data present, isFetching back to false, gate cleared --
-					// the sibling hole of the isFetching one). 解除定版 RELEASES; it
-					// freezes nothing, and a persistent read failure must not be able
-					// to strand an operator with a finalized tool and no way out --
-					// the same escape-hatch rule staleList already follows.
+					// `displayedMayBeStale` DOES gate it, and that is not a contradiction
+					// of the paragraph above (R8-1/R10-1/R11-1). staleList is a persistent
+					// condition -- gating on it could strand an operator with no action at
+					// all -- while every term of that one is a round trip that clears
+					// itself, and what they protect is specific: a revise just rewrote the
+					// summary, so the text on screen is the PREVIOUS one, and freezing
+					// during that window finalizes content the user has never seen. It is
+					// applied to the 定版 DIRECTION only, never 解除定版: 定版 freezes what
+					// is displayed, 解除定版 RELEASES it and freezes nothing, and a
+					// persistent read failure must not be able to strand an operator with a
+					// finalized tool and no way out -- the same escape-hatch rule staleList
+					// already follows. See `displayedMayBeStale` for the three terms and
+					// for the revise form, which is gated by the same value for the same
+					// reason.
 					disabled={
 						isUpdatingStatus ||
 						(!isFinal &&
-							(settlingJobEnd ||
-								isFetching ||
-								isError ||
-								!canFinalizeSummary(detail.summary)))
+							(displayedMayBeStale || !canFinalizeSummary(detail.summary)))
 					}
 					onClick={() => onSetStatus(isFinal ? "draft" : "final")}
 				>
@@ -486,7 +497,19 @@ function ToolSummaryPanel({
 									placeholder="例如：回應請改成只列出前 5 筆結果。"
 									autosize
 									minRows={2}
-									disabled={writesBlocked || isFinal || isTogglingThisTool}
+									// Gated by `displayedMayBeStale` for the same reason the submit
+									// below is: feedback is written ABOUT the summary rendered above
+									// it, so it must not be authored against content already known to
+									// be superseded. Disabling the FIELD and not only the button is
+									// deliberate -- letting someone type a paragraph and only then
+									// discover the button is dead is a worse version of the same
+									// refusal.
+									disabled={
+										writesBlocked ||
+										isFinal ||
+										isTogglingThisTool ||
+										displayedMayBeStale
+									}
 									error={fieldState.error?.message}
 								/>
 								<CharCounter value={field.value} max={AI_INPUT_MAX} />
@@ -513,7 +536,20 @@ function ToolSummaryPanel({
 							// toggle is in flight costs nothing and removes the half of
 							// that race the switch's own gate cannot see (a PATCH already
 							// on the wire when the revise is queued).
-							disabled={writesBlocked || isFinal || isTogglingThisTool}
+							//
+							// `displayedMayBeStale` is the 定版 gate applied to the OTHER
+							// action that reasons from what is on screen (R2-4): this submit
+							// sends feedback the user wrote ABOUT the summary above it, so
+							// issuing it while that text is known to be superseded hands a
+							// builder session instructions for an implementation that no
+							// longer exists. See `displayedMayBeStale` for the rule, and for
+							// why 解除定版 is deliberately not gated the same way.
+							disabled={
+								writesBlocked ||
+								isFinal ||
+								isTogglingThisTool ||
+								displayedMayBeStale
+							}
 						>
 							送出修訂
 						</Button>

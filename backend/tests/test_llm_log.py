@@ -383,6 +383,106 @@ def test_redaction_masks_known_secret_in_request_and_response(
     assert llm_log._REDACTION_MARKER in file_text
 
 
+def test_advertised_tool_names_go_through_the_same_redaction(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A tool NAME that equals a registered secret value is masked in the record
+    and in the detail payload, exactly like a body.
+
+    The names used to be copied straight into the attempt, so they were the one
+    stored field that bypassed the redaction choke point -- and a name CAN
+    legitimately be a registered value (a hand-edited ``.env`` holding
+    ``TOKEN=kbsearch`` while ``kbsearch`` is an installed tool). Ordinary names
+    are untouched, and both sinks see the same masked record."""
+    secret = "kbsearch-tool"  # also the name of an installed tool
+    log_file = tmp_path / "llm.jsonl"
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_file=str(log_file), llm_log_max_entries=50),
+    )
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {secret})
+    llm_log._reset_for_tests()
+
+    _record(workflow="capture", tools_advertised=[secret, "notes"])
+
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    names = record["attempts"][0]["tools_advertised"]
+    assert names == [llm_log._REDACTION_MARKER, "notes"]
+    # The JSONL sink wrote the SAME masked record -- the value never on disk.
+    file_text = log_file.read_text(encoding="utf-8")
+    assert secret not in file_text
+
+
+def test_advertised_tool_names_keep_none_and_empty_apart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Routing the names through ``_stored_body`` must not blur the two answers
+    that mean different things: None (no ``tools`` parameter rode on this attempt
+    at all) stays None, and [] (a tools parameter rode, but nothing in it carried
+    a readable name) stays []."""
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {"kb-live-key-abcdef"})
+    llm_log._reset_for_tests()
+
+    _record(workflow="capture", tools_advertised=[])
+    _record(workflow="enrich")  # the kwarg is not passed at all
+
+    summaries = llm_log.list_summaries(2)
+    without_kwarg = llm_log.get_record(summaries[0]["id"])
+    empty_list = llm_log.get_record(summaries[1]["id"])
+    assert without_kwarg is not None and empty_list is not None
+    assert without_kwarg["attempts"][0]["tools_advertised"] is None
+    assert empty_list["attempts"][0]["tools_advertised"] == []
+
+
+def test_advertised_tool_name_cut_for_size_sets_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A name cut by the size stage folds into the attempt's own ``truncated``
+    flag rather than being dropped silently.
+
+    Unreachable in production -- ``tools._NAME_RE`` bounds a name to 64 chars and
+    the cap's own floor is 1000 -- which is exactly why it is pinned here: a
+    signal discarded because it "cannot fire" is one that later fires unnoticed.
+    Driven by lowering the cap, the same way the body-truncation tests do."""
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_body_max_chars=1000, llm_log_max_entries=50),
+    )
+    llm_log._reset_for_tests()
+
+    _record(workflow="capture", tools_advertised=["short"])
+    unflagged = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert unflagged is not None
+    assert unflagged["attempts"][0]["truncated"] is False
+
+    _record(workflow="capture", tools_advertised=["n" * 2000])
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    attempt = record["attempts"][0]
+    assert attempt["truncated"] is True
+    assert attempt["tools_advertised"][0].endswith(llm_log._BODY_TRUNCATION_MARKER)
+
+
+def test_process_token_is_stable_and_re_minted_on_a_simulated_restart() -> None:
+    """The token names THIS process's id space, so it must be the same string on
+    every read within a process and a DIFFERENT one once that id space restarts.
+
+    ``_reset_for_tests`` is what a restart looks like to this module (the ring is
+    dropped and ids go back to 0), so re-minting there is a correctness property,
+    not a testing convenience: a token that survived the reset would vouch for
+    ids it no longer describes."""
+    before = llm_log.process_token()
+    assert llm_log.process_token() == before
+    assert before  # opaque, but never empty
+
+    llm_log._reset_for_tests()
+    assert llm_log.process_token() != before
+
+
 def test_redaction_skips_values_shorter_than_min(monkeypatch: pytest.MonkeyPatch) -> None:
     """A too-short (<6 char) provider value is NEVER redacted: masking a 1-5 char
     value would shred ordinary prose, and a real key is never that short."""

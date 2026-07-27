@@ -55,7 +55,7 @@ from afterthread.schemas import (
     ToolSummaryStatusUpdate,
     ToolUpdateRequest,
 )
-from afterthread.services import tool_builder, tool_meta
+from afterthread.services import llm_log, tool_builder, tool_meta
 from afterthread.services import tools as tools_service
 from afterthread.services.llm import LLMNotConfiguredError, LLMUpstreamError
 from afterthread.services.tools import _NAME_RE, _SUMMARY_STATUSES
@@ -322,19 +322,52 @@ def _summary_detail(meta: dict[str, Any] | None) -> ToolSummaryDetail:
     path, exactly as ``read_tool_meta`` treats an unparseable sidecar as no
     sidecar. ``status`` is filtered against the registry's own vocabulary so an
     unknown value can never reach the FE's badge (or, worse, read as 定版).
+
+    ``llm_log_id`` is additionally filtered by WHOSE id it is. The AI log's ids
+    are a per-process counter and its ring is wiped on restart, while the sidecar
+    keeps the integer forever -- so after a restart a stored id resolves to
+    whatever interaction now occupies it: a different tool's summary session, or
+    a different workflow entirely. The existing ``started_at`` staleness hint on
+    the log page cannot help, because the deep link SELECTS the row by that id,
+    so the detail and the row agree with each other. Only the writer's process
+    identity can answer it, so ``store_summary_meta`` records
+    ``llm_log_process`` beside the id and this compares it to
+    ``llm_log.process_token()``.
+
+    NULLING the id rather than adding an "is it still valid" boolean, for three
+    reasons that all point the same way: ``ToolSummaryDetail`` is already a
+    four-field all-nullable shape whose null ``llm_log_id`` means exactly "there
+    is no record to link", the FE already renders precisely that (no 查看 AI 日誌
+    anchor), and shipping the integer alongside a false flag would hand a client
+    an id that resolves -- to the wrong interaction -- and make every consumer
+    read two fields to answer one question. A null here is NOT the same as the
+    ring having evicted a record: an id from THIS process survives eviction as a
+    link that 404s honestly ("that record has aged out"), which is the existing,
+    benign case.
+
+    A sidecar with NO token -- every one written before this field existed -- is
+    treated as foreign, which is the conservative reading: those ids were minted
+    by a process that has since exited by definition of the file outliving it, and
+    guessing "current" is the one answer that produces a wrong link. The next
+    ``regenerate`` re-stamps both fields together.
     """
     data = meta or {}
     summary = data.get("summary")
     status = data.get("status")
     updated_at = data.get("updated_at")
     log_id = data.get("llm_log_id")
+    from_this_process = data.get("llm_log_process") == llm_log.process_token()
     return ToolSummaryDetail(
         summary=summary if isinstance(summary, str) else None,
         status=status if isinstance(status, str) and status in _SUMMARY_STATUSES else None,
         updated_at=updated_at if isinstance(updated_at, str) else None,
         # `bool` is an `int` subclass; excluding it keeps a stray `true` from
         # rendering as a link to log record 1.
-        llm_log_id=log_id if isinstance(log_id, int) and not isinstance(log_id, bool) else None,
+        llm_log_id=(
+            log_id
+            if from_this_process and isinstance(log_id, int) and not isinstance(log_id, bool)
+            else None
+        ),
     )
 
 

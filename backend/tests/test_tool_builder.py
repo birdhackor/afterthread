@@ -3076,6 +3076,11 @@ def test_router_get_summary_returns_the_sidecar(
             "status": "draft",
             "updated_at": "2026-07-26T00:00:00+00:00",
             "llm_log_id": 7,
+            # The token a real store stamps beside the id (store_summary_meta).
+            # Without it the route nulls the link, because a stored id only names
+            # a record while the process that minted it is alive -- see the two
+            # tests below for both halves of that.
+            "llm_log_process": llm_log.process_token(),
             "origin": {"openapi_url": "http://kb.example/o.json", "instructions": "查 KB"},
         },
     )
@@ -3090,6 +3095,61 @@ def test_router_get_summary_returns_the_sidecar(
         "updated_at": "2026-07-26T00:00:00+00:00",
         "llm_log_id": 7,
     }
+
+
+def test_router_get_summary_drops_a_log_link_a_restart_invalidated(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A stored ``llm_log_id`` stops being offered once the process that minted it
+    is gone -- and everything else about the summary is untouched.
+
+    Log ids are a per-process counter over a ring that is wiped on restart, while
+    the sidecar keeps the integer forever. After a restart the SAME id resolves to
+    whatever interaction now holds it: a different tool's summary session, or a
+    different workflow entirely. Nothing downstream can notice, because the deep
+    link SELECTS the row by that id, so the detail and the row agree with each
+    other -- the existing started_at staleness hint cannot help.
+
+    The restart is produced honestly rather than by mocking the route:
+    ``llm_log._reset_for_tests`` drops the ring, restarts ids at 0 and re-mints
+    the process token, which is exactly what a restart is from this module's
+    point of view."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _write_meta(
+        pkg,
+        summary="這個工具會查 KB",
+        status="draft",
+        llm_log_id=3,
+        llm_log_process=llm_log.process_token(),
+    )
+    assert client.get("/api/tools/kbsearch/summary").json()["llm_log_id"] == 3
+
+    llm_log._reset_for_tests()  # a restart: same sidecar, a new id space
+
+    body = client.get("/api/tools/kbsearch/summary").json()
+    assert body["llm_log_id"] is None
+    assert body["summary"] == "這個工具會查 KB"  # only the link is withheld
+    assert body["status"] == "draft"
+    # The id is still on disk -- this is a READ-side judgement, not a rewrite.
+    assert _meta(pkg)["llm_log_id"] == 3
+
+
+def test_router_get_summary_treats_a_tokenless_sidecar_as_foreign(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A sidecar with no token at all -- every one written before the field
+    existed -- reads as "not from this process".
+
+    That is the conservative direction and the only defensible one: a file
+    outliving the process that wrote it is the whole premise, so guessing
+    "current" is the answer that produces a wrong link. The next regenerate
+    re-stamps id and token together."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _write_meta(pkg, summary="舊格式的側檔", status="draft", llm_log_id=3)
+
+    body = client.get("/api/tools/kbsearch/summary").json()
+    assert body["llm_log_id"] is None
+    assert body["summary"] == "舊格式的側檔"
 
 
 def test_router_get_summary_degrades_a_hand_edited_sidecar(
@@ -3138,6 +3198,7 @@ def test_router_summary_survives_a_lone_surrogate_in_the_sidecar(
                 "status": "draft",
                 "updated_at": "2026-07-26T00:00:00+00:00",
                 "llm_log_id": 7,
+                "llm_log_process": llm_log.process_token(),
             }
         ),
         encoding="utf-8",
@@ -3188,7 +3249,13 @@ def test_router_patch_summary_finalizes_and_unfinalizes(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     pkg = _seed_package(monkeypatch, tmp_path)
-    _write_meta(pkg, summary="說明", status="draft", llm_log_id=4)
+    _write_meta(
+        pkg,
+        summary="說明",
+        status="draft",
+        llm_log_id=4,
+        llm_log_process=llm_log.process_token(),
+    )
 
     response = client.patch("/api/tools/kbsearch/summary", json={"status": "final"})
     assert response.status_code == 200
