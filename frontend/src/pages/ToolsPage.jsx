@@ -410,9 +410,20 @@ function ToolSummaryPanel({
 					// protects is specific: a revise just rewrote the summary, so the
 					// text on screen is the PREVIOUS one; freezing during that window
 					// would finalize content the user has never seen.
+					// `isFetching` belongs here for the same reason `settlingJobEnd`
+					// does, and it covers a case that one cannot (R10-1): while this
+					// row was COLLAPSED its query was disabled, so the revalidation a
+					// finished revise fired never issued a GET and the job was still
+					// recorded as settled. Re-expanding then renders the CACHED
+					// pre-revise summary while a background refetch is in flight --
+					// data is present, so no Loader -- and 定版 freezes whatever is on
+					// screen. An action whose whole meaning is "freeze what I am
+					// looking at" must not run while what is on screen is already
+					// known to be superseded.
 					disabled={
 						isUpdatingStatus ||
 						settlingJobEnd ||
+						isFetching ||
 						(!isFinal && !canFinalizeSummary(detail.summary))
 					}
 					onClick={() => onSetStatus(isFinal ? "draft" : "final")}
