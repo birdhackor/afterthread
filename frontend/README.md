@@ -128,14 +128,25 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   取代」這種中途操作，在前端補一個它不需要的鎖只會擋掉後端特地支援的動作。
   （這說的是 busy gate；**「定版」方向另有自己的一組閘**，見下面「定版／解除定版
   不吃 `writesBlocked`」那條——不受這個 gate 管制不等於不受任何 gate 管制。）
-- **`ToolsPage` 的 per-row 閘：啟用開關 ⇄ 進行中的修訂**：跨分頁的 `summaryBusy`
-  管的是後端那個全域 single-flight，但「啟用／停用」跟修訂的衝突是**另一回事**、
-  而且是 per-row 的檔案系統競態：`PATCH /api/tools/{name}` 會原地改寫該套件的
-  `tool.json`，而修訂 session 正是以 `tool.json` 的 `(st_dev, st_ino, st_ctime_ns)`
-  當「還是同一個套件嗎」的身分、換裝前再驗一次。所以該列的 `Switch` 會被該列自己的
-  修訂（送出中或工作進行中）停用，該列的「送出修訂」也會被該列自己的 toggle
-  停用；只鎖同一列，別的工具不連坐。**刪除刻意不在這個閘內**（由後端的目標不存在
-  拒絕回答，且它走自己的確認 Modal）。
+- **`ToolsPage` 的 per-row 閘：啟用開關 ⇄ 進行中的修訂／重新產生——web-v5 P1
+  之後已經拆掉**。這一條留著是因為它同時記著「當初為什麼需要」與「現在為什麼不
+  需要」，照舊文重構的人才不會把鎖裝回去。舊理由是 per-row 的檔案系統競態：
+  `PATCH /api/tools/{name}` 會原地改寫該套件的 `tool.json`，而修訂 session 與
+  同步的「重新產生總結」都是以 `tool.json` 的 `(st_dev, st_ino, st_ctime_ns)`
+  當「還是同一個套件嗎」的身分、在一整趟 LLM 往返之後才重驗——所以一次切換會讓
+  整場修訂作廢（「原工具在修訂期間被改動或重新安裝」）、或讓一趟總結往返換到
+  404。web-v5 P1 把 `enabled` 搬進套件自己的 `.state.json`，`tools.set_enabled`
+  從此**完全不開 `tool.json`**，那個身分不可能被一次切換推走；而落在修訂裡的
+  切換由後端換裝前的 `tools.carry_package_state` 帶過去、落在換裝那一瞬間的則由
+  `tools._STATE_PUBLISH_LOCK` 排到換裝之後、寫到剛發佈的那一包（`set_enabled`
+  在**取鎖之前**就把名稱解析完，所以它寫的是當下叫這個名字的套件）。兩邊都算數，
+  因此：**該列的 `Switch` 不再看修訂／重新產生，兩個 AI 寫入也不再看該列的
+  toggle**（`onRegenerate` 裡那個重檢一起拿掉——`disabled` 只是渲染，閘與重檢必須
+  同進同退）。使用者拿回來的是：修訂／重新產生跑到一半才決定「這個工具該關掉」時，
+  現在按得下去。`Switch` 還留著的兩個條件跟身分無關、各自成立：`!tool.valid`
+  （無效套件本來就不會被端給模型，開關對它沒有意義）與 `mutating`（同一列已有
+  PATCH／DELETE 在飛，那是重複送出的問題）。**刪除**一樣不受修訂管制（由後端的
+  目標不存在拒絕回答，且它走自己的確認 Modal）。
 - **`ToolsPage` 的兩個工作查詢在終局後會關掉自己**：`enabled` 用
   `toolJobQueryEnabled(jobId)`（函式型 `enabled`），跟停止輪詢的
   `toolJobRefetchInterval` 共用同一條規則。只停輪詢不夠：app 的 query 預設是
@@ -161,10 +172,13 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   詳情寫進 A 的項、徽章卻蓋到 B 的列，而且沒有任何請求失敗來說明。**規則是：寫入
   用實例身分，重新讀取（invalidate／removeQueries）用名稱前綴**——後者只是叫伺服器
   再答一次，只可能拿到當下的答案，涵蓋得寬鬆才是保守方向。
-  **「閘」也刻意維持按名稱比對**（`reviseBusyForThisTool`／`isTogglingThisTool`）：
-  `PATCH /api/tools/{name}` 與 `POST .../revise` 都按名稱定址，它們防的檔案系統
-  競態會落在「當下叫這個名字的套件」；決定「卡片屬於哪一列」「徽章要蓋哪一列」
-  則相反。
+  **當初刻意按名稱比對的是「閘」**（`reviseBusyForThisTool`／
+  `isTogglingThisTool`）：`PATCH /api/tools/{name}` 與 `POST .../revise` 都按名稱
+  定址，它們防的檔案系統競態會落在「當下叫這個名字的套件」，比對得寬鬆才是保守
+  方向。這兩個閘在 web-v5 P1 之後已經移除（見上面那條），同一條理由現在只剩下按
+  名稱比對的**忙碌指示**（`isSubmittingRevise`／`isRegenerating`／
+  `isUpdatingStatus`，只決定按鈕的 loading）。決定「卡片屬於哪一列」「徽章要蓋
+  哪一列」則相反，一律用實例身分。
 - **權威回應寫進快取前，一定要先取消同一把鍵上在飛的讀**：`setQueryData` 不會動
   in-flight 的 fetch，所以一個在 mutation 之前因視窗對焦發出、讀到舊值的 GET
   可以在寫入之後才落地，把畫面翻回舊資料，而且**不會有任何錯誤提示**（那個 GET

@@ -613,13 +613,28 @@ def package_enabled(directory: Path) -> bool:
     """The package's EFFECTIVE toggle state, by the ONE precedence rule (R1).
 
     A named front door for the question "is the tool in this directory on?", so
-    the answer is derived in exactly one place. ``tool_builder`` asks it before a
-    revise swap (the toggle has to survive a rebuild that replaces the whole
-    directory); the scan answers it inline because it needs the state's ERROR too.
+    the answer is derived in exactly one place -- and "in exactly one place" is
+    load-bearing rather than tidy: a PARTIAL spelling of this rule (state file
+    present and off -> refuse) is what let a package whose effective state is
+    disabled start a subprocess, because it read ABSENT as "no answer" instead of
+    as the manifest's legacy key. Every consumer asks it here or, for the scan
+    itself, inline -- ``tool_builder`` before a revise swap (the toggle has to
+    survive a rebuild that replaces the whole directory), ``_make_handler`` and
+    ``_run_tool_subprocess`` at CALL time (both of them: see either for why one is
+    not enough), and the scan inline because it needs the state's ERROR too.
 
     An unreadable state file answers False here, which is the same fail-closed
     direction ``_read_enabled_state`` takes and the same one the scan turns into
     an invalid row.
+
+    It is a whole ``_scan_package``, and on the execution path that is a measured
+    ~0.5 ms per call rather than the ~12 us of the state ``lstat`` alone (most of
+    it the entry-file containment resolve, not the two reads). Paid twice per tool
+    call, it is ~2.5% of the ~40 ms a trivial tool costs to spawn at all -- the
+    execution path now pays what advertising the same tool already paid. A cheaper
+    "read the manifest myself when the state file is absent" would be a SECOND
+    spelling of the precedence rule, in the two functions that just demonstrated
+    what a second spelling costs.
     """
     return _scan_package(directory).enabled
 
@@ -2373,7 +2388,8 @@ def _build_llm_tool(scan: _PackageScan) -> LlmTool:
     is no longer this pairing's to catch: since web-v5 P1 a toggle moves nothing,
     so the stale ``scan.enabled`` this function reads can advertise a tool that was
     switched off a moment ago. That is answered where it now belongs -- the handler
-    re-reads the state file at CALL time and refuses (``_make_handler``).
+    re-derives the effective toggle at CALL time (``package_enabled``) and refuses
+    (``_make_handler``).
 
     A ``scan.identity`` of None still reaches ``_make_handler``, which refuses
     every call rather than treating "cannot say" as "unchanged" (D40 P3b r11).
@@ -3229,15 +3245,14 @@ def _run_tool_subprocess(
     the handler's check alone would leave this window uncovered and the tool would
     start. Same rule as its neighbour: the gate belongs against the act it guards.
 
-    ABSENT still needs no manifest read here for the same reason it does not in
-    the handler: the identity check on the line above has just proven ``tool.json``
-    unmoved, so a package with no state file still says what it said when it was
-    advertised, and an advertised tool was enabled.
+    It asks that question through ``package_enabled`` -- the ONE precedence rule --
+    exactly as the handler does, and for the reason spelled out there: an ABSENT
+    state file is an ANSWER (the manifest's legacy key), not a silence, and the
+    identity check on the line above says nothing about a file it never looks at.
     """
     if not _still_the_expected_package(directory, expected_identity):
         return _TOOL_REPLACED_RESULT
-    state = _read_enabled_state(directory)
-    if state.present and not state.enabled:
+    if not package_enabled(directory):
         return _TOOL_DISABLED_RESULT
     try:
         proc = subprocess.Popen(
@@ -3509,12 +3524,14 @@ def _make_handler(
       off by a deferred delete since (see ``_INFLIGHT_SECRETS``).
 
     A SECOND, SEPARATE refusal answers a question the identity check never could:
-    "may this tool run AT ALL?". The enabled toggle lives in the package's
-    ``.state.json`` (web-v5 P1), so it is re-read at CALL time and a switched-off
-    tool is refused with its OWN string (``_TOOL_DISABLED_RESULT``). This used to
-    happen BY ACCIDENT and it is worth being explicit about why it no longer can:
-    a toggle used to rewrite ``tool.json``, so the identity check above caught the
-    drift and refused -- for the wrong reason, but it refused. Now that a toggle
+    "may this tool run AT ALL?". The toggle lives in the package's ``.state.json``
+    with the manifest's legacy key behind it (web-v5 P1), so the EFFECTIVE state is
+    re-derived at CALL time through ``package_enabled`` -- the same one rule the
+    listing and the advertisement use -- and a switched-off tool is refused with
+    its OWN string (``_TOOL_DISABLED_RESULT``). This used to happen BY ACCIDENT and
+    it is worth being explicit about why it no longer can: a toggle used to rewrite
+    ``tool.json``, so the identity check above caught the drift and refused -- for
+    the wrong reason, but it refused. Now that a toggle
     leaves the manifest byte-identical, that accident is gone, and without this
     check a tool the operator disabled mid-conversation would simply RUN. The two
     checks are not redundant and neither subsumes the other: one asks "is this
@@ -3563,18 +3580,25 @@ def _make_handler(
             # word on this question belongs to the line above ``Popen``.
             if not _still_the_expected_package(directory, identity):
                 return _TOOL_REPLACED_RESULT
-            # "May this tool run?", asked at CALL time and answered by the file
-            # that owns it. AFTER the identity check, and the order is load-bearing
-            # twice over: a package that has been REPLACED must be reported as
-            # replaced rather than have its successor's state file consulted, and
-            # -- because the check above has just proven ``tool.json`` unmoved --
-            # an ABSENT state file provably still means whatever the manifest said
-            # when this tool was advertised, which for an advertised tool is
-            # ENABLED. So the pre-migration package needs no manifest re-read here:
-            # the identity guard is what makes reading only ``.state.json`` a
-            # complete answer.
-            state = _read_enabled_state(directory)
-            if state.present and not state.enabled:
+            # "May this tool run?", asked at CALL time through the ONE precedence
+            # rule (``package_enabled``) rather than through ``.state.json`` alone.
+            # AFTER the identity check, which stays load-bearing for its own reason:
+            # a package that has been REPLACED must be reported as replaced rather
+            # than have its successor's toggle consulted.
+            #
+            # The front door and not the state file, because ABSENT is an ANSWER --
+            # the manifest's legacy key (R1) -- and not a silence. A state file can
+            # be absent because it was DELETED as well as because it was never
+            # written, and deleting it is the repair this phase documents for a
+            # corrupt one. The identity check above proves ``tool.json`` unmoved; it
+            # proves nothing about a file it never looks at, so "no state file" does
+            # NOT mean "whatever the manifest said when this tool was advertised".
+            # The sequence that makes the difference, all of it documented
+            # operations: a pre-migration package whose manifest still carries
+            # ``enabled: false``, a PATCH switching it ON, the tool advertised and
+            # this handler built, then the state file removed -- effective state
+            # false, and a check reading only ``.state.json`` would start it.
+            if not package_enabled(directory):
                 return _TOOL_DISABLED_RESULT
             settings = get_settings()
             env, env_secrets = _build_tool_env(directory)
@@ -3685,8 +3709,8 @@ def set_enabled(name: str, enabled: bool) -> bool:
 
     What it costs, stated because it is a genuine loss and R4 is what repays it:
     the identity check no longer refuses a call to a tool that was disabled
-    mid-conversation, because nothing moved. ``_make_handler`` therefore asks the
-    state file DIRECTLY at execution time -- see there.
+    mid-conversation, because nothing moved. ``_make_handler`` therefore asks
+    ``package_enabled`` DIRECTLY at execution time -- see there.
 
     False when the name is unsafe (see ``_resolve_package_dir``), the package
     directory is an alias (see below), there is no package directory, or the write

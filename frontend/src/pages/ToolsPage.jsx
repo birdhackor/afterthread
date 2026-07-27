@@ -273,17 +273,20 @@ function SummaryStatusBadge({ status }) {
 // summaryWritesBlocked for all three). It deliberately does NOT gate the
 // 定版/解除定版 button -- see that button's own disabled comment below for why.
 // 送出修訂 additionally answers to `displayedMayBeStale`, which is what this
-// panel knows first-hand about its OWN summary query; `isTogglingThisTool` is a
-// third gate with a different cause again, and it applies to BOTH writes (R7-2)
-// -- see the revise submit and the 重新產生 button for the causal chain, which is
-// the same one on both.
+// panel knows first-hand about its OWN summary query.
+//
+// What is deliberately NO LONGER here: an in-flight 啟用 toggle
+// (`isTogglingThisTool`, R7-2) used to gate both writes as well. It was the
+// mirror half of a filesystem race web-v5 P1 removed at the root -- a toggle
+// writes the package's .state.json and never rewrites tool.json, so it cannot
+// move the manifest identity a revise or a regenerate is holding across its LLM
+// round trip. See the enable Switch in ToolRow for the whole chain.
 function ToolSummaryPanel({
 	name,
 	description,
 	expanded,
 	writesBlocked,
 	settlingJobEnd,
-	isTogglingThisTool,
 	isRegenerating,
 	onRegenerate,
 	isUpdatingStatus,
@@ -357,7 +360,7 @@ function ToolSummaryPanel({
 	const displayedMayBeStale = settlingJobEnd || isFetching || isError;
 
 	const submitRevise = handleSubmit((values) => {
-		if (writesBlocked || isFinal || isTogglingThisTool || displayedMayBeStale) {
+		if (writesBlocked || isFinal || displayedMayBeStale) {
 			return;
 		}
 		const feedback = values.feedback.trim();
@@ -419,21 +422,21 @@ function ToolSummaryPanel({
 					size="xs"
 					variant="light"
 					loading={isRegenerating}
-					// `isTogglingThisTool` for the SAME reason 送出修訂 carries it, and
-					// it was half of a pairing that only ever got its other half (R7-2).
-					// POST .../summary/regenerate resolves the package and captures its
-					// manifest identity up front (tool_meta.regenerate_summary ->
-					// _resolve_package), then awaits a whole LLM round trip before the
-					// sidecar write re-checks that identity. PATCH /api/tools/{name}
-					// rewrites tool.json in place to flip `enabled`, which MOVES it -- so
-					// a toggle flipped anywhere inside that round trip makes the write
-					// refuse, `_store_meta` answer None, and the route return
-					// 404「工具不存在」 for a tool the user is looking at. Unlike a
-					// check-then-act instant this overlap lasts the whole generation, and
-					// the user has already paid for it by the time they are told the tool
-					// does not exist. The Switch is disabled from the other direction
-					// while this is in flight -- see its own `disabled` below.
-					disabled={writesBlocked || isFinal || isTogglingThisTool}
+					// NOT gated by an in-flight 啟用 toggle any more, and the gate that
+					// stood here is worth naming because its reasoning was sound until P1
+					// (R7-2): POST .../summary/regenerate resolves the package and
+					// captures its manifest identity up front
+					// (tool_meta.regenerate_summary -> _resolve_package), then awaits a
+					// whole LLM round trip before the sidecar write re-checks that
+					// identity -- and PATCH /api/tools/{name} used to rewrite tool.json in
+					// place to flip `enabled`, MOVING it, so a toggle landing inside the
+					// round trip turned a finished generation into 404「工具不存在」.
+					// web-v5 P1 moved the toggle into the package's own .state.json:
+					// tools.set_enabled never opens tool.json, so the identity
+					// tool_meta._store_meta re-checks (tools._write_package_file_atomic ->
+					// _still_the_expected_package) cannot be moved by a switch at all.
+					// Nothing is left for that term to prevent.
+					disabled={writesBlocked || isFinal}
 					onClick={onRegenerate}
 				>
 					重新產生
@@ -536,12 +539,7 @@ function ToolSummaryPanel({
 									// deliberate -- letting someone type a paragraph and only then
 									// discover the button is dead is a worse version of the same
 									// refusal.
-									disabled={
-										writesBlocked ||
-										isFinal ||
-										isTogglingThisTool ||
-										displayedMayBeStale
-									}
+									disabled={writesBlocked || isFinal || displayedMayBeStale}
 									error={fieldState.error?.message}
 								/>
 								<CharCounter value={field.value} max={AI_INPUT_MAX} />
@@ -553,21 +551,24 @@ function ToolSummaryPanel({
 							type="submit"
 							size="xs"
 							loading={isSubmittingRevise}
-							// `isTogglingThisTool` is the reverse half of the enable
-							// switch's own revise gate (see ToolRow), and it is a
-							// FILESYSTEM race, not UI tidiness. A revise session pins the
-							// package's identity as `(st_dev, st_ino, st_ctime_ns)` of its
-							// tool.json at start and re-checks it immediately before the
-							// swap (tool_builder._package_identity / run_revise), while
-							// PATCH /api/tools/{name} REWRITES that same tool.json in place
-							// to flip `enabled` (tools.set_enabled). So a toggle landing
-							// anywhere inside a revise changes the manifest's ctime, the
-							// pre-swap check reads a different identity, and the whole
-							// multi-minute build is discarded with 「原工具在修訂期間被改動
-							// 或重新安裝」. Holding the submit for the few hundred ms a
-							// toggle is in flight costs nothing and removes the half of
-							// that race the switch's own gate cannot see (a PATCH already
-							// on the wire when the revise is queued).
+							// The `isTogglingThisTool` term that used to be here is gone,
+							// and it is the same retirement as 重新產生's above. It was the
+							// reverse half of the enable switch's own revise gate (see
+							// ToolRow) and it guarded a real filesystem race: a revise
+							// session pins the package's identity as
+							// `(st_dev, st_ino, st_ctime_ns)` of its tool.json at start and
+							// re-checks it immediately before the swap
+							// (tool_builder._package_identity / run_revise), while PATCH
+							// /api/tools/{name} used to REWRITE that same tool.json in place
+							// to flip `enabled` -- so a toggle landing anywhere inside a
+							// revise moved the manifest's ctime and the whole multi-minute
+							// build was discarded with 「原工具在修訂期間被改動或重新安裝」.
+							// Since web-v5 P1 tools.set_enabled writes only the package's
+							// .state.json, the pre-swap check reads the same identity it
+							// recorded, and the toggle itself is either carried across the
+							// swap (tools.carry_package_state, the first statement of the
+							// locked tail) or lands on the already-published package -- both
+							// halves under tools._STATE_PUBLISH_LOCK, so neither can be lost.
 							//
 							// `displayedMayBeStale` is the 定版 gate applied to the OTHER
 							// action that reasons from what is on screen (R2-4): this submit
@@ -576,12 +577,7 @@ function ToolSummaryPanel({
 							// builder session instructions for an implementation that no
 							// longer exists. See `displayedMayBeStale` for the rule, and for
 							// why 解除定版 is deliberately not gated the same way.
-							disabled={
-								writesBlocked ||
-								isFinal ||
-								isTogglingThisTool ||
-								displayedMayBeStale
-							}
+							disabled={writesBlocked || isFinal || displayedMayBeStale}
 						>
 							送出修訂
 						</Button>
@@ -609,8 +605,6 @@ function ToolRow({
 	onToggle,
 	onDelete,
 	mutating,
-	isTogglingThisTool,
-	reviseBusyForThisTool,
 	writesBlocked,
 	settlingJobEnd,
 	isRegenerating,
@@ -664,43 +658,39 @@ function ToolRow({
 							label="啟用"
 							labelPosition="left"
 							checked={tool.enabled}
-							// `reviseBusyForThisTool` is not over-locking, it is the one
-							// coupling the backend cannot absorb. PATCH /api/tools/{name}
-							// rewrites THIS package's tool.json in place to flip `enabled`
-							// (tools.set_enabled) -- and tool.json's
-							// (st_dev, st_ino, st_ctime_ns) is precisely the identity a
-							// revise session records at start and re-checks immediately
-							// before swapping the rebuilt package in
-							// (tool_builder._package_identity, chosen over the directory's
-							// own inode exactly BECAUSE the manifest is what an install
-							// rewrites). So toggling 啟用 during a revise silently dooms
-							// it: minutes later the swap is refused with 「原工具在修訂期間
-							// 被改動或重新安裝」 and the whole build is thrown away, with
-							// no hint that a toggle caused it. Per-ROW, not panel-wide:
-							// only the revised package's own manifest is at stake, so
-							// another tool's switch stays live.
+							// TWO terms, and what is NOT here is the point (web-v5 P1R2-2).
+							// This switch used to be disabled for the whole of a revise
+							// (`reviseBusyForThisTool`) and of a regenerate
+							// (`isRegenerating`), because PATCH /api/tools/{name} rewrote
+							// THIS package's tool.json in place to flip `enabled` -- and
+							// tool.json's (st_dev, st_ino, st_ctime_ns) is exactly the
+							// identity a revise records at start and re-checks before the
+							// swap (tool_builder._package_identity), and the one a
+							// regenerate holds across its LLM round trip. A toggle therefore
+							// doomed either one. web-v5 P1 moved `enabled` into the
+							// package's own .state.json and tools.set_enabled never opens
+							// the manifest, so that identity cannot move; the revise's own
+							// tail then either CARRIES a toggle across the swap
+							// (tools.carry_package_state, read from the live package as the
+							// first statement of the tail) or -- both being serialized by
+							// tools._STATE_PUBLISH_LOCK, whose hold set_enabled joins AFTER
+							// resolving the name -- takes it on the package the swap just
+							// published. Either way it is honoured, so holding the operator
+							// away from the switch for the minutes a revise runs would
+							// prevent nothing: an operator who decides mid-revise that a
+							// tool must be off can now say so.
 							//
-							// 刪除 is deliberately NOT in this gate: deleting mid-revise is
-							// answered by the backend's own target-missing refusal (the
-							// revise finds nothing to swap), and it is what a user who has
-							// given up on the tool actually wants -- it also runs through
-							// its own confirm modal rather than a one-click toggle.
+							// The two that stay are not identity arguments and do not
+							// answer to that change: `!tool.valid` (see this component's
+							// own comment above), and `mutating` because a PATCH or DELETE
+							// is already on the wire -- a double-fire question, not an
+							// identity one.
 							//
-							// `isRegenerating` completes the SAME pairing for the OTHER AI
-							// write (R7-2). 重新產生 is synchronous, but "synchronous" is a
-							// statement about the HTTP request, not about duration: the
-							// route holds the manifest identity it resolved across a full
-							// LLM round trip and the sidecar write re-checks it at the end,
-							// so a toggle flipped meanwhile turns a completed generation
-							// into a 404. Per-ROW, and NOT folded into the panel-wide
-							// `mutating`: only THIS package's manifest is at stake, so
-							// another row's switch stays live while this one regenerates.
-							disabled={
-								!tool.valid ||
-								mutating ||
-								reviseBusyForThisTool ||
-								isRegenerating
-							}
+							// 刪除 is deliberately NOT gated by a revise either: deleting
+							// mid-revise is answered by the backend's own target-missing
+							// refusal, it is what a user who has given up on the tool
+							// actually wants, and it runs through its own confirm modal.
+							disabled={!tool.valid || mutating}
 							onChange={(event) =>
 								onToggle(tool.name, event.currentTarget.checked)
 							}
@@ -741,7 +731,6 @@ function ToolRow({
 							expanded={expanded}
 							writesBlocked={writesBlocked}
 							settlingJobEnd={settlingJobEnd}
-							isTogglingThisTool={isTogglingThisTool}
 							isRegenerating={isRegenerating}
 							onRegenerate={onRegenerate}
 							isUpdatingStatus={isUpdatingStatus}
@@ -1438,23 +1427,14 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 				const isSubmittingRevise =
 					reviseMutation.isPending &&
 					reviseMutation.variables?.name === tool.name;
-				// "A revise is touching THIS package's files, or is about to."
-				// Both terms are needed for the same reason summaryBusy needs both
-				// of its own: `reviseJobActive` only turns true once the 202 has
-				// landed and set `activeJob`, so the submit-in-flight window before
-				// that is covered by isSubmittingRevise. Per-row because the hazard
-				// it gates (a tool.json rewrite invalidating the revise's package
-				// identity -- see the Switch) is confined to the revised package.
-				const reviseBusyForThisTool =
-					isSubmittingRevise ||
-					(activeJob?.name === tool.name && reviseJobActive);
-				// The mirror-image term: a PATCH already on the wire for THIS tool.
-				// One toggleMutation serves every row, so the row must be matched
-				// explicitly -- toggling tool A does not endanger a revise or a
-				// regenerate of B.
-				const isTogglingThisTool =
-					toggleMutation.isPending &&
-					toggleMutation.variables?.name === tool.name;
+				// The two per-row values that used to live here -- "a revise is
+				// touching THIS package's files" and "a PATCH is already on the wire
+				// for THIS tool" -- are gone with the gates they fed (web-v5 P1R2-2):
+				// both existed only to keep a toggle and an AI write apart while a
+				// toggle rewrote tool.json, and it no longer does. Nothing else read
+				// them, so keeping either would be a dead binding rather than a
+				// smaller lock. See the enable Switch for the backend mechanism that
+				// replaced them.
 				return (
 					<ToolRow
 						// Keyed by INSTANCE, not by name. A name is reassignable (another
@@ -1470,8 +1450,6 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 						key={rowKey}
 						tool={tool}
 						mutating={mutating}
-						isTogglingThisTool={isTogglingThisTool}
-						reviseBusyForThisTool={reviseBusyForThisTool}
 						onToggle={(name, enabled) =>
 							toggleMutation.mutate({ name, enabled })
 						}
@@ -1490,11 +1468,12 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 						// same reason submitRevise re-checks it inside the panel: a
 						// disabled prop is a rendering, and the two AI writes must be
 						// impossible to issue while the gate holds, not merely awkward.
-						// `isTogglingThisTool` answers to that same rule (R7-2): it now
-						// gates the button as well, and a gate that lives only on a
-						// `disabled` prop is a rendering rather than a guard.
+						// The re-check follows the gate, in both directions: when
+						// `isTogglingThisTool` left this button's `disabled` (web-v5
+						// P1R2-2) it left this line with it, or the guard would have
+						// outlived the rendering it exists to mirror.
 						onRegenerate={() => {
-							if (summaryWritesBlocked || isTogglingThisTool) {
+							if (summaryWritesBlocked) {
 								return;
 							}
 							regenerateMutation.mutate({

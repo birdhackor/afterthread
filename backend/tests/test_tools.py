@@ -1016,6 +1016,103 @@ def test_a_toggle_during_the_scan_cannot_advertise_the_tool_it_disabled(
     assert asyncio.run(advertised["zzz"]({})) == "z"
 
 
+def test_a_deleted_state_file_falls_back_to_a_manifest_that_disables(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """P1R2-1: at CALL time, ABSENT is an ANSWER -- the manifest's -- not a silence.
+
+    The check used to refuse only on ``state.present and not state.enabled``, on
+    the reasoning that the identity check above it had just proven ``tool.json``
+    unmoved, so a package with no state file still said what it said when it was
+    advertised. The premise is false in one word: the package did not HAVE "no
+    state file" when it was advertised -- it had one saying True, and the file was
+    DELETED since. The identity check speaks for ``tool.json``; it never looks at
+    ``.state.json``.
+
+    Every step below is a documented operation. A package installed before web-v5
+    P1 carries its toggle in the manifest and here it says OFF; a PATCH switches it
+    on (writing the state file, R1's migration); the tool is advertised and this
+    handler built; then the operator deletes the state file, which is the repair
+    both READMEs give for a corrupt one. The effective state by the precedence rule
+    is the manifest's False again, and this is a stable state -- not a
+    check-then-act instant -- so a partial check would start the subprocess for as
+    long as that conversation lasts."""
+    root = tmp_path / "tools"
+    sentinel = tmp_path / "ran"
+    pkg = _make_tool(
+        root,
+        "legacy",
+        f"import sys\nopen({str(sentinel)!r}, 'w').write('x')\nsys.stdout.write('ok')\n",
+        enabled=False,  # a PRE-MIGRATION manifest, and it says off
+    )
+    _install_tools(monkeypatch, root)
+    assert enabled_llm_tools() == []  # ... so the fallback keeps it off the wire
+
+    assert set_enabled("legacy", True) is True
+    handler = enabled_llm_tools()[0].handler
+    assert asyncio.run(handler({})) == "ok"  # advertised and runnable, on the state file
+    sentinel.unlink()
+
+    (pkg / tools._STATE_FILENAME).unlink()  # the documented repair, mid-conversation
+
+    assert asyncio.run(handler({})) == tools._TOOL_DISABLED_RESULT
+    assert asyncio.run(handler({})) != tools._TOOL_REPLACED_RESULT  # nothing was replaced
+    assert not sentinel.exists()  # nothing was started
+    # ... and the listing agrees, because both now ask the same one rule.
+    assert list_tools()[0]["enabled"] is False
+
+
+def test_a_deleted_state_file_still_runs_a_tool_whose_manifest_enables_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The other direction of the same fallback, so the fix cannot be "refuse ABSENT".
+
+    Answering the precedence rule means the manifest gets to say YES as well as no.
+    A package whose legacy key is True, toggled (which creates the state file) and
+    then stripped of that file mid-conversation, is ENABLED -- refusing it would
+    take a tool away from a conversation on the strength of a file the operator is
+    explicitly allowed to delete (D21)."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "legacy", "import sys\nsys.stdout.write('ok')\n", enabled=True)
+    _install_tools(monkeypatch, root)
+    assert set_enabled("legacy", True) is True  # migrates it: the file now exists
+    assert (pkg / tools._STATE_FILENAME).is_file()
+    handler = enabled_llm_tools()[0].handler
+
+    (pkg / tools._STATE_FILENAME).unlink()
+
+    assert asyncio.run(handler({})) == "ok"
+    assert list_tools()[0]["enabled"] is True
+
+
+def test_runtime_refuses_a_tool_whose_state_file_became_unreadable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The third state, at CALL time: unknown intent refuses, exactly as it lists.
+
+    R2 already pins that an unreadable state file makes a package invalid AND
+    switched off in the listing. The execution path has to reach the same answer
+    through the same rule -- a tool that cannot say whether it may run must not run
+    -- and it must reach it whichever way ``package_enabled`` is spelled, which is
+    why this is pinned at the handler rather than only at the scan."""
+    root = tmp_path / "tools"
+    sentinel = tmp_path / "ran"
+    pkg = _make_tool(
+        root,
+        "torn",
+        f"import sys\nopen({str(sentinel)!r}, 'w').write('x')\nsys.stdout.write('ok')\n",
+    )
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler
+    assert asyncio.run(handler({})) == "ok"
+    sentinel.unlink()
+
+    (pkg / tools._STATE_FILENAME).write_text("{", encoding="utf-8")  # a torn write
+
+    assert asyncio.run(handler({})) == tools._TOOL_DISABLED_RESULT
+    assert not sentinel.exists()
+
+
 def test_a_promote_during_the_scan_cannot_run_the_new_package(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2566,6 +2663,40 @@ def test_a_toggle_landing_while_a_call_prepares_still_refuses_before_popen(
         return real_build_env(directory)
 
     monkeypatch.setattr(tools, "_build_tool_env", toggle_then_build)
+
+    assert asyncio.run(handler({})) == tools._TOOL_DISABLED_RESULT
+    assert not sentinel.exists()  # no child was ever started
+
+
+def test_a_state_file_deleted_while_a_call_prepares_still_refuses_before_popen(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """P1R2-1 at the second site, where the partial check was the same partial check.
+
+    The handler's own check passes here -- the state file still says True when it
+    runs -- so this pins the line above ``Popen`` and nothing else: it must answer
+    the precedence rule too, or a pre-migration package whose manifest disables it
+    starts its child after all. Driven from inside ``_build_tool_env``, the ``.env``
+    read that sits in the window between the two checks, so the deletion lands there
+    deterministically rather than by racing a thread."""
+    root = tmp_path / "tools"
+    sentinel = tmp_path / "ran"
+    pkg = _make_tool(
+        root,
+        "busy",
+        f"import sys\nopen({str(sentinel)!r}, 'w').write('x')\nsys.stdout.write('ok')\n",
+        enabled=False,  # pre-migration, and the manifest says off
+    )
+    _install_tools(monkeypatch, root)
+    assert set_enabled("busy", True) is True
+    handler = enabled_llm_tools()[0].handler
+    real_build_env = tools._build_tool_env
+
+    def delete_state_then_build(directory: Path) -> tuple[dict[str, str], frozenset[str]]:
+        (pkg / tools._STATE_FILENAME).unlink()
+        return real_build_env(directory)
+
+    monkeypatch.setattr(tools, "_build_tool_env", delete_state_then_build)
 
     assert asyncio.run(handler({})) == tools._TOOL_DISABLED_RESULT
     assert not sentinel.exists()  # no child was ever started

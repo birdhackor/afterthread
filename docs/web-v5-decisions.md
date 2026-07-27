@@ -75,9 +75,9 @@ package_identity after : (64770, 543698, 1785167009937732790)
 
 **修法有兩條，寫進 README 與 tool-calling.md**：再按一次開關（`set_enabled`
 不讀這個檔案，直接覆蓋成乾淨的一份），或自己刪掉該檔案退回 fallback。**誠實的
-殘留**：前端的開關在 `valid=false` 的列上是停用的（既有行為，本階段不動前端），
-所以 UI 上只剩「自己刪檔」這條——而手改套件檔案是 D21 明文支援的行為。API 兩條
-都通。
+殘留**：前端的開關在 `valid=false` 的列上是停用的（既有行為；r2 動了前端那幾個閘，
+但這一個**刻意留著**，見 r2 附錄的「留下的」），所以 UI 上只剩「自己刪檔」這條
+——而手改套件檔案是 D21 明文支援的行為。API 兩條都通。
 
 ### 寫入：共用發佈紀律，且**不帶** `expected_identity`（R3）
 
@@ -312,3 +312,118 @@ keyword-only 的 `default_mode`（「第一次寫入要用的權限」，正規�
 **可證的量測**：把 `default_mode` 的傳遞拿掉 →
 `test_a_revise_carries_the_state_files_mode_not_just_its_value[operator-set]`
 量到 `0o600`（期望 `0o640`）。
+
+### D41 附錄（P1 review r2）：執行前的檢查問完整的優先序，前端的耦合閘隨根因退場
+
+兩條 finding 指的方向相反，而且**必須**相反：一條說後端的檢查太寬鬆（放行了一個
+有效狀態是停用的工具），另一條說前端太嚴格（擋掉一個已經安全的動作）。兩者的共同
+根因是同一件事被修掉之後**沒有把所有依賴它的推理重新算過**：R4 的檢查繼承了一個
+錯的前提，前端的閘則繼承了一個已經消失的危害。
+
+#### R2-1：ABSENT 是一個**答案**，不是沉默（P2）
+
+兩處 R4 檢查（handler 進入時、`Popen` 前一行）都只寫成
+`state.present and not state.enabled`，理由寫在註解裡：「上一行的身分檢查剛證明
+`tool.json` 沒動過，所以沒有狀態檔的套件仍然說著它被廣告當時說的那句話，而被廣告
+的工具就是啟用的。」
+
+**那句推論自己就寫著它為什麼錯**：那個套件被廣告的時候**並不是**「沒有狀態檔」
+——它有一個寫著 true 的狀態檔，而那個檔案**後來被刪掉了**。身分檢查證明的是
+`tool.json` 沒動；它不看 `.state.json`，也就對那個檔案被移除一事完全沒有發言權。
+
+**具體序列，每一步都是本階段文件自己教的操作**：一個 P1 之前安裝、`tool.json` 的
+legacy 欄位寫著 `enabled: false` 的套件 → 一次 `PATCH` 把它打開（產生 `.state.json`）
+→ 工具被廣告、handler 建好 → 操作者刪掉 `.state.json`（那正是 R1-2 寫進兩份 README
+的修法之一，也是 D21 明文支援的手改）→ 依 R1 的優先序，有效狀態回到 manifest 的
+`false`，但兩處檢查看到 ABSENT 就放行、子行程照樣啟動。這是一個**穩定狀態**，不是
+check-then-act 的一瞬間：那個對話剩下的每一次呼叫都會跑。
+
+**裁決：兩處都改問 `package_enabled`**——那個 R1 為此存在的單一前門，也就是掃描
+用來回答清單與廣告的同一個答案。**不採**「狀態檔不存在時自己補讀一次 manifest」的
+省事路徑：那會是這條優先序的**第二份拼法**，而寫在這兩個函式裡的正是「一份拼法只
+做了一半」造成的缺陷。錯的那段推理註解一併刪掉——留著一段被推翻的理由，比留著一個
+錯的檢查更難修。
+
+**三態對照（每一個消費者，包含本來就對的）**：
+
+| 消費者 | 怎麼問 | ABSENT | PRESENT 可讀 | PRESENT 讀不出 |
+|---|---|---|---|---|
+| `_scan_package`（優先序的**定義**） | inline（它還需要 `error`） | manifest legacy 欄位（預設 true） | 檔案說的值 | false ＋ 列成無效 |
+| `list_tools` | `scan.enabled` | 同上 | 同上 | 同上 |
+| `enabled_llm_tools` | `scan.valid and scan.enabled` | 同上 | 同上 | 同上（兩個濾條都說不） |
+| `_make_handler`（呼叫進入） | `package_enabled` ← **本輪改** | 同上 | 同上 | 同上 |
+| `_run_tool_subprocess`（`Popen` 前一行） | `package_enabled` ← **本輪改** | 同上 | 同上 | 同上 |
+| `tools.carry_package_state`（修訂換裝） | `package_enabled` | 同上 | 同上 | 同上（帶成停用） |
+| `PATCH /api/tools/{name}` → `set_enabled` | **寫入者，不讀** | — | — | — |
+| 前端 `Switch` 的 `checked` | `GET /api/tools` 的 `enabled` 欄 | 同掃描 | 同掃描 | 同掃描（該列另外因無效而停用開關） |
+
+**執行路徑的代價（實測，非估算；本機 ext4、從未切換過的套件＝常見情形）**：
+
+```
+_read_enabled_state（舊檢查，ABSENT）     11.93 us
+package_enabled    （新檢查，ABSENT）    526.38 us
+_read_enabled_state（舊檢查，PRESENT）    87.50 us
+package_enabled    （新檢查，PRESENT）   579.51 us
+一次完整工具呼叫（含子行程）              40.40 ms
+```
+
+一處多約 514 us，兩處合計約 1.03 ms，佔一次最小工具呼叫的 **2.5%**。cProfile 顯示
+成本的大宗不是那兩次讀檔，而是 `_entry_file_exists` 的 realpath／containment 與每趟
+掃描約 38 次 `lstat`。**接受**：執行路徑現在付的，就是廣告同一個工具本來就付過的
+那筆；換到的是清單、廣告與執行三處**證得出來**在回答同一個問題。
+
+**可證的量測（把修法換回舊寫法，當場失敗）**：以 `state.present and not
+state.enabled` 冒充 `package_enabled` 重跑上面那個序列 → 回 `'ok'`、且子行程真的寫
+出了 sentinel（**被停用的工具跑了**）；新寫法回 `_TOOL_DISABLED_RESULT`、sentinel
+不存在。
+
+#### R2-2：前端還在擋一個**已經不會發生**的失敗（P2）
+
+`ToolsPage` 的三個閘全部由同一句話背書，而註解到今天還在講那句話：「一次開關會就地
+改寫 `tool.json`，把 manifest 身分移走。」P1 之後那句話是假的。
+
+**先驗證每一個窗口真的被接住了，再刪**（讀後端，不是照 finding 的說法）：
+
+- **修訂被開關弄死**：換裝前的重檢是 `tool_builder.py:2274`
+  （`_package_identity(target) != package_identity`），而 `_package_identity` 就是
+  `tools.package_identity`＝`tool.json` 的 `(dev, ino, ctime)`；`set_enabled`
+  （`tools.py:3672`↓）從頭到尾沒有打開 `tool.json`，只經 `write_package_state`
+  發佈 `.state.json`。身分不可能被切換推走。
+- **開關被修訂還原**：`tools.carry_package_state(target, staging)` 是鎖內 tail 的
+  第一句（`tool_builder.py:2254`），讀的是**正式套件**當下的值；落在它之前的切換
+  被帶過去。落在 tail 裡的切換擋在 `tools._STATE_PUBLISH_LOCK`
+  （`tools.py:3743`）外面，而 `set_enabled` 在**取鎖之前**就解析完名稱
+  （`tools.py:3728`），所以它醒來時寫的是「現在叫這個名字的那一包」＝剛發佈的新
+  套件。備份清理刻意在鎖外（`tool_builder.py:2344`↓），那時修訂已經生效。
+- **重新產生換到 404**：`tool_meta.regenerate_summary` 在 `_resolve_package`
+  （`tool_meta.py:614`）捕捉 manifest 身分，LLM 往返之後由 `_store_meta`
+  （`tool_meta.py:689`，`expected_identity=identity`）→ `write_tool_meta` →
+  `_write_package_file_atomic` 的 `_still_the_expected_package`（`tools.py:1305`）
+  重檢**同一個** `tool.json` 身分。切換不動它。
+
+三個窗口都被接住，**沒有**發現任何一個沒被接住的窗口，所以刪。
+
+**刪掉的**（連同因此變成死綁定的變數 `reviseBusyForThisTool`／`isTogglingThisTool`）：
+`Switch` 的 `reviseBusyForThisTool` 與 `isRegenerating`；`重新產生` 與 `送出修訂`
+（含 `修訂意見` 欄位）的 `isTogglingThisTool`，以及 `onRegenerate` handler 裡那個
+重檢——`disabled` 只是渲染、重檢才是閘，兩者必須同進同退，留下任何一半都是規則被
+拆成兩半。
+
+**留下的，各自有與身分無關的理由**：`Switch` 的 `!tool.valid`（無效套件不會被廣告
+也不會執行，開關對它沒有可觀察的效果）與 `mutating`（同一列已有 `PATCH`／`DELETE`
+在飛——那是重複送出的問題，不是身分問題）；`送出修訂` 的 `writesBlocked`、`isFinal`
+與 `displayedMayBeStale`（最後那個講的是「對著可能已被取代的內容寫回饋」，是另一類
+危害，D40 R2-4 另行裁決過）。`定版／解除定版` 一個字都不動。
+
+**使用者拿回什麼**：一次修訂或重新產生跑到一半才決定「這個工具必須關掉」時，現在
+按得下去——這在本專案自稱主要介面的那個介面裡，原本要等一整個 session。
+
+**測試上的誠實**：這一條**沒有**新增前端測試，理由與 D40 overall r7 O7-2 當初寫下
+的一模一樣（那正是本輪退休掉的那組閘）：它是 JSX 的 `disabled` 運算式加一個 handler
+內的重檢，屬元件層級，而本專案的 vitest 跑在 node、**沒有 jsdom**，純函式以外的東西
+量不到。這裡也**沒有**為了湊覆蓋率把它抽成純函式：一個「不看修訂、不看重新產生」的
+述詞，其正確性正在於它**不接收**那兩個輸入，而那是型別與程式碼審查看得見的事，不是
+單元測試證得出來的事。後端那半（開關在每個窗口都被接住）由既有的
+`test_a_toggle_that_lands_before_the_swap_is_carried_across_not_reverted`、
+`test_a_toggle_arriving_during_the_swap_waits_for_it_and_still_wins` 與
+`test_an_enabled_toggle_during_the_generation_now_costs_nothing_at_all` 釘住。
