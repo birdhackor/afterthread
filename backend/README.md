@@ -156,7 +156,12 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   所以掃描捕捉的身分會在 sidecar 讀完之後重驗，不符就把那一包重掃一次（實例真的
   換掉時列的是**新**那一包）；重驗一直不成立就只把 `summary_status` 降成 `null`
   ——與「沒有／讀不懂 sidecar」同一個答案，不另立詞彙。
-- `PATCH /api/tools/{name}` — 切換某工具的 `enabled`；找不到回 404。
+- `PATCH /api/tools/{name}` — 切換某工具的 `enabled`；找不到回 404。寫的是套件的
+  `.state.json`（見下方「工具套件格式」），**完全不碰 `tool.json`**——所以一次
+  切換不會移動 manifest 身分，不會讓進行中的修訂作廢、也不會讓一趟總結往返的
+  寫入被拒。`tool.json` 讀不到／過大／是 FIFO 都不再是拒絕理由（那些檢查守的是
+  已經不存在的 manifest 改寫），因此壞掉的套件現在也關得掉；它照樣列成無效、
+  照樣不會被端給模型。
 - `DELETE /api/tools/{name}` — 刪除整個工具套件目錄；找不到回 404。若刪除當下**正好
   有工具子行程在跑那個套件**，目錄不會被直接刪掉，而是改名成一個隱藏名稱、等該次呼叫
   結束後由下一個工具工作的收尾清掃收走——直接刪會讓那個子行程的相對開檔全部失敗。工具
@@ -216,7 +221,7 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 ## 工具（KB 網頁安裝器）
 
 - **工具套件格式**：`<TOOLS_DIR>/<name>/`，內含 `tool.json`（`name`／
-  `description`／`parameters`(JSON Schema)／`entry`(argv)／可選 `enabled`）、
+  `description`／`parameters`(JSON Schema)／`entry`(argv)——**只有規格**）、
   `entry` 會執行的實作檔，以及可選的 `.env`（該工具自己的秘密，例如某個 KB 的
   API key，啟動子行程時注入）。`name` 必須等於目錄名，且符合
   `^[a-z0-9][a-z0-9_-]{0,63}$`。執行契約（`services/tools.py` 的
@@ -227,6 +232,30 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `.env`）——絕不整包繼承父行程環境，因為父行程環境帶著 `OPENAI_API_KEY`；這
   防的是「不小心」外洩，不是對抗惡意子行程的沙箱（同 UID 的子行程理論上仍讀得
   到 `/proc/<ppid>/environ`）。
+- **啟用開關存在 `.state.json`，不在 `tool.json` 裡**（web-v5 P1，設計依據見
+  `docs/web-v5-decisions.md`）。套件層的隱藏檔，內容就是 `{"enabled": bool}`，
+  唯一的寫入者是 `PATCH /api/tools/{name}`（`tools.set_enabled`，mkstemp →
+  fsync → `os.replace` 的原子發佈）。**為什麼分開**：`tool.json` 的
+  `(dev, ino, ctime)` 是本子系統回答「這個路徑上還是我剛才看的那一包嗎」的判準
+  （修訂換裝、總結側檔寫入、對話中途執行前都要問），而 `enabled` 住在裡面時，
+  一次開關就地改寫那個檔案、把判準推走——一次開關對每一道守衛都長得像「整包被
+  換掉」。現在一次開關讓 manifest **逐位元組不變、身分也不動**。
+  - **遷移**：沒有 `.state.json` 的既有套件，退回讀 `tool.json` 的舊 `enabled`
+    欄位（預設 true）。這就是全部的遷移——沒有啟動掃描、讀取路徑永遠不寫入；
+    第一次切換才產生 `.state.json`，且**刻意不**刪除 manifest 裡那個已成 legacy
+    的欄位（為了整潔改寫 manifest，正好會移動這次改動要固定住的身分）。
+  - **檔案在但讀不出來 ≠ 沒設定**：截斷／不是 JSON／`enabled` 不是布林／被換成
+    symlink・FIFO・目錄，一律代表「操作者的意圖不明」，該套件列成
+    `valid=false`、`error=".state.json exists but is not readable"`，同時
+    `enabled=false`。刻意不退回預設開啟——那等於把一個被特意關掉的工具重新交給
+    模型。修法：再按一次開關（PATCH 不讀這個檔案，直接覆蓋成乾淨的一份），或
+    自己把檔案刪掉退回上面的 fallback。（前端的開關在 `valid=false` 的列上是
+    停用的，所以 UI 上的修法是後者或重裝；API 兩條都通。）
+  - **`.state.json` 與 `.ai_meta.json` 同屬後端保留名域**：builder session 不能
+    出貨（promote 前一律剷除，含 `<名稱>.*.tmp` 發佈暫存檔、含各層級、比對大小寫
+    不敏感），修訂複製也不帶進暫存區；但換裝是整包替換，所以換裝前後端會把**正式
+    套件當下的啟用狀態**重新寫進暫存區，寫不進去就拒絕換裝——否則每一次修訂都會
+    把你刻意關掉的工具靜默打開。
 - **安裝器**（`services/tool_builder.py`，`/tools` 頁「安裝新工具」分頁的後端；
   設計依據見 `docs/web-v2-decisions.md` D21/D27）：`POST /api/tools/install`
   在背景跑一次帶有四個 meta-tool（`write_file`／`read_file`／`list_dir`／
@@ -299,7 +328,9 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   的建造者 session（同樣的 meta-tools、同樣的 `tool_install` 工作流程名與預算），
   差別在於暫存工作區是從**既有套件複製**來的，最後以 **replace 模式**換掉正式
   目錄裡的那一包。三件事值得知道：
-  - 複製時**排除套件根層的 `.env`**（AI 總結 sidecar 則在任何層級都排除）。根層
+  - 複製時**排除套件根層的 `.env`**（後端保留名域——AI 總結 sidecar 與
+    `.state.json`——則在任何層級都排除；`.state.json` 由換裝前的重新寫入補回，見
+    「工具套件格式」）。根層
     `.env` 一定要排除：它的值就在「已知秘密」集合裡，複製進去必然被安裝驗證的
     「檔案不得內嵌秘密值」擋下，等於這個工具再也修訂不了。它在驗證通過之後、換裝
     之前**以 `shutil.copy2` 從正式套件逐位元組複製進暫存區**——不解碼、不重新編碼，

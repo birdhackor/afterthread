@@ -659,6 +659,35 @@ def _make_tool(
     return pkg
 
 
+def _edit_manifest_in_place(pkg: Path) -> tuple[int, int, int]:
+    """Rewrite ``tool.json`` byte-identically until its manifest identity MOVES.
+
+    The stand-in for the one writer that still rewrites an installed manifest now
+    that the enabled toggle does not: an operator editing a package's spec by hand
+    (a supported action, D21). Byte-identical content on purpose -- the identity is
+    about the FILE, not its bytes, which is precisely the reading D40 adjudicated.
+
+    The LOOP is not paranoia, it is a measured property of the filesystem: ext4
+    here stamps ``st_ctime_ns`` at ~1 ms granularity (measured), so a rewrite
+    landing in the same millisecond as the previous one leaves the tuple
+    unchanged. Retrying until the tick advances makes every test that depends on
+    "this edit moved the identity" deterministic instead of dependent on how long
+    the lines above it happened to take. Returns the NEW identity.
+    """
+    manifest = pkg / "tool.json"
+    raw = manifest.read_text(encoding="utf-8")
+    before = tools.package_identity(pkg)
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        manifest.write_text(raw, encoding="utf-8")
+        after = tools.package_identity(pkg)
+        assert after is not None
+        if after != before:
+            assert manifest.read_text(encoding="utf-8") == raw  # the BYTES never changed
+            return after
+    raise AssertionError("the manifest identity never moved across an in-place rewrite")
+
+
 def _install_tools(monkeypatch: pytest.MonkeyPatch, tools_root: Path, **overrides: Any) -> Settings:
     settings = Settings(tools_dir=str(tools_root), **overrides)
     monkeypatch.setattr("afterthread.services.tools.get_settings", lambda: settings)
@@ -849,18 +878,52 @@ def test_runtime_refuses_when_the_advertised_identity_could_not_be_read(
     assert not sentinel.exists()
 
 
-def test_runtime_refuses_after_the_enabled_toggle_rewrites_the_manifest(
+def test_runtime_refuses_a_tool_disabled_after_it_was_offered(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The documented FALSE POSITIVE, pinned so it is not rediscovered as a bug.
+    """R4: the refusal that used to be an ACCIDENT, made explicit.
 
-    ``set_enabled`` rewrites ``tool.json`` IN PLACE, which moves its ctime -- so
-    toggling a tool during a conversation that already advertised it makes every
-    later call to that tool in that conversation refuse, even for an
-    off-then-on that leaves the bytes identical. That is the conservative
-    direction: the only reading that would let this through ("the manifest was
-    merely rewritten, carry on") is the one that cannot tell an enabled-flip from
-    a wholesale replacement. The cost is one re-run of a single AI request."""
+    Before web-v5 P1 a toggle rewrote ``tool.json``, so a tool switched off
+    mid-conversation was refused by the IDENTITY check -- it saw the manifest's
+    ctime move and reported the package as replaced. The toggle no longer touches
+    that file, so that accident is gone; without a check of its own, a disabled
+    tool would simply RUN (overall-r7 finding O7-1(a), reintroduced).
+
+    The handler therefore re-reads ``.state.json`` at CALL time, and the refusal
+    carries its OWN string: nothing about the package changed, so telling the
+    model it was replaced would send it to re-read a spec that is still exactly
+    what it was given."""
+    root = tmp_path / "tools"
+    sentinel = tmp_path / "ran"
+    _make_tool(
+        root,
+        "toggled",
+        f"import sys\nopen({str(sentinel)!r}, 'w').write('x')\nsys.stdout.write('ok')\n",
+    )
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler
+    assert asyncio.run(handler({})) == "ok"
+    sentinel.unlink()
+
+    assert set_enabled("toggled", False) is True
+
+    assert asyncio.run(handler({})) == tools._TOOL_DISABLED_RESULT
+    assert asyncio.run(handler({})) != tools._TOOL_REPLACED_RESULT  # a DIFFERENT answer
+    assert not sentinel.exists()  # nothing was started
+
+
+def test_an_off_then_on_toggle_no_longer_refuses_the_rest_of_the_conversation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The FALSE POSITIVE web-v5 P1 removes, pinned so it cannot creep back.
+
+    D40 accepted, and pinned, that toggling a tool during a conversation that had
+    already advertised it made every LATER call refuse -- including an off-then-on
+    that leaves the tool exactly as it was found -- because the toggle rewrote
+    ``tool.json`` and the identity check could not tell an enabled-flip from a
+    wholesale replacement. Moving the toggle out of the manifest is what retires
+    that whole reading: the switch ends up back ON, nothing was replaced, and the
+    tool runs."""
     root = tmp_path / "tools"
     _make_tool(root, "toggled", "import sys\nsys.stdout.write('ok')\n")
     _install_tools(monkeypatch, root)
@@ -869,6 +932,30 @@ def test_runtime_refuses_after_the_enabled_toggle_rewrites_the_manifest(
 
     assert set_enabled("toggled", False) is True
     assert set_enabled("toggled", True) is True
+
+    assert asyncio.run(handler({})) == "ok"
+
+
+def test_runtime_refuses_after_a_hand_edit_rewrites_the_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The identity check's live example of drift, now that no toggle supplies one.
+
+    Hand-editing a package's files is a SUPPORTED operator action (D21), and an
+    in-place rewrite of ``tool.json`` still moves its ctime -- so a spec edited
+    during a conversation that already advertised the old spec makes every later
+    call in that conversation refuse, even for an edit-and-revert that leaves the
+    bytes identical. That is the same conservative direction D40 adjudicated, just
+    reached by the only writer that still reaches it: the alternative reading
+    ("the manifest was merely rewritten, carry on") cannot tell an edit from a
+    wholesale replacement."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "edited", "import sys\nsys.stdout.write('ok')\n")
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler
+    assert asyncio.run(handler({})) == "ok"
+
+    _edit_manifest_in_place(pkg)  # byte-identical, and STILL a rewrite
 
     assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
 
@@ -893,10 +980,14 @@ def test_a_toggle_during_the_scan_cannot_advertise_the_tool_it_disabled(
 
     Advertising the stale row is NOT what this fixes (the scan genuinely read
     ``enabled: true``, and D40 accepts a one-request-stale registry); what it
-    fixes is that the refusal at CALL time now has a pre-toggle identity to
-    refuse against, which is the same conservative direction
-    ``test_runtime_refuses_after_the_enabled_toggle_rewrites_the_manifest``
-    already pins for a toggle arriving one moment later."""
+    fixes is that the call is refused rather than run.
+
+    WHICH refusal changed with web-v5 P1, and the new one is the load-bearing
+    half. R7-1's fix worked by capturing the identity early, so the toggle's
+    manifest rewrite made the call MISMATCH. A toggle no longer rewrites anything,
+    so this window is now closed by the handler's own execution-time read of
+    ``.state.json`` (R4) -- the same conservative direction, reached by the check
+    that is actually about the question being asked."""
     root = tmp_path / "tools"
     sentinel = tmp_path / "ran"
     _make_tool(
@@ -918,7 +1009,7 @@ def test_a_toggle_during_the_scan_cannot_advertise_the_tool_it_disabled(
     monkeypatch.setattr(tools, "_scan_package", scan_then_toggle)
     advertised = {tool.spec["function"]["name"]: tool.handler for tool in enabled_llm_tools()}
 
-    assert asyncio.run(advertised["aaa"]({})) == tools._TOOL_REPLACED_RESULT
+    assert asyncio.run(advertised["aaa"]({})) == tools._TOOL_DISABLED_RESULT
     assert not sentinel.exists()  # the disabled tool was never started
     # The control: capturing A's identity EARLIER must not make an untouched
     # package in the same scan refuse. Nothing rewrote zzz's manifest, so it runs.
@@ -1033,22 +1124,28 @@ def test_the_two_identities_answer_two_different_questions(
     ``directory_identity`` answers "is anything still running out of these
     FILES?", and each is WRONG for the other's question:
 
-    * an in-place manifest rewrite (``set_enabled``) MOVES the manifest identity
-      -- which is what makes it a package identity, and what makes it useless as
-      an execution key: a running child would vanish from the registry;
+    * an in-place manifest rewrite MOVES the manifest identity -- which is what
+      makes it a package identity, and what makes it useless as an execution key:
+      a running child would vanish from the registry. Since web-v5 P1 the only
+      writer that still reaches it mid-life is an operator's HAND-EDIT (D21), so
+      that is what this measures;
     * a delete-and-recreate REUSES the directory inode (the measurement D40 P3b
       r10 settled the package question on), so the directory identity must never
       be read as "the same package";
     * a rename carries the directory identity -- the property both deferral
-      writers depend on, since they rename first and ask afterwards."""
+      writers depend on, since they rename first and ask afterwards.
+
+    The split OUTLIVES the case that forced it, which is why it is still here: R5
+    introduced it because ``set_enabled`` moved the manifest identity under a
+    running child, and the toggle no longer does -- but a hand-edit does, so the
+    two questions still need two answers."""
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
     manifest_before, directory_before = tools.package_identity(pkg), tools.directory_identity(pkg)
     assert manifest_before is not None and directory_before is not None
 
-    assert set_enabled("echo", False) is True
-    assert tools.package_identity(pkg) != manifest_before  # the package "changed"
+    assert _edit_manifest_in_place(pkg) != manifest_before  # the package "changed"
     assert tools.directory_identity(pkg) == directory_before  # the files did not move
 
     renamed = root / ".echo.stale-x"
@@ -2041,6 +2138,173 @@ def test_set_enabled_toggles_and_is_reflected(
     assert len(enabled_llm_tools()) == 1
 
 
+def test_a_toggle_leaves_the_manifest_byte_identical_and_its_identity_unmoved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """THE property web-v5 P1 exists for, measured rather than asserted.
+
+    ``enabled`` used to live in ``tool.json``, so flipping a switch rewrote the
+    manifest and MOVED its ``package_identity`` -- which is this subsystem's answer
+    to "is the package at this path still the one I looked at?". Four separately
+    reviewed defects came out of that single fact (overall-r5 O5-1, r7 O7-2, r8
+    O8-1, and 裁決紀錄 #8): a toggle looked exactly like a revise or a reinstall to
+    every guard that consults it.
+
+    Everything else in this phase follows from the two assertions below. They are
+    checked across BOTH directions and a repeat of the same direction, because the
+    old behaviour moved the ctime on every write regardless of what it wrote."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", enabled=True)
+    _install_tools(monkeypatch, root)
+    manifest = pkg / "tool.json"
+    before_bytes = manifest.read_bytes()
+    before_identity = tools.package_identity(pkg)
+    assert before_identity is not None
+
+    for value in (False, False, True):
+        assert set_enabled("echo", value) is True
+        assert manifest.read_bytes() == before_bytes
+        assert tools.package_identity(pkg) == before_identity
+
+    # ... and the toggle really did take effect, so this is not a no-op passing by
+    # doing nothing at all.
+    assert list_tools()[0]["enabled"] is True
+    assert set_enabled("echo", False) is True
+    assert list_tools()[0]["enabled"] is False
+    assert manifest.read_bytes() == before_bytes
+    assert tools.package_identity(pkg) == before_identity
+
+
+def test_the_state_file_wins_over_a_manifest_that_disagrees(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R1's precedence: ``.state.json`` present and readable is AUTHORITATIVE.
+
+    The manifest's ``enabled`` key survives on disk deliberately -- rewriting a
+    manifest to tidy away a legacy field would move the very identity this split
+    exists to hold still -- so the two files can and will disagree. The state file
+    is the answer, in both directions."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", enabled=True)
+    _install_tools(monkeypatch, root)
+
+    (pkg / tools._STATE_FILENAME).write_text('{"enabled": false}', encoding="utf-8")
+    assert list_tools()[0]["enabled"] is False
+    assert enabled_llm_tools() == []
+
+    (pkg / tools._STATE_FILENAME).write_text('{"enabled": true}', encoding="utf-8")
+    # The manifest now says the opposite of the state file in the other direction.
+    manifest = pkg / "tool.json"
+    raw = json.loads(manifest.read_text(encoding="utf-8"))
+    raw["enabled"] = False
+    manifest.write_text(json.dumps(raw), encoding="utf-8")
+    assert list_tools()[0]["enabled"] is True
+    assert len(enabled_llm_tools()) == 1
+
+
+def test_a_package_with_no_state_file_falls_back_to_its_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R1's migration, and it is the whole of the migration: there is no pass.
+
+    A package installed before web-v5 P1 has ``enabled`` in its ``tool.json`` and
+    no ``.state.json``. It keeps reporting exactly what it reported before, and --
+    the part that matters -- the READ does not write: the state file is still
+    absent afterwards, so a scan can never mutate a package. The first toggle is
+    what migrates it, and the manifest is left alone even then."""
+    root = tmp_path / "tools"
+    off = _make_tool(root, "off", "import sys\nsys.stdout.write('x')\n", enabled=False)
+    on = _make_tool(root, "on", "import sys\nsys.stdout.write('x')\n", enabled=True)
+    _install_tools(monkeypatch, root)
+
+    listed = {t["name"]: t for t in list_tools()}
+    assert listed["off"]["enabled"] is False
+    assert listed["on"]["enabled"] is True
+    assert [t.spec["function"]["name"] for t in enabled_llm_tools()] == ["on"]
+    # Reads only: neither package grew a state file, in either direction.
+    assert not (off / tools._STATE_FILENAME).exists()
+    assert not (on / tools._STATE_FILENAME).exists()
+
+    # The FIRST toggle is the migration, and it adds a file rather than editing one.
+    manifest_before = (off / "tool.json").read_bytes()
+    assert set_enabled("off", True) is True
+    assert json.loads((off / tools._STATE_FILENAME).read_text(encoding="utf-8")) == {
+        "enabled": True
+    }
+    assert (off / "tool.json").read_bytes() == manifest_before  # legacy key left in place
+    assert json.loads(manifest_before)["enabled"] is False  # ... and still saying the old thing
+    assert {t["name"]: t["enabled"] for t in list_tools()}["off"] is True
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "",  # truncated to nothing
+        "{",  # a torn write
+        "null",  # legal JSON, not an object
+        "[]",
+        "{}",  # an object with no answer in it
+        '{"enabled": "yes"}',  # an answer that is not a bool
+        '{"enabled": 1}',
+        "x" * (tools._STATE_MAX_BYTES + 1),  # past the cap
+    ],
+)
+def test_an_unreadable_state_file_disables_rather_than_defaulting_to_on(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, content: str
+) -> None:
+    """R2: ABSENT and UNREADABLE are different questions, answered differently.
+
+    Absent is the ordinary pre-migration case and falls back to the manifest. A
+    file that EXISTS but cannot be read as our shape means the operator's intent is
+    unknown -- and defaulting that to ``enabled: True`` would hand the model a tool
+    somebody deliberately switched off, which is the one direction this subsystem
+    never errs in.
+
+    Both halves of the answer are pinned: the row is INVALID with the listing's own
+    ``error`` channel carrying why (so the operator is told, rather than watching a
+    tool silently vanish from the model's reach), AND ``enabled`` is False -- so
+    ``enabled_llm_tools``' ``valid AND enabled`` filter refuses on either half
+    alone. The manifest here says ``enabled: true``, so a fallback would have
+    advertised it."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", enabled=True)
+    (pkg / tools._STATE_FILENAME).write_text(content, encoding="utf-8")
+    _install_tools(monkeypatch, root)
+
+    listed = list_tools()[0]
+    assert listed["valid"] is False
+    assert listed["enabled"] is False
+    assert listed["error"] == tools._STATE_UNREADABLE_ERROR
+    assert enabled_llm_tools() == []
+
+    # Repairable through the API without a delete: the toggle does not READ this
+    # file, so it publishes a clean one straight over it.
+    assert set_enabled("echo", True) is True
+    repaired = list_tools()[0]
+    assert repaired["valid"] is True and repaired["enabled"] is True
+
+
+def test_a_state_file_that_cannot_be_looked_at_is_not_read_as_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failure to LOOK is not evidence of absence (the D40 P3b r2-3 rule).
+
+    ``_read_regular_file_capped`` folds "no such file" and "refused to read it"
+    into one None, so the reader takes its own ``lstat`` first: only
+    ``FileNotFoundError`` means absent. A DIRECTORY at the name is the shape that
+    proves the distinction is real -- it exists, nothing can parse it, and reading
+    it as "there is no state file" would fall back to the manifest's ``true``."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", enabled=True)
+    (pkg / tools._STATE_FILENAME).mkdir()
+    _install_tools(monkeypatch, root)
+
+    state = tools._read_enabled_state(pkg)
+    assert state.present is True  # NOT absent
+    assert state.enabled is False and state.error is not None
+    assert enabled_llm_tools() == []
+
+
 def test_delete_tool_removes_package(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """With nothing executing against it, a delete still DESTROYS the package on
     the spot -- the deferral below is the exception, not the new normal, and it
@@ -2118,17 +2382,24 @@ def test_delete_during_an_execution_defers_the_removal(
     assert secret not in tools.known_secret_values()  # the hold ended with the call
 
 
-def test_delete_after_an_enabled_toggle_still_defers_a_running_call(
+def test_delete_after_a_manifest_edit_still_defers_a_running_call(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """An ``enabled`` toggle mid-call must not make a running child invisible.
+    """An in-place manifest rewrite mid-call must not make a running child invisible.
 
-    The registry used to be keyed on the MANIFEST identity, and ``set_enabled``
-    rewrites ``tool.json`` IN PLACE -- so a handler that registered before the
-    toggle was looked up afterwards under a tuple it had never registered, the
-    delete concluded nothing was running, and ``rmtree`` took the files out from
-    under a live subprocess. That split is not the syscall-pair instant this
-    subsystem accepts elsewhere: it lasts from the toggle until the child exits.
+    O5-1's guarantee, kept under test with the writer that still reaches it. The
+    registry used to be keyed on the MANIFEST identity -- so a handler that
+    registered before that file was rewritten was looked up afterwards under a
+    tuple it had never registered, the delete concluded nothing was running, and
+    ``rmtree`` took the files out from under a live subprocess. That split is not
+    the syscall-pair instant this subsystem accepts elsewhere: it lasts from the
+    rewrite until the child exits.
+
+    ``set_enabled`` was the writer O5-1 found it through, and since web-v5 P1 the
+    toggle does not touch ``tool.json`` at all (its own sibling test pins that a
+    toggle now disturbs nothing here). An operator HAND-EDITING the spec of a tool
+    that is running is a supported action (D21) and moves the same identity the
+    same way, so the guarantee still needs this test.
 
     Keyed on the DIRECTORY, both sides agree again -- an edit to a file inside a
     directory changes nothing about the directory's own ``(st_dev, st_ino)``, and
@@ -2157,11 +2428,10 @@ def test_delete_after_an_enabled_toggle_still_defers_a_running_call(
     caller.start()
     try:
         _wait_for(marker.exists)  # the CHILD is running, not merely queued
-        assert set_enabled("toggled", False) is True
-        # The premise, measured in place rather than assumed: the toggle DID move
+        # The premise, measured in place rather than assumed: the rewrite DID move
         # the manifest identity (so a manifest-keyed lookup would miss) while the
         # directory identity the call registered under is unchanged.
-        assert tools.package_identity(pkg) != before
+        assert _edit_manifest_in_place(pkg) != before
         assert delete_tool("toggled") is True
     finally:
         gate.write_text("go", encoding="utf-8")
@@ -2171,6 +2441,53 @@ def test_delete_after_an_enabled_toggle_still_defers_a_running_call(
     remains = [child for child in root.iterdir()]
     assert len(remains) == 1 and tools._STALE_BACKUP_RE.match(remains[0].name)
     assert (remains[0] / "data.txt").exists()  # deferred, not destroyed
+
+
+def test_a_toggle_mid_call_moves_neither_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The other side of the test above: a toggle mid-call now disturbs NOTHING.
+
+    O5-1's failure needed a toggle to move the manifest identity under a running
+    child. After web-v5 P1 it moves neither identity, so the delete's deferral
+    question and the handler's registration are answering about the same package
+    they were before -- the finding's precondition is gone rather than handled.
+
+    The child is deliberately left running across the toggle, which is exactly the
+    state that used to strand the registration."""
+    root = tmp_path / "tools"
+    marker, gate = tmp_path / "started", tmp_path / "go"
+    pkg = _make_tool(
+        root,
+        "toggled",
+        "import os, sys, time\n"
+        f"open({str(marker)!r}, 'w').write('x')\n"
+        f"while not os.path.exists({str(gate)!r}):\n"
+        "    time.sleep(0.01)\n"
+        "sys.stdout.write(open('data.txt').read())\n",
+    )
+    (pkg / "data.txt").write_text("PAYLOAD", encoding="utf-8")
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler
+    manifest_before = tools.package_identity(pkg)
+    directory_before = tools.directory_identity(pkg)
+    manifest_bytes = (pkg / "tool.json").read_bytes()
+
+    result: dict[str, str] = {}
+    caller = threading.Thread(target=lambda: result.update(out=asyncio.run(handler({}))))
+    caller.start()
+    try:
+        _wait_for(marker.exists)  # the CHILD is running, not merely queued
+        assert set_enabled("toggled", False) is True
+        assert tools.package_identity(pkg) == manifest_before
+        assert tools.directory_identity(pkg) == directory_before
+        assert (pkg / "tool.json").read_bytes() == manifest_bytes
+        assert delete_tool("toggled") is True
+    finally:
+        gate.write_text("go", encoding="utf-8")
+        caller.join(timeout=30)
+
+    assert result["out"] == "PAYLOAD"  # the running child was still protected
 
 
 def test_a_delete_landing_while_a_call_prepares_is_registered_for_and_refused(
@@ -2215,6 +2532,43 @@ def test_a_delete_landing_while_a_call_prepares_is_registered_for_and_refused(
     assert len(remains) == 1 and tools._STALE_BACKUP_RE.match(remains[0].name)
     assert (remains[0] / "run.py").exists()  # deferred, not destroyed
     assert not pkg.exists()  # ... and the NAME went at once, as the route promises
+
+
+def test_a_toggle_landing_while_a_call_prepares_still_refuses_before_popen(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R4 at the WIDTH the accident used to cover, not just at the handler.
+
+    The window R6-1 named is real for this question too: between the handler's own
+    checks and the ``Popen`` sit a ``.env`` read, an argument serialization and a
+    threadpool queue wait of unbounded length. Before web-v5 P1 a toggle landing
+    anywhere in there rewrote ``tool.json``, so the identity check on the line
+    above ``Popen`` caught it. Restoring the handler's check ALONE would have
+    quietly narrowed that guarantee -- the tool would start.
+
+    Driven from inside ``_build_tool_env``, the very ``.env`` read that sits in the
+    gap, so it lands there deterministically rather than by racing a thread. The
+    child writes a sentinel as its first act, so "nothing was started" is a fact on
+    disk rather than an inference from the returned string."""
+    root = tmp_path / "tools"
+    sentinel = tmp_path / "ran"
+    _make_tool(
+        root,
+        "busy",
+        f"import sys\nopen({str(sentinel)!r}, 'w').write('x')\nsys.stdout.write('ok')\n",
+    )
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler
+    real_build_env = tools._build_tool_env
+
+    def toggle_then_build(directory: Path) -> tuple[dict[str, str], frozenset[str]]:
+        assert set_enabled("busy", False) is True
+        return real_build_env(directory)
+
+    monkeypatch.setattr(tools, "_build_tool_env", toggle_then_build)
+
+    assert asyncio.run(handler({})) == tools._TOOL_DISABLED_RESULT
+    assert not sentinel.exists()  # no child was ever started
 
 
 def test_deferred_delete_remains_are_invisible_to_every_registry_path(
@@ -2340,12 +2694,21 @@ def test_symlinked_manifest_listed_invalid(monkeypatch: pytest.MonkeyPatch, tmp_
     assert "real file" in (listed["linky"]["error"] or "")
 
 
-def test_set_enabled_rejects_symlinked_manifest(
+def test_set_enabled_never_writes_through_a_symlinked_manifest(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """set_enabled must not rewrite a file OUTSIDE the package through a
-    symlinked tool.json: the resolved-path containment check refuses the write,
-    and the foreign file is left byte-for-byte untouched (H3)."""
+    """The H3 guarantee this used to need a containment check for, now structural.
+
+    A symlinked ``tool.json`` could once have redirected ``set_enabled``'s rewrite
+    onto a file outside the package (``write_text`` follows links), so the write
+    boundary carried its own resolve-then-contain refusal. Since web-v5 P1 the
+    toggle does not open the manifest AT ALL, so the foreign file is untouched by
+    construction rather than by a check that could be forgotten.
+
+    The toggle itself now SUCCEEDS, and that is the deliberate half: it writes the
+    package's own ``.state.json``. The package stays invalid for the symlinked
+    manifest (so it is never advertised or executed either way), and an operator
+    can now switch a broken package OFF -- which is exactly when they want to."""
     root = tmp_path / "tools"
     pkg = root / "echo"
     pkg.mkdir(parents=True)
@@ -2364,8 +2727,39 @@ def test_set_enabled_rejects_symlinked_manifest(
     (pkg / "tool.json").symlink_to(outside)
     _install_tools(monkeypatch, root)
 
-    assert set_enabled("echo", False) is False  # write refused
-    assert outside.read_text() == original  # foreign file untouched (no rewrite)
+    assert set_enabled("echo", False) is True
+    assert outside.read_text() == original  # foreign file untouched (never opened)
+    assert (pkg / tools._STATE_FILENAME).is_file()  # the toggle went to its OWN file
+    listed = {t["name"]: t for t in list_tools()}["echo"]
+    assert listed["valid"] is False and listed["enabled"] is False
+
+
+def test_set_enabled_refuses_a_symlinked_state_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The write-boundary refusal, moved to the file the toggle actually writes.
+
+    ``.state.json`` is now the only thing a toggle touches, so it inherits the
+    hazard: a symlink planted at that name (by an unjailed builder, by an
+    operator) must not carry the write out of the package. The publish's pre-write
+    ``lstat`` refuses any non-regular target outright -- and even reaching
+    ``os.replace`` would only have replaced the LINK -- so the foreign file is
+    untouched and the toggle honestly reports "did not happen"."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    outside = tmp_path / "outside.json"
+    outside.write_text("keep", encoding="utf-8")
+    (pkg / tools._STATE_FILENAME).symlink_to(outside)
+    _install_tools(monkeypatch, root)
+
+    assert set_enabled("echo", False) is False
+    assert outside.read_text(encoding="utf-8") == "keep"  # never written through
+    assert (pkg / tools._STATE_FILENAME).is_symlink()  # the link itself survives
+    # And the READ side agrees: a non-regular state file is UNREADABLE, which is
+    # a disabled, invalid row -- never a silent fallback to "on".
+    listed = {t["name"]: t for t in list_tools()}["echo"]
+    assert listed["valid"] is False and listed["enabled"] is False
+    assert listed["error"] == tools._STATE_UNREADABLE_ERROR
 
 
 def test_delete_internal_alias_removes_only_link(
@@ -2395,11 +2789,12 @@ def test_delete_internal_alias_removes_only_link(
 def test_set_enabled_refuses_internal_alias(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """set_enabled must never read or write a manifest THROUGH an internal alias:
+    """set_enabled must never act on a package THROUGH an internal alias:
     tools/<alias> -> tools/<real> resolves inside the root, so absent the
-    pre-resolve symlink block a toggle on the alias would rewrite the REAL
-    package's tool.json. The alias PATCH is refused (False) and the real manifest
-    is left byte-for-byte untouched."""
+    pre-resolve symlink block a toggle on the alias would land the state file
+    INSIDE the REAL package -- switching off a tool the operator addressed by
+    another name. The alias PATCH is refused (False) and the real package is left
+    byte-for-byte untouched, state file included."""
     root = tmp_path / "tools"
     _make_tool(root, "real", "import sys\nsys.stdout.write('x')\n", enabled=True)
     (root / "alias").symlink_to(root / "real", target_is_directory=True)
@@ -2408,17 +2803,26 @@ def test_set_enabled_refuses_internal_alias(
     before = (root / "real" / "tool.json").read_bytes()
     assert set_enabled("alias", False) is False
     assert (root / "real" / "tool.json").read_bytes() == before  # real manifest untouched
+    assert not (root / "real" / tools._STATE_FILENAME).exists()  # and no state written
     real = {t["name"]: t for t in list_tools()}["real"]
     assert real["enabled"] is True  # the real package's flag never flipped
 
 
-def test_set_enabled_refuses_oversized_manifest(
+def test_set_enabled_toggles_a_package_whose_manifest_is_oversized(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The manifest cap must hold at the WRITE entry too (N2): set_enabled
-    stat-checks tool.json against _MANIFEST_MAX_BYTES BEFORE reading it, so an
-    oversized manifest is refused (False) without being loaded into memory --
-    matching the scan, which already lists it invalid."""
+    """Two manifest-cap refusals retire together, and the file stays byte-identical.
+
+    ``set_enabled`` used to refuse an OVERSIZED manifest, and separately to refuse
+    one whose pretty-printed (``indent=2``) re-serialization would cross the cap --
+    a real hazard back when a mere toggle REWROTE the file and could expand it past
+    the ceiling, flipping the tool invalid. There is no rewrite and no
+    re-serialization now, so both refusals are gone with the thing they guarded.
+
+    What is left is strictly better: an operator can switch OFF a package whose
+    manifest is broken (exactly when they most want to), the manifest is not
+    touched, and the package stays invalid -- so nothing became runnable that was
+    not runnable before."""
     root = tmp_path / "tools"
     _make_tool(
         root,
@@ -2435,52 +2839,28 @@ def test_set_enabled_refuses_oversized_manifest(
     _install_tools(monkeypatch, root)
 
     before = (root / "big" / "tool.json").read_bytes()
-    assert set_enabled("big", False) is False
+    assert set_enabled("big", False) is True
     assert (root / "big" / "tool.json").read_bytes() == before  # untouched
+    listed = {t["name"]: t for t in list_tools()}["big"]
+    assert listed["valid"] is False and listed["enabled"] is False
+    assert enabled_llm_tools() == []
 
 
-def test_set_enabled_refuses_when_pretty_form_would_exceed_cap(
+def test_set_enabled_with_a_fifo_manifest_does_not_hang(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A manifest whose COMPACT on-disk form sits under the cap but whose
-    PRETTY (indent=2) re-serialization would cross it is refused, and the file is
-    left byte-identical (N2). Without the post-build size check, a mere
-    enable/disable toggle would EXPAND the manifest past the cap and flip the tool
-    invalid on the next scan."""
-    root = tmp_path / "tools"
-    manifest = {
-        "name": "swell",
-        "description": "d",
-        # A big array expands far more pretty-printed (a newline + 6-space indent
-        # per element) than compact, so it can straddle the cap between the two
-        # forms without any single field being individually oversized.
-        "parameters": {"type": "object", "filler": ["v"] * 12000},
-        "entry": [sys.executable, "run.py"],
-        "enabled": True,
-    }
-    # Pin the premise: the compact form (what _make_tool writes) fits under the
-    # cap, but the pretty form set_enabled would write does not.
-    compact = json.dumps(manifest)
-    assert len(compact.encode("utf-8")) < _MANIFEST_MAX_BYTES
-    pretty = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
-    assert len(pretty.encode("utf-8")) > _MANIFEST_MAX_BYTES
-    _make_tool(root, "swell", "import sys\nsys.stdout.write('x')\n", tool_json=manifest)
-    _install_tools(monkeypatch, root)
+    """The F3b hang hazard, re-measured on the path that still exists.
 
-    before = (root / "swell" / "tool.json").read_bytes()
-    assert set_enabled("swell", False) is False  # pretty form would overflow the cap
-    assert (root / "swell" / "tool.json").read_bytes() == before  # byte-identical
+    A writer-less FIFO at ``tool.json`` would block a plain ``read_text()``
+    FOREVER, wedging the PATCH worker. ``set_enabled`` no longer opens the manifest
+    on any path, so the hazard is structurally absent rather than caught -- and the
+    toggle succeeds, leaving the FIFO exactly as it found it.
 
-
-def test_set_enabled_fifo_manifest_refused_without_hanging(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A FIFO swapped in for tool.json makes set_enabled return False PROMPTLY,
-    never hanging (F3b): a plain read_text() would open(O_RDONLY) the FIFO and BLOCK
-    the PATCH worker FOREVER waiting for a writer. set_enabled now reads the manifest
-    through the shared O_NONBLOCK+S_ISREG helper, so the FIFO is refused at once and
-    the write is never reached. Driven on a WATCHED daemon thread so a regression (a
-    blocking reopen) fails LOUDLY here instead of wedging the whole suite."""
+    The same is pinned for the file the toggle DOES open: a FIFO at
+    ``.state.json`` is refused by the publish's ``lstat`` S_ISREG gate (and by the
+    read side's, which is why the row below reports unreadable), neither of which
+    can block. Both halves run on a WATCHED daemon thread so a regression fails
+    LOUDLY here instead of wedging the whole suite."""
     root = tmp_path / "tools"
     pkg = root / "fifotool"
     pkg.mkdir(parents=True)
@@ -2488,15 +2868,28 @@ def test_set_enabled_fifo_manifest_refused_without_hanging(
     os.mkfifo(pkg / "tool.json")  # a writer-less FIFO -- read_text() would block forever
     _install_tools(monkeypatch, root)
 
-    box: dict[str, bool] = {}
-    worker = threading.Thread(
-        target=lambda: box.__setitem__("ok", set_enabled("fifotool", False)), daemon=True
-    )
-    worker.start()
-    worker.join(timeout=10)
-    assert not worker.is_alive(), "set_enabled on a FIFO tool.json hung (F3b regression)"
-    assert box["ok"] is False  # the FIFO manifest was refused, not rewritten
+    def toggle(name: str) -> bool:
+        box: dict[str, bool] = {}
+        worker = threading.Thread(
+            target=lambda: box.__setitem__("ok", set_enabled(name, False)), daemon=True
+        )
+        worker.start()
+        worker.join(timeout=10)
+        assert not worker.is_alive(), "set_enabled hung on a FIFO (F3b regression)"
+        return box["ok"]
+
+    assert toggle("fifotool") is True  # the manifest is never opened at all
     assert (pkg / "tool.json").is_fifo()  # still the FIFO, never overwritten
+
+    fifo_state = root / "fifostate"
+    _make_tool(root, "fifostate", "import sys\nsys.stdout.write('x')\n")
+    (fifo_state / tools._STATE_FILENAME).unlink(missing_ok=True)
+    os.mkfifo(fifo_state / tools._STATE_FILENAME)
+
+    assert toggle("fifostate") is False  # the publish refuses a non-regular target
+    assert (fifo_state / tools._STATE_FILENAME).is_fifo()
+    listed = {t["name"]: t for t in list_tools()}["fifostate"]
+    assert listed["valid"] is False and listed["enabled"] is False
 
 
 def test_write_regular_file_refuses_symlink_leaf(tmp_path: Path) -> None:

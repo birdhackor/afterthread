@@ -270,6 +270,15 @@ _ERROR_REVISE_ENV_UNMATCHABLE = (
     "請把該行的值寫成最單純的形式（原值直接寫，或整段用引號包住），"  # noqa: RUF001
     "並移除行尾註解與多餘的跳脫。"
 )
+# The revise could not carry the package's 啟用 state across the swap (web-v5 P1).
+# It REFUSES rather than publishing anyway, and the direction is the point: the
+# swap replaces the whole package directory, so a state file that fails to land
+# leaves the new package reading the manifest fallback -- i.e. ENABLED. Publishing
+# a revision that silently switches a deliberately-disabled tool back on is the one
+# outcome "do not run beats leak" forbids, and everything this write touches is
+# inside STAGING, so refusing costs an abandoned build and nothing else.
+# Category-only like the rest.
+_ERROR_REVISE_STATE_RESTORE = "無法保留工具的啟用狀態，修訂已取消。"  # noqa: RUF001
 # The replace-mode promote's two "the package is no longer what we resolved"
 # refusals. Both are races against a concurrent delete/replace by an actor with
 # the service's uid -- the SAME accepted residual class ``_promote_staging``'s
@@ -1376,15 +1385,33 @@ def _inject_secret_into_env(env_file: Path, name: str, value: str) -> str | None
 
 
 def _is_reserved_sidecar_name(filename: str) -> bool:
-    """True for a filename inside the AI sidecar's RESERVED namespace (D40).
+    """True for a filename inside the BACKEND's RESERVED namespace (D40, web-v5 P1).
 
-    Two shapes, and the temp one is not padding: ``tools._write_sidecar_atomic``
-    publishes through ``mkstemp(prefix=f"{_AI_META_FILENAME}.", suffix=".tmp")``,
-    so a leftover from an interrupted publish is a legitimate inhabitant of this
-    namespace -- and therefore just as legitimate a thing for a builder to
-    imitate. Matching the prefix+suffix pair (rather than the exact name only)
-    means the strip covers the whole namespace the backend claims, not just the
-    one filename an attacker would have to be naive enough to use.
+    Driven off ``tools._RESERVED_PACKAGE_FILENAMES`` -- a SET rather than one
+    hard-coded name, because there are now two backend-authored files in a
+    package: the AI summary sidecar (``.ai_meta.json``) and the mutable state file
+    the enabled toggle lives in (``.state.json``). Reading the tuple from ``tools``
+    rather than restating the names here is what keeps the side that WRITES them
+    and the side that REFUSES them from drifting apart; the symbol keeps the word
+    "sidecar" for the same reason ``tools._STALE_BACKUP_RE`` keeps the word
+    "backup" (the D40 addenda point at these names, and the on-disk contract is
+    what actually matters).
+
+    Two shapes per name, and the temp one is not padding:
+    ``tools._write_package_file_atomic`` publishes through
+    ``mkstemp(prefix=f"{filename}.", suffix=".tmp")``, so a leftover from an
+    interrupted publish is a legitimate inhabitant of this namespace -- and
+    therefore just as legitimate a thing for a builder to imitate. Matching the
+    prefix+suffix pair (rather than the exact name only) means the strip covers
+    the whole namespace the backend claims, not just the one filename an attacker
+    would have to be naive enough to use.
+
+    What a builder-shipped ``.state.json`` would buy, so the extension is not read
+    as symmetry for its own sake: the file the RUNTIME consults at call time to
+    decide whether a tool may run (``tools._make_handler``). A revise session that
+    wrote one would be answering, in the operator's own vocabulary, a question only
+    the operator gets to answer -- switching a tool the operator had disabled back
+    on, at promote, with no mutation API call anywhere in the record.
 
     Matched CASE-INSENSITIVELY (R10-2), which is not pedantry on a project that
     supports macOS: the default macOS filesystem is case-INSENSITIVE, so a
@@ -1399,8 +1426,10 @@ def _is_reserved_sidecar_name(filename: str) -> bool:
     names are compared, never displayed.
     """
     folded = filename.casefold()
-    reserved = tools._AI_META_FILENAME.casefold()
-    return folded == reserved or (folded.startswith(reserved) and folded.endswith(".tmp"))
+    return any(
+        folded == reserved or (folded.startswith(reserved) and folded.endswith(".tmp"))
+        for reserved in (name.casefold() for name in tools._RESERVED_PACKAGE_FILENAMES)
+    )
 
 
 def _remove_reserved_sidecar_path(path: Path) -> None:
@@ -1412,12 +1441,14 @@ def _remove_reserved_sidecar_path(path: Path) -> None:
     ``missing_ok`` covers the entry vanishing between the walk and here.
 
     A real DIRECTORY at the reserved name needs ``rmtree`` (``unlink`` answers
-    EISDIR). It is not a forged sidecar -- ``read_tool_meta`` refuses a
-    non-regular file -- but it would permanently BRICK the package's summary:
-    ``_write_sidecar_atomic``'s lstat gate refuses to publish over anything
-    non-regular, so the install hook, every later regenerate, and 定版 would all
-    fail forever on a package the operator has no API path to repair. The name is
-    the backend's; nothing of the builder's may occupy it in any form.
+    EISDIR). It is not a forged file -- both readers refuse a non-regular one --
+    but it would permanently BRICK what that name is for:
+    ``_write_package_file_atomic``'s lstat gate refuses to publish over anything
+    non-regular, so at ``.ai_meta.json`` the install hook, every later regenerate
+    and 定版 would fail forever, and at ``.state.json`` the package would list
+    INVALID with a toggle that cannot be written either -- on a package the
+    operator has no API path to repair. The name is the backend's; nothing of the
+    builder's may occupy it in any form.
 
     Raises ``OSError`` on a refusal, which is what makes the caller fail-closed.
     """
@@ -1735,7 +1766,7 @@ def _preserve_env_file(
     bounded (see there).
 
     Both ends are guarded by an ``lstat``, mirroring the pre-write ``lstat``
-    ``tools._write_sidecar_atomic`` makes and the ``O_NOFOLLOW`` + ``S_ISREG`` gate
+    ``tools._write_package_file_atomic`` makes and the ``O_NOFOLLOW`` + ``S_ISREG`` gate
     of the shared file helpers:
 
     * SOURCE -- ``FileNotFoundError`` is the ONLY "there is no ``.env``" answer
@@ -2040,6 +2071,13 @@ def _promote_staging_replace(
     never takes a deleted credential file's place (R3-1, see
     ``_preserve_env_file``).
 
+    The package's 啟用 state is carried across on the next line, and it is the same
+    shape of step for the same kind of reason (web-v5 P1): ``.state.json`` is
+    backend-authored, so it is kept out of staging and re-published here from the
+    LIVE package instead of being copied into a session that could rewrite it. A
+    failure REFUSES the revise -- see the comment at the call and
+    ``_ERROR_REVISE_STATE_RESTORE``.
+
     The swap itself is rename-aside, move-in, drop-the-backup:
 
     * the old package is renamed to a DOT-prefixed sibling
@@ -2112,6 +2150,30 @@ def _promote_staging_replace(
     )
     if env_error is not None:
         return None, env_error
+    # The 啟用 state is carried across the swap the same way, and for a reason the
+    # revise flow did not used to have (web-v5 P1): the toggle now lives in the
+    # package's own ``.state.json``, which ``_revise_copy_ignore`` deliberately
+    # keeps OUT of staging (it is backend-authored -- a session with shell must not
+    # be able to rewrite the file that decides whether its own tool may run) and
+    # ``_strip_builder_sidecars`` deletes if the session wrote one anyway. The swap
+    # below replaces the WHOLE directory, so without this line every revise would
+    # publish a package with no state file at all -- read through the manifest
+    # fallback as ENABLED, silently undoing a switch the operator set.
+    #
+    # ``package_enabled`` on the LIVE package, not on staging: staging has no state
+    # file by construction, and the live answer is the one being preserved. It reads
+    # an unreadable state file as False, so a corrupt one is carried across as
+    # DISABLED rather than repaired into "on" -- the same direction the scan takes.
+    # A failed write REFUSES the revise (see ``_ERROR_REVISE_STATE_RESTORE``); it
+    # writes into staging, so nothing observable is left behind by the refusal.
+    #
+    # It sits next to the ``.env`` copy for the same structural reason: both layer
+    # the BACKEND's own bytes onto a package that has already passed
+    # ``validate_package``, which judges what the BUILDER produced. Bounded and
+    # tiny, unlike that copy, so its position relative to the 定版 gate below is
+    # free -- it is here to keep the two preservation steps together.
+    if not tools.write_package_state(staging, tools.package_enabled(target)):
+        return None, _ERROR_REVISE_STATE_RESTORE
     # 定版 is re-checked HERE, at the last moment before the swap, not only at
     # the entry gates -- the same store-time re-check ``tools.store_summary_meta``
     # makes for regenerate (D40 r2), and for the same reason at a much longer
@@ -2282,8 +2344,8 @@ def _sweep_stale_backups(base: Path) -> None:
       gates its own rmtree, and ``_promote_staging_replace`` its target);
     * its DIRECTORY identity must be readable AND absent from
       ``tools.directory_execution_in_flight`` -- the identity the writers deferred
-      under, which a rename carries and an ``enabled`` toggle cannot move (see
-      ``tools.directory_identity``).
+      under, which a rename carries and an in-place manifest rewrite cannot move
+      (see ``tools.directory_identity``).
 
     "Cannot say" therefore KEEPS the directory: the destructive act here is the
     removal, so a check that cannot speak must not vouch for it (D40 P3b r11's
@@ -2609,10 +2671,15 @@ def _revise_copy_ignore(root: Path, source_dir: Any, names: list[str]) -> set[st
       are in ``known_secret_values``, so copying it would be rejected outright by
       ``validate_package``'s embedded-secret gate, and the backend copies the live
       file back after validation instead (``_preserve_env_file``);
-    * the sidecar's reserved namespace at EVERY depth -- a backend-authored
-      namespace no package content may inhabit, regenerated through the
-      ``write_tool_meta`` choke point after the swap, and one
-      ``_strip_builder_sidecars`` would delete from staging anyway.
+    * the BACKEND's reserved namespace at EVERY depth (``.ai_meta.json`` and
+      ``.state.json``, plus their publish temporaries) -- names no package content
+      may inhabit, and ones ``_strip_builder_sidecars`` would delete from staging
+      anyway. Each is restored on the other side of the swap through its own choke
+      point rather than by being copied into a session that can rewrite it: the
+      sidecar is regenerated through ``write_tool_meta``, and the state file is
+      re-published from the LIVE package by ``_promote_staging_replace`` (see
+      there -- without that step every revise would silently re-enable a tool the
+      operator had switched off, since the swap replaces the whole directory).
 
     A NESTED ``.env`` is ordinary package content and is COPIED (R2-2). The r1
     rule dropped every ``.env``-casefolded name at every depth on the theory that

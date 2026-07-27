@@ -1031,7 +1031,7 @@ def test_run_install_strips_forged_sidecars_at_every_depth(
     against the by-then-registered value: a planted nested copy would brick every
     later revise with a rejection naming a file the operator never wrote.
 
-    ``.ai_meta.json.<x>.tmp`` is the namespace ``_write_sidecar_atomic``'s
+    ``.ai_meta.json.<x>.tmp`` is the namespace ``_write_package_file_atomic``'s
     ``mkstemp`` publishes through, so a leftover there is a legitimate artifact
     -- and therefore just as legitimate a thing for a builder to imitate.
 
@@ -1092,6 +1092,39 @@ def test_strip_builder_sidecars_matches_the_reserved_name_case_insensitively(
     assert remaining == ["run.py"]
 
 
+def test_strip_builder_sidecars_covers_the_state_file_namespace(tmp_path: Path) -> None:
+    """R5 (web-v5 P1): ``.state.json`` joins the namespace, at every depth and case.
+
+    What a builder-shipped state file would buy is not symmetry for its own sake:
+    it is the file the RUNTIME consults at call time to decide whether a tool may
+    run. A revise session that wrote one would be switching a tool the operator had
+    DISABLED back on, at promote, with no mutation API call anywhere in the record.
+
+    The publish temporaries are covered for the same reason the sidecar's are --
+    ``_write_package_file_atomic`` mints ``<name>.<x>.tmp`` in the package, so a
+    leftover is a legitimate inhabitant of the namespace and therefore just as
+    legitimate a thing to imitate."""
+    staging = tmp_path / "staging"
+    (staging / "sub").mkdir(parents=True)
+    (staging / tools._STATE_FILENAME).write_text('{"enabled": true}', encoding="utf-8")
+    (staging / f"{tools._STATE_FILENAME}.abc123.tmp").write_text("{}", encoding="utf-8")
+    (staging / ".STATE.JSON").write_text('{"enabled": true}', encoding="utf-8")
+    (staging / "sub" / tools._STATE_FILENAME).write_text('{"enabled": true}', encoding="utf-8")
+    (staging / "run.py").write_text("print(1)", encoding="utf-8")
+    (staging / "sub" / "keep.py").write_text("K = 1\n", encoding="utf-8")
+
+    assert tool_builder._strip_builder_sidecars(staging) is None
+
+    assert sorted(entry.name for entry in staging.iterdir()) == ["run.py", "sub"]
+    assert sorted(entry.name for entry in (staging / "sub").iterdir()) == ["keep.py"]
+    # And the predicate itself agrees on both namespaces, so neither can be
+    # dropped by a future edit that only looks at one of them.
+    for reserved in tools._RESERVED_PACKAGE_FILENAMES:
+        assert tool_builder._is_reserved_sidecar_name(reserved) is True
+        assert tool_builder._is_reserved_sidecar_name(f"{reserved}.x.tmp") is True
+    assert tool_builder._is_reserved_sidecar_name("state.json") is False
+
+
 def test_strip_builder_sidecars_handles_links_and_directories(tmp_path: Path) -> None:
     """The reserved name belongs to the backend in EVERY form it can take.
 
@@ -1102,7 +1135,7 @@ def test_strip_builder_sidecars_handles_links_and_directories(tmp_path: Path) ->
 
     A real DIRECTORY at the name is not a forged sidecar -- ``read_tool_meta``
     refuses a non-regular file -- but leaving it would permanently BRICK the
-    package's summary: ``_write_sidecar_atomic``'s lstat gate refuses to publish
+    package's summary: ``_write_package_file_atomic``'s lstat gate refuses to publish
     over anything non-regular, so the install hook, every later regenerate and
     定版 would all fail forever, with no API path to repair it.
 
@@ -3982,6 +4015,53 @@ def test_run_revise_copies_the_package_without_the_root_env_or_any_sidecar(
     assert (pkg / "config" / ".env").read_bytes() == nested_env
 
 
+def test_run_revise_keeps_the_state_file_out_of_staging_but_carries_it_across(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R5 both ways: the builder never SEES the state file, and a revise never
+    silently re-enables the tool.
+
+    The two halves are one decision. ``.state.json`` is backend-authored, so it is
+    excluded from the copy -- a session with real shell capability (D21) must not
+    be handed the file that decides whether its own tool may run. But the swap
+    REPLACES the whole package directory, so excluding it and stopping there would
+    make every revise publish a package with no state file at all, read through the
+    manifest fallback as ENABLED: an operator's deliberate 停用 undone by a revise
+    about pagination, with nothing anywhere reporting it.
+
+    So the promote re-publishes it from the LIVE package through the same choke
+    point ``set_enabled`` uses. The tool is disabled going in and disabled coming
+    out, and the builder's staging never had one to read or rewrite."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    root = pkg.parent
+    assert tools.set_enabled("kbsearch", False) is True
+    manifest_before = (pkg / "tool.json").read_bytes()
+    seen: dict[str, set[str]] = {}
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY},
+        side_effect=lambda: seen.update(staged=_tree(_staging_dir(root))),
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert tools._STATE_FILENAME not in seen["staged"]  # the builder never saw it
+    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY  # really revised
+    assert json.loads((pkg / tools._STATE_FILENAME).read_text(encoding="utf-8")) == {
+        "enabled": False
+    }
+    assert {t["name"]: t["enabled"] for t in tools.list_tools()}["kbsearch"] is False
+    assert tools.enabled_llm_tools() == []
+    # The manifest is not where any of this lives: this fixture's revision changes
+    # only run.py, so the published manifest is byte-identical to the one that went
+    # in AND carries no ``enabled`` key at all -- the state file is provably the
+    # only thing that decided the toggle on either side of the swap.
+    assert (pkg / "tool.json").read_bytes() == manifest_before
+    assert "enabled" not in json.loads((pkg / "tool.json").read_text(encoding="utf-8"))
+
+
 def test_run_revise_preserves_the_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """The installed ``.env`` survives a revise unchanged -- comments, quoting,
     inline ``#``, trailing whitespace and line ORDER included -- and a builder that
@@ -4522,6 +4602,27 @@ def _wait_for(condition: Callable[[], bool], *, timeout: float = 30.0) -> None:
     raise AssertionError("condition was not reached in time")
 
 
+def _edit_manifest_in_place(pkg: Path) -> tuple[int, int, int]:
+    """Rewrite ``tool.json`` byte-identically until its manifest identity MOVES.
+
+    The twin of ``tests/test_tools.py``'s helper of the same name -- see there for
+    the measured ~1 ms ``st_ctime_ns`` granularity the retry loop exists for, and
+    for why a HAND-EDIT is the writer this stands in for now that the enabled
+    toggle no longer rewrites the manifest."""
+    manifest = pkg / "tool.json"
+    raw = manifest.read_text(encoding="utf-8")
+    before = tool_builder._package_identity(pkg)
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        manifest.write_text(raw, encoding="utf-8")
+        after = tool_builder._package_identity(pkg)
+        assert after is not None
+        if after != before:
+            assert manifest.read_text(encoding="utf-8") == raw  # the BYTES never changed
+            return after
+    raise AssertionError("the manifest identity never moved across an in-place rewrite")
+
+
 def test_promote_replace_defers_the_backup_while_a_tool_call_is_running(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4580,22 +4681,27 @@ def test_promote_replace_defers_the_backup_while_a_tool_call_is_running(
     assert [child.name for child in base.iterdir() if ".stale-" in child.name] == []
 
 
-def test_promote_replace_defers_after_an_enabled_toggle_moved_the_manifest(
+def test_promote_replace_defers_after_a_manifest_edit_moved_the_identity(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The deferral must survive an ``enabled`` toggle landing mid-call.
+    """The deferral must survive an in-place manifest rewrite landing mid-call.
 
     Same shape as the test above, with the one event that used to break it: the
-    operator flips the tool off (or off and on) while a call of it is running.
-    ``set_enabled`` rewrites ``tool.json`` in place, so with the execution registry
-    keyed on the MANIFEST identity the promote looked the call up under a tuple
-    nobody had registered, answered "nothing is running", and ``rmtree``d the
-    backup while the child still had its cwd on it -- and the window is the whole
-    call, not a syscall pair.
+    package's ``tool.json`` is rewritten while a call of it is running. With the
+    execution registry keyed on the MANIFEST identity the promote looked the call
+    up under a tuple nobody had registered, answered "nothing is running", and
+    ``rmtree``d the backup while the child still had its cwd on it -- and the
+    window is the whole call, not a syscall pair.
 
-    The revise session here reads its identity AFTER the toggle, which is what a
+    ``set_enabled`` was the writer O5-1 found this through, and since web-v5 P1 the
+    toggle does not touch the manifest at all. An operator hand-editing the spec of
+    a running tool is a supported action (D21) and moves the same identity, so the
+    guarantee is pinned through that instead -- byte-identically, since what moves
+    is the FILE's ctime and not its contents.
+
+    The revise session here reads its identity AFTER the edit, which is what a
     session started at this moment genuinely holds (a session that had captured
-    the PRE-toggle manifest is refused outright by the pre-swap check -- that is
+    the PRE-edit manifest is refused outright by the pre-swap check -- that is
     the adjudicated behaviour of the OTHER identity, and it is unchanged). So the
     two identities are deliberately out of step here, which is exactly the state
     that used to lose the registration."""
@@ -4614,9 +4720,8 @@ def test_promote_replace_defers_after_an_enabled_toggle_moved_the_manifest(
     caller.start()
     try:
         _wait_for(marker.exists)  # the CHILD is running, not merely queued
-        assert tools.set_enabled("kbsearch", False) is True
-        identity = tool_builder._package_identity(installed)
-        assert identity is not None and identity != before  # the premise, measured
+        identity = _edit_manifest_in_place(installed)
+        assert identity != before  # the premise, measured
         origin, error = tool_builder._promote_staging_replace(
             staging,
             "kbsearch",

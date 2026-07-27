@@ -806,15 +806,21 @@ async def generate_and_store_summary(
     operator's instructions are captured NOWHERE else in the system -- the caller
     holds them, this is the only chance to persist them, and ``regenerate_summary``
     recovers them by READING the sidecar, so a sidecar that never lands means every
-    later revise session runs without them, permanently. Meanwhile
-    ``PATCH /api/tools/{name}`` takes no admission reservation and no per-package
-    guard: it calls ``tools.set_enabled`` straight through, which rewrites
-    ``tool.json`` in place and MOVES the manifest identity captured at the resolve
-    (D40 r5 -- that identity MUST move, it is what tells a revise from a reinstall).
-    So an operator toggling 啟用 anywhere inside the round trip gets the store's
-    identity guard, correctly, and the write is refused. Persisting the origin
-    first is what makes that refusal cost only the summary TEXT, which any later
-    regeneration rebuilds from the files.
+    later revise session runs without them, permanently. What can make the write at
+    the END not land is the store's identity guard: this hook holds the manifest
+    identity captured at its resolve, and a package REPLACED during the round trip
+    (a delete-and-reinstall under the same name takes no admission reservation)
+    correctly refuses it. Persisting the origin first is what makes that refusal
+    cost only the summary TEXT, which any later regeneration rebuilds from the
+    files.
+
+    A 啟用 TOGGLE was the reachable instance of that when O8-1 was found, and it is
+    no longer one: ``PATCH /api/tools/{name}`` still takes no admission reservation
+    and no per-package guard, but since web-v5 P1 ``tools.set_enabled`` writes the
+    package's ``.state.json`` and leaves ``tool.json`` byte-identical -- so the
+    identity does not move and there is nothing for the guard to refuse. The early
+    write STAYS: it is what covers the replacement case, which still moves the
+    identity and still must be refused.
 
     Persisting early rather than LOCKING the toggle, deliberately: a lock would
     restrict a route that currently always works, for a window no operator can

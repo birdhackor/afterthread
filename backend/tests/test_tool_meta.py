@@ -1409,27 +1409,37 @@ def test_the_install_origin_reaches_disk_before_the_llm_round_trip(
     assert final["llm_log_process"] == llm_log.process_token()
 
 
-def test_an_enabled_toggle_during_the_generation_costs_the_summary_not_the_origin(
+def test_an_enabled_toggle_during_the_generation_now_costs_nothing_at_all(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A toggle inside the round trip may cost the summary TEXT; never the origin.
+    """O8-1's whole scenario, re-measured after web-v5 P1: nothing is lost any more.
 
-    ``PATCH /api/tools/{name}`` takes no admission reservation and no per-package
-    guard, and ``set_enabled`` rewrites ``tool.json`` in place -- which MOVES the
-    manifest identity this hook captured at its resolve (D40 r5). So the sidecar
-    write at the end is correctly REFUSED (that behaviour is pinned elsewhere and
-    must not change), the install hook swallows the refusal as it swallows every
-    store outcome, and the job still reports success.
+    THE HISTORY, because this test's assertions are the inversion of what it used
+    to pin. ``PATCH /api/tools/{name}`` takes no admission reservation and no
+    per-package guard, and ``set_enabled`` USED TO rewrite ``tool.json`` in place --
+    which MOVED the manifest identity this hook captured at its resolve (D40 r5).
+    The sidecar write at the end was then correctly REFUSED, the install hook
+    swallowed the refusal as it swallows every store outcome, and the job still
+    reported success. r8's fix was to persist the un-regenerable half (the
+    ``origin``) BEFORE the round trip, so a toggle cost the summary TEXT -- which
+    any later regeneration rebuilds -- instead of the OpenAPI url and the
+    operator's instructions, which are captured nowhere else in the system.
 
-    What that used to cost was the ORIGIN, permanently and silently: it lived only
-    in this process, ``regenerate_summary`` recovers it by READING the sidecar, and
-    with no sidecar there was nothing to recover -- every later revise session ran
-    without the OpenAPI url and the original instructions. Driven from INSIDE the
-    generation, not by racing a thread, so it is the window itself that is pinned."""
+    web-v5 P1 removes the mechanism rather than the instance: a toggle writes
+    ``.state.json`` and leaves the manifest byte-identical, so the identity the
+    hook is holding does not move, the guard has nothing to refuse, and the FULL
+    sidecar lands. r8's early write stays exactly where it is -- it closes the same
+    window against a genuine mid-round-trip REPLACEMENT, which still moves the
+    identity and still must be refused.
+
+    Driven from INSIDE the generation, not by racing a thread, so it is the window
+    itself that is pinned."""
     root = tmp_path / "tools"
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
     origin = {"openapi_url": "http://kb.example", "instructions": "查 KB"}
+    manifest_before = (pkg / "tool.json").read_bytes()
+    identity_before = tools.package_identity(pkg)
 
     def toggle_mid_call() -> None:
         assert tools.set_enabled("kbsearch", False) is True
@@ -1437,10 +1447,16 @@ def test_an_enabled_toggle_during_the_generation_costs_the_summary_not_the_origi
     _fake_generate(monkeypatch, summary="這個工具會查 KB", side_effect=toggle_mid_call)
     asyncio.run(generate_and_store_summary("kbsearch", origin=origin))
 
+    # The premise, measured in place: the toggle really happened, and really moved
+    # nothing the sidecar's identity guard looks at.
+    assert {t["name"]: t["enabled"] for t in tools.list_tools()}["kbsearch"] is False
+    assert (pkg / "tool.json").read_bytes() == manifest_before
+    assert tools.package_identity(pkg) == identity_before
+
     after = tools.read_tool_meta(pkg)
     assert after is not None
-    assert after["summary"] == ""  # the REGENERABLE half: genuinely lost, and cheap
-    assert after["origin"] == origin  # the un-regenerable half: survived
+    assert after["summary"] == "這個工具會查 KB"  # the regenerable half: no longer lost
+    assert after["origin"] == origin  # the un-regenerable half: still safe (r8)
 
     # And the recovery path really can read it back -- which is the whole reason
     # the origin is worth saving: a later regeneration feeds it into its own prompt
