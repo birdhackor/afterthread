@@ -290,19 +290,22 @@ export function claimLatestSummaryWrite(ledger, instanceKey, stamp) {
 //
 // Deliberately NOT refetching, with the reason each time:
 //
-// * 409 `tool_job_in_progress` -- someone holds the single-flight slot. A job
-//   that has not finished has written nothing; there is nothing new to read.
-// * 503 `llm_not_configured` / 502 `llm_upstream_error` -- the regenerate never
-//   reached the sidecar (routers/tools.py raises both from the LLM call, before
-//   `_store_meta`). Configuration and upstream health are not tool state.
-// * 0 (transport) / 5xx / anything else -- no evidence either way. Blanket
-//   refetching on every error is how a flaky link turns one failure into a
-//   refetch loop, and the two banners already say the view may be stale.
+// * 409 `tool_job_in_progress` -- ANOTHER actor holds the single-flight slot,
+//   which is a fact about the world we did not know a moment ago: something
+//   outside this page is mid-operation on this backend, and when it finishes it
+//   may have replaced the very package we are looking at. Revalidating does not
+//   make the foreign job observable -- we hold no id for it and cannot be told
+//   when it ends -- so this only re-reads the CURRENT truth. Acting on a foreign
+//   job's COMPLETION is the residual family bounded by 裁決紀錄 #7 (a
+//   name-addressed API plus no instance identity in GET /api/tools).
 export function summaryErrorRevalidates({ status, code } = {}) {
 	if (status === 404) {
 		return true;
 	}
 	return (
-		status === 409 && (code === "tool_finalized" || code === "summary_missing")
+		status === 409 &&
+		(code === "tool_finalized" ||
+			code === "summary_missing" ||
+			code === "tool_job_in_progress")
 	);
 }

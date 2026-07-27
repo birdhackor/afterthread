@@ -246,6 +246,7 @@ function ToolSummaryPanel({
 	description,
 	expanded,
 	writesBlocked,
+	settlingJobEnd,
 	isTogglingThisTool,
 	isRegenerating,
 	onRegenerate,
@@ -401,8 +402,17 @@ function ToolSummaryPanel({
 					//
 					// Only the 定版 direction needs a content gate (nothing to freeze
 					// without text); 解除定版 stays unconditional.
+					//
+					// `settlingJobEnd` DOES gate it, and that is not a contradiction of
+					// the paragraph above (R8-1). staleList is a persistent condition --
+					// gating on it could strand an operator with no action at all --
+					// while this is one round trip that clears itself. And what it
+					// protects is specific: a revise just rewrote the summary, so the
+					// text on screen is the PREVIOUS one; freezing during that window
+					// would finalize content the user has never seen.
 					disabled={
 						isUpdatingStatus ||
+						settlingJobEnd ||
 						(!isFinal && !canFinalizeSummary(detail.summary))
 					}
 					onClick={() => onSetStatus(isFinal ? "draft" : "final")}
@@ -495,6 +505,7 @@ function ToolRow({
 	isTogglingThisTool,
 	reviseBusyForThisTool,
 	writesBlocked,
+	settlingJobEnd,
 	isRegenerating,
 	onRegenerate,
 	isUpdatingStatus,
@@ -607,6 +618,7 @@ function ToolRow({
 							description={tool.description}
 							expanded={expanded}
 							writesBlocked={writesBlocked}
+							settlingJobEnd={settlingJobEnd}
 							isTogglingThisTool={isTogglingThisTool}
 							isRegenerating={isRegenerating}
 							onRegenerate={onRegenerate}
@@ -1334,6 +1346,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 						}
 						onDelete={(name) => setDeleteTarget(name)}
 						writesBlocked={summaryWritesBlocked}
+						settlingJobEnd={settlingJobEnd}
 						isRegenerating={
 							regenerateMutation.isPending &&
 							regenerateMutation.variables?.name === tool.name
@@ -1500,18 +1513,36 @@ function InstallPanel({ externalBusy = false, onBusyChange }) {
 	// "nothing happened" is what left it invisible until a manual refresh.
 	const installEnded =
 		job?.state === "succeeded" || jobQuery.error?.status === 404;
+	// Same reasoning as the revise side's settlingJobEnd (R8-2): jobActive drops
+	// the instant the poll ends, but the OTHER tab is still showing the pre-install
+	// list -- and an install can hand a name another process just deleted to a new
+	// package. Holding the reported-busy flag across the re-read is what makes the
+	// row (and its unsent feedback draft) remount before anything can be submitted
+	// against the new tool.
+	const [settlingInstallEnd, setSettlingInstallEnd] = useState(false);
 	useEffect(() => {
 		if (installEnded) {
-			queryClient.invalidateQueries({ queryKey: ["tools"] });
-			// ...and every open summary panel (R7-3). An install can hand the name
-			// of a tool someone else just deleted to a BRAND NEW package, and when
-			// the AI-authored description happens to match, the row key and the
-			// summary key are unchanged -- so the list rerenders into the new tool
-			// while the panel keeps rendering the old one's summary, status and AI
-			// 日誌 link, with nothing stale-looking about it. The whole prefix,
-			// because this form does not know which panels are open, and a
-			// revalidation of a closed one is free (its query is disabled).
-			queryClient.invalidateQueries({ queryKey: ["tool-summary"] });
+			setSettlingInstallEnd(true);
+			let cancelled = false;
+			// The summary prefix too (R7-3): an install can hand the name of a
+			// tool someone else just deleted to a BRAND NEW package, and when the
+			// AI-authored description happens to match, the row key and the summary
+			// key are unchanged -- so the list would rerender into the new tool
+			// while an open panel kept showing the previous one's summary, status
+			// and AI 日誌 link. The whole prefix, because this form does not know
+			// which panels are open, and revalidating a closed one is free (its
+			// query is disabled).
+			Promise.all([
+				queryClient.invalidateQueries({ queryKey: ["tools"] }),
+				queryClient.invalidateQueries({ queryKey: ["tool-summary"] }),
+			]).finally(() => {
+				if (!cancelled) {
+					setSettlingInstallEnd(false);
+				}
+			});
+			return () => {
+				cancelled = true;
+			};
 		}
 	}, [installEnded, queryClient]);
 
@@ -1534,7 +1565,7 @@ function InstallPanel({ externalBusy = false, onBusyChange }) {
 	// this form -- D40) disable while this form's own submit or job is live;
 	// see the longer note on ToolsPage and on InstalledToolsPanel's
 	// summaryBusy for why this crosses tabs at all.
-	const busy = installMutation.isPending || jobActive;
+	const busy = installMutation.isPending || jobActive || settlingInstallEnd;
 	useEffect(() => {
 		onBusyChange?.(busy);
 	}, [busy, onBusyChange]);

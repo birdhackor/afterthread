@@ -400,11 +400,20 @@ describe("summaryErrorRevalidates", () => {
 		).toBe(true);
 	});
 
-	it("is false for failures that say nothing about tool state", () => {
-		// A job holding the single-flight slot has written nothing yet.
+	it("is true for a foreign job holding the single-flight slot", () => {
+		// INVERTED from r4 (see summaryErrorRevalidates' own note). r4 read this
+		// as "the job has written nothing yet, so nothing changed" -- true about
+		// that job, and beside the point: the 409 tells us something OUTSIDE this
+		// page is mid-operation on this backend, which is a fact about the world
+		// we did not have a moment ago. Re-reading cannot make the foreign job
+		// observable (we hold no id for it), so this only refreshes the CURRENT
+		// truth; acting on its COMPLETION is the residual bounded by 裁決紀錄 #7.
 		expect(
 			summaryErrorRevalidates({ status: 409, code: "tool_job_in_progress" }),
-		).toBe(false);
+		).toBe(true);
+	});
+
+	it("is false for failures that say nothing about tool state", () => {
 		// Configuration and upstream health are not tool state, and a regenerate
 		// raises both BEFORE the sidecar is touched.
 		expect(
