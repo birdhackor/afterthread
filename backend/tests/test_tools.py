@@ -659,6 +659,22 @@ def _make_tool(
     return pkg
 
 
+def _state_document(enabled: bool) -> dict[str, Any]:
+    """The document ``tools.write_package_state`` publishes -- ownership marker included.
+
+    Spelled from the module's own constants rather than a literal, so a test that
+    hand-writes a state file is writing whatever the publisher would (P1R5-1): the
+    marker is what makes the readers treat the file as OURS at all, and a fixture
+    that omitted it would be exercising the FOREIGN path by accident.
+    """
+    return {tools._STATE_MARKER_KEY: tools._STATE_MARKER_VALUE, "enabled": enabled}
+
+
+def _write_state_file(pkg: Path, enabled: bool) -> None:
+    """Hand-write a state file the backend will recognize as its own."""
+    (pkg / tools._STATE_FILENAME).write_text(json.dumps(_state_document(enabled)), encoding="utf-8")
+
+
 def _edit_manifest_in_place(pkg: Path) -> tuple[int, int, int]:
     """Rewrite ``tool.json`` byte-identically until its manifest identity MOVES.
 
@@ -889,7 +905,7 @@ def test_runtime_refuses_a_tool_disabled_after_it_was_offered(
     that file, so that accident is gone; without a check of its own, a disabled
     tool would simply RUN (overall-r7 finding O7-1(a), reintroduced).
 
-    The handler therefore re-reads ``.state.json`` at CALL time, and the refusal
+    The handler therefore re-reads ``.afterthread-state.json`` at CALL time, and the refusal
     carries its OWN string: nothing about the package changed, so telling the
     model it was replaced would send it to re-read a spec that is still exactly
     what it was given."""
@@ -986,7 +1002,7 @@ def test_a_toggle_during_the_scan_cannot_advertise_the_tool_it_disabled(
     half. R7-1's fix worked by capturing the identity early, so the toggle's
     manifest rewrite made the call MISMATCH. A toggle no longer rewrites anything,
     so this window is now closed by the handler's own execution-time read of
-    ``.state.json`` (R4) -- the same conservative direction, reached by the check
+    ``.afterthread-state.json`` (R4) -- the same conservative direction, reached by the check
     that is actually about the question being asked."""
     root = tmp_path / "tools"
     sentinel = tmp_path / "ran"
@@ -1027,7 +1043,7 @@ def test_a_deleted_state_file_falls_back_to_a_manifest_that_disables(
     advertised. The premise is false in one word: the package did not HAVE "no
     state file" when it was advertised -- it had one saying True, and the file was
     DELETED since. The identity check speaks for ``tool.json``; it never looks at
-    ``.state.json``.
+    ``.afterthread-state.json``.
 
     Every step below is a documented operation. A package installed before web-v5
     P1 carries its toggle in the manifest and here it says OFF; a PATCH switches it
@@ -1094,7 +1110,11 @@ def test_runtime_refuses_a_tool_whose_state_file_became_unreadable(
     switched off in the listing. The execution path has to reach the same answer
     through the same rule -- a tool that cannot say whether it may run must not run
     -- and it must reach it whichever way ``package_enabled`` is spelled, which is
-    why this is pinned at the handler rather than only at the scan."""
+    why this is pinned at the handler rather than only at the scan.
+
+    The file here is OURS and unusable (the marker is there, the answer is not),
+    which is what "unreadable" narrowed to in P1R5-1: a document with no marker is
+    somebody else's and is answered from the manifest instead."""
     root = tmp_path / "tools"
     sentinel = tmp_path / "ran"
     pkg = _make_tool(
@@ -1107,7 +1127,10 @@ def test_runtime_refuses_a_tool_whose_state_file_became_unreadable(
     assert asyncio.run(handler({})) == "ok"
     sentinel.unlink()
 
-    (pkg / tools._STATE_FILENAME).write_text("{", encoding="utf-8")  # a torn write
+    (pkg / tools._STATE_FILENAME).write_text(
+        json.dumps({tools._STATE_MARKER_KEY: tools._STATE_MARKER_VALUE, "enabled": None}),
+        encoding="utf-8",
+    )
 
     assert asyncio.run(handler({})) == tools._TOOL_DISABLED_RESULT
     assert not sentinel.exists()
@@ -1118,7 +1141,7 @@ def test_a_reader_that_opened_the_state_file_sees_one_whole_published_version(
 ) -> None:
     """P1R4-3: the property the execution path actually has, stated as a test.
 
-    Reading ``.state.json`` LAST does NOT make the value provably current at the
+    Reading ``.afterthread-state.json`` LAST does NOT make the value provably current at the
     moment it is acted on, and a docstring next door used to say it did.
     ``_read_regular_file_capped`` selects the version at its ``open``, not at its
     ``read``, and the publisher swaps the file in with ``os.replace`` -- so a PATCH
@@ -1148,9 +1171,9 @@ def test_a_reader_that_opened_the_state_file_sees_one_whole_published_version(
         if fd >= 0:
             os.close(fd)
 
-    assert json.loads(held) == {"enabled": True}  # whole, parseable, the OLD version
+    assert json.loads(held) == _state_document(True)  # whole, parseable, the OLD version
     fresh = tools._read_enabled_state(pkg)
-    assert (fresh.present, fresh.enabled, fresh.error) == (True, False, None)
+    assert (fresh.ours, fresh.enabled, fresh.error) == (True, False, None)
 
 
 def test_a_toggle_landing_between_the_state_read_and_popen_is_still_caught(
@@ -1159,7 +1182,7 @@ def test_a_toggle_landing_between_the_state_read_and_popen_is_still_caught(
     """P1R3-1: the check's ANSWER has to be as close to ``Popen`` as the check is.
 
     Round 2 put ``package_enabled`` on the line above ``Popen`` but spelled it as a
-    whole ``_scan_package``, which reads ``.state.json`` FIRST and then parses a
+    whole ``_scan_package``, which reads ``.afterthread-state.json`` FIRST and then parses a
     manifest, resolves the entry and stats it -- ~0.5 ms of file operations after
     the value it returns was read. A PATCH landing in that tail shipped a tool the
     operator had just switched off: the identity check above cannot help (it is
@@ -1212,7 +1235,7 @@ def test_the_execution_toggle_check_reads_the_state_file_last_and_scans_nothing(
     the toggle read from ``Popen``. On the other path -- a package that HAS a state
     file -- there is nothing to drive from, so what has to be pinned is how little
     is there: the last file the runtime READS before starting the child is
-    ``.state.json``, and it does not run a package SCAN to get there.
+    ``.afterthread-state.json``, and it does not run a package SCAN to get there.
 
     The last file READ, not the last thing done: since P1R4-1 the identity check
     stands between that read and ``Popen``, because only one of the two can be
@@ -1268,9 +1291,14 @@ def test_the_scan_and_the_execution_check_answer_the_one_rule_identically(
     "they cannot disagree" stopped being true by construction and became true by
     both calling ``_effective_enabled`` with the reads they are already holding.
     That is only worth having if it is checked, so this walks every shape the two
-    can be asked about -- the three states of the state file, both directions of
-    the manifest fallback behind an ABSENT one, and each way the manifest itself
-    can fail to offer a legacy key -- and requires the same answer from both.
+    can be asked about -- the four states of the state file, both directions of
+    the manifest fallback behind an ABSENT one and behind a FOREIGN one, and each
+    way the manifest itself can fail to offer a legacy key -- and requires the same
+    answer from both.
+
+    FOREIGN is the shape P1R5-1 added, and it is here in BOTH manifest directions
+    for the reason ABSENT is: the point is not that the answer is True or False, it
+    is that the file at our name did not get a vote either way.
 
     The invalid rows are included deliberately: ``enabled`` is reported for a
     package that is not runnable too (the listing shows the switch), so a rule that
@@ -1292,12 +1320,20 @@ def test_the_scan_and_the_execution_check_answer_the_one_rule_identically(
     present_on = _make_tool(root, "present-on", "import sys\n", enabled=False)
     present_off = _make_tool(root, "present-off", "import sys\n", enabled=True)
     unreadable = _make_tool(root, "unreadable", "import sys\n", enabled=True)
+    foreign_on = _make_tool(root, "foreign-on", "import sys\n", enabled=True)
+    foreign_off = _make_tool(root, "foreign-off", "import sys\n", enabled=False)
     not_json = _make_tool(root, "not-json", "import sys\n", enabled=False)
     oversized = _make_tool(root, "oversized", "import sys\n", enabled=False)
     _install_tools(monkeypatch, root)
     assert set_enabled("present-on", True) is True  # state file DISAGREES with each
     assert set_enabled("present-off", False) is True
-    (unreadable / tools._STATE_FILENAME).write_text("{", encoding="utf-8")
+    (unreadable / tools._STATE_FILENAME).write_text(
+        json.dumps({tools._STATE_MARKER_KEY: tools._STATE_MARKER_VALUE, "enabled": "yes"}),
+        encoding="utf-8",
+    )
+    # A tool's OWN file at our name, saying the opposite of each manifest.
+    (foreign_on / tools._STATE_FILENAME).write_text('{"enabled": false}', encoding="utf-8")
+    (foreign_off / tools._STATE_FILENAME).write_text('{"enabled": true}', encoding="utf-8")
     (not_json / "tool.json").write_text("{not json", encoding="utf-8")
     (oversized / "tool.json").write_text("x" * (_MANIFEST_MAX_BYTES + 1), encoding="utf-8")
     no_manifest = root / "no-manifest"
@@ -1313,7 +1349,9 @@ def test_the_scan_and_the_execution_check_answer_the_one_rule_identically(
         legacy_off: False,  # ... in the other direction
         present_on: True,  # PRESENT wins over a manifest that disagrees
         present_off: False,
-        unreadable: False,  # PRESENT-but-unreadable is disabled, never the default
+        unreadable: False,  # OURS-but-unreadable is disabled, never the default
+        foreign_on: True,  # FOREIGN -> the manifest answers, as if there were no file
+        foreign_off: False,  # ... in the other direction
         not_json: True,  # no legacy key to offer -> the same default the scan gives
         oversized: True,
         no_manifest: True,
@@ -2642,21 +2680,26 @@ def test_a_toggle_leaves_the_manifest_byte_identical_and_its_identity_unmoved(
 def test_the_state_file_wins_over_a_manifest_that_disagrees(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """R1's precedence: ``.state.json`` present and readable is AUTHORITATIVE.
+    """R1's precedence: a state file of OURS, readable, is AUTHORITATIVE.
 
     The manifest's ``enabled`` key survives on disk deliberately -- rewriting a
     manifest to tidy away a legacy field would move the very identity this split
     exists to hold still -- so the two files can and will disagree. The state file
-    is the answer, in both directions."""
+    is the answer, in both directions.
+
+    "Of ours" is carried by the ownership MARKER (P1R5-1) and the fixture writes it,
+    so this is the unchanged behaviour of a recognized file. The same bytes WITHOUT
+    the marker lose every one of these assertions -- that is the sibling test,
+    ``test_a_foreign_file_at_the_state_files_name_is_answered_as_absent``."""
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", enabled=True)
     _install_tools(monkeypatch, root)
 
-    (pkg / tools._STATE_FILENAME).write_text('{"enabled": false}', encoding="utf-8")
+    _write_state_file(pkg, False)
     assert list_tools()[0]["enabled"] is False
     assert enabled_llm_tools() == []
 
-    (pkg / tools._STATE_FILENAME).write_text('{"enabled": true}', encoding="utf-8")
+    _write_state_file(pkg, True)
     # The manifest now says the opposite of the state file in the other direction.
     manifest = pkg / "tool.json"
     raw = json.loads(manifest.read_text(encoding="utf-8"))
@@ -2672,7 +2715,7 @@ def test_a_package_with_no_state_file_falls_back_to_its_manifest(
     """R1's migration, and it is the whole of the migration: there is no pass.
 
     A package installed before web-v5 P1 has ``enabled`` in its ``tool.json`` and
-    no ``.state.json``. It keeps reporting exactly what it reported before, and --
+    no ``.afterthread-state.json``. It keeps reporting exactly what it reported before, and --
     the part that matters -- the READ does not write: the state file is still
     absent afterwards, so a scan can never mutate a package. The first toggle is
     what migrates it, and the manifest is left alone even then."""
@@ -2692,9 +2735,9 @@ def test_a_package_with_no_state_file_falls_back_to_its_manifest(
     # The FIRST toggle is the migration, and it adds a file rather than editing one.
     manifest_before = (off / "tool.json").read_bytes()
     assert set_enabled("off", True) is True
-    assert json.loads((off / tools._STATE_FILENAME).read_text(encoding="utf-8")) == {
-        "enabled": True
-    }
+    assert json.loads((off / tools._STATE_FILENAME).read_text(encoding="utf-8")) == _state_document(
+        True
+    )
     assert (off / "tool.json").read_bytes() == manifest_before  # legacy key left in place
     assert json.loads(manifest_before)["enabled"] is False  # ... and still saying the old thing
     assert {t["name"]: t["enabled"] for t in list_tools()}["off"] is True
@@ -2703,14 +2746,10 @@ def test_a_package_with_no_state_file_falls_back_to_its_manifest(
 @pytest.mark.parametrize(
     "content",
     [
-        "",  # truncated to nothing
-        "{",  # a torn write
-        "null",  # legal JSON, not an object
-        "[]",
-        "{}",  # an object with no answer in it
-        '{"enabled": "yes"}',  # an answer that is not a bool
-        '{"enabled": 1}',
-        "x" * (tools._STATE_MAX_BYTES + 1),  # past the cap
+        "x" * (tools._STATE_MAX_BYTES + 1),  # past the cap: nothing to look for a marker in
+        json.dumps({tools._STATE_MARKER_KEY: tools._STATE_MARKER_VALUE}),  # ours, no answer
+        json.dumps({tools._STATE_MARKER_KEY: tools._STATE_MARKER_VALUE, "enabled": "yes"}),
+        json.dumps({tools._STATE_MARKER_KEY: tools._STATE_MARKER_VALUE, "enabled": 1}),
     ],
 )
 def test_an_unreadable_state_file_disables_rather_than_defaulting_to_on(
@@ -2718,11 +2757,18 @@ def test_an_unreadable_state_file_disables_rather_than_defaulting_to_on(
 ) -> None:
     """R2: ABSENT and UNREADABLE are different questions, answered differently.
 
-    Absent is the ordinary pre-migration case and falls back to the manifest. A
-    file that EXISTS but cannot be read as our shape means the operator's intent is
-    unknown -- and defaulting that to ``enabled: True`` would hand the model a tool
-    somebody deliberately switched off, which is the one direction this subsystem
-    never errs in.
+    Absent is the ordinary pre-migration case and falls back to the manifest. OUR
+    file failing to say anything usable means the operator's intent is unknown --
+    and defaulting that to ``enabled: True`` would hand the model a tool somebody
+    deliberately switched off, which is the one direction this subsystem never errs
+    in.
+
+    The cases are the ones that are still OURS after P1R5-1 narrowed this set: a
+    file we could not read at all (so there is no marker to look for), and a
+    marker-bearing document whose ``enabled`` is missing or not a bool. A document
+    we CAN read that carries no marker is a different question with a different
+    answer -- see
+    ``test_a_foreign_file_at_the_state_files_name_is_answered_as_absent``.
 
     Both halves of the answer are pinned: the row is INVALID with the listing's own
     ``error`` channel carrying why (so the operator is told, rather than watching a
@@ -2741,8 +2787,9 @@ def test_an_unreadable_state_file_disables_rather_than_defaulting_to_on(
     assert listed["error"] == tools._STATE_UNREADABLE_ERROR
     assert enabled_llm_tools() == []
 
-    # Repairable through the API without a delete: the toggle does not READ this
-    # file, so it publishes a clean one straight over it.
+    # Repairable through the API without a delete: an unreadable file is read as
+    # OURS, so the toggle publishes a clean one straight over it. (A FOREIGN one is
+    # the opposite -- refused rather than overwritten; see the test named above.)
     assert set_enabled("echo", True) is True
     repaired = list_tools()[0]
     assert repaired["valid"] is True and repaired["enabled"] is True
@@ -2764,9 +2811,106 @@ def test_a_state_file_that_cannot_be_looked_at_is_not_read_as_absent(
     _install_tools(monkeypatch, root)
 
     state = tools._read_enabled_state(pkg)
-    assert state.present is True  # NOT absent
+    assert state.ours is True  # NOT absent, and read as ours-and-broken
     assert state.enabled is False and state.error is not None
+    assert state.notice is None  # ... which is not the same answer a FOREIGN file gets
     assert enabled_llm_tools() == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"cursor": 41}',  # the tool's own JSON settings
+        '{"enabled": false}',  # ... or a hand-written one that omitted the marker
+        '{"afterthread": "something-else", "enabled": false}',  # marker, wrong value
+        "cursor=41\n",  # a plain-text cursor: not JSON at all
+        "",  # empty
+        "[]",  # legal JSON, not an object
+    ],
+)
+def test_a_foreign_file_at_the_state_files_name_is_answered_as_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, content: str
+) -> None:
+    """P1R5-1: the directory is the PACKAGE's, so a file at our name may not be ours.
+
+    ``.state.json`` was not a reserved name before web-v5 P1, so a tool could
+    perfectly well already own one -- a cursor, a cache, its own settings. Reading
+    any file at that path as the operator's toggle produced three silent harms at
+    once: a package whose own file happened to say ``enabled: true`` was
+    re-advertised and EXECUTED with nobody having touched the switch; one whose file
+    had no boolean ``enabled`` was listed INVALID and stopped working; and the first
+    publish over it destroyed whatever the tool kept there.
+
+    The name now declares whose file it is, which makes the collision implausible.
+    The MARKER is what makes it detectable, and that is the half that closes it: an
+    operator or a future tool can still create a file under any name we pick. A
+    document without the marker is answered exactly as a MISSING one is -- the
+    manifest decides -- and the file is neither read for a value, nor overwritten,
+    nor deleted.
+
+    Pinned here: the answer comes from the manifest (both directions), the package
+    stays VALID and runnable, the file is byte-identical after a scan, a listing and
+    an execution, and the listing carries something the operator can act on."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('ok')\n", enabled=True)
+    (pkg / tools._STATE_FILENAME).write_text(content, encoding="utf-8")
+    before = (pkg / tools._STATE_FILENAME).read_bytes()
+    _install_tools(monkeypatch, root)
+
+    # The MANIFEST answers -- and it is what answers, not a default: flipping the
+    # legacy key flips the reported state while the file on disk says nothing new.
+    assert tools.package_enabled(pkg) is True
+    listed = list_tools()[0]
+    assert listed["valid"] is True  # a foreign file does not break a working tool
+    assert listed["enabled"] is True
+    assert listed["error"] == tools._STATE_FOREIGN_NOTICE  # ... and says so, actionably
+    handler = enabled_llm_tools()[0].handler
+    assert asyncio.run(handler({})) == "ok"  # advertised AND runnable
+
+    manifest = pkg / "tool.json"
+    raw = json.loads(manifest.read_text(encoding="utf-8"))
+    raw["enabled"] = False
+    manifest.write_text(json.dumps(raw), encoding="utf-8")
+    assert tools.package_enabled(pkg) is False
+    assert list_tools()[0]["enabled"] is False
+    assert enabled_llm_tools() == []
+
+    assert (pkg / tools._STATE_FILENAME).read_bytes() == before  # nothing touched it
+
+
+def test_set_enabled_refuses_rather_than_destroying_a_foreign_state_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """P1R5-1's write side: the ONE writer of that name will not write over a
+    file that is not ours.
+
+    ``set_enabled`` is the only thing that publishes there, so "we never overwrite
+    somebody else's file" is true only if it refuses. It answers False -- a 404 from
+    the route -- rather than succeeding silently: the read side would go on answering
+    from the manifest, so a "success" would be a toggle that provably did not take
+    effect. The refusal is also where the operator MEETS the problem, which is why
+    the listing's note names both repairs.
+
+    The contrast is the point of the last block: the moment the operator moves their
+    file out of the way, the same call behaves exactly as it always has."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", enabled=True)
+    theirs = b'{"cursor": 41}\n'
+    (pkg / tools._STATE_FILENAME).write_bytes(theirs)
+    _install_tools(monkeypatch, root)
+
+    assert set_enabled("echo", False) is False  # "did not happen" -> 404
+    assert (pkg / tools._STATE_FILENAME).read_bytes() == theirs
+    assert list_tools()[0]["enabled"] is True  # ... and it really did not happen
+    # No temp file left behind either: the refusal is before the publish, not inside it.
+    assert not list(pkg.glob(f"{tools._STATE_FILENAME}.*"))
+
+    (pkg / tools._STATE_FILENAME).unlink()  # the operator moves their file aside
+    assert set_enabled("echo", False) is True
+    assert json.loads((pkg / tools._STATE_FILENAME).read_text(encoding="utf-8")) == _state_document(
+        False
+    )
+    assert list_tools()[0]["enabled"] is False
 
 
 def test_delete_tool_removes_package(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -3212,7 +3356,7 @@ def test_set_enabled_never_writes_through_a_symlinked_manifest(
     construction rather than by a check that could be forgotten.
 
     The toggle itself now SUCCEEDS, and that is the deliberate half: it writes the
-    package's own ``.state.json``. The package stays invalid for the symlinked
+    package's own ``.afterthread-state.json``. The package stays invalid for the symlinked
     manifest (so it is never advertised or executed either way), and an operator
     can now switch a broken package OFF -- which is exactly when they want to."""
     root = tmp_path / "tools"
@@ -3245,7 +3389,7 @@ def test_set_enabled_refuses_a_symlinked_state_file(
 ) -> None:
     """The write-boundary refusal, moved to the file the toggle actually writes.
 
-    ``.state.json`` is now the only thing a toggle touches, so it inherits the
+    ``.afterthread-state.json`` is now the only thing a toggle touches, so it inherits the
     hazard: a symlink planted at that name (by an unjailed builder, by an
     operator) must not carry the write out of the package. The publish's pre-write
     ``lstat`` refuses any non-regular target outright -- and even reaching
@@ -3305,9 +3449,9 @@ def test_set_enabled_publishes_under_the_state_publish_lock(
     assert held == [True]  # the write happened INSIDE the hold, not beside it
     assert tools._STATE_PUBLISH_LOCK.acquire(blocking=False) is True  # released again
     tools._STATE_PUBLISH_LOCK.release()
-    assert json.loads((pkg / tools._STATE_FILENAME).read_text(encoding="utf-8")) == {
-        "enabled": False
-    }
+    assert json.loads((pkg / tools._STATE_FILENAME).read_text(encoding="utf-8")) == _state_document(
+        False
+    )
 
 
 def test_a_publish_that_wakes_to_a_symlinked_package_directory_is_refused(
@@ -3318,7 +3462,7 @@ def test_a_publish_that_wakes_to_a_symlinked_package_directory_is_refused(
     P1 dropped ``set_enabled``'s write-boundary containment check on the grounds
     that the publisher's own pre-write ``lstat`` enforces it. That is true of the
     FINAL component and false of every ANCESTOR: ``lstat`` does not follow a
-    symlinked ``.state.json``, but it -- like ``mkstemp(dir=...)`` and
+    symlinked ``.afterthread-state.json``, but it -- like ``mkstemp(dir=...)`` and
     ``os.replace`` -- follows the directories above it. The resolved path is a
     STRING re-interpreted at each of those syscalls, and ``set_enabled`` resolves
     it BEFORE waiting on ``_STATE_PUBLISH_LOCK``, a wait that can last a whole
@@ -3506,7 +3650,7 @@ def test_set_enabled_with_a_fifo_manifest_does_not_hang(
     toggle succeeds, leaving the FIFO exactly as it found it.
 
     The same is pinned for the file the toggle DOES open: a FIFO at
-    ``.state.json`` is refused by the publish's ``lstat`` S_ISREG gate (and by the
+    ``.afterthread-state.json`` is refused by the publish's ``lstat`` S_ISREG gate (and by the
     read side's, which is why the row below reports unreadable), neither of which
     can block. Both halves run on a WATCHED daemon thread so a regression fails
     LOUDLY here instead of wedging the whole suite."""
@@ -4174,9 +4318,9 @@ def test_a_failed_directory_fsync_does_not_unpublish_a_written_state_file(
     monkeypatch.setattr(os, "fsync", refuse_directories)
 
     assert tools.write_package_state(pkg, False) is True  # the truth, not a 404
-    assert json.loads((pkg / tools._STATE_FILENAME).read_text(encoding="utf-8")) == {
-        "enabled": False
-    }
+    assert json.loads((pkg / tools._STATE_FILENAME).read_text(encoding="utf-8")) == _state_document(
+        False
+    )
     assert not list(pkg.glob(f"{tools._STATE_FILENAME}.*"))  # no temp file orphaned
 
 

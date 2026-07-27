@@ -22,12 +22,15 @@ sessions, and the AI 日誌 shows them as one kind).
    round and wall-clock budgets;
 4. on a ``ready`` result, first re-verify staging itself has not been moved or
    replaced by a symlink (``_verify_staging_root`` -- the builder's run_shell
-   runs unjailed, D21), then strip any builder-written AI sidecar from staging
-   (``_strip_builder_sidecars`` -- that file is backend-authored, and a forged
-   one bypasses the whole ``write_tool_meta`` choke point), validate the staged
-   package with the SAME checks the registry applies to installed packages
-   (``tools.validate_package``) and move it into ``<tools_dir>/<name>``; on
-   anything else, fail with a friendly error. Staging is always cleaned up;
+   runs unjailed, D21), then strip any builder-written file from the backend's
+   reserved namespace (``_strip_builder_sidecars`` -- those files are
+   backend-authored, and a forged one bypasses the ``write_tool_meta`` choke point
+   or answers the operator's enabled switch), validate the staged package with the
+   SAME checks the registry applies to installed packages
+   (``tools.validate_package``), publish the package's initial enabled state
+   (``tools.write_package_state`` -- so the manifest's legacy key never decides it,
+   P1R5-3) and move it into ``<tools_dir>/<name>``; on anything else, fail with a
+   friendly error. Staging is always cleaned up;
 5. once installed, hand the package to ``tool_meta.generate_and_store_summary``
    for its AI summary sidecar (D40). Strictly best-effort and it cannot raise:
    the install is already a success by then, so a failed summary must never
@@ -37,12 +40,14 @@ sessions, and the AI 日誌 shows them as one kind).
 which exists because the package it is editing is ALREADY LIVE (D40):
 
 * staging is populated by COPYING the installed package (no fetch), MINUS the
-  package ROOT's ``.env`` and MINUS the backend's own sidecar namespace. The
-  ``.env`` exclusion is not tidiness: its values are in ``known_secret_values``,
-  so copying it in would make ``validate_package``'s embedded-secret gate reject
-  every revise. The LIVE file is copied back into staging BYTE-FOR-BYTE after
-  validation (``_preserve_env_file``), exactly where an install injects its form
-  secret;
+  package ROOT's ``.env``, MINUS the ROOT state file and MINUS the AI sidecar at
+  any depth. The ``.env`` exclusion is not tidiness: its values are in
+  ``known_secret_values``, so copying it in would make ``validate_package``'s
+  embedded-secret gate reject every revise. The LIVE file is copied back into
+  staging BYTE-FOR-BYTE after validation (``_preserve_env_file``), exactly where an
+  install injects its form secret, and the state file is restored the same way
+  (``tools.carry_package_state``). Both exclusions are ROOT-only, because below the
+  root those names are the package's own content (P1R5-2);
 * every value of that ``.env`` is registered as an in-flight secret for the
   WHOLE revise window, because ``known_secret_values`` skips dot-directories and
   the swap below parks the old package in one;
@@ -279,6 +284,14 @@ _ERROR_REVISE_ENV_UNMATCHABLE = (
 # inside STAGING, so refusing costs an abandoned build and nothing else.
 # Category-only like the rest.
 _ERROR_REVISE_STATE_RESTORE = "無法保留工具的啟用狀態，修訂已取消。"  # noqa: RUF001
+# P1R5-3: a FRESH install publishes its own initial state file before the move, so
+# a newly installed package is never read through the manifest fallback -- see
+# ``_promote_staging``. It refuses the install rather than continuing without one,
+# and it can afford to: the write lands in STAGING, before the move, so at the
+# moment it fails NOTHING is installed and "cancelled" is simply true. That is the
+# same shape ``_inject_secret_into_env``'s failures have, one step further along the
+# same function. Category-only like the rest.
+_ERROR_INSTALL_STATE_WRITE = "無法寫入工具的啟用狀態，安裝已取消。"  # noqa: RUF001
 # The replace-mode promote's two "the package is no longer what we resolved"
 # refusals. Both are races against a concurrent delete/replace by an actor with
 # the service's uid -- the SAME accepted residual class ``_promote_staging``'s
@@ -354,6 +367,13 @@ code means failure (STDERR is shown as the error).
 workspace; at runtime those values are injected into the tool's environment. \
 They are NOT auto-loaded inside your run_shell tests -- source them yourself \
 when testing: `set -a; . ./.env 2>/dev/null; set +a; ...`.
+- Two filenames belong to the backend, and anything you write at them is DELETED \
+before the tool is installed: `.ai_meta.json` anywhere in the package, and \
+`.afterthread-state.json` at the workspace ROOT (that one is the operator's \
+enabled switch and only the operator sets it). A file of your own named \
+`.afterthread-state.json` inside a SUBDIRECTORY is yours and is kept, so put any \
+state your tool needs there (e.g. `data/.afterthread-state.json`) or under any \
+other name.
 - Prefer Python 3 with ONLY its standard library (urllib.request for HTTP), \
 so the tool runs anywhere without installing dependencies. If the environment \
 variable TLS_NO_VERIFY is set to a truthy value, skip TLS certificate \
@@ -469,8 +489,12 @@ run.py`) without ever seeing them. If the user's feedback asks to CHANGE a \
 secret value, say so in your summary -- that is done by hand, not here.
 - Never write a secret value into any file. A package that embeds a known \
 secret is REFUSED, and that refusal discards your whole revision.
-- The AI summary file for this tool is written by the backend; do not create or \
-edit one.
+- The two backend-owned filenames named in the contract above are missing from \
+this workspace for the same reason `.env` is, and the backend puts them back \
+after you finish: the AI summary file, and `.afterthread-state.json` at the \
+workspace ROOT. Do not create or edit either -- a root one you write is deleted. \
+A nested `.afterthread-state.json` you find in the workspace is the package's \
+own file: leave it alone unless the feedback asks you to change it.
 
 Finish exactly as described above, with one added rule: "tool_name" MUST be \
 exactly {name}, because it names the installed package this revision replaces \
@@ -1384,18 +1408,35 @@ def _inject_secret_into_env(env_file: Path, name: str, value: str) -> str | None
     return None
 
 
-def _is_reserved_sidecar_name(filename: str) -> bool:
+def _is_reserved_sidecar_name(filename: str, *, at_root: bool) -> bool:
     """True for a filename inside the BACKEND's RESERVED namespace (D40, web-v5 P1).
 
     Driven off ``tools._RESERVED_PACKAGE_FILENAMES`` -- a SET rather than one
     hard-coded name, because there are now two backend-authored files in a
     package: the AI summary sidecar (``.ai_meta.json``) and the mutable state file
-    the enabled toggle lives in (``.state.json``). Reading the tuple from ``tools``
+    the enabled toggle lives in (``.afterthread-state.json``). Reading the tuple from ``tools``
     rather than restating the names here is what keeps the side that WRITES them
     and the side that REFUSES them from drifting apart; the symbol keeps the word
     "sidecar" for the same reason ``tools._STALE_BACKUP_RE`` keeps the word
     "backup" (the D40 addenda point at these names, and the on-disk contract is
     what actually matters).
+
+    ``at_root`` is REQUIRED and keyword-only, because the two namespaces have
+    different DEPTHS and a default would silently pick one (P1R5-2). At the package
+    root every reserved name applies; below it only
+    ``tools._RESERVED_AT_EVERY_DEPTH`` does, which the state file is deliberately
+    not in. The rule this follows is the one ``_revise_copy_ignore`` already made
+    about a nested ``.env`` (R2-2): nothing of OURS ever reads or writes below the
+    root, so a nested file at that name is the package's own content -- and a
+    builder that created its tool's initial state at ``data/<that name>``, verified
+    it with ``run_shell`` and shipped it had the file deleted here, with the
+    manifest still validating and the install still reporting success. The tool then
+    failed on its first real call.
+    ``.ai_meta.json`` keeps its every-depth reservation, which is pre-existing and
+    separately adjudicated -- see ``_strip_builder_sidecars`` for the reason (a
+    nested copy bricks every later revise through the embedded-secret gate), and
+    ``tools._RESERVED_AT_EVERY_DEPTH`` for why that argument is about that file
+    rather than about reserved names in general.
 
     Two shapes per name, and the temp one is not padding:
     ``tools._write_package_file_atomic`` publishes through
@@ -1406,7 +1447,7 @@ def _is_reserved_sidecar_name(filename: str) -> bool:
     the whole namespace the backend claims, not just the one filename an attacker
     would have to be naive enough to use.
 
-    What a builder-shipped ``.state.json`` would buy, so the extension is not read
+    What a builder-shipped ``.afterthread-state.json`` would buy, so the extension is not read
     as symmetry for its own sake: the file the RUNTIME consults at call time to
     decide whether a tool may run (``tools._make_handler``). A revise session that
     wrote one would be answering, in the operator's own vocabulary, a question only
@@ -1425,10 +1466,11 @@ def _is_reserved_sidecar_name(filename: str) -> bool:
     because it is the Unicode-correct full-case-folding operation, and these
     names are compared, never displayed.
     """
+    reserved_here = tools._RESERVED_PACKAGE_FILENAMES if at_root else tools._RESERVED_AT_EVERY_DEPTH
     folded = filename.casefold()
     return any(
         folded == reserved or (folded.startswith(reserved) and folded.endswith(".tmp"))
-        for reserved in (name.casefold() for name in tools._RESERVED_PACKAGE_FILENAMES)
+        for reserved in (name.casefold() for name in reserved_here)
     )
 
 
@@ -1445,7 +1487,7 @@ def _remove_reserved_sidecar_path(path: Path) -> None:
     but it would permanently BRICK what that name is for:
     ``_write_package_file_atomic``'s lstat gate refuses to publish over anything
     non-regular, so at ``.ai_meta.json`` the install hook, every later regenerate
-    and 定版 would fail forever, and at ``.state.json`` the package would list
+    and 定版 would fail forever, and at ``.afterthread-state.json`` the package would list
     INVALID with a toggle that cannot be written either -- on a package the
     operator has no API path to repair. The name is the backend's; nothing of the
     builder's may occupy it in any form.
@@ -1506,16 +1548,26 @@ def _strip_builder_sidecars(staging: Path) -> str | None:
     will SHIP -- a gate that vets a file the promote then deletes (or, worse,
     keeps) is describing a package that never existed.
 
-    EVERY DEPTH, via ``os.walk``, not just the package root. A nested
-    ``sub/.ai_meta.json`` is inert for ``read_tool_meta`` (which only ever reads
-    the package ROOT), so this is not the smuggling path -- but it still rides
-    into the installed package, where a future revise copies it into a fresh
-    staging build that ``validate_package``'s embedded-secret gate DOES scan
-    against the by-then-registered value: a planted nested copy would brick every
-    later revise of that tool with a rejection naming a file the operator never
-    wrote. The walk is a handful of stats over a small tree; the sidecar's name
-    belongs to the backend at every depth, and saying so once here is cheaper
-    than a caveat every future reader has to re-derive.
+    EVERY DEPTH, via ``os.walk``, for the SIDECAR. A nested ``sub/.ai_meta.json``
+    is inert for ``read_tool_meta`` (which only ever reads the package ROOT), so
+    this is not the smuggling path -- but it still rides into the installed package,
+    where a future revise copies it into a fresh staging build that
+    ``validate_package``'s embedded-secret gate DOES scan against the by-then-
+    registered value: a planted nested copy would brick every later revise of that
+    tool with a rejection naming a file the operator never wrote. The walk is a
+    handful of stats over a small tree; the sidecar's name belongs to the backend at
+    every depth, and saying so once here is cheaper than a caveat every future
+    reader has to re-derive.
+
+    The STATE FILE is the package ROOT's only (P1R5-2), which is why the walk asks
+    ``_is_reserved_sidecar_name`` where it is as well as what it found. Deleting a
+    nested one destroyed ordinary package content: a builder may legitimately write
+    its tool's own initial state at ``data/<that name>``, and nothing of ours ever
+    looks below the root. The root one is still stripped unconditionally, and that
+    half is load-bearing -- it is what leaves the name free for the initial state
+    ``_promote_staging`` publishes (P1R5-3), and a builder allowed to occupy the
+    root name could make the toggle unsettable and then decide it from the manifest
+    it also writes.
 
     Fail-closed: any ``OSError`` (weird perms, an immutable attribute, a
     directory that will not empty) cancels the install with a category-only
@@ -1533,16 +1585,20 @@ def _strip_builder_sidecars(staging: Path) -> str | None:
     try:
         for dirpath, dirnames, filenames in os.walk(staging, onerror=_reraise_walk_error):
             here = Path(dirpath)
+            # WHERE we are, not just what we found: the state file is reserved at
+            # the root only (P1R5-2). ``os.walk`` yields its own argument as the
+            # first dirpath, so this is that comparison and nothing subtler.
+            at_root = here == staging
             # dirnames is walked over a COPY and pruned in place: a symlink-to-
             # directory at the reserved name lands here (os.walk classifies by a
             # following is_dir), and a pruned entry must not then be descended
             # into after it has been removed.
             for dirname in list(dirnames):
-                if _is_reserved_sidecar_name(dirname):
+                if _is_reserved_sidecar_name(dirname, at_root=at_root):
                     dirnames.remove(dirname)
                     _remove_reserved_sidecar_path(here / dirname)
             for filename in filenames:
-                if _is_reserved_sidecar_name(filename):
+                if _is_reserved_sidecar_name(filename, at_root=at_root):
                     _remove_reserved_sidecar_path(here / filename)
     except OSError:
         return _ERROR_SIDECAR_STRIP
@@ -1639,6 +1695,27 @@ def _promote_staging(
     for the full attack chain and for why validation must run on exactly what will
     ship. This is the ONLY file the promote removes; every other file the builder
     produced rides into the package untouched, exactly as before.
+
+    The INITIAL STATE FILE is published last, into staging, just before the move
+    (P1R5-3), and it is what stops a builder from setting the operator's toggle. The
+    strip already deletes any state file the session wrote, but the manifest's
+    LEGACY ``enabled`` key survives -- ``validate_package`` accepts it (a legacy
+    package's manifest carries one, so it must), and the migration fallback reads
+    it. A model emitting an otherwise-valid ``tool.json`` with ``"enabled": false``
+    therefore installed successfully, reported success, and the tool was listed
+    disabled and never offered, with no mutation API call anywhere in the record.
+    Publishing an explicit ``true`` here means a freshly installed package is never
+    in the fallback's ABSENT case at all, which leaves that fallback meaning exactly
+    what it was written to mean: "installed before web-v5 P1". The alternatives were
+    rejected for being about the wrong file -- refusing the install teaches the
+    operator nothing they can act on (they did not write the manifest), and
+    stripping the key would REWRITE a manifest whose identity this phase exists to
+    hold still. The stale key simply stays inert, exactly as it does after a toggle.
+
+    ``true`` unconditionally, not "whatever the manifest said": a newly installed
+    tool being offered is this app's standing default, and the whole point is that
+    the BUILDER does not get a vote. An operator who wants it off switches it off,
+    and now can -- the file is already there.
     """
     root_error = _verify_staging_root(staging, base)
     if root_error is not None:
@@ -1656,6 +1733,14 @@ def _promote_staging(
         inject_error = _inject_secret_into_env(staging / ".env", secret_name, secret_value)
         if inject_error is not None:
             return inject_error
+    # The operator's toggle, set by the backend rather than inherited from whatever
+    # the model happened to put in the manifest (P1R5-3, see the docstring). Into
+    # STAGING and before the move, so a failure cancels an install that has not
+    # happened yet -- the same place and the same reason the secret injection above
+    # sits here. No lock: nothing can PATCH a tool that does not exist yet, and the
+    # instant the move lands a toggle is answered normally.
+    if not tools.write_package_state(staging, True):
+        return _ERROR_INSTALL_STATE_WRITE
     try:
         base.mkdir(parents=True, exist_ok=True)
         shutil.move(str(staging), str(target))
@@ -2072,7 +2157,7 @@ def _promote_staging_replace(
     ``_preserve_env_file``).
 
     The package's 啟用 state is carried across too, and it is the same shape of step
-    for the same kind of reason (web-v5 P1): ``.state.json`` is backend-authored, so
+    for the same kind of reason (web-v5 P1): ``.afterthread-state.json`` is backend-authored, so
     it is kept out of staging and re-published from the LIVE package instead of
     being copied into a session that could rewrite it. A failure REFUSES the revise
     -- see the comment at the call and ``_ERROR_REVISE_STATE_RESTORE``. Unlike the
@@ -2228,7 +2313,7 @@ def _promote_staging_replace(
     with tools._STATE_PUBLISH_LOCK:
         # The 啟用 state is carried across the swap the same way the ``.env`` is, and
         # for a reason the revise flow did not used to have (web-v5 P1): the toggle
-        # now lives in the package's own ``.state.json``, which
+        # now lives in the package's own ``.afterthread-state.json``, which
         # ``_revise_copy_ignore`` deliberately keeps OUT of staging (it is
         # backend-authored -- a session with shell must not be able to rewrite the
         # file that decides whether its own tool may run) and
@@ -2248,9 +2333,12 @@ def _promote_staging_replace(
         # it writes into staging, where there is no state file to inherit from.
         #
         # An unreadable state file is carried as DISABLED rather than repaired into
-        # "on" -- the same direction the scan takes. A failed write REFUSES the
-        # revise (see ``_ERROR_REVISE_STATE_RESTORE``); it writes into staging, so
-        # nothing observable is left behind by the refusal.
+        # "on" -- the same direction the scan takes. A file at that name that is NOT
+        # OURS is instead copied across byte-for-byte, because it is the package's
+        # own and a revise may not delete it (P1R5-1); see ``carry_package_state``
+        # for both shapes. A failed write REFUSES the revise (see
+        # ``_ERROR_REVISE_STATE_RESTORE``); it writes into staging, so nothing
+        # observable is left behind by the refusal.
         if not tools.carry_package_state(target, staging):
             return None, _ERROR_REVISE_STATE_RESTORE
         # The package must still be the one this session copied from -- re-checked HERE, as
@@ -2700,7 +2788,7 @@ def _is_preserved_env_name(root: Path, filename: str, *, exact_present: bool) ->
 def _revise_copy_ignore(root: Path, source_dir: Any, names: list[str]) -> set[str]:
     """``copytree``'s ignore callback: the names a revise copy must leave behind.
 
-    Bound to the package ``root`` by the caller (``partial``), because the two
+    Bound to the package ``root`` by the caller (``partial``), because the
     namespaces it drops have DIFFERENT depths:
 
     * the ROOT ``.env`` only -- MANDATORY there, and identified by this very
@@ -2709,15 +2797,17 @@ def _revise_copy_ignore(root: Path, source_dir: Any, names: list[str]) -> set[st
       are in ``known_secret_values``, so copying it would be rejected outright by
       ``validate_package``'s embedded-secret gate, and the backend copies the live
       file back after validation instead (``_preserve_env_file``);
-    * the BACKEND's reserved namespace at EVERY depth (``.ai_meta.json`` and
-      ``.state.json``, plus their publish temporaries) -- names no package content
-      may inhabit, and ones ``_strip_builder_sidecars`` would delete from staging
-      anyway. Each is restored on the other side of the swap through its own choke
-      point rather than by being copied into a session that can rewrite it: the
-      sidecar is regenerated through ``write_tool_meta``, and the state file is
-      re-published from the LIVE package by ``_promote_staging_replace`` (see
-      there -- without that step every revise would silently re-enable a tool the
-      operator had switched off, since the swap replaces the whole directory).
+    * the ROOT state file (plus its publish temporaries) -- restored on the other
+      side of the swap by ``tools.carry_package_state`` rather than carried through
+      a session that can rewrite it, which is what stops a revise from silently
+      re-enabling a tool the operator had switched off (the swap replaces the whole
+      directory). That restore also brings a FOREIGN file at that name back
+      byte-for-byte, so withholding it here costs a package that owns the name
+      nothing (P1R5-1);
+    * the AI SIDECAR at EVERY depth (``.ai_meta.json`` and its temporaries) -- the
+      one name no package content may inhabit anywhere, for the reason
+      ``_strip_builder_sidecars`` gives. It is regenerated after the swap through
+      ``write_tool_meta``.
 
     A NESTED ``.env`` is ordinary package content and is COPIED (R2-2). The r1
     rule dropped every ``.env``-casefolded name at every depth on the theory that
@@ -2732,6 +2822,13 @@ def _revise_copy_ignore(root: Path, source_dir: Any, names: list[str]) -> set[st
     file. That is the gate working -- an operator who put a live credential in a
     second file learns about it -- and it is strictly better than shipping a
     package with a file quietly removed.
+
+    A NESTED state file is copied for EXACTLY that reason (P1R5-2), which is this
+    same ruling applied to the name that arrived after it rather than a new one: the
+    r1-through-r4 rule dropped it at every depth on the theory that the name is the
+    backend's, and the backend never reads or writes below the root. A revise of a
+    tool that keeps its own state at ``data/<that name>`` deleted it and validated
+    the result as fine.
 
     ``source_dir`` is the directory being visited; ``shutil`` passes it through
     ``os.fspath``, so it arrives as a str and is compared as a ``Path`` (children
@@ -2750,7 +2847,7 @@ def _revise_copy_ignore(root: Path, source_dir: Any, names: list[str]) -> set[st
         name
         for name in names
         if (at_root and _is_preserved_env_name(root, name, exact_present=exact_env_present))
-        or _is_reserved_sidecar_name(name)
+        or _is_reserved_sidecar_name(name, at_root=at_root)
     }
 
 

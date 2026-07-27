@@ -135,7 +135,7 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   同步的「重新產生總結」都是以 `tool.json` 的 `(st_dev, st_ino, st_ctime_ns)`
   當「還是同一個套件嗎」的身分、在一整趟 LLM 往返之後才重驗——所以一次切換會讓
   整場修訂作廢（「原工具在修訂期間被改動或重新安裝」）、或讓一趟總結往返換到
-  404。web-v5 P1 把 `enabled` 搬進套件自己的 `.state.json`，`tools.set_enabled`
+  404。web-v5 P1 把 `enabled` 搬進套件自己的 `.afterthread-state.json`，`tools.set_enabled`
   從此**完全不開 `tool.json`**，那個身分不可能被一次切換推走；而落在修訂裡的
   切換由後端換裝前的 `tools.carry_package_state` 帶過去、落在換裝那一瞬間的則由
   `tools._STATE_PUBLISH_LOCK` 排到換裝之後、寫到剛發佈的那一包（`set_enabled`

@@ -817,7 +817,7 @@ async def generate_and_store_summary(
     A 啟用 TOGGLE was the reachable instance of that when O8-1 was found, and it is
     no longer one: ``PATCH /api/tools/{name}`` still takes no admission reservation
     and no per-package guard, but since web-v5 P1 ``tools.set_enabled`` writes the
-    package's ``.state.json`` and leaves ``tool.json`` byte-identical -- so the
+    package's ``.afterthread-state.json`` and leaves ``tool.json`` byte-identical -- so the
     identity does not move and there is nothing for the guard to refuse. The early
     write STAYS: it is what covers the replacement case, which still moves the
     identity and still must be refused.

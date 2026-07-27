@@ -278,7 +278,7 @@ function SummaryStatusBadge({ status }) {
 // What is deliberately NO LONGER here: an in-flight 啟用 toggle
 // (`isTogglingThisTool`, R7-2) used to gate both writes as well. It was the
 // mirror half of a filesystem race web-v5 P1 removed at the root -- a toggle
-// writes the package's .state.json and never rewrites tool.json, so it cannot
+// writes the package's .afterthread-state.json and never rewrites tool.json, so it cannot
 // move the manifest identity a revise or a regenerate is holding across its LLM
 // round trip. See the enable Switch in ToolRow for the whole chain.
 function ToolSummaryPanel({
@@ -431,7 +431,7 @@ function ToolSummaryPanel({
 					// identity -- and PATCH /api/tools/{name} used to rewrite tool.json in
 					// place to flip `enabled`, MOVING it, so a toggle landing inside the
 					// round trip turned a finished generation into 404「工具不存在」.
-					// web-v5 P1 moved the toggle into the package's own .state.json:
+					// web-v5 P1 moved the toggle into the package's own .afterthread-state.json:
 					// tools.set_enabled never opens tool.json, so the identity
 					// tool_meta._store_meta re-checks (tools._write_package_file_atomic ->
 					// _still_the_expected_package) cannot be moved by a switch at all.
@@ -564,7 +564,7 @@ function ToolSummaryPanel({
 							// revise moved the manifest's ctime and the whole multi-minute
 							// build was discarded with 「原工具在修訂期間被改動或重新安裝」.
 							// Since web-v5 P1 tools.set_enabled writes only the package's
-							// .state.json, the pre-swap check reads the same identity it
+							// .afterthread-state.json, the pre-swap check reads the same identity it
 							// recorded, and the toggle itself is either carried across the
 							// swap (tools.carry_package_state, the first statement of the
 							// locked tail) or lands on the already-published package -- both
@@ -668,7 +668,7 @@ function ToolRow({
 							// swap (tool_builder._package_identity), and the one a
 							// regenerate holds across its LLM round trip. A toggle therefore
 							// doomed either one. web-v5 P1 moved `enabled` into the
-							// package's own .state.json and tools.set_enabled never opens
+							// package's own .afterthread-state.json and tools.set_enabled never opens
 							// the manifest, so that identity cannot move; the revise's own
 							// tail then either CARRIES a toggle across the swap
 							// (tools.carry_package_state, read from the live package as the

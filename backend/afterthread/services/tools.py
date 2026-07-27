@@ -10,11 +10,14 @@ A tool package is a directory ``<tools_dir>/<name>/`` holding:
   argv list (e.g. ``["python3", "run.py"]``). It is the package's SPEC and
   nothing else: its file identity is what tells "still the same package?" apart
   from "replaced", so nothing we mutate on the operator's behalf may live in it;
-* an OPTIONAL ``.state.json`` (``{"enabled": bool}``) holding the package's
-  MUTABLE state -- currently just the toggle that gates whether the tool is
-  advertised to the model. Absent means "not migrated yet", and is read through
-  the LEGACY optional ``enabled`` key some ``tool.json`` files still carry
-  (default true); see ``_STATE_FILENAME`` for why the two were split apart;
+* an OPTIONAL ``.afterthread-state.json`` (``{"afterthread": "tool-state",
+  "enabled": bool}``) holding the package's MUTABLE state -- currently just the
+  toggle that gates whether the tool is advertised to the model. The NAME says
+  whose file it is and the MARKER inside proves it: a file at that name without
+  the marker belongs to somebody else and is read as though there were no state
+  file at all. No state file of ours means the LEGACY optional ``enabled`` key
+  some ``tool.json`` files still carry decides (default true); see
+  ``_STATE_FILENAME`` for why the two were split apart;
 * the implementation files ``entry`` runs;
 * an OPTIONAL ``.env`` (``KEY=VALUE`` lines) holding THAT tool's own secrets
   (e.g. a KB API key), which are injected into the subprocess environment;
@@ -202,11 +205,12 @@ _AI_META_FILENAME = ".ai_meta.json"
 # property (at the same ratio) every other capped read in this module has.
 _AI_META_MAX_BYTES = 256 * 1024
 
-# The per-package MUTABLE STATE file (web-v5 P1): ``{"enabled": bool}``, and the
-# ONLY home of the enabled toggle from here on. It is dot-prefixed for exactly the
-# reasons ``_AI_META_FILENAME`` lists above (invisible to ``_scan_all``, carried by
-# a delete, skipped by the summary prompt's file inventory), and it is a SEPARATE
-# FILE from ``tool.json`` for one reason that is worth stating loudly:
+# The per-package MUTABLE STATE file (web-v5 P1): ``{"afterthread": "tool-state",
+# "enabled": bool}``, and the ONLY home of the enabled toggle from here on. It is
+# dot-prefixed for exactly the reasons ``_AI_META_FILENAME`` lists above (invisible
+# to ``_scan_all``, carried by a delete, skipped by the summary prompt's file
+# inventory), and it is a SEPARATE FILE from ``tool.json`` for one reason that is
+# worth stating loudly:
 #
 #   ``tool.json``'s ``(st_dev, st_ino, st_ctime_ns)`` IS this subsystem's answer to
 #   "is the package at this path still the one I looked at?" (``package_identity``).
@@ -222,7 +226,37 @@ _AI_META_MAX_BYTES = 256 * 1024
 # read through (``_read_enabled_state`` / ``_scan_package``), and rewriting a
 # manifest to tidy it away would move the very identity this file exists to hold
 # still. Written ONLY through ``write_package_state``.
-_STATE_FILENAME = ".state.json"
+#
+# The NAME declares whose file it is, and it was chosen that way after the first
+# spelling (``.state.json``) was found to claim a name a package might already own
+# (P1R5-1). This directory is the PACKAGE's, not ours: a tool may perfectly well
+# keep a cursor, a cache or its own settings beside its code, and ``.state.json``
+# is a name it could reach for without ever hearing of this backend -- at which
+# point we would read its file as the operator's toggle, refuse to run the tool
+# when the file failed to parse as ours, and destroy it on the first publish.
+# Nothing had shipped from this branch, so the name was changed rather than made
+# compatible with. A name is not a proof, though, so the RECOGNITION below is what
+# actually closes it: the name makes a collision implausible, the marker makes one
+# detectable.
+_STATE_FILENAME = ".afterthread-state.json"
+
+# The OWNERSHIP MARKER, and the half of P1R5-1 that does the work. Our writer puts
+# this key/value at the front of every state file it publishes, and every reader
+# requires it before treating the document as a statement of ANYTHING: a file at
+# our name that does not carry it is somebody else's and is answered exactly as a
+# missing one is (``_read_enabled_state`` -> the manifest fallback), never
+# overwritten (``set_enabled`` refuses) and never deleted (a revise carries it
+# across the swap byte-for-byte, ``carry_package_state``).
+#
+# Why a marker at all when the name already says "afterthread": an operator or a
+# future tool can still create a file under ANY name we pick, and the name alone
+# gives the reader no way to tell that from our own. The marker is the difference
+# between "we assume this is ours" and "this file says it is". The pair is spelled
+# as two constants rather than one literal dict so the writer and the recognizer
+# cannot drift, which is the same argument ``_RESERVED_PACKAGE_FILENAMES`` makes
+# about the names themselves.
+_STATE_MARKER_KEY = "afterthread"
+_STATE_MARKER_VALUE = "tool-state"
 
 # Hard ceiling on the state file, far tighter than the manifest's or the sidecar's
 # and for a reason that is theirs inverted: this file is read on EVERY scan of
@@ -233,7 +267,7 @@ _STATE_FILENAME = ".state.json"
 # and is refused as UNREADABLE rather than parsed (see ``_read_enabled_state``).
 _STATE_MAX_BYTES = 4 * 1024
 
-# Every filename inside a package that belongs to the BACKEND rather than to the
+# Every filename at a package's ROOT that belongs to the BACKEND rather than to the
 # package's content. A builder session must not be able to ship one and a revise
 # copy must not carry one into staging -- both enforced from this ONE tuple by
 # ``tool_builder._is_reserved_sidecar_name`` (which also covers each name's
@@ -241,6 +275,24 @@ _STATE_MAX_BYTES = 4 * 1024
 # mints them). A set rather than a hard-coded name because there are now two, and
 # a second hard-coded spelling is how the next one gets forgotten.
 _RESERVED_PACKAGE_FILENAMES: tuple[str, ...] = (_AI_META_FILENAME, _STATE_FILENAME)
+
+# The subset of the above that is reserved at EVERY DEPTH, not just at the root.
+# The state file is deliberately NOT in it (P1R5-2), following the ruling this
+# module's own revise-copy filter already made about a NESTED ``.env``
+# (``tool_builder._revise_copy_ignore``, R2-2): the ROOT one is the backend's,
+# because the root is the only place anything of ours reads or writes; a nested one
+# is ordinary package content, and the tool -- which runs with its package
+# directory as cwd -- may open ``data/.afterthread-state.json`` for its own reasons.
+# Reserving it at every depth meant a builder that created its tool's own initial
+# state there, and verified it worked with ``run_shell``, had the file silently
+# deleted at promote: the manifest still validated, the install reported success,
+# and the tool failed on its first real call.
+#
+# ``.ai_meta.json`` stays every-depth. That is a PRE-EXISTING and separately
+# adjudicated rule (D40 r7-1 / R8-2, restated in ``_strip_builder_sidecars``) with
+# its own reason -- a nested copy bricks every later revise through the
+# embedded-secret gate -- and this finding does not reopen it.
+_RESERVED_AT_EVERY_DEPTH: tuple[str, ...] = (_AI_META_FILENAME,)
 
 # The mode floor every published sidecar carries (R11). The backend MUST be able
 # to read back what it just wrote -- that is the same writer-accepts-implies-
@@ -319,7 +371,7 @@ class _PackageScan:
     WHY, via ``error``) but never advertised to the model or executed.
     ``parameters`` / ``entry`` / ``identity`` are populated only when ``valid``
     is True. ``enabled`` comes from ``_read_enabled_state`` (the package's own
-    ``.state.json``, or the manifest's legacy key when there is none) and is
+    ``.afterthread-state.json``, or the manifest's legacy key when there is none) and is
     resolved as early as possible so even an otherwise-invalid package reports
     the toggle state the operator set.
 
@@ -332,6 +384,15 @@ class _PackageScan:
     read succeeded) and is a refusal downstream, never a pass. It vouches for the
     SPEC only: ``enabled`` comes out of a different file that this identity
     deliberately says nothing about (see ``_STATE_FILENAME``).
+
+    ``notice`` is an operator-facing note that does NOT make the package invalid,
+    and it is a separate field from ``error`` precisely so that stays true: today
+    it carries exactly one thing, a file at the state file's name that is not ours
+    (P1R5-1), and such a package is perfectly runnable -- it just answers the toggle
+    from its manifest and refuses a PATCH. ``error`` remains "why this package is
+    not executable", which is the meaning ``validate_package`` gates an install on;
+    folding an advisory into it would have made an install fail for something that
+    breaks nothing. ``_listed_row`` is where the two meet the UI's single field.
     """
 
     name: str
@@ -343,6 +404,7 @@ class _PackageScan:
     parameters: dict[str, Any] | None
     entry: list[str] | None
     identity: tuple[int, int, int] | None
+    notice: str | None = None
 
 
 # --- discovery / validation ------------------------------------------------
@@ -526,97 +588,153 @@ def _write_regular_file(path: Path, content: str) -> bool:
             os.close(fd)
 
 
-# The operator-facing reason a package whose ``.state.json`` exists but cannot be
+# The operator-facing reason a package whose OWN state file exists but cannot be
 # read is listed INVALID. Category-only, like every other scan error: it names the
 # file (which the operator owns and may delete by hand -- D21's supported repair)
 # and never a filesystem error string.
-_STATE_UNREADABLE_ERROR = ".state.json exists but is not readable"
+_STATE_UNREADABLE_ERROR = ".afterthread-state.json exists but is not readable"
+
+# The operator-facing note for a file at our name that is NOT ours (P1R5-1): it has
+# no ownership marker, so it is somebody else's -- a tool's own cursor/cache/
+# settings, or a hand-written file that omitted the marker. The package stays VALID
+# and keeps running (the whole point: a foreign file must not take a working tool
+# out of the registry); this only says why the toggle is answering from the
+# manifest and why a PATCH refuses. Both repairs are named, because both are things
+# only the operator can do -- we will not touch that file.
+_STATE_FOREIGN_NOTICE = (
+    ".afterthread-state.json is not this backend's state file (no "
+    f'"{_STATE_MARKER_KEY}": "{_STATE_MARKER_VALUE}" marker) and is being left '
+    "alone: the enabled toggle falls back to tool.json and cannot be changed. Add "
+    "the marker, or move that file to another name."
+)
 
 
 @dataclass(frozen=True, slots=True)
 class _EnabledState:
-    """What the package's ``.state.json`` says about ``enabled``.
+    """What the package's ``.afterthread-state.json`` says about ``enabled``.
 
-    Exactly three shapes reach a caller, and keeping ABSENT apart from UNREADABLE
-    is the whole reason this is a struct rather than a ``bool``:
+    FOUR shapes reach a caller, and keeping them apart is the whole reason this is
+    a struct rather than a ``bool``. ``ours`` is the axis that matters: it is not
+    "is there a file there" but "is the file there ONE OF MINE", which are
+    different questions in a directory the backend does not own (P1R5-1):
 
-    * ``present=False`` -- there is no state file. The ONE case that falls back to
-      the manifest's legacy ``enabled`` key, and that fallback IS the migration: a
-      package installed before web-v5 P1 keeps reporting exactly what it reported
-      before, with no startup pass and no write on a read path;
-    * ``present=True, error=None`` -- the file was read and is authoritative;
-    * ``present=True, error is not None`` -- the file EXISTS but could not be read
-      as our shape, so the operator's intent is unknown. ``enabled`` is then False,
-      never the True a missing file gets: defaulting an unreadable toggle to "on"
-      would hand the model a tool somebody deliberately switched off, which is the
-      one direction this subsystem never errs in.
+    * ``ours=False, notice=None`` -- ABSENT: no file at our name. The case that
+      falls back to the manifest's legacy ``enabled`` key, and that fallback IS the
+      migration for a package installed before web-v5 P1: it keeps reporting
+      exactly what it reported before, with no startup pass and no write on a read
+      path;
+    * ``ours=True, error=None`` -- the file is ours (it carries the marker) and is
+      authoritative;
+    * ``ours=True, error is not None`` -- UNREADABLE: there is a file at our name
+      that we cannot read AT ALL (not a regular file, refused by the OS, past the
+      cap) or that carries our marker but no usable ``enabled``. We cannot prove it
+      is ours and we do not try: at a name that says "afterthread" the fail-closed
+      reading is that it IS ours and broken. ``enabled`` is then False, never the
+      True a missing file gets -- defaulting an unreadable toggle to "on" would
+      hand the model a tool somebody deliberately switched off, which is the one
+      direction this subsystem never errs in;
+    * ``ours=False, notice is not None`` -- FOREIGN: there IS a file at our name,
+      we read it, and it is not ours. Answered EXACTLY like ABSENT (the manifest
+      decides), because the alternative is the three silent harms P1R5-1 measured:
+      re-advertising a tool nobody switched on, listing a working package invalid
+      because its own file is not our shape, and overwriting whatever it kept
+      there. ``notice`` is the operator-facing half; the file itself is read-only
+      to us from here on.
     """
 
-    present: bool
+    ours: bool
     enabled: bool
     error: str | None
+    notice: str | None
+
+
+# The three CONSTANT answers, minted once rather than per call: this runs for every
+# package on every scan and twice per tool call, and the class is frozen, so there
+# is nothing a shared instance can be mutated into. Only the fourth shape (ours, and
+# readable) carries a value and has to be built.
+_ABSENT_STATE = _EnabledState(ours=False, enabled=True, error=None, notice=None)
+_UNREADABLE_STATE = _EnabledState(
+    ours=True, enabled=False, error=_STATE_UNREADABLE_ERROR, notice=None
+)
+_FOREIGN_STATE = _EnabledState(ours=False, enabled=True, error=None, notice=_STATE_FOREIGN_NOTICE)
 
 
 def _read_enabled_state(directory: Path) -> _EnabledState:
-    """Read the package's ``.state.json``. Total: never raises, always answers.
+    """Read the package's ``.afterthread-state.json``. Total: never raises, always answers.
 
-    ABSENT and UNREADABLE are DIFFERENT QUESTIONS and are answered differently
-    (see ``_EnabledState``), so this cannot go through ``_read_regular_file_capped``
-    alone -- that helper folds "no such file" and "refused to read it" into the
-    same None. The ``lstat`` above it is what tells them apart, and its error
-    handling copies an adjudication this subsystem has already made once, for
-    ``.env`` at promote time (D40 P3b r2-3): ``FileNotFoundError`` is the ONLY
-    evidence of absence; every other ``OSError`` (EIO, ESTALE, EACCES, a parent
-    that is not a directory) is a failure to LOOK, and treating a failure to look
-    as "there is nothing here" is what would silently re-enable a disabled tool.
-    A non-regular file at the name (a symlink aimed out of the package, a FIFO, a
-    directory) is likewise UNREADABLE rather than absent.
+    ABSENT, FOREIGN and UNREADABLE are DIFFERENT QUESTIONS and are answered
+    differently (see ``_EnabledState``), so this cannot go through
+    ``_read_regular_file_capped`` alone -- that helper folds "no such file" and
+    "refused to read it" into the same None. The ``lstat`` above it is what tells
+    those two apart, and its error handling copies an adjudication this subsystem
+    has already made once, for ``.env`` at promote time (D40 P3b r2-3):
+    ``FileNotFoundError`` is the ONLY evidence of absence; every other ``OSError``
+    (EIO, ESTALE, EACCES, a parent that is not a directory) is a failure to LOOK,
+    and treating a failure to look as "there is nothing here" is what would
+    silently re-enable a disabled tool. A non-regular file at the name (a symlink
+    aimed out of the package, a FIFO, a directory) is likewise UNREADABLE rather
+    than absent.
 
-    Everything past the ``lstat`` is the ordinary corrupt-file set, and all of it
-    lands in the same UNREADABLE answer: the bounded reader refusing, a file over
-    ``_STATE_MAX_BYTES``, invalid JSON, JSON that is not an object, and a missing
-    or non-``bool`` ``enabled``. That last one is not pedantry -- ``{}`` and
-    ``{"enabled": "yes"}`` are exactly as silent about the operator's intent as a
-    truncated file is, and the reason for refusing them is the same one.
+    The MARKER is what tells FOREIGN from ours, and it is checked before a single
+    field is believed (P1R5-1). A document we could read that does not carry
+    ``{"afterthread": "tool-state"}`` is not ours -- whether it is a tool's own
+    JSON settings, a plain-text cursor, or a hand-written ``{"enabled": false}``
+    that omitted the marker -- and "not ours" is answered as ABSENT is, with a
+    ``notice`` the listing can show. Nothing here writes, so the file is untouched
+    either way; ``set_enabled`` is where the refusal to overwrite it lives.
+
+    What stays UNREADABLE rather than becoming FOREIGN is the set we cannot read AT
+    ALL: refused by the OS, non-regular, past ``_STATE_MAX_BYTES``. There is no
+    marker to find in a file we never decoded, and at a name that says "afterthread"
+    the fail-closed reading -- ours, broken, listed invalid and switched off (R2) --
+    is the one that cannot re-enable something by accident. A marker-bearing
+    document with a missing or non-``bool`` ``enabled`` joins them for the R2 reason
+    unchanged: it is OUR file failing to say anything about the operator's intent,
+    which is exactly as silent as a truncated one.
 
     ``RecursionError`` is caught next to ``ValueError`` for the reason
     ``read_tool_meta`` documents: this runs once per package on EVERY scan, so a
     single hand-edited file escaping as an exception would break the whole 工具
-    page and every AI request's advertisement, not just its own row.
+    page and every AI request's advertisement, not just its own row. A document
+    that will not parse is FOREIGN rather than unreadable, because "not JSON at
+    all" is the shape a tool's own cursor or cache file has.
     """
     path = directory / _STATE_FILENAME
     try:
         info = os.lstat(path)
     except FileNotFoundError:
-        return _EnabledState(present=False, enabled=True, error=None)
+        return _ABSENT_STATE
     except OSError:
-        return _EnabledState(present=True, enabled=False, error=_STATE_UNREADABLE_ERROR)
-    unreadable = _EnabledState(present=True, enabled=False, error=_STATE_UNREADABLE_ERROR)
+        return _UNREADABLE_STATE
     if not stat.S_ISREG(info.st_mode):
-        return unreadable
+        return _UNREADABLE_STATE
     text = _read_regular_file_capped(path, _STATE_MAX_BYTES)
     if text is None or len(text) > _STATE_MAX_BYTES:
-        return unreadable
+        return _UNREADABLE_STATE
     try:
         raw = json.loads(text)
     except ValueError, RecursionError:
-        return unreadable
-    if not isinstance(raw, dict):
-        return unreadable
+        return _FOREIGN_STATE
+    if not isinstance(raw, dict) or raw.get(_STATE_MARKER_KEY) != _STATE_MARKER_VALUE:
+        return _FOREIGN_STATE
     enabled = raw.get("enabled")
     if not isinstance(enabled, bool):
-        return unreadable
-    return _EnabledState(present=True, enabled=enabled, error=None)
+        return _UNREADABLE_STATE
+    return _EnabledState(ours=True, enabled=enabled, error=None, notice=None)
 
 
 def _effective_enabled(state: _EnabledState, manifest: dict[str, Any] | None) -> bool:
     """THE precedence rule (R1), spelled ONCE, over the two reads it is defined on.
 
-    ``.state.json`` present and readable is authoritative; present and UNREADABLE
-    arrives here as ``enabled=False`` already (see ``_EnabledState``); ABSENT falls
-    back to the manifest's LEGACY ``enabled`` key -- optional, non-bool ignored,
-    default true, which is exactly what ``_scan_package`` answered before web-v5 P1
-    and is what makes that fallback the whole of the migration.
+    A state file of OURS is authoritative, readable or not (an UNREADABLE one
+    arrives here as ``enabled=False`` already -- see ``_EnabledState``). Everything
+    else falls back to the manifest's LEGACY ``enabled`` key -- optional, non-bool
+    ignored, default true, which is exactly what ``_scan_package`` answered before
+    web-v5 P1 and is what makes that fallback the whole of the migration.
+    "Everything else" is TWO cases and they are deliberately one branch (P1R5-1):
+    no file at all, and a file at our name that is not ours. A foreign file has to
+    answer exactly as a missing one does, or a package that happened to own that
+    name would be read as having a toggle nobody set.
 
     It takes the two READ RESULTS rather than a directory, and that is what lets
     there be one spelling at all: both callers already hold what they need for
@@ -636,7 +754,7 @@ def _effective_enabled(state: _EnabledState, manifest: dict[str, Any] | None) ->
     file, oversized, not JSON, not an object) is a manifest with no legacy key to
     offer, and the scan answers those paths with the state's own default too.
     """
-    if state.present:
+    if state.ours:
         return state.enabled
     legacy = True if manifest is None else manifest.get("enabled", True)
     return legacy if isinstance(legacy, bool) else True
@@ -692,12 +810,17 @@ def package_enabled(directory: Path) -> bool:
     short-circuits on an unreadable state file before it reads anything else).
 
     ORDER, which is the point and not a detail: the state file is the LAST thing
-    read on every path. When it is present that is the only read; when it is absent
-    the fallback is fetched and the state is then read AGAIN, so no other file
+    read on every path. When the file is ours that is the only read; otherwise the
+    fallback is fetched and the state is then read AGAIN, so no other file
     operation of OURS stands between the toggle and the caller's next line. The
     second read is an ``lstat`` that fails ENOENT (~10 us) and can only make the
     answer more current -- a PATCH landing while the manifest is being read CREATES
     the file that read looks for, and the rule prefers it the moment it exists.
+    A FOREIGN file makes that second read cost a real open rather than an ENOENT
+    ``lstat``, and it is still taken: the file could have been replaced by ours in
+    between (an operator moving their file out of the way and pressing the switch),
+    and skipping the re-read would be the one shape where this function's answer is
+    older than the manifest read it just did.
 
     What reading it LAST does NOT buy, written down because a claim next door once
     said it did (P1R4-3): this value is not proven CURRENT at the instant a caller
@@ -718,12 +841,14 @@ def package_enabled(directory: Path) -> bool:
     row. So does a package directory that is itself a SYMLINK -- the one shape
     neither this function nor the scan sends through ``_effective_enabled``,
     because both REFUSE TO LOOK before joining a name onto it; they are kept in
-    step by answering that refusal identically (see the branch below).
+    step by answering that refusal identically (see the branch below). A FOREIGN
+    file answers whatever the MANIFEST says, which is the same thing an absent one
+    answers and is the whole of P1R5-1's fix on the read side.
     """
     if directory.is_symlink():
         # Refused before any name is joined onto it, for the reason
         # ``_scan_package`` states where it does the same thing first: reading
-        # ``<link>/.state.json`` would follow the link out of the tools dir (the
+        # ``<link>/.afterthread-state.json`` would follow the link out of the tools dir (the
         # bounded reader's O_NOFOLLOW covers the final component, never a parent).
         #
         # FALSE, and it answered True for one round on the grounds that the row is
@@ -743,13 +868,13 @@ def package_enabled(directory: Path) -> bool:
         # twice and give two answers.
         return False
     state = _read_enabled_state(directory)
-    if state.present:
+    if state.ours:
         # Not a branch of the RULE -- the rule below still decides -- but of which
-        # files have to be read: a present state file is authoritative, so the
+        # files have to be read: a state file of OURS is authoritative, so the
         # manifest cannot change the answer and is not opened.
         return _effective_enabled(state, None)
-    # ABSENT: fetch the fallback FIRST, then ask the authority again, so the state
-    # read is the last thing this function does on this path as well.
+    # ABSENT or FOREIGN: fetch the fallback FIRST, then ask the authority again, so
+    # the state read is the last thing this function does on this path as well.
     manifest = _read_manifest_object(directory)
     return _effective_enabled(_read_enabled_state(directory), manifest)
 
@@ -769,7 +894,7 @@ def _scan_package(directory: Path, expected_name: str | None = None) -> _Package
     """
     name = expected_name if expected_name is not None else directory.name
 
-    def scan_failed(error: str, *, enabled: bool) -> _PackageScan:
+    def scan_failed(error: str, *, enabled: bool, notice: str | None = None) -> _PackageScan:
         return _PackageScan(
             name=name,
             directory=directory,
@@ -780,6 +905,7 @@ def _scan_package(directory: Path, expected_name: str | None = None) -> _Package
             parameters=None,
             entry=None,
             identity=None,
+            notice=notice,
         )
 
     # A package directory that is itself a SYMLINK is refused (listed invalid,
@@ -789,7 +915,7 @@ def _scan_package(directory: Path, expected_name: str | None = None) -> _Package
     # validation is unaffected: its directory is a real ``mkdir``ed uuid dir.
     #
     # FIRST, and before the state read below, precisely because that read joins a
-    # NAME onto this directory: reading ``<link>/.state.json`` would follow the
+    # NAME onto this directory: reading ``<link>/.afterthread-state.json`` would follow the
     # link out of the tools dir (the bounded reader's O_NOFOLLOW covers the final
     # component, never a parent), and this is the check that says we never treat
     # such a path as a package at all.
@@ -807,16 +933,16 @@ def _scan_package(directory: Path, expected_name: str | None = None) -> _Package
         )
 
     # The toggle, resolved before ANY manifest work so that every failure below
-    # still reports the state the operator actually set. ``.state.json`` present
-    # and readable is authoritative; ABSENT falls back to the manifest's legacy
-    # key further down (R1 -- that fallback IS the migration, so nothing here
-    # writes). An UNREADABLE one is neither: it means the operator's intent is
-    # unknown, and this subsystem answers "unknown" with a refusal, not with the
-    # permissive default (R2).
+    # still reports the state the operator actually set. A state file of OURS is
+    # authoritative; ABSENT -- and a FOREIGN file, which is answered identically
+    # (P1R5-1) -- falls back to the manifest's legacy key further down (R1 -- that
+    # fallback IS the migration, so nothing here writes). An UNREADABLE one is
+    # neither: it means the operator's intent is unknown, and this subsystem answers
+    # "unknown" with a refusal, not with the permissive default (R2).
     state = _read_enabled_state(directory)
 
     def invalid(error: str, *, enabled: bool = state.enabled) -> _PackageScan:
-        return scan_failed(error, enabled=enabled)
+        return scan_failed(error, enabled=enabled, notice=state.notice)
 
     # A state file we cannot read makes the package INVALID, not merely switched
     # off, and both halves are deliberate. INVALID because ``error`` is exactly
@@ -828,10 +954,11 @@ def _scan_package(directory: Path, expected_name: str | None = None) -> _Package
     # BOTH say no means no single later refactor of either filter can quietly put
     # the tool back in front of the model.
     #
-    # The repair paths, stated rather than left to be discovered: ``set_enabled``
-    # does not read this file, so a PATCH publishes a clean one over it and the
-    # package is valid again; and deleting the file by hand restores the
-    # pre-migration fallback, which is a supported operator action (D21).
+    # The repair paths, stated rather than left to be discovered: a PATCH publishes
+    # a clean file over it and the package is valid again (``set_enabled`` reads
+    # only enough to see there is no FOREIGN file to protect, and an unreadable one
+    # is by definition not that -- see there); and deleting the file by hand
+    # restores the pre-migration fallback, a supported operator action (D21).
     if state.error is not None:
         return invalid(state.error)
 
@@ -884,9 +1011,10 @@ def _scan_package(directory: Path, expected_name: str | None = None) -> _Package
     # function is already holding (which is why it calls the rule and not the front
     # door -- re-reading either file here would pair a spec from one read with a
     # toggle from another). The MIGRATION is that rule's ABSENT branch and it is a
-    # call rather than a startup pass: a package with no ``.state.json`` is read
+    # call rather than a startup pass: a package with no state file of ours is read
     # through the manifest's LEGACY ``enabled`` key exactly as it was before web-v5
-    # P1. A package that HAS a state file never consults it -- the manifest is
+    # P1, and so is one whose file at that name turned out to be somebody else's
+    # (P1R5-1). A package that HAS one of ours never consults the manifest -- it is
     # spec-only from then on, and the stale key it may still carry is inert
     # (deliberately not stripped: rewriting a manifest to tidy it would move the
     # identity this split exists to hold still).
@@ -929,6 +1057,11 @@ def _scan_package(directory: Path, expected_name: str | None = None) -> _Package
         parameters=parameters,
         entry=list(entry),
         identity=identity,
+        # VALID and carrying a note: a foreign file at the state file's name breaks
+        # nothing (the manifest answers the toggle), so it must not take a working
+        # tool out of the registry -- that silent invalidation was one of the three
+        # harms P1R5-1 measured. It rides ``notice``, never ``error``.
+        notice=state.notice,
     )
 
 
@@ -1406,6 +1539,32 @@ def _write_package_file_atomic(
     namespace ``tool_builder._is_reserved_sidecar_name`` strips -- the summary
     prompt's file inventory skips dot-files, so even a leftover temp can never feed
     a summary back into its own next prompt.
+
+    ONE case does not go through that unlink, and stating it is the difference
+    between a discipline and a slogan (P1R5-4). The cleanup names the temp by PATH,
+    so a rename of the package DIRECTORY between ``mkstemp`` and the failure carries
+    the temp file away with the directory, and the ``unlink`` then looks where it no
+    longer is. That is not a leak, because the only actors who rename a package
+    directory aside move it into a namespace that is collected WHOLE, and the temp
+    rides along inside it. Measured on this machine's ext4, renaming the directory
+    from inside ``mkstemp``:
+
+    * ``delete_tool`` deferring past an in-flight call -> the temp is inside
+      ``.<name>.stale-<token>``, and ``tool_builder._sweep_stale_backups`` (end of
+      every tool job) ``rmtree``s that directory with the temp in it. Measured: file
+      present in the renamed directory, gone after one sweep;
+    * a revise swap -> the temp is inside ``.bak-<token>``, which
+      ``_promote_staging_replace`` ``rmtree``s the moment the swap succeeds (or
+      defers into the same ``.stale-`` namespace for the same sweep);
+    * a swap that RAISED and rolled the backup back -> the publish then SUCCEEDS
+      (the path resolves to the restored directory again by ``os.replace``), so
+      there is no temp to collect at all. Measured.
+
+    The residue that genuinely survives is the one the operator is already told
+    about: ``_ERROR_REVISE_UNRECOVERABLE`` leaves a ``.bak-`` directory the sweep
+    deliberately never touches, because it is their only copy of the tool. A temp
+    file inside it is inert dot-file litter in a directory they are recovering by
+    hand. Everything else is collected by whoever collects the directory.
     """
     path = directory / filename
     # The mode to publish under. There is ALWAYS one now (R11): a fresh file
@@ -1472,7 +1631,12 @@ def _write_package_file_atomic(
             with contextlib.suppress(OSError):
                 os.close(fd)
         # Safe unconditionally: tmp_path is a name mkstemp invented for THIS call
-        # alone, never a path a caller passed in (cli.py's same argument).
+        # alone, never a path a caller passed in (cli.py's same argument). By PATH,
+        # so it finds nothing when the package DIRECTORY was renamed aside under us
+        # -- that ENOENT is the suppressed case, and what happens to the file
+        # instead is measured in the docstring (it rides into the collected
+        # namespace with the directory). Not worth a directory fd: the only way to
+        # reach that branch is a rename that already hands the file to a collector.
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)
         return False
@@ -1681,7 +1845,7 @@ def write_tool_meta(
 
 
 # TRANSITIONAL (web-v5 P1) -- P2 DELETES this, and the note is part of the code so
-# it is not inherited as a puzzle. In the target layout ``.state.json`` lives at
+# it is not inherited as a puzzle. In the target layout ``.afterthread-state.json`` lives at
 # ``<name>/`` while only ``<name>/versions/<vid>/`` is ever swapped, so a revise
 # stops touching the toggle's file at all and there is nothing left for a lock to
 # make exclusive. Until then the swap replaces the WHOLE directory, which is what
@@ -1709,7 +1873,7 @@ def write_tool_meta(
 #
 # What it does NOT cover, stated so it is not read as more than it is: it is an
 # IN-PROCESS lock, exactly like ``_META_LOCK``. A second afterthread process on the
-# same tools directory, or an operator editing ``.state.json`` by hand (D21's
+# same tools directory, or an operator editing ``.afterthread-state.json`` by hand (D21's
 # supported action), is not serialized by it and never was -- this app runs as ONE
 # process (the console script serves the API and the UI together) and its only
 # concurrency is the threadpool every route hops through, which is precisely what
@@ -1741,11 +1905,16 @@ def write_package_state(directory: Path, enabled: bool, *, default_mode: int = _
     is what makes the execution registry, the revise swap and the summary sidecar's
     identity guard all stop caring that a switch was flipped.
 
-    Built from a literal key and a ``bool`` the caller's type gates, exactly as
+    Built from literal keys and a ``bool`` the caller's type gates, exactly as
     ``write_tool_meta`` builds the sidecar from its own literals: there is no
     caller structure to serialize, so nothing here can put a key or a value on
     disk that this function did not choose. No redaction pass either -- unlike the
     sidecar, no field of this file can carry operator or model text.
+
+    The OWNERSHIP MARKER goes in every document this publishes, and it is what
+    makes every reader's "is this mine?" answerable (P1R5-1). It is the writing half
+    of the recognition rule: the name alone cannot distinguish our file from a
+    package's own, and this is the sentence that does.
 
     NO ``expected_identity``, and that is a decision rather than an omission:
 
@@ -1775,40 +1944,61 @@ def write_package_state(directory: Path, enabled: bool, *, default_mode: int = _
     # Trailing newline so the file is a well-formed text line like every other
     # small file this project publishes (cli.py's .env, set_enabled's old manifest
     # rewrite). ensure_ascii is irrelevant to a bool but is passed for uniformity
-    # with the sidecar's encode. The payload is two ASCII tokens, so neither the
-    # dumps nor the encode can raise and neither needs a guard.
-    data = (json.dumps({"enabled": enabled}, ensure_ascii=False) + "\n").encode("utf-8")
+    # with the sidecar's encode. The payload is three ASCII tokens, so neither the
+    # dumps nor the encode can raise and neither needs a guard. The marker is FIRST
+    # so an operator opening the file reads whose it is before what it says.
+    document = {_STATE_MARKER_KEY: _STATE_MARKER_VALUE, "enabled": enabled}
+    data = (json.dumps(document, ensure_ascii=False) + "\n").encode("utf-8")
     return _write_package_file_atomic(
         directory, _STATE_FILENAME, data, None, default_mode=default_mode
     )
 
 
 def carry_package_state(source: Path, destination: Path) -> bool:
-    """Re-publish ``source``'s toggle -- value AND file mode -- into ``destination``.
+    """Put ``source``'s state-file slot into ``destination`` across a revise swap.
 
     TRANSITIONAL (web-v5 P1), and the ONE step that keeps a revise from silently
-    re-enabling a tool: ``.state.json`` is backend-authored, so it is kept out of
-    staging entirely (``tool_builder._revise_copy_ignore`` /
-    ``_strip_builder_sidecars``), and the swap replaces the WHOLE package
-    directory -- so without this the published package has no state file at all
-    and is read through the manifest fallback as ENABLED. P2's layout swaps only
-    ``<name>/versions/<vid>/`` and leaves ``.state.json`` where it is, at which
-    point this function has nothing left to do.
+    re-enabling a tool: the state file's NAME is kept out of staging entirely
+    (``tool_builder._revise_copy_ignore`` / ``_strip_builder_sidecars``), and the
+    swap replaces the WHOLE package directory -- so without this the published
+    package has no state file at all and is read through the manifest fallback as
+    ENABLED. P2's layout swaps only ``<name>/versions/<vid>/`` and leaves the state
+    file where it is, at which point this function has nothing left to do.
 
     The caller must hold ``_STATE_PUBLISH_LOCK`` across this AND the swap that
     makes the copy live -- see that lock for what is lost otherwise. This function
     does not take it itself: a hold that ended here would end BEFORE the rename it
     exists to cover.
 
-    ``package_enabled`` on the LIVE package, so an unreadable state file is carried
-    across as DISABLED rather than repaired into "on" -- the same direction the scan
-    reads it in, and the same direction this subsystem always errs in.
+    TWO shapes, because the name is ours but the DIRECTORY is the package's
+    (P1R5-1):
+
+    * the ordinary one -- there is no file at that name, or the file there is OURS
+      -- RE-PUBLISHES the toggle. ``package_enabled`` on the LIVE package, so an
+      unreadable state file is carried across as DISABLED rather than repaired into
+      "on", the same direction the scan reads it in;
+    * a FOREIGN file (one at our name that is not ours) is COPIED byte-for-byte
+      instead, and nothing of ours is published over it. It is the package's own
+      file; a revise is "rebuild this package from my feedback", not permission to
+      delete a file the tool may open at runtime. The copy follows the shape
+      ``tool_builder._preserve_env_file`` established for the other file we withhold
+      from the builder and restore afterwards, and it is bounded by construction:
+      only a file we READ within ``_STATE_MAX_BYTES`` can be classified foreign, so
+      nothing unbounded runs inside ``_STATE_PUBLISH_LOCK``.
+
+    What the second shape COSTS, since it is the honest half: a package with a
+    foreign file at that name has nowhere to keep a toggle of ours, so its effective
+    state is whatever its MANIFEST says -- and the manifest is what the revise
+    rewrites. A revise of such a package can therefore change its toggle, exactly as
+    hand-editing that key would. The operator-visible half is the ``notice`` the
+    listing carries; the fix is to move the file out of the way.
 
     The MODE is carried for the reason the publisher preserves one at all (R7-3,
     R11): an operator who chmod'd their state file ``0o640`` so a same-group process
     could read it keeps that across a PATCH, and would otherwise lose it to any
     unrelated revise -- the publisher inherits from the file AT THE TARGET, and the
-    target here is a staging directory that has none.
+    target here is a staging directory that has none. (The foreign branch does not
+    need it: ``copy2`` carries the source's mode itself.)
 
     This ``lstat`` deliberately does NOT tell absence from a failure to LOOK, and
     that is not the D40 P3b r2-3 rule being broken: that rule is about deciding a
@@ -1819,6 +2009,8 @@ def carry_package_state(source: Path, destination: Path) -> bool:
     wider from a stat we could not take is the only mistake available here, and it
     is the one not made.
     """
+    if _read_enabled_state(source).notice is not None:
+        return _copy_foreign_state_file(source / _STATE_FILENAME, destination / _STATE_FILENAME)
     try:
         info = os.lstat(source / _STATE_FILENAME)
     except OSError:
@@ -1826,6 +2018,41 @@ def carry_package_state(source: Path, destination: Path) -> bool:
     else:
         mode = (info.st_mode & 0o777) if stat.S_ISREG(info.st_mode) else _OWNER_RW
     return write_package_state(destination, package_enabled(source), default_mode=mode)
+
+
+def _copy_foreign_state_file(source: Path, destination: Path) -> bool:
+    """Copy a package's OWN file at the state file's name into staging. Success.
+
+    The half of ``carry_package_state`` that runs when the name is occupied by
+    something we did not write (P1R5-1). ``copy2`` rather than a re-publish because
+    the requirement is that the file come through the swap UNCHANGED -- bytes, mode
+    and mtime -- exactly as ``tool_builder._preserve_env_file`` states it for the
+    other withheld file: the tool runs with its package as cwd and may hash, diff or
+    binary-parse its own file, so normalizing it would be the same mistake in a
+    smaller place.
+
+    ``follow_symlinks=False`` so a link raced in at the source between the read that
+    classified it and this line is copied AS a link rather than read through -- the
+    same choice ``_copy_package_into_staging``'s ``symlinks=True`` makes, and the
+    reason this cannot be turned into a read of somewhere else. The DESTINATION must
+    be free: the copy filter withheld the name and the sidecar strip deleted
+    anything at it, so a file there means an assumption broke, and ``copy2`` FOLLOWS
+    its destination -- refusing is the only safe answer. Every failure is False,
+    which the caller turns into a refused revise with nothing published.
+    """
+    try:
+        os.lstat(destination)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+    else:
+        return False
+    try:
+        shutil.copy2(source, destination, follow_symlinks=False)
+    except OSError:
+        return False
+    return True
 
 
 def _narrowed_summary_status(meta: dict[str, Any] | None) -> str | None:
@@ -2353,6 +2580,18 @@ def _listed_row(scan: _PackageScan) -> dict[str, Any]:
     gives (``summary_status``), rather than a second vocabulary for "we could not
     pair one". The other five fields still come from one scan, so the row is
     still one instance's.
+
+    The row's ``error`` is where the scan's ``error`` and its ``notice`` meet, and
+    the fatal one wins (P1R5-1). Two fields inside, one on the wire: the API shape
+    is fixed (``schemas.ToolSummary``) and this is its one free-text channel to the
+    operator, while the two must stay apart INSIDE because ``validate_package``
+    gates an install on ``error`` alone. A row can therefore now be ``valid=True``
+    with a non-null ``error``, which is new and is exactly one shape: a package
+    holding a file at the state file's name that is not ours. Honest limitation:
+    the 工具 page renders a row's error only when the row is INVALID
+    (``ToolsPage.jsx``), so this note is visible through ``GET /api/tools`` and in
+    the refusal an attempted toggle gets, not on the card -- showing advisories on
+    valid rows is a UI decision of its own (the same shape as P1R4-4's).
     """
     paired = False
     status: str | None = None
@@ -2368,7 +2607,7 @@ def _listed_row(scan: _PackageScan) -> dict[str, Any]:
         "description": scan.description,
         "enabled": scan.enabled,
         "valid": scan.valid,
-        "error": scan.error,
+        "error": scan.error if scan.error is not None else scan.notice,
         "summary_status": status if paired else None,
     }
 
@@ -2448,7 +2687,7 @@ def package_identity(directory: Path) -> tuple[int, int, int] | None:
     rewrites, and the file an operator HAND-EDITS to change a tool's spec (a
     supported action, D21; see ``_make_handler`` for what that costs an in-flight
     conversation). Since web-v5 P1 nothing WE do rewrites it outside an install or
-    a revise: the enabled toggle moved to ``.state.json`` precisely so that
+    a revise: the enabled toggle moved to ``.afterthread-state.json`` precisely so that
     flipping a switch stops looking like a replacement to every guard that reads
     this tuple (see ``_STATE_FILENAME``).
 
@@ -3711,7 +3950,7 @@ def _make_handler(
       off by a deferred delete since (see ``_INFLIGHT_SECRETS``).
 
     A SECOND, SEPARATE refusal answers a question the identity check never could:
-    "may this tool run AT ALL?". The toggle lives in the package's ``.state.json``
+    "may this tool run AT ALL?". The toggle lives in the package's ``.afterthread-state.json``
     with the manifest's legacy key behind it (web-v5 P1), so the EFFECTIVE state is
     re-derived at CALL time through ``package_enabled`` -- the same one rule the
     listing and the advertisement use -- and a switched-off tool is refused with
@@ -3768,7 +4007,7 @@ def _make_handler(
             if not _still_the_expected_package(directory, identity):
                 return _TOOL_REPLACED_RESULT
             # "May this tool run?", asked at CALL time through the ONE precedence
-            # rule (``package_enabled``) rather than through ``.state.json`` alone.
+            # rule (``package_enabled``) rather than through ``.afterthread-state.json`` alone.
             # AFTER the identity check HERE, and BEFORE it at the ``Popen`` site,
             # and the two orderings answer two different questions. Neither check
             # is adjacent to an act at this end -- a ``.env`` read, a serialization
@@ -3790,7 +4029,7 @@ def _make_handler(
             # operations: a pre-migration package whose manifest still carries
             # ``enabled: false``, a PATCH switching it ON, the tool advertised and
             # this handler built, then the state file removed -- effective state
-            # false, and a check reading only ``.state.json`` would start it.
+            # false, and a check reading only ``.afterthread-state.json`` would start it.
             if not package_enabled(directory):
                 return _TOOL_DISABLED_RESULT
             settings = get_settings()
@@ -3887,7 +4126,7 @@ def _resolve_package_dir_no_alias(name: str) -> Path | None:
 
 
 def set_enabled(name: str, enabled: bool) -> bool:
-    """Publish a package's ``enabled`` toggle into its ``.state.json``. Returns success.
+    """Publish a package's ``enabled`` toggle into its ``.afterthread-state.json``. Returns success.
 
     It does NOT touch ``tool.json``, and that is the change web-v5 P1 exists for
     rather than an implementation detail. The manifest's file identity is this
@@ -3906,9 +4145,25 @@ def set_enabled(name: str, enabled: bool) -> bool:
     ``package_enabled`` DIRECTLY at execution time -- see there.
 
     False when the name is unsafe (see ``_resolve_package_dir``), the package
-    directory is an alias (see below), there is no package directory, or the write
-    fails -- so the PATCH route maps a bad name and a missing package alike to a
-    clean "did not happen" rather than a 500.
+    directory is an alias (see below), there is no package directory, the name is
+    occupied by a FOREIGN file (see below), or the write fails -- so the PATCH route
+    maps a bad name and a missing package alike to a clean "did not happen" rather
+    than a 500.
+
+    The FOREIGN refusal is the write-side half of P1R5-1, and it is what makes "we
+    never overwrite a file that is not ours" true rather than merely intended: this
+    is the only writer of that name, so if it publishes over a package's own file
+    nothing else can stop it. The answer it gives -- False, i.e. a 404 from the
+    route -- is a deliberate choice among three: publish anyway (destroys the file:
+    the harm), succeed silently (lies: the toggle would not take effect, since the
+    read side answers from the manifest), or refuse. Refusing is the only one where
+    what the operator is told matches what is on disk, and it is what surfaces the
+    problem AT THE MOMENT the operator tries to act on it -- the listing's ``notice``
+    says the same thing in words. It costs that package its toggle until the
+    operator moves their file aside, which is the honest price of not owning the
+    directory. An UNREADABLE file is deliberately NOT refused: it is read as ours
+    (see ``_read_enabled_state``), and publishing over it is the documented repair
+    for a corrupt one.
 
     THREE refusals this used to carry are gone with the manifest rewrite, listed so
     the change is not read as an oversight: an unreadable ``tool.json``, an
@@ -3987,6 +4242,14 @@ def set_enabled(name: str, enabled: bool) -> bool:
         # outright. What remains after it is the publisher's lstat/mkstemp/replace
         # -- the syscall run this module accepts by name.
         if _resolve_package_dir_no_alias(name) != directory:
+            return False
+        # NOT OURS, NOT OVERWRITTEN (P1R5-1). One read, on the line above the
+        # publish for the reason every other check here sits there: what remains
+        # after it is the publisher's own lstat/mkstemp/replace, the syscall run
+        # this module accepts by name. Only a FOREIGN file stops the write -- an
+        # unreadable one is read as ours and publishing over it is the documented
+        # repair, and an absent one is the ordinary first write.
+        if _read_enabled_state(directory).notice is not None:
             return False
         return write_package_state(directory, enabled)
 

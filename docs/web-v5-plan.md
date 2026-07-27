@@ -44,7 +44,7 @@ web-v4 的 overall review 跑了九輪，每輪都找到新的競態，沒有收
     run.py …           # 實作
     .env               # 秘密（修訂時以 _preserve_env_file 特別保留）
     .ai_meta.json      # 總結側檔
-    .state.json        # 可變狀態：enabled（P1 新增；不存在時退回 manifest 舊欄位）
+    .afterthread-state.json        # 可變狀態：enabled（P1 新增；不存在時退回 manifest 舊欄位）
   .staging/<uuid>/     # 建置中
   .bak-<…>/            # 修訂備份（救援副本）
   .stale-<…>/          # 延後清理
@@ -65,7 +65,7 @@ web-v4 的 overall review 跑了九輪，每輪都找到新的競態，沒有收
       origin.json      # 建置來源（openapi_url + instructions），發布時就寫好
       summary.json     # 該版本的 AI 總結（產生後寫入該版本）
     current            # 純文字檔，內容是目前生效的 <vid>
-    .state.json        # 可變狀態：enabled（未來可含 finalized）
+    .afterthread-state.json        # 可變狀態：enabled（未來可含 finalized）
     .env               # 秘密，跨版本存活（不再需要特別保留邏輯）
   .staging/<uuid>/
 ```
@@ -76,7 +76,7 @@ web-v4 的 overall review 跑了九輪，每輪都找到新的競態，沒有收
   版本 id；切換用 mkstemp + `os.replace`（與現行側檔寫入同一個原子寫法）。
   用 symlink 會迫使我們鬆動既有的「拒絕 symlink 套件目錄／manifest」硬化，
   那是這個子系統最不該動的部分。
-- **`enabled` 搬到 `.state.json`**，dot-prefix 與 `.ai_meta.json` 同慣例（掃描與
+- **`enabled` 搬到 `.afterthread-state.json`**，dot-prefix 與 `.ai_meta.json` 同慣例（掃描與
   模型可見檔案清單都不會撿到）。切換啟用從此**不再碰 manifest**，`tool.json` 的身分
   也就不再因為一次開關而移動。
   **P1 實作後的補正（見 `web-v5-decisions.md` D41）**：dot-prefix 讓這個檔案不被
@@ -85,19 +85,24 @@ web-v4 的 overall review 跑了九輪，每輪都找到新的競態，沒有收
   `tool_builder` 的**保留名域**（builder 出貨前剷除、修訂複製不帶入），並在換裝前
   **從正式套件把啟用狀態重新寫進 staging**——少了後者，每一次修訂都會靜默打開一個
   被刻意關掉的工具。
+  **P1 review r5 的補正**：檔名從草案的 `.state.json` 改成 `.afterthread-state.json`，
+  而且檔案裡多了一個所有權標記 `{"afterthread": "tool-state", …}`。原因是這份計畫
+  （與 P1 的實作）都預設了「這個名字是我們的」，而套件目錄是**工具的**——一個既有
+  工具本來就可能用 `.state.json` 放自己的游標或快取。保留名域也**縮到只有根目錄**
+  那一個（`.ai_meta.json` 維持各層級，理由不同、另行裁決）。詳見 D41 的 r5 附錄。
 - **手改仍然被接住**。解析出版本目錄之後，manifest 身分檢查**保留**——它現在只回答
   「有人手動改過嗎」這一個問題，而不是同時被開關污染。對話中途 schema 變了仍然拒絕，
   行為不變。
   **P1 實作後的補正**：「行為不變」只對**手改**那一半成立。改動前，「對話中途被停用
   的工具不會跑」是身分檢查的**副作用**（開關改寫 manifest → 身分漂移 → 拒絕）；
   身分不再漂移之後，那個拒絕會**無聲消失**，等於原樣復活 overall-r7 O7-1 的情境
-  (a)。所以 P1 讓 handler 在執行當下自己讀 `.state.json` 並以**另一段**拒絕字串
+  (a)。所以 P1 讓 handler 在執行當下自己讀 `.afterthread-state.json` 並以**另一段**拒絕字串
   回覆——兩道檢查現在回答兩個不同的問題，缺一不可。
 - **`.env` 放在套件層**，跨版本自然存活，修訂流程裡的保留／可遮蔽性重驗邏輯可以簡化。
 - **origin 在發布版本時就寫進版本目錄**。web-v4 R8 的「origin 永久遺失」在此不成立：
   它不再依賴一趟 LLM 往返之後才落盤。
 - **總結屬於版本**。「總結描述的是另一個實作」這類問題隨之消失；`finalized` 屬於套件
-  （是使用者對這個工具的意圖），留在 `.state.json`。
+  （是使用者對這個工具的意圖），留在 `.afterthread-state.json`。
 - **舊版本靠引用計數回收**。現行的「執行中登記」變成版本引用計數，語意更直接；
   保留最近數版可順帶得到**回溯上一版**的能力（附帶收穫，不是本次目標）。
 
@@ -129,7 +134,7 @@ R9-2 仍然要等 P2 的版本版面。
 
 | 階段 | 範圍 | 為什麼這樣切 |
 |---|---|---|
-| **P1** ✅ | `enabled` 移出 `tool.json` → `.state.json`（含既有安裝的遷移） | 最小、最集中的根因修正。`.state.json` 在新舊版面都放在同一個位置，不會白做 |
+| **P1** ✅ | `enabled` 移出 `tool.json` → `.afterthread-state.json`（含既有安裝的遷移；名稱與所有權標記見 D41 r5） | 最小、最集中的根因修正。`.afterthread-state.json` 在新舊版面都放在同一個位置，不會白做 |
 | **P2** | 版本版面端到端：`current` 指標、解析、掃描、執行、安裝／修訂發布新版本、遷移 | 讀寫兩側必須一起換，中間狀態沒有意義 |
 | **P3** | origin 與總結移入版本目錄 | 依賴 P2 的版面 |
 | **P4** | 舊版本回收（引用計數 + 保留策略），視成本決定是否附帶回溯 | 只有在版本存在之後才有意義 |
@@ -148,5 +153,10 @@ R9-2 仍然要等 P2 的版本版面。
   寫入被拒」的那批，也就是這個階段刻意反轉的行為本身。R1 的 fallback 讓所有用
   `tool.json` 裡 `enabled` 建包的 fixture 原封不動繼續通過。P2 換版面時風險才真正
   出現。
+  **r5 的補正**：後來把檔名改成 `.afterthread-state.json`、內容加上所有權標記時，
+  改動的測試是 21 個——**改名本身幾乎不花成本**（測試都用 `tools._STATE_FILENAME`），
+  真正要動的是**手寫檔案內容**的那些 fixture：一個少了標記的 `{"enabled": ...}` 現在
+  是「別人的檔案」。這反過來也是這條風險的證據：內容約定比版面更容易被 fixture
+  寫死。
 - **e2e 不涵蓋工具**（smoke 的 `tools_dir` 未設定），所以整合面的保護只有單元測試，
   這點在 P2 要特別留意。

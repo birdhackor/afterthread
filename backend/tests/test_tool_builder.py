@@ -28,6 +28,7 @@ import os
 import shutil
 import socket
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Generator
@@ -1093,12 +1094,21 @@ def test_strip_builder_sidecars_matches_the_reserved_name_case_insensitively(
 
 
 def test_strip_builder_sidecars_covers_the_state_file_namespace(tmp_path: Path) -> None:
-    """R5 (web-v5 P1): ``.state.json`` joins the namespace, at every depth and case.
+    """R5 (web-v5 P1): the state file joins the namespace -- at the ROOT, in any case.
 
     What a builder-shipped state file would buy is not symmetry for its own sake:
     it is the file the RUNTIME consults at call time to decide whether a tool may
     run. A revise session that wrote one would be switching a tool the operator had
     DISABLED back on, at promote, with no mutation API call anywhere in the record.
+    It is also the name ``_promote_staging`` publishes the initial state at, so the
+    root has to be free (P1R5-3).
+
+    ROOT ONLY, which P1R5-2 narrowed from every depth: nothing of ours reads or
+    writes below the package root, so a nested file at that name is the package's
+    own content -- and a builder writing its tool's initial state at
+    ``data/<that name>`` had it deleted here, with the manifest still validating and
+    the install still reporting success. ``.ai_meta.json`` keeps every depth for its
+    own separately-adjudicated reason; the sibling test below pins that half.
 
     The publish temporaries are covered for the same reason the sidecar's are --
     ``_write_package_file_atomic`` mints ``<name>.<x>.tmp`` in the package, so a
@@ -1108,21 +1118,31 @@ def test_strip_builder_sidecars_covers_the_state_file_namespace(tmp_path: Path) 
     (staging / "sub").mkdir(parents=True)
     (staging / tools._STATE_FILENAME).write_text('{"enabled": true}', encoding="utf-8")
     (staging / f"{tools._STATE_FILENAME}.abc123.tmp").write_text("{}", encoding="utf-8")
-    (staging / ".STATE.JSON").write_text('{"enabled": true}', encoding="utf-8")
+    (staging / tools._STATE_FILENAME.upper()).write_text('{"enabled": true}', encoding="utf-8")
     (staging / "sub" / tools._STATE_FILENAME).write_text('{"enabled": true}', encoding="utf-8")
+    (staging / "sub" / f"{tools._STATE_FILENAME}.abc123.tmp").write_text("{}", encoding="utf-8")
     (staging / "run.py").write_text("print(1)", encoding="utf-8")
     (staging / "sub" / "keep.py").write_text("K = 1\n", encoding="utf-8")
 
     assert tool_builder._strip_builder_sidecars(staging) is None
 
     assert sorted(entry.name for entry in staging.iterdir()) == ["run.py", "sub"]
-    assert sorted(entry.name for entry in (staging / "sub").iterdir()) == ["keep.py"]
-    # And the predicate itself agrees on both namespaces, so neither can be
-    # dropped by a future edit that only looks at one of them.
+    # The nested ones are the package's own files and SURVIVE (P1R5-2).
+    assert sorted(entry.name for entry in (staging / "sub").iterdir()) == [
+        tools._STATE_FILENAME,
+        f"{tools._STATE_FILENAME}.abc123.tmp",
+        "keep.py",
+    ]
+    # And the predicate itself agrees on both namespaces at the root, so neither
+    # can be dropped by a future edit that only looks at one of them -- while below
+    # the root only the every-depth subset applies.
     for reserved in tools._RESERVED_PACKAGE_FILENAMES:
-        assert tool_builder._is_reserved_sidecar_name(reserved) is True
-        assert tool_builder._is_reserved_sidecar_name(f"{reserved}.x.tmp") is True
-    assert tool_builder._is_reserved_sidecar_name("state.json") is False
+        assert tool_builder._is_reserved_sidecar_name(reserved, at_root=True) is True
+        assert tool_builder._is_reserved_sidecar_name(f"{reserved}.x.tmp", at_root=True) is True
+        nested = tool_builder._is_reserved_sidecar_name(reserved, at_root=False)
+        assert nested is (reserved in tools._RESERVED_AT_EVERY_DEPTH)
+    assert tools._STATE_FILENAME not in tools._RESERVED_AT_EVERY_DEPTH
+    assert tool_builder._is_reserved_sidecar_name("state.json", at_root=True) is False
 
 
 def test_strip_builder_sidecars_handles_links_and_directories(tmp_path: Path) -> None:
@@ -1323,6 +1343,102 @@ def test_promote_staging_allows_honest_staging(tmp_path: Path) -> None:
     assert error is None
     assert (base / "kbsearch" / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY
     assert not staging.exists()  # moved, not copied
+
+
+def _honest_staging(base: Path, name: str = "kbsearch", **manifest: Any) -> Path:
+    """A staging directory a promote will accept: real shell, real leaf, valid package."""
+    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
+    staging.mkdir(parents=True)
+    (staging / "tool.json").write_text(
+        json.dumps(_package_manifest(name) | manifest), encoding="utf-8"
+    )
+    (staging / "run.py").write_text(_GOOD_RUN_PY, encoding="utf-8")
+    return staging
+
+
+def test_a_fresh_install_publishes_its_own_state_and_ignores_the_manifests_legacy_key(
+    tmp_path: Path,
+) -> None:
+    """P1R5-3: the BUILDER does not get to set the operator's switch.
+
+    The strip already deletes a state file the session wrote, but the manifest's
+    legacy ``enabled`` key survived it: ``validate_package`` accepts one (a
+    pre-P1 package's manifest carries one, so it must) and the migration fallback
+    reads it. A model emitting an otherwise-perfect ``tool.json`` carrying
+    ``"enabled": false`` therefore installed successfully, reported success, and the
+    tool was listed DISABLED and never offered -- with no mutation API call anywhere
+    in the record.
+
+    The promote now publishes an explicit initial state, so a freshly installed
+    package is never in the fallback's ABSENT case at all. The legacy key is left
+    exactly where it was, inert: rewriting the manifest to tidy it would move the
+    identity this whole phase exists to hold still."""
+    base = tmp_path / "tools"
+    staging = _honest_staging(base, enabled=False)
+
+    assert tool_builder._promote_staging(staging, "kbsearch", base) is None
+
+    installed = base / "kbsearch"
+    assert json.loads(
+        (installed / tools._STATE_FILENAME).read_text(encoding="utf-8")
+    ) == _state_document(True)
+    assert tools.package_enabled(installed) is True
+    # ... and the builder's key is still on disk, saying the opposite and ignored.
+    assert json.loads((installed / "tool.json").read_text(encoding="utf-8"))["enabled"] is False
+
+
+def test_a_legacy_package_still_answers_from_its_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The other half of P1R5-3: the fallback still means what it was written to mean.
+
+    Publishing an initial state at promote narrows the ABSENT case to exactly
+    "installed before web-v5 P1" -- it must not also silence it. A package that
+    never went through this promote keeps reading its manifest's legacy key, in both
+    directions, and still grows no file from being read."""
+    base = tmp_path / "tools"
+    legacy_off = base / "legacy-off"
+    legacy_off.mkdir(parents=True)
+    (legacy_off / "tool.json").write_text(
+        json.dumps(_package_manifest("legacy-off") | {"enabled": False}), encoding="utf-8"
+    )
+    (legacy_off / "run.py").write_text(_GOOD_RUN_PY, encoding="utf-8")
+    _install_settings(monkeypatch, tools_dir=str(base))
+
+    assert tools.package_enabled(legacy_off) is False
+    assert {t["name"]: t["enabled"] for t in tools.list_tools()} == {"legacy-off": False}
+    assert not (legacy_off / tools._STATE_FILENAME).exists()  # the read wrote nothing
+
+
+def test_a_nested_state_file_survives_an_install_while_the_root_one_is_stripped(
+    tmp_path: Path,
+) -> None:
+    """P1R5-2: the reservation is the package ROOT's, because that is all we read.
+
+    A builder may legitimately create its tool's own initial state in a
+    subdirectory -- and verify it with ``run_shell``, which is what makes the old
+    every-depth rule so quiet: the file was deleted at promote, the manifest still
+    validated, the install reported success, and the tool failed on its first real
+    call. Nothing of ours ever opens a path below the package root.
+
+    The ROOT one is still stripped, and that half is load-bearing rather than
+    symmetry: it is the name the promote publishes the operator's initial state at
+    (P1R5-3)."""
+    base = tmp_path / "tools"
+    staging = _honest_staging(base)
+    (staging / "data").mkdir()
+    mine = staging / "data" / tools._STATE_FILENAME
+    mine.write_text("cursor=41\n", encoding="utf-8")  # not even JSON: the tool's own file
+    (staging / tools._STATE_FILENAME).write_text('{"enabled": false}', encoding="utf-8")
+
+    assert tool_builder._promote_staging(staging, "kbsearch", base) is None
+
+    installed = base / "kbsearch"
+    assert (installed / "data" / tools._STATE_FILENAME).read_text(encoding="utf-8") == "cursor=41\n"
+    # The root one the builder wrote was replaced by the backend's own, not honoured.
+    assert json.loads(
+        (installed / tools._STATE_FILENAME).read_text(encoding="utf-8")
+    ) == _state_document(True)
 
 
 def test_cleanup_staging_does_not_follow_a_symlinked_staging(tmp_path: Path) -> None:
@@ -3081,6 +3197,15 @@ def _meta(pkg: Path) -> dict[str, Any]:
     return meta
 
 
+def _state_document(enabled: bool) -> dict[str, Any]:
+    """The document ``tools.write_package_state`` publishes -- ownership marker included.
+
+    From the module's own constants rather than a literal: the marker is what makes
+    the readers treat a file at that name as OURS at all (P1R5-1), so an assertion
+    spelled without it would pass against a file the backend would ignore."""
+    return {tools._STATE_MARKER_KEY: tools._STATE_MARKER_VALUE, "enabled": enabled}
+
+
 def _seed_package(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str = "kbsearch") -> Path:
     """An installed package (no sidecar) with the settings pointed at it."""
     root = tmp_path / "tools"
@@ -4021,7 +4146,7 @@ def test_run_revise_keeps_the_state_file_out_of_staging_but_carries_it_across(
     """R5 both ways: the builder never SEES the state file, and a revise never
     silently re-enables the tool.
 
-    The two halves are one decision. ``.state.json`` is backend-authored, so it is
+    The two halves are one decision. ``.afterthread-state.json`` is backend-authored, so it is
     excluded from the copy -- a session with real shell capability (D21) must not
     be handed the file that decides whether its own tool may run. But the swap
     REPLACES the whole package directory, so excluding it and stopping there would
@@ -4049,9 +4174,9 @@ def test_run_revise_keeps_the_state_file_out_of_staging_but_carries_it_across(
     assert outcome.ok is True
     assert tools._STATE_FILENAME not in seen["staged"]  # the builder never saw it
     assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY  # really revised
-    assert json.loads((pkg / tools._STATE_FILENAME).read_text(encoding="utf-8")) == {
-        "enabled": False
-    }
+    assert json.loads((pkg / tools._STATE_FILENAME).read_text(encoding="utf-8")) == _state_document(
+        False
+    )
     assert {t["name"]: t["enabled"] for t in tools.list_tools()}["kbsearch"] is False
     assert tools.enabled_llm_tools() == []
     # The manifest is not where any of this lives: this fixture's revision changes
@@ -4060,6 +4185,55 @@ def test_run_revise_keeps_the_state_file_out_of_staging_but_carries_it_across(
     # only thing that decided the toggle on either side of the swap.
     assert (pkg / "tool.json").read_bytes() == manifest_before
     assert "enabled" not in json.loads((pkg / "tool.json").read_text(encoding="utf-8"))
+
+
+def test_a_revise_leaves_a_nested_state_file_alone_and_carries_a_foreign_root_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """P1R5-2 and P1R5-1 on the revise path, which is where both were destructive.
+
+    A NESTED file at the reserved name is ordinary package content: it is copied
+    into the workspace like any other file and comes back unchanged, exactly as the
+    nested ``.env`` does (R2-2, whose reasoning this follows).
+
+    A ROOT one that is not OURS -- no ownership marker, so it is the package's own
+    cursor/cache/settings -- is a different problem with the same requirement. It is
+    withheld from the builder like ours would be, and the promote's carry copies it
+    back BYTE-FOR-BYTE instead of publishing a ``{"enabled": ...}`` over it. Before
+    P1R5-1 the first revise of such a package destroyed it, and the toggle it was
+    mistaken for was never the operator's to begin with.
+
+    The toggle for such a package answers from the MANIFEST, which is what
+    ``package_enabled`` reports here -- the file at our name got no vote in either
+    direction."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    root = pkg.parent
+    (pkg / "data").mkdir()
+    nested = b"cursor=41\r\n\x00binary tail"
+    (pkg / "data" / tools._STATE_FILENAME).write_bytes(nested)
+    theirs = b'{"cursor": 41, "enabled": true}\n'
+    (pkg / tools._STATE_FILENAME).write_bytes(theirs)
+    seen: dict[str, set[str]] = {}
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY},
+        side_effect=lambda: seen.update(staged=_tree(_staging_dir(root))),
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY  # really revised
+    # The nested one went THROUGH the workspace; the root one never entered it.
+    assert f"data/{tools._STATE_FILENAME}" in seen["staged"]
+    assert tools._STATE_FILENAME not in seen["staged"]
+    # Both are byte-identical on the other side of the swap.
+    assert (pkg / "data" / tools._STATE_FILENAME).read_bytes() == nested
+    assert (pkg / tools._STATE_FILENAME).read_bytes() == theirs
+    # ... and the foreign file still does not answer the toggle: the manifest does,
+    # and this fixture's manifest has no legacy key, so the default stands.
+    assert tools.package_enabled(pkg) is True
 
 
 def test_run_revise_preserves_the_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -4599,9 +4773,9 @@ def test_a_toggle_that_lands_before_the_swap_is_carried_across_not_reverted(
     assert error is None and origin is None
     assert (installed / "run.py").read_text(encoding="utf-8") == "print('revised')"  # it swapped
     # ... and the operator's LATER intent survived the swap that shipped over it.
-    assert json.loads((installed / tools._STATE_FILENAME).read_text(encoding="utf-8")) == {
-        "enabled": False
-    }
+    assert json.loads(
+        (installed / tools._STATE_FILENAME).read_text(encoding="utf-8")
+    ) == _state_document(False)
     assert {t["name"]: t["enabled"] for t in tools.list_tools()}["kbsearch"] is False
     assert tools.enabled_llm_tools() == []
     assert _leftovers(base) == []
@@ -4670,9 +4844,9 @@ def test_a_toggle_arriving_during_the_swap_waits_for_it_and_still_wins(
     assert not worker.is_alive() and outcome["ok"] is True  # it was blocked, not refused
     assert error is None and origin is None
     assert (installed / "run.py").read_text(encoding="utf-8") == "print('revised')"  # it swapped
-    assert json.loads((installed / tools._STATE_FILENAME).read_text(encoding="utf-8")) == {
-        "enabled": False
-    }
+    assert json.loads(
+        (installed / tools._STATE_FILENAME).read_text(encoding="utf-8")
+    ) == _state_document(False)
     assert _leftovers(base) == []
 
 
@@ -4747,7 +4921,7 @@ def test_promote_replace_refuses_when_the_state_cannot_be_carried(
 def test_a_revise_carries_the_state_files_mode_not_just_its_value(
     tmp_path: Path, live_mode: int | None
 ) -> None:
-    """R1-3: an operator's ``chmod`` on ``.state.json`` survives a revise.
+    """R1-3: an operator's ``chmod`` on ``.afterthread-state.json`` survives a revise.
 
     The publisher preserves an existing file's low-9 mode (R7-3/R11) by inheriting
     it AT THE TARGET -- and the revise's target is STAGING, which has no state file
@@ -4778,7 +4952,7 @@ def test_a_revise_carries_the_state_files_mode_not_just_its_value(
     published = installed / tools._STATE_FILENAME
     assert published.stat().st_mode & 0o777 == (live_mode or tools._OWNER_RW)
     # The VALUE came across too, so this is not a mode test passing on an empty swap.
-    assert json.loads(published.read_text(encoding="utf-8")) == {"enabled": live_mode is None}
+    assert json.loads(published.read_text(encoding="utf-8")) == _state_document(live_mode is None)
 
 
 def test_stale_backup_names_are_minted_and_recognized_by_one_shape(tmp_path: Path) -> None:
@@ -4983,6 +5157,51 @@ def test_promote_replace_defers_after_a_manifest_edit_moved_the_identity(
     assert len([child for child in base.iterdir() if ".stale-" in child.name]) == 1
     tool_builder._sweep_stale_backups(base)
     assert [child.name for child in base.iterdir() if ".stale-" in child.name] == []
+
+
+def test_a_publish_temp_rides_a_renamed_package_into_the_namespace_that_collects_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1R5-4: where the ONE temp file the path-based cleanup cannot reach goes.
+
+    The publisher unlinks its temp on every failure path, but by PATH -- so when the
+    package DIRECTORY is renamed aside between ``mkstemp`` and the publish (a
+    ``delete_tool`` deferring past an in-flight call, a revise swap), the temp goes
+    with the directory and the unlink looks where it no longer is. The docstring
+    used to say a failed write leaves nothing behind, full stop.
+
+    What actually happens is measured here rather than argued: the temp is inside
+    the renamed directory, and the renamed directory is one somebody else collects
+    WHOLE. Both writers rename into the same marked namespace, and the sweep that
+    runs at the end of every tool job ``rmtree``s it with the temp inside. That is
+    why this needs no directory fd: the only way to reach that branch is a rename
+    that has already handed the file to a collector."""
+    base = tmp_path / "tools"
+    pkg = base / "echo"
+    pkg.mkdir(parents=True)
+    real_mkstemp = tempfile.mkstemp
+    moved: dict[str, Path] = {}
+
+    def rename_the_package_aside(*args: Any, **kwargs: Any) -> tuple[int, str]:
+        fd, name = real_mkstemp(*args, **kwargs)
+        deferred = tools._stale_backup_path(base, "echo", uuid4().hex)
+        os.rename(pkg, deferred)  # exactly what delete_tool does when a call is in flight
+        moved["deferred"] = deferred
+        return fd, name
+
+    monkeypatch.setattr(tempfile, "mkstemp", rename_the_package_aside)
+
+    assert tools.write_package_state(pkg, False) is False  # nothing published
+    monkeypatch.undo()
+
+    deferred = moved["deferred"]
+    orphan = [entry.name for entry in deferred.iterdir() if entry.name.endswith(".tmp")]
+    assert orphan == [f"{tools._STATE_FILENAME}.{orphan[0].split('.')[-2]}.tmp"]
+    assert not pkg.exists()  # ... and nothing was left at the package's own path
+
+    tool_builder._sweep_stale_backups(base)  # the end-of-job sweep, unchanged
+    assert not deferred.exists()
+    assert list(base.iterdir()) == []
 
 
 def test_a_promote_landing_while_a_call_prepares_never_runs_the_new_package(

@@ -3,7 +3,7 @@
 沿用 web-v4 的體例：`docs/web-v5-plan.md` 寫**打算**做什麼，本文件寫**為什麼最後
 不是那樣**、以及實作過程中做了哪些計畫沒寫到的判斷。逐階段接續。
 
-## D41（P1）：`enabled` 移出 `tool.json` → 套件層 `.state.json`
+## D41（P1）：`enabled` 移出 `tool.json` → 套件層 `.afterthread-state.json`
 
 ### 這一階段真正在修的東西
 
@@ -41,12 +41,22 @@ package_identity after : (64770, 543698, 1785167009937732790)
 
 ### 讀取優先序與遷移（R1）
 
-`.state.json` 在且讀得出來 ⇒ 權威。**不存在** ⇒ 退回 `tool.json` 既有的可選
+`.afterthread-state.json` 在且讀得出來 ⇒ 權威。**不存在** ⇒ 退回 `tool.json` 既有的可選
 `enabled`（預設 true，與改動前 `_scan_package` 完全一致）。
 
 **那個 fallback 就是遷移的全部**：沒有啟動時的掃描改寫，讀取路徑永遠不寫入
 （測試 `test_a_package_with_no_state_file_falls_back_to_its_manifest` 直接釘住
-「掃完之後兩個套件都還是沒有狀態檔」）。第一次切換才產生 `.state.json`。
+「掃完之後兩個套件都還是沒有狀態檔」）。第一次切換才產生 `.afterthread-state.json`。
+
+> **r5 更正（見下方 r5 附錄 R5-1／R5-3）**：這一節有三處要改。**一**、檔名是
+> `.afterthread-state.json`，而「在且讀得出來」要再加一個條件——**帶著所有權標記**；
+> 讀得出來但沒有標記的檔案**不是我們的**，答案與「不存在」完全相同。**二**、
+> 「那個 fallback 就是遷移的全部」對**絕大多數**既有安裝成立，但對一個**本來就有
+> 同名檔案**的套件不成立：那一包的開關從此按不動（`PATCH` 回 404），要操作者自己
+> 把檔案改名或加上標記。原本記在計畫與 `tool-calling.md` 的「舊安裝不用做任何事」
+> 因此是錯的，兩份都已更正。**三**、`_promote_staging` 現在會在搬檔前**主動寫一份
+> 初始狀態**，所以「第一次切換才產生」只對 r5 之前安裝的套件成立；新安裝從第一天
+> 就有這個檔案，fallback 因此收斂成它本來的意思——「web-v5 P1 之前裝的」。
 
 **刻意不刪 manifest 裡那個已成 legacy 的欄位**：為了整潔改寫 manifest，正好會
 移動這次改動要固定住的那個身分——這是本階段唯一不能犯的錯。所以兩個檔案會長期
@@ -73,6 +83,13 @@ package_identity after : (64770, 543698, 1785167009937732790)
 - **`{}` 與 `{"enabled": "yes"}` 也算讀不出來**：它們對「操作者的意圖」的沉默
   程度和一個被截斷的檔案完全一樣。
 
+> **r5 更正（見下方 r5 附錄 R5-1）**：最後那一項的**例子**換人了，規則本身沒變。
+> 判準現在是「這是不是**我們的**檔案」：`{}` 與 `{"enabled": "yes"}` 都沒有所有權
+> 標記，所以它們現在是 **FOREIGN**（當成沒有狀態檔，退回 manifest），不是
+> unreadable。這一節講的 unreadable 收斂成兩種——**完全讀不到**（非一般檔、拒絕
+> 讀取、超過上限），以及**帶著標記但 `enabled` 不是布林**。後者就是原本那句話講的
+> 那個性質，只是主詞從「任何一個在那裡的檔案」換成「我們自己的那個檔案」。
+
 **修法有兩條，寫進 README 與 tool-calling.md**：再按一次開關（`set_enabled`
 不讀這個檔案，直接覆蓋成乾淨的一份），或自己刪掉該檔案退回 fallback。**誠實的
 殘留**：前端的開關在 `valid=false` 的列上是停用的（既有行為；r2 動了前端那幾個閘，
@@ -86,7 +103,7 @@ package_identity after : (64770, 543698, 1785167009937732790)
 是一百行分別裁決過的細節（R7-3 的權限保留、R11 的 owner 下限、lstat 拒絕
 symlink／非一般檔、fsync、暫存檔清理、R6-2／R6-3 的最後一刻身分比對）；複製一份
 用手維持同步，正是本模組在「一邊寫、另一邊讀」的每個地方都反對的漂移。暫存檔前綴
-改由 `filename` 導出，所以 `.state.json.<x>.tmp` 自動落在同一個保留名域裡。
+改由 `filename` 導出，所以 `.afterthread-state.json.<x>.tmp` 自動落在同一個保留名域裡。
 
 **不帶 `expected_identity`**，理由三條：
 
@@ -122,7 +139,7 @@ symlink／非一般檔、fsync、暫存檔清理、R6-2／R6-3 的最後一刻�
 但它確實拒絕了。身分不再位移之後，那個意外消失，一個被停用的工具會直接**跑起來**
 ——那正是 overall-r7 O7-1 的情境 (a) 原樣復活。
 
-所以 handler 在執行當下**自己讀 `.state.json`** 並拒絕，而且用**自己的字串**：
+所以 handler 在執行當下**自己讀 `.afterthread-state.json`** 並拒絕，而且用**自己的字串**：
 
 ```
 _TOOL_DISABLED_RESULT = "tool not run: this tool was disabled after it was offered"
@@ -142,7 +159,7 @@ _TOOL_DISABLED_RESULT = "tool not run: this tool was disabled after it was offer
 - 更重要的：身分檢查剛剛證明了 `tool.json` **沒有動過**，所以「狀態檔不存在」
   可證地仍然等於 manifest 當初廣告時說的那個值——對一個已被廣告的工具而言就是
   **啟用**。因此 handler **不需要**在這裡重讀 manifest：身分守衛正是讓「只讀
-  `.state.json`」成為完整答案的那個前提。
+  `.afterthread-state.json`」成為完整答案的那個前提。
 
 **這道檢查要放兩個地方，不是一個**（最容易只做一半的地方）。舊的那個「意外」是由
 **`Popen` 前一行**的身分檢查提供的，涵蓋的窗口因此包含 handler 檢查與 `Popen`
@@ -169,12 +186,19 @@ manifest，因為上一行剛證明 manifest 沒動。
 「完全相同」或「`<名稱>` 前綴 + `.tmp` 後綴」，仍 casefold）。`_strip_builder_sidecars`
 與 `_revise_copy_ignore` 都只呼叫那個判別式，所以兩處自動涵蓋。
 
+> **r5 更正（見下方 r5 附錄 R5-2）**：「兩處自動涵蓋」正確，但它涵蓋的**深度**是
+> 錯的。`_STATE_FILENAME` 現在**只保留套件根目錄**那一個，判別式因此多一個必填的
+> keyword-only `at_root`，並改由兩個 tuple 決定：根目錄看
+> `_RESERVED_PACKAGE_FILENAMES`，其他層級看 `_RESERVED_AT_EVERY_DEPTH`（只有
+> `_AI_META_FILENAME`）。理由就是 `_revise_copy_ignore` 自己對巢狀 `.env` 做過的
+> 那條裁決（R2-2）。
+
 **函式名保留 `_is_reserved_sidecar_name`**（即使現在涵蓋兩個檔案）：與
 `_STALE_BACKUP_RE` 保留 "backup" 字眼同一條理由——D40 的附錄指名這些符號，改名
 會讓那些裁決指向不存在的名字，而真正的契約是磁碟上的名字。
 
 **排除之後必須補回來，否則會生出一個新缺陷**（計畫文件沒寫到這一步）：修訂的
-換裝是**整包替換**目錄，所以把 `.state.json` 排除在複製之外、然後什麼都不做的話，
+換裝是**整包替換**目錄，所以把 `.afterthread-state.json` 排除在複製之外、然後什麼都不做的話，
 **每一次修訂都會發佈一個沒有狀態檔的套件**——退回 manifest fallback 讀成「啟用」，
 一次關於分頁的修訂靜默打開了操作者刻意關掉的工具。
 
@@ -257,7 +281,7 @@ rename，全部以毫秒計，而且鎖內**沒有 await、沒有子行程、不
 的開關會正確地落在新套件上。
 
 **它蓋不到什麼，寫明**：這是**行程內**的鎖，與 `_META_LOCK` 同一個等級。第二個
-afterthread 行程共用同一個 tools 目錄、或操作者手改 `.state.json`（D21 明文支援），
+afterthread 行程共用同一個 tools 目錄、或操作者手改 `.afterthread-state.json`（D21 明文支援），
 都不受它序列化——本 app 就是**單一行程**（console script 同時服務 API 與 UI），
 它唯一的並行來源是每條路由都會跳進去的 threadpool，而那正是這把鎖涵蓋的東西。
 
@@ -272,7 +296,7 @@ afterthread 行程共用同一個 tools 目錄、或操作者手改 `.state.json
 
 **這是過渡性的，而且程式碼裡就寫著**（`_STATE_PUBLISH_LOCK` 與
 `carry_package_state` 的註解都標了 TRANSITIONAL）：web-v5 的**目標版面**把
-`.state.json` 放在 `<name>/`、只換 `<name>/versions/<vid>/`，修訂根本不再碰開關的
+`.afterthread-state.json` 放在 `<name>/`、只換 `<name>/versions/<vid>/`，修訂根本不再碰開關的
 檔案，這整個危險在 P2 就不存在。**P2 要做的是刪掉它們，不是繼承它們**——一把活得比
 理由久的鎖，就是下一個 reviewer 的謎題。
 
@@ -309,7 +333,7 @@ D21）。
 #### R1-3：修訂會靜默收窄狀態檔的權限（P3）
 
 發佈器保留既有檔案的低 9 位權限（R7-3／R11 的紀律），但**它是從寫入目標那裡繼承**
-的，而修訂寫進的是 staging——那裡按構造沒有 `.state.json`，於是每一次不相干的修訂
+的，而修訂寫進的是 staging——那裡按構造沒有 `.afterthread-state.json`，於是每一次不相干的修訂
 都把操作者設的 `0640`（讓同群組的行程讀得到）收窄回預設值。同一個理由讓
 README「PATCH 是這個檔案唯一的寫入者」那句話也不成立：修訂的發佈路徑也寫它。
 
@@ -340,11 +364,11 @@ keyword-only 的 `default_mode`（「第一次寫入要用的權限」，正規�
 
 **那句推論自己就寫著它為什麼錯**：那個套件被廣告的時候**並不是**「沒有狀態檔」
 ——它有一個寫著 true 的狀態檔，而那個檔案**後來被刪掉了**。身分檢查證明的是
-`tool.json` 沒動；它不看 `.state.json`，也就對那個檔案被移除一事完全沒有發言權。
+`tool.json` 沒動；它不看 `.afterthread-state.json`，也就對那個檔案被移除一事完全沒有發言權。
 
 **具體序列，每一步都是本階段文件自己教的操作**：一個 P1 之前安裝、`tool.json` 的
-legacy 欄位寫著 `enabled: false` 的套件 → 一次 `PATCH` 把它打開（產生 `.state.json`）
-→ 工具被廣告、handler 建好 → 操作者刪掉 `.state.json`（那正是 R1-2 寫進兩份 README
+legacy 欄位寫著 `enabled: false` 的套件 → 一次 `PATCH` 把它打開（產生 `.afterthread-state.json`）
+→ 工具被廣告、handler 建好 → 操作者刪掉 `.afterthread-state.json`（那正是 R1-2 寫進兩份 README
 的修法之一，也是 D21 明文支援的手改）→ 依 R1 的優先序，有效狀態回到 manifest 的
 `false`，但兩處檢查看到 ABSENT 就放行、子行程照樣啟動。這是一個**穩定狀態**，不是
 check-then-act 的一瞬間：那個對話剩下的每一次呼叫都會跑。
@@ -412,7 +436,7 @@ state.enabled` 冒充 `package_enabled` 重跑上面那個序列 → 回 `'ok'`�
   （`_package_identity(target) != package_identity`），而 `_package_identity` 就是
   `tools.package_identity`＝`tool.json` 的 `(dev, ino, ctime)`；`set_enabled`
   （`tools.py:3672`↓）從頭到尾沒有打開 `tool.json`，只經 `write_package_state`
-  發佈 `.state.json`。身分不可能被切換推走。
+  發佈 `.afterthread-state.json`。身分不可能被切換推走。
 - **開關被修訂還原**：`tools.carry_package_state(target, staging)` 是鎖內 tail 的
   第一句（`tool_builder.py:2254`），讀的是**正式套件**當下的值；落在它之前的切換
   被帶過去。落在 tail 裡的切換擋在 `tools._STATE_PUBLISH_LOCK`
@@ -486,7 +510,7 @@ manifest 工作之前的第一件事，這是刻意的：所有失敗路徑都�
 （三態、ABSENT 底下 legacy 的兩個方向、manifest 三種提不出 legacy 欄位的壞法）
 逐一要求 `_scan_package(d).enabled` 與 `package_enabled(d)` 相同。
 
-**順序才是重點**：`package_enabled` **最後才讀 `.state.json`**。狀態檔存在時它是
+**順序才是重點**：`package_enabled` **最後才讀 `.afterthread-state.json`**。狀態檔存在時它是
 唯一一次讀取；不存在時先取 manifest 當 fallback、**再把狀態檔讀一次**（一次
 ENOENT 的 lstat，約 10 us），所以呼叫端拿到的值與它下一行的動作之間只隔一個比較。
 那次重讀只會讓答案**更新**：`PATCH` 若落在 manifest 讀取那一段，它產生的正是這次
@@ -523,7 +547,7 @@ PRESENT 幾乎就是那次狀態檔讀取本身（65 vs 58 us），兩處合計�
 **符號代價寫明**：`package_enabled` 不再是 `_scan_package` 的一行包裝，所以多了
 一個 `_read_manifest_object`（total reader，所有壞法都回 None，與掃描把它們各自
 變成 `error` 是同一組事實的兩種用途）。`package_enabled` 也自己擋掉 symlink 的
-**套件目錄**，理由與 `_scan_package` 把同一道檢查放第一位一樣：`<link>/.state.json`
+**套件目錄**，理由與 `_scan_package` 把同一道檢查放第一位一樣：`<link>/.afterthread-state.json`
 會跟著連結離開 tools 目錄。它回的是掃描對這種目錄回的同一個答案（預設值），因為
 這是**拒絕去看**而不是判斷——那一列本來就 `valid=false`。
 
@@ -531,7 +555,7 @@ PRESENT 幾乎就是那次狀態檔讀取本身（65 vs 58 us），兩處合計�
 > **錯的守衛**——執行路徑根本不看 `valid`（handler 是套件還正常時建好的）。兩處
 > 的答案在 r4 都改成 `False`。
 
-**窗口本身的量測（`strace` 同一次工具呼叫，數「最後一次碰 `.state.json` 到
+**窗口本身的量測（`strace` 同一次工具呼叫，數「最後一次碰 `.afterthread-state.json` 到
 `vfork` 之間隔了幾個 syscall」）**：
 
 ```
@@ -547,15 +571,15 @@ r2 那 40 個是什麼，值得照抄一段：讀完狀態檔之後還有兩次 
 ```
 lstat(".../tool.json")      ← 身分檢查
 lstat(".../echo")           ← package_enabled 的 symlink 拒絕
-lstat(".../.state.json")    ← 第一次讀（ABSENT）
+lstat(".../.afterthread-state.json")    ← 第一次讀（ABSENT）
 openat(".../tool.json")     ← 取 legacy fallback
-lstat(".../.state.json")    ← 第二次讀：權威，而且是最後一個
+lstat(".../.afterthread-state.json")    ← 第二次讀：權威，而且是最後一個
 vfork(...)                  ← 子行程
 ```
 
 > **r4 更正（見下方 r4 附錄 R4-1）**：這張表與這段尾巴在 r4 之後不成立，而且
 > 「0 個 syscall」原本就**不是**它被當成的那個保證。r4 把身分檢查移到最後，所以
-> 「最後一次碰 `.state.json` → `vfork`」變成 **1 個路徑 syscall**（那次身分
+> 「最後一次碰 `.afterthread-state.json` → `vfork`」變成 **1 個路徑 syscall**（那次身分
 > `lstat`）；而「身分檢查 → `vfork`」則從 6～7 個路徑 syscall 變成 **0 個**。
 > 新的實測尾巴見 r4 附錄。
 
@@ -572,12 +596,12 @@ vfork(...)                  ← 子行程
 
 P1 移除 `set_enabled` 的寫入邊界 containment 重驗，理由記成「發佈器自己的 `lstat`
 結構上就保證了」。**那句話只對一半**：`lstat` 不跟隨**最後一段**（所以 symlink 的
-`.state.json` 確實擋得住），但它跟隨**每一層上層目錄**，而 `mkstemp(dir=…)` 與
+`.afterthread-state.json` 確實擋得住），但它跟隨**每一層上層目錄**，而 `mkstemp(dir=…)` 與
 `os.replace` 也一樣。再加上 `set_enabled` **在取鎖之前**就解析完路徑，而解析出來的
 是一個會在每次 syscall 被重新詮釋的**字串**，那個等待又可能長達一整個修訂尾段——
-於是「套件目錄被改名移開、原位放一個指向別處的 symlink」會讓發佈把 `.state.json`
+於是「套件目錄被改名移開、原位放一個指向別處的 symlink」會讓發佈把 `.afterthread-state.json`
 寫進連結目標，並且回報成功。**實測**：拿掉重驗、在取鎖那一刻置換目錄，
-`set_enabled` 回 `True`，而 `/tmp/…/elsewhere/.state.json` 裡真的躺著
+`set_enabled` 回 `True`，而 `/tmp/…/elsewhere/.afterthread-state.json` 裡真的躺著
 `{"enabled": false}`。
 
 **裁決分兩層，而且要分清楚**：
@@ -633,7 +657,7 @@ README 早就這樣寫，於是 API 自己的契約與 README 對同一條端點
 **實測（跑真的路由）**：FIFO manifest → 200 `{enabled: false, valid: false,
 error: "missing tool.json"}`；過大 → 200 `error: "tool.json is too large"`；
 chmod 000 → 200 `error: "tool.json is not a readable regular file"`；
-`.state.json` 是目錄（發佈失敗）→ 404；不存在的工具 → 404。docstring 改成這份
+`.afterthread-state.json` 是目錄（發佈失敗）→ 404；不存在的工具 → 404。docstring 改成這份
 清單，並寫明「manifest 已不在 404 的理由之列」以免下次又被讀成疏漏。
 
 ### D41 附錄（P1 review r4）：兩道檢查搶同一個名額，而「零 syscall」從來不是新鮮度
@@ -672,7 +696,7 @@ r3 之後的順序是 `_still_the_expected_package` → `package_enabled` → `P
 
 ```
                                     r3（身分在前）   r4（開關在前）
-最後一次碰 .state.json → vfork          6～7 個          1 個（身分 lstat）
+最後一次碰 .afterthread-state.json → vfork          6～7 個          1 個（身分 lstat）
 身分 lstat → vfork                       6～7 個          0 個
 ```
 
@@ -682,9 +706,9 @@ r3 之後的順序是 `_still_the_expected_package` → `package_enabled` → `P
 ```
 PRESENT（有狀態檔）                      ABSENT（沒有，走 fallback）
 lstat(".../echo")        symlink 拒絕    lstat(".../echo")        symlink 拒絕
-lstat(".../.state.json") 讀取器的 lstat  lstat(".../.state.json") ENOENT（第一次）
-openat(".../.state.json")＋fstat/read    openat(".../tool.json")＋fstat/read
-lstat(".../tool.json")   ← 身分檢查      lstat(".../.state.json") ENOENT（權威）
+lstat(".../.afterthread-state.json") 讀取器的 lstat  lstat(".../.afterthread-state.json") ENOENT（第一次）
+openat(".../.afterthread-state.json")＋fstat/read    openat(".../tool.json")＋fstat/read
+lstat(".../tool.json")   ← 身分檢查      lstat(".../.afterthread-state.json") ENOENT（權威）
 vfork(...)                               lstat(".../tool.json")   ← 身分檢查
                                          vfork(...)
 ```
@@ -792,7 +816,198 @@ fallback，或直接送 `PATCH`）。
 
 #### 本輪被駁回的一條
 
-第五條 finding（修訂會吞掉換裝窗口內對 `.state.json` 的手改）**駁回**，理由記在
+第五條 finding（修訂會吞掉換裝窗口內對 `.afterthread-state.json` 的手改）**駁回**，理由記在
 repo 根目錄 `裁決紀錄.md` #9：那段期間對**任何**檔案的手改都會被丟棄（那是「整包
 換掉」的定義），行程內的鎖鎖不住編輯器，而 P2 的版面會讓這個窗口連同過渡性的
 `_STATE_PUBLISH_LOCK` 一起消失。本輪的修改**不觸碰**該行為。
+
+### D41 附錄（P1 review r5）：這個檔案的名字與內容，都不是後端說了算
+
+四條 finding，而且是**同一個錯誤的四張臉**：P1 在一個**它不擁有的目錄**裡宣告了一個
+檔名，然後把每一個叫這個名字的檔案都當成自己的。套件目錄是**工具的**——D21 明文
+說操作者手改套件檔案是支援的行為，而一個工具本來就可能在自己的目錄裡放游標、快取
+或設定檔。P1 之前 `.state.json` 不是保留名，所以「已經有一個」不是假想。
+
+本輪同時把檔名從 `.state.json` 改成 `.afterthread-state.json`，並**就地更新了上面
+每一節的檔名**（這個分支還沒發布，磁碟上不存在舊名字；讓附錄指向一個不存在的檔案
+比改名本身糟）。
+
+#### R5-1：一個不是我們的檔案，被讀成開關、讀成無效、然後被覆蓋掉（P1）
+
+三種傷害，全部無聲：
+
+1. 一個 manifest 寫著 `enabled: false`、而**自己的** `.state.json` 剛好帶著一個為真的
+   `enabled` 的套件，會被**重新廣告並執行**——沒有任何人碰過那個開關；
+2. 一個自己的檔案裡沒有布林 `enabled` 的套件，會翻成 `valid=false` **停止運作**；
+3. 第一次發佈（一次 `PATCH`，或一次修訂的 carry）會把它換成一份光禿禿的
+   `{"enabled": …}`，**摧毀那個工具存在那裡的東西**。
+
+**修法是兩半，缺一不可**：
+
+- **(a) 名字要自己講出它屬於誰**：`.state.json` → `.afterthread-state.json`。這讓
+  碰撞變得**不合情理**，但它證明不了任何事——操作者或未來的工具照樣可以在我們挑的
+  任何名字上建檔案。
+- **(b) 只信任認得出來是自己的那一份**：文件裡的所有權標記
+  `{"afterthread": "tool-state", …}`（`_STATE_MARKER_KEY` / `_STATE_MARKER_VALUE`，
+  發佈器每次都寫）。**這一半才是真正關上危害的那一半**。
+
+**沒有標記的檔案 = ABSENT**，一個字都不多：退回 manifest fallback，與「這個套件從來
+沒有狀態檔」逐字同一個答案。並且**絕不覆蓋**（`set_enabled` 拒絕、回 False → 404）、
+**絕不刪除**（修訂的 carry 改成 `shutil.copy2` 逐位元組帶過換裝）。
+
+**每個消費端各自的答案（四種狀態 × 四個消費端）**：
+
+| 那個名字上的東西 | `_read_enabled_state` | 掃描／清單 | `set_enabled` | 修訂 carry |
+|---|---|---|---|---|
+| 不存在 | ABSENT | manifest fallback | 發佈新檔 | 發佈當下的有效值 |
+| 我們的、讀得出來 | 權威 | 檔案說的值 | 覆蓋 | 發佈當下的有效值 |
+| 我們的、答不出來（有標記但 `enabled` 不是布林；或完全讀不到） | UNREADABLE | `valid=false` ＋ `enabled=false` | 覆蓋（＝R1-2 寫明的修法） | 帶成停用 |
+| **不是我們的**（讀得出來、沒有標記） | FOREIGN | **`valid=true`** ＋ manifest 的值 ＋ `notice` | **拒絕（404）** | **逐位元組複製** |
+
+**幾個刻意的取捨**：
+
+- **FOREIGN 不會讓套件無效**，否則就是傷害 2 換一個入口。它走的是 `_PackageScan`
+  新增的 `notice` 欄，`_listed_row` 在沒有致命 `error` 時把它放進列的 `error` 欄。
+  兩個欄位在**內部**分開，因為 `validate_package` 是用 `error` 當安裝閘的——把一個
+  「什麼都沒壞」的提示折進去，會讓安裝為了一個不影響執行的事實而失敗。
+- **UI 上看不到那句話**（誠實寫明）：前端只在 `valid=false` 的列顯示 `error`
+  （`ToolsPage.jsx`），所以這個 notice 只在 `GET /api/tools` 看得到，以及操作者按下
+  那顆開關時撞到的 404。要讓有效的列也顯示提示，是一個關於**所有**提示的產品決定
+  ——與 R4-4 對「無效列的開關能不能按」的處理同一個形狀，同樣留作建議。
+- **`set_enabled` 為什麼是拒絕而不是「假裝成功」**：讀取端仍然會從 manifest 回答，
+  所以一次「成功」會是一個**可證明沒有生效**的開關。三個選項（照樣覆蓋／假裝成功／
+  拒絕）裡只有拒絕讓「告訴操作者的」與「磁碟上的」一致，而且它把問題送到操作者**正在
+  動手的那一刻**。代價寫明：那一包在操作者把自己的檔案挪開之前，開關按不動。
+- **完全讀不出來的檔案仍然算「我們的」**（fail-closed）。在一個寫著 "afterthread" 的
+  名字上，讀不到內容時把它當成自己的壞檔案，是唯一不會意外開啟工具的讀法，也讓 R2
+  與 R1-2 的裁決原封不動。**反方向的殘留寫明**：一次把標記也一起毀掉的手改或磁碟
+  損壞會落進 FOREIGN，於是退回 manifest——而 manifest 多半是開啟。這是「不認得的
+  檔案絕不當成自己的」買來的代價，而 (a) 讓它不合情理。
+- **修訂的代價**：一個名字被佔住的套件沒有地方放我們的開關，所以它的有效狀態由
+  **manifest** 決定，而 manifest 正是修訂會重寫的東西——一次修訂因此可能改變那一包的
+  開關。這與「手改那個 legacy 欄位」是同一件事，寫在 `carry_package_state` 裡。
+- **FOREIGN 的判定上限就是 `_STATE_MAX_BYTES`**（4 KiB），所以 carry 那次 `copy2`
+  是有界的，`_STATE_PUBLISH_LOCK` 裡不會跑進一個無上限的複製。超過上限的檔案落在
+  UNREADABLE，也就是說**它會被一次修訂換掉**——這是為了守住鎖的有界性刻意接受的
+  殘留（我們的檔案約 50 位元組，上限是它的 80 倍）。
+
+**執行路徑的代價（本機 ext4 實測，best of 7×2000，與 r3 附錄同一個方法）**：
+
+```
+ABSENT（從未切換過）                 92.5 us   （r3 記的是 95 us）
+我們的、讀得出來                     63.4 us   （r3 記的是 65 us）
+UNREADABLE（超過上限）               52.1 us   （r3 記的是 70 us）
+FOREIGN（工具自己的檔案）           167.9 us   ← 本輪新增的形狀
+```
+
+前三種**沒有回歸**（標記比對是一次 dict 查找，三個常數答案改成模組層單例，
+所以連配置都省掉了）。FOREIGN 貴是因為它是唯一要付**兩次真正 open** 的形狀：
+第一次讀出「這不是我們的」，然後取 manifest fallback，最後依「狀態檔最後才讀」
+的規則**再讀一次**。兩處執行前檢查合計約 0.34 ms，約佔一次最小工具呼叫
+（37.6 ms）的 **0.9%**——只有名字被佔住的那些套件會付，而那第二次讀不能省：
+它正是「操作者把自己的檔案挪開、按下開關」在這一瞬間會被看見的機制。
+
+**測試**：`test_a_foreign_file_at_the_state_files_name_is_answered_as_absent`（六種
+內容 × 掃描／清單／廣告／執行，並在前後比對位元組）、
+`test_set_enabled_refuses_rather_than_destroying_a_foreign_state_file`（拒絕、檔案
+不變、沒有暫存檔殘留，而且操作者把檔案挪開之後一切如常）、
+`test_a_revise_leaves_a_nested_state_file_alone_and_carries_a_foreign_root_one`。
+帶標記的檔案「與今天完全相同」由既有那一整批釘住（fixture 改用 `_state_document`）。
+
+#### R5-2：保留名域縮到根目錄——沿用本模組自己對巢狀 `.env` 的裁決（P2）
+
+`_strip_builder_sidecars` 與 `_revise_copy_ignore` 在**每一個深度**比對這個 basename，
+而 runtime **只讀根目錄那一個**。於是一個 builder 把工具的初始狀態寫在
+`data/.state.json`、還用 `run_shell` 驗過能跑，promote 卻把它靜默刪掉：manifest 照樣
+通過驗證、安裝照樣回報成功，工具在**第一次真的被呼叫**時才壞掉。修訂則是在 builder
+看到工作區之前就把同一個檔案丟掉。
+
+**裁決：只保留根目錄那一個**，理由不是新的——`_revise_copy_ignore` 早就對巢狀 `.env`
+做過**逐字同一個**裁決（R2-2：根目錄那個是後端的，巢狀的是普通套件內容，工具以套件
+目錄為 cwd，大可自己打開它）。判別式因此多一個**必填 keyword-only** 的 `at_root`
+（預設值會變成一個等著被忘記的錯誤分支，同 `_is_preserved_env_name` 的 `exact_present`），
+根目錄查 `_RESERVED_PACKAGE_FILENAMES`、其他層級查 `_RESERVED_AT_EVERY_DEPTH`。
+系統提示的兩處（安裝的套件契約、修訂的三件事）都加上了這條規則，並明說巢狀的同名
+檔案是它自己的。
+
+**根目錄那一個仍然無條件剷除**，這半是承重的：它是 R5-3 發佈初始狀態的位置，而一個
+被允許佔住根目錄名字的 builder 可以讓開關**按不動**，然後由它自己寫的 manifest 決定
+那個值——正是 R5-3 要擋的東西換一條路進來。
+
+**`.ai_meta.json` 維持各層級，本輪不動**（spec 明文），而**同一條論證對它是否成立，
+作為建議寫在這裡**：**不完全成立，因此建議維持現狀**。狀態檔的論證是「後端從不看
+根目錄以下」，這對 sidecar 也成立（`read_tool_meta` 只讀根）；但 sidecar 的每層級規則
+另有一個與「會不會被讀到」無關的理由——一個巢狀副本會讓**之後每一次修訂**都被
+`validate_package` 的 embedded-secret 閘擋下，錯誤訊息指著一個操作者從沒寫過的檔案
+（`_strip_builder_sidecars` 的 docstring 原文）。那個理由不隨本輪的改動消失，所以
+兩個檔案的深度**本來就該不同**，這不是遺漏。若日後要重看，該一起裁決的是那個閘的
+訊息，而不是保留名域。
+
+**測試**：`test_strip_builder_sidecars_covers_the_state_file_namespace`（根目錄剷除、
+巢狀保留，並直接對兩個 tuple 斷言）、
+`test_a_nested_state_file_survives_an_install_while_the_root_one_is_stripped`、
+`test_a_revise_leaves_a_nested_state_file_alone_and_carries_a_foreign_root_one`。
+
+#### R5-3：新安裝仍然可以透過 manifest 的 legacy 欄位自己設開關（P2）
+
+fresh promote 會剷掉 builder 寫的狀態檔，但對 `tool.json` 的 legacy `enabled`
+**什麼都沒做**，而 `validate_package` 接受它（舊套件的 manifest 本來就帶著它，所以
+非接受不可），遷移 fallback 又會讀它。於是一個模型只要生出一個其他方面完全合格、
+但帶著 `"enabled": false` 的 manifest，安裝就會**成功**、回報成功，而那個工具**裝好
+就是停用的、從來沒被端給模型**——builder 決定了操作者的開關，正是這整個保留名域
+存在要防的事。
+
+**裁決：讓 fallback 只服務真正的既有安裝**——`_promote_staging` 在**搬檔之前**、
+注入表單秘密的下一行，把 `{"afterthread": "tool-state", "enabled": true}` 發佈進
+staging。新安裝從此**不會落在 ABSENT 這一格**，fallback 因此收斂成它本來的意思：
+「web-v5 P1 之前裝的」。
+
+**`true` 是無條件的**：新裝的工具會被端給模型是本 app 的既定預設，而重點就是
+**builder 沒有投票權**。操作者要關就自己關，而且現在關得掉——檔案已經在那裡了。
+
+**寫入失敗怎麼辦**：`_ERROR_INSTALL_STATE_WRITE`（「無法寫入工具的啟用狀態，安裝已
+取消。」）。**這不會把一次已經成功的安裝變成失敗**：寫入落在 staging、在 `shutil.move`
+**之前**，所以失敗當下什麼都還沒安裝，「已取消」是實話——與同一個函式上方
+`_inject_secret_into_env` 的失敗處理逐字同一個形狀（那也是驗證之後、搬檔之前的一次
+後端自有寫入）。**不取鎖**：那時還沒有任何名字可以被 `PATCH`。
+
+**兩個沒選的方案，理由寫明**：**拒絕**帶 legacy 欄位的 manifest 會為了一個模型的
+小毛病失敗掉一次安裝，而操作者根本不是那個 manifest 的作者；**在 promote 時把欄位
+剷掉**會改寫 manifest，而不改寫 manifest 正是這一階段的全部（R1）。留著它、忽略它，
+與一次開關之後的處置完全一致。
+
+**測試**：`test_a_fresh_install_publishes_its_own_state_and_ignores_the_manifests_legacy_key`
+（manifest 寫著 false，裝完是 true，而那個欄位原封不動留在磁碟上）、
+`test_a_legacy_package_still_answers_from_its_manifest`（沒走過這條 promote 的套件
+兩個方向都照 manifest 讀，而且讀完仍然沒有狀態檔）。
+
+#### R5-4：原子發佈的暫存檔清理追不上一次目錄改名——量測之後只改敘述（P3）
+
+`_write_package_file_atomic` 只留著暫存檔的**路徑名**，所以套件目錄在 `mkstemp` 與
+發佈之間被改名移開時，`os.replace` 失敗、接著的 `os.unlink(tmp_path)` 看的是一個已經
+不在那裡的路徑。發佈器宣稱的「每一條失敗路徑都會 unlink 暫存檔，失敗的寫入不會在
+套件裡留下任何東西」因此講得太滿。
+
+**先量測，不推論**（本機 ext4，從 `mkstemp` 內部發動改名）：
+
+```
+(a) delete_tool 因執行中而延後 → 暫存檔在 .<name>.stale-<token>/ 裡
+      publish=False，套件原路徑不存在，改名後的目錄內有 .afterthread-state.json.<x>.tmp
+      跑一次 _sweep_stale_backups → 該目錄整個消失，tools 目錄乾淨
+(b) 修訂換裝失敗並回滾（改名走、又改回來）→ publish=True，暫存檔不存在
+      （路徑在 os.replace 時又解析回同一個目錄，發佈直接成功）
+(c) 修訂換裝成功 → 暫存檔在 .bak-<token>/ 裡，promote 隨即 rmtree 掉整個備份
+```
+
+**結論：殘留已經被收走了**，所以程式不動，只把敘述改對——暫存檔**跟著目錄走**，由
+**收走那個目錄的人**收走。兩個會把套件目錄改名移開的行為者都改進同一個有標記的
+命名空間，而 `_sweep_stale_backups`（每個工具工作結尾）`rmtree` 整個目錄。**不加
+目錄 fd**：要走到那條分支，唯一的辦法是一次已經把檔案交給收集者的改名。
+
+**真正還在的殘留寫明**：`_ERROR_REVISE_UNRECOVERABLE` 留下的 `.bak-` 目錄——清掃
+**刻意**不碰它（那是操作者僅存的一份工具副本）。那裡面的一個暫存檔是一個 dot-file
+垃圾，躺在一個操作者本來就要手動處理的目錄裡。
+
+**測試**：`test_a_publish_temp_rides_a_renamed_package_into_the_namespace_that_collects_it`
+（從 `mkstemp` 內部改名，斷言暫存檔在改名後的目錄裡、套件原路徑什麼都沒留下，然後
+一次既有的清掃把它連同目錄收走）。

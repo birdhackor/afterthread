@@ -1426,7 +1426,7 @@ def test_an_enabled_toggle_during_the_generation_now_costs_nothing_at_all(
     operator's instructions, which are captured nowhere else in the system.
 
     web-v5 P1 removes the mechanism rather than the instance: a toggle writes
-    ``.state.json`` and leaves the manifest byte-identical, so the identity the
+    ``.afterthread-state.json`` and leaves the manifest byte-identical, so the identity the
     hook is holding does not move, the guard has nothing to refuse, and the FULL
     sidecar lands. r8's early write stays exactly where it is -- it closes the same
     window against a genuine mid-round-trip REPLACEMENT, which still moves the
