@@ -3014,6 +3014,9 @@ def test_router_job_status_and_404(client: TestClient) -> None:
         "tool_name": "kb",
         "summary": "done",
         "llm_log_id": 3,
+        # The id's id SPACE, stamped by the route because the job table cannot
+        # outlive it (R9-1; see the token's own tests in test_llm_log).
+        "llm_log_process": llm_log.process_token(),
     }
 
     missing = client.get("/api/tools/jobs/ghost")

@@ -2178,3 +2178,124 @@ check-then-act 的一瞬間。
   重構，一次對 alias 發動的修訂就會讀到真包內容、整包走完一整場 builder session，最後才在換裝
   的 symlink 閘被拒——一次付了全額又丟掉的修訂，外加把「以名字操作卻打到另一個套件」的語意
   搬回來。
+
+### D40 附錄（overall review r9 O9-1）：工作卡片上的日誌 id 也要記得它是哪一個行程的
+
+O2-2 讓**側檔**存下 `llm_log_process`，因為檔案活得比行程久。工作表不會——後端重啟之後
+每個 job id 都是 404——但**瀏覽器分頁會**：`工具` 頁在工作終局後就停止輪詢
+（`toolJobQueryEnabled`），那份回應無限期留在 react-query 快取裡。於是一個跨過重啟的分頁
+照樣渲染那張結果卡片，「查看 AI 日誌」照樣連到 `?log=<id>`，而 `deepLinkTarget` 會在**新
+行程**的清單裡找到同一個編號、判定 `in-list`、把它當成 builder 軌跡展開。既有的
+`started_at` 過期守衛救不了（深連結是**用那個 id 去選那一列**的，詳情與該列自洽），而
+「編號會被重新配發」的提醒只寫在 **off-list** 卡片上，最常見的 in-list 路徑一個字都沒說。
+**後端自己偵測不到**：重啟會把工作表一起帶走，所以後端從來不會**送出**一個陳舊的 id——
+陳舊的值只存在前端快取裡。
+
+**裁決：連結自己帶著「我是哪一個行程鑄的」，由 AI 日誌頁對照當前 token。**
+
+- **工作那一半在路由蓋章，不存進 job**（`routers/tools.tool_job_status`）：工作表是行程內
+  記憶體，與 ring 及其計數器同生共死，所以**還答得出來的工作，它的 `llm_log_id` 必然是本
+  行程鑄的**——這是結構性的，不是約定。側檔需要把 token 寫進檔案，是因為**檔案**活得比
+  行程久；工作沒有那個問題。兩邊維持**同一條「沒有 id 就沒有 token」**規則，所以兩個欄位
+  不可能對「有沒有可背書的連結」給出不一致的答案。（`tool_builder` 一個字都沒動。）
+- **當前 token 放在清單回應的信封上**（`LlmLogListResponse.process_token`），不是列上、也
+  不是詳情上。三個理由同向：(a) 它是**回答這次請求的行程**的性質，不是任何一筆紀錄的欄位，
+  而 `LlmLogBase` 是 per-record 的形狀（放上去等於 50 份同一個字串）；(b) 清單是這一頁在
+  判斷深連結**之前**就會拿到的那個回應，而詳情是**按列延後**抓的——in-list 那條路要先展開
+  才問得到，正好晚在需要它的那一刻之後；(c) 「清單還沒回來就不下判斷」是 O6-4 既有的規則，
+  token 與清單同時到達，等於免費沿用它。
+- **拒絕就是拒絕，不改成「照開但加警語」**：id 在新行程的清單裡**找得到**才是這條 finding
+  的危險所在，所以 `deepLinkTarget` 在查清單**之前**先問 token，不符就回新的 `foreign`，
+  頁面**不展開任何列**，改在清單上方放一張卡片。文案與形狀**沿用 off-list 卡片終局那一支**
+  （灰色 Alert、標題是編號、沒有重試鍵——這是結局不是失敗），並直接重用它既有的「編號在
+  後端重啟後會從頭重新配發」那句話；token 讓我們能把那句話從「可能」講成「就是」。
+- **Accordion 的初值改成推導**：舊寫法在 mount 時就把 `openValue` 設成連結的 id（那時清單與
+  token 都還沒到），所以列一出現就會展開。現在 state 的初值是 `undefined`＝「操作者還沒碰
+  過」，畫面上的值由 `in-list` 才給的推導值決定；使用者第一次點擊（或關閉，Mantine 會回報
+  `null`）就接管。這不是風格：一個 foreign 連結**必須**開不了那一列，而使用者**必須**仍能
+  自己手動展開同一列——那一列在這個行程裡是一筆正當的紀錄。
+- **沒有帶 token 的連結維持原本行為**，這是**刻意**的，不是漏掉：全系統唯一不帶 token 的
+  連結是 `工具` 頁**總結面板**那一條，而它的 id 由後端在**回應當下**就過濾過（O2-2：非本
+  行程一律 `null`），所以它從來提不出主張、也不需要提。把「沒有主張」讀成「來自舊行程」會
+  做兩件錯事：讓一條後端剛剛背書過的連結變成拒絕，以及對使用者自己存下來的網址**宣稱一件
+  我們並不知道的事**（r6 的規則：不要主張程式碼給不出的保證）。
+- **誠實寫下的殘留**：`ToolSummaryDetail` 那條連結的 id 也可能在**前端快取**裡跨過重啟
+  （面板已展開、拿著舊回應、還沒成功重抓）。它與工作卡片**不同級**：面板的查詢沒有被停用，
+  任何一次成功的重抓都會把 id 換成 `null`，所以它會**自癒**且窗口只有那一瞬；工作卡片則是
+  永久的。要把它一併關掉得替 `ToolSummaryDetail` 也加一個 token 欄位——那是 O2-2 明文權衡
+  過的形狀（四個全可為 null 的欄位、null 就是「沒有可連的紀錄」），為一個自癒的窗口翻案
+  不划算。若日後那條連結也開始被快取消費（或 O2-2 的形狀因別的理由變動），這是該一起收斂
+  的地方。
+- **測試覆蓋要誠實**：純邏輯（`logLinkSearch`／`deepLinkTarget`）抽進
+  `utils/toolSummary.js` 並以 vitest 釘住五種情況（相符展開、外來拒絕且與是否在清單裡無關、
+  清單未到不下判斷、沒有主張照舊、token 被 search parser 轉成數字仍以字串比對）。**沒有**
+  覆蓋到的是元件層：卡片本身的渲染、以及 Accordion 推導值的接管行為——本專案的 vitest 跑在
+  node、沒有 jsdom（見 `frontend/README.md`），元件不 render。深連結參數的傳遞則是**實測**
+  的，不是推論：對安裝版 `@tanstack/react-router` 1.170.17 跑過
+  `buildLocation({to:"/llm-logs", search:{log:9, logProcess:"cafe"}})` → `/llm-logs?log=9&logProcess=cafe`，
+  以及一次 memory-history 匹配 → `match.search` 同時含 `log` 與 `logProcess`（route 的
+  `validateSearch` 只**合併**，不剔除未宣告的鍵）。
+
+### D40 附錄（overall review r9 O9-2）：一列要描述**一個**套件實例
+
+R7-1 修的是 `enabled_llm_tools` 的「規格與身分要在同一個操作裡拍下來」；**清單**是同一個
+形狀的另一半，而 r7 的範圍是執行路徑，所以漏了：`_scan_all()` 先把每一包掃完，接著 comprehension
+才**照路徑**呼叫 `_listed_summary_status(scan.directory)`——完全不看掃描已經捕捉到的身分。
+一次修訂換裝落在兩次讀之間，那一列就會帶著 A 的 `description`／`enabled`／`valid` 配上 B 的
+`summary_status`。
+
+**比「整列過期」更糟的理由**：前端用 name＋description 導出 `toolInstanceKey`，所以一列仍顯示
+A 的 description 就會讓面板**不 remount**、查詢鍵不變，而它旁邊的徽章講的是 B。手上有一段還沒
+送出的、寫給 A 的修訂意見的操作者，看不到任何東西改變，然後把它當成 B 的修訂送出去。這**不是**
+裁決紀錄 #7：那條的兩個 description **逐位元組相同**、歧義無法消除；這裡兩者**不同**，而撕裂的
+那一列正是讓人看不出差別的原因。
+
+**裁決：在清單這一側配對，用掃描已經有的身分重驗。**
+
+- **為什麼不是「把 sidecar 讀進 `_scan_package`」**：`enabled_llm_tools` 與清單**共用**
+  `_scan_package`，而它在**每一次** capture／enrich／assist-update 都會掃過每一包。把讀搬進去
+  等於讓每一次 AI 請求為一個它從不看的欄位多付每包一次檔案讀取；加旗標則讓「掃描是一個操作」
+  只在部分呼叫成立。**量測（不是估計）**：5 包、同一個 tmp 樹，`enabled_llm_tools` 修法前後
+  都是 185 次 `lstat`／5 次有界讀取（**一模一樣**）；`list_tools` 從 190／10 變成 195／10
+  ——每一列多一次 `lstat`（就是那道重驗），讀取次數不變。
+- **配對的判準**：身分是 `_scan_package` 在 manifest 讀取**上一行**取的（R7-1 的順序原封不動），
+  在 sidecar 讀完之後再問一次 `_still_the_expected_package`。沒動過，就代表兩次讀都落在同一個
+  實例上。不符就**把那一包重掃一次**、兩次讀重來，所以換裝落在清單中途時那一列是**完整的 B**
+  （現在佔著這個名字的那一包），絕不會是 A 的 manifest 配 B 的徽章。
+- **配不起來的兩種掃描直接放行**：`scan.identity` 在**每一個 invalid 掃描**上都是 None（慣例，
+  R7-1），alias 那一列也在其中（它的狀態由 `_listed_summary_status` 不讀任何檔案就決定）；還有
+  「valid 但 lstat 失敗」那一種，`_make_handler` 本來就會拒絕執行它。兩者都沒有身分可配，重掃
+  也變不出來，所以只會空轉。它們的列與這個函式出現之前一模一樣。
+- **重試有上限，用盡就只降級那一個欄位**：`_LISTING_SCAN_ATTEMPTS = 3`（第一次答完所有正常情況、
+  第二次給這條 finding 的換裝、第三次給落在重試裡的換裝）。無上限的重試會把一個 hang 放在整個
+  `工具` 頁等待的那一個請求上。用盡時 `summary_status` 回 `None`——與「沒有／讀不懂 sidecar」
+  **同一個既有答案**，不另立詞彙——而其餘五個欄位仍出自同一次掃描，所以那一列仍然只描述一個實例。
+- **可證的量測**：把重驗關掉，`test_list_tools_row_describes_one_instance_when_a_promote_lands_mid_row`
+  當場拿到 `("test tool", "final")`——**A 的說明配 B 的徽章**，正是這條 finding 的形狀；
+  `test_list_tools_reports_no_status_when_the_two_reads_never_agree` 則拿到 `"final"`。窗口是**從
+  掃描內部驅動**的（沿用 r6／r7／r8 的手法），不是靠賽跑執行緒。
+
+### D40 附錄（overall review r9 O9-3）：佔位側檔只能蓋這次呼叫自己跑出來的 id
+
+`_generate_summary` 先在 threadpool 把提示組出來（fail-closed 遮蔽器、`.env` 解析、走遍整包
+檔案），**之後**才呼叫 `generate_structured`——而 session 是在後者才建立的。呼叫端的
+`except Exception` 兩半都包，卻無條件用 `llm_log.last_record_id_for_workflow(_SUMMARY_WORKFLOW)`
+蓋章。失敗發生在**前半段**時，這次呼叫根本沒有 session，那個讀數就是**上一次總結 session**
+的 id——屬於上一個被總結的工具。於是工具 X 的軌跡被當成工具 Y 的失敗軌跡呈現在 UI 上。既有的
+「提示組建失敗」測試讓 provider 一直壞著，連佔位都寫不進去，所以這條路一直沒有覆蓋。
+
+**裁決：把 generation **之前**的讀數留下來，讀數沒變就等於「沒有我的 session」→ None。**
+
+- **不去改 `generate_structured` 的契約**：`last_record_id_for_workflow` 的 docstring 已經明文
+  裁定過，為單一消費者把 log id 穿回那個「每個 workflow 與每個測試都建構在上面」的邊界不划算
+  ——而這裡正是同一個消費者提同一個要求。
+- **`None` 不需要新詞彙**：側檔本來就寫得下 `null` 的 `llm_log_id`，前端本來就是
+  `!= null` 才渲染那條連結（O2-2 已經確立）。
+- **原樣繼承既有的不精確**：一次**併發**的總結 session 在這個窗口內完成，讀數就會變、它的 id
+  就是失敗佔位蓋上的那一個。那正是裁決紀錄 #3 寫下的已接受最壞情況（單人本機工具、同一個
+  workflow、相鄰一次的除錯連結），而且嚴格優於它取代的舊行為——舊行為連的是一場在這次呼叫
+  **開始之前就已經結束**的 session。
+- **可證的量測**：把 `_summary_session_log_id` 換回原本的直接讀取，
+  `test_placeholder_carries_no_log_id_when_the_prompt_build_failed` 當場拿到 `1`——ring 裡那筆
+  「別的工具的總結」。另一半（失敗發生在 LLM 呼叫**之內**時仍連到它自己那一場）由
+  `test_placeholder_carries_its_own_session_when_the_llm_call_failed` 釘住，成功路徑不動。

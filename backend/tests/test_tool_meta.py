@@ -807,6 +807,89 @@ def test_generate_and_store_summary_writes_placeholder_when_no_sidecar_yet(
     assert meta["llm_log_id"] is not None
 
 
+def _seed_previous_summary_session() -> int:
+    """A finished ``tool_summary`` record for SOME OTHER tool, in the ring.
+
+    The placeholder path stamps ``last_record_id_for_workflow("tool_summary")``,
+    so without a previous record of that workflow the two failure modes (stamping
+    my own session vs. stamping whatever was newest) are indistinguishable: both
+    would be None. This is the previous tool's trace a regression would borrow.
+    """
+    recorder = llm_log.LlmInteractionRecorder(workflow="tool_summary", model="m")
+    recorder.begin_attempt([{"role": "user", "content": "summarize the OTHER tool"}])
+    recorder.record_response("the other tool's summary")
+    recorder.finish(outcome="ok", error=None)
+    previous = llm_log.last_record_id_for_workflow("tool_summary")
+    assert previous is not None
+    return previous
+
+
+def test_placeholder_carries_no_log_id_when_the_prompt_build_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R9-3: a failure BEFORE any session started stamps None, not the last one.
+
+    ``_generate_summary`` builds its prompt first -- the fail-closed redactor, the
+    ``.env`` parse, a walk over every file in the package -- and only then calls
+    ``generate_structured``, which is what opens a session. A failure in that
+    first half leaves the workflow's newest record exactly as it was: the
+    PREVIOUS summary session, belonging to whatever tool was summarized last. The
+    caller's ``except`` covers both halves and used to stamp that id onto this
+    tool's placeholder, so the UI offered another tool's full prompt/response as
+    this one's failure trace.
+
+    The failure is spelled as the prompt builder raising, which is the same shape
+    the fail-closed redactor produces (see the existing prompt-building test) but
+    leaves the SIDECAR writer working -- that test keeps the secret provider down,
+    so no placeholder is written at all and this path stayed uncovered."""
+    root = tmp_path / "tools"
+    pkg = _package(root)
+    _summary_settings(monkeypatch, root)
+    previous = _seed_previous_summary_session()
+
+    def boom(*args: Any, **kwargs: Any) -> str:
+        raise RuntimeError("prompt build failed")
+
+    async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the prompt never got built, so no session may start")
+
+    monkeypatch.setattr(tool_meta, "_summary_user_prompt", boom)
+    monkeypatch.setattr("afterthread.services.tool_meta.generate_structured", must_not_generate)
+
+    asyncio.run(generate_and_store_summary("kbsearch", origin={"instructions": "查 KB"}))
+
+    meta = tools.read_tool_meta(pkg)
+    assert meta is not None
+    assert meta["summary"] == ""  # the placeholder really was written ...
+    assert meta["origin"] == {"openapi_url": None, "instructions": "查 KB"}
+    assert meta["llm_log_id"] is None  # ... with no trace, rather than someone else's
+    # The other tool's record is still the workflow's newest, so a regression
+    # here borrows THAT id visibly rather than silently having nothing to take.
+    assert llm_log.last_record_id_for_workflow("tool_summary") == previous
+
+
+def test_placeholder_carries_its_own_session_when_the_llm_call_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The other side of the same rule: a session that DID start is linked.
+
+    A failure raised from the LLM call has a record of its own -- created by
+    ``generate_structured`` before it raises -- so the placeholder stamps that,
+    not None and not the previous tool's."""
+    root = tmp_path / "tools"
+    pkg = _package(root)
+    _summary_settings(monkeypatch, root)
+    previous = _seed_previous_summary_session()
+    _fake_generate(monkeypatch, explode=LLMUpstreamError("Timeout: slow"))
+
+    asyncio.run(generate_and_store_summary("kbsearch", origin={"instructions": "查 KB"}))
+
+    meta = tools.read_tool_meta(pkg)
+    assert meta is not None
+    assert meta["llm_log_id"] == llm_log.last_record_id_for_workflow("tool_summary")
+    assert meta["llm_log_id"] != previous  # this call's own session, not the older one
+
+
 def test_generate_and_store_summary_never_clobbers_a_good_summary(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

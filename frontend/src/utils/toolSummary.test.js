@@ -3,6 +3,8 @@ import {
 	canFinalizeSummary,
 	claimLatestSummaryWrite,
 	createSummaryWriteLedger,
+	deepLinkTarget,
+	logLinkSearch,
 	nextSummaryWriteStamp,
 	ownSummaryBusy,
 	patchToolRowSummaryStatus,
@@ -440,5 +442,141 @@ describe("summaryErrorRevalidates", () => {
 		expect(
 			summaryErrorRevalidates({ status: 400, code: "tool_finalized" }),
 		).toBe(false);
+	});
+});
+
+describe("logLinkSearch", () => {
+	it("emits no ?log= at all without an id", () => {
+		// The null-id case is a plain jump to the page, unchanged: a job whose
+		// session never started has nothing to point at.
+		expect(logLinkSearch(null, "tok")).toEqual({});
+		expect(logLinkSearch(undefined, undefined)).toEqual({});
+	});
+
+	it("carries the id's process alongside it when the caller knows it", () => {
+		expect(logLinkSearch(7, "abc123")).toEqual({
+			log: 7,
+			logProcess: "abc123",
+		});
+	});
+
+	it("leaves a bare ?log= when there is no process to claim", () => {
+		// The summary panel's link: its id is re-filtered against the answering
+		// process on every read (backend routers/tools._summary_detail), so it
+		// makes no claim and is resolved the way it always was.
+		expect(logLinkSearch(7, null)).toEqual({ log: 7 });
+		expect(logLinkSearch(7, undefined)).toEqual({ log: 7 });
+	});
+});
+
+describe("deepLinkTarget", () => {
+	const logs = [{ id: 7 }, { id: 6 }];
+	const token = "process-a";
+
+	it("decides nothing before the list (and its token) have landed", () => {
+		expect(
+			deepLinkTarget({
+				logId: 7,
+				logProcess: "process-b",
+				logs: [],
+				listLoaded: false,
+				processToken: undefined,
+			}),
+		).toEqual({ mode: "none", value: "7" });
+		expect(
+			deepLinkTarget({
+				logId: null,
+				logProcess: null,
+				logs,
+				listLoaded: true,
+				processToken: token,
+			}),
+		).toEqual({ mode: "none", value: null });
+	});
+
+	it("opens the row when the link's process is this one", () => {
+		expect(
+			deepLinkTarget({
+				logId: 7,
+				logProcess: token,
+				logs,
+				listLoaded: true,
+				processToken: token,
+			}),
+		).toEqual({ mode: "in-list", value: "7" });
+		// Off-list is still off-list, not foreign: the claim matches, the record
+		// is merely older than this page.
+		expect(
+			deepLinkTarget({
+				logId: 3,
+				logProcess: token,
+				logs,
+				listLoaded: true,
+				processToken: token,
+			}),
+		).toEqual({ mode: "off-list", value: "3" });
+	});
+
+	it("refuses a link minted by a previous backend run, id in the list or not", () => {
+		// The whole point: id 7 IS on this page, and that is exactly what made the
+		// misresolution silent -- the row and its detail agree with each other.
+		expect(
+			deepLinkTarget({
+				logId: 7,
+				logProcess: "process-b",
+				logs,
+				listLoaded: true,
+				processToken: token,
+			}),
+		).toEqual({ mode: "foreign", value: "7" });
+		expect(
+			deepLinkTarget({
+				logId: 3,
+				logProcess: "process-b",
+				logs,
+				listLoaded: true,
+				processToken: token,
+			}),
+		).toEqual({ mode: "foreign", value: "3" });
+	});
+
+	it("compares the claim as text, whatever the search parser made of it", () => {
+		// The router coerces an all-digit search value to a Number (measured
+		// against the installed @tanstack/react-router), so both sides are
+		// stringified -- and a token that did NOT survive that round trip
+		// intact falls on the refusing side.
+		expect(
+			deepLinkTarget({
+				logId: 7,
+				logProcess: 12345,
+				logs,
+				listLoaded: true,
+				processToken: "12345",
+			}),
+		).toEqual({ mode: "in-list", value: "7" });
+	});
+
+	it("resolves a link that makes no claim exactly as before", () => {
+		// A bare ?log= is the summary panel's link (backend-vouched at serve
+		// time) or a URL someone kept; "we cannot say" must not be reported as
+		// "we know it is stale".
+		expect(
+			deepLinkTarget({
+				logId: 7,
+				logProcess: null,
+				logs,
+				listLoaded: true,
+				processToken: token,
+			}),
+		).toEqual({ mode: "in-list", value: "7" });
+		expect(
+			deepLinkTarget({
+				logId: 3,
+				logProcess: undefined,
+				logs,
+				listLoaded: true,
+				processToken: token,
+			}),
+		).toEqual({ mode: "off-list", value: "3" });
 	});
 });

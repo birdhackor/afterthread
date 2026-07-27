@@ -619,8 +619,18 @@ async def tool_job_status(job_id: str) -> ToolJobStatus:
     two identical pollers to keep in sync. The old `/install/{job_id}` spelling
     is REMOVED rather than aliased -- the FE and the backend ship in the same
     wheel, so there is no version skew for an alias to protect.
+
+    ``llm_log_process`` is stamped HERE rather than stored on the job, and that
+    is sound STRUCTURALLY rather than by convention: the job table is in-process
+    memory that dies with the log ring and its id counter (a restart 404s every
+    job above), so any ``llm_log_id`` a job can still be served with was minted
+    in THIS process. The sidecar needs its token written down because the FILE
+    outlives the process; a job cannot. Both keep the same both-or-neither rule
+    -- no id, no token -- so the pair can never disagree about whether there is a
+    link worth vouching for (``ToolJobStatus``, ``tools.store_summary_meta``).
     """
     job = tool_builder.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=_JOB_NOT_FOUND)
-    return ToolJobStatus.model_validate(job)
+    token = llm_log.process_token() if job.get("llm_log_id") is not None else None
+    return ToolJobStatus.model_validate({**job, "llm_log_process": token})

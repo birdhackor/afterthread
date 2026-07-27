@@ -4196,6 +4196,143 @@ def test_list_tools_reports_no_summary_status_for_an_alias(
     assert rows["real"]["summary_status"] == "final"
 
 
+def test_list_tools_row_describes_one_instance_when_a_promote_lands_mid_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R9-2: a row is A's manifest OR B's, never A's description with B's badge.
+
+    The two reads a row is built from -- the manifest scan and the sidecar read --
+    used to be joined by PATH alone, so a revise promote landing between them
+    stitched half of each package into one row. The 工具 page derives a row's
+    instance identity from name + description, so the torn row keeps the panel
+    (and any unsent 修訂意見) mounted against A while the badge beside it reports
+    B: the operator sees nothing change and submits the feedback against B.
+
+    Driven from INSIDE the read rather than by racing a thread (the r6/r7/r8
+    window tests' method): the swap lands in the instant BEFORE the sidecar read,
+    i.e. strictly between the two reads a row is made of. The row must then be
+    fully B -- B is what the name resolves to by the time the sidecar was read,
+    so it is the honest answer, and it is certainly not A's description beside
+    B's badge, which is what ships without the pairing (measured: the row comes
+    back ``("test tool", "final")``)."""
+    root = tmp_path / "tools"
+    old = _make_tool(root, "kb", "import sys\nsys.stdout.write('OLD')\n")
+    _write_meta(old, summary="舊工具的說明", status="draft")
+    replacement = _make_tool(
+        tmp_path / "staging",
+        "kb",
+        "import sys\nsys.stdout.write('NEW')\n",
+        tool_json={
+            "name": "kb",
+            "description": "the replacement",
+            "parameters": {"type": "object", "properties": {}},
+            "entry": [sys.executable, "run.py"],
+            "enabled": True,
+        },
+    )
+    _write_meta(replacement, summary="新工具的說明", status="final")
+    _install_tools(monkeypatch, root)
+
+    pkg = root / "kb"
+    real_status = tools.summary_status
+    swapped = False
+
+    def promote_then_read_status(directory: Path) -> str | None:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            os.rename(pkg, root / ".kb.bak-r9")
+            os.rename(replacement, pkg)
+        return real_status(directory)
+
+    monkeypatch.setattr(tools, "summary_status", promote_then_read_status)
+    rows = {row["name"]: row for row in list_tools()}
+
+    assert swapped  # the swap really landed in the gap
+    row = rows["kb"]
+    assert (row["description"], row["summary_status"]) == ("the replacement", "final")
+
+
+def test_list_tools_pairs_each_row_without_rescanning_an_undisturbed_package(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The ordinary listing is what it was: one scan and one sidecar read per
+    package, plus the identity re-check that pairs them.
+
+    The pairing costs a re-scan only when a package really moved, so an untouched
+    tools directory pays exactly one ``_scan_package`` per row -- the assertion
+    that keeps a retry loop from quietly becoming the normal path."""
+    root = tmp_path / "tools"
+    first = _make_tool(root, "aaa", "import sys\nsys.stdout.write('x')\n")
+    _make_tool(root, "bbb", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    _write_meta(first, summary="s", status="final")
+
+    scanned: list[str] = []
+    real_scan = tools._scan_package
+
+    def counting_scan(directory: Path, expected_name: str | None = None) -> tools._PackageScan:
+        scanned.append(directory.name)
+        return real_scan(directory, expected_name=expected_name)
+
+    monkeypatch.setattr(tools, "_scan_package", counting_scan)
+    rows = {row["name"]: row["summary_status"] for row in list_tools()}
+
+    assert rows == {"aaa": "final", "bbb": None}
+    assert scanned == ["aaa", "bbb"]
+
+
+def test_list_tools_reports_no_status_when_the_two_reads_never_agree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A package replaced on EVERY attempt gets no badge rather than a foreign one.
+
+    The bound exists so one listing cannot spin forever; the answer it degrades to
+    is the same None a missing or corrupt sidecar already produces, not a new
+    vocabulary -- and the row's other fields still come from one scan."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "kb", "import sys\nsys.stdout.write('x')\n")
+    _write_meta(pkg, summary="s", status="final")
+    _install_tools(monkeypatch, root)
+
+    real_status = tools.summary_status
+    manifest = pkg / "tool.json"
+
+    def status_then_replace_the_manifest(directory: Path) -> str | None:
+        status = real_status(directory)
+        # A REPLACED manifest, which is what every install writes (mkstemp then
+        # os.replace) -- a NEW inode, so the identity moves on every attempt no
+        # matter how fast the loop runs. An in-place rewrite would move only the
+        # ctime, and two rewrites inside one timestamp tick are indistinguishable
+        # (the ABA `package_identity` has always accepted), which made this test
+        # pass or fail by timing.
+        fresh = directory / "tool.json.next"
+        fresh.write_text(manifest.read_text(encoding="utf-8"), encoding="utf-8")
+        os.replace(fresh, manifest)
+        return status
+
+    monkeypatch.setattr(tools, "summary_status", status_then_replace_the_manifest)
+    rows = {row["name"]: row for row in list_tools()}
+
+    assert rows["kb"]["summary_status"] is None
+    assert rows["kb"]["valid"] is True  # the rest of the row is still one scan's
+
+
+def test_list_tools_still_reports_none_for_a_corrupt_sidecar(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The pairing must not change what an unreadable sidecar reports: the row is
+    the same one instance, and None is already its answer."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "kb", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    _sidecar(pkg).write_text("{not json", encoding="utf-8")
+
+    rows = {row["name"]: row for row in list_tools()}
+    assert rows["kb"]["summary_status"] is None
+    assert rows["kb"]["valid"] is True
+
+
 def test_sidecar_never_listed_as_a_package(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """The dot-prefixed sidecar is invisible to the registry scan: it is neither
     a phantom row nor a reason for the real package to look broken."""

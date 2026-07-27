@@ -749,6 +749,42 @@ async def _generate_summary(
     return result.summary
 
 
+def _summary_session_log_id(before: int | None) -> int | None:
+    """The log id of a summary session THIS call ran, or None if none ever started.
+
+    ``last_record_id_for_workflow`` answers "the newest ``tool_summary`` record",
+    which is only the same question as "the record of the call I just made" when
+    that call actually opened a session. ``_generate_summary`` builds its prompt
+    FIRST -- the fail-closed redactor, the ``.env`` parse, a walk over every file
+    in the package -- and only then calls ``generate_structured``, which is where
+    a record is created. A failure in the build half therefore leaves the reading
+    exactly as it was: the PREVIOUS summary session's id, belonging to whatever
+    tool was summarized last. Stamping that onto this tool's failure placeholder
+    presents another tool's prompt and response as this one's failure trace.
+
+    So the reading taken BEFORE the generation is what gives the one after it a
+    meaning: unchanged means no session of mine exists -> None, which
+    ``llm_log_id`` already spells (the sidecar writes null, the FE renders no
+    ``查看 AI 日誌`` anchor) and which needs no new vocabulary.
+
+    Asking the generation itself would be more direct, and is deliberately NOT
+    done: ``last_record_id_for_workflow``'s own docstring adjudicates that
+    threading a log id back through ``generate_structured`` -- the boundary every
+    workflow and test is built against -- is not worth rewriting for a single
+    consumer, and this is that same consumer asking the same favour.
+
+    Inherits that docstring's stated imprecision unchanged: a CONCURRENT summary
+    session finishing inside this window moves the reading, so its id is what a
+    failed build stamps. That is the adjudicated worst case (裁決紀錄 #3) -- a
+    debugging link to a simultaneous session of the SAME workflow, one keypress
+    apart in a single-user local tool -- and is strictly better than the previous
+    behaviour it replaces, which linked a session that had already finished
+    before this call began.
+    """
+    current = llm_log.last_record_id_for_workflow(_SUMMARY_WORKFLOW)
+    return None if current == before else current
+
+
 async def generate_and_store_summary(
     name: str,
     *,
@@ -796,10 +832,16 @@ async def generate_and_store_summary(
     A failed generation still leaves a sidecar carrying the ``origin`` and the
     failed session's log id with an EMPTY summary, so the 工具 page can show
     "尚無總結" with a working 重新產生 button and the operator can read the
-    trace. It writes that placeholder when no sidecar exists yet OR when the only
-    one there is the origin-only file this call just wrote: on a later
-    regeneration the previous, GOOD summary must survive a transient LLM failure
-    rather than being blanked by it, and our own empty-summary file is not one.
+    trace. That id is the one THIS call produced or nothing at all
+    (``_summary_session_log_id``): the failure can come from the prompt BUILD,
+    which never opens a session, and the workflow's newest record is then some
+    other tool's summary -- a null ``llm_log_id`` is already how "there is no
+    trace to link" is spelled, and offering a trace that belongs to a different
+    package is worse than offering none. It writes that placeholder when no
+    sidecar exists yet OR when the only one there is the origin-only file this
+    call just wrote: on a later regeneration the previous, GOOD summary must
+    survive a transient LLM failure rather than being blanked by it, and our own
+    empty-summary file is not one.
     All three writes -- the origin, the summary and the placeholder -- carry the
     identity of the package this hook resolved, so none can land in a package that
     took the name during the generation.
@@ -859,6 +901,11 @@ async def generate_and_store_summary(
             ),
             dict,
         )
+        # Read BEFORE the generation, because the placeholder below can only tell
+        # "the session I just ran" from "whatever was already newest" by the
+        # difference (see _summary_session_log_id). Cheap: one locked pass over
+        # the in-memory ring.
+        log_id_before = llm_log.last_record_id_for_workflow(_SUMMARY_WORKFLOW)
         try:
             summary = await _generate_summary(
                 name, directory, origin=origin, builder_summary=builder_summary
@@ -885,7 +932,7 @@ async def generate_and_store_summary(
                     directory,
                     summary="",
                     origin=origin,
-                    llm_log_id=llm_log.last_record_id_for_workflow(_SUMMARY_WORKFLOW),
+                    llm_log_id=_summary_session_log_id(log_id_before),
                     identity=identity,
                 )
             return

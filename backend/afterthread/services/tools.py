@@ -1737,10 +1737,91 @@ def _listed_summary_status(directory: Path) -> str | None:
     refusing routes give. The row itself is unaffected and stays ``valid=False``
     (``_scan_package`` refuses a symlinked package directory outright), so this
     only removes the read-through, not the row.
+
+    Answers about the package AT THIS PATH, which is not the same thing as "the
+    package the rest of the row describes" -- ``_listed_row`` is what makes those
+    one and the same, by re-checking the scan's identity around this call.
     """
     if directory.is_symlink():
         return None
     return summary_status(directory)
+
+
+# How many times ``_listed_row`` may take its two reads of one package before it
+# gives up on pairing them. The first pass answers every ordinary listing; the
+# second exists for the swap this bound is here to survive; the third for a swap
+# landing inside that retry. A package being replaced faster than it can be read
+# twice is one this call has nothing true to say about, and an UNBOUNDED retry
+# would put a hang on the one request the whole 工具 page waits for.
+_LISTING_SCAN_ATTEMPTS = 3
+
+
+def _listed_row(scan: _PackageScan) -> dict[str, Any]:
+    """One LISTING row whose every field describes ONE package instance (R9-2).
+
+    A row is built from TWO reads -- the manifest scan (name/description/enabled/
+    valid/error) and the sidecar read behind ``summary_status`` -- and they used
+    to be joined by PATH alone: ``_scan_all`` materializes every scan first, and
+    only then did the comprehension re-read each package's sidecar. A revise
+    promote landing between them stitched package A's description into a row
+    carrying package B's badge, and that mixture is worse than either half being
+    stale: the 工具 page derives a row's instance identity from `name` +
+    `description` (`toolInstanceKey`), so A's description keeps the panel mounted
+    and its query key unchanged while the badge beside it is B's -- an operator
+    with unsent feedback about A sees nothing change and submits it against B.
+    (NOT 裁決紀錄 #7, where the two descriptions are byte-identical and the
+    ambiguity is unavoidable; here they DIFFER, and the torn row is what hides
+    it.)
+
+    The pairing is the identity ``_scan_package`` already captured on the line
+    above the manifest read (R7-1, ``_PackageScan.identity``), re-checked AFTER
+    the sidecar read: finding it unmoved means no install, revise or toggle
+    landed across EITHER read, so both describe the same instance. A mismatch
+    re-scans that one package and takes both reads again, so a swap landing
+    mid-listing yields a row that is fully B (the instance that now holds the
+    name) -- never A's manifest beside B's badge.
+
+    Pairing HERE rather than capturing the status inside ``_scan_package``, and
+    the cost is the whole reason: ``enabled_llm_tools`` shares that function and
+    calls it for every package on EVERY capture/enrich/assist-update, so moving
+    the sidecar read into the scan would charge every AI request one extra file
+    read per installed package for a field it never looks at -- or add a flag
+    that makes "the scan is one operation" true only on some calls. The listing
+    pays instead, and pays one ``lstat`` per valid row (measured: the scan's own
+    reads are unchanged, and ``enabled_llm_tools`` issues exactly what it did
+    before).
+
+    Two scans cannot be paired at all and are returned on the first pass:
+    ``scan.identity`` is None on every INVALID scan by convention (the alias row
+    among them, whose status ``_listed_summary_status`` decides without reading
+    anything), and on the valid-but-lstat-failed scan that ``_make_handler``
+    already refuses to run. Neither has an identity that a re-scan could make
+    appear, so retrying could only spin. Their rows are what the two reads saw,
+    exactly as before this function existed.
+
+    Exhausting ``_LISTING_SCAN_ATTEMPTS`` reports ``summary_status`` None -- the
+    SAME "no trustworthy status" answer a missing or corrupt sidecar already
+    gives (``summary_status``), rather than a second vocabulary for "we could not
+    pair one". The other five fields still come from one scan, so the row is
+    still one instance's.
+    """
+    paired = False
+    status: str | None = None
+    for attempt in range(_LISTING_SCAN_ATTEMPTS):
+        if attempt:
+            scan = _scan_package(scan.directory)
+        status = _listed_summary_status(scan.directory)
+        if scan.identity is None or _still_the_expected_package(scan.directory, scan.identity):
+            paired = True
+            break
+    return {
+        "name": scan.name,
+        "description": scan.description,
+        "enabled": scan.enabled,
+        "valid": scan.valid,
+        "error": scan.error,
+        "summary_status": status if paired else None,
+    }
 
 
 def list_tools() -> list[dict[str, Any]]:
@@ -1757,18 +1838,12 @@ def list_tools() -> list[dict[str, Any]]:
     bounded read per package, on the same scan that already reads every
     ``tool.json``; a package with no (or a corrupt) sidecar reports None, and so
     does an internal ALIAS row (see ``_listed_summary_status``).
+
+    Each row is assembled by ``_listed_row``, which pairs that read with the
+    scan's own identity so a package replaced mid-listing cannot leave a row
+    stitched from two instances.
     """
-    return [
-        {
-            "name": scan.name,
-            "description": scan.description,
-            "enabled": scan.enabled,
-            "valid": scan.valid,
-            "error": scan.error,
-            "summary_status": _listed_summary_status(scan.directory),
-        }
-        for scan in _scan_all()
-    ]
+    return [_listed_row(scan) for scan in _scan_all()]
 
 
 def package_identity(directory: Path) -> tuple[int, int, int] | None:

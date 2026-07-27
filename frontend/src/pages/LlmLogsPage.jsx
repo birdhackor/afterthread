@@ -20,6 +20,10 @@ import { apiGet } from "../api/client.js";
 import { EmptyState } from "../components/EmptyState.jsx";
 import { TagList } from "../components/TagList.jsx";
 import { usePageTitle } from "../hooks/usePageTitle.js";
+// The resolving half of the `?log=` contract, kept next to the 工具 page's
+// emitting half (and covered by that file's tests -- this page's own logic is
+// components, which node-env vitest cannot render).
+import { deepLinkTarget } from "../utils/toolSummary.js";
 
 // The list page reads at most this many recent interactions; the backend caps
 // the ring itself (llm_log_max_entries) and validates the limit to [1, 500].
@@ -343,32 +347,27 @@ function LogDetailPanel({ log, expanded }) {
 	);
 }
 
-// Where a `?log=<id>` deep link can point, given the list that came back. Pure,
-// and split out so the three cases are one expression instead of three
-// conditions spread through the render:
+// What a `?log=<id>` link gets instead of a record when it says which backend
+// run it came from and that run has ended (deepLinkTarget's "foreign"). No
+// fetch: the id names a slot in a counter this process restarted, so whatever
+// answers to it now is a DIFFERENT interaction -- showing it, in a row or in a
+// card, is the misattribution this refusal exists to prevent.
 //
-// * "none" -- no link, or the list has not landed yet (the row may still be in
-//   it, so claiming the record is off-list would be a lie in flight);
-// * "in-list" -- the row is on this page; the Accordion opens it and the
-//   existing per-row detail fetch does the rest;
-// * "off-list" -- there IS a target and the newest LIST_LIMIT rows do not
-//   contain it. That is NOT the same as "gone": the ring keeps
-//   llm_log_max_entries records and the detail endpoint addresses any of them,
-//   so the record may be perfectly readable and merely older than this page.
-//   Only the fetch below can tell those apart, and a 404 from it is the one
-//   answer that means evicted.
-function deepLinkTarget(targetLogId, logs, listLoaded) {
-	if (targetLogId == null) {
-		return { mode: "none", value: null };
-	}
-	const value = String(targetLogId);
-	if (!listLoaded) {
-		return { mode: "none", value };
-	}
-	return {
-		mode: logs.some((log) => String(log.id) === value) ? "in-list" : "off-list",
-		value,
-	};
+// Same shape and same vocabulary as OffListRecord's terminal 404 arm (a gray
+// Alert titled with the id, no 重試 -- this is an outcome, not a failure), and
+// it reuses that card's own sentence about ids being re-issued after a restart
+// rather than introducing a second way of saying it. What it can say more
+// firmly is WHICH side of that hedge this link fell on, because the token
+// settles it.
+function ForeignProcessLink({ logId }) {
+	return (
+		<Alert color="gray" title={`紀錄 #${logId}`}>
+			<Text size="sm">
+				這個連結來自先前的後端執行：編號在後端重啟後會從頭重新配發，#{logId}{" "}
+				現在指到的是另一次互動，所以這裡不展開任何紀錄。請直接在下方清單依時間找出你要的那一筆。
+			</Text>
+		</Alert>
+	);
 }
 
 // The record a `?log=<id>` link points at when it is NOT among the newest
@@ -468,17 +467,27 @@ function OffListRecord({ logId }) {
 export function LlmLogsPage() {
 	usePageTitle("AI 日誌");
 	// Optional deep-link target from /llm-logs?log=<id> (validated on the route):
-	// seed the open accordion item to that id so a link from the 工具 page
+	// open the accordion item with that id so a link from the 工具 page
 	// auto-expands the matching builder-session record on load. An id that is NOT
 	// among the rows we fetched is honoured too, by asking the detail endpoint for
 	// it directly (see OffListRecord) -- the link is a promise to show THAT
 	// record, and the list this page reads is only the newest LIST_LIMIT of them.
 	// `strict: false` reads the search loosely so this page needs no route-object
-	// import.
-	const { log: targetLogId } = useSearch({ strict: false });
-	const [openValue, setOpenValue] = useState(
-		targetLogId != null ? String(targetLogId) : null,
-	);
+	// import -- which is also how `logProcess` arrives: the route's validateSearch
+	// coerces `log` and the router MERGES the rest of the parsed search into the
+	// match (measured against the installed @tanstack/react-router 1.170.17,
+	// router-core matchRoutes: `{...parentSearch, ...strictSearch}`), so the
+	// claim rides along unvalidated and is treated as opaque here.
+	const { log: targetLogId, logProcess: targetLogProcess } = useSearch({
+		strict: false,
+	});
+	// `undefined` = the operator has not touched the accordion yet, which is what
+	// lets the deep link decide what is open WITHOUT being able to force a row
+	// open behind their back: a foreign link opens nothing, and the first click
+	// (or close, which reports null) takes the value over for good. Seeding this
+	// with the id -- as it used to be -- would have opened the row before the
+	// list, and therefore the process token, had even arrived.
+	const [openValue, setOpenValue] = useState(undefined);
 
 	const { data, error, isError, isFetching, refetch } = useQuery({
 		queryKey: ["llm-logs"],
@@ -492,7 +501,21 @@ export function LlmLogsPage() {
 	const loading = data === undefined && isFetching;
 	const showError = isError && data === undefined && !isFetching;
 	const logs = data?.logs ?? [];
-	const target = deepLinkTarget(targetLogId, logs, data !== undefined);
+	// The token comes from THIS response, so it and the rows it is compared for
+	// are one reading of one process (backend schemas.LlmLogListResponse).
+	const target = deepLinkTarget({
+		logId: targetLogId,
+		logProcess: targetLogProcess,
+		logs,
+		listLoaded: data !== undefined,
+		processToken: data?.process_token,
+	});
+	const openedValue =
+		openValue === undefined
+			? target.mode === "in-list"
+				? target.value
+				: null
+			: openValue;
 
 	return (
 		<Stack gap="md">
@@ -530,6 +553,10 @@ export function LlmLogsPage() {
 				<OffListRecord logId={target.value} />
 			) : null}
 
+			{target.mode === "foreign" ? (
+				<ForeignProcessLink logId={target.value} />
+			) : null}
+
 			{data && logs.length === 0 ? (
 				<EmptyState message="尚無 AI 互動紀錄" />
 			) : null}
@@ -546,7 +573,7 @@ export function LlmLogsPage() {
 						<HeaderRow />
 						<Accordion
 							variant="separated"
-							value={openValue}
+							value={openedValue}
 							onChange={setOpenValue}
 							chevronPosition="right"
 						>
@@ -558,7 +585,7 @@ export function LlmLogsPage() {
 									<Accordion.Panel>
 										<LogDetailPanel
 											log={log}
-											expanded={openValue === String(log.id)}
+											expanded={openedValue === String(log.id)}
 										/>
 									</Accordion.Panel>
 								</Accordion.Item>

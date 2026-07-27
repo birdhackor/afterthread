@@ -421,9 +421,27 @@ class LlmLogSummary(LlmLogBase):
 
 
 class LlmLogListResponse(BaseModel):
-    """Newest-first page of LLM interaction summaries."""
+    """Newest-first page of LLM interaction summaries.
+
+    ``process_token`` is the ANSWERING process's opaque identity for the id space
+    every ``id`` on this page belongs to (``llm_log.process_token()``). Log ids
+    are a per-process counter over a ring that dies with the process, so an id a
+    client is HOLDING -- a ``?log=<id>`` deep link built from a job response the
+    browser cached before a restart -- may name a completely different
+    interaction here. Only the minting process's token can tell those apart, and
+    this is the reading the AI 日誌 page compares a link's claim against.
+
+    It rides on the ENVELOPE rather than on the rows: it is a property of the
+    process that answered, not of any record, so ``LlmLogBase`` (shared by the
+    row and the detail, one entry per RECORD) would be both the wrong shape and
+    50 copies of one string. The list is also the response that arrives BEFORE
+    the page decides what a deep link points at, while the detail is fetched
+    lazily per record -- an in-list link would have had to open the row first to
+    learn whether it should have.
+    """
 
     logs: list[LlmLogSummary]
+    process_token: str
 
 
 class LlmLogMessage(BaseModel):
@@ -679,6 +697,17 @@ class ToolJobStatus(BaseModel):
     are debuggable from the UI. Jobs are process-local and unpersisted: after a
     backend restart every previous job id is a 404.
 
+    ``llm_log_process`` names the process whose id space that ``llm_log_id``
+    belongs to -- the same both-or-neither pairing the sidecar keeps on disk
+    (``tools.store_summary_meta``), for the same reason: log ids restart from
+    zero in every process, so an id that OUTLIVES its process resolves to
+    whatever now occupies the number. A job never outlives its process (the 404
+    above), but a browser TAB does: the 工具 page stops polling a terminal job
+    and keeps its response cached, so the outcome card -- and the ``查看 AI 日誌``
+    link on it -- can still be on screen after a restart. The token travels with
+    the link so the AI 日誌 page can refuse to resolve it (R9-1); the backend
+    cannot catch this one alone, because it never SERVES a stale id.
+
     One model for BOTH job kinds (D40 renamed it from ``ToolInstallJobStatus``
     without touching a field): an install and a revise both end in a package
     being written into the tools directory, they share one job table and one
@@ -693,3 +722,4 @@ class ToolJobStatus(BaseModel):
     tool_name: str | None
     summary: str | None
     llm_log_id: int | None
+    llm_log_process: str | None

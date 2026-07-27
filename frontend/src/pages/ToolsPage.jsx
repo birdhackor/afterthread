@@ -44,6 +44,7 @@ import {
 	canFinalizeSummary,
 	claimLatestSummaryWrite,
 	createSummaryWriteLedger,
+	logLinkSearch,
 	nextSummaryWriteStamp,
 	ownSummaryBusy,
 	patchToolRowSummaryStatus,
@@ -119,12 +120,20 @@ function toolErrorMessage(error, fallback, codeCopy = null) {
 // matching row, or -- when the record is older than the rows that page lists --
 // fetches that one record by id and shows it on its own (only a record the
 // backend has really dropped reports itself gone). With no id it is a plain jump.
-function LogLink({ llmLogId }) {
+//
+// `llmLogProcess` is the id's PROVENANCE, carried along as `?logProcess=` (see
+// utils/toolSummary.logLinkSearch, which owns both halves of that contract).
+// The job card passes it and the summary panel does not, and the asymmetry is
+// the backend's, not this component's: a job response is cached by this client
+// and never refetched once the job is terminal, so its id can outlive the
+// process that minted it, while the summary route re-filters its own id against
+// the answering process on every read.
+function LogLink({ llmLogId, llmLogProcess }) {
 	return (
 		<Anchor
 			component={Link}
 			to="/llm-logs"
-			search={llmLogId != null ? { log: llmLogId } : {}}
+			search={logLinkSearch(llmLogId, llmLogProcess)}
 			size="sm"
 		>
 			查看 AI 日誌{llmLogId != null ? `（紀錄 #${llmLogId}）` : ""}
@@ -197,7 +206,10 @@ function ToolJobProgress({ kind, jobId, jobQuery }) {
 							: `已安裝工具「${job.tool_name}」。`}
 					</Text>
 					{job.summary ? <Text size="sm">{job.summary}</Text> : null}
-					<LogLink llmLogId={job.llm_log_id} />
+					<LogLink
+						llmLogId={job.llm_log_id}
+						llmLogProcess={job.llm_log_process}
+					/>
 				</Stack>
 			</Alert>
 		);
@@ -212,7 +224,10 @@ function ToolJobProgress({ kind, jobId, jobQuery }) {
 						AI 回報：{job.summary}
 					</Text>
 				) : null}
-				<LogLink llmLogId={job.llm_log_id} />
+				<LogLink
+					llmLogId={job.llm_log_id}
+					llmLogProcess={job.llm_log_process}
+				/>
 			</Stack>
 		</Alert>
 	);
@@ -1120,10 +1135,10 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	// code one revalidateAfterSummaryError applies to the immediate refusals. The
 	// reason is that the job payload carries no structured cause: ToolJobStatus is
 	// `{job_id, state, created_at, finished_at, error, tool_name, summary,
-	// llm_log_id}` (backend schemas.py) -- `error` is friendly zh-TW prose the
-	// backend rewords every review round, so matching on it would be a gate that
-	// silently opens. What CAN be said precisely is the failure vocabulary: of
-	// tool_builder's revise outcomes, 找不到要修訂的工具 / 原工具已被刪除 /
+	// llm_log_id, llm_log_process}` (backend schemas.py) -- `error` is friendly
+	// zh-TW prose the backend rewords every review round, so matching on it would
+	// be a gate that silently opens. What CAN be said precisely is the failure
+	// vocabulary: of tool_builder's revise outcomes, 找不到要修訂的工具 / 原工具已被刪除 /
 	// 原工具目錄已被替換為連結 / 原工具在修訂期間被改動或重新安裝 /
 	// 總結已定版 / 無法確認總結是否已定版 / 無法確認原工具的內容 all assert a
 	// change we are not showing, and the `.env` ones say the package was

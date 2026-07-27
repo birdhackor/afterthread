@@ -33,7 +33,7 @@ from fastapi.testclient import TestClient
 from pydantic import BaseModel, ConfigDict
 
 from afterthread.config import Settings
-from afterthread.services import llm_log
+from afterthread.services import llm_log, tool_builder
 from afterthread.services.llm import (
     LLMNotConfiguredError,
     LLMUpstreamError,
@@ -1312,6 +1312,67 @@ def test_no_secret_leak_in_logs_or_api_payloads(
 
 
 # --- router endpoints ------------------------------------------------------
+
+
+def test_router_list_carries_this_process_id_space_token(client: TestClient) -> None:
+    """R9-1: the list says WHOSE id space its rows' ids belong to.
+
+    A client can be holding an id from a previous backend run -- a `?log=` deep
+    link built from a tool job the browser cached and stops refetching once the
+    job is terminal -- and every one of those ids resolves here, to an unrelated
+    interaction that merely reuses the number. The token is what lets the page
+    tell that apart, and it rides on the ENVELOPE (one property of the answering
+    process) rather than on each row.
+
+    The restart is produced the way ``_reset_for_tests`` produces one, the same
+    way O2-2's sidecar tests do it, rather than by mocking the route."""
+    _record(workflow="capture")
+    body = client.get("/api/llm/logs").json()
+    assert body["process_token"] == llm_log.process_token()
+    assert body["process_token"]  # opaque, but never empty
+
+    llm_log._reset_for_tests()
+    after_restart = client.get("/api/llm/logs").json()
+    assert after_restart["process_token"] != body["process_token"]
+
+
+def test_router_job_status_names_the_process_that_minted_its_log_id(client: TestClient) -> None:
+    """The job's half of the same pairing: an id and the token of its id space.
+
+    Stamped when the job is SERVED rather than stored on it, which holds
+    structurally: the job table is in-process memory that dies with the ring and
+    its counter, so any id a job can still be served with was minted here. The
+    both-or-neither rule the sidecar keeps is kept here too -- no id, no token --
+    so the pair can never disagree about whether there is a link to vouch for."""
+    linked = tool_builder.InstallJob(
+        job_id="job-linked",
+        state="succeeded",
+        created_at="2026-07-27T00:00:00+00:00",
+        finished_at="2026-07-27T00:01:00+00:00",
+        tool_name="kb",
+        summary="done",
+        llm_log_id=7,
+    )
+    unlinked = tool_builder.InstallJob(
+        job_id="job-unlinked",
+        state="failed",
+        created_at="2026-07-27T00:00:00+00:00",
+        finished_at="2026-07-27T00:01:00+00:00",
+        error="安裝失敗",
+    )
+    with tool_builder._JOBS_LOCK:
+        tool_builder._JOBS[linked.job_id] = linked
+        tool_builder._JOBS[unlinked.job_id] = unlinked
+    try:
+        with_link = client.get("/api/tools/jobs/job-linked").json()
+        without_link = client.get("/api/tools/jobs/job-unlinked").json()
+    finally:
+        tool_builder._reset_jobs_for_tests()
+
+    assert with_link["llm_log_id"] == 7
+    assert with_link["llm_log_process"] == llm_log.process_token()
+    assert without_link["llm_log_id"] is None
+    assert without_link["llm_log_process"] is None
 
 
 def test_router_lists_summaries_newest_first(client: TestClient) -> None:

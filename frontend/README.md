@@ -54,7 +54,7 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
 | `/items/$itemId` | `ItemDetailPage` | 單筆項目詳情：完整欄位、progress 歷史（可追加一筆）、狀態/階段快速修改、`ItemAiActions` 提供的「AI 補齊」（enrich）／「AI 進度更新」（assist-update）兩個操作、刪除。 |
 | `/items/$itemId/edit` | `ItemEditPage` | 手動編輯項目的表單頁（沿用 `ItemForm` 元件）。 |
 | `/tools` | `ToolsPage` | 「已安裝工具」（清單／啟停／刪除，每列可展開讀取／重新產生／定版／解除定版 AI 總結，並可提意見送出 AI 修訂）與「安裝新工具」（貼 OpenAPI JSON 網址 + 指示，AI 背景建置、輪詢進度）兩個分頁；細節見根目錄 README「KB 工具安裝指南」。 |
-| `/llm-logs` | `LlmLogsPage` | AI 日誌：呼叫 `GET /api/llm/logs` 列出最近的 LLM 互動，每筆可展開讀取 `GET /api/llm/logs/{id}` 取得的請求/回應內容（每則受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；支援 `?log=<id>` 深連結（`工具` 頁的安裝／修訂結果會連過來）：在清單裡就自動展開該列，不在清單裡（比最近 50 筆更舊）就直接向詳情端點取那一筆、單獨顯示在清單上方，真的被擠出保留區才說明它已經不在。 |
+| `/llm-logs` | `LlmLogsPage` | AI 日誌：呼叫 `GET /api/llm/logs` 列出最近的 LLM 互動，每筆可展開讀取 `GET /api/llm/logs/{id}` 取得的請求/回應內容（每則受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；支援 `?log=<id>` 深連結（`工具` 頁的安裝／修訂結果會連過來）：在清單裡就自動展開該列，不在清單裡（比最近 50 筆更舊）就直接向詳情端點取那一筆、單獨顯示在清單上方，真的被擠出保留區才說明它已經不在；連結若標明自己來自**另一個**後端行程（`?logProcess=`，見下方慣例）則一律不展開，只說明編號已被重新配發。 |
 | （其他） | `NotFoundPage` | 404 fallback（router 的 `defaultNotFoundComponent`）。 |
 
 ## 慣例
@@ -254,7 +254,22 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   失敗要不要重讀的判準 `summaryErrorRevalidates`），因為那與「安裝」無關，硬塞
   進前者的檔名只會誤導之後的讀者——這個專案的 vitest 在 node 環境跑、沒有
   jsdom，元件本身測不到，抽出的純函式是唯一能自動化驗證的介面，所以新邏輯一律
-  先問「這算安裝，還是總結」再決定放哪個檔案。
+  先問「這算安裝，還是總結」再決定放哪個檔案。**唯一的例外寫在
+  `toolSummary.js` 的最後一節**：AI 日誌深連結的**兩半**（`工具` 頁產生連結的
+  `logLinkSearch`、`AI 日誌` 頁解讀連結的 `deepLinkTarget`）刻意放在同一個檔案，
+  因為它們是同一份約定；拆開的話，發出主張的那一頁和依主張行動的那一頁會各自漂移，
+  而且只有其中一半會有測試（`LlmLogsPage` 因此從這裡 import 它那一半）。
+- **`?log=` 深連結帶著它的行程 token**：AI 日誌的 id 是**每個後端行程各自從 0 開始**
+  的計數器，而 `工具` 頁的工作卡片在工作終局後就停止輪詢、快取無限期留著——分頁跨過
+  一次後端重啟，那張卡片的「查看 AI 日誌」還在，`llm_log_id` 卻已經被重新配發給
+  另一次互動。所以工作回應多帶一個 `llm_log_process`，連結變成
+  `?log=<id>&logProcess=<token>`（`logProcess` 不在 route 的 `validateSearch` 裡，
+  但 TanStack Router 會把解析到的其他 search 併進 match，`useSearch({strict:false})`
+  讀得到——已對安裝版 1.170.17 實測）；`AI 日誌` 頁拿清單回應的 `process_token` 比對，
+  **不符就不展開任何列**，改在清單上方說明這個連結來自先前的後端執行。**沒有帶
+  token 的連結維持原本行為**（`工具` 頁總結面板的連結就是這種：後端在**回應當下**
+  就把非本行程的 `llm_log_id` 改成 `null`，所以它不需要也無從提出主張；使用者自己
+  存下來的網址同理——「說不出來」不可以被講成「我確定它過期了」）。
 - **沒有 jsdom ⇒ 寫錯的 prop 名稱沒有任何閘門擋得住**：`pnpm lint`（Biome）不做
   型別檢查、`pnpm build`（Vite）只轉譯不檢型別、`pnpm test`（vitest）在 node 環境
   下完全不 render 元件。一個拼錯的 Mantine prop 是合法 JS／合法 JSX，會被靜默

@@ -261,8 +261,16 @@ def llm_logs(limit: Annotated[int, Query(ge=1, le=500)] = 50) -> LlmLogListRespo
     [1, 500] at the query layer so an oversized page cannot be requested. The
     ring is process-wide and dies with the process, so an empty list is the
     normal state right after a restart.
+
+    That restart is also why the page needs ``process_token`` (see
+    ``LlmLogListResponse``): the ids here are a per-process counter, and a client
+    holding an OLDER one -- a ``?log=<id>`` deep link built from a cached job
+    response -- must be able to find out that its id was re-issued rather than
+    have this page open whatever now answers to the number.
     """
-    return LlmLogListResponse.model_validate({"logs": llm_log.list_summaries(limit)})
+    return LlmLogListResponse.model_validate(
+        {"logs": llm_log.list_summaries(limit), "process_token": llm_log.process_token()}
+    )
 
 
 @router.get(
