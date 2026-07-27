@@ -1807,3 +1807,129 @@ r3 的執行登記（`_INFLIGHT_EXECUTIONS`）只有 `_promote_staging_replace` 
 第一輪記、或記一個 schema 的雜湊），讓事後對得回去。本輪**不做**——它會放大 ring/JSONL
 體積，正是 D39 當初拒絕記完整 spec 的同一個理由，而且要先想清楚「快照到什麼粒度才真的
 有除錯價值」。在那之前，誠實描述現況比留一句做不到的承諾好。
+
+### D40 附錄（overall review r5 O5-1）：「還是同一個套件嗎」與「還有人在跑嗎」是兩個問題
+
+r3／r4 的執行登記（`tools._INFLIGHT_EXECUTIONS`）以 **manifest 身分**為 key，而
+`set_enabled` 會**就地改寫** `tool.json` 來翻 `enabled`——它把那個 key 移走了。於是一個在
+toggle **之前**登記的 handler，對 toggle **之後**才來查的 delete／promote **完全不存在**：
+它們判定沒有人在跑，然後把套件毀掉，而子行程還在裡面。這**不是**本子系統到處接受的
+syscall 瞬間——裂痕從 toggle 一直持續到子行程結束（以 `llm_tool_timeout_seconds` 計）。
+
+**裁決：把兩個問題分開，因為它們本來就是兩個問題。**
+
+- **「這還是我廣告出去規格的那個套件嗎」＝ manifest**（`tools.package_identity`，維持不
+  變）。這個判準**必須**在 `tool.json` 被改寫時移動——那正是它分辨得出修訂／重裝的原因；
+  D40 r2 O2-1 已經明文接受「toggle 之後該對話剩下的呼叫都被拒」是刻意選的保守方向，並以
+  `test_runtime_refuses_after_the_enabled_toggle_rewrites_the_manifest` 釘住。**本輪不動
+  它**，只是把它「不適合當執行 key」這件事寫進兩邊的 docstring。
+- **「還有子行程在讀這些檔案嗎」＝ 目錄**（新的 `tools.directory_identity`，
+  `(st_dev, st_ino)`）。一個執行登記講的是**檔案**，它必須撐過**目錄裡任何一個檔案的
+  任何一次編輯**。
+- **兩種 tuple 形狀，不是同一個 tuple 的兩種拼法**：2 元組 vs 3 元組，所以「call site 拿錯
+  身分」是**型別錯誤**而不是靜默不符——這是「無人拿錯」的結構性證明，不是靠讀程式碼。
+
+**實測（Linux／ext4，本機，非推論）**：
+
+| 動作 | 目錄身分 | manifest 身分 |
+| --- | --- | --- |
+| `set_enabled` 就地改寫 `tool.json` | **不變** | **變**（ctime 被推進） |
+| promote 的 rename-aside（`.bak-`） | **不變** | 不變 |
+| delete 的 rename（`.stale-`） | **不變** | 不變 |
+| 刪掉再以同名重裝 | **inode 被重用**（5/5 次） | **變**（每次安裝都寫新檔） |
+
+最後一列正是 D40 P3b r10 當初把「同一個套件？」定在 manifest 上的同一組實測，這裡原樣保留
+——目錄身分**永遠不可以**拿來回答那個問題。
+
+**登記的取用時機也跟著變**：`_make_handler` 在**呼叫當下**（manifest 檢查之後、讀 `.env`
+之前）才讀目錄身分，而不是在廣告時跟 manifest 身分一起拍照。理由是它**不是一張要拿來比對
+的快照**，而是**要公布保護的 key**：它必須指向這次呼叫**即將跑進去**的那個目錄，不是規格
+送出去時那個。讀不到就**拒絕執行**（`_TOOL_REPLACED_RESULT`），與 manifest 檢查同一條規則
+——公布不出去的保護，就是沒有人會為它延後刪除。
+
+**三個消費端一起改**：`_promote_staging_replace`（從自己剛改名出來的 backup 讀）、
+`delete_tool`（從自己剛改名出來的 deferred 讀）、`_sweep_stale_backups`（從磁碟上那個目錄
+讀）。全部都是「從我**手上這包**重新導出」，所以兩邊對得上是結構性的，不必共用路徑或鎖。
+
+- **`delete_tool` 的 None 方向反過來了**（寫明而非默默改）：舊的理由是「manifest 都
+  lstat 不到的套件，不可能有 handler 登記過」——那個理由在換 key 之後**不成立**：一個剛
+  被我們成功改名的目錄若 lstat 失敗，說的只是「我叫不出它的名字」，不是「裡面沒有人」。
+  改成**延後**（與 promote、sweep 同向），觀感零差異（工具照樣立刻離開註冊表、照樣回
+  True），留下的是有標記的殘骸，下一個工具工作的清掃會重試。
+- **sweep 的殘留少一項**：舊版要求讀得到 **manifest** 才敢刪，所以「`tool.json` 被刪掉的
+  已標記備份」永遠掃不掉（r3 誠實寫下的殘留 (c)）。改問目錄之後那條殘留**消失**，而
+  「說不出話就留著」仍在——只是它現在只涵蓋「`is_dir` 剛通過卻 lstat 失敗」這種真正的瞬時
+  失敗。名字（`_STALE_BACKUP_RE`）仍然是「這包是不是我們的垃圾」的唯一憑據。
+
+**可證的量測**：把登記 key 換回 manifest 身分，
+`test_delete_after_an_enabled_toggle_still_defers_a_running_call` 與
+`test_promote_replace_defers_after_an_enabled_toggle_moved_the_manifest` 的子行程當場收到
+`tool failed (exit 1): ... 'data.txt'`——正是 r3／r4 那兩條 finding 描述的失敗，只是這次由
+一次 toggle 觸發。
+
+### D40 附錄（overall review r5 O5-2）：一次 attempt 掃一次秘密，工具名也要進大小預算
+
+O2-3 把 `tools_advertised` 送進 `_stored_body` 是對的，但**每個名字各自呼叫一次**，而
+`_stored_body` 的第一站 `_redact` **每次都重新問一次 provider**——那個 provider 是
+`tools.known_secret_values`：`iterdir`＋每包一次 `stat`，cache miss 還要讀 `.env`。於是一次
+廣告 N 個工具的 attempt，會在 **event loop 上、送出上游請求之前**，對 N 個套件做 N 輪
+stat sweep。**實測 HEAD**（2 則訊息＋N 個名字）：N=0→2 次、N=1→3、N=5→7、N=20→22、
+N=50→52；修好之後**一律 1 次**（`record_response` 另計 1 次，見下）。
+
+- **一個 step 一張快照**：`_secret_snapshot()` materialize 一次，`begin_attempt` 的**所有
+  訊息與所有名字**共用它；`record_response` 自己取一張（它在整整一次上游往返之後才發生，
+  沿用舊的那張等於拿一個**已知過期**的集合去遮蔽）。順帶得到的性質：同一個 attempt 內每個
+  字串都對**同一個**秘密集合遮蔽，而不是第 1 則訊息看到的集合和第 5 則不一樣。
+- **`_stored_body(text, secrets)` 不給預設值**：預設值會讓「忘了 hoist」變成安靜又能跑的
+  寫法，而那正是這條 finding 的形狀。fail-open 的兩段守備原封不動（provider 爆炸→不遮蔽
+  照記；`_mask_known_secrets` 爆炸→回原文），只是分屬兩個 `try`。
+- **名單也要有界**：這是紀錄裡唯一沒有大小紀律的欄位——套件數量在整個 codebase 裡**沒有
+  任何上限**（一包一個目錄），而它旁邊的每個 body 都被 cap 了兩次。兩道天花板各補對方補不
+  到的洞：**字元總預算**（`llm_log_body_max_chars`，與 `_apply_total_budget` 對訊息用的
+  **同一顆旋鈕、同一個理由**，不新增設定）擋位元組；**`_MAX_TOOLS_ADVERTISED = 100`**
+  擋筆數，因為一個存下來的名字可以短到 0 字元，字元預算天生擋不住。刻意**不併進訊息那份
+  預算**：一大堆工具名把**對話本身**擠出紀錄，是比省下的空間糟得多的交易。
+- **截斷要看得見**：被丟掉的變成一則尾端 `…[另 N 項工具已省略以控制紀錄大小]`（與
+  `_elision_marker` 同體例），並照樣點亮 attempt 自己的 `truncated`。保留的是**廣告順序**
+  的前綴（這個欄位回答的是「這一輪模型看得到什麼」，沒有 recency 可言，但有可比對的順序），
+  而「原本有幾個」是截斷之後最值得留下的那半個答案。`None` 與 `[]` 的語意逐字不變。
+
+### D40 附錄（overall review r5 O5-3）：總結寫進去的那一刻，還得是同一個套件
+
+`generate_and_store_summary`／`regenerate_summary` 解析完目錄之後，會經過一整趟 LLM 往返
+才寫 sidecar，中間**只有目錄路徑**被帶著走。而「刪掉再以同名安裝」**完全不佔工作名額**
+（`_JOBS`／`_SYNC_OPS` 只管 install／revise／同步 regenerate），所以那趟往返之內，A 的總結
+**和 A 的 origin**（安裝 URL 與操作者指示）會被寫進 B，蓋掉 B 自己的側檔——而之後 B 的每
+一次修訂都會把那份 origin 當第一手脈絡讀回去。失敗路徑寫的 placeholder 一模一樣。
+
+**裁決：用既有的 manifest 身分（它存在的理由正是這個問題），在解析時捕捉、在寫入前重驗。**
+
+- **捕捉與解析同一跳**：`tool_meta._resolve_package` 回傳 `(directory, identity)`，永遠成對
+  ——沒有「拿到路徑但沒想到身分」這種呼叫形狀。
+- **重驗在 `tools.store_summary_meta` 裡、`_META_LOCK` 之內、`write_tool_meta` 的前一行**，
+  參數 `expected_identity` **必填無預設**。位置是 D40 P3b r12 的規則直接套用：一道語意是
+  「從我們看過之後沒有變」的檢查，必須佔住它能佔的**最後一個瞬間**；擺在鎖的開頭，它後面
+  就會多出一次側檔讀取**和一整趟遮蔽器的目錄掃描**，正是 r11／r12 拒絕留下的那種 I/O 空窗。
+- **寫明的代價**：因為排在定版閘之後，「搶走這個名字的新套件自己是已定版」時，呼叫端收到的
+  是 `finalized`（409）而不是 `not_stored`（404）。兩者都是「你的總結沒有存進去」，什麼都
+  沒被寫，差別只在代碼——而它講的是**現在佔著這個名字的那個套件**的實話。
+- **查不出身分＝拒絕，而且在門口拒絕**：`_resolve_package` 讀不到 manifest 身分就直接回
+  None，兩個入口分別得到既有的「沉默」與「404」。與 P3b r11 同一條規則、同一個理由（與其
+  燒完一整場 session 再丟掉答案，不如一開始就說清楚）。**代價寫清楚**：一個 `tool.json` 讀
+  不到的套件從此不能產生總結——但那種套件本來就無效，既不能執行也不能修訂。
+
+**可證的量測**：拿掉那道重驗，四個新測試當場失敗——B 的側檔被 A 的總結蓋掉、B 收到 A 的
+origin、placeholder 落進 B、以及沒有 manifest 的套件照樣被寫入。
+
+### D40 附錄（overall review r5 O5-4）：`web-v4-plan.md` 的四句話已被安全性修法推翻
+
+計畫文件仍寫著：修訂用寬容的 dotenv 讀取器、`copytree` 排除**所有**層級的 `.env`、換裝成功
+就 `rmtree` backup、前端輪詢助手叫 `installJobRefetchInterval`／`isInstallJobActive`。四句都
+是**後來的安全性修法推翻掉的**，而照著它重構 promote 的人會把「無條件刪除 backup」（打斷
+進行中的工具呼叫）和「刪掉巢狀 `.env`」原樣裝回去。
+
+**裁決：就地改寫成實作的樣子，並把「為什麼原句危險」寫在旁邊**，沿用 O-3 已經在同一份文件
+建立的體例（「規劃時寫的是 X，實作已改掉」）。**否決**「在開頭掛一張『這是原始計畫、以
+D40 附錄為準』的告示」：那會把文件裡**正確**的部分一起貶值，而危險的句子原封不動留在原地
+給跳著讀的人——這裡的風險是**具體的重構動作**，不是文獻學上的先後。同時在前言寫明這份文件
+的定位與「兩邊出入以 decisions 為準」，讓下一個人知道規則是什麼，而不用從體例反推。

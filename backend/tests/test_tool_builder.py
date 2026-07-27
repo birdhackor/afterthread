@@ -4577,6 +4577,64 @@ def test_promote_replace_defers_the_backup_while_a_tool_call_is_running(
     assert [child.name for child in base.iterdir() if ".stale-" in child.name] == []
 
 
+def test_promote_replace_defers_after_an_enabled_toggle_moved_the_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The deferral must survive an ``enabled`` toggle landing mid-call.
+
+    Same shape as the test above, with the one event that used to break it: the
+    operator flips the tool off (or off and on) while a call of it is running.
+    ``set_enabled`` rewrites ``tool.json`` in place, so with the execution registry
+    keyed on the MANIFEST identity the promote looked the call up under a tuple
+    nobody had registered, answered "nothing is running", and ``rmtree``d the
+    backup while the child still had its cwd on it -- and the window is the whole
+    call, not a syscall pair.
+
+    The revise session here reads its identity AFTER the toggle, which is what a
+    session started at this moment genuinely holds (a session that had captured
+    the PRE-toggle manifest is refused outright by the pre-swap check -- that is
+    the adjudicated behaviour of the OTHER identity, and it is unchanged). So the
+    two identities are deliberately out of step here, which is exactly the state
+    that used to lose the registration."""
+    base = tmp_path / "tools"
+    marker, gate = tmp_path / "started", tmp_path / "go"
+    installed, before = _busy_package(base, marker, gate)
+    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
+    staging.mkdir(parents=True)
+    (staging / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")), encoding="utf-8")
+    (staging / "run.py").write_text("print('revised')", encoding="utf-8")
+    _install_settings(monkeypatch, tools_dir=str(base))
+    handler = tools.enabled_llm_tools()[0].handler
+
+    result: dict[str, str] = {}
+    caller = threading.Thread(target=lambda: result.update(out=asyncio.run(handler({}))))
+    caller.start()
+    try:
+        _wait_for(marker.exists)  # the CHILD is running, not merely queued
+        assert tools.set_enabled("kbsearch", False) is True
+        identity = tool_builder._package_identity(installed)
+        assert identity is not None and identity != before  # the premise, measured
+        origin, error = tool_builder._promote_staging_replace(
+            staging,
+            "kbsearch",
+            base,
+            env_existed_at_start=False,
+            package_identity=identity,
+            registered=[],
+        )
+    finally:
+        gate.write_text("go", encoding="utf-8")
+        caller.join(timeout=30)
+
+    assert error is None and origin is None  # the revision published as usual
+    assert (installed / "run.py").read_text(encoding="utf-8") == "print('revised')"
+    assert result["out"] == "PAYLOAD"  # read from the OLD package, after the swap
+    assert _leftovers(base) == []  # nothing left wearing the rescue shape
+    assert len([child for child in base.iterdir() if ".stale-" in child.name]) == 1
+    tool_builder._sweep_stale_backups(base)
+    assert [child.name for child in base.iterdir() if ".stale-" in child.name] == []
+
+
 def test_promote_replace_drops_the_backup_immediately_when_nothing_is_running(
     tmp_path: Path,
 ) -> None:
@@ -4587,8 +4645,9 @@ def test_promote_replace_drops_the_backup_immediately_when_nothing_is_running(
     base = tmp_path / "tools"
     installed, staging = _replace_fixture(base)
     identity = tool_builder._package_identity(installed)
-    assert identity is not None
-    assert tools.package_execution_in_flight(identity) is False  # the precondition, pinned
+    running = tools.directory_identity(installed)
+    assert identity is not None and running is not None
+    assert tools.directory_execution_in_flight(running) is False  # the precondition, pinned
 
     _origin, error = tool_builder._promote_staging_replace(
         staging,
@@ -4617,15 +4676,16 @@ def test_sweep_keeps_a_backup_that_is_still_in_use_and_spares_everything_else(
     """The sweep removes only what it can affirmatively say is collectable.
 
     Four neighbours it must not touch, because it is a destructive traversal in a
-    directory the operator also owns: a marked backup whose package is still
-    executing (a process exit between deferral and sweep is why this is driven off
-    the DISK, so it must re-derive that identity itself), a hidden directory that
-    is not one of ours, and a SYMLINK wearing a marked name -- an rmtree through
-    which would delete a tree nobody verified."""
+    directory the operator also owns: a marked backup whose files are still being
+    read (a process exit between deferral and sweep is why this is driven off the
+    DISK, so it must re-derive that identity itself -- the DIRECTORY's, which is
+    what the writers deferred under), a hidden directory that is not one of ours,
+    and a SYMLINK wearing a marked name -- an rmtree through which would delete a
+    tree nobody verified."""
     base = tmp_path / "tools"
     base.mkdir()
     busy = _stale_dir(base, "kbsearch")
-    identity = tool_builder._package_identity(busy)
+    identity = tools.directory_identity(busy)
     assert identity is not None
     idle = _stale_dir(base, "other")
     (base / ".staging").mkdir()
@@ -4688,8 +4748,16 @@ def test_sweep_collects_what_a_deferred_delete_left_behind(
     it needs no collector of its own: the sweep that every tool job already runs
     picks it up. Both halves are pinned here -- it is NOT collected while the call
     that caused the deferral is still running (the sweep re-derives that from the
-    directory's own manifest, since the deferral may have happened in an earlier
-    process), and it IS collected on the next pass afterwards."""
+    directory itself, since the deferral may have happened in an earlier process),
+    and it IS collected on the next pass afterwards.
+
+    An ``enabled`` toggle sits between the call and the delete on purpose. It
+    rewrites ``tool.json`` in place, which moves the MANIFEST identity while the
+    child runs -- so with the registry keyed there, neither the delete nor this
+    sweep could match what the running call registered: the delete would destroy
+    the package under its own child, and a deferral that did survive would be
+    collected while still in use. Keyed on the directory, every side re-derives
+    the same tuple from the directory it is holding."""
     base = tmp_path / "tools"
     marker, gate = tmp_path / "started", tmp_path / "go"
     _busy_package(base, marker, gate)
@@ -4701,6 +4769,7 @@ def test_sweep_collects_what_a_deferred_delete_left_behind(
     caller.start()
     try:
         _wait_for(marker.exists)
+        assert tools.set_enabled("kbsearch", False) is True
         assert tools.delete_tool("kbsearch") is True
         deferred = [child for child in base.iterdir() if tools._STALE_BACKUP_RE.match(child.name)]
         assert len(deferred) == 1
@@ -4737,16 +4806,33 @@ def test_sweep_never_collects_the_rescue_copy_of_an_unrecoverable_swap(tmp_path:
     assert (rescue / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY
 
 
-def test_sweep_keeps_a_marked_backup_whose_manifest_cannot_be_read(tmp_path: Path) -> None:
+def test_sweep_keeps_a_marked_backup_whose_identity_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """Refusing to say KEEPS the directory, the documented direction for this call
     site: the destructive act here is the removal, so a check that cannot speak
     must not vouch for it (D40 P3b r11's rule, pointed the way this use needs).
-    The stated cost is that such a backup is never swept -- hidden, inert litter,
-    the same permanence a partially failed rmtree already has."""
+
+    What "cannot say" MEANS moved with the key. The sweep now asks the DIRECTORY
+    (that is what a deferral is registered under -- a manifest-keyed answer misses
+    a child that registered before an ``enabled`` toggle), so a marked backup
+    whose ``tool.json`` is gone is now ordinary collectable litter rather than the
+    permanent residue it used to be, and only a genuine ``lstat`` failure on the
+    directory itself still holds one back. Both halves are pinned here, since one
+    is a behaviour change: the manifest-less backup goes, the unnameable one
+    stays."""
     base = tmp_path / "tools"
     base.mkdir()
-    unreadable = tools._stale_backup_path(base, "kbsearch", uuid4().hex)
-    unreadable.mkdir()  # no tool.json at all: _package_identity answers None
+    no_manifest = tools._stale_backup_path(base, "kbsearch", uuid4().hex)
+    no_manifest.mkdir()  # nothing to read a MANIFEST identity from
+
+    tool_builder._sweep_stale_backups(base)
+
+    assert not no_manifest.exists()  # the directory answers for itself
+
+    unreadable = tools._stale_backup_path(base, "other", uuid4().hex)
+    unreadable.mkdir()
+    monkeypatch.setattr(tools, "directory_identity", lambda _directory: None)
 
     tool_builder._sweep_stale_backups(base)
 

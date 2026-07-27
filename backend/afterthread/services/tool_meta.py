@@ -608,12 +608,48 @@ def _stored_origin(meta: dict[str, Any] | None) -> dict[str, Any] | None:
     return kept or None
 
 
+def _resolve_package(name: str) -> tuple[Path, tuple[int, int, int]] | None:
+    """Resolve a package by name AND take its identity, in ONE blocking hop.
+
+    The pair, never one without the other, because every summary path here has
+    the same shape: resolve a directory, spend an LLM round trip, write into that
+    directory. Between those two moments the operator can delete the package and
+    install a DIFFERENT one under the same name -- and a write addressed by path
+    alone would then persist package A's summary, and A's origin, into package B.
+    So the identity of what was resolved is captured here, at the resolve, and
+    carried to the store, which re-checks it in the instant before it writes (see
+    ``tools.store_summary_meta``).
+
+    None means "no package to summarize", and now covers one more case than the
+    resolve alone: a directory whose ``tool.json`` cannot be lstat'ed has no
+    identity, and the store would refuse it at the end anyway (a check that cannot
+    speak must not vouch -- D40 P3b r11). Answering that here rather than there is
+    the same call the revise flow makes for the same reason: refuse at the door
+    rather than after burning a whole LLM session on it. It costs nothing real --
+    such a package is invalid, so it cannot be executed or revised either.
+
+    The alias-refusing resolve (``tools._resolve_package_dir_no_alias``) is shared
+    with every other by-name summary path, so "every summary path refuses an
+    internal alias" stays true by construction.
+
+    BLOCKING: filesystem work, so callers reach it through ``run_in_threadpool``.
+    """
+    directory = tools._resolve_package_dir_no_alias(name)
+    if directory is None:
+        return None
+    identity = tools.package_identity(directory)
+    if identity is None:
+        return None
+    return directory, identity
+
+
 def _store_meta(
     directory: Path,
     *,
     summary: str,
     origin: dict[str, Any] | None,
     llm_log_id: int | None,
+    identity: tuple[int, int, int],
 ) -> dict[str, Any] | StoreRefusal | None:
     """Store the new summary, mapping the registry's outcome onto this module's.
 
@@ -632,11 +668,22 @@ def _store_meta(
     ``"not_stored"`` -> None (the did-not-happen 404), ``"ok"`` -> the sidecar as
     it now reads back.
 
+    ``identity`` is what ``_resolve_package`` saw when it resolved ``directory``,
+    threaded through unchanged: the store re-checks it against the path in the
+    instant before it writes, so a package swapped out during the LLM round trip
+    gets ``"not_stored"`` (-> None) instead of receiving another package's
+    summary. It is a required argument all the way down for that reason -- there
+    is no call shape in which "I did not think about the identity" is spellable.
+
     BLOCKING: this does filesystem I/O and takes a lock, so every caller reaches
     it through ``run_in_threadpool`` -- never inline on the event loop.
     """
     outcome, meta = tools.store_summary_meta(
-        directory, summary=summary, origin=origin, llm_log_id=llm_log_id
+        directory,
+        summary=summary,
+        origin=origin,
+        llm_log_id=llm_log_id,
+        expected_identity=identity,
     )
     if outcome == "finalized":
         return StoreRefusal.FINALIZED
@@ -720,7 +767,9 @@ async def generate_and_store_summary(
     "尚無總結" with a working 重新產生 button and the operator can read the
     trace. It writes that placeholder ONLY when no sidecar exists yet: on a
     later regeneration the previous, GOOD summary must survive a transient LLM
-    failure rather than being blanked by it.
+    failure rather than being blanked by it. Both writes -- the summary and the
+    placeholder -- carry the identity of the package this hook resolved, so
+    neither can land in a package that took the name during the generation.
 
     ``_store_meta``'s ``StoreRefusal.FINALIZED`` is a silent no-op here, like
     every other store outcome: this path already ignores the write result
@@ -739,17 +788,18 @@ async def generate_and_store_summary(
     that lock.
     """
     try:
-        # The alias-refusing resolve, shared with every other by-name summary
-        # path (see tools._resolve_package_dir_no_alias). The install hook
-        # cannot actually reach an alias -- it was handed the name it just
-        # promoted -- but going through the ONE helper costs nothing and keeps
-        # "every summary path refuses an alias" true by construction rather
+        # The resolve and the identity of what was resolved, together (see
+        # _resolve_package): the install hook cannot reach an alias -- it was
+        # handed the name it just promoted -- but going through the ONE helper
+        # costs nothing and keeps both "every summary path refuses an alias" and
+        # "every summary write is identity-guarded" true by construction rather
         # than by inspection.
-        directory = await run_in_threadpool(tools._resolve_package_dir_no_alias, name)
-        if directory is None:
+        resolved = await run_in_threadpool(_resolve_package, name)
+        if resolved is None:
             # The package vanished (a racing delete) between promote and here.
             # Nothing to summarize and nowhere to write; silence is correct.
             return
+        directory, identity = resolved
         try:
             summary = await _generate_summary(
                 name, directory, origin=origin, builder_summary=builder_summary
@@ -758,13 +808,18 @@ async def generate_and_store_summary(
             if await run_in_threadpool(tools.read_tool_meta, directory) is None:
                 # Best-effort, so the write result is DELIBERATELY ignored here
                 # and below: a refused sidecar must never fail an install that
-                # already succeeded (see this function's contract).
+                # already succeeded (see this function's contract). The PLACEHOLDER
+                # is identity-guarded exactly like the real summary -- it carries
+                # this package's origin and this session's log id, and dropping
+                # those into a package that took the name meanwhile would be the
+                # same misattribution with a shorter body.
                 await run_in_threadpool(
                     _store_meta,
                     directory,
                     summary="",
                     origin=origin,
                     llm_log_id=llm_log.last_record_id_for_workflow(_SUMMARY_WORKFLOW),
+                    identity=identity,
                 )
             return
         await run_in_threadpool(
@@ -773,6 +828,7 @@ async def generate_and_store_summary(
             summary=summary,
             origin=origin,
             llm_log_id=llm_log.last_record_id_for_workflow(_SUMMARY_WORKFLOW),
+            identity=identity,
         )
     except Exception:
         # Total backstop: a bug in prompt building, the sidecar read, or the
@@ -790,7 +846,8 @@ async def regenerate_summary(name: str) -> dict[str, Any] | StoreRefusal | None:
     just happened.
 
     None is the SAME kind of honesty for the non-LLM failures: the package
-    vanished under us, or the sidecar write was refused. Both mean the
+    vanished under us, the package that now holds this name is no longer the one
+    this summary describes, or the sidecar write was refused. All three mean the
     regeneration did not happen, and the route folds them into its
     did-not-happen 404 exactly as ``set_summary_status`` folds its own failed
     rewrite into ``not_found``. Answering 200 with a summary that is nowhere on
@@ -828,6 +885,12 @@ async def regenerate_summary(name: str) -> dict[str, Any] | StoreRefusal | None:
     here is still a race backstop -- and, via the shared alias-refusing helper,
     the same hard-block every other by-name summary path runs.
 
+    The reservation covers the job domain; it does NOT cover a plain
+    delete-and-reinstall, which takes no job slot at all. That is what the
+    identity captured by ``_resolve_package`` and re-checked at the store is for:
+    a package replaced under the same name during this call gets no write, and
+    the caller gets the same None.
+
     The three BLOCKING steps -- the resolve, the origin read, and the store --
     each hop through ``run_in_threadpool``, mirroring how ``routers.tools`` calls
     every registry function. Only the LLM round trip stays on the loop, which is
@@ -836,9 +899,10 @@ async def regenerate_summary(name: str) -> dict[str, Any] | StoreRefusal | None:
     a lock held on the event loop would block the whole process rather than one
     worker.
     """
-    directory = await run_in_threadpool(tools._resolve_package_dir_no_alias, name)
-    if directory is None:
+    resolved = await run_in_threadpool(_resolve_package, name)
+    if resolved is None:
         return None
+    directory, identity = resolved
     origin = _stored_origin(await run_in_threadpool(tools.read_tool_meta, directory))
     summary = await _generate_summary(name, directory, origin=origin, builder_summary=None)
     return await run_in_threadpool(
@@ -847,4 +911,5 @@ async def regenerate_summary(name: str) -> dict[str, Any] | StoreRefusal | None:
         summary=summary,
         origin=origin,
         llm_log_id=llm_log.last_record_id_for_workflow(_SUMMARY_WORKFLOW),
+        identity=identity,
     )

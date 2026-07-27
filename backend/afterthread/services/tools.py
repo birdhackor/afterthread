@@ -1430,6 +1430,7 @@ def store_summary_meta(
     summary: str,
     origin: dict[str, Any] | None,
     llm_log_id: int | None,
+    expected_identity: tuple[int, int, int] | None,
 ) -> tuple[str, dict[str, Any] | None]:
     """Merge a freshly generated summary into the sidecar. Returns ``(outcome, meta)``.
 
@@ -1453,11 +1454,12 @@ def store_summary_meta(
       overwriting the summary TEXT (what this did before) satisfied the letter of
       定版 and broke its meaning: the operator froze an explanation and got a
       different one;
-    * ``("not_stored", None)`` -- the write was refused (a fail-closed redaction,
-      the ghost guard on a racing delete, a symlinked/non-regular sidecar, a
-      payload past the size cap), or it landed and the re-read still found
-      nothing (a delete racing in behind it). One did-not-happen answer, because
-      from the caller's view nothing usable is on disk either way;
+    * ``("not_stored", None)`` -- the write was refused (the package is no longer
+      the one this summary was generated for, a fail-closed redaction, the ghost
+      guard on a racing delete, a symlinked/non-regular sidecar, a payload past
+      the size cap), or it landed and the re-read still found nothing (a delete
+      racing in behind it). One did-not-happen answer, because from the caller's
+      view nothing usable is on disk either way;
     * ``("ok", meta)`` -- the sidecar AS IT NOW READS BACK. Re-reading rather
       than returning the composed dict is not belt-and-braces: ``write_tool_meta``
       rebuilds the file from its OWN schema (a narrowed ``origin``, coerced
@@ -1504,6 +1506,32 @@ def store_summary_meta(
     exception -- because ``regenerate_summary``'s route maps this return, and a
     raised provider error would turn a 404 into a 500.
 
+    ``expected_identity`` is the caller's ``package_identity`` of ``directory``,
+    taken when it RESOLVED that directory, and re-taken here in the last instant
+    before the write. It is required rather than defaulted because the whole
+    hazard is a caller forgetting it: a summary generation resolves the package,
+    spends an LLM round trip, and then writes -- so a delete plus a reinstall of
+    the same NAME inside that window would otherwise persist package A's summary,
+    and A's origin, into package B. Refusing is ``("not_stored", None)``: the
+    generation did not happen as far as any package on disk is concerned, which
+    is the answer a vanished package already produces and which both callers
+    already handle (the install hook swallows it, the synchronous route folds it
+    into its did-not-happen 404). None is likewise a refusal -- the same
+    "a check that cannot speak must not vouch" rule the revise flow (D40 P3b r11)
+    and ``_make_handler`` apply to this identity, and one that costs nothing real:
+    a package with no readable ``tool.json`` cannot be executed or revised either.
+
+    It sits AFTER the finalize gate and the redaction rather than at the top of
+    the hold, because a check meaning "nothing changed since we looked" belongs at
+    the LAST instant it can occupy (D40 P3b r12) -- everything below it is one
+    write, while everything above it is a file read and a redactor sweep of the
+    tools directory, exactly the kind of I/O window r11/r12 refused to leave
+    undefended. The stated cost of that order: if the package that TOOK the name
+    is itself finalized, the caller is told ``finalized`` rather than
+    ``not_stored``. Nothing is written either way, and both mean "your summary was
+    not stored"; only the code differs, and it is honest about the package that
+    now holds the name.
+
     ``llm_log_process`` is stamped HERE, and only here, from
     ``llm_log.process_token()``. It is the token of the process whose id space
     ``llm_log_id`` was drawn from, and taking it at the store rather than
@@ -1540,6 +1568,11 @@ def store_summary_meta(
             "llm_log_process": llm_log.process_token() if llm_log_id is not None else None,
             "origin": origin if origin is not None else existing.get("origin"),
         }
+        # LAST, with nothing but the write after it: still the package this
+        # summary was generated for? (See this function's docstring for why here
+        # and not at the top of the hold.)
+        if expected_identity is None or package_identity(directory) != expected_identity:
+            return ("not_stored", None)
         if not write_tool_meta(directory, meta):
             return ("not_stored", None)
         stored = read_tool_meta(directory)
@@ -1601,9 +1634,13 @@ def package_identity(directory: Path) -> tuple[int, int, int] | None:
     """The package's MANIFEST identity: ``(st_dev, st_ino, st_ctime_ns)`` of its
     ``tool.json``, or None when it cannot be read.
 
-    ONE definition with TWO callers, both asking the same question -- "is the
-    package at this path still the one I looked at?" -- across a window they do
-    not hold a lock over:
+    ONE of TWO identities this module keeps, and the one that answers "is the
+    package at this path still the ONE I looked at?" -- see ``directory_identity``
+    below for the other question ("is anything still running out of these
+    files?"), which needs a different answer and therefore a different tuple.
+
+    Three callers, all asking THIS question across a window they do not hold a
+    lock over:
 
     * ``tool_builder.run_revise`` takes it when the session reads the package and
       again immediately before the swap, so a multi-minute build cannot publish
@@ -1612,7 +1649,11 @@ def package_identity(directory: Path) -> tuple[int, int, int] | None:
       (i.e. when its schema is ADVERTISED to the model) and again before the
       subprocess starts, so a revise that replaced the package mid-conversation
       cannot have the model answer against the old schema while the NEW entry
-      runs.
+      runs;
+    * ``store_summary_meta`` takes it when the directory a summary is being
+      generated FOR is resolved, and again in the instant before the sidecar is
+      written, so an LLM round trip cannot end with one package's summary landing
+      in another package that took its name meanwhile.
 
     Two spellings of the same tuple would be two chances to drift, which is why
     this lives here (``tool_builder`` already imports this module, so this is the
@@ -1650,6 +1691,54 @@ def package_identity(directory: Path) -> tuple[int, int, int] | None:
     except OSError:
         return None
     return (info.st_dev, info.st_ino, info.st_ctime_ns)
+
+
+def directory_identity(directory: Path) -> tuple[int, int] | None:
+    """The DIRECTORY's own identity: ``(st_dev, st_ino)``, or None when unreadable.
+
+    The other half of ``package_identity``, and a DIFFERENT question on purpose:
+    that one asks "is this still the same PACKAGE?", this one asks "is anything
+    still running out of these FILES?". One tuple cannot answer both, because the
+    two must survive different things:
+
+    * the manifest identity MUST move when ``tool.json`` is rewritten -- that is
+      exactly how a revision, a reinstall, and (accepted, stated in
+      ``_make_handler``) an ``enabled`` toggle are told apart from "unchanged";
+    * an execution's lifetime must survive EVERY edit inside the directory, that
+      toggle included. Keying ``_INFLIGHT_EXECUTIONS`` on the manifest made a
+      handler that registered before a toggle invisible to the delete or promote
+      that queried after it -- and the removal each of them defers for exactly
+      this reason then landed on files a child was still reading. The split
+      lasted from the toggle until the child exited, not a syscall pair.
+
+    MEASURED here rather than assumed (Linux/ext4, this repo's own filesystem):
+
+    * ``set_enabled``'s in-place manifest rewrite leaves this tuple UNCHANGED
+      while the manifest identity moves (the rewrite pushes ``tool.json``'s
+      ctime);
+    * the replace-mode promote's rename-aside and ``delete_tool``'s rename into
+      the deferred namespace both CARRY it -- a rename moves the name, not the
+      inode, which is the same fact that makes a rename invisible to a running
+      child;
+    * a delete followed by a reinstall of the same name REUSES the directory
+      inode (5/5 rounds measured), which is precisely why this must never be read
+      as "the same package" -- ``package_identity`` records the adjudication that
+      settled that question on the manifest.
+
+    Two SHAPES, not two spellings of one tuple: 2 elements here, 3 there, so a
+    call site reaching for the wrong identity is a type error rather than a
+    silent mismatch.
+
+    ``lstat``, like its sibling: an executable package directory is never a
+    symlink (``_scan_package`` refuses one, so nothing symlinked can be running),
+    and both deferral writers unlink or refuse a symlink long before they ask.
+    None on any error, with each caller stating which way it takes "cannot say".
+    """
+    try:
+        info = os.lstat(directory)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino)
 
 
 def _build_llm_tool(scan: _PackageScan) -> LlmTool:
@@ -2521,10 +2610,20 @@ def _run_tool_subprocess(
 # string in this module follows.
 _TOOL_REPLACED_RESULT = "tool not run: this tool's package changed after it was offered"
 
-# In-flight tool EXECUTIONS, keyed by the manifest identity ``_make_handler``
-# verified just before starting the child, and COUNTED rather than flagged: two
-# workflows can call the same tool at once, and the first to finish must not
-# cancel the second one's protection.
+# In-flight tool EXECUTIONS, keyed by the DIRECTORY identity ``_make_handler``
+# reads in the instant before it starts the child (``directory_identity``), and
+# COUNTED rather than flagged: two workflows can call the same tool at once, and
+# the first to finish must not cancel the second one's protection.
+#
+# The DIRECTORY and not the manifest, and that is the whole reason this key has
+# its own function. Both questions used to be answered by ``package_identity``,
+# and ``set_enabled`` splits them apart: it rewrites ``tool.json`` in place, so a
+# handler that registered under the pre-toggle manifest identity was INVISIBLE to
+# a delete or a promote reading the post-toggle one -- which then destroyed the
+# package while that child was still running out of it. That split persists from
+# the toggle until the child exits, so it is not the syscall-pair instant this
+# module accepts elsewhere. A registration is a claim about FILES, and it has to
+# outlive every edit to a file inside them (measured: it does).
 #
 # Why the identity check alone is not enough: it protects the START of a call,
 # not its DURATION. The child then runs for up to ``llm_tool_timeout_seconds``
@@ -2543,19 +2642,21 @@ _TOOL_REPLACED_RESULT = "tool not run: this tool's package changed after it was 
 # So the fix is not to make the promote wait (a revise the operator asked for
 # must never be blocked by a tool call) but to keep the removal off a package
 # something is still executing against: ``tool_builder._promote_staging_replace``
-# consults ``package_execution_in_flight`` below and defers the backup to a later
-# sweep when the answer is yes. The backup name is dot-prefixed and invisible to
-# ``_scan_all``, so a deferred one is inert litter, never a phantom package.
+# consults ``directory_execution_in_flight`` below and defers the backup to a
+# later sweep when the answer is yes. The backup name is dot-prefixed and
+# invisible to ``_scan_all``, so a deferred one is inert litter, never a phantom
+# package.
 #
 # Its own lock, exactly like ``_INFLIGHT_SECRETS``: registration happens on the
 # event loop while the query runs on a threadpool worker (the promote's own hop).
-_INFLIGHT_EXECUTIONS: dict[tuple[int, int, int], int] = {}
+_INFLIGHT_EXECUTIONS: dict[tuple[int, int], int] = {}
 _EXECUTION_LOCK = threading.Lock()
 
 
 @contextlib.contextmanager
-def _inflight_execution(identity: tuple[int, int, int]) -> Iterator[None]:
-    """Count one execution against ``identity``'s package in, and back out again.
+def _inflight_execution(identity: tuple[int, int]) -> Iterator[None]:
+    """Count one execution against that DIRECTORY (``directory_identity``) in, and
+    back out again.
 
     A context manager rather than a register/discard pair at the call site
     because the ``finally`` is the point: a handler that raises, or an AI request
@@ -2580,18 +2681,24 @@ def _inflight_execution(identity: tuple[int, int, int]) -> Iterator[None]:
                 _INFLIGHT_EXECUTIONS.pop(identity, None)
 
 
-def package_execution_in_flight(identity: tuple[int, int, int]) -> bool:
-    """True while a tool subprocess may still be reading that package's files.
+def directory_execution_in_flight(identity: tuple[int, int]) -> bool:
+    """True while a tool subprocess may still be reading THAT DIRECTORY's files.
 
-    The one question ``tool_builder``'s replace-mode promote asks before dropping
-    the old package's hidden backup (see ``_INFLIGHT_EXECUTIONS`` for what the
-    removal does to a running child, and why the rename before it does not).
+    The one question the three destructive callers ask before removing a
+    directory: ``tool_builder._promote_staging_replace`` before dropping the
+    backup it renamed aside, ``delete_tool`` before removing what the operator
+    asked it to, and ``tool_builder._sweep_stale_backups`` before collecting
+    either one's deferred remains (see ``_INFLIGHT_EXECUTIONS`` for what a removal
+    does to a running child, and why the rename before it does not).
 
-    Keyed on the MANIFEST identity, which is what makes the two sides line up
-    without sharing a path: the promote checked that same tuple against the
-    package it renamed aside, and renaming a directory changes nothing about the
-    ``tool.json`` inside it (measured), so the tuple the handler registered is
-    still the tuple that identifies the files now sitting in the backup.
+    Keyed on the DIRECTORY identity, which is what makes the two sides line up
+    without sharing a path or a lock: each caller re-derives it from the directory
+    it is HOLDING -- after the rename, from disk, possibly in a later process --
+    and a rename carries ``(st_dev, st_ino)`` unchanged (measured), so the tuple
+    the handler registered is still the tuple that names those files. The
+    manifest identity cannot do this job: ``set_enabled`` moves it under a running
+    child, and the two sides would then be comparing different answers to
+    different questions.
     """
     with _EXECUTION_LOCK:
         return identity in _INFLIGHT_EXECUTIONS
@@ -2690,10 +2797,19 @@ def _make_handler(
     released by a ``finally``, so no failure shape -- exception, timeout,
     cancellation -- can leak either one:
 
-    * the same identity as an in-flight EXECUTION, so a promote (or a
-      ``delete_tool``) landing mid-run keeps the files this child is still
+    * this package's DIRECTORY identity as an in-flight EXECUTION, so a promote
+      (or a ``delete_tool``) landing mid-run keeps the files this child is still
       reading instead of deleting them under it (see ``_INFLIGHT_EXECUTIONS`` for
-      what was measured about the rename and the removal);
+      what was measured about the rename and the removal). A SECOND identity, not
+      the one checked above, and the difference is the point: the manifest
+      identity answers "same package?" and therefore MOVES when ``set_enabled``
+      rewrites ``tool.json``, which would strand this registration under a key
+      nobody looks up. It is read HERE rather than captured with the advertised
+      one because it is not a snapshot to compare against -- it is the key the
+      protection is published under, so it must name the directory this call is
+      about to run in, not the one that was there when the schema went out. Not
+      being able to read it is a REFUSAL for the same reason the check above is:
+      a hold nobody can see is a child nobody will defer for;
     * the ``.env`` VALUES ``_build_tool_env`` just handed the child as in-flight
       SECRETS, so the redaction that runs when the child finishes still knows the
       values it was given even if the file has been rotated, replaced or carried
@@ -2711,11 +2827,23 @@ def _make_handler(
     correct behaviour anyway -- today the snapshot happily runs a tool the operator
     just disabled. Writes that do NOT trip it: the summary sidecar
     (``.ai_meta.json`` is a different file, so the manifest's own ctime is
-    untouched) and anything the tool itself writes into its package.
+    untouched) and anything the tool itself writes into its package. What the
+    false positive must NOT reach is the execution registration below -- a toggle
+    that made a running child invisible to the promote about to delete its files
+    would not be a costed refusal, it would be a broken call (see
+    ``directory_identity``).
     """
 
     async def _handler(arguments: dict[str, Any]) -> str:
         if identity is None or package_identity(directory) != identity:
+            return _TOOL_REPLACED_RESULT
+        # The directory this call is about to run OUT OF, read after the refusal
+        # above and before the ``.env`` below -- the same slot, for the same
+        # reason: a call we are not going to make should not load a package's
+        # secrets, and a call we cannot publish a hold for is a call we are not
+        # going to make.
+        running = directory_identity(directory)
+        if running is None:
             return _TOOL_REPLACED_RESULT
         settings = get_settings()
         env, env_secrets = _build_tool_env(directory)
@@ -2724,14 +2852,15 @@ def _make_handler(
         # ``with``, because both answer for the call's DURATION rather than its
         # start:
         #
-        # * the EXECUTION, so a promote landing mid-run keeps the files this
-        #   child is still reading. Everything after this line reads the
-        #   package's files from an inode a promote can rename aside (harmless)
-        #   and then remove (not harmless). Entering here rather than inside
-        #   ``_run_tool_subprocess`` covers the threadpool queue wait too, and
-        #   orders the registration strictly BEFORE the ``Popen`` it protects --
-        #   a promote that observes no registration therefore cannot have a child
-        #   of ours already running against the package it is dropping;
+        # * the EXECUTION, under the DIRECTORY's identity, so a promote landing
+        #   mid-run keeps the files this child is still reading. Everything after
+        #   this line reads the package's files from an inode a promote can
+        #   rename aside (harmless) and then remove (not harmless). Entering here
+        #   rather than inside ``_run_tool_subprocess`` covers the threadpool
+        #   queue wait too, and orders the registration strictly BEFORE the
+        #   ``Popen`` it protects -- a promote that observes no registration
+        #   therefore cannot have a child of ours already running against the
+        #   package it is dropping;
         # * the ``.env`` VALUES this child was just handed, so they stay
         #   redactable no matter what the file says by the time the child
         #   finishes. The scope has to reach past the subprocess: the masking of
@@ -2741,7 +2870,7 @@ def _make_handler(
         #   before the string is handed to the llm loop -- everything downstream
         #   (the role:"tool" message, the log, the JSONL sink) sees the masked
         #   copy.
-        with _inflight_execution(identity), _inflight_secrets(env_secrets):
+        with _inflight_execution(running), _inflight_secrets(env_secrets):
             return await run_in_threadpool(
                 _run_tool_subprocess,
                 list(entry),
@@ -2989,13 +3118,21 @@ def delete_tool(name: str) -> bool:
         return False
     # The identity is taken from what we now HOLD rather than from the name we
     # were given, so it describes the very files a child could still be reading
-    # (a rename changes nothing about the ``tool.json`` inside -- measured).
-    # "Cannot read it" falls through to the removal, the OPPOSITE direction from
-    # the sweep's own "cannot say -> keep": the destructive act here is the one
-    # the caller asked for, and a package whose manifest cannot be lstat'ed is one
-    # no handler can have registered, so there is nothing running to protect.
-    identity = package_identity(deferred)
-    if identity is not None and package_execution_in_flight(identity):
+    # (a rename carries a directory's ``(st_dev, st_ino)`` -- measured). The
+    # DIRECTORY's identity and not its manifest's: that is what the handler
+    # registered, and it is the only one an ``enabled`` toggle mid-call cannot
+    # move (see ``directory_identity``).
+    #
+    # "Cannot read it" DEFERS, the same direction the sweep takes and the
+    # opposite of the manifest read this used to do. The old reasoning -- a
+    # package whose manifest cannot be lstat'ed is one no handler can have
+    # registered -- does not survive the move: an lstat failure on a directory we
+    # just renamed successfully says nothing about what is running inside it, only
+    # that we cannot name it. Nothing observable changes either way (the tool is
+    # already out of the registry and this still returns True); what is left
+    # behind is marked remains the next tool job's sweep re-derives from disk.
+    identity = directory_identity(deferred)
+    if identity is None or directory_execution_in_flight(identity):
         return True
     # Best-effort from here: the tool is already gone as far as everything that
     # reads this directory is concerned, so a removal that fails part-way must not

@@ -298,6 +298,12 @@ _ERROR_REVISE_IDENTITY_UNKNOWN = "無法確認原工具的內容（`tool.json` �
 # chances to drift, so there is one definition and this alias keeps the private
 # name this module's three call sites already read as "the revise's identity".
 # See ``tools.package_identity`` for why it is ``tool.json`` and not the directory.
+#
+# The alias covers THIS question only. The other identity in ``tools`` -- the
+# DIRECTORY's own, which answers "is anything still executing out of these
+# files?" -- is spelled ``tools.directory_identity`` at each of its two call
+# sites here, next to the ``tools.``-prefixed registry helpers it belongs with,
+# so the two questions can never be mistaken for each other while reading.
 _package_identity = tools.package_identity
 
 
@@ -2213,9 +2219,16 @@ def _promote_staging_replace(
     # instant this module accepts elsewhere, and ordinary workflows are outside the
     # tool job's single-flight, so it is reachable rather than exotic.
     #
-    # ``package_identity`` is the tuple this function already matched against the
-    # package it renamed aside, and the handler registered the SAME tuple before
-    # starting its child -- one identity, two sides, no path to keep in sync.
+    # The question is asked with the DIRECTORY's identity, re-read from the backup
+    # we are HOLDING rather than carried across the swap -- a rename moves the
+    # name, not the inode (measured), so this is the same tuple the handler
+    # registered before starting its child. Deliberately NOT ``package_identity``,
+    # which this function matched a few lines up for a different question:
+    # ``set_enabled`` rewrites ``tool.json`` in place, so a manifest-keyed lookup
+    # misses a child that registered before a toggle and drops the backup out from
+    # under it (see ``tools.directory_identity``). "Cannot read it" defers too:
+    # the removal is the destructive act here, so a check that cannot speak must
+    # not vouch for it, and a deferral is only ever litter for the sweep.
     # Deferring costs nothing: the name is dot-prefixed, so a leftover backup is
     # invisible to every registry path, and ``_sweep_stale_backups`` collects it at
     # the end of the next tool job.
@@ -2228,7 +2241,8 @@ def _promote_staging_replace(
     # the rename fails there is nothing to fall back to -- removing it is precisely
     # what we must not do while a child is reading it -- so the backup simply stays,
     # hidden and inert, and the operator can delete it by hand.
-    if tools.package_execution_in_flight(package_identity):
+    running = tools.directory_identity(backup)
+    if running is None or tools.directory_execution_in_flight(running):
         with contextlib.suppress(OSError):
             os.rename(backup, tools._stale_backup_path(base, name, token))
         return origin, None
@@ -2251,9 +2265,9 @@ def _sweep_stale_backups(base: Path) -> None:
     is the decision: the process can exit between the deferral and the sweep (an
     operator quits the app, the machine reboots), and an in-memory list would take
     the only record of the leftover with it. A marked directory on disk describes
-    itself -- the name says its writer finished with it, and its own manifest
-    carries the identity the registry is keyed on -- so a LATER RUN can sweep what
-    an earlier one deferred.
+    itself -- the name says its writer finished with it, and the directory IS the
+    identity the registry is keyed on -- so a LATER RUN can sweep what an earlier
+    one deferred.
 
     A directory is removed only when it is affirmatively collectable, three
     conditions deep because the act is a destructive traversal:
@@ -2266,17 +2280,20 @@ def _sweep_stale_backups(base: Path) -> None:
     * it must be a real directory and not a SYMLINK -- an rmtree through a link
       deletes a tree we never verified (the same reason ``_cleanup_staging``
       gates its own rmtree, and ``_promote_staging_replace`` its target);
-    * its manifest identity must be readable AND absent from
-      ``tools.package_execution_in_flight``.
+    * its DIRECTORY identity must be readable AND absent from
+      ``tools.directory_execution_in_flight`` -- the identity the writers deferred
+      under, which a rename carries and an ``enabled`` toggle cannot move (see
+      ``tools.directory_identity``).
 
-    "Cannot read the manifest" therefore KEEPS the directory: the destructive act
-    here is the removal, so a check that cannot speak must not vouch for it (D40
-    P3b r11's rule, pointed the way this call site needs). Residual, stated rather
-    than discovered later: a marked directory whose ``tool.json`` is gone --
-    deleted by the tool itself, or left behind by a partially failed rmtree -- is
-    never swept. It is hidden, inert litter that no registry path can see, and
-    exactly the permanence a failed ``rmtree(ignore_errors=True)`` already has
-    today.
+    "Cannot say" therefore KEEPS the directory: the destructive act here is the
+    removal, so a check that cannot speak must not vouch for it (D40 P3b r11's
+    rule, pointed the way this call site needs). What that covers is now only a
+    genuine ``lstat`` failure on a directory ``is_dir`` just accepted -- i.e. a
+    directory that vanished under this loop, which the next pass re-reads anyway.
+    A marked directory whose ``tool.json`` is GONE (deleted by the tool itself, or
+    left behind by a partially failed rmtree) used to be permanent litter for want
+    of a manifest to read; keying on the directory retires that residual, and the
+    name remains the only thing that says a directory is ours to collect.
     """
     with contextlib.suppress(Exception):
         for child in sorted(base.iterdir()):
@@ -2286,8 +2303,8 @@ def _sweep_stale_backups(base: Path) -> None:
                 or not child.is_dir()
             ):
                 continue
-            identity = _package_identity(child)
-            if identity is None or tools.package_execution_in_flight(identity):
+            identity = tools.directory_identity(child)
+            if identity is None or tools.directory_execution_in_flight(identity):
                 continue
             shutil.rmtree(child, ignore_errors=True)
 

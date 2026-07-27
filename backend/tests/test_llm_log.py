@@ -185,7 +185,7 @@ def test_stored_body_at_or_under_cap_is_unchanged(monkeypatch: pytest.MonkeyPatc
     untruncated -- the cap must never touch a body that already fits."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_body_max_chars=1000))
     text = "x" * 1000
-    stored, truncated = llm_log._stored_body(text)
+    stored, truncated = llm_log._stored_body(text, [])
     assert stored == text
     assert truncated is False
 
@@ -195,7 +195,7 @@ def test_stored_body_over_cap_is_hard_cut_with_marker(monkeypatch: pytest.Monkey
     marker appended in place of the last characters (not merely a bare
     slice), and reports truncated=True."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_body_max_chars=1000))
-    stored, truncated = llm_log._stored_body("y" * 5000)
+    stored, truncated = llm_log._stored_body("y" * 5000, [])
     assert truncated is True
     assert len(stored) == 1000
     assert stored.endswith(llm_log._BODY_TRUNCATION_MARKER)
@@ -214,7 +214,7 @@ def test_stored_body_cap_smaller_than_marker_hard_cuts_without_it(
     Confirms the marker is DROPPED (not partially appended) and the result is
     a bare hard cut to exactly ``cap`` chars."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: SimpleNamespace(llm_log_body_max_chars=5))
-    stored, truncated = llm_log._stored_body("z" * 100)
+    stored, truncated = llm_log._stored_body("z" * 100, [])
     assert truncated is True
     assert stored == "zzzzz"
 
@@ -435,6 +435,100 @@ def test_advertised_tool_names_keep_none_and_empty_apart(
     assert without_kwarg is not None and empty_list is not None
     assert without_kwarg["attempts"][0]["tools_advertised"] is None
     assert empty_list["attempts"][0]["tools_advertised"] == []
+
+
+def test_one_secret_sweep_per_attempt_however_many_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The known-secret provider is asked ONCE per recorded step, not once per
+    string.
+
+    The provider is ``tools.known_secret_values``: an ``iterdir`` plus a ``stat``
+    per installed package, plus a ``.env`` read on every cache miss -- and this
+    runs on the EVENT LOOP, before the request goes out. One sweep per name made
+    an attempt advertising N tools do N sweeps over N packages, quadratic
+    filesystem work to mask a handful of short names. Counted rather than timed,
+    because the count is the property; the masking itself is asserted in the same
+    breath so the cheaper shape cannot be mistaken for a weaker one."""
+    calls: list[int] = []
+    secret = "kbsearch-tool"  # also the name of an installed tool
+
+    def counting_provider() -> set[str]:
+        calls.append(1)
+        return {secret}
+
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    monkeypatch.setattr(llm_log, "_secret_provider", counting_provider)
+    llm_log._reset_for_tests()
+
+    recorder = llm_log.LlmInteractionRecorder(workflow="capture", model="m")
+    recorder.begin_attempt(
+        [{"role": "system", "content": "SYS"}, {"role": "user", "content": "USR"}],
+        tools_advertised=[secret, *[f"tool{index}" for index in range(20)]],
+    )
+    assert calls == [1]  # 2 messages + 21 names, ONE sweep
+
+    recorder.record_response("out")
+    assert len(calls) == 2  # the response is a separate step, a whole round trip later
+    recorder.finish(outcome="ok", error=None)
+
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    names = record["attempts"][0]["tools_advertised"]
+    assert names[0] == llm_log._REDACTION_MARKER  # still masked off the shared snapshot
+    assert names[1] == "tool0"
+
+
+def test_advertised_names_are_bounded_and_the_record_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one field of a record that used to bypass every size discipline.
+
+    Nothing caps how many packages a tools directory holds, so the array could be
+    arbitrarily long in the ring AND the JSONL sink while every body beside it was
+    capped twice. Both ceilings are pinned -- the COUNT (a name may store zero
+    characters, which no character budget can bound) and the aggregate CHARACTER
+    budget (``llm_log_body_max_chars``, the same knob ``_apply_total_budget``
+    re-uses for the message bodies) -- and so is the thing that makes a cut
+    honest: a trailing marker naming how many were dropped, plus the attempt's own
+    ``truncated`` flag. Silently short lists are how a reader concludes the model
+    was offered three tools when it was offered three hundred."""
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    llm_log._reset_for_tests()
+
+    def _last_attempt() -> dict[str, Any]:
+        record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+        assert record is not None
+        return record["attempts"][0]
+
+    over_count = [f"tool{index}" for index in range(llm_log._MAX_TOOLS_ADVERTISED + 7)]
+    _record(workflow="capture", tools_advertised=over_count)
+    attempt = _last_attempt()
+    names = attempt["tools_advertised"]
+    assert names[: llm_log._MAX_TOOLS_ADVERTISED] == over_count[: llm_log._MAX_TOOLS_ADVERTISED]
+    assert names[-1] == llm_log._names_elision_marker(7)  # kept in advertisement order
+    assert len(names) == llm_log._MAX_TOOLS_ADVERTISED + 1
+    assert attempt["truncated"] is True
+
+    # The character half, with a count far under the cap: each stored name is
+    # itself capped at the budget, so the first always fits and the rest do not.
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_body_max_chars=1000, llm_log_max_entries=50),
+    )
+    llm_log._reset_for_tests()
+
+    _record(workflow="capture", tools_advertised=["a" * 900, "b" * 900, "c" * 900])
+    attempt = _last_attempt()
+    assert attempt["tools_advertised"] == ["a" * 900, llm_log._names_elision_marker(2)]
+    assert attempt["truncated"] is True
+
+    # An ordinary list is stored EXACTLY as before -- no marker, no flag.
+    _record(workflow="capture", tools_advertised=["alpha", "beta"])
+    attempt = _last_attempt()
+    assert attempt["tools_advertised"] == ["alpha", "beta"]
+    assert attempt["truncated"] is False
 
 
 def test_advertised_tool_name_cut_for_size_sets_truncated(

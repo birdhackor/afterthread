@@ -765,8 +765,10 @@ def test_store_meta_refuses_a_finalized_sidecar(
     _write_meta(pkg, summary="定版的說明", status="final", origin=origin)
     before = (pkg / tools._AI_META_FILENAME).read_bytes()
 
+    identity = tools.package_identity(pkg)
+    assert identity is not None
     assert (
-        tool_meta._store_meta(pkg, summary="新的", origin=None, llm_log_id=9)
+        tool_meta._store_meta(pkg, summary="新的", origin=None, llm_log_id=9, identity=identity)
         is tool_meta.StoreRefusal.FINALIZED
     )
     assert (pkg / tools._AI_META_FILENAME).read_bytes() == before  # byte-for-byte
@@ -1160,6 +1162,141 @@ def test_regenerate_summary_refuses_a_finalize_that_lands_mid_generation(
     assert stored is not None
     assert stored["summary"] == "定版的說明"
     assert stored["status"] == "final"
+
+
+def _replace_package(root: Path, name: str = "kbsearch") -> Path:
+    """Delete ``name`` and install a DIFFERENT package under the same name.
+
+    What an operator can do inside one summary generation without touching the
+    job domain at all: the tool job single-flight covers install/revise/regenerate,
+    never a plain delete followed by an install. The replacement carries its own
+    ``tool.json`` -- which is what makes it a different package identity -- and its
+    own sidecar, so a write that landed here would be visible as BOTH a lost
+    summary and a stolen one."""
+    import shutil
+
+    shutil.rmtree(root / name)
+    replacement = _package(root, name, run_py="import sys\nsys.stdout.write('B')\n")
+    _write_meta(replacement, summary="新工具自己的總結", status="draft")
+    return replacement
+
+
+def test_regenerate_summary_writes_nothing_when_the_package_was_replaced(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A summary belongs to the package it was generated FROM, not to the name.
+
+    The generation resolves a directory, spends an LLM round trip, then writes --
+    and a delete plus a same-name install inside that window is not blocked by
+    anything (the job single-flight does not cover it). Without the identity the
+    resolve captured, package A's summary AND A's origin would be persisted into
+    package B, over B's own.
+
+    The answer is the same None a vanished package gives, because from the
+    caller's side both mean "the regeneration did not happen" -- and the route
+    folds that into its 404 rather than reporting a summary that is nowhere."""
+    root = tmp_path / "tools"
+    pkg = _package(root)
+    _summary_settings(monkeypatch, root)
+    _write_meta(pkg, summary="A 的總結", status="draft")
+    replaced: dict[str, Path] = {}
+
+    def replace_mid_call() -> None:
+        replaced["pkg"] = _replace_package(root)
+
+    _fake_generate(monkeypatch, summary="A 的新說明", side_effect=replace_mid_call)
+
+    assert asyncio.run(regenerate_summary("kbsearch")) is None
+
+    stored = tools.read_tool_meta(replaced["pkg"])
+    assert stored is not None
+    assert stored["summary"] == "新工具自己的總結"  # B's own sidecar, untouched
+
+
+def test_generate_and_store_summary_writes_nothing_when_the_package_was_replaced(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The install hook takes the same guard, and swallows the refusal like every
+    other store outcome -- an install that already succeeded must never be failed
+    by its summary.
+
+    Both of its writes are covered, because both carry this session's origin and
+    log id: the SUMMARY here, and the PLACEHOLDER (below) which is written when the
+    generation failed. A placeholder landing in package B would attach A's install
+    origin -- the URL and the operator's instructions -- to a package B that was
+    installed from something else entirely, and every later revise of B would read
+    that origin back as first-hand context."""
+    root = tmp_path / "tools"
+    _package(root)
+    _summary_settings(monkeypatch, root)
+
+    def replace_mid_call() -> None:
+        _replace_package(root)
+
+    _fake_generate(monkeypatch, summary="A 的說明", side_effect=replace_mid_call)
+
+    asyncio.run(generate_and_store_summary("kbsearch", origin={"instructions": "查 A"}))
+
+    stored = tools.read_tool_meta(root / "kbsearch")
+    assert stored is not None
+    assert stored["summary"] == "新工具自己的總結"
+    assert stored["origin"] is None  # A's install context never reached B
+
+
+def test_generate_and_store_summary_placeholder_respects_the_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The FAILURE path writes too, so it is guarded too.
+
+    A failed generation leaves an empty summary plus the origin and the failed
+    session's log id -- the same misattribution with a shorter body if it lands in
+    the wrong package. Driven with a replacement that has NO sidecar, so the
+    placeholder's own "only when there is nothing there" precondition is met at
+    the target and only the identity can stop the write."""
+    root = tmp_path / "tools"
+    _package(root)
+    _summary_settings(monkeypatch, root)
+
+    def replace_then_fail() -> None:
+        import shutil
+
+        shutil.rmtree(root / "kbsearch")
+        _package(root, "kbsearch", run_py="import sys\nsys.stdout.write('B')\n")
+
+    _fake_generate(
+        monkeypatch,
+        explode=LLMUpstreamError("upstream is down"),
+        side_effect=replace_then_fail,
+    )
+
+    asyncio.run(generate_and_store_summary("kbsearch", origin={"instructions": "查 A"}))
+
+    assert tools.read_tool_meta(root / "kbsearch") is None  # B got no sidecar at all
+
+
+def test_summary_paths_refuse_a_package_with_no_manifest_before_the_llm_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No identity, no write -- and the refusal happens at the DOOR.
+
+    "A check that cannot speak must not vouch" (D40 P3b r11) applies to the store
+    the same way it applies to the revise, so a directory whose ``tool.json``
+    cannot be read cannot have a summary stored against it. Refusing at the
+    resolve rather than after the round trip is the same call r11 made for the
+    same reason: burning a whole LLM session to then throw the answer away helps
+    nobody, and such a package is invalid -- it cannot be executed or revised
+    either. Pinned by the generation never being CALLED."""
+    root = tmp_path / "tools"
+    pkg = _package(root)
+    (pkg / "tool.json").unlink()
+    _summary_settings(monkeypatch, root)
+    captured = _fake_generate(monkeypatch, summary="不該被產生")
+
+    assert asyncio.run(regenerate_summary("kbsearch")) is None
+    asyncio.run(generate_and_store_summary("kbsearch", origin=None))  # must not raise
+
+    assert captured == {}  # no LLM session was started by either path
+    assert tools.read_tool_meta(pkg) is None
 
 
 class _ContendedLock:

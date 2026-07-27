@@ -5,6 +5,14 @@
 主代理規劃／裁決，subagent 實作，每 phase commit 後跑 codex adversarial review 至收斂再
 push，全部完成後對 `fdff6166..HEAD` 跑 overall review。
 
+**這份文件的定位**：它是**計畫**，但**不是歷史草稿**——凡是 review 推翻掉的段落，一律
+**就地改成實作真正的樣子，並把「為什麼原句危險」一起寫在旁邊**（沿用「規劃時寫的是
+X，實作已改掉」的體例）。理由是這份文件會被當成入口讀，而被推翻的多半正是**安全性
+修法**：留著原句、只在開頭掛一張「這是舊計畫」的告示，等於讓照著它重構的人把
+`.env` 的寬容讀取、無條件刪除 backup 這類洞原樣裝回去，而告示救不了跳著讀的人。逐條
+的最終依據仍是 [`web-v4-decisions.md`](web-v4-decisions.md) 的 D40 附錄；兩邊若有出入，
+以那邊為準。
+
 ## 需求對照
 
 1. 快速捕捉「追問」與詳情頁「仍待補齊」用唯讀 Checkbox，看起來可勾卻不能勾 → **P1**：
@@ -119,18 +127,36 @@ Revise job（與 install 共用 `_JOBS`／single-flight——任何 queued/runni
   `install_in_progress`，避免動既有 pin 與 FE 分支）；409 `tool_finalized`（已定版須先
   解除）。**不宣告 502/503**（LLM 失敗封在 job.state，比照 install——test_ai_contract
   的 exact-set 不受影響）。
-- 執行：`_resolve_package_dir(name)` 解析 → `_load_tool_dotenv` 取既有 `.env` 值，
-  逐值 `register_inflight_secret`（try/finally discard；補 hidden-backup 交換窗的遮蔽
-  覆蓋）→ `copytree` 到 `.staging/<uuid>`，**排除 `.env` 與 `.ai_meta.json`**（`.env`
-  含真值會觸發 embedded-secret gate）→ meta-tools 重用 `_build_meta_tools(staging,
-  secret_env=既有 env 值)` → revise 專用 system prompt（既有包＋使用者意見框架；
-  聲明 `.env` 由系統保留、勿依賴改寫）＋ feedback user prompt（不重抓 OpenAPI）→
-  `generate_structured(InstallResult, workflow="tool_install"（沿用）, tool_install 的
-  rounds/timeout)`。
+- 執行：`_resolve_package_dir(name)` 解析 → 取既有 `.env` 值，逐值
+  `register_inflight_secret`（try/finally discard；補 hidden-backup 交換窗的遮蔽
+  覆蓋）→ `copytree` 到 `.staging/<uuid>` → meta-tools 重用
+  `_build_meta_tools(staging, secret_env=既有 env 值)` → revise 專用 system prompt
+  （既有包＋使用者意見框架；聲明 `.env` 由系統保留、勿依賴改寫）＋ feedback user
+  prompt（不重抓 OpenAPI）→ `generate_structured(InstallResult,
+  workflow="tool_install"（沿用）, tool_install 的 rounds/timeout)`。
+  **規劃時寫的 `_load_tool_dotenv`（執行期那個寬容讀取器：讀不到就當沒有 env）
+  不是實作採用的入口**：修訂改走 `_read_env_for_values` 這個嚴格讀取器——非
+  regular file、超過位元組上限、解析失敗、或值遮不掉（長度下限＋逐行拼法閘，
+  D40 r1／r5／r6／r7／r8／r9）一律**入口即拒**，因為修訂會把這個檔案原樣**出貨**，
+  而寬容讀取器的「當作沒有」在這裡等於「把一份我們遮不掉的憑證帶進提示與日誌」。
+  照原句改回寬容讀取，就是把那組閘門整組拆掉。
+  **排除的也不是「所有 `.env`」**：`_revise_copy_ignore` 只排除**根層**的 `.env`
+  （而且以目錄列表＋不跟隨的同一實體比對認定，不是比拼法；D40 r5／r6），sidecar 的
+  保留命名空間才是**任何層級**都排除。巢狀 `.env` 是套件自己的內容、照複製——工具以
+  套件目錄為 cwd，`open("config/.env")` 完全合法，一次「加上分頁」的修訂靜默刪掉它、
+  再把殘缺的套件驗證成沒問題，比原規則想擋的事更糟（D40 r2 附錄 R2-2）。
 - 收尾檢查：`result.tool_name == name`（防模型改名越權）→ `validate_package` →
-  回填保留的 `.env`（覆蓋 builder 寫的）→ **promote replace 模式**：舊包改名為隱藏
-  sibling `.{name}.bak-<uuid>` → move staging 進位 → 失敗 rollback（backup 移回）、
-  成功 rmtree backup。與 delete 併發的 race 比照 install 既有 accepted-risk（單人
+  回填保留的 `.env`（覆蓋 builder 寫的；出貨前對**要複製的那些位元組**再跑一次同一套
+  `.env` 政策，D40 r7／overall O-1）→ 換裝前**最後一道**是「還是同一個套件嗎」的
+  manifest 身分重驗（D40 r10／r11／r12）→ **promote replace 模式**：舊包改名為隱藏
+  sibling `.{name}.bak-<uuid>` → move staging 進位 → 失敗 rollback（backup 移回）。
+  **成功後不是無條件 `rmtree` backup**：**還有子行程在執行那包的檔案時，backup 改名
+  進延後名域 `.{name}.stale-<token>`，由 `_sweep_stale_backups` 之後收**（D40 overall
+  r3 O3-1；`delete_tool` 走同一條路，overall r4 O4-2）。實測（Linux/ext4）：改名對
+  cwd 停在該目錄的子行程完全無感，`rmtree` 則讓之後每一次相對開檔變成 ENOENT——照原句
+  改回無條件刪除，就是把一次進行中的工具呼叫打斷，而模型收到的是「這個動作失敗了」。
+  「有沒有人在執行」以**目錄身分**（`tools.directory_identity`）為 key，不是 manifest
+  身分（overall r5 O5-1）。與 delete 併發的 race 比照 install 既有 accepted-risk（單人
   本機工具）。
 - 成功後同樣 best-effort 重生 summary sidecar（origin 保留原值）。
 
@@ -153,8 +179,12 @@ Revise job（與 install 共用 `_JOBS`／single-flight——任何 queued/runni
 - `ToolRow` 加「總結」展開區（沿用頁內既有慣例：inline 展開）：summary 文字
   （`whiteSpace: pre-wrap`）、狀態 badge（草稿／已定版／尚無總結）、「重新產生」
   （sync mutation）、「定版／解除定版」（PATCH）、意見 Textarea＋「送出修訂」
-  （POST revise → 沿用 `toolInstall.js` 的 `installJobRefetchInterval`／
-  `isInstallJobActive` 純函式輪詢 `GET /api/tools/jobs/{job_id}`）。
+  （POST revise → 沿用 `toolInstall.js` 的純函式輪詢 `GET /api/tools/jobs/{job_id}`）。
+  **規劃時寫的 `installJobRefetchInterval`／`isInstallJobActive` 這兩個名字已不存在**：
+  同一批工作（安裝、AI 修訂、同步重新產生總結）共用一張 job 表之後，實作把它們改成
+  `toolJobRefetchInterval`／`isToolJobActive`（另有 `TOOL_JOB_POLL_MS`／
+  `isTerminalToolJobState`／`toolJobQueryEnabled`）。名字裡的 install 是錯的資訊，不是
+  拼字問題——它會讓人以為修訂另有一套輪詢。
 - revise job 進行中：該 row 控制項與 install 表單同受既有 gate 管制（同一 job 表
   single-flight，FE 呈現一致）。
 - 成功後 invalidate `["tools"]`；install 輪詢 URL 換到 `/api/tools/jobs/{job_id}`。

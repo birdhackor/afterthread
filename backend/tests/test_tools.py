@@ -895,6 +895,49 @@ def test_runtime_identity_survives_a_summary_sidecar_write(
     assert asyncio.run(handler({})) == "ok"
 
 
+def test_the_two_identities_answer_two_different_questions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The measurements the split rests on, pinned so neither can be "simplified"
+    into the other.
+
+    ``package_identity`` answers "is this still the same PACKAGE?" and
+    ``directory_identity`` answers "is anything still running out of these
+    FILES?", and each is WRONG for the other's question:
+
+    * an in-place manifest rewrite (``set_enabled``) MOVES the manifest identity
+      -- which is what makes it a package identity, and what makes it useless as
+      an execution key: a running child would vanish from the registry;
+    * a delete-and-recreate REUSES the directory inode (the measurement D40 P3b
+      r10 settled the package question on), so the directory identity must never
+      be read as "the same package";
+    * a rename carries the directory identity -- the property both deferral
+      writers depend on, since they rename first and ask afterwards."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    manifest_before, directory_before = tools.package_identity(pkg), tools.directory_identity(pkg)
+    assert manifest_before is not None and directory_before is not None
+
+    assert set_enabled("echo", False) is True
+    assert tools.package_identity(pkg) != manifest_before  # the package "changed"
+    assert tools.directory_identity(pkg) == directory_before  # the files did not move
+
+    renamed = root / ".echo.stale-x"
+    os.rename(pkg, renamed)
+    assert tools.directory_identity(renamed) == directory_before  # the name moved, not the inode
+    assert tools.directory_identity(pkg) is None  # ... and nothing answers for the old name
+
+    shutil.rmtree(renamed)
+    reinstalled = _make_tool(root, "echo", "import sys\nsys.stdout.write('y')\n")
+    assert tools.package_identity(reinstalled) != manifest_before  # a NEW package, always
+    # The directory inode is routinely REUSED here, which is exactly why the
+    # question above cannot be answered with it. Asserted as "may be equal" rather
+    # than "is equal" because inode allocation is the filesystem's business: the
+    # claim being pinned is that this tuple does not distinguish packages.
+    assert tools.directory_identity(reinstalled) is not None
+
+
 def test_runtime_registers_the_execution_for_as_long_as_the_child_runs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -908,7 +951,11 @@ def test_runtime_registers_the_execution_for_as_long_as_the_child_runs(
     reading it, and ``tool_builder``'s promote consults that before dropping its
     backup. Asserted against a real child that blocks until this test releases it
     (and that announces itself first), so the True is genuinely concurrent with a
-    running process rather than inferred from the handler having been entered."""
+    running process rather than inferred from the handler having been entered.
+
+    Published under the DIRECTORY's identity, which is the one the removal
+    threatens and the one every consumer re-derives from the directory it holds
+    (see ``tools.directory_identity``)."""
     root = tmp_path / "tools"
     marker, gate = tmp_path / "started", tmp_path / "go"
     pkg = _make_tool(
@@ -921,23 +968,23 @@ def test_runtime_registers_the_execution_for_as_long_as_the_child_runs(
         "sys.stdout.write('ok')\n",
     )
     _install_tools(monkeypatch, root)
-    identity = tools.package_identity(pkg)
+    identity = tools.directory_identity(pkg)
     assert identity is not None
     handler = enabled_llm_tools()[0].handler
-    assert tools.package_execution_in_flight(identity) is False
+    assert tools.directory_execution_in_flight(identity) is False
 
     result: dict[str, str] = {}
     caller = threading.Thread(target=lambda: result.update(out=asyncio.run(handler({}))))
     caller.start()
     try:
         _wait_for(marker.exists)
-        assert tools.package_execution_in_flight(identity) is True
+        assert tools.directory_execution_in_flight(identity) is True
     finally:
         gate.write_text("go", encoding="utf-8")
         caller.join(timeout=30)
 
     assert result["out"] == "ok"
-    assert tools.package_execution_in_flight(identity) is False  # released with the call
+    assert tools.directory_execution_in_flight(identity) is False  # released with the call
 
 
 def test_inflight_execution_is_counted_and_released_on_every_exit() -> None:
@@ -949,17 +996,18 @@ def test_inflight_execution_is_counted_and_released_on_every_exit() -> None:
     backup forever -- so a handler that raises, and an AI request cancelled
     mid-call (the shape asyncio uses on a timeout), must both come back out. The
     key is REMOVED at zero, so a stale count can never read as "still in use"."""
-    identity = (1, 2, 3)
+    identity = (1, 2)
     with tools._inflight_execution(identity):
         with tools._inflight_execution(identity):
-            assert tools.package_execution_in_flight(identity) is True
-        assert tools.package_execution_in_flight(identity) is True  # the outer call still holds it
-    assert tools.package_execution_in_flight(identity) is False
+            assert tools.directory_execution_in_flight(identity) is True
+        # the outer call still holds it
+        assert tools.directory_execution_in_flight(identity) is True
+    assert tools.directory_execution_in_flight(identity) is False
 
     for exc in (RuntimeError, asyncio.CancelledError):
         with pytest.raises(exc), tools._inflight_execution(identity):
             raise exc()
-        assert tools.package_execution_in_flight(identity) is False
+        assert tools.directory_execution_in_flight(identity) is False
     assert tools._INFLIGHT_EXECUTIONS == {}  # nothing left behind, not even a zero
 
 
@@ -1936,6 +1984,61 @@ def test_delete_during_an_execution_defers_the_removal(
     remains = [child.name for child in root.iterdir()]
     assert len(remains) == 1 and tools._STALE_BACKUP_RE.match(remains[0])
     assert secret not in tools.known_secret_values()  # the hold ended with the call
+
+
+def test_delete_after_an_enabled_toggle_still_defers_a_running_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An ``enabled`` toggle mid-call must not make a running child invisible.
+
+    The registry used to be keyed on the MANIFEST identity, and ``set_enabled``
+    rewrites ``tool.json`` IN PLACE -- so a handler that registered before the
+    toggle was looked up afterwards under a tuple it had never registered, the
+    delete concluded nothing was running, and ``rmtree`` took the files out from
+    under a live subprocess. That split is not the syscall-pair instant this
+    subsystem accepts elsewhere: it lasts from the toggle until the child exits.
+
+    Keyed on the DIRECTORY, both sides agree again -- an edit to a file inside a
+    directory changes nothing about the directory's own ``(st_dev, st_ino)``, and
+    a rename carries it (both measured; see ``tools.directory_identity``). The
+    child reads its data file by relative path only AFTER the delete has returned,
+    so a destroyed package would come back as a tool FAILURE rather than its
+    payload. The collection still happens, one sweep later."""
+    root = tmp_path / "tools"
+    marker, gate = tmp_path / "started", tmp_path / "go"
+    pkg = _make_tool(
+        root,
+        "toggled",
+        "import os, sys, time\n"
+        f"open({str(marker)!r}, 'w').write('x')\n"
+        f"while not os.path.exists({str(gate)!r}):\n"
+        "    time.sleep(0.01)\n"
+        "sys.stdout.write(open('data.txt').read())\n",
+    )
+    (pkg / "data.txt").write_text("PAYLOAD", encoding="utf-8")
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler
+    before = tools.package_identity(pkg)
+
+    result: dict[str, str] = {}
+    caller = threading.Thread(target=lambda: result.update(out=asyncio.run(handler({}))))
+    caller.start()
+    try:
+        _wait_for(marker.exists)  # the CHILD is running, not merely queued
+        assert set_enabled("toggled", False) is True
+        # The premise, measured in place rather than assumed: the toggle DID move
+        # the manifest identity (so a manifest-keyed lookup would miss) while the
+        # directory identity the call registered under is unchanged.
+        assert tools.package_identity(pkg) != before
+        assert delete_tool("toggled") is True
+    finally:
+        gate.write_text("go", encoding="utf-8")
+        caller.join(timeout=30)
+
+    assert result["out"] == "PAYLOAD"  # the files survived the delete, as intended
+    remains = [child for child in root.iterdir()]
+    assert len(remains) == 1 and tools._STALE_BACKUP_RE.match(remains[0].name)
+    assert (remains[0] / "data.txt").exists()  # deferred, not destroyed
 
 
 def test_deferred_delete_remains_are_invisible_to_every_registry_path(
@@ -3091,6 +3194,7 @@ def test_set_summary_status_and_store_summary_meta_serialize(
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
+    identity = tools.package_identity(pkg)
     assert _write_meta(pkg, summary="說明", status="draft") is True
 
     errors: list[BaseException] = []
@@ -3107,7 +3211,11 @@ def test_set_summary_status_and_store_summary_meta_serialize(
         try:
             for index in range(20):
                 tools.store_summary_meta(
-                    pkg, summary=f"生成 {index}", origin=None, llm_log_id=index
+                    pkg,
+                    summary=f"生成 {index}",
+                    origin=None,
+                    llm_log_id=index,
+                    expected_identity=identity,
                 )
         except BaseException as exc:  # reported to the main thread, never swallowed
             errors.append(exc)
@@ -3149,11 +3257,14 @@ def test_store_summary_meta_outcomes(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
+    identity = tools.package_identity(pkg)
 
     # ok: status and origin inherited from disk, the summary replaced.
     origin = {"openapi_url": "http://kb.example/o.json", "instructions": "查 KB"}
     assert _write_meta(pkg, summary="舊的", status="draft", origin=origin) is True
-    outcome, meta = tools.store_summary_meta(pkg, summary="新的", origin=None, llm_log_id=9)
+    outcome, meta = tools.store_summary_meta(
+        pkg, summary="新的", origin=None, llm_log_id=9, expected_identity=identity
+    )
     assert outcome == "ok"
     assert meta is not None
     assert meta["summary"] == "新的"
@@ -3164,7 +3275,9 @@ def test_store_summary_meta_outcomes(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     # finalized: nothing is written, and the answer is NOT the failure code.
     assert tools.set_summary_status("echo", "final") == "ok"
     before = _sidecar(pkg).read_bytes()
-    assert tools.store_summary_meta(pkg, summary="更新的", origin=None, llm_log_id=1) == (
+    assert tools.store_summary_meta(
+        pkg, summary="更新的", origin=None, llm_log_id=1, expected_identity=identity
+    ) == (
         "finalized",
         None,
     )
@@ -3172,7 +3285,9 @@ def test_store_summary_meta_outcomes(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 
     # not_stored: the write was refused (here, the ghost guard on a missing dir).
     gone = tmp_path / "nope" / "gone"
-    assert tools.store_summary_meta(gone, summary="s", origin=None, llm_log_id=None) == (
+    assert tools.store_summary_meta(
+        gone, summary="s", origin=None, llm_log_id=None, expected_identity=None
+    ) == (
         "not_stored",
         None,
     )
@@ -3193,14 +3308,19 @@ def test_store_summary_meta_stamps_the_minting_process_beside_the_log_id(
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
+    identity = tools.package_identity(pkg)
 
-    outcome, meta = tools.store_summary_meta(pkg, summary="說明", origin=None, llm_log_id=7)
+    outcome, meta = tools.store_summary_meta(
+        pkg, summary="說明", origin=None, llm_log_id=7, expected_identity=identity
+    )
     assert outcome == "ok"
     assert meta is not None
     assert meta["llm_log_id"] == 7
     assert meta["llm_log_process"] == llm_log.process_token()
 
-    outcome, meta = tools.store_summary_meta(pkg, summary="說明", origin=None, llm_log_id=None)
+    outcome, meta = tools.store_summary_meta(
+        pkg, summary="說明", origin=None, llm_log_id=None, expected_identity=identity
+    )
     assert outcome == "ok"
     assert meta is not None
     assert meta["llm_log_id"] is None
@@ -3252,14 +3372,19 @@ def test_store_summary_meta_strips_and_caps_the_summary(
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
+    identity = tools.package_identity(pkg)
 
-    outcome, meta = tools.store_summary_meta(pkg, summary="  spaced  ", origin=None, llm_log_id=1)
+    outcome, meta = tools.store_summary_meta(
+        pkg, summary="  spaced  ", origin=None, llm_log_id=1, expected_identity=identity
+    )
     assert outcome == "ok"
     assert meta is not None
     assert meta["summary"] == "spaced"
 
     long_text = "y" * (tools._TOOL_SUMMARY_CAP + 500)
-    outcome, meta = tools.store_summary_meta(pkg, summary=long_text, origin=None, llm_log_id=1)
+    outcome, meta = tools.store_summary_meta(
+        pkg, summary=long_text, origin=None, llm_log_id=1, expected_identity=identity
+    )
     assert outcome == "ok"
     assert meta is not None
     assert meta["summary"] == "y" * tools._TOOL_SUMMARY_CAP
@@ -3279,12 +3404,17 @@ def test_store_summary_meta_redacts_before_capping(
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
+    identity = tools.package_identity(pkg)
     secret = "ZZTOP-live-secret-abcdef"
     monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
 
     padding = "y" * (tools._TOOL_SUMMARY_CAP - 4)
     outcome, meta = tools.store_summary_meta(
-        pkg, summary=padding + secret, origin=None, llm_log_id=1
+        pkg,
+        summary=padding + secret,
+        origin=None,
+        llm_log_id=1,
+        expected_identity=identity,
     )
 
     assert outcome == "ok"
@@ -3309,10 +3439,13 @@ def test_store_summary_meta_redacts_before_stripping(
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
+    identity = tools.package_identity(pkg)
     secret = " secret-token-abcdef "
     monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
 
-    outcome, meta = tools.store_summary_meta(pkg, summary=secret, origin=None, llm_log_id=1)
+    outcome, meta = tools.store_summary_meta(
+        pkg, summary=secret, origin=None, llm_log_id=1, expected_identity=identity
+    )
 
     assert outcome == "ok"
     assert meta is not None
@@ -3330,6 +3463,7 @@ def test_store_summary_meta_fails_closed_on_a_redaction_failure(
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
+    identity = tools.package_identity(pkg)
     assert _write_meta(pkg, summary="舊的", status="draft") is True
     before = _sidecar(pkg).read_bytes()
 
@@ -3338,7 +3472,9 @@ def test_store_summary_meta_fails_closed_on_a_redaction_failure(
 
     monkeypatch.setattr(tools, "known_secret_values", explode)
 
-    assert tools.store_summary_meta(pkg, summary="新的", origin=None, llm_log_id=1) == (
+    assert tools.store_summary_meta(
+        pkg, summary="新的", origin=None, llm_log_id=1, expected_identity=identity
+    ) == (
         "not_stored",
         None,
     )
@@ -3350,7 +3486,9 @@ def test_store_summary_meta_fails_closed_on_a_redaction_failure(
     monkeypatch.setattr(tools, "known_secret_values", frozenset)  # restore, to finalize
     assert tools.set_summary_status("echo", "final") == "ok"
     monkeypatch.setattr(tools, "known_secret_values", explode)
-    assert tools.store_summary_meta(pkg, summary="新的", origin=None, llm_log_id=1) == (
+    assert tools.store_summary_meta(
+        pkg, summary="新的", origin=None, llm_log_id=1, expected_identity=identity
+    ) == (
         "finalized",
         None,
     )
