@@ -1299,3 +1299,24 @@ P4 第四輪 review 的五個問題其實是**同一個主題**：r3 建立了�
   回應蓋到列上，正是這條 finding 本身。**規則因此可以一句話說完：寫入用實例身分，
   重新讀取（invalidate／removeQueries）用名稱前綴**——後者只是叫伺服器再答一次，
   只可能拿到當下的答案。
+
+### D40 附錄（P4 review r5）：快取寫入不得清掉「清單已過時」這個事實
+
+三條 finding 都指向同一個結構問題：**用 mutation 的回應去斷言狀態，會蓋掉「我們其實
+不知道」這件事**。
+
+- **值寫入會把 error query 變回 success**：清單背景更新失敗時 TanStack Query 保留舊資料
+  並標記 error，`staleList` 因此正確擋住 AI 寫入；但一次被允許的定版成功後，對
+  `["tools"]` 的值寫入把 query 狀態改回 success、清掉 error，於是那個 gate 自己消失，
+  舊工具的未送出意見立刻重新可送。修法：**清單已知過時時不做值寫入，只 invalidate**
+  ——重新讀取是誠實的，斷言不是；失敗的 refetch 也會保住 error 狀態。判斷用的是
+  **寫入當下**從 query client 現讀的狀態，不是 closure 建立時的 render 快照。
+- **issue stamp 不等於伺服器寫入順序**：兩個 HTTP request 抵達 sidecar 鎖的順序不受
+  前端發出順序保證，所以被 stamp 判定為「舊」的回應，可能才是描述**較晚**伺服器狀態的
+  那一個。丟掉它的**值**是對的（我們無從判斷），連**重新讀取**一起丟掉是錯的——那正是
+  「伺服器已 final、面板永遠顯示 draft，旁邊還配一個綠色成功通知」的成因。修法：被
+  supersede 的回應仍然 invalidate。
+- **list-only refresh 不會重抓 summary**：同名且 description 相同的重裝會共用 key，
+  於是刷新清單後面板仍是舊工具的總結、且看起來是 success。修法：「重新整理」同時
+  invalidate `["tool-summary"]` 前綴（按名稱重問伺服器，這正是 key 本身答不出的問題）。
+  意見草稿仍會存活，那需要後端提供真正的實例身分，已書面裁決延後（`裁決紀錄.md` #7）。

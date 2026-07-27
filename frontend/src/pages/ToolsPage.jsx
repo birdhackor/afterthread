@@ -725,6 +725,16 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	// be about a row does not touch that row, instead of being stamped onto
 	// whatever answers to the name now.
 	//
+	// Whether the tool list on screen is known to be stale, read LIVE from the
+	// cache rather than from a render-time snapshot: this runs inside a mutation
+	// callback that may settle several renders after the closure was created, and
+	// the answer must describe the moment of the WRITE. Same shape as the
+	// `staleList` the panel renders its banner from (an error with data still
+	// present), asked of the query client instead of this render's props.
+	const listIsStale = () =>
+		queryClient.getQueryState(["tools"])?.status === "error" &&
+		queryClient.getQueryData(["tools"]) !== undefined;
+
 	// `stamp` orders this write against the OTHER mutation that can be writing the
 	// same entry concurrently (see createSummaryWriteLedger).
 	const applySummaryDetail = async (detail, { name, description }, stamp) => {
@@ -736,7 +746,16 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 		// cancelling it would throw away the only thing that could still correct
 		// the row.
 		if (!claimLatestSummaryWrite(writeLedger.current, instanceKey, stamp)) {
-			return undefined;
+			// Superseded by a newer WRITE, but still invalidate (R5-2). An issue
+			// stamp orders our own requests, not the SERVER's writes: two HTTP
+			// requests can reach the sidecar lock in the opposite order, so the
+			// response we are dropping may be the one describing the LATER server
+			// state. Dropping its value is right (we cannot tell), dropping the
+			// re-read too is not -- that is how the panel ends up permanently
+			// showing draft for a tool the server has already finalized, with a
+			// green toast next to it. The re-read costs one GET and can only ever
+			// return the post-write truth.
+			return queryClient.invalidateQueries({ queryKey: ["tools"] });
 		}
 		// Cancel BEFORE writing, for both keys about to be written. A write that
 		// races a read it did not cancel is a write that can be undone by older
@@ -766,7 +785,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 		// with the same stamp is idempotent by construction (only a STRICTLY newer
 		// applied stamp refuses).
 		if (!claimLatestSummaryWrite(writeLedger.current, instanceKey, stamp)) {
-			return undefined;
+			return queryClient.invalidateQueries({ queryKey: ["tools"] });
 		}
 		// Write only if the entry is still there. removeQueries on delete cannot
 		// stop a request already on the wire, and a plain value write would rebuild
@@ -781,9 +800,19 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 		// both filtering on _SUMMARY_STATUSES), so this can only ever write
 		// "draft" | "final" | null -- exactly what GET /api/tools would have
 		// returned for that field.
-		queryClient.setQueryData(["tools"], (listBody) =>
-			patchToolRowSummaryStatus(listBody, instanceKey, detail.status),
-		);
+		// ... and NOT while the list is known stale (R5-1). Two reasons, either
+		// alone sufficient: the row we would patch carries an identity we have
+		// already decided not to trust (it is what blocks the AI writes), and a
+		// value write flips the query from error back to success -- clearing the
+		// very `staleList` flag that gate reads, so a permitted 定版 would silently
+		// re-enable a revise submit whose draft belongs to the tool the stale row
+		// describes. The invalidation below is the honest alternative: it re-reads
+		// instead of asserting, and a still-failing refetch keeps the error state.
+		if (!listIsStale()) {
+			queryClient.setQueryData(["tools"], (listBody) =>
+				patchToolRowSummaryStatus(listBody, instanceKey, detail.status),
+			);
+		}
 		// Kept as the eventual-consistency backstop for the REST of the row
 		// (enabled, valid, description, error), which this response says nothing
 		// about. Its refetch error is still swallowed by TanStack Query -- that is
@@ -1091,7 +1120,22 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	return (
 		<Stack gap="md">
 			<Group justify="flex-end">
-				<Button variant="light" loading={isFetching} onClick={() => refetch()}>
+				<Button
+					variant="light"
+					loading={isFetching}
+					onClick={() => {
+						// Refresh means refresh EVERYTHING on screen, not just the list
+						// (R5-3). An expanded panel's summary sits under its own key, and
+						// a same-name reinstall whose description came out identical
+						// REUSES that key -- so a list-only refetch would leave the old
+						// tool's summary rendered as success next to a row that is now a
+						// different package, with nothing stale-looking to warn about.
+						// Revalidating by NAME prefix asks the server what answers to that
+						// name now, which is the only question the key cannot answer.
+						refetch();
+						queryClient.invalidateQueries({ queryKey: ["tool-summary"] });
+					}}
+				>
 					重新整理
 				</Button>
 			</Group>
