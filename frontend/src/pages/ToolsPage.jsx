@@ -145,11 +145,26 @@ function ToolJobProgress({ kind, jobId, jobQuery }) {
 	const verb = kind === "revise" ? "修訂" : "安裝";
 
 	if (jobQuery.isError) {
+		// A 404 means the job RECORD is gone (jobs are process-local), NOT that the
+		// work did not happen -- and telling the operator to resubmit was wrong
+		// (R12-1). The backend applies the package change FIRST, generates the
+		// summary SECOND, and marks the job done LAST, so a restart during the
+		// summary step loses the record while the install or revision is already
+		// live. "Resubmit" then buys a second unwanted revision of the already
+		// revised tool (another multi-minute LLM run, another rewrite of content
+		// the user did not ask to change) or an install that fails on a name that
+		// is now taken. What we actually know is that the outcome is unknown, so
+		// that is what this says, and the list has just been refetched for exactly
+		// this reason -- the answer is on screen.
+		const unknownOutcome =
+			kind === "revise"
+				? "找不到這個修訂工作，後端可能已重新啟動。修訂可能已經完成——請先看上方清單與這個工具的總結，確認之後再決定要不要重送。"
+				: "找不到這個安裝工作，後端可能已重新啟動。工具可能已經安裝好了——請先看已安裝工具清單，確認之後再決定要不要重裝。";
 		return (
-			<Alert color="red" title={`無法取得${verb}進度`}>
+			<Alert color="orange" title={`無法確認${verb}結果`}>
 				<Text size="sm">
 					{jobQuery.error?.status === 404
-						? `找不到這個${verb}工作，後端可能已重新啟動，請重新送出${verb}`
+						? unknownOutcome
 						: (jobQuery.error?.message ?? "請稍後再試")}
 				</Text>
 			</Alert>
