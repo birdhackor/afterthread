@@ -5074,6 +5074,55 @@ def test_run_revise_refuses_a_shadowed_line_that_spells_the_value_reversibly(
         assert not tools._INFLIGHT_SECRETS
 
 
+def test_run_revise_refuses_a_backslash_escape_inside_single_quotes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """python-dotenv decodes ``\\\\`` inside SINGLE quotes too, so a shadowed
+    single-quoted line can spell the winner's credential reversibly (R9-1).
+
+    This is the case that killed the first shape check: it stripped matching
+    quotes and treated the remainder as literal, which is true of POSIX shell
+    single quotes and NOT true of this parser -- verified against the pinned
+    library rather than assumed. The file below holds two backslashes on the
+    shadowed line and one on the winning line; both mean the same live value, the
+    redactor matches only the winner, and a ``cat`` hands the model the other."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    raw = "TOKEN='abc\\\\defghi'\nTOKEN='abc\\defghi'\n"
+    (pkg / ".env").write_text(raw, encoding="utf-8")
+    parsed = tools._parse_dotenv_text(raw)["TOKEN"]
+    assert parsed == "abc\\defghi"  # ONE backslash: the shadowed line is reversible
+    before = _file_bytes(pkg)
+    captured = _fake_generate(
+        monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
+    assert parsed not in (outcome.error or "")
+    assert captured == {}  # refused before the session
+    assert _file_bytes(pkg) == before
+
+
+def test_run_revise_allows_a_single_quoted_backslash_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The R9-1 rule refuses the reversible SPELLING, not backslashes as such: a
+    value that genuinely contains one, written the way our own serializer would
+    write it, still revises -- otherwise a Windows path in a .env would make a
+    package permanently unrevisable."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    raw = "TOKEN='abc\\defghi'\n"
+    (pkg / ".env").write_text(raw, encoding="utf-8")
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert (pkg / ".env").read_text(encoding="utf-8") == raw
+
+
 def test_run_revise_allows_a_plainly_spelled_shadowed_line(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

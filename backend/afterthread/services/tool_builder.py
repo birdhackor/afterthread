@@ -2542,6 +2542,14 @@ def _env_assignment_rhs_all(text: str) -> list[str]:
     ]
 
 
+# The key name `_plainly_spelled` assigns its probe RHS to before handing the line
+# to the real dotenv parser. Any valid key works; a fixed private one keeps the
+# probe out of the way of whatever keys a package actually uses, and naming it
+# here rather than inlining a literal makes the probe's purpose legible at the
+# call site.
+_SHAPE_PROBE_KEY = "AFTERTHREAD_SPELLING_PROBE"
+
+
 def _plainly_spelled(rhs: str) -> bool:
     """True when an RHS holds its own text LITERALLY -- no reversible encoding.
 
@@ -2554,12 +2562,31 @@ def _plainly_spelled(rhs: str) -> bool:
     ``_dotenv_safe_spellings``.
 
     An empty RHS (``KEY=``) is plain: it holds nothing to hide.
+
+    What this must NOT do is decide for itself what a spelling means. The first
+    attempt stripped matching quotes and treated the remainder as literal, and
+    that was wrong in a way worth recording (R9-1): python-dotenv decodes ``\\\\``
+    to a single backslash INSIDE SINGLE QUOTES too -- verified against the pinned
+    library, not assumed from shell habits, where single quotes are literal. So::
+
+        TOKEN='abc\\\\defghi'   <- reversible: two backslashes on disk, one in the value
+        TOKEN='abc\\defghi'    <- the same live value, spelled plainly
+
+    the shadowed line passed as "plain" while spelling the winner's credential in
+    a form no redactor matches. The fix is to stop hand-reading the spelling: the
+    RHS is handed to the REAL parser (as a probe assignment) to learn what it
+    means, and only then asked whether it is a spelling we could have written for
+    that meaning. Two libraries answer the two questions they own -- dotenv what a
+    line means, our serializer which spellings are safe -- and neither is
+    re-implemented here. An RHS the parser cannot read as a value at all is
+    refused, like every other shape this gate cannot account for.
     """
     if not rhs:
         return True
-    quoted = len(rhs) >= 2 and rhs[0] == rhs[-1] and rhs[0] in "\"'"
-    inner = rhs[1:-1] if quoted else rhs
-    return rhs in _dotenv_safe_spellings(inner)
+    probed = tools._parse_dotenv_text(f"{_SHAPE_PROBE_KEY}={rhs}\n").get(_SHAPE_PROBE_KEY)
+    if probed is None:
+        return False
+    return rhs in _dotenv_safe_spellings(probed)
 
 
 def _dotenv_safe_spellings(value: str) -> tuple[str, ...]:
