@@ -54,7 +54,7 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
 | `/items/$itemId` | `ItemDetailPage` | 單筆項目詳情：完整欄位、progress 歷史（可追加一筆）、狀態/階段快速修改、`ItemAiActions` 提供的「AI 補齊」（enrich）／「AI 進度更新」（assist-update）兩個操作、刪除。 |
 | `/items/$itemId/edit` | `ItemEditPage` | 手動編輯項目的表單頁（沿用 `ItemForm` 元件）。 |
 | `/tools` | `ToolsPage` | 「已安裝工具」（清單／啟停／刪除，每列可展開讀取／重新產生／定版／解除定版 AI 總結，並可提意見送出 AI 修訂）與「安裝新工具」（貼 OpenAPI JSON 網址 + 指示，AI 背景建置、輪詢進度）兩個分頁；細節見根目錄 README「KB 工具安裝指南」。 |
-| `/llm-logs` | `LlmLogsPage` | AI 日誌：呼叫 `GET /api/llm/logs` 列出最近的 LLM 互動，每筆可展開讀取 `GET /api/llm/logs/{id}` 取得的請求/回應內容（每則受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；支援 `?log=<id>` 深連結自動展開（`工具` 頁的安裝結果會連過來）。 |
+| `/llm-logs` | `LlmLogsPage` | AI 日誌：呼叫 `GET /api/llm/logs` 列出最近的 LLM 互動，每筆可展開讀取 `GET /api/llm/logs/{id}` 取得的請求/回應內容（每則受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；支援 `?log=<id>` 深連結（`工具` 頁的安裝／修訂結果會連過來）：在清單裡就自動展開該列，不在清單裡（比最近 50 筆更舊）就直接向詳情端點取那一筆、單獨顯示在清單上方，真的被擠出保留區才說明它已經不在。 |
 | （其他） | `NotFoundPage` | 404 fallback（router 的 `defaultNotFoundComponent`）。 |
 
 ## 慣例
@@ -230,10 +230,13 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   在說「我已經不是你畫面上那個樣子了」——`404`（工具已不叫這個名字）、409
   `tool_finalized`（我們的控制項是開著的，代表快取說它不是 final）、409
   `summary_missing`（定版是拿快取裡的文字判斷可不可按的）三者都證明快取過期，就
-  重新讀總結＋清單（列徽章與詳情 status 是同一個側檔欄位）。`tool_job_in_progress`
-  （還沒寫任何東西）、`llm_not_configured`／502（在寫側檔之前就失敗）、5xx／傳輸
-  失敗（沒有任何證據）刻意**不**重讀——規則寫在純函式 `summaryErrorRevalidates`
-  裡並逐條測試。修訂**工作**是唯一的例外：`ToolJobStatus` 沒有結構化原因、只有一段
+  重新讀總結＋清單（列徽章與詳情 status 是同一個側檔欄位）。第四個是 409
+  `tool_job_in_progress`：它證明的不是快取過期，而是**這個頁面之外有東西正在對這個
+  後端動作**——那是一秒前還不知道的事實，而那個工作完成時可能已經換掉我們正在看的
+  套件，所以**也要重讀**（D40 r8 推翻了 r4「那個工作還沒寫任何東西」的判定：對那個
+  工作而言為真，但沒抓到重點）。`llm_not_configured`／502（在寫側檔之前就失敗）與
+  5xx／傳輸失敗（沒有任何證據）才是刻意**不**重讀的——規則寫在純函式
+  `summaryErrorRevalidates` 裡並逐條測試。修訂**工作**是唯一的例外：`ToolJobStatus` 沒有結構化原因、只有一段
   後端每輪都在改寫的 zh-TW `error` 字串，字串比對是會靜默失效的閘，所以改成「終局
   轉換（成功或失敗）就重讀」——那是每個工作最多一次、且發生在數分鐘工作之後，不是
   「每個錯誤都重抓」。

@@ -510,18 +510,39 @@ def test_advertised_names_are_bounded_and_the_record_says_so(
     assert len(names) == llm_log._MAX_TOOLS_ADVERTISED + 1
     assert attempt["truncated"] is True
 
-    # The character half, with a count far under the cap: each stored name is
-    # itself capped at the budget, so the first always fits and the rest do not.
+    # The character half, at a name length production can actually produce
+    # (``tools._NAME_RE`` admits at most 64 characters). 20 of these exhaust the
+    # budget EXACTLY, which is the case that used to publish an over-budget
+    # record: the marker was appended after the last character was already spent,
+    # so the stored total came to budget + len(marker). The bound is asserted on
+    # the SUM of what was stored, marker included -- the number the ring and the
+    # JSONL sink actually pay -- rather than on the shape of the list.
+    budget = 1000
     monkeypatch.setattr(
         llm_log,
         "get_settings",
-        lambda: Settings(llm_log_body_max_chars=1000, llm_log_max_entries=50),
+        lambda: Settings(llm_log_body_max_chars=budget, llm_log_max_entries=50),
     )
     llm_log._reset_for_tests()
 
+    real_names = [f"kb-search-{index:02d}-{'a' * 37}" for index in range(25)]
+    assert {len(name) for name in real_names} == {50}
+    _record(workflow="capture", tools_advertised=real_names)
+    attempt = _last_attempt()
+    names = attempt["tools_advertised"]
+    assert sum(len(name) for name in names) <= budget
+    assert names[:-1] == real_names[:19]  # one name given back to make room
+    assert names[-1] == llm_log._names_elision_marker(6)  # ... and the count says so
+    assert attempt["truncated"] is True
+
+    # A single name longer than the whole budget still gets stored (``_stored_body``
+    # capped it at the budget itself, so the first entry always fits) -- a length no
+    # package name can have, kept only because that invariant is real code.
+    llm_log._reset_for_tests()
     _record(workflow="capture", tools_advertised=["a" * 900, "b" * 900, "c" * 900])
     attempt = _last_attempt()
     assert attempt["tools_advertised"] == ["a" * 900, llm_log._names_elision_marker(2)]
+    assert sum(len(name) for name in attempt["tools_advertised"]) <= budget
     assert attempt["truncated"] is True
 
     # An ordinary list is stored EXACTLY as before -- no marker, no flag.

@@ -863,7 +863,42 @@ def _redacted(value: str | None) -> str | None:
     return None if value is None else _utf8_safe(redact_known_secrets(value))
 
 
-def _write_sidecar_atomic(directory: Path, data: bytes) -> bool:
+def _still_the_expected_package(directory: Path, expected: tuple[int, int, int] | None) -> bool:
+    """Is the package at ``directory`` still the one ``expected`` names?
+
+    The ONE spelling of "nothing swapped under us", shared by the three places
+    that act irreversibly on a package they looked at earlier: the runtime just
+    before ``Popen`` (``_run_tool_subprocess``), the sidecar just before
+    ``os.replace`` (``_write_sidecar_atomic``), and ``_make_handler``'s refusal
+    before it does any work at all. Each of those used to check somewhere
+    EARLIER and then do real work -- a ``.env`` read, an argument serialization, a
+    redactor sweep, an mkstemp+fsync -- between the check and the act it was
+    guarding, which is a window rather than the check-then-act INSTANT this
+    module accepts elsewhere. One helper does not make them one call site, but it
+    does make "the check is the line above the act" the recognizable shape.
+
+    ``expected`` of None is FALSE, never a pass: the caller could not establish an
+    identity, and a check that cannot speak must not vouch (D40 P3b r11). The
+    identity is the MANIFEST's (``package_identity``) because the question is
+    "same PACKAGE?"; the other identity (``directory_identity``) answers "same
+    FILES?" and is not interchangeable -- see both functions.
+    """
+    return expected is not None and package_identity(directory) == expected
+
+
+class _PackageReplaced(Exception):
+    """Raised INSIDE ``_write_sidecar_atomic`` when the guard refuses the publish.
+
+    Never escapes that function, and exists only so the refusal leaves through
+    the same ``except`` that already unlinks the temp file: the alternative is a
+    second copy of that cleanup, kept in step by hand, on the one path that runs
+    when something is already going wrong.
+    """
+
+
+def _write_sidecar_atomic(
+    directory: Path, data: bytes, expected_identity: tuple[int, int, int] | None
+) -> bool:
     """Publish ``data`` as the package's sidecar ATOMICALLY. Returns success.
 
     Why the sidecar does NOT ride ``_write_regular_file`` any more: that helper
@@ -931,11 +966,28 @@ def _write_sidecar_atomic(directory: Path, data: bytes) -> bool:
     writes through it), but IS a silent change of the refusal contract those
     tests pin. ENOENT is the ordinary first-write case and is not a refusal.
 
+    ``expected_identity`` is the package this content was composed FOR, and it is
+    verified on the line above ``os.replace`` -- the last instant that exists here
+    (R6-2/R6-3). It lives at the publish rather than in the callers because that
+    is where the guarantee is: everything between a caller's own check and this
+    line is real work (a sidecar read, a redactor sweep of the whole tools
+    directory, a JSON encode, mkstemp, write, fsync), and a package can be
+    replaced inside it -- after which A's summary, A's origin or A's frozen status
+    would be published into B. Both compound operations above take their identity
+    from the resolve that produced ``directory`` and hand it down here unchanged,
+    so the comparison spans the whole operation rather than the last few lines of
+    it. None means the caller asserts NO identity and the publish is unguarded --
+    the pre-R6 behaviour, kept for callers that just created the package
+    themselves (test seeding) and never taken by a production one: both of those
+    refuse a None identity of their own accord, in their own vocabulary, before
+    they reach the write.
+
     Every failure is False, never an exception: summary metadata is best-effort,
     and the caller has exactly one "did-not-happen" answer to map. The temp file
     is unlinked on every failure path (best-effort, suppressed -- a cleanup error
     must not mask the original), so a failed write leaves nothing behind in the
-    package. That matters more here than for a generic temp file: a stray
+    package -- including the refusal above, which is a failure like any other from
+    the caller's side. That matters more here than for a generic temp file: a stray
     ``.ai_meta.json.*.tmp`` sitting in a package would be scanned by every later
     ``validate_package`` embedded-secret sweep. It is dot-prefixed for the same
     family of reasons the sidecar itself is -- the summary prompt's file
@@ -990,8 +1042,20 @@ def _write_sidecar_atomic(directory: Path, data: bytes) -> bool:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        # The LAST instant: one lstat, then the publish. Nothing but the compare
+        # separates them, so what a swap can still reach is the syscall PAIR this
+        # module accepts by name elsewhere -- and even that lands harmlessly, since
+        # the temp file was minted inside the directory that moved and the rename
+        # below would then fail with ENOENT (measured; False, nothing published).
+        # None is skipped rather than refused, because at THIS layer it means "the
+        # caller asserted nothing" -- the callers that have an identity to assert
+        # refuse their own None long before they get here.
+        if expected_identity is not None and not _still_the_expected_package(
+            directory, expected_identity
+        ):
+            raise _PackageReplaced
         os.replace(tmp_path, path)
-    except OSError:
+    except OSError, _PackageReplaced:
         if fd_owned:
             with contextlib.suppress(OSError):
                 os.close(fd)
@@ -1003,7 +1067,9 @@ def _write_sidecar_atomic(directory: Path, data: bytes) -> bool:
     return True
 
 
-def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
+def write_tool_meta(
+    directory: Path, meta: dict[str, Any], *, expected_identity: tuple[int, int, int] | None = None
+) -> bool:
     """Write the sidecar from the KNOWN SCHEMA, redacting its text. Returns success.
 
     This does NOT serialize ``meta``. It reads the six fields it understands out
@@ -1105,6 +1171,15 @@ def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
     that helper for why the truncate-then-write shape was a real data-loss
     vector for a FINALIZED summary.
 
+    ``expected_identity`` is carried STRAIGHT THROUGH to that helper, which checks
+    it on the line above ``os.replace``; this function does not read it, and the
+    redaction/encode/cap work below deliberately runs BEFORE the check rather than
+    after it (that ordering is the whole point -- see ``_write_sidecar_atomic``).
+    It defaults to "assert nothing" so a caller that just created the package
+    itself need not invent one; every production caller passes the identity its
+    own resolve captured, and both of them refuse a None identity in their own
+    vocabulary before they get here.
+
     CONSEQUENCE, stated so it is not rediscovered as a bug: extra keys a
     hand-edited sidecar carries are DROPPED by the next write. Round-tripping
     them was never a contract -- it was a side effect of serializing the caller's
@@ -1179,7 +1254,7 @@ def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
         return False
     if len(data) > _AI_META_MAX_BYTES:
         return False
-    return _write_sidecar_atomic(directory, data)
+    return _write_sidecar_atomic(directory, data, expected_identity)
 
 
 def _narrowed_summary_status(meta: dict[str, Any] | None) -> str | None:
@@ -1392,9 +1467,38 @@ def set_summary_status(name: str, status: str) -> str:
     the hold the two interleave and one of them writes a state neither ever saw.
     The RESOLVE stays outside the hold -- it is ordinary path work, not part of
     the sidecar's read-modify-write, so there is no reason to serialize it.
+
+    What ``_META_LOCK`` does NOT serialize is a revise's promote or a delete: both
+    are DIRECTORY operations that take no sidecar lock (see that lock's own
+    comment for why a file-sequence lock is the wrong instrument for them). So the
+    package this PATCH resolved can be swapped for a same-named one while the read
+    above is in flight, and A's meta -- its text, its status, its origin -- would
+    then be written into B and frozen there, after which B's own summary hook
+    refuses to update the sidecar it does not recognize. The identity is therefore
+    CAPTURED at the resolve, next to the path it describes, and re-checked at the
+    only instant that settles it, the line above ``os.replace``
+    (``_write_sidecar_atomic``). A mismatch is a failed write, which this function
+    already folds into ``"not_found"`` -- honest either way: the tool the caller
+    addressed is not the tool at that path any more.
+
+    An unreadable identity (no ``tool.json`` to lstat) is likewise ``"not_found"``,
+    the same "a check that cannot speak must not vouch" rule ``store_summary_meta``
+    and ``_make_handler`` apply. Stated cost, and how it sits with the escape
+    hatch above: 解除定版 stays unconditional on the SIDECAR -- an empty, corrupt
+    or corruptly-TYPED summary can still be un-frozen, which is the whole class
+    that gate was written for -- but a package whose MANIFEST cannot be read is
+    not addressable at all, and that has always been a ``"not_found"`` here (the
+    resolve above answers the same way for a missing directory). Such a package is
+    invalid on the listing, cannot be executed, cannot be revised, and cannot have
+    a summary generated for it (D40 r5 O5-3 accepted that last one); the frozen
+    text on it describes a tool that will not run either way, and deleting it
+    still works.
     """
     directory = _resolve_package_dir_no_alias(name)
     if directory is None:
+        return "not_found"
+    identity = package_identity(directory)
+    if identity is None:
         return "not_found"
     with _META_LOCK:
         meta = read_tool_meta(directory)
@@ -1421,7 +1525,9 @@ def set_summary_status(name: str, status: str) -> str:
             meta["summary"] = ""
         meta["status"] = status
         meta["updated_at"] = datetime.now(UTC).isoformat()
-        return "ok" if write_tool_meta(directory, meta) else "not_found"
+        # The identity goes with the write, not before it: the guard belongs on
+        # the line above the publish (see the docstring and _write_sidecar_atomic).
+        return "ok" if write_tool_meta(directory, meta, expected_identity=identity) else "not_found"
 
 
 def store_summary_meta(
@@ -1507,8 +1613,8 @@ def store_summary_meta(
     raised provider error would turn a 404 into a 500.
 
     ``expected_identity`` is the caller's ``package_identity`` of ``directory``,
-    taken when it RESOLVED that directory, and re-taken here in the last instant
-    before the write. It is required rather than defaulted because the whole
+    taken when it RESOLVED that directory, and carried down to the line above
+    ``os.replace``. It is required rather than defaulted because the whole
     hazard is a caller forgetting it: a summary generation resolves the package,
     spends an LLM round trip, and then writes -- so a delete plus a reinstall of
     the same NAME inside that window would otherwise persist package A's summary,
@@ -1521,16 +1627,23 @@ def store_summary_meta(
     and ``_make_handler`` apply to this identity, and one that costs nothing real:
     a package with no readable ``tool.json`` cannot be executed or revised either.
 
-    It sits AFTER the finalize gate and the redaction rather than at the top of
-    the hold, because a check meaning "nothing changed since we looked" belongs at
-    the LAST instant it can occupy (D40 P3b r12) -- everything below it is one
-    write, while everything above it is a file read and a redactor sweep of the
-    tools directory, exactly the kind of I/O window r11/r12 refused to leave
-    undefended. The stated cost of that order: if the package that TOOK the name
-    is itself finalized, the caller is told ``finalized`` rather than
-    ``not_stored``. Nothing is written either way, and both mean "your summary was
-    not stored"; only the code differs, and it is honest about the package that
-    now holds the name.
+    Where the COMPARISON happens moved in R6-2: it used to be the last line of
+    this function, which read as "the last instant" but is not one --
+    ``write_tool_meta`` still had a redactor sweep of the tools directory, a JSON
+    encode, an mkstemp, a write and an fsync to do before it published anything,
+    and a promote takes no ``_META_LOCK``, so a package swapped inside THAT window
+    received this summary. The identity is now handed down and checked on the line
+    above ``os.replace``. What stays here is the None refusal: "the caller has no
+    identity" is a property of the call rather than a race, so it is answered
+    where the vocabulary for it lives, and in the same slot it always occupied so
+    the outcome ORDER is unchanged (a finalized package still answers
+    ``finalized``, a redaction failure still answers ``not_stored``).
+
+    The stated cost of that order: if the package that TOOK the name is itself
+    finalized, the caller is told ``finalized`` rather than ``not_stored``.
+    Nothing is written either way, and both mean "your summary was not stored";
+    only the code differs, and it is honest about the package that now holds the
+    name.
 
     ``llm_log_process`` is stamped HERE, and only here, from
     ``llm_log.process_token()``. It is the token of the process whose id space
@@ -1568,12 +1681,12 @@ def store_summary_meta(
             "llm_log_process": llm_log.process_token() if llm_log_id is not None else None,
             "origin": origin if origin is not None else existing.get("origin"),
         }
-        # LAST, with nothing but the write after it: still the package this
-        # summary was generated for? (See this function's docstring for why here
-        # and not at the top of the hold.)
-        if expected_identity is None or package_identity(directory) != expected_identity:
+        # "Nothing to assert" is refused here; "is it still the same package" is
+        # asserted at the publish, where the answer cannot go stale before it is
+        # used (see this function's docstring and _write_sidecar_atomic).
+        if expected_identity is None:
             return ("not_stored", None)
-        if not write_tool_meta(directory, meta):
+        if not write_tool_meta(directory, meta, expected_identity=expected_identity):
             return ("not_stored", None)
         stored = read_tool_meta(directory)
         return ("ok", stored) if stored is not None else ("not_stored", None)
@@ -2534,9 +2647,18 @@ def _communicate_bounded(
     )
 
 
+# Returned INSTEAD of running anything when the package is no longer the one
+# whose schema was advertised (see ``_make_handler``). Category only -- no name,
+# no path, no identity values -- because this string goes straight into the
+# conversation as a role:"tool" message, the same discipline every other outcome
+# string in this module follows.
+_TOOL_REPLACED_RESULT = "tool not run: this tool's package changed after it was offered"
+
+
 def _run_tool_subprocess(
     entry: list[str],
     directory: Path,
+    expected_identity: tuple[int, int, int] | None,
     env: dict[str, str],
     args_json: str,
     timeout: float,
@@ -2547,6 +2669,8 @@ def _run_tool_subprocess(
     Blocking; the async handler runs it via ``run_in_threadpool``. Every outcome
     is an agent-visible string, never an exception:
 
+    * the package at ``directory`` is no longer ``expected_identity`` ->
+      ``_TOOL_REPLACED_RESULT``, nothing is started;
     * cannot even start (bad interpreter/entry, no exec bit) -> a "failed to
       start" category;
     * exceeded ``timeout`` -> the process GROUP is SIGKILLed and a "timed out"
@@ -2560,7 +2684,23 @@ def _run_tool_subprocess(
     Output is drained by ``_communicate_bounded`` (NOT ``communicate``), which
     caps each stream in memory as it reads rather than slurping it whole first --
     a runaway tool is killed at the cap instead of OOMing the service.
+
+    ``expected_identity`` is the manifest identity of the package whose schema the
+    model was shown, and it is verified HERE, on the line above ``Popen``, rather
+    than only in the handler that queued this call (R6-1). ``cwd`` is resolved by
+    the KERNEL, at exec time, from the PATH -- so a revise that publishes a new
+    package at that path while this call is still queuing or reading its ``.env``
+    would start the NEW package's entry file carrying the OLD entry argv, the old
+    schema's arguments and the old package's environment values. The handler's own
+    check cannot answer for that: between it and this line sit a ``.env`` read, a
+    JSON serialization and a threadpool queue wait of unbounded length. What
+    remains after this check is the lstat/exec pair -- the check-then-act instant
+    this module accepts by name -- and the execution registration the handler took
+    BEFORE this call means the package cannot have been destroyed in it, only
+    renamed (measured: a rename is invisible to a running child).
     """
+    if not _still_the_expected_package(directory, expected_identity):
+        return _TOOL_REPLACED_RESULT
     try:
         proc = subprocess.Popen(
             entry,
@@ -2603,17 +2743,11 @@ def _run_tool_subprocess(
     return _cap_output(redact_known_secrets(output.stdout), output_cap)
 
 
-# Returned INSTEAD of running anything when the package is no longer the one
-# whose schema was advertised (see ``_make_handler``). Category only -- no name,
-# no path, no identity values -- because this string goes straight into the
-# conversation as a role:"tool" message, the same discipline every other outcome
-# string in this module follows.
-_TOOL_REPLACED_RESULT = "tool not run: this tool's package changed after it was offered"
-
 # In-flight tool EXECUTIONS, keyed by the DIRECTORY identity ``_make_handler``
-# reads in the instant before it starts the child (``directory_identity``), and
-# COUNTED rather than flagged: two workflows can call the same tool at once, and
-# the first to finish must not cancel the second one's protection.
+# reads as the FIRST thing a call does and registers on the next line
+# (``directory_identity``), and COUNTED rather than flagged: two workflows can
+# call the same tool at once, and the first to finish must not cancel the
+# second one's protection.
 #
 # The DIRECTORY and not the manifest, and that is the whole reason this key has
 # its own function. Both questions used to be answered by ``package_identity``,
@@ -2774,28 +2908,42 @@ def _make_handler(
     allowed here (``LlmTool``'s handler contract is no-raise): the model gets a
     category-only sentence, is free to try something else, and nothing runs.
 
-    The check sits BEFORE ``_build_tool_env`` deliberately. That read pulls the
+    ORDER, which is the whole of R6-1: the DIRECTORY identity is read first and
+    registered on the very next line, then everything else happens INSIDE that
+    registration -- the manifest check, the ``.env`` read, the argument
+    serialization, the threadpool hop. It used to be the other way round (check,
+    read, serialize, and only then register), which left a window holding a file
+    read and an unbounded JSON encode between "this is the directory I looked at"
+    and "this directory is protected". A promote landing in it saw no registration,
+    published its new package at the path and dropped the backup -- and this call
+    then started a child whose ``cwd`` resolved to the NEW package while carrying
+    the OLD entry, schema and environment values. Registering first inverts that:
+    the hold is published before anything can be observed to be missing, and every
+    check that has to answer "still the same package?" is re-taken after it,
+    ending on the line above ``Popen`` (``_run_tool_subprocess``).
+
+    The price of registering before the checks, stated rather than discovered: a
+    call that goes on to REFUSE holds an execution registration for the length of
+    those checks, so a promote or delete racing it may DEFER its removal instead
+    of taking it. That costs one marked, hidden directory collected by the next
+    tool job's sweep (see ``_STALE_BACKUP_RE``) -- inert litter, never a phantom
+    package, and the trade is deliberate: the opposite mistake destroys a package
+    a child is reading.
+
+    The manifest check still sits BEFORE ``_build_tool_env``. That read pulls the
     package's ``.env`` -- live credentials -- and there is no reason to load a
-    replaced package's secrets into a call we are about to refuse; putting the
-    one check first also means the ``.env`` this handler exports belongs to the
-    package the check just accepted. A SECOND check after the read was considered
-    and rejected: it would narrow the window by exactly the width of one bounded
-    file read while adding a second refusal path, and the window it cannot narrow
-    -- between the last check and ``Popen`` -- is the same check-then-act instant
-    ``_promote_staging`` and the revise flow already accept by name. Both this
-    ``lstat`` and the (pre-existing) ``.env`` read run on the event loop, matching
-    the shape this handler already had; the check is strictly the smaller of the
-    two.
+    replaced package's secrets into a call we are about to refuse; it also means
+    the ``.env`` this handler exports belongs to the package the check accepted.
 
     A None ``identity`` -- the manifest could not be lstat'ed when the tool was
     advertised -- is a REFUSAL, never a pass, matching the revise flow's own
     "cannot establish identity" rule (D40 P3b r11): a check that cannot speak
-    must not vouch.
+    must not vouch. It is answered before the registration because it is a fact
+    about the ADVERTISEMENT, not about the directory: no lstat can change it.
 
-    That check answers for the START of a call. The RUN is covered by two
-    registrations taken together, immediately before the threadpool hop and
-    released by a ``finally``, so no failure shape -- exception, timeout,
-    cancellation -- can leak either one:
+    Those checks answer for the START of a call. The RUN is covered by two
+    registrations, released by a ``finally`` so no failure shape -- exception,
+    timeout, cancellation -- can leak either one:
 
     * this package's DIRECTORY identity as an in-flight EXECUTION, so a promote
       (or a ``delete_tool``) landing mid-run keeps the files this child is still
@@ -2835,51 +2983,54 @@ def _make_handler(
     """
 
     async def _handler(arguments: dict[str, Any]) -> str:
-        if identity is None or package_identity(directory) != identity:
+        if identity is None:
             return _TOOL_REPLACED_RESULT
-        # The directory this call is about to run OUT OF, read after the refusal
-        # above and before the ``.env`` below -- the same slot, for the same
-        # reason: a call we are not going to make should not load a package's
-        # secrets, and a call we cannot publish a hold for is a call we are not
-        # going to make.
+        # FIRST, and registered on the very next line: the directory this call is
+        # about to run OUT OF. Reading it here rather than at advertisement time is
+        # deliberate (it is the key a protection is PUBLISHED under, not a snapshot
+        # to compare), and nothing is allowed between the read and the hold -- see
+        # the docstring's ORDER paragraph for what used to sit in that gap. Not
+        # being able to read it is a refusal: a hold nobody can see is a child
+        # nobody will defer for.
         running = directory_identity(directory)
         if running is None:
             return _TOOL_REPLACED_RESULT
-        settings = get_settings()
-        env, env_secrets = _build_tool_env(directory)
-        args_json = json.dumps(arguments, ensure_ascii=False)
-        # TWO registrations, both entered here and both released by the SAME
-        # ``with``, because both answer for the call's DURATION rather than its
-        # start:
-        #
-        # * the EXECUTION, under the DIRECTORY's identity, so a promote landing
-        #   mid-run keeps the files this child is still reading. Everything after
-        #   this line reads the package's files from an inode a promote can
-        #   rename aside (harmless) and then remove (not harmless). Entering here
-        #   rather than inside ``_run_tool_subprocess`` covers the threadpool
-        #   queue wait too, and orders the registration strictly BEFORE the
-        #   ``Popen`` it protects -- a promote that observes no registration
-        #   therefore cannot have a child of ours already running against the
-        #   package it is dropping;
-        # * the ``.env`` VALUES this child was just handed, so they stay
-        #   redactable no matter what the file says by the time the child
-        #   finishes. The scope has to reach past the subprocess: the masking of
-        #   the child's output happens INSIDE ``_run_tool_subprocess`` (F1/D36),
-        #   so releasing on the child's exit would still be too early. It ends
-        #   where the awaited call returns, which is after that redaction and
-        #   before the string is handed to the llm loop -- everything downstream
-        #   (the role:"tool" message, the log, the JSONL sink) sees the masked
-        #   copy.
-        with _inflight_execution(running), _inflight_secrets(env_secrets):
-            return await run_in_threadpool(
-                _run_tool_subprocess,
-                list(entry),
-                directory,
-                env,
-                args_json,
-                settings.llm_tool_timeout_seconds,
-                settings.llm_tool_output_max_chars,
-            )
+        # The EXECUTION registration, under the DIRECTORY's identity, so a promote
+        # or a delete landing from here on keeps the files this child may be
+        # reading instead of removing them under it. It covers the checks below,
+        # the ``.env`` read, the serialization AND the threadpool queue wait, and
+        # it is ordered strictly before the ``Popen`` it protects: a promote that
+        # observes no registration cannot have a child of ours running against the
+        # package it is dropping.
+        with _inflight_execution(running):
+            # Re-taken INSIDE the hold: whatever moved in the instant before it was
+            # published is caught here rather than carried into a call. The last
+            # word on this question belongs to the line above ``Popen``.
+            if not _still_the_expected_package(directory, identity):
+                return _TOOL_REPLACED_RESULT
+            settings = get_settings()
+            env, env_secrets = _build_tool_env(directory)
+            args_json = json.dumps(arguments, ensure_ascii=False)
+            # The ``.env`` VALUES this child is about to be handed, held so they
+            # stay redactable no matter what the file says by the time the child
+            # finishes. The scope has to reach past the subprocess: the masking of
+            # the child's output happens INSIDE ``_run_tool_subprocess`` (F1/D36),
+            # so releasing on the child's exit would still be too early. It ends
+            # where the awaited call returns, which is after that redaction and
+            # before the string is handed to the llm loop -- everything downstream
+            # (the role:"tool" message, the log, the JSONL sink) sees the masked
+            # copy.
+            with _inflight_secrets(env_secrets):
+                return await run_in_threadpool(
+                    _run_tool_subprocess,
+                    list(entry),
+                    directory,
+                    identity,
+                    env,
+                    args_json,
+                    settings.llm_tool_timeout_seconds,
+                    settings.llm_tool_output_max_chars,
+                )
 
     return _handler
 

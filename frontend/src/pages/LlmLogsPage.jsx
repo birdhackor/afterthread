@@ -25,13 +25,21 @@ import { usePageTitle } from "../hooks/usePageTitle.js";
 // the ring itself (llm_log_max_entries) and validates the limit to [1, 500].
 const LIST_LIMIT = 50;
 
-// Workflow -> zh-TW label. Mirrors the workflow names generate_structured is
-// called with (afterthread/services/memory_ai.py); an unrecognized value
-// falls back to 其他 rather than showing a raw English token.
+// Workflow -> zh-TW label. Mirrors every workflow name generate_structured is
+// called with: the three memory ones (afterthread/services/memory_ai.py), the
+// builder session shared by an install and an AI 修訂 (tool_builder._WORKFLOW),
+// and the summary session that follows one or a 重新產生 (tool_meta.
+// _SUMMARY_WORKFLOW). The last two are SEPARATE names by decision (D40) --
+// two sessions of one job, split so their log links cannot collide -- so
+// labelling only the memory three left every tool session reading 其他, which
+// is exactly the distinction the split was made to preserve. An unrecognized
+// value still falls back to 其他 rather than showing a raw English token.
 const WORKFLOW_LABELS = {
 	capture: "快速捕捉",
 	enrich: "AI 補齊",
 	assist_update: "AI 進度更新",
+	tool_install: "工具建置",
+	tool_summary: "工具總結",
 	unknown: "其他",
 };
 
@@ -335,16 +343,138 @@ function LogDetailPanel({ log, expanded }) {
 	);
 }
 
+// Where a `?log=<id>` deep link can point, given the list that came back. Pure,
+// and split out so the three cases are one expression instead of three
+// conditions spread through the render:
+//
+// * "none" -- no link, or the list has not landed yet (the row may still be in
+//   it, so claiming the record is off-list would be a lie in flight);
+// * "in-list" -- the row is on this page; the Accordion opens it and the
+//   existing per-row detail fetch does the rest;
+// * "off-list" -- there IS a target and the newest LIST_LIMIT rows do not
+//   contain it. That is NOT the same as "gone": the ring keeps
+//   llm_log_max_entries records and the detail endpoint addresses any of them,
+//   so the record may be perfectly readable and merely older than this page.
+//   Only the fetch below can tell those apart, and a 404 from it is the one
+//   answer that means evicted.
+function deepLinkTarget(targetLogId, logs, listLoaded) {
+	if (targetLogId == null) {
+		return { mode: "none", value: null };
+	}
+	const value = String(targetLogId);
+	if (!listLoaded) {
+		return { mode: "none", value };
+	}
+	return {
+		mode: logs.some((log) => String(log.id) === value) ? "in-list" : "off-list",
+		value,
+	};
+}
+
+// The record a `?log=<id>` link points at when it is NOT among the newest
+// LIST_LIMIT rows. Fetched by id from the detail endpoint -- the same one the
+// rows use -- and rendered in its own card ABOVE the list, never as a row: it is
+// not one, and the list's own staleness discipline (a row's identity is id +
+// started_at) has nothing to compare against here.
+//
+// What this replaces: seeding the Accordion's open value with an id that is not
+// in the list, which opened nothing and said nothing. A link handed out by the
+// 工具 page (and persisted in a tool's sidecar, so it long outlives the 50 rows
+// this page reads) silently did nothing at all -- not even the "the record is
+// gone" explanation the detail route was already able to give.
+function OffListRecord({ logId }) {
+	const { data, error, isError, isFetching, refetch } = useQuery({
+		// Third key element marks the fetch as "by id alone": the row queries key
+		// on id + started_at (the instance discriminator), which this one cannot
+		// know before the fetch, so a shared key could hand one query the other's
+		// cached record.
+		queryKey: ["llm-log", logId, "deep-link"],
+		queryFn: () => apiGet(`/api/llm/logs/${logId}`),
+	});
+
+	if (data === undefined && isFetching) {
+		return (
+			<Center py="md">
+				<Loader size="sm" />
+			</Center>
+		);
+	}
+
+	if (isError && data === undefined) {
+		// 404 is the ONE answer that means the record is really gone: the id was
+		// evicted past llm_log_max_entries, or the backend restarted and the ring
+		// (which lives in memory) went with it. Everything else is a transport or
+		// server failure and keeps the retry.
+		const message =
+			error?.status === 404
+				? `找不到編號 #${logId} 的 AI 日誌：紀錄只保留最近 LLM_LOG_MAX_ENTRIES 筆（預設存在後端記憶體，重啟即清空），這一筆已經不在了。`
+				: (error?.message ?? "無法載入這筆 AI 日誌");
+		return (
+			<Alert
+				color={error?.status === 404 ? "gray" : "red"}
+				title={`紀錄 #${logId}`}
+			>
+				<Stack gap="sm" align="flex-start">
+					<Text size="sm">{message}</Text>
+					{error?.status === 404 ? null : (
+						<Button size="xs" onClick={() => refetch()}>
+							重試
+						</Button>
+					)}
+				</Stack>
+			</Alert>
+		);
+	}
+
+	if (!data) {
+		return null;
+	}
+
+	return (
+		<Card withBorder padding="md" radius="md">
+			<Stack gap="sm">
+				<Group gap="xs" align="center">
+					<Text fw={600}>連結指向的紀錄 #{data.id}</Text>
+					<Badge size="sm" variant="light" color="gray">
+						不在下方最近 {LIST_LIMIT} 筆內
+					</Badge>
+					<OutcomeBadge outcome={data.outcome} />
+				</Group>
+				<Text size="xs" c="dimmed">
+					{formatTimestamp(data.started_at)} ・
+					{WORKFLOW_LABELS[data.workflow] ?? WORKFLOW_LABELS.unknown} ・ 耗時{" "}
+					{formatDuration(data.duration_ms)} ・ tokens{" "}
+					{data.usage?.total_tokens ?? "—"} ・ 模型：{data.model || "—"}
+				</Text>
+				<Text size="xs" c="dimmed">
+					編號在後端重啟後會從頭重新配發，所以很舊的連結可能指到後來佔用同一個編號的另一次互動——請對照上面的時間。
+				</Text>
+				{data.error ? (
+					<Text size="sm" c="red">
+						錯誤：{data.error}
+					</Text>
+				) : null}
+				{data.attempts.map((attempt, index) => (
+					// biome-ignore lint/suspicious/noArrayIndexKey: immutable fetched record; attempt position is its identity
+					<AttemptCard key={index} attempt={attempt} index={index} />
+				))}
+			</Stack>
+		</Card>
+	);
+}
+
 // The "AI 日誌" page: a list of recent LLM interactions (newest first) with a
 // manual 重新整理, each row expandable to its full request/response bodies.
 export function LlmLogsPage() {
 	usePageTitle("AI 日誌");
 	// Optional deep-link target from /llm-logs?log=<id> (validated on the route):
 	// seed the open accordion item to that id so a link from the 工具 page
-	// auto-expands the matching builder-session record on load. If the id is not
-	// in the current list, `openValue` just points at no rendered item and
-	// nothing opens -- silently ignored, exactly as required. `strict: false`
-	// reads the search loosely so this page needs no route-object import.
+	// auto-expands the matching builder-session record on load. An id that is NOT
+	// among the rows we fetched is honoured too, by asking the detail endpoint for
+	// it directly (see OffListRecord) -- the link is a promise to show THAT
+	// record, and the list this page reads is only the newest LIST_LIMIT of them.
+	// `strict: false` reads the search loosely so this page needs no route-object
+	// import.
 	const { log: targetLogId } = useSearch({ strict: false });
 	const [openValue, setOpenValue] = useState(
 		targetLogId != null ? String(targetLogId) : null,
@@ -362,6 +492,7 @@ export function LlmLogsPage() {
 	const loading = data === undefined && isFetching;
 	const showError = isError && data === undefined && !isFetching;
 	const logs = data?.logs ?? [];
+	const target = deepLinkTarget(targetLogId, logs, data !== undefined);
 
 	return (
 		<Stack gap="md">
@@ -393,6 +524,10 @@ export function LlmLogsPage() {
 						</Button>
 					</Stack>
 				</Alert>
+			) : null}
+
+			{target.mode === "off-list" ? (
+				<OffListRecord logId={target.value} />
 			) : null}
 
 			{data && logs.length === 0 ? (

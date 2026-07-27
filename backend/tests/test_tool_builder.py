@@ -4635,6 +4635,74 @@ def test_promote_replace_defers_after_an_enabled_toggle_moved_the_manifest(
     assert [child.name for child in base.iterdir() if ".stale-" in child.name] == []
 
 
+def test_a_promote_landing_while_a_call_prepares_never_runs_the_new_package(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The window R6-1 is about, from the promote's side: the handler has read the
+    identity of the directory it is going to run out of, but the child has not
+    started yet.
+
+    ``cwd`` is resolved by the KERNEL from the PATH at exec time, so a swap that
+    lands in this gap does not merely race the call -- it REDIRECTS it. The child
+    would come up inside the REVISED package while carrying the entry argv, the
+    schema and the ``.env`` values of the one the model was offered, and the AI
+    log would record the old name with no sign anything moved. The old ordering
+    made that reachable twice over: the registration came after the ``.env`` read
+    (so this promote would have dropped the backup outright), and the identity was
+    checked once, before all of it.
+
+    Driven from inside ``_build_tool_env`` -- the ``.env`` read itself -- so the
+    promote completes inside the gap deterministically. What must hold: the
+    revised package NEVER runs (its entry would leave a marker), the call refuses
+    instead, and the backup is deferred rather than destroyed, which is only
+    possible if the registration was already published when the promote asked."""
+    base = tmp_path / "tools"
+    installed = base / "kbsearch"
+    installed.mkdir(parents=True)
+    manifest = _package_manifest("kbsearch")
+    manifest["entry"] = [sys.executable, "run.py"]
+    (installed / "tool.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (installed / "run.py").write_text("print('OLD')", encoding="utf-8")
+    identity = tool_builder._package_identity(installed)
+    assert identity is not None
+
+    revised_ran = tmp_path / "revised-ran"
+    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
+    staging.mkdir(parents=True)
+    (staging / "tool.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (staging / "run.py").write_text(
+        f"open({str(revised_ran)!r}, 'w').write('x')\nprint('NEW')\n", encoding="utf-8"
+    )
+    _install_settings(monkeypatch, tools_dir=str(base))
+    handler = tools.enabled_llm_tools()[0].handler
+    real_build_env = tools._build_tool_env
+
+    def promote_then_build(directory: Path) -> tuple[dict[str, str], frozenset[str]]:
+        origin, error = tool_builder._promote_staging_replace(
+            staging,
+            "kbsearch",
+            base,
+            env_existed_at_start=False,
+            package_identity=identity,
+            registered=[],
+        )
+        assert error is None and origin is None  # the revise publishes, as always
+        return real_build_env(directory)
+
+    monkeypatch.setattr(tools, "_build_tool_env", promote_then_build)
+
+    assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
+    assert not revised_ran.exists()  # the redirected child never happened
+    # ... and it was genuinely there to be run: the swap DID publish, as a revise
+    # must -- a promote is never delayed or refused by a tool call (D40 r3).
+    assert "print('NEW')" in (installed / "run.py").read_text(encoding="utf-8")
+    # Deferred, not dropped: the promote found this call registered, which it
+    # could only do if the registration preceded the ``.env`` read it ran inside.
+    assert _leftovers(base) == []
+    stale = [child for child in base.iterdir() if ".stale-" in child.name]
+    assert len(stale) == 1 and (stale[0] / "run.py").read_text(encoding="utf-8") == "print('OLD')"
+
+
 def test_promote_replace_drops_the_backup_immediately_when_nothing_is_running(
     tmp_path: Path,
 ) -> None:

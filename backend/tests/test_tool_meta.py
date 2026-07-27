@@ -1355,14 +1355,17 @@ def test_regenerate_summary_cannot_undo_a_finalize_holding_the_lock(
     failures: list[BaseException] = []
     real_write = tools.write_tool_meta
 
-    def write_then_park(directory: Path, meta: dict[str, Any]) -> bool:
+    def write_then_park(directory: Path, meta: dict[str, Any], **kwargs: Any) -> bool:
         # Runs INSIDE set_summary_status's lock hold. Parking here is what forces
         # the store to arrive while the finalize is mid-sequence -- the exact
-        # window the r2 code lost the race in.
+        # window the r2 code lost the race in. ``**kwargs`` keeps this double
+        # TRANSPARENT to the identity the caller now hands the writer (R6-3): this
+        # test is about the lock, and a double that dropped that argument would be
+        # testing a call shape production no longer makes.
         if meta.get("status") == "final":
             inside.set()
             assert blocked.wait(timeout=5), "the store never contended for _META_LOCK"
-        return real_write(directory, meta)
+        return real_write(directory, meta, **kwargs)
 
     monkeypatch.setattr(tools, "write_tool_meta", write_then_park)
 

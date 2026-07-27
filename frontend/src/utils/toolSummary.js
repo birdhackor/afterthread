@@ -288,16 +288,26 @@ export function claimLatestSummaryWrite(ledger, instanceKey, stamp) {
 //   nothing to freeze. 定版 is enabled by canFinalizeSummary over the CACHED
 //   text, so this refusal is proof the cached text is gone.
 //
-// Deliberately NOT refetching, with the reason each time:
+// The FOURTH, which proves something different and revalidates anyway:
 //
 // * 409 `tool_job_in_progress` -- ANOTHER actor holds the single-flight slot,
 //   which is a fact about the world we did not know a moment ago: something
 //   outside this page is mid-operation on this backend, and when it finishes it
-//   may have replaced the very package we are looking at. Revalidating does not
-//   make the foreign job observable -- we hold no id for it and cannot be told
-//   when it ends -- so this only re-reads the CURRENT truth. Acting on a foreign
-//   job's COMPLETION is the residual family bounded by 裁決紀錄 #7 (a
-//   name-addressed API plus no instance identity in GET /api/tools).
+//   may have replaced the very package we are looking at. This one used to be
+//   in the list below, on the ground that "that job has not written anything
+//   yet" -- true of the job, and beside the point (D40 P4 r8 inverted it and
+//   recorded why). Revalidating does not make the foreign job observable -- we
+//   hold no id for it and cannot be told when it ends -- so this only re-reads
+//   the CURRENT truth. Acting on a foreign job's COMPLETION is the residual
+//   family bounded by 裁決紀錄 #7 (a name-addressed API plus no instance
+//   identity in GET /api/tools).
+//
+// Deliberately NOT refetching, with the reason each time:
+//
+// * `llm_not_configured` / 502 -- the call failed BEFORE anything could reach
+//   the sidecar, so the cache is exactly as right (or wrong) as it was;
+// * 5xx and transport failures -- no evidence about server state at all, and a
+//   storm of them would refetch on every retry, hiding rather than helping.
 export function summaryErrorRevalidates({ status, code } = {}) {
 	if (status === 404) {
 		return true;

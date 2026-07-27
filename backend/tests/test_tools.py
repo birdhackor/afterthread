@@ -1311,7 +1311,9 @@ def test_runtime_background_descendant_reaped_no_thread_leak(
         # the reader/writer threads run in this thread's context and
         # active_count() is a clean before/after measure with no threadpool-worker
         # confound.
-        result = tools._run_tool_subprocess(entry, pkg, env, "{}", 30.0, 1000)
+        result = tools._run_tool_subprocess(
+            entry, pkg, tools.package_identity(pkg), env, "{}", 30.0, 1000
+        )
         elapsed = time.monotonic() - started
 
         assert "STARTED" in result  # the leader's own output survived the escalation
@@ -1374,7 +1376,9 @@ def test_runtime_detached_child_closing_pipes_is_killed(
 
     try:
         started = time.monotonic()
-        result = tools._run_tool_subprocess(entry, pkg, env, "{}", 30.0, 1000)
+        result = tools._run_tool_subprocess(
+            entry, pkg, tools.package_identity(pkg), env, "{}", 30.0, 1000
+        )
         elapsed = time.monotonic() - started
 
         assert "LEADER_DONE" in result  # the leader's own output survived
@@ -2039,6 +2043,50 @@ def test_delete_after_an_enabled_toggle_still_defers_a_running_call(
     remains = [child for child in root.iterdir()]
     assert len(remains) == 1 and tools._STALE_BACKUP_RE.match(remains[0].name)
     assert (remains[0] / "data.txt").exists()  # deferred, not destroyed
+
+
+def test_a_delete_landing_while_a_call_prepares_is_registered_for_and_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The window R6-1 is about: after the handler read the directory identity and
+    BEFORE the child starts.
+
+    Two things had to be true for a call to be safe there, and neither was:
+
+    * the execution had to be REGISTERED before anything else, so a delete landing
+      in the gap defers the removal instead of taking it. The registration used to
+      come last, after the ``.env`` read and the argument serialization -- so the
+      delete saw nothing in flight and destroyed a package this call was about to
+      run out of;
+    * the "still the same package?" question had to be asked again at the END. The
+      handler asked it once, before all that work.
+
+    The delete is driven from inside ``_build_tool_env`` -- literally the ``.env``
+    read the finding names -- so it lands in the gap deterministically rather than
+    by racing a thread. What must hold: the deferred remains prove the
+    registration was already published, and the call refuses rather than starting
+    a child against a name that no longer belongs to the package it was offered
+    for."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "busy", "import sys\nsys.stdout.write('OLD')\n")
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler
+    real_build_env = tools._build_tool_env
+
+    def delete_then_build(directory: Path) -> tuple[dict[str, str], frozenset[str]]:
+        assert delete_tool("busy") is True
+        return real_build_env(directory)
+
+    monkeypatch.setattr(tools, "_build_tool_env", delete_then_build)
+
+    assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
+
+    # The delete DEFERRED: it found this call already registered, which it could
+    # only do if the registration preceded the ``.env`` read it was driven from.
+    remains = [child for child in root.iterdir()]
+    assert len(remains) == 1 and tools._STALE_BACKUP_RE.match(remains[0].name)
+    assert (remains[0] / "run.py").exists()  # deferred, not destroyed
+    assert not pkg.exists()  # ... and the NAME went at once, as the route promises
 
 
 def test_deferred_delete_remains_are_invisible_to_every_registry_path(
@@ -3454,6 +3502,110 @@ def test_store_summary_meta_redacts_before_stripping(
     assert "secret-token-abcdef" not in _sidecar(pkg).read_text(encoding="utf-8")
 
 
+def _swap_the_package_once(
+    monkeypatch: pytest.MonkeyPatch, root: Path, name: str, replacement_run_py: str
+) -> Callable[[], Path]:
+    """Arm a same-name package swap INSIDE the sidecar writer's own steps.
+
+    The window R6-2/R6-3 are about is not the caller's: it opens after the
+    caller's last look and closes at ``os.replace``, and everything in it belongs
+    to ``write_tool_meta`` -- a redactor sweep of the whole tools directory, a
+    JSON encode, an mkstemp, a write, an fsync. So the swap is driven from one of
+    those steps (``_redacted``, the first) rather than from a thread race, which
+    makes it deterministic AND pins the window to exactly where the finding puts
+    it. Delete-then-reinstall-the-same-name is the swap that costs no job slot at
+    all (D40 r5 O5-3), so it is the one a summary can genuinely lose a race to.
+
+    Fires ONCE (the writer redacts three fields), and returns an accessor for the
+    replacement package."""
+    root_pkg = root / name
+    state: dict[str, Path] = {}
+    real_redacted = tools._redacted
+
+    def swap_then_redact(value: str | None) -> str | None:
+        if "pkg" not in state:
+            shutil.rmtree(root_pkg)
+            state["pkg"] = _make_tool(root, name, replacement_run_py)
+        return real_redacted(value)
+
+    monkeypatch.setattr(tools, "_redacted", swap_then_redact)
+    return lambda: state["pkg"]
+
+
+def test_store_summary_meta_refuses_a_package_swapped_inside_the_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A's summary must not be published into a B that took A's NAME mid-write.
+
+    The identity check used to be the last line of ``store_summary_meta``, which
+    reads as "the last instant" but is not one: ``write_tool_meta`` still had a
+    redactor sweep, an encode, an mkstemp, a write and an fsync ahead of it, and
+    NOTHING serializes a promote or a delete against that (``_META_LOCK`` is a
+    sidecar-file lock, and neither of those touches the sidecar). So a package
+    swapped inside that window received A's summary AND A's origin -- which every
+    later revise of B then reads back as its first-hand context.
+
+    The check now sits on the line above ``os.replace``. What must hold: nothing
+    is published, the answer is the did-not-happen one the route already maps,
+    and the writer leaves no temp file behind in the package that did nothing
+    wrong."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    identity = tools.package_identity(pkg)
+    replacement = _swap_the_package_once(
+        monkeypatch, root, "echo", "import sys\nsys.stdout.write('B')\n"
+    )
+
+    assert tools.store_summary_meta(
+        pkg,
+        summary="A 這個工具會查 KB",
+        origin={"openapi_url": "http://a.example/o.json", "instructions": "A 的指示"},
+        llm_log_id=7,
+        expected_identity=identity,
+    ) == ("not_stored", None)
+
+    swapped = replacement()
+    assert tools.package_identity(swapped) != identity  # the swap really happened
+    assert tools.read_tool_meta(swapped) is None  # ... and B has no sidecar at all
+    # The temp file was minted in B's directory (the swap lands before mkstemp),
+    # so the refusal has to clean it up: a stray one would be scanned by every
+    # later embedded-secret sweep of that package.
+    assert sorted(child.name for child in swapped.iterdir()) == ["run.py", "tool.json"]
+
+
+def test_set_summary_status_cannot_finalize_onto_a_package_swapped_inside_the_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The other official API call in that window: a PATCH must not freeze A's
+    meta onto B.
+
+    ``set_summary_status`` read A's sidecar, and the rewrite it built from it went
+    to whatever package answered to the name by the time the bytes landed -- so a
+    revise (or a delete + same-name reinstall) landing between the read and the
+    publish left B holding A's text, A's origin and ``status: "final"``. B's own
+    summary hook then REFUSES to update a finalized sidecar, so the wrong
+    explanation is frozen in front of the right implementation until someone
+    thinks to un-finalize it.
+
+    The identity is captured at the resolve and checked above ``os.replace``; the
+    refusal folds into the ``"not_found"`` this function already answers for a
+    write that did not happen."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    assert _write_meta(pkg, summary="A 的說明", status="draft") is True
+    replacement = _swap_the_package_once(
+        monkeypatch, root, "echo", "import sys\nsys.stdout.write('B')\n"
+    )
+
+    assert tools.set_summary_status("echo", "final") == "not_found"
+
+    swapped = replacement()
+    assert tools.read_tool_meta(swapped) is None  # B was never written into
+    assert tools.summary_status(swapped) is None  # ... and certainly never frozen
+
+
 def test_store_summary_meta_fails_closed_on_a_redaction_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3749,7 +3901,7 @@ def test_set_summary_status_still_reports_not_found_on_a_real_write_failure(
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
     _write_meta(pkg, summary="說明", status="draft")
-    monkeypatch.setattr(tools, "write_tool_meta", lambda directory, meta: False)
+    monkeypatch.setattr(tools, "write_tool_meta", lambda *args, **kwargs: False)
 
     assert tools.set_summary_status("echo", "final") == "not_found"
 

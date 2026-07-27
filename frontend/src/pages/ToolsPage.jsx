@@ -115,8 +115,10 @@ function toolErrorMessage(error, fallback, codeCopy = null) {
 // "查看 AI 日誌" link shown on both install outcomes: the builder session's
 // full prompt/response trace is the debugging surface for a failed (or
 // suspicious) install, and llm_log_id names the exact record to expand. The
-// link deep-links to that record via `?log=<id>` (LlmLogsPage reads it and
-// auto-expands the matching row on load); with no id it is a plain jump.
+// link deep-links to that record via `?log=<id>`: LlmLogsPage auto-expands the
+// matching row, or -- when the record is older than the rows that page lists --
+// fetches that one record by id and shows it on its own (only a record the
+// backend has really dropped reports itself gone). With no id it is a plain jump.
 function LogLink({ llmLogId }) {
 	return (
 		<Anchor

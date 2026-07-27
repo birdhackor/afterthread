@@ -771,6 +771,18 @@ def _bounded_tool_names(names: list[str], secrets: list[str]) -> tuple[list[str]
     that survives truncation best -- how large the tool set was -- and a marker is
     unmistakable for a name (``tools._NAME_RE`` admits no CJK, no brackets).
 
+    The marker is STORED, so it is CHARGED to the budget like everything else
+    (R6-5): it used to be appended unconditionally after the loop had already
+    spent the whole budget on names, which put the stored total OVER the ceiling
+    by the marker's length -- a bound that admits an exception is not one. Kept
+    names are given back from the END until it fits (so the stored list stays a
+    PREFIX of the advertisement order, which is the property above), and the
+    marker is rebuilt each time because the count it names grows with every one
+    returned. That always terminates with room: ``llm_log_body_max_chars`` is floored at 1000
+    (config.py) and this marker is ~20 characters plus the digits of a count, so
+    the marker alone fits inside the smallest budget an operator can configure --
+    it can never be the entry that has to be dropped.
+
     None never reaches here (the caller short-circuits it) and ``[]`` returns
     ``([], False)``, so the two answers stay as far apart as ``LlmAttempt``
     documents.
@@ -791,7 +803,17 @@ def _bounded_tool_names(names: list[str], secrets: list[str]) -> tuple[list[str]
         truncated = truncated or was_truncated
     dropped = len(names) - len(stored)
     if dropped:
-        stored.append(_names_elision_marker(dropped))
+        marker = _names_elision_marker(dropped)
+        # The marker comes out of the SAME budget the names did (see docstring):
+        # give kept names back from the END until it fits, so what survives is
+        # still a PREFIX of the advertisement order. Each one returned makes the
+        # count -- and possibly the marker -- one longer, so it is rebuilt rather
+        # than measured once.
+        while stored and used + len(marker) > budget:
+            used -= len(stored.pop())
+            dropped += 1
+            marker = _names_elision_marker(dropped)
+        stored.append(marker)
         truncated = True
     return stored, truncated
 
