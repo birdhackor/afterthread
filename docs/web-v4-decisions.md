@@ -871,3 +871,89 @@ sidecar 讀取之前、r12 才排到第一個 rename 的前一行。每一版都
 瞬間**；把它擺在任何還有 I/O 的步驟之前，等於宣告那段 I/O 期間不設防。現在它之後只剩
 兩個 rename，回到既有裁決承認的 syscall 瞬間殘留等級。測試以「在 sidecar 讀取內部
 置換套件」驅動，釘的是**順序**而不只是檢查本身存在。
+
+### D40 附錄（P4 review r1）：keepMountedMode 補 Activity 效果凍結、summaryBusy 補送出窗口、刪除後 removeQueries、定版與重新產生改寫快取
+
+P4（工具總結面板：意見修訂與定版）落地後的第一輪 review 抓到四個問題，全部在
+`ToolsPage.jsx` 內：一個是 Mantine 版本升級後一句舊註解變成假的，一個是忙碌旗標漏了
+一個窗口，另外兩個是同一個模式重複出現——拿到後端的權威回應卻丟掉，改靠一次
+`invalidateQueries` 補救。
+
+- **常駐掛載不等於 effect 常駐——Mantine 9.4.1 用 React Activity 隱藏非現用分頁
+  （R1-1）**：`ToolsPage` 頂部原本的註解宣稱「panels stay mounted -- Mantine's
+  default -- so an install keeps polling while the user looks at the list」，這句話
+  在 Mantine 把 `Tabs.Panel` 的隱藏機制換成 React 19 的 `Activity` 元件之後已經不成立。
+  `Tabs` 的 `defaultProps`（`node_modules/@mantine/core/esm/components/Tabs/Tabs.mjs`）
+  把 `keepMounted`／`keepMountedMode` 分別預設成 `true`／`"activity"`；
+  `TabsPanel.mjs`（第 23-34 行：`shouldKeepMounted && useActivity && env !== "test"`）
+  在 `keepMountedMode !== "display-none"` 時，把非現用分頁的 children 包進
+  `<Activity mode="hidden">`——React 的 `Activity` 隱藏時「保留 state、但拆掉
+  effect」，而 react-query 的 `refetchInterval`（`toolJobRefetchInterval`）正是一個
+  effect，不是純資料。後果：使用者從「已安裝工具」切到「安裝新工具」時，前者若正
+  輪詢一個修訂工作，該輪詢會靜默停止；經 `onBusyChange` 回報給另一分頁的忙碌旗標也
+  跟著卡在切換當下那個值，直到切回來才會恢復——安裝表單因此可能被鎖住得比後端實際
+  情況更久，而且完全沒有任何錯誤提示。反向（安裝進行中切到已安裝工具分頁）同理。
+  裁決：`Tabs` 加 `keepMountedMode="display-none"`，兩分頁改用 Mantine 本來就會套在
+  `TabsPanel` 那個 Box 上的 `display: none` 樣式隱藏（兩種模式都會設這個樣式——視覺
+  與可聚焦性因此完全不變），不再額外包一層 `Activity`。原本錯誤的註解改寫並移到
+  `<Tabs>` 那一行正上方（不留在函式最上方，避免這個 prop 日後被當成「跟預設值重複」
+  誤刪），具名這個 prop、引用 Mantine 原始碼的確切檔案與行號；並註明這是「程式碼 +
+  函式庫原始碼」的論證而非測試釘住的——這個頁面沒有 jsdom，本來就測不到掛載/渲染
+  行為。附帶檢查：`frontend/src` 內除了 `ToolsPage.jsx`，沒有第二個檔案用到
+  `Tabs`／`Tabs.Panel`，這個錯誤假設沒有在別處重複出現。
+
+- **`summaryBusy` 漏了送出修訂那個請求本身的等待窗（R1-2）**：`reviseJobActive` 只有
+  在 `reviseMutation` 的 `onSuccess` 把 `activeJob`（帶著後端剛核發的 `job_id`）設進
+  state 之後才會變 true；但使用者按下「送出修訂」到那個 202 回應真正落地之間，有一段
+  `reviseMutation.isPending` 已經是 true、`reviseJobActive` 卻還是 false 的窗口，原本
+  的 `summaryBusy`（`regenerateMutation.isPending || reviseJobActive || externalBusy`）
+  完全沒蓋到。這段期間其他列的重新產生／修訂、以及另一分頁的安裝送出全部維持可按——
+  誰先送達後端的單一 in-flight 名額誰就贏，使用者自己那個已經送出、理應優先的修訂
+  請求反而可能因為輸給別的請求而收到 409。
+  裁決：`summaryBusy` 加上 `reviseMutation.isPending`——`.mutate()` 呼叫本身就會同步把
+  `isPending` 翻成 true，讓忙碌旗標從按下送出那一刻起，無縫接到 `reviseJobActive`
+  接手之後的窗口，中間不留一個 tick 的空隙。`statusMutation.isPending`
+  （定版／解除定版）維持不在這個旗標內，理由不變：後端這個端點本來就不查
+  single-flight，見 `ToolSummaryPanel` 該按鈕自己的既有註解。
+
+- **刪除後 `["tool-summary", name]` 快取沒人清，同名重裝在 gc window 內撞到舊資料
+  （R1-3）**：`deleteMutation` 的 `onSuccess` 原本只 `invalidateQueries(["tools"])`，
+  從未動過 `["tool-summary", name]`。TanStack Query 預設 `gcTime` 是 5 分鐘，展開過的
+  列即使刪除、收合，其總結快取仍會留在記憶體裡到期限到；若使用者在這 5 分鐘內用同一
+  個名字重新安裝（同名允許——後端把它當一個全新的套件），新列的面板初次展開讀到的會
+  是舊工具的 `summary`／`status`／`llm_log_id`（連 AI 日誌深連結都指向被刪除那個工具
+  的紀錄），而如果新工具自己的 refetch 剛好暫時失敗，這份舊資料還會被當成新工具當前
+  狀態繼續顯示，沒有任何錯誤提示。
+  裁決：`deleteMutation` 的 `onSuccess` 改成對 `["tool-summary", name]` 呼叫
+  `removeQueries`（而非 `invalidateQueries`）並帶 `exact: true`。用 removeQueries 而
+  非 invalidate 的理由：資源已經不存在，沒有什麼好「重新驗證」的，該做的是把快取
+  徹底清空，讓下一次展開（不管是不是同名重裝）都是一次全新的請求；`exact: true`
+  確保只精準命中這個工具自己的鍵（TanStack Query 的 `queryKey` 過濾預設不看 `exact`
+  時是逐元素部分比對——這裡因為第二個元素就是 name，其實不加也不會波及別的工具，但
+  寫明 `exact: true` 讓這個保證不必依賴「這把鍵永遠只有兩層」這個現在為真、未來未必
+  為真的假設）。
+
+- **定版／重新產生都拿到了新鮮的總結內容卻直接丟掉，靠 invalidate 補救（R1-4）**：
+  `regenerateMutation` 與 `statusMutation` 的 mutation 函式回應本身就是後端剛寫回
+  磁碟後、重新讀出來的權威 `ToolSummaryDetail`——查證 `routers/tools.py`：
+  `regenerate_tool_summary`（第 495 行）與 `update_tool_summary_status`（第 402 行）
+  都以 `return _summary_detail(meta)` 收尾，跟 `get_tool_summary`（第 360 行）用的是
+  同一個 `_summary_detail` builder（第 315-338 行）、同一個四欄位形狀
+  `{summary, status, updated_at, llm_log_id}`；三條路由的 `@router` 宣告也都直接是
+  `response_model=ToolSummaryDetail`，沒有任何一條加 exclude/alias 之類會讓序列化
+  形狀分岔的選項。但兩個 mutation 過去都直接丟棄這個回應，改用
+  `invalidateQueries(["tool-summary", name])` 觸發背景 refetch 來更新畫面。查證
+  `@tanstack/query-core` 的實作：`invalidateQueries` 轉呼叫 `refetchQueries`，後者對
+  每個 refetch 的 promise 在 `!fetchOptions.throwOnError`（我們的呼叫沒有傳
+  `throwOnError`，因此為真）時執行 `promise.catch(noop)`——背景 refetch 的錯誤因此
+  **保證**被吞掉，連 `await` 這個 invalidate 呼叫本身都不會因此 reject。只要那次
+  refetch 剛好暫時失敗（網路抖動、後端瞬間忙碌），使用者看到的就是一個綠色成功通知，
+  緊接著卻是完全沒變的畫面——定版按鈕仍顯示「解除定版」（其實已經是 draft）、AI
+  控制項的鎖定狀態也還停在舊的。
+  裁決：兩個 mutation 的 `onSuccess` 都改成
+  `queryClient.setQueryData(["tool-summary", name], detail)`，把回應內容直接寫入
+  快取；`["tools"]` 的 `invalidateQueries` 維持不變，不能用同樣的方式改寫——列表那筆
+  資料還帶著 `enabled`／`valid`／`description` 等這個回應完全沒有的欄位，硬要在這裡
+  拼湊等於用猜的。這個寫入不會把 GET 產生不出來的形狀放進快取：三條路由共用同一個
+  `_summary_detail()` builder 與同一個 pydantic `response_model`，這是原始碼層級的
+  保證，不是巧合。

@@ -100,7 +100,14 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
 - **`ToolsPage` 的跨分頁 busy gate（D40）**：後端的工具任務（安裝、AI
   修訂）與同步的「重新產生總結」共用同一個全域 single-flight，任一個進行中都會
   讓其他兩者收到 409。`ToolsPage` 的兩個分頁（`InstalledToolsPanel`／
-  `InstallPanel`）常駐掛載（Tabs 預設行為），各自把自己算出的忙碌旗標經
+  `InstallPanel`）常駐掛載且維持 effect 存活：`Tabs` 除了 Mantine 預設就開的
+  `keepMounted`，還額外指定 `keepMountedMode="display-none"`——Mantine 另一個
+  預設值 `"activity"` 會把非現用分頁的內容包進 React 的 `Activity`
+  （`mode="hidden"`），隱藏時保留元件 state 但拆掉 effect，等於讓被切走那一
+  分頁的 react-query 輪詢與這裡的 `onBusyChange` effect 一起靜默停擺（細節與
+  Mantine 原始碼引用見 `ToolsPage` 該 prop 上方的註解）；`display-none` 改用
+  純 CSS `display: none` 隱藏未啟用分頁，兩分頁的 effect 因此永遠跟現用分頁
+  一樣持續運作。兩分頁各自把自己算出的忙碌旗標經
   `onBusyChange` 回報給 `ToolsPage`，再以 `externalBusy` 傳回給對方，讓一個分頁
   的任務進行中時，另一分頁的送出控制項也會停用——純粹是本地端對後端那個
   single-flight 的樂觀鏡像（只涵蓋這個分頁實例自己送出/得知的任務），後端仍是

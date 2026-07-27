@@ -515,6 +515,19 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 		onSuccess: async (_data, name) => {
 			setDeleteTarget(null);
 			notifications.show({ color: "green", message: `已刪除「${name}」` });
+			// removeQueries, not invalidateQueries: the tool is GONE, so there is
+			// nothing left to revalidate against -- and a same-name reinstall
+			// inside TanStack Query's default 5-minute gc window is a DIFFERENT
+			// tool, whose panel must start cold rather than pre-populated with the
+			// deleted tool's summary/status/llm_log_id (or, if the reinstall's own
+			// refetch then transiently fails, with the deleted tool's stale data
+			// rendered as though it belonged to the new one). `exact: true` so
+			// this only ever touches THIS tool's own key, never a predicate broad
+			// enough to reach an unrelated tool's cached summary.
+			queryClient.removeQueries({
+				queryKey: ["tool-summary", name],
+				exact: true,
+			});
 			await queryClient.invalidateQueries({ queryKey: ["tools"] });
 		},
 		onError: (mutationError) => {
@@ -535,11 +548,23 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	// activity disable every OTHER row's controls (see summaryBusy below).
 	const regenerateMutation = useMutation({
 		mutationFn: (name) => apiPost(`/api/tools/${name}/summary/regenerate`),
-		onSuccess: async (_data, name) => {
-			await Promise.all([
-				queryClient.invalidateQueries({ queryKey: ["tool-summary", name] }),
-				queryClient.invalidateQueries({ queryKey: ["tools"] }),
-			]);
+		onSuccess: async (detail, name) => {
+			// Written straight into the cache rather than invalidated: this
+			// response body IS the fresh ToolSummaryDetail -- routers.tools'
+			// regenerate_tool_summary returns `_summary_detail(meta)` over the
+			// just-stored sidecar, the exact same builder GET .../summary calls
+			// over the exact same shape (`{summary, status, updated_at,
+			// llm_log_id}`, all four fields always present) -- so there is
+			// nothing an invalidation's background refetch would tell us that we
+			// do not already have in hand, and TanStack Query swallows THAT
+			// refetch's error by default: a transient failure right after this
+			// success would otherwise leave a green toast next to a stale panel
+			// (stuck loading indicator or, worse, the pre-regenerate text/status).
+			// `["tools"]` still needs a real invalidation, not a local patch: its
+			// row shape carries fields (enabled, valid, description, ...) this
+			// response does not, so patching it here would mean guessing the rest.
+			queryClient.setQueryData(["tool-summary", name], detail);
+			await queryClient.invalidateQueries({ queryKey: ["tools"] });
 			notifications.show({
 				color: "green",
 				message: `已重新產生「${name}」的總結`,
@@ -557,11 +582,18 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	const statusMutation = useMutation({
 		mutationFn: ({ name, status }) =>
 			apiPatch(`/api/tools/${name}/summary`, { status }),
-		onSuccess: async (_data, { name, status }) => {
-			await Promise.all([
-				queryClient.invalidateQueries({ queryKey: ["tool-summary", name] }),
-				queryClient.invalidateQueries({ queryKey: ["tools"] }),
-			]);
+		onSuccess: async (detail, { name, status }) => {
+			// Same reasoning as regenerateMutation above: update_tool_summary_status
+			// also returns `_summary_detail(meta)` over a fresh re-read of the
+			// sidecar it just wrote (routers/tools.py), the identical builder and
+			// shape GET .../summary uses -- so writing it straight into the cache
+			// (rather than relying on an invalidation whose refetch error TanStack
+			// Query would silently drop) is what keeps the 定版/解除定版 button
+			// label and the AI controls' disabled state from lagging behind their
+			// own success toast. `["tools"]` still needs a real invalidation for
+			// the row badge (summary_status), same reason as regenerateMutation.
+			queryClient.setQueryData(["tool-summary", name], detail);
+			await queryClient.invalidateQueries({ queryKey: ["tools"] });
 			notifications.show({
 				color: "green",
 				message:
@@ -631,11 +663,25 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	// above for whatever race this local knowledge cannot see -- another
 	// browser tab, or a job this page instance never learned about.
 	//
+	// `reviseMutation.isPending` is its own term and NOT redundant with
+	// `reviseJobActive`: the latter only turns true once `activeJob` is set,
+	// which happens in reviseMutation's onSuccess (the 202 carrying the new
+	// job_id) -- so the gap between the user pressing 送出修訂 and that
+	// response landing has isPending true while reviseJobActive is still
+	// false. Without this term, every OTHER control this gate covers stayed
+	// enabled through that gap, so a regenerate/revise fired against a
+	// different row (or an install started from the other tab) could win the
+	// backend's single-flight first and make the user's OWN revise request --
+	// already in flight -- the one that comes back 409.
+	//
 	// Deliberately does NOT include statusMutation.isPending: see the
 	// 定版/解除定版 button's own disabled comment in ToolSummaryPanel for why
 	// PATCH .../summary is exempt from this gate entirely.
 	const summaryBusy =
-		regenerateMutation.isPending || reviseJobActive || externalBusy;
+		regenerateMutation.isPending ||
+		reviseMutation.isPending ||
+		reviseJobActive ||
+		externalBusy;
 
 	useEffect(() => {
 		onBusyChange?.(summaryBusy);
@@ -1016,8 +1062,9 @@ function InstallPanel({ externalBusy = false, onBusyChange }) {
 }
 
 // The 工具 page: installed-tools management plus the AI web installer, as two
-// tabs (panels stay mounted -- Mantine's default -- so an install keeps
-// polling while the user looks at the list).
+// tabs -- see the keepMountedMode comment on the Tabs element below for what
+// actually keeps an in-flight install/revise job polling no matter which tab
+// is showing.
 export function ToolsPage() {
 	usePageTitle("工具");
 
@@ -1025,8 +1072,10 @@ export function ToolsPage() {
 	// shared by an install job, a revise job, AND a synchronous regenerate --
 	// so a job running in one tab must also lock the OTHER tab's job-starting
 	// controls, not just its own. This is only visible to the user because both
-	// tabs stay mounted (see the comment above): each panel reports its own
-	// busy state up here and receives the other's back down as `externalBusy`.
+	// tabs stay mounted AND keep polling in the background (see the
+	// keepMountedMode comment on the Tabs element below): each panel reports
+	// its own busy state up here and receives the other's back down as
+	// `externalBusy`.
 	// It is a best-effort, LOCAL mirror of the backend's slot (only jobs this
 	// page instance itself started/knows about) -- the backend remains the
 	// authority, and each mutation's onError still handles the 409 this cannot
@@ -1044,7 +1093,30 @@ export function ToolsPage() {
 				</Text>
 			</div>
 
-			<Tabs defaultValue="installed">
+			{/* keepMountedMode="display-none" is load-bearing, not a redundant prop
+			    to tidy away. Mantine's OWN default (keepMountedMode="activity") wraps
+			    an inactive Tabs.Panel's children in React's Activity with
+			    mode="hidden" whenever keepMounted is true (also Mantine's default --
+			    see node_modules/@mantine/core/esm/components/Tabs/TabsPanel/
+			    TabsPanel.mjs lines 23-34). A hidden Activity boundary PRESERVES
+			    component state but DESTROYS effects, and react-query's
+			    refetchInterval (toolJobRefetchInterval) is effect-driven -- so
+			    without this prop, a revise job polled from InstalledToolsPanel would
+			    silently stop advancing the instant the user switched to the install
+			    tab (symmetrically for an in-flight install), and the busy flag
+			    mirrored across tabs (installBusy/summaryBusy above) would stay stuck
+			    at whatever it last reported -- locking the OTHER tab's controls for
+			    no reason visible to the user. "display-none" mode hides the inactive
+			    panel with a plain CSS `display: none` on the panel's own wrapper Box
+			    instead of an Activity boundary; that style is already applied to the
+			    wrapper in EITHER mode (see the cited source), so this changes
+			    nothing about what is visible or focusable, only whether the
+			    children's effects keep running while off-screen. No jsdom in this
+			    repo's tests to assert this with a render (see toolInstall.test.js/
+			    toolSummary.test.js for the pure logic that IS covered), so this is a
+			    code+library-source argument checked against the installed 9.4.1
+			    sources cited above, not a test. */}
+			<Tabs defaultValue="installed" keepMountedMode="display-none">
 				<Tabs.List>
 					<Tabs.Tab value="installed">已安裝工具</Tabs.Tab>
 					<Tabs.Tab value="install">安裝新工具</Tabs.Tab>
