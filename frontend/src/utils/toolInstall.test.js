@@ -7,6 +7,7 @@ import {
 	secretNameError,
 	secretValueError,
 	TOOL_JOB_POLL_MS,
+	toolJobQueryEnabled,
 	toolJobRefetchInterval,
 } from "./toolInstall.js";
 
@@ -111,6 +112,65 @@ describe("isToolJobActive", () => {
 		).toBe(true);
 		expect(isToolJobActive({ jobId: "j1", errorStatus: 500 })).toBe(true);
 		expect(isToolJobActive({ jobId: "j1", errorStatus: 0 })).toBe(true);
+	});
+});
+
+describe("toolJobQueryEnabled", () => {
+	it("is disabled with no job id, whatever the query says", () => {
+		// Guards the query key `["tool-job", undefined]` case: with no job to poll
+		// there is no URL to build, so nothing may fire.
+		expect(toolJobQueryEnabled(null)(queryWithState("running"))).toBe(false);
+		expect(toolJobQueryEnabled(undefined)(queryWithState(null))).toBe(false);
+	});
+
+	it("is enabled while the job is live (including before the first poll)", () => {
+		expect(toolJobQueryEnabled("j1")(queryWithState(null))).toBe(true);
+		expect(toolJobQueryEnabled("j1")(undefined)).toBe(true);
+		expect(toolJobQueryEnabled("j1")(queryWithState("queued"))).toBe(true);
+		expect(toolJobQueryEnabled("j1")(queryWithState("running"))).toBe(true);
+	});
+
+	it("falls to disabled once the job is terminal or its id 404s", () => {
+		// THE fix for the refocus-refetch leak: after this point the app's
+		// refetchOnWindowFocus default must have nothing left to act on.
+		expect(toolJobQueryEnabled("j1")(queryWithState("succeeded"))).toBe(false);
+		expect(toolJobQueryEnabled("j1")(queryWithState("failed"))).toBe(false);
+		expect(toolJobQueryEnabled("j1")(queryWithError(404))).toBe(false);
+	});
+
+	it("stays enabled on a transient (non-404) poll error", () => {
+		expect(toolJobQueryEnabled("j1")(queryWithError(500))).toBe(true);
+		expect(toolJobQueryEnabled("j1")(queryWithError(0))).toBe(true);
+	});
+
+	it("agrees with the poll-stop rule and the form lock on every input", () => {
+		// The point of the shared rule: `enabled`, the poll cadence and the
+		// caller-side lock are ONE predicate, so a job can never be (say) locked
+		// but unpollable. Pinned as an equivalence over the whole input space
+		// rather than three separately-maintained expectations.
+		const queries = [
+			queryWithState(null),
+			queryWithState("queued"),
+			queryWithState("running"),
+			queryWithState("some-future-state"),
+			queryWithState("succeeded"),
+			queryWithState("failed"),
+			queryWithError(404),
+			queryWithError(500),
+			queryWithError(0),
+			undefined,
+		];
+		for (const query of queries) {
+			const enabled = toolJobQueryEnabled("j1")(query);
+			expect(enabled).toBe(toolJobRefetchInterval(query) !== false);
+			expect(enabled).toBe(
+				isToolJobActive({
+					jobId: "j1",
+					state: query?.state?.data?.state,
+					errorStatus: query?.state?.error?.status,
+				}),
+			);
+		}
 	});
 });
 

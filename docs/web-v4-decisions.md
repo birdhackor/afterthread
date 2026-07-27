@@ -957,3 +957,139 @@ P4（工具總結面板：意見修訂與定版）落地後的第一輪 review �
   拼湊等於用猜的。這個寫入不會把 GET 產生不出來的形狀放進快取：三條路由共用同一個
   `_summary_detail()` builder 與同一個 pydantic `response_model`，這是原始碼層級的
   保證，不是巧合。
+
+### D40 附錄（P4 review r2）：`Collapse` 的 prop 名寫錯導致整個面板從未打開、工作輪詢在終局後仍隨對焦重打、啟用開關與修訂的 manifest ctime 競態、列徽章補寫快取、總結快取加實例判別、修訂被拒的文案改對動作
+
+P4 第二輪 review 抓到六個問題。第一個是整個 phase 的功能其實從未運作過——而它同時
+暴露了一個更值得記下來的類別問題：**這個前端沒有 jsdom，任何自動化閘門都抓不到寫錯
+的 prop 名稱**。其餘五個分別是快取／輪詢生命週期（兩個）、跨端點的檔案系統競態（一
+個）、快取一致性（一個）與文案（一個）。
+
+- **`Collapse` 的展開 prop 是 `expanded`，不是 `in`——P4 的功能從未真的可用（R2-1）**：
+  `ToolsPage.jsx` 原本寫 `<Collapse in={expanded}>`。查證安裝版本
+  `node_modules/@mantine/core/esm/components/Collapse/Collapse.mjs` 第 20 行的
+  解構：`const { children, expanded, transitionDuration, ... } = useProps(...)`，
+  以及 `lib/components/Collapse/Collapse.d.ts` 的 `expanded: boolean`（**必填**，
+  沒有 `?`）——`in` 是 React Transition Group 的拼法，不是這個元件的。錯誤的 prop
+  名在 JSX 裡完全合法：它只是落進 `...others`，被 spread 到外層 Box 上，於是元件內
+  的 `expanded` 永遠是 `undefined`（falsy），面板永遠維持收合。實際症狀是切換按鈕
+  的文字（「AI 總結」↔「收合 AI 總結」）會變，但底下什麼都不會出現——而 P4 的所有
+  功能都在那個面板裡：總結的 `GET .../summary`、重新產生、定版／解除定版、整個修訂
+  表單與其進度卡。換句話說，這個 phase 出貨時是完全不能用的。
+  裁決：改成 `<Collapse expanded={expanded}>`，並在該行上方留下具名引用（檔案 + 行號
+  + 型別宣告）的註解，說明為什麼這個錯誤是靜默的。
+- **附帶記下這個「類別」：prop 名稱錯誤在本專案沒有任何自動化閘門擋得住**。`pnpm lint`
+  （Biome）不做型別檢查，也無從知道 `Collapse` 有哪些 prop；`pnpm build`（Vite/rolldown）
+  只轉譯不檢型別；`pnpm test`（vitest）在 **node 環境、沒有 jsdom** 下跑（這正是
+  `utils/toolInstall.js`／`utils/toolSummary.js` 這兩個純函式檔存在的原因，見
+  `frontend/README.md`），因此完全不 render 元件。三個閘門全綠，功能卻是零。專案沒有
+  引入 TypeScript／jsdom 的打算（D07），所以**今天唯一可用的緩解手段就是「對照安裝版
+  原始碼逐一核對 prop 名稱」的人工掃描**——把它寫下來，是為了不要假裝閘門有覆蓋到。
+  本輪執行的掃描結果（全部對照
+  `node_modules/@mantine/core/lib/components/**/*.d.ts` 的介面宣告，以及 style props
+  的 `core/Box/style-props/style-props.types.d.ts`）：`Collapse` 的 `in` 是**唯一**
+  一個錯的；`Tabs`（`defaultValue`／`keepMountedMode`）、`Tabs.Tab`／`Tabs.Panel`
+  的 `value`、`Alert`（`color`／`title`）、`Badge`／`Button`／`Loader`／`Switch`
+  （含 `labelPosition`）、`Card`（`withBorder`／`padding`／`radius`）、`Modal`
+  （`opened`／`onClose`／`centered`／`closeOnEscape`／`closeOnClickOutside`／
+  `withCloseButton`）、`Textarea`（`autosize`／`minRows`／`description`／
+  `withAsterisk`）、`TextInput`／`PasswordInput`、`Group`／`Stack`／`Center`／
+  `Text`／`Title`／`Anchor`，以及所有 style props（`gap`／`px`／`py`／`pt`／`c`／
+  `fw`／`style`）全部與安裝版宣告相符。
+- **工作輪詢停了，但查詢沒關——終局之後每次視窗對焦都再打一次，且可能把成功卡變成
+  404 錯誤卡（R2-2）**：`toolJobRefetchInterval` 會在工作終局或 404 後回傳 `false`
+  停掉輪詢，但兩個工作查詢（安裝的 `["tool-install", jobId]` 與修訂的
+  `["tool-job", jobId]`）的 `enabled` 都只寫 `jobId !== null`／`activeJob !== null`，
+  設過就永遠是 true。app 的 query 預設（`main.jsx`）是 `refetchOnWindowFocus: true`
+  ＋ `staleTime: 5s`，查證 `@tanstack/query-core` 5.101.2 的
+  `queryObserver.js`：`shouldFetchOnWindowFocus()` → `shouldFetchOn()`，其第一道閘
+  就是 `resolveQueryBoolean(options.enabled, query) !== false`——`enabled` 為真時，
+  只要資料超過 5s 就會重打。後果不只是多餘流量：後端的工作表是**行程內、有界**的
+  （重啟即失、舊 id 會被擠掉），所以幾分鐘後回來切個視窗，原本停在「修訂完成」的綠色
+  卡片會被換成「找不到這個修訂工作，後端可能已重新啟動」的紅色錯誤卡——使用者什麼都
+  沒做。
+  裁決：讓 `enabled` 在**與停止輪詢完全相同的條件**下落回 false。做法是把停止規則抽成
+  `toolInstall.js` 內唯一的私有述詞 `isLiveToolJob({state, errorStatus})`，另外兩個既
+  有出口（`toolJobRefetchInterval`、`isToolJobActive`）改為它的 adapter，再新增
+  `toolJobQueryEnabled(jobId)` 回傳 query-core 支援的函式型 `enabled`
+  （`QueryBooleanOption = boolean | ((query: Query) => boolean)`，見
+  `build/modern/_tsup-dts-rollup.d.ts` 第 1250 行；由 `resolveQueryBoolean` 每次判斷
+  時對「當下的 query」重新求值）。這樣輪詢節奏、`enabled`、表單鎖三者是**同一個函式**，
+  不可能各自漂移；停用的查詢仍保留 `data`／`error`，所以最後的成功／失敗卡原地凍結。
+  兩個分頁的工作查詢都套用。新測試除了逐條釘住 `toolJobQueryEnabled`，還加了一條
+  等價性測試：對整個輸入空間斷言 `enabled` ≡ `refetchInterval !== false` ≡
+  `isToolJobActive`。
+- **啟用／停用開關與進行中的修訂會互相毀掉對方（R2-3）**：`PATCH /api/tools/{name}`
+  走 `tools.set_enabled`，它會**原地改寫該套件的 `tool.json`**（讀出、改 `enabled`、
+  再用 `_write_regular_file` 寫回）。而 `tool_builder._package_identity` 把「這還是不是
+  同一個套件」定義成 `tool.json` 的 `(st_dev, st_ino, st_ctime_ns)`（P3b review r10
+  刻意選 manifest 而非目錄 inode），`run_revise` 在 session 開始時記下它、換裝前再檢查
+  一次（r11／r12 把它排成換裝前最後一道）。兩者相加：修訂進行中按一下「啟用」，
+  manifest 的 ctime 就變了，幾分鐘後那個跑完的建置會在換裝前被拒，錯誤是
+  「原工具在修訂期間被改動或重新安裝」——使用者完全看不出是自己那個開關造成的。反向
+  競態同理（PATCH 還在飛的時候送出修訂）。原本的開關只擋 `mutating`
+  （toggle／delete 是否 pending），對修訂一無所知。
+  裁決：雙向補閘，且都是**per-row**——只有被修訂那個套件的 manifest 有風險，別的工具
+  不該被連坐。(1) 該列的 `Switch` 加上 `reviseBusyForThisTool`（＝該列的修訂送出
+  pending，或 `activeJob.name` 是該列且 `reviseJobActive`；兩個項缺一不可的理由與
+  `summaryBusy` 相同——202 落地前 `activeJob` 還沒設）；(2) 該列的「送出修訂」按鈕與
+  修訂意見輸入框加上 `isTogglingThisTool`（＝ `toggleMutation` pending 且
+  `variables.name` 是該列），`submitRevise` 內也同步擋掉。**刪除刻意不納入**這個閘：
+  修訂途中刪掉工具由後端自己的「目標不存在」拒絕回答，而且那本來就是使用者放棄這個
+  工具時要的動作，也走自己的確認 Modal，不是一鍵開關。因果鏈（manifest 改寫 → ctime →
+  後端身分檢查）寫在兩個控制項各自的註解裡，免得日後被當成過度上鎖而拿掉。
+- **列上的總結徽章仍靠一次會被吞掉錯誤的 invalidate（R2-4）**：r1 已經把
+  `regenerate`／`PATCH .../summary` 的權威回應直接寫進 `["tool-summary", ...]` 快取，
+  但**列**的 `summary_status` 徽章當時仍完全交給 `invalidateQueries(["tools"])` 的背景
+  refetch——而那個 refetch 的錯誤 TanStack Query 預設就是吞掉的（r1 已查證
+  `refetchQueries` 對 promise 做 `promise.catch(noop)`）。所以只要 `GET /api/tools`
+  剛好抖一下，畫面就是綠色的「已定版」通知旁邊，列徽章還寫著「草稿」。
+  裁決：新增純函式 `patchToolRowSummaryStatus(listBody, name, status)`，兩個 mutation
+  的 `onSuccess` 收斂進共用的 `applySummaryDetail()`，用 `setQueryData(["tools"], …)`
+  只改**那一列的那一個欄位**。刻意不「補一整列」：總結回應不帶
+  `enabled`／`valid`／`description`／`error`，硬湊等於把 `GET /api/tools` 產不出來的
+  形狀塞進快取（列不存在時原樣返回、`tools` 不是陣列時原樣返回，皆已測）。跨欄位搬值
+  是安全的：列的 `summary_status` 與詳情的 `status` 都經過同一套後端詞彙過濾
+  （`services/tools._narrowed_summary_status` 與 `routers/tools._summary_detail` 都比對
+  `_SUMMARY_STATUSES`），只可能是 `"draft" | "final" | null`。`invalidateQueries`
+  維持不動，繼續當**其餘欄位**的最終一致性後盾。
+- **總結快取以工具「名稱」為鍵，但名稱是可以被重新指派的（R2-5）**：另一個瀏覽器分頁
+  （或任何有檔案系統權限的行程）可以刪掉一個工具、再用同一個名字裝一個**完全不同**的
+  工具，而這個 QueryClient 對此一無所知——r1 加的 `removeQueries` 只涵蓋「本 client 自己
+  執行的刪除」。舊的快取項於是會被當成新工具的總結渲染出來；更糟的是，如果新工具自己的
+  背景 GET 剛好失敗，`isError && data === undefined` 這個判斷是 **false**（react-query
+  會保留 `data`、只把 status 翻成 'error'），舊內容就這樣無限期留在畫面上，連一個錯誤
+  提示都沒有。
+  裁決：比照 `LlmLogsPage.LogDetailPanel` 的**兩段式**做法（鍵裡放判別子 + 渲染前再
+  比對一次），但誠實交代這裡的判別子比它弱。查證 `GET /api/tools` 的每列實際欄位
+  （`services/tools.list_tools` → `schemas.ToolSummary`）只有
+  `{name, description, enabled, valid, error, summary_status}`——**沒有任何安裝 id 或
+  時間戳**，也就是沒有真正的實例身分可用。其中唯一由「安裝」寫出來的欄位是
+  `description`（來自該次安裝自己的 AI builder session 寫的 `tool.json`），所以鍵改成
+  `toolSummaryQueryKey(name, description)` = `["tool-summary", name, description]`。
+  刻意**不**用 `summary_status` 當判別子：它在正常使用下就會變（定版／解除定版會讓一個
+  根本沒換過的工具憑空換鍵）。連帶修正：`deleteMutation` 的 `removeQueries` 原本帶
+  `exact: true`，鍵長成三段之後那會**一個都比對不到**、靜默停止清理——改用
+  `toolSummaryKeyPrefix(name)` 前綴比對（TanStack Query 預設逐元素部分比對），順便把
+  同一個名字底下所有舊描述留下的項一起清掉；修訂成功後的 invalidate 同理改前綴（修訂
+  重建套件，`description` 正是可能剛變掉的東西）。
+  **殘留風險（明講）**：兩次安裝的 AI 描述若剛好逐位元組相同，仍會共用同一個快取鍵。
+  但那扇窗其實很窄——`GET /api/tools/{name}/summary` 是按**名稱**定址的，所以**成功**的
+  refetch 永遠回的是當下那個工具的 sidecar；真正危險的是 refetch **失敗**那條路，而那
+  正是上面說的「舊內容無聲留在畫面上」。因此第二段防線直接針對它：面板在
+  `isError` 且**有** `data` 時，於內容上方加一張橘色「無法更新總結」Alert，說明以下是
+  先前讀到的內容、可能已過期。內容仍然顯示（那是目前最好的讀數，且藏掉會連定版控制項
+  一起藏掉），但不再是無聲的。
+- **修訂被「已定版」拒絕時，顯示的是「重新產生」的補救說明（R2-6）**：後端的
+  `_TOOL_FINALIZED_MESSAGE` 是「總結已定版，請先解除定版再重新產生」，因為同一個
+  `tool_finalized` 碼同時服務 regenerate 與 revise 兩條路由；顯示在「無法送出修訂」
+  標題底下時，等於叫使用者去做一件他根本沒按的事。
+  裁決：`toolErrorMessage` 加一個選用的 `codeCopy` 覆寫表，只有 revise 的
+  `tool_finalized` 提供本地文案（「總結已定版，請先解除定版再送出修訂」）。逐碼檢查
+  過並**刻意不加**分支的：`tool_job_in_progress`（「已有工具任務正在進行中，請等待
+  完成」——後端本來就刻意寫成不指名動作，兩個標題底下都通順）、`summary_missing`
+  （「尚無總結可定版」——只由 `PATCH .../summary` 發出，已經指名該動作）、
+  `llm_not_configured`／502（共用 client 的 `messageFor` 已處理，且本身動作中性）、
+  `tools_not_configured`／`install_in_progress`（只出現在安裝表單，已由 `InstallPanel`
+  自己的 `onError` 內聯處理）。理由寫在 `toolErrorMessage` 上方，免得下一輪又重問一次
+  「為什麼只有一個碼有分支」。

@@ -115,18 +115,52 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   409（`tool_job_in_progress`）錯誤處理接住。每個工具列的 AI 總結面板走 inline
   展開（`@mantine/core` 的 `Collapse` + `useDisclosure`，零新依賴，比照 D38
   選用 Mantine 內建元件的理由；每列獨立展開，不像 `LlmLogsPage` 的 Accordion
-  同時間只開一項），總結內容以 `enabled: expanded` 延遲讀取（比照
+  同時間只開一項；展開 prop 是 `Collapse` 自己的 `expanded`，**不是** React
+  Transition Group 的 `in`——寫錯只會被靜默吞進 `...others`，見下面「沒有 jsdom」
+  那條），總結內容以 `enabled: expanded` 延遲讀取（比照
   `LlmLogsPage.LogDetailPanel`，收合的列從不打 API）。定版／解除定版
   （`PATCH .../summary`）刻意**不**受這個 busy gate 管制：後端這個端點本來就
   沒有查 single-flight，且刻意支援「AI 修訂進行中先定版，換裝前重新檢查會擋下
   取代」這種中途操作，在前端補一個它不需要的鎖只會擋掉後端特地支援的動作。
+- **`ToolsPage` 的 per-row 閘：啟用開關 ⇄ 進行中的修訂**：跨分頁的 `summaryBusy`
+  管的是後端那個全域 single-flight，但「啟用／停用」跟修訂的衝突是**另一回事**、
+  而且是 per-row 的檔案系統競態：`PATCH /api/tools/{name}` 會原地改寫該套件的
+  `tool.json`，而修訂 session 正是以 `tool.json` 的 `(st_dev, st_ino, st_ctime_ns)`
+  當「還是同一個套件嗎」的身分、換裝前再驗一次。所以該列的 `Switch` 會被該列自己的
+  修訂（送出中或工作進行中）停用，該列的「送出修訂」也會被該列自己的 toggle
+  停用；只鎖同一列，別的工具不連坐。**刪除刻意不在這個閘內**（由後端的目標不存在
+  拒絕回答，且它走自己的確認 Modal）。
+- **`ToolsPage` 的兩個工作查詢在終局後會關掉自己**：`enabled` 用
+  `toolJobQueryEnabled(jobId)`（函式型 `enabled`），跟停止輪詢的
+  `toolJobRefetchInterval` 共用同一條規則。只停輪詢不夠：app 的 query 預設是
+  `refetchOnWindowFocus: true` ＋ `staleTime: 5s`，`enabled` 留著 true 的查詢會在
+  每次視窗對焦重打，而後端工作表是行程內有界的，於是幾分鐘後一張「修訂完成」會被
+  換成 404 錯誤卡。
+- **總結快取鍵帶實例判別子**：`toolSummaryQueryKey(name, description)`。工具名稱
+  是可以被重新指派的（別的分頁刪掉再用同名裝一個不同的工具），而
+  `GET /api/tools` 的列裡沒有任何安裝 id／時間戳可用，`description` 是唯一由安裝
+  寫出來的欄位。判別子是啟發式而非證明，所以面板另外在 `isError` 但**有**舊資料時
+  加一張「內容可能已過期」的 Alert——react-query 會保留 `data` 只把 status 翻成
+  'error'，那正是舊內容原本會無聲留在畫面上的狀態。做 invalidate／removeQueries
+  時一律用 `toolSummaryKeyPrefix(name)` 前綴比對，**不可以**加 `exact`（鍵是三段，
+  `exact` 會一個都比對不到）。
 - **`utils/toolInstall.js` 與 `utils/toolSummary.js` 的分工**：前者是安裝表單
   驗證（URL／秘密名稱與值）＋工具任務輪詢共用的純函式
   （`isToolJobActive`／`toolJobRefetchInterval`／`isTerminalToolJobState`——
   D40 之前只服務安裝工作，現在安裝與修訂共用同一張後端 job 表與同一個輪詢
   路由，因此改用不含「install」字樣的名稱，並更新了每個呼叫點與測試）；後者
   是 AI 總結網域的純邏輯（狀態→badge 對映 `summaryStatusMeta`、是否可定版
-  `canFinalizeSummary`），因為那與「安裝」無關，硬塞進前者的檔名只會誤導
-  之後的讀者——這個專案的 vitest 在 node 環境跑、沒有 jsdom，元件本身測不到，
-  抽出的純函式是唯一能自動化驗證的介面，所以新邏輯一律先問「這算安裝，還是
-  總結」再決定放哪個檔案。
+  `canFinalizeSummary`、快取鍵 `toolSummaryQueryKey`／`toolSummaryKeyPrefix`、
+  列徽章的快取更新器 `patchToolRowSummaryStatus`），因為那與「安裝」無關，硬塞
+  進前者的檔名只會誤導之後的讀者——這個專案的 vitest 在 node 環境跑、沒有
+  jsdom，元件本身測不到，抽出的純函式是唯一能自動化驗證的介面，所以新邏輯一律
+  先問「這算安裝，還是總結」再決定放哪個檔案。
+- **沒有 jsdom ⇒ 寫錯的 prop 名稱沒有任何閘門擋得住**：`pnpm lint`（Biome）不做
+  型別檢查、`pnpm build`（Vite）只轉譯不檢型別、`pnpm test`（vitest）在 node 環境
+  下完全不 render 元件。一個拼錯的 Mantine prop 是合法 JS／合法 JSX，會被靜默
+  spread 進 `...others`，三個閘門依然全綠而功能是零（P4 的
+  `<Collapse in={…}>` 就是這樣讓整個 AI 總結面板從未打開過）。改動 Mantine 元件的
+  props 時，唯一可靠的驗證是**對照安裝版原始碼**——
+  `node_modules/@mantine/core/lib/components/<Name>/<Name>.d.ts` 的介面宣告，或
+  `esm/.../<Name>.mjs` 的解構，style props 則見
+  `lib/core/Box/style-props/style-props.types.d.ts`。憑記憶或憑線上文件都不算。
