@@ -205,11 +205,24 @@ async def list_installed_tools() -> ToolListResponse:
 async def update_tool(name: ToolName, payload: ToolUpdateRequest) -> ToolSummary:
     """Toggle a tool's ``enabled`` flag; returns the updated row.
 
-    ``set_enabled`` returning False collapses every did-not-happen case --
-    missing package, unreadable/unwritable manifest, feature off -- into one
-    404 with a fixed detail: from the caller's view the addressable tool
-    resource does not (usably) exist. The response is re-read from a fresh
-    registry scan so it reports exactly what the next GET would.
+    ``set_enabled`` returning False collapses every did-not-happen case into one
+    404 with a fixed detail: from the caller's view the addressable tool resource
+    does not (usably) exist. Those cases are the feature being off, a name that
+    resolves to nothing installed (or out of the tools dir, or through an internal
+    alias), and a failed publish of the package's ``.state.json`` -- something
+    that is not a regular file sitting at that name, an unwritable package
+    directory, a package replaced between the resolve and the write.
+
+    The MANIFEST is not among them any more, and the difference is visible to a
+    caller: since web-v5 P1 the toggle writes ``.state.json`` and never opens
+    ``tool.json``, so a package whose manifest is a FIFO, oversized or unreadable
+    now toggles successfully with a 200 while its row stays ``valid: false``. That
+    is the intended behaviour (an operator can switch OFF a broken package, which
+    is when they most want to) and it is what backend/README.md documents; a broken
+    package is never advertised to the model either way.
+
+    The response is re-read from a fresh registry scan so it reports exactly what
+    the next GET would.
     """
     changed = await run_in_threadpool(tools_service.set_enabled, name, payload.enabled)
     if not changed:

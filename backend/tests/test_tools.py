@@ -1113,6 +1113,153 @@ def test_runtime_refuses_a_tool_whose_state_file_became_unreadable(
     assert not sentinel.exists()
 
 
+def test_a_toggle_landing_between_the_state_read_and_popen_is_still_caught(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """P1R3-1: the check's ANSWER has to be as close to ``Popen`` as the check is.
+
+    Round 2 put ``package_enabled`` on the line above ``Popen`` but spelled it as a
+    whole ``_scan_package``, which reads ``.state.json`` FIRST and then parses a
+    manifest, resolves the entry and stats it -- ~0.5 ms of file operations after
+    the value it returns was read. A PATCH landing in that tail shipped a tool the
+    operator had just switched off: the identity check above cannot help (it is
+    older still) and the handler's own check is older again.
+
+    The rule now reads the state file LAST, so on the only path where anything at
+    all separates that read from the ``Popen`` -- no state file, so the manifest's
+    legacy key has to be fetched -- the state is read AGAIN afterwards. That read
+    is the whole fix and this drives a PATCH straight into it: the toggle is
+    performed from inside ``_read_manifest_object``, which is the one step in that
+    gap, and only on the SECOND call so that it lands at the ``Popen`` site rather
+    than at the handler's entry check.
+
+    Without the re-read the manifest's ``enabled: true`` wins and the child starts;
+    with it the freshly published ``false`` does. The sentinel makes "nothing was
+    started" a fact on disk rather than an inference from the returned string."""
+    root = tmp_path / "tools"
+    sentinel = tmp_path / "ran"
+    pkg = _make_tool(
+        root,
+        "busy",
+        f"import sys\nopen({str(sentinel)!r}, 'w').write('x')\nsys.stdout.write('ok')\n",
+        enabled=True,  # ... and NO state file: the fallback is what answers
+    )
+    _install_tools(monkeypatch, root)
+    assert not (pkg / tools._STATE_FILENAME).exists()
+    handler = enabled_llm_tools()[0].handler
+    real_read_manifest = tools._read_manifest_object
+    calls: list[Path] = []
+
+    def toggle_inside_the_gap(directory: Path) -> dict[str, Any] | None:
+        calls.append(directory)
+        if len(calls) == 2:  # the ``Popen`` site, not the handler's entry
+            assert set_enabled("busy", False) is True
+        return real_read_manifest(directory)
+
+    monkeypatch.setattr(tools, "_read_manifest_object", toggle_inside_the_gap)
+
+    assert asyncio.run(handler({})) == tools._TOOL_DISABLED_RESULT
+    assert len(calls) == 2  # the probe really fired at the second site
+    assert not sentinel.exists()  # no child was ever started
+
+
+def test_the_execution_toggle_check_reads_the_state_file_last_and_scans_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """P1R3-1's adjacency, pinned as call ORDER because nothing sits in the gap.
+
+    The sibling test above drives a PATCH through the one step that can separate
+    the toggle read from ``Popen``. On the other path -- a package that HAS a state
+    file -- there is nothing to drive from, so what has to be pinned is that
+    nothing is there: the last thing the runtime does before starting the child is
+    read ``.state.json``, and it does not run a package SCAN to get there.
+
+    Both halves matter and neither implies the other. A scan would answer the same
+    question correctly (it is where the rule is defined) while re-introducing the
+    ~0.5 ms of manifest parsing and entry-file resolving between the read and the
+    act -- which is exactly what round 2 shipped."""
+    root = tmp_path / "tools"
+    _make_tool(root, "traced", "import sys\nsys.stdout.write('ok')\n")
+    _install_tools(monkeypatch, root)
+    assert set_enabled("traced", True) is True  # give it a state file
+    handler = enabled_llm_tools()[0].handler  # advertisement scans; probes go on after
+
+    trace: list[str] = []
+    real_state = tools._read_enabled_state
+    real_scan = tools._scan_package
+    real_popen = subprocess.Popen
+
+    def traced_state(directory: Path) -> tools._EnabledState:
+        trace.append("state")
+        return real_state(directory)
+
+    def traced_scan(directory: Path, expected_name: str | None = None) -> tools._PackageScan:
+        trace.append("scan")
+        return real_scan(directory, expected_name=expected_name)
+
+    def traced_popen(*args: Any, **kwargs: Any) -> Any:
+        trace.append("popen")
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(tools, "_read_enabled_state", traced_state)
+    monkeypatch.setattr(tools, "_scan_package", traced_scan)
+    monkeypatch.setattr(subprocess, "Popen", traced_popen)
+
+    assert asyncio.run(handler({})) == "ok"
+
+    assert trace[-2:] == ["state", "popen"]  # the toggle read is the line above it
+    assert "scan" not in trace  # ... and getting it cost no scan at all
+    assert trace.count("state") == 2  # once per site (handler entry, pre-Popen)
+
+
+def test_the_scan_and_the_execution_check_answer_the_one_rule_identically(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One spelling, demonstrated rather than asserted (P1R3-1).
+
+    ``package_enabled`` stopped BEING ``_scan_package(directory).enabled``, so
+    "they cannot disagree" stopped being true by construction and became true by
+    both calling ``_effective_enabled`` with the reads they are already holding.
+    That is only worth having if it is checked, so this walks every shape the two
+    can be asked about -- the three states of the state file, both directions of
+    the manifest fallback behind an ABSENT one, and each way the manifest itself
+    can fail to offer a legacy key -- and requires the same answer from both.
+
+    The invalid rows are included deliberately: ``enabled`` is reported for a
+    package that is not runnable too (the listing shows the switch), so a rule that
+    diverged only on those would diverge exactly where nobody looks."""
+    root = tmp_path / "tools"
+    absent = _make_tool(root, "absent", "import sys\n", enabled=True)
+    legacy_off = _make_tool(root, "legacy-off", "import sys\n", enabled=False)
+    present_on = _make_tool(root, "present-on", "import sys\n", enabled=False)
+    present_off = _make_tool(root, "present-off", "import sys\n", enabled=True)
+    unreadable = _make_tool(root, "unreadable", "import sys\n", enabled=True)
+    not_json = _make_tool(root, "not-json", "import sys\n", enabled=False)
+    oversized = _make_tool(root, "oversized", "import sys\n", enabled=False)
+    _install_tools(monkeypatch, root)
+    assert set_enabled("present-on", True) is True  # state file DISAGREES with each
+    assert set_enabled("present-off", False) is True
+    (unreadable / tools._STATE_FILENAME).write_text("{", encoding="utf-8")
+    (not_json / "tool.json").write_text("{not json", encoding="utf-8")
+    (oversized / "tool.json").write_text("x" * (_MANIFEST_MAX_BYTES + 1), encoding="utf-8")
+    no_manifest = root / "no-manifest"
+    no_manifest.mkdir()
+
+    expected = {
+        absent: True,  # ABSENT -> the manifest's legacy key
+        legacy_off: False,  # ... in the other direction
+        present_on: True,  # PRESENT wins over a manifest that disagrees
+        present_off: False,
+        unreadable: False,  # PRESENT-but-unreadable is disabled, never the default
+        not_json: True,  # no legacy key to offer -> the same default the scan gives
+        oversized: True,
+        no_manifest: True,
+    }
+    for directory, answer in expected.items():
+        assert tools._scan_package(directory).enabled is answer, directory
+        assert tools.package_enabled(directory) is answer, directory
+
+
 def test_a_promote_during_the_scan_cannot_run_the_new_package(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2935,6 +3082,63 @@ def test_set_enabled_publishes_under_the_state_publish_lock(
     }
 
 
+def test_a_publish_that_wakes_to_a_symlinked_package_directory_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """P1R3-2: the containment re-check P1 retired was not structurally replaced.
+
+    P1 dropped ``set_enabled``'s write-boundary containment check on the grounds
+    that the publisher's own pre-write ``lstat`` enforces it. That is true of the
+    FINAL component and false of every ANCESTOR: ``lstat`` does not follow a
+    symlinked ``.state.json``, but it -- like ``mkstemp(dir=...)`` and
+    ``os.replace`` -- follows the directories above it. The resolved path is a
+    STRING re-interpreted at each of those syscalls, and ``set_enabled`` resolves
+    it BEFORE waiting on ``_STATE_PUBLISH_LOCK``, a wait that can last a whole
+    revise tail.
+
+    Driven at exactly that instant rather than by racing a revise: the lock is
+    replaced by a context manager that performs the swap as it is entered, which is
+    "the directory was replaced while this toggle waited" with no timing in it.
+
+    What must hold is BOTH halves -- the toggle reports "did not happen" (the route
+    turns that into a 404) and the link's target is left without so much as a temp
+    file in it. The hazard itself is 裁決紀錄 #5's class (an actor who can plant
+    that symlink already runs as the service uid), which is why this test exists
+    for the JUSTIFICATION rather than for the threat: a retired guard whose stated
+    replacement does not exist is what gets budgeted for and is not there.
+
+    The legitimate re-interpretation this must NOT break -- a toggle that wakes
+    after a real revise swap and lands on the newly published package -- is pinned
+    by ``test_a_toggle_arriving_during_the_swap_waits_for_it_and_still_wins`` in
+    test_tool_builder.py, against the real swap rather than a stand-in."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", enabled=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    _install_tools(monkeypatch, root)
+    aside = root / ".moved-aside"
+    real_lock = tools._STATE_PUBLISH_LOCK
+
+    class _SwapWhileTheToggleWaits:
+        def __enter__(self) -> None:
+            os.rename(pkg, aside)  # the package the toggle resolved, moved away
+            pkg.symlink_to(elsewhere, target_is_directory=True)
+            real_lock.acquire()
+
+        def __exit__(self, *_exc: object) -> None:
+            real_lock.release()
+
+    monkeypatch.setattr(tools, "_STATE_PUBLISH_LOCK", _SwapWhileTheToggleWaits())
+
+    assert set_enabled("echo", False) is False
+
+    assert list(elsewhere.iterdir()) == []  # nothing written THROUGH the link
+    assert not (aside / tools._STATE_FILENAME).exists()  # nor into the real package
+    assert (root / "echo").is_symlink()  # the planted link is untouched too
+    assert real_lock.acquire(blocking=False) is True  # and the hold was released
+    real_lock.release()
+
+
 def test_a_non_regular_state_file_is_not_repaired_by_the_toggle(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3678,6 +3882,74 @@ def test_write_tool_meta_keeps_the_old_sidecar_when_the_publish_fails(
     # would be scanned by every later validate_package embedded-secret sweep.
     assert not list(pkg.glob(f"{tools._AI_META_FILENAME}.*"))
     assert sorted(child.name for child in pkg.iterdir()) == [tools._AI_META_FILENAME]
+
+
+def test_the_publish_fsyncs_the_package_directory_after_the_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1R3-3: the rename is made DURABLE, because one payload's loss fails OPEN.
+
+    This publisher's "no directory fsync" ruling was inherited from cli.py's
+    ``.env`` and justified by a worst case of one REGENERABLE summary. The same
+    publisher now carries the enabled toggle, which is not regenerable and whose
+    loss goes the wrong way: a legacy manifest saying ``enabled: true``, an
+    operator's successful PATCH to false, then power loss after ``os.replace``
+    returned but before the directory entry is durable, and the fallback re-enables
+    a tool that was deliberately switched off.
+
+    Asserted at the mechanism (a crash cannot be staged in a unit test): after the
+    rename, the DIRECTORY holding the published name is fsynced, and it is fsynced
+    for the sidecar as well -- one discipline for every file this function
+    publishes, rather than a flag the next backend-authored file has to remember to
+    set."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    synced: list[tuple[bool, int]] = []
+    real_fsync = os.fsync
+
+    def watched(fd: int) -> None:
+        info = os.fstat(fd)
+        synced.append((stat.S_ISDIR(info.st_mode), info.st_ino))
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", watched)
+
+    assert tools.write_package_state(pkg, False) is True
+    assert synced[0][0] is False  # the temp FILE's contents first ...
+    assert synced[-1] == (True, pkg.stat().st_ino)  # ... then the name that flipped
+
+    synced.clear()
+    assert _write_meta(pkg, summary="說明") is True
+    assert synced[-1] == (True, pkg.stat().st_ino)  # the sidecar publish too
+
+
+def test_a_failed_directory_fsync_does_not_unpublish_a_written_state_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The durability step may not turn a publish that HAPPENED into a False.
+
+    It runs after ``os.replace`` has returned, so by then the file is published and
+    the toggle has taken effect. Reporting "did not happen" there would be a lie the
+    caller acts on -- ``set_enabled`` maps False to a 404, so the operator would be
+    told their switch did not land while the tool really is switched off. A failing
+    (or unsupported) directory fsync therefore leaves exactly the pre-P1R3-3
+    guarantee: atomic, not durable."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    real_fsync = os.fsync
+
+    def refuse_directories(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(22, "Invalid argument")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", refuse_directories)
+
+    assert tools.write_package_state(pkg, False) is True  # the truth, not a 404
+    assert json.loads((pkg / tools._STATE_FILENAME).read_text(encoding="utf-8")) == {
+        "enabled": False
+    }
+    assert not list(pkg.glob(f"{tools._STATE_FILENAME}.*"))  # no temp file orphaned
 
 
 def test_write_tool_meta_publishes_atomically(

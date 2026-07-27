@@ -109,6 +109,12 @@ symlink／非一般檔、fsync、暫存檔清理、R6-2／R6-3 的最後一刻�
 `lstat` 拒絕任何非一般檔（含 symlink），而 `os.replace` 換掉的是**連結本身**，
 從不寫穿它。這一條由 `test_set_enabled_refuses_a_symlinked_state_file` 直接釘。
 
+> **r3 更正（見下方 r3 附錄 R3-2）**：上面這段對「保證沒有跟著移除」的敘述是
+> **錯的**。發佈器的三個動作只管**最後一段**：`lstat` 不跟隨最後一段，但
+> `mkstemp(dir=…)` 與 `os.replace` 跟隨**每一層上層目錄**。而 `set_enabled`
+> 在**取鎖之前**就解析完路徑，解析出來的又只是一個會被重新詮釋的字串。這道
+> 重驗因此在 r3 被放回鎖內、發佈前一行。
+
 ### 執行時的 `enabled` 檢查（R4）——把一個意外變成明講
 
 **這是本階段最容易漏掉的一條。** 改動前，「對話中途被停用的工具不會跑」是**副作用**：
@@ -344,11 +350,19 @@ check-then-act 的一瞬間：那個對話剩下的每一次呼叫都會跑。
 做了一半」造成的缺陷。錯的那段推理註解一併刪掉——留著一段被推翻的理由，比留著一個
 錯的檢查更難修。
 
+> **r3 更正（見下方 r3 附錄 R3-1）**：上面把選項寫成「呼叫 `package_enabled`
+> （＝一整趟掃描）或寫第二份拼法」是一個**假二分**，而且選了貴的那個——`package_enabled`
+> 當時就是 `_scan_package(...).enabled`，它**很早**就讀了狀態檔，然後才去讀 manifest、
+> 解析 entry、stat 它，所以 `Popen` 前一行用的那個值已經是 0.5 ms 與十幾次檔案操作
+> 之前的東西，落在那段裡的 `PATCH` 照樣出貨。第三個選項才是對的：把**優先序本身**
+> 抽成一個小函式（`_effective_enabled`），掃描與兩處檢查都呼叫它——一份拼法保住了，
+> 而執行前那道檢查貼回它守的動作旁邊。
+
 **三態對照（每一個消費者，包含本來就對的）**：
 
 | 消費者 | 怎麼問 | ABSENT | PRESENT 可讀 | PRESENT 讀不出 |
 |---|---|---|---|---|
-| `_scan_package`（優先序的**定義**） | inline（它還需要 `error`） | manifest legacy 欄位（預設 true） | 檔案說的值 | false ＋ 列成無效 |
+| `_scan_package`（優先序的**定義**） | ~~inline~~ → `_effective_enabled`（r3；它還需要 `error`，兩份讀取自己已經在手上） | manifest legacy 欄位（預設 true） | 檔案說的值 | false ＋ 列成無效 |
 | `list_tools` | `scan.enabled` | 同上 | 同上 | 同上 |
 | `enabled_llm_tools` | `scan.valid and scan.enabled` | 同上 | 同上 | 同上（兩個濾條都說不） |
 | `_make_handler`（呼叫進入） | `package_enabled` ← **本輪改** | 同上 | 同上 | 同上 |
@@ -371,6 +385,11 @@ package_enabled    （新檢查，PRESENT）   579.51 us
 成本的大宗不是那兩次讀檔，而是 `_entry_file_exists` 的 realpath／containment 與每趟
 掃描約 38 次 `lstat`。**接受**：執行路徑現在付的，就是廣告同一個工具本來就付過的
 那筆；換到的是清單、廣告與執行三處**證得出來**在回答同一個問題。
+
+> **r3 更正**：這筆代價被接受的理由只講了**慢**，漏了真正的問題——那 514 us
+> **落在讀完開關之後**。r3 抽出優先序之後新舊並排重測：ABSENT 443 → 95 us、
+> PRESENT 530 → 65 us、PRESENT 讀不出 77 → 70 us（本節舊數字取自另一次量測，
+> 絕對值受機器雜訊影響，量級一致）。新數字與方法見 r3 附錄。
 
 **可證的量測（把修法換回舊寫法，當場失敗）**：以 `state.present and not
 state.enabled` 冒充 `package_enabled` 重跑上面那個序列 → 回 `'ok'`、且子行程真的寫
@@ -427,3 +446,168 @@ state.enabled` 冒充 `package_enabled` 重跑上面那個序列 → 回 `'ok'`�
 `test_a_toggle_that_lands_before_the_swap_is_carried_across_not_reverted`、
 `test_a_toggle_arriving_during_the_swap_waits_for_it_and_still_wins` 與
 `test_an_enabled_toggle_during_the_generation_now_costs_nothing_at_all` 釘住。
+
+### D41 附錄（P1 review r3）：把規則抽出來，而不是把整趟掃描搬到熱路徑上
+
+四條 finding。第一條是 **r2 自己的修法引進的**（而且是被一個假二分推上去的），
+第二條是 **P1 退休一道守衛時寫錯的理由**，第三條是**裁決當時描述的載荷已經換人**，
+第四條是路由契約與 README 互相矛盾。
+
+#### R3-1：一份拼法可以很便宜——r2 選的是「貴的那一份」（P2）
+
+r2 把兩處執行前檢查改問 `package_enabled`，而當時 `package_enabled` 就是
+`_scan_package(...).enabled`。掃描**很早**就讀了狀態檔（`_read_enabled_state` 是
+manifest 工作之前的第一件事，這是刻意的：所有失敗路徑都要能回報操作者設的值），
+然後才去讀 manifest、解析 entry、做 realpath containment、stat 它。於是 `Popen`
+前一行拿到的那個布林，**在子行程啟動時已經是 0.5 ms 與十幾次檔案操作之前的東西**
+——一次落在那段裡的 `PATCH` 照樣把剛被關掉的工具送出去，正是 R4 存在要擋的結果，
+被 R2-1 的修法重新引進。上一行的身分檢查幫不上忙：它更早。這也不是本子系統以名義
+接受的那種 syscall 對。
+
+**r2 的裁決把選項寫成二分（「呼叫 `package_enabled`＝一整趟掃描」對「寫第二份
+拼法」），並選了貴的那個以保住單一拼法。那是假二分**——第三個選項是把**優先序
+本身**抽出來：
+
+- `_effective_enabled(state, manifest)`：**純函式**，就是那條規則，只回答開關這一題。
+  present ⇒ 檔案說的值（讀不出來時它本來就已經是 False）；ABSENT ⇒ manifest 的
+  legacy 欄位（預設 true、非布林忽略）。
+- `_scan_package` **呼叫它**，把自己**已經在手上**的兩份讀取交給它——不是重讀。
+  重讀會讓同一次掃描用 A 次讀到的規格配 B 次讀到的開關，正是本階段要消滅的那一類。
+- `package_enabled` 是**讀取端的前門**：它去取那兩份輸入，然後問同一個
+  `_effective_enabled`。`tool_builder` 的換裝 carry 與兩處執行前檢查都走它。
+
+**兩者證得出不會分歧**：不是「兩份拼法我們會維持同步」，而是**同一個函式**；
+`test_the_scan_and_the_execution_check_answer_the_one_rule_identically` 對八種形狀
+（三態、ABSENT 底下 legacy 的兩個方向、manifest 三種提不出 legacy 欄位的壞法）
+逐一要求 `_scan_package(d).enabled` 與 `package_enabled(d)` 相同。
+
+**順序才是重點**：`package_enabled` **最後才讀 `.state.json`**。狀態檔存在時它是
+唯一一次讀取；不存在時先取 manifest 當 fallback、**再把狀態檔讀一次**（一次
+ENOENT 的 lstat，約 10 us），所以呼叫端拿到的值與它下一行的動作之間只隔一個比較。
+那次重讀只會讓答案**更新**：`PATCH` 若落在 manifest 讀取那一段，它產生的正是這次
+重讀要找的檔案，規則會改用它。
+
+**實測（同一個行程內新舊並排量、best of 7×2000 次以壓掉雜訊；非估算）**：
+
+```
+                              r2（整趟掃描）  r3（抽出規則）  pre-r2 的 _read_enabled_state
+ABSENT（從未切換過＝常見情形）      443 us         95 us            10.6 us
+PRESENT 可讀                        530 us         65 us            58.3 us
+PRESENT 讀不出                       77 us         70 us            63.5 us
+ABSENT（12 KiB manifest）           742 us        257 us            10.4 us
+一次完整工具呼叫（含子行程）                    37.6 ms
+```
+
+（r2 附錄記的 526／579 us 是當時另一次量測，機器雜訊使絕對值不同，量級與結論一致。
+「PRESENT 讀不出」在 r2 本來就便宜，因為掃描讀到壞掉的狀態檔就短路了。）
+
+pre-r2 的 10 us 買不回來，也不該買回來——它便宜的原因就是**它回答錯了問題**
+（ABSENT 讀成沉默）。r3 的 95／65 us 是「同一條規則、答對、而且值是新鮮的」的價錢：
+PRESENT 幾乎就是那次狀態檔讀取本身（65 vs 58 us），兩處合計約 0.19 ms，佔一次最小
+工具呼叫 **0.5%**（r2 是 2.5%）。
+
+**符號代價寫明**：`package_enabled` 不再是 `_scan_package` 的一行包裝，所以多了
+一個 `_read_manifest_object`（total reader，所有壞法都回 None，與掃描把它們各自
+變成 `error` 是同一組事實的兩種用途）。`package_enabled` 也自己擋掉 symlink 的
+**套件目錄**，理由與 `_scan_package` 把同一道檢查放第一位一樣：`<link>/.state.json`
+會跟著連結離開 tools 目錄。它回的是掃描對這種目錄回的同一個答案（預設值），因為
+這是**拒絕去看**而不是判斷——那一列本來就 `valid=false`。
+
+**窗口本身的量測（`strace` 同一次工具呼叫，數「最後一次碰 `.state.json` 到
+`vfork` 之間隔了幾個 syscall」）**：
+
+```
+r2（package_enabled = 一整趟掃描）        40 個 syscall
+r3（抽出規則）                             0 個
+```
+
+r2 那 40 個是什麼，值得照抄一段：讀完狀態檔之後還有兩次 `lstat tool.json`、一次
+`openat tool.json`，接著是 `_entry_file_exists` 的 realpath——把 `/tmp/…/tools/echo`
+與**直譯器絕對路徑**的每一層目錄逐層 `lstat`／`readlink`（`/home`、`~/.local`、
+`~/.local/share/uv`…），最後才 `lstat run.py`、`vfork`。r3 的尾巴則是：
+
+```
+lstat(".../tool.json")      ← 身分檢查
+lstat(".../echo")           ← package_enabled 的 symlink 拒絕
+lstat(".../.state.json")    ← 第一次讀（ABSENT）
+openat(".../tool.json")     ← 取 legacy fallback
+lstat(".../.state.json")    ← 第二次讀：權威，而且是最後一個
+vfork(...)                  ← 子行程
+```
+
+**可證的量測（把修法換回 r2 的寫法，當場失敗）**：
+
+- `test_a_toggle_landing_between_the_state_read_and_popen_is_still_caught`
+  從 `_read_manifest_object` 內部（也就是那個間隙本身）發動 `PATCH` → r2 寫法回
+  `'ok'`（**被停用的工具真的跑了**），r3 寫法回 `_TOOL_DISABLED_RESULT`；
+- `test_the_execution_toggle_check_reads_the_state_file_last_and_scans_nothing`
+  的軌跡在 r2 寫法下是 `['scan', 'state', 'scan', 'state', 'popen']`——每一次檢查
+  都是一整趟掃描；r3 下是 `['state', 'state', 'popen']`。
+
+#### R3-2：P1 退休 containment 重驗時寫的理由是錯的（P2）
+
+P1 移除 `set_enabled` 的寫入邊界 containment 重驗，理由記成「發佈器自己的 `lstat`
+結構上就保證了」。**那句話只對一半**：`lstat` 不跟隨**最後一段**（所以 symlink 的
+`.state.json` 確實擋得住），但它跟隨**每一層上層目錄**，而 `mkstemp(dir=…)` 與
+`os.replace` 也一樣。再加上 `set_enabled` **在取鎖之前**就解析完路徑，而解析出來的
+是一個會在每次 syscall 被重新詮釋的**字串**，那個等待又可能長達一整個修訂尾段——
+於是「套件目錄被改名移開、原位放一個指向別處的 symlink」會讓發佈把 `.state.json`
+寫進連結目標，並且回報成功。**實測**：拿掉重驗、在取鎖那一刻置換目錄，
+`set_enabled` 回 `True`，而 `/tmp/…/elsewhere/.state.json` 裡真的躺著
+`{"enabled": false}`。
+
+**裁決分兩層，而且要分清楚**：
+
+- **危害本身**屬裁決紀錄 #5 的類別：能在 tools 目錄裡改名、種 symlink 的行為者
+  以**服務自身 uid** 執行，直接寫那個檔案更省事——加固這條間接路徑對他零價值。
+- **但 P1 寫下的理由是錯的**，而「一道被退休的守衛，其宣稱的替代品並不存在」比
+  「留著它」或「誠實地退休它」都糟：下一個讀者會照那句話編列預算。
+
+**所以重驗放回來**，位置是**鎖內、發佈前一行**（本模組其他 last-instant 檢查的同
+一個位置），走的是既有的組合解析器 `_resolve_package_dir_no_alias`——那正是上面
+那幾行 inline 寫的同三步（名稱 regex ＋ alias 拒絕 ＋ resolve-and-contain），所以
+重驗不可能漂成比原檢查弱的版本。**比對的是相等**，於是 r2 分析依賴的那次**合法**
+重新詮釋照樣成立：一次修訂換裝之後 `<tools_dir>/<name>` 是**另一個真實目錄**但
+**同一個解析後路徑**（普通目錄 resolve 成自己，不論背後是哪個 inode），而種進去的
+symlink 不是被 alias 閘擋掉、就是 resolve 到別處。那條合法路徑由既有的
+`test_a_toggle_arriving_during_the_swap_waits_for_it_and_still_wins`（對**真的**換裝）
+釘住，本輪不另寫一份。
+
+**剩下的窗口，寫明**：重驗與發佈之間是 `lstat` → `mkstemp` → `fchmod` → 寫 → fsync
+→ `os.replace`，也就是發佈器自己那串 syscall；那是本模組以名義接受的殘留，
+與側檔寫入在同一條線上。
+
+#### R3-3：目錄 fsync——裁決當時描述的載荷已經換人（P3）
+
+`_write_package_file_atomic` 一直寫著「刻意不 fsync 目錄」，理由借的是 cli.py 對
+`.env` 的裁決，並補一句「這裡更容易接受，最壞情況只是一份**可重新產生**的總結」。
+**同一個發佈器現在還載著啟用狀態**，而它不可重新產生，**遺失的方向是開**：一個
+legacy 欄位寫著 `enabled: true` 的舊套件，操作者成功 `PATCH` 成 false，然後在
+`os.replace` 回來之後、目錄項落地之前掉電——退回 fallback 就把一個被刻意關掉的
+工具重新打開。那與本階段對「讀不出來的狀態檔」刻意選的 fail-closed **方向相反**。
+
+**裁決：fsync 目錄，而且對兩種載荷都做。** 代價本機 ext4 實測一次發佈約
+1.2 → 2.5 ms，而發佈只發生在人按開關、一趟總結往返結束、一次修訂換裝——不在掃描、
+廣告或呼叫路徑上。**不加 per-caller 旗標**：那等於讓下一個後端自有檔案的耐久性
+取決於有沒有人記得開它，而 `_RESERVED_PACKAGE_FILENAMES` 與這個函式的 `filename`
+參數當初都是往反方向裁決的。
+
+**它放在 `try` 之外**，因為到那一行 `os.replace` 已經回來、檔案已經發佈：這裡的
+失敗**不能**變成 False，否則 `set_enabled` 會把一個確實生效的開關回成 404。
+`OSError` 一律吞掉，留下的就是 r3 之前的保證（原子但不耐久）。兩件事各有測試：
+`test_the_publish_fsyncs_the_package_directory_after_the_rename`（改名之後被 fsync
+的是**那個目錄**，狀態檔與側檔都是）與
+`test_a_failed_directory_fsync_does_not_unpublish_a_written_state_file`。
+
+#### R3-4：PATCH 路由的 docstring 還在描述 P1 已經退掉的拒絕（P3）
+
+`routers/tools.py` 的 `update_tool` 仍寫著「manifest 讀不出／寫不進 ⇒ `set_enabled`
+回 False ⇒ 404」。P1 之後那條路徑根本不讀 manifest，所以 `tool.json` 是 FIFO、
+過大或讀不出來的套件現在**成功切換、回 200**，只是那一列仍是 `valid=false`——
+README 早就這樣寫，於是 API 自己的契約與 README 對同一條端點互相矛盾。
+
+**實測（跑真的路由）**：FIFO manifest → 200 `{enabled: false, valid: false,
+error: "missing tool.json"}`；過大 → 200 `error: "tool.json is too large"`；
+chmod 000 → 200 `error: "tool.json is not a readable regular file"`；
+`.state.json` 是目錄（發佈失敗）→ 404；不存在的工具 → 404。docstring 改成這份
+清單，並寫明「manifest 已不在 404 的理由之列」以免下次又被讀成疏漏。

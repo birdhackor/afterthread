@@ -609,34 +609,119 @@ def _read_enabled_state(directory: Path) -> _EnabledState:
     return _EnabledState(present=True, enabled=enabled, error=None)
 
 
+def _effective_enabled(state: _EnabledState, manifest: dict[str, Any] | None) -> bool:
+    """THE precedence rule (R1), spelled ONCE, over the two reads it is defined on.
+
+    ``.state.json`` present and readable is authoritative; present and UNREADABLE
+    arrives here as ``enabled=False`` already (see ``_EnabledState``); ABSENT falls
+    back to the manifest's LEGACY ``enabled`` key -- optional, non-bool ignored,
+    default true, which is exactly what ``_scan_package`` answered before web-v5 P1
+    and is what makes that fallback the whole of the migration.
+
+    It takes the two READ RESULTS rather than a directory, and that is what lets
+    there be one spelling at all: both callers already hold what they need for
+    their own reasons and neither may fetch it twice. ``_scan_package`` reads the
+    state for its ``error`` and the manifest for six other fields -- pairing a spec
+    from one read with a toggle from another is the class this phase exists to
+    remove -- while ``package_enabled`` needs the read of the file a toggle
+    actually writes to be the LAST thing it does. Handing both the same function
+    makes "the listing, the advertisement and the execution check cannot disagree"
+    a property of the code rather than a claim about two spellings kept in step,
+    and a HALF spelling of this rule (state present and off -> refuse) is precisely
+    what once let a package whose effective state is disabled start a subprocess.
+
+    ``manifest`` of None means "not read, or not readable as an object", and it
+    collapses to the same default true a missing key gets: every shape
+    ``_scan_package`` reports as its own distinct error (not a readable regular
+    file, oversized, not JSON, not an object) is a manifest with no legacy key to
+    offer, and the scan answers those paths with the state's own default too.
+    """
+    if state.present:
+        return state.enabled
+    legacy = True if manifest is None else manifest.get("enabled", True)
+    return legacy if isinstance(legacy, bool) else True
+
+
+def _read_manifest_object(directory: Path) -> dict[str, Any] | None:
+    """The package's ``tool.json`` as a plain object, or None. Never raises.
+
+    The TOTAL reader standing beside ``_scan_package``'s strict one, in the same
+    relation ``read_tool_meta`` has to ``summary_status_or_unknown``: every shape
+    the scan turns into its own operator-facing ``error`` -- not a readable regular
+    file (the one bounded reader's ``O_NOFOLLOW``/``S_ISREG`` gate refuses a
+    symlinked or non-regular manifest), past ``_MANIFEST_MAX_BYTES``, not JSON, not
+    an object -- is ONE None here, because its only caller wants one field out of
+    it and has the same answer for all of them (see ``_effective_enabled``).
+
+    ``RecursionError`` is caught beside ``ValueError`` for the reason
+    ``_read_enabled_state`` gives: this runs on the EXECUTION path, where an
+    exception is not one of the answers available -- the handler's contract is a
+    string, always.
+    """
+    text = _read_regular_file_capped(directory / "tool.json", _MANIFEST_MAX_BYTES)
+    if text is None or len(text) > _MANIFEST_MAX_BYTES:
+        return None
+    try:
+        raw = json.loads(text)
+    except ValueError, RecursionError:
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
 def package_enabled(directory: Path) -> bool:
     """The package's EFFECTIVE toggle state, by the ONE precedence rule (R1).
 
-    A named front door for the question "is the tool in this directory on?", so
-    the answer is derived in exactly one place -- and "in exactly one place" is
-    load-bearing rather than tidy: a PARTIAL spelling of this rule (state file
-    present and off -> refuse) is what let a package whose effective state is
-    disabled start a subprocess, because it read ABSENT as "no answer" instead of
-    as the manifest's legacy key. Every consumer asks it here or, for the scan
-    itself, inline -- ``tool_builder`` before a revise swap (the toggle has to
-    survive a rebuild that replaces the whole directory), ``_make_handler`` and
-    ``_run_tool_subprocess`` at CALL time (both of them: see either for why one is
-    not enough), and the scan inline because it needs the state's ERROR too.
+    The named front door for "is the tool in this directory on?", used by every
+    consumer that is not the scan itself: ``tool_builder`` before a revise swap
+    (the toggle has to survive a rebuild that replaces the whole directory), and
+    ``_make_handler`` / ``_run_tool_subprocess`` at CALL time (both of them: see
+    either for why one is not enough). ``_scan_package`` does not call this -- it
+    is holding both reads already -- but it decides through the SAME
+    ``_effective_enabled``, so the two cannot answer differently.
 
-    An unreadable state file answers False here, which is the same fail-closed
-    direction ``_read_enabled_state`` takes and the same one the scan turns into
-    an invalid row.
+    This used to BE ``_scan_package(directory).enabled``, which kept one spelling
+    of the rule at a price that turned out to be the wrong trade rather than a
+    cost: a full scan reads the state file EARLY and then goes on to read and parse
+    the manifest, resolve the entry and stat it, so the toggle value the check
+    above ``Popen`` acted on was ~0.5 ms and a dozen file operations old by the
+    time the child started. That is a window a PATCH lands in -- the very window
+    the check exists to close. Extracting the RULE rather than calling the whole
+    SCAN keeps the single spelling and removes the window (measured on this
+    machine, best of 7 x 2000 calls: 443 -> 95 us ABSENT, 530 -> 65 us PRESENT,
+    77 -> 70 us UNREADABLE -- the last one was already cheap, because a scan
+    short-circuits on an unreadable state file before it reads anything else).
 
-    It is a whole ``_scan_package``, and on the execution path that is a measured
-    ~0.5 ms per call rather than the ~12 us of the state ``lstat`` alone (most of
-    it the entry-file containment resolve, not the two reads). Paid twice per tool
-    call, it is ~2.5% of the ~40 ms a trivial tool costs to spawn at all -- the
-    execution path now pays what advertising the same tool already paid. A cheaper
-    "read the manifest myself when the state file is absent" would be a SECOND
-    spelling of the precedence rule, in the two functions that just demonstrated
-    what a second spelling costs.
+    ORDER, which is the point and not a detail: the state file is the LAST thing
+    read on every path. When it is present that is the only read; when it is absent
+    the fallback is fetched and the state is then read AGAIN, so what a caller acts
+    on is never older than the compare that follows it. The second read is an
+    ``lstat`` that fails ENOENT (~10 us) and can only make the answer FRESHER -- a
+    PATCH landing while the manifest is being read CREATES the file that read looks
+    for, and the rule prefers it the moment it exists.
+
+    An unreadable state file answers False, the same fail-closed direction
+    ``_read_enabled_state`` takes and the same one the scan turns into an invalid
+    row.
     """
-    return _scan_package(directory).enabled
+    if directory.is_symlink():
+        # Refused before any name is joined onto it, for the reason
+        # ``_scan_package`` states where it does the same thing first: reading
+        # ``<link>/.state.json`` would follow the link out of the tools dir (the
+        # bounded reader's O_NOFOLLOW covers the final component, never a parent).
+        # True is what the scan answers for such a directory too, and for the same
+        # reason -- this is a refusal to LOOK, not a judgement about a toggle; the
+        # row is INVALID, so nothing that consults ``valid`` advertises or runs it.
+        return True
+    state = _read_enabled_state(directory)
+    if state.present:
+        # Not a branch of the RULE -- the rule below still decides -- but of which
+        # files have to be read: a present state file is authoritative, so the
+        # manifest cannot change the answer and is not opened.
+        return _effective_enabled(state, None)
+    # ABSENT: fetch the fallback FIRST, then ask the authority again, so the state
+    # read is the last thing this function does on this path as well.
+    manifest = _read_manifest_object(directory)
+    return _effective_enabled(_read_enabled_state(directory), manifest)
 
 
 def _scan_package(directory: Path, expected_name: str | None = None) -> _PackageScan:
@@ -756,18 +841,18 @@ def _scan_package(directory: Path, expected_name: str | None = None) -> _Package
     if not isinstance(raw, dict):
         return invalid("tool.json is not a JSON object")
 
-    # The MIGRATION, and it is one line rather than a startup pass: a package with
-    # no ``.state.json`` is read through the manifest's LEGACY ``enabled`` key,
-    # exactly as it was before web-v5 P1 (optional, non-bool ignored, default
-    # true). A package that HAS a state file never consults this -- the manifest
-    # is spec-only from then on, and the stale key it may still carry is inert
+    # The precedence rule, ASKED rather than restated: the same
+    # ``_effective_enabled`` ``package_enabled`` asks, handed the two reads this
+    # function is already holding (which is why it calls the rule and not the front
+    # door -- re-reading either file here would pair a spec from one read with a
+    # toggle from another). The MIGRATION is that rule's ABSENT branch and it is a
+    # call rather than a startup pass: a package with no ``.state.json`` is read
+    # through the manifest's LEGACY ``enabled`` key exactly as it was before web-v5
+    # P1. A package that HAS a state file never consults it -- the manifest is
+    # spec-only from then on, and the stale key it may still carry is inert
     # (deliberately not stripped: rewriting a manifest to tidy it would move the
     # identity this split exists to hold still).
-    if state.present:
-        enabled = state.enabled
-    else:
-        enabled_raw = raw.get("enabled", True)
-        enabled = enabled_raw if isinstance(enabled_raw, bool) else True
+    enabled = _effective_enabled(state, raw)
 
     name_field = raw.get("name")
     if not isinstance(name_field, str) or not _NAME_RE.match(name_field):
@@ -1176,11 +1261,33 @@ def _write_package_file_atomic(
     half-written toggle would not degrade a panel, it would take a working tool
     out of the registry.
 
-    What is deliberately NOT claimed, so nobody assumes it: the DIRECTORY is not
-    fsynced, so the rename is not durable against power loss (the file's own
-    contents are). That is the same ruling cli.py records for ``.env`` -- an
-    ordering guarantee against failure, not a crash-consistency one -- and it is
-    even easier to accept here, where the worst case is one regenerable summary.
+    The DIRECTORY is fsynced after the rename (P1R3-3), so the publish is DURABLE
+    against power loss and not merely atomic against failure. That reverses an
+    earlier ruling here, and the reason is that the ruling was made about a payload
+    this function no longer only carries: it borrowed cli.py's ``.env`` reasoning
+    on the grounds that the worst case was one REGENERABLE summary. The state file
+    is not regenerable and its loss fails OPEN -- a legacy manifest saying
+    ``enabled: true``, an operator's successful PATCH to false, then power loss
+    after ``os.replace`` returned but before the directory entry is durable, and
+    the fallback re-enables a tool somebody deliberately switched off. That is the
+    one direction this subsystem never errs in, and the same phase deliberately
+    fails CLOSED on the neighbouring question (an unreadable state file).
+
+    UNCONDITIONALLY, for both payloads rather than for the state file alone. The
+    cost is ~1.3 ms on this machine's ext4 (a publish goes ~1.2 -> ~2.5 ms) and
+    nothing here is a hot path: this runs on a human's toggle click, once per LLM
+    round trip for a summary, and once per revise for the carry -- never on a scan,
+    an advertisement or a tool call. A per-caller flag would buy back a millisecond
+    an operator cannot perceive by making the next backend-authored file's
+    durability depend on somebody remembering to ask for it, which is the trade
+    ``_RESERVED_PACKAGE_FILENAMES`` and this function's own ``filename`` parameter
+    were argued the other way.
+
+    Its failure cannot change the answer, and that is why it sits outside the
+    ``try``: by then ``os.replace`` has returned, so the file IS published and
+    reporting "did not happen" would be a lie the caller acts on (a toggle that
+    took effect answered as a 404). A suppressed OSError leaves exactly the
+    pre-P1R3-3 guarantee -- atomic, not durable.
 
     PERMISSIONS are PRESERVED across the publish (R7-3) -- which the plain
     write-to-temp shape does NOT do on its own, and that was a real regression
@@ -1331,6 +1438,17 @@ def _write_package_file_atomic(
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)
         return False
+    # The rename made durable (see docstring). OUTSIDE the try on purpose: the
+    # publish has already happened, so no failure here may turn it into a False --
+    # it would unlink a temp file that no longer exists and report a toggle that
+    # DID take effect as "did not happen". O_DIRECTORY so a path that is somehow
+    # not a directory is refused rather than fsynced as whatever it is.
+    with contextlib.suppress(OSError):
+        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     return True
 
 
@@ -1546,7 +1664,8 @@ def write_tool_meta(
 # question asked about two different windows: there the proposal was to hold a
 # toggle out for the length of an LLM ROUND TRIP (minutes, operator-visible), and
 # the fix was to move the un-regenerable write earlier instead. Everything inside
-# this hold is bounded and tiny: two capped file reads, a ~20-byte atomic write, an
+# this hold is bounded and tiny: two capped file reads, a name resolve,
+# a ~20-byte atomic write (now with the directory fsync that makes it durable), an
 # lstat and two renames. Nothing here awaits, spawns a subprocess or waits on
 # another lock.
 #
@@ -3249,6 +3368,16 @@ def _run_tool_subprocess(
     exactly as the handler does, and for the reason spelled out there: an ABSENT
     state file is an ANSWER (the manifest's legacy key), not a silence, and the
     identity check on the line above says nothing about a file it never looks at.
+
+    Being on the line above ``Popen`` is not enough on its own, and for one round
+    this check was there while its ANSWER was not (P1R3-1): asking the rule by
+    running a whole ``_scan_package`` read the state file first and then spent
+    ~0.5 ms parsing a manifest and resolving an entry file, so the value acted on
+    here was already old and a PATCH landing in that tail shipped a tool the
+    operator had just switched off. ``package_enabled`` now reads that file LAST,
+    so what separates the toggle's value from the ``Popen`` below is this compare
+    -- the check-then-act instant this module accepts by name, the same one the
+    identity check above it leaves.
     """
     if not _still_the_expected_package(directory, expected_identity):
         return _TOOL_REPLACED_RESULT
@@ -3726,13 +3855,27 @@ def set_enabled(name: str, enabled: bool) -> bool:
     want to -- and a broken package is listed invalid and never advertised either
     way, so nothing becomes runnable that was not.
 
-    The containment re-check at the write boundary is likewise gone, and its
-    guarantee is NOT: it existed because ``write_text`` follows symlinks, so a
-    symlinked ``tool.json`` could have redirected the rewrite out of the package.
-    The publish below refuses a symlink (or any non-regular file) at its target
-    outright through its pre-write ``lstat``, and ``os.replace`` replaces a LINK
-    rather than writing through one -- the same refusal set, enforced by the writer
-    instead of restated here.
+    The containment re-check at the write boundary is RE-TAKEN under the lock, and
+    the reason is worth stating because P1 removed it on a claim that was false in
+    one direction (P1R3-2). The claim was that the publisher enforces it
+    structurally: its pre-write ``lstat`` refuses a symlink (or any non-regular
+    file) at its TARGET, and ``os.replace`` replaces a LINK rather than writing
+    through one. Both are true of the FINAL component and neither says anything
+    about an ANCESTOR -- ``lstat``, ``mkstemp(dir=...)`` and ``os.replace`` all
+    follow those. The path resolved above is a STRING that is re-interpreted at
+    every one of those syscalls, and between the resolve and the publish sits a
+    wait for ``_STATE_PUBLISH_LOCK`` that can last a whole revise tail, so a
+    package directory renamed aside and replaced by a symlink in that wait would
+    have taken the publish with it. The re-check below is the same three steps this
+    function takes above -- name regex, alias refusal, resolve-and-contain -- asked
+    again at the last instant that exists here.
+
+    That it is a HAZARD an actor at this privilege level gains nothing from is
+    separately true (裁決紀錄 #5: whoever can plant that symlink runs as the
+    service uid and could write the file directly), and it is not the reason the
+    check is back. A retired guard whose stated replacement does not exist is worse
+    than either keeping it or retiring it honestly, because the next reader budgets
+    for a guarantee nobody is providing.
     """
     base = tools_dir()
     if base is None or not _NAME_RE.match(name):
@@ -3765,6 +3908,22 @@ def set_enabled(name: str, enabled: bool) -> bool:
     # the package that now owns the name, which is the right answer to "the operator
     # switched off the tool called X".
     with _STATE_PUBLISH_LOCK:
+        # The containment re-check (P1R3-2), INSIDE the hold and as late as this
+        # module's other last-instant checks -- the publisher's own guards cover the
+        # final component only, and everything above ran before a wait that can last
+        # a whole revise tail (see the docstring).
+        #
+        # Through the composed resolver, which is the SAME name regex + alias
+        # refusal + resolve-and-contain the lines above take, so the re-check cannot
+        # drift into a weaker version of the check it repeats. Compared for EQUALITY
+        # against the path already resolved: the legitimate re-interpretation stays
+        # legitimate, because a revise swap leaves a different real directory at the
+        # SAME resolved path (a plain directory resolves to itself, whatever inode
+        # is behind it) while a planted symlink resolves elsewhere or is refused
+        # outright. What remains after it is the publisher's lstat/mkstemp/replace
+        # -- the syscall run this module accepts by name.
+        if _resolve_package_dir_no_alias(name) != directory:
+            return False
         return write_package_state(directory, enabled)
 
 
