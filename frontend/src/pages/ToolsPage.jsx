@@ -735,6 +735,16 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 		queryClient.getQueryState(["tools"])?.status === "error" &&
 		queryClient.getQueryData(["tools"]) !== undefined;
 
+	// Re-read BOTH halves of what a summary response describes: the panel's own
+	// detail entry and the row badge that shows the same sidecar field. By NAME
+	// prefix, because a revalidation asks the name-addressed server to answer
+	// again -- writes address an instance, re-reads address the name.
+	const revalidateSummaryAndList = (name) =>
+		Promise.all([
+			queryClient.invalidateQueries({ queryKey: toolSummaryKeyPrefix(name) }),
+			queryClient.invalidateQueries({ queryKey: ["tools"] }),
+		]);
+
 	// `stamp` orders this write against the OTHER mutation that can be writing the
 	// same entry concurrently (see createSummaryWriteLedger).
 	const applySummaryDetail = async (detail, { name, description }, stamp) => {
@@ -755,7 +765,13 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 			// showing draft for a tool the server has already finalized, with a
 			// green toast next to it. The re-read costs one GET and can only ever
 			// return the post-write truth.
-			return queryClient.invalidateQueries({ queryKey: ["tools"] });
+			//
+			// BOTH keys, not just the list (R6-1): the entry whose value we just
+			// dropped is the SUMMARY one, so re-reading only the row badge would
+			// leave the expanded panel asserting the state we decided we could not
+			// trust -- the same permanent disagreement one line up, moved from the
+			// badge to the panel.
+			return revalidateSummaryAndList(name);
 		}
 		// Cancel BEFORE writing, for both keys about to be written. A write that
 		// races a read it did not cancel is a write that can be undone by older
@@ -785,7 +801,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 		// with the same stamp is idempotent by construction (only a STRICTLY newer
 		// applied stamp refuses).
 		if (!claimLatestSummaryWrite(writeLedger.current, instanceKey, stamp)) {
-			return queryClient.invalidateQueries({ queryKey: ["tools"] });
+			return revalidateSummaryAndList(name);
 		}
 		// Write only if the entry is still there. removeQueries on delete cannot
 		// stop a request already on the wire, and a plain value write would rebuild
@@ -983,8 +999,18 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	// whole terminal transition is therefore mostly right and never wasteful in
 	// the way a blanket error refetch is: this fires at most ONCE per job, after
 	// minutes of work, not once per retry of a flapping request.
+	// A 404 from the poll counts as an ending too (R6-2). It is not a terminal
+	// STATE -- the cached body may still say "running" -- but it is the end of
+	// what we can observe, and the reason for it is usually that the backend
+	// restarted (jobs are process-local) or that the bounded table evicted this
+	// one. Either way the work may well have completed: a revise that promoted
+	// its package and then lost its job row leaves us holding a stale row and a
+	// stale summary while the gate re-opens, so the user's next action lands on
+	// the package the vanished job already replaced.
+	const jobEnded =
+		isTerminalToolJobState(job?.state) || jobQuery.error?.status === 404;
 	useEffect(() => {
-		if (activeJob && isTerminalToolJobState(job?.state)) {
+		if (activeJob && jobEnded) {
 			// Prefix filter (partial match), so it reaches this tool's entry
 			// whatever discriminator it is keyed under -- which matters most
 			// precisely here: a revise REBUILDS the package, so the description
@@ -995,7 +1021,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 			});
 			queryClient.invalidateQueries({ queryKey: ["tools"] });
 		}
-	}, [activeJob, job?.state, queryClient]);
+	}, [activeJob, jobEnded, queryClient]);
 
 	const reviseJobActive = isToolJobActive({
 		jobId: activeJob?.jobId ?? null,
@@ -1437,11 +1463,19 @@ function InstallPanel({ externalBusy = false, onBusyChange }) {
 	// A succeeded install added a row the 已安裝工具 tab must show; invalidating
 	// on the state transition (idempotent -- StrictMode's double effect just
 	// invalidates twice) keeps the two tabs consistent without a manual refresh.
+	//
+	// A 404 counts too (R6-2), and for the same reason it does on the revise side:
+	// jobs are process-local, so a backend restart between promote and the poll
+	// makes a job that DID install a tool disappear mid-flight. Refetching the
+	// list on that ending is how the new row still shows up; treating 404 as
+	// "nothing happened" is what left it invisible until a manual refresh.
+	const installEnded =
+		job?.state === "succeeded" || jobQuery.error?.status === 404;
 	useEffect(() => {
-		if (job?.state === "succeeded") {
+		if (installEnded) {
 			queryClient.invalidateQueries({ queryKey: ["tools"] });
 		}
-	}, [job?.state, queryClient]);
+	}, [installEnded, queryClient]);
 
 	// One install at a time from this form: the job stays "active" -- form locked,
 	// progress card polling -- until it reaches a terminal state OR its poll 404s
