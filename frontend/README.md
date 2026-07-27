@@ -148,26 +148,71 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   'error'，那正是舊內容原本會無聲留在畫面上的狀態。做 invalidate／removeQueries
   時一律用 `toolSummaryKeyPrefix(name)` 前綴比對，**不可以**加 `exact`（鍵是三段，
   `exact` 會一個都比對不到）。
-- **同一個判別子必須同時管快取鍵、列的 React key 與工作卡的歸屬**：三者是同一個
-  「這還是同一個工具嗎」的問題。列的 key 用 `toolInstanceKey(name, description)`
+- **同一個判別子必須同時管快取鍵、列的 React key、工作卡的歸屬與列徽章的補寫**：
+  四者是同一個「這還是同一個工具嗎」的問題。列的 key 用
+  `toolInstanceKey(name, description)`
   （＝把 `toolSummaryQueryKey` 那把鍵 `JSON.stringify`，所以兩者不可能各自漂移），
   身分一變就 remount、列內未送出的修訂意見不會跨過同名重裝被送給別的工具；修訂
-  工作卡也以同一把鍵決定歸屬（`activeJob` 記下送出當下那一列的 `description`）。
-  **但「閘」刻意維持按名稱比對**（`reviseBusyForThisTool`／`isTogglingThisTool`）：
+  工作卡也以同一把鍵決定歸屬（`activeJob` 記下送出當下那一列的 `description`）；
+  `patchToolRowSummaryStatus(listBody, instanceKey, status)` 同樣**按實例身分**找
+  列——一個回應同時要寫詳情快取與列徽章，兩邊必須指同一個工具，否則同名重裝之後
+  詳情寫進 A 的項、徽章卻蓋到 B 的列，而且沒有任何請求失敗來說明。**規則是：寫入
+  用實例身分，重新讀取（invalidate／removeQueries）用名稱前綴**——後者只是叫伺服器
+  再答一次，只可能拿到當下的答案，涵蓋得寬鬆才是保守方向。
+  **「閘」也刻意維持按名稱比對**（`reviseBusyForThisTool`／`isTogglingThisTool`）：
   `PATCH /api/tools/{name}` 與 `POST .../revise` 都按名稱定址，它們防的檔案系統
-  競態會落在「當下叫這個名字的套件」，比對得寬鬆才是保守方向；決定「卡片屬於哪
-  一列」則相反。
+  競態會落在「當下叫這個名字的套件」；決定「卡片屬於哪一列」「徽章要蓋哪一列」
+  則相反。
 - **權威回應寫進快取前，一定要先取消同一把鍵上在飛的讀**：`setQueryData` 不會動
   in-flight 的 fetch，所以一個在 mutation 之前因視窗對焦發出、讀到舊值的 GET
   可以在寫入之後才落地，把畫面翻回舊資料，而且**不會有任何錯誤提示**（那個 GET
   是成功的）。共用的寫入路徑一律先 `await cancelQueries({queryKey})` 再
   `setQueryData`。`removeQueries` 不需要這道手續：`queryCache.remove()` 會
   `query.destroy()` → `cancel({silent: true})`，本來就取消得掉。
+- **取消只排序了「寫 vs 讀」，寫與寫要另外排**：「重新產生」與「定版／解除定版」
+  可以同時在飛（定版刻意不受忙碌閘管制，見上），寫同一個快取項時**先回來的不一定
+  是先送出的**，落後的那個會把畫面永久留在舊答案上，而兩個請求都成功、沒有任何提示。
+  作法是**發出當下**取一個單調遞增的號碼（`createSummaryWriteLedger` /
+  `nextSummaryWriteStamp`，比照 `atoms/llm.js` 的世代計數器），套用前用
+  `claimLatestSummaryWrite` 比對；**嚴格較舊**的回應直接丟掉。刻意**不**改成「兩個
+  mutation 互鎖」：那正是後端特地不需要的鎖，會把定版這條逃生路在最需要的時候關掉。
+  問兩次是有意的——`cancelQueries` 是一個 await，較新的回應可能在那個窗口內插進來，
+  所以取消前問一次（避免落後的回應去取消較新寫入剛啟動的重新讀取）、取消後再問一次。
+- **寫進快取只能「改已存在的項」，不能「建出新的項」**：`removeQueries` 攔不住
+  已經在飛的請求，所以刪除之後才落地的 regenerate／定版回應會把剛清掉的項**重建**
+  出來，之後同名同描述的重裝一展開就撞到它。用 query-core 自己的規則解：
+  `setQueryData` 的 updater 回傳 `undefined` 時，它會在 `queryCache.build()` **之前**
+  就 return（`build/modern/queryClient.js` 第 99-101 行），等於「只在已存在時寫」。
+  `writeSummaryDetailIfPresent` 就是這個 updater；`patchToolRowSummaryStatus` 因為
+  看不懂的 body 原樣返回，本來就已經符合同一條規則。
 - **「還有東西看不見」是這頁的一類 bug，不是個案**：清單背景 refetch 失敗時列會
   留在畫面上（react-query 保留 `data` 只翻 status），必須用非阻擋的橘色 Alert
   講明清單可能過期；修訂中的工具被刪掉／被同名重裝換掉時，列內的進度卡會跟著
   消失但輪詢與忙碌閘還在，所以沒有任何一列擁有那個工作時，改由面板層渲染同一張
   卡（兩個條件是同一把鍵上的互補，卡片永遠恰好顯示一次）。
+- **警告不等於保證：清單已知過期時，按名稱定址的 AI 寫入要真的停用**：清單背景
+  refetch 失敗時列的實例身分跟列本身一樣是過期的，列不會 remount、未送出的修訂
+  意見留著，而「送出修訂」是打到 `/api/tools/{名稱}/revise`——同名重裝之後那就是
+  另一個工具。所以 `summaryWritesBlocked = summaryBusy || staleList` 是**一個值、
+  一個 prop**（`writesBlocked`），同時管「重新產生」與「送出修訂」的 `disabled`
+  **和**送出處的提前 return（`disabled` 只是渲染，不是閘），Alert 也要寫明控制項
+  已停用。**讀取不受管制**（展開面板只會 GET）。**定版／解除定版刻意不納入**：它是
+  後端刻意做成無條件的逃生路（D40 r6），一個已定版的工具本來就被 `tool_finalized`
+  擋掉另外兩個動作，連它也鎖住等於讓操作者無路可走；而且它只改一個列舉欄位、按
+  反方向就能還原，其啟用條件是算自面板自己那個**按名稱**讀回來的總結，不是算自
+  過期的列。啟用開關與刪除同樣不納入（意圖本來就是「叫這個名字的工具」，可還原或
+  有確認 Modal，也沒有夾帶為某個實例寫的內容）。
+- **哪些失敗要重新讀取，要逐碼講清楚**：一個拒絕不只是訊息，有些拒絕本身就是伺服器
+  在說「我已經不是你畫面上那個樣子了」——`404`（工具已不叫這個名字）、409
+  `tool_finalized`（我們的控制項是開著的，代表快取說它不是 final）、409
+  `summary_missing`（定版是拿快取裡的文字判斷可不可按的）三者都證明快取過期，就
+  重新讀總結＋清單（列徽章與詳情 status 是同一個側檔欄位）。`tool_job_in_progress`
+  （還沒寫任何東西）、`llm_not_configured`／502（在寫側檔之前就失敗）、5xx／傳輸
+  失敗（沒有任何證據）刻意**不**重讀——規則寫在純函式 `summaryErrorRevalidates`
+  裡並逐條測試。修訂**工作**是唯一的例外：`ToolJobStatus` 沒有結構化原因、只有一段
+  後端每輪都在改寫的 zh-TW `error` 字串，字串比對是會靜默失效的閘，所以改成「終局
+  轉換（成功或失敗）就重讀」——那是每個工作最多一次、且發生在數分鐘工作之後，不是
+  「每個錯誤都重抓」。
 - **`utils/toolInstall.js` 與 `utils/toolSummary.js` 的分工**：前者是安裝表單
   驗證（URL／秘密名稱與值）＋工具任務輪詢共用的純函式
   （`isToolJobActive`／`toolJobRefetchInterval`／`isTerminalToolJobState`——
@@ -176,7 +221,10 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   是 AI 總結網域的純邏輯（狀態→badge 對映 `summaryStatusMeta`、是否可定版
   `canFinalizeSummary`、快取鍵 `toolSummaryQueryKey`／`toolSummaryKeyPrefix`／
   列的 `toolInstanceKey`、面板自己的忙碌旗標 `ownSummaryBusy`、
-  列徽章的快取更新器 `patchToolRowSummaryStatus`），因為那與「安裝」無關，硬塞
+  列徽章的快取更新器 `patchToolRowSummaryStatus`、詳情的「只在已存在時寫」updater
+  `writeSummaryDetailIfPresent`、寫入排序帳本
+  `createSummaryWriteLedger`／`nextSummaryWriteStamp`／`claimLatestSummaryWrite`、
+  失敗要不要重讀的判準 `summaryErrorRevalidates`），因為那與「安裝」無關，硬塞
   進前者的檔名只會誤導之後的讀者——這個專案的 vitest 在 node 環境跑、沒有
   jsdom，元件本身測不到，抽出的純函式是唯一能自動化驗證的介面，所以新邏輯一律
   先問「這算安裝，還是總結」再決定放哪個檔案。

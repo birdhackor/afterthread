@@ -1,12 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
 	canFinalizeSummary,
+	claimLatestSummaryWrite,
+	createSummaryWriteLedger,
+	nextSummaryWriteStamp,
 	ownSummaryBusy,
 	patchToolRowSummaryStatus,
+	summaryErrorRevalidates,
 	summaryStatusMeta,
 	toolInstanceKey,
 	toolSummaryKeyPrefix,
 	toolSummaryQueryKey,
+	writeSummaryDetailIfPresent,
 } from "./toolSummary.js";
 
 describe("summaryStatusMeta", () => {
@@ -190,8 +195,12 @@ describe("patchToolRowSummaryStatus", () => {
 		],
 	});
 
-	it("rewrites only the named row's summary_status", () => {
-		const patched = patchToolRowSummaryStatus(body(), "a", "final");
+	it("rewrites only the identified row's summary_status", () => {
+		const patched = patchToolRowSummaryStatus(
+			body(),
+			toolInstanceKey("a", "A"),
+			"final",
+		);
 		expect(patched.tools[0]).toEqual({
 			name: "a",
 			description: "A",
@@ -203,37 +212,224 @@ describe("patchToolRowSummaryStatus", () => {
 	});
 
 	it("carries null through (解除定版 to a statusless sidecar)", () => {
-		expect(patchToolRowSummaryStatus(body(), "b", null).tools[1]).toMatchObject(
-			{ summary_status: null },
-		);
-		expect(patchToolRowSummaryStatus(body(), "a", null).tools[0]).toMatchObject(
-			{ summary_status: null },
-		);
+		expect(
+			patchToolRowSummaryStatus(body(), toolInstanceKey("b", "B"), null)
+				.tools[1],
+		).toMatchObject({ summary_status: null });
+		expect(
+			patchToolRowSummaryStatus(body(), toolInstanceKey("a", "A"), null)
+				.tools[0],
+		).toMatchObject({ summary_status: null });
 	});
 
 	it("does not mutate the cached body in place", () => {
 		// setQueryData updaters must return a NEW object: react-query compares by
 		// reference to decide whether observers re-render.
 		const original = body();
-		const patched = patchToolRowSummaryStatus(original, "a", "final");
+		const patched = patchToolRowSummaryStatus(
+			original,
+			toolInstanceKey("a", "A"),
+			"final",
+		);
 		expect(original.tools[0].summary_status).toBe("draft");
 		expect(patched).not.toBe(original);
 		expect(patched.tools).not.toBe(original.tools);
 	});
 
-	it("never invents a row for an unknown name", () => {
+	it("never invents a row for an unknown identity", () => {
 		// A summary response knows nothing about enabled/valid/description, so a
 		// fabricated row would be a shape GET /api/tools never returns.
-		const patched = patchToolRowSummaryStatus(body(), "missing", "final");
+		const patched = patchToolRowSummaryStatus(
+			body(),
+			toolInstanceKey("missing", "M"),
+			"final",
+		);
 		expect(patched.tools).toHaveLength(2);
 		expect(patched.tools.map((row) => row.name)).toEqual(["a", "b"]);
 	});
 
+	it("refuses a same-NAME row whose instance no longer matches", () => {
+		// THE r4 pin. The detail write goes to the instance key; if this patched by
+		// name, a response for ("a", "A") landing after a same-name reinstall would
+		// stamp its status onto ("a", "重裝後的新描述") -- the row badge and the
+		// panel then disagree permanently, and nothing failed to say so.
+		const reinstalled = {
+			tools: [
+				{ name: "a", description: "重裝後的新描述", summary_status: "draft" },
+			],
+		};
+		const patched = patchToolRowSummaryStatus(
+			reinstalled,
+			toolInstanceKey("a", "A"),
+			"final",
+		);
+		expect(patched.tools[0].summary_status).toBe("draft");
+	});
+
+	it("addresses the row by exactly the identity the cache key uses", () => {
+		// Not "a description comparison that happens to agree": the row is found
+		// through toolInstanceKey, the same function the React key and (via
+		// toolSummaryQueryKey) the detail cache entry are built from -- including
+		// its null/undefined collapsing, so a row whose description is absent is
+		// still the tool a response for `undefined` is about.
+		const noDescription = { tools: [{ name: "a", summary_status: "draft" }] };
+		expect(
+			patchToolRowSummaryStatus(
+				noDescription,
+				toolInstanceKey("a", null),
+				"final",
+			).tools[0].summary_status,
+		).toBe("final");
+	});
+
 	it("passes through a body it cannot understand", () => {
-		// The list may not have loaded yet, or may have failed.
-		expect(patchToolRowSummaryStatus(undefined, "a", "final")).toBeUndefined();
-		expect(patchToolRowSummaryStatus(null, "a", "final")).toBeNull();
+		// The list may not have loaded yet, or may have failed. Returning the same
+		// `undefined` it was handed is also what makes this write-only-if-present
+		// to setQueryData (see writeSummaryDetailIfPresent).
+		const key = toolInstanceKey("a", "A");
+		expect(patchToolRowSummaryStatus(undefined, key, "final")).toBeUndefined();
+		expect(patchToolRowSummaryStatus(null, key, "final")).toBeNull();
 		const noTools = { unexpected: true };
-		expect(patchToolRowSummaryStatus(noTools, "a", "final")).toBe(noTools);
+		expect(patchToolRowSummaryStatus(noTools, key, "final")).toBe(noTools);
+	});
+});
+
+describe("writeSummaryDetailIfPresent", () => {
+	const detail = { summary: "新的總結", status: "draft", updated_at: null };
+
+	it("writes the response over an existing entry", () => {
+		expect(writeSummaryDetailIfPresent(detail)({ summary: "舊的" })).toBe(
+			detail,
+		);
+		// Including entries whose current value is falsy but PRESENT -- null is a
+		// real cached value here, not "no entry".
+		expect(writeSummaryDetailIfPresent(detail)(null)).toBe(detail);
+	});
+
+	it("returns undefined when there is no entry, so setQueryData creates none", () => {
+		// The delete race: removeQueries cleared this tool, but a regenerate/定版
+		// response was already on the wire. query-core's setQueryData bails on an
+		// `undefined` updater result BEFORE queryCache.build, so this arrival is a
+		// no-op instead of resurrecting the deleted tool's detail entry.
+		expect(writeSummaryDetailIfPresent(detail)(undefined)).toBeUndefined();
+	});
+});
+
+describe("summary write ordering (ledger)", () => {
+	it("hands out strictly increasing stamps in issue order", () => {
+		const ledger = createSummaryWriteLedger();
+		const first = nextSummaryWriteStamp(ledger);
+		const second = nextSummaryWriteStamp(ledger);
+		const third = nextSummaryWriteStamp(ledger);
+		expect(first).toBeLessThan(second);
+		expect(second).toBeLessThan(third);
+	});
+
+	it("lets the LAST-ISSUED write win however the responses arrive", () => {
+		// THE r4 pin. 重新產生 is issued first, 定版 second (the 定版 button is
+		// deliberately outside the busy gate, so this pair is legal by design). The
+		// PATCH response comes back first and is applied; the older regenerate
+		// response lands afterwards and must be dropped, or the panel silently
+		// reverts to 草稿 while the row badge says 已定版.
+		const ledger = createSummaryWriteLedger();
+		const key = toolInstanceKey("kb", "描述");
+		const regenerate = nextSummaryWriteStamp(ledger);
+		const finalize = nextSummaryWriteStamp(ledger);
+		expect(claimLatestSummaryWrite(ledger, key, finalize)).toBe(true);
+		expect(claimLatestSummaryWrite(ledger, key, regenerate)).toBe(false);
+	});
+
+	it("is idempotent for one write, which has to ask twice", () => {
+		// applySummaryDetail claims before cancelQueries and re-claims after that
+		// await. Both calls must answer the same thing, or the write it just
+		// authorised would be refused by its own second question.
+		const ledger = createSummaryWriteLedger();
+		const key = toolInstanceKey("kb", "描述");
+		const stamp = nextSummaryWriteStamp(ledger);
+		expect(claimLatestSummaryWrite(ledger, key, stamp)).toBe(true);
+		expect(claimLatestSummaryWrite(ledger, key, stamp)).toBe(true);
+	});
+
+	it("refuses a write superseded DURING its own cancel window", () => {
+		// The interleaving the second claim exists for: an older write claims,
+		// awaits its cancel, a newer one claims inside that window, and then the
+		// older one's cancel settles last.
+		const ledger = createSummaryWriteLedger();
+		const key = toolInstanceKey("kb", "描述");
+		const older = nextSummaryWriteStamp(ledger);
+		const newer = nextSummaryWriteStamp(ledger);
+		expect(claimLatestSummaryWrite(ledger, key, older)).toBe(true);
+		expect(claimLatestSummaryWrite(ledger, key, newer)).toBe(true);
+		expect(claimLatestSummaryWrite(ledger, key, older)).toBe(false);
+	});
+
+	it("orders each tool instance independently", () => {
+		// A newer write for one tool must never drop an older-stamped write for a
+		// DIFFERENT tool -- including the same name under another description,
+		// which is a different cache entry.
+		const ledger = createSummaryWriteLedger();
+		const first = nextSummaryWriteStamp(ledger);
+		const second = nextSummaryWriteStamp(ledger);
+		expect(
+			claimLatestSummaryWrite(ledger, toolInstanceKey("kb", "B"), second),
+		).toBe(true);
+		expect(
+			claimLatestSummaryWrite(ledger, toolInstanceKey("kb", "A"), first),
+		).toBe(true);
+		expect(
+			claimLatestSummaryWrite(ledger, toolInstanceKey("other", "A"), first),
+		).toBe(true);
+	});
+});
+
+describe("summaryErrorRevalidates", () => {
+	it("is true for the refusals that PROVE the server moved", () => {
+		// 404: the tool no longer answers to this name (every summary route
+		// resolves the package first).
+		expect(summaryErrorRevalidates({ status: 404 })).toBe(true);
+		// tool_finalized: our controls were enabled, so our cached detail said the
+		// tool was NOT final -- and the remedy the message names (解除定版) is a
+		// button that only appears once the panel knows it is.
+		expect(
+			summaryErrorRevalidates({ status: 409, code: "tool_finalized" }),
+		).toBe(true);
+		// summary_missing: 定版 is enabled by canFinalizeSummary over the CACHED
+		// text, so this refusal is proof that text is gone.
+		expect(
+			summaryErrorRevalidates({ status: 409, code: "summary_missing" }),
+		).toBe(true);
+	});
+
+	it("is false for failures that say nothing about tool state", () => {
+		// A job holding the single-flight slot has written nothing yet.
+		expect(
+			summaryErrorRevalidates({ status: 409, code: "tool_job_in_progress" }),
+		).toBe(false);
+		// Configuration and upstream health are not tool state, and a regenerate
+		// raises both BEFORE the sidecar is touched.
+		expect(
+			summaryErrorRevalidates({ status: 503, code: "llm_not_configured" }),
+		).toBe(false);
+		expect(summaryErrorRevalidates({ status: 502 })).toBe(false);
+		expect(summaryErrorRevalidates({ status: 500 })).toBe(false);
+		// status 0 is the client's transport-failure shape (api/client.js).
+		expect(summaryErrorRevalidates({ status: 0, code: "network_error" })).toBe(
+			false,
+		);
+		expect(summaryErrorRevalidates({})).toBe(false);
+		expect(summaryErrorRevalidates()).toBe(false);
+	});
+
+	it("keys the 409s on the CODE, not on the status alone", () => {
+		// A future 409 code must default to "no evidence", not inherit a refetch
+		// from the two that earned one.
+		expect(
+			summaryErrorRevalidates({ status: 409, code: "some_future_code" }),
+		).toBe(false);
+		expect(summaryErrorRevalidates({ status: 409 })).toBe(false);
+		// ...and the two codes do not license a refetch under another status.
+		expect(
+			summaryErrorRevalidates({ status: 400, code: "tool_finalized" }),
+		).toBe(false);
 	});
 });

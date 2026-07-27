@@ -1194,3 +1194,108 @@ P4 第三輪 review 抓到六個問題。主題其實只有三個：**寫入與�
   revise／regenerate 被拒時收到的是 `tool_job_in_progress`＋「已有工具任務正在進行中，
   請等待完成」，後端本來就刻意不指名動作，在「無法送出修訂」與「重新產生失敗」兩個標題
   底下都讀得通。
+
+### D40 附錄（P4 review r4）：身分只做給了一半的消費者、寫與寫沒有排序、警告不等於閘、寫入不可重建已刪除的項、列徽章改按實例定址
+
+P4 第四輪 review 的五個問題其實是**同一個主題**：r3 建立了「工具實例身分」這個概念，
+但只套用到**部分**消費者；而且 r3 的 cancel-before-write 只排序了「寫 vs 讀」，沒有
+排序「寫 vs 寫」。這一輪把主題補完，而不是補五個點。
+
+- **清單已知過期時，AI 寫入只被「警告」而沒有被「擋下」（R4-1）**：r3 加的橘色
+  「無法更新工具清單」Alert 說明了列可能已過期，然後讓使用者照樣按下去。具體情境：
+  為工具 A 打好但還沒送出的修訂意見 ＋ 另一個分頁把 A 刪掉、用同名裝了 B ＋
+  `GET /api/tools` 這時剛好失敗。清單沒更新，所以那一列連同它的**實例身分**都還是舊的
+  ——列不會 remount（r3 的 `toolInstanceKey` 是算自列的 `description`，而列本身就是
+  過期的），未送出的意見留在 textarea，而「送出修訂」是打到
+  `POST /api/tools/{名稱}/revise`，於是 A 的意見被送去改 B。這正是 r3 宣稱建立的保證。
+  裁決：把「清單已知過期」折進**唯一一個**寫入閘
+  `summaryWritesBlocked = summaryBusy || staleList`，以單一 prop `writesBlocked` 傳到
+  面板，同時管「重新產生」與「送出修訂」的 `disabled` **與**兩個送出處的提前 return
+  （`submitRevise` 內、以及 `onRegenerate` 這個 callback 內——`disabled` 只是渲染，
+  不是閘）。Alert 文案補上「這兩個動作已暫時停用」與理由。**讀取不擋**：展開面板與
+  `GET .../summary` 不寫任何東西。
+  **定版／解除定版刻意留著**（三個理由，缺一不可）：(a) 它是後端刻意做成無條件的
+  逃生路（D40 r6），而一個已定版的工具本來就會讓「重新產生」「送出修訂」收到
+  `tool_finalized`，連定版也鎖住等於在 `GET /api/tools` 抖動時讓操作者**完全無路可走**；
+  (b) 它只寫一個列舉欄位、按反方向立刻還原，而被送錯的修訂是拿別的工具的意見去
+  **重建一個套件**；(c) 它的啟用條件算自 `detail.summary`——面板自己那個**按名稱**發出的
+  `GET .../summary`，成功的讀取永遠是當下那個工具的側檔——所以它是這裡唯一一個
+  **不是**拿過期清單在推論的控制項。啟用開關與刪除同樣不納入：兩者的意圖本來就是
+  「叫這個名字的那個工具」，可還原或有確認 Modal，也沒有夾帶為某個實例寫的內容。
+
+- **cancel-before-write 只排序了「寫 vs 讀」，沒排序「寫 vs 寫」（R4-2）**：
+  「重新產生」與「定版／解除定版」的閘**刻意不同**（定版不受忙碌閘管制，這是 D40
+  特地支援的用法），所以兩者可以同時在飛，寫的又是同一個快取項。若**先送出**的回應
+  **後**落地，快取就永久停在較舊的答案上，而列徽章可能已被結尾那次
+  `invalidateQueries(["tools"])` 的重新讀取更新成新的——兩邊互相矛盾，兩個請求卻都成功，
+  沒有任何錯誤提示。
+  裁決：**不**序列化。「用一個 per-row in-flight 旗標同時擋住兩者」正是後端特地不需要的
+  鎖（D40 r3／r12：換裝前會自己重檢定版、`_store_meta` 也會在寫入時重檢），會把逃生路
+  在最需要的時候關掉。改成**發出當下蓋號碼、較舊的回應丟掉**：純函式帳本
+  `createSummaryWriteLedger`／`nextSummaryWriteStamp`／`claimLatestSummaryWrite`，號碼在
+  mutation 的 `onMutate` 取（查證 query-core `mutation.js`：`onMutate` 在
+  `retryer.start()` 之前呼叫，所以號碼的順序＝使用者按下去的順序，不是回應回來的順序），
+  帳本以 `toolInstanceKey` 分格，不同工具互不影響。**問兩次**是刻意的：`cancelQueries`
+  是一個 await，較新的回應可能在那個窗口內被接受並開始自己的 cancel，於是誰的 cancel
+  最後 settle 誰就最後寫；因此取消**前**問一次（讓落後的回應連 cancel 都不要做——否則
+  它會取消掉較新寫入剛啟動的那次重新讀取）、取消**後**再問一次。比較用嚴格
+  `stamp < applied`，所以同一個號碼問幾次答案都一樣。與 `atoms/llm.js` 的世代計數器、
+  列表頁的 `requestId` 是同一個模式。
+  查證過但沒採用的第三條路：拿回應裡的 `updated_at` 當真實伺服器序。不行——同狀態的
+  PATCH 刻意不寫檔（D40 r7），時間戳會相等；沒有側檔時它是 `null`；解析度也不保證能
+  分開兩次相鄰的寫入。
+
+- **只有「成功」會重新讀取，「失敗」不會——即使失敗本身就是伺服器在說狀態變了（R4-3）**：
+  修訂工作成功會 invalidate 總結＋清單，失敗則什麼都不做；三個 mutation 的即時錯誤
+  （`tool_finalized`／`summary_missing`／404）也只跳一個 toast，畫面繼續主張那個錯誤剛剛
+  否定掉的狀態。最刺眼的是 `tool_finalized`：文案叫使用者「請先解除定版」，但「解除定版」
+  這顆按鈕**只有在面板知道工具是 final 之後才會出現**——它指定的補救動作在畫面上根本
+  按不到。
+  裁決分兩層。**即時錯誤逐碼判定**，抽成純函式 `summaryErrorRevalidates({status, code})`：
+  `404`（每條總結路由都先解析套件，代表這個名字已經不是那個工具）、409 `tool_finalized`
+  （我們的控制項是開著的，代表快取說它不是 final，也就是別人剛定版了）、409
+  `summary_missing`（定版是拿**快取裡**的文字判斷可不可按的，這個拒絕就是那段文字不在了）
+  三者重新讀取總結＋清單；`tool_job_in_progress`（佔著名額的工作還沒寫任何東西）、
+  `llm_not_configured`／502（`routers/tools.py` 在碰側檔之前就 raise）、5xx／傳輸失敗
+  （沒有證據，而且會讓抖動的連線變成重抓迴圈）刻意不重讀。清單一起重讀是因為列徽章的
+  `summary_status` 與詳情的 `status` 是同一個側檔欄位讀兩次。
+  **修訂工作是唯一例外，改成「終局轉換就重讀」**（成功與失敗都算）：`ToolJobStatus`
+  （`backend/afterthread/schemas.py`）只有 `error: str | None` 這段 zh-TW 散文，沒有結構化
+  原因，而那些字串後端每一輪 review 都在改寫，比對字串等於做一個會靜默失效的閘。能精確
+  說的是失敗詞彙本身：`tool_builder` 的修訂結局裡「找不到要修訂的工具」「原工具已被刪除」
+  「原工具目錄已被替換為連結」「原工具在修訂期間被改動或重新安裝」「總結已定版」
+  「無法確認總結是否已定版」「無法確認原工具的內容」全都在陳述一個我們沒顯示的變化，
+  `.env` 那組則代表套件被手動改過，只有純建置／LLM 失敗什麼都沒說。所以整個終局轉換
+  一起重讀：**每個工作最多一次**、發生在數分鐘的工作之後，跟「每個錯誤都重抓」不是同一
+  件事。
+
+- **刪除清得掉快取，清不掉已經在飛的寫入（R4-4）**：`deleteMutation` 的
+  `removeQueries` 攔不住一個已經送出的 regenerate／定版請求，那個回應之後照樣走
+  `applySummaryDetail` → `setQueryData(summaryKey, detail)`，把剛清掉的詳情項**重建**
+  出來；接著同名、同描述的重裝在 gc window 內一展開就撞到它。
+  裁決：讓寫入本身變成有條件的——查證 query-core 自己的 API 而非另外做檢查：
+  `queryClient.setQueryData` 會先 `prevData = query?.state.data`、把 updater 交給
+  `functionalUpdate`（`build/modern/utils.js` 第 6-8 行：函式型 updater 會被**呼叫**並帶入
+  舊值），然後 `if (data === void 0) return void 0;`（`build/modern/queryClient.js`
+  第 99-101 行）——這個 return 在 `queryCache.build(...)`（第 102 行）**之前**。所以
+  「updater 回傳 undefined」就是 query-core 原生的「只在已存在時寫」。純函式
+  `writeSummaryDetailIfPresent(detail)` 就是這個 updater，並有測試釘住兩個方向。
+  順帶記下：`patchToolRowSummaryStatus` 因為看不懂的 body 原樣返回（含 `undefined`），
+  本來就已經符合同一條規則，不必再改。沒有任何「合法的建立寫入」被這條擋掉：能觸發這兩個
+  mutation 的按鈕只在**展開**的面板裡渲染，而面板在 `data === undefined` 時渲染的是
+  Loader、不是按鈕。
+
+- **列徽章按名稱比對，詳情按實例比對（R4-5）**：`patchToolRowSummaryStatus(listBody,
+  name, status)` 找列是比 `row.name`，但同一個回應的詳情寫入用的是實例鍵。於是同名重裝
+  之後，一個為 A 發出、晚落地的回應會把 A 的 `summary_status` 蓋到 B 那一列，而詳情寫進
+  的是 A 的快取項——列徽章與面板從此永久矛盾，而且沒有任何請求失敗來說明。
+  裁決：改成 `patchToolRowSummaryStatus(listBody, instanceKey, status)`，以
+  `toolInstanceKey(row.name, row.description)` 比對。刻意傳「那把鍵」而不是在函式裡
+  另外比 `row.description === description`：這樣兩個消費者就是**同一個函式**回答的同一個
+  問題，判別子日後若變強，兩邊一起變強。
+  **殘留（明講）**：清單已經換掉、找不到符合實例身分的列時，這個補寫就**不做**——徽章
+  回退成靠結尾那次 `invalidateQueries(["tools"])`（它的背景 refetch 錯誤 TanStack Query
+  會吞掉，也就是回到 r2 之前那個窄窄的情境）。這是刻意的：把一個無法證明是同一個工具的
+  回應蓋到列上，正是這條 finding 本身。**規則因此可以一句話說完：寫入用實例身分，
+  重新讀取（invalidate／removeQueries）用名稱前綴**——後者只是叫伺服器再答一次，
+  只可能拿到當下的答案。
