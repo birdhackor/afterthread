@@ -112,7 +112,11 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   的任務進行中時，另一分頁的送出控制項也會停用——純粹是本地端對後端那個
   single-flight 的樂觀鏡像（只涵蓋這個分頁實例自己送出/得知的任務），後端仍是
   權威，鏡像沒接住的競態（例如另一個瀏覽分頁送出的任務）一樣會用既有的
-  409（`tool_job_in_progress`）錯誤處理接住。每個工具列的 AI 總結面板走 inline
+  409（`tool_job_in_progress`）錯誤處理接住。**分頁往上報的只能是它第一手知道的
+  忙碌**（`ownSummaryBusy`），絕不可把收到的 `externalBusy` 折進去再報回對方——那
+  會讓鏡像回聲，安裝表單自己送出的那段窗口會被自己指控成「另一分頁有 AI
+  任務正在進行中」；本地的閘（自己的 ＋ 對方的）才是疊加的那一層。每個工具列的
+  AI 總結面板走 inline
   展開（`@mantine/core` 的 `Collapse` + `useDisclosure`，零新依賴，比照 D38
   選用 Mantine 內建元件的理由；每列獨立展開，不像 `LlmLogsPage` 的 Accordion
   同時間只開一項；展開 prop 是 `Collapse` 自己的 `expanded`，**不是** React
@@ -144,13 +148,34 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   'error'，那正是舊內容原本會無聲留在畫面上的狀態。做 invalidate／removeQueries
   時一律用 `toolSummaryKeyPrefix(name)` 前綴比對，**不可以**加 `exact`（鍵是三段，
   `exact` 會一個都比對不到）。
+- **同一個判別子必須同時管快取鍵、列的 React key 與工作卡的歸屬**：三者是同一個
+  「這還是同一個工具嗎」的問題。列的 key 用 `toolInstanceKey(name, description)`
+  （＝把 `toolSummaryQueryKey` 那把鍵 `JSON.stringify`，所以兩者不可能各自漂移），
+  身分一變就 remount、列內未送出的修訂意見不會跨過同名重裝被送給別的工具；修訂
+  工作卡也以同一把鍵決定歸屬（`activeJob` 記下送出當下那一列的 `description`）。
+  **但「閘」刻意維持按名稱比對**（`reviseBusyForThisTool`／`isTogglingThisTool`）：
+  `PATCH /api/tools/{name}` 與 `POST .../revise` 都按名稱定址，它們防的檔案系統
+  競態會落在「當下叫這個名字的套件」，比對得寬鬆才是保守方向；決定「卡片屬於哪
+  一列」則相反。
+- **權威回應寫進快取前，一定要先取消同一把鍵上在飛的讀**：`setQueryData` 不會動
+  in-flight 的 fetch，所以一個在 mutation 之前因視窗對焦發出、讀到舊值的 GET
+  可以在寫入之後才落地，把畫面翻回舊資料，而且**不會有任何錯誤提示**（那個 GET
+  是成功的）。共用的寫入路徑一律先 `await cancelQueries({queryKey})` 再
+  `setQueryData`。`removeQueries` 不需要這道手續：`queryCache.remove()` 會
+  `query.destroy()` → `cancel({silent: true})`，本來就取消得掉。
+- **「還有東西看不見」是這頁的一類 bug，不是個案**：清單背景 refetch 失敗時列會
+  留在畫面上（react-query 保留 `data` 只翻 status），必須用非阻擋的橘色 Alert
+  講明清單可能過期；修訂中的工具被刪掉／被同名重裝換掉時，列內的進度卡會跟著
+  消失但輪詢與忙碌閘還在，所以沒有任何一列擁有那個工作時，改由面板層渲染同一張
+  卡（兩個條件是同一把鍵上的互補，卡片永遠恰好顯示一次）。
 - **`utils/toolInstall.js` 與 `utils/toolSummary.js` 的分工**：前者是安裝表單
   驗證（URL／秘密名稱與值）＋工具任務輪詢共用的純函式
   （`isToolJobActive`／`toolJobRefetchInterval`／`isTerminalToolJobState`——
   D40 之前只服務安裝工作，現在安裝與修訂共用同一張後端 job 表與同一個輪詢
   路由，因此改用不含「install」字樣的名稱，並更新了每個呼叫點與測試）；後者
   是 AI 總結網域的純邏輯（狀態→badge 對映 `summaryStatusMeta`、是否可定版
-  `canFinalizeSummary`、快取鍵 `toolSummaryQueryKey`／`toolSummaryKeyPrefix`、
+  `canFinalizeSummary`、快取鍵 `toolSummaryQueryKey`／`toolSummaryKeyPrefix`／
+  列的 `toolInstanceKey`、面板自己的忙碌旗標 `ownSummaryBusy`、
   列徽章的快取更新器 `patchToolRowSummaryStatus`），因為那與「安裝」無關，硬塞
   進前者的檔名只會誤導之後的讀者——這個專案的 vitest 在 node 環境跑、沒有
   jsdom，元件本身測不到，抽出的純函式是唯一能自動化驗證的介面，所以新邏輯一律

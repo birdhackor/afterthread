@@ -1093,3 +1093,104 @@ P4 第二輪 review 抓到六個問題。第一個是整個 phase 的功能其�
   `tools_not_configured`／`install_in_progress`（只出現在安裝表單，已由 `InstallPanel`
   自己的 `onError` 內聯處理）。理由寫在 `toolErrorMessage` 上方，免得下一輪又重問一次
   「為什麼只有一個碼有分支」。
+  （`install_in_progress` 這一條在 r3 被推翻，見下。）
+
+### D40 附錄（P4 review r3）：權威回應要先取消同鍵的讀、清單過期要看得見、列的身分＝快取的身分、孤兒工作卡、忙碌鏡像不回聲、安裝 409 文案改中性
+
+P4 第三輪 review 抓到六個問題。主題其實只有三個：**寫入與讀取的競態**（r1／r2 把權威
+回應寫進快取，但沒處理「同一把鍵上還有一個沒取消的讀」）、**身分只做了一半**（r2 把
+判別子放進快取鍵，卻沒放進列的 React key 與工作卡的歸屬），以及**看不見的狀態**（清單
+背景更新失敗、列消失後的工作、被自己回聲的忙碌旗標）。
+
+- **`setQueryData` 沒有先取消同鍵的 in-flight 讀，權威回應可能被較舊的資料蓋回去
+  （R3-1）**：`applySummaryDetail()` 直接 `setQueryData` 寫入 `["tool-summary", …]`
+  與 `["tools"]`，但沒有取消這兩把鍵上正在飛的 GET。app 的預設是
+  `refetchOnWindowFocus: true` ＋ `staleTime: 5s`，所以一個在 PATCH 之前因視窗對焦而
+  發出、讀到 `draft` 的 `GET .../summary`，完全可能在 PATCH 的 `final` 寫進快取之後才
+  落地，把畫面翻回 `draft`。而且**不會有任何提示**——r2 加的「無法更新總結」橘色 Alert
+  只在 `isError` 時出現，這個 GET 是**成功**的。使用者看到的是綠色「已定版」通知之後
+  幾秒，面板自己變回草稿。
+  裁決：兩個 mutation 共用的 `applySummaryDetail()` 改成 async，寫入前先
+  `await Promise.all([cancelQueries(summaryKey), cancelQueries(["tools"])])`——即標準的
+  cancel-then-setQueryData 順序。查證安裝版 `@tanstack/query-core` 5.101.2 而非憑記憶：
+  `queryClient.cancelQueries` → `query.cancel({revert: true})` → retryer 的 `cancel`
+  **同步** reject 自己的 thenable（`retryer.js` 第 29-35 行），因此 `query.#fetch` 走
+  `CancelledError` 分支、**不會**再用那個晚到的回應呼叫 `setData`（`query.js`
+  第 308-318 行）；`cancelQueries` 自己是 `.then(noop).catch(noop)`
+  （`queryClient.js` 第 146 行），所以絕不會反過來讓 `onSuccess` reject。結尾那個
+  `invalidateQueries(["tools"])` 維持不動：它啟動的是一個**新**的讀，只可能看到寫入後的
+  伺服器狀態。順帶記下一個查證結果：`removeQueries`（刪除那條路）**不需要**同樣處理，
+  `queryCache.remove()` 會呼叫 `query.destroy()` → `cancel({silent: true})`
+  （`queryCache.js` 第 39-48 行 + `query.js` 第 86-89 行），本來就會把在飛的讀取消掉。
+
+- **清單背景更新失敗時畫面完全沒有提示，於是新總結會配著舊描述一起顯示（R3-2）**：
+  `InstalledToolsPanel` 只有兩種錯誤呈現：`showError`（`data === undefined` 才擋整頁）
+  與什麼都不做。react-query 會保留 `data` 只把 status 翻成 'error'，所以「有列在畫面上
+  但背景 refetch 失敗」這個狀態過去是**完全靜默**的。這在同名重裝時會產生一個危險的
+  混合：總結面板的快取鍵取自**列**的 `description`，而 `GET /api/tools/{name}/summary`
+  是按**名稱**定址的——於是「`GET /api/tools` 失敗 ＋ 總結 GET 成功」會把**新**工具的
+  總結寫在**舊**描述的鍵底下，畫面上就是新總結配舊描述。這**不是** r2 記錄的
+  「描述逐位元組相同」殘留，是另一條路。
+  裁決：比照面板自己那張「無法更新總結」，在清單層加一張橘色「無法更新工具清單」
+  Alert（非阻擋、列繼續顯示——空白頁比過期清單更糟，而且「重新整理」就在正上方）。
+  修完之後**仍可能發生的混合，全部列在該 Alert 上方的註解裡**：(a) 上述那一種（列的
+  欄位是失敗前的、展開的總結是當前的），(b) 反向（清單新、總結舊——由面板自己那張
+  Alert 交代），(c) 兩次安裝的描述逐位元組相同（r2 已記錄的殘留，兩張 Alert 都不會亮，
+  因為沒有任何請求失敗）。差別在於前兩種從「無聲」變成「有標示」。
+
+- **判別子只進了快取鍵，沒進列的身分——未送出的修訂意見會跨過同名重裝（R3-3）**：
+  列是 `key={tool.name}`，React 只要 key 沒變就重用同一個元件實例。所以背景 refetch
+  把同名的另一個工具換進來時，總結查詢**正確地**換到新的快取項，那一列卻**沒有**
+  remount：使用者為工具 A 打的修訂意見還留在 textarea 裡，可以就這樣送給 B。
+  裁決：新增純函式 `toolInstanceKey(name, description)` 當列的 React key，而且**建構自**
+  `toolSummaryQueryKey`（`JSON.stringify` 那把鍵）——這兩者是同一個問題問兩次，必須綁在
+  一起移動；日後若判別子變強，兩邊自動一起變強。查證：`JSON.stringify` 對一個只有原始值
+  的陣列，跟 TanStack Query 自己的 `hashKey`（`utils.js` 第 85 行，replacer 只排序
+  plain object 的鍵）產生完全相同的字串，所以「兩列共用 React key」與「兩列共用快取項」
+  是同一件事。工作卡的歸屬同步改成**實例**比對（`activeJob` 多記一個 `description`，
+  於送出當下取自該列），理由見下一條。
+  **刻意保留為「按名稱」的是「閘」**：`reviseBusyForThisTool`／`isTogglingThisTool`
+  比對的是 `name`，因為 `PATCH /api/tools/{name}` 與 `POST /api/tools/{name}/revise`
+  都是**按名稱**定址的，它們防的檔案系統風險會落在「當下叫這個名字的那個套件」身上，
+  在這裡比對得更寬鬆才是保守方向；決定「這張卡屬於哪一列」則相反，比對得寬鬆就會把卡
+  掛到一個它並不描述的工具底下。這個區分寫在程式碼註解裡。
+  **已知副作用（明講）**：修訂成功會重建套件，AI 可能寫出不同的 `description`，於是那一
+  列會 remount、面板收合。未送出的意見在 202 當下就已經 `reset` 過，不會有資料損失；
+  收合後工作卡改由下一條的面板層卡片顯示，仍然看得見。
+
+- **列消失後，它裡面的工作卡跟著消失，但輪詢與忙碌閘還在（R3-4）**：進度卡渲染在列
+  之內，所以修訂進行中把工具刪掉（或被同名重裝換掉）時，卡片就沒了，可是 parent 仍在
+  輪詢、`summaryBusy` 仍是 true——其他列的總結操作被鎖住好幾分鐘、畫面上沒有任何解釋，
+  而且最後那個「原工具在修訂期間被改動或重新安裝」／目標不存在的失敗**永遠不會被顯示**。
+  裁決：在面板層渲染同一張 `ToolJobProgress`，條件是「清單裡沒有任何一列擁有這個工作的
+  實例身分」，上方加一行指名工具的說明文字。列的顯示條件（`rowKey === activeJobKey`）
+  與面板的顯示條件是同一把鍵上的互補，因此**一張卡永遠恰好顯示一次**——不會重複，也不
+  會消失。工作**不會**被丟掉或靜音：刪除不清 `activeJob`，讓它照常跑到終局並顯示失敗。
+
+- **跨分頁的忙碌鏡像會回聲（R3-5）**：`InstalledToolsPanel` 往上報的
+  `summaryBusy` 本身就含有它收到的 `externalBusy`，`ToolsPage` 再把它當
+  `externalBusy` 交給安裝分頁——於是安裝 POST 進行中（還沒有任何 job id 的那段窗口），
+  安裝表單上會出現「『已安裝工具』頁面有 AI 任務正在進行中」，指控一個根本不存在的
+  AI 任務。
+  裁決：分成兩個值。`ownSummaryBusy({regeneratePending, revisePending, reviseJobActive})`
+  是這個分頁**第一手知道**的事，也是唯一往上報的東西；本地的閘 `summaryBusy` 才額外
+  疊上 `externalBusy`。抽成純函式是因為這個專案沒有 jsdom、元件測不到，而這個計算的
+  重點正是「它看不到 `externalBusy`」——測試因此有一條專門的釘子：多傳一個
+  `externalBusy: true` 進去，結果仍必須是 `false`。`InstallPanel` 那一側查過了，它的
+  `busy = installMutation.isPending || jobActive` 本來就沒把 `externalBusy` 折進去，
+  不需要改。
+
+- **安裝被 409 拒絕時顯示的是「已有安裝正在進行中」，但擋下它的可能是別人的修訂
+  （R3-6）**：D40 之後，安裝、修訂與同步的重新產生共用同一個 `_JOBS`／`_SYNC_OPS`
+  名額，而 `POST /api/tools/install` 對這三種佔用一律回同一個
+  `install_in_progress`＋「已有安裝正在進行中，請等待其完成」（後端
+  `tests/test_tool_builder.py` 就釘著「regenerate 佔著名額時，install 收到的正是這個
+  碼」）。於是一個因為別的分頁正在**修訂**而被擋下的安裝，會叫使用者去等一個沒人開始
+  的安裝。這推翻了 r2 那條「`install_in_progress` 不需要本地文案」的裁決。
+  裁決：用 r2 為 revise 的 `tool_finalized` 建立的同一個 per-call `codeCopy` 覆寫機制，
+  在安裝路徑上給這個碼中性文案（「已有工具任務正在進行中（安裝、AI
+  修訂或重新產生總結），請等待完成後再安裝」）。該分支只在 409 進入，所以
+  `toolErrorMessage` 的 404 分支在這裡可證不可達。反向查過並確認**不必改**：
+  revise／regenerate 被拒時收到的是 `tool_job_in_progress`＋「已有工具任務正在進行中，
+  請等待完成」，後端本來就刻意不指名動作，在「無法送出修訂」與「重新產生失敗」兩個標題
+  底下都讀得通。

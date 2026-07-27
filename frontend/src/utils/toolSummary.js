@@ -79,6 +79,46 @@ export function toolSummaryQueryKey(name, description) {
 	return [...toolSummaryKeyPrefix(name), description];
 }
 
+// The same instance identity as a STRING, for the row's React `key`. Built FROM
+// toolSummaryQueryKey rather than re-spelled, because the two are ONE question
+// asked in two places: the cache key decides which summary body belongs to this
+// row, the React key decides whether the row -- and the unsent revise feedback
+// typed into it -- survives or is remounted. Keyed on the NAME alone, a row kept
+// its identity across a same-name reinstall while its summary query correctly
+// moved to a new entry: the user could type feedback for tool A, have a
+// background refetch swap in tool B underneath, and submit that text against B.
+// Whatever discriminator this project can prove later, both move together.
+//
+// JSON.stringify over an array of primitives is byte-for-byte what TanStack
+// Query's own hashKey does to such a key (query-core utils.js line 85: a
+// JSON.stringify whose replacer only sorts PLAIN OBJECT keys, of which there are
+// none here), so two rows collide on the React key exactly when they would
+// collide on the cache key -- including the residual where two installs produce
+// byte-identical descriptions.
+export function toolInstanceKey(name, description) {
+	return JSON.stringify(toolSummaryQueryKey(name, description));
+}
+
+// --- the panel's OWN busy state ----------------------------------------------
+
+// Everything THIS panel started and is still waiting on -- and deliberately
+// NOTHING about the other tab. The 工具 page mirrors each tab's busy flag into
+// the other as `externalBusy`; when the value reported UPWARD also contained the
+// `externalBusy` it had just been handed, that mirror echoed: the install tab
+// said busy during its own POST, the 工具 page fed that in here, this panel
+// reported it straight back, and the install form told the user 「已安裝工具」
+// had an AI job running -- during the user's own install submit, before any job
+// id existed. A panel may only report what it knows first-hand; combining that
+// with the other tab's flag is the PARENT's business, and is done at the local
+// gate (summaryBusy) instead.
+export function ownSummaryBusy({
+	regeneratePending,
+	revisePending,
+	reviseJobActive,
+}) {
+	return Boolean(regeneratePending || revisePending || reviseJobActive);
+}
+
 // --- ["tools"] list-cache patch ----------------------------------------------
 
 // Return the GET /api/tools body with ONE row's `summary_status` replaced, or

@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
 	canFinalizeSummary,
+	ownSummaryBusy,
 	patchToolRowSummaryStatus,
 	summaryStatusMeta,
+	toolInstanceKey,
 	toolSummaryKeyPrefix,
 	toolSummaryQueryKey,
 } from "./toolSummary.js";
@@ -83,6 +85,100 @@ describe("toolSummaryQueryKey / toolSummaryKeyPrefix", () => {
 		);
 		// ...and the prefix still gathers both, which is what delete must clear.
 		expect(toolSummaryKeyPrefix("kb")).toEqual(toolSummaryKeyPrefix("kb"));
+	});
+});
+
+describe("toolInstanceKey", () => {
+	it("is a string (React keys are not arrays)", () => {
+		expect(typeof toolInstanceKey("kb", "描述")).toBe("string");
+	});
+
+	it("separates the same name under two different descriptions", () => {
+		// The whole point of keying the ROW on this: a same-name reinstall must
+		// remount the row, so the revise feedback typed for the old instance cannot
+		// be submitted against the new one.
+		expect(toolInstanceKey("kb", "第一次安裝")).not.toBe(
+			toolInstanceKey("kb", "重裝後的新描述"),
+		);
+	});
+
+	it("separates two different names, and is stable for equal inputs", () => {
+		expect(toolInstanceKey("a", "同一段描述")).not.toBe(
+			toolInstanceKey("b", "同一段描述"),
+		);
+		expect(toolInstanceKey("kb", "描述")).toBe(toolInstanceKey("kb", "描述"));
+	});
+
+	it("agrees with the summary cache key on every pair it is given", () => {
+		// The invariant that makes the row and its summary ONE identity: two rows
+		// share a React key exactly when they share a cache entry. Pinned as an
+		// equivalence so a future change to either spelling has to break a test.
+		const pairs = [
+			["kb", "描述 A"],
+			["kb", "描述 B"],
+			["other", "描述 A"],
+			["kb", null],
+			["kb", undefined],
+			["kb", ""],
+		];
+		for (const [nameA, descA] of pairs) {
+			for (const [nameB, descB] of pairs) {
+				const sameKey =
+					toolInstanceKey(nameA, descA) === toolInstanceKey(nameB, descB);
+				const sameCacheKey =
+					JSON.stringify(toolSummaryQueryKey(nameA, descA)) ===
+					JSON.stringify(toolSummaryQueryKey(nameB, descB));
+				expect(sameKey).toBe(sameCacheKey);
+			}
+		}
+	});
+
+	it("treats a missing description as one identity, not two", () => {
+		// GET /api/tools may omit description entirely or send null; both mean
+		// "this install wrote no description", so they must not split one tool
+		// into two rows/cache entries that flip as the field appears.
+		expect(toolInstanceKey("kb", null)).toBe(toolInstanceKey("kb", undefined));
+	});
+});
+
+describe("ownSummaryBusy", () => {
+	it("is true for each thing this panel itself started", () => {
+		expect(ownSummaryBusy({ regeneratePending: true })).toBe(true);
+		expect(ownSummaryBusy({ revisePending: true })).toBe(true);
+		expect(ownSummaryBusy({ reviseJobActive: true })).toBe(true);
+	});
+
+	it("is false when this panel has nothing in flight", () => {
+		expect(
+			ownSummaryBusy({
+				regeneratePending: false,
+				revisePending: false,
+				reviseJobActive: false,
+			}),
+		).toBe(false);
+		expect(ownSummaryBusy({})).toBe(false);
+	});
+
+	it("cannot be made true by the OTHER tab's flag", () => {
+		// THE pin for the mirror echo: whatever the parent hands this panel about
+		// the install tab, it is not part of what this panel reports upward. An
+		// extra key is ignored by construction -- if someone later folds
+		// externalBusy back into this function, this test fails.
+		expect(
+			ownSummaryBusy({
+				regeneratePending: false,
+				revisePending: false,
+				reviseJobActive: false,
+				externalBusy: true,
+			}),
+		).toBe(false);
+	});
+
+	it("returns a real boolean, never a passed-through value", () => {
+		// It feeds a `disabled` prop and a state setter; leaking undefined/0/""
+		// would make React swap a controlled prop between defined and undefined.
+		expect(ownSummaryBusy({ regeneratePending: undefined })).toBe(false);
+		expect(ownSummaryBusy({ revisePending: "yes" })).toBe(true);
 	});
 });
 

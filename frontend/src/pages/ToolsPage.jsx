@@ -42,8 +42,10 @@ import {
 } from "../utils/toolInstall.js";
 import {
 	canFinalizeSummary,
+	ownSummaryBusy,
 	patchToolRowSummaryStatus,
 	summaryStatusMeta,
+	toolInstanceKey,
 	toolSummaryKeyPrefix,
 	toolSummaryQueryKey,
 } from "../utils/toolSummary.js";
@@ -71,18 +73,29 @@ const AI_INPUT_MAX = SECTION_MAX_LENGTH;
 //   under the title 「無法送出修訂」 and told the user to 重新產生 something
 //   they never asked to regenerate. The revise call site supplies its own copy;
 //   the regenerate call site deliberately does not.
+// * `install_in_progress` -- _INSTALL_IN_PROGRESS_MESSAGE is 「已有安裝正在進行
+//   中，請等待其完成」, which names INSTALL. That was true when only installs
+//   contended for the slot; since D40 the SAME admission (`_JOBS`/`_SYNC_OPS`)
+//   is taken by a revise job and by a synchronous regenerate too, and
+//   `POST /api/tools/install` still answers all three refusals with this one
+//   install-flavoured code (routers/tools.py: `start_install_job` returning None
+//   -> _INSTALL_IN_PROGRESS_CODE; backend test_tool_builder.py pins install
+//   getting exactly this code while a REGENERATE holds the slot). So an install
+//   refused because another tab is revising told the user to wait for an install
+//   nobody started. The install call site supplies its own neutral copy.
 // * `tool_job_in_progress` -- 「已有工具任務正在進行中，請等待完成」 names no
 //   action at all, deliberately (routers.tools: it can be raised by a job the
-//   user did not start from this control), and reads correctly under BOTH
-//   titles. No local copy: a branch reproducing an equally-good string would be
-//   dead weight.
+//   user did not start from this control), and reads correctly under BOTH the
+//   revise and the regenerate titles -- the reverse of the install case above,
+//   which is why only that one needed new copy. No local copy: a branch
+//   reproducing an equally-good string would be dead weight.
 // * `summary_missing` -- 「尚無總結可定版」 is raised ONLY by PATCH .../summary
 //   and already names that one action. No local copy.
 // * `llm_not_configured` (503) / any 502 -- the shared client's messageFor
 //   already renders these ("AI 功能尚未設定" / "AI 服務暫時無法使用，請稍後再
 //   試") and both are action-neutral. No local copy.
-// * `tools_not_configured` / `install_in_progress` -- install-form only, and
-//   already handled inline by InstallPanel's own onError. Not reachable here.
+// * `tools_not_configured` -- install-form only, and already handled inline by
+//   InstallPanel's own onError as an explanatory Alert. Not reachable here.
 function toolErrorMessage(error, fallback, codeCopy = null) {
 	if (error?.status === 404) {
 		return "找不到這個工具，清單可能已過期，請重新整理";
@@ -284,7 +297,7 @@ function ToolSummaryPanel({
 		// a job-shaped action, just "the request landed" -- see the job progress
 		// card below for the part that takes minutes.
 		reviseMutation.mutate(
-			{ name, feedback },
+			{ name, description, feedback },
 			{ onSuccess: () => reset({ feedback: "" }) },
 		);
 	});
@@ -588,11 +601,12 @@ function ToolRow({
 function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	const queryClient = useQueryClient();
 	const [deleteTarget, setDeleteTarget] = useState(null);
-	// The one revise job this panel is currently tracking, and which tool it
-	// belongs to. Mirrors InstallPanel's single `jobId` for the same reason:
-	// the backend's single-flight (D40) admits only ONE install/revise job at a
-	// time across every tool, so there is never more than one to track.
-	const [activeJob, setActiveJob] = useState(null); // { name, jobId } | null
+	// The one revise job this panel is currently tracking, and which tool
+	// INSTANCE it belongs to (name + the row's discriminator at submit time --
+	// see activeJobKey). Mirrors InstallPanel's single `jobId` for the same
+	// reason: the backend's single-flight (D40) admits only ONE install/revise
+	// job at a time across every tool, so there is never more than one to track.
+	const [activeJob, setActiveJob] = useState(null); // { name, description, jobId } | null
 
 	const { data, error, isError, isFetching, refetch } = useQuery({
 		queryKey: ["tools"],
@@ -670,8 +684,31 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	// discriminator (toolSummaryQueryKey): the acting ROW is the only place that
 	// knows which instance it is writing for, and reading it back out of the
 	// list cache here would just be the same value fetched less reliably.
-	const applySummaryDetail = (detail, { name, description }) => {
-		queryClient.setQueryData(toolSummaryQueryKey(name, description), detail);
+	const applySummaryDetail = async (detail, { name, description }) => {
+		const summaryKey = toolSummaryQueryKey(name, description);
+		// Cancel BEFORE writing, for both keys about to be written. A write that
+		// races a read it did not cancel is a write that can be undone by older
+		// data: setQueryData does not touch in-flight fetches, so a GET .../summary
+		// that a window refocus started BEFORE this PATCH -- and that read 「draft」
+		// -- can land AFTER this line and put 「draft」 back over the authoritative
+		// 「final」 we were just handed. Nothing would report it, because that GET
+		// SUCCEEDED: no error banner, no failed refetch, just the panel silently
+		// reverting to the pre-mutation state seconds after a green success toast.
+		// Same hazard for the row badge and its ["tools"] read.
+		//
+		// Verified against @tanstack/query-core 5.101.2 rather than assumed:
+		// queryClient.cancelQueries -> query.cancel({revert: true}) -> the retryer's
+		// `cancel` REJECTS its thenable synchronously (retryer.js lines 29-35), so
+		// query.#fetch takes its CancelledError path and never calls setData with
+		// the late response (query.js lines 308-318) -- and cancelQueries itself
+		// swallows everything (`.then(noop).catch(noop)`, queryClient.js line 146),
+		// so it can never reject this onSuccess. The invalidation at the end then
+		// starts a FRESH read, one that can only have seen the post-write server.
+		await Promise.all([
+			queryClient.cancelQueries({ queryKey: summaryKey }),
+			queryClient.cancelQueries({ queryKey: ["tools"] }),
+		]);
+		queryClient.setQueryData(summaryKey, detail);
 		// Patch ONLY summary_status on ONLY this row -- never fabricate a row (see
 		// patchToolRowSummaryStatus). The value is safe to cross over: the list's
 		// `summary_status` and the detail's `status` are narrowed through the same
@@ -750,8 +787,13 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	const reviseMutation = useMutation({
 		mutationFn: ({ name, feedback }) =>
 			apiPost(`/api/tools/${name}/revise`, { feedback }),
-		onSuccess: (result, { name }) => {
-			setActiveJob({ name, jobId: result.job_id });
+		onSuccess: (result, { name, description }) => {
+			// `description` is recorded, not sent: like the two summary mutations it
+			// rides in the variables purely as the acting row's instance
+			// discriminator, and it is what lets the progress card stay attached to
+			// the tool the revise was submitted against rather than to whatever
+			// package answers to that name later (see activeJobKey).
+			setActiveJob({ name, description, jobId: result.job_id });
 		},
 		onError: (mutationError) => {
 			notifications.show({
@@ -836,23 +878,62 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	// Deliberately does NOT include statusMutation.isPending: see the
 	// 定版/解除定版 button's own disabled comment in ToolSummaryPanel for why
 	// PATCH .../summary is exempt from this gate entirely.
-	const summaryBusy =
-		regenerateMutation.isPending ||
-		reviseMutation.isPending ||
-		reviseJobActive ||
-		externalBusy;
+	//
+	// TWO values, not one, and the split is what stops the mirror from echoing.
+	// `ownBusy` is what this panel knows FIRST-HAND and is the only thing it
+	// reports upward (see ownSummaryBusy); `summaryBusy` is the LOCAL gate, which
+	// additionally honours the other tab's flag. Reporting `summaryBusy` upward
+	// fed `externalBusy` straight back into the value the 工具 page mirrors, so
+	// the install form's own submit (installBusy -> our externalBusy -> our
+	// report -> the page's summaryBusy -> the install form's externalBusy) came
+	// back to it as 「已安裝工具」頁面有 AI 任務正在進行中 -- during that submit,
+	// before any job id anywhere existed.
+	const ownBusy = ownSummaryBusy({
+		regeneratePending: regenerateMutation.isPending,
+		revisePending: reviseMutation.isPending,
+		reviseJobActive,
+	});
+	const summaryBusy = ownBusy || externalBusy;
 
 	useEffect(() => {
-		onBusyChange?.(summaryBusy);
-	}, [summaryBusy, onBusyChange]);
+		onBusyChange?.(ownBusy);
+	}, [ownBusy, onBusyChange]);
 
 	// Same first-load / retry discipline as the AI 日誌 page: `data === undefined
 	// && isFetching` re-shows the Loader on 重新整理 after a failure, while a
 	// failed background refetch that still has rows falls through to them.
 	const loading = data === undefined && isFetching;
 	const showError = isError && data === undefined && !isFetching;
+	// The OTHER failure shape, which used to render as nothing at all: a
+	// background GET /api/tools failed while rows are still on screen. See the
+	// Alert below for why silence here was worse than a stale list.
+	const staleList = isError && data !== undefined;
 	const tools = data?.tools ?? [];
 	const mutating = toggleMutation.isPending || deleteMutation.isPending;
+
+	// The INSTANCE the tracked revise job was submitted against -- the same
+	// identity string the rows are keyed by (toolInstanceKey), captured at submit
+	// time. Association by NAME alone would follow the name to whatever package
+	// answers to it now, so a same-name reinstall would hand the old job's
+	// progress card to a row that is a different tool.
+	//
+	// This is DISPLAY ownership only. The per-row LOCKS below stay keyed on the
+	// NAME on purpose, and the difference is not an inconsistency: PATCH
+	// /api/tools/{name} and POST /api/tools/{name}/revise both address the
+	// backend BY NAME, so the filesystem hazard they gate lands on whatever
+	// package currently holds that name -- matching more loosely there is the
+	// conservative direction. Deciding which row a card belongs to is the
+	// opposite: matching loosely puts a card under a tool it does not describe.
+	const activeJobKey = activeJob
+		? toolInstanceKey(activeJob.name, activeJob.description)
+		: null;
+	// ...and if NO row owns it, it is shown at panel level instead (below), so a
+	// job can never become invisible while it is still holding the busy gate.
+	const orphanedJob =
+		activeJob !== null &&
+		!tools.some(
+			(tool) => toolInstanceKey(tool.name, tool.description) === activeJobKey,
+		);
 
 	return (
 		<Stack gap="md">
@@ -887,11 +968,73 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 				</Alert>
 			) : null}
 
+			{/* The list's counterpart to ToolSummaryPanel's own 「無法更新總結」
+			    banner, and for the same reason: react-query keeps `data` and only
+			    flips status to 'error', so a failed BACKGROUND refetch left these
+			    rows on screen looking freshly verified. Non-blocking on purpose --
+			    stale rows beat a blanked page, and 重新整理 is right above.
+
+			    What that silence allowed, concretely: the summary panel is keyed on
+			    the ROW's description, but GET /api/tools/{name}/summary addresses by
+			    NAME. So with a same-name reinstall, a FAILING GET /api/tools plus a
+			    SUCCEEDING summary GET wrote the NEW tool's summary under the OLD
+			    description's key, and the page rendered the new tool's summary beside
+			    the old tool's row description -- a mixture no single request was
+			    wrong about.
+
+			    Mixtures still possible after this banner, now all announced rather
+			    than silent: (a) exactly the one above -- the row fields (description,
+			    enabled, valid, error, summary_status) are from before the failure
+			    while an expanded panel's summary is current, because the summary
+			    query keeps succeeding independently; (b) the reverse, list current
+			    and summary stale, which the panel's own orange banner announces;
+			    (c) the documented residual the discriminator cannot see at all --
+			    two installs whose AI-written descriptions come out byte-identical
+			    share both the row key and the cache key (see toolSummaryQueryKey),
+			    and no banner fires because nothing failed. */}
+			{staleList ? (
+				<Alert color="orange" title="無法更新工具清單">
+					<Text size="sm">
+						{error?.message ?? "請稍後再試"}
+						。以下清單是先前讀到的內容，可能已過期（工具可能已被刪除或重新安裝），展開的
+						AI 總結則可能來自更新後的工具。
+					</Text>
+				</Alert>
+			) : null}
+
+			{/* A tracked revise job whose row is no longer in the list -- deleted
+			    mid-revise, or replaced by a same-name reinstall. The progress card
+			    normally lives INSIDE the row, so when the row went away the job kept
+			    polling and kept summaryBusy set while showing nothing: every other
+			    summary control stayed disabled for minutes with no explanation, and
+			    the eventual 「原工具在修訂期間被改動或重新安裝」/target-missing
+			    failure was never displayed at all. Hoisting the same card here keeps
+			    the invariant that a tracked job is visible EXACTLY once -- the row
+			    renders it when it owns the instance (see reviseJobId below), this
+			    renders it when no row does. */}
+			{orphanedJob ? (
+				<Stack gap="xs">
+					<Text size="sm" c="dimmed">
+						工具「{activeJob.name}
+						」的 AI 修訂進度（這個工具已被刪除或重新安裝，不再對應下方任何一列）
+					</Text>
+					<ToolJobProgress
+						kind="revise"
+						jobId={activeJob.jobId}
+						jobQuery={jobQuery}
+					/>
+				</Stack>
+			) : null}
+
 			{data && tools.length === 0 ? (
 				<EmptyState message="尚未安裝任何工具" />
 			) : null}
 
 			{tools.map((tool) => {
+				// The row's identity, not just its address. See toolInstanceKey: it
+				// is the summary cache key stringified, so a row is remounted at
+				// exactly the moment its summary query moves to a different entry.
+				const rowKey = toolInstanceKey(tool.name, tool.description);
 				const isSubmittingRevise =
 					reviseMutation.isPending &&
 					reviseMutation.variables?.name === tool.name;
@@ -913,7 +1056,17 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 					toggleMutation.variables?.name === tool.name;
 				return (
 					<ToolRow
-						key={tool.name}
+						// Keyed by INSTANCE, not by name. A name is reassignable (another
+						// tab can delete a tool and install a different one under it), and
+						// React reuses a component instance whose key is unchanged -- so
+						// with `key={tool.name}` the row's own state survived a swap the
+						// summary cache correctly treated as a new tool: the revise
+						// feedback typed for the old tool stayed in the textarea, ready to
+						// be submitted against the new one. This is the SAME identity
+						// question toolSummaryQueryKey answers, which is why the key is
+						// built from it and not spelled again -- if the discriminator ever
+						// gets stronger, both move together or the two disagree.
+						key={rowKey}
 						tool={tool}
 						mutating={mutating}
 						isTogglingThisTool={isTogglingThisTool}
@@ -949,7 +1102,12 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 						}
 						reviseMutation={reviseMutation}
 						isSubmittingRevise={isSubmittingRevise}
-						reviseJobId={activeJob?.name === tool.name ? activeJob.jobId : null}
+						// Instance match, so the card follows the tool it was submitted
+						// against rather than the name. When nothing matches, the panel
+						// shows it instead (see orphanedJob) -- the two conditions are
+						// complements of each other over the same key, so the card is
+						// rendered exactly once, never twice and never nowhere.
+						reviseJobId={rowKey === activeJobKey ? activeJob.jobId : null}
 						reviseJobQuery={jobQuery}
 					/>
 				);
@@ -1020,15 +1178,27 @@ function InstallPanel({ externalBusy = false, onBusyChange }) {
 				setNotConfigured(true);
 				return;
 			}
-			// One install runs at a time (backend 409 install_in_progress): show
-			// the backend's zh-TW reason inline on the form so the user knows to
-			// wait for the running install, rather than a transient toast. jobId is
-			// deliberately NOT touched here (and submit no longer clears it), so the
-			// still-running job stays tracked and its progress card keeps polling --
-			// the conflict is only that a SECOND install cannot start yet.
+			// One TOOL JOB runs at a time (backend 409 install_in_progress): show the
+			// reason inline on the form so the user knows to wait, rather than as a
+			// transient toast. jobId is deliberately NOT touched here (and submit no
+			// longer clears it), so a still-running job of our own stays tracked and
+			// its progress card keeps polling -- the conflict is only that a SECOND
+			// job cannot start yet.
+			//
+			// Local copy, via toolErrorMessage's opt-in codeCopy override (the same
+			// mechanism the revise path uses for tool_finalized): the backend's
+			// message for this code says 「已有安裝正在進行中」, but since D40 the
+			// slot it reports on is shared with AI 修訂 and 重新產生總結 -- so the
+			// most common way to see this is an install refused because the OTHER
+			// tab, or another browser, is revising. Naming an install that nobody
+			// started sends the user looking for it. The 404 arm of toolErrorMessage
+			// is unreachable from here: this branch is entered only on a 409.
 			if (submitError?.code === "install_in_progress") {
 				setConflictMessage(
-					submitError.message ?? "已有安裝正在進行中，請等待其完成",
+					toolErrorMessage(submitError, "已有工具任務正在進行中，請等待完成", {
+						install_in_progress:
+							"已有工具任務正在進行中（安裝、AI 修訂或重新產生總結），請等待完成後再安裝",
+					}),
 				);
 				return;
 			}
