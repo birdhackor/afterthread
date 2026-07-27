@@ -873,6 +873,134 @@ def test_runtime_refuses_after_the_enabled_toggle_rewrites_the_manifest(
     assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
 
 
+def test_a_toggle_during_the_scan_cannot_advertise_the_tool_it_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The window the identity capture had to move INTO ``_scan_package`` to close.
+
+    ``enabled_llm_tools`` materializes ``_scan_all()`` in full before the FIRST
+    handler is built, so with the identity taken at BUILD time the gap between
+    reading tool A's manifest and lstat'ing it spanned the scan of every other
+    package -- an unbounded number of file reads, not a syscall pair. A toggle
+    landing in there paired A's stale ``enabled``/spec/entry with the identity of
+    the manifest the toggle had ALREADY rewritten, so every downstream guard
+    compared equal and the disabled tool ran.
+
+    Driven from INSIDE the scan rather than from a racing thread, so it is the
+    window itself that is pinned and the test cannot flake: ``_scan_all`` walks
+    sorted names, so a toggle performed while "zzz" is being scanned is exactly
+    "after A was scanned, before any handler exists".
+
+    Advertising the stale row is NOT what this fixes (the scan genuinely read
+    ``enabled: true``, and D40 accepts a one-request-stale registry); what it
+    fixes is that the refusal at CALL time now has a pre-toggle identity to
+    refuse against, which is the same conservative direction
+    ``test_runtime_refuses_after_the_enabled_toggle_rewrites_the_manifest``
+    already pins for a toggle arriving one moment later."""
+    root = tmp_path / "tools"
+    sentinel = tmp_path / "ran"
+    _make_tool(
+        root,
+        "aaa",
+        f"import sys\nopen({str(sentinel)!r}, 'w').write('x')\nsys.stdout.write('ok')\n",
+    )
+    _make_tool(root, "zzz", "import sys\nsys.stdout.write('z')\n")
+    _install_tools(monkeypatch, root)
+
+    real_scan = tools._scan_package
+
+    def scan_then_toggle(directory: Path, expected_name: str | None = None) -> tools._PackageScan:
+        scan = real_scan(directory, expected_name=expected_name)
+        if directory.name == "zzz":
+            assert set_enabled("aaa", False) is True
+        return scan
+
+    monkeypatch.setattr(tools, "_scan_package", scan_then_toggle)
+    advertised = {tool.spec["function"]["name"]: tool.handler for tool in enabled_llm_tools()}
+
+    assert asyncio.run(advertised["aaa"]({})) == tools._TOOL_REPLACED_RESULT
+    assert not sentinel.exists()  # the disabled tool was never started
+    # The control: capturing A's identity EARLIER must not make an untouched
+    # package in the same scan refuse. Nothing rewrote zzz's manifest, so it runs.
+    assert asyncio.run(advertised["zzz"]({})) == "z"
+
+
+def test_a_promote_during_the_scan_cannot_run_the_new_package(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The same window with a replace-mode promote, which is the redirect hazard.
+
+    A ``cwd`` is resolved by the kernel from the PATH at exec, so pairing A's old
+    entry argv and old parameter schema with the identity of the package that
+    replaced A does not merely race -- it runs the NEW package's files under the
+    OLD contract, with the new package's ``.env``, and the AI log records only the
+    NAME, which did not change. The swap is spelled the way ``_promote_staging_
+    replace`` spells it (rename the old package aside, rename the new one in), and
+    it is performed from inside a later package's scan for the same determinism as
+    the toggle above."""
+    root = tmp_path / "tools"
+    _make_tool(root, "aaa", "import sys\nsys.stdout.write('OLD')\n")
+    _make_tool(root, "zzz", "import sys\nsys.stdout.write('z')\n")
+    replacement = _make_tool(tmp_path / "staging", "aaa", "import sys\nsys.stdout.write('NEW')\n")
+    _install_tools(monkeypatch, root)
+
+    pkg = root / "aaa"
+    real_scan = tools._scan_package
+
+    def scan_then_promote(directory: Path, expected_name: str | None = None) -> tools._PackageScan:
+        scan = real_scan(directory, expected_name=expected_name)
+        if directory.name == "zzz":
+            os.rename(pkg, root / ".aaa.bak-r7")
+            os.rename(replacement, pkg)
+        return scan
+
+    monkeypatch.setattr(tools, "_scan_package", scan_then_promote)
+    advertised = {tool.spec["function"]["name"]: tool.handler for tool in enabled_llm_tools()}
+
+    assert asyncio.run(advertised["aaa"]({})) == tools._TOOL_REPLACED_RESULT
+    assert (pkg / "run.py").read_text(encoding="utf-8").endswith("'NEW')\n")  # it IS the new one
+
+
+def test_the_identity_is_taken_before_the_manifest_read_so_the_gap_refuses(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The ORDER inside ``_scan_package``, which is the whole of R7-1 rather than
+    a detail of it -- and the one thing the two tests above cannot see, since a
+    swap landing after the whole scan is caught under either ordering.
+
+    The swap is driven into the residual gap itself: it happens the instant the
+    manifest READ returns, so it falls strictly between the two syscalls that
+    remain paired. lstat-then-read (what ships) pins the OLD identity against the
+    OLD spec here and against a NEW spec when the swap lands one syscall earlier
+    -- either way the call refuses. read-then-lstat pins the OLD spec against the
+    NEW identity, which compares EQUAL at execution and runs the replacement
+    under the old contract: moving that one line below the read turns this
+    assertion into ``'NEW'``."""
+    root = tmp_path / "tools"
+    _make_tool(root, "aaa", "import sys\nsys.stdout.write('OLD')\n")
+    replacement = _make_tool(tmp_path / "staging", "aaa", "import sys\nsys.stdout.write('NEW')\n")
+    _install_tools(monkeypatch, root)
+
+    pkg = root / "aaa"
+    real_read = tools._read_regular_file_capped
+    swapped = False
+
+    def read_then_promote(path: Path, cap: int) -> str | None:
+        nonlocal swapped
+        text = real_read(path, cap)
+        if not swapped and path == pkg / "tool.json":
+            swapped = True
+            os.rename(pkg, root / ".aaa.bak-r7")
+            os.rename(replacement, pkg)
+        return text
+
+    monkeypatch.setattr(tools, "_read_regular_file_capped", read_then_promote)
+    handler = enabled_llm_tools()[0].handler
+    assert swapped  # the swap really landed in the gap, not somewhere harmless
+
+    assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
+
+
 def test_runtime_identity_survives_a_summary_sidecar_write(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

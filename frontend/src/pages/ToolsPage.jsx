@@ -259,8 +259,9 @@ function SummaryStatusBadge({ status }) {
 // 定版/解除定版 button -- see that button's own disabled comment below for why.
 // 送出修訂 additionally answers to `displayedMayBeStale`, which is what this
 // panel knows first-hand about its OWN summary query; `isTogglingThisTool` is a
-// third gate with a different cause again; see the revise submit for the causal
-// chain.
+// third gate with a different cause again, and it applies to BOTH writes (R7-2)
+// -- see the revise submit and the 重新產生 button for the causal chain, which is
+// the same one on both.
 function ToolSummaryPanel({
 	name,
 	description,
@@ -403,7 +404,21 @@ function ToolSummaryPanel({
 					size="xs"
 					variant="light"
 					loading={isRegenerating}
-					disabled={writesBlocked || isFinal}
+					// `isTogglingThisTool` for the SAME reason 送出修訂 carries it, and
+					// it was half of a pairing that only ever got its other half (R7-2).
+					// POST .../summary/regenerate resolves the package and captures its
+					// manifest identity up front (tool_meta.regenerate_summary ->
+					// _resolve_package), then awaits a whole LLM round trip before the
+					// sidecar write re-checks that identity. PATCH /api/tools/{name}
+					// rewrites tool.json in place to flip `enabled`, which MOVES it -- so
+					// a toggle flipped anywhere inside that round trip makes the write
+					// refuse, `_store_meta` answer None, and the route return
+					// 404「工具不存在」 for a tool the user is looking at. Unlike a
+					// check-then-act instant this overlap lasts the whole generation, and
+					// the user has already paid for it by the time they are told the tool
+					// does not exist. The Switch is disabled from the other direction
+					// while this is in flight -- see its own `disabled` below.
+					disabled={writesBlocked || isFinal || isTogglingThisTool}
 					onClick={onRegenerate}
 				>
 					重新產生
@@ -655,7 +670,22 @@ function ToolRow({
 							// revise finds nothing to swap), and it is what a user who has
 							// given up on the tool actually wants -- it also runs through
 							// its own confirm modal rather than a one-click toggle.
-							disabled={!tool.valid || mutating || reviseBusyForThisTool}
+							//
+							// `isRegenerating` completes the SAME pairing for the OTHER AI
+							// write (R7-2). 重新產生 is synchronous, but "synchronous" is a
+							// statement about the HTTP request, not about duration: the
+							// route holds the manifest identity it resolved across a full
+							// LLM round trip and the sidecar write re-checks it at the end,
+							// so a toggle flipped meanwhile turns a completed generation
+							// into a 404. Per-ROW, and NOT folded into the panel-wide
+							// `mutating`: only THIS package's manifest is at stake, so
+							// another row's switch stays live while this one regenerates.
+							disabled={
+								!tool.valid ||
+								mutating ||
+								reviseBusyForThisTool ||
+								isRegenerating
+							}
 							onChange={(event) =>
 								onToggle(tool.name, event.currentTarget.checked)
 							}
@@ -1405,7 +1435,8 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 					(activeJob?.name === tool.name && reviseJobActive);
 				// The mirror-image term: a PATCH already on the wire for THIS tool.
 				// One toggleMutation serves every row, so the row must be matched
-				// explicitly -- toggling tool A does not endanger a revise of B.
+				// explicitly -- toggling tool A does not endanger a revise or a
+				// regenerate of B.
 				const isTogglingThisTool =
 					toggleMutation.isPending &&
 					toggleMutation.variables?.name === tool.name;
@@ -1444,8 +1475,11 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 						// same reason submitRevise re-checks it inside the panel: a
 						// disabled prop is a rendering, and the two AI writes must be
 						// impossible to issue while the gate holds, not merely awkward.
+						// `isTogglingThisTool` answers to that same rule (R7-2): it now
+						// gates the button as well, and a gate that lives only on a
+						// `disabled` prop is a rendering rather than a guard.
 						onRegenerate={() => {
-							if (summaryWritesBlocked) {
+							if (summaryWritesBlocked || isTogglingThisTool) {
 								return;
 							}
 							regenerateMutation.mutate({

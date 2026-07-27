@@ -2023,3 +2023,92 @@ hook 會因為「已定版」而拒絕更新，於是一段描述錯誤實作的
   都還寫著 `tool_job_in_progress`「刻意不重讀」，但 P4 r8 已經把它**反轉**並記下理由（那個 409
   講的不是「工作還沒寫東西」，而是**這個頁面之外有東西正在動這個後端**）。兩處都改成現況，並
   指名 r8 的理由；真正不重讀的只剩 `llm_not_configured`／502 與 5xx／傳輸失敗。
+
+### D40 附錄（overall review r7 O7-1）：規格與替它背書的身分要在同一個操作裡拍下來，而且順序決定往哪邊倒
+
+`enabled_llm_tools` 是 `[_build_llm_tool(scan) for scan in _scan_all() if …]`，`_scan_all()`
+回的是**完全 materialize 的 list**——所以**每一包都掃完**才輪到第一個 `_build_llm_tool`，而身分
+在那裡才 `lstat`。讀 A 的 `tool.json` 與 lstat A 的 `tool.json` 之間，隔著**其他所有套件的整趟
+掃描**（無上限的檔案讀取），而 `_build_llm_tool` 的 docstring 卻寫成「一對 syscall 寬、本子系統
+到處接受的殘留」。**那句話是假的，而且是 O6-2 更正過的同一種誇大。**
+
+兩個具體失敗，**都會通過下游每一道身分閘**——因為閘比對的是**變更之後**才拍下來的那個身分：
+
+- **(a) toggle**：A 掃出來是 enabled，掃後面幾包的期間操作者把 A 關掉（`set_enabled` 就地改寫
+  `tool.json`、推進 ctime）；`_build_llm_tool` 把 A 的**過期** enabled／規格／entry 配上
+  **toggle 之後**的身分，於是**已停用的工具照樣被廣告、照樣執行**——D40 早就裁定「對話中途
+  toggle 必須拒絕」（`test_runtime_refuses_after_the_enabled_toggle_rewrites_the_manifest`），
+  這條路把它無聲擊穿。
+- **(b) promote**：A 的舊規格、舊 entry argv 配上**新套件 B** 的身分，子行程在 B 的目錄裡、帶
+  B 的 `.env`、跑 A 的參數契約。O6-1 的改道危害從另一扇門走回來。
+
+**裁決：在 `_scan_package` 裡、讀 manifest 的同一個操作捕捉身分**，掛在 `_PackageScan.identity`
+上，`_build_llm_tool` 消費 `scan.identity` 而不是重新 lstat。
+
+**順序本身就是修法，不是修法的細節**——`lstat` 排在**讀之前**：
+
+- **lstat-then-read**：釘住**舊**身分對上可能是**新**的規格 → 執行時比對**不符 → 拒絕**（fail
+  safe），與本子系統到處採取的方向一致。
+- **read-then-lstat**：釘住**新**身分對上**舊**規格 → 執行時比對**相符 → 真的把新套件跑起來**
+  （fail open），正是上面 (b) 的形狀。
+- **實測（不是推論）**：把那一行搬到讀之後，
+  `test_the_identity_is_taken_before_the_manifest_read_so_the_gap_refuses` 當場拿到 `'NEW'`
+  ——**替換進來的套件真的執行了**；搬回讀之前就回到拒絕。**同一次實測還顯示另外兩個新測試在
+  兩種順序下都通過**，所以「順序」非有自己的測試不可：它是唯一會在重構中被當成無害搬動的那
+  一行。
+- 殘留窗口因此**真的**只剩 `lstat`→`open` 這一對，而且落在**拒絕**那一側；docstring 改成講
+  這件事，不再宣稱一個程式碼給不出的保證（r6 的規則）。
+
+**型別與空值**：`identity` 是 `tuple[int, int, int] | None`（manifest 身分的 3 元組，與
+`directory_identity` 的 2 元組在型別上分得開，O5-1 的結構性證明照舊）。**invalid 掃描一律
+None**，與 `parameters`／`entry`「只有 valid 才填」同一條慣例；而**valid 卻拿不到身分**
+（lstat 失敗、讀成功）照舊由 `_make_handler` **拒絕每一次呼叫**——說不出話的檢查不背書
+（P3b r11）。
+
+**可證的量測（修法前，HEAD `7efd2a6`）**：toggle 那個測試拿到 `'ok'`（**停用的工具跑了**），
+promote 那個拿到 `'NEW'`（**新套件跑了**）。
+
+### D40 附錄（overall review r7 O7-2）：啟用開關與同步重新產生也要互鎖，不是只有修訂拿到
+
+同一組互鎖在**修訂**上早就是雙向的：`submitRevise` 看 `isTogglingThisTool`、`啟用` 開關看
+`reviseBusyForThisTool`，理由寫在開關旁邊——一次 `tool.json` 改寫會把後端捕捉的 manifest 身分
+移走。**重新產生只拿到一半**：按鈕只看 `writesBlocked || isFinal`，開關的 `mutating` 也不含
+重新產生。
+
+**失敗形狀**：操作者按下重新產生 → 後端解析套件時捕捉身分（`tool_meta.regenerate_summary` →
+`_resolve_package`）→ LLM 往返期間操作者翻開關、`tool.json` 被改寫 → 側檔寫入端的身分閘正確
+地拒絕 → `_store_meta` 回 None → 路由回 **404「工具不存在」**，而那個工具明明還在。使用者**等
+完也付完**一整趟 LLM 呼叫，換到「這個工具不存在」。這是**橫跨整趟往返**的 UI 重疊，不是
+check-then-act 的一瞬間。
+
+**裁決：把既有的對稱補完**——按鈕加上 `isTogglingThisTool`（與 `送出修訂` 同款），開關加上
+**本列的** `isRegenerating`。兩個既有先例都照做：
+
+- **per-row，不是 panel 全域**：`isRegenerating` 早就按列比對（`regenerateMutation.variables
+  ?.name === tool.name`），所以不會鎖到別列；也**刻意不併進 `mutating`**——那會連同一列的
+  `刪除` 一起鎖掉，而刪除中途放棄一個工具本來就是允許的動作。
+- **`disabled` 是畫面，不是閘**：`onRegenerate` 這個真正發出寫入的 handler 裡**也**重檢
+  `isTogglingThisTool`，與它旁邊註解已經寫著的理由、以及 `submitRevise` 自己的重檢同一條規則。
+- **`定版/解除定版` 一個字都不動**：它不受忙碌閘管制是**已裁決**的（D40 P4 r1／r8／r11：它是
+  唯一的逃生路），這裡不擴張。
+
+**測試上的誠實**：這個條件是 JSX 的 `disabled` 運算式加一個 handler 內的重檢，**是元件層級**；
+本專案的 vitest 跑在 node、**沒有 jsdom**（`toolInstall.js` 檔頭與 P4 附錄都記著這件事），純函式
+以外的東西量不到，而這一條抽不成純函式（它讀的是兩個 mutation 的 in-flight 狀態與本列身分）。
+所以**沒有新增前端測試**，這裡寫明它未被覆蓋，而不是假裝有。
+
+### D40 附錄（overall review r7 O7-3）：兩處架構描述講的是實作沒有的契約
+
+沿用 O-3／O5-4 的體例：**就地改成實作真正的樣子**，不掛「這是舊文件」的告示。
+
+- **`web-v4-plan.md`：同步重新產生總結不在那張 job 表裡**。原句把「安裝、AI 修訂、同步重新產生
+  總結」並列成共用一張 job 表、共用 `toolJob*` 那套輪詢助手。實際上重新產生是**同步 mutation**：
+  只向同一個**准入**單一飛行取一個名額（`tool_builder.reserve_sync_operation`，與 `_admit_job`
+  共用 `_JOBS_LOCK`／`_SYNC_OPS`），**不建立 job**、回應是 `ToolSummaryDetail`（沒有 `job_id`）、
+  永遠不進輪詢。共用的是**名額**，不是 job 表——照原句實作 regenerate 客戶端的人，會去等一個
+  永遠不會來的 job id。
+- **`routers/ai.py`：「恰好三個 AI 操作宣告 502/503」已經不是現況**。那句話用來論證兩個日誌端點
+  「不影響契約」，但 `test_ai_contract` 現在列的是**三個工作流程 ＋ 安裝提交（只有 503）＋
+  `_TOOLS_SUMMARY_REGENERATE_OP`**——重新產生是**第四個**請求期 LLM 操作，兩個 exact set 都在。
+  照那句舊話去「修正」OpenAPI，會把重新產生真正需要的 502/503 宣告拆掉。註解改成只主張它有資格
+  主張的那件事：**這兩個端點兩個集合都不在**。

@@ -271,9 +271,18 @@ class _PackageScan:
 
     ``valid`` gates execution: an invalid package is listed (so the UI can show
     WHY, via ``error``) but never advertised to the model or executed.
-    ``parameters`` / ``entry`` are populated only when ``valid`` is True.
-    ``enabled`` is read as early as possible (right after the JSON parses) so
-    even an otherwise-invalid package reports the toggle state the operator set.
+    ``parameters`` / ``entry`` / ``identity`` are populated only when ``valid``
+    is True. ``enabled`` is read as early as possible (right after the JSON
+    parses) so even an otherwise-invalid package reports the toggle state the
+    operator set.
+
+    ``identity`` is the MANIFEST identity (``package_identity``) of the very
+    ``tool.json`` the other fields were read out of, and it rides HERE rather
+    than being re-taken by ``_build_llm_tool`` because the spec and the identity
+    that vouches for it have to be captured in ONE operation -- see
+    ``_scan_package`` for the ordering, and ``_build_llm_tool`` for what the
+    pairing buys. None on a VALID scan is possible (the lstat failed while the
+    read succeeded) and is a refusal downstream, never a pass.
     """
 
     name: str
@@ -284,6 +293,7 @@ class _PackageScan:
     error: str | None
     parameters: dict[str, Any] | None
     entry: list[str] | None
+    identity: tuple[int, int, int] | None
 
 
 # --- discovery / validation ------------------------------------------------
@@ -490,6 +500,7 @@ def _scan_package(directory: Path, expected_name: str | None = None) -> _Package
             error=error,
             parameters=None,
             entry=None,
+            identity=None,
         )
 
     # A package directory that is itself a SYMLINK is refused (listed invalid,
@@ -509,6 +520,22 @@ def _scan_package(directory: Path, expected_name: str | None = None) -> _Package
         return invalid("tool.json must be a real file (not a symlink)")
     if not tool_json.is_file():
         return invalid("missing tool.json")
+    # The identity that will VOUCH for the spec read on the next line, captured
+    # here so the two are ONE operation (R7-1). It used to be re-taken later, in
+    # _build_llm_tool -- and because _scan_all materializes EVERY package before
+    # the first tool is built, the gap between reading a manifest and lstat'ing
+    # it spanned the scan of every other package. A toggle or a promote landing
+    # in there paired one package's stale spec with the identity of what had
+    # already replaced it, which every downstream guard then compared EQUAL.
+    #
+    # BEFORE the read, not after, and that is the fix rather than a detail --
+    # measured both ways rather than reasoned about. lstat-then-read pins the OLD
+    # identity against a possibly NEW spec: the execution-time comparison then
+    # MISMATCHES and the call refuses, which is the direction this subsystem errs
+    # in everywhere. read-then-lstat pins the NEW identity against the OLD spec,
+    # which compares equal and RUNS the new package under the old contract. So
+    # the residual here is one lstat/open pair, and it falls on the refusing side.
+    identity = package_identity(directory)
     # Read the manifest through the ONE bounded-regular-file helper (F3b): its
     # fstat gate refuses a FIFO/socket/device swapped in for tool.json and its
     # O_NOFOLLOW backstops the is_symlink() fast path above against a symlink
@@ -568,6 +595,7 @@ def _scan_package(directory: Path, expected_name: str | None = None) -> _Package
         error=None,
         parameters=parameters,
         entry=list(entry),
+        identity=identity,
     )
 
 
@@ -1758,11 +1786,12 @@ def package_identity(directory: Path) -> tuple[int, int, int] | None:
     * ``tool_builder.run_revise`` takes it when the session reads the package and
       again immediately before the swap, so a multi-minute build cannot publish
       itself over a package the operator replaced meanwhile;
-    * ``_make_handler`` takes it when a package is turned into an ``LlmTool``
-      (i.e. when its schema is ADVERTISED to the model) and again before the
-      subprocess starts, so a revise that replaced the package mid-conversation
-      cannot have the model answer against the old schema while the NEW entry
-      runs;
+    * ``_scan_package`` takes it on the line above the manifest READ, so the spec
+      that gets ADVERTISED to the model and the identity that vouches for it come
+      out of one operation; ``_make_handler`` carries that value and takes this
+      again before the subprocess starts, so a revise that replaced the package
+      mid-conversation cannot have the model answer against the old schema while
+      the NEW entry runs;
     * ``store_summary_meta`` takes it when the directory a summary is being
       generated FOR is resolved, and again in the instant before the sidecar is
       written, so an LLM round trip cannot end with one package's summary landing
@@ -1861,13 +1890,20 @@ def _build_llm_tool(scan: _PackageScan) -> LlmTool:
     the assertions document that precondition and keep the type checker happy
     without an ``Any`` escape hatch.
 
-    The package's manifest identity is captured HERE, in the same call that
-    freezes the spec, because this is the moment the schema below becomes a
-    PROMISE to the model -- see ``_make_handler`` for what is done with it. The
-    instant between ``_scan_package``'s READ of ``tool.json`` and this ``lstat``
-    of it is the one thing the pairing cannot cover (a swap landing exactly there
-    pins the NEW identity against the OLD spec); that is one syscall pair wide and
-    the same check-then-act residual this subsystem accepts throughout.
+    The identity handed to ``_make_handler`` is the one ``_scan_package`` took on
+    the line above the manifest read (``scan.identity``), NOT a fresh ``lstat``
+    taken here -- and that is the point rather than an optimization. This
+    function does not run until ``_scan_all`` has returned, i.e. until EVERY
+    package has been scanned, so an ``lstat`` here would be separated from the
+    read it vouches for by an unbounded number of file reads: a toggle or a
+    promote landing in that gap pinned the NEW identity against the OLD spec, and
+    every downstream guard -- this handler's own, and the one above ``Popen`` --
+    then compared EQUAL and ran it. Pairing them at the read leaves a window of
+    exactly one ``lstat``/``open`` pair, and leaves it on the side that REFUSES
+    (see ``_scan_package`` for the measurement of both orderings).
+
+    A ``scan.identity`` of None still reaches ``_make_handler``, which refuses
+    every call rather than treating "cannot say" as "unchanged" (D40 P3b r11).
     """
     assert scan.parameters is not None
     assert scan.entry is not None
@@ -1882,7 +1918,7 @@ def _build_llm_tool(scan: _PackageScan) -> LlmTool:
     }
     return LlmTool(
         spec=spec,
-        handler=_make_handler(scan.directory, scan.entry, package_identity(scan.directory)),
+        handler=_make_handler(scan.directory, scan.entry, scan.identity),
     )
 
 
@@ -2891,9 +2927,10 @@ def _make_handler(
     final backstop.
 
     ``identity`` is that package's manifest identity as of the moment its schema
-    was advertised (``_build_llm_tool`` -> ``package_identity``), and the FIRST
-    thing this handler does is take it again and REFUSE on any difference. What
-    that closes: ``enabled_llm_tools()`` snapshots each tool's name, description,
+    was READ (``_scan_package`` -> ``package_identity``, the line above the read,
+    carried here on the scan), and the FIRST thing this handler does is take it
+    again and REFUSE on any difference. What that closes:
+    ``enabled_llm_tools()`` snapshots each tool's name, description,
     parameters and entry at the START of a capture / enrich / assist-update, but
     resolution and execution happen from the PATH, minutes later, when the model
     finally calls it -- and the ordinary AI workflows are not inside the tool

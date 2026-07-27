@@ -232,9 +232,15 @@ def llm_status() -> LLMStatus:
 
 # The read-only LLM interaction log (D09). Both endpoints stay in the /llm
 # namespace and deliberately declare NO 502/503: they never call the LLM, they
-# only read the in-memory ring, so the "exactly three AI operations declare
-# 502/503" contract (test_ai_contract) is untouched. The detail endpoint can
-# 404, declared below so generated clients know it.
+# only read the in-memory ring, so both stay OUT of the two exact sets
+# test_ai_contract pins -- which is the claim this comment makes, and the only
+# one it is entitled to. Those sets are no longer "exactly three AI operations":
+# D40's synchronous tool-summary regenerate is a FOURTH request-time LLM call
+# and joins BOTH (it raises the shared llm_not_configured / llm_upstream_error
+# defined here), and the installer's submit joins the 503 set alone under its own
+# tools_not_configured code. Adjusting either endpoint below to restore a
+# three-operation contract would strip declarations those operations genuinely
+# need. The detail endpoint can 404, declared below so generated clients know it.
 _LLM_LOG_NOT_FOUND = "LLM log not found"
 
 _LLM_LOG_NOT_FOUND_RESPONSE: dict[int | str, dict[str, Any]] = {

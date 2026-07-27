@@ -181,10 +181,16 @@ Revise job（與 install 共用 `_JOBS`／single-flight——任何 queued/runni
   （sync mutation）、「定版／解除定版」（PATCH）、意見 Textarea＋「送出修訂」
   （POST revise → 沿用 `toolInstall.js` 的純函式輪詢 `GET /api/tools/jobs/{job_id}`）。
   **規劃時寫的 `installJobRefetchInterval`／`isInstallJobActive` 這兩個名字已不存在**：
-  同一批工作（安裝、AI 修訂、同步重新產生總結）共用一張 job 表之後，實作把它們改成
+  安裝與 AI 修訂共用同一張 job 表（`GET /api/tools/jobs/{job_id}`）之後，實作把它們改成
   `toolJobRefetchInterval`／`isToolJobActive`（另有 `TOOL_JOB_POLL_MS`／
   `isTerminalToolJobState`／`toolJobQueryEnabled`）。名字裡的 install 是錯的資訊，不是
   拼字問題——它會讓人以為修訂另有一套輪詢。
+- **同步重新產生總結不在那張表裡**（原句把它和安裝、修訂並列成「共用一張 job 表」，是
+  錯的）：它是**同步 mutation**，只向同一個**准入**單一飛行取一個名額
+  （`tool_builder.reserve_sync_operation`，與 `_admit_job` 共用 `_JOBS_LOCK`／`_SYNC_OPS`），
+  **不建立 job**、回應是 `ToolSummaryDetail`（沒有 `job_id`）、也永遠不進 `toolJob*` 那套
+  輪詢。共用的是**名額**，不是 job 表——照原句去實作 regenerate 客戶端的人，會去等一個
+  永遠不會來的 job id。
 - revise job 進行中：該 row 控制項與 install 表單同受既有 gate 管制（同一 job 表
   single-flight，FE 呈現一致）。
 - 成功後 invalidate `["tools"]`；install 輪詢 URL 換到 `/api/tools/jobs/{job_id}`。
