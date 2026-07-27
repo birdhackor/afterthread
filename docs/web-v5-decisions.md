@@ -208,3 +208,107 @@ D40 的附錄指名了幾個以「enabled toggle」命名的測試，它們釘�
 的 `enabled_llm_tools` 每次。這是把可變狀態搬出 manifest 的固有代價（權威來源就
 是那個檔案），並非可以最佳化掉的東西；`_STATE_MAX_BYTES` 因此訂得比 manifest 還
 緊（4 KiB）：讀得一樣頻繁，而承載的只有一個布林。
+
+### D41 附錄（P1 review r1）：P1 自己拆掉的那道意外守衛，要用一把鎖補回來
+
+三條 finding，第一條是 **P1 引進的缺陷**，另兩條是它旁邊被一起看見的舊帳。
+
+#### R1-1：修訂會靜默還原一次成功的開關（P2）
+
+`_promote_staging_replace` 原本在 `_preserve_env_file` 旁邊就把正式套件的啟用狀態
+讀出來、寫進 staging，註解還寫著這一步「位置是自由的」（因為它有界又便宜）。**那句
+話就是缺陷**：讀完之後還排著 定版 重檢、`summary_status_or_unknown` 的側檔讀取、
+一整趟 `_scan_package`、以及兩個 rename——這段期間落地的任何一次
+`PATCH /api/tools/{name}` 都會被 staging 裡那份舊值蓋回去，而且**兩邊都回報成功**。
+
+**這個窗口在 P1 之前是被意外蓋住的**：開關會改寫 `tool.json`、位移 manifest 身分，
+換裝前的身分重檢因此拒絕。P1 讓身分不再位移（那正是它存在的目的），意外消失，**沒有
+任何東西接手**——重檢照樣通過，換裝照樣把舊布林出貨，操作者剛關掉的工具被重新端給
+模型。
+
+裁決分兩半，第二半才是真正關上它的：
+
+1. **讀取搬到能搬的最後一刻**：`carry_package_state` 現在是 tail 的第一句，排在
+   定版 閘與 origin 讀取**之後**、身分重檢**之前**。身分重檢仍然是第一個 rename
+   前的最後一道（D40 P3b r12 的裁決不動，且新增測試從 carry 內部置換套件來釘住
+   這個相對順序）。
+2. **光靠順序關不掉**（讀取與換裝之間永遠至少還有一次寫入），所以引入
+   `tools._STATE_PUBLISH_LOCK`，讓 `set_enabled` 的發佈與 promote 的
+   `[讀取 → 寫入 staging → 身分重檢 → 兩個 rename]` **互斥**。
+
+**為什麼這裡可以鎖，而 D40 overall r8 當初拒絕鎖開關**：同一個問題問在兩個不同長度
+的窗口上。r8 要鎖住的是**一整趟 LLM 往返**（以分鐘計、操作者看得見），所以裁決是把
+救不回來的那一半提前落盤、不動路由；這裡鎖住的是一次小寫入、一次 lstat 與兩個
+rename，全部以毫秒計，而且鎖內**沒有 await、沒有子行程、不取任何其他鎖**（唯一的
+巢狀風險已排除：`write_package_state` / `carry_package_state` /
+`_write_package_file_atomic` 全部不取鎖，都是在持有中被呼叫的）。備份的 `rmtree`／
+延後改名**刻意留在鎖外**——那不是「有界的一瞬間」，而且到那時修訂已經生效，落在那裡
+的開關會正確地落在新套件上。
+
+**它蓋不到什麼，寫明**：這是**行程內**的鎖，與 `_META_LOCK` 同一個等級。第二個
+afterthread 行程共用同一個 tools 目錄、或操作者手改 `.state.json`（D21 明文支援），
+都不受它序列化——本 app 就是**單一行程**（console script 同時服務 API 與 UI），
+它唯一的並行來源是每條路由都會跳進去的 threadpool，而那正是這把鎖涵蓋的東西。
+
+**一個張眼睛做的取捨**：啟用 carry 現在排在 定版 閘與第一個 rename **之間**，所以
+一次落在那次小寫入＋`fsync` 裡的 定版 會被漏掉——就跟一直以來落在身分 lstat 裡的
+那一次一樣。換到的是開關那個窗口**歸零**（原本橫跨一整趟掃描、側檔讀取與一道閘）。
+兩邊不對稱才是理由：定版 是操作者的動作落在**我們自己有界的一次寫入**裡（既有已接受
+的那一類，只是多一步），而開關是被一個操作者根本不會聯想到的操作**每一次都**還原掉，
+窗口還是 LLM session 的殘餘工作撐出來的。這條與 D40 P3b r4「定版 閘要排到最後」不
+牴觸：r4 拒絕的是**外部決定長度**的步驟（操作者選的 `.env` 大小），carry 的長度由
+`_MANIFEST_MAX_BYTES`／`_STATE_MAX_BYTES` 與一次 20 位元組的寫入決定。
+
+**這是過渡性的，而且程式碼裡就寫著**（`_STATE_PUBLISH_LOCK` 與
+`carry_package_state` 的註解都標了 TRANSITIONAL）：web-v5 的**目標版面**把
+`.state.json` 放在 `<name>/`、只換 `<name>/versions/<vid>/`，修訂根本不再碰開關的
+檔案，這整個危險在 P2 就不存在。**P2 要做的是刪掉它們，不是繼承它們**——一把活得比
+理由久的鎖，就是下一個 reviewer 的謎題。
+
+**可證的量測（把修法拿掉，當場失敗）**：
+
+- 把 carry 搬回 `.env` 複製旁邊 →
+  `test_a_toggle_that_lands_before_the_swap_is_carried_across_not_reverted` 拿到
+  `{'enabled': True}`（期望 `False`）——**剛被關掉的工具真的被重新打開**；
+- 把 `set_enabled` 的鎖拿掉 →
+  `test_set_enabled_publishes_under_the_state_publish_lock` 的探針回 `[False]`，
+  而 `test_a_toggle_arriving_during_the_swap_waits_for_it_and_still_wins` 裡那條
+  `PATCH` 直接撞進「套件已被改名到 backup」的瞬間、回 `False`（路由 404）。
+
+#### R1-2：README 寫的修法有一半根本不成立（P2）
+
+`_read_enabled_state` 把 symlink／FIFO／目錄與截斷／非 JSON／非布林一律列為
+unreadable，而 README 把六種情況列在一起、然後說「再按一次開關就好，PATCH 不讀這個
+檔案，直接覆蓋成乾淨的一份」。**對一般檔案是真的，對非一般檔案是假的**：
+`_write_package_file_atomic` 的 pre-write `lstat` 一律拒絕非一般檔，所以 PATCH 失敗、
+路由回 404，那個 FIFO 原封不動地留在那裡。工具被正確地列成無效並停用，但**宣稱的修法
+不是修法**。
+
+**裁決：改文件，不改寫入邊界。** 那道拒絕是刻意的寫入邊界性質（`os.replace` 換掉的是
+連結本身、從不寫穿它），而 `_remove_reserved_sidecar_path` 的「什麼都 unlink」只適用
+於 **staging 裡的 builder 產出**，不適用於正式套件。README 因此把兩類拆開：一般檔案
+壞掉 ⇒ 按開關即可修好；非一般檔案 ⇒ 只能自己動手移除該項目（操作者按定義有 shell，
+D21）。
+
+**沒有實作、留作建議**：可以在發佈器之外加一條「先 unlink 再 publish」的修復路徑
+（例如 `set_enabled` 在確認目標是非一般檔時先移除它）。它會讓 UI 上的開關也能修好
+這種套件，代價是把「絕不動非一般檔」這條寫入邊界規則開一個口——那應該是它自己的一次
+裁決，不是這一輪順手做掉的事。
+
+#### R1-3：修訂會靜默收窄狀態檔的權限（P3）
+
+發佈器保留既有檔案的低 9 位權限（R7-3／R11 的紀律），但**它是從寫入目標那裡繼承**
+的，而修訂寫進的是 staging——那裡按構造沒有 `.state.json`，於是每一次不相干的修訂
+都把操作者設的 `0640`（讓同群組的行程讀得到）收窄回預設值。同一個理由讓
+README「PATCH 是這個檔案唯一的寫入者」那句話也不成立：修訂的發佈路徑也寫它。
+
+**裁決：沿用同一個機制，不發明第二個。** `_write_package_file_atomic` 多一個
+keyword-only 的 `default_mode`（「第一次寫入要用的權限」，正規化規則與繼承來的完全
+一樣：低 9 位 OR `_OWNER_RW`），`carry_package_state` 讀正式套件那個檔案的權限、
+往下傳。**目標端已經有檔案時仍然是繼承贏**——真的在那裡的東西勝過呼叫端對「本來會
+是什麼」的猜測。**正式套件沒有狀態檔、或那裡不是一般檔**時沒有權限可繼承，維持今天
+的預設值（`_OWNER_RW`）。
+
+**可證的量測**：把 `default_mode` 的傳遞拿掉 →
+`test_a_revise_carries_the_state_files_mode_not_just_its_value[operator-set]`
+量到 `0o600`（期望 `0o640`）。

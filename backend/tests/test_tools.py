@@ -2762,6 +2762,92 @@ def test_set_enabled_refuses_a_symlinked_state_file(
     assert listed["error"] == tools._STATE_UNREADABLE_ERROR
 
 
+def test_set_enabled_publishes_under_the_state_publish_lock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The toggle's half of the mutual exclusion (web-v5 P1, R1-1).
+
+    A revise's swap replaces the WHOLE package directory, so it carries the live
+    toggle into staging first -- and a PATCH landing between that read and the
+    rename is silently REVERTED, with both operations reporting success. Since P1 a
+    toggle no longer moves the manifest identity, so the swap's identity re-check
+    (which used to refuse that case by accident) passes and ships the stale value.
+    Ordering cannot close the window on its own, so both sides take
+    ``_STATE_PUBLISH_LOCK``; this pins THIS side, and
+    ``test_a_toggle_arriving_during_the_swap_waits_for_it_and_still_wins`` pins the
+    swap's.
+
+    Asserted from inside the publish rather than by racing the swap:
+    ``acquire(blocking=False)`` fails on a held non-reentrant lock even for its own
+    holder, so the hold is measured in one thread. The RESOLVE stays outside the
+    hold deliberately -- a toggle that resolves before a swap and publishes after
+    one lands on the package that now owns the name, which is the right answer."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", enabled=True)
+    _install_tools(monkeypatch, root)
+    real_write = tools.write_package_state
+    held: list[bool] = []
+
+    def write_and_report_the_hold(directory: Path, enabled: bool, **kwargs: Any) -> bool:
+        held.append(not tools._STATE_PUBLISH_LOCK.acquire(blocking=False))
+        return real_write(directory, enabled, **kwargs)
+
+    monkeypatch.setattr(tools, "write_package_state", write_and_report_the_hold)
+
+    assert set_enabled("echo", False) is True
+
+    assert held == [True]  # the write happened INSIDE the hold, not beside it
+    assert tools._STATE_PUBLISH_LOCK.acquire(blocking=False) is True  # released again
+    tools._STATE_PUBLISH_LOCK.release()
+    assert json.loads((pkg / tools._STATE_FILENAME).read_text(encoding="utf-8")) == {
+        "enabled": False
+    }
+
+
+def test_a_non_regular_state_file_is_not_repaired_by_the_toggle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The documented repair splits in two, and this is the half it does NOT cover.
+
+    A regular file holding garbage IS repaired by pressing the toggle again -- the
+    publish does not read the file, it replaces it (pinned by
+    ``test_an_unreadable_state_file_disables_rather_than_defaulting_to_on``). A
+    NON-REGULAR entry at that name is not: ``_write_package_file_atomic``'s
+    pre-write ``lstat`` refuses any non-regular target outright, which is a
+    deliberate write-boundary property and not something to relax so a README
+    sentence comes true. So the PATCH fails, the route answers 404, the entry sits
+    there untouched, and the only repair is the operator removing it by hand (D21).
+
+    A DIRECTORY is the shape pinned here; the other two the README enumerates have
+    tests of their own for reasons of their own -- a symlink because it must not be
+    written THROUGH (``test_set_enabled_refuses_a_symlinked_state_file``), a FIFO
+    because it must not HANG (``test_set_enabled_with_a_fifo_manifest_does_not_hang``)."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", enabled=True)
+    (pkg / tools._STATE_FILENAME).mkdir()
+    (pkg / tools._STATE_FILENAME / "keep.txt").write_text("operator's", encoding="utf-8")
+    _install_tools(monkeypatch, root)
+
+    assert set_enabled("echo", False) is False  # what the route turns into a 404
+    assert set_enabled("echo", True) is False  # neither direction repairs it
+
+    entry = pkg / tools._STATE_FILENAME
+    assert entry.is_dir() and (entry / "keep.txt").read_text(encoding="utf-8") == "operator's"
+    assert sorted(child.name for child in pkg.iterdir()) == [
+        tools._STATE_FILENAME,
+        "run.py",
+        "tool.json",
+    ]  # no temp file left behind by the refusal either
+    listed = {t["name"]: t for t in list_tools()}["echo"]
+    assert listed["valid"] is False and listed["enabled"] is False
+    assert listed["error"] == tools._STATE_UNREADABLE_ERROR
+
+    # The hand repair the README now names -- and only it -- puts the tool back.
+    shutil.rmtree(entry)
+    assert set_enabled("echo", False) is True
+    assert {t["name"]: t["enabled"] for t in list_tools()}["echo"] is False
+
+
 def test_delete_internal_alias_removes_only_link(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

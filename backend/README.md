@@ -234,8 +234,11 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   到 `/proc/<ppid>/environ`）。
 - **啟用開關存在 `.state.json`，不在 `tool.json` 裡**（web-v5 P1，設計依據見
   `docs/web-v5-decisions.md`）。套件層的隱藏檔，內容就是 `{"enabled": bool}`，
-  唯一的寫入者是 `PATCH /api/tools/{name}`（`tools.set_enabled`，mkstemp →
-  fsync → `os.replace` 的原子發佈）。**為什麼分開**：`tool.json` 的
+  寫入者**只有兩個**，而且共用同一套原子發佈（mkstemp → fsync → `os.replace`，
+  並保留既有檔案的權限）：`PATCH /api/tools/{name}`（`tools.set_enabled`），
+  以及**修訂換裝前**把正式套件當下的狀態（含檔案權限）重新寫進暫存區的那一步
+  （`tools.carry_package_state`，見下面保留名域那一項）。兩者互斥執行，所以一次
+  落在換裝過程中的 `PATCH` 不會被換裝原樣蓋回去。**為什麼分開**：`tool.json` 的
   `(dev, ino, ctime)` 是本子系統回答「這個路徑上還是我剛才看的那一包嗎」的判準
   （修訂換裝、總結側檔寫入、對話中途執行前都要問），而 `enabled` 住在裡面時，
   一次開關就地改寫那個檔案、把判準推走——一次開關對每一道守衛都長得像「整包被
@@ -248,14 +251,25 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
     symlink・FIFO・目錄，一律代表「操作者的意圖不明」，該套件列成
     `valid=false`、`error=".state.json exists but is not readable"`，同時
     `enabled=false`。刻意不退回預設開啟——那等於把一個被特意關掉的工具重新交給
-    模型。修法：再按一次開關（PATCH 不讀這個檔案，直接覆蓋成乾淨的一份），或
-    自己把檔案刪掉退回上面的 fallback。（前端的開關在 `valid=false` 的列上是
-    停用的，所以 UI 上的修法是後者或重裝；API 兩條都通。）
+    模型。**修法依「壞掉的是什麼」分兩種**：
+    - **一般檔案但內容壞掉**（截斷、不是 JSON、`enabled` 不是布林、超過上限）：
+      再按一次開關就修好——PATCH 不讀這個檔案，直接覆蓋成乾淨的一份；或自己把
+      檔案刪掉退回上面的 fallback。
+    - **那個名字上不是一般檔案**（symlink、FIFO、目錄）：**按開關沒有用**。
+      發佈器的 pre-write `lstat` 一律拒絕非一般檔（這是刻意的寫入邊界性質，
+      `os.replace` 換掉的是連結本身、從不寫穿它），所以 PATCH 會失敗、路由回
+      404，而那個 FIFO／連結／目錄原封不動。**只能自己動手把該項目移除**（`rm`／
+      `rm -r` 那個 `.state.json`），之後再按開關或直接退回 fallback——手改套件
+      檔案本來就是 D21 明文支援的行為，操作者按定義有 shell。
+    （前端的開關在 `valid=false` 的列上是停用的，所以 UI 上一律是「自己刪檔或
+    重裝」；API 則只有上面第一種情況通。）
   - **`.state.json` 與 `.ai_meta.json` 同屬後端保留名域**：builder session 不能
     出貨（promote 前一律剷除，含 `<名稱>.*.tmp` 發佈暫存檔、含各層級、比對大小寫
     不敏感），修訂複製也不帶進暫存區；但換裝是整包替換，所以換裝前後端會把**正式
-    套件當下的啟用狀態**重新寫進暫存區，寫不進去就拒絕換裝——否則每一次修訂都會
-    把你刻意關掉的工具靜默打開。
+    套件當下的啟用狀態**（連同該檔案的權限）重新寫進暫存區，寫不進去就拒絕換裝
+    ——否則每一次修訂都會把你刻意關掉的工具靜默打開。這一步刻意排在**能排的最後
+    一刻**（身分重檢的前一行），而且與 `PATCH` 互斥：讀到的開關值與換裝之間若還
+    夾著別的工作，那段時間內的一次 `PATCH` 就會被換裝靜默蓋回去。
 - **安裝器**（`services/tool_builder.py`，`/tools` 頁「安裝新工具」分頁的後端；
   設計依據見 `docs/web-v2-decisions.md` D21/D27）：`POST /api/tools/install`
   在背景跑一次帶有四個 meta-tool（`write_file`／`read_file`／`list_dir`／

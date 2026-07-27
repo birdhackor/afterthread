@@ -4539,6 +4539,248 @@ def test_promote_replace_copies_a_live_env_at_the_ceiling_byte_for_byte(tmp_path
     assert _leftovers(base) == []
 
 
+def _state_publish_lock_is_held() -> bool:
+    """Is ``tools._STATE_PUBLISH_LOCK`` held RIGHT NOW?
+
+    ``acquire(blocking=False)`` on a non-reentrant ``threading.Lock`` fails even
+    for the thread that already holds it, so this answers from inside the promote's
+    own thread without a second one -- and releases again on the "not held" branch
+    so the probe itself never changes what it measures."""
+    if tools._STATE_PUBLISH_LOCK.acquire(blocking=False):
+        tools._STATE_PUBLISH_LOCK.release()
+        return False
+    return True
+
+
+def test_a_toggle_that_lands_before_the_swap_is_carried_across_not_reverted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R1-1: the live toggle is read at the LAST moment, not at the first (web-v5 P1).
+
+    The carry used to sit beside the ``.env`` copy, before the 定版 gate, the
+    sidecar read and its own ``_scan_package`` -- and its comment called that
+    position "free" because the step itself is bounded and tiny. Bounded is not
+    EARLY: a ``PATCH /api/tools/{name}`` landing anywhere after that read was
+    SILENTLY REVERTED, because the staging copy already held the old value and the
+    swap then published it over the operator's newer one.
+
+    Before P1 that window was covered BY ACCIDENT -- the toggle rewrote
+    ``tool.json``, the identity moved, and the re-check refused the swap. P1 removed
+    the accident (that is the whole point of it) and nothing replaced it, so the
+    re-check now passes and the stale boolean ships. Both operations report success.
+
+    Driven from INSIDE the 定版 gate, the way the r6/r7/r8 window tests drive
+    theirs: with the old ordering the published state file comes out ``true`` and
+    the tool the operator just switched off is offered to the model again."""
+    base = tmp_path / "tools"
+    installed, staging = _replace_fixture(base)
+    _install_settings(monkeypatch, tools_dir=str(base))
+    assert tools.package_enabled(installed) is True  # the value the carry would read
+    real_gate = tools.summary_status_or_unknown
+    toggled: list[bool] = []
+
+    def toggle_off_inside_the_gate(directory: Path) -> tuple[str | None, dict[str, Any] | None]:
+        result = real_gate(directory)
+        toggled.append(tools.set_enabled("kbsearch", False))
+        return result
+
+    monkeypatch.setattr(tools, "summary_status_or_unknown", toggle_off_inside_the_gate)
+
+    origin, error = tool_builder._promote_staging_replace(
+        staging,
+        "kbsearch",
+        base,
+        env_existed_at_start=False,
+        package_identity=tool_builder._package_identity(installed),
+        registered=[],
+    )
+
+    assert toggled == [True]  # the window is real: the PATCH ran, and it succeeded
+    assert error is None and origin is None
+    assert (installed / "run.py").read_text(encoding="utf-8") == "print('revised')"  # it swapped
+    # ... and the operator's LATER intent survived the swap that shipped over it.
+    assert json.loads((installed / tools._STATE_FILENAME).read_text(encoding="utf-8")) == {
+        "enabled": False
+    }
+    assert {t["name"]: t["enabled"] for t in tools.list_tools()}["kbsearch"] is False
+    assert tools.enabled_llm_tools() == []
+    assert _leftovers(base) == []
+
+
+def test_a_toggle_arriving_during_the_swap_waits_for_it_and_still_wins(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R1-1's second half: ordering alone cannot close the window, so the toggle
+    and the swap's tail are made MUTUALLY EXCLUSIVE.
+
+    Even read at the last possible moment there is still a staging write, an lstat
+    and two renames between reading the live toggle and publishing it, and a PATCH
+    inside THAT is lost exactly the same way. ``tools._STATE_PUBLISH_LOCK`` covers
+    [carry -> identity re-check -> both renames] on this side and ``set_enabled``'s
+    publish on the other, so the two cannot interleave at all.
+
+    Pinned three ways, the first two without depending on any timing: the lock is
+    HELD at the start of the tail and still held at the rename boundary, and it is
+    RELEASED by the time the promote returns. The thread is the demonstration, not
+    the mechanism -- it is started from inside the tail, so with the lock gone its
+    write would race the swap it must outlive. Why a lock is acceptable here and was
+    rejected in D40 r8: everything inside the hold is a small write, an lstat and
+    two renames, not an LLM round trip."""
+    base = tmp_path / "tools"
+    installed, staging = _replace_fixture(base)
+    _install_settings(monkeypatch, tools_dir=str(base))
+    patched: dict[str, bool] = {}
+    started = threading.Event()
+    outcome: dict[str, bool] = {}
+
+    def toggle() -> None:
+        started.set()
+        outcome["ok"] = tools.set_enabled("kbsearch", False)
+
+    worker = threading.Thread(target=toggle, daemon=True)
+    real_carry = tools.carry_package_state
+    real_backup_path = tool_builder._backup_path
+
+    def carry_then_let_a_toggle_try(source: Path, destination: Path) -> bool:
+        carried = real_carry(source, destination)
+        patched["held_at_the_carry"] = _state_publish_lock_is_held()
+        worker.start()
+        started.wait(timeout=30)  # the PATCH is now inside set_enabled, blocked
+        return carried
+
+    def probe_at_the_rename_boundary(base_dir: Path, name: str, token: str) -> Path:
+        patched["held_at_the_rename"] = _state_publish_lock_is_held()
+        return real_backup_path(base_dir, name, token)
+
+    monkeypatch.setattr(tools, "carry_package_state", carry_then_let_a_toggle_try)
+    monkeypatch.setattr(tool_builder, "_backup_path", probe_at_the_rename_boundary)
+
+    origin, error = tool_builder._promote_staging_replace(
+        staging,
+        "kbsearch",
+        base,
+        env_existed_at_start=False,
+        package_identity=tool_builder._package_identity(installed),
+        registered=[],
+    )
+    worker.join(timeout=30)
+
+    assert patched == {"held_at_the_carry": True, "held_at_the_rename": True}
+    assert _state_publish_lock_is_held() is False  # released with the swap, not later
+    assert not worker.is_alive() and outcome["ok"] is True  # it was blocked, not refused
+    assert error is None and origin is None
+    assert (installed / "run.py").read_text(encoding="utf-8") == "print('revised')"  # it swapped
+    assert json.loads((installed / tools._STATE_FILENAME).read_text(encoding="utf-8")) == {
+        "enabled": False
+    }
+    assert _leftovers(base) == []
+
+
+def test_promote_replace_refuses_a_package_replaced_during_the_state_carry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R12-1 re-pinned one step later: the identity re-check is STILL the last
+    thing before the first rename, now that a step was moved in behind it.
+
+    The r12 test drives its swap from inside the sidecar read; the 啟用 carry runs
+    AFTER that read, so this drives one from inside the CARRY -- the only new I/O
+    the tail gained. A check whose whole job is "nothing changed since we looked"
+    has to occupy the last instant it can, and putting the carry after it would have
+    handed that instant away."""
+    base = tmp_path / "tools"
+    installed, staging = _replace_fixture(base)
+    real_carry = tools.carry_package_state
+
+    def carry_then_move_the_identity(source: Path, destination: Path) -> bool:
+        carried = real_carry(source, destination)
+        _edit_manifest_in_place(installed)  # a hand edit (D21), byte-identical
+        return carried
+
+    monkeypatch.setattr(tools, "carry_package_state", carry_then_move_the_identity)
+
+    origin, error = tool_builder._promote_staging_replace(
+        staging,
+        "kbsearch",
+        base,
+        env_existed_at_start=False,
+        package_identity=tool_builder._package_identity(installed),
+        registered=[],
+    )
+
+    assert error == tool_builder._ERROR_REVISE_TARGET_REPLACED
+    assert origin is None
+    assert (installed / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY  # never swapped
+    assert _leftovers(base) == []
+
+
+def test_promote_replace_refuses_when_the_state_cannot_be_carried(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A carry that fails REFUSES the revise -- it does not swap and hope.
+
+    Everything the carry writes lands in STAGING, so the refusal costs one
+    abandoned build and nothing observable; publishing anyway would mean a package
+    with no state file at all, read through the manifest fallback as ENABLED. The
+    failure is injected at the carry itself because every real way to make the
+    write fail (a non-regular file at the staged name) is deleted on the way in by
+    ``_strip_builder_sidecars`` -- which is the point of that step."""
+    base = tmp_path / "tools"
+    installed, staging = _replace_fixture(base)
+    monkeypatch.setattr(tools, "carry_package_state", lambda source, destination: False)
+
+    origin, error = tool_builder._promote_staging_replace(
+        staging,
+        "kbsearch",
+        base,
+        env_existed_at_start=False,
+        package_identity=tool_builder._package_identity(installed),
+        registered=[],
+    )
+
+    assert error == tool_builder._ERROR_REVISE_STATE_RESTORE
+    assert origin is None
+    assert (installed / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY  # never swapped
+    assert _leftovers(base) == []  # refused before the first rename, so no backup exists
+
+
+@pytest.mark.parametrize("live_mode", [0o640, None], ids=["operator-set", "no-live-file"])
+def test_a_revise_carries_the_state_files_mode_not_just_its_value(
+    tmp_path: Path, live_mode: int | None
+) -> None:
+    """R1-3: an operator's ``chmod`` on ``.state.json`` survives a revise.
+
+    The publisher preserves an existing file's low-9 mode (R7-3/R11) by inheriting
+    it AT THE TARGET -- and the revise's target is STAGING, which has no state file
+    by construction, so there was nothing to inherit and every unrelated revise
+    silently narrowed a ``0o640`` the operator set (so a same-group process could
+    read it) back to the default. Same discipline, one parameter: the carry reads
+    the LIVE file's mode and hands it down as the first-write default.
+
+    The second case is the other half of "preserve means do not CHANGE": with no
+    live state file there is no mode to inherit and the default stands."""
+    base = tmp_path / "tools"
+    installed, staging = _replace_fixture(base)
+    if live_mode is not None:
+        assert tools.write_package_state(installed, False) is True
+        (installed / tools._STATE_FILENAME).chmod(live_mode)
+
+    origin, error = tool_builder._promote_staging_replace(
+        staging,
+        "kbsearch",
+        base,
+        env_existed_at_start=False,
+        package_identity=tool_builder._package_identity(installed),
+        registered=[],
+    )
+
+    assert error is None and origin is None
+    assert (installed / "run.py").read_text(encoding="utf-8") == "print('revised')"  # it swapped
+    published = installed / tools._STATE_FILENAME
+    assert published.stat().st_mode & 0o777 == (live_mode or tools._OWNER_RW)
+    # The VALUE came across too, so this is not a mode test passing on an empty swap.
+    assert json.loads(published.read_text(encoding="utf-8")) == {"enabled": live_mode is None}
+
+
 def test_stale_backup_names_are_minted_and_recognized_by_one_shape(tmp_path: Path) -> None:
     """``tools._stale_backup_path`` writes the name and ``tools._STALE_BACKUP_RE``
     reads it back off disk, so the two must agree for the sweep to find its litter

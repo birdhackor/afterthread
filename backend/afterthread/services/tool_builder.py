@@ -2071,14 +2071,19 @@ def _promote_staging_replace(
     never takes a deleted credential file's place (R3-1, see
     ``_preserve_env_file``).
 
-    The package's 啟用 state is carried across on the next line, and it is the same
-    shape of step for the same kind of reason (web-v5 P1): ``.state.json`` is
-    backend-authored, so it is kept out of staging and re-published here from the
-    LIVE package instead of being copied into a session that could rewrite it. A
-    failure REFUSES the revise -- see the comment at the call and
-    ``_ERROR_REVISE_STATE_RESTORE``.
+    The package's 啟用 state is carried across too, and it is the same shape of step
+    for the same kind of reason (web-v5 P1): ``.state.json`` is backend-authored, so
+    it is kept out of staging and re-published from the LIVE package instead of
+    being copied into a session that could rewrite it. A failure REFUSES the revise
+    -- see the comment at the call and ``_ERROR_REVISE_STATE_RESTORE``. Unlike the
+    ``.env`` copy it does NOT sit here: it is the FIRST statement of the locked tail
+    below, because what it reads is a value the operator can change at any instant
+    (R1-1), and every step between that read and the swap is a window in which the
+    change is lost.
 
-    The swap itself is rename-aside, move-in, drop-the-backup:
+    The swap itself is rename-aside, move-in, drop-the-backup, and it runs -- with
+    the 啟用 carry and the identity re-check -- under ``tools._STATE_PUBLISH_LOCK``,
+    which is what keeps a ``PATCH /api/tools/{name}`` from landing inside it:
 
     * the old package is renamed to a DOT-prefixed sibling
       ``.{name}.bak-<uuid>``. Dot-prefixed is load-bearing, not cosmetic:
@@ -2123,6 +2128,16 @@ def _promote_staging_replace(
     a single-user local tool, and no new standard is invented for it here. Every
     one of them is an INSTANT between two syscalls, which is the property R4-1
     restored by moving the one step that was not (the ``.env`` copy) off the end.
+
+    ONE window is wider than that, and it is a trade taken with its eyes open
+    (R1-1): the 啟用 carry now sits between the 定版 gate and the first rename, so
+    a finalization landing inside a small write + ``fsync`` is missed the way one
+    landing inside the identity lstat always was. What that buys is the toggle
+    window going to ZERO instead of spanning a full scan, a sidecar read and a
+    gate. The asymmetry is why: 定版 is an operator action landing inside OUR
+    bounded write (the same accepted class, one step longer), while the toggle was
+    being reverted by an operation the operator did not connect to it, every time,
+    over a window an LLM session's leftovers made wide.
     """
     root_error = _verify_staging_root(staging, base)
     if root_error is not None:
@@ -2150,30 +2165,6 @@ def _promote_staging_replace(
     )
     if env_error is not None:
         return None, env_error
-    # The 啟用 state is carried across the swap the same way, and for a reason the
-    # revise flow did not used to have (web-v5 P1): the toggle now lives in the
-    # package's own ``.state.json``, which ``_revise_copy_ignore`` deliberately
-    # keeps OUT of staging (it is backend-authored -- a session with shell must not
-    # be able to rewrite the file that decides whether its own tool may run) and
-    # ``_strip_builder_sidecars`` deletes if the session wrote one anyway. The swap
-    # below replaces the WHOLE directory, so without this line every revise would
-    # publish a package with no state file at all -- read through the manifest
-    # fallback as ENABLED, silently undoing a switch the operator set.
-    #
-    # ``package_enabled`` on the LIVE package, not on staging: staging has no state
-    # file by construction, and the live answer is the one being preserved. It reads
-    # an unreadable state file as False, so a corrupt one is carried across as
-    # DISABLED rather than repaired into "on" -- the same direction the scan takes.
-    # A failed write REFUSES the revise (see ``_ERROR_REVISE_STATE_RESTORE``); it
-    # writes into staging, so nothing observable is left behind by the refusal.
-    #
-    # It sits next to the ``.env`` copy for the same structural reason: both layer
-    # the BACKEND's own bytes onto a package that has already passed
-    # ``validate_package``, which judges what the BUILDER produced. Bounded and
-    # tiny, unlike that copy, so its position relative to the 定版 gate below is
-    # free -- it is here to keep the two preservation steps together.
-    if not tools.write_package_state(staging, tools.package_enabled(target)):
-        return None, _ERROR_REVISE_STATE_RESTORE
     # 定版 is re-checked HERE, at the last moment before the swap, not only at
     # the entry gates -- the same store-time re-check ``tools.store_summary_meta``
     # makes for regenerate (D40 r2), and for the same reason at a much longer
@@ -2220,58 +2211,102 @@ def _promote_staging_replace(
     if status == tools._SUMMARY_STATUS_UNKNOWN:
         return None, _ERROR_REVISE_SUMMARY_UNREADABLE
     origin = _existing_origin(meta)
-    # The package must still be the one this session copied from -- re-checked HERE, as the
-    # LAST thing before the first rename (R12-1). It moved twice, and both moves were
-    # the same mistake: r10 put it before the ``.env`` copy, r11 before the sidecar
-    # read, and each left an unguarded window in which a replaced package could still
-    # be renamed aside and overwritten by a revision of the package that no longer
-    # exists -- the sidecar read can even answer ``draft`` from the OLD package's file
-    # after the swap it is supposed to guard. A check whose whole job is "nothing
-    # changed since we looked" belongs at the last instant it can occupy; everything
-    # after it is the two renames themselves.
+    # THE TAIL, and it runs under ``tools._STATE_PUBLISH_LOCK`` (TRANSITIONAL,
+    # web-v5 P1 -- P2's layout deletes the need, see that lock). Everything from the
+    # 啟用 carry to the second rename is what a ``PATCH /api/tools/{name}`` must not
+    # interleave with: the carry reads the LIVE toggle, and a toggle landing after
+    # that read is already lost to the copy sitting in staging. Since P1 a toggle no
+    # longer moves the manifest identity, so the re-check below -- which used to
+    # refuse such a swap BY ACCIDENT -- passes, and the swap ships the stale value.
+    # Ordering alone cannot close that (the staging write is always between the read
+    # and the swap), so the two operations are made mutually exclusive instead.
     #
-    # ``tool.json``'s own (dev, ino, ctime) -- see ``_package_identity`` for why the
-    # DIRECTORY's inode is not an identity (it is reused across a delete+recreate)
-    # and why its timestamps are too broad (they fire on the .env deletion r3
-    # deliberately honors). A caller with no identity to offer is refused outright:
-    # the entry gate already declines that case, and treating None as "matches" here
-    # would reopen exactly what this closes.
-    if package_identity is None or _package_identity(target) != package_identity:
-        return None, _ERROR_REVISE_TARGET_REPLACED
-
-    token = uuid4().hex
-    backup = _backup_path(base, name, token)
-    try:
-        os.rename(target, backup)
-    except OSError as exc:
-        return None, f"工具包置換失敗（{type(exc).__name__}）。"  # noqa: RUF001
-    try:
-        os.rename(staging, target)
-    except Exception as exc:
-        # TOTAL, unlike the OSError catches everywhere else in this module, and
-        # for one reason: between the rename above and this one the tool DOES NOT
-        # EXIST. Anything that escapes here leaves the operator's working tool
-        # gone with only a hidden backup to show for it, so the roll-back has to
-        # run for EVERY failure shape, not just the filesystem-shaped ones.
-        # str(exc) is never surfaced -- the message stays category-only.
+    # The lock ends where the swap does. The backup disposal below runs OUTSIDE it:
+    # an ``rmtree`` of a whole package is not the bounded instant this hold is
+    # allowed to be, and by then the revision is already live, so a toggle landing
+    # there lands on the published package and is honoured.
+    with tools._STATE_PUBLISH_LOCK:
+        # The 啟用 state is carried across the swap the same way the ``.env`` is, and
+        # for a reason the revise flow did not used to have (web-v5 P1): the toggle
+        # now lives in the package's own ``.state.json``, which
+        # ``_revise_copy_ignore`` deliberately keeps OUT of staging (it is
+        # backend-authored -- a session with shell must not be able to rewrite the
+        # file that decides whether its own tool may run) and
+        # ``_strip_builder_sidecars`` deletes if the session wrote one anyway. The
+        # swap below replaces the WHOLE directory, so without this line every revise
+        # would publish a package with no state file at all -- read through the
+        # manifest fallback as ENABLED, silently undoing a switch the operator set.
         #
-        # The roll-back does NOT clear ``target`` first, and that is a decision,
-        # not an omission (R1-2): a rename that RAISED moved nothing, so the name
-        # is free -- the half-written target that made clearing it look necessary
-        # was ``shutil.move``'s copy fallback, which is exactly what the line above
-        # no longer is. The ONLY way ``target`` exists here is that a concurrent
-        # actor with the service's uid created it in the instant since our own
-        # rename-aside, and then ``rmtree``-ing it would be a destructive traversal
-        # on a directory this function neither created nor verified (the
-        # ``_verify_staging_root`` gate proves things about STAGING, nothing about
-        # this path) -- destroying a third party's data to reclaim a name. The
-        # rename below fails with ENOTEMPTY instead and the operator is told where
-        # their backup is, which is the honest answer to "two writers, one name".
+        # It reads the LIVE package and it reads it HERE, as late as it can: this
+        # used to sit up beside the ``.env`` copy, where its comment called that
+        # position "free" because the step itself is bounded and tiny. That claim was
+        # the defect (R1-1). Bounded is not the same as EARLY -- everything it stood
+        # before (the 定版 gate, the sidecar read, and this call's own
+        # ``_scan_package``) was window between reading the operator's toggle and
+        # shipping it. ``carry_package_state`` also brings the live file's MODE
+        # across (R1-3), which the publisher cannot inherit on its own here because
+        # it writes into staging, where there is no state file to inherit from.
+        #
+        # An unreadable state file is carried as DISABLED rather than repaired into
+        # "on" -- the same direction the scan takes. A failed write REFUSES the
+        # revise (see ``_ERROR_REVISE_STATE_RESTORE``); it writes into staging, so
+        # nothing observable is left behind by the refusal.
+        if not tools.carry_package_state(target, staging):
+            return None, _ERROR_REVISE_STATE_RESTORE
+        # The package must still be the one this session copied from -- re-checked HERE, as
+        # the LAST thing before the first rename (R12-1). It moved twice, and both moves
+        # were the same mistake: r10 put it before the ``.env`` copy, r11 before the sidecar
+        # read, and each left an unguarded window in which a replaced package could still
+        # be renamed aside and overwritten by a revision of the package that no longer
+        # exists -- the sidecar read can even answer ``draft`` from the OLD package's file
+        # after the swap it is supposed to guard. A check whose whole job is "nothing
+        # changed since we looked" belongs at the last instant it can occupy; everything
+        # after it is the two renames themselves. The 啟用 carry above therefore goes
+        # BEFORE it, not after: this check must stay the last thing that looks at the
+        # package, and the carry is a step, not a check.
+        #
+        # ``tool.json``'s own (dev, ino, ctime) -- see ``_package_identity`` for why the
+        # DIRECTORY's inode is not an identity (it is reused across a delete+recreate)
+        # and why its timestamps are too broad (they fire on the .env deletion r3
+        # deliberately honors). A caller with no identity to offer is refused outright:
+        # the entry gate already declines that case, and treating None as "matches" here
+        # would reopen exactly what this closes.
+        if package_identity is None or _package_identity(target) != package_identity:
+            return None, _ERROR_REVISE_TARGET_REPLACED
+
+        token = uuid4().hex
+        backup = _backup_path(base, name, token)
         try:
-            os.rename(backup, target)
-        except Exception:
-            return None, _ERROR_REVISE_UNRECOVERABLE
-        return None, f"工具包置換失敗（{type(exc).__name__}），原工具已還原。"  # noqa: RUF001
+            os.rename(target, backup)
+        except OSError as exc:
+            return None, f"工具包置換失敗（{type(exc).__name__}）。"  # noqa: RUF001
+        try:
+            os.rename(staging, target)
+        except Exception as exc:
+            # TOTAL, unlike the OSError catches everywhere else in this module, and
+            # for one reason: between the rename above and this one the tool DOES
+            # NOT EXIST. Anything that escapes here leaves the operator's working
+            # tool gone with only a hidden backup to show for it, so the roll-back
+            # has to run for EVERY failure shape, not just the filesystem-shaped
+            # ones. str(exc) is never surfaced -- the message stays category-only.
+            #
+            # The roll-back does NOT clear ``target`` first, and that is a decision,
+            # not an omission (R1-2): a rename that RAISED moved nothing, so the name
+            # is free -- the half-written target that made clearing it look necessary
+            # was ``shutil.move``'s copy fallback, which is exactly what the line above
+            # no longer is. The ONLY way ``target`` exists here is that a concurrent
+            # actor with the service's uid created it in the instant since our own
+            # rename-aside, and then ``rmtree``-ing it would be a destructive traversal
+            # on a directory this function neither created nor verified (the
+            # ``_verify_staging_root`` gate proves things about STAGING, nothing about
+            # this path) -- destroying a third party's data to reclaim a name. The
+            # rename below fails with ENOTEMPTY instead and the operator is told where
+            # their backup is, which is the honest answer to "two writers, one name".
+            try:
+                os.rename(backup, target)
+            except Exception:
+                return None, _ERROR_REVISE_UNRECOVERABLE
+            return None, f"工具包置換失敗（{type(exc).__name__}），原工具已還原。"  # noqa: RUF001
     # The revision is LIVE. The backup is litter now -- but only if nothing is
     # still reading it: a tool call that started before the swap is running with
     # its cwd on those very files (the rename moved the name, not the inode), and
@@ -2285,10 +2320,13 @@ def _promote_staging_replace(
     # we are HOLDING rather than carried across the swap -- a rename moves the
     # name, not the inode (measured), so this is the same tuple the handler
     # registered before starting its child. Deliberately NOT ``package_identity``,
-    # which this function matched a few lines up for a different question:
-    # ``set_enabled`` rewrites ``tool.json`` in place, so a manifest-keyed lookup
-    # misses a child that registered before a toggle and drops the backup out from
-    # under it (see ``tools.directory_identity``). "Cannot read it" defers too:
+    # which this function matched a few lines up for a different question: a HAND
+    # EDIT of ``tool.json`` (D21's supported operator action) rewrites it in place
+    # while a child is still running in that directory, so a manifest-keyed lookup
+    # misses a child that registered before the edit and drops the backup out from
+    # under it (see ``tools.directory_identity``; before web-v5 P1 the enabled
+    # toggle was the writer this sentence named, and the split outlives it).
+    # "Cannot read it" defers too:
     # the removal is the destructive act here, so a check that cannot speak must
     # not vouch for it, and a deferral is only ever litter for the sweep.
     # Deferring costs nothing: the name is dot-prefixed, so a leftover backup is

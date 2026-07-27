@@ -1124,6 +1124,8 @@ def _write_package_file_atomic(
     filename: str,
     data: bytes,
     expected_identity: tuple[int, int, int] | None,
+    *,
+    default_mode: int = _OWNER_RW,
 ) -> bool:
     """Publish ``data`` as ``<directory>/<filename>`` ATOMICALLY. Returns success.
 
@@ -1184,6 +1186,16 @@ def _write_package_file_atomic(
     the opposite mistake (cli.py fchmods ``.env`` because a human is told to go
     edit it; nobody is told to edit this).
 
+    ``default_mode`` is what a FIRST write publishes under, and it exists because
+    one caller's file to preserve is not at the path being written: the revise
+    carries the live package's state file into STAGING, which has none by
+    construction, so "inherit from the existing file" finds nothing and the mode
+    an operator set would be silently narrowed to the default by any unrelated
+    revise (R1-3). It is normalized exactly like an inherited mode -- low 9 bits,
+    OR'd with ``_OWNER_RW`` -- so there is one rule rather than two, and an
+    existing file at the target still WINS over it: preserving what is really
+    there outranks a caller's guess about what would have been there.
+
     A READ-ONLY sidecar is a semantic that DID change here, deliberately, and is
     not being restored. ``_write_regular_file``'s ``O_TRUNC`` open needed write
     permission on the FILE, so a ``0o400`` sidecar refused the write with EACCES;
@@ -1237,9 +1249,10 @@ def _write_package_file_atomic(
     """
     path = directory / filename
     # The mode to publish under. There is ALWAYS one now (R11): a fresh file
-    # gets _OWNER_RW explicitly rather than mkstemp's umask-masked default, and an
-    # inherited mode is OR'd with it below.
-    preserve_mode: int = _OWNER_RW
+    # gets _OWNER_RW explicitly rather than mkstemp's umask-masked default (or the
+    # caller's ``default_mode``, normalized by the same rule), and an inherited
+    # mode is OR'd with it below.
+    preserve_mode: int = (default_mode & 0o777) | _OWNER_RW
     try:
         existing_mode = os.lstat(path).st_mode
     except FileNotFoundError:
@@ -1496,15 +1509,65 @@ def write_tool_meta(
     return _write_package_file_atomic(directory, _AI_META_FILENAME, data, expected_identity)
 
 
-def write_package_state(directory: Path, enabled: bool) -> bool:
+# TRANSITIONAL (web-v5 P1) -- P2 DELETES this, and the note is part of the code so
+# it is not inherited as a puzzle. In the target layout ``.state.json`` lives at
+# ``<name>/`` while only ``<name>/versions/<vid>/`` is ever swapped, so a revise
+# stops touching the toggle's file at all and there is nothing left for a lock to
+# make exclusive. Until then the swap replaces the WHOLE directory, which is what
+# makes the two operations below collide.
+#
+# What it serializes: ``set_enabled``'s publish, and the TAIL of
+# ``tool_builder._promote_staging_replace`` -- [read the live toggle -> write it
+# into staging -> re-check the manifest identity -> the two renames]. Without it a
+# PATCH landing anywhere inside that tail is silently REVERTED: the staging copy
+# already holds the value read at the top of the tail, and since web-v5 P1 a toggle
+# no longer moves the manifest identity, so the identity re-check that used to
+# refuse such a swap BY ACCIDENT now passes and ships the stale boolean. Both
+# operations report success and the operator's most recent intent is undone.
+# Ordering alone cannot close it -- there is always at least the staging write
+# between the read and the swap -- so the two are made mutually exclusive instead.
+#
+# Why a lock is right HERE and was REJECTED in D40's overall r8, which is the same
+# question asked about two different windows: there the proposal was to hold a
+# toggle out for the length of an LLM ROUND TRIP (minutes, operator-visible), and
+# the fix was to move the un-regenerable write earlier instead. Everything inside
+# this hold is bounded and tiny: two capped file reads, a ~20-byte atomic write, an
+# lstat and two renames. Nothing here awaits, spawns a subprocess or waits on
+# another lock.
+#
+# What it does NOT cover, stated so it is not read as more than it is: it is an
+# IN-PROCESS lock, exactly like ``_META_LOCK``. A second afterthread process on the
+# same tools directory, or an operator editing ``.state.json`` by hand (D21's
+# supported action), is not serialized by it and never was -- this app runs as ONE
+# process (the console script serves the API and the UI together) and its only
+# concurrency is the threadpool every route hops through, which is precisely what
+# this covers. It also does not cover the REST of a revise: the LLM session, the
+# build, the validation and the ``.env`` copy all run outside it, so a toggle during
+# a revise is answered immediately, as it is today.
+#
+# Two invariants, the same pair ``_META_LOCK`` states: never held across an
+# ``await`` (both acquirers are plain sync functions reached through
+# ``run_in_threadpool``), and it NEVER nests -- ``write_package_state`` /
+# ``carry_package_state`` / ``_write_package_file_atomic`` are all lock-FREE and are
+# called from INSIDE a hold.
+_STATE_PUBLISH_LOCK = threading.Lock()
+
+
+def write_package_state(directory: Path, enabled: bool, *, default_mode: int = _OWNER_RW) -> bool:
     """Publish ``{"enabled": ...}`` as the package's state file. Returns success.
 
     The ONE writer of ``_STATE_FILENAME``, and the whole of what a toggle does to
-    disk. ``tool.json`` is not opened, not read and above all not REWRITTEN -- that
-    is the entire point of web-v5 P1, and it is measurable rather than asserted: a
-    toggle leaves the manifest byte-identical and its ``package_identity``
-    unchanged, which is what makes the execution registry, the revise swap and the
-    summary sidecar's identity guard all stop caring that a switch was flipped.
+    disk. Both of its callers are here in this module (``set_enabled``, and
+    ``carry_package_state`` for the revise swap), and both take
+    ``_STATE_PUBLISH_LOCK`` around the operation this is the write of -- this
+    function itself does not, so the hold spans the caller's whole
+    check/read-then-write rather than just these few lines.
+
+    ``tool.json`` is not opened, not read and above all not REWRITTEN -- that is the
+    entire point of web-v5 P1, and it is measurable rather than asserted: a toggle
+    leaves the manifest byte-identical and its ``package_identity`` unchanged, which
+    is what makes the execution registry, the revise swap and the summary sidecar's
+    identity guard all stop caring that a switch was flipped.
 
     Built from a literal key and a ``bool`` the caller's type gates, exactly as
     ``write_tool_meta`` builds the sidecar from its own literals: there is no
@@ -1530,6 +1593,10 @@ def write_package_state(directory: Path, enabled: bool) -> bool:
       in the listing and flip back in one click -- not the sidecar's cost, which
       was A's text and A's un-regenerable origin misfiled into B forever.
 
+    ``default_mode`` is passed straight through: it only ever matters when there is
+    no state file at ``directory`` to inherit from, which for a toggle is the
+    ordinary first-write case and for ``carry_package_state`` is the whole point.
+
     Every failure is False (the publish's contract), which is exactly the
     "did not happen" ``set_enabled`` reports and the route turns into a 404.
     """
@@ -1539,7 +1606,54 @@ def write_package_state(directory: Path, enabled: bool) -> bool:
     # with the sidecar's encode. The payload is two ASCII tokens, so neither the
     # dumps nor the encode can raise and neither needs a guard.
     data = (json.dumps({"enabled": enabled}, ensure_ascii=False) + "\n").encode("utf-8")
-    return _write_package_file_atomic(directory, _STATE_FILENAME, data, None)
+    return _write_package_file_atomic(
+        directory, _STATE_FILENAME, data, None, default_mode=default_mode
+    )
+
+
+def carry_package_state(source: Path, destination: Path) -> bool:
+    """Re-publish ``source``'s toggle -- value AND file mode -- into ``destination``.
+
+    TRANSITIONAL (web-v5 P1), and the ONE step that keeps a revise from silently
+    re-enabling a tool: ``.state.json`` is backend-authored, so it is kept out of
+    staging entirely (``tool_builder._revise_copy_ignore`` /
+    ``_strip_builder_sidecars``), and the swap replaces the WHOLE package
+    directory -- so without this the published package has no state file at all
+    and is read through the manifest fallback as ENABLED. P2's layout swaps only
+    ``<name>/versions/<vid>/`` and leaves ``.state.json`` where it is, at which
+    point this function has nothing left to do.
+
+    The caller must hold ``_STATE_PUBLISH_LOCK`` across this AND the swap that
+    makes the copy live -- see that lock for what is lost otherwise. This function
+    does not take it itself: a hold that ended here would end BEFORE the rename it
+    exists to cover.
+
+    ``package_enabled`` on the LIVE package, so an unreadable state file is carried
+    across as DISABLED rather than repaired into "on" -- the same direction the scan
+    reads it in, and the same direction this subsystem always errs in.
+
+    The MODE is carried for the reason the publisher preserves one at all (R7-3,
+    R11): an operator who chmod'd their state file ``0o640`` so a same-group process
+    could read it keeps that across a PATCH, and would otherwise lose it to any
+    unrelated revise -- the publisher inherits from the file AT THE TARGET, and the
+    target here is a staging directory that has none.
+
+    This ``lstat`` deliberately does NOT tell absence from a failure to LOOK, and
+    that is not the D40 P3b r2-3 rule being broken: that rule is about deciding a
+    VALUE, which here is ``package_enabled``'s job and is answered by the strict
+    reader with its own fail-closed direction. All this decides is which permission
+    bits to start from, and every case it cannot read -- no file, a FIFO, an EIO --
+    falls to ``_OWNER_RW``, which is the NARROWEST thing it could publish. Guessing
+    wider from a stat we could not take is the only mistake available here, and it
+    is the one not made.
+    """
+    try:
+        info = os.lstat(source / _STATE_FILENAME)
+    except OSError:
+        mode = _OWNER_RW
+    else:
+        mode = (info.st_mode & 0o777) if stat.S_ISREG(info.st_mode) else _OWNER_RW
+    return write_package_state(destination, package_enabled(source), default_mode=mode)
 
 
 def _narrowed_summary_status(meta: dict[str, Any] | None) -> str | None:
@@ -3618,7 +3732,16 @@ def set_enabled(name: str, enabled: bool) -> bool:
     # state file is an UNREADABLE one, and an unreadable one takes the package out
     # of the registry (see ``_read_enabled_state``), so publishing this by
     # truncate-then-write would make a failed toggle strictly worse than no toggle.
-    return write_package_state(directory, enabled)
+    #
+    # Under ``_STATE_PUBLISH_LOCK`` (TRANSITIONAL, web-v5 P1) so this publish cannot
+    # land inside a revise's swap tail, which would carry the value we just replaced
+    # across the swap and silently revert this toggle -- see that lock. The hold is
+    # this write and nothing else: the resolve above stays outside it, because a
+    # toggle that resolves the name before a swap and publishes after one lands on
+    # the package that now owns the name, which is the right answer to "the operator
+    # switched off the tool called X".
+    with _STATE_PUBLISH_LOCK:
+        return write_package_state(directory, enabled)
 
 
 def delete_tool(name: str) -> bool:
