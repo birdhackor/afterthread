@@ -151,8 +151,13 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 - `DELETE /api/tools/{name}` — 刪除整個工具套件目錄；找不到回 404。
 - `POST /api/tools/install` — 送出 KB 網頁安裝器工作（見下方「工具（KB 網頁
   安裝器）」）；202 + `job_id`，建置在背景執行。`TOOLS_DIR` 未設定回 `503
-  tools_not_configured`；已有安裝在跑時回 `409 install_in_progress`（同一時間
-  只允許一個安裝工作）。
+  tools_not_configured`；名額被佔用時回 `409 install_in_progress`。**那個名額
+  不是安裝專屬的**：安裝、AI 修訂與同步的「重新產生總結」共用同一個 single-flight
+  （見下方三條路由與「依意見修訂既有工具」），所以這個 409 最常見的來源其實是
+  別的分頁正在修訂。代碼與訊息字串維持既有的 `install_in_progress`／
+  「已有安裝正在進行中，請等待其完成」（前端有 pin 住的分支，不動），但前端**刻意
+  覆寫**成中性文案「已有工具任務正在進行中（安裝、AI 修訂或重新產生總結），請等待
+  完成後再安裝」——指名一個使用者從沒送出的「安裝」只會讓他去找一個不存在的東西。
 - `GET /api/tools/jobs/{job_id}` — 輪詢一個工具工作（安裝**或**修訂）的狀態
   （`queued`／`running`／`succeeded`／`failed` + 完成後的 `tool_name`／
   `summary`／`llm_log_id`）；工作已完成的清單被裁剪掉、或後端重啟過（工作只存在
@@ -227,8 +232,12 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   看得懂的兩個字串欄位），手動加的多餘 key 下一次寫入就會被丟掉（這本來就不是
   契約）。三個可能帶操作者／LLM 文字的**值**（`summary`、`origin.openapi_url`、
   `origin.instructions`）一律過 `redact_known_secrets` 且**遮蔽失敗就不寫**——
-  sidecar 之後會被修訂流程複製進暫存目錄接受「檔案不得內嵌秘密值」檢查，含密文
-  等於讓這個工具再也修訂不了。`origin.openapi_url` 另外**先被收斂**成
+  而這道遮蔽是這個檔案**唯一**的防線，不是「反正後面還有一關」。（舊版本這裡寫
+  「sidecar 之後會被修訂流程複製進暫存目錄接受『檔案不得內嵌秘密值』檢查」——那不
+  成立：修訂的複製在**任何層級**都排除 sidecar 的保留命名空間，`_strip_builder_sidecars`
+  又會在驗證**之前**把暫存區裡的 sidecar 刪掉，所以 sidecar 從來不會走到那道閘。
+  寫清楚是因為誤以為下游還有一關的人，會覺得把這裡的 fail-closed 放寬成「遮不掉就
+  照寫」是安全的。）`origin.openapi_url` 另外**先被收斂**成
   `scheme://host[:port]`（userinfo／path／query／fragment 只要存在任何一項就整段丟
   掉、補一個固定標記；host[:port] 另外驗證形狀——`urlsplit` parse 得出 netloc 不代表
   它是合法主機，例如 `Bearer SECRET` 這種字串也會 parse 成功；無法解析、scheme 不是
@@ -341,10 +350,13 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `<TOOLS_DIR>/.staging/<uuid>`。這個目錄名稱以 `.` 開頭，registry 掃描
   （`tools._scan_all`）會直接跳過隱藏目錄，不會被列成無效工具，可以安全地手動
   刪除。
-- **同一時間只允許一個安裝工作**：`start_install_job` 在同一把鎖底下檢查「是否
-  已有 queued/running 的工作」並建立新工作；已有工作在跑時，第二個 submit 回
-  `409 install_in_progress`。工作狀態是 in-memory、不持久化，後端重啟後所有
-  工作（含仍在跑的）都會消失，FE 對舊 `job_id` 的輪詢會收到 404。
+- **同一時間只允許一個工具任務**：`start_install_job` 在同一把鎖底下檢查「名額是否
+  被佔用」並建立新工作；被佔用時，第二個 submit 回 `409 install_in_progress`。
+  **名額由三種動作共用**：安裝工作、AI 修訂工作（同一張 `_JOBS` 表）、以及同步的
+  「重新產生總結」（`_SYNC_OPS` 的一個 token，在同一把鎖底下「檢查即取得」，見
+  上方該路由）——所以擋下這次送出的，未必是另一個安裝。工作狀態是 in-memory、
+  不持久化，後端重啟後所有工作（含仍在跑的）都會消失，FE 對舊 `job_id` 的輪詢會
+  收到 404。
 
 ## 設計筆記
 

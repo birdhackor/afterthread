@@ -4799,20 +4799,96 @@ def test_run_revise_ships_the_builder_env_when_the_package_never_had_one(
     -- otherwise a revise could never act on "store the key in .env" feedback.
 
     This is what makes the deletion case above a real discrimination rather than
-    a blanket "never ship a builder ``.env``"."""
+    a blanket "never ship a builder ``.env``".
+
+    Strengthened on two points the acceptance never covered. The file goes out
+    BYTE for byte (nothing normalizes what the builder wrote), and its value is
+    REGISTERED as an in-flight secret while the post-promote summary session runs
+    -- that session reads the freshly published package and writes a sidecar, and
+    the registration is what the redactors have to work with in the window where
+    the ``.env`` is brand new. Observed inside the summary stub because that is
+    the window; the session's ``finally`` discards it, which the last assertion
+    pins."""
     pkg = _seed_package(monkeypatch, tmp_path)
     assert not (pkg / ".env").exists()
+    at_summary: dict[str, set[str]] = {}
     _fake_generate(
         monkeypatch,
         result=_revise_result(),
         files={"run.py": _REVISED_RUN_PY, ".env": _MODEL_ENV},
     )
 
+    def observe_while_summarizing() -> None:
+        with tools._INFLIGHT_LOCK:
+            at_summary["inflight"] = set(tools._INFLIGHT_SECRETS)
+
+    _fake_summary_generate(monkeypatch, side_effect=observe_while_summarizing)
+
     outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
-    assert (pkg / ".env").read_text(encoding="utf-8") == _MODEL_ENV
+    assert (pkg / ".env").read_bytes() == _MODEL_ENV.encode("utf-8")
     assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert at_summary["inflight"] == {"made-up-by-the-model"}
+    with tools._INFLIGHT_LOCK:
+        assert not tools._INFLIGHT_SECRETS
+
+
+@pytest.mark.parametrize(
+    ("staged_env", "expected_error"),
+    [
+        ("PIN=1234\n", tool_builder._ERROR_REVISE_ENV_UNMASKABLE),
+        ('TOKEN="abcd\\"efgh"\n', tool_builder._ERROR_REVISE_ENV_UNMATCHABLE),
+    ],
+    ids=["below-the-floor", "reversible-spelling"],
+)
+def test_run_revise_refuses_a_builder_env_the_redactors_could_not_mask(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, staged_env: str, expected_error: str
+) -> None:
+    """A builder-WRITTEN ``.env`` must clear the same policy a preserved one does.
+
+    This is the seam between two rules that were each correct alone. The standing
+    acceptance says a package that never had a ``.env`` MAY receive one the
+    builder wrote; the maskability policy says a ``.env`` value the redactors
+    cannot mask must never be handed to this system. Nothing joined them: the
+    preserve step returned success without ever parsing the staged file, and
+    ``validate_package`` only checks its SIZE and scans for values ALREADY known,
+    so it cannot see a new short value or a reversible spelling.
+
+    So a revise could publish ``PIN=1234`` -- which the 6-char floor then
+    permanently refuses to mask in live tool results, in the AI 日誌 and in the
+    summary -- or ``TOKEN="abcd\\"efgh"``, whose escaped spelling matches no
+    registered value when a ``cat`` prints it. The proof that this is a defect
+    rather than untidiness: the NEXT revise of that package refuses at its entry
+    gate on exactly these two rules, so the system would have produced a state it
+    declines to work with.
+
+    Both refusals are the SAME category-only strings the entry gate uses -- same
+    condition, same remedy -- and they name neither key nor value. Refusing here
+    costs the operator nothing they had: the installed package is untouched, the
+    swap never ran, and no hidden backup is left behind."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    assert not (pkg / ".env").exists()
+    before = _file_bytes(pkg)
+    captured = _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY, ".env": staged_env},
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == expected_error
+    assert "PIN" not in (outcome.error or "")  # category only: never the key ...
+    assert "1234" not in (outcome.error or "")  # ... and never the value
+    assert captured  # the session DID run: only the promote could have stopped it
+    assert _file_bytes(pkg) == before  # the installed package is exactly as it was
+    assert not (pkg / ".env").exists()  # ... including having no .env at all
+    assert _leftovers(pkg.parent) == []  # nothing was renamed aside
+    assert not (pkg.parent / tool_builder._STAGING_DIRNAME).exists()
+    with tools._INFLIGHT_LOCK:
+        assert not tools._INFLIGHT_SECRETS
 
 
 def test_run_revise_keeps_an_env_the_operator_added_mid_session(
@@ -5779,18 +5855,25 @@ def test_run_revise_treats_a_lone_env_case_variant_as_having_no_managed_env(
     nothing has to be restored. The standing R3-1 acceptance therefore applies in
     its "never had one" branch -- the builder's own ``.env`` ships, exactly as it
     does on an install -- and it is asserted here because it is the observable
-    proof that the variant was not mistaken for the managed file."""
+    proof that the variant was not mistaken for the managed file.
+
+    The builder's value is a MASKABLE one on purpose: that branch now runs the
+    same ``.env`` policy over what it is about to ship, so a short or reversibly
+    spelled value would be refused (see
+    ``test_run_revise_refuses_a_builder_env_the_redactors_could_not_mask``) and
+    this test would stop being about case variants at all."""
     if not _case_sensitive_filesystem(tmp_path):
         pytest.skip("this filesystem folds .env and .ENV into one file")
     pkg = _seed_package(monkeypatch, tmp_path)
     root = pkg.parent
     variant = b"# ordinary content, no credentials\r\nMODE=verbose\n"
     (pkg / ".ENV").write_bytes(variant)
+    written_by_the_model = "WRITTEN_BY_THE_MODEL=yes-it-really-was\n"
     seen: dict[str, set[str]] = {}
     _fake_generate(
         monkeypatch,
         result=_revise_result(),
-        files={"run.py": _REVISED_RUN_PY, ".env": "WRITTEN_BY_THE_MODEL=yes\n"},
+        files={"run.py": _REVISED_RUN_PY, ".env": written_by_the_model},
         side_effect=lambda: seen.update(staged=_tree(_staging_dir(root))),
     )
 
@@ -5801,7 +5884,7 @@ def test_run_revise_treats_a_lone_env_case_variant_as_having_no_managed_env(
     assert (pkg / ".ENV").read_bytes() == variant  # ... and published unchanged
     # "never had one" -> the builder's .env ships, which is only true if the
     # variant was NOT read as the managed file.
-    assert (pkg / ".env").read_text(encoding="utf-8") == "WRITTEN_BY_THE_MODEL=yes\n"
+    assert (pkg / ".env").read_text(encoding="utf-8") == written_by_the_model
 
 
 def test_run_revise_refuses_an_env_over_the_byte_ceiling_that_fits_in_chars(

@@ -1043,17 +1043,23 @@ def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
     walk.
 
     The redaction that remains is FAIL-CLOSED, and that is the load-bearing part
-    of this helper. Two independent reasons a secret must never reach this file:
+    of this helper. The summary is LLM output about a package whose ``.env`` holds
+    live values, and this file is served back to the UI -- the same class
+    ``redact_known_secrets`` closes everywhere raw model/tool text enters
+    persisted state.
 
-    * the summary is LLM output about a package whose ``.env`` holds live
-      values, and this file is served back to the UI -- the same class
-      ``redact_known_secrets`` closes everywhere raw model/tool text enters
-      persisted state;
-    * a future revise (D40) copies the installed package into a staging build,
-      and ``validate_package``'s embedded-secret gate scans EVERY file there. A
-      sidecar carrying an unredacted value would therefore make every later
-      revise of that tool fail validation -- bricking the feature for that
-      package with a rejection naming a file the user never wrote.
+    It is also the ONLY thing standing between a secret and this file, which is
+    why the fail-closed part is stated so loudly. An earlier version of this
+    docstring named a second line of defence -- a revise copies the installed
+    package into a staging build, and ``validate_package``'s embedded-secret gate
+    scans EVERY file there -- and that has not been true since the revise flow
+    took its final shape: ``tool_builder._revise_copy_ignore`` withholds the
+    sidecar's reserved namespace at EVERY depth, and ``_strip_builder_sidecars``
+    deletes any sidecar found in staging BEFORE validation runs, so no sidecar
+    ever reaches that gate. The correction matters rather than being pedantic: a
+    maintainer who believed a downstream gate would catch an unmasked value could
+    reasonably relax the refusal below into "write it unmasked", and nothing
+    downstream would catch anything.
 
     So a redaction failure (``known_secret_values`` raising -- the LIVE path
     deliberately propagates rather than degrading to unmasked, see
@@ -1093,13 +1099,16 @@ def write_tool_meta(directory: Path, meta: dict[str, Any]) -> bool:
     dict, and it is precisely what let a stray key/value carry unmasked text into
     the file. The five fields above are the sidecar.
 
-    The ``is_dir`` precondition matters more than it looks: ``_write_regular_file``
-    CREATES missing parents (the meta-tool contract needs that), so without it a
-    summary landing just after a racing ``delete_tool`` would re-create the
-    deleted package's directory holding nothing but a sidecar -- and the registry
-    would then list that ghost as a broken package named after the tool the user
-    just removed. It narrows, but cannot close, that window (the delete can still
-    land between this check and the open); the remaining race is the same
+    The ``is_dir`` precondition is kept as the EXPLICIT answer to a racing
+    ``delete_tool``: a summary landing just after one must not re-create the
+    deleted package's directory holding nothing but a sidecar, which the registry
+    would then list as a broken package named after the tool the user just
+    removed. It was load-bearing when the sidecar rode ``_write_regular_file``,
+    which CREATES missing parents (the meta-tool contract needs that);
+    ``_write_sidecar_atomic``'s ``mkstemp`` in the package directory now fails
+    with ENOENT instead, so the check states the rule rather than being the only
+    thing enforcing it. It narrows, but cannot close, that window (the delete can
+    still land between this check and the write); the remaining race is the same
     single-user local-tool edge install/delete already accepts (D21/D40).
     """
     if not directory.is_dir():
@@ -1609,13 +1618,48 @@ _INFLIGHT_SECRETS: set[str] = set()
 _INFLIGHT_LOCK = threading.Lock()
 
 # Cache of one package's parsed ``.env`` VALUES, keyed by the ``.env`` path and
-# tagged with the file's ``mtime_ns``, so ``known_secret_values`` re-parses a
-# package only when its ``.env`` actually changed. This matters because the
-# provider runs once PER STORED LOG BODY (every request message + every response
-# of every attempt), and a busy installer session records the whole GROWING
-# conversation on each of dozens of rounds -- without the cache, every one of
-# those records would re-read every installed tool's ``.env`` from disk.
-_ENV_VALUE_CACHE: dict[str, tuple[int, frozenset[str]]] = {}
+# tagged with a FILE IDENTITY taken from its ``stat``, so ``known_secret_values``
+# re-parses a package only when its ``.env`` actually changed. This matters
+# because the provider runs once PER STORED LOG BODY (every request message +
+# every response of every attempt), and a busy installer session records the
+# whole GROWING conversation on each of dozens of rounds -- without the cache,
+# every one of those records would re-read every installed tool's ``.env`` from
+# disk.
+#
+# The tag is ``(st_dev, st_ino, st_mtime_ns, st_ctime_ns, st_size)`` and it used
+# to be the ``st_mtime_ns`` alone, which describes WHEN a path was last written
+# rather than WHICH FILE is there now -- and mtime is the one timestamp userspace
+# can set to anything (``utime``), while several perfectly ordinary ways of
+# replacing a file preserve it on purpose. Measured on this repo's filesystem
+# (ext4) rather than assumed, each against a cached entry:
+#
+# * ``shutil.copy2`` over the existing path -- which is what the revise flow
+#   itself uses to put a ``.env`` back -- changes ONLY ``st_ctime_ns``;
+# * a rewrite followed by ``os.utime`` restoring the old stamps (a
+#   timestamp-preserving restore, a backup rollout, ``cp -p``) changes ONLY
+#   ``st_ctime_ns``, even when the new content is the same LENGTH;
+# * write-to-temp + rename with the mtime carried over (``rsync -t``, and the
+#   revise flow's own publish) changes ``st_ino`` and ``st_ctime_ns``;
+# * ``unlink`` + recreate REUSES the inode here, so ``st_ino`` alone would not
+#   have caught the case above either -- which is why ctime is in the tag and not
+#   just the inode;
+# * renaming the parent DIRECTORY (the last step of a revise publish) changes
+#   nothing about the file, so a roll-back that puts the original package back is
+#   still a cache HIT, correctly.
+#
+# Under the old tag every one of those left the redactor serving the PREVIOUS
+# values: the tool then emits the new secret and neither the live tool-result
+# redactor, nor llm_log, nor the summary writer masks it. ``st_ctime_ns`` is the
+# field that carries the weight (no syscall sets it backwards; every content or
+# metadata change moves it), with dev/ino catching a replacement that reuses the
+# timestamps and size catching one that reuses the tick. The residual, stated
+# rather than implied: the file-timestamp clock advances in ~1 ms steps here
+# (measured), so a same-inode, same-size, mtime-preserving replacement landing
+# INSIDE the millisecond of the cached read is still a hit. That is one syscall
+# pair wide -- the same check-then-act instant this subsystem accepts everywhere
+# else -- and it cannot be closed by any stat-based tag, only by re-reading every
+# ``.env`` on every log body, which is the cost this cache exists to avoid.
+_ENV_VALUE_CACHE: dict[str, tuple[tuple[int, int, int, int, int], frozenset[str]]] = {}
 _ENV_VALUE_CACHE_LOCK = threading.Lock()
 
 
@@ -1634,18 +1678,24 @@ def discard_inflight_secret(value: str) -> None:
 
 
 def _cached_env_values(directory: Path) -> frozenset[str]:
-    """The redactable VALUES of one package's ``.env``, cached per (path, mtime).
+    """The redactable VALUES of one package's ``.env``, cached per (path, identity).
 
     Reuses the ONE bounded ``.env`` loader (``_load_tool_dotenv``) rather than
     hand-rolling a second parser, so the FIFO/symlink/oversize hardening and the
     drop-bare-keys behavior are inherited unchanged. Empty values are dropped so
     a ``KEY=`` line contributes nothing (``_redact`` also guards empties, but not
     seeding them keeps the set tidy).
+
+    The path is the cache KEY and the file's identity is the TAG (see
+    ``_ENV_VALUE_CACHE`` for what is in it and for the measurements that chose
+    the fields): a path answers "whose ``.env`` is this", and only the identity
+    can answer "is it still the same file with the same contents". Both come out
+    of the one ``stat`` this function already made.
     """
     env_file = directory / ".env"
     key = str(env_file)
     try:
-        mtime = env_file.stat().st_mtime_ns
+        info = env_file.stat()
     except OSError:
         # No ``.env`` (the common case) or an unstattable path: nothing to
         # contribute. Forget any stale cache entry so a LATER-created ``.env`` is
@@ -1653,15 +1703,16 @@ def _cached_env_values(directory: Path) -> frozenset[str]:
         with _ENV_VALUE_CACHE_LOCK:
             _ENV_VALUE_CACHE.pop(key, None)
         return frozenset()
+    identity = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size)
     with _ENV_VALUE_CACHE_LOCK:
         cached = _ENV_VALUE_CACHE.get(key)
-        if cached is not None and cached[0] == mtime:
+        if cached is not None and cached[0] == identity:
             return cached[1]
-    # Parse OUTSIDE the lock (it does file I/O); the (path, mtime) key makes a
+    # Parse OUTSIDE the lock (it does file I/O); the (path, identity) key makes a
     # concurrent double-parse harmless -- both produce the identical set.
     values = frozenset(value for value in _load_tool_dotenv(directory).values() if value)
     with _ENV_VALUE_CACHE_LOCK:
-        _ENV_VALUE_CACHE[key] = (mtime, values)
+        _ENV_VALUE_CACHE[key] = (identity, values)
     return values
 
 
@@ -1675,7 +1726,7 @@ def known_secret_values() -> frozenset[str]:
       it into a body), but redacting it too means even a tool that somehow echoed
       it back cannot surface it in the log;
     * every VALUE in every installed tool package's ``.env`` (a KB API key etc.),
-      cached per (path, mtime) so a call per record stays cheap;
+      cached per (path, file identity) so a call per record stays cheap;
     * the in-flight install secrets registered above (the pre-promote window).
 
     Wired as llm_log's secret provider by main. llm_log calls this INSIDE its own

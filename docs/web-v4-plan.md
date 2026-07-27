@@ -80,9 +80,19 @@ P3a＝sidecar 檔案 I/O、summary 生成（install hook）、定版 `PATCH`、�
   sidecar 對 registry 掃描不可見；`delete_tool` 的 `rmtree` 自動帶走）。
 - 形狀：`{"summary": str, "status": "draft"|"final", "updated_at": iso, "llm_log_id":
   int|null, "origin": {"openapi_url": str|null, "instructions": str|null}}`。
-- I/O 走 `tools._write_regular_file` / `_read_regular_file_capped`（FIFO/symlink 硬化），
-  讀取 JSON 損壞視同不存在。**寫入前 summary 一律過 `redact_known_secrets`**（fail-closed：
-  遮蔽失敗就不寫）——否則之後 revise 的 staging 複製會被 embedded-secret gate 拒絕。
+- 讀取走 `tools._read_regular_file_capped`（FIFO/symlink 硬化），JSON 損壞視同不存在；
+  **寫入走 `tools._write_sidecar_atomic`**（同目錄 mkstemp → fsync → `os.replace`，
+  寫前 `lstat` 保留 symlink/非 regular 的拒絕語意與既有權限位元）。**規劃時寫的是
+  `_write_regular_file`，實作已改掉**：那個 helper 以 `O_TRUNC` 開**目標檔**，
+  ENOSPC／配額／I/O 失敗會留下一個被截斷的 sidecar——對已定版的總結就是無可回復的
+  資料遺失（D40 r3 附錄）。這裡把計畫改寫成實作，是因為留著原句等於邀請後人「改回
+  就地截斷寫入」——那看起來像回到計畫，實際上是拆掉一個已定版總結所依賴的原子發布。
+  **寫入前 summary 一律過 `redact_known_secrets`**
+  （fail-closed：遮蔽失敗就不寫）。**規劃時給的理由（「否則之後 revise 的 staging
+  複製會被 embedded-secret gate 拒絕」）並不成立**：實作的 `_revise_copy_ignore` 在
+  任何層級都排除 sidecar 的保留命名空間，`_strip_builder_sidecars` 又會在
+  `validate_package` 之前刪掉暫存區裡的 sidecar，所以 sidecar 從來不會走到那道閘——
+  這道遮蔽是這個檔案唯一的防線（見 `write_tool_meta` docstring）。
 - sidecar file I/O helpers 放 `tools.py`（與 `.env` 處理同域）；LLM 生成放新模組
   `services/tool_meta.py`（imports tools＋llm，無循環）。
 
@@ -92,7 +102,12 @@ Summary 生成（workflow 名 `tool_summary`，與 `tool_install` 分開，避�
 - 輸入：tool.json＋實作檔內容（排除 `.env` 與 `.ai_meta.json`；`.env` 只給 key 名）＋
   origin instructions＋builder 自己的 InstallResult.summary。逐檔 redact-then-cap，總量
   受 `token_budget.char_allowance(llm_prompt_budget_tokens)`。
-- 輸出模型 `ToolSummaryResult{summary}`：redact→strip→cap（8000 chars）、非空。
+- 輸出模型 `ToolSummaryResult{summary}`：validator 只驗**形狀**（`_coerce_str`＋非空）。
+  **redact→strip→cap（8000 chars）不在模型上，實作已搬到儲存邊界**
+  （`tools.store_summary_meta`，順序不變；D40 r4 附錄）：`generate_structured` 的
+  validate 跑在 event loop 上，而遮蔽要掃整個 tools 目錄（`iterdir`＋每包一次 `stat`，
+  cache miss 還要讀 `.env`）。`strip` 必須跟著搬——它排在遮蔽之後才對，留在 validator
+  等於把同一個洞從另一邊打開（登記值自帶前後空白時，先 strip 就再也比不中）。
 - 時機：install job 內 promote 成功後 best-effort 執行（`LLMNotConfiguredError`／
   `LLMUpstreamError`／`Exception` 就地吞掉——安裝成功絕不因總結失敗翻盤）；失敗時
   sidecar 仍寫入（summary 空字串＋origin），供之後 regenerate。

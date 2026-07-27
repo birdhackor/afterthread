@@ -225,6 +225,10 @@ _ERROR_REVISE_SUMMARY_UNREADABLE = "無法確認總結是否已定版（AI 總�
 # nothing anyway and copying it would be the one unbounded step left before the
 # swap. RESTORE: the byte copy into staging failed, so the revision would ship
 # without the credentials it inherited.
+# UNREADABLE and TOO_LARGE also answer for the file the BUILDER wrote, when the
+# package never had a ``.env`` of its own and that file is therefore the one that
+# ships (``_shipped_env_policy_error``): the condition each names is a property of
+# whatever is about to land at ``<package>/.env``, not of where it came from.
 _ERROR_REVISE_ENV_UNREADABLE = "無法讀取既有工具包的 .env，修訂已取消。"  # noqa: RUF001
 _ERROR_REVISE_ENV_TOO_LARGE = "既有工具包的 .env 超過大小上限，修訂已取消。"  # noqa: RUF001
 _ERROR_REVISE_ENV_RESTORE = "無法還原工具包的 .env，修訂已取消。"  # noqa: RUF001
@@ -238,7 +242,10 @@ _ERROR_REVISE_ENV_DISCARD = "無法移除修訂產生的 .env（原檔已於修�
 # the CONDITION and the two remedies, never the key and never the value -- the
 # whole point is that this value cannot be masked, so it must not be echoed by the
 # very message that refuses to expose it. See ``run_revise``'s own gate for why
-# refusing beats running.
+# refusing beats running. The same string answers when the offending value was
+# written by the BUILDER into a package that never had a ``.env``
+# (``_shipped_env_policy_error``): the condition and the remedy are about the value
+# that would ship, and neither changes with the author.
 _ERROR_REVISE_ENV_UNMASKABLE = (
     "既有工具包的 .env 內有值過短、無法遮蔽，修訂已取消：請加長該值，或將它從 .env 移除。"  # noqa: RUF001
 )
@@ -1648,6 +1655,73 @@ def _promote_staging(
     return None
 
 
+def _shipped_env_policy_error(
+    path: Path, path_stat: os.stat_result, *, registered: list[str]
+) -> str | None:
+    """Run the WHOLE ``.env`` policy on the file that is about to SHIP; None = ok.
+
+    Blocking (a bounded read plus ``_unmaskable_env_error``'s scan, both inside
+    ``_promote_staging_replace``'s worker hop). ``path_stat`` is the caller's own
+    ``lstat`` -- the one it already took to decide whether the file is there at
+    all -- so this adds no syscall and cannot disagree with the shape the caller
+    saw.
+
+    ONE body, called for whichever file ends up at ``<package>/.env``: the LIVE
+    one being copied back, or the BUILDER's own when the package never had one.
+    That is the point rather than tidiness -- the two gates must be incapable of
+    answering differently about the same bytes, so they are not two gates, they
+    are this one asked twice about two different files. Same reader, same cap,
+    same non-empty filter, same messages; only the FILE differs.
+
+    The order is refuse-then-register:
+
+    * a non-regular file (a symlink or FIFO raced in, or planted by the unjailed
+      ``run_shell``) is refused rather than read through, exactly as the bounded
+      reader's ``O_NOFOLLOW`` + ``S_ISREG`` would;
+    * over ``tools._ENV_FILE_MAX_BYTES`` is refused on the SAME ceiling the
+      session's entry read, ``tools.validate_package`` and the runtime loader all
+      apply -- a file past it parses to a TRUNCATED set of values, so the ones
+      past the cap would ship unregistered;
+    * a value the redactors cannot mask -- too short for them to look at, or
+      spelled by its own assignment line in a way this system would not write --
+      refuses with ``_unmaskable_env_error``'s own category-only string. Reused
+      rather than duplicated per file: the CONDITION and the REMEDY are the same
+      (a value that ships in a ``.env`` has to be one we can mask, or not be in
+      the file), which is exactly the R3-2 criterion for when one message serves
+      two refusal points;
+    * only then are the values REGISTERED, and appended to ``registered`` -- the
+      session's own list, whose ``finally`` discards every value it holds.
+      Registering at the point of discovery and recording it in the SAME breath
+      is what makes it leak-proof: no return path can leave a value registered
+      with nobody to discard it. Both the registration and the discard are
+      idempotent, so a value the session's entry read already registered costs
+      nothing when it turns up here again. It happens BEFORE the caller copies
+      or ships, so the post-swap paths -- the regenerated sidecar, the summary
+      session and its AI 日誌 record, all written while the old package sits in
+      a dot-prefixed backup ``known_secret_values`` skips -- have something to
+      mask against.
+    """
+    if not stat.S_ISREG(path_stat.st_mode):
+        return _ERROR_REVISE_ENV_UNREADABLE
+    if path_stat.st_size > tools._ENV_FILE_MAX_BYTES:
+        return _ERROR_REVISE_ENV_TOO_LARGE
+    text = tools._read_regular_file_capped(path, tools._ENV_FILE_MAX_BYTES)
+    if text is None:
+        return _ERROR_REVISE_ENV_UNREADABLE
+    if len(text) > tools._ENV_FILE_MAX_BYTES:
+        # Grew between the caller's ``lstat`` and this read -- the same miniature
+        # TOCTOU backstop ``_read_env_for_values`` keeps for the same reason.
+        return _ERROR_REVISE_ENV_TOO_LARGE
+    values = {key: value for key, value in tools._parse_dotenv_text(text).items() if value}
+    mask_error = _unmaskable_env_error(text, values)
+    if mask_error is not None:
+        return mask_error
+    for value in values.values():
+        tools.register_inflight_secret(value)
+        registered.append(value)
+    return None
+
+
 def _preserve_env_file(
     target: Path, staging: Path, *, existed_at_start: bool, registered: list[str]
 ) -> str | None:
@@ -1687,7 +1761,9 @@ def _preserve_env_file(
     * SOURCE -- ``FileNotFoundError`` is the ONLY "there is no ``.env``" answer
       (R2-3). Every other ``OSError`` (EIO, ESTALE, EACCES, ...) is a failure to
       LOOK, not evidence of absence, and treating it as absence would ship a
-      revision whose credentials silently vanished. A non-regular source (a
+      revision whose credentials silently vanished. That same ``lstat`` is then
+      handed to ``_shipped_env_policy_error``, which makes the two judgements
+      below out of it -- one stat, both answers. A non-regular source (a
       symlink or FIFO raced in after the entry read vetted a regular file) is
       refused rather than copied through, exactly as the bounded reader's
       ``O_NOFOLLOW`` refuses it. The same ``lstat``'s ``st_size`` also CAPS the
@@ -1762,7 +1838,23 @@ def _preserve_env_file(
       instructions is part of the contract. Deleting it would leave a revise
       unable to act on "store the key in .env" feedback, and it smuggles nothing:
       a value nobody registered is one the embedded-secret gate has nothing to
-      compare against either way. This is the standing acceptance, and it stays;
+      compare against either way. This is the standing acceptance, and it stays
+      -- but it is an acceptance about WHERE the file may come from, never a
+      waiver of the policy about what may be IN it. Until now nothing applied
+      that policy to a builder-written ``.env``: this branch returned success
+      without parsing it, and ``validate_package`` only checks the size and
+      scans for values ALREADY known, so it cannot see a NEW short value or a
+      reversible spelling. So a revise could publish ``PIN=1234`` -- which the
+      redactor's floor then permanently refuses to mask in live tool results, in
+      the AI 日誌 and in the summary -- or ``TOKEN="abcd\\"efgh"``, and the proof
+      that this was wrong rather than untidy is that the NEXT revise of that
+      package refuses at its entry gate: we would have produced a state we
+      ourselves decline to work with. It now faces
+      ``_shipped_env_policy_error`` -- the SAME reader, cap, spelling gate and
+      floor the preserved file gets -- and its values are registered before the
+      publish, which is what closes the seam between this standing acceptance
+      and the maskability policy. A refusal is the same category-only string,
+      and it aborts before the swap like every other failure here;
     * it HAD one and it is gone now -- the operator deleted the credentials file
       DURING the session. That deletion is a deliberate act on the live package,
       while the builder's file is an artifact of a prompt that told it not to
@@ -1789,7 +1881,18 @@ def _preserve_env_file(
         return _ERROR_REVISE_ENV_UNREADABLE
     if source_stat is None:
         if not existed_at_start:
-            return None  # never had one: the builder's .env ships (see the docstring)
+            # Never had one: the builder's ``.env`` ships (the standing
+            # acceptance) -- but only if it clears the same policy the preserved
+            # file does, which nothing used to ask of it. ENOENT here is the
+            # ordinary case (the prompt tells the builder not to write one), and
+            # it ships a package with no ``.env`` exactly as before.
+            try:
+                staged_stat = os.lstat(staging / ".env")
+            except FileNotFoundError:
+                return None
+            except OSError:
+                return _ERROR_REVISE_ENV_UNREADABLE
+            return _shipped_env_policy_error(staging / ".env", staged_stat, registered=registered)
         try:
             os.remove(staging / ".env")
         except FileNotFoundError:
@@ -1801,40 +1904,18 @@ def _preserve_env_file(
             # neither created nor verified (the same rule the roll-back applies).
             return _ERROR_REVISE_ENV_DISCARD
         return None
-    if not stat.S_ISREG(source_stat.st_mode):
-        return _ERROR_REVISE_ENV_UNREADABLE
-    if source_stat.st_size > tools._ENV_FILE_MAX_BYTES:
-        # Same ceiling, same file, same session (see the docstring): over it, the
-        # values were never parseable and the copy would be the one unbounded step
-        # left before the swap.
-        return _ERROR_REVISE_ENV_TOO_LARGE
     # The SAME policy the session's entry applied, re-asked of the bytes that are
-    # actually about to ship (R7-2). The reader, the cap and the non-empty filter
-    # are the entry read's, so the two gates cannot answer differently about one
-    # file; only the FILE can have changed. The read and the ``copy2`` below are
-    # two opens an instant apart -- the ordinary check-then-act residual this
-    # module accepts, the same one the ``lstat`` above already carries, and not
-    # something a single lossy decode could close (this text is decoded with
-    # ``errors="replace"``, so writing it back would not be a byte copy).
-    text = tools._read_regular_file_capped(source, tools._ENV_FILE_MAX_BYTES)
-    if text is None:
-        return _ERROR_REVISE_ENV_UNREADABLE
-    if len(text) > tools._ENV_FILE_MAX_BYTES:
-        # Grew between the ``lstat`` and this read -- the same miniature TOCTOU
-        # backstop ``_read_env_for_values`` keeps for the same reason.
-        return _ERROR_REVISE_ENV_TOO_LARGE
-    values = {key: value for key, value in tools._parse_dotenv_text(text).items() if value}
-    mask_error = _unmaskable_env_error(text, values)
-    if mask_error is not None:
-        return mask_error
-    # Registered BEFORE the copy and recorded in the session's own list in the
-    # same breath, so the ``finally`` that ends the revise discards exactly what
-    # was registered (see the docstring). ``register_inflight_secret`` and the
-    # discard are both idempotent, so a value the entry read already registered
-    # costs nothing here.
-    for value in values.values():
-        tools.register_inflight_secret(value)
-        registered.append(value)
+    # actually about to ship (R7-2) -- shape, ceiling, spelling, floor, and the
+    # registration -- through the ONE body that also judges a builder-written
+    # ``.env`` above, so the two can never answer differently about the same
+    # bytes. The read it makes and the ``copy2`` below are two opens an instant
+    # apart -- the ordinary check-then-act residual this module accepts, the same
+    # one the ``lstat`` above already carries, and not something a single lossy
+    # decode could close (that text is decoded with ``errors="replace"``, so
+    # writing it back would not be a byte copy).
+    policy_error = _shipped_env_policy_error(source, source_stat, registered=registered)
+    if policy_error is not None:
+        return policy_error
     destination = staging / ".env"
     try:
         destination_mode: int | None = os.lstat(destination).st_mode
@@ -1936,7 +2017,13 @@ def _promote_staging_replace(
 
     A package that NEVER had a ``.env`` preserves nothing, and then a
     builder-written one SHIPS -- deliberately, and identically to an install,
-    where writing ``.env`` from the user's instructions is part of the contract.
+    where writing ``.env`` from the user's instructions is part of the contract
+    -- but it ships only after facing the SAME policy the preserved file does
+    (``_shipped_env_policy_error``), which is the seam that acceptance and the
+    maskability rules left open between them: "this file may come from the
+    builder" was never "this file may hold a value we cannot mask", and until
+    that gate existed a revise could publish one and then refuse to revise the
+    package it had just made.
     A package that HAD one which vanished mid-session is the opposite case and is
     told apart by ``env_existed_at_start``, which the caller carries down from its
     own entry read: there the staged ``.env`` is DROPPED instead, so a placeholder

@@ -1419,3 +1419,101 @@ job 是 process-local 的，而後端的順序是**先套用套件變更 → 再
 修法：文案改成陳述**結果未知**，並指向已經在畫面上的答案——這個 ending 本來就會重新
 讀取清單與總結（r6/r7），所以「先看清單再決定要不要重送」不是推託，是真的可以當場
 確認。顏色也從紅色改為橘色：這不是失敗，是不確定。
+
+### D40 附錄（overall review O-1）：builder 自己寫的 `.env` 也要過同一套遮蔽政策
+
+`_preserve_env_file` 的「開場沒有 `.env`」分支直接回成功——staging 裡那份 builder
+寫的 `.env` **從來沒有被任何政策看過**就出貨了。而 `validate_package` 補不上這一角：
+它只驗大小，內嵌秘密閘比對的是**已經登記過**的值，所以一個**全新**的短值或一種可逆
+拼法它天生看不見。於是一次修訂可以發佈 `PIN=1234`（遮蔽器的 6 字元下限從此永遠不會
+遮它——不論在即時工具結果、AI 日誌還是總結裡），或 `TOKEN="abcd\"efgh"`（`cat` 印出來
+的那一行對不上任何登記值）。
+
+**這是缺陷而不是不整齊的證據**：那個套件的**下一次修訂**會在入口閘被拒
+（R1-1／R5-1／R7-1 就是同一組規則）——我們生產了一個自己拒絕再處理的狀態。
+
+裁決：**不推翻**「從來沒有 `.env` 的套件可以收下 builder 寫的那份」（R3-1 的既有
+接受），因為那條講的是**檔案可以從哪裡來**；它從來就不是「檔案裡可以放什麼」的豁免。
+出貨前對 staging 那份跑**同一套**政策：`lstat`（非 regular 就拒）→ 位元組上限 →
+受限讀取器 → dotenv 解析 → `_unmaskable_env_error`（下限＋逐行拼法）→ **複製／出貨
+之前**把值 `register_inflight_secret` 並記進 session 自己的清單（`finally` 照樣清）。
+
+- **一個函式，兩個檔案**：`_shipped_env_policy_error` 同時服務「複製回來的正式
+  `.env`」與「builder 寫的那份」。兩道閘必須**不可能**對同一批位元組給出不同答案，
+  所以它們不是兩道閘，是同一道問了兩次；呼叫端各自的 `lstat` 直接傳進去，不多花
+  syscall。
+- **沿用既有訊息，不新增一條**：`_ERROR_REVISE_ENV_UNMASKABLE`／`_UNMATCHABLE` 的
+  **條件與補救都一樣**（要出貨的 `.env` 值必須遮得掉，否則就別放在 `.env` 裡），
+  這正是 R3-2 立的準繩——補救不同才要拆訊息。
+- **登記涵蓋的是換裝後那一段**：總結 session、重生的 sidecar、那次總結的 AI 日誌，
+  都發生在舊包還躺在 dot 前綴備份裡的時候，而 `known_secret_values` 跳過隱藏目錄。
+  **不涵蓋**的是 builder session 自己那一輪（`InstallResult.summary` 的遮蔽發生在
+  promote 之前），那半邊是 `裁決紀錄.md` #6 記的不可防殘留。
+- **誠實記下的代價與殘留**：(a) builder 若在 `.env` 寫一個短的非秘密值（`MODE=dev`），
+  這次修訂會被拒——但那與「任何含短值的既有 `.env` 都無法修訂」是同一條既有規則，
+  修的正是「我們自己生產出那種套件」；(b) **安裝路徑仍可**產生這種套件：install 只對
+  **表單**秘密設下限與拼法保證（`schemas._SECRET_VALUE_MIN_LEN` ＋
+  `_dotenv_serialize_value`），builder 在 install 期間自己寫進 `.env` 的行沒有同款閘。
+  該套件照常執行、總結路由照常可用，只有修訂會在入口被拒，補救就是訊息講的那一句
+  （手動編輯該 `.env`）。**本輪不擴大到 install**：那是既有面、且要動的是另一條
+  promote 路徑，記在這裡以免日後誤判為遺漏。
+
+### D40 附錄（overall review O-2）：遮蔽器的 `.env` 快取要認「檔案」，不是「路徑＋mtime」
+
+`_cached_env_values` 以 `(路徑, st_mtime_ns)` 認定快取是否還新鮮，而 mtime 正是
+userspace **唯一可以任意設定**的時間戳，好幾種再普通不過的換檔方式都**刻意**保留它。
+實測（本 repo 的 ext4，非臆測）：
+
+- `shutil.copy2` 覆蓋既有路徑（**修訂流程自己**還原 `.env` 用的就是它）：只有
+  `st_ctime_ns` 變；
+- 就地改寫後 `os.utime` 還原時間戳（`cp -p`、備份回填、保留時間戳的還原）：只有
+  `st_ctime_ns` 變，**即使新內容長度相同**；
+- 寫暫存檔再 rename、時間戳沿用（`rsync -t`，以及修訂的發佈）：`st_ino` 與
+  `st_ctime_ns` 都變；
+- `unlink` 後重建：inode **會被重用**（實測），所以光看 inode 也擋不住上一項；
+- 只 rename **父目錄**（修訂發佈的最後一步）：檔案本身什麼都沒變——所以回滾把原本
+  的套件放回去之後，快取**仍然命中**，這是正確的。
+
+裁決：tag 改成 `(st_dev, st_ino, st_mtime_ns, st_ctime_ns, st_size)`。真正扛住的是
+`st_ctime_ns`（沒有 syscall 能把它往回設，任何內容或中繼資料變動都會推進它），
+dev/ino 擋掉「時間戳被完整沿用的置換」，size 擋掉「落在同一個時鐘刻度內」的一部分。
+**誠實寫下殘留**：實測這台機器的檔案時間戳時鐘以約 1ms 前進，所以一個
+**同 inode、同大小、保留 mtime** 的置換若落在快取那次讀取的**同一毫秒內**，仍然會命中
+——那是一對 syscall 的寬度，與本子系統到處接受的 check-then-act 瞬間同級，而且任何
+以 stat 為基礎的 tag 都關不掉它（唯一的關法是每一則日誌都重讀每個 `.env`，正是這個
+快取存在的理由）。
+
+**不另外加「修訂成功後顯式失效」**：實測顯示修訂的發佈**必定**同時改變 `st_ino` 與
+`st_ctime_ns`（`copy2` 在 staging 造出新 inode，父目錄 rename 不會把它改回去），所以
+那道失效對它要保護的路徑是**構造上不可達**的死碼；而它擋不到的第三方置換，本來也不在
+它的射程內。多一條會變動快取的入口就要多一份鎖與正確性論證——「防禦性功能的失敗模式
+比它解決的問題難時，先確認問題真的存在」的既有教訓直接適用。
+
+### D40 附錄（overall review O-3～O-5）：三處文件描述的是已經不存在的架構
+
+三處都不是措辭問題，而是**會誘導後人拆掉現行防線**的敘述，所以連「為什麼這句話危險」
+一起寫進修正裡：
+
+- **O-3 sidecar 不會走到內嵌秘密閘**：`backend/README.md`、`tools.write_tool_meta`
+  的 docstring 與 `docs/web-v4-plan.md` 都說 sidecar 會被修訂的 staging 複製帶去接受
+  `validate_package` 的內嵌秘密掃描。實際上 `_revise_copy_ignore` 在**任何層級**都排除
+  sidecar 的保留命名空間，`_strip_builder_sidecars` 又在驗證**之前**刪掉 staging 裡的
+  sidecar——那道閘**從來沒有**看過任何 sidecar。危險在於：相信下游還有一關的人，會覺得
+  把 `write_tool_meta` 的 fail-closed 遮蔽放寬成「遮不掉就照寫」是安全的，而其實那是
+  這個檔案唯一的防線。同一份計畫文件另外兩句也一併校正：sidecar 的寫入早已改成
+  `_write_sidecar_atomic`（不是 `_write_regular_file` 的就地截斷——回頭改會拆掉已定版
+  總結所依賴的原子發布），`redact→strip→cap` 也早已從 `ToolSummaryResult` 的 validator
+  搬到 `tools.store_summary_meta` 這個儲存邊界（validator 跑在 event loop 上）。
+- **O-4 single-flight 不是安裝專屬**：repo 根目錄 `README.md` 與 `backend/README.md`
+  仍把名額寫成「同一時間只能有一個安裝在跑」，而 D40 之後安裝、修訂與**同步的重新
+  產生總結**共用同一個名額（前端早就改口叫「工具任務」）。連它們引用的錯誤文案一起
+  更正：後端的代碼與字串維持 `install_in_progress`／「已有安裝正在進行中」（前端有
+  pin 住的分支），但前端**刻意覆寫**成中性的「已有工具任務正在進行中（安裝、AI 修訂或
+  重新產生總結）」——指名一個使用者從沒送出的「安裝」只會讓他去找一個不存在的東西。
+- **O-5 寫入閘少了一項，而且把定版寫成完全不受管制**：`frontend/README.md` 把閘寫成
+  `summaryBusy || staleList`，漏了 `settlingJobEnd`；更要緊的是它讀起來像「定版永遠
+  不受這類不確定性管制」，而實際出貨的按鈕對**定版方向**同時受 `settlingJobEnd`／
+  `isFetching`／`isError` 管制，只有**解除定版**無條件可用。改寫時把它寫成規則而不是
+  個案——**凍結需要看得到現況，釋放不需要**，而且持久的讀取失敗絕不能把操作者鎖在
+  「已定版且無路可退」——否則下一次照著 README 重構的人會把 r8／r10／r11 關掉的洞
+  原樣裝回去。

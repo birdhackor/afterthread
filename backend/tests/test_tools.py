@@ -1216,6 +1216,71 @@ def test_validate_package_rejection_never_echoes_secret_in_filename(
 # --- known-secret redaction (F1 / F4, D36) ---------------------------------
 
 
+def test_known_secret_values_sees_a_same_mtime_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A ``.env`` whose CONTENT changed without its mtime advancing must invalidate
+    the redactor's per-package cache.
+
+    The tag used to be the ``st_mtime_ns`` alone, and mtime is the one timestamp
+    userspace can set to anything: a timestamp-preserving restore (``cp -p``, a
+    backup rollout, ``shutil.copy2`` -- which is exactly what the revise flow uses
+    to put a ``.env`` back) leaves it untouched. The cache then kept serving the
+    OLD value, so the tool emitted the NEW secret and nothing masked it -- not the
+    live tool-result redactor, not llm_log, not the summary writer.
+
+    Driven the way the hazard actually arrives: write, populate the cache, rewrite
+    with different content, then force the ORIGINAL stamps back with ``os.utime``.
+    ``st_ctime_ns`` is what catches this one (no syscall can set it backwards),
+    which is why the tag is a file identity rather than a timestamp."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "kb", "import sys\n", dotenv="KB_API_KEY=first-secret-abcdef\n")
+    _install_tools(monkeypatch, root)
+    tools._ENV_VALUE_CACHE.clear()
+
+    assert "first-secret-abcdef" in tools.known_secret_values()  # cache populated
+
+    env_file = pkg / ".env"
+    before = env_file.stat()
+    env_file.write_text("KB_API_KEY=second-secret-abcdef\n", encoding="utf-8")
+    os.utime(env_file, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert env_file.stat().st_mtime_ns == before.st_mtime_ns  # the premise of the test
+
+    values = tools.known_secret_values()
+    assert "second-secret-abcdef" in values  # the value that would leak today
+    assert "first-secret-abcdef" not in values
+
+
+def test_known_secret_values_still_caches_an_unchanged_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """... and it is still a CACHE, not a no-op that re-reads every time.
+
+    The provider runs once per stored log body -- every request message and every
+    response of every attempt -- so a busy installer session would otherwise
+    re-read every installed tool's ``.env`` from disk dozens of times per round.
+    Widening the tag must not cost that: an untouched file has the identical
+    identity, so the second call parses nothing."""
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "import sys\n", dotenv="KB_API_KEY=cached-secret-abcdef\n")
+    _install_tools(monkeypatch, root)
+    tools._ENV_VALUE_CACHE.clear()
+
+    parses: list[Path] = []
+    real_loader = tools._load_tool_dotenv
+
+    def counting_loader(directory: Path) -> dict[str, str]:
+        parses.append(directory)
+        return real_loader(directory)
+
+    monkeypatch.setattr(tools, "_load_tool_dotenv", counting_loader)
+
+    assert "cached-secret-abcdef" in tools.known_secret_values()
+    assert len(parses) == 1  # the miss
+    assert "cached-secret-abcdef" in tools.known_secret_values()
+    assert len(parses) == 1  # ... and the hit, with no second read
+
+
 def test_redaction_marker_matches_llm_log() -> None:
     """tools._REDACTION_MARKER and llm_log._REDACTION_MARKER MUST be byte-identical:
     a secret masked in a live tool result and one masked in the AI 日誌 have to be
