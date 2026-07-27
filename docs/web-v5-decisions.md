@@ -133,6 +133,11 @@ _TOOL_DISABLED_RESULT = "tool not run: this tool was disabled after it was offer
 
 **兩道檢查都留著，順序是身分在前**，而順序本身有兩個作用：
 
+> **r4 更正（見下方 r4 附錄 R4-1）**：「順序是身分在前」在 r4 之後**只對 handler
+> 那一處成立**。`Popen` 前一行是反過來的（開關在前、身分緊貼 `Popen`），因為那個
+> 位置只有一個名額，而**改道**比「晚一個 lstat 才看到開關」嚴重。下面第二個項目
+> 符號的推論另外早在 r2（R2-1）就被推翻了。
+
 - 被**換掉**的套件要回報「換掉了」，而不是去讀它繼受者的狀態檔；
 - 更重要的：身分檢查剛剛證明了 `tool.json` **沒有動過**，所以「狀態檔不存在」
   可證地仍然等於 manifest 當初廣告時說的那個值——對一個已被廣告的工具而言就是
@@ -487,6 +492,15 @@ ENOENT 的 lstat，約 10 us），所以呼叫端拿到的值與它下一行的�
 那次重讀只會讓答案**更新**：`PATCH` 若落在 manifest 讀取那一段，它產生的正是這次
 重讀要找的檔案，規則會改用它。
 
+> **r4 更正（見下方 r4 附錄 R4-1／R4-3）**：這段有兩處要改。**一**、「只隔一個
+> 比較」在 r4 之後是「一個比較、一個 `lstat`、再一個比較」——身分檢查移到了
+> `Popen` 的前一行，理由見 R4-1。**二**、把「值是新鮮的」講成一種**保證**是錯的：
+> 讀取器選定版本的時點是 `open`，不是 `read`（`_read_regular_file_capped` 先
+> `os.open` 再從那個 fd 讀），而發佈是 `os.replace`，所以一次落在 open 之後的
+> `PATCH` 會讓這次讀取從一個**已經不是現行版本**的 inode 拿到舊值。真正成立的
+> 性質是「拿到的一定是**某一個完整發佈版本**、絕不是撕裂的半份，而那個版本是
+> `open` 當下的現行版本」。
+
 **實測（同一個行程內新舊並排量、best of 7×2000 次以壓掉雜訊；非估算）**：
 
 ```
@@ -513,6 +527,10 @@ PRESENT 幾乎就是那次狀態檔讀取本身（65 vs 58 us），兩處合計�
 會跟著連結離開 tools 目錄。它回的是掃描對這種目錄回的同一個答案（預設值），因為
 這是**拒絕去看**而不是判斷——那一列本來就 `valid=false`。
 
+> **r4 更正（見下方 r4 附錄 R4-2）**：最後那句「那一列本來就 `valid=false`」是
+> **錯的守衛**——執行路徑根本不看 `valid`（handler 是套件還正常時建好的）。兩處
+> 的答案在 r4 都改成 `False`。
+
 **窗口本身的量測（`strace` 同一次工具呼叫，數「最後一次碰 `.state.json` 到
 `vfork` 之間隔了幾個 syscall」）**：
 
@@ -534,6 +552,12 @@ openat(".../tool.json")     ← 取 legacy fallback
 lstat(".../.state.json")    ← 第二次讀：權威，而且是最後一個
 vfork(...)                  ← 子行程
 ```
+
+> **r4 更正（見下方 r4 附錄 R4-1）**：這張表與這段尾巴在 r4 之後不成立，而且
+> 「0 個 syscall」原本就**不是**它被當成的那個保證。r4 把身分檢查移到最後，所以
+> 「最後一次碰 `.state.json` → `vfork`」變成 **1 個路徑 syscall**（那次身分
+> `lstat`）；而「身分檢查 → `vfork`」則從 6～7 個路徑 syscall 變成 **0 個**。
+> 新的實測尾巴見 r4 附錄。
 
 **可證的量測（把修法換回 r2 的寫法，當場失敗）**：
 
@@ -611,3 +635,164 @@ error: "missing tool.json"}`；過大 → 200 `error: "tool.json is too large"`�
 chmod 000 → 200 `error: "tool.json is not a readable regular file"`；
 `.state.json` 是目錄（發佈失敗）→ 404；不存在的工具 → 404。docstring 改成這份
 清單，並寫明「manifest 已不在 404 的理由之列」以免下次又被讀成疏漏。
+
+### D41 附錄（P1 review r4）：兩道檢查搶同一個名額，而「零 syscall」從來不是新鮮度
+
+四條 finding。前兩條都是**執行前檢查**的問題——一條是 r3 自己的修法把 D40 O6-1
+的 P1 危害重新打開，一條是一個**拒絕去看**被寫成 fail-open；第三條是 r3 對那道
+檢查的**保證**講得比程式碼給得到的多；第四條是兩份使用者文件對同一個修法互相
+矛盾。
+
+#### R4-1：`Popen` 前只有一個名額，而它屬於身分檢查（P1）
+
+r3 之後的順序是 `_still_the_expected_package` → `package_enabled` → `Popen`，於是
+身分的答案在子行程起來時已經隔了一次狀態檔讀取（ABSENT 路徑還多一次 manifest
+讀取）。**這不是本模組接受的那個 lstat/exec 對**，而且它讓「身分檢查就在 `Popen`
+上一行」這句話變成假的。
+
+**危害是 D40 overall r6 O6-1 原樣復活**：`cwd` 是核心在 exec 當下從**路徑**解析
+的，所以落在那個間隙裡的一次換裝不只是競態，是**改道**——子行程在**新套件**裡
+起來，卻帶著舊的 entry argv、模型看到的舊參數 schema、以及**已經組好的舊套件
+`.env` 值**；事後看不出異狀（attempt 記的是**名字**，名字沒變）。執行登記幫不上
+忙：它延後的是**舊備份的移除**，它不阻止換裝。
+
+**實測（修法前，HEAD `fffedca`）**：從 `Popen` 前那次狀態檔讀取內部發動
+`_promote_staging_replace` 形狀的換裝 → 回到模型手上的是 `'NEW'`——**替換進來的
+套件真的執行了**。
+
+**兩道檢查不可能都在最後，所以這是一個排序判斷，裁決如下：身分檢查在最後。**
+在舊契約下跑**別的套件的程式碼**、還配上舊套件的環境值，比「在操作者剛剛按下的
+開關之後幾微秒才停下來」嚴重。反過來排，開關那一側只剩**一個 `lstat`** 的窗口，
+那正是本模組到處以名義接受的殘留；而身分那一側的窗口**歸零**。
+
+**修法**：`package_enabled` 排到 `_still_the_expected_package` **之前**，身分檢查
+與 `Popen` 之間不留任何東西。
+
+**實測（`strace` 同一次真的工具呼叫，改前／改後並排；本機 ext4）**：
+
+```
+                                    r3（身分在前）   r4（開關在前）
+最後一次碰 .state.json → vfork          6～7 個          1 個（身分 lstat）
+身分 lstat → vfork                       6～7 個          0 個
+```
+
+（兩邊在 `vfork` 前都還有 3 次 `fstat`，那是 `subprocess.Popen` 對**已經開好的**
+三根 pipe 做的，不解析任何路徑。）r4 的尾巴逐行：
+
+```
+PRESENT（有狀態檔）                      ABSENT（沒有，走 fallback）
+lstat(".../echo")        symlink 拒絕    lstat(".../echo")        symlink 拒絕
+lstat(".../.state.json") 讀取器的 lstat  lstat(".../.state.json") ENOENT（第一次）
+openat(".../.state.json")＋fstat/read    openat(".../tool.json")＋fstat/read
+lstat(".../tool.json")   ← 身分檢查      lstat(".../.state.json") ENOENT（權威）
+vfork(...)                               lstat(".../tool.json")   ← 身分檢查
+                                         vfork(...)
+```
+
+**handler 那一處刻意維持相反的順序**（身分在前、開關在後），而且理由不衝突：那裡
+**兩道檢查都不貼著任何動作**（後面還有 `.env` 讀取、序列化、無上限的 threadpool
+排隊），所以排第二換不到任何東西；而身分在前換得到「已經被換掉的套件回報**換掉
+了**，而不是去讀它繼受者的狀態檔」。只有 `Popen` 那一處的「貼著」是稀缺資源。
+
+**寫明的代價**：一個**同時**被換掉又被關掉的套件，在 `Popen` 那一處現在會拿到
+`_TOOL_DISABLED_RESULT` 而不是 `_TOOL_REPLACED_RESULT`。兩種都不會跑；handler
+自己的身分在前那一對已經在常見情形先回報了換掉；而拒絕字串按契約本來就只講類別。
+
+**可證的量測（把順序換回去，當場失敗）**：
+`test_a_revise_landing_between_the_toggle_read_and_popen_is_refused_not_run` 拿到
+`'NEW'`；`test_the_identity_check_is_the_last_thing_before_the_subprocess_starts`
+的軌跡變成 `['identity', 'enabled', 'identity', 'enabled', 'popen']`。
+
+#### R4-2：symlink 的套件目錄讓停用檢查回 `True`，於是停用的工具跑起來（P2）
+
+`package_enabled` 對 symlink 的**套件目錄**回 `True`，理由寫著「這是拒絕去看，
+不是判斷；那一列本來就 `valid=false`，凡是看 `valid` 的都不會廣告或執行它」。
+**執行路徑不看 `valid`**——它的 handler 是套件還正常時建好的，手上只有一個路徑。
+而 `package_identity` 跟隨**上層** symlink，所以它照樣看到同一個 `tool.json`
+inode，身分檢查也過。
+
+**實測（修法前）**：廣告一個工具 → 用 API 把它關掉（回
+`_TOOL_DISABLED_RESULT`，正確）→ 把目錄改名移開、原位種一個同名 symlink 指回去
+→ 兩道執行檢查都通過，`Popen` 跟著連結把**停用的工具**跑起來（`'ok'` ＋ sentinel
+落地）。一次違反兩個契約：操作者的開關，以及「symlink 的套件一律無效、絕不執行」。
+
+**裁決：放在開關那一題，並且把答案改成 fail-closed。** 三個理由：
+
+1. **不增加任何 syscall**。那個 `lstat`（`directory.is_symlink()`）本來就在
+   `package_enabled` 的第一行，改的只是它的**答案**。放進身分檢查則要對
+   `_still_the_expected_package` 的**三個**呼叫端各加一次目錄 lstat，而 spec 的
+   要求正是「若已經在那裡的檢查答得出來，就不要在 `Popen` 前多加第三次讀檔」。
+2. **它修的是根因而不是再加一道拒絕**。原本的 `True` 是被一句**已證明為假**的話
+   背書的；本模組對「拒絕去看」的規則到處都是 fail-closed（`_read_enabled_state`
+   的 OSError 分支、R2 對讀不出的狀態檔的裁決），只有這一格 fail-open。
+3. **一條規則的等式保住**。`_scan_package` 對同一形狀也改回 `False`，所以掃描與
+   執行前檢查仍然答得一樣——只是那個共同答案從 `True` 變成 `False`。這正是 R2
+   已經裁決過的形狀：**答不出「可不可以跑」的套件，列成無效**且**停用**，於是
+   `enabled_llm_tools` 的 `valid AND enabled` 兩個濾條都說不。
+
+**清單上的答案（本輪改變的行為，寫明）**：symlink 的套件目錄那一列，`enabled`
+從 `true` 變成 `false`（`valid=false` 與 `error` 不變）。UI 上那顆開關本來就因
+`!tool.valid` 而停用，所以操作者看到的是「無效 ＋ 關著 ＋ 一句原因」，三者一致。
+
+**殘留窗口寫明**：symlink 的拒絕現在排在身分檢查**之前**，所以還剩一個 `lstat`
+的窗口——要在那一瞬間把 live 目錄改名並種上 symlink。那是裁決紀錄 #5 的等級
+（該行為者以**服務自身 uid** 執行，直接動檔案更省事），與 R4-1 接受的殘留同一個。
+
+**回報字串**：走 `package_enabled` 就代表回 `_TOOL_DISABLED_RESULT`。這是對的
+方向：對模型而言「這個工具不能跑」正是事實，而告訴它「套件被換掉了」（去重讀
+規格）對一個現在是連結的路徑是更差的建議——沒有新規格可讀；操作者那一側則由
+那一列的 `error` 講清楚。
+
+**可證的量測（把任一半換回去，當場失敗）**：只還原 `package_enabled` →
+`test_a_symlinked_package_directory_cannot_run_a_tool_disabled_through_the_api`
+回 `'ok'`（**停用的工具跑了**）；只還原 `_scan_package` →
+`test_symlinked_package_dir_listed_invalid` 的 `enabled` 量到 `True`。兩種還原都
+會讓 `test_the_scan_and_the_execution_check_answer_the_one_rule_identically`
+失敗——**該測試本輪新增了 symlink 目錄這第九種形狀**（r3 當初驗了 13 種、只釘 8
+種，這一種不在釘住的那批裡，所以是補上而不是修改既有案例）。
+
+#### R4-3：「最後一次讀到 `vfork` 之間 0 個 syscall」證明不了新鮮度（P2）
+
+r3 用那個 0 佐證「值是新鮮的」。**證不到**：`_read_enabled_state` 走
+`_read_regular_file_capped`，那個 helper 先 `os.open`、**再**從那個 fd 讀，所以
+**版本在 `open` 就選定了**；而發佈端是 `os.replace`。一次在 runtime 打開舊 inode
+**之後**才落地的 `PATCH`，會讓 runtime 從一個**已經不是現行版本**的檔案讀到
+`true`。
+
+**裁決：不加鎖，改講法。** 這裡的窗口是 open→read，兩三個 syscall，正是本子系統
+**以名義接受**的那個殘留；要關掉它只能在執行路徑上加鎖，那等於讓**每一次工具
+呼叫**與**每一次開關**互相序列化。錯的是**宣稱**，不是實作。
+
+**改成的真正性質**（已寫進 `package_enabled` 的 docstring、`backend/README.md`
+與 `docs/tool-calling.md`）：讀取器拿到的一定是**某一個完整發佈版本**——絕不是
+撕裂的半份、也不是兩份各一半——而那個版本是它 `open` 當下的現行版本。
+
+**便宜就釘住的那一半**：`test_a_reader_that_opened_the_state_file_sees_one_whole_published_version`
+先 `os.open` 舊 inode、再跑一次成功的 `set_enabled`，然後從**握著的 fd** 讀——
+拿到的是完整、可解析的**舊**文件，而下一次讀取拿到新的。（這條釘的是**性質**，
+不是某個修法的守衛，所以沒有「拿掉就失敗」的對照——要讓它失敗得把發佈器換成
+truncate-in-place 的寫法。）
+
+#### R4-4：`tool-calling.md` 教的修法在 UI 上做不到（P3）
+
+`docs/tool-calling.md` 告訴操作者：狀態檔壞掉但**還是一般檔案**時「按一次開關就
+好」。但那個狀態正是讓該列 `valid=false` 的原因，而前端對**每一個**無效列都停用
+那顆 `Switch`（`ToolsPage.jsx:693`，`disabled={!tool.valid || mutating}`）。所以
+那條修法只有走 API 或自己改檔案才做得到。`backend/README.md` 早就寫對了，兩份
+使用者文件因此互相矛盾。
+
+**裁決：改文件，不改前端。** `tool-calling.md` 現在把「PATCH 覆蓋成乾淨的一份」
+與「UI 上那顆開關按不下去」分開講，並指出可行的兩條路（刪掉那個檔案退回
+fallback，或直接送 `PATCH`）。
+
+**沒做、留作建議**：讓 `Switch` 在無效列上也可按，是一個關於**所有**無效套件的
+產品決定（今天「無效 ⇒ 開關停用」對每一種無效理由一視同仁，而多數無效理由確實
+讓開關沒有可觀察的效果），不是順手改掉的事；要做應該連同「哪些 `error` 值下開關
+仍有意義」一起裁決。
+
+#### 本輪被駁回的一條
+
+第五條 finding（修訂會吞掉換裝窗口內對 `.state.json` 的手改）**駁回**，理由記在
+repo 根目錄 `裁決紀錄.md` #9：那段期間對**任何**檔案的手改都會被丟棄（那是「整包
+換掉」的定義），行程內的鎖鎖不住編輯器，而 P2 的版面會讓這個窗口連同過渡性的
+`_STATE_PUBLISH_LOCK` 一起消失。本輪的修改**不觸碰**該行為。

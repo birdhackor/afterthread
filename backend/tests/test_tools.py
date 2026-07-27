@@ -1113,6 +1113,46 @@ def test_runtime_refuses_a_tool_whose_state_file_became_unreadable(
     assert not sentinel.exists()
 
 
+def test_a_reader_that_opened_the_state_file_sees_one_whole_published_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """P1R4-3: the property the execution path actually has, stated as a test.
+
+    Reading ``.state.json`` LAST does NOT make the value provably current at the
+    moment it is acted on, and a docstring next door used to say it did.
+    ``_read_regular_file_capped`` selects the version at its ``open``, not at its
+    ``read``, and the publisher swaps the file in with ``os.replace`` -- so a PATCH
+    that lands after the reader's ``open`` leaves the reader answering out of an
+    inode that is no longer the published one. Closing that would take a lock on
+    the execution path, serializing every tool call against every toggle, which
+    this subsystem deliberately does not do.
+
+    What IS true is pinned here instead, and it is the reason the residual is
+    acceptable: a reader gets ONE whole published version, never a torn file and
+    never half of each. The held fd stands in for a runtime that opened the old
+    inode a syscall before the PATCH; it still reads the complete previous document
+    afterwards, while the next reader sees the new one."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "swapped-under", "import sys\n")
+    _install_tools(monkeypatch, root)
+    assert set_enabled("swapped-under", True) is True
+    state_path = pkg / tools._STATE_FILENAME
+
+    fd = os.open(state_path, os.O_RDONLY)  # the version is chosen HERE
+    try:
+        assert set_enabled("swapped-under", False) is True  # published mid-read
+        with os.fdopen(fd, encoding="utf-8") as handle:
+            fd = -1  # fdopen owns it now
+            held = handle.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+    assert json.loads(held) == {"enabled": True}  # whole, parseable, the OLD version
+    fresh = tools._read_enabled_state(pkg)
+    assert (fresh.present, fresh.enabled, fresh.error) == (True, False, None)
+
+
 def test_a_toggle_landing_between_the_state_read_and_popen_is_still_caught(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1166,13 +1206,20 @@ def test_a_toggle_landing_between_the_state_read_and_popen_is_still_caught(
 def test_the_execution_toggle_check_reads_the_state_file_last_and_scans_nothing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """P1R3-1's adjacency, pinned as call ORDER because nothing sits in the gap.
+    """P1R3-1's adjacency, pinned as call ORDER because so little sits in the gap.
 
     The sibling test above drives a PATCH through the one step that can separate
     the toggle read from ``Popen``. On the other path -- a package that HAS a state
-    file -- there is nothing to drive from, so what has to be pinned is that
-    nothing is there: the last thing the runtime does before starting the child is
-    read ``.state.json``, and it does not run a package SCAN to get there.
+    file -- there is nothing to drive from, so what has to be pinned is how little
+    is there: the last file the runtime READS before starting the child is
+    ``.state.json``, and it does not run a package SCAN to get there.
+
+    The last file READ, not the last thing done: since P1R4-1 the identity check
+    stands between that read and ``Popen``, because only one of the two can be
+    adjacent and a redirect is the worse failure (see
+    ``test_the_identity_check_is_the_last_thing_before_the_subprocess_starts``,
+    which pins that order). It reads nothing -- one ``lstat`` of ``tool.json`` --
+    so this assertion is about READS and is exactly as strong as it was.
 
     Both halves matter and neither implies the other. A scan would answer the same
     question correctly (it is where the rule is defined) while re-introducing the
@@ -1207,7 +1254,7 @@ def test_the_execution_toggle_check_reads_the_state_file_last_and_scans_nothing(
 
     assert asyncio.run(handler({})) == "ok"
 
-    assert trace[-2:] == ["state", "popen"]  # the toggle read is the line above it
+    assert trace[-2:] == ["state", "popen"]  # the toggle read is the LAST READ before it
     assert "scan" not in trace  # ... and getting it cost no scan at all
     assert trace.count("state") == 2  # once per site (handler entry, pre-Popen)
 
@@ -1227,7 +1274,18 @@ def test_the_scan_and_the_execution_check_answer_the_one_rule_identically(
 
     The invalid rows are included deliberately: ``enabled`` is reported for a
     package that is not runnable too (the listing shows the switch), so a rule that
-    diverged only on those would diverge exactly where nobody looks."""
+    diverged only on those would diverge exactly where nobody looks.
+
+    The SYMLINKED directory is the ninth shape and the only one neither side sends
+    through ``_effective_enabled``: both REFUSE TO LOOK before joining a name onto
+    such a path, so the equality here is the only thing keeping those two hard-coded
+    answers in step. It was added in P1R4-2 together with the answer itself, which
+    flipped from True to False: True was justified by "the row is invalid, so
+    nothing that consults ``valid`` runs it", and the EXECUTION path does not
+    consult ``valid`` (see
+    ``test_a_symlinked_package_directory_cannot_run_a_tool_disabled_through_the_api``
+    for the sequence that ran a disabled tool through one). A refusal to look now
+    answers the way every other refusal to look in this module answers: closed."""
     root = tmp_path / "tools"
     absent = _make_tool(root, "absent", "import sys\n", enabled=True)
     legacy_off = _make_tool(root, "legacy-off", "import sys\n", enabled=False)
@@ -1244,6 +1302,11 @@ def test_the_scan_and_the_execution_check_answer_the_one_rule_identically(
     (oversized / "tool.json").write_text("x" * (_MANIFEST_MAX_BYTES + 1), encoding="utf-8")
     no_manifest = root / "no-manifest"
     no_manifest.mkdir()
+    # A REAL, otherwise-perfectly-enabled package, reachable only through a link --
+    # so nothing but the refusal to look can produce the answer below.
+    _make_tool(tmp_path, "linked-real", "import sys\n", enabled=True)
+    linked = root / "linked"
+    linked.symlink_to(tmp_path / "linked-real", target_is_directory=True)
 
     expected = {
         absent: True,  # ABSENT -> the manifest's legacy key
@@ -1254,10 +1317,167 @@ def test_the_scan_and_the_execution_check_answer_the_one_rule_identically(
         not_json: True,  # no legacy key to offer -> the same default the scan gives
         oversized: True,
         no_manifest: True,
+        linked: False,  # a refusal to LOOK, answered closed on BOTH sides (P1R4-2)
     }
     for directory, answer in expected.items():
         assert tools._scan_package(directory).enabled is answer, directory
         assert tools.package_enabled(directory) is answer, directory
+
+
+def test_the_identity_check_is_the_last_thing_before_the_subprocess_starts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """P1R4-1: two checks want the slot above ``Popen`` and only one can have it.
+
+    Round 3 left the order ``identity -> toggle -> Popen``, which put a state-file
+    read -- and on the ABSENT path a manifest read as well -- between the identity
+    ANSWER and the exec that acts on it. ``cwd`` is resolved by the KERNEL from the
+    PATH at exec time, so a revise landing in that gap does not merely race: the
+    child starts inside the NEW package carrying the OLD entry argv, the old
+    schema's arguments and the old package's ``.env`` values, and nothing afterwards
+    shows it (an attempt records the NAME, which did not change) -- the hazard D40's
+    overall-r6 O6-1 was rated P1 for.
+
+    What the toggle gives up by moving first is one ``lstat``, the identity check's
+    own syscall: a switch flipped inside it starts the tool the operator turned off
+    microseconds earlier -- its own code, its own contract, its own ``.env``. That
+    is the smaller wrong and it is the check-then-act instant this module accepts by
+    name everywhere else.
+
+    The HANDLER keeps the opposite order, and the full trace pins that too: neither
+    of its checks is adjacent to anything (a ``.env`` read, a serialization and a
+    queue wait follow both), so nothing is bought by being second there, while
+    identity-first means an already-replaced package is reported as replaced instead
+    of having its successor's toggle consulted. Pinned as ORDER because these are
+    exactly the lines a refactor moves as though they were free."""
+    root = tmp_path / "tools"
+    _make_tool(root, "ordered", "import sys\nsys.stdout.write('ok')\n")
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler  # the advertisement scans; probe after it
+
+    trace: list[str] = []
+    real_enabled = tools.package_enabled
+    real_identity = tools._still_the_expected_package
+    real_popen = subprocess.Popen
+
+    def traced_enabled(directory: Path) -> bool:
+        trace.append("enabled")
+        return real_enabled(directory)
+
+    def traced_identity(directory: Path, expected: tuple[int, int, int] | None) -> bool:
+        trace.append("identity")
+        return real_identity(directory, expected)
+
+    def traced_popen(*args: Any, **kwargs: Any) -> Any:
+        trace.append("popen")
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(tools, "package_enabled", traced_enabled)
+    monkeypatch.setattr(tools, "_still_the_expected_package", traced_identity)
+    monkeypatch.setattr(subprocess, "Popen", traced_popen)
+
+    assert asyncio.run(handler({})) == "ok"
+
+    assert trace[-3:] == ["enabled", "identity", "popen"]  # identity is the last word
+    # ... and the handler's own pair is deliberately the other way round.
+    assert trace == ["identity", "enabled", "enabled", "identity", "popen"]
+
+
+def test_a_revise_landing_between_the_toggle_read_and_popen_is_refused_not_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The order above, driven rather than traced: the gap must REFUSE a swap.
+
+    The probe replaces the package the way ``_promote_staging_replace`` does (rename
+    the live one aside, rename the new one in) from inside the pre-``Popen`` toggle
+    read -- i.e. after the handler's checks and strictly before the identity check
+    that now follows it. With the identity check second the swap is caught and the
+    call answers ``_TOOL_REPLACED_RESULT``; with round 3's order it was the identity
+    check that ran first and this exact probe measured ``'NEW'`` coming back to the
+    model, the replacement's code executed under the old contract.
+
+    The state file is created up front so ``package_enabled`` takes its PRESENT path
+    and reads once per site -- the ABSENT path reads twice, which would land the
+    probe at the handler instead of at ``Popen``."""
+    root = tmp_path / "tools"
+    sentinel = tmp_path / "new-ran"
+    _make_tool(root, "swapped", "import sys\nsys.stdout.write('OLD')\n")
+    replacement = _make_tool(
+        tmp_path / "staging",
+        "swapped",
+        f"import sys\nopen({str(sentinel)!r}, 'w').write('x')\nsys.stdout.write('NEW')\n",
+    )
+    _install_tools(monkeypatch, root)
+    assert set_enabled("swapped", True) is True  # a state file: ONE read per site
+    pkg = root / "swapped"
+    handler = enabled_llm_tools()[0].handler
+
+    real_state = tools._read_enabled_state
+    reads: list[Path] = []
+
+    def swap_inside_the_gap(directory: Path) -> tools._EnabledState:
+        reads.append(directory)
+        if len(reads) == 2:  # the pre-``Popen`` site, not the handler's entry
+            os.rename(pkg, root / ".swapped.bak-probe")
+            os.rename(replacement, pkg)
+        return real_state(directory)
+
+    monkeypatch.setattr(tools, "_read_enabled_state", swap_inside_the_gap)
+
+    assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
+    assert (pkg / "run.py").read_text(encoding="utf-8").endswith("'NEW')\n")  # it DID swap
+    assert not sentinel.exists()  # ... and the new package never ran
+
+
+def test_a_symlinked_package_directory_cannot_run_a_tool_disabled_through_the_api(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """P1R4-2: the execution path never consults ``valid``, so the row cannot guard it.
+
+    ``package_enabled`` refused to LOOK into a symlinked package directory and
+    answered True, on the grounds that such a row is INVALID and nothing that
+    consults ``valid`` advertises or runs it. The handler is the counter-example: it
+    was BUILT while the package was a real directory, and it holds a path. So this
+    walks the whole documented sequence -- advertise, switch OFF through the API,
+    move the directory aside, plant a link of the same name -- and every check that
+    was supposed to stop it passed: ``package_identity`` follows PARENT symlinks, so
+    it still saw the same ``tool.json`` inode (asserted below, because that is WHY
+    the identity check cannot answer this one), the toggle check answered True, and
+    ``Popen`` followed the link and ran a disabled tool.
+
+    Both contracts were broken at once -- the operator's switch and the standing
+    "a symlinked package is invalid and is never executed" rule -- so the refusal
+    goes where the ``lstat`` already is, and it answers the way this module answers
+    every other refusal to look: closed."""
+    root = tmp_path / "tools"
+    sentinel = tmp_path / "ran"
+    _make_tool(
+        root,
+        "sneaky",
+        f"import sys\nopen({str(sentinel)!r}, 'w').write('x')\nsys.stdout.write('ok')\n",
+    )
+    _install_tools(monkeypatch, root)
+    pkg = root / "sneaky"
+    identity_before = tools.package_identity(pkg)
+    handler = enabled_llm_tools()[0].handler
+    assert asyncio.run(handler({})) == "ok"  # a legitimate package still runs
+    sentinel.unlink()
+
+    assert set_enabled("sneaky", False) is True
+    assert asyncio.run(handler({})) == tools._TOOL_DISABLED_RESULT
+
+    moved = root / "sneaky-moved"
+    os.rename(pkg, moved)
+    pkg.symlink_to(moved, target_is_directory=True)
+
+    # The identity check is UNMOVED across the swap -- it lstats <dir>/tool.json and
+    # the link leads straight back to the same inode -- which is exactly why it is
+    # not the check that can answer this.
+    assert pkg.is_symlink()
+    assert tools.package_identity(pkg) == identity_before
+
+    assert asyncio.run(handler({})) == tools._TOOL_DISABLED_RESULT
+    assert not sentinel.exists()  # nothing was started
 
 
 def test_a_promote_during_the_scan_cannot_run_the_new_package(
@@ -2932,7 +3152,14 @@ def test_symlinked_package_dir_listed_invalid(
 ) -> None:
     """A package directory that is itself a SYMLINK (even to a real, otherwise-
     valid package) is listed invalid and never executed -- _scan_all's is_dir()
-    filter follows the link, so this is the guard that keeps it out (H3)."""
+    filter follows the link, so this is the guard that keeps it out (H3).
+
+    The row is also switched OFF (P1R4-2), and that is a decision rather than a
+    detail: R2 already adjudicated that a package which cannot answer "may I run?"
+    is listed invalid AND disabled, so that no later refactor of either half of
+    ``enabled_llm_tools``'s ``valid AND enabled`` filter can put it back in front of
+    the model. Refusing to LOOK is exactly such a package, and answering the
+    permissive default here is what let the execution path run one."""
     root = tmp_path / "tools"
     root.mkdir()
     # A real, valid package OUTSIDE the tools dir, reached only via a symlink.
@@ -2942,6 +3169,7 @@ def test_symlinked_package_dir_listed_invalid(
 
     listed = {t["name"]: t for t in list_tools()}
     assert listed["evil"]["valid"] is False
+    assert listed["evil"]["enabled"] is False  # ... and the switch reads OFF, not on
     assert "real directory" in (listed["evil"]["error"] or "")
     assert enabled_llm_tools() == []  # never advertised or executable
 

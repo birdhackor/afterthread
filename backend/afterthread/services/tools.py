@@ -693,25 +693,55 @@ def package_enabled(directory: Path) -> bool:
 
     ORDER, which is the point and not a detail: the state file is the LAST thing
     read on every path. When it is present that is the only read; when it is absent
-    the fallback is fetched and the state is then read AGAIN, so what a caller acts
-    on is never older than the compare that follows it. The second read is an
-    ``lstat`` that fails ENOENT (~10 us) and can only make the answer FRESHER -- a
-    PATCH landing while the manifest is being read CREATES the file that read looks
-    for, and the rule prefers it the moment it exists.
+    the fallback is fetched and the state is then read AGAIN, so no other file
+    operation of OURS stands between the toggle and the caller's next line. The
+    second read is an ``lstat`` that fails ENOENT (~10 us) and can only make the
+    answer more current -- a PATCH landing while the manifest is being read CREATES
+    the file that read looks for, and the rule prefers it the moment it exists.
+
+    What reading it LAST does NOT buy, written down because a claim next door once
+    said it did (P1R4-3): this value is not proven CURRENT at the instant a caller
+    acts on it, and no arrangement of reads can prove that -- only a lock the
+    execution path deliberately does not take, since it would serialize every tool
+    call against every toggle. ``_read_regular_file_capped`` selects the version at
+    its ``open``, not at its ``read``, and the publisher swaps the file in with
+    ``os.replace``: a PATCH publishing ``false`` after this reader has opened the
+    old inode leaves this reader returning ``true`` out of a file that is no longer
+    the published one. The property that IS true, and is the one worth having:
+    every read here is a consistent snapshot of ONE published version -- never a
+    torn file, never half of each -- and the version is whichever was current at
+    the ``open``. That open->read gap is two or three syscalls wide and is the
+    residual this subsystem accepts by name.
 
     An unreadable state file answers False, the same fail-closed direction
     ``_read_enabled_state`` takes and the same one the scan turns into an invalid
-    row.
+    row. So does a package directory that is itself a SYMLINK -- the one shape
+    neither this function nor the scan sends through ``_effective_enabled``,
+    because both REFUSE TO LOOK before joining a name onto it; they are kept in
+    step by answering that refusal identically (see the branch below).
     """
     if directory.is_symlink():
         # Refused before any name is joined onto it, for the reason
         # ``_scan_package`` states where it does the same thing first: reading
         # ``<link>/.state.json`` would follow the link out of the tools dir (the
         # bounded reader's O_NOFOLLOW covers the final component, never a parent).
-        # True is what the scan answers for such a directory too, and for the same
-        # reason -- this is a refusal to LOOK, not a judgement about a toggle; the
-        # row is INVALID, so nothing that consults ``valid`` advertises or runs it.
-        return True
+        #
+        # FALSE, and it answered True for one round on the grounds that the row is
+        # INVALID so nothing that consults ``valid`` advertises or runs it. The
+        # EXECUTION path does not consult ``valid``: its handler was built while
+        # the package was still a real directory, and ``package_identity`` follows
+        # PARENT symlinks, so it goes on seeing the same ``tool.json`` inode after
+        # the directory is renamed aside and a link of the same name planted over
+        # it. Measured: advertise a tool, switch it OFF through the API, move the
+        # directory aside, plant the link -- both execution checks passed and
+        # ``Popen`` followed the link and ran it, breaking the toggle AND the
+        # standing "a symlinked package is never executed" rule at once. A refusal
+        # to LOOK is answered here the way this module answers every other one:
+        # fail CLOSED, the direction ``_read_enabled_state`` takes for an OSError
+        # and the scan takes for an unreadable state file. ``_scan_package``
+        # answers False for this shape too, so the ONE rule still cannot be asked
+        # twice and give two answers.
+        return False
     state = _read_enabled_state(directory)
     if state.present:
         # Not a branch of the RULE -- the rule below still decides -- but of which
@@ -763,9 +793,17 @@ def _scan_package(directory: Path, expected_name: str | None = None) -> _Package
     # link out of the tools dir (the bounded reader's O_NOFOLLOW covers the final
     # component, never a parent), and this is the check that says we never treat
     # such a path as a package at all.
+    #
+    # ``enabled=False``, not the permissive default: this is a refusal to LOOK, and
+    # the whole of R2 is that a package which cannot answer "may I run?" is listed
+    # INVALID *and* switched OFF, so no later refactor of either half of
+    # ``enabled_llm_tools``'s ``valid AND enabled`` filter can quietly put it back
+    # in front of the model. ``package_enabled`` answers this shape the same way,
+    # for the reason given there -- the EXECUTION path never consults ``valid``, so
+    # "the row is invalid" was never the protection this branch claimed it was.
     if directory.is_symlink():
         return scan_failed(
-            "package directory must be a real directory (not a symlink)", enabled=True
+            "package directory must be a real directory (not a symlink)", enabled=False
         )
 
     # The toggle, resolved before ANY manifest work so that every failure below
@@ -3323,10 +3361,11 @@ def _run_tool_subprocess(
     Blocking; the async handler runs it via ``run_in_threadpool``. Every outcome
     is an agent-visible string, never an exception:
 
+    * the tool may no longer run -- switched OFF since it was offered, or its
+      package directory is now a SYMLINK (``package_enabled`` refuses to look into
+      one, fail-closed) -> ``_TOOL_DISABLED_RESULT``, nothing is started;
     * the package at ``directory`` is no longer ``expected_identity`` ->
       ``_TOOL_REPLACED_RESULT``, nothing is started;
-    * the tool has been switched OFF since it was offered ->
-      ``_TOOL_DISABLED_RESULT``, nothing is started;
     * cannot even start (bad interpreter/entry, no exec bit) -> a "failed to
       start" category;
     * exceeded ``timeout`` -> the process GROUP is SIGKILLed and a "timed out"
@@ -3341,48 +3380,67 @@ def _run_tool_subprocess(
     caps each stream in memory as it reads rather than slurping it whole first --
     a runaway tool is killed at the cap instead of OOMing the service.
 
-    ``expected_identity`` is the manifest identity of the package whose schema the
-    model was shown, and it is verified HERE, on the line above ``Popen``, rather
-    than only in the handler that queued this call (R6-1). ``cwd`` is resolved by
-    the KERNEL, at exec time, from the PATH -- so a revise that publishes a new
-    package at that path while this call is still queuing or reading its ``.env``
-    would start the NEW package's entry file carrying the OLD entry argv, the old
-    schema's arguments and the old package's environment values. The handler's own
-    check cannot answer for that: between it and this line sit a ``.env`` read, a
-    JSON serialization and a threadpool queue wait of unbounded length. What
-    remains after this check is the lstat/exec pair -- the check-then-act instant
-    this module accepts by name -- and the execution registration the handler took
-    BEFORE this call means the package cannot have been destroyed in it, only
-    renamed (measured: a rename is invisible to a running child).
+    TWO checks stand between this call and the child, and only one of them can be
+    the LAST -- so the order is a ranking of the two failures, made explicitly:
 
-    The ENABLED re-read on the next line is the same argument applied to the other
-    question, and it is here rather than only in the handler for a reason that is
+    * ``expected_identity`` is the manifest identity of the package whose schema
+      the model was shown, and it is verified LAST, on the line immediately above
+      ``Popen``, rather than only in the handler that queued this call (R6-1).
+      ``cwd`` is resolved by the KERNEL, at exec time, from the PATH -- so a revise
+      that publishes a new package at that path while this call is still queuing,
+      reading its ``.env`` or asking the toggle would start the NEW package's entry
+      file carrying the OLD entry argv, the old schema's arguments and the old
+      package's environment values. That is a REDIRECT, not merely a race, and it
+      is invisible afterwards: an attempt's ``tools_advertised`` records the NAME,
+      which did not change. The handler's own check cannot answer for it either:
+      between it and this line sit a ``.env`` read, a JSON serialization and a
+      threadpool queue wait of unbounded length.
+    * the ENABLED check runs FIRST, and what it gives up by not being last is a
+      window of exactly one ``lstat`` -- the identity check's own syscall. A toggle
+      landing in it starts a tool the operator switched off microseconds earlier;
+      the tool's own code, its own contract, its own ``.env``. That is the smaller
+      wrong, and it is the residual this module accepts by name everywhere else.
+      The reverse ordering buys that ``lstat`` back at the price of handing the
+      redirect a window of one state-file read plus (on the ABSENT path) a manifest
+      read -- measured: with the toggle last, a swap driven into that gap ran the
+      NEW package's code and returned its output to the model.
+
+    So: what remains after the identity check is the lstat/exec pair -- the
+    check-then-act instant this module accepts by name -- and the execution
+    registration the handler took BEFORE this call means the package cannot have
+    been destroyed in it, only renamed (measured: a rename is invisible to a
+    running child).
+
+    The toggle is re-asked HERE, and not only in the handler, for a reason that is
     about NOT NARROWING an existing guarantee. Before web-v5 P1 a toggle rewrote
-    ``tool.json``, so a switch flipped anywhere in that same unbounded window --
-    the ``.env`` read, the serialization, the queue wait -- was caught by the
-    identity check on the line above. Now that a toggle moves nothing, restoring
-    the handler's check alone would leave this window uncovered and the tool would
-    start. Same rule as its neighbour: the gate belongs against the act it guards.
+    ``tool.json``, so a switch flipped anywhere in that unbounded window -- the
+    ``.env`` read, the serialization, the queue wait -- was caught by the identity
+    check as drift. Now that a toggle moves nothing, the handler's check alone
+    would leave this window uncovered and the tool would start.
 
     It asks that question through ``package_enabled`` -- the ONE precedence rule --
     exactly as the handler does, and for the reason spelled out there: an ABSENT
-    state file is an ANSWER (the manifest's legacy key), not a silence, and the
-    identity check on the line above says nothing about a file it never looks at.
+    state file is an ANSWER (the manifest's legacy key), not a silence. Being
+    adjacent to ``Popen`` is not enough on its own, and for one round this check
+    was adjacent while its ANSWER was not (P1R3-1): asking the rule by running a
+    whole ``_scan_package`` read the state file first and then spent ~0.5 ms
+    parsing a manifest and resolving an entry file, so the value acted on was
+    already old and a PATCH landing in that tail shipped a tool the operator had
+    just switched off. ``package_enabled`` reads that file LAST, so what separates
+    the toggle's value from the ``Popen`` below is one compare, one ``lstat`` and
+    one more compare.
 
-    Being on the line above ``Popen`` is not enough on its own, and for one round
-    this check was there while its ANSWER was not (P1R3-1): asking the rule by
-    running a whole ``_scan_package`` read the state file first and then spent
-    ~0.5 ms parsing a manifest and resolving an entry file, so the value acted on
-    here was already old and a PATCH landing in that tail shipped a tool the
-    operator had just switched off. ``package_enabled`` now reads that file LAST,
-    so what separates the toggle's value from the ``Popen`` below is this compare
-    -- the check-then-act instant this module accepts by name, the same one the
-    identity check above it leaves.
+    The ORDER also decides which SENTENCE a package that is both replaced and
+    switched off gets: the successor's toggle is consulted first, so such a call
+    can answer ``_TOOL_DISABLED_RESULT`` where it once answered
+    ``_TOOL_REPLACED_RESULT``. Nothing runs either way, the handler's own
+    identity-first pair already reported the replacement for the common case, and
+    a refusal string is category-only by contract.
     """
-    if not _still_the_expected_package(directory, expected_identity):
-        return _TOOL_REPLACED_RESULT
     if not package_enabled(directory):
         return _TOOL_DISABLED_RESULT
+    if not _still_the_expected_package(directory, expected_identity):
+        return _TOOL_REPLACED_RESULT
     try:
         proc = subprocess.Popen(
             entry,
@@ -3711,9 +3769,15 @@ def _make_handler(
                 return _TOOL_REPLACED_RESULT
             # "May this tool run?", asked at CALL time through the ONE precedence
             # rule (``package_enabled``) rather than through ``.state.json`` alone.
-            # AFTER the identity check, which stays load-bearing for its own reason:
-            # a package that has been REPLACED must be reported as replaced rather
-            # than have its successor's toggle consulted.
+            # AFTER the identity check HERE, and BEFORE it at the ``Popen`` site,
+            # and the two orderings answer two different questions. Neither check
+            # is adjacent to an act at this end -- a ``.env`` read, a serialization
+            # and a queue wait follow both -- so nothing is bought by being second,
+            # and what identity-first buys is that a package already REPLACED is
+            # reported as replaced instead of having its successor's toggle
+            # consulted. Down at ``Popen`` adjacency is the entire subject, only one
+            # check can have it, and the redirect is the worse failure; see
+            # ``_run_tool_subprocess`` for that ranking.
             #
             # The front door and not the state file, because ABSENT is an ANSWER --
             # the manifest's legacy key (R1) -- and not a silence. A state file can
