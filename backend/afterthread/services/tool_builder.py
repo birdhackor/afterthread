@@ -2479,7 +2479,9 @@ async def run_install(
         # here on is decoration. Generate its AI summary sidecar while we still
         # hold the install's context (the OpenAPI url and instructions are
         # captured NOWHERE else, so this is the only chance to persist them for
-        # a later revise session), and while the in-flight secret is still
+        # a later revise session -- which is why the hook writes them to disk
+        # BEFORE its own LLM round trip rather than only after it, see
+        # ``generate_and_store_summary``), and while the in-flight secret is still
         # registered, so the summary is redacted against it as well as against
         # the now-installed .env. ``generate_and_store_summary`` cannot raise
         # (see tool_meta): a summary that fails must never flip this outcome.

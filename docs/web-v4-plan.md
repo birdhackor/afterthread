@@ -86,8 +86,16 @@ P3a＝sidecar 檔案 I/O、summary 生成（install hook）、定版 `PATCH`、�
 
 - 每個工具包內新增 `.ai_meta.json`（隱藏檔慣例；`_scan_package` 只讀 `tool.json`，
   sidecar 對 registry 掃描不可見；`delete_tool` 的 `rmtree` 自動帶走）。
-- 形狀：`{"summary": str, "status": "draft"|"final", "updated_at": iso, "llm_log_id":
-  int|null, "origin": {"openapi_url": str|null, "instructions": str|null}}`。
+- 形狀（**六**個欄位）：`{"summary": str, "status": "draft"|"final", "updated_at": iso,
+  "llm_log_id": int|null, "llm_log_process": str|null, "origin": {"openapi_url": str|null,
+  "instructions": str|null}}`。**規劃時只寫了五個，`llm_log_process` 是 overall-r2 補上
+  的**：AI 日誌的 id 是**每個行程各自從頭配發**的計數器、紀錄環也隨行程結束而消滅，而這
+  個檔案把那個整數**永久**存著——重啟之後同一個 id 會解析到現在佔著它的那一筆（別的工具、
+  甚至別的 workflow），下游完全分辨不出來。這個欄位是「這個 id 還是我這個行程鑄的嗎」的
+  憑據，由 `tools.store_summary_meta` 與 id **在同一處**戳上（沒有 id 就沒有 token，兩個
+  欄位不可能各說各話）。照原句去寫 migration、正規化器或重建寫入端的人會把它漏掉，於是
+  `routers/tools.py` 的 `_summary_detail` 會把**每一個**存下來的 id 都判為外來的、一律回
+  `null`——連當前行程自己還握得住的紀錄，都會失去「查看 AI 日誌」連結。
 - 讀取走 `tools._read_regular_file_capped`（FIFO/symlink 硬化），JSON 損壞視同不存在；
   **寫入走 `tools._write_sidecar_atomic`**（同目錄 mkstemp → fsync → `os.replace`，
   寫前 `lstat` 保留 symlink/非 regular 的拒絕語意與既有權限位元）。**規劃時寫的是
@@ -127,13 +135,21 @@ Revise job（與 install 共用 `_JOBS`／single-flight——任何 queued/runni
   `install_in_progress`，避免動既有 pin 與 FE 分支）；409 `tool_finalized`（已定版須先
   解除）。**不宣告 502/503**（LLM 失敗封在 job.state，比照 install——test_ai_contract
   的 exact-set 不受影響）。
-- 執行：`_resolve_package_dir(name)` 解析 → 取既有 `.env` 值，逐值
+- 執行：`_resolve_package_dir_no_alias(name)` 解析 → 取既有 `.env` 值，逐值
   `register_inflight_secret`（try/finally discard；補 hidden-backup 交換窗的遮蔽
   覆蓋）→ `copytree` 到 `.staging/<uuid>` → meta-tools 重用
   `_build_meta_tools(staging, secret_env=既有 env 值)` → revise 專用 system prompt
   （既有包＋使用者意見框架；聲明 `.env` 由系統保留、勿依賴改寫）＋ feedback user
   prompt（不重抓 OpenAPI）→ `generate_structured(InstallResult,
   workflow="tool_install"（沿用）, tool_install 的 rounds/timeout)`。
+  **規劃時寫的解析器是 `_resolve_package_dir`（會跟隨 alias 的那個），實作刻意改用
+  `_resolve_package_dir_no_alias`**：`tools/alias -> tools/real` 這種內部符號連結
+  **解析之後仍然落在 tools root 之內**，所以寬容的那個解析器的 resolve-then-contain
+  檢查會**通過**。照原句重構的人，會讓一次「對著 alias 發動的修訂」讀到**真包**的內容、
+  把它整包餵進一整場 builder session，最後才在換裝的 symlink 閘被拒——一次付了全額又
+  丟掉的修訂，而且把「以名字操作卻打到另一個套件」這組語意整個搬回來。拒絕 alias 的
+  那個解析器是所有 by-name 路徑（總結讀寫、定版、同步重新產生、修訂）共用的，
+  「每一條 by-name 路徑都拒絕內部 alias」因此是由構造保證，不是靠逐處檢查。
   **規劃時寫的 `_load_tool_dotenv`（執行期那個寬容讀取器：讀不到就當沒有 env）
   不是實作採用的入口**：修訂改走 `_read_env_for_values` 這個嚴格讀取器——非
   regular file、超過位元組上限、解析失敗、或值遮不掉（長度下限＋逐行拼法閘，

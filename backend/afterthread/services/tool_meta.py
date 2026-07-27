@@ -22,7 +22,10 @@ Three properties are deliberate, and each has a failure mode behind it:
   no-observer-failure stance ``llm_log``'s recorder takes. A failed generation
   still leaves a sidecar (empty summary + origin) so the operator can hit
   regenerate; the ONE thing it must never do is overwrite a GOOD summary with
-  an empty one.
+  an empty one. Best-effort is why the ``origin`` is persisted BEFORE the round
+  trip rather than only after it (O8-1): a swallowed refusal must cost only
+  what a later regeneration can rebuild, and the origin is the one thing in the
+  sidecar that nothing can.
 * **Fed from the files, not from memory.** The prompt carries the actual
   package contents, so the summary describes what is genuinely installed --
   including a package the operator later hand-edited (README documents editing
@@ -762,22 +765,58 @@ async def generate_and_store_summary(
     stance ``llm_log``'s recorder takes, and the reason for the total
     ``except Exception`` backstop rather than a list of expected LLM errors.
 
+    The ``origin`` is written to disk BEFORE the round trip, and that ordering is
+    the point rather than an optimization (O8-1). The OpenAPI url and the
+    operator's instructions are captured NOWHERE else in the system -- the caller
+    holds them, this is the only chance to persist them, and ``regenerate_summary``
+    recovers them by READING the sidecar, so a sidecar that never lands means every
+    later revise session runs without them, permanently. Meanwhile
+    ``PATCH /api/tools/{name}`` takes no admission reservation and no per-package
+    guard: it calls ``tools.set_enabled`` straight through, which rewrites
+    ``tool.json`` in place and MOVES the manifest identity captured at the resolve
+    (D40 r5 -- that identity MUST move, it is what tells a revise from a reinstall).
+    So an operator toggling 啟用 anywhere inside the round trip gets the store's
+    identity guard, correctly, and the write is refused. Persisting the origin
+    first is what makes that refusal cost only the summary TEXT, which any later
+    regeneration rebuilds from the files.
+
+    Persisting early rather than LOCKING the toggle, deliberately: a lock would
+    restrict a route that currently always works, for a window no operator can
+    see, to protect data that has a cheaper home -- and the identity-moving
+    behaviour it would have to change is adjudicated (D40 r5). The early write
+    removes the permanent harm without touching either.
+
+    Residual, stated rather than implied away: this write is best-effort like
+    everything else in this hook. If IT is refused -- the package was already
+    replaced between promote and here -- the outcome is exactly what it is
+    without it, and the install still succeeds. What is closed is the window that
+    OPENS at the resolve and stays open for a whole LLM round trip; not the
+    syscall-width one before it.
+
     A failed generation still leaves a sidecar carrying the ``origin`` and the
     failed session's log id with an EMPTY summary, so the 工具 page can show
     "尚無總結" with a working 重新產生 button and the operator can read the
-    trace. It writes that placeholder ONLY when no sidecar exists yet: on a
-    later regeneration the previous, GOOD summary must survive a transient LLM
-    failure rather than being blanked by it. Both writes -- the summary and the
-    placeholder -- carry the identity of the package this hook resolved, so
-    neither can land in a package that took the name during the generation.
+    trace. It writes that placeholder when no sidecar exists yet OR when the only
+    one there is the origin-only file this call just wrote: on a later
+    regeneration the previous, GOOD summary must survive a transient LLM failure
+    rather than being blanked by it, and our own empty-summary file is not one.
+    All three writes -- the origin, the summary and the placeholder -- carry the
+    identity of the package this hook resolved, so none can land in a package that
+    took the name during the generation.
 
     ``_store_meta``'s ``StoreRefusal.FINALIZED`` is a silent no-op here, like
     every other store outcome: this path already ignores the write result
     because it must never fail an install, and a package finalized between
     promote and here is one whose summary the operator has explicitly frozen --
-    declining to overwrite it IS the right outcome, not an error to report. The
-    placeholder branch cannot hit it at all (it only writes when there is no
-    sidecar, and a sidecar is what carries a status).
+    declining to overwrite it IS the right outcome, not an error to report. That
+    now covers the placeholder branch too: it used to be unreachable there (it
+    only wrote when there was NO sidecar, and a sidecar is what carries a status),
+    but the origin write above leaves one, so a 定版 landing in the round trip can
+    reach it. Nothing needs to change for that -- the frozen text is preserved and
+    the refusal is swallowed like every other outcome. It stays hard to reach at
+    all: ``tools.set_summary_status`` refuses to freeze an absent/empty summary
+    (``no_meta``), which is exactly what the origin-only file has, so it takes a
+    hand-edited sidecar to get there.
 
     Every filesystem step -- the resolve, the sidecar read, the store -- runs via
     ``run_in_threadpool``. This is called from the install JOB's task, which
@@ -800,12 +839,40 @@ async def generate_and_store_summary(
             # Nothing to summarize and nowhere to write; silence is correct.
             return
         directory, identity = resolved
+        # The ORIGIN, on disk, on the line ABOVE the round trip (see this
+        # function's contract for why the order is the fix). Empty summary,
+        # ordinary draft status, and llm_log_id=None because no summary session
+        # has run yet -- reading the workflow's last id HERE would link this
+        # package to some previous tool's generation.
+        #
+        # Only when there IS an origin: with nothing un-regenerable to save, the
+        # write's whole effect would be to create a sidecar (and a 草稿 badge) for
+        # a package that has no summary metadata to show.
+        origin_stored = origin is not None and isinstance(
+            await run_in_threadpool(
+                _store_meta,
+                directory,
+                summary="",
+                origin=origin,
+                llm_log_id=None,
+                identity=identity,
+            ),
+            dict,
+        )
         try:
             summary = await _generate_summary(
                 name, directory, origin=origin, builder_summary=builder_summary
             )
         except Exception:
-            if await run_in_threadpool(tools.read_tool_meta, directory) is None:
+            # ``origin_stored`` short-circuits the read because the sidecar it
+            # would find is the one written above -- an empty summary this call
+            # authored, not a good one worth protecting. Nothing else can have
+            # replaced it meanwhile: a running install/revise job holds the single
+            # flight, so a synchronous regenerate cannot be admitted inside this
+            # window (``tool_builder._admit_job`` / ``reserve_sync_operation``),
+            # and a 定版 landing here writes no summary of its own and is refused
+            # by the store's finalize gate anyway.
+            if origin_stored or await run_in_threadpool(tools.read_tool_meta, directory) is None:
                 # Best-effort, so the write result is DELIBERATELY ignored here
                 # and below: a refused sidecar must never fail an install that
                 # already succeeded (see this function's contract). The PLACEHOLDER

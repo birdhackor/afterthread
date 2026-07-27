@@ -2112,3 +2112,69 @@ check-then-act 的一瞬間。
   `_TOOLS_SUMMARY_REGENERATE_OP`**——重新產生是**第四個**請求期 LLM 操作，兩個 exact set 都在。
   照那句舊話去「修正」OpenAPI，會把重新產生真正需要的 502/503 宣告拆掉。註解改成只主張它有資格
   主張的那件事：**這兩個端點兩個集合都不在**。
+
+### D40 附錄（overall review r8 O8-1）：救不回來的那一半要先落地，不是把開關鎖起來
+
+`generate_and_store_summary` 的形狀是「解析套件並捕捉身分 → 一整趟 LLM 往返 → 寫側檔」，而
+**整份 origin（安裝 URL 與操作者指示）只活在這趟呼叫的參數裡**——`tool_builder.py:2478` 自己就寫
+著「are captured NOWHERE else, so this is the only chance to persist them」。同時
+`PATCH /api/tools/{name}`（`routers/tools.py:214`）**既不取准入名額、也沒有任何 per-package 閘**，
+直接呼叫 `set_enabled` 就地改寫 `tool.json`、把 manifest 身分推走（D40 r5 的實測表第一列）。於是一次
+落在那趟往返裡的 toggle：側檔寫入被身分閘**正確地**拒絕（R6-2／R7-1 的行為，**不動**）→ 安裝鉤子
+按契約吞掉拒絕（總結失敗絕不翻盤已成功的安裝）→ 工作照樣回報 `succeeded`。**實測（修法前，HEAD
+`a7fe29c`）**：`read_tool_meta(pkg)` 回 `None`——連一個側檔都沒有。而 `regenerate_summary` 是靠
+**讀側檔**把 origin 撈回來的（`tool_meta.py:906`），沒有側檔就沒得撈：**之後每一次修訂 session 都
+永遠少了 OpenAPI URL 與原始指示**。
+
+**裁決：把救不回來的那一半排到往返之前，而不是鎖住開關。**
+
+- **早寫一次，只寫 origin**：`_resolve_package` 交出 `(directory, identity)` 之後、LLM 呼叫之前，
+  用**剛捕捉到的那個身分**寫一份 origin-only 側檔（空 summary、普通 draft 狀態，
+  `llm_log_id=None`——這一刻還沒有任何總結 session 跑完，在這裡讀 `last_record_id_for_workflow`
+  只會把**別的工具**的生成連到這個套件）。這是**多一次寫入**，不是取代：失敗佔位與最終寫入
+  兩條路原封不動。
+- **為什麼不是鎖 toggle**：鎖會為了**一個操作者根本看不見的窗口**，去限制一條**現在永遠可用**
+  的路由；而它要改的那個「身分必須被 toggle 推走」的行為是**已裁決**的（D40 r5：manifest 身分
+  回答的是「還是同一個套件嗎」，toggle 必須保守地作廢它）。早寫**沒有動到任何一邊**，卻把
+  「永久損失」變成「損失一段隨時重生得出來的文字」——`summary` 本來就能從檔案重新產生，origin
+  不能。方向與本子系統一貫的取捨相同：能換位置解決的，不要換語意。
+- **寫明的殘留**：這次早寫和這個鉤子裡的每一件事一樣是 best-effort。**如果連它都被拒**（promote
+  與這裡之間套件就已經被換掉），結果就跟今天一模一樣，安裝照樣成功。被關掉的是**從解析開始、
+  橫跨一整趟 LLM 往返**的那個窗口；解析前那一對 syscall 寬的殘留照舊在，且照舊倒向拒絕。
+- **佔位路徑的前提條件要跟著改，否則會賠掉日誌連結**：舊條件是「沒有側檔才寫佔位」，用來保護
+  「之前那份好總結不能被一次暫時性 LLM 失敗抹掉」。早寫之後那個條件永遠為假，於是**失敗那一
+  場 session 的 `llm_log_id` 會寫不進去**——操作者失去「查看 AI 日誌」的追蹤入口。改成
+  「早寫成功了 **或** 本來就沒有側檔」：早寫成功時擋在那裡的是**這次呼叫自己寫的空總結**，不是
+  值得保護的東西。這段窗口內也不可能被別人塞一份好總結進來：安裝／修訂工作握著單一飛行，
+  同步 regenerate 取不到名額（`_admit_job`／`reserve_sync_operation`），而 `定版` 自己不寫
+  summary、且會被 store 的 finalize 閘擋下。
+- **沒有 origin 就不早寫**：那時候沒有任何救不回來的東西要救，唯一效果是替一個還沒有總結中繼
+  資料的套件憑空生一個側檔（與一個 `草稿` 徽章）。
+- **前端這一半：查證後不動，而不是發明一個名詞**。R7-2 的先例是「per-ROW、只針對那個工作真正
+  講的那個工具、而且在真正發出寫入的地方重檢」。但**安裝工作在完成之前根本說不出工具名**：
+  `_run_job`（`tool_builder.py:3497-3516`）只在**終局**那次 `_update_job` 才填 `tool_name`，
+  running 期間輪詢到的是 `null`；而名字是 AI 在 `InstallResult.tool_name` 裡選的，前端在送出時
+  也不可能先知道。沒有名字就沒有 per-row 的對象，把它擴成 panel 全域就正好違反 R7-2 自己的
+  規則。所以**前端一個字都不動**，並在這裡寫明它未被覆蓋。（**修訂**那一半早就有覆蓋：
+  `reviseBusyForThisTool` 涵蓋整個工作，包含換裝後的總結階段。）
+- **可證的量測**：早寫拿掉之後，`test_the_install_origin_reaches_disk_before_the_llm_round_trip`
+  與 `test_an_enabled_toggle_during_the_generation_costs_the_summary_not_the_origin` 當場都停在
+  `assert read_tool_meta(pkg) is not None`——**整個側檔不存在**，origin 隨行程消失。toggle 是從
+  生成內部驅動的（沿用 r6／r7 的窗口測試手法），不是靠賽跑執行緒。
+
+### D40 附錄（overall review r8 O8-2／O8-3）：計畫文件兩處已被實作推翻的敘述
+
+沿用 O-3／O5-4／O7-3 的體例：**就地改成實作真正的樣子**，不掛「這是舊文件」的告示。
+
+- **O8-2：側檔是 `六` 個欄位，不是五個**。`web-v4-plan.md` 仍把最終形狀寫成
+  `summary`／`status`／`updated_at`／`llm_log_id`／`origin`，而實作寫的是六個
+  （`tools.py:1704-1710`）——`llm_log_process` 是 overall-r2 補的，為的是**不要默默相信一個由
+  別的行程鑄出來的 log id**。照原句去寫 migration、正規化器或重建寫入端的人會把它漏掉，
+  `routers/tools.py:368` 於是會把**每一個**存下來的 id 都判為外來的、一律回 `null`，
+  連當前行程還握得住的紀錄都失去「查看 AI 日誌」連結。
+- **O8-3：修訂用的是拒絕 alias 的解析器**。原句寫 `_resolve_package_dir(name)`，
+  `tool_builder.py:3182` 刻意用 `_resolve_package_dir_no_alias`。會跟隨 alias 的那個解析器，
+  對 `tools/alias -> tools/real` 這種**解析後仍在 tools root 之內**的內部連結會放行；照原句
+  重構，一次對 alias 發動的修訂就會讀到真包內容、整包走完一整場 builder session，最後才在換裝
+  的 symlink 閘被拒——一次付了全額又丟掉的修訂，外加把「以名字操作卻打到另一個套件」的語意
+  搬回來。

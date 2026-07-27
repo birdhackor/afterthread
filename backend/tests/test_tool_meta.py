@@ -798,6 +798,13 @@ def test_generate_and_store_summary_writes_placeholder_when_no_sidecar_yet(
     assert meta["status"] == "draft"
     # Narrowed on the way to disk: both known fields, the absent one null.
     assert meta["origin"] == {"openapi_url": None, "instructions": "查 KB"}
+    # The failed session's TRACE is linked too -- and that is what makes this a
+    # placeholder rather than the origin-only file the same call already wrote
+    # before the round trip (O8-1). Left to the "only when no sidecar exists"
+    # precondition alone, the early write would have suppressed this one and the
+    # operator would have lost the 查看 AI 日誌 link to the failure.
+    assert meta["llm_log_id"] == llm_log.last_record_id_for_workflow("tool_summary")
+    assert meta["llm_log_id"] is not None
 
 
 def test_generate_and_store_summary_never_clobbers_a_good_summary(
@@ -1272,6 +1279,96 @@ def test_generate_and_store_summary_placeholder_respects_the_replacement(
     asyncio.run(generate_and_store_summary("kbsearch", origin={"instructions": "查 A"}))
 
     assert tools.read_tool_meta(root / "kbsearch") is None  # B got no sidecar at all
+
+
+def test_the_install_origin_reaches_disk_before_the_llm_round_trip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The un-regenerable half of the sidecar is written BEFORE the generation.
+
+    ``origin`` -- the OpenAPI url and the operator's instructions -- is captured
+    nowhere else in the system (``tool_builder.run_install`` says so at the hook
+    call), while the summary TEXT can be regenerated from the files at any time.
+    Persisting the origin at the resolve is what makes the round trip risk the
+    regenerable half alone. Observed from INSIDE the stubbed generation, which is
+    exactly the window the real round trip occupies."""
+    root = tmp_path / "tools"
+    pkg = _package(root)
+    _summary_settings(monkeypatch, root)
+    origin = {"openapi_url": "http://kb.example", "instructions": "查 KB"}
+    seen: dict[str, Any] = {}
+
+    def look_at_the_sidecar() -> None:
+        seen["meta"] = tools.read_tool_meta(pkg)
+
+    _fake_generate(monkeypatch, summary="這個工具會查 KB", side_effect=look_at_the_sidecar)
+
+    asyncio.run(generate_and_store_summary("kbsearch", origin=origin, builder_summary="built it"))
+
+    early = seen["meta"]
+    assert early is not None
+    assert early["origin"] == origin
+    # ORIGIN ONLY: nothing has been generated yet, and no summary session has
+    # finished, so there is no log id to vouch for either.
+    assert early["summary"] == ""
+    assert early["status"] == "draft"
+    assert early["llm_log_id"] is None
+    assert early["llm_log_process"] is None
+
+    # ...and the ordinary path still ends with the FULL meta. The early write is
+    # an ADDITION, not a replacement: it costs no field of the final one.
+    final = tools.read_tool_meta(pkg)
+    assert final is not None
+    assert final["summary"] == "這個工具會查 KB"
+    assert final["status"] == "draft"
+    assert final["origin"] == origin
+    assert final["llm_log_id"] == llm_log.last_record_id_for_workflow("tool_summary")
+    assert final["llm_log_process"] == llm_log.process_token()
+
+
+def test_an_enabled_toggle_during_the_generation_costs_the_summary_not_the_origin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A toggle inside the round trip may cost the summary TEXT; never the origin.
+
+    ``PATCH /api/tools/{name}`` takes no admission reservation and no per-package
+    guard, and ``set_enabled`` rewrites ``tool.json`` in place -- which MOVES the
+    manifest identity this hook captured at its resolve (D40 r5). So the sidecar
+    write at the end is correctly REFUSED (that behaviour is pinned elsewhere and
+    must not change), the install hook swallows the refusal as it swallows every
+    store outcome, and the job still reports success.
+
+    What that used to cost was the ORIGIN, permanently and silently: it lived only
+    in this process, ``regenerate_summary`` recovers it by READING the sidecar, and
+    with no sidecar there was nothing to recover -- every later revise session ran
+    without the OpenAPI url and the original instructions. Driven from INSIDE the
+    generation, not by racing a thread, so it is the window itself that is pinned."""
+    root = tmp_path / "tools"
+    pkg = _package(root)
+    _summary_settings(monkeypatch, root)
+    origin = {"openapi_url": "http://kb.example", "instructions": "查 KB"}
+
+    def toggle_mid_call() -> None:
+        assert tools.set_enabled("kbsearch", False) is True
+
+    _fake_generate(monkeypatch, summary="這個工具會查 KB", side_effect=toggle_mid_call)
+    asyncio.run(generate_and_store_summary("kbsearch", origin=origin))
+
+    after = tools.read_tool_meta(pkg)
+    assert after is not None
+    assert after["summary"] == ""  # the REGENERABLE half: genuinely lost, and cheap
+    assert after["origin"] == origin  # the un-regenerable half: survived
+
+    # And the recovery path really can read it back -- which is the whole reason
+    # the origin is worth saving: a later regeneration feeds it into its own prompt
+    # as first-hand context and keeps it in the sidecar it rewrites.
+    captured = _fake_generate(monkeypatch, summary="重新產生的說明")
+    meta = asyncio.run(regenerate_summary("kbsearch"))
+    assert isinstance(meta, dict)
+    assert meta["summary"] == "重新產生的說明"
+    assert meta["origin"] == origin
+    assert "http://kb.example" in captured["user_prompt"]
+    assert "查 KB" in captured["user_prompt"]
 
 
 def test_summary_paths_refuse_a_package_with_no_manifest_before_the_llm_call(
