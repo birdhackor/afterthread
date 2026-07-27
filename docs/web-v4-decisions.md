@@ -1396,3 +1396,14 @@ r8 的兩個 settling gate 都寫成「useEffect 裡設 true、revalidation 的 
 修法：定版按鈕併入 `isFetching`。可以寫成一句類別規則——**一個動作若語意是「凍結我
 正在看的東西」，就不能在「正在看的東西已知被取代」時執行**；`settlingJobEnd` 擋的是
 「剛結束的 job 讓它過期」，`isFetching` 擋的是「任何原因造成的背景更新還沒落地」。
+
+### D40 附錄（P4 review r11）：不確定性擋的是「凍結」方向，不是整顆按鈕
+
+r10 只補了 `isFetching`，漏掉它的手足：重讀**失敗**時 TanStack Query 保留舊 `data`、
+標記 `isError`、而 `isFetching` 回到 `false`，同時 invalidation 的 promise 仍然完成，
+`settledJobId` 因此清掉 `settlingJobEnd`——gate 全開，畫面上卻是修訂前的內容。
+
+修法把三個「畫面可能不是現況」的條件（`settlingJobEnd`／`isFetching`／`isError`）
+統一只套在 **定版方向**。這個不對稱正是重點：**定版凍結畫面上的東西，解除定版釋放它**。
+凍結必須看得到現況；釋放不需要，而且一個持久的讀取失敗絕不能把操作者鎖在「已定版
+且無路可退」的狀態——這與 `staleList` 對逃生門的既有規則同一條。

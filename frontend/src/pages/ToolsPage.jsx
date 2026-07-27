@@ -420,11 +420,24 @@ function ToolSummaryPanel({
 					// screen. An action whose whole meaning is "freeze what I am
 					// looking at" must not run while what is on screen is already
 					// known to be superseded.
+					// Everything that means "what is on screen may not be current" gates
+					// the 定版 DIRECTION only, never 解除定版 (R11-1). The asymmetry is
+					// the point: 定版 freezes what is displayed, so it must not run over
+					// content we know is superseded -- `settlingJobEnd` while a finished
+					// job's re-read is in flight, `isFetching` while any refresh is,
+					// and `isError` when that refresh FAILED and left the stale copy on
+					// screen (data present, isFetching back to false, gate cleared --
+					// the sibling hole of the isFetching one). 解除定版 RELEASES; it
+					// freezes nothing, and a persistent read failure must not be able
+					// to strand an operator with a finalized tool and no way out --
+					// the same escape-hatch rule staleList already follows.
 					disabled={
 						isUpdatingStatus ||
-						settlingJobEnd ||
-						isFetching ||
-						(!isFinal && !canFinalizeSummary(detail.summary))
+						(!isFinal &&
+							(settlingJobEnd ||
+								isFetching ||
+								isError ||
+								!canFinalizeSummary(detail.summary)))
 					}
 					onClick={() => onSetStatus(isFinal ? "draft" : "final")}
 				>
