@@ -34,6 +34,7 @@ from collections.abc import Callable, Generator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -59,8 +60,9 @@ from afterthread.services.tool_builder import (
 @pytest.fixture(autouse=True)
 def _reset_singletons() -> Generator[None]:
     """Empty the job table, the llm_log ring, and the process-wide known-secret
-    registries around every test (all module-level singletons the installer
-    touches), then DRAIN the single-flight client-construction worker.
+    and in-flight-execution registries around every test (all module-level
+    singletons the installer touches), then DRAIN the single-flight
+    client-construction worker.
 
     The drain is what makes the timing/threading fetch tests deterministic under
     any collection order: a prior test's still-running (or still-queued) fake
@@ -73,11 +75,16 @@ def _reset_singletons() -> Generator[None]:
     tool_builder._reset_jobs_for_tests()
     llm_log._reset_for_tests()
     tools._INFLIGHT_SECRETS.clear()
+    tools._INFLIGHT_EXECUTIONS.clear()
     tools._ENV_VALUE_CACHE.clear()
     yield
     tool_builder._reset_jobs_for_tests()
     llm_log._reset_for_tests()
     tools._INFLIGHT_SECRETS.clear()
+    # The execution registry decides whether a promote drops its backup, so a
+    # registration surviving a test would silently turn the next one's swap into a
+    # deferral -- the same reason the secret set is cleared here.
+    tools._INFLIGHT_EXECUTIONS.clear()
     tools._ENV_VALUE_CACHE.clear()
     tool_builder._drain_setup_worker_for_tests()
 
@@ -4447,6 +4454,265 @@ def test_promote_replace_copies_a_live_env_at_the_ceiling_byte_for_byte(tmp_path
     assert (installed / "run.py").read_text(encoding="utf-8") == "print('revised')"  # it swapped
     assert (installed / ".env").read_bytes() == raw  # ... and the credentials came across
     assert _leftovers(base) == []
+
+
+def test_stale_backup_names_are_minted_and_recognized_by_one_shape(tmp_path: Path) -> None:
+    """``_stale_backup_path`` writes the name and ``_STALE_BACKUP_RE`` reads it
+    back off disk, so the two must agree for the sweep to find its litter at all.
+
+    Pinned at the LONGEST legal package name (``tools._NAME_RE``'s 64 chars),
+    which is where a lazily-written pattern stops matching -- and pinned against
+    every neighbour the sweep must NOT collect: the plain ``.bak-`` name (which
+    can be the rescue copy ``_ERROR_REVISE_UNRECOVERABLE`` leaves behind), the
+    installer's ``.staging`` shell, an operator's own hidden directory, and
+    near-misses of the token."""
+    longest = "k" + "a-b_9" * 12 + "xyz"
+    token = "0123456789abcdef" * 2
+    assert len(longest) == 64 and tools._NAME_RE.match(longest)
+    minted = tool_builder._stale_backup_path(tmp_path, longest, token)
+    assert tool_builder._STALE_BACKUP_RE.match(minted.name)
+    assert minted.parent == tmp_path
+    for other in (
+        tool_builder._backup_path(tmp_path, "kbsearch", token).name,  # the rescue shape
+        tool_builder._STAGING_DIRNAME,
+        ".notes",
+        "kbsearch",
+        ".kbsearch.stale-nothex",
+        f".kbsearch.stale-{'0' * 31}",
+        f".kbsearch.stale-{'0' * 32}\n",  # \Z, not $: a filename may hold a newline
+    ):
+        assert not tool_builder._STALE_BACKUP_RE.match(other), other
+
+
+def _busy_package(base: Path, marker: Path, gate: Path) -> tuple[Path, tuple[int, int, int]]:
+    """An installed ``kbsearch`` whose entry announces itself, waits for ``gate``,
+    and only THEN opens a package file by RELATIVE path -- i.e. a tool call whose
+    reads happen AFTER the test has had the chance to swap the package underneath
+    it. Returns the package and its manifest identity."""
+    installed = base / "kbsearch"
+    installed.mkdir(parents=True)
+    manifest = _package_manifest("kbsearch")
+    manifest["entry"] = [sys.executable, "run.py"]
+    (installed / "tool.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (installed / "data.txt").write_text("PAYLOAD", encoding="utf-8")
+    (installed / "run.py").write_text(
+        "import os, sys, time\n"
+        f"open({str(marker)!r}, 'w').write('x')\n"
+        f"while not os.path.exists({str(gate)!r}):\n"
+        "    time.sleep(0.01)\n"
+        "sys.stdout.write(open('data.txt').read())\n",
+        encoding="utf-8",
+    )
+    identity = tool_builder._package_identity(installed)
+    assert identity is not None
+    return installed, identity
+
+
+def _wait_for(condition: Callable[[], bool], *, timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return
+        time.sleep(0.01)
+    raise AssertionError("condition was not reached in time")
+
+
+def test_promote_replace_defers_the_backup_while_a_tool_call_is_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tool call in flight when the swap lands keeps its files for the whole
+    call, and the backup is collected afterwards.
+
+    The runtime's identity check protects the START of a call; this is the other
+    half. An ordinary capture/enrich is NOT in the tool job's single-flight, so a
+    revise can promote while a tool subprocess of that same package is running --
+    and MEASURED (the module comment records it): the rename-aside is invisible to
+    the child (its cwd is the inode), while the ``rmtree`` that used to follow
+    immediately makes every later relative open fail with ENOENT. The child here
+    reads ``data.txt`` by relative path only AFTER the swap has completed, so a
+    dropped backup would surface as a failed/empty tool result -- returned to the
+    model as the answer to the workflow that called it.
+
+    The promote itself is NOT delayed or refused (a revise the operator asked for
+    must not be blocked by a tool call): it publishes, and only the removal waits.
+    """
+    base = tmp_path / "tools"
+    marker, gate = tmp_path / "started", tmp_path / "go"
+    installed, identity = _busy_package(base, marker, gate)
+    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
+    staging.mkdir(parents=True)
+    (staging / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")), encoding="utf-8")
+    (staging / "run.py").write_text("print('revised')", encoding="utf-8")
+    _install_settings(monkeypatch, tools_dir=str(base))
+    handler = tools.enabled_llm_tools()[0].handler
+
+    result: dict[str, str] = {}
+    caller = threading.Thread(target=lambda: result.update(out=asyncio.run(handler({}))))
+    caller.start()
+    try:
+        _wait_for(marker.exists)  # the CHILD is running, not merely queued
+        origin, error = tool_builder._promote_staging_replace(
+            staging,
+            "kbsearch",
+            base,
+            env_existed_at_start=False,
+            package_identity=identity,
+            registered=[],
+        )
+    finally:
+        gate.write_text("go", encoding="utf-8")
+        caller.join(timeout=30)
+
+    assert error is None and origin is None  # the revision published as usual
+    assert (installed / "run.py").read_text(encoding="utf-8") == "print('revised')"
+    assert result["out"] == "PAYLOAD"  # read from the OLD package, after the swap
+    # The backup outlived the swap on purpose, MARKED collectable (the rename a
+    # running child cannot notice), and is collected once the call has ended.
+    assert _leftovers(base) == []  # nothing left wearing the rescue shape
+    stale = [child.name for child in base.iterdir() if ".stale-" in child.name]
+    assert len(stale) == 1
+    tool_builder._sweep_stale_backups(base)
+    assert [child.name for child in base.iterdir() if ".stale-" in child.name] == []
+
+
+def test_promote_replace_drops_the_backup_immediately_when_nothing_is_running(
+    tmp_path: Path,
+) -> None:
+    """The deferral is the exception, not the new normal: with no execution
+    registered against the package, a successful swap still removes the backup
+    inside the promote itself -- no sweep, no litter, no behaviour change for the
+    ordinary case."""
+    base = tmp_path / "tools"
+    installed, staging = _replace_fixture(base)
+    identity = tool_builder._package_identity(installed)
+    assert identity is not None
+    assert tools.package_execution_in_flight(identity) is False  # the precondition, pinned
+
+    _origin, error = tool_builder._promote_staging_replace(
+        staging,
+        "kbsearch",
+        base,
+        env_existed_at_start=False,
+        package_identity=identity,
+        registered=[],
+    )
+
+    assert error is None
+    assert _leftovers(base) == []  # gone by the time the promote returned
+
+
+def _stale_dir(base: Path, name: str) -> Path:
+    """A marked, collectable backup of ``name`` with a readable manifest."""
+    path = tool_builder._stale_backup_path(base, name, uuid4().hex)
+    path.mkdir()
+    (path / "tool.json").write_text(json.dumps(_package_manifest(name)), encoding="utf-8")
+    return path
+
+
+def test_sweep_keeps_a_backup_that_is_still_in_use_and_spares_everything_else(
+    tmp_path: Path,
+) -> None:
+    """The sweep removes only what it can affirmatively say is collectable.
+
+    Four neighbours it must not touch, because it is a destructive traversal in a
+    directory the operator also owns: a marked backup whose package is still
+    executing (a process exit between deferral and sweep is why this is driven off
+    the DISK, so it must re-derive that identity itself), a hidden directory that
+    is not one of ours, and a SYMLINK wearing a marked name -- an rmtree through
+    which would delete a tree nobody verified."""
+    base = tmp_path / "tools"
+    base.mkdir()
+    busy = _stale_dir(base, "kbsearch")
+    identity = tool_builder._package_identity(busy)
+    assert identity is not None
+    idle = _stale_dir(base, "other")
+    (base / ".staging").mkdir()
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("keep", encoding="utf-8")
+    linked = tool_builder._stale_backup_path(base, "linked", uuid4().hex)
+    linked.symlink_to(outside, target_is_directory=True)
+
+    with tools._inflight_execution(identity):
+        tool_builder._sweep_stale_backups(base)
+        assert busy.is_dir()  # still being read by a live subprocess
+
+    assert not idle.exists()  # ... while an idle one goes in the same pass
+    assert (base / ".staging").is_dir()  # not ours to collect
+    assert linked.is_symlink() and (outside / "keep.txt").exists()  # never followed
+
+    tool_builder._sweep_stale_backups(base)
+    assert not busy.exists()  # collected once the call it belonged to ended
+
+
+def test_cleanup_staging_is_where_the_sweep_actually_runs(tmp_path: Path) -> None:
+    """The wiring, pinned: a deferral is only worth as much as the sweep that
+    follows it, and this is the step EVERY tool job reaches unconditionally --
+    install or revise, success or failure -- so a leftover never has to wait for
+    another revise to succeed.
+
+    Second half: a staging root the gate REFUSES makes this function return early
+    (deliberately -- a tampered workspace is evidence, not garbage), and the sweep
+    must still happen. That is why it hangs off a ``finally`` rather than sitting
+    after the early return."""
+    base = tmp_path / "tools"
+    base.mkdir()
+    marked = _stale_dir(base, "kbsearch")
+    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
+    staging.mkdir(parents=True)
+
+    tool_builder._cleanup_staging(staging, base)
+
+    assert not marked.exists()
+    assert not staging.exists()  # the ordinary cleanup still did its own job
+
+    refused = tmp_path / "outside" / "buildid"
+    refused.mkdir(parents=True)
+    assert tool_builder._verify_staging_root(refused, base) is not None  # the early-return path
+    later = _stale_dir(base, "other")
+
+    tool_builder._cleanup_staging(refused, base)
+
+    assert not later.exists()
+    assert refused.is_dir()  # ... and the refused workspace was left alone
+
+
+def test_sweep_never_collects_the_rescue_copy_of_an_unrecoverable_swap(tmp_path: Path) -> None:
+    """A plain ``.bak-`` directory is NOT the sweep's business, and this is the
+    reason the marked namespace exists at all.
+
+    When the publish rename fails AND the roll-back fails, that hidden backup is
+    the operator's ONLY copy of their tool -- ``_ERROR_REVISE_UNRECOVERABLE`` sends
+    them to it by hand. It sits in the tools dir with a readable manifest and
+    nothing executing against it, i.e. it satisfies every "collectable" test except
+    the name. A sweep that keyed on ``.bak-`` would delete it moments later, in the
+    very same job's cleanup."""
+    base = tmp_path / "tools"
+    base.mkdir()
+    rescue = tool_builder._backup_path(base, "kbsearch", uuid4().hex)
+    rescue.mkdir()
+    (rescue / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")), encoding="utf-8")
+    (rescue / "run.py").write_text(_GOOD_RUN_PY, encoding="utf-8")
+
+    tool_builder._sweep_stale_backups(base)
+
+    assert (rescue / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY
+
+
+def test_sweep_keeps_a_marked_backup_whose_manifest_cannot_be_read(tmp_path: Path) -> None:
+    """Refusing to say KEEPS the directory, the documented direction for this call
+    site: the destructive act here is the removal, so a check that cannot speak
+    must not vouch for it (D40 P3b r11's rule, pointed the way this use needs).
+    The stated cost is that such a backup is never swept -- hidden, inert litter,
+    the same permanence a partially failed rmtree already has."""
+    base = tmp_path / "tools"
+    base.mkdir()
+    unreadable = tool_builder._stale_backup_path(base, "kbsearch", uuid4().hex)
+    unreadable.mkdir()  # no tool.json at all: _package_identity answers None
+
+    tool_builder._sweep_stale_backups(base)
+
+    assert unreadable.is_dir()
 
 
 def test_run_revise_rolls_back_a_failed_publish(

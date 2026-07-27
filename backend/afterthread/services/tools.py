@@ -66,7 +66,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -2441,6 +2441,81 @@ def _run_tool_subprocess(
 # string in this module follows.
 _TOOL_REPLACED_RESULT = "tool not run: this tool's package changed after it was offered"
 
+# In-flight tool EXECUTIONS, keyed by the manifest identity ``_make_handler``
+# verified just before starting the child, and COUNTED rather than flagged: two
+# workflows can call the same tool at once, and the first to finish must not
+# cancel the second one's protection.
+#
+# Why the identity check alone is not enough: it protects the START of a call,
+# not its DURATION. The child then runs for up to ``llm_tool_timeout_seconds``
+# with its cwd on the package directory, and a revise promoted during that
+# window renames that directory aside and then DELETES it. MEASURED rather than
+# assumed (Linux/ext4, a child holding cwd in a directory that is renamed and
+# then removed under it):
+#
+# * the rename-aside disturbs NOTHING -- a running process's cwd is a reference
+#   to the INODE, so relative opens and lazy imports keep working, they just
+#   resolve under the backup's hidden name;
+# * the ``rmtree`` that follows is the whole hazard -- after it, every relative
+#   open fails with ENOENT (so does ``getcwd``), and only descriptors the child
+#   had ALREADY opened keep reading.
+#
+# So the fix is not to make the promote wait (a revise the operator asked for
+# must never be blocked by a tool call) but to keep the removal off a package
+# something is still executing against: ``tool_builder._promote_staging_replace``
+# consults ``package_execution_in_flight`` below and defers the backup to a later
+# sweep when the answer is yes. The backup name is dot-prefixed and invisible to
+# ``_scan_all``, so a deferred one is inert litter, never a phantom package.
+#
+# Its own lock, exactly like ``_INFLIGHT_SECRETS``: registration happens on the
+# event loop while the query runs on a threadpool worker (the promote's own hop).
+_INFLIGHT_EXECUTIONS: dict[tuple[int, int, int], int] = {}
+_EXECUTION_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _inflight_execution(identity: tuple[int, int, int]) -> Iterator[None]:
+    """Count one execution against ``identity``'s package in, and back out again.
+
+    A context manager rather than a register/discard pair at the call site
+    because the ``finally`` is the point: a handler that raises, or an AI request
+    cancelled mid-call, must not leave a registration behind -- one leaked entry
+    would defer that package's backup on every future promote, forever. The lock
+    is taken for the two dict updates ONLY, never held across the ``yield`` (which
+    spans an ``await`` and the whole subprocess run).
+
+    The count is dropped to zero by REMOVING the key, so ``in`` is the whole
+    query and a stale zero can never read as "still in use".
+    """
+    with _EXECUTION_LOCK:
+        _INFLIGHT_EXECUTIONS[identity] = _INFLIGHT_EXECUTIONS.get(identity, 0) + 1
+    try:
+        yield
+    finally:
+        with _EXECUTION_LOCK:
+            remaining = _INFLIGHT_EXECUTIONS.get(identity, 0) - 1
+            if remaining > 0:
+                _INFLIGHT_EXECUTIONS[identity] = remaining
+            else:
+                _INFLIGHT_EXECUTIONS.pop(identity, None)
+
+
+def package_execution_in_flight(identity: tuple[int, int, int]) -> bool:
+    """True while a tool subprocess may still be reading that package's files.
+
+    The one question ``tool_builder``'s replace-mode promote asks before dropping
+    the old package's hidden backup (see ``_INFLIGHT_EXECUTIONS`` for what the
+    removal does to a running child, and why the rename before it does not).
+
+    Keyed on the MANIFEST identity, which is what makes the two sides line up
+    without sharing a path: the promote checked that same tuple against the
+    package it renamed aside, and renaming a directory changes nothing about the
+    ``tool.json`` inside it (measured), so the tuple the handler registered is
+    still the tuple that identifies the files now sitting in the backup.
+    """
+    with _EXECUTION_LOCK:
+        return identity in _INFLIGHT_EXECUTIONS
+
 
 def _make_handler(
     directory: Path, entry: list[str], identity: tuple[int, int, int] | None
@@ -2491,6 +2566,15 @@ def _make_handler(
     "cannot establish identity" rule (D40 P3b r11): a check that cannot speak
     must not vouch.
 
+    That check answers for the START of a call. The RUN is covered by the second
+    half of the pairing: the same identity is registered as an in-flight
+    execution around the subprocess, so a promote landing mid-run keeps the files
+    this child is still reading instead of deleting them under it (see
+    ``_INFLIGHT_EXECUTIONS`` for what was measured about the rename and the
+    removal). The registration is the LAST thing before the run and is released
+    by a ``finally``, so no failure shape -- exception, timeout, cancellation --
+    can leave a package pinned.
+
     FALSE POSITIVES, stated rather than discovered later: ``set_enabled`` rewrites
     ``tool.json`` IN PLACE to flip ``enabled``, which moves its ctime. So toggling
     a tool during a conversation that already advertised it makes every later call
@@ -2512,15 +2596,24 @@ def _make_handler(
         settings = get_settings()
         env = _build_tool_env(directory)
         args_json = json.dumps(arguments, ensure_ascii=False)
-        return await run_in_threadpool(
-            _run_tool_subprocess,
-            list(entry),
-            directory,
-            env,
-            args_json,
-            settings.llm_tool_timeout_seconds,
-            settings.llm_tool_output_max_chars,
-        )
+        # Registered around the run, not merely checked before it: everything
+        # after this line reads the package's files from an inode a promote can
+        # rename aside (harmless) and then remove (not harmless). Entering here
+        # rather than inside ``_run_tool_subprocess`` covers the threadpool queue
+        # wait too, and orders the registration strictly BEFORE the ``Popen`` it
+        # protects -- a promote that observes no registration therefore cannot
+        # have a child of ours already running against the package it is
+        # dropping.
+        with _inflight_execution(identity):
+            return await run_in_threadpool(
+                _run_tool_subprocess,
+                list(entry),
+                directory,
+                env,
+                args_json,
+                settings.llm_tool_timeout_seconds,
+                settings.llm_tool_output_max_chars,
+            )
 
     return _handler
 

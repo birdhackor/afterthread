@@ -32,7 +32,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -665,6 +665,16 @@ def _install_tools(monkeypatch: pytest.MonkeyPatch, tools_root: Path, **override
     return settings
 
 
+def _wait_for(condition: Callable[[], bool], *, timeout: float = 30.0) -> None:
+    """Poll until ``condition`` holds, or fail loudly -- never hang the suite."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return
+        time.sleep(0.01)
+    raise AssertionError("condition was not reached in time")
+
+
 def test_runtime_happy_path_echoes_stdin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     root = tmp_path / "tools"
     _make_tool(root, "echo", "import sys\nsys.stdout.write('ECHO:' + sys.stdin.read())\n")
@@ -883,6 +893,74 @@ def test_runtime_identity_survives_a_summary_sidecar_write(
     )
 
     assert asyncio.run(handler({})) == "ok"
+
+
+def test_runtime_registers_the_execution_for_as_long_as_the_child_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The identity check answers for the START of a call; this registration is
+    what covers its DURATION.
+
+    A replace-mode promote renames the old package aside -- which a running child
+    does not even notice, its cwd being the inode -- and then DELETES it, which is
+    what pulls the files out from under the child. So the runtime publishes "a
+    subprocess is executing this package" for exactly as long as one can still be
+    reading it, and ``tool_builder``'s promote consults that before dropping its
+    backup. Asserted against a real child that blocks until this test releases it
+    (and that announces itself first), so the True is genuinely concurrent with a
+    running process rather than inferred from the handler having been entered."""
+    root = tmp_path / "tools"
+    marker, gate = tmp_path / "started", tmp_path / "go"
+    pkg = _make_tool(
+        root,
+        "slow",
+        "import os, sys, time\n"
+        f"open({str(marker)!r}, 'w').write('x')\n"
+        f"while not os.path.exists({str(gate)!r}):\n"
+        "    time.sleep(0.01)\n"
+        "sys.stdout.write('ok')\n",
+    )
+    _install_tools(monkeypatch, root)
+    identity = tools.package_identity(pkg)
+    assert identity is not None
+    handler = enabled_llm_tools()[0].handler
+    assert tools.package_execution_in_flight(identity) is False
+
+    result: dict[str, str] = {}
+    caller = threading.Thread(target=lambda: result.update(out=asyncio.run(handler({}))))
+    caller.start()
+    try:
+        _wait_for(marker.exists)
+        assert tools.package_execution_in_flight(identity) is True
+    finally:
+        gate.write_text("go", encoding="utf-8")
+        caller.join(timeout=30)
+
+    assert result["out"] == "ok"
+    assert tools.package_execution_in_flight(identity) is False  # released with the call
+
+
+def test_inflight_execution_is_counted_and_released_on_every_exit() -> None:
+    """The registry counts rather than flags, and comes back down on every exit.
+
+    COUNTED because two workflows can call the same tool at once and the first to
+    finish must not cancel the second one's protection. RELEASED in a ``finally``
+    because a leaked entry would make every future promote defer that package's
+    backup forever -- so a handler that raises, and an AI request cancelled
+    mid-call (the shape asyncio uses on a timeout), must both come back out. The
+    key is REMOVED at zero, so a stale count can never read as "still in use"."""
+    identity = (1, 2, 3)
+    with tools._inflight_execution(identity):
+        with tools._inflight_execution(identity):
+            assert tools.package_execution_in_flight(identity) is True
+        assert tools.package_execution_in_flight(identity) is True  # the outer call still holds it
+    assert tools.package_execution_in_flight(identity) is False
+
+    for exc in (RuntimeError, asyncio.CancelledError):
+        with pytest.raises(exc), tools._inflight_execution(identity):
+            raise exc()
+        assert tools.package_execution_in_flight(identity) is False
+    assert tools._INFLIGHT_EXECUTIONS == {}  # nothing left behind, not even a zero
 
 
 def test_description_capped_uniformly(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
