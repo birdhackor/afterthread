@@ -276,6 +276,10 @@ _ERROR_REVISE_TARGET_ALIAS = "原工具目錄已被替換為連結，修訂已�
 # remedy is to re-send the feedback against what is installed now, which is what
 # the message says; like every outcome error here it names the condition only.
 _ERROR_REVISE_TARGET_REPLACED = "原工具在修訂期間被改動或重新安裝，請確認現況後重新送出意見。"  # noqa: RUF001
+# R11-2: we could not establish WHICH package this is before starting -- a missing
+# or unreadable ``tool.json``. Refused up front rather than after a full build,
+# because the pre-swap identity check would have nothing to compare against.
+_ERROR_REVISE_IDENTITY_UNKNOWN = "無法確認原工具的內容（`tool.json` 讀取失敗），修訂已取消。"  # noqa: RUF001
 
 
 def _package_identity(directory: Path) -> tuple[int, int, int] | None:
@@ -1992,19 +1996,6 @@ def _promote_staging_replace(
         return None, _ERROR_REVISE_TARGET_ALIAS
     if not target.is_dir():
         return None, _ERROR_REVISE_TARGET_MISSING
-    # ... and it must still be the SAME directory the session copied from (R10-1).
-    # "A directory of that name exists" is not the question: an operator can delete
-    # and reinstall -- or atomically replace -- the package during the MINUTES an
-    # LLM session runs, and publishing a revision of the old snapshot over the new
-    # package would rename the new one aside and then delete it, silently taking
-    # whatever the operator just put there. The identity is the directory's own
-    # (st_dev, st_ino) captured when the session read the package; a replacement is
-    # a NEW directory and compares different, while ordinary in-place edits keep
-    # the inode and still revise (refusing those would make revise unusable, and
-    # they are not the loss this guards). None means the caller could not capture
-    # one, and then this check cannot speak -- the other gates still do.
-    if package_identity is not None and _package_identity(target) != package_identity:
-        return None, _ERROR_REVISE_TARGET_REPLACED
     # The live ``.env`` is copied into staging BEFORE the 定版 gate below, and the
     # order is the fix R4-1 asked for: this is the only pre-swap step that can take
     # an operator-chosen amount of TIME, and a gate that runs before it cannot see a
@@ -2031,6 +2022,22 @@ def _promote_staging_replace(
     # stops an already-corrupt sidecar from buying a whole session before arriving
     # here to be refused anyway.
     #
+    # The package must still be the one this session copied from -- re-checked HERE,
+    # after the ``.env`` copy rather than before it (R11-1). The copy reads through
+    # ``target`` and takes an operator-influenced amount of time, so a check that
+    # ran before it left that whole window unguarded: a package replaced during the
+    # copy would be renamed aside and overwritten by a revision of the package that
+    # no longer exists. Together with the 定版 gate below, the last thing between
+    # this and the swap is two renames.
+    #
+    # ``tool.json``'s own (dev, ino, ctime) -- see ``_package_identity`` for why the
+    # DIRECTORY's inode is not an identity (it is reused across a delete+recreate)
+    # and why its timestamps are too broad (they fire on the .env deletion r3
+    # deliberately honors). A caller with no identity to offer is refused outright:
+    # the entry gate already declines that case, and treating None as "matches" here
+    # would reopen exactly what this closes.
+    if package_identity is None or _package_identity(target) != package_identity:
+        return None, _ERROR_REVISE_TARGET_REPLACED
     # Through ``summary_status_or_unknown``, not ``summary_status``, and the whole
     # point is the difference (R3-2): ``summary_status`` folds "no sidecar" and
     # "there IS one but it is unreadable/corrupt" into the SAME None, so a gate
@@ -2994,6 +3001,15 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
     # session and re-checked before the swap. An operator can delete and reinstall
     # the tool during the minutes a build runs, and a name is not an identity.
     package_identity = await run_in_threadpool(_package_identity, directory)
+    if package_identity is None:
+        # Uncertainty REFUSES here like everywhere else on this path (R11-2). A
+        # package whose manifest we cannot even stat is either broken (the
+        # resolver admits a directory with no tool.json) or momentarily
+        # unreadable, and in both cases we would be starting a session we could
+        # never safely publish: with no identity to compare, the pre-swap check
+        # would have to either wave the swap through -- exactly the loss R10-1
+        # closed -- or refuse after burning the whole build.
+        return InstallOutcome(ok=False, error=_ERROR_REVISE_IDENTITY_UNKNOWN)
     env_existed_at_start, env_values, env_text, env_error = await run_in_threadpool(
         _read_env_for_values, directory
     )

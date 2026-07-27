@@ -847,3 +847,15 @@ promote 只確認「同名目錄存在、不是連結、沒定版」，卻沒確
 寫這個檔（`validate_package` 唯一必需的檔案），所以被置換的套件必然帶著不同的
 manifest；而刪掉或編輯**其他**檔案不會動到它。就地編輯 manifest 本身會被視同置換，
 這是正確的保守方向——那正是修訂要改寫的檔案。
+
+### D40 附錄（P3b review r11）：身分重驗要在 `.env` 複製之後，且「查不出身分」等於拒絕
+
+r10 把身分重驗放在 `_preserve_env_file` **之前**，於是那段「讀 target 的 `.env`、
+逐項驗、`copy2`」的時間完全沒被守住——操作者在複製期間置換套件，仍會被舊快照的
+修訂覆蓋。改放到**複製之後、定版閘旁邊**：換裝前只剩兩個 rename。
+
+另一個缺口是 `package_identity is None` 時整個跳過檢查。這不只在暫時性 `lstat` 失敗
+時發生——resolver 本來就允許沒有 `tool.json` 的 broken package。「查不出身分就放行」
+正好是 r10 要關的那個洞，所以改成**入口即拒**（`_ERROR_REVISE_IDENTITY_UNKNOWN`）：
+與其在燒完整場 build 之後才發現沒東西可比對，不如一開始就說清楚；promote 端也一併
+把 None 視為拒絕，不留第二條路。

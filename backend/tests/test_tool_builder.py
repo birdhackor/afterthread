@@ -4121,7 +4121,12 @@ def test_promote_replace_refuses_a_finalization_that_landed_mid_session(
     )
 
     origin, error = tool_builder._promote_staging_replace(
-        staging, "kbsearch", base, env_existed_at_start=False, package_identity=None, registered=[]
+        staging,
+        "kbsearch",
+        base,
+        env_existed_at_start=False,
+        package_identity=tool_builder._package_identity(base / "kbsearch"),
+        registered=[],
     )
 
     assert error == tool_builder._ERROR_REVISE_FINALIZED
@@ -4167,7 +4172,7 @@ def test_promote_replace_refuses_when_the_sidecar_cannot_be_read(tmp_path: Path)
             "kbsearch",
             base,
             env_existed_at_start=False,
-            package_identity=None,
+            package_identity=tool_builder._package_identity(base / "kbsearch"),
             registered=[],
         )
     finally:
@@ -4196,7 +4201,12 @@ def test_promote_replace_refuses_a_sidecar_that_is_not_a_regular_file(tmp_path: 
     os.mkfifo(installed / tools._AI_META_FILENAME)
 
     _origin, error = tool_builder._promote_staging_replace(
-        staging, "kbsearch", base, env_existed_at_start=False, package_identity=None, registered=[]
+        staging,
+        "kbsearch",
+        base,
+        env_existed_at_start=False,
+        package_identity=tool_builder._package_identity(base / "kbsearch"),
+        registered=[],
     )
 
     assert error == tool_builder._ERROR_REVISE_SUMMARY_UNREADABLE
@@ -4230,7 +4240,12 @@ def test_promote_replace_proceeds_when_the_status_is_knowable(
         )
 
     origin, error = tool_builder._promote_staging_replace(
-        staging, "kbsearch", base, env_existed_at_start=False, package_identity=None, registered=[]
+        staging,
+        "kbsearch",
+        base,
+        env_existed_at_start=False,
+        package_identity=tool_builder._package_identity(base / "kbsearch"),
+        registered=[],
     )
 
     assert error is None
@@ -4282,7 +4297,7 @@ def test_promote_replace_refuses_a_finalization_that_lands_during_the_env_copy(
         "kbsearch",
         base,
         env_existed_at_start=True,
-        package_identity=None,
+        package_identity=tool_builder._package_identity(base / "kbsearch"),
         registered=registered,
     )
 
@@ -4321,7 +4336,7 @@ def test_promote_replace_refuses_an_oversized_live_env(tmp_path: Path) -> None:
         "kbsearch",
         base,
         env_existed_at_start=True,
-        package_identity=None,
+        package_identity=tool_builder._package_identity(base / "kbsearch"),
         registered=registered,
     )
 
@@ -4353,7 +4368,7 @@ def test_promote_replace_copies_a_live_env_at_the_ceiling_byte_for_byte(tmp_path
         "kbsearch",
         base,
         env_existed_at_start=True,
-        package_identity=None,
+        package_identity=tool_builder._package_identity(base / "kbsearch"),
         registered=registered,
     )
 
@@ -5179,6 +5194,65 @@ def test_run_revise_refuses_when_the_package_was_reinstalled_mid_session(
     # the operator's reinstalled package is exactly as they left it
     assert (pkg / "run.py").read_text(encoding="utf-8") == keep
     assert not any(entry.name.startswith(".kbsearch.bak-") for entry in base.iterdir())
+
+
+def test_run_revise_refuses_a_replacement_that_lands_during_the_env_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The identity re-check has to sit AFTER the ``.env`` copy, not before it
+    (R11-1).
+
+    The copy reads through the target and takes an operator-influenced amount of
+    time, so a check that ran before it left that entire window unguarded: a
+    package replaced DURING the copy would still be renamed aside and overwritten
+    by a revision of the package that no longer exists."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    base = pkg.parent
+    (pkg / ".env").write_text("TOKEN=abcdefgh\n", encoding="utf-8")
+    keep = "print('installed while the copy ran')"
+    real_copy = shutil.copy2
+
+    def replace_during_copy(src: Any, dst: Any, **kwargs: Any) -> Any:
+        result = real_copy(src, dst, **kwargs)
+        shutil.rmtree(pkg)
+        pkg.mkdir()
+        (pkg / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")), encoding="utf-8")
+        (pkg / "run.py").write_text(keep, encoding="utf-8")
+        return result
+
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+    monkeypatch.setattr(shutil, "copy2", replace_during_copy)
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_TARGET_REPLACED
+    assert (pkg / "run.py").read_text(encoding="utf-8") == keep
+    assert not any(entry.name.startswith(".kbsearch.bak-") for entry in base.iterdir())
+
+
+def test_run_revise_refuses_a_package_whose_identity_cannot_be_established(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No identity, no session (R11-2): uncertainty refuses here like everywhere
+    else on this path.
+
+    The resolver admits a directory with no ``tool.json`` (a broken package), and
+    a transient stat failure looks the same. Starting anyway would leave the
+    pre-swap check with nothing to compare against -- so it would either wave the
+    swap through, which is precisely the loss R10-1 closed, or refuse after the
+    whole build had already been paid for."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / "tool.json").unlink()
+    captured = _fake_generate(
+        monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_IDENTITY_UNKNOWN
+    assert captured == {}  # refused before the session
 
 
 def test_run_revise_allows_a_plainly_spelled_shadowed_line(
