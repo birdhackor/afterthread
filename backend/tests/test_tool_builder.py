@@ -5034,6 +5034,63 @@ def test_run_revise_refuses_an_env_value_the_file_spells_reversibly(
         assert not tools._INFLIGHT_SECRETS  # nothing was registered either
 
 
+def test_run_revise_refuses_a_shadowed_line_that_spells_the_value_reversibly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A SHADOWED assignment can spell the live credential reversibly while the
+    winning one spells it safely, and checking only the deciding line missed it
+    (R8-1).
+
+    dotenv is last-wins, so the parsed value comes from the second line and the
+    per-key spelling check passes on it. But a ``cat`` of the file shows BOTH
+    lines: the redactor masks the second (it equals the registered value) and
+    hands the model the first, which encodes the very same credential through an
+    escape. The reasoning that let shadowed lines through -- "dotenv discarded it,
+    so it holds no registered value" -- was simply false: what dotenv discards can
+    still SPELL what dotenv kept. Every assignment line is now shape-checked, and
+    a shadowed line spelled plainly (the ordinary "I changed this value" edit)
+    still passes, which the sibling test below pins."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    raw = 'KEY="abcd\\"efgh"\nKEY=\'abcd"efgh\'\n'
+    (pkg / ".env").write_text(raw, encoding="utf-8")
+    parsed = tools._parse_dotenv_text(raw)["KEY"]
+    assert parsed == 'abcd"efgh'
+    # The WINNING line spells it literally -- which is exactly why the per-key
+    # check passes and why the shadowed line had to be checked separately.
+    assert "'" + parsed + "'" in raw
+    before = _file_bytes(pkg)
+    captured = _fake_generate(
+        monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
+    )
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
+    assert parsed not in (outcome.error or "")  # never the value
+    assert captured == {}  # the builder session never started
+    assert _file_bytes(pkg) == before
+    with tools._INFLIGHT_LOCK:
+        assert not tools._INFLIGHT_SECRETS
+
+
+def test_run_revise_allows_a_plainly_spelled_shadowed_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The R8-1 rule is about SPELLING, not about duplicate keys: an ordinary
+    edit history (an old value left above the new one, both written plainly) is
+    not a leak and must still revise, or the guard would refuse the most common
+    hand-edit there is."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (pkg / ".env").write_text("KEY=oldvalue\nKEY=newvalue\n", encoding="utf-8")
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert (pkg / ".env").read_text(encoding="utf-8") == "KEY=oldvalue\nKEY=newvalue\n"
+
+
 def test_run_revise_allows_env_values_the_file_spells_literally(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -5239,11 +5296,19 @@ def test_run_revise_refuses_a_value_its_assignment_line_cannot_vouch_for(
 @pytest.mark.parametrize(
     ("label", "raw", "refused"),
     [
-        # dotenv is LAST-occurrence-wins, so the LAST line is the one that decides
-        # the value -- and a plainly-spelled last line is a package that revises.
-        ("last assignment is plain", 'KEY="ab\\"cdefg"\nKEY=abcdef\n', False),
-        # ... and the reverse: an earlier plain line does not excuse the one that wins.
+        # dotenv is LAST-occurrence-wins, so the LAST line decides the value --
+        # but a reversible EARLIER line is refused too, and this expectation was
+        # INVERTED by R8-1: r6 pinned it as passing on the reasoning that a
+        # shadowed line "holds no registered value", which is false when the
+        # shadowed spelling encodes the very value the winner spells safely.
+        # Every assignment line is shape-checked now, so this refuses.
+        ("shadowed line is reversible", 'KEY="ab\\"cdefg"\nKEY=abcdef\n', True),
+        # ... and the winning line is still checked against the parsed value, so a
+        # plain earlier line does not excuse the one that wins.
         ("last assignment is reversible", 'KEY=abcdef\nKEY="ab\\"cdefg"\n', True),
+        # The ordinary edit history -- both lines plain -- still revises. The rule
+        # is about SPELLING, never about duplicate keys.
+        ("both lines plain", "KEY=oldvalue\nKEY=abcdef\n", False),
     ],
 )
 def test_run_revise_checks_the_last_assignment_of_a_duplicated_env_key(

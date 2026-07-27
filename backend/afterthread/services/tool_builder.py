@@ -2521,6 +2521,47 @@ def _env_assignment_rhs(text: str) -> dict[str, str]:
     return spelled
 
 
+def _env_assignment_rhs_all(text: str) -> list[str]:
+    """EVERY assignment line's raw RHS, shadowed ones included (R8-1).
+
+    Pure, and deliberately the counterpart of ``_env_assignment_rhs`` rather than
+    a variant of it: that one answers "which spelling DECIDED this key's value"
+    and therefore keeps exactly one line per key; this one answers "what spellings
+    does this file CONTAIN", which is a different question with a different
+    answer. Same line splitting and same key recognizer, so the two agree on what
+    an assignment line is.
+
+    The shadowed lines are the whole point. dotenv discards them, so they carry no
+    parsed value -- but they can still SPELL the live credential in the reversible
+    form the winning line avoided, and a ``cat`` of the file shows them all.
+    """
+    return [
+        line.split("=", 1)[1].strip()
+        for line in text.split("\n")
+        if _env_line_key(line) is not None
+    ]
+
+
+def _plainly_spelled(rhs: str) -> bool:
+    """True when an RHS holds its own text LITERALLY -- no reversible encoding.
+
+    Pure, and answerable WITHOUT knowing which value the line was meant to spell,
+    which is what makes it usable on a shadowed line (R8-1). It asks the same
+    question ``_dotenv_safe_spellings`` asks, from the other end: rather than
+    "which spellings are safe for THIS value", it asks "is this spelling safe for
+    whatever it contains" -- so it strips the quoting dotenv would strip and
+    checks that the result round-trips back to the same RHS through
+    ``_dotenv_safe_spellings``.
+
+    An empty RHS (``KEY=``) is plain: it holds nothing to hide.
+    """
+    if not rhs:
+        return True
+    quoted = len(rhs) >= 2 and rhs[0] == rhs[-1] and rhs[0] in "\"'"
+    inner = rhs[1:-1] if quoted else rhs
+    return rhs in _dotenv_safe_spellings(inner)
+
+
 def _dotenv_safe_spellings(value: str) -> tuple[str, ...]:
     r"""Every RHS spelling this system is willing to VOUCH for ``value`` with.
 
@@ -2645,10 +2686,23 @@ def _unmaskable_env_error(text: str, values: dict[str, str]) -> str | None:
     such a spelling apart from one whose first fragment merely happens to sit on
     the opening line.
 
-    An EARLIER, shadowed line may still spell something reversibly, and that is
-    not a hole: dotenv discarded it, so it is not a registered value at all -- it
-    is ordinary file text like any other string in the package, with no secret
-    behind it for a redactor to have missed.
+    EVERY assignment line is checked, not only the deciding one (R8-1), and the
+    reasoning that let the earlier ones through was simply wrong. It ran: a
+    shadowed line is not what dotenv parsed, so it holds no registered value and
+    is ordinary file text. But a shadowed line can encode the SAME live value the
+    winning line does, in the reversible spelling the winner avoided::
+
+        TOKEN="abcd\\"efgh"    <- shadowed, but this IS the live credential
+        TOKEN='abcd"efgh'      <- what dotenv parses; a spelling we accept
+
+    The registered value is ``abcd"efgh``; a ``cat`` shows both lines; the
+    redactor masks the second and hands the first to the model verbatim. So a
+    shadowed line is checked too -- not against a value (we cannot know which
+    value it was meant to spell) but for its SHAPE: its RHS must be a spelling
+    that holds its own text literally, i.e. one ``_dotenv_safe_spellings`` would
+    admit for the text it contains. A line written plainly can hide nothing; a
+    line carrying an escape is refused whether or not we can prove what it hides,
+    which is the same "refuse what we cannot verify" this whole gate is built on.
 
     The INSTALL path already treats exactly this as a leak and refuses:
     ``_dotenv_serialize_value`` returns None for a value it could only write with
@@ -2682,6 +2736,14 @@ def _unmaskable_env_error(text: str, values: dict[str, str]) -> str | None:
         rhs = spelled.get(key)
         if rhs is None or rhs not in _dotenv_safe_spellings(value):
             return _ERROR_REVISE_ENV_UNMATCHABLE
+    # ... and every OTHER assignment line, shadowed ones included (R8-1), for its
+    # SHAPE alone: `_plainly_spelled` asks whether a line holds its own text
+    # literally, which is answerable without knowing which value it was meant to
+    # spell -- and it is exactly what a shadowed line needs to be innocent.
+    # `spelled` cannot serve here: it keeps only the WINNER per key, which is the
+    # one line this check does not need.
+    if any(not _plainly_spelled(rhs) for rhs in _env_assignment_rhs_all(text)):
+        return _ERROR_REVISE_ENV_UNMATCHABLE
     return None
 
 
