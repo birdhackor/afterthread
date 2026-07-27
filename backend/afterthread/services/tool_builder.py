@@ -269,6 +269,55 @@ _ERROR_REVISE_ENV_UNMATCHABLE = (
 # docstring names for its own check-then-move window.
 _ERROR_REVISE_TARGET_MISSING = "原工具已被刪除，修訂結果未安裝。"  # noqa: RUF001
 _ERROR_REVISE_TARGET_ALIAS = "原工具目錄已被替換為連結，修訂已取消。"  # noqa: RUF001
+# R10-1: the package of that NAME is still there, but it is not the one this
+# session copied from -- an operator deleted and reinstalled it, or replaced it
+# wholesale, during the minutes the build ran. Publishing the old snapshot's
+# revision over it would rename the new package aside and then delete it. The
+# remedy is to re-send the feedback against what is installed now, which is what
+# the message says; like every outcome error here it names the condition only.
+_ERROR_REVISE_TARGET_REPLACED = "原工具在修訂期間被改動或重新安裝，請確認現況後重新送出意見。"  # noqa: RUF001
+
+
+def _package_identity(directory: Path) -> tuple[int, int, int] | None:
+    """The package's MANIFEST identity: ``(st_dev, st_ino, st_ctime_ns)`` of its
+    ``tool.json``, or None when it cannot be read.
+
+    Taken TWICE per revise -- once when the session reads the package, once before
+    the swap -- so both calls must mean the same thing; that is why it is one
+    helper rather than two inline ``lstat`` calls.
+
+    The MANIFEST rather than the directory, and that choice is the whole design.
+    Two weaker readings were measured and discarded:
+
+    * the directory's inode alone does not answer "is this the same package": a
+      delete-and-reinstall of the same name REUSES the inode on an ordinary Linux
+      filesystem (measured here, not assumed -- the first version of this check
+      was written against the opposite assumption and silently passed the exact
+      scenario it exists to refuse);
+    * the directory's inode plus its ctime/mtime DOES catch the reinstall, but it
+      also fires on any change to the directory's CONTENTS -- and that contradicts
+      an earlier adjudication this module already implements: an operator deleting
+      the package's ``.env`` mid-session is HONORED (D40 r3), not refused. A check
+      that cannot tell "replaced" from "edited" would have to break one of the two.
+
+    ``tool.json`` separates them cleanly: every install and reinstall WRITES it (it
+    is the one file ``validate_package`` requires), so a package that was replaced
+    carries a different one; deleting or editing some OTHER file in the package
+    leaves it untouched. Editing the manifest ITSELF in place during a revise is
+    then treated as a replacement, which is the right side to err on -- that is
+    the file whose contents the revision is rewriting.
+
+    ``lstat``, so a manifest swapped for a symlink compares different rather than
+    reporting on its target. None on any error: the caller treats "cannot say" as
+    "this check cannot speak", never as "identity matches".
+    """
+    try:
+        info = os.lstat(directory / "tool.json")
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino, info.st_ctime_ns)
+
+
 # The swap failed AND the roll-back failed too: the only state where the
 # operator has to act. It names the SHAPE of the rescue (a hidden backup
 # directory beside the tool) rather than the path, keeping the category-only
@@ -1804,6 +1853,7 @@ def _promote_staging_replace(
     base: Path,
     *,
     env_existed_at_start: bool,
+    package_identity: tuple[int, int, int] | None,
     registered: list[str],
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Swap a revised build in for the INSTALLED ``<base>/<name>`` (D40).
@@ -1942,6 +1992,19 @@ def _promote_staging_replace(
         return None, _ERROR_REVISE_TARGET_ALIAS
     if not target.is_dir():
         return None, _ERROR_REVISE_TARGET_MISSING
+    # ... and it must still be the SAME directory the session copied from (R10-1).
+    # "A directory of that name exists" is not the question: an operator can delete
+    # and reinstall -- or atomically replace -- the package during the MINUTES an
+    # LLM session runs, and publishing a revision of the old snapshot over the new
+    # package would rename the new one aside and then delete it, silently taking
+    # whatever the operator just put there. The identity is the directory's own
+    # (st_dev, st_ino) captured when the session read the package; a replacement is
+    # a NEW directory and compares different, while ordinary in-place edits keep
+    # the inode and still revise (refusing those would make revise unusable, and
+    # they are not the loss this guards). None means the caller could not capture
+    # one, and then this check cannot speak -- the other gates still do.
+    if package_identity is not None and _package_identity(target) != package_identity:
+        return None, _ERROR_REVISE_TARGET_REPLACED
     # The live ``.env`` is copied into staging BEFORE the 定版 gate below, and the
     # order is the fix R4-1 asked for: this is the only pre-swap step that can take
     # an operator-chosen amount of TIME, and a gate that runs before it cannot see a
@@ -2927,6 +2990,10 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
     # (R3-1). VALUES only: the FILE is copied at promote time. Empty values
     # contribute nothing to redaction and are not registered, matching
     # tools._cached_env_values' own "a KEY= line contributes nothing" rule.
+    # R10-1: the identity of the package we are about to revise, taken BEFORE the
+    # session and re-checked before the swap. An operator can delete and reinstall
+    # the tool during the minutes a build runs, and a name is not an identity.
+    package_identity = await run_in_threadpool(_package_identity, directory)
     env_existed_at_start, env_values, env_text, env_error = await run_in_threadpool(
         _read_env_for_values, directory
     )
@@ -3049,6 +3116,7 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
             name,
             base,
             env_existed_at_start=env_existed_at_start,
+            package_identity=package_identity,
             # The promote re-vets the ``.env`` it is about to ship and registers
             # whatever it finds there (R7-2). It appends to THIS list, so the
             # ``finally`` below discards those values too -- the alternative,
