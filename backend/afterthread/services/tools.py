@@ -44,7 +44,7 @@ v1 does NOT sandbox with a container. What it DOES guarantee:
   name against the package-name regex AND re-checks resolved-path containment
   under ``tools_dir`` before touching the filesystem, so a traversal name like
   ``"../.."`` (or a symlinked package escaping the tools dir) can never make us
-  rewrite or ``rmtree`` a path outside the tools directory;
+  rewrite, rename or ``rmtree`` a path outside the tools directory;
 * runtime and output are bounded (timeout + process-group kill, output cap), so
   a hung or runaway tool cannot pin the interaction or blow the prompt/log.
 
@@ -71,6 +71,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any
+from uuid import uuid4
 
 from dotenv import dotenv_values
 from starlette.concurrency import run_in_threadpool
@@ -144,9 +145,10 @@ _ENV_FILE_MAX_BYTES = 64 * 1024
 # * ``known_secret_values`` and the installer's ``.staging`` shell already use
 #   "a leading dot means internal to the backend" (see ``_STAGING_DIRNAME``), so
 #   an operator browsing a package reads it the same way;
-# * ``delete_tool``'s ``rmtree`` takes it with the package -- summary and tool
-#   share one lifetime, which is exactly why this lives in the package rather
-#   than in SQLite;
+# * ``delete_tool`` takes it with the package -- summary and tool share one
+#   lifetime, which is exactly why this lives in the package rather than in
+#   SQLite (a delete DEFERRED past a running call carries the sidecar into the
+#   hidden name with everything else, so the two still die together);
 # * the summary generator skips every dot-file when it feeds the package to the
 #   model, so the sidecar never feeds itself back into its own next prompt.
 #
@@ -1706,17 +1708,39 @@ def enabled_llm_tools() -> list[LlmTool]:
 # tool ``.env``, and an in-flight install registers its form secret before that
 # ``.env`` even exists.
 
-# In-flight install secrets. A web-installer form secret (secret_value) is
-# registered here for the DURATION of one install (tool_builder add/discards
-# around run_install), so it is already redactable during the builder session --
-# the window BEFORE promote writes it into the package ``.env``, after which the
-# per-package ``.env`` scan below is what covers it. This registry lives HERE,
-# not in tool_builder, on purpose: ``known_secret_values`` must read it, and
-# tool_builder already imports us, so putting it in tool_builder would force a
-# reverse import (a cycle) -- the SAME inversion llm_log applies to us. Its own
-# lock guards it because ``known_secret_values`` can run on a threadpool recorder
-# thread while an install mutates the set on the event loop.
-_INFLIGHT_SECRETS: set[str] = set()
+# In-flight secrets: values that must stay redactable for the DURATION of one
+# operation, independently of what the ``.env`` scan below can see AT THE MOMENT
+# a body is recorded. Three kinds of holder register here:
+#
+# * a web-installer form secret (``secret_value``), for the whole install
+#   (tool_builder registers/discards around ``run_install``) -- the window BEFORE
+#   promote writes it into the package ``.env``, after which the per-package
+#   ``.env`` scan below is what covers it;
+# * a revise session's ``.env`` values, for the whole builder session, plus
+#   whatever the promote re-vets on its way out;
+# * the ``.env`` values ONE TOOL CALL was handed. ``_build_tool_env`` copies the
+#   package's ``.env`` into the child's environment, and the child can echo any
+#   of it back -- but the redaction of that output happens when the child
+#   FINISHES, and by then the file may say something else entirely (an operator
+#   rotating a credential, a revise publishing a new package, this module's own
+#   deferred ``delete_tool``). The scan would then only know the NEW value and
+#   the OLD one would ride into the role:"tool" message, the log and the JSONL
+#   sink unmasked. So the values a child actually RECEIVED are held here for
+#   exactly as long as that call can still produce output to mask.
+#
+# COUNTED rather than flagged, for the same reason ``_INFLIGHT_EXECUTIONS`` is:
+# holders overlap (two workflows calling the same tool, a revise running while an
+# ordinary conversation calls that same tool -- ordinary AI workflows are outside
+# the tool job's single-flight), and they can hold the SAME value, since it is the
+# same ``.env``. With a plain set the first holder to finish would strip the
+# protection the survivor still needs.
+#
+# This registry lives HERE, not in tool_builder, on purpose: ``known_secret_values``
+# must read it, and tool_builder already imports us, so putting it in tool_builder
+# would force a reverse import (a cycle) -- the SAME inversion llm_log applies to
+# us. Its own lock guards it because ``known_secret_values`` can run on a
+# threadpool recorder thread while an install mutates the mapping on the event loop.
+_INFLIGHT_SECRETS: dict[str, int] = {}
 _INFLIGHT_LOCK = threading.Lock()
 
 # Cache of one package's parsed ``.env`` VALUES, keyed by the ``.env`` path and
@@ -1766,17 +1790,58 @@ _ENV_VALUE_CACHE_LOCK = threading.Lock()
 
 
 def register_inflight_secret(value: str) -> None:
-    """Mark ``value`` redactable for the current install (see ``_INFLIGHT_SECRETS``)."""
+    """Take ONE hold on ``value`` being redactable (see ``_INFLIGHT_SECRETS``).
+
+    Every call must be matched by exactly one ``discard_inflight_secret`` from a
+    ``finally``: the count is what lets overlapping holders of the same value
+    (two calls to the same tool, a revise session and a tool call reading the
+    same ``.env``) each release only their OWN hold.
+    """
     if not value:
         return
     with _INFLIGHT_LOCK:
-        _INFLIGHT_SECRETS.add(value)
+        _INFLIGHT_SECRETS[value] = _INFLIGHT_SECRETS.get(value, 0) + 1
 
 
 def discard_inflight_secret(value: str) -> None:
-    """Drop ``value`` from the in-flight set once its install ends (try/finally)."""
+    """Release ONE hold on ``value``; it stays redactable while others remain.
+
+    The count is dropped to zero by REMOVING the key, so ``known_secret_values``
+    can read the mapping as a plain set of values and a stale zero can never
+    keep a value in it. Releasing a value nobody holds is a no-op (never a
+    negative count), which keeps this as forgiving as the ``set.discard`` it
+    replaced for a caller whose registration was skipped.
+    """
     with _INFLIGHT_LOCK:
-        _INFLIGHT_SECRETS.discard(value)
+        remaining = _INFLIGHT_SECRETS.get(value, 0) - 1
+        if remaining > 0:
+            _INFLIGHT_SECRETS[value] = remaining
+        else:
+            _INFLIGHT_SECRETS.pop(value, None)
+
+
+@contextlib.contextmanager
+def _inflight_secrets(values: frozenset[str]) -> Iterator[None]:
+    """Hold ``values`` redactable for the body, and release them again.
+
+    The mate of ``_inflight_execution`` for the OTHER thing one tool call needs
+    to outlive itself, and a context manager for the same reason: the ``finally``
+    is the point. A handler that raises, times out, or is cancelled mid-call must
+    not leave a hold behind -- a leaked one would keep masking a value forever,
+    which is not a leak that shows up anywhere until a redaction starts eating
+    ordinary prose.
+
+    Registration is INSIDE the try, so a failure part-way through the loop still
+    releases the holds already taken (the release of a value never registered is
+    a no-op, so releasing them all is safe).
+    """
+    try:
+        for value in values:
+            register_inflight_secret(value)
+        yield
+    finally:
+        for value in values:
+            discard_inflight_secret(value)
 
 
 def _cached_env_values(directory: Path) -> frozenset[str]:
@@ -1829,7 +1894,11 @@ def known_secret_values() -> frozenset[str]:
       it back cannot surface it in the log;
     * every VALUE in every installed tool package's ``.env`` (a KB API key etc.),
       cached per (path, file identity) so a call per record stays cheap;
-    * the in-flight install secrets registered above (the pre-promote window).
+    * every value currently HELD in-flight (see ``_INFLIGHT_SECRETS``) -- an
+      install's form secret before promote writes it, a revise session's values,
+      and the values a running tool call handed its child. Each covers a window
+      the directory scan above cannot answer for, because the file it reads is
+      whatever is on disk NOW rather than what the holder was given.
 
     Wired as llm_log's secret provider by main. llm_log calls this INSIDE its own
     ``except Exception`` guard (the no-observer-failure invariant), so a hiccup
@@ -2089,7 +2158,7 @@ def _load_tool_dotenv(directory: Path) -> dict[str, str]:
     return _parse_dotenv_text(text)
 
 
-def _build_tool_env(directory: Path) -> dict[str, str]:
+def _build_tool_env(directory: Path) -> tuple[dict[str, str], frozenset[str]]:
     """Build the child environment FROM SCRATCH: passthrough allowlist + tool .env.
 
     The parent environment is NEVER copied wholesale -- see the module docstring.
@@ -2104,12 +2173,23 @@ def _build_tool_env(directory: Path) -> dict[str, str]:
     MAY skip TLS certificate verification the same way this backend's own
     outbound connections do (see config.py), without that trust decision being
     silently forced on every tool regardless of the operator's setting.
+
+    Returns the env AND the (non-empty) ``.env`` VALUES that went into it, from
+    the SAME read -- which is the whole point of handing them back rather than
+    letting the caller re-read the file: a second read could see a rotated
+    ``.env`` and register values the child never got, leaving the ones it DID get
+    unmaskable. The passthrough names are deliberately NOT in that set: PATH and
+    HOME are not secrets, and masking them would shred every result that mentions
+    a path. The values are handed to ``_inflight_secrets`` by ``_make_handler``.
     """
     env = {name: os.environ[name] for name in _PASSTHROUGH_ENV if name in os.environ}
     if get_settings().tls_no_verify:
         env["TLS_NO_VERIFY"] = "1"
-    env.update(_load_tool_dotenv(directory))
-    return env
+    dotenv = _load_tool_dotenv(directory)
+    env.update(dotenv)
+    # Empty values are dropped for the SAME reason ``_cached_env_values`` drops
+    # them: a ``KEY=`` line contributes no secret to anything.
+    return env, frozenset(value for value in dotenv.values() if value)
 
 
 def _cap_output(text: str, cap: int) -> str:
@@ -2517,6 +2597,45 @@ def package_execution_in_flight(identity: tuple[int, int, int]) -> bool:
         return identity in _INFLIGHT_EXECUTIONS
 
 
+# The DEFERRED-REMOVAL namespace: where a package goes when it must stop being a
+# package NOW but cannot be destroyed yet, because a subprocess is still reading
+# it. ``.{name}.stale-<token>`` means "superseded, collect when idle", and it is
+# the only shape ``tool_builder._sweep_stale_backups`` will ever remove.
+#
+# TWO writers mint this name, for the same reason and with the same guarantee:
+# ``tool_builder._promote_staging_replace`` (a revise published, its backup is
+# litter) and ``delete_tool`` below (the operator removed the tool). Both would
+# otherwise ``rmtree`` a directory a child has its cwd on. It lives HERE rather
+# than in tool_builder -- where the sweep and the ``.bak-`` rescue name still
+# live -- for the ONE reason ``_INFLIGHT_SECRETS`` does: this module cannot
+# import tool_builder (tool_builder imports us), so a shared definition can only
+# sit on this side, and two spellings of a name one side WRITES and the other
+# READS OFF DISK is exactly the drift that would make the sweep stop finding its
+# own litter.
+#
+# Dot-prefixed is load-bearing, not cosmetic: ``_scan_all`` and
+# ``known_secret_values`` both skip hidden directories, so deferred remains are
+# inert litter rather than a phantom package. ``\Z`` rather than ``$`` because
+# the pattern gates an ``rmtree``: ``$`` also matches before a trailing newline,
+# and a filename may legally contain one.
+#
+# The identifiers keep the word BACKUP even though a delete's remains are not a
+# backup of anything, and that is a decision: the on-disk name -- the actual
+# contract, the thing one side writes and the other reads -- says ``stale``,
+# which is true of both writers, and renaming the Python symbols would leave the
+# D40 r3 addendum pointing at names that no longer exist.
+_STALE_BACKUP_RE = re.compile(r"^\.[a-z0-9][a-z0-9_-]{0,63}\.stale-[0-9a-f]{32}\Z")
+
+
+def _stale_backup_path(base: Path, name: str, token: str) -> Path:
+    """Where a package goes to await collection (see ``_STALE_BACKUP_RE``).
+
+    The mate of that pattern: what this writes, the sweep must recognize, so a
+    test pins the pair (including at the longest legal package name).
+    """
+    return base / f".{name}.stale-{token}"
+
+
 def _make_handler(
     directory: Path, entry: list[str], identity: tuple[int, int, int] | None
 ) -> Callable[[dict[str, Any]], Awaitable[str]]:
@@ -2566,14 +2685,19 @@ def _make_handler(
     "cannot establish identity" rule (D40 P3b r11): a check that cannot speak
     must not vouch.
 
-    That check answers for the START of a call. The RUN is covered by the second
-    half of the pairing: the same identity is registered as an in-flight
-    execution around the subprocess, so a promote landing mid-run keeps the files
-    this child is still reading instead of deleting them under it (see
-    ``_INFLIGHT_EXECUTIONS`` for what was measured about the rename and the
-    removal). The registration is the LAST thing before the run and is released
-    by a ``finally``, so no failure shape -- exception, timeout, cancellation --
-    can leave a package pinned.
+    That check answers for the START of a call. The RUN is covered by two
+    registrations taken together, immediately before the threadpool hop and
+    released by a ``finally``, so no failure shape -- exception, timeout,
+    cancellation -- can leak either one:
+
+    * the same identity as an in-flight EXECUTION, so a promote (or a
+      ``delete_tool``) landing mid-run keeps the files this child is still
+      reading instead of deleting them under it (see ``_INFLIGHT_EXECUTIONS`` for
+      what was measured about the rename and the removal);
+    * the ``.env`` VALUES ``_build_tool_env`` just handed the child as in-flight
+      SECRETS, so the redaction that runs when the child finishes still knows the
+      values it was given even if the file has been rotated, replaced or carried
+      off by a deferred delete since (see ``_INFLIGHT_SECRETS``).
 
     FALSE POSITIVES, stated rather than discovered later: ``set_enabled`` rewrites
     ``tool.json`` IN PLACE to flip ``enabled``, which moves its ctime. So toggling
@@ -2594,17 +2718,30 @@ def _make_handler(
         if identity is None or package_identity(directory) != identity:
             return _TOOL_REPLACED_RESULT
         settings = get_settings()
-        env = _build_tool_env(directory)
+        env, env_secrets = _build_tool_env(directory)
         args_json = json.dumps(arguments, ensure_ascii=False)
-        # Registered around the run, not merely checked before it: everything
-        # after this line reads the package's files from an inode a promote can
-        # rename aside (harmless) and then remove (not harmless). Entering here
-        # rather than inside ``_run_tool_subprocess`` covers the threadpool queue
-        # wait too, and orders the registration strictly BEFORE the ``Popen`` it
-        # protects -- a promote that observes no registration therefore cannot
-        # have a child of ours already running against the package it is
-        # dropping.
-        with _inflight_execution(identity):
+        # TWO registrations, both entered here and both released by the SAME
+        # ``with``, because both answer for the call's DURATION rather than its
+        # start:
+        #
+        # * the EXECUTION, so a promote landing mid-run keeps the files this
+        #   child is still reading. Everything after this line reads the
+        #   package's files from an inode a promote can rename aside (harmless)
+        #   and then remove (not harmless). Entering here rather than inside
+        #   ``_run_tool_subprocess`` covers the threadpool queue wait too, and
+        #   orders the registration strictly BEFORE the ``Popen`` it protects --
+        #   a promote that observes no registration therefore cannot have a child
+        #   of ours already running against the package it is dropping;
+        # * the ``.env`` VALUES this child was just handed, so they stay
+        #   redactable no matter what the file says by the time the child
+        #   finishes. The scope has to reach past the subprocess: the masking of
+        #   the child's output happens INSIDE ``_run_tool_subprocess`` (F1/D36),
+        #   so releasing on the child's exit would still be too early. It ends
+        #   where the awaited call returns, which is after that redaction and
+        #   before the string is handed to the llm loop -- everything downstream
+        #   (the role:"tool" message, the log, the JSONL sink) sees the masked
+        #   copy.
+        with _inflight_execution(identity), _inflight_secrets(env_secrets):
             return await run_in_threadpool(
                 _run_tool_subprocess,
                 list(entry),
@@ -2771,7 +2908,33 @@ def delete_tool(name: str) -> bool:
     Name-validated and containment-checked exactly like ``set_enabled`` (the
     traversal hard-block is what makes an ``rmtree`` here safe), so it can only
     ever remove a directory that genuinely sits inside ``tools_dir``. False when
-    the name is unsafe, the package is absent, or the removal fails.
+    the name is unsafe, the package is absent, or it could not be taken out of
+    the registry at all.
+
+    A package a subprocess is STILL EXECUTING against is left in the
+    deferred-removal namespace instead of being destroyed, which is the same
+    treatment ``tool_builder._promote_staging_replace`` gives the backup it can no
+    longer drop, for the same measured reason (see ``_INFLIGHT_EXECUTIONS``): a
+    running child's cwd is a reference to the INODE, so the rename disturbs
+    NOTHING, while the ``rmtree`` turns every later relative open -- a lazily
+    imported helper, a data file -- into ENOENT. A tool call failing halfway is
+    worse than it sounds: the model sees a failure for an action whose external
+    side effect may already have happened, and may simply retry it.
+
+    Deferring changes nothing the caller can observe. The tool is gone from the
+    registry the instant this returns EITHER WAY: the new name is dot-prefixed,
+    which is precisely what ``_scan_all`` (and so ``list_tools`` /
+    ``enabled_llm_tools``) and ``known_secret_values`` skip. The route's contract
+    is untouched -- True is a genuine deletion of what the user saw, False still
+    folds every "did not happen" into one 404.
+
+    The remains are collected by the SAME sweep the promote's deferrals go
+    through (``tool_builder._sweep_stale_backups``, at the end of every tool job),
+    which re-derives everything it needs from disk. Residuals, stated rather than
+    discovered later, and identical to the promote's: a pathologically long call
+    postpones the collection to a later job, and a process that exits in between
+    leaves the marked directory for the next run to sweep. Both are hidden, inert
+    litter, never a phantom package.
     """
     base = tools_dir()
     if base is None or not _NAME_RE.match(name):
@@ -2798,8 +2961,46 @@ def delete_tool(name: str) -> bool:
     directory = _resolve_package_dir(name)
     if directory is None or not directory.is_dir():
         return False
+    # RENAME FIRST, then decide -- the exact order ``_promote_staging_replace``
+    # uses, and for a reason that is structural rather than stylistic. Asking the
+    # registry first and removing second leaves a window: a handler that passes
+    # its own identity check an instant after our answer registers and starts a
+    # child against files the ``rmtree`` is already walking. Moving the rename
+    # ahead closes that window instead of narrowing it, because the rename is what
+    # makes every later handler REFUSE on its own -- ``package_identity`` of the
+    # now-empty path answers None, and a None identity is a refusal (see
+    # ``_make_handler``). After it, the only executions that can exist against
+    # this directory are ones that were already registered, which is exactly the
+    # set the query below can see. The rename itself is the operation MEASURED to
+    # be invisible to a running child (see ``_INFLIGHT_EXECUTIONS``).
+    #
+    # ``directory.parent`` rather than ``base``: the containment check above
+    # already proved the resolved package sits directly under the resolved tools
+    # root, so this is that root -- and taking it FROM the path being renamed is
+    # what makes "the new name lands in the same directory" true by construction
+    # rather than by re-deriving it. A rename inside one directory is also the
+    # only shape that cannot cross a filesystem, and the only one that is atomic.
+    deferred = _stale_backup_path(directory.parent, name, uuid4().hex)
     try:
-        shutil.rmtree(directory)
+        os.rename(directory, deferred)
     except OSError:
+        # The package is untouched and still listed, so this is the honest "did
+        # not happen" -- the same answer a failed removal gave before.
         return False
+    # The identity is taken from what we now HOLD rather than from the name we
+    # were given, so it describes the very files a child could still be reading
+    # (a rename changes nothing about the ``tool.json`` inside -- measured).
+    # "Cannot read it" falls through to the removal, the OPPOSITE direction from
+    # the sweep's own "cannot say -> keep": the destructive act here is the one
+    # the caller asked for, and a package whose manifest cannot be lstat'ed is one
+    # no handler can have registered, so there is nothing running to protect.
+    identity = package_identity(deferred)
+    if identity is not None and package_execution_in_flight(identity):
+        return True
+    # Best-effort from here: the tool is already gone as far as everything that
+    # reads this directory is concerned, so a removal that fails part-way must not
+    # be reported as "did not happen" -- it leaves MARKED remains the sweep retries
+    # on every later tool job, which is a self-healing residue rather than the
+    # half-deleted, still-listed package a failing ``rmtree`` used to leave.
+    shutil.rmtree(deferred, ignore_errors=True)
     return True

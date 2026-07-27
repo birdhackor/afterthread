@@ -1860,7 +1860,7 @@ def test_inject_secret_tricky_value_reaches_subprocess_env(tmp_path: Path) -> No
     value = "tricky'$#-value abcdef"
     env_file = tmp_path / ".env"
     assert tool_builder._inject_secret_into_env(env_file, "KB_API_KEY", value) is None
-    env = tools._build_tool_env(tmp_path)
+    env, _ = tools._build_tool_env(tmp_path)
     assert env["KB_API_KEY"] == value
 
 
@@ -4457,8 +4457,10 @@ def test_promote_replace_copies_a_live_env_at_the_ceiling_byte_for_byte(tmp_path
 
 
 def test_stale_backup_names_are_minted_and_recognized_by_one_shape(tmp_path: Path) -> None:
-    """``_stale_backup_path`` writes the name and ``_STALE_BACKUP_RE`` reads it
-    back off disk, so the two must agree for the sweep to find its litter at all.
+    """``tools._stale_backup_path`` writes the name and ``tools._STALE_BACKUP_RE``
+    reads it back off disk, so the two must agree for the sweep to find its litter
+    at all. Both live in ``tools`` because ``tools.delete_tool`` mints this name
+    too and only that side can hold a definition both writers share.
 
     Pinned at the LONGEST legal package name (``tools._NAME_RE``'s 64 chars),
     which is where a lazily-written pattern stops matching -- and pinned against
@@ -4469,8 +4471,8 @@ def test_stale_backup_names_are_minted_and_recognized_by_one_shape(tmp_path: Pat
     longest = "k" + "a-b_9" * 12 + "xyz"
     token = "0123456789abcdef" * 2
     assert len(longest) == 64 and tools._NAME_RE.match(longest)
-    minted = tool_builder._stale_backup_path(tmp_path, longest, token)
-    assert tool_builder._STALE_BACKUP_RE.match(minted.name)
+    minted = tools._stale_backup_path(tmp_path, longest, token)
+    assert tools._STALE_BACKUP_RE.match(minted.name)
     assert minted.parent == tmp_path
     for other in (
         tool_builder._backup_path(tmp_path, "kbsearch", token).name,  # the rescue shape
@@ -4481,7 +4483,7 @@ def test_stale_backup_names_are_minted_and_recognized_by_one_shape(tmp_path: Pat
         f".kbsearch.stale-{'0' * 31}",
         f".kbsearch.stale-{'0' * 32}\n",  # \Z, not $: a filename may hold a newline
     ):
-        assert not tool_builder._STALE_BACKUP_RE.match(other), other
+        assert not tools._STALE_BACKUP_RE.match(other), other
 
 
 def _busy_package(base: Path, marker: Path, gate: Path) -> tuple[Path, tuple[int, int, int]]:
@@ -4603,7 +4605,7 @@ def test_promote_replace_drops_the_backup_immediately_when_nothing_is_running(
 
 def _stale_dir(base: Path, name: str) -> Path:
     """A marked, collectable backup of ``name`` with a readable manifest."""
-    path = tool_builder._stale_backup_path(base, name, uuid4().hex)
+    path = tools._stale_backup_path(base, name, uuid4().hex)
     path.mkdir()
     (path / "tool.json").write_text(json.dumps(_package_manifest(name)), encoding="utf-8")
     return path
@@ -4630,7 +4632,7 @@ def test_sweep_keeps_a_backup_that_is_still_in_use_and_spares_everything_else(
     outside = tmp_path / "elsewhere"
     outside.mkdir()
     (outside / "keep.txt").write_text("keep", encoding="utf-8")
-    linked = tool_builder._stale_backup_path(base, "linked", uuid4().hex)
+    linked = tools._stale_backup_path(base, "linked", uuid4().hex)
     linked.symlink_to(outside, target_is_directory=True)
 
     with tools._inflight_execution(identity):
@@ -4677,6 +4679,42 @@ def test_cleanup_staging_is_where_the_sweep_actually_runs(tmp_path: Path) -> Non
     assert refused.is_dir()  # ... and the refused workspace was left alone
 
 
+def test_sweep_collects_what_a_deferred_delete_left_behind(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The delete side of the deferral, end to end.
+
+    ``tools.delete_tool`` mints the SAME marked name a promote does, precisely so
+    it needs no collector of its own: the sweep that every tool job already runs
+    picks it up. Both halves are pinned here -- it is NOT collected while the call
+    that caused the deferral is still running (the sweep re-derives that from the
+    directory's own manifest, since the deferral may have happened in an earlier
+    process), and it IS collected on the next pass afterwards."""
+    base = tmp_path / "tools"
+    marker, gate = tmp_path / "started", tmp_path / "go"
+    _busy_package(base, marker, gate)
+    _install_settings(monkeypatch, tools_dir=str(base))
+    handler = tools.enabled_llm_tools()[0].handler
+
+    result: dict[str, str] = {}
+    caller = threading.Thread(target=lambda: result.update(out=asyncio.run(handler({}))))
+    caller.start()
+    try:
+        _wait_for(marker.exists)
+        assert tools.delete_tool("kbsearch") is True
+        deferred = [child for child in base.iterdir() if tools._STALE_BACKUP_RE.match(child.name)]
+        assert len(deferred) == 1
+        tool_builder._sweep_stale_backups(base)
+        assert deferred[0].is_dir()  # a call is still reading it: not ours to collect
+    finally:
+        gate.write_text("go", encoding="utf-8")
+        caller.join(timeout=30)
+
+    assert result["out"] == "PAYLOAD"  # the child read its data file after the delete
+    tool_builder._sweep_stale_backups(base)
+    assert list(base.iterdir()) == []
+
+
 def test_sweep_never_collects_the_rescue_copy_of_an_unrecoverable_swap(tmp_path: Path) -> None:
     """A plain ``.bak-`` directory is NOT the sweep's business, and this is the
     reason the marked namespace exists at all.
@@ -4707,7 +4745,7 @@ def test_sweep_keeps_a_marked_backup_whose_manifest_cannot_be_read(tmp_path: Pat
     the same permanence a partially failed rmtree already has."""
     base = tmp_path / "tools"
     base.mkdir()
-    unreadable = tool_builder._stale_backup_path(base, "kbsearch", uuid4().hex)
+    unreadable = tools._stale_backup_path(base, "kbsearch", uuid4().hex)
     unreadable.mkdir()  # no tool.json at all: _package_identity answers None
 
     tool_builder._sweep_stale_backups(base)

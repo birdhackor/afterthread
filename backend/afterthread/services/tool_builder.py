@@ -94,7 +94,6 @@ import concurrent.futures
 import contextlib
 import os
 import queue
-import re
 import shutil
 import stat
 import subprocess
@@ -1666,13 +1665,15 @@ def _shipped_env_policy_error(
       session's own list, whose ``finally`` discards every value it holds.
       Registering at the point of discovery and recording it in the SAME breath
       is what makes it leak-proof: no return path can leave a value registered
-      with nobody to discard it. Both the registration and the discard are
-      idempotent, so a value the session's entry read already registered costs
-      nothing when it turns up here again. It happens BEFORE the caller copies
-      or ships, so the post-swap paths -- the regenerated sidecar, the summary
-      session and its AI 日誌 record, all written while the old package sits in
-      a dot-prefixed backup ``known_secret_values`` skips -- have something to
-      mask against.
+      with nobody to discard it. Registrations are COUNTED (see
+      ``tools._INFLIGHT_SECRETS``), so a value the session's entry read already
+      registered simply takes a second hold here and the list's ``finally``
+      releases both -- one entry per hold is exactly what that count wants, and
+      the duplicate is what keeps the two release points independent. It happens
+      BEFORE the caller copies or ships, so the post-swap paths -- the
+      regenerated sidecar, the summary session and its AI 日誌 record, all
+      written while the old package sits in a dot-prefixed backup
+      ``known_secret_values`` skips -- have something to mask against.
     """
     if not stat.S_ISREG(path_stat.st_mode):
         return _ERROR_REVISE_ENV_UNREADABLE
@@ -1908,13 +1909,15 @@ def _preserve_env_file(
 # The two hidden names the old package can wear, minted from ONE token so a
 # directory listing shows them as the same object:
 #
-# * ``.{name}.bak-<token>`` -- parked here for the swap. If the swap ends badly
-#   this IS the operator's tool (see ``_ERROR_REVISE_UNRECOVERABLE``), so NOTHING
-#   ever collects this name automatically;
-# * ``.{name}.stale-<token>`` -- renamed here by a promote that PUBLISHED
-#   successfully but could not drop the backup yet, because a tool subprocess was
-#   still reading it. This name means "superseded, collect when idle", and it is
-#   the only shape ``_sweep_stale_backups`` will remove.
+# * ``.{name}.bak-<token>`` -- parked here for the swap, by this module alone. If
+#   the swap ends badly this IS the operator's tool (see
+#   ``_ERROR_REVISE_UNRECOVERABLE``), so NOTHING ever collects this name
+#   automatically;
+# * ``.{name}.stale-<token>`` -- the deferred-removal namespace, whose name and
+#   pattern live in ``tools`` because ``tools.delete_tool`` mints it too (a
+#   delete during a running call has the same problem a promote does) and only
+#   that side can hold a definition both can share. It means "superseded, collect
+#   when idle", and it is the only shape ``_sweep_stale_backups`` will remove.
 #
 # The distinction has to live in the NAME because the sweep is disk-driven and
 # runs in a later process as happily as in this one: "the swap succeeded" is not
@@ -1925,24 +1928,12 @@ def _preserve_env_file(
 #
 # Dot-prefixed is load-bearing, not cosmetic, for both -- see
 # ``_promote_staging_replace`` for what ``tools._scan_all`` and
-# ``known_secret_values`` do with hidden names. ``\Z`` rather than ``$`` in the
-# pattern because it gates an ``rmtree``: ``$`` also matches before a trailing
-# newline, and a filename may legally contain one.
-_STALE_BACKUP_RE = re.compile(r"^\.[a-z0-9][a-z0-9_-]{0,63}\.stale-[0-9a-f]{32}\Z")
+# ``known_secret_values`` do with hidden names.
 
 
 def _backup_path(base: Path, name: str, token: str) -> Path:
     """Where the old package is parked for the swap. Never swept automatically."""
     return base / f".{name}.bak-{token}"
-
-
-def _stale_backup_path(base: Path, name: str, token: str) -> Path:
-    """Where a PUBLISHED swap parks a backup it could not drop yet.
-
-    The mate of ``_STALE_BACKUP_RE``: what this writes, the sweep must recognize,
-    so a test pins the pair (including at the longest legal package name).
-    """
-    return base / f".{name}.stale-{token}"
 
 
 def _promote_staging_replace(
@@ -2239,37 +2230,39 @@ def _promote_staging_replace(
     # hidden and inert, and the operator can delete it by hand.
     if tools.package_execution_in_flight(package_identity):
         with contextlib.suppress(OSError):
-            os.rename(backup, _stale_backup_path(base, name, token))
+            os.rename(backup, tools._stale_backup_path(base, name, token))
         return origin, None
     shutil.rmtree(backup, ignore_errors=True)
     return origin, None
 
 
 def _sweep_stale_backups(base: Path) -> None:
-    """Remove superseded backups nothing is executing against any more.
+    """Remove deferred remains nothing is executing against any more.
 
     Blocking, best-effort, never raises -- the same contract as
     ``_cleanup_staging``, which is where it runs from.
 
-    ``_promote_staging_replace`` drops its backup itself the instant the swap
-    succeeds; the only ones that reach here are those it could not drop because a
-    tool subprocess was still reading them, and marked ``.stale-`` on the way out.
+    Two writers feed it, and both defer for the same reason -- a tool subprocess
+    was still reading the directory they wanted gone: ``_promote_staging_replace``
+    (which otherwise drops its backup itself the instant the swap succeeds) and
+    ``tools.delete_tool`` (which otherwise ``rmtree``s the package outright).
+    Both mark what they leave with ``tools._stale_backup_path`` on the way out.
     Driven off the DIRECTORY rather than an in-memory list of deferrals, and that
     is the decision: the process can exit between the deferral and the sweep (an
     operator quits the app, the machine reboots), and an in-memory list would take
-    the only record of the leftover with it. A marked backup on disk describes
-    itself -- the name says the swap succeeded, and its own manifest carries the
-    identity the registry is keyed on -- so a LATER RUN can sweep what an earlier
-    one deferred.
+    the only record of the leftover with it. A marked directory on disk describes
+    itself -- the name says its writer finished with it, and its own manifest
+    carries the identity the registry is keyed on -- so a LATER RUN can sweep what
+    an earlier one deferred.
 
     A directory is removed only when it is affirmatively collectable, three
     conditions deep because the act is a destructive traversal:
 
-    * the name must be one a PUBLISHED swap marked (``_STALE_BACKUP_RE``, the mate
-      of ``_stale_backup_path``). A plain ``.bak-`` is deliberately NOT swept: the
-      same shape is what ``_ERROR_REVISE_UNRECOVERABLE`` leaves behind, where it
-      is the operator's only surviving copy of their tool. An operator's own
-      hidden directory is likewise never touched;
+    * the name must carry those writers' mark (``tools._STALE_BACKUP_RE``, the
+      mate of ``tools._stale_backup_path``). A plain ``.bak-`` is deliberately NOT
+      swept: that shape is what ``_ERROR_REVISE_UNRECOVERABLE`` leaves behind,
+      where it is the operator's only surviving copy of their tool. An operator's
+      own hidden directory is likewise never touched;
     * it must be a real directory and not a SYMLINK -- an rmtree through a link
       deletes a tree we never verified (the same reason ``_cleanup_staging``
       gates its own rmtree, and ``_promote_staging_replace`` its target);
@@ -2279,14 +2272,19 @@ def _sweep_stale_backups(base: Path) -> None:
     "Cannot read the manifest" therefore KEEPS the directory: the destructive act
     here is the removal, so a check that cannot speak must not vouch for it (D40
     P3b r11's rule, pointed the way this call site needs). Residual, stated rather
-    than discovered later: a marked backup whose ``tool.json`` is gone -- deleted
-    by the tool itself, or left behind by a partially failed rmtree -- is never
-    swept. It is hidden, inert litter that no registry path can see, and exactly
-    the permanence a failed ``rmtree(ignore_errors=True)`` already has today.
+    than discovered later: a marked directory whose ``tool.json`` is gone --
+    deleted by the tool itself, or left behind by a partially failed rmtree -- is
+    never swept. It is hidden, inert litter that no registry path can see, and
+    exactly the permanence a failed ``rmtree(ignore_errors=True)`` already has
+    today.
     """
     with contextlib.suppress(Exception):
         for child in sorted(base.iterdir()):
-            if not _STALE_BACKUP_RE.match(child.name) or child.is_symlink() or not child.is_dir():
+            if (
+                not tools._STALE_BACKUP_RE.match(child.name)
+                or child.is_symlink()
+                or not child.is_dir()
+            ):
                 continue
             identity = _package_identity(child)
             if identity is None or tools.package_execution_in_flight(identity):
@@ -2296,8 +2294,8 @@ def _sweep_stale_backups(base: Path) -> None:
 
 def _cleanup_staging(staging: Path, base: Path) -> None:
     """Remove the session's staging dir (if the move did not consume it), drop the
-    ``.staging`` shell when this was the last build in flight, and sweep any
-    replace-mode backup a promote had to leave behind.
+    ``.staging`` shell when this was the last build in flight, and sweep whatever
+    a promote or a delete had to leave behind.
 
     Blocking (runs via ``run_in_threadpool``), never raises: cleanup is
     best-effort by definition. ``rmdir`` (not rmtree) on the parent: it only
@@ -2321,17 +2319,19 @@ def _cleanup_staging(staging: Path, base: Path) -> None:
     The check-to-rmtree instant remains the accepted check-then-act residual
     window ``_verify_staging_root``'s own docstring names.
 
-    The backup sweep rides HERE rather than at the head of the next promote, and
-    the reason is reach: this is the one step EVERY tool job passes through
+    The sweep rides HERE rather than at the head of the next promote, and the
+    reason is reach: this is the one step EVERY tool job passes through
     unconditionally -- installs as well as revises, failures as well as successes
-    -- so a deferred backup does not wait for another revise to succeed before
-    anything looks at it, and a fresh process sweeps what the previous one left
-    the first time any job runs. It also keeps the promote's pre-swap sequence
-    (which r4/r10/r11/r12 spent four rounds ordering) free of a new destructive
-    traversal. It hangs off a ``finally`` because it is INDEPENDENT of everything
-    above it: a tampered workspace returns early -- deliberately, see above -- and
-    that says nothing about whether a backup elsewhere in ``base`` is collectable.
-    The staging logic itself is untouched by this addition.
+    -- so a deferral does not wait for another revise to succeed before anything
+    looks at it, and a fresh process sweeps what the previous one left the first
+    time any job runs. That reach is what lets ``tools.delete_tool`` defer into
+    the same namespace without a sweep trigger of its own. It also keeps the
+    promote's pre-swap sequence (which r4/r10/r11/r12 spent four rounds ordering)
+    free of a new destructive traversal. It hangs off a ``finally`` because it is
+    INDEPENDENT of everything above it: a tampered workspace returns early --
+    deliberately, see above -- and that says nothing about whether a deferral
+    elsewhere in ``base`` is collectable. The staging logic itself is untouched
+    by this addition.
     """
     try:
         with contextlib.suppress(Exception):

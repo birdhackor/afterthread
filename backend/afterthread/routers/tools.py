@@ -227,9 +227,18 @@ async def delete_installed_tool(name: ToolName) -> None:
     """Delete a tool package (its whole directory).
 
     The registry's ``delete_tool`` re-validates the name AND resolved-path
-    containment under the tools dir before its rmtree (the path-traversal /
-    symlink-escape hard-block lives THERE, not in this router), and returns
-    False for a missing package -> 404.
+    containment under the tools dir before it touches anything (the
+    path-traversal / symlink-escape hard-block lives THERE, not in this router),
+    and returns False for a missing package -> 404.
+
+    "Delete" is not always an immediate rmtree any more, and the difference is
+    invisible from here on purpose: a package with a tool call still executing
+    against it is RENAMED into the hidden deferred namespace instead, so the
+    running subprocess keeps the files it is reading while every reader of the
+    tools dir stops seeing the tool at once (see ``tools.delete_tool`` and the
+    D40 overall-r4 addendum). Either way the resource is gone as far as this API
+    is concerned, so both answer 204 -- reporting "did not happen" for the
+    deferred case would be the one dishonest option.
     """
     removed = await run_in_threadpool(tools_service.delete_tool, name)
     if not removed:

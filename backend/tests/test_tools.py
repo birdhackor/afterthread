@@ -963,6 +963,140 @@ def test_inflight_execution_is_counted_and_released_on_every_exit() -> None:
     assert tools._INFLIGHT_EXECUTIONS == {}  # nothing left behind, not even a zero
 
 
+def test_a_call_holds_the_dotenv_it_was_given_until_its_output_is_redacted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The values a child RECEIVED stay maskable for the whole call, whatever the
+    file says by the time it finishes.
+
+    ``_build_tool_env`` copies the package's ``.env`` into the child's environment,
+    but the masking of that child's output happens when it EXITS -- and the
+    redactor reads whatever is on disk AT THAT MOMENT. Rotate the credential while
+    a long call is in flight and the child's echo of the OLD one would sail past a
+    redactor that has only ever heard of the new one, into the role:"tool" message,
+    the in-memory log and the JSONL sink.
+
+    The rotation is measured, not assumed: the scan's own view of the package
+    (``_cached_env_values``) is asserted to have already forgotten the old value at
+    the instant ``known_secret_values`` still reports it -- so the hold, and
+    nothing else, is what covers the gap."""
+    root = tmp_path / "tools"
+    old, new = "old-secret-abcdef", "new-secret-ghijkl"
+    marker, gate = tmp_path / "started", tmp_path / "go"
+    pkg = _make_tool(
+        root,
+        "rotating",
+        "import os, sys, time\n"
+        f"open({str(marker)!r}, 'w').write('x')\n"
+        f"while not os.path.exists({str(gate)!r}):\n"
+        "    time.sleep(0.01)\n"
+        "sys.stdout.write('SECRET=' + os.environ['KB_KEY'])\n",
+        dotenv=f"KB_KEY={old}\n",
+    )
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler
+
+    result: dict[str, str] = {}
+    caller = threading.Thread(target=lambda: result.update(out=asyncio.run(handler({}))))
+    caller.start()
+    try:
+        _wait_for(marker.exists)  # the CHILD is running with the old value in its env
+        assert old in tools.known_secret_values()
+        (pkg / ".env").write_text(f"KB_KEY={new}\n", encoding="utf-8")  # rotated mid-call
+        assert tools._cached_env_values(pkg) == frozenset({new})  # the scan moved on...
+        assert old in tools.known_secret_values()  # ... the call's own hold did not
+    finally:
+        gate.write_text("go", encoding="utf-8")
+        caller.join(timeout=30)
+
+    assert result["out"] == f"SECRET={tools._REDACTION_MARKER}"  # masked on the way out
+    assert tools._INFLIGHT_SECRETS == {}  # released with the call, not left behind
+    assert old not in tools.known_secret_values()
+
+
+def test_two_overlapping_calls_keep_a_shared_dotenv_value_maskable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Two calls holding the SAME value: the first to finish must not strip the
+    protection the second still needs.
+
+    Reachable rather than exotic -- two AI workflows can call one tool at once,
+    and they read the one ``.env`` -- which is why the registry counts holds
+    instead of flagging values. The ``.env`` is removed once both children are
+    running, so from that instant the registry is the ONLY thing that can mask
+    either child's output; a set-shaped registry would leave the survivor's echo
+    in the clear."""
+    root = tmp_path / "tools"
+    shared = "shared-secret-abcdef"
+    gate_a, gate_b = tmp_path / "a", tmp_path / "b"
+    pkg = _make_tool(
+        root,
+        "shared",
+        "import json, os, sys, time\n"
+        "gate = json.loads(sys.stdin.read())['gate']\n"
+        "open(gate + '.started', 'w').write('x')\n"
+        "while not os.path.exists(gate):\n"
+        "    time.sleep(0.01)\n"
+        "sys.stdout.write('SECRET=' + os.environ['KB_KEY'])\n",
+        dotenv=f"KB_KEY={shared}\n",
+    )
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler
+
+    out: dict[str, str] = {}
+
+    def _call(key: str, gate: Path) -> threading.Thread:
+        thread = threading.Thread(
+            target=lambda: out.__setitem__(key, asyncio.run(handler({"gate": str(gate)})))
+        )
+        thread.start()
+        return thread
+
+    first, second = _call("a", gate_a), _call("b", gate_b)
+    try:
+        _wait_for(lambda: all(Path(f"{g}.started").exists() for g in (gate_a, gate_b)))
+        (pkg / ".env").unlink()  # from here only the holds can answer for this value
+        assert shared in tools.known_secret_values()
+        gate_a.write_text("go", encoding="utf-8")
+        first.join(timeout=30)
+        assert not first.is_alive()
+        assert shared in tools.known_secret_values()  # one hold released, one remains
+    finally:
+        gate_b.write_text("go", encoding="utf-8")
+        second.join(timeout=30)
+
+    assert out["a"] == out["b"] == f"SECRET={tools._REDACTION_MARKER}"
+    assert tools._INFLIGHT_SECRETS == {}  # ... and the last release cleared the key
+    assert shared not in tools.known_secret_values()
+
+
+def test_inflight_secrets_are_counted_and_released_on_every_exit() -> None:
+    """The secret registry's own contract, at the unit the holders share.
+
+    COUNTED so overlapping holders (two calls to one tool, a revise session and a
+    call reading the same ``.env``) each release only their own hold. RELEASED in
+    a ``finally`` because a leaked hold masks a value FOREVER -- a failure that
+    shows up as a redactor eating ordinary prose, long after the call that leaked
+    it. The key is REMOVED at zero so ``known_secret_values`` can read the mapping
+    as a plain set."""
+    value = "held-secret-abcdef"
+    with tools._inflight_secrets(frozenset({value})):
+        with tools._inflight_secrets(frozenset({value})):
+            assert value in tools.known_secret_values()
+        assert value in tools.known_secret_values()  # the outer hold still stands
+    assert tools._INFLIGHT_SECRETS == {}
+
+    for exc in (RuntimeError, asyncio.CancelledError):
+        with pytest.raises(exc), tools._inflight_secrets(frozenset({value})):
+            raise exc()
+        assert tools._INFLIGHT_SECRETS == {}  # not even a zero, on either shape
+
+    # Releasing a value nobody holds is a no-op, never a negative count -- the
+    # forgiveness the ``set.discard`` this replaced used to give for free.
+    tools.discard_inflight_secret(value)
+    assert tools._INFLIGHT_SECRETS == {}
+
+
 def test_description_capped_uniformly(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """An over-long description keeps the package VALID but is capped to 1000
     chars in BOTH the list view and the advertised OpenAI spec."""
@@ -1039,7 +1173,7 @@ def test_runtime_dotenv_does_not_interpolate_parent_env(
     )
     _install_tools(monkeypatch, root)
 
-    env = tools._build_tool_env(pkg)
+    env, _ = tools._build_tool_env(pkg)
     assert env["LEAK"] == "${OPENAI_API_KEY}"  # literal, not the resolved parent key
     assert "sk-secret-should-not-leak" not in env.values()
 
@@ -1053,7 +1187,7 @@ def test_build_tool_env_passes_through_tls_no_verify_when_on(
     pkg = _make_tool(root, "envtool", "import sys\nsys.stdout.write('ok')\n")
     _install_tools(monkeypatch, root, tls_no_verify=True)
 
-    env = tools._build_tool_env(pkg)
+    env, _ = tools._build_tool_env(pkg)
     assert env["TLS_NO_VERIFY"] == "1"
 
 
@@ -1067,7 +1201,7 @@ def test_build_tool_env_omits_tls_no_verify_when_off(
     pkg = _make_tool(root, "envtool", "import sys\nsys.stdout.write('ok')\n")
     _install_tools(monkeypatch, root)  # tls_no_verify defaults False
 
-    env = tools._build_tool_env(pkg)
+    env, _ = tools._build_tool_env(pkg)
     assert "TLS_NO_VERIFY" not in env
 
 
@@ -1086,7 +1220,7 @@ def test_build_tool_env_tool_dotenv_can_override_tls_no_verify(
     )
     _install_tools(monkeypatch, root, tls_no_verify=True)
 
-    env = tools._build_tool_env(pkg)
+    env, _ = tools._build_tool_env(pkg)
     assert env["TLS_NO_VERIFY"] == "0"  # the tool's own .env wins
 
 
@@ -1120,7 +1254,7 @@ def test_runtime_background_descendant_reaped_no_thread_leak(
     )
     pkg = _make_tool(root, "descendant", run_py)
     entry = [sys.executable, "run.py"]
-    env = tools._build_tool_env(pkg)
+    env, _ = tools._build_tool_env(pkg)
 
     before = threading.active_count()
     try:
@@ -1188,7 +1322,7 @@ def test_runtime_detached_child_closing_pipes_is_killed(
     )
     pkg = _make_tool(root, "detached", run_py)
     entry = [sys.executable, "run.py"]
-    env = tools._build_tool_env(pkg)
+    env, _ = tools._build_tool_env(pkg)
 
     try:
         started = time.monotonic()
@@ -1252,7 +1386,7 @@ def test_runtime_fifo_dotenv_degrades_without_hanging(
 
     box: dict[str, dict[str, str]] = {}
     worker = threading.Thread(
-        target=lambda: box.__setitem__("env", tools._build_tool_env(pkg)), daemon=True
+        target=lambda: box.__setitem__("env", tools._build_tool_env(pkg)[0]), daemon=True
     )
     worker.start()
     worker.join(timeout=10)
@@ -1728,13 +1862,116 @@ def test_set_enabled_toggles_and_is_reflected(
 
 
 def test_delete_tool_removes_package(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """With nothing executing against it, a delete still DESTROYS the package on
+    the spot -- the deferral below is the exception, not the new normal, and it
+    leaves no hidden remains for a sweep to find."""
     root = tmp_path / "tools"
     _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
 
     assert delete_tool("echo") is True
     assert list_tools() == []
+    assert list(root.iterdir()) == []  # destroyed by the time it returned, not left marked
     assert delete_tool("echo") is False  # already gone
+
+
+def test_delete_during_an_execution_defers_the_removal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A delete landing mid-call must not pull the files out from under the child.
+
+    The same MEASURED asymmetry the replace-mode promote turns on (see
+    ``tools._INFLIGHT_EXECUTIONS``): a running child's cwd is a reference to the
+    INODE, so renaming the package aside disturbs nothing, while the ``rmtree``
+    makes every later relative open ENOENT. The child here opens ``data.txt`` by
+    relative path only AFTER the delete has returned, so a destroyed package
+    would come back as a tool FAILURE -- handed to the model as the answer to an
+    action whose external side effect may already have happened, and which it may
+    then retry.
+
+    Nothing the caller can observe changes: the delete reports success and the
+    tool is gone from every registry path AT ONCE. Its ``.env`` goes with it --
+    which is exactly why the call's own hold on those values is what still masks
+    the child's echo of one."""
+    root = tmp_path / "tools"
+    secret = "kb-secret-abcdef"
+    marker, gate = tmp_path / "started", tmp_path / "go"
+    pkg = _make_tool(
+        root,
+        "busy",
+        "import os, sys, time\n"
+        f"open({str(marker)!r}, 'w').write('x')\n"
+        f"while not os.path.exists({str(gate)!r}):\n"
+        "    time.sleep(0.01)\n"
+        "sys.stdout.write(open('data.txt').read() + ':' + os.environ['KB_KEY'])\n",
+        dotenv=f"KB_KEY={secret}\n",
+    )
+    (pkg / "data.txt").write_text("PAYLOAD", encoding="utf-8")
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler
+
+    result: dict[str, str] = {}
+    caller = threading.Thread(target=lambda: result.update(out=asyncio.run(handler({}))))
+    caller.start()
+    try:
+        _wait_for(marker.exists)  # the CHILD is running, not merely queued
+        assert delete_tool("busy") is True  # the route still reports success (204)
+        assert list_tools() == []  # ... and it is gone from the registry at once
+        assert enabled_llm_tools() == []
+        assert not pkg.exists()  # the NAME is free again
+        assert tools._cached_env_values(pkg) == frozenset()  # its ``.env`` went with it
+        assert secret in tools.known_secret_values()  # only the call's hold answers now
+        # The rename runs BEFORE the registry is consulted, which is what makes the
+        # set of executions that can exist against this directory closed: an
+        # already-advertised handler entered afterwards can only refuse, because
+        # the identity of the now-absent path is None.
+        assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
+    finally:
+        gate.write_text("go", encoding="utf-8")
+        caller.join(timeout=30)
+
+    # The child read a package file AFTER the delete, and its echoed secret was
+    # still masked even though the ``.env`` behind it is no longer scannable.
+    assert result["out"] == f"PAYLOAD:{tools._REDACTION_MARKER}"
+    remains = [child.name for child in root.iterdir()]
+    assert len(remains) == 1 and tools._STALE_BACKUP_RE.match(remains[0])
+    assert secret not in tools.known_secret_values()  # the hold ended with the call
+
+
+def test_deferred_delete_remains_are_invisible_to_every_registry_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """What a deferral leaves behind is inert litter, never a phantom package.
+
+    Pinned directly on the marked name rather than through a live call, because
+    the property has to hold for remains that OUTLIVE the process that made them
+    (a deferral, then an exit before the sweep). Every path that walks the tools
+    directory skips it for the one reason the name is dot-prefixed: the scan
+    behind ``list_tools`` / ``enabled_llm_tools``, and the redactor's own
+    per-package ``.env`` sweep."""
+    root = tmp_path / "tools"
+    _make_tool(root, "alive", "import sys\nsys.stdout.write('x')\n", dotenv="A=live-abcdef\n")
+    remains = tools._stale_backup_path(root, "ghost", "0123456789abcdef" * 2)
+    remains.mkdir()
+    (remains / "tool.json").write_text(
+        json.dumps(
+            {
+                "name": "ghost",
+                "description": "test tool",
+                "parameters": {"type": "object", "properties": {}},
+                "entry": [sys.executable, "run.py"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (remains / ".env").write_text("A=ghost-secret-abcdef\n", encoding="utf-8")
+    _install_tools(monkeypatch, root)
+
+    assert [row["name"] for row in list_tools()] == ["alive"]
+    assert [tool.spec["function"]["name"] for tool in enabled_llm_tools()] == ["alive"]
+    known = tools.known_secret_values()
+    assert "live-abcdef" in known and "ghost-secret-abcdef" not in known
+    assert delete_tool("ghost") is False  # not addressable by name either
 
 
 @pytest.mark.parametrize(
