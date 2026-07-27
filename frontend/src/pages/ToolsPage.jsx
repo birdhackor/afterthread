@@ -22,7 +22,7 @@ import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Controller, useForm } from "react-hook-form";
 import { apiDelete, apiGet, apiPatch, apiPost } from "../api/client.js";
 import { CharCounter } from "../components/CharCounter.jsx";
@@ -739,11 +739,17 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	// detail entry and the row badge that shows the same sidecar field. By NAME
 	// prefix, because a revalidation asks the name-addressed server to answer
 	// again -- writes address an instance, re-reads address the name.
-	const revalidateSummaryAndList = (name) =>
-		Promise.all([
-			queryClient.invalidateQueries({ queryKey: toolSummaryKeyPrefix(name) }),
-			queryClient.invalidateQueries({ queryKey: ["tools"] }),
-		]);
+	// useCallback because an effect depends on it (see the job-ending effect): an
+	// identity that changed every render would re-run that effect every render,
+	// and it sets state.
+	const revalidateSummaryAndList = useCallback(
+		(name) =>
+			Promise.all([
+				queryClient.invalidateQueries({ queryKey: toolSummaryKeyPrefix(name) }),
+				queryClient.invalidateQueries({ queryKey: ["tools"] }),
+			]),
+		[queryClient],
+	);
 
 	// `stamp` orders this write against the OTHER mutation that can be writing the
 	// same entry concurrently (see createSummaryWriteLedger).
@@ -829,11 +835,18 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 				patchToolRowSummaryStatus(listBody, instanceKey, detail.status),
 			);
 		}
-		// Kept as the eventual-consistency backstop for the REST of the row
-		// (enabled, valid, description, error), which this response says nothing
-		// about. Its refetch error is still swallowed by TanStack Query -- that is
-		// exactly why the two writes above exist rather than relying on it.
-		return queryClient.invalidateQueries({ queryKey: ["tools"] });
+		// Then re-read BOTH, always (R7-1). The writes above are for immediacy --
+		// they show the answer we were just handed without waiting for a round
+		// trip, and they survive an invalidation whose error TanStack Query
+		// swallows. They are NOT a claim that we know the server's order: two
+		// summary mutations can be in flight together (finalize must stay
+		// available during a regenerate), and neither our issue stamps nor the
+		// arrival order tells us which one the backend applied last -- server
+		// order and response order can interleave in either direction. So the
+		// value we write is the best guess, and this re-read is the truth. It also
+		// covers the REST of the row (enabled, valid, description, error), which
+		// this response says nothing about.
+		return revalidateSummaryAndList(name);
 	};
 
 	// The failure counterpart of applySummaryDetail, shared by all three
@@ -1009,19 +1022,35 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	// the package the vanished job already replaced.
 	const jobEnded =
 		isTerminalToolJobState(job?.state) || jobQuery.error?.status === 404;
+	// The gate must stay CLOSED until that re-read lands (R7-2). A job ending
+	// releases isToolJobActive immediately, but what is on screen at that instant
+	// is still the pre-job row and the pre-job summary -- and after a revise that
+	// is exactly the data the job just invalidated by rebuilding the package. Left
+	// open, the user can regenerate or submit new feedback against the OLD tool's
+	// state during the refetch, which the 404 card actively invites them to do
+	// ("送出修訂" is its stated remedy). So this flag is set with the ending and
+	// cleared only when both re-reads settle; it joins the write gate below.
+	const [settlingJobEnd, setSettlingJobEnd] = useState(false);
 	useEffect(() => {
-		if (activeJob && jobEnded) {
-			// Prefix filter (partial match), so it reaches this tool's entry
-			// whatever discriminator it is keyed under -- which matters most
-			// precisely here: a revise REBUILDS the package, so the description
-			// this tool is keyed on is one of the things that may have just
-			// changed.
-			queryClient.invalidateQueries({
-				queryKey: toolSummaryKeyPrefix(activeJob.name),
-			});
-			queryClient.invalidateQueries({ queryKey: ["tools"] });
+		if (!(activeJob && jobEnded)) {
+			return;
 		}
-	}, [activeJob, jobEnded, queryClient]);
+		setSettlingJobEnd(true);
+		let cancelled = false;
+		// Prefix filter (partial match), so it reaches this tool's entry
+		// whatever discriminator it is keyed under -- which matters most
+		// precisely here: a revise REBUILDS the package, so the description
+		// this tool is keyed on is one of the things that may have just
+		// changed.
+		revalidateSummaryAndList(activeJob.name).finally(() => {
+			if (!cancelled) {
+				setSettlingJobEnd(false);
+			}
+		});
+		return () => {
+			cancelled = true;
+		};
+	}, [activeJob, jobEnded, revalidateSummaryAndList]);
 
 	const reviseJobActive = isToolJobActive({
 		jobId: activeJob?.jobId ?? null,
@@ -1117,7 +1146,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	// both are name-addressed by intent ("the tool called X"), both are
 	// reversible or confirmed, and neither carries content authored against one
 	// specific instance the way a revise draft does.
-	const summaryWritesBlocked = summaryBusy || staleList;
+	const summaryWritesBlocked = summaryBusy || staleList || settlingJobEnd;
 
 	// The INSTANCE the tracked revise job was submitted against -- the same
 	// identity string the rows are keyed by (toolInstanceKey), captured at submit
@@ -1474,6 +1503,15 @@ function InstallPanel({ externalBusy = false, onBusyChange }) {
 	useEffect(() => {
 		if (installEnded) {
 			queryClient.invalidateQueries({ queryKey: ["tools"] });
+			// ...and every open summary panel (R7-3). An install can hand the name
+			// of a tool someone else just deleted to a BRAND NEW package, and when
+			// the AI-authored description happens to match, the row key and the
+			// summary key are unchanged -- so the list rerenders into the new tool
+			// while the panel keeps rendering the old one's summary, status and AI
+			// 日誌 link, with nothing stale-looking about it. The whole prefix,
+			// because this form does not know which panels are open, and a
+			// revalidation of a closed one is free (its query is disabled).
+			queryClient.invalidateQueries({ queryKey: ["tool-summary"] });
 		}
 	}, [installEnded, queryClient]);
 
