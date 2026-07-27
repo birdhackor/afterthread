@@ -2022,22 +2022,6 @@ def _promote_staging_replace(
     # stops an already-corrupt sidecar from buying a whole session before arriving
     # here to be refused anyway.
     #
-    # The package must still be the one this session copied from -- re-checked HERE,
-    # after the ``.env`` copy rather than before it (R11-1). The copy reads through
-    # ``target`` and takes an operator-influenced amount of time, so a check that
-    # ran before it left that whole window unguarded: a package replaced during the
-    # copy would be renamed aside and overwritten by a revision of the package that
-    # no longer exists. Together with the 定版 gate below, the last thing between
-    # this and the swap is two renames.
-    #
-    # ``tool.json``'s own (dev, ino, ctime) -- see ``_package_identity`` for why the
-    # DIRECTORY's inode is not an identity (it is reused across a delete+recreate)
-    # and why its timestamps are too broad (they fire on the .env deletion r3
-    # deliberately honors). A caller with no identity to offer is refused outright:
-    # the entry gate already declines that case, and treating None as "matches" here
-    # would reopen exactly what this closes.
-    if package_identity is None or _package_identity(target) != package_identity:
-        return None, _ERROR_REVISE_TARGET_REPLACED
     # Through ``summary_status_or_unknown``, not ``summary_status``, and the whole
     # point is the difference (R3-2): ``summary_status`` folds "no sidecar" and
     # "there IS one but it is unreadable/corrupt" into the SAME None, so a gate
@@ -2070,6 +2054,25 @@ def _promote_staging_replace(
     if status == tools._SUMMARY_STATUS_UNKNOWN:
         return None, _ERROR_REVISE_SUMMARY_UNREADABLE
     origin = _existing_origin(meta)
+    # The package must still be the one this session copied from -- re-checked HERE, as the
+    # LAST thing before the first rename (R12-1). It moved twice, and both moves were
+    # the same mistake: r10 put it before the ``.env`` copy, r11 before the sidecar
+    # read, and each left an unguarded window in which a replaced package could still
+    # be renamed aside and overwritten by a revision of the package that no longer
+    # exists -- the sidecar read can even answer ``draft`` from the OLD package's file
+    # after the swap it is supposed to guard. A check whose whole job is "nothing
+    # changed since we looked" belongs at the last instant it can occupy; everything
+    # after it is the two renames themselves.
+    #
+    # ``tool.json``'s own (dev, ino, ctime) -- see ``_package_identity`` for why the
+    # DIRECTORY's inode is not an identity (it is reused across a delete+recreate)
+    # and why its timestamps are too broad (they fire on the .env deletion r3
+    # deliberately honors). A caller with no identity to offer is refused outright:
+    # the entry gate already declines that case, and treating None as "matches" here
+    # would reopen exactly what this closes.
+    if package_identity is None or _package_identity(target) != package_identity:
+        return None, _ERROR_REVISE_TARGET_REPLACED
+
     backup = base / f".{name}.bak-{uuid4().hex}"
     try:
         os.rename(target, backup)

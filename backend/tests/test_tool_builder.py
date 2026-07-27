@@ -5255,6 +5255,45 @@ def test_run_revise_refuses_a_package_whose_identity_cannot_be_established(
     assert captured == {}  # refused before the session
 
 
+def test_run_revise_refuses_a_replacement_that_lands_during_the_sidecar_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The identity re-check must be the LAST thing before the first rename
+    (R12-1).
+
+    It moved twice for the same reason: r10 placed it before the ``.env`` copy,
+    r11 before the sidecar read, and each left a window in which a replacement
+    still got overwritten. The sidecar read is the sharpest version of the
+    problem -- it can answer ``draft`` from the OLD package's file for the very
+    swap it is meant to guard. Driven here by replacing the package from inside
+    the status read, so the test pins the ORDER and not merely the check."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    base = pkg.parent
+    keep = "print('installed while the sidecar was read')"
+    real_status = tools.summary_status_or_unknown
+
+    def replace_during_status(directory: Any) -> Any:
+        result = real_status(directory)
+        if pkg.exists():
+            shutil.rmtree(pkg)
+            pkg.mkdir()
+            (pkg / "tool.json").write_text(
+                json.dumps(_package_manifest("kbsearch")), encoding="utf-8"
+            )
+            (pkg / "run.py").write_text(keep, encoding="utf-8")
+        return result
+
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+    monkeypatch.setattr(tools, "summary_status_or_unknown", replace_during_status)
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_TARGET_REPLACED
+    assert (pkg / "run.py").read_text(encoding="utf-8") == keep
+    assert not any(entry.name.startswith(".kbsearch.bak-") for entry in base.iterdir())
+
+
 def test_run_revise_allows_a_plainly_spelled_shadowed_line(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
