@@ -1042,27 +1042,35 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	// state during the refetch, which the 404 card actively invites them to do
 	// ("送出修訂" is its stated remedy). So this flag is set with the ending and
 	// cleared only when both re-reads settle; it joins the write gate below.
-	const [settlingJobEnd, setSettlingJobEnd] = useState(false);
+	// Derived from WHICH job we have already revalidated for, not from a boolean a
+	//ffect sets and a finally clears (R9-1/R9-2). That shape had two defects and
+	// both are structural, not slips: it is false for one render after the job
+	// turns terminal (the effect has not run yet), which is a frame in which the
+	// gate is open over pre-job data; and if a NEW job starts before the old
+	// revalidation settles, the cleanup suppresses the clear and nothing else ever
+	// runs it, so the flag sticks true forever. Deriving it cannot do either --
+	// it is true from the very render the ending appears, and a new job id makes
+	// it false immediately because that job has not ended yet.
+	const [settledJobId, setSettledJobId] = useState(null);
+	const settlingJobEnd =
+		activeJob !== null && jobEnded && settledJobId !== activeJob.jobId;
 	useEffect(() => {
-		if (!(activeJob && jobEnded)) {
+		if (!(activeJob && jobEnded) || settledJobId === activeJob.jobId) {
 			return;
 		}
-		setSettlingJobEnd(true);
-		let cancelled = false;
+		const endedJobId = activeJob.jobId;
 		// Prefix filter (partial match), so it reaches this tool's entry
 		// whatever discriminator it is keyed under -- which matters most
 		// precisely here: a revise REBUILDS the package, so the description
 		// this tool is keyed on is one of the things that may have just
 		// changed.
 		revalidateSummaryAndList(activeJob.name).finally(() => {
-			if (!cancelled) {
-				setSettlingJobEnd(false);
-			}
+			// Record the id rather than clearing a flag: an unmount or a newer job
+			// cannot leave this stuck, and a stale settle for an older job simply
+			// records an id nothing is comparing against any more.
+			setSettledJobId(endedJobId);
 		});
-		return () => {
-			cancelled = true;
-		};
-	}, [activeJob, jobEnded, revalidateSummaryAndList]);
+	}, [activeJob, jobEnded, settledJobId, revalidateSummaryAndList]);
 
 	const reviseJobActive = isToolJobActive({
 		jobId: activeJob?.jobId ?? null,
@@ -1519,11 +1527,18 @@ function InstallPanel({ externalBusy = false, onBusyChange }) {
 	// package. Holding the reported-busy flag across the re-read is what makes the
 	// row (and its unsent feedback draft) remount before anything can be submitted
 	// against the new tool.
-	const [settlingInstallEnd, setSettlingInstallEnd] = useState(false);
+	// Derived, for the reasons spelled out on the revise side's settledJobId
+	// (R9-1/R9-2): a boolean set in an effect is open for one render and can stick
+	// true forever if a new job starts before the old revalidation settles -- and
+	// on THIS side "forever" meant the other tab's AI controls stayed locked until
+	// a page reload, because a second install that FAILS does not even match
+	// installEnded, so nothing would ever have cleared it.
+	const [settledInstallJobId, setSettledInstallJobId] = useState(null);
+	const settlingInstallEnd =
+		jobId !== null && installEnded && settledInstallJobId !== jobId;
 	useEffect(() => {
-		if (installEnded) {
-			setSettlingInstallEnd(true);
-			let cancelled = false;
+		if (installEnded && jobId !== null && settledInstallJobId !== jobId) {
+			const endedJobId = jobId;
 			// The summary prefix too (R7-3): an install can hand the name of a
 			// tool someone else just deleted to a BRAND NEW package, and when the
 			// AI-authored description happens to match, the row key and the summary
@@ -1536,15 +1551,10 @@ function InstallPanel({ externalBusy = false, onBusyChange }) {
 				queryClient.invalidateQueries({ queryKey: ["tools"] }),
 				queryClient.invalidateQueries({ queryKey: ["tool-summary"] }),
 			]).finally(() => {
-				if (!cancelled) {
-					setSettlingInstallEnd(false);
-				}
+				setSettledInstallJobId(endedJobId);
 			});
-			return () => {
-				cancelled = true;
-			};
 		}
-	}, [installEnded, queryClient]);
+	}, [installEnded, jobId, settledInstallJobId, queryClient]);
 
 	// One install at a time from this form: the job stays "active" -- form locked,
 	// progress card polling -- until it reaches a terminal state OR its poll 404s
@@ -1570,10 +1580,23 @@ function InstallPanel({ externalBusy = false, onBusyChange }) {
 		onBusyChange?.(busy);
 	}, [busy, onBusyChange]);
 
-	const fieldsDisabled = installMutation.isPending || jobActive || externalBusy;
+	// `settlingInstallEnd` is in here too, not only in the reported `busy` (R9-2):
+	// a second install started during the first one's revalidation window would
+	// have raced the very refetch that makes the new row appear, and under the old
+	// sticky-flag shape it also stranded the other tab's controls permanently.
+	const fieldsDisabled =
+		installMutation.isPending ||
+		jobActive ||
+		settlingInstallEnd ||
+		externalBusy;
 
 	const submit = handleSubmit((values) => {
-		if (installMutation.isPending || jobActive || externalBusy) {
+		if (
+			installMutation.isPending ||
+			jobActive ||
+			settlingInstallEnd ||
+			externalBusy
+		) {
 			return;
 		}
 		setNotConfigured(false);

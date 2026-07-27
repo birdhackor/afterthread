@@ -1366,3 +1366,20 @@ P4 第四輪 review 的五個問題其實是**同一個主題**：r3 建立了�
   有東西正在對這個後端動作**，那是一秒前還不知道的事實。重讀不會讓外部工作變得可觀測
   （我們沒有它的 id），只是把當下的真相讀回來；要對它的**完成**做出反應，屬於
   `裁決紀錄.md` #7 的殘留家族（按名稱定址的 API ＋ 清單沒有實例身分）。
+
+### D40 附錄（P4 review r9）：「effect 設、finally 清」的 boolean 本身就是 bug 產生器
+
+r8 的兩個 settling gate 都寫成「useEffect 裡設 true、revalidation 的 finally 裡清 false」，
+而**這個形狀**有兩個結構性缺陷（不是筆誤）：
+
+1. **有一幀空窗**：job 轉 terminal 的那一次 render，`isToolJobActive` 已經是 false 而
+   旗標還沒被 effect 設起來——定版按鈕在舊資料上短暫可按，正是 r8 要封的情境。
+2. **可能永遠卡住**：舊 revalidation 還沒 settle 就開始新的 job，cleanup 會讓 `finally`
+   不再清除；而安裝端第二個 job 若是 `failed`，它根本不符合 `installEnded`，於是沒有任何
+   路徑會再清它——另一分頁的 AI 操作被鎖到重新載入頁面為止。
+
+修法是換掉形狀而不是補洞：**從「已經為哪個 job id 重驗過」推導**
+（`settlingJobEnd = jobEnded && settledJobId !== activeJob.jobId`）。它在 ending 出現的
+**第一個 render 就是 true**（沒有空窗），而新的 job id 會讓它立刻變 false（新 job 還沒
+結束），因此卡死狀態在結構上不存在。安裝端同時補上本地閘（原本只加進回報給父層的
+`busy`，自己的表單沒擋，於是重讀期間可以再送出一次安裝）。
