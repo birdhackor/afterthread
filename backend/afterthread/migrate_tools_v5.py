@@ -45,12 +45,13 @@ of migration-owned shells is a later, explicitly journaled maintenance phase.
 After every package is active, ``committed`` is published atomically and durably
 before the first ``.at-premigrate`` cleanup rename. Once read, ``committed``
 permits cleanup only; no error path may attempt rollback. Cleanup first records
-the verified old package's directory identity durably, then renames it to its
-tombstone. Rename preserves that identity, so the journal can still prove
-ownership while ``rmtree`` progressively removes the package's own identifying
-files. Before recursion begins, the journal also records the exact deletion
-target, role, and identity. That authority lives outside the tree being removed,
-so a retry never depends on an ownership marker that recursion may have deleted.
+the verified old package's directory identity durably. Every recursive deletion
+then publishes a fresh 256-bit-random quarantine name, renames the proved tree to
+that name, and records that the rename completed before recursion begins. The
+random name is minted after the backup and is neither deterministic nor present
+in an operator restore, so inode reuse at the original name cannot reproduce the
+deletion key. That authority lives outside the tree being removed, so a retry
+never depends on an ownership marker that recursion may have deleted.
 
 Tests inject failures through :class:`MigrationOperations`, at both sides of
 every journal publish and filesystem action.  The indirection is deliberately
@@ -95,7 +96,8 @@ from afterthread.services.tools import (
 _JOURNAL_FILENAME = ".afterthread-migration.json"
 _LEGACY_JOURNAL_VERSION = 1
 _IDENTITY_JOURNAL_VERSION = 2
-_JOURNAL_VERSION = 3
+_REPLAYABLE_DELETION_JOURNAL_VERSION = 3
+_JOURNAL_VERSION = 4
 _JOURNAL_MAX_BYTES = 1024 * 1024
 _META_DIRNAME = ".afterthread.meta"
 _OWNERSHIP_FILENAME = "migration-owner.json"
@@ -106,6 +108,7 @@ _SHELL_SUFFIX = ".at-migration-shell"
 _MIGRATED_SUFFIX = ".at-migrated"
 _PREMIGRATE_SUFFIX = ".at-premigrate"
 _PREMIGRATE_TOMBSTONE_SUFFIX = ".at-premigrate-tombstone"
+_DELETION_SUFFIX = ".at-deletion-"
 _ACTIONS = ("assemble", "copy_env", "publish_shell", "park_old", "activate_new")
 _STATUS_VALUES = frozenset({"running", "rolling_back", "rolled_back", "committed"})
 _VID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$")
@@ -113,13 +116,15 @@ _PACKAGE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _SIBLING_RE = re.compile(r"^(.+)\.at-(?:migrated|premigrate)$")
 _SHELL_RE = re.compile(r"^\.(.+)\.at-migration-shell$")
 _PREMIGRATE_TOMBSTONE_RE = re.compile(r"^\.[a-z0-9][a-z0-9_-]{0,63}\.at-premigrate-tombstone$")
+_DELETION_RE = re.compile(r"^\.[a-z0-9][a-z0-9_-]{0,63}\.at-deletion-[0-9a-f]{64}$")
 _ENV_KEY_RE = re.compile(rb"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*=")
 _LEGACY_PACKAGE_KEYS = frozenset({"name", "vid", "completed", "pending"})
 _IDENTITY_PACKAGE_KEYS = _LEGACY_PACKAGE_KEYS | {
     "shell_identity",
     "premigrate_identity",
 }
-_PACKAGE_KEYS = _IDENTITY_PACKAGE_KEYS | {"deletion"}
+_REPLAYABLE_DELETION_PACKAGE_KEYS = _IDENTITY_PACKAGE_KEYS | {"deletion"}
+_PACKAGE_KEYS = _REPLAYABLE_DELETION_PACKAGE_KEYS | {"premigrate_deleted"}
 
 
 class MigrationRefused(Exception):
@@ -555,6 +560,7 @@ def _fresh_preflight(root: Path) -> Preflight:
             _SIBLING_RE.fullmatch(child.name)
             or _SHELL_RE.fullmatch(child.name)
             or _PREMIGRATE_TOMBSTONE_RE.fullmatch(child.name)
+            or _DELETION_RE.fullmatch(child.name)
         ):
             problems.append(
                 f"{child.name}: migration sibling exists without {_JOURNAL_FILENAME}; "
@@ -766,6 +772,15 @@ def _premigrate_tombstone_path(root: Path, name: str) -> Path:
     return root / f".{name}{_PREMIGRATE_TOMBSTONE_SUFFIX}"
 
 
+def _randomized_deletion_path(root: Path, name: str) -> Path:
+    """Mint a quarantine name that cannot be reproduced by an ordinary restore."""
+
+    while True:
+        path = root / f".{name}{_DELETION_SUFFIX}{secrets.token_hex(32)}"
+        if not path.exists() and not path.is_symlink():
+            return path
+
+
 def _directory_identity(path: Path) -> tuple[int, int] | None:
     """Identify one real directory without following its final component."""
 
@@ -810,7 +825,12 @@ def _has_bootstrap_ownership_marker(path: Path, *, name: str, vid: str, role: st
         return False
     if (
         set(raw) != {"version", "status", "tools_dir", "started_at", "backup", "packages"}
-        or raw.get("version") not in {_IDENTITY_JOURNAL_VERSION, _JOURNAL_VERSION}
+        or raw.get("version")
+        not in {
+            _IDENTITY_JOURNAL_VERSION,
+            _REPLAYABLE_DELETION_JOURNAL_VERSION,
+            _JOURNAL_VERSION,
+        }
         or raw.get("tools_dir") != str(path.parent)
         or not isinstance(raw.get("packages"), list)
     ):
@@ -818,7 +838,13 @@ def _has_bootstrap_ownership_marker(path: Path, *, name: str, vid: str, role: st
     identity = _directory_identity(path)
     if identity is None:
         return False
-    expected_keys = _PACKAGE_KEYS if raw["version"] == _JOURNAL_VERSION else _IDENTITY_PACKAGE_KEYS
+    expected_keys = (
+        _PACKAGE_KEYS
+        if raw["version"] == _JOURNAL_VERSION
+        else _REPLAYABLE_DELETION_PACKAGE_KEYS
+        if raw["version"] == _REPLAYABLE_DELETION_JOURNAL_VERSION
+        else _IDENTITY_PACKAGE_KEYS
+    )
 
     def matches(package: Any) -> bool:
         if (
@@ -966,7 +992,7 @@ def _assemble_shell(
 
     shell = _shell_path(root, package.name)
     vid = package_record["vid"]
-    _clear_completed_tree_deletion(root, journal, package_record, operations)
+    _resume_tree_deletion(root, journal, package_record, operations)
     if shell.exists() or shell.is_symlink():
         if _is_new_package_at(shell, vid):
             if package_record["shell_identity"] is None:
@@ -980,17 +1006,7 @@ def _assemble_shell(
                     operations=operations,
                 )
             return
-        identity = _directory_identity(shell)
-        deletion_matches = identity is not None and _deletion_authority_matches(
-            package_record,
-            shell,
-            role="shell",
-            identity=identity,
-        )
-        if (
-            not _has_ownership_marker(shell, name=package.name, vid=vid, role="shell")
-            and not deletion_matches
-        ):
+        if not _has_ownership_marker(shell, name=package.name, vid=vid, role="shell"):
             if not _is_empty_real_directory(shell):
                 raise MigrationRefused(
                     f"{shell.name}: incomplete shell has no journal ownership proof"
@@ -1022,7 +1038,7 @@ def _assemble_shell(
                     label=f"{package.name}:assemble:ownership",
                     operations=operations,
                 )
-            authority = _authorize_tree_deletion(
+            _authorize_tree_deletion(
                 root,
                 journal,
                 package_record,
@@ -1031,8 +1047,6 @@ def _assemble_shell(
                 require_identity=tuple(shell_identity),
                 operations=operations,
             )
-            _remove_authorized_tree(shell, authority)
-            _clear_completed_tree_deletion(root, journal, package_record, operations)
     if shell.exists() or shell.is_symlink():
         raise AssertionError("shell reconciliation returned without removing its artifact")
 
@@ -1212,6 +1226,7 @@ def _validate_journal(raw: dict[str, Any], root: Path) -> dict[str, Any]:
     if version not in {
         _LEGACY_JOURNAL_VERSION,
         _IDENTITY_JOURNAL_VERSION,
+        _REPLAYABLE_DELETION_JOURNAL_VERSION,
         _JOURNAL_VERSION,
     }:
         raise MigrationRefused("migration journal has an unknown version")
@@ -1236,6 +1251,8 @@ def _validate_journal(raw: dict[str, Any], root: Path) -> dict[str, Any]:
             if version == _LEGACY_JOURNAL_VERSION
             else _IDENTITY_PACKAGE_KEYS
             if version == _IDENTITY_JOURNAL_VERSION
+            else _REPLAYABLE_DELETION_PACKAGE_KEYS
+            if version == _REPLAYABLE_DELETION_JOURNAL_VERSION
             else _PACKAGE_KEYS
         )
         if not isinstance(package, dict) or set(package) != expected_package_keys:
@@ -1247,6 +1264,7 @@ def _validate_journal(raw: dict[str, Any], root: Path) -> dict[str, Any]:
         shell_identity = package.get("shell_identity")
         premigrate_identity = package.get("premigrate_identity")
         deletion = package.get("deletion")
+        premigrate_deleted = package.get("premigrate_deleted", False)
 
         def valid_identity(value: object) -> bool:
             return value is None or (
@@ -1267,24 +1285,42 @@ def _validate_journal(raw: dict[str, Any], root: Path) -> dict[str, Any]:
         ) -> bool:
             if value is None:
                 return True
-            if not isinstance(value, dict) or set(value) != {"path", "role", "identity"}:
+            if not isinstance(value, dict):
                 return False
             role = value.get("role")
             deletion_identity = value.get("identity")
             if not valid_identity(deletion_identity) or deletion_identity is None:
                 return False
             if role == "shell":
-                valid_paths = {
+                valid_sources = {
                     _shell_path(root, package_name).name,
                     _migrated_path(root, package_name).name,
                 }
                 recorded_identity = shell_record
             elif role == "premigrate" and raw["status"] == "committed":
-                valid_paths = {_premigrate_tombstone_path(root, package_name).name}
+                valid_sources = {
+                    _premigrate_path(root, package_name).name,
+                    _premigrate_tombstone_path(root, package_name).name,
+                }
                 recorded_identity = premigrate_record
             else:
                 return False
-            return value.get("path") in valid_paths and deletion_identity == recorded_identity
+            if version == _REPLAYABLE_DELETION_JOURNAL_VERSION:
+                return (
+                    set(value) == {"path", "role", "identity"}
+                    and value.get("path") in valid_sources
+                    and deletion_identity == recorded_identity
+                )
+            deletion_path = value.get("path")
+            return (
+                set(value) == {"source", "path", "role", "identity", "stage"}
+                and value.get("source") in valid_sources
+                and isinstance(deletion_path, str)
+                and deletion_path.startswith(f".{package_name}{_DELETION_SUFFIX}")
+                and _DELETION_RE.fullmatch(deletion_path) is not None
+                and value.get("stage") in {"planned", "parked"}
+                and deletion_identity == recorded_identity
+            )
 
         if (
             not isinstance(name, str)
@@ -1300,6 +1336,8 @@ def _validate_journal(raw: dict[str, Any], root: Path) -> dict[str, Any]:
             or not valid_identity(shell_identity)
             or not valid_identity(premigrate_identity)
             or not valid_deletion(deletion)
+            or not isinstance(premigrate_deleted, bool)
+            or (premigrate_deleted and (raw["status"] != "committed" or deletion is not None))
         ):
             raise MigrationRefused("migration journal has an invalid package value")
         if pending is not None and (completed >= len(_ACTIONS) or pending != _ACTIONS[completed]):
@@ -1329,8 +1367,29 @@ def _validate_journal(raw: dict[str, Any], root: Path) -> dict[str, Any]:
                 )
             package["shell_identity"] = None
             package["premigrate_identity"] = None
+        if version == _REPLAYABLE_DELETION_JOURNAL_VERSION and deletion is not None:
+            legacy_target = root / deletion["path"]
+            if legacy_target.exists() or legacy_target.is_symlink():
+                identity = tuple(deletion["identity"])
+                marker_matches = _has_ownership_marker(
+                    legacy_target,
+                    name=name,
+                    vid=vid,
+                    role=deletion["role"],
+                )
+                vid_matches = deletion["role"] == "shell" and _is_new_package_at(legacy_target, vid)
+                if _directory_identity(legacy_target) != identity or (
+                    not marker_matches and not vid_matches
+                ):
+                    raise MigrationRefused(
+                        f"{legacy_target.name}: v3 deletion authority is replayable and "
+                        "the remaining tree has no independent ownership proof"
+                    )
+            elif deletion["role"] == "premigrate":
+                premigrate_deleted = True
         if version != _JOURNAL_VERSION:
             package["deletion"] = None
+            package["premigrate_deleted"] = premigrate_deleted
         names.add(name)
     if pending_count > 1:
         raise MigrationRefused("migration journal is more than one action ahead")
@@ -1436,7 +1495,11 @@ def _disk_step_done(root: Path, package: dict[str, Any], action: str) -> bool:
             _is_new_package_at(migrated, vid) or _is_new_package_at(live, vid)
         )
     if action == "activate_new":
-        return _is_new_package_at(live, vid) and _old_package_at(premigrate)
+        return (
+            _is_new_package_at(live, vid)
+            and _old_package_at(premigrate)
+            and _same_env(premigrate, live)
+        )
     raise AssertionError(f"unknown migration action: {action}")
 
 
@@ -1510,7 +1573,11 @@ def _perform_action(
         )
         return
     if action == "activate_new":
-        if _is_new_package_at(live, vid) and _old_package_at(premigrate):
+        if (
+            _is_new_package_at(live, vid)
+            and _old_package_at(premigrate)
+            and _same_env(premigrate, live)
+        ):
             return
         if (
             live.exists()
@@ -1519,6 +1586,12 @@ def _perform_action(
             or not _old_package_at(premigrate)
         ):
             raise MigrationRefused(f"{name}: cannot reconcile new-package activation")
+        operations.mutate(
+            f"copy_env_after_park:{name}",
+            lambda: _copy_env_file(premigrate, migrated),
+        )
+        if not _same_env(premigrate, migrated):
+            raise MigrationRefused(f"{name}: parked .env copy did not preserve its latest bytes")
         operations.mutate(
             f"rename:{name}:activate_new",
             lambda: _rename_durable(migrated, live, root),
@@ -1670,41 +1743,102 @@ def _resume_rollback(
     _atomic_publish_journal(root, journal, label="rolled_back", operations=operations)
 
 
-def _deletion_authority_matches(
-    package: dict[str, Any],
-    path: Path,
-    *,
-    role: str,
-    identity: tuple[int, int],
-) -> bool:
-    """Match the external proof that remains after an owned marker is deleted."""
+def _remove_authorized_tree(path: Path, authority: dict[str, Any]) -> None:
+    """Remove only the random real directory named by a parked authority."""
 
-    return package["deletion"] == {
-        "path": path.name,
-        "role": role,
-        "identity": list(identity),
-    }
+    if not path.exists() and not path.is_symlink():
+        return
+    info = os.lstat(path)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or authority.get("stage") != "parked"
+        or authority.get("path") != path.name
+        or authority.get("identity") != [info.st_dev, info.st_ino]
+    ):
+        raise MigrationRefused(
+            f"{path.name}: cleanup target does not match its journal deletion authority"
+        )
+    shutil.rmtree(path)
 
 
-def _clear_completed_tree_deletion(
+def _resume_tree_deletion(
     root: Path,
     journal: dict[str, Any],
     package: dict[str, Any],
     operations: MigrationOperations,
 ) -> None:
-    """Retire a deletion proof once its exact target spelling is absent."""
+    """Finish the journaled random rename and deletion before other reconciliation."""
 
-    deletion = package["deletion"]
-    if deletion is None:
+    authority = package["deletion"]
+    if authority is None:
         return
-    path = root / deletion["path"]
-    if path.exists() or path.is_symlink():
-        return
+    source = root / authority["source"]
+    quarantine = root / authority["path"]
+    identity = tuple(authority["identity"])
+    role = authority["role"]
+
+    if authority["stage"] == "planned":
+        source_identity = _directory_identity(source)
+        quarantine_identity = _directory_identity(quarantine)
+        if source_identity is not None and quarantine_identity is not None:
+            raise MigrationRefused(
+                f"{quarantine.name}: randomized deletion destination is already occupied"
+            )
+        owned_path = source if source_identity is not None else quarantine
+        owned_identity = source_identity if source_identity is not None else quarantine_identity
+        marker_matches = _has_ownership_marker(
+            owned_path,
+            name=package["name"],
+            vid=package["vid"],
+            role=role,
+        )
+        vid_matches = role == "shell" and _is_new_package_at(owned_path, package["vid"])
+        if owned_identity != identity or (not marker_matches and not vid_matches):
+            raise MigrationRefused(
+                f"{owned_path.name}: planned deletion lost its independent ownership proof"
+            )
+        if source_identity is not None:
+
+            def park_at_random_name() -> None:
+                if quarantine.exists() or quarantine.is_symlink():
+                    raise MigrationRefused(
+                        f"{quarantine.name}: randomized deletion destination is occupied"
+                    )
+                _rename_durable(source, quarantine, root)
+
+            operations.mutate(
+                f"delete:{package['name']}:{role}:park",
+                park_at_random_name,
+            )
+        if _directory_identity(quarantine) != identity or source.exists() or source.is_symlink():
+            raise MigrationRefused(
+                f"{quarantine.name}: randomized deletion rename did not preserve identity"
+            )
+        authority["stage"] = "parked"
+        _atomic_publish_journal(
+            root,
+            journal,
+            label=f"{package['name']}:{role}:delete_parked",
+            operations=operations,
+        )
+
+    if authority["stage"] != "parked":
+        raise AssertionError("validated deletion authority has an unknown stage")
+    if quarantine.exists() or quarantine.is_symlink():
+        operations.mutate(
+            f"delete:{package['name']}:{role}:tree",
+            lambda: _remove_authorized_tree(quarantine, authority),
+        )
+    if quarantine.exists() or quarantine.is_symlink():
+        raise MigrationRefused(f"{quarantine.name}: recursive deletion did not complete")
+
+    if role == "premigrate":
+        package["premigrate_deleted"] = True
     package["deletion"] = None
     _atomic_publish_journal(
         root,
         journal,
-        label=f"{package['name']}:{path.name}:deleted",
+        label=f"{package['name']}:{role}:deleted",
         operations=operations,
     )
 
@@ -1719,15 +1853,15 @@ def _authorize_tree_deletion(
     require_new_vid: str | None = None,
     require_identity: tuple[int, int] | None = None,
     operations: MigrationOperations,
-) -> dict[str, Any]:
-    """Publish proof outside a tree before recursive deletion can destroy its marker."""
+) -> None:
+    """Prove a tree, publish an unguessable name, then rename before recursion."""
 
+    if package["deletion"] is not None:
+        raise AssertionError("a package cannot authorize two concurrent tree deletions")
     info = os.lstat(path)
     if not stat.S_ISDIR(info.st_mode):
         raise MigrationRefused(f"{path.name}: cleanup target is not a real directory")
     identity = info.st_dev, info.st_ino
-    if _deletion_authority_matches(package, path, role=role, identity=identity):
-        return package["deletion"]
     if require_new_vid is None and require_identity is None:
         raise MigrationRefused(f"{path.name}: cleanup target has no journal ownership proof")
     identity_matches = require_identity == identity
@@ -1747,36 +1881,22 @@ def _authorize_tree_deletion(
     identity_field = "shell_identity" if role == "shell" else "premigrate_identity"
     if vid_matches:
         package[identity_field] = list(identity)
+    quarantine = _randomized_deletion_path(root, package["name"])
     authority = {
-        "path": path.name,
+        "source": path.name,
+        "path": quarantine.name,
         "role": role,
         "identity": list(identity),
+        "stage": "planned",
     }
     package["deletion"] = authority
     _atomic_publish_journal(
         root,
         journal,
-        label=f"{package['name']}:{path.name}:delete_authority",
+        label=f"{package['name']}:{role}:delete_authority",
         operations=operations,
     )
-    return authority
-
-
-def _remove_authorized_tree(path: Path, authority: dict[str, Any]) -> None:
-    """Remove only the real directory named by a durable external authority."""
-
-    if not path.exists() and not path.is_symlink():
-        return
-    info = os.lstat(path)
-    if not stat.S_ISDIR(info.st_mode) or authority != {
-        "path": path.name,
-        "role": authority.get("role"),
-        "identity": [info.st_dev, info.st_ino],
-    }:
-        raise MigrationRefused(
-            f"{path.name}: cleanup target does not match its journal deletion authority"
-        )
-    shutil.rmtree(path)
+    _resume_tree_deletion(root, journal, package, operations)
 
 
 def _remove_owned_journal(root: Path, journal: dict[str, Any]) -> None:
@@ -1804,113 +1924,86 @@ def _cleanup_committed(
         name = package["name"]
         premigrate = _premigrate_path(root, name)
         tombstone = _premigrate_tombstone_path(root, name)
-        _clear_completed_tree_deletion(root, journal, package, operations)
+        _resume_tree_deletion(root, journal, package, operations)
 
-        # ``committed`` chooses cleanup, but does not identify whatever occupies a
-        # deterministic tombstone name. Record the verified source directory's
-        # inode BEFORE creating its marker or renaming it. The inode survives both
-        # rename and partial rmtree, while a foreign replacement at either spelling
-        # fails the proof. A hard link to that journal generation bridges the
-        # non-atomic final-marker write, just as it does for a new shell.
-        recorded_identity = package["premigrate_identity"]
-        if recorded_identity is None:
-            if tombstone.exists() or tombstone.is_symlink():
-                raise MigrationRefused(
-                    f"{tombstone.name}: cleanup target has no journal ownership proof"
+        if not package["premigrate_deleted"]:
+            # ``committed`` chooses cleanup, but does not own a deterministic
+            # spelling. Record the old directory's inode, establish its marker,
+            # then let deletion move it to a fresh random name. A v3 interruption
+            # may already have moved the same proved inode to the legacy
+            # tombstone; that path is accepted only with its surviving marker.
+            recorded_identity = package["premigrate_identity"]
+            if recorded_identity is None:
+                if tombstone.exists() or tombstone.is_symlink():
+                    raise MigrationRefused(
+                        f"{tombstone.name}: cleanup target has no journal ownership proof"
+                    )
+                if not _old_package_at(premigrate):
+                    raise MigrationRefused(
+                        f"{premigrate.name}: committed cleanup target no longer looks like "
+                        "the old package"
+                    )
+                identity = _record_directory_identity(
+                    root,
+                    journal,
+                    package,
+                    "premigrate_identity",
+                    premigrate,
+                    label=f"{name}:premigrate:ownership",
+                    operations=operations,
                 )
-            if not _old_package_at(premigrate):
-                raise MigrationRefused(
-                    f"{premigrate.name}: committed cleanup target no longer looks like "
-                    "the old package"
-                )
-            identity = _record_directory_identity(
-                root,
-                journal,
-                package,
-                "premigrate_identity",
-                premigrate,
-                label=f"{name}:premigrate:ownership",
-                operations=operations,
-            )
-        else:
-            identity = tuple(recorded_identity)
+            else:
+                identity = tuple(recorded_identity)
 
-        premigrate_exists = premigrate.exists() or premigrate.is_symlink()
-        tombstone_exists = tombstone.exists() or tombstone.is_symlink()
-        if premigrate_exists and _directory_identity(premigrate) != identity:
-            raise MigrationRefused(
-                f"{premigrate.name}: cleanup target does not match its journal ownership proof"
-            )
-        if tombstone_exists and _directory_identity(tombstone) != identity:
-            raise MigrationRefused(
-                f"{tombstone.name}: cleanup target does not match its journal ownership proof"
-            )
-        if premigrate_exists:
-            if not _old_package_at(premigrate):
+            premigrate_exists = premigrate.exists() or premigrate.is_symlink()
+            tombstone_exists = tombstone.exists() or tombstone.is_symlink()
+            if premigrate_exists and tombstone_exists:
+                raise MigrationRefused(f"{tombstone.name}: legacy cleanup source has two spellings")
+            owned_path = premigrate if premigrate_exists else tombstone
+            if _directory_identity(owned_path) != identity:
                 raise MigrationRefused(
-                    f"{premigrate.name}: committed cleanup target no longer looks like "
-                    "the old package"
+                    f"{owned_path.name}: cleanup target does not match its journal ownership proof"
                 )
-            _establish_ownership(
-                root,
-                premigrate,
-                name=name,
-                vid=package["vid"],
-                role="premigrate",
-                label=f"cleanup:{name}:premigrate:establish_ownership",
-                operations=operations,
-            )
-        owned_path = premigrate if premigrate_exists else tombstone
-        if premigrate_exists or tombstone_exists:
-            owned_identity = _directory_identity(owned_path)
-            deletion_matches = owned_identity is not None and _deletion_authority_matches(
-                package,
-                owned_path,
-                role="premigrate",
-                identity=owned_identity,
-            )
-            if (
-                not _has_ownership_marker(
-                    owned_path,
+            if premigrate_exists:
+                if not _old_package_at(premigrate):
+                    raise MigrationRefused(
+                        f"{premigrate.name}: committed cleanup target no longer looks like "
+                        "the old package"
+                    )
+                _establish_ownership(
+                    root,
+                    premigrate,
                     name=name,
                     vid=package["vid"],
                     role="premigrate",
+                    label=f"cleanup:{name}:premigrate:establish_ownership",
+                    operations=operations,
                 )
-                and not deletion_matches
+            if not _has_ownership_marker(
+                owned_path,
+                name=name,
+                vid=package["vid"],
+                role="premigrate",
             ):
                 raise MigrationRefused(
                     f"{owned_path.name}: cleanup target does not match its journal ownership proof"
                 )
-        if premigrate_exists and tombstone_exists:
-            raise MigrationRefused(f"{tombstone.name}: cleanup destination is already occupied")
-        if premigrate_exists:
-            operations.mutate(
-                f"cleanup:{name}:premigrate:park",
-                lambda source=premigrate, target=tombstone: _rename_durable(source, target, root),
-            )
-            tombstone_exists = True
-        if tombstone_exists:
-            authority = _authorize_tree_deletion(
+            _authorize_tree_deletion(
                 root,
                 journal,
                 package,
-                tombstone,
+                owned_path,
                 role="premigrate",
                 require_identity=identity,
                 operations=operations,
             )
-            operations.mutate(
-                f"cleanup:{name}:premigrate:delete",
-                lambda path=tombstone, proof=authority: _remove_authorized_tree(path, proof),
-            )
-            _clear_completed_tree_deletion(root, journal, package, operations)
         # These should normally be absent after activation.  A crash can leave a
         # shell only before commit, but validating/removing them here makes cleanup
         # idempotent if a future action arrangement ever leaves one.
         for artifact in (_shell_path(root, name), _migrated_path(root, name)):
             if artifact.exists() or artifact.is_symlink():
                 shell_identity = package["shell_identity"]
-                authority = _authorize_tree_deletion(
+                _authorize_tree_deletion(
                     root,
                     journal,
                     package,
@@ -1922,11 +2015,6 @@ def _cleanup_committed(
                     ),
                     operations=operations,
                 )
-                operations.mutate(
-                    f"cleanup:{name}:{artifact.name}",
-                    lambda path=artifact, proof=authority: _remove_authorized_tree(path, proof),
-                )
-                _clear_completed_tree_deletion(root, journal, package, operations)
 
     def remove_journal() -> None:
         _remove_owned_journal(root, journal)
@@ -1944,14 +2032,14 @@ def _cleanup_rolled_back(
     for package in journal["packages"]:
         name = package["name"]
         vid = package["vid"]
-        _clear_completed_tree_deletion(root, journal, package, operations)
+        _resume_tree_deletion(root, journal, package, operations)
         for artifact in (_shell_path(root, name), _migrated_path(root, name)):
             if artifact.exists() or artifact.is_symlink():
                 shell_identity = package["shell_identity"]
                 # The exact vid proves a complete shell; its recorded inode also
                 # proves an incomplete or partially removed one. A failed proof
                 # stops cleanup rather than disabling either check.
-                authority = _authorize_tree_deletion(
+                _authorize_tree_deletion(
                     root,
                     journal,
                     package,
@@ -1963,11 +2051,6 @@ def _cleanup_rolled_back(
                     ),
                     operations=operations,
                 )
-                operations.mutate(
-                    f"cleanup_rollback:{name}:{artifact.name}",
-                    lambda path=artifact, proof=authority: _remove_authorized_tree(path, proof),
-                )
-                _clear_completed_tree_deletion(root, journal, package, operations)
         premigrate = _premigrate_path(root, name)
         if premigrate.exists() or premigrate.is_symlink():
             raise MigrationRefused(
@@ -2036,6 +2119,7 @@ def _new_journal(
                 "shell_identity": None,
                 "premigrate_identity": None,
                 "deletion": None,
+                "premigrate_deleted": False,
             }
         )
     return {

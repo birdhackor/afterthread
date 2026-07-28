@@ -349,8 +349,9 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `PATH`／`HOME`／`LANG`／`LC_ALL`／`TMPDIR`，再加 package `.env` 與正規化的
   TLS 設定，避免不小心把父行程 `OPENAI_API_KEY` 一起交出去；同 UID 行程仍可能
   讀 `/proc`，所以這不是對抗惡意程式的隔離。
-- **一次性 web-v5 遷移**：先停掉 afterthread，確認 `TOOLS_DIR` 指向舊扁平套件，
-  在 `backend/` 執行：
+- **一次性 web-v5 遷移**：先停掉 afterthread，關閉所有仍開著套件 `.env` 的編輯器，
+  並確保遷移期間不會手動或由同步程式改寫 `.env`；確認 `TOOLS_DIR` 指向舊扁平套件，
+  再於 `backend/` 執行：
 
   ```bash
   uv run python -m afterthread.migrate_tools_v5 --dry-run
@@ -370,6 +371,12 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   legacy state 原封不動當工具內容、把 `.ai_meta.json` 拆成 origin/summary，並將
   `.env` 位元與 mode 保留在 package 層。所有套件啟用後才持久寫下
   `committed`；commit 前錯誤回復所有名稱，commit 後只重試清理、不再 rollback。
+  為縮短第一次複製後仍可能收到編輯器 autosave 的窗口，程式會先把舊套件停放到
+  `.at-premigrate`，再從該停放來源重抄一次 `.env`，成功才啟用新套件；重抄失敗會
+  走 commit 前 rollback。這仍無法消除最後一次重抄／一致性檢查與後續啟用、commit、
+  cleanup 之間的 check-then-act 瞬間：若寫入恰好落在該瞬間，仍可能只存在於隨後被
+  清理的舊副本，且遷移前備份不含那次新寫入。因此「停服務」之外仍必須關閉編輯器並
+  停止同步寫入。
   journal 另持久記錄 shell／舊套件目錄 identity，並在目錄內寫入綁定 package +
   vid + role 的 ownership marker；刪除必須同時重驗這些證明（完整 target-layout
   VID 也是正證明），名稱本身從不授權刪除。新 shell 在仍為空目錄時先記錄 identity，
@@ -377,10 +384,12 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   完整落盤後才移除 bootstrap。因此任何中斷點的 shell 不是仍為空（可無損移除），
   就是已有 identity + marker；正式 marker 寫到一半也仍有 bootstrap 可供對帳。
   進入 `rmtree` 前會先以 identity + marker（完整 target-layout 亦可用精確 VID）
-  重驗所有權，再把刪除目標名稱、role 與 identity 原子且持久地發布到 tree 外的
-  journal。遞迴刪除即使先刪掉 `migration-owner.json`，重跑仍以這筆外部 authority
-  對帳同一 inode 並完成；成功後才持久清除 authority。從未通過正證明的非空目錄
-  仍會停止並完整保留。
+  重驗所有權，再產生 256-bit 隨機 quarantine 名稱，將來源 rename 過去，並把
+  source、隨機名稱、role、identity 與已完成 rename 的階段原子且持久地發布到 tree
+  外的 journal。名稱在備份後才隨機產生，不由 package 名或 inode 推導，也不存在於
+  一般 restore/sync 的來源，因此 restore 即使在原名稱重建並重用 inode，也無法重製
+  deletion key。遞迴刪除即使先刪掉 `migration-owner.json`，重跑仍能沿隨機名稱完成；
+  成功後才持久清除 authority。從未通過正證明的非空目錄仍會停止並完整保留。
   中斷後以同一指令重跑，journal 會按其狀態續做／回復／清理；不要手動猜測或刪除
   `.at-*` 兄弟目錄。既有 journal 已代表先前確認過的 migration authority，所以
   真實重跑會直接對帳，不再詢問；此時 `--dry-run` 只報 journal status，不做對帳。
