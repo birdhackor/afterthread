@@ -788,7 +788,7 @@ def _has_final_ownership_marker(path: Path, *, name: str, vid: str, role: str) -
 def _has_bootstrap_ownership_marker(path: Path, *, name: str, vid: str, role: str) -> bool:
     """Recognize the atomic journal link that protects final-marker creation."""
 
-    if role != "shell":
+    if role not in {"shell", "premigrate"}:
         return False
     try:
         raw, _mode = _read_json_object(
@@ -800,7 +800,6 @@ def _has_bootstrap_ownership_marker(path: Path, *, name: str, vid: str, role: st
     if (
         set(raw) != {"version", "status", "tools_dir", "started_at", "backup", "packages"}
         or raw.get("version") != _JOURNAL_VERSION
-        or raw.get("status") != "running"
         or raw.get("tools_dir") != str(path.parent)
         or not isinstance(raw.get("packages"), list)
     ):
@@ -816,16 +815,30 @@ def _has_bootstrap_ownership_marker(path: Path, *, name: str, vid: str, role: st
         "shell_identity",
         "premigrate_identity",
     }
-    return any(
-        isinstance(package, dict)
-        and set(package) == expected_keys
-        and package["name"] == name
-        and package["vid"] == vid
-        and package["completed"] == 0
-        and package["pending"] == "assemble"
-        and package["shell_identity"] == list(identity)
-        for package in raw["packages"]
-    )
+
+    def matches(package: Any) -> bool:
+        if (
+            not isinstance(package, dict)
+            or set(package) != expected_keys
+            or package["name"] != name
+            or package["vid"] != vid
+        ):
+            return False
+        if role == "shell":
+            return (
+                raw["status"] == "running"
+                and package["completed"] == 0
+                and package["pending"] == "assemble"
+                and package["shell_identity"] == list(identity)
+            )
+        return (
+            raw["status"] == "committed"
+            and package["completed"] == len(_ACTIONS)
+            and package["pending"] is None
+            and package["premigrate_identity"] == list(identity)
+        )
+
+    return any(matches(package) for package in raw["packages"])
 
 
 def _has_ownership_marker(path: Path, *, name: str, vid: str, role: str) -> bool:
@@ -837,13 +850,14 @@ def _has_ownership_marker(path: Path, *, name: str, vid: str, role: str) -> bool
 
 
 def _ensure_ownership_marker(path: Path, *, name: str, vid: str, role: str) -> None:
-    """Create one marker, or accept only the exact marker this journal owns."""
+    """Create or repair one marker only while an atomic bootstrap proves ownership."""
 
     marker = path / _META_DIRNAME / _OWNERSHIP_FILENAME
     if marker.exists() or marker.is_symlink():
         if _has_final_ownership_marker(path, name=name, vid=vid, role=role):
             return
-        raise MigrationRefused(f"{path.name}: migration ownership marker is foreign")
+        if not _has_bootstrap_ownership_marker(path, name=name, vid=vid, role=role):
+            raise MigrationRefused(f"{path.name}: migration ownership marker is foreign")
     _write_shell_file(
         marker,
         _json_bytes(
@@ -870,21 +884,27 @@ def _is_empty_real_directory(path: Path) -> bool:
         return False
 
 
-def _establish_shell_ownership(
+def _establish_ownership(
     root: Path,
-    shell: Path,
+    path: Path,
     *,
     name: str,
     vid: str,
+    role: str,
+    label: str,
     operations: MigrationOperations,
 ) -> None:
-    """Atomically bridge an identified empty shell to its final JSON marker."""
+    """Atomically bridge one identified directory to its final JSON marker."""
 
-    bootstrap = shell / _OWNERSHIP_BOOTSTRAP_FILENAME
+    bootstrap = path / _OWNERSHIP_BOOTSTRAP_FILENAME
+    marker = path / _META_DIRNAME / _OWNERSHIP_FILENAME
     if bootstrap.exists() or bootstrap.is_symlink():
-        if not _has_bootstrap_ownership_marker(shell, name=name, vid=vid, role="shell"):
-            raise MigrationRefused(f"{shell.name}: migration ownership bootstrap is foreign")
-    elif not _has_final_ownership_marker(shell, name=name, vid=vid, role="shell"):
+        if not _has_bootstrap_ownership_marker(path, name=name, vid=vid, role=role):
+            raise MigrationRefused(f"{path.name}: migration ownership bootstrap is foreign")
+    elif marker.exists() or marker.is_symlink():
+        if not _has_final_ownership_marker(path, name=name, vid=vid, role=role):
+            raise MigrationRefused(f"{path.name}: migration ownership marker is foreign")
+    else:
 
         def link_current_journal() -> None:
             journal_path = root / _JOURNAL_FILENAME
@@ -892,23 +912,23 @@ def _establish_shell_ownership(
                 journal_info = os.lstat(journal_path)
             except OSError as exc:
                 raise MigrationRefused(
-                    f"{shell.name}: migration journal cannot establish shell ownership"
+                    f"{path.name}: migration journal cannot establish {role} ownership"
                 ) from exc
             if not stat.S_ISREG(journal_info.st_mode):
                 raise MigrationRefused(
-                    f"{shell.name}: migration journal cannot establish shell ownership"
+                    f"{path.name}: migration journal cannot establish {role} ownership"
                 )
             os.link(journal_path, bootstrap, follow_symlinks=False)
-            _fsync_directory(shell)
+            _fsync_directory(path)
 
-        operations.mutate(f"assemble:{name}:establish_ownership", link_current_journal)
+        operations.mutate(label, link_current_journal)
 
-    if not _has_ownership_marker(shell, name=name, vid=vid, role="shell"):
-        raise MigrationRefused(f"{shell.name}: migration could not establish shell ownership")
-    _ensure_ownership_marker(shell, name=name, vid=vid, role="shell")
+    if not _has_ownership_marker(path, name=name, vid=vid, role=role):
+        raise MigrationRefused(f"{path.name}: migration could not establish {role} ownership")
+    _ensure_ownership_marker(path, name=name, vid=vid, role=role)
     if bootstrap.exists():
         bootstrap.unlink()
-        _fsync_directory(shell)
+        _fsync_directory(path)
 
 
 def _record_directory_identity(
@@ -1009,11 +1029,13 @@ def _assemble_shell(
         label=f"{package.name}:assemble:ownership",
         operations=operations,
     )
-    _establish_shell_ownership(
+    _establish_ownership(
         root,
         shell,
         name=package.name,
         vid=vid,
+        role="shell",
+        label=f"assemble:{package.name}:establish_ownership",
         operations=operations,
     )
     version = shell / _VERSIONS_DIRNAME / vid
@@ -1656,8 +1678,10 @@ def _cleanup_committed(
 
         # ``committed`` chooses cleanup, but does not identify whatever occupies a
         # deterministic tombstone name. Record the verified source directory's
-        # inode BEFORE rename. The inode survives both rename and partial rmtree,
-        # while a foreign replacement at either spelling fails the proof.
+        # inode BEFORE creating its marker or renaming it. The inode survives both
+        # rename and partial rmtree, while a foreign replacement at either spelling
+        # fails the proof. A hard link to that journal generation bridges the
+        # non-atomic final-marker write, just as it does for a new shell.
         recorded_identity = package["premigrate_identity"]
         if recorded_identity is None:
             if tombstone.exists() or tombstone.is_symlink():
@@ -1669,12 +1693,6 @@ def _cleanup_committed(
                     f"{premigrate.name}: committed cleanup target no longer looks like "
                     "the old package"
                 )
-            _ensure_ownership_marker(
-                premigrate,
-                name=name,
-                vid=package["vid"],
-                role="premigrate",
-            )
             identity = _record_directory_identity(
                 root,
                 journal,
@@ -1697,6 +1715,21 @@ def _cleanup_committed(
             raise MigrationRefused(
                 f"{tombstone.name}: cleanup target does not match its journal ownership proof"
             )
+        if premigrate_exists:
+            if not _old_package_at(premigrate):
+                raise MigrationRefused(
+                    f"{premigrate.name}: committed cleanup target no longer looks like "
+                    "the old package"
+                )
+            _establish_ownership(
+                root,
+                premigrate,
+                name=name,
+                vid=package["vid"],
+                role="premigrate",
+                label=f"cleanup:{name}:premigrate:establish_ownership",
+                operations=operations,
+            )
         owned_path = premigrate if premigrate_exists else tombstone
         if (premigrate_exists or tombstone_exists) and not _has_ownership_marker(
             owned_path,
@@ -1710,11 +1743,6 @@ def _cleanup_committed(
         if premigrate_exists and tombstone_exists:
             raise MigrationRefused(f"{tombstone.name}: cleanup destination is already occupied")
         if premigrate_exists:
-            if not _old_package_at(premigrate):
-                raise MigrationRefused(
-                    f"{premigrate.name}: committed cleanup target no longer looks like "
-                    "the old package"
-                )
             operations.mutate(
                 f"cleanup:{name}:premigrate:park",
                 lambda source=premigrate, target=tombstone: _rename_durable(source, target, root),

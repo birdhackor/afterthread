@@ -30,8 +30,14 @@ framework。原因不是排斥抽象，而是這裡的逐輪 deadline、順序�
 
 廣告時 handler 同時封住 `PackageRoot`、精確 `VersionRoot`、entry 與 manifest
 identity。模型可能幾分鐘後才真的呼叫；若那時 `current` 已從 V 切到 N，handler
-仍直接跑 V，不重新解析 pointer。這讓模型看到的 schema、實際 entry 與 cwd 永遠屬於
-同一版，而不是拿舊契約去跑新程式。
+**仍然跑 V**——這讓模型看到的 schema、實際 entry 與 cwd 永遠屬於同一版，而不是拿舊
+契約去跑新程式。
+
+**但呼叫當下仍會解析一次 `current`，只是不看它指向誰。** 要求它**不是 `Unresolved`**
+（也就是「這個套件現在還有可用的版本」），但**不要求它等於 V**。少了這道確認，一個
+`current` 被弄壞的套件會在列表上顯示 invalid＋停用，而已廣告的 handler 照樣跑得起來
+——同一個問題兩條路徑兩個答案（overall review r2-4）。具體差別：你刪掉或弄壞 `current`
+而 V 本身完好時，這次呼叫得到明確拒絕，不會啟動子行程。
 
 ### 模型要求與後端執行
 

@@ -4721,9 +4721,9 @@ def test_invariant_a_delete_discard_and_sweep_share_one_running_package_judgemen
     assert isinstance(resolution, tools.Resolved)
     stale = _stale_dir(base, "old")
     _install_settings(monkeypatch, tools_dir=str(base))
-    asked: list[tools.PackageRoot] = []
+    asked: list[tools.PackageLayoutRoot] = []
 
-    def nobody_running(package_root: tools.PackageRoot) -> bool:
+    def nobody_running(package_root: tools.PackageLayoutRoot) -> bool:
         asked.append(package_root)
         return False
 
@@ -4734,9 +4734,11 @@ def test_invariant_a_delete_discard_and_sweep_share_one_running_package_judgemen
     tool_builder._sweep_stale_backups(base)
 
     assert len(asked) == 3
-    assert all(isinstance(root, tools.PackageRoot) for root in asked)
+    assert type(asked[0]) is tools.PackageLayoutRoot
     assert asked[0].path.name.startswith(".live.stale-")
+    assert type(asked[1]) is tools.PackageRoot
     assert asked[1].path == discard_package
+    assert type(asked[2]) is tools.PackageLayoutRoot
     assert asked[2].path == stale
 
 

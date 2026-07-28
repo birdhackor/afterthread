@@ -276,10 +276,15 @@ class _PackageScan:
 
 
 @dataclass(frozen=True, slots=True)
-class PackageRoot:
-    """A real installed package directory, never a version or staging build."""
+class PackageLayoutRoot:
+    """A package-shaped layout that may still be staging or already retired."""
 
     path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class PackageRoot(PackageLayoutRoot):
+    """A real installed package directory, never a version or staging build."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1583,8 +1588,8 @@ class CurrentPublication:
         return self.published
 
 
-def publish_current(package_root: PackageRoot, vid: str) -> CurrentPublication:
-    """Publish one syntactically valid vid and expose only its durability."""
+def publish_current(package_root: PackageLayoutRoot, vid: str) -> CurrentPublication:
+    """Publish one syntactically valid vid into a package-shaped layout."""
 
     if not _VID_RE.fullmatch(vid):
         return CurrentPublication(published=False, durable=False)
@@ -1606,9 +1611,9 @@ def publish_current(package_root: PackageRoot, vid: str) -> CurrentPublication:
 
 
 def write_package_state(
-    package_root: PackageRoot, enabled: bool, *, default_mode: int = _OWNER_RW
+    package_root: PackageLayoutRoot, enabled: bool, *, default_mode: int = _OWNER_RW
 ) -> bool:
-    """Atomically publish the owned package-layer toggle document."""
+    """Atomically publish the owned toggle into a package-shaped layout."""
     # Trailing newline so the file is a well-formed text line like every other
     # small file this project publishes (cli.py's .env, set_enabled's old manifest
     # rewrite). ensure_ascii is irrelevant to a bool but is passed for uniformity
@@ -2810,8 +2815,8 @@ def directory_execution_in_flight(identity: tuple[int, int]) -> bool:
         return identity in _INFLIGHT_EXECUTIONS
 
 
-def package_execution_in_flight(package_root: PackageRoot) -> bool:
-    """Answer once whether any real version directory under a package is running.
+def package_execution_in_flight(package_root: PackageLayoutRoot) -> bool:
+    """Answer once whether any real version directory under a package layout is running.
 
     Every directory in ``versions/`` is considered, including a future
     ``<vid>.discarded`` parking name.  A filesystem answer we cannot establish
@@ -3234,7 +3239,7 @@ def delete_tool(name: str) -> bool:
     # that we cannot name it. Nothing observable changes either way (the tool is
     # already out of the registry and this still returns True); what is left
     # behind is marked remains the next tool job's sweep re-derives from disk.
-    if package_execution_in_flight(PackageRoot(deferred)):
+    if package_execution_in_flight(PackageLayoutRoot(deferred)):
         return True
     # Best-effort from here: the tool is already gone as far as everything that
     # reads this directory is concerned, so a removal that fails part-way must not

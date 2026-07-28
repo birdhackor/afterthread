@@ -246,9 +246,10 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `^[a-z0-9][a-z0-9_-]{0,63}$`，另含非空 `description`、
   `parameters` JSON Schema 與 `entry` argv。版本 id 符合
   `^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$`。
-- **四個型別是防錯邊界，不是命名慣例**：`PackageRoot` 只表示已安裝套件，
+- **五個型別是防錯邊界，不是命名慣例**：`PackageLayoutRoot` 表示可能仍在 staging
+  或已退休的 package-shaped layout，`PackageRoot` 是其只表示已安裝套件的子型別，
   `VersionRoot` 只表示一個已安裝版本，`BuildRoot` 只表示尚未安裝的 builder
-  內容，`Resolution` 則只能是帶有前三者中合法 package/version/vid 的 `Resolved`
+  內容，`Resolution` 則只能是帶有合法 package/version/vid 的 `Resolved`
   或帶原因的 `Unresolved`。餵錯層級通常不會立刻炸掉，而會從錯的位置讀到「缺席」，
   所以用型別讓 package state、version manifest 與 staging 驗證無法混用。
   `validate_tool_content(BuildRoot, expected_name)` 與

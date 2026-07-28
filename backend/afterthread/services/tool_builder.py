@@ -1600,10 +1600,10 @@ def _promote_staging(
     # package-level pointer is allowed to name this version.
     if not _fsync_tree(version) or not _fsync_directory(versions):
         return None, _ERROR_DURABILITY
-    package_root = tools.PackageRoot(shell_root)
-    if not tools.write_package_state(package_root, True):
+    package_layout = tools.PackageLayoutRoot(shell_root)
+    if not tools.write_package_state(package_layout, True):
         return None, _ERROR_INSTALL_STATE_WRITE
-    if not tools.publish_current(package_root, vid):
+    if not tools.publish_current(package_layout, vid):
         return None, _ERROR_CURRENT_WRITE
     if secret_name and secret_value:
         inject_error = _inject_secret_into_env(shell_root / ".env", secret_name, secret_value)
@@ -1762,7 +1762,7 @@ def _sweep_stale_backups(base: Path) -> None:
                 or not child.is_dir()
             ):
                 continue
-            if tools.package_execution_in_flight(tools.PackageRoot(child)):
+            if tools.package_execution_in_flight(tools.PackageLayoutRoot(child)):
                 continue
             shutil.rmtree(child, ignore_errors=True)
         # A discard that found any version execution in flight parks only its

@@ -515,23 +515,55 @@ def test_shell_creation_and_ownership_boundaries_are_self_recovering(
     _assert_migrated(root)
 
 
-def test_partially_written_final_marker_keeps_bootstrap_proof_and_reruns(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "point",
+    [
+        "before:journal:alpha:premigrate:ownership",
+        "after:journal:alpha:premigrate:ownership",
+        "before:cleanup:alpha:premigrate:establish_ownership",
+        "after:cleanup:alpha:premigrate:establish_ownership",
+    ],
+)
+def test_premigrate_identity_and_bootstrap_boundaries_are_self_recovering(
+    tmp_path: Path, point: str
 ) -> None:
-    """The atomic journal link remains proof until the JSON marker is durable."""
+    """Both sides of the identity publish and atomic bootstrap remain retryable."""
 
     root = tmp_path / "tools"
     _make_package(root)
-    shell = migration._shell_path(root, "alpha")
-    marker = shell / migration._META_DIRNAME / migration._OWNERSHIP_FILENAME
+
+    with pytest.raises(InjectedCrash):
+        _run(root, operations=PointFailureOperations({point: InjectedCrash()}))
+
+    journal = json.loads((root / migration._JOURNAL_FILENAME).read_text(encoding="utf-8"))
+    assert journal["status"] == "committed"
+    assert _run(root) == 0
+    _assert_migrated(root)
+
+
+@pytest.mark.parametrize("role", ["shell", "premigrate"])
+def test_partially_written_final_markers_keep_bootstrap_proof_and_rerun(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    role: str,
+) -> None:
+    """Each final-marker path can retry a torn write without losing ownership."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    owned = (
+        migration._shell_path(root, "alpha")
+        if role == "shell"
+        else migration._premigrate_path(root, "alpha")
+    )
+    marker = owned / migration._META_DIRNAME / migration._OWNERSHIP_FILENAME
     real_write = migration._write_shell_file
-    interrupted = False
+    interruptions_remaining = 1 if role == "shell" else 2
 
     def interrupt_marker_write(path: Path, data: bytes, mode: int = 0o600) -> None:
-        nonlocal interrupted
-        if path == marker and not interrupted:
-            interrupted = True
+        nonlocal interruptions_remaining
+        if path == marker and interruptions_remaining:
+            interruptions_remaining -= 1
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data[:17])
             raise InjectedCrash()
@@ -542,10 +574,44 @@ def test_partially_written_final_marker_keeps_bootstrap_proof_and_reruns(
         _run(root)
 
     assert marker.is_file()
-    assert not migration._has_final_ownership_marker(shell, name="alpha", vid=_VID, role="shell")
-    assert migration._has_bootstrap_ownership_marker(shell, name="alpha", vid=_VID, role="shell")
+    assert not migration._has_final_ownership_marker(owned, name="alpha", vid=_VID, role=role)
+    assert migration._has_bootstrap_ownership_marker(owned, name="alpha", vid=_VID, role=role)
+    if role == "premigrate":
+        # Interrupt the repair itself as well: the durable bootstrap must license
+        # any number of retries, not merely one clean second attempt.
+        with pytest.raises(InjectedCrash):
+            _run(root)
+        assert migration._has_bootstrap_ownership_marker(owned, name="alpha", vid=_VID, role=role)
     assert _run(root) == 0
     _assert_migrated(root)
+
+
+def test_foreign_premigrate_marker_is_preserved_and_operator_resolvable(
+    tmp_path: Path,
+) -> None:
+    """An inode record never licenses replacing a marker that preceded bootstrap."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    with pytest.raises(InjectedCrash):
+        _run(
+            root,
+            operations=PointFailureOperations({"after:journal:committed": InjectedCrash()}),
+        )
+    premigrate = migration._premigrate_path(root, "alpha")
+    meta = premigrate / migration._META_DIRNAME
+    meta.mkdir()
+    marker = meta / migration._OWNERSHIP_FILENAME
+    marker.write_bytes(b"operator-owned marker bytes\x00\n")
+    before = marker.read_bytes()
+    output: list[str] = []
+
+    assert _run(root, output=output) == 1
+
+    assert (premigrate / migration._META_DIRNAME / migration._OWNERSHIP_FILENAME).read_bytes() == (
+        before
+    )
+    assert "migration ownership marker is foreign" in "\n".join(output)
 
 
 def test_owned_incomplete_shell_is_removed_before_assembly_retries(
