@@ -1,54 +1,9 @@
-"""The AI summary of an INSTALLED tool package (see D40 in docs/web-v4-decisions.md).
+"""Generate and publish summaries for installed versioned tools.
 
-The installer (``tool_builder``) answers "did it build?"; this module answers
-"what did it build, and how does it work?" -- one short LLM session that READS
-the promoted package (manifest + implementation files) and writes a user-facing
-explanation into the package's own ``.ai_meta.json`` sidecar. The sidecar itself
-belongs to ``tools``: this module composes the summary and hands it to
-``tools.store_summary_meta``, which owns the merge and atomic write. Nothing
-here touches the file directly.
-
-Three properties are deliberate, and each has a failure mode behind it:
-
-* **A separate workflow name** (``tool_summary``, never ``tool_install``). Both
-  sessions run inside the SAME install job, one after the other, and both link
-  their record via ``llm_log.last_record_id_for_workflow`` -- which resolves by
-  NAME. Sharing a name would make the install outcome's ``llm_log_id`` point at
-  the summary session instead of the build it is supposed to explain.
-* **Best-effort, never fatal** (``generate_and_store_summary`` cannot raise).
-  It runs AFTER the package has already been promoted, so a summary failure
-  must never flip a genuinely successful install to failed -- the same
-  no-observer-failure stance ``llm_log``'s recorder takes. A failed generation
-  still leaves a sidecar (empty summary + origin) so the operator can hit
-  regenerate; the ONE thing it must never do is overwrite a GOOD summary with
-  an empty one. Best-effort is why the ``origin`` is persisted BEFORE the round
-  trip rather than only after it (O8-1): a swallowed refusal must cost only
-  what a later regeneration can rebuild, and the origin is the one thing in the
-  sidecar that nothing can.
-* **Fed from the files, not from memory.** The prompt carries the actual
-  package contents, so the summary describes what is genuinely installed --
-  including a package the operator later hand-edited (README documents editing
-  a tool in place). ``.env`` VALUES never enter the prompt (only the key
-  NAMES), the sidecar itself is skipped so a summary can never feed itself back
-  in, and every piece -- files, paths, the operator's own install context --
-  is redacted BEFORE it is stripped or cut, behind one final pass over the
-  whole assembled prompt: the redact-then-cap order the codebase uses, closed
-  as a property of the PROMPT rather than of each field in it. The install
-  URL is the one piece redaction alone could not close, so it is STRUCTURALLY
-  reduced first (``_sanitized_origin_url``): a credential in a URL's path,
-  query or userinfo is routinely one we were never told about, or one we were
-  told about in a different encoding, and neither is matchable.
-
-The LLM's own reply is validated for SHAPE here and redacted/capped at the
-STORE (``tools.store_summary_meta``), not in the pydantic validator: that
-validator runs on the event loop, and redaction reads the filesystem. See
-``ToolSummaryResult``.
-
-``regenerate_summary`` is the same generation behind the synchronous
-``POST /api/tools/{name}/summary/regenerate`` route, and is the ONE entry point
-that lets the LLM failures propagate -- a user who pressed 重新產生 is waiting
-for an answer, so "the LLM is not configured" must reach them as a 503/502
-rather than being swallowed into a silent no-op.
+Prompt content comes from one resolved VersionRoot, while package-layer ``.env``
+contributes key names only. Immutable provenance remains in ``origin.json``; this
+module atomically replaces only that version's ``summary.json``. Install-time
+generation is best-effort, while explicit regeneration surfaces LLM failures.
 """
 
 import os
@@ -398,7 +353,7 @@ def _package_files(directory: Path) -> list[tuple[str, str]]:
     return collected
 
 
-def _env_key_names(directory: Path) -> list[str]:
+def _env_key_names(package_root: tools.PackageRoot) -> list[str]:
     """The package ``.env``'s KEY names -- never its values.
 
     The names are what makes the explanation useful ("it reads KB_API_KEY from
@@ -407,12 +362,13 @@ def _env_key_names(directory: Path) -> list[str]:
     taken. A missing or malformed ``.env`` degrades to [] via that loader's own
     contract.
     """
-    return sorted(tools._load_tool_dotenv(directory))
+    return sorted(tools._load_tool_dotenv(package_root))
 
 
 def _summary_user_prompt(
     name: str,
-    directory: Path,
+    package_root: tools.PackageRoot,
+    version_root: tools.VersionRoot,
     *,
     origin: dict[str, Any] | None,
     builder_summary: str | None,
@@ -476,6 +432,7 @@ def _summary_user_prompt(
         f"Explain the installed tool package `{name}`.",
     ]
     # --- the SUBJECT first (see the ordering note above) ---
+    directory = version_root.path
     manifest = tools._read_regular_file_capped(directory / "tool.json", _FILE_CONTENT_CAP)
     if manifest is not None:
         parts.append(
@@ -499,7 +456,7 @@ def _summary_user_prompt(
         # redaction pass would otherwise catch.
         safe_relative_path = tools._utf8_safe(tools.redact_known_secrets(relative_path))
         parts.append(f"{safe_relative_path}:\n{content}")
-    keys = _env_key_names(directory)
+    keys = _env_key_names(package_root)
     if keys:
         # NAMES only -- see _env_key_names. Stated as environment variables
         # because that is how the runtime hands them to the tool.
@@ -591,7 +548,9 @@ def _stored_origin(meta: dict[str, Any] | None) -> dict[str, Any] | None:
     return kept or None
 
 
-def _resolve_package(name: str) -> tuple[Path, tuple[int, int, int]] | None:
+def _resolve_package(
+    name: str,
+) -> tuple[tools.PackageRoot, tools.VersionRoot, tuple[int, int, int]] | None:
     """Resolve a package by name AND take its identity, in ONE blocking hop.
 
     The pair, never one without the other, because every summary path here has
@@ -617,17 +576,20 @@ def _resolve_package(name: str) -> tuple[Path, tuple[int, int, int]] | None:
 
     BLOCKING: filesystem work, so callers reach it through ``run_in_threadpool``.
     """
-    directory = tools._resolve_package_dir_no_alias(name)
-    if directory is None:
+    package_root = tools._resolve_package_dir_no_alias(name)
+    if package_root is None:
         return None
-    identity = tools.package_identity(directory)
+    resolution = tools.resolve_current(package_root)
+    if isinstance(resolution, tools.Unresolved):
+        return None
+    identity = tools.package_identity(resolution.version_root)
     if identity is None:
         return None
-    return directory, identity
+    return package_root, resolution.version_root, identity
 
 
 def _store_meta(
-    directory: Path,
+    version_root: tools.VersionRoot,
     *,
     summary: str,
     origin: dict[str, Any] | None,
@@ -636,9 +598,9 @@ def _store_meta(
 ) -> dict[str, Any] | None:
     """Store the new summary and return the sidecar that landed.
 
-    The registry re-reads the sidecar to inherit its origin, writes through the
-    schema/redaction boundary, and re-reads what landed. This wrapper narrows
-    ``"not_stored"`` to None and returns the stored dictionary otherwise.
+    The registry writes through the summary schema/redaction boundary and then
+    reads the version metadata back, combining immutable ``origin.json`` with the
+    new ``summary.json``. This wrapper narrows ``"not_stored"`` to None.
 
     ``identity`` is what ``_resolve_package`` saw when it resolved ``directory``,
     threaded through unchanged: the store re-checks it against the path in the
@@ -651,7 +613,7 @@ def _store_meta(
     ``run_in_threadpool`` -- never inline on the event loop.
     """
     _outcome, meta = tools.store_summary_meta(
-        directory,
+        version_root,
         summary=summary,
         origin=origin,
         llm_log_id=llm_log_id,
@@ -662,7 +624,8 @@ def _store_meta(
 
 async def _generate_summary(
     name: str,
-    directory: Path,
+    package_root: tools.PackageRoot,
+    version_root: tools.VersionRoot,
     *,
     origin: dict[str, Any] | None,
     builder_summary: str | None,
@@ -700,7 +663,8 @@ async def _generate_summary(
     user_prompt = await run_in_threadpool(
         _summary_user_prompt,
         name,
-        directory,
+        package_root,
+        version_root,
         origin=origin,
         builder_summary=builder_summary,
     )
@@ -756,71 +720,11 @@ async def generate_and_store_summary(
     origin: dict[str, Any] | None = None,
     builder_summary: str | None = None,
 ) -> None:
-    """Summarize a just-installed package into its sidecar. NEVER raises.
+    """Best-effort summary publication for one just-installed current version.
 
-    Called from inside the install job AFTER the package has been promoted, so
-    the package is already installed and the job is already a success by the
-    time this runs: every failure -- the LLM being unconfigured, an upstream
-    error, a bug in here -- is swallowed, because none of them makes the
-    installed tool any less installed. This is the same no-observer-failure
-    stance ``llm_log``'s recorder takes, and the reason for the total
-    ``except Exception`` backstop rather than a list of expected LLM errors.
-
-    The ``origin`` is written to disk BEFORE the round trip, and that ordering is
-    the point rather than an optimization (O8-1). The OpenAPI url and the
-    operator's instructions are captured NOWHERE else in the system -- the caller
-    holds them, this is the only chance to persist them, and ``regenerate_summary``
-    recovers them by READING the sidecar, so a sidecar that never lands means every
-    later revise session runs without them, permanently. What can make the write at
-    the END not land is the store's identity guard: this hook holds the manifest
-    identity captured at its resolve, and a package REPLACED during the round trip
-    (a delete-and-reinstall under the same name takes no admission reservation)
-    correctly refuses it. Persisting the origin first is what makes that refusal
-    cost only the summary TEXT, which any later regeneration rebuilds from the
-    files.
-
-    A 啟用 TOGGLE was the reachable instance of that when O8-1 was found, and it is
-    no longer one: ``PATCH /api/tools/{name}`` still takes no admission reservation
-    and no per-package guard, but since web-v5 P1 ``tools.set_enabled`` writes the
-    package's ``.afterthread-state.json`` and leaves ``tool.json`` byte-identical -- so the
-    identity does not move and there is nothing for the guard to refuse. The early
-    write STAYS: it is what covers the replacement case, which still moves the
-    identity and still must be refused.
-
-    Persisting early rather than LOCKING the toggle, deliberately: a lock would
-    restrict a route that currently always works, for a window no operator can
-    see, to protect data that has a cheaper home -- and the identity-moving
-    behaviour it would have to change is adjudicated (D40 r5). The early write
-    removes the permanent harm without touching either.
-
-    Residual, stated rather than implied away: this write is best-effort like
-    everything else in this hook. If IT is refused -- the package was already
-    replaced between promote and here -- the outcome is exactly what it is
-    without it, and the install still succeeds. What is closed is the window that
-    OPENS at the resolve and stays open for a whole LLM round trip; not the
-    syscall-width one before it.
-
-    A failed generation still leaves a sidecar carrying the ``origin`` and the
-    failed session's log id with an EMPTY summary, so the 工具 page can show
-    "尚無總結" with a working 重新產生 button and the operator can read the
-    trace. That id is the one THIS call produced or nothing at all
-    (``_summary_session_log_id``): the failure can come from the prompt BUILD,
-    which never opens a session, and the workflow's newest record is then some
-    other tool's summary -- a null ``llm_log_id`` is already how "there is no
-    trace to link" is spelled, and offering a trace that belongs to a different
-    package is worse than offering none. It writes that placeholder when no
-    sidecar exists yet OR when the only one there is the origin-only file this
-    call just wrote: on a later regeneration the previous, GOOD summary must
-    survive a transient LLM failure rather than being blanked by it, and our own
-    empty-summary file is not one.
-    All three writes -- the origin, the summary and the placeholder -- carry the
-    identity of the package this hook resolved, so none can land in a package that
-    took the name during the generation.
-
-    Every filesystem step -- the resolve, the sidecar read, the store -- runs via
-    ``run_in_threadpool``. This is called from the install JOB's task, which
-    shares the event loop with every HTTP request in the process, so its blocking
-    work is exactly as unwelcome on the loop as a route's would be.
+    ``origin.json`` already committed with the version and is never rewritten
+    here. A placeholder may record this summary attempt; every write is bound to
+    the resolved VersionRoot identity, and no failure can undo the install.
     """
     try:
         # The resolve and the identity of what was resolved, together (see
@@ -834,20 +738,14 @@ async def generate_and_store_summary(
             # The package vanished (a racing delete) between promote and here.
             # Nothing to summarize and nowhere to write; silence is correct.
             return
-        directory, identity = resolved
-        # The ORIGIN, on disk, on the line ABOVE the round trip (see this
-        # function's contract for why the order is the fix). Empty summary,
-        # llm_log_id=None because no summary session
-        # has run yet -- reading the workflow's last id HERE would link this
-        # package to some previous tool's generation.
-        #
-        # Only when there IS an origin: with nothing un-regenerable to save, the
-        # write's whole effect would be to create a sidecar for
-        # a package that has no summary metadata to show.
-        origin_stored = origin is not None and isinstance(
+        package_root, version_root, identity = resolved
+        # origin.json is already the commit marker. When the caller supplies that
+        # context, create an empty summary placeholder before the LLM round trip;
+        # no previous workflow id is attached because this session has not run.
+        placeholder_stored = origin is not None and isinstance(
             await run_in_threadpool(
                 _store_meta,
-                directory,
+                version_root,
                 summary="",
                 origin=origin,
                 llm_log_id=None,
@@ -862,26 +760,31 @@ async def generate_and_store_summary(
         log_id_before = llm_log.last_record_id_for_workflow(_SUMMARY_WORKFLOW)
         try:
             summary = await _generate_summary(
-                name, directory, origin=origin, builder_summary=builder_summary
+                name,
+                package_root,
+                version_root,
+                origin=origin,
+                builder_summary=builder_summary,
             )
         except Exception:
-            # ``origin_stored`` short-circuits the read because the sidecar it
+            # ``placeholder_stored`` short-circuits the read because the sidecar it
             # would find is the one written above -- an empty summary this call
             # authored, not a good one worth protecting. Nothing else can have
             # replaced it meanwhile: a running install/revise job holds the single
             # flight, so a synchronous regenerate cannot be admitted inside this
             # window (``tool_builder._admit_job`` / ``reserve_sync_operation``).
-            if origin_stored or await run_in_threadpool(tools.read_tool_meta, directory) is None:
+            if (
+                placeholder_stored
+                or await run_in_threadpool(tools.read_tool_meta, version_root) is None
+            ):
                 # Best-effort, so the write result is DELIBERATELY ignored here
                 # and below: a refused sidecar must never fail an install that
                 # already succeeded (see this function's contract). The PLACEHOLDER
-                # is identity-guarded exactly like the real summary -- it carries
-                # this package's origin and this session's log id, and dropping
-                # those into a package that took the name meanwhile would be the
-                # same misattribution with a shorter body.
+                # is identity-guarded exactly like the real summary and carries
+                # only this attempt's log id.
                 await run_in_threadpool(
                     _store_meta,
-                    directory,
+                    version_root,
                     summary="",
                     origin=origin,
                     llm_log_id=_summary_session_log_id(log_id_before),
@@ -890,7 +793,7 @@ async def generate_and_store_summary(
             return
         await run_in_threadpool(
             _store_meta,
-            directory,
+            version_root,
             summary=summary,
             origin=origin,
             llm_log_id=llm_log.last_record_id_for_workflow(_SUMMARY_WORKFLOW),
@@ -903,67 +806,28 @@ async def generate_and_store_summary(
 
 
 async def regenerate_summary(name: str) -> dict[str, Any] | None:
-    """Regenerate one package's summary SYNCHRONOUSLY; returns the fresh meta.
+    """Regenerate one resolved version's summary synchronously.
 
-    The user-driven counterpart of the install hook, and the deliberate mirror
-    image of its error handling: ``LLMNotConfiguredError`` / ``LLMUpstreamError``
-    PROPAGATE so the route can answer 503/502: someone is waiting on this
-    request, and silently returning the old summary would be a lie about what
-    just happened.
-
-    None is the SAME kind of honesty for the non-LLM failures: the package
-    vanished under us, the package that now holds this name is no longer the one
-    this summary describes, or the sidecar write was refused. All three mean the
-    regeneration did not happen, and the route folds them into its
-    did-not-happen 404. Answering 200 with a summary that is nowhere on
-    disk would leave the user reading text that disappears on their next visit.
-
-    What it does NOT change is the no-clobber rule -- the sidecar is only
-    rewritten after a successful generation, so a failed regenerate leaves the
-    previous summary exactly as it was.
-
-    The STORED origin is read first and fed back into the prompt. The install's
-    OpenAPI URL and instructions are the first-hand account of what this package
-    was supposed to be, they exist nowhere but this sidecar, and a regeneration
-    that dropped them would explain the files with strictly less context than
-    the install did -- while ``_store_meta`` would separately have to inherit
-    them anyway. Passing the same narrowed origin back through the store keeps
-    the returned meta equal to what is on disk; a sidecar with no usable origin
-    yields None and the store's inheritance still covers it.
-
-    The caller (the route) has checked that the tool exists and HOLDS a
-    reservation in the job admission domain for the whole
-    of this call (R7-3) -- not merely a "no job is active" reading taken before
-    it. That distinction is what protects the store below: the read that builds
-    the prompt and the write that lands the result are separated by an LLM round
-    trip, and without the reservation a revise could be admitted inside that
-    window, replace the package and write its own sidecar, which this call would
-    then overwrite with a summary of a package that no longer exists. The resolve
-    here is still a race backstop -- and, via the shared alias-refusing helper,
-    the same hard-block every other by-name summary path runs.
-
-    The reservation covers the job domain; it does NOT cover a plain
-    delete-and-reinstall, which takes no job slot at all. That is what the
-    identity captured by ``_resolve_package`` and re-checked at the store is for:
-    a package replaced under the same name during this call gets no write, and
-    the caller gets the same None.
-
-    The three BLOCKING steps -- the resolve, the origin read, and the store --
-    each hop through ``run_in_threadpool``, mirroring how ``routers.tools`` calls
-    every registry function. Only the LLM round trip stays on the loop, which is
-    the one thing there that is genuinely async. This matters twice over for the
-    store does blocking filesystem work that belongs on a worker rather than the
-    event loop.
+    LLM configuration and upstream failures propagate to the route. Filesystem or
+    identity refusals return None, the previous summary is never blanked on failure,
+    and immutable origin context is read from that same VersionRoot.
     """
     resolved = await run_in_threadpool(_resolve_package, name)
     if resolved is None:
         return None
-    directory, identity = resolved
-    origin = _stored_origin(await run_in_threadpool(tools.read_tool_meta, directory))
-    summary = await _generate_summary(name, directory, origin=origin, builder_summary=None)
+    package_root, version_root, identity = resolved
+    origin_document = await run_in_threadpool(tools.read_origin_meta, version_root)
+    origin = _stored_origin({"origin": origin_document} if origin_document is not None else None)
+    summary = await _generate_summary(
+        name,
+        package_root,
+        version_root,
+        origin=origin,
+        builder_summary=None,
+    )
     return await run_in_threadpool(
         _store_meta,
-        directory,
+        version_root,
         summary=summary,
         origin=origin,
         llm_log_id=llm_log.last_record_id_for_workflow(_SUMMARY_WORKFLOW),

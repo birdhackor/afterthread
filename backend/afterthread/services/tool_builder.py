@@ -1,59 +1,17 @@
-"""The KB web installer: one LLM "tool builder" session that writes, tests and
-installs a tool package (see D21 in docs/web-v2-decisions.md, Phase 5c).
+"""Build, install, and revise versioned tool packages.
 
-Two entry points, one builder session shape. ``run_install`` builds a NEW
-package from an OpenAPI document; ``run_revise`` (D40) hands the ALREADY
-INSTALLED package back to the same kind of session together with the user's
-feedback and REPLACES the installed copy with the result. They share the
-prompts, the meta-tools, the staging discipline, the friendly-outcome contract,
-the job table and the llm_log workflow name (``tool_install``: both are builder
-sessions, and the AI 日誌 shows them as one kind).
+Both entry points run the same LLM builder session inside
+``<tools_dir>/.staging/<uuid>/build`` and reserve ``shell`` beside it for the
+assembled artifact. A fresh install assembles an entire package shell and makes
+it visible with one rename. A revise copies the resolved version into ``build``,
+commits one new version in ``shell``, renames that version under ``versions/``,
+and only then atomically publishes ``current``.
 
-``run_install(openapi_url, instructions)`` is the whole feature:
-
-1. fetch the OpenAPI document (bounded: 30s, capped redirects, 2MB body);
-2. create a throwaway STAGING directory ``<tools_dir>/.staging/<uuid>`` --
-   hidden, so the registry scan never lists an in-progress build (see
-   ``tools._scan_all``);
-3. run ONE ``generate_structured`` call (workflow ``tool_install``) armed with
-   four META-TOOLS -- the file tools ``write_file`` / ``read_file`` /
-   ``list_dir`` (paths jailed inside staging) plus ``run_shell`` (a full shell
-   that merely STARTS in staging) -- under the installer's own (much larger)
-   round and wall-clock budgets;
-4. on a ``ready`` result, first re-verify staging itself has not been moved or
-   replaced by a symlink (``_verify_staging_root`` -- the builder's run_shell
-   runs unjailed, D21), then strip any builder-written file from the backend's
-   reserved namespace (``_strip_builder_sidecars`` -- those files are
-   backend-authored, and a forged one bypasses the ``write_tool_meta`` choke point
-   or answers the operator's enabled switch), validate the staged package with the
-   SAME checks the registry applies to installed packages
-   (``tools.validate_package``), publish the package's initial enabled state
-   (``tools.write_package_state`` -- so the manifest's legacy key never decides it,
-   P1R5-3) and move it into ``<tools_dir>/<name>``; on anything else, fail with a
-   friendly error. Staging is always cleaned up;
-5. once installed, hand the package to ``tool_meta.generate_and_store_summary``
-   for its AI summary sidecar (D40). Strictly best-effort and it cannot raise:
-   the install is already a success by then, so a failed summary must never
-   flip the outcome.
-
-``run_revise(name, feedback)`` reuses steps 2-5 with three differences, each of
-which exists because the package it is editing is ALREADY LIVE (D40):
-
-* staging is populated by COPYING the installed package (no fetch), MINUS the
-  package ROOT's ``.env``, MINUS the ROOT state file and MINUS the AI sidecar at
-  any depth. The ``.env`` exclusion is not tidiness: its values are in
-  ``known_secret_values``, so copying it in would make ``validate_package``'s
-  embedded-secret gate reject every revise. The LIVE file is copied back into
-  staging BYTE-FOR-BYTE after validation (``_preserve_env_file``), exactly where an
-  install injects its form secret, and the state file is restored the same way
-  (``tools.carry_package_state``). Both exclusions are ROOT-only, because below the
-  root those names are the package's own content (P1R5-2);
-* every value of that ``.env`` is registered as an in-flight secret for the
-  WHOLE revise window, because ``known_secret_values`` skips dot-directories and
-  the swap below parks the old package in one;
-* promotion REPLACES rather than creates (``_promote_staging_replace``), and the
-  model is not allowed to redirect it: ``tool_name`` must equal the package it
-  was handed.
+The package-layer ``.env`` is never part of a revised version and is untouched
+for the whole revise. Its values are nevertheless registered during the builder
+session so prompts, results, summaries, and AI logs keep masking them. Builder
+shell access remains deliberately unjailed under D21; the file meta-tools alone
+are contained within the build root.
 
 Language rule for the strings in this module: META-TOOL RESULTS (and the
 builder prompts) are MODEL-facing and therefore English, like every prompt in
@@ -99,6 +57,7 @@ import concurrent.futures
 import contextlib
 import os
 import queue
+import secrets
 import shutil
 import stat
 import subprocess
@@ -205,39 +164,15 @@ _ERROR_STAGING_TAMPERED = "暫存工作區已被移動或替換，安裝已取�
 # D40 revise-only outcomes. Category-only by the same construction as the install
 # ones above: a fixed zh-TW string, never a path and never a value.
 _ERROR_REVISE_NOT_FOUND = "找不到要修訂的工具（可能已被刪除）。"  # noqa: RUF001
-# The ``.env`` is READ before the build -- for its VALUES, which have to be
-# registered and exported -- and the FILE itself is copied back into staging after
-# validation (R2-1). Both failure modes refuse the whole revise. UNREADABLE: a
-# `.env` whose values we cannot enumerate is one whose secrets the redactor does
-# not know while ``run_shell`` is running, which is the leak R1-1 already refuses
-# to take. TOO_LARGE: the bounded reader returns cap+1 chars, so parsing it yields
-# a TRUNCATED set of values -- the ones past the cap would go unregistered while
-# the copied file still carries them; the COPY refuses on the same ceiling too
-# (R4-1), because an over-cap ``.env`` is one the runtime loader degrades to
-# nothing anyway and copying it would be the one unbounded step left before the
-# swap. RESTORE: the byte copy into staging failed, so the revision would ship
-# without the credentials it inherited.
-# UNREADABLE and TOO_LARGE also answer for the file the BUILDER wrote, when the
-# package never had a ``.env`` of its own and that file is therefore the one that
-# ships (``_shipped_env_policy_error``): the condition each names is a property of
-# whatever is about to land at ``<package>/.env``, not of where it came from.
+# Package ``.env`` values must be readable before a revise session because they
+# are exported to run_shell and registered with both redactors.
 _ERROR_REVISE_ENV_UNREADABLE = "無法讀取既有工具包的 .env，修訂已取消。"  # noqa: RUF001
 _ERROR_REVISE_ENV_TOO_LARGE = "既有工具包的 .env 超過大小上限，修訂已取消。"  # noqa: RUF001
-_ERROR_REVISE_ENV_RESTORE = "無法還原工具包的 .env，修訂已取消。"  # noqa: RUF001
-# DISCARD: the live ``.env`` was DELETED during the session, so the builder's own
-# ``.env`` must not ship in its place (R3-1) -- and removing it from staging
-# failed, so the revision cannot be published in the shape that deletion asked
-# for. Refusing keeps the operator's package as it is; publishing anyway would
-# put a placeholder where credentials used to be.
-_ERROR_REVISE_ENV_DISCARD = "無法移除修訂產生的 .env（原檔已於修訂期間刪除），修訂已取消。"  # noqa: RUF001
 # A hand-edited ``.env`` holding a value BELOW the redactor's floor (R1-1). Names
 # the CONDITION and the two remedies, never the key and never the value -- the
 # whole point is that this value cannot be masked, so it must not be echoed by the
 # very message that refuses to expose it. See ``run_revise``'s own gate for why
-# refusing beats running. The same string answers when the offending value was
-# written by the BUILDER into a package that never had a ``.env``
-# (``_shipped_env_policy_error``): the condition and the remedy are about the value
-# that would ship, and neither changes with the author.
+# refusing beats running.
 _ERROR_REVISE_ENV_UNMASKABLE = (
     "既有工具包的 .env 內有值過短、無法遮蔽，修訂已取消：請加長該值，或將它從 .env 移除。"  # noqa: RUF001
 )
@@ -262,27 +197,10 @@ _ERROR_REVISE_ENV_UNMATCHABLE = (
     "請把該行的值寫成最單純的形式（原值直接寫，或整段用引號包住），"  # noqa: RUF001
     "並移除行尾註解與多餘的跳脫。"
 )
-# The revise could not carry the package's 啟用 state across the swap (web-v5 P1).
-# It REFUSES rather than publishing anyway, and the direction is the point: the
-# swap replaces the whole package directory, so a state file that fails to land
-# leaves the new package reading the manifest fallback -- i.e. ENABLED. Publishing
-# a revision that silently switches a deliberately-disabled tool back on is the one
-# outcome "do not run beats leak" forbids, and everything this write touches is
-# inside STAGING, so refusing costs an abandoned build and nothing else.
-# Category-only like the rest.
-_ERROR_REVISE_STATE_RESTORE = "無法保留工具的啟用狀態，修訂已取消。"  # noqa: RUF001
-# P1R5-3: a FRESH install publishes its own initial state file before the move, so
-# a newly installed package is never read through the manifest fallback -- see
-# ``_promote_staging``. It refuses the install rather than continuing without one,
-# and it can afford to: the write lands in STAGING, before the move, so at the
-# moment it fails NOTHING is installed and "cancelled" is simply true. That is the
-# same shape ``_inject_secret_into_env``'s failures have, one step further along the
-# same function. Category-only like the rest.
+# A fresh install publishes its package toggle before the final shell rename.
 _ERROR_INSTALL_STATE_WRITE = "無法寫入工具的啟用狀態，安裝已取消。"  # noqa: RUF001
-# The replace-mode promote's two "the package is no longer what we resolved"
-# refusals. Both are races against a concurrent delete/replace by an actor with
-# the service's uid -- the SAME accepted residual class ``_promote_staging``'s
-# docstring names for its own check-then-move window.
+# Revise refuses a package that vanished, became an alias, or no longer matches
+# the version identity captured before the paid builder session.
 _ERROR_REVISE_TARGET_MISSING = "原工具已被刪除，修訂結果未安裝。"  # noqa: RUF001
 _ERROR_REVISE_TARGET_ALIAS = "原工具目錄已被替換為連結，修訂已取消。"  # noqa: RUF001
 # R10-1: the package of that NAME is still there, but it is not the one this
@@ -296,14 +214,20 @@ _ERROR_REVISE_TARGET_REPLACED = "原工具在修訂期間被改動或重新安�
 # or unreadable ``tool.json``. Refused up front rather than after a full build,
 # because the pre-swap identity check would have nothing to compare against.
 _ERROR_REVISE_IDENTITY_UNKNOWN = "無法確認原工具的內容（`tool.json` 讀取失敗），修訂已取消。"  # noqa: RUF001
+_ERROR_VERSION_ID_WRITE = "無法為工具建立不重複的版本編號，操作已取消。"  # noqa: RUF001
+_ERROR_ORIGIN_WRITE = "無法寫入工具版本的來源資料，操作已取消。"  # noqa: RUF001
+_ERROR_CURRENT_WRITE = "無法發布工具的新版本，操作已取消。"  # noqa: RUF001
+_ERROR_DURABILITY = "無法確認工具資料已安全寫入磁碟，操作已取消。"  # noqa: RUF001
+
+_VID_RETRY_LIMIT = 16
 
 
-# The manifest-identity helper this module's pre-swap check uses. It LIVES in
+# The manifest-identity helper this module's pre-publication check uses. It LIVES in
 # ``tools`` (which this module already imports, so that is the direction with no
 # cycle) because the runtime asks the identical question on the identical tuple:
 # ``tools._make_handler`` pins a package's identity when its schema is advertised
 # to the model and re-checks it before executing, exactly as ``run_revise`` pins
-# it at session start and re-checks it before the swap. Two spellings would be two
+# it at session start and re-checks it before installing a version. Two spellings would be two
 # chances to drift, so there is one definition and this alias keeps the private
 # name this module's three call sites already read as "the revise's identity".
 # See ``tools.package_identity`` for why it is ``tool.json`` and not the directory.
@@ -316,13 +240,80 @@ _ERROR_REVISE_IDENTITY_UNKNOWN = "無法確認原工具的內容（`tool.json` �
 _package_identity = tools.package_identity
 
 
-# The swap failed AND the roll-back failed too: the only state where the
-# operator has to act. It names the SHAPE of the rescue (a hidden backup
-# directory beside the tool) rather than the path, keeping the category-only
-# rule intact while still being actionable.
-_ERROR_REVISE_UNRECOVERABLE = (
-    "工具包置換失敗且無法還原，原工具已保留為工具目錄下的隱藏備份目錄，請手動處理。"  # noqa: RUF001
-)
+def _mint_vid() -> str:
+    """Create the human-readable UTC id used for one immutable version."""
+
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return f"{timestamp}-{secrets.token_hex(3)}"
+
+
+def _choose_unused_vid(versions: Path) -> str | None:
+    """Choose a vid whose complete namespace is unused, with bounded retries."""
+
+    try:
+        existing = [entry.name for entry in versions.iterdir()]
+    except OSError:
+        return None
+    for _ in range(_VID_RETRY_LIMIT):
+        candidate = _mint_vid()
+        if not any(name.startswith(candidate) for name in existing):
+            return candidate
+    return None
+
+
+def _entry_exists(path: Path) -> bool:
+    """Test any directory entry, including a dangling symlink."""
+
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _fsync_directory(path: Path) -> bool:
+    """Make the directory entries already created under ``path`` durable."""
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return False
+    try:
+        os.fsync(fd)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return True
+
+
+def _fsync_tree(root: Path) -> bool:
+    """Persist regular files first and directories bottom-up."""
+
+    try:
+        directories = [root]
+        for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+            here = Path(dirpath)
+            dirnames.sort()
+            filenames.sort()
+            for filename in filenames:
+                path = here / filename
+                info = os.lstat(path)
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            directories.extend(here / dirname for dirname in dirnames)
+        return all(_fsync_directory(path) for path in reversed(directories))
+    except OSError:
+        return False
+
 
 # The builder's system prompt. English, like every prompt in this codebase.
 # It must carry the ENTIRE package contract (tool.json fields, the name regex,
@@ -1453,7 +1444,11 @@ def _is_reserved_sidecar_name(filename: str, *, at_root: bool) -> bool:
     because it is the Unicode-correct full-case-folding operation, and these
     names are compared, never displayed.
     """
-    reserved_here = tools._RESERVED_PACKAGE_FILENAMES if at_root else tools._RESERVED_AT_EVERY_DEPTH
+    reserved_here = (
+        (*tools._RESERVED_PACKAGE_FILENAMES, tools._META_DIRNAME)
+        if at_root
+        else tools._RESERVED_AT_EVERY_DEPTH
+    )
     folded = filename.casefold()
     return any(
         folded == reserved or (folded.startswith(reserved) and folded.endswith(".tmp"))
@@ -1640,766 +1635,167 @@ def _verify_staging_root(staging: Path, base: Path) -> str | None:
 
 
 def _promote_staging(
-    staging: Path,
+    build_root: tools.BuildRoot,
+    shell_root: Path,
     name: str,
     base: Path,
+    origin: dict[str, Any],
     secret_name: str | None = None,
     secret_value: str | None = None,
 ) -> str | None:
-    """Validate the staged package and move it to ``<base>/<name>``; None = ok.
+    """Assemble a complete package shell and atomically install it.
 
-    Blocking (runs via ``run_in_threadpool``). Validation runs the SAME checks
-    the registry applies on every scan (``tools.validate_package``), so a
-    package that passes here cannot list as broken after the move. The
-    exists-check is LOAD-BEARING, not just a friendly error: ``shutil.move``
-    onto an existing directory would nest the staging dir INSIDE it (a
-    corrupted install) rather than fail. Check-then-move is a race only
-    against a second concurrent install of the same name -- a single-user
-    local tool's edge we accept, and the nested-dir result would still be an
-    invalid package (name mismatch), never executable.
-
-    ``staging`` is re-verified FIRST of all (``_verify_staging_root``, R8-1),
-    before even the sidecar strip: the builder's ``run_shell`` can rename staging
-    away and plant a symlink at its original path pointing at ``base`` itself, and
-    the strip's ``os.walk`` would then delete every installed package's sidecar
-    before validation ever ran. This is the SAME check-then-act residual this
-    docstring already accepts above for the exists-check -- see
-    ``_verify_staging_root`` -- just one step earlier.
-
-    The form secret (D36) is written into the staged ``.env`` AFTER
-    ``validate_package`` (which judges exactly what the BUILDER produced) and
-    AFTER the name-free check (so we never touch a package we will not install),
-    but BEFORE the move -- with ``_inject_secret_into_env``'s own post-append
-    size guard, since ``validate_package`` never saw that line. This ordering is
-    what keeps ``validate_package``'s view consistent: it always vets the
-    LLM-authored package as-is, and the secret is a backend addition layered on
-    top and gated separately.
-
-    The AI sidecar is stripped NEXT, ahead of validation (R7-1): it is
-    backend-authored metadata, so a builder-written one is a forgery that bypasses
-    the ``write_tool_meta`` choke point entirely -- see ``_strip_builder_sidecars``
-    for the full attack chain and for why validation must run on exactly what will
-    ship. This is the ONLY file the promote removes; every other file the builder
-    produced rides into the package untouched, exactly as before.
-
-    The INITIAL STATE FILE is published last, into staging, just before the move
-    (P1R5-3), and it is what stops a builder from setting the operator's toggle. The
-    strip already deletes any state file the session wrote, but the manifest's
-    LEGACY ``enabled`` key survives -- ``validate_package`` accepts it (a legacy
-    package's manifest carries one, so it must), and the migration fallback reads
-    it. A model emitting an otherwise-valid ``tool.json`` with ``"enabled": false``
-    therefore installed successfully, reported success, and the tool was listed
-    disabled and never offered, with no mutation API call anywhere in the record.
-    Publishing an explicit ``true`` here means a freshly installed package is never
-    in the fallback's ABSENT case at all, which leaves that fallback meaning exactly
-    what it was written to mean: "installed before web-v5 P1". The alternatives were
-    rejected for being about the wrong file -- refusing the install teaches the
-    operator nothing they can act on (they did not write the manifest), and
-    stripping the key would REWRITE a manifest whose identity this phase exists to
-    hold still. The stale key simply stays inert, exactly as it does after a toggle.
-
-    ``true`` unconditionally, not "whatever the manifest said": a newly installed
-    tool being offered is this app's standing default, and the whole point is that
-    the BUILDER does not get a vote. An operator who wants it off switches it off,
-    and now can -- the file is already there.
+    Build validation happens before assembly. The committed version and package
+    metadata are durable before the shell rename; the tools directory is durable
+    before success is returned.
     """
-    root_error = _verify_staging_root(staging, base)
+    root_error = _verify_staging_root(build_root.path, base)
     if root_error is not None:
         return root_error
-    strip_error = _strip_builder_sidecars(staging)
+    if _entry_exists(shell_root):
+        return _ERROR_STAGING_TAMPERED
+    strip_error = _strip_builder_sidecars(build_root.path)
     if strip_error is not None:
         return strip_error
-    error = tools.validate_package(staging, expected_name=name)
+    error = tools.validate_tool_content(build_root, expected_name=name)
     if error is not None:
         return f"工具包驗證失敗：{error}"  # noqa: RUF001
     target = base / name
-    if target.exists():
+    if _entry_exists(target):
         return _ERROR_NAME_TAKEN
-    if secret_name and secret_value:
-        inject_error = _inject_secret_into_env(staging / ".env", secret_name, secret_value)
-        if inject_error is not None:
-            return inject_error
-    # The operator's toggle, set by the backend rather than inherited from whatever
-    # the model happened to put in the manifest (P1R5-3, see the docstring). Into
-    # STAGING and before the move, so a failure cancels an install that has not
-    # happened yet -- the same place and the same reason the secret injection above
-    # sits here. No lock: nothing can PATCH a tool that does not exist yet, and the
-    # instant the move lands a toggle is answered normally.
-    if not tools.write_package_state(staging, True):
-        return _ERROR_INSTALL_STATE_WRITE
+
     try:
         base.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(staging), str(target))
+        shell_root.mkdir()
+        versions = shell_root / tools._VERSIONS_DIRNAME
+        versions.mkdir()
+        (shell_root / tools._META_DIRNAME).mkdir()
+    except OSError as exc:
+        return f"無法組裝工具包（{type(exc).__name__}）。"  # noqa: RUF001
+
+    vid = _choose_unused_vid(versions)
+    if vid is None:
+        return _ERROR_VERSION_ID_WRITE
+    version = versions / vid
+    try:
+        os.rename(build_root.path, version)
+        (version / tools._META_DIRNAME).mkdir()
+    except OSError as exc:
+        return f"無法組裝工具包（{type(exc).__name__}）。"  # noqa: RUF001
+    if not tools.write_origin_meta(tools.BuildRoot(version), origin | {"previous": None}):
+        return _ERROR_ORIGIN_WRITE
+
+    # The committed marker and every entry it describes must survive before the
+    # package-level pointer is allowed to name this version.
+    if not _fsync_tree(version) or not _fsync_directory(versions):
+        return _ERROR_DURABILITY
+    package_root = tools.PackageRoot(shell_root)
+    if not tools.write_package_state(package_root, True):
+        return _ERROR_INSTALL_STATE_WRITE
+    if not tools.publish_current(package_root, vid):
+        return _ERROR_CURRENT_WRITE
+    if secret_name and secret_value:
+        inject_error = _inject_secret_into_env(shell_root / ".env", secret_name, secret_value)
+        if inject_error is not None:
+            return inject_error
+
+    # Persist the complete shell, including package metadata and .env, before its
+    # one atomic install rename. Then persist the parent entry before success.
+    if not _fsync_tree(shell_root):
+        return _ERROR_DURABILITY
+    if _entry_exists(target):
+        return _ERROR_NAME_TAKEN
+    try:
+        os.rename(shell_root, target)
     except OSError as exc:
         return f"工具包搬移失敗（{type(exc).__name__}）。"  # noqa: RUF001
+    if not _fsync_directory(base):
+        return _ERROR_DURABILITY
     return None
 
 
-def _shipped_env_policy_error(
-    path: Path, path_stat: os.stat_result, *, registered: list[str]
-) -> str | None:
-    """Run the WHOLE ``.env`` policy on the file that is about to SHIP; None = ok.
-
-    Blocking (a bounded read plus ``_unmaskable_env_error``'s scan, both inside
-    ``_promote_staging_replace``'s worker hop). ``path_stat`` is the caller's own
-    ``lstat`` -- the one it already took to decide whether the file is there at
-    all -- so this adds no syscall and cannot disagree with the shape the caller
-    saw.
-
-    ONE body, called for whichever file ends up at ``<package>/.env``: the LIVE
-    one being copied back, or the BUILDER's own when the package never had one.
-    That is the point rather than tidiness -- the two gates must be incapable of
-    answering differently about the same bytes, so they are not two gates, they
-    are this one asked twice about two different files. Same reader, same cap,
-    same non-empty filter, same messages; only the FILE differs.
-
-    The order is refuse-then-register:
-
-    * a non-regular file (a symlink or FIFO raced in, or planted by the unjailed
-      ``run_shell``) is refused rather than read through, exactly as the bounded
-      reader's ``O_NOFOLLOW`` + ``S_ISREG`` would;
-    * over ``tools._ENV_FILE_MAX_BYTES`` is refused on the SAME ceiling the
-      session's entry read, ``tools.validate_package`` and the runtime loader all
-      apply -- a file past it parses to a TRUNCATED set of values, so the ones
-      past the cap would ship unregistered;
-    * a value the redactors cannot mask -- too short for them to look at, or
-      spelled by its own assignment line in a way this system would not write --
-      refuses with ``_unmaskable_env_error``'s own category-only string. Reused
-      rather than duplicated per file: the CONDITION and the REMEDY are the same
-      (a value that ships in a ``.env`` has to be one we can mask, or not be in
-      the file), which is exactly the R3-2 criterion for when one message serves
-      two refusal points;
-    * only then are the values REGISTERED, and appended to ``registered`` -- the
-      session's own list, whose ``finally`` discards every value it holds.
-      Registering at the point of discovery and recording it in the SAME breath
-      is what makes it leak-proof: no return path can leave a value registered
-      with nobody to discard it. Registrations are COUNTED (see
-      ``tools._INFLIGHT_SECRETS``), so a value the session's entry read already
-      registered simply takes a second hold here and the list's ``finally``
-      releases both -- one entry per hold is exactly what that count wants, and
-      the duplicate is what keeps the two release points independent. It happens
-      BEFORE the caller copies or ships, so the post-swap paths -- the
-      regenerated sidecar, the summary session and its AI 日誌 record, all
-      written while the old package sits in a dot-prefixed backup
-      ``known_secret_values`` skips -- have something to mask against.
-    """
-    if not stat.S_ISREG(path_stat.st_mode):
-        return _ERROR_REVISE_ENV_UNREADABLE
-    if path_stat.st_size > tools._ENV_FILE_MAX_BYTES:
-        return _ERROR_REVISE_ENV_TOO_LARGE
-    text = tools._read_regular_file_capped(path, tools._ENV_FILE_MAX_BYTES)
-    if text is None:
-        return _ERROR_REVISE_ENV_UNREADABLE
-    if len(text) > tools._ENV_FILE_MAX_BYTES:
-        # Grew between the caller's ``lstat`` and this read -- the same miniature
-        # TOCTOU backstop ``_read_env_for_values`` keeps for the same reason.
-        return _ERROR_REVISE_ENV_TOO_LARGE
-    values = {key: value for key, value in tools._parse_dotenv_text(text).items() if value}
-    mask_error = _unmaskable_env_error(text, values)
-    if mask_error is not None:
-        return mask_error
-    for value in values.values():
-        tools.register_inflight_secret(value)
-        registered.append(value)
-    return None
-
-
-def _preserve_env_file(
-    target: Path, staging: Path, *, existed_at_start: bool, registered: list[str]
-) -> str | None:
-    """Copy the LIVE package's ``.env`` into ``staging`` BYTE-FOR-BYTE; None = ok (D40).
-
-    Blocking (runs inside ``_promote_staging_replace``). This IS the whole
-    preservation mechanism, and it is a FILE COPY rather than the text round-trip
-    r1 kept (R2-1). That round-trip's justification was that every consumer reads
-    this file through the same lossy decode, so the normalization it performed was
-    unobservable -- and that premise is simply FALSE: the runtime invokes a tool
-    with its PACKAGE DIRECTORY as the working directory, so the tool's own entry
-    can ``open(".env", "rb")`` and hash it, diff it, or parse CRLF itself. A revise
-    about pagination has no business rewriting a file it was never asked to touch.
-    ``shutil.copy2`` never decodes anything: the bytes, the mode and the mtime all
-    survive, so a CRLF-authored or non-utf-8 ``.env`` comes through unchanged.
-
-    The direction is LIVE -> staging, which is why this is cheap to be wrong
-    about: the live package is only READ here, and everything it writes lands in
-    STAGING, which nothing outside this build observes -- so a swap that fails
-    afterwards costs nothing, and the original file is still the original file
-    rather than a rewrite of it. It must run AFTER the target existence/symlink
-    checks, because it reads through ``target`` and the caller has to have
-    established that ``target`` is the real installed directory first. The size
-    ceiling below keeps this operator-controlled copy bounded.
-
-    Both ends are guarded by an ``lstat``, mirroring the pre-write ``lstat``
-    ``tools._write_package_file_atomic`` makes and the ``O_NOFOLLOW`` + ``S_ISREG`` gate
-    of the shared file helpers:
-
-    * SOURCE -- ``FileNotFoundError`` is the ONLY "there is no ``.env``" answer
-      (R2-3). Every other ``OSError`` (EIO, ESTALE, EACCES, ...) is a failure to
-      LOOK, not evidence of absence, and treating it as absence would ship a
-      revision whose credentials silently vanished. That same ``lstat`` is then
-      handed to ``_shipped_env_policy_error``, which makes the two judgements
-      below out of it -- one stat, both answers. A non-regular source (a
-      symlink or FIFO raced in after the entry read vetted a regular file) is
-      refused rather than copied through, exactly as the bounded reader's
-      ``O_NOFOLLOW`` refuses it. The same ``lstat``'s ``st_size`` also CAPS the
-      copy at ``tools._ENV_FILE_MAX_BYTES`` (R4-1) -- the ceiling
-      ``_read_env_for_values`` already applies to this very file at the session's
-      start, and the one ``tools.validate_package`` applies to a staged ``.env``.
-      An over-cap ``.env`` could never have been parsed for its values anyway
-      (``tools._load_tool_dotenv`` degrades it to no-env at runtime, so the tool is
-      not even reading it), so copying it would publish a file the rest of the
-      system rejects, and would spend an unbounded stretch of the pre-swap window
-      doing it. Bounding it leaves only the instant between this ``lstat`` and the
-      ``copy2`` -- a swap-in of a bigger file right there is the ordinary
-      check-then-act residual the standing adjudication accepts, the same size as
-      the ones the target checks above carry;
-    * DESTINATION -- ENOENT is the ordinary case (the copy excluded it) and a
-      regular file is the builder's own ``.env``, which the prompt's contract says
-      we overwrite. Anything else refuses, and that check is load-bearing rather
-      than symmetry: ``copy2`` FOLLOWS its destination, so a symlink planted at
-      ``<staging>/.env`` by the unjailed ``run_shell`` (D21) would take the live
-      credentials through it and out of staging, and a DIRECTORY there would send
-      the file to ``<staging>/.env/.env`` and ship a package with no ``.env`` at
-      all. This is exactly the refusal set ``tools._write_regular_file``'s
-      ``O_NOFOLLOW`` + ``S_ISREG`` gate gave the text write this replaces -- no
-      wider (a hardlink passes both, then and now, and is D21's accepted
-      same-uid residual), no narrower.
-
-    Every failure is a category-only string that aborts BEFORE the swap, so a
-    package we could not preserve the ``.env`` of is never published.
-
-    The file copied is the one on disk at THIS instant, not the snapshot the
-    session's entry read took. That is deliberate: an operator who edits the live
-    ``.env`` mid-session keeps their edit instead of having it reverted by a
-    revise. But it also means the ENTRY gates -- the spelling policy, the
-    redactor's length floor, the byte ceiling -- vetted a file that may no longer
-    exist, so this re-reads the source and re-runs ``_unmaskable_env_error`` on
-    the bytes it is ACTUALLY about to ship (R7-2). Without it, a package with no
-    ``.env`` (or a compliant one) at the session's start could gain a
-    non-compliant one mid-session and we would PUBLISH it, having never applied
-    the policy to it at all: the entry gate answers for a file, not for a path,
-    and this is the second place the same question has to be asked because it is
-    the place the answer is acted on. A refusal here is the same category-only
-    string the entry gate returns, and it aborts before the swap like every other
-    failure below.
-
-    The values found by that re-read are REGISTERED as in-flight secrets before
-    the copy, and appended to ``registered`` -- the session's own list, whose
-    ``finally`` discards every value it holds. Registering at the point of
-    discovery and recording it in the SAME breath is what makes the registration
-    leak-proof: no return path, error or otherwise, can lose track of a value we
-    have made the process redact. A value the operator added mid-session was never
-    exported into ``run_shell`` BY US (only the entry-read values were) -- though a
-    builder that read the file for itself has already seen it, which is the
-    residual below -- but it IS about to be shipped, and everything after the swap --
-    the outcome summary, the regenerated sidecar, the AI 日誌 record of that
-    summary session -- is written while the old package sits in a DOT-prefixed
-    backup that ``known_secret_values`` skips. That is the same masking gap the
-    entry registration exists to cover, just entered from the other end.
-
-    What this does NOT fix is the IN-SESSION read: the builder's unjailed
-    ``run_shell`` (D21) can ``cat`` a credentials file the operator creates DURING
-    the session, and ``llm_log`` redacts at STORAGE time, so a value that becomes
-    known here cannot retroactively mask records already written. That is recorded
-    as an accepted, unpreventable residual (裁決紀錄 #6) rather than papered over:
-    the closable half is "never SHIP what the guards would refuse", and this is it.
-
-    ``existed_at_start`` is what the session OBSERVED when it read the values
-    (``_read_env_for_values``), and it is threaded all the way down here because
-    "there is no ``.env`` right now" is TWO different situations (R3-1):
-
-    * it never had one -- the builder's own ``.env`` SHIPS, unchanged, exactly as
-      it does on an install where writing ``.env`` from the operator's
-      instructions is part of the contract. Deleting it would leave a revise
-      unable to act on "store the key in .env" feedback, and it smuggles nothing:
-      a value nobody registered is one the embedded-secret gate has nothing to
-      compare against either way. This is the standing acceptance, and it stays
-      -- but it is an acceptance about WHERE the file may come from, never a
-      waiver of the policy about what may be IN it. Until now nothing applied
-      that policy to a builder-written ``.env``: this branch returned success
-      without parsing it, and ``validate_package`` only checks the size and
-      scans for values ALREADY known, so it cannot see a NEW short value or a
-      reversible spelling. So a revise could publish ``PIN=1234`` -- which the
-      redactor's floor then permanently refuses to mask in live tool results, in
-      the AI 日誌 and in the summary -- or ``TOKEN="abcd\\"efgh"``, and the proof
-      that this was wrong rather than untidy is that the NEXT revise of that
-      package refuses at its entry gate: we would have produced a state we
-      ourselves decline to work with. It now faces
-      ``_shipped_env_policy_error`` -- the SAME reader, cap, spelling gate and
-      floor the preserved file gets -- and its values are registered before the
-      publish, which is what closes the seam between this standing acceptance
-      and the maskability policy. A refusal is the same category-only string,
-      and it aborts before the swap like every other failure here;
-    * it HAD one and it is gone now -- the operator deleted the credentials file
-      DURING the session. That deletion is a deliberate act on the live package,
-      while the builder's file is an artifact of a prompt that told it not to
-      write one at all; letting a placeholder silently take a deleted credential
-      file's place is precisely the failure this branch exists to stop. So the
-      staged ``.env`` is REMOVED and the published package has none, which is what
-      the deletion asked for. If that removal fails -- including a directory or
-      anything else ``os.remove`` will not take at that name -- this returns a
-      category-only error and the swap never runs, because "we could not make the
-      revision match" must not resolve to "publish the placeholder anyway".
-
-    The MIRROR case needs no flag and gets none: a ``.env`` that did NOT exist at
-    the start but is there now was created by the operator mid-session, and the
-    ordinary copy below preserves it -- the same "the file on disk at THIS instant
-    wins" rule the paragraph above states, applied in the other direction.
-    """
-    source = target / ".env"
-    source_stat: os.stat_result | None
-    try:
-        source_stat = os.lstat(source)
-    except FileNotFoundError:
-        source_stat = None  # nothing to copy -- but WHY decides what happens next
-    except OSError:
-        return _ERROR_REVISE_ENV_UNREADABLE
-    if source_stat is None:
-        if not existed_at_start:
-            # Never had one: the builder's ``.env`` ships (the standing
-            # acceptance) -- but only if it clears the same policy the preserved
-            # file does, which nothing used to ask of it. ENOENT here is the
-            # ordinary case (the prompt tells the builder not to write one), and
-            # it ships a package with no ``.env`` exactly as before.
-            try:
-                staged_stat = os.lstat(staging / ".env")
-            except FileNotFoundError:
-                return None
-            except OSError:
-                return _ERROR_REVISE_ENV_UNREADABLE
-            return _shipped_env_policy_error(staging / ".env", staged_stat, registered=registered)
-        try:
-            os.remove(staging / ".env")
-        except FileNotFoundError:
-            return None  # the builder wrote none either -- nothing to undo
-        except OSError:
-            # ``os.remove`` never follows a symlink, so a planted link is unlinked
-            # rather than followed; a DIRECTORY at that name lands here instead,
-            # and refusing beats a destructive traversal on something this function
-            # neither created nor verified (the same rule the roll-back applies).
-            return _ERROR_REVISE_ENV_DISCARD
-        return None
-    # The SAME policy the session's entry applied, re-asked of the bytes that are
-    # actually about to ship (R7-2) -- shape, ceiling, spelling, floor, and the
-    # registration -- through the ONE body that also judges a builder-written
-    # ``.env`` above, so the two can never answer differently about the same
-    # bytes. The read it makes and the ``copy2`` below are two opens an instant
-    # apart -- the ordinary check-then-act residual this module accepts, the same
-    # one the ``lstat`` above already carries, and not something a single lossy
-    # decode could close (that text is decoded with ``errors="replace"``, so
-    # writing it back would not be a byte copy).
-    policy_error = _shipped_env_policy_error(source, source_stat, registered=registered)
-    if policy_error is not None:
-        return policy_error
-    destination = staging / ".env"
-    try:
-        destination_mode: int | None = os.lstat(destination).st_mode
-    except FileNotFoundError:
-        destination_mode = None  # nothing there yet: the ordinary first-write case
-    except OSError:
-        return _ERROR_REVISE_ENV_RESTORE
-    if destination_mode is not None and not stat.S_ISREG(destination_mode):
-        return _ERROR_REVISE_ENV_RESTORE
-    try:
-        shutil.copy2(source, destination)
-    except OSError:
-        return _ERROR_REVISE_ENV_RESTORE
-    return None
-
-
-# The two hidden names the old package can wear, minted from ONE token so a
-# directory listing shows them as the same object:
-#
-# * ``.{name}.bak-<token>`` -- parked here for the swap, by this module alone. If
-#   the swap ends badly this IS the operator's tool (see
-#   ``_ERROR_REVISE_UNRECOVERABLE``), so NOTHING ever collects this name
-#   automatically;
-# * ``.{name}.stale-<token>`` -- the deferred-removal namespace, whose name and
-#   pattern live in ``tools`` because ``tools.delete_tool`` mints it too (a
-#   delete during a running call has the same problem a promote does) and only
-#   that side can hold a definition both can share. It means "superseded, collect
-#   when idle", and it is the only shape ``_sweep_stale_backups`` will remove.
-#
-# The distinction has to live in the NAME because the sweep is disk-driven and
-# runs in a later process as happily as in this one: "the swap succeeded" is not
-# something it could otherwise re-derive, and getting it wrong would mean deleting
-# a tool the operator was told to go rescue by hand. Marking it is a RENAME, which
-# the measurement in ``tools._INFLIGHT_EXECUTIONS`` shows a running child does not
-# notice at all (its cwd is the inode) -- unlike the removal it defers.
-#
-# Dot-prefixed is load-bearing, not cosmetic, for both -- see
-# ``_promote_staging_replace`` for what ``tools._scan_all`` and
-# ``known_secret_values`` do with hidden names.
-
-
-def _backup_path(base: Path, name: str, token: str) -> Path:
-    """Where the old package is parked for the swap. Never swept automatically."""
-    return base / f".{name}.bak-{token}"
-
-
-def _promote_staging_replace(
-    staging: Path,
-    name: str,
-    base: Path,
-    *,
-    env_existed_at_start: bool,
-    package_identity: tuple[int, int, int] | None,
-    registered: list[str],
+def _publish_revised_version(
+    build_root: tools.BuildRoot,
+    shell_root: Path,
+    package_root: tools.PackageRoot,
+    previous: tools.Resolved,
+    expected_identity: tuple[int, int, int],
+    feedback: str,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Swap a revised build in for the INSTALLED ``<base>/<name>`` (D40).
+    """Install one durable version and only then publish it through ``current``."""
 
-    Returns ``(origin, error)``: the error is the usual category-only zh-TW string
-    (None = the revision is live), and the origin is the OLD sidecar's
-    ``origin`` block, read here immediately before the swap so a long-running
-    revision inherits the latest durable install context. Both are
-    None on a refusal, and ``(None, None)`` on a success whose package simply had
-    no origin to inherit; the caller only consults the origin after the error is
-    None. The ``(value, error)`` shape mirrors ``_read_env_for_values``, the
-    module's other "do a thing, hand back what only that thing could learn".
-
-    Blocking (runs via ``run_in_threadpool``). A SEPARATE function rather than a
-    flag on ``_promote_staging``, because the two have opposite preconditions on
-    the same path: install requires the target to be ABSENT (its exists-check is
-    load-bearing -- ``shutil.move`` onto an existing directory NESTS instead of
-    failing), revise requires it to be PRESENT (there is nothing to revise
-    otherwise, and creating it here would turn a racing delete into a silent
-    reinstall). Folding both into one function would mean a boolean deciding
-    which of two contradictory checks runs -- and the gates they share are shared
-    by CALLING them, which is what this does:
-
-    1. ``_verify_staging_root`` FIRST of all (R8-1), before any destructive
-       traversal -- the builder's run_shell is unjailed, so the same "staging
-       moved aside, symlink planted at its path" attack applies here;
-    2. ``_strip_builder_sidecars`` (R7-1) -- the sidecar is backend-authored, and
-       this path regenerates one moments later anyway;
-    3. ``tools.validate_package`` -- the revised package must clear exactly the
-       gates a fresh install does. A revision that no longer validates NEVER
-       reaches the swap below, so the installed tool keeps running.
-
-    Then the two checks that are specific to replacing something:
-
-    * the target must still be a DIRECTORY -- a delete landing during the build
-      is answered with ``_ERROR_REVISE_TARGET_MISSING``, never by installing the
-      revision as a new tool;
-    * and it must not be a SYMLINK. ``is_symlink`` does not follow the final
-      component, mirroring ``tools._resolve_package_dir_no_alias``'s refusal (the
-      resolve that admitted this name erases the alias/real distinction): the
-      rename below would otherwise move the LINK aside and leave the real
-      package orphaned under a name nothing addresses.
-
-    The live ``.env`` is then copied into staging (``_preserve_env_file``) AFTER
-    validation -- the same slot, for the same reason, as
-    the install's ``_inject_secret_into_env``: ``validate_package`` judges what the
-    BUILDER produced (and its embedded-secret gate would reject the live values on
-    sight), and the backend's own bytes are layered on top of a package that has
-    already passed. It overwrites whatever ``.env`` the builder wrote, which is
-    the prompt's stated contract. It is a BYTE copy of the live file, not a
-    re-encoding of text read earlier (R2-1) -- see that helper for why the file's
-    exact bytes are observable and therefore not ours to normalize, and for why
-    reading from the live package here is safe. The copy is size-gated there
-    against the SAME ceiling the session's entry read and ``validate_package`` use
-    (R4-1); the earlier claim that no size check was needed rested on the live
-    ``.env`` still being the file whose values we parsed at the start, and a
-    mid-session replacement is exactly what this function must survive. That same
-    reasoning is why the helper now re-runs the WHOLE ``.env`` policy on the bytes
-    it is about to copy (R7-2): the entry gates answered for a file that may have
-    been replaced since, and this is the step that decides what SHIPS. It also
-    registers what it finds there, appending to ``registered`` -- the caller's own
-    in-flight list, which is why that list is threaded down instead of the values
-    being handed back: a value is made redactable and recorded in the same breath,
-    so no error path can leave one registered with nobody to discard it.
-
-    Everything it writes lands in STAGING, which no other actor reads. What it
-    depends on -- ``target`` being a real, non-symlink installed directory -- is
-    established by the two checks above.
-
-    A package that NEVER had a ``.env`` preserves nothing, and then a
-    builder-written one SHIPS -- deliberately, and identically to an install,
-    where writing ``.env`` from the user's instructions is part of the contract
-    -- but it ships only after facing the SAME policy the preserved file does
-    (``_shipped_env_policy_error``), which is the seam that acceptance and the
-    maskability rules left open between them: "this file may come from the
-    builder" was never "this file may hold a value we cannot mask", and until
-    that gate existed a revise could publish one and then refuse to revise the
-    package it had just made.
-    A package that HAD one which vanished mid-session is the opposite case and is
-    told apart by ``env_existed_at_start``, which the caller carries down from its
-    own entry read: there the staged ``.env`` is DROPPED instead, so a placeholder
-    never takes a deleted credential file's place (R3-1, see
-    ``_preserve_env_file``).
-
-    The package's 啟用 state is carried across too, and it is the same shape of step
-    for the same kind of reason (web-v5 P1): ``.afterthread-state.json`` is backend-authored, so
-    it is kept out of staging and re-published from the LIVE package instead of
-    being copied into a session that could rewrite it. A failure REFUSES the revise
-    -- see the comment at the call and ``_ERROR_REVISE_STATE_RESTORE``. Unlike the
-    ``.env`` copy it does NOT sit here: it is the FIRST statement of the locked tail
-    below, because what it reads is a value the operator can change at any instant
-    (R1-1), and every step between that read and the swap is a window in which the
-    change is lost.
-
-    The swap itself is rename-aside, move-in, drop-the-backup, and it runs -- with
-    the 啟用 carry and the identity re-check -- under ``tools._STATE_PUBLISH_LOCK``,
-    which is what keeps a ``PATCH /api/tools/{name}`` from landing inside it:
-
-    * the old package is renamed to a DOT-prefixed sibling
-      ``.{name}.bak-<uuid>``. Dot-prefixed is load-bearing, not cosmetic:
-      ``tools._scan_all`` skips hidden entries, so the backup can never surface
-      in ``GET /api/tools`` as a phantom duplicate during the swap window (and
-      the same convention keeps ``known_secret_values`` from re-reading it --
-      which is exactly why ``run_revise`` registers those values in-flight);
-    * a plain ``os.rename`` then puts the revision at the now-free name.
-      DELIBERATELY not ``shutil.move`` (R1-2): move falls back to a
-      copytree-then-delete whenever ``os.rename`` raises -- not only across
-      devices, since it catches every ``OSError`` -- so the publish would not be
-      atomic. With the old package already parked in the backup, a partial copy
-      leaves a HALF-BUILT directory at the tool's name, and the roll-back's
-      ``os.rename(backup, target)`` then fails because the name is occupied: a
-      half-replaced tool plus a hidden backup, the exact state
-      ``_ERROR_REVISE_UNRECOVERABLE`` exists to make rare. The same-filesystem
-      assumption ``rename`` needs is STRUCTURAL here, not a hope: staging is
-      ``<tools_dir>/.staging/<uuid>`` and the target is ``<tools_dir>/<name>``,
-      and ``_verify_staging_root`` above has already PROVEN staging resolves
-      inside that same ``<tools_dir>`` shell -- so the two live under one root and
-      EXDEV cannot arise from the paths themselves (only from a mount an operator
-      planted inside their own tools directory, which fails loudly and rolls back
-      like any other error);
-    * a publish failure is ROLLED BACK by renaming the backup home. If even that
-      fails, the operator is told a hidden backup is what to rescue
-      (``_ERROR_REVISE_UNRECOVERABLE``) -- the one outcome that needs a human;
-    * success drops the backup with ``ignore_errors`` (the revision is live by
-      then; a leftover backup is litter, not a failure) -- UNLESS a tool call is
-      still executing against those files, in which case the backup is renamed
-      into the collectable ``.stale-`` namespace and its removal is DEFERRED to
-      ``_sweep_stale_backups``. The promote itself never waits and never refuses
-      for this: a revise the operator asked for must not be blocked by a tool
-      call. See ``tools._INFLIGHT_EXECUTIONS`` for the measurement this rests on
-      -- a rename is invisible to a running child (its cwd is the inode), the
-      ``rmtree`` is what pulls the files out from under it.
-
-    Every failure is a category-only zh-TW string -- never a path, never a value
-    -- like every other outcome error in this module. The check-then-act windows
-    (between the target checks and the rename, and between the two renames) are
-    the SAME accepted residual ``_promote_staging``'s docstring already names for
-    its exists-check: a race against a second actor holding the service's uid, on
-    a single-user local tool, and no new standard is invented for it here. Every
-    one of them is an INSTANT between two syscalls, which is the property R4-1
-    restored by moving the one step that was not (the ``.env`` copy) off the end.
-
-    The 啟用 carry stays in the locked tail immediately before the rename, which
-    keeps the toggle window at zero instead of spanning validation and file copies.
-    """
-    root_error = _verify_staging_root(staging, base)
+    base = package_root.path.parent
+    root_error = _verify_staging_root(build_root.path, base)
     if root_error is not None:
         return None, root_error
-    strip_error = _strip_builder_sidecars(staging)
+    if _entry_exists(shell_root):
+        return None, _ERROR_STAGING_TAMPERED
+    strip_error = _strip_builder_sidecars(build_root.path)
     if strip_error is not None:
         return None, strip_error
-    error = tools.validate_package(staging, expected_name=name)
+    error = tools.validate_tool_content(build_root, expected_name=package_root.path.name)
     if error is not None:
         return None, f"工具包驗證失敗：{error}"  # noqa: RUF001
-    target = base / name
-    if target.is_symlink():
-        return None, _ERROR_REVISE_TARGET_ALIAS
-    if not target.is_dir():
-        return None, _ERROR_REVISE_TARGET_MISSING
-    # Copy the live ``.env`` only after the target checks. Everything it writes
-    # goes into staging, so an abandoned build takes the copy with it.
-    env_error = _preserve_env_file(
-        target, staging, existed_at_start=env_existed_at_start, registered=registered
-    )
-    if env_error is not None:
-        return None, env_error
-    # Read the live sidecar immediately before the swap so the post-revise
-    # summary inherits the latest durable install origin. A missing, corrupt, or
-    # unreadable sidecar has no usable origin and does not block publication.
-    origin = _existing_origin(tools.read_tool_meta(target))
-    # THE TAIL, and it runs under ``tools._STATE_PUBLISH_LOCK`` (TRANSITIONAL,
-    # web-v5 P1 -- P2's layout deletes the need, see that lock). Everything from the
-    # 啟用 carry to the second rename is what a ``PATCH /api/tools/{name}`` must not
-    # interleave with: the carry reads the LIVE toggle, and a toggle landing after
-    # that read is already lost to the copy sitting in staging. Since P1 a toggle no
-    # longer moves the manifest identity, so the re-check below -- which used to
-    # refuse such a swap BY ACCIDENT -- passes, and the swap ships the stale value.
-    # Ordering alone cannot close that (the staging write is always between the read
-    # and the swap), so the two operations are made mutually exclusive instead.
-    #
-    # The lock ends where the swap does. The backup disposal below runs OUTSIDE it:
-    # an ``rmtree`` of a whole package is not the bounded instant this hold is
-    # allowed to be, and by then the revision is already live, so a toggle landing
-    # there lands on the published package and is honoured.
-    with tools._STATE_PUBLISH_LOCK:
-        # The 啟用 state is carried across the swap the same way the ``.env`` is, and
-        # for a reason the revise flow did not used to have (web-v5 P1): the toggle
-        # now lives in the package's own ``.afterthread-state.json``, which
-        # ``_revise_copy_ignore`` deliberately keeps OUT of staging (it is
-        # backend-authored -- a session with shell must not be able to rewrite the
-        # file that decides whether its own tool may run) and
-        # ``_strip_builder_sidecars`` deletes if the session wrote one anyway. The
-        # swap below replaces the WHOLE directory, so without this line every revise
-        # would publish a package with no state file at all -- read through the
-        # manifest fallback as ENABLED, silently undoing a switch the operator set.
-        #
-        # It reads the LIVE package and it reads it HERE, as late as it can: this
-        # used to sit up beside the ``.env`` copy, where its comment called that
-        # position "free" because the step itself is bounded and tiny. That claim was
-        # the defect (R1-1). Bounded is not the same as EARLY -- everything it stood
-        # before (the sidecar read and this call's own ``_scan_package``) was
-        # window between reading the operator's toggle and
-        # shipping it. ``carry_package_state`` also brings the live file's MODE
-        # across (R1-3), which the publisher cannot inherit on its own here because
-        # it writes into staging, where there is no state file to inherit from.
-        #
-        # An unreadable state file is carried as DISABLED rather than repaired into
-        # "on" -- the same direction the scan takes. A file at that name that is NOT
-        # OURS is instead copied across byte-for-byte, because it is the package's
-        # own and a revise may not delete it (P1R5-1); see ``carry_package_state``
-        # for both shapes. A failed write REFUSES the revise (see
-        # ``_ERROR_REVISE_STATE_RESTORE``); it writes into staging, so nothing
-        # observable is left behind by the refusal.
-        if not tools.carry_package_state(target, staging):
-            return None, _ERROR_REVISE_STATE_RESTORE
-        # The package must still be the one this session copied from -- re-checked HERE, as
-        # the LAST thing before the first rename (R12-1). It moved twice, and both moves
-        # were the same mistake: r10 put it before the ``.env`` copy, r11 before the sidecar
-        # read, and each left an unguarded window in which a replaced package could still
-        # be renamed aside and overwritten by a revision of the package that no longer
-        # exists -- the sidecar read can even answer ``draft`` from the OLD package's file
-        # after the swap it is supposed to guard. A check whose whole job is "nothing
-        # changed since we looked" belongs at the last instant it can occupy; everything
-        # after it is the two renames themselves. The 啟用 carry above therefore goes
-        # BEFORE it, not after: this check must stay the last thing that looks at the
-        # package, and the carry is a step, not a check.
-        #
-        # ``tool.json``'s own (dev, ino, ctime) -- see ``_package_identity`` for why the
-        # DIRECTORY's inode is not an identity (it is reused across a delete+recreate)
-        # and why its timestamps are too broad (they fire on the .env deletion r3
-        # deliberately honors). A caller with no identity to offer is refused outright:
-        # the entry gate already declines that case, and treating None as "matches" here
-        # would reopen exactly what this closes.
-        if package_identity is None or _package_identity(target) != package_identity:
-            return None, _ERROR_REVISE_TARGET_REPLACED
 
-        token = uuid4().hex
-        backup = _backup_path(base, name, token)
+    try:
+        package_info = os.lstat(package_root.path)
+        versions_info = os.lstat(package_root.path / tools._VERSIONS_DIRNAME)
+    except FileNotFoundError:
+        return None, _ERROR_REVISE_TARGET_MISSING
+    except OSError:
+        return None, _ERROR_REVISE_TARGET_ALIAS
+    if not stat.S_ISDIR(package_info.st_mode) or not stat.S_ISDIR(versions_info.st_mode):
+        return None, _ERROR_REVISE_TARGET_ALIAS
+    if tools.package_identity(previous.version_root) != expected_identity:
+        return None, _ERROR_REVISE_TARGET_REPLACED
+
+    prior_origin = tools.read_origin_meta(previous.version_root) or {}
+    origin = {
+        "source": "builder-revise",
+        "openapi_url": prior_origin.get("openapi_url"),
+        "instructions": prior_origin.get("instructions"),
+        "feedback": feedback,
+        "previous": previous.vid,
+    }
+    try:
+        os.rename(build_root.path, shell_root)
+        (shell_root / tools._META_DIRNAME).mkdir()
+    except OSError as exc:
+        return None, f"無法組裝工具版本（{type(exc).__name__}）。"  # noqa: RUF001
+    if not tools.write_origin_meta(tools.BuildRoot(shell_root), origin):
+        return None, _ERROR_ORIGIN_WRITE
+    if not _fsync_tree(shell_root):
+        return None, _ERROR_DURABILITY
+
+    versions = package_root.path / tools._VERSIONS_DIRNAME
+    for _ in range(_VID_RETRY_LIMIT):
+        vid = _choose_unused_vid(versions)
+        if vid is None:
+            return None, _ERROR_VERSION_ID_WRITE
+        target = versions / vid
+        if _entry_exists(target):
+            continue
+        if tools.package_identity(previous.version_root) != expected_identity:
+            return None, _ERROR_REVISE_TARGET_REPLACED
         try:
-            os.rename(target, backup)
+            os.rename(shell_root, target)
+        except FileExistsError:
+            continue
         except OSError as exc:
-            return None, f"工具包置換失敗（{type(exc).__name__}）。"  # noqa: RUF001
-        try:
-            os.rename(staging, target)
-        except Exception as exc:
-            # TOTAL, unlike the OSError catches everywhere else in this module, and
-            # for one reason: between the rename above and this one the tool DOES
-            # NOT EXIST. Anything that escapes here leaves the operator's working
-            # tool gone with only a hidden backup to show for it, so the roll-back
-            # has to run for EVERY failure shape, not just the filesystem-shaped
-            # ones. str(exc) is never surfaced -- the message stays category-only.
-            #
-            # The roll-back does NOT clear ``target`` first, and that is a decision,
-            # not an omission (R1-2): a rename that RAISED moved nothing, so the name
-            # is free -- the half-written target that made clearing it look necessary
-            # was ``shutil.move``'s copy fallback, which is exactly what the line above
-            # no longer is. The ONLY way ``target`` exists here is that a concurrent
-            # actor with the service's uid created it in the instant since our own
-            # rename-aside, and then ``rmtree``-ing it would be a destructive traversal
-            # on a directory this function neither created nor verified (the
-            # ``_verify_staging_root`` gate proves things about STAGING, nothing about
-            # this path) -- destroying a third party's data to reclaim a name. The
-            # rename below fails with ENOTEMPTY instead and the operator is told where
-            # their backup is, which is the honest answer to "two writers, one name".
-            try:
-                os.rename(backup, target)
-            except Exception:
-                return None, _ERROR_REVISE_UNRECOVERABLE
-            return None, f"工具包置換失敗（{type(exc).__name__}），原工具已還原。"  # noqa: RUF001
-    # The revision is LIVE. The backup is litter now -- but only if nothing is
-    # still reading it: a tool call that started before the swap is running with
-    # its cwd on those very files (the rename moved the name, not the inode), and
-    # ``rmtree``-ing them mid-run turns the ordinary AI workflow that called the
-    # tool into a failed or half-finished tool result. That window is the CALL's
-    # whole duration (up to ``llm_tool_timeout_seconds``), not the syscall-pair
-    # instant this module accepts elsewhere, and ordinary workflows are outside the
-    # tool job's single-flight, so it is reachable rather than exotic.
-    #
-    # The question is asked with the DIRECTORY's identity, re-read from the backup
-    # we are HOLDING rather than carried across the swap -- a rename moves the
-    # name, not the inode (measured), so this is the same tuple the handler
-    # registered before starting its child. Deliberately NOT ``package_identity``,
-    # which this function matched a few lines up for a different question: a HAND
-    # EDIT of ``tool.json`` (D21's supported operator action) rewrites it in place
-    # while a child is still running in that directory, so a manifest-keyed lookup
-    # misses a child that registered before the edit and drops the backup out from
-    # under it (see ``tools.directory_identity``; before web-v5 P1 the enabled
-    # toggle was the writer this sentence named, and the split outlives it).
-    # "Cannot read it" defers too:
-    # the removal is the destructive act here, so a check that cannot speak must
-    # not vouch for it, and a deferral is only ever litter for the sweep.
-    # Deferring costs nothing: the name is dot-prefixed, so a leftover backup is
-    # invisible to every registry path, and ``_sweep_stale_backups`` collects it at
-    # the end of the next tool job.
-    #
-    # Deferring RENAMES it into the collectable namespace first, and that rename is
-    # what tells a later sweep -- possibly in a later PROCESS -- that this backup
-    # belongs to a swap that SUCCEEDED. A plain ``.bak-`` directory can also be the
-    # state ``_ERROR_REVISE_UNRECOVERABLE`` leaves behind, where it is the
-    # operator's only copy of their tool, so no sweep may ever touch that name. If
-    # the rename fails there is nothing to fall back to -- removing it is precisely
-    # what we must not do while a child is reading it -- so the backup simply stays,
-    # hidden and inert, and the operator can delete it by hand.
-    running = tools.directory_identity(backup)
-    if running is None or tools.directory_execution_in_flight(running):
-        with contextlib.suppress(OSError):
-            os.rename(backup, tools._stale_backup_path(base, name, token))
+            return None, f"無法安裝工具版本（{type(exc).__name__}）。"  # noqa: RUF001
+        if not _fsync_directory(versions):
+            return None, _ERROR_DURABILITY
+        if not tools.publish_current(package_root, vid):
+            return None, _ERROR_CURRENT_WRITE
         return origin, None
-    shutil.rmtree(backup, ignore_errors=True)
-    return origin, None
+    return None, _ERROR_VERSION_ID_WRITE
 
 
 def _sweep_stale_backups(base: Path) -> None:
-    """Remove deferred remains nothing is executing against any more.
+    """Best-effort collection of marked packages with no running version.
 
-    Blocking, best-effort, never raises -- the same contract as
-    ``_cleanup_staging``, which is where it runs from.
-
-    Two writers feed it, and both defer for the same reason -- a tool subprocess
-    was still reading the directory they wanted gone: ``_promote_staging_replace``
-    (which otherwise drops its backup itself the instant the swap succeeds) and
-    ``tools.delete_tool`` (which otherwise ``rmtree``s the package outright).
-    Both mark what they leave with ``tools._stale_backup_path`` on the way out.
-    Driven off the DIRECTORY rather than an in-memory list of deferrals, and that
-    is the decision: the process can exit between the deferral and the sweep (an
-    operator quits the app, the machine reboots), and an in-memory list would take
-    the only record of the leftover with it. A marked directory on disk describes
-    itself -- the name says its writer finished with it, and the directory IS the
-    identity the registry is keyed on -- so a LATER RUN can sweep what an earlier
-    one deferred.
-
-    A directory is removed only when it is affirmatively collectable, three
-    conditions deep because the act is a destructive traversal:
-
-    * the name must carry those writers' mark (``tools._STALE_BACKUP_RE``, the
-      mate of ``tools._stale_backup_path``). A plain ``.bak-`` is deliberately NOT
-      swept: that shape is what ``_ERROR_REVISE_UNRECOVERABLE`` leaves behind,
-      where it is the operator's only surviving copy of their tool. An operator's
-      own hidden directory is likewise never touched;
-    * it must be a real directory and not a SYMLINK -- an rmtree through a link
-      deletes a tree we never verified (the same reason ``_cleanup_staging``
-      gates its own rmtree, and ``_promote_staging_replace`` its target);
-    * its DIRECTORY identity must be readable AND absent from
-      ``tools.directory_execution_in_flight`` -- the identity the writers deferred
-      under, which a rename carries and an in-place manifest rewrite cannot move
-      (see ``tools.directory_identity``).
-
-    "Cannot say" therefore KEEPS the directory: the destructive act here is the
-    removal, so a check that cannot speak must not vouch for it (D40 P3b r11's
-    rule, pointed the way this call site needs). What that covers is now only a
-    genuine ``lstat`` failure on a directory ``is_dir`` just accepted -- i.e. a
-    directory that vanished under this loop, which the next pass re-reads anyway.
-    A marked directory whose ``tool.json`` is GONE (deleted by the tool itself, or
-    left behind by a partially failed rmtree) used to be permanent litter for want
-    of a manifest to read; keying on the directory retires that residual, and the
-    name remains the only thing that says a directory is ours to collect.
+    The all-versions judgement is shared with ``tools.delete_tool``. Hidden
+    entries outside the marked namespace and symlinks are never traversed.
     """
     with contextlib.suppress(Exception):
         for child in sorted(base.iterdir()):
@@ -2409,16 +1805,15 @@ def _sweep_stale_backups(base: Path) -> None:
                 or not child.is_dir()
             ):
                 continue
-            identity = tools.directory_identity(child)
-            if identity is None or tools.directory_execution_in_flight(identity):
+            if tools.package_execution_in_flight(tools.PackageRoot(child)):
                 continue
             shutil.rmtree(child, ignore_errors=True)
 
 
 def _cleanup_staging(staging: Path, base: Path) -> None:
-    """Remove the session's staging dir (if the move did not consume it), drop the
+    """Remove the whole session root (if the move did not consume it), drop the
     ``.staging`` shell when this was the last build in flight, and sweep whatever
-    a promote or a delete had to leave behind.
+    a delete had to leave behind.
 
     Blocking (runs via ``run_in_threadpool``), never raises: cleanup is
     best-effort by definition. ``rmdir`` (not rmtree) on the parent: it only
@@ -2501,9 +1896,12 @@ async def run_install(
     if openapi_text is None:
         return InstallOutcome(ok=False, error=fetch_error)
 
-    staging = base / _STAGING_DIRNAME / uuid4().hex
+    session_root = base / _STAGING_DIRNAME / uuid4().hex
+    build_root = tools.BuildRoot(session_root / "build")
+    shell_root = session_root / "shell"
     try:
-        await run_in_threadpool(staging.mkdir, parents=True)
+        await run_in_threadpool(session_root.mkdir, parents=True)
+        await run_in_threadpool(build_root.path.mkdir)
     except OSError as exc:
         return InstallOutcome(ok=False, error=f"無法建立暫存工作區（{type(exc).__name__}）。")  # noqa: RUF001
 
@@ -2528,7 +1926,7 @@ async def run_install(
                 _builder_user_prompt(instructions, openapi_text),
                 InstallResult,
                 workflow=_WORKFLOW,
-                tools=_build_meta_tools(staging, secret_env=secret_env),
+                tools=_build_meta_tools(build_root.path, secret_env=secret_env),
                 max_tool_rounds=settings.tool_install_max_rounds,
                 timeout_seconds=settings.tool_install_timeout_seconds,
             )
@@ -2571,7 +1969,19 @@ async def run_install(
             )
 
         promote_error = await run_in_threadpool(
-            _promote_staging, staging, result.tool_name, base, secret_name, secret_value
+            _promote_staging,
+            build_root,
+            shell_root,
+            result.tool_name,
+            base,
+            {
+                "source": "builder-install",
+                "openapi_url": tool_meta._sanitized_origin_url(openapi_url),
+                "instructions": instructions,
+                "feedback": None,
+            },
+            secret_name,
+            secret_value,
         )
         if promote_error is not None:
             return InstallOutcome(
@@ -2624,72 +2034,17 @@ async def run_install(
         # (possibly empty) .staging shell. Every other exit removes the build.
         if secret_value:
             tools.discard_inflight_secret(secret_value)
-        await run_in_threadpool(_cleanup_staging, staging, base)
+        await run_in_threadpool(_cleanup_staging, session_root, base)
 
 
 # --- the revise run -----------------------------------------------------------
 
 
 def _is_preserved_env_name(root: Path, filename: str, *, exact_present: bool) -> bool:
-    """True when ``<root>/<filename>`` IS the managed ``<root>/.env`` (D40).
+    """Identify the exact package-root ``.env`` entry withheld from a build.
 
-    The exact name always is. A CASEFOLD variant (``.ENV``, ``.Env``) is excluded
-    only when the DIRECTORY LISTING it came from does NOT also carry the exact
-    ``.env`` (``exact_present``) AND it is the same entry ``<root>/.env`` opens.
-
-    The LISTING is the discriminator (R6-2), and the inode alone is NOT. The r5
-    rule asked only "same ``st_dev``/``st_ino`` as ``<root>/.env``", and on a
-    case-SENSITIVE filesystem ``.env`` and ``.ENV`` can be HARD LINKS: two
-    distinct directory entries sharing one inode. Both were then held back from
-    the copy while ``_preserve_env_file`` restores only the exact ``.env``, so
-    after a successful publish and the backup drop ``.ENV`` was simply GONE --
-    which is the very failure R5-2 set out to remove, reappearing through the test
-    it chose. The question was never "same inode"; it is "is this the same
-    DIRECTORY ENTRY", and the listing answers it outright:
-
-    * a case-INSENSITIVE filesystem cannot hold two entries differing only in
-      case, so its listing carries exactly ONE of them (in whatever case it is
-      stored) and ``<root>/.env`` opens that one. ``exact_present`` is False, the
-      same-entry test is True, and the live credentials stay out of staging --
-      copying them in would make ``validate_package``'s embedded-secret gate
-      reject every revise of that tool, permanently, naming a file the operator
-      never wrote;
-    * a case-SENSITIVE one holding both carries BOTH names in the listing, hard
-      link or not. ``exact_present`` is True, so the variant is ORDINARY package
-      content and is copied -- a tool whose entry runs with the package directory
-      as its cwd may read it for its own reasons -- while the exact ``.env`` is
-      still withheld by the branch above. A blind casefold match (r1) and the
-      inode test (r5) both dropped it, and since only the exact ``.env`` is ever
-      restored, an unrelated revise DELETED it and then validated the mutilated
-      package as fine: the failure R2-2 removed for nested ``.env`` files,
-      surviving at the root under a different name;
-    * a case-SENSITIVE one holding ONLY the variant has no ``<root>/.env`` to be
-      the same entry as, so it is copied and the package counts as having no
-      managed ``.env`` at all -- which is exactly what ``tools._load_tool_dotenv``
-      finds when it opens the exact name there.
-
-    ``os.lstat`` rather than ``os.stat``/``os.path.samefile`` on purpose, and it
-    stays that way (R5-2's reason survives R6-2's change): a SYMLINK named ``.ENV``
-    pointing at ``.env`` compares EQUAL under a FOLLOWING stat, and excluding a
-    distinct entry that is never restored is this whole finding in miniature. lstat
-    keeps the link a link, ``copytree(symlinks=True)`` carries it across as one,
-    and it resolves again the moment ``_preserve_env_file`` puts ``.env`` back.
-    What the stat still buys, now that the listing decides the case question, is
-    the confirmation that ``<root>/.env`` -- the exact path every other part of
-    this system opens -- really does resolve to THIS entry before we withhold it.
-
-    Both stats are guarded: a name that vanished between ``scandir`` and here, or
-    a root with no ``.env`` at all, is simply NOT the same file, so it is copied.
-    That is the safe direction -- the alternative is deleting package content on
-    the strength of a stat that failed -- and the credential file itself cannot
-    slip through it, because the exact-name branch above never stats anything.
-
-    ``exact_present`` is a REQUIRED keyword-only argument for the same reason
-    ``_preserve_env_file``'s ``existed_at_start`` is (R3-1): a default would be a
-    silent wrong branch waiting for the first caller that forgets to pass it.
-
-    Only IDENTITY is decided here; WHERE it counts is ``_revise_copy_ignore``'s
-    job, and it counts only at the package root (R2-2).
+    Case variants are ordinary version content when the filesystem carries both
+    names. A lone case-folded alias is withheld only when it is the same entry.
     """
     if filename == ".env":
         return True
@@ -2704,72 +2059,21 @@ def _is_preserved_env_name(root: Path, filename: str, *, exact_present: bool) ->
 
 
 def _revise_copy_ignore(root: Path, source_dir: Any, names: list[str]) -> set[str]:
-    """``copytree``'s ignore callback: the names a revise copy must leave behind.
+    """Exclude package metadata and package ``.env`` from a version build copy.
 
-    Bound to the package ``root`` by the caller (``partial``), because the
-    namespaces it drops have DIFFERENT depths:
-
-    * the ROOT ``.env`` only -- MANDATORY there, and identified by this very
-      LISTING plus a non-following same-entry test rather than by spelling
-      (``_is_preserved_env_name``, R6-2 narrowing R5-2). That one file's values
-      are in ``known_secret_values``, so copying it would be rejected outright by
-      ``validate_package``'s embedded-secret gate, and the backend copies the live
-      file back after validation instead (``_preserve_env_file``);
-    * the ROOT state file (plus its publish temporaries) -- restored on the other
-      side of the swap by ``tools.carry_package_state`` rather than carried through
-      a session that can rewrite it, which is what stops a revise from silently
-      re-enabling a tool the operator had switched off (the swap replaces the whole
-      directory). That restore also brings a FOREIGN file at that name back
-      byte-for-byte, so withholding it here costs a package that owns the name
-      nothing (P1R5-1);
-    * the AI SIDECAR at EVERY depth (``.ai_meta.json`` and its temporaries) -- the
-      one name no package content may inhabit anywhere, for the reason
-      ``_strip_builder_sidecars`` gives. It is regenerated after the swap through
-      ``write_tool_meta``.
-
-    A NESTED ``.env`` is ordinary package content and is COPIED (R2-2). The r1
-    rule dropped every ``.env``-casefolded name at every depth on the theory that
-    only the root one is ever loaded -- true of the RUNTIME's env injection, and
-    irrelevant to the tool's own code, which runs with the package directory as
-    its cwd and may perfectly well ``open("config/.env")`` for its own reasons. A
-    revise about pagination silently deleting that file, and then VALIDATING the
-    mutilated package as fine, is a worse failure than anything the rule bought.
-    The consequence is stated rather than hidden: if a nested file embeds a
-    REGISTERED secret value, the copy trips ``validate_package``'s embedded-secret
-    gate and the promote is refused with that gate's existing message naming the
-    file. That is the gate working -- an operator who put a live credential in a
-    second file learns about it -- and it is strictly better than shipping a
-    package with a file quietly removed.
-
-    A NESTED state file is copied for EXACTLY that reason (P1R5-2), which is this
-    same ruling applied to the name that arrived after it rather than a new one: the
-    r1-through-r4 rule dropped it at every depth on the theory that the name is the
-    backend's, and the backend never reads or writes below the root. A revise of a
-    tool that keeps its own state at ``data/<that name>`` deleted it and validated
-    the result as fine.
-
-    ``source_dir`` is the directory being visited; ``shutil`` passes it through
-    ``os.fspath``, so it arrives as a str and is compared as a ``Path`` (children
-    are built by joining onto ``root``, so only the top-level call can equal it).
-
-    ``names`` is not just the thing being filtered, it is EVIDENCE (R6-2): whether
-    the exact ``.env`` appears in this listing is what tells a case-INSENSITIVE
-    ``.ENV`` (one entry, ours, withhold it) from a case-SENSITIVE one (two
-    entries, the package's, copy it). It is computed ONCE per directory rather
-    than per name, because ``names`` is a list and a package root may hold many
-    files.
+    Nested names remain tool content. The package-layer files stay in place and
+    therefore never enter the builder session or the newly committed version.
     """
     at_root = Path(source_dir) == root
-    exact_env_present = at_root and ".env" in names
     return {
         name
         for name in names
-        if (at_root and _is_preserved_env_name(root, name, exact_present=exact_env_present))
+        if (at_root and name.casefold() == tools._META_DIRNAME.casefold())
         or _is_reserved_sidecar_name(name, at_root=at_root)
     }
 
 
-def _copy_package_into_staging(source: Path, staging: Path) -> str | None:
+def _copy_package_into_staging(source: tools.VersionRoot, staging: tools.BuildRoot) -> str | None:
     """Copy the installed package into a fresh staging dir; None = ok (D40).
 
     Blocking (runs via ``run_in_threadpool``). ``copytree`` creates ``staging``
@@ -2791,90 +2095,22 @@ def _copy_package_into_staging(source: Path, staging: Path) -> str | None:
     where the install-side ``os.walk`` gate stays as adjudicated).
     """
     try:
-        shutil.copytree(source, staging, symlinks=True, ignore=partial(_revise_copy_ignore, source))
+        shutil.copytree(
+            source.path,
+            staging.path,
+            symlinks=True,
+            ignore=partial(_revise_copy_ignore, source.path),
+        )
     except OSError as exc:
         return f"無法複製既有工具包到暫存工作區（{type(exc).__name__}）。"  # noqa: RUF001
     return None
 
 
 def _read_env_for_values(directory: Path) -> tuple[bool, dict[str, str], str, str | None]:
-    """``(existed, values, text, error)``: the package's ``.env`` VALUES (D40).
+    """Read package ``.env`` values for masking and builder-shell export.
 
-    Blocking, and the PARSE happens here rather than in the caller (R4-3). The
-    read was moved onto a threadpool worker long ago, but ``python-dotenv`` was
-    still handed the text back on the EVENT LOOP -- and a near-64 KiB ``.env``
-    full of quoting is a real parse, not a formality, while this runs from a
-    background job that shares the loop with every HTTP request in the process.
-    Read and parse are one worker hop now, so no dotenv work is left on the loop;
-    the caller still gets exactly what it needs, an existence bit and a values
-    dict -- plus the RAW TEXT those values came out of.
-
-    The text is returned so ``_unmaskable_env_error`` can compare each parsed value
-    against the spelling the FILE actually holds -- specifically the raw right-hand
-    side of the line that DETERMINED it (R5-1, narrowed by R6-1), which is why the
-    whole text rather than a per-value verdict crosses back: the guard has to be
-    able to find that line. It has to come from THIS
-    read rather than a second one for the same reason the values do: a ``.env`` an
-    unjailed ``run_shell`` can rewrite mid-session could read back differently, and
-    a guard that vetted a different revision of the file than the one whose values
-    were registered would be vetting nothing. It is ``""`` on every error path and
-    whenever there is no ``.env`` -- with no values there is no spelling to check.
-
-    ``existed`` is False with no error only when the package simply has no
-    ``.env`` -- the common case, and the one where there are no values to register
-    or export. It is the OBSERVATION "this package had no ``.env`` when the session
-    started", and the caller carries exactly that bit down to
-    ``_preserve_env_file`` (R3-1). It is taken from the READ, not from the parsed
-    values: an EMPTY ``.env`` (or one that is all comments) parses to ``{}`` and
-    must still count as EXISTING, because what it decides is whether a
-    builder-written ``.env`` may take a deleted one's place. On any error the
-    values are empty and the caller refuses the whole revise, so the bit is
-    meaningless there and is reported False.
-
-    This read is about VALUES ONLY, and that separation is deliberate (R2-1): the
-    FILE is never round-tripped through this text -- ``_preserve_env_file`` copies
-    it byte-for-byte at promote time -- so the lossy decode the shared bounded
-    reader performs (utf-8 with ``errors="replace"``, universal newlines) touches
-    nothing that lands on disk. The parse is ``tools._parse_dotenv_text``, the one
-    parser ``tools._load_tool_dotenv`` itself delegates to, so the values
-    registered as in-flight secrets and exported into ``run_shell`` are exactly the
-    values the RUNTIME will hand the revised tool. Values are parsed from this ONE
-    read rather than from a second one for the ordinary reason: two reads could
-    disagree.
-
-    Deliberately stricter than the runtime's own loader, which degrades an
-    unreadable or oversized ``.env`` to "no extra env" and keeps the tool running.
-    Here the same degrade would run a whole builder session -- ``run_shell``
-    included -- with the tool's real credentials UNKNOWN to the redactor, which is
-    the leak R1-1's floor check refuses to take by the other route. So a ``.env``
-    that exists but that the bounded, O_NOFOLLOW'd reader declines (a symlink, a
-    FIFO, an unreadable mode), or that comes back over the cap with its tail of
-    values cut off, stops the revise before the session starts.
-
-    The ``lstat`` answers TWO questions now -- is there a ``.env`` here, and is it
-    within the ceiling -- and only ``FileNotFoundError`` answers "no" to the first
-    (R2-3). Every other ``OSError`` (EIO on a failing disk, ESTALE on an NFS mount,
-    EACCES on a directory an operator just chmod'ed) is a failure to LOOK, and
-    reading it as absence would start a session whose ``.env`` values are
-    unregistered while ``run_shell`` still receives nothing at all -- the degrade
-    this function exists to refuse.
-
-    The ceiling is measured in BYTES, off that same ``lstat``'s ``st_size`` (R5-3).
-    It used to be measured in decoded CHARS, and the two are not the same ceiling:
-    a CJK-heavy ``.env`` of ~30k characters is ~90 KB, so it sailed through this
-    gate, spent a full multi-round builder session, and was then refused by
-    ``_preserve_env_file``'s BYTE check at promote -- guaranteed-to-fail work,
-    charged in full, on every retry. Entry and promote now apply the SAME ceiling
-    to the SAME file in the SAME unit, which is also the unit
-    ``tools.validate_package`` gates a staged ``.env`` in, so the answer no longer
-    depends on which of the three asks. The promote-side check STAYS: the file can
-    be swapped for a bigger one mid-session, which is exactly the R4-1 hazard, and
-    an entry gate cannot see that. The CHAR check below stays too, for the same
-    reason in miniature -- a file that GREW between this ``lstat`` and the read
-    comes back at cap+1 chars and is refused there. What is deliberately NOT
-    touched is ``tools._load_tool_dotenv``'s own char-based cap: that is a
-    SEPARATE, pre-existing bound on what the RUNTIME will load (and it degrades to
-    no-env rather than refusing), and nothing here changes it.
+    This is a bounded, non-following read. It never writes or copies the package
+    file; revise leaves those bytes and that directory entry untouched.
     """
     env_file = directory / ".env"
     try:
@@ -3196,96 +2432,32 @@ def _current_manifest_text(directory: Path) -> str | None:
     return tools._read_regular_file_capped(directory / "tool.json", tools._MANIFEST_MAX_BYTES)
 
 
-def _existing_origin(meta: dict[str, Any] | None) -> dict[str, Any] | None:
-    """The install ORIGIN inside an ALREADY-READ sidecar meta, or None.
-
-    Pure. It takes the already-read meta rather than opening the sidecar itself,
-    so the promote path controls when its one origin read happens. The sidecar is
-    the only copy of the OpenAPI URL and original instructions; a usable origin
-    is narrowed and re-sanitized by ``tool_meta._stored_origin``, while a missing,
-    corrupt, or unreadable sidecar yields None and does not block publication.
-    """
-    return tool_meta._stored_origin(meta)
-
-
 async def run_revise(name: str, feedback: str) -> InstallOutcome:
-    """Run one whole revise: copy, build in staging, validate, REPLACE (D40).
+    """Build and commit one new version, then publish ``current``.
 
-    Same contract as ``run_install`` in every externally visible way -- it runs
-    inside a fire-and-forget background job, so every failure is a FRIENDLY
-    OUTCOME (zh-TW ``error``) and never an exception, and ``llm_log_id`` is
-    captured right after the builder call on success and failure alike.
-
-    Before any work the package must resolve through
-    ``tools._resolve_package_dir_no_alias``. The shared by-name resolver refuses
-    an internal alias exactly as every summary route does.
-
-    The ``.env`` is read for its VALUES (and refused if unreadable, or over the
-    BYTE ceiling promote itself applies -- R5-3, so a ``.env`` promote would refuse
-    never buys a whole session first) BEFORE anything else, and every value in it
-    is registered as an in-flight secret for the WHOLE window, discarded value by
-    value in the ``finally``. That
-    read is NOT how the file is preserved -- the FILE is copied byte-for-byte at
-    promote time (``_preserve_env_file``, R2-1), and the two concerns stay apart:
-    values are parsed, the file is copied. D40 requires the registration
-    for a window that install does not have: the swap parks the old package in a
-    DOT-prefixed backup, and ``known_secret_values`` skips dot-directories, so
-    for the length of that swap the tool's own credentials would otherwise be
-    unknown to the redactor -- while the builder conversation is still being
-    recorded. Registering them up front also makes them redactable in every
-    prompt/response of the session, and makes the embedded-secret gate refuse a
-    revision that copied them into a file.
-
-    That same policy is re-applied at PROMOTE, to the bytes actually being
-    published (R7-2): this entry gate answers for the file it read, and an
-    operator can put a different one there while the session runs -- including on
-    a package that had no ``.env`` at all when it started. See
-    ``_preserve_env_file`` for the half of that hazard which IS closable, and
-    裁決紀錄 #6 for the half which is not.
-
-    A value the redactors could not mask refuses the whole session, whether it is
-    too SHORT for them to look at (R1-1) or SPELLED by its own assignment line in a
-    way this system would not write (R5-1, narrowed to that LINE by R6-1 -- a
-    comment elsewhere in the file repeating the value vouched for nothing -- and to
-    EXACT equality with a spelling we can generate ourselves by R7-1, after a
-    comment on the SAME line vouched for one too) --
-    one policy, one gate,
-    ``_unmaskable_env_error``. Registration is not protection on its own, and this
-    path hands every one of those values to ``run_shell``, whose output is wrapped
-    verbatim into the next round's prompt, recorded into the AI 日誌 attempt
-    bodies, and can reach ``InstallResult.summary`` -> the job poll -> the sidecar.
-    So the only two honest options are "do not run" and "leak". Both halves are the
-    SAME rule the INSTALL path already applies at its own entry -- the form's
-    ``schemas._SECRET_VALUE_MIN_LEN`` floor, and ``_dotenv_serialize_value``'s
-    refusal to write a spelling whose escapes fire -- with the difference that
-    install WRITES the file and a revise INHERITS whatever a hand-edit left in it.
-    INSTALL is structurally clear of both: its staging is built EMPTY
-    (``staging.mkdir``) and ``_promote_staging`` refuses a name that already
-    exists, so it never inherits a pre-existing package's ``.env``, and the only
-    value it puts there is the form secret the schema floored and the serializer
-    round-trip-checked.
+    The initially resolved version supplies the build content and identity. The
+    package toggle and ``.env`` remain package-layer state throughout.
     """
     base = tools.tools_dir()
     if base is None:
         return InstallOutcome(ok=False, error=_ERROR_TOOLS_DISABLED)
 
-    directory = await run_in_threadpool(tools._resolve_package_dir_no_alias, name)
-    if directory is None:
+    package_root = await run_in_threadpool(tools._resolve_package_dir_no_alias, name)
+    if package_root is None:
+        return InstallOutcome(ok=False, error=_ERROR_REVISE_NOT_FOUND)
+    resolution = await run_in_threadpool(tools.resolve_current, package_root)
+    if isinstance(resolution, tools.Unresolved):
         return InstallOutcome(ok=False, error=_ERROR_REVISE_NOT_FOUND)
     # ONE worker hop does the read AND the dotenv parse (R4-3): the parse is real
     # work on a 64 KiB file and this job shares the loop with every request.
-    # ``env_existed_at_start`` is the READ's answer, not the parse's -- an empty or
-    # comment-only ``.env`` parses to {} and still EXISTED -- and it is carried down
-    # to the promote because "there is no ``.env`` now" is ambiguous by then: a
-    # package that never had one may ship the builder's, but one whose ``.env`` the
-    # operator DELETED mid-session must not have a placeholder put in its place
-    # (R3-1). VALUES only: the FILE is copied at promote time. Empty values
-    # contribute nothing to redaction and are not registered, matching
-    # tools._cached_env_values' own "a KEY= line contributes nothing" rule.
+    # VALUES only: the package-layer FILE is never copied or rewritten by revise.
+    # Empty values contribute nothing to redaction and are not registered,
+    # matching tools._cached_env_values' own "a KEY= line contributes nothing"
+    # rule.
     # R10-1: the identity of the package we are about to revise, taken BEFORE the
     # session and re-checked before the swap. An operator can delete and reinstall
     # the tool during the minutes a build runs, and a name is not an identity.
-    package_identity = await run_in_threadpool(_package_identity, directory)
+    package_identity = await run_in_threadpool(_package_identity, resolution.version_root)
     if package_identity is None:
         # Uncertainty REFUSES here like everywhere else on this path (R11-2). A
         # package whose manifest we cannot even stat is either broken (the
@@ -3295,8 +2467,8 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
         # would have to either wave the swap through -- exactly the loss R10-1
         # closed -- or refuse after burning the whole build.
         return InstallOutcome(ok=False, error=_ERROR_REVISE_IDENTITY_UNKNOWN)
-    env_existed_at_start, env_values, env_text, env_error = await run_in_threadpool(
-        _read_env_for_values, directory
+    _env_existed, env_values, env_text, env_error = await run_in_threadpool(
+        _read_env_for_values, package_root.path
     )
     if env_error is not None:
         return InstallOutcome(ok=False, error=env_error)
@@ -3318,14 +2490,20 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
     for value in registered:
         tools.register_inflight_secret(value)
 
-    staging = base / _STAGING_DIRNAME / uuid4().hex
+    session_root = base / _STAGING_DIRNAME / uuid4().hex
+    build_root = tools.BuildRoot(session_root / "build")
+    shell_root = session_root / "shell"
     try:
-        copy_error = await run_in_threadpool(_copy_package_into_staging, directory, staging)
+        copy_error = await run_in_threadpool(
+            _copy_package_into_staging, resolution.version_root, build_root
+        )
         if copy_error is not None:
             return InstallOutcome(ok=False, error=copy_error)
 
         settings = get_settings()
-        manifest_text = await run_in_threadpool(_current_manifest_text, directory)
+        manifest_text = await run_in_threadpool(
+            _current_manifest_text, resolution.version_root.path
+        )
         # BOTH prompt builds are BLOCKING work, not the pure string joins they look
         # like (R1-3): each goes through ``tools.redact_known_secrets``, which calls
         # ``known_secret_values`` -- an ``iterdir`` of the whole tools directory plus
@@ -3349,7 +2527,7 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
                 # The whole existing .env goes into run_shell's environment (never
                 # into a prompt), so the model can live-test the real API against
                 # the tool's own credentials without the file being in staging.
-                tools=_build_meta_tools(staging, secret_env=env_values or None),
+                tools=_build_meta_tools(build_root.path, secret_env=env_values or None),
                 max_tool_rounds=settings.tool_install_max_rounds,
                 timeout_seconds=settings.tool_install_timeout_seconds,
             )
@@ -3407,21 +2585,16 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
                 llm_log_id=llm_log_id,
             )
 
-        # The origin comes back from the promote's last-moment sidecar read, not
-        # from an earlier read that could go stale during the builder session.
+        # The publisher reads immutable provenance from the version whose identity
+        # was captured before the builder session.
         origin, promote_error = await run_in_threadpool(
-            _promote_staging_replace,
-            staging,
-            name,
-            base,
-            env_existed_at_start=env_existed_at_start,
-            package_identity=package_identity,
-            # The promote re-vets the ``.env`` it is about to ship and registers
-            # whatever it finds there (R7-2). It appends to THIS list, so the
-            # ``finally`` below discards those values too -- the alternative,
-            # handing them back through the return, would leak a registration on
-            # any path that did not reach the return.
-            registered=registered,
+            _publish_revised_version,
+            build_root,
+            shell_root,
+            package_root,
+            resolution,
+            package_identity,
+            feedback,
         )
         if promote_error is not None:
             return InstallOutcome(
@@ -3440,16 +2613,12 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
         await tool_meta.generate_and_store_summary(name, origin=origin, builder_summary=summary)
         return InstallOutcome(ok=True, tool_name=name, summary=summary, llm_log_id=llm_log_id)
     finally:
-        # Mirror run_install's order: drop the in-flight secrets first (the
-        # preserved .env carries them again, so known_secret_values covers them
-        # through its own scan), then clean staging. A successful swap consumed
-        # the staging dir; every other exit removes the build. The list may have
-        # GROWN since it was built -- the promote appends whatever the shipped
-        # ``.env`` turned out to hold (R7-2) -- which is the point of passing it
-        # down rather than returning those values.
+        # The package .env was untouched, so its live scan keeps covering these
+        # values after the temporary registrations are dropped. Cleanup always
+        # targets the complete session root, including any unused shell.
         for value in registered:
             tools.discard_inflight_secret(value)
-        await run_in_threadpool(_cleanup_staging, staging, base)
+        await run_in_threadpool(_cleanup_staging, session_root, base)
 
 
 # --- background jobs ---------------------------------------------------------

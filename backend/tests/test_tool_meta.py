@@ -39,6 +39,8 @@ from afterthread.services.tool_meta import (
     regenerate_summary,
 )
 
+_TEST_VID = "20260728T010203Z-abcdef"
+
 
 @pytest.fixture(autouse=True)
 def _reset_singletons() -> Generator[None]:
@@ -71,7 +73,22 @@ def _write_meta(pkg: Path, **fields: Any) -> bool:
     The writer refuses a meta without a string ``updated_at`` (it will not invent
     a timestamp on a caller's behalf), so tests seed a sidecar through here and
     state only the fields under test."""
-    return tools.write_tool_meta(pkg, {"updated_at": "2026-01-01T00:00:00+00:00", **fields})
+    origin = fields.pop("origin", None)
+    if isinstance(origin, dict) and not tools.write_origin_meta(
+        tools.BuildRoot(pkg),
+        {
+            "source": origin.get("source", "test-fixture"),
+            "openapi_url": origin.get("openapi_url"),
+            "instructions": origin.get("instructions"),
+            "feedback": origin.get("feedback"),
+            "previous": origin.get("previous"),
+        },
+    ):
+        return False
+    return tools.write_tool_meta(
+        tools.VersionRoot(pkg),
+        {"updated_at": "2026-01-01T00:00:00+00:00", **fields},
+    )
 
 
 def _package(
@@ -80,8 +97,10 @@ def _package(
     *,
     run_py: str = "import sys\nsys.stdout.write('x')\n",
     dotenv: str | None = None,
+    origin: dict[str, Any] | None = None,
 ) -> Path:
-    pkg = root / name
+    package = root / name
+    pkg = package / tools._VERSIONS_DIRNAME / _TEST_VID
     pkg.mkdir(parents=True)
     (pkg / "run.py").write_text(run_py, encoding="utf-8")
     (pkg / "tool.json").write_text(
@@ -95,9 +114,48 @@ def _package(
         ),
         encoding="utf-8",
     )
+    version_meta = pkg / tools._META_DIRNAME
+    version_meta.mkdir()
+    origin_document = {
+        "source": "test-fixture",
+        "openapi_url": None,
+        "instructions": None,
+        "feedback": None,
+        "previous": None,
+    }
+    if origin is not None:
+        origin_document.update(origin)
+    (version_meta / tools._ORIGIN_FILENAME).write_text(
+        json.dumps(origin_document),
+        encoding="utf-8",
+    )
+    package_meta = package / tools._META_DIRNAME
+    package_meta.mkdir()
+    (package_meta / tools._CURRENT_FILENAME).write_text(f"{_TEST_VID}\n", encoding="ascii")
+    (package_meta / tools._PACKAGE_STATE_FILENAME).write_text(
+        json.dumps(
+            {
+                tools._STATE_MARKER_KEY: tools._STATE_MARKER_VALUE,
+                "enabled": True,
+            }
+        ),
+        encoding="utf-8",
+    )
     if dotenv is not None:
-        (pkg / ".env").write_text(dotenv, encoding="utf-8")
+        (package / ".env").write_text(dotenv, encoding="utf-8")
     return pkg
+
+
+def _package_root(version: Path) -> tools.PackageRoot:
+    return tools.PackageRoot(version.parents[1])
+
+
+def _version_root(version: Path) -> tools.VersionRoot:
+    return tools.VersionRoot(version)
+
+
+def _installed_version(root: Path, name: str = "kbsearch") -> tools.VersionRoot:
+    return tools.VersionRoot(root / name / tools._VERSIONS_DIRNAME / _TEST_VID)
 
 
 def _fake_generate(
@@ -381,7 +439,8 @@ def test_user_prompt_carries_the_package_but_never_env_values(
 
     prompt = tool_meta._summary_user_prompt(
         "kbsearch",
-        pkg,
+        _package_root(pkg),
+        _version_root(pkg),
         origin={"openapi_url": "http://kb.example/openapi.json", "instructions": "查 KB"},
         builder_summary="built and tested",
     )
@@ -406,7 +465,9 @@ def test_user_prompt_skips_the_sidecar_and_dot_files(
     _write_meta(pkg, summary="PREVIOUS-SUMMARY-TEXT")
     (pkg / ".hidden-note").write_text("HIDDEN-FILE-TEXT", encoding="utf-8")
 
-    prompt = tool_meta._summary_user_prompt("kbsearch", pkg, origin=None, builder_summary=None)
+    prompt = tool_meta._summary_user_prompt(
+        "kbsearch", _package_root(pkg), _version_root(pkg), origin=None, builder_summary=None
+    )
 
     assert "PREVIOUS-SUMMARY-TEXT" not in prompt
     assert "HIDDEN-FILE-TEXT" not in prompt
@@ -424,7 +485,9 @@ def test_user_prompt_redacts_known_secrets_in_files(
     pkg = _package(root, "kbsearch", run_py=f"TOKEN = '{secret}'\n")
     _summary_settings(monkeypatch, root)
 
-    prompt = tool_meta._summary_user_prompt("kbsearch", pkg, origin=None, builder_summary=None)
+    prompt = tool_meta._summary_user_prompt(
+        "kbsearch", _package_root(pkg), _version_root(pkg), origin=None, builder_summary=None
+    )
     assert secret not in prompt
     assert tools._REDACTION_MARKER in prompt
 
@@ -446,7 +509,8 @@ def test_user_prompt_redacts_the_operator_supplied_origin(
 
     prompt = tool_meta._summary_user_prompt(
         "kbsearch",
-        pkg,
+        _package_root(pkg),
+        _version_root(pkg),
         origin={
             "openapi_url": f"https://kb.example/openapi.json?token={secret}",
             "instructions": f"用 {secret} 認證",
@@ -498,7 +562,11 @@ def test_user_prompt_drops_url_credentials_redaction_cannot_reach(
     monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({"abc123+/XYZ"}))
 
     prompt = tool_meta._summary_user_prompt(
-        "kbsearch", pkg, origin={"openapi_url": url}, builder_summary=None
+        "kbsearch",
+        _package_root(pkg),
+        _version_root(pkg),
+        origin={"openapi_url": url},
+        builder_summary=None,
     )
 
     assert needle not in prompt
@@ -522,7 +590,11 @@ def test_user_prompt_omits_an_unusable_origin_url(
     _summary_settings(monkeypatch, root)
 
     prompt = tool_meta._summary_user_prompt(
-        "kbsearch", pkg, origin={"openapi_url": url}, builder_summary=None
+        "kbsearch",
+        _package_root(pkg),
+        _version_root(pkg),
+        origin={"openapi_url": url},
+        builder_summary=None,
     )
 
     assert "It was built from this OpenAPI document" not in prompt
@@ -542,7 +614,9 @@ def test_user_prompt_redacts_a_filename_carrying_a_secret(
     _summary_settings(monkeypatch, root)
     monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
 
-    prompt = tool_meta._summary_user_prompt("kbsearch", pkg, origin=None, builder_summary=None)
+    prompt = tool_meta._summary_user_prompt(
+        "kbsearch", _package_root(pkg), _version_root(pkg), origin=None, builder_summary=None
+    )
     assert secret not in prompt
     assert tools._REDACTION_MARKER in prompt
 
@@ -569,7 +643,9 @@ def test_user_prompt_scrubs_a_non_utf8_filename_header(
     decoded_name = os.fsdecode(raw_name)
     assert "\udcff" in decoded_name  # sanity: this OS really does surrogateescape it
 
-    prompt = tool_meta._summary_user_prompt("kbsearch", pkg, origin=None, builder_summary=None)
+    prompt = tool_meta._summary_user_prompt(
+        "kbsearch", _package_root(pkg), _version_root(pkg), origin=None, builder_summary=None
+    )
 
     prompt.encode("utf-8")  # the real proof: a lone surrogate would raise here
     assert "\udcff" not in prompt
@@ -594,7 +670,9 @@ def test_user_prompt_final_pass_masks_a_field_no_call_site_redacts(
     _summary_settings(monkeypatch, root)
     monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
 
-    prompt = tool_meta._summary_user_prompt(secret, pkg, origin=None, builder_summary=None)
+    prompt = tool_meta._summary_user_prompt(
+        secret, _package_root(pkg), _version_root(pkg), origin=None, builder_summary=None
+    )
     assert secret not in prompt
     assert tools._REDACTION_MARKER in prompt
 
@@ -609,7 +687,9 @@ def test_user_prompt_bounded_by_the_prompt_budget(
     (pkg / "extra.py").write_text("w" * (tool_meta._FILE_CONTENT_CAP * 2), encoding="utf-8")
     _summary_settings(monkeypatch, root, llm_prompt_budget_tokens=4_000)
 
-    prompt = tool_meta._summary_user_prompt("kbsearch", pkg, origin=None, builder_summary=None)
+    prompt = tool_meta._summary_user_prompt(
+        "kbsearch", _package_root(pkg), _version_root(pkg), origin=None, builder_summary=None
+    )
     assert len(prompt) <= 4_000
 
 
@@ -641,7 +721,8 @@ def test_user_prompt_budget_cut_eats_context_not_the_package(
 
     prompt = tool_meta._summary_user_prompt(
         "kbsearch",
-        pkg,
+        _package_root(pkg),
+        _version_root(pkg),
         origin={"openapi_url": "http://kb.example/o.json", "instructions": instructions},
         builder_summary=None,
     )
@@ -674,25 +755,29 @@ def test_generate_and_store_summary_writes_a_sidecar(
     """The happy path: a sidecar carrying the summary, the origin, and a
     link to the summary session's own AI 日誌 record."""
     root = tmp_path / "tools"
-    pkg = _package(root)
+    origin = {
+        "source": "builder-install",
+        "openapi_url": "http://kb.example/openapi.json",
+        "instructions": "查 KB",
+        "feedback": None,
+        "previous": None,
+    }
+    pkg = _package(root, origin=origin)
     _summary_settings(monkeypatch, root)
     captured = _fake_generate(monkeypatch, summary="這個工具會查 KB")
 
     asyncio.run(
         generate_and_store_summary(
             "kbsearch",
-            origin={"openapi_url": "http://kb.example/openapi.json", "instructions": "查 KB"},
+            origin=origin,
             builder_summary="built it",
         )
     )
 
-    meta = tools.read_tool_meta(pkg)
+    meta = tools.read_tool_meta(_version_root(pkg))
     assert meta is not None
     assert meta["summary"] == "這個工具會查 KB"
-    assert meta["origin"] == {
-        "openapi_url": "http://kb.example/openapi.json",
-        "instructions": "查 KB",
-    }
+    assert meta["origin"] == origin
     assert meta["updated_at"]
     # Linked to the genuine record of THIS session, found by its own workflow name.
     assert meta["llm_log_id"] == llm_log.last_record_id_for_workflow("tool_summary")
@@ -740,10 +825,11 @@ def test_generate_and_store_summary_preserves_origin(
     _fake_generate(monkeypatch, summary="新的")
     asyncio.run(generate_and_store_summary("kbsearch", origin=None))
 
-    meta = tools.read_tool_meta(pkg)
+    meta = tools.read_tool_meta(_version_root(pkg))
     assert meta is not None
     assert meta["summary"] == "新的"
-    assert meta["origin"] == origin  # inherited, never erased
+    assert meta["origin"]["openapi_url"] == origin["openapi_url"]
+    assert meta["origin"]["instructions"] == origin["instructions"]
 
 
 def test_generate_and_store_summary_writes_placeholder_when_no_sidecar_yet(
@@ -752,17 +838,18 @@ def test_generate_and_store_summary_writes_placeholder_when_no_sidecar_yet(
     """A failed FIRST generation still leaves a sidecar (empty summary + origin
     + the failed session's log id), so the page can offer 重新產生."""
     root = tmp_path / "tools"
-    pkg = _package(root)
+    pkg = _package(root, origin={"instructions": "查 KB"})
     _summary_settings(monkeypatch, root)
     _fake_generate(monkeypatch, explode=LLMNotConfiguredError("nope"))
 
     asyncio.run(generate_and_store_summary("kbsearch", origin={"instructions": "查 KB"}))
 
-    meta = tools.read_tool_meta(pkg)
+    meta = tools.read_tool_meta(_version_root(pkg))
     assert meta is not None
     assert meta["summary"] == ""
     # Narrowed on the way to disk: both known fields, the absent one null.
-    assert meta["origin"] == {"openapi_url": None, "instructions": "查 KB"}
+    assert meta["origin"]["instructions"] == "查 KB"
+    assert meta["origin"]["openapi_url"] is None
     # The failed session's TRACE is linked too -- and that is what makes this a
     # placeholder rather than the origin-only file the same call already wrote
     # before the round trip (O8-1). Left to the "only when no sidecar exists"
@@ -808,7 +895,7 @@ def test_placeholder_carries_no_log_id_when_the_prompt_build_failed(
     leaves the SIDECAR writer working -- that test keeps the secret provider down,
     so no placeholder is written at all and this path stayed uncovered."""
     root = tmp_path / "tools"
-    pkg = _package(root)
+    pkg = _package(root, origin={"instructions": "查 KB"})
     _summary_settings(monkeypatch, root)
     previous = _seed_previous_summary_session()
 
@@ -823,10 +910,11 @@ def test_placeholder_carries_no_log_id_when_the_prompt_build_failed(
 
     asyncio.run(generate_and_store_summary("kbsearch", origin={"instructions": "查 KB"}))
 
-    meta = tools.read_tool_meta(pkg)
+    meta = tools.read_tool_meta(_version_root(pkg))
     assert meta is not None
     assert meta["summary"] == ""  # the placeholder really was written ...
-    assert meta["origin"] == {"openapi_url": None, "instructions": "查 KB"}
+    assert meta["origin"]["instructions"] == "查 KB"
+    assert meta["origin"]["openapi_url"] is None
     assert meta["llm_log_id"] is None  # ... with no trace, rather than someone else's
     # The other tool's record is still the workflow's newest, so a regression
     # here borrows THAT id visibly rather than silently having nothing to take.
@@ -849,7 +937,7 @@ def test_placeholder_carries_its_own_session_when_the_llm_call_failed(
 
     asyncio.run(generate_and_store_summary("kbsearch", origin={"instructions": "查 KB"}))
 
-    meta = tools.read_tool_meta(pkg)
+    meta = tools.read_tool_meta(_version_root(pkg))
     assert meta is not None
     assert meta["llm_log_id"] == llm_log.last_record_id_for_workflow("tool_summary")
     assert meta["llm_log_id"] != previous  # this call's own session, not the older one
@@ -868,7 +956,7 @@ def test_generate_and_store_summary_never_clobbers_a_good_summary(
     _fake_generate(monkeypatch, explode=LLMUpstreamError("APIConnectionError: unreachable"))
     asyncio.run(generate_and_store_summary("kbsearch"))
 
-    meta = tools.read_tool_meta(pkg)
+    meta = tools.read_tool_meta(_version_root(pkg))
     assert meta is not None
     assert meta["summary"] == "先前的好總結"
 
@@ -908,7 +996,7 @@ def test_generate_and_store_summary_never_raises_when_prompt_building_explodes(
 
     asyncio.run(generate_and_store_summary("kbsearch"))  # must not raise
     # Nothing could be written either (the sidecar write is fail-closed too).
-    assert not (pkg / tools._AI_META_FILENAME).exists()
+    assert not (pkg / tools._META_DIRNAME / tools._SUMMARY_FILENAME).exists()
 
 
 def test_generate_and_store_summary_ignores_a_refused_write(
@@ -958,7 +1046,7 @@ def test_generate_and_store_summary_redacts_into_the_sidecar(
 
     asyncio.run(generate_and_store_summary("kbsearch"))
 
-    stored = (pkg / tools._AI_META_FILENAME).read_text(encoding="utf-8")
+    stored = (pkg / tools._META_DIRNAME / tools._SUMMARY_FILENAME).read_text(encoding="utf-8")
     assert secret not in stored
     assert tools._REDACTION_MARKER in stored
 
@@ -981,8 +1069,9 @@ def test_regenerate_summary_returns_the_fresh_meta(
     assert meta["summary"] == "新的說明"
     # Carried back from the install, in the narrowed shape the writer stores
     # (both known fields, the absent one explicitly null).
-    assert meta["origin"] == {"openapi_url": None, "instructions": "查 KB"}
-    assert tools.read_tool_meta(pkg) == meta  # what it returned IS what it stored
+    assert meta["origin"]["instructions"] == "查 KB"
+    assert meta["origin"]["openapi_url"] is None
+    assert tools.read_tool_meta(_version_root(pkg)) == meta  # what it returned IS what it stored
 
 
 def test_regenerate_summary_feeds_the_stored_origin_back_into_the_prompt(
@@ -1034,16 +1123,16 @@ def test_regenerate_summary_sanitizes_a_legacy_origin_url(
     root = tmp_path / "tools"
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
-    # Written by hand: a legacy raw URL is exactly what our writer no longer
-    # produces, so this is the only way to get one onto disk.
-    (pkg / tools._AI_META_FILENAME).write_text(
+    # Written by hand: a legacy raw URL is exactly what the current publisher no
+    # longer produces, so this is the only way to get one into committed origin.
+    (pkg / tools._META_DIRNAME / tools._ORIGIN_FILENAME).write_text(
         json.dumps(
             {
-                "summary": "舊的",
-                "origin": {
-                    "openapi_url": "https://ops:LEGACY-BASIC@kb.example/o.json?token=LEGACY-TOKEN",
-                    "instructions": "ORIGIN-INSTRUCTIONS-MARKER",
-                },
+                "source": "legacy",
+                "openapi_url": "https://ops:LEGACY-BASIC@kb.example/o.json?token=LEGACY-TOKEN",
+                "instructions": "ORIGIN-INSTRUCTIONS-MARKER",
+                "feedback": None,
+                "previous": None,
             }
         ),
         encoding="utf-8",
@@ -1056,12 +1145,15 @@ def test_regenerate_summary_sanitizes_a_legacy_origin_url(
     assert "LEGACY-BASIC" not in captured["user_prompt"]
     assert "https://kb.example" in captured["user_prompt"]
     assert "o.json" not in captured["user_prompt"]  # r5: the path is gone too
-    # ... and the rewritten sidecar carries the reduced URL, not the raw one.
+    # Origin is the immutable commit marker: prompt construction sanitizes its
+    # view without rewriting committed provenance.
     assert isinstance(meta, dict)
     stored_url = meta["origin"]["openapi_url"]
-    assert stored_url == "https://kb.example" + tool_meta._ORIGIN_URL_TRIMMED_MARKER
+    assert stored_url == ("https://ops:LEGACY-BASIC@kb.example/o.json?token=LEGACY-TOKEN")
     assert meta["origin"]["instructions"] == "ORIGIN-INSTRUCTIONS-MARKER"
-    assert "LEGACY-TOKEN" not in (pkg / tools._AI_META_FILENAME).read_text(encoding="utf-8")
+    assert "LEGACY-TOKEN" in (pkg / tools._META_DIRNAME / tools._ORIGIN_FILENAME).read_text(
+        encoding="utf-8"
+    )
 
 
 def test_regenerate_summary_ignores_an_unusable_stored_origin(
@@ -1078,7 +1170,7 @@ def test_regenerate_summary_ignores_an_unusable_stored_origin(
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
     origin = {"openapi_url": 12, "junk": "JUNK-MARKER"}
-    (pkg / tools._AI_META_FILENAME).write_text(
+    (pkg / tools._META_DIRNAME / tools._SUMMARY_FILENAME).write_text(
         json.dumps({"summary": "舊的", "origin": origin}), encoding="utf-8"
     )
     captured = _fake_generate(monkeypatch, summary="新的說明")
@@ -1089,8 +1181,9 @@ def test_regenerate_summary_ignores_an_unusable_stored_origin(
     assert isinstance(meta, dict)
     # Inherited (never overwritten by {}), then narrowed on the way to disk: the
     # junk key is dropped and the unreadable field lands as an explicit null.
-    assert meta["origin"] == {"openapi_url": None, "instructions": None}
-    assert tools.read_tool_meta(pkg) == meta
+    assert meta["origin"]["openapi_url"] is None
+    assert meta["origin"]["instructions"] is None
+    assert tools.read_tool_meta(_version_root(pkg)) == meta
 
 
 def test_regenerate_summary_refuses_an_internal_alias(
@@ -1111,7 +1204,7 @@ def test_regenerate_summary_refuses_an_internal_alias(
     monkeypatch.setattr("afterthread.services.tool_meta.generate_structured", must_not_generate)
 
     assert asyncio.run(regenerate_summary("alias")) is None
-    meta = tools.read_tool_meta(pkg)
+    meta = tools.read_tool_meta(_version_root(pkg))
     assert meta is not None
     assert meta["summary"] == "真的說明"  # the real sidecar is untouched
 
@@ -1141,7 +1234,7 @@ def test_regenerate_summary_propagates_llm_failures_without_clobbering(
     with pytest.raises(expected):
         asyncio.run(regenerate_summary("kbsearch"))
 
-    meta = tools.read_tool_meta(pkg)
+    meta = tools.read_tool_meta(_version_root(pkg))
     assert meta is not None
     assert meta["summary"] == "先前的好總結"
 
@@ -1225,7 +1318,7 @@ def test_regenerate_summary_writes_nothing_when_the_package_was_replaced(
 
     assert asyncio.run(regenerate_summary("kbsearch")) is None
 
-    stored = tools.read_tool_meta(replaced["pkg"])
+    stored = tools.read_tool_meta(_version_root(replaced["pkg"]))
     assert stored is not None
     assert stored["summary"] == "新工具自己的總結"  # B's own sidecar, untouched
 
@@ -1254,10 +1347,10 @@ def test_generate_and_store_summary_writes_nothing_when_the_package_was_replaced
 
     asyncio.run(generate_and_store_summary("kbsearch", origin={"instructions": "查 A"}))
 
-    stored = tools.read_tool_meta(root / "kbsearch")
+    stored = tools.read_tool_meta(_installed_version(root))
     assert stored is not None
     assert stored["summary"] == "新工具自己的總結"
-    assert stored["origin"] is None  # A's install context never reached B
+    assert stored["origin"]["source"] == "test-fixture"  # A's context never reached B
 
 
 def test_generate_and_store_summary_placeholder_respects_the_replacement(
@@ -1288,7 +1381,7 @@ def test_generate_and_store_summary_placeholder_respects_the_replacement(
 
     asyncio.run(generate_and_store_summary("kbsearch", origin={"instructions": "查 A"}))
 
-    assert tools.read_tool_meta(root / "kbsearch") is None  # B got no sidecar at all
+    assert tools.read_tool_meta(_installed_version(root)) is None  # B got no sidecar at all
 
 
 def test_the_install_origin_reaches_disk_before_the_llm_round_trip(
@@ -1303,13 +1396,13 @@ def test_the_install_origin_reaches_disk_before_the_llm_round_trip(
     regenerable half alone. Observed from INSIDE the stubbed generation, which is
     exactly the window the real round trip occupies."""
     root = tmp_path / "tools"
-    pkg = _package(root)
-    _summary_settings(monkeypatch, root)
     origin = {"openapi_url": "http://kb.example", "instructions": "查 KB"}
+    pkg = _package(root, origin=origin)
+    _summary_settings(monkeypatch, root)
     seen: dict[str, Any] = {}
 
     def look_at_the_sidecar() -> None:
-        seen["meta"] = tools.read_tool_meta(pkg)
+        seen["meta"] = tools.read_tool_meta(_version_root(pkg))
 
     _fake_generate(monkeypatch, summary="這個工具會查 KB", side_effect=look_at_the_sidecar)
 
@@ -1317,7 +1410,8 @@ def test_the_install_origin_reaches_disk_before_the_llm_round_trip(
 
     early = seen["meta"]
     assert early is not None
-    assert early["origin"] == origin
+    assert early["origin"]["openapi_url"] == origin["openapi_url"]
+    assert early["origin"]["instructions"] == origin["instructions"]
     # ORIGIN ONLY: nothing has been generated yet, and no summary session has
     # finished, so there is no log id to vouch for either.
     assert early["summary"] == ""
@@ -1326,10 +1420,11 @@ def test_the_install_origin_reaches_disk_before_the_llm_round_trip(
 
     # ...and the ordinary path still ends with the FULL meta. The early write is
     # an ADDITION, not a replacement: it costs no field of the final one.
-    final = tools.read_tool_meta(pkg)
+    final = tools.read_tool_meta(_version_root(pkg))
     assert final is not None
     assert final["summary"] == "這個工具會查 KB"
-    assert final["origin"] == origin
+    assert final["origin"]["openapi_url"] == origin["openapi_url"]
+    assert final["origin"]["instructions"] == origin["instructions"]
     assert final["llm_log_id"] == llm_log.last_record_id_for_workflow("tool_summary")
     assert final["llm_log_process"] == llm_log.process_token()
 
@@ -1360,11 +1455,11 @@ def test_an_enabled_toggle_during_the_generation_now_costs_nothing_at_all(
     Driven from INSIDE the generation, not by racing a thread, so it is the window
     itself that is pinned."""
     root = tmp_path / "tools"
-    pkg = _package(root)
-    _summary_settings(monkeypatch, root)
     origin = {"openapi_url": "http://kb.example", "instructions": "查 KB"}
+    pkg = _package(root, origin=origin)
+    _summary_settings(monkeypatch, root)
     manifest_before = (pkg / "tool.json").read_bytes()
-    identity_before = tools.package_identity(pkg)
+    identity_before = tools.package_identity(_version_root(pkg))
 
     def toggle_mid_call() -> None:
         assert tools.set_enabled("kbsearch", False) is True
@@ -1376,12 +1471,13 @@ def test_an_enabled_toggle_during_the_generation_now_costs_nothing_at_all(
     # nothing the sidecar's identity guard looks at.
     assert {t["name"]: t["enabled"] for t in tools.list_tools()}["kbsearch"] is False
     assert (pkg / "tool.json").read_bytes() == manifest_before
-    assert tools.package_identity(pkg) == identity_before
+    assert tools.package_identity(_version_root(pkg)) == identity_before
 
-    after = tools.read_tool_meta(pkg)
+    after = tools.read_tool_meta(_version_root(pkg))
     assert after is not None
     assert after["summary"] == "這個工具會查 KB"  # the regenerable half: no longer lost
-    assert after["origin"] == origin  # the un-regenerable half: still safe (r8)
+    assert after["origin"]["openapi_url"] == origin["openapi_url"]
+    assert after["origin"]["instructions"] == origin["instructions"]
 
     # And the recovery path really can read it back -- which is the whole reason
     # the origin is worth saving: a later regeneration feeds it into its own prompt
@@ -1390,7 +1486,8 @@ def test_an_enabled_toggle_during_the_generation_now_costs_nothing_at_all(
     meta = asyncio.run(regenerate_summary("kbsearch"))
     assert isinstance(meta, dict)
     assert meta["summary"] == "重新產生的說明"
-    assert meta["origin"] == origin
+    assert meta["origin"]["openapi_url"] == origin["openapi_url"]
+    assert meta["origin"]["instructions"] == origin["instructions"]
     assert "http://kb.example" in captured["user_prompt"]
     assert "查 KB" in captured["user_prompt"]
 
@@ -1417,7 +1514,7 @@ def test_summary_paths_refuse_a_package_with_no_manifest_before_the_llm_call(
     asyncio.run(generate_and_store_summary("kbsearch", origin=None))  # must not raise
 
     assert captured == {}  # no LLM session was started by either path
-    assert tools.read_tool_meta(pkg) is None
+    assert tools.read_tool_meta(_version_root(pkg)) is None
 
 
 def test_regenerate_summary_builds_the_prompt_off_the_event_loop(

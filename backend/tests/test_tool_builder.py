@@ -28,7 +28,6 @@ import os
 import shutil
 import socket
 import sys
-import tempfile
 import threading
 import time
 from collections.abc import Callable, Generator
@@ -56,6 +55,8 @@ from afterthread.services.tool_builder import (
     _resolve_in_staging,
     run_install,
 )
+
+_TEST_VID = "20260728T010203Z-abcdef"
 
 
 @pytest.fixture(autouse=True)
@@ -679,8 +680,9 @@ def test_run_install_happy_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     assert outcome.tool_name == "kbsearch"
     assert outcome.summary == "built and tested"
     assert outcome.llm_log_id is not None  # linked to the genuine session record
-    assert (root / "kbsearch" / "tool.json").is_file()
-    assert (root / "kbsearch" / "run.py").is_file()
+    installed = _resolved_version(root / "kbsearch")
+    assert (installed / "tool.json").is_file()
+    assert (installed / "run.py").is_file()
     listed = tools.list_tools()
     assert [(t["name"], t["valid"], t["enabled"]) for t in listed] == [("kbsearch", True, True)]
     assert not (root / ".staging").exists()  # staging fully cleaned
@@ -712,12 +714,15 @@ def test_run_install_writes_the_summary_sidecar(
     outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build a search tool"))
 
     assert outcome.ok is True
-    meta = tools.read_tool_meta(root / "kbsearch")
+    meta = tools.read_tool_meta(tools.VersionRoot(_resolved_version(root / "kbsearch")))
     assert meta is not None
     assert meta["summary"] == "這個工具會查 KB"
     assert meta["origin"] == {
+        "source": "builder-install",
         "openapi_url": "http://kb.example" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
         "instructions": "build a search tool",
+        "feedback": None,
+        "previous": None,
     }
     assert meta["llm_log_id"] == llm_log.last_record_id_for_workflow("tool_summary")
     # The sidecar is invisible to the registry: still exactly one valid package.
@@ -768,12 +773,13 @@ def test_run_install_never_captures_url_credentials(
     )
 
     assert outcome.ok is True
-    meta = tools.read_tool_meta(root / "kbsearch")
+    version = _resolved_version(root / "kbsearch")
+    meta = tools.read_tool_meta(tools.VersionRoot(version))
     assert meta is not None
     assert meta["origin"]["openapi_url"] == (
         "https://kb.example" + tool_meta._ORIGIN_URL_TRIMMED_MARKER
     )
-    sidecar = (root / "kbsearch" / tools._AI_META_FILENAME).read_text(encoding="utf-8")
+    sidecar = (version / tools._META_DIRNAME / tools._SUMMARY_FILENAME).read_text(encoding="utf-8")
     assert "openapi.json" not in sidecar  # r5: the path is gone, not just the query
     for credential in ("PRESIGNED-abcdef", "BASIC-CREDENTIAL"):
         assert credential not in sidecar
@@ -805,8 +811,9 @@ def test_run_install_success_survives_a_failing_summary(
 
     assert outcome.ok is True
     assert outcome.error is None
-    assert (root / "kbsearch" / "tool.json").is_file()
-    meta = tools.read_tool_meta(root / "kbsearch")
+    version = _resolved_version(root / "kbsearch")
+    assert (version / "tool.json").is_file()
+    meta = tools.read_tool_meta(tools.VersionRoot(version))
     assert meta is not None
     assert meta["summary"] == ""  # the placeholder a failed generation leaves
 
@@ -994,25 +1001,26 @@ def test_run_install_strips_a_forged_summary_sidecar(
     # The PACKAGE is fine and installs: the sidecar was decoration, not grounds
     # to punish the operator for something the model did unasked.
     assert outcome.ok is True
-    pkg = root / "kbsearch"
+    package = root / "kbsearch"
+    pkg = _resolved_version(package)
     assert (pkg / "tool.json").is_file()
     assert (pkg / "run.py").is_file()
     assert (pkg / ".env").is_file()
 
     # A sidecar EXISTS -- and it is the hook's, written through write_tool_meta
     # with the stubbed generation's text.
-    meta = tools.read_tool_meta(pkg)
+    meta = tools.read_tool_meta(tools.VersionRoot(pkg))
     assert meta is not None
     assert meta["summary"] == "這個工具會查 KB"
 
     # The forged content is nowhere in the installed package: walking every file,
     # the smuggled value appears in the ``.env`` and in nothing else.
     bearers = sorted(
-        str(path.relative_to(pkg))
-        for path in pkg.rglob("*")
+        str(path.relative_to(package))
+        for path in package.rglob("*")
         if path.is_file() and smuggled in path.read_text(encoding="utf-8", errors="replace")
     )
-    assert bearers == [".env"]
+    assert bearers == [f"versions/{pkg.name}/.env"]
     assert not (root / ".staging").exists()
 
 
@@ -1053,7 +1061,7 @@ def test_run_install_strips_forged_sidecars_at_every_depth(
     outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build a search tool"))
 
     assert outcome.ok is True
-    pkg = root / "kbsearch"
+    pkg = _resolved_version(root / "kbsearch")
     assert not (pkg / "lib" / tools._AI_META_FILENAME).exists()
     assert not list(pkg.glob(f"{tools._AI_META_FILENAME}*.tmp"))
     # Everything the builder legitimately produced survived the walk untouched.
@@ -1061,7 +1069,7 @@ def test_run_install_strips_forged_sidecars_at_every_depth(
     assert (pkg / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY
     assert json.loads((pkg / "tool.json").read_text(encoding="utf-8"))["name"] == "kbsearch"
     # ... and the ROOT sidecar is the hook's, not any of the plants.
-    meta = tools.read_tool_meta(pkg)
+    meta = tools.read_tool_meta(tools.VersionRoot(pkg))
     assert meta is not None
     assert meta["summary"] == "這個工具會查 KB"
 
@@ -1230,6 +1238,21 @@ def test_run_install_fails_closed_when_the_forged_sidecar_cannot_be_deleted(
 # does for the sidecar-strip shapes above.
 
 
+def _promote_for_test(staging: Path, name: str, base: Path) -> str | None:
+    return tool_builder._promote_staging(
+        tools.BuildRoot(staging),
+        staging.parent / "shell",
+        name,
+        base,
+        {
+            "source": "test-fixture",
+            "openapi_url": None,
+            "instructions": None,
+            "feedback": None,
+        },
+    )
+
+
 def test_promote_staging_refuses_symlinked_staging_root(tmp_path: Path) -> None:
     """The exact R8-1 attack: a symlink planted AT the staging leaf, pointing at an
     unrelated directory that happens to hold a planted sidecar. Refused before the
@@ -1245,7 +1268,7 @@ def test_promote_staging_refuses_symlinked_staging_root(tmp_path: Path) -> None:
     staging = staging_parent / "buildid"
     staging.symlink_to(decoy, target_is_directory=True)
 
-    error = tool_builder._promote_staging(staging, "kbsearch", base)
+    error = _promote_for_test(staging, "kbsearch", base)
 
     assert error == _ERROR_STAGING_TAMPERED
     assert not (base / "kbsearch").exists()
@@ -1278,7 +1301,7 @@ def test_promote_staging_refuses_staging_replaced_by_symlink_to_real_tools_dir(
     staging = staging_parent / "buildid"
     staging.symlink_to(base, target_is_directory=True)
 
-    error = tool_builder._promote_staging(staging, "kbsearch", base)
+    error = _promote_for_test(staging, "kbsearch", base)
 
     assert error == _ERROR_STAGING_TAMPERED
     assert not (base / "kbsearch").exists()
@@ -1313,7 +1336,7 @@ def test_promote_staging_refuses_ancestor_staging_shell_replaced_by_symlink(
 
     assert not staging.is_symlink()  # the leaf alone looks perfectly honest
 
-    error = tool_builder._promote_staging(staging, "kbsearch", base)
+    error = _promote_for_test(staging, "kbsearch", base)
 
     assert error == _ERROR_STAGING_TAMPERED
     assert not (base / "kbsearch").exists()
@@ -1331,10 +1354,12 @@ def test_promote_staging_allows_honest_staging(tmp_path: Path) -> None:
     (staging / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")), encoding="utf-8")
     (staging / "run.py").write_text(_GOOD_RUN_PY, encoding="utf-8")
 
-    error = tool_builder._promote_staging(staging, "kbsearch", base)
+    error = _promote_for_test(staging, "kbsearch", base)
 
     assert error is None
-    assert (base / "kbsearch" / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY
+    assert (_resolved_version(base / "kbsearch") / "run.py").read_text(
+        encoding="utf-8"
+    ) == _GOOD_RUN_PY
     assert not staging.exists()  # moved, not copied
 
 
@@ -1369,38 +1394,39 @@ def test_a_fresh_install_publishes_its_own_state_and_ignores_the_manifests_legac
     base = tmp_path / "tools"
     staging = _honest_staging(base, enabled=False)
 
-    assert tool_builder._promote_staging(staging, "kbsearch", base) is None
+    assert _promote_for_test(staging, "kbsearch", base) is None
 
     installed = base / "kbsearch"
     assert json.loads(
-        (installed / tools._STATE_FILENAME).read_text(encoding="utf-8")
+        (installed / tools._META_DIRNAME / tools._PACKAGE_STATE_FILENAME).read_text(
+            encoding="utf-8"
+        )
     ) == _state_document(True)
-    assert tools.package_enabled(installed) is True
+    assert tools.package_enabled(tools.PackageRoot(installed)) is True
     # ... and the builder's key is still on disk, saying the opposite and ignored.
-    assert json.loads((installed / "tool.json").read_text(encoding="utf-8"))["enabled"] is False
+    assert (
+        json.loads((_resolved_version(installed) / "tool.json").read_text(encoding="utf-8"))[
+            "enabled"
+        ]
+        is False
+    )
 
 
-def test_a_legacy_package_still_answers_from_its_manifest(
+def test_a_versioned_package_without_state_is_disabled(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The other half of P1R5-3: the fallback still means what it was written to mean.
-
-    Publishing an initial state at promote narrows the ABSENT case to exactly
-    "installed before web-v5 P1" -- it must not also silence it. A package that
-    never went through this promote keeps reading its manifest's legacy key, in both
-    directions, and still grows no file from being read."""
+    """Invariant C: package state absence is disabled; manifest legacy is inert."""
     base = tmp_path / "tools"
-    legacy_off = base / "legacy-off"
-    legacy_off.mkdir(parents=True)
-    (legacy_off / "tool.json").write_text(
-        json.dumps(_package_manifest("legacy-off") | {"enabled": False}), encoding="utf-8"
-    )
-    (legacy_off / "run.py").write_text(_GOOD_RUN_PY, encoding="utf-8")
+    staging = _honest_staging(base, "legacy-off", enabled=True)
+    assert _promote_for_test(staging, "legacy-off", base) is None
     _install_settings(monkeypatch, tools_dir=str(base))
+    package = base / "legacy-off"
+    state = package / tools._META_DIRNAME / tools._PACKAGE_STATE_FILENAME
+    state.unlink()
 
-    assert tools.package_enabled(legacy_off) is False
+    assert tools.package_enabled(tools.PackageRoot(package)) is False
     assert {t["name"]: t["enabled"] for t in tools.list_tools()} == {"legacy-off": False}
-    assert not (legacy_off / tools._STATE_FILENAME).exists()  # the read wrote nothing
+    assert not state.exists()  # the read wrote nothing
 
 
 def test_a_nested_state_file_survives_an_install_while_the_root_one_is_stripped(
@@ -1424,13 +1450,16 @@ def test_a_nested_state_file_survives_an_install_while_the_root_one_is_stripped(
     mine.write_text("cursor=41\n", encoding="utf-8")  # not even JSON: the tool's own file
     (staging / tools._STATE_FILENAME).write_text('{"enabled": false}', encoding="utf-8")
 
-    assert tool_builder._promote_staging(staging, "kbsearch", base) is None
+    assert _promote_for_test(staging, "kbsearch", base) is None
 
     installed = base / "kbsearch"
-    assert (installed / "data" / tools._STATE_FILENAME).read_text(encoding="utf-8") == "cursor=41\n"
+    version = _resolved_version(installed)
+    assert (version / "data" / tools._STATE_FILENAME).read_text(encoding="utf-8") == "cursor=41\n"
     # The root one the builder wrote was replaced by the backend's own, not honoured.
     assert json.loads(
-        (installed / tools._STATE_FILENAME).read_text(encoding="utf-8")
+        (installed / tools._META_DIRNAME / tools._PACKAGE_STATE_FILENAME).read_text(
+            encoding="utf-8"
+        )
     ) == _state_document(True)
 
 
@@ -1542,7 +1571,7 @@ def test_promote_staging_fails_closed_on_unreadable_subtree_with_sidecar(tmp_pat
     (sealed / tools._AI_META_FILENAME).write_text(_forged_meta("nested forgery"), encoding="utf-8")
     sealed.chmod(0o000)
     try:
-        error = tool_builder._promote_staging(staging, "kbsearch", base)
+        error = _promote_for_test(staging, "kbsearch", base)
     finally:
         sealed.chmod(0o700)  # restore so tmp_path's own teardown can remove the tree
 
@@ -1569,7 +1598,7 @@ def test_promote_staging_fails_closed_on_unreadable_subtree_without_sidecar(tmp_
     sealed.mkdir()  # deliberately empty -- no sidecar planted anywhere inside
     sealed.chmod(0o000)
     try:
-        error = tool_builder._promote_staging(staging, "kbsearch", base)
+        error = _promote_for_test(staging, "kbsearch", base)
     finally:
         sealed.chmod(0o700)
 
@@ -1588,10 +1617,12 @@ def test_promote_staging_readable_package_unaffected_by_onerror_hook(tmp_path: P
     (staging / "run.py").write_text(_GOOD_RUN_PY, encoding="utf-8")
     (staging / "lib" / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
 
-    error = tool_builder._promote_staging(staging, "kbsearch", base)
+    error = _promote_for_test(staging, "kbsearch", base)
 
     assert error is None
-    assert (base / "kbsearch" / "lib" / "helper.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert (_resolved_version(base / "kbsearch") / "lib" / "helper.py").read_text(
+        encoding="utf-8"
+    ) == "VALUE = 1\n"
 
 
 # --- install-form secret (D36) -------------------------------------------------
@@ -1738,11 +1769,10 @@ def test_run_install_registers_and_discards_inflight_secret(
         assert secret_value not in tools._INFLIGHT_SECRETS
 
 
-def test_run_install_replaces_disobedient_secret_line(
+def test_run_install_injects_only_the_form_secret_at_the_package_layer(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """If the model DISOBEYED and wrote its own ``KB_API_KEY`` line, promote
-    REPLACES it with the real value rather than duplicating (D36)."""
+    """Builder content stays version-local while the form secret is package state."""
     root = tmp_path / "tools"
     _install_settings(monkeypatch, tools_dir=str(root))
     _fake_generate(
@@ -1765,13 +1795,12 @@ def test_run_install_replaces_disobedient_secret_line(
         )
     )
     env_text = (root / "kbsearch" / ".env").read_text(encoding="utf-8")
-    assert "KB_API_KEY=real-secret-value-123456" in env_text
-    assert "placeholder-the-model-wrote" not in env_text
-    assert "OTHER=keep" in env_text  # unrelated lines preserved
-    assert env_text.count("KB_API_KEY=") == 1  # replaced, not duplicated
+    assert env_text == "KB_API_KEY=real-secret-value-123456\n"
+    version_env = _resolved_version(root / "kbsearch") / ".env"
+    assert "OTHER=keep" in version_env.read_text(encoding="utf-8")
 
 
-def test_run_install_secret_over_env_cap_refused(
+def test_install_rechecks_package_env_size_before_rename(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """If writing the secret into the staged ``.env`` would push it past the
@@ -1780,16 +1809,12 @@ def test_run_install_secret_over_env_cap_refused(
     OWN post-append guard (D36)."""
     root = tmp_path / "tools"
     _install_settings(monkeypatch, tools_dir=str(root))
-    # A .env just under the cap: passes validate_package, but appending the
-    # secret line pushes the total over _ENV_FILE_MAX_BYTES.
-    near_cap_env = "PAD=" + "y" * (tools._ENV_FILE_MAX_BYTES - 5)  # <= 64KiB, no newline
     _fake_generate(
         monkeypatch,
         result={"tool_name": "kbsearch", "summary": "s", "ready": True},
         files={
             "tool.json": json.dumps(_package_manifest("kbsearch")),
             "run.py": _GOOD_RUN_PY,
-            ".env": near_cap_env,
         },
     )
     _no_fetch(monkeypatch)
@@ -1799,7 +1824,7 @@ def test_run_install_secret_over_env_cap_refused(
             "http://kb.example/openapi.json",
             "build",
             secret_name="KB_API_KEY",
-            secret_value="v-abcdef",
+            secret_value="v" * tools._ENV_FILE_MAX_BYTES,
         )
     )
     assert outcome.ok is False
@@ -1990,7 +2015,7 @@ def test_inject_secret_round_trips_tricky_values(tmp_path: Path, value: str) -> 
     env_file = tmp_path / ".env"
     error = tool_builder._inject_secret_into_env(env_file, "KB_API_KEY", value)
     assert error is None
-    loaded = tools._load_tool_dotenv(tmp_path)
+    loaded = tools._load_tool_dotenv(tools.PackageRoot(tmp_path))
     assert loaded["KB_API_KEY"] == value
 
 
@@ -2002,7 +2027,7 @@ def test_inject_secret_tricky_value_reaches_subprocess_env(tmp_path: Path) -> No
     value = "tricky'$#-value abcdef"
     env_file = tmp_path / ".env"
     assert tool_builder._inject_secret_into_env(env_file, "KB_API_KEY", value) is None
-    env, _ = tools._build_tool_env(tmp_path)
+    env, _ = tools._build_tool_env(tools.PackageRoot(tmp_path))
     assert env["KB_API_KEY"] == value
 
 
@@ -2049,7 +2074,7 @@ def test_inject_secret_single_quote_value_stays_verbatim_in_raw_env(tmp_path: Pa
     assert tool_builder._inject_secret_into_env(env_file, "KB_API_KEY", value) is None
     raw = env_file.read_text(encoding="utf-8")
     assert value in raw  # exact substring -> redactable
-    assert tools._load_tool_dotenv(tmp_path)["KB_API_KEY"] == value  # and round-trips
+    assert tools._load_tool_dotenv(tools.PackageRoot(tmp_path))["KB_API_KEY"] == value
 
 
 @pytest.mark.parametrize(
@@ -2175,7 +2200,7 @@ def test_run_install_promotes_tricky_secret_round_trippable(
         )
     )
     assert outcome.ok is True
-    loaded = tools._load_tool_dotenv(root / "kbsearch")
+    loaded = tools._load_tool_dotenv(tools.PackageRoot(root / "kbsearch"))
     assert loaded["KB_API_KEY"] == secret_value  # exact, no dotenv transform
 
 
@@ -2870,12 +2895,7 @@ def test_start_install_job_single_flight(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_router_list_tools(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    root = tmp_path / "tools"
-    pkg = root / "kbsearch"
-    pkg.mkdir(parents=True)
-    (pkg / "run.py").write_text("print('x')\n")
-    (pkg / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")))
-    _install_settings(monkeypatch, tools_dir=str(root))
+    _seed_package(monkeypatch, tmp_path)
 
     response = client.get("/api/tools")
     assert response.status_code == 200
@@ -2904,12 +2924,7 @@ def test_router_list_tools_empty_when_unconfigured(
 def test_router_patch_toggles_enabled(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    root = tmp_path / "tools"
-    pkg = root / "kbsearch"
-    pkg.mkdir(parents=True)
-    (pkg / "run.py").write_text("print('x')\n")
-    (pkg / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")))
-    _install_settings(monkeypatch, tools_dir=str(root))
+    _seed_package(monkeypatch, tmp_path)
 
     response = client.patch("/api/tools/kbsearch", json={"enabled": False})
     assert response.status_code == 200
@@ -3158,12 +3173,27 @@ def _write_meta(pkg: Path, **fields: Any) -> bool:
     The writer refuses a meta without a string ``updated_at`` (it will not invent
     a timestamp on a caller's behalf), so the route tests seed a sidecar through
     here and state only the fields under test."""
-    return tools.write_tool_meta(pkg, {"updated_at": "2026-01-01T00:00:00+00:00", **fields})
+    origin = fields.pop("origin", None)
+    if isinstance(origin, dict) and not tools.write_origin_meta(
+        tools.BuildRoot(pkg),
+        {
+            "source": origin.get("source", "test-fixture"),
+            "openapi_url": origin.get("openapi_url"),
+            "instructions": origin.get("instructions"),
+            "feedback": origin.get("feedback"),
+            "previous": origin.get("previous"),
+        },
+    ):
+        return False
+    return tools.write_tool_meta(
+        tools.VersionRoot(pkg),
+        {"updated_at": "2026-01-01T00:00:00+00:00", **fields},
+    )
 
 
 def _meta(pkg: Path) -> dict[str, Any]:
     """The package's sidecar, asserted present (it is what the test just wrote)."""
-    meta = tools.read_tool_meta(pkg)
+    meta = tools.read_tool_meta(tools.VersionRoot(pkg))
     assert meta is not None
     return meta
 
@@ -3180,12 +3210,66 @@ def _state_document(enabled: bool) -> dict[str, Any]:
 def _seed_package(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str = "kbsearch") -> Path:
     """An installed package (no sidecar) with the settings pointed at it."""
     root = tmp_path / "tools"
-    pkg = root / name
+    package = root / name
+    pkg = package / tools._VERSIONS_DIRNAME / _TEST_VID
     pkg.mkdir(parents=True)
     (pkg / "run.py").write_text("print('x')\n")
     (pkg / "tool.json").write_text(json.dumps(_package_manifest(name)))
+    version_meta = pkg / tools._META_DIRNAME
+    version_meta.mkdir()
+    (version_meta / tools._ORIGIN_FILENAME).write_text(
+        json.dumps(
+            {
+                "source": "test-fixture",
+                "openapi_url": None,
+                "instructions": None,
+                "feedback": None,
+                "previous": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    package_meta = package / tools._META_DIRNAME
+    package_meta.mkdir()
+    (package_meta / tools._CURRENT_FILENAME).write_text(f"{_TEST_VID}\n", encoding="ascii")
+    (package_meta / tools._PACKAGE_STATE_FILENAME).write_text(
+        json.dumps(_state_document(True)), encoding="utf-8"
+    )
     _install_settings(monkeypatch, tools_dir=str(root))
     return pkg
+
+
+def _package_path(version: Path) -> Path:
+    return version.parents[1]
+
+
+def _package_root(version: Path) -> tools.PackageRoot:
+    return tools.PackageRoot(_package_path(version))
+
+
+def _version_root(version: Path) -> tools.VersionRoot:
+    return tools.VersionRoot(version)
+
+
+def _state_path(version: Path) -> Path:
+    return _package_path(version) / tools._META_DIRNAME / tools._PACKAGE_STATE_FILENAME
+
+
+def _summary_path(version: Path) -> Path:
+    return version / tools._META_DIRNAME / tools._SUMMARY_FILENAME
+
+
+def _resolved_version(package: Path) -> Path:
+    vid = (
+        (package / tools._META_DIRNAME / tools._CURRENT_FILENAME)
+        .read_text(encoding="ascii")
+        .rstrip("\n")
+    )
+    return package / tools._VERSIONS_DIRNAME / vid
+
+
+def _current_version(version: Path) -> Path:
+    return _resolved_version(_package_path(version))
 
 
 def test_router_get_summary_all_null_without_a_sidecar(
@@ -3208,7 +3292,7 @@ def test_router_get_summary_returns_the_sidecar(
 ) -> None:
     pkg = _seed_package(monkeypatch, tmp_path)
     tools.write_tool_meta(
-        pkg,
+        _version_root(pkg),
         {
             "summary": "這個工具會查 KB",
             "updated_at": "2026-07-26T00:00:00+00:00",
@@ -3292,7 +3376,7 @@ def test_router_get_summary_degrades_a_hand_edited_sidecar(
     """The sidecar sits in a package the operator may hand-edit, so out-of-shape
     values render as nulls rather than 500ing the read."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / tools._AI_META_FILENAME).write_text(
+    _summary_path(pkg).write_text(
         json.dumps({"summary": 12, "updated_at": [], "llm_log_id": "three"}),
         encoding="utf-8",
     )
@@ -3318,7 +3402,7 @@ def test_router_summary_survives_a_lone_surrogate_in_the_sidecar(
     whole job is to DEGRADE a corrupt sidecar. The read boundary scrubs now, so
     the GET renders U+FFFD; this file never passed through our writer."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / tools._AI_META_FILENAME).write_text(
+    _summary_path(pkg).write_text(
         json.dumps(
             {
                 "summary": "a\ud800b",
@@ -3376,12 +3460,13 @@ def test_router_regenerate_summary_stores_and_returns_the_new_summary(
     body = response.json()
     assert body["summary"] == "新的說明"
     assert body["llm_log_id"] is not None
-    stored = tools.read_tool_meta(pkg)
+    stored = tools.read_tool_meta(_version_root(pkg))
     assert stored is not None
     assert stored["summary"] == "新的說明"
     # Inherited from the install, in the narrowed shape the writer stores (both
     # known fields, the absent one an explicit null).
-    assert stored["origin"] == {"openapi_url": None, "instructions": "查 KB"}
+    assert stored["origin"]["openapi_url"] is None
+    assert stored["origin"]["instructions"] == "查 KB"
 
 
 def test_router_regenerate_summary_409_while_a_job_runs(
@@ -3553,7 +3638,7 @@ def test_router_summary_routes_refuse_an_internal_alias(
     pkg = _seed_package(monkeypatch, tmp_path, "real")
     (pkg.parent / "alias").symlink_to(pkg, target_is_directory=True)
     _write_meta(pkg, summary="真的說明")
-    before = (pkg / tools._AI_META_FILENAME).read_bytes()
+    before = _summary_path(pkg).read_bytes()
 
     async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("no session may start for an aliased package")
@@ -3568,7 +3653,7 @@ def test_router_summary_routes_refuse_an_internal_alias(
     assert client.post("/api/tools/alias/summary/regenerate").status_code == 404
     assert client.post("/api/tools/alias/revise", json={"feedback": "改"}).status_code == 404
 
-    assert (pkg / tools._AI_META_FILENAME).read_bytes() == before
+    assert _summary_path(pkg).read_bytes() == before
 
 
 def test_router_regenerate_summary_404_when_the_sidecar_write_is_refused(
@@ -3838,10 +3923,10 @@ def _file_bytes(root: Path) -> dict[str, bytes]:
 
 
 def _staging_dir(root: Path) -> Path:
-    """The ONE in-flight staging directory (asserted unique)."""
+    """The build root inside the one in-flight session (asserted unique)."""
     staged = list((root / ".staging").iterdir())
     assert len(staged) == 1, staged
-    return staged[0]
+    return staged[0] / "build"
 
 
 def _leftovers(root: Path) -> list[str]:
@@ -3873,8 +3958,8 @@ def test_run_revise_copies_the_package_without_the_root_env_or_any_sidecar(
     validation then passing on the mutilated package. Pinned on both sides here: the
     builder sees it, and the revised INSTALLED package still has it, byte for byte."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    root = pkg.parent
-    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    root = _package_path(pkg).parent
+    (_package_path(pkg) / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
     (pkg / "lib").mkdir()
     (pkg / "lib" / "util.py").write_text("X = 1\n", encoding="utf-8")
     (pkg / "sub").mkdir()
@@ -3908,7 +3993,7 @@ def test_run_revise_copies_the_package_without_the_root_env_or_any_sidecar(
         "config/.env",
     }
     # ... and the file an unrelated revise used to delete is still there, untouched.
-    assert (pkg / "config" / ".env").read_bytes() == nested_env
+    assert (_current_version(pkg) / "config" / ".env").read_bytes() == nested_env
 
 
 def test_run_revise_keeps_the_state_file_out_of_staging_but_carries_it_across(
@@ -3929,7 +4014,7 @@ def test_run_revise_keeps_the_state_file_out_of_staging_but_carries_it_across(
     point ``set_enabled`` uses. The tool is disabled going in and disabled coming
     out, and the builder's staging never had one to read or rewrite."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    root = pkg.parent
+    root = _package_path(pkg).parent
     assert tools.set_enabled("kbsearch", False) is True
     manifest_before = (pkg / "tool.json").read_bytes()
     seen: dict[str, set[str]] = {}
@@ -3943,19 +4028,20 @@ def test_run_revise_keeps_the_state_file_out_of_staging_but_carries_it_across(
     outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
-    assert tools._STATE_FILENAME not in seen["staged"]  # the builder never saw it
-    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY  # really revised
-    assert json.loads((pkg / tools._STATE_FILENAME).read_text(encoding="utf-8")) == _state_document(
-        False
-    )
+    assert tools._META_DIRNAME not in seen["staged"]  # the builder never saw it
+    assert (_current_version(pkg) / "run.py").read_text(
+        encoding="utf-8"
+    ) == _REVISED_RUN_PY  # really revised
+    assert json.loads(_state_path(pkg).read_text(encoding="utf-8")) == _state_document(False)
     assert {t["name"]: t["enabled"] for t in tools.list_tools()}["kbsearch"] is False
     assert tools.enabled_llm_tools() == []
     # The manifest is not where any of this lives: this fixture's revision changes
     # only run.py, so the published manifest is byte-identical to the one that went
     # in AND carries no ``enabled`` key at all -- the state file is provably the
     # only thing that decided the toggle on either side of the swap.
-    assert (pkg / "tool.json").read_bytes() == manifest_before
-    assert "enabled" not in json.loads((pkg / "tool.json").read_text(encoding="utf-8"))
+    revised = _current_version(pkg)
+    assert (revised / "tool.json").read_bytes() == manifest_before
+    assert "enabled" not in json.loads((revised / "tool.json").read_text(encoding="utf-8"))
 
 
 def test_a_revise_leaves_a_nested_state_file_alone_and_carries_a_foreign_root_one(
@@ -3978,12 +4064,12 @@ def test_a_revise_leaves_a_nested_state_file_alone_and_carries_a_foreign_root_on
     ``package_enabled`` reports here -- the file at our name got no vote in either
     direction."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    root = pkg.parent
+    root = _package_path(pkg).parent
     (pkg / "data").mkdir()
     nested = b"cursor=41\r\n\x00binary tail"
     (pkg / "data" / tools._STATE_FILENAME).write_bytes(nested)
     theirs = b'{"cursor": 41, "enabled": true}\n'
-    (pkg / tools._STATE_FILENAME).write_bytes(theirs)
+    _state_path(pkg).write_bytes(theirs)
     seen: dict[str, set[str]] = {}
     _fake_generate(
         monkeypatch,
@@ -3995,19 +4081,23 @@ def test_a_revise_leaves_a_nested_state_file_alone_and_carries_a_foreign_root_on
     outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
-    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY  # really revised
+    assert (_current_version(pkg) / "run.py").read_text(
+        encoding="utf-8"
+    ) == _REVISED_RUN_PY  # really revised
     # The nested one went THROUGH the workspace; the root one never entered it.
     assert f"data/{tools._STATE_FILENAME}" in seen["staged"]
     assert tools._STATE_FILENAME not in seen["staged"]
     # Both are byte-identical on the other side of the swap.
-    assert (pkg / "data" / tools._STATE_FILENAME).read_bytes() == nested
-    assert (pkg / tools._STATE_FILENAME).read_bytes() == theirs
+    assert (_current_version(pkg) / "data" / tools._STATE_FILENAME).read_bytes() == nested
+    assert _state_path(pkg).read_bytes() == theirs
     # ... and the foreign file still does not answer the toggle: the manifest does,
     # and this fixture's manifest has no legacy key, so the default stands.
-    assert tools.package_enabled(pkg) is True
+    assert tools.package_enabled(_package_root(pkg)) is False
 
 
-def test_run_revise_preserves_the_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_invariant_f_revise_never_touches_the_package_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """The installed ``.env`` survives a revise unchanged -- comments, quoting,
     inline ``#``, trailing whitespace and line ORDER included -- and a builder that
     writes its own is overruled, which is the prompt's stated contract.
@@ -4016,8 +4106,10 @@ def test_run_revise_preserves_the_env_file(monkeypatch: pytest.MonkeyPatch, tmp_
     copied, never re-serialized and never even decoded (R2-1). The CRLF/invalid-byte
     case that proves the general claim is pinned below."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
-    before = (pkg / ".env").read_bytes()
+    (_package_path(pkg) / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    env_path = _package_path(pkg) / ".env"
+    before = env_path.read_bytes()
+    identity_before = (env_path.stat().st_dev, env_path.stat().st_ino, env_path.stat().st_mtime_ns)
     _fake_generate(
         monkeypatch,
         result=_revise_result(),
@@ -4028,8 +4120,40 @@ def test_run_revise_preserves_the_env_file(monkeypatch: pytest.MonkeyPatch, tmp_
     outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
-    assert (pkg / ".env").read_bytes() == before
-    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert env_path.read_bytes() == before
+    assert (env_path.stat().st_dev, env_path.stat().st_ino, env_path.stat().st_mtime_ns) == (
+        identity_before
+    )
+    assert (_current_version(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+
+
+def test_invariant_f_revised_package_immediately_redacts_package_env_from_logs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pkg = _seed_package(monkeypatch, tmp_path)
+    secret = "current-package-secret-abcdef"
+    env_path = _package_path(pkg) / ".env"
+    env_path.write_text(f"KB_API_KEY={secret}\n", encoding="utf-8")
+    env_inode = env_path.stat().st_ino
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert env_path.stat().st_ino == env_inode
+    assert secret in tools.known_secret_values()
+    monkeypatch.setattr(llm_log, "_secret_provider", tools.known_secret_values)
+    recorder = llm_log.LlmInteractionRecorder(workflow="probe", model="m")
+    recorder.begin_attempt([{"role": "user", "content": f"use {secret}"}])
+    recorder.record_response(f"used {secret}")
+    recorder.finish(outcome="ok", error=None)
+    record_id = llm_log.last_record_id_for_workflow("probe")
+    assert record_id is not None
+    record = llm_log.get_record(record_id)
+    assert record is not None
+    stored = json.dumps(record, ensure_ascii=False)
+    assert secret not in stored
+    assert llm_log._REDACTION_MARKER in stored
 
 
 def test_run_revise_preserves_a_crlf_env_byte_for_byte(
@@ -4050,17 +4174,19 @@ def test_run_revise_preserves_a_crlf_env_byte_for_byte(
     pinned below, because a plain ``copyfile`` would silently drop it."""
     pkg = _seed_package(monkeypatch, tmp_path)
     raw = b"# comment\r\nKB_API_KEY=live-secret-value\r\nBLOB=\xff\xfe-not-utf8\r\n"
-    (pkg / ".env").write_bytes(raw)
-    (pkg / ".env").chmod(0o640)
+    (_package_path(pkg) / ".env").write_bytes(raw)
+    (_package_path(pkg) / ".env").chmod(0o640)
     digest_before = hashlib.sha256(raw).hexdigest()
     _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
 
     outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
-    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY  # it really ran
-    assert hashlib.sha256((pkg / ".env").read_bytes()).hexdigest() == digest_before
-    assert (pkg / ".env").stat().st_mode & 0o777 == 0o640
+    assert (_current_version(pkg) / "run.py").read_text(
+        encoding="utf-8"
+    ) == _REVISED_RUN_PY  # it really ran
+    assert hashlib.sha256((_package_path(pkg) / ".env").read_bytes()).hexdigest() == digest_before
+    assert (_package_path(pkg) / ".env").stat().st_mode & 0o777 == 0o640
 
 
 def test_run_revise_registers_the_live_env_values_for_the_session(
@@ -4073,7 +4199,7 @@ def test_run_revise_registers_the_live_env_values_for_the_session(
     covers the package while it sits there, but it skips dot-directories, and the
     swap parks the old package in one (see the swap-window test below)."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
     seen: dict[str, Any] = {}
     _fake_generate(
         monkeypatch,
@@ -4093,43 +4219,6 @@ def test_run_revise_registers_the_live_env_values_for_the_session(
     # what keeps the values redactable afterwards, via the scan).
     with tools._INFLIGHT_LOCK:
         assert not tools._INFLIGHT_SECRETS
-
-
-def test_run_revise_keeps_the_env_redactable_across_the_backup_swap(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The reason D40 requires the in-flight registration, pinned.
-
-    At the instant the swap runs, the old package has been renamed to a
-    DOT-prefixed backup -- which ``known_secret_values`` skips (it only reads
-    non-hidden package directories) and which ``_scan_all`` skips too -- and the
-    revision is not in place yet. Without the registration the tool's own
-    credentials would be UNKNOWN to the redactor for exactly that window, while
-    the builder session's records are still being written."""
-    pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
-    seen: dict[str, Any] = {}
-    real_rename = os.rename
-
-    def recording_rename(src: Any, dst: Any) -> Any:
-        # The PUBLISH rename (its source is the staging dir) -- by which point the
-        # old package has already become `.kbsearch.bak-<uuid>` and the revision is
-        # not in place yet. The backup rename that precedes it is left alone.
-        if tool_builder._STAGING_DIRNAME in str(src):
-            seen["known"] = tools.known_secret_values()
-            seen["listed"] = [row["name"] for row in tools.list_tools()]
-            seen["backups"] = _leftovers(pkg.parent)
-        return real_rename(src, dst)
-
-    monkeypatch.setattr(os, "rename", recording_rename)
-    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
-
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
-
-    assert outcome.ok is True
-    assert _TRICKY_ENV_VALUE in seen["known"]  # still redactable mid-swap
-    assert seen["backups"] and seen["backups"][0].startswith(".kbsearch.bak-")
-    assert seen["listed"] == []  # the hidden backup is invisible to the registry
 
 
 def test_run_revise_refuses_a_model_rename(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -4164,8 +4253,8 @@ def test_run_revise_replaces_the_installed_package(
     registry still sees exactly one valid package, and the swap leaves no hidden
     backup or staging residue behind."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    root = pkg.parent
-    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    root = _package_path(pkg).parent
+    (_package_path(pkg) / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
     captured = _fake_generate(
         monkeypatch,
         result=_revise_result(summary="改好了並測過"),
@@ -4178,8 +4267,9 @@ def test_run_revise_replaces_the_installed_package(
     assert outcome.tool_name == "kbsearch"
     assert outcome.summary == "改好了並測過"
     assert outcome.llm_log_id == llm_log.last_record_id_for_workflow("tool_install")
-    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
-    assert (pkg / "lib" / "helper.py").read_text(encoding="utf-8") == "Y = 2\n"
+    revised = _current_version(pkg)
+    assert (revised / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert (revised / "lib" / "helper.py").read_text(encoding="utf-8") == "Y = 2\n"
     assert [(row["name"], row["valid"]) for row in tools.list_tools()] == [("kbsearch", True)]
     assert _leftovers(root) == []
     assert not (root / ".staging").exists()
@@ -4190,681 +4280,47 @@ def test_run_revise_replaces_the_installed_package(
     assert captured["timeout_seconds"] == settings.tool_install_timeout_seconds
 
 
-def _replace_fixture(base: Path) -> tuple[Path, Path]:
-    """``(installed, staging)`` for a direct ``_promote_staging_replace`` call: a
-    valid installed ``kbsearch`` and a valid staged revision of the same name."""
-    installed = base / "kbsearch"
-    installed.mkdir(parents=True)
-    (installed / "tool.json").write_text(
-        json.dumps(_package_manifest("kbsearch")), encoding="utf-8"
-    )
-    (installed / "run.py").write_text(_GOOD_RUN_PY, encoding="utf-8")
-    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
-    staging.mkdir(parents=True)
-    (staging / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")), encoding="utf-8")
-    (staging / "run.py").write_text("print('revised')", encoding="utf-8")
-    return installed, staging
-
-
-def test_promote_replace_refuses_an_oversized_live_env(tmp_path: Path) -> None:
-    """The copy is bounded by the SAME ceiling the rest of the system applies to a
-    ``.env`` (R4-1), and refuses BEFORE anything is moved.
-
-    Two reasons, and the second is why an unbounded copy was a defect rather than
-    a waste: over the cap the values were never parseable in the first place
-    (``_read_env_for_values`` refuses, ``tools._load_tool_dotenv`` degrades the
-    tool to no-env at runtime), so copying it would publish a file the rest of the
-    system rejects; and the copy is the last thing standing between the gates and
-    the swap, so its duration has to be ours to bound."""
-    base = tmp_path / "tools"
-    installed, staging = _replace_fixture(base)
-    (installed / ".env").write_bytes(b"K=" + b"v" * (tools._ENV_FILE_MAX_BYTES - 1))
-    assert (installed / ".env").stat().st_size == tools._ENV_FILE_MAX_BYTES + 1
-    registered: list[str] = []
-
-    origin, error = tool_builder._promote_staging_replace(
-        staging,
-        "kbsearch",
-        base,
-        env_existed_at_start=True,
-        package_identity=tool_builder._package_identity(base / "kbsearch"),
-        registered=registered,
-    )
-
-    assert error == tool_builder._ERROR_REVISE_ENV_TOO_LARGE
-    assert origin is None
-    assert registered == []  # refused by SIZE before anything was read or registered
-    assert not (staging / ".env").exists()  # refused BEFORE the copy, not after it
-    assert (installed / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY  # never swapped
-    assert _leftovers(base) == []
-
-
-def test_promote_replace_copies_a_live_env_at_the_ceiling_byte_for_byte(tmp_path: Path) -> None:
-    """The refusal above is the ceiling EXACTLY, and the ordinary path is
-    unchanged: a ``.env`` AT the cap still publishes, byte for byte.
-
-    The gate must not creep past the property it enforces -- a size check that
-    quietly refused ordinary files would make a package unrevisable forever, with
-    a message that names no key and no value to explain why."""
-    base = tmp_path / "tools"
-    installed, staging = _replace_fixture(base)
-    head = b"# CRLF \xff and a non-utf8 byte survive too\r\nK="
-    raw = head + b"v" * (tools._ENV_FILE_MAX_BYTES - len(head))
-    assert len(raw) == tools._ENV_FILE_MAX_BYTES  # the cap EXACTLY, on the allowed side
-    (installed / ".env").write_bytes(raw)
-    registered: list[str] = []
-
-    origin, error = tool_builder._promote_staging_replace(
-        staging,
-        "kbsearch",
-        base,
-        env_existed_at_start=True,
-        package_identity=tool_builder._package_identity(base / "kbsearch"),
-        registered=registered,
-    )
-
-    assert error is None
-    # A file AT the cap is READ and vetted too, not waved through: its one value
-    # is registered, and the promote-side policy re-run passed on it (R7-2).
-    assert registered == [raw.split(b"K=", 1)[1].decode("utf-8")]
-    assert origin is None  # no sidecar in this fixture: nothing to inherit
-    assert (installed / "run.py").read_text(encoding="utf-8") == "print('revised')"  # it swapped
-    assert (installed / ".env").read_bytes() == raw  # ... and the credentials came across
-    assert _leftovers(base) == []
-
-
-def _state_publish_lock_is_held() -> bool:
-    """Is ``tools._STATE_PUBLISH_LOCK`` held RIGHT NOW?
-
-    ``acquire(blocking=False)`` on a non-reentrant ``threading.Lock`` fails even
-    for the thread that already holds it, so this answers from inside the promote's
-    own thread without a second one -- and releases again on the "not held" branch
-    so the probe itself never changes what it measures."""
-    if tools._STATE_PUBLISH_LOCK.acquire(blocking=False):
-        tools._STATE_PUBLISH_LOCK.release()
-        return False
-    return True
-
-
-def test_a_toggle_that_lands_before_the_swap_is_carried_across_not_reverted(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """R1-1: the live toggle is read at the LAST moment, not at the first (web-v5 P1).
-
-    The carry used to sit beside the ``.env`` copy, before the sidecar read and
-    its own ``_scan_package`` -- and its comment called that position "free"
-    because the step itself is bounded and tiny. Bounded is not
-    EARLY: a ``PATCH /api/tools/{name}`` landing anywhere after that read was
-    SILENTLY REVERTED, because the staging copy already held the old value and the
-    swap then published it over the operator's newer one.
-
-    Before P1 that window was covered BY ACCIDENT -- the toggle rewrote
-    ``tool.json``, the identity moved, and the re-check refused the swap. P1 removed
-    the accident (that is the whole point of it) and nothing replaced it, so the
-    re-check now passes and the stale boolean ships. Both operations report success.
-
-    Driven from INSIDE the last sidecar read: with the old ordering the published
-    state file comes out ``true`` and the tool the operator just switched off is
-    offered to the model again."""
-    base = tmp_path / "tools"
-    installed, staging = _replace_fixture(base)
-    _install_settings(monkeypatch, tools_dir=str(base))
-    assert tools.package_enabled(installed) is True  # the value the carry would read
-    real_read = tools.read_tool_meta
-    toggled: list[bool] = []
-
-    def toggle_off_inside_the_read(directory: Path) -> dict[str, Any] | None:
-        result = real_read(directory)
-        toggled.append(tools.set_enabled("kbsearch", False))
-        return result
-
-    monkeypatch.setattr(tools, "read_tool_meta", toggle_off_inside_the_read)
-
-    origin, error = tool_builder._promote_staging_replace(
-        staging,
-        "kbsearch",
-        base,
-        env_existed_at_start=False,
-        package_identity=tool_builder._package_identity(installed),
-        registered=[],
-    )
-
-    assert toggled == [True]  # the window is real: the PATCH ran, and it succeeded
-    assert error is None and origin is None
-    assert (installed / "run.py").read_text(encoding="utf-8") == "print('revised')"  # it swapped
-    # ... and the operator's LATER intent survived the swap that shipped over it.
-    assert json.loads(
-        (installed / tools._STATE_FILENAME).read_text(encoding="utf-8")
-    ) == _state_document(False)
-    assert {t["name"]: t["enabled"] for t in tools.list_tools()}["kbsearch"] is False
-    assert tools.enabled_llm_tools() == []
-    assert _leftovers(base) == []
-
-
-def test_a_toggle_arriving_during_the_swap_waits_for_it_and_still_wins(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """R1-1's second half: ordering alone cannot close the window, so the toggle
-    and the swap's tail are made MUTUALLY EXCLUSIVE.
-
-    Even read at the last possible moment there is still a staging write, an lstat
-    and two renames between reading the live toggle and publishing it, and a PATCH
-    inside THAT is lost exactly the same way. ``tools._STATE_PUBLISH_LOCK`` covers
-    [carry -> identity re-check -> both renames] on this side and ``set_enabled``'s
-    publish on the other, so the two cannot interleave at all.
-
-    Pinned three ways, the first two without depending on any timing: the lock is
-    HELD at the start of the tail and still held at the rename boundary, and it is
-    RELEASED by the time the promote returns. The thread is the demonstration, not
-    the mechanism -- it is started from inside the tail, so with the lock gone its
-    write would race the swap it must outlive. Why a lock is acceptable here and was
-    rejected in D40 r8: everything inside the hold is a small write, an lstat and
-    two renames, not an LLM round trip."""
-    base = tmp_path / "tools"
-    installed, staging = _replace_fixture(base)
-    _install_settings(monkeypatch, tools_dir=str(base))
-    patched: dict[str, bool] = {}
-    started = threading.Event()
-    outcome: dict[str, bool] = {}
-
-    def toggle() -> None:
-        started.set()
-        outcome["ok"] = tools.set_enabled("kbsearch", False)
-
-    worker = threading.Thread(target=toggle, daemon=True)
-    real_carry = tools.carry_package_state
-    real_backup_path = tool_builder._backup_path
-
-    def carry_then_let_a_toggle_try(source: Path, destination: Path) -> bool:
-        carried = real_carry(source, destination)
-        patched["held_at_the_carry"] = _state_publish_lock_is_held()
-        worker.start()
-        started.wait(timeout=30)  # the PATCH is now inside set_enabled, blocked
-        return carried
-
-    def probe_at_the_rename_boundary(base_dir: Path, name: str, token: str) -> Path:
-        patched["held_at_the_rename"] = _state_publish_lock_is_held()
-        return real_backup_path(base_dir, name, token)
-
-    monkeypatch.setattr(tools, "carry_package_state", carry_then_let_a_toggle_try)
-    monkeypatch.setattr(tool_builder, "_backup_path", probe_at_the_rename_boundary)
-
-    origin, error = tool_builder._promote_staging_replace(
-        staging,
-        "kbsearch",
-        base,
-        env_existed_at_start=False,
-        package_identity=tool_builder._package_identity(installed),
-        registered=[],
-    )
-    worker.join(timeout=30)
-
-    assert patched == {"held_at_the_carry": True, "held_at_the_rename": True}
-    assert _state_publish_lock_is_held() is False  # released with the swap, not later
-    assert not worker.is_alive() and outcome["ok"] is True  # it was blocked, not refused
-    assert error is None and origin is None
-    assert (installed / "run.py").read_text(encoding="utf-8") == "print('revised')"  # it swapped
-    assert json.loads(
-        (installed / tools._STATE_FILENAME).read_text(encoding="utf-8")
-    ) == _state_document(False)
-    assert _leftovers(base) == []
-
-
-def test_promote_replace_refuses_a_package_replaced_during_the_state_carry(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """R12-1 re-pinned one step later: the identity re-check is STILL the last
-    thing before the first rename, now that a step was moved in behind it.
-
-    The r12 test drives its swap from inside the sidecar read; the 啟用 carry runs
-    AFTER that read, so this drives one from inside the CARRY -- the only new I/O
-    the tail gained. A check whose whole job is "nothing changed since we looked"
-    has to occupy the last instant it can, and putting the carry after it would have
-    handed that instant away."""
-    base = tmp_path / "tools"
-    installed, staging = _replace_fixture(base)
-    real_carry = tools.carry_package_state
-
-    def carry_then_move_the_identity(source: Path, destination: Path) -> bool:
-        carried = real_carry(source, destination)
-        _edit_manifest_in_place(installed)  # a hand edit (D21), byte-identical
-        return carried
-
-    monkeypatch.setattr(tools, "carry_package_state", carry_then_move_the_identity)
-
-    origin, error = tool_builder._promote_staging_replace(
-        staging,
-        "kbsearch",
-        base,
-        env_existed_at_start=False,
-        package_identity=tool_builder._package_identity(installed),
-        registered=[],
-    )
-
-    assert error == tool_builder._ERROR_REVISE_TARGET_REPLACED
-    assert origin is None
-    assert (installed / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY  # never swapped
-    assert _leftovers(base) == []
-
-
-def test_promote_replace_refuses_when_the_state_cannot_be_carried(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A carry that fails REFUSES the revise -- it does not swap and hope.
-
-    Everything the carry writes lands in STAGING, so the refusal costs one
-    abandoned build and nothing observable; publishing anyway would mean a package
-    with no state file at all, read through the manifest fallback as ENABLED. The
-    failure is injected at the carry itself because every real way to make the
-    write fail (a non-regular file at the staged name) is deleted on the way in by
-    ``_strip_builder_sidecars`` -- which is the point of that step."""
-    base = tmp_path / "tools"
-    installed, staging = _replace_fixture(base)
-    monkeypatch.setattr(tools, "carry_package_state", lambda source, destination: False)
-
-    origin, error = tool_builder._promote_staging_replace(
-        staging,
-        "kbsearch",
-        base,
-        env_existed_at_start=False,
-        package_identity=tool_builder._package_identity(installed),
-        registered=[],
-    )
-
-    assert error == tool_builder._ERROR_REVISE_STATE_RESTORE
-    assert origin is None
-    assert (installed / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY  # never swapped
-    assert _leftovers(base) == []  # refused before the first rename, so no backup exists
-
-
-@pytest.mark.parametrize("live_mode", [0o640, None], ids=["operator-set", "no-live-file"])
-def test_a_revise_carries_the_state_files_mode_not_just_its_value(
-    tmp_path: Path, live_mode: int | None
-) -> None:
-    """R1-3: an operator's ``chmod`` on ``.afterthread-state.json`` survives a revise.
-
-    The publisher preserves an existing file's low-9 mode (R7-3/R11) by inheriting
-    it AT THE TARGET -- and the revise's target is STAGING, which has no state file
-    by construction, so there was nothing to inherit and every unrelated revise
-    silently narrowed a ``0o640`` the operator set (so a same-group process could
-    read it) back to the default. Same discipline, one parameter: the carry reads
-    the LIVE file's mode and hands it down as the first-write default.
-
-    The second case is the other half of "preserve means do not CHANGE": with no
-    live state file there is no mode to inherit and the default stands."""
-    base = tmp_path / "tools"
-    installed, staging = _replace_fixture(base)
-    if live_mode is not None:
-        assert tools.write_package_state(installed, False) is True
-        (installed / tools._STATE_FILENAME).chmod(live_mode)
-
-    origin, error = tool_builder._promote_staging_replace(
-        staging,
-        "kbsearch",
-        base,
-        env_existed_at_start=False,
-        package_identity=tool_builder._package_identity(installed),
-        registered=[],
-    )
-
-    assert error is None and origin is None
-    assert (installed / "run.py").read_text(encoding="utf-8") == "print('revised')"  # it swapped
-    published = installed / tools._STATE_FILENAME
-    assert published.stat().st_mode & 0o777 == (live_mode or tools._OWNER_RW)
-    # The VALUE came across too, so this is not a mode test passing on an empty swap.
-    assert json.loads(published.read_text(encoding="utf-8")) == _state_document(live_mode is None)
-
-
-def test_stale_backup_names_are_minted_and_recognized_by_one_shape(tmp_path: Path) -> None:
-    """``tools._stale_backup_path`` writes the name and ``tools._STALE_BACKUP_RE``
-    reads it back off disk, so the two must agree for the sweep to find its litter
-    at all. Both live in ``tools`` because ``tools.delete_tool`` mints this name
-    too and only that side can hold a definition both writers share.
-
-    Pinned at the LONGEST legal package name (``tools._NAME_RE``'s 64 chars),
-    which is where a lazily-written pattern stops matching -- and pinned against
-    every neighbour the sweep must NOT collect: the plain ``.bak-`` name (which
-    can be the rescue copy ``_ERROR_REVISE_UNRECOVERABLE`` leaves behind), the
-    installer's ``.staging`` shell, an operator's own hidden directory, and
-    near-misses of the token."""
-    longest = "k" + "a-b_9" * 12 + "xyz"
-    token = "0123456789abcdef" * 2
-    assert len(longest) == 64 and tools._NAME_RE.match(longest)
-    minted = tools._stale_backup_path(tmp_path, longest, token)
-    assert tools._STALE_BACKUP_RE.match(minted.name)
-    assert minted.parent == tmp_path
-    for other in (
-        tool_builder._backup_path(tmp_path, "kbsearch", token).name,  # the rescue shape
-        tool_builder._STAGING_DIRNAME,
-        ".notes",
-        "kbsearch",
-        ".kbsearch.stale-nothex",
-        f".kbsearch.stale-{'0' * 31}",
-        f".kbsearch.stale-{'0' * 32}\n",  # \Z, not $: a filename may hold a newline
-    ):
-        assert not tools._STALE_BACKUP_RE.match(other), other
-
-
-def _busy_package(base: Path, marker: Path, gate: Path) -> tuple[Path, tuple[int, int, int]]:
-    """An installed ``kbsearch`` whose entry announces itself, waits for ``gate``,
-    and only THEN opens a package file by RELATIVE path -- i.e. a tool call whose
-    reads happen AFTER the test has had the chance to swap the package underneath
-    it. Returns the package and its manifest identity."""
-    installed = base / "kbsearch"
-    installed.mkdir(parents=True)
-    manifest = _package_manifest("kbsearch")
-    manifest["entry"] = [sys.executable, "run.py"]
-    (installed / "tool.json").write_text(json.dumps(manifest), encoding="utf-8")
-    (installed / "data.txt").write_text("PAYLOAD", encoding="utf-8")
-    (installed / "run.py").write_text(
-        "import os, sys, time\n"
-        f"open({str(marker)!r}, 'w').write('x')\n"
-        f"while not os.path.exists({str(gate)!r}):\n"
-        "    time.sleep(0.01)\n"
-        "sys.stdout.write(open('data.txt').read())\n",
+def _versioned_package_at(package: Path, name: str, run_py: str = _GOOD_RUN_PY) -> Path:
+    """Create one committed version under an explicit package path."""
+    version = package / tools._VERSIONS_DIRNAME / _TEST_VID
+    version.mkdir(parents=True)
+    (version / "tool.json").write_text(json.dumps(_package_manifest(name)), encoding="utf-8")
+    (version / "run.py").write_text(run_py, encoding="utf-8")
+    version_meta = version / tools._META_DIRNAME
+    version_meta.mkdir()
+    (version_meta / tools._ORIGIN_FILENAME).write_text(
+        json.dumps(
+            {
+                "source": "test-fixture",
+                "openapi_url": None,
+                "instructions": None,
+                "feedback": None,
+                "previous": None,
+            }
+        ),
         encoding="utf-8",
     )
-    identity = tool_builder._package_identity(installed)
-    assert identity is not None
-    return installed, identity
+    package_meta = package / tools._META_DIRNAME
+    package_meta.mkdir()
+    (package_meta / tools._CURRENT_FILENAME).write_text(f"{_TEST_VID}\n", encoding="ascii")
+    (package_meta / tools._PACKAGE_STATE_FILENAME).write_text(
+        json.dumps(_state_document(True)), encoding="utf-8"
+    )
+    return version
+
+
+def _stale_dir(base: Path, name: str) -> Path:
+    package = tools._stale_backup_path(base, name, uuid4().hex)
+    _versioned_package_at(package, name)
+    return package
 
 
 def _wait_for(condition: Callable[[], bool], *, timeout: float = 30.0) -> None:
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if condition():
-            return
+    while not condition():
+        if time.monotonic() >= deadline:
+            raise AssertionError("condition was not reached before timeout")
         time.sleep(0.01)
-    raise AssertionError("condition was not reached in time")
-
-
-def _edit_manifest_in_place(pkg: Path) -> tuple[int, int, int]:
-    """Rewrite ``tool.json`` byte-identically until its manifest identity MOVES.
-
-    The twin of ``tests/test_tools.py``'s helper of the same name -- see there for
-    the measured ~1 ms ``st_ctime_ns`` granularity the retry loop exists for, and
-    for why a HAND-EDIT is the writer this stands in for now that the enabled
-    toggle no longer rewrites the manifest."""
-    manifest = pkg / "tool.json"
-    raw = manifest.read_text(encoding="utf-8")
-    before = tool_builder._package_identity(pkg)
-    deadline = time.monotonic() + 30.0
-    while time.monotonic() < deadline:
-        manifest.write_text(raw, encoding="utf-8")
-        after = tool_builder._package_identity(pkg)
-        assert after is not None
-        if after != before:
-            assert manifest.read_text(encoding="utf-8") == raw  # the BYTES never changed
-            return after
-    raise AssertionError("the manifest identity never moved across an in-place rewrite")
-
-
-def test_promote_replace_defers_the_backup_while_a_tool_call_is_running(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A tool call in flight when the swap lands keeps its files for the whole
-    call, and the backup is collected afterwards.
-
-    The runtime's identity check protects the START of a call; this is the other
-    half. An ordinary capture/enrich is NOT in the tool job's single-flight, so a
-    revise can promote while a tool subprocess of that same package is running --
-    and MEASURED (the module comment records it): the rename-aside is invisible to
-    the child (its cwd is the inode), while the ``rmtree`` that used to follow
-    immediately makes every later relative open fail with ENOENT. The child here
-    reads ``data.txt`` by relative path only AFTER the swap has completed, so a
-    dropped backup would surface as a failed/empty tool result -- returned to the
-    model as the answer to the workflow that called it.
-
-    The promote itself is NOT delayed or refused (a revise the operator asked for
-    must not be blocked by a tool call): it publishes, and only the removal waits.
-    """
-    base = tmp_path / "tools"
-    marker, gate = tmp_path / "started", tmp_path / "go"
-    installed, identity = _busy_package(base, marker, gate)
-    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
-    staging.mkdir(parents=True)
-    (staging / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")), encoding="utf-8")
-    (staging / "run.py").write_text("print('revised')", encoding="utf-8")
-    _install_settings(monkeypatch, tools_dir=str(base))
-    handler = tools.enabled_llm_tools()[0].handler
-
-    result: dict[str, str] = {}
-    caller = threading.Thread(target=lambda: result.update(out=asyncio.run(handler({}))))
-    caller.start()
-    try:
-        _wait_for(marker.exists)  # the CHILD is running, not merely queued
-        origin, error = tool_builder._promote_staging_replace(
-            staging,
-            "kbsearch",
-            base,
-            env_existed_at_start=False,
-            package_identity=identity,
-            registered=[],
-        )
-    finally:
-        gate.write_text("go", encoding="utf-8")
-        caller.join(timeout=30)
-
-    assert error is None and origin is None  # the revision published as usual
-    assert (installed / "run.py").read_text(encoding="utf-8") == "print('revised')"
-    assert result["out"] == "PAYLOAD"  # read from the OLD package, after the swap
-    # The backup outlived the swap on purpose, MARKED collectable (the rename a
-    # running child cannot notice), and is collected once the call has ended.
-    assert _leftovers(base) == []  # nothing left wearing the rescue shape
-    stale = [child.name for child in base.iterdir() if ".stale-" in child.name]
-    assert len(stale) == 1
-    tool_builder._sweep_stale_backups(base)
-    assert [child.name for child in base.iterdir() if ".stale-" in child.name] == []
-
-
-def test_promote_replace_defers_after_a_manifest_edit_moved_the_identity(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The deferral must survive an in-place manifest rewrite landing mid-call.
-
-    Same shape as the test above, with the one event that used to break it: the
-    package's ``tool.json`` is rewritten while a call of it is running. With the
-    execution registry keyed on the MANIFEST identity the promote looked the call
-    up under a tuple nobody had registered, answered "nothing is running", and
-    ``rmtree``d the backup while the child still had its cwd on it -- and the
-    window is the whole call, not a syscall pair.
-
-    ``set_enabled`` was the writer O5-1 found this through, and since web-v5 P1 the
-    toggle does not touch the manifest at all. An operator hand-editing the spec of
-    a running tool is a supported action (D21) and moves the same identity, so the
-    guarantee is pinned through that instead -- byte-identically, since what moves
-    is the FILE's ctime and not its contents.
-
-    The revise session here reads its identity AFTER the edit, which is what a
-    session started at this moment genuinely holds (a session that had captured
-    the PRE-edit manifest is refused outright by the pre-swap check -- that is
-    the adjudicated behaviour of the OTHER identity, and it is unchanged). So the
-    two identities are deliberately out of step here, which is exactly the state
-    that used to lose the registration."""
-    base = tmp_path / "tools"
-    marker, gate = tmp_path / "started", tmp_path / "go"
-    installed, before = _busy_package(base, marker, gate)
-    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
-    staging.mkdir(parents=True)
-    (staging / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")), encoding="utf-8")
-    (staging / "run.py").write_text("print('revised')", encoding="utf-8")
-    _install_settings(monkeypatch, tools_dir=str(base))
-    handler = tools.enabled_llm_tools()[0].handler
-
-    result: dict[str, str] = {}
-    caller = threading.Thread(target=lambda: result.update(out=asyncio.run(handler({}))))
-    caller.start()
-    try:
-        _wait_for(marker.exists)  # the CHILD is running, not merely queued
-        identity = _edit_manifest_in_place(installed)
-        assert identity != before  # the premise, measured
-        origin, error = tool_builder._promote_staging_replace(
-            staging,
-            "kbsearch",
-            base,
-            env_existed_at_start=False,
-            package_identity=identity,
-            registered=[],
-        )
-    finally:
-        gate.write_text("go", encoding="utf-8")
-        caller.join(timeout=30)
-
-    assert error is None and origin is None  # the revision published as usual
-    assert (installed / "run.py").read_text(encoding="utf-8") == "print('revised')"
-    assert result["out"] == "PAYLOAD"  # read from the OLD package, after the swap
-    assert _leftovers(base) == []  # nothing left wearing the rescue shape
-    assert len([child for child in base.iterdir() if ".stale-" in child.name]) == 1
-    tool_builder._sweep_stale_backups(base)
-    assert [child.name for child in base.iterdir() if ".stale-" in child.name] == []
-
-
-def test_a_publish_temp_rides_a_renamed_package_into_the_namespace_that_collects_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """P1R5-4: where the ONE temp file the path-based cleanup cannot reach goes.
-
-    The publisher unlinks its temp on every failure path, but by PATH -- so when the
-    package DIRECTORY is renamed aside between ``mkstemp`` and the publish (a
-    ``delete_tool`` deferring past an in-flight call, a revise swap), the temp goes
-    with the directory and the unlink looks where it no longer is. The docstring
-    used to say a failed write leaves nothing behind, full stop.
-
-    What actually happens is measured here rather than argued: the temp is inside
-    the renamed directory, and the renamed directory is one somebody else collects
-    WHOLE. Both writers rename into the same marked namespace, and the sweep that
-    runs at the end of every tool job ``rmtree``s it with the temp inside. That is
-    why this needs no directory fd: the only way to reach that branch is a rename
-    that has already handed the file to a collector."""
-    base = tmp_path / "tools"
-    pkg = base / "echo"
-    pkg.mkdir(parents=True)
-    real_mkstemp = tempfile.mkstemp
-    moved: dict[str, Path] = {}
-
-    def rename_the_package_aside(*args: Any, **kwargs: Any) -> tuple[int, str]:
-        fd, name = real_mkstemp(*args, **kwargs)
-        deferred = tools._stale_backup_path(base, "echo", uuid4().hex)
-        os.rename(pkg, deferred)  # exactly what delete_tool does when a call is in flight
-        moved["deferred"] = deferred
-        return fd, name
-
-    monkeypatch.setattr(tempfile, "mkstemp", rename_the_package_aside)
-
-    assert tools.write_package_state(pkg, False) is False  # nothing published
-    monkeypatch.undo()
-
-    deferred = moved["deferred"]
-    orphan = [entry.name for entry in deferred.iterdir() if entry.name.endswith(".tmp")]
-    assert orphan == [f"{tools._STATE_FILENAME}.{orphan[0].split('.')[-2]}.tmp"]
-    assert not pkg.exists()  # ... and nothing was left at the package's own path
-
-    tool_builder._sweep_stale_backups(base)  # the end-of-job sweep, unchanged
-    assert not deferred.exists()
-    assert list(base.iterdir()) == []
-
-
-def test_a_promote_landing_while_a_call_prepares_never_runs_the_new_package(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The window R6-1 is about, from the promote's side: the handler has read the
-    identity of the directory it is going to run out of, but the child has not
-    started yet.
-
-    ``cwd`` is resolved by the KERNEL from the PATH at exec time, so a swap that
-    lands in this gap does not merely race the call -- it REDIRECTS it. The child
-    would come up inside the REVISED package while carrying the entry argv, the
-    schema and the ``.env`` values of the one the model was offered, and the AI
-    log would record the old name with no sign anything moved. The old ordering
-    made that reachable twice over: the registration came after the ``.env`` read
-    (so this promote would have dropped the backup outright), and the identity was
-    checked once, before all of it.
-
-    Driven from inside ``_build_tool_env`` -- the ``.env`` read itself -- so the
-    promote completes inside the gap deterministically. What must hold: the
-    revised package NEVER runs (its entry would leave a marker), the call refuses
-    instead, and the backup is deferred rather than destroyed, which is only
-    possible if the registration was already published when the promote asked."""
-    base = tmp_path / "tools"
-    installed = base / "kbsearch"
-    installed.mkdir(parents=True)
-    manifest = _package_manifest("kbsearch")
-    manifest["entry"] = [sys.executable, "run.py"]
-    (installed / "tool.json").write_text(json.dumps(manifest), encoding="utf-8")
-    (installed / "run.py").write_text("print('OLD')", encoding="utf-8")
-    identity = tool_builder._package_identity(installed)
-    assert identity is not None
-
-    revised_ran = tmp_path / "revised-ran"
-    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
-    staging.mkdir(parents=True)
-    (staging / "tool.json").write_text(json.dumps(manifest), encoding="utf-8")
-    (staging / "run.py").write_text(
-        f"open({str(revised_ran)!r}, 'w').write('x')\nprint('NEW')\n", encoding="utf-8"
-    )
-    _install_settings(monkeypatch, tools_dir=str(base))
-    handler = tools.enabled_llm_tools()[0].handler
-    real_build_env = tools._build_tool_env
-
-    def promote_then_build(directory: Path) -> tuple[dict[str, str], frozenset[str]]:
-        origin, error = tool_builder._promote_staging_replace(
-            staging,
-            "kbsearch",
-            base,
-            env_existed_at_start=False,
-            package_identity=identity,
-            registered=[],
-        )
-        assert error is None and origin is None  # the revise publishes, as always
-        return real_build_env(directory)
-
-    monkeypatch.setattr(tools, "_build_tool_env", promote_then_build)
-
-    assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
-    assert not revised_ran.exists()  # the redirected child never happened
-    # ... and it was genuinely there to be run: the swap DID publish, as a revise
-    # must -- a promote is never delayed or refused by a tool call (D40 r3).
-    assert "print('NEW')" in (installed / "run.py").read_text(encoding="utf-8")
-    # Deferred, not dropped: the promote found this call registered, which it
-    # could only do if the registration preceded the ``.env`` read it ran inside.
-    assert _leftovers(base) == []
-    stale = [child for child in base.iterdir() if ".stale-" in child.name]
-    assert len(stale) == 1 and (stale[0] / "run.py").read_text(encoding="utf-8") == "print('OLD')"
-
-
-def test_promote_replace_drops_the_backup_immediately_when_nothing_is_running(
-    tmp_path: Path,
-) -> None:
-    """The deferral is the exception, not the new normal: with no execution
-    registered against the package, a successful swap still removes the backup
-    inside the promote itself -- no sweep, no litter, no behaviour change for the
-    ordinary case."""
-    base = tmp_path / "tools"
-    installed, staging = _replace_fixture(base)
-    identity = tool_builder._package_identity(installed)
-    running = tools.directory_identity(installed)
-    assert identity is not None and running is not None
-    assert tools.directory_execution_in_flight(running) is False  # the precondition, pinned
-
-    _origin, error = tool_builder._promote_staging_replace(
-        staging,
-        "kbsearch",
-        base,
-        env_existed_at_start=False,
-        package_identity=identity,
-        registered=[],
-    )
-
-    assert error is None
-    assert _leftovers(base) == []  # gone by the time the promote returned
-
-
-def _stale_dir(base: Path, name: str) -> Path:
-    """A marked, collectable backup of ``name`` with a readable manifest."""
-    path = tools._stale_backup_path(base, name, uuid4().hex)
-    path.mkdir()
-    (path / "tool.json").write_text(json.dumps(_package_manifest(name)), encoding="utf-8")
-    return path
 
 
 def test_sweep_keeps_a_backup_that_is_still_in_use_and_spares_everything_else(
@@ -4882,7 +4338,7 @@ def test_sweep_keeps_a_backup_that_is_still_in_use_and_spares_everything_else(
     base = tmp_path / "tools"
     base.mkdir()
     busy = _stale_dir(base, "kbsearch")
-    identity = tools.directory_identity(busy)
+    identity = tools.directory_identity(tools.VersionRoot(_resolved_version(busy)))
     assert identity is not None
     idle = _stale_dir(base, "other")
     (base / ".staging").mkdir()
@@ -4936,6 +4392,31 @@ def test_cleanup_staging_is_where_the_sweep_actually_runs(tmp_path: Path) -> Non
     assert refused.is_dir()  # ... and the refused workspace was left alone
 
 
+def test_invariant_a_delete_and_stale_sweep_share_one_running_package_judgement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A spy pins both destructive callers to the one all-versions helper."""
+    base = tmp_path / "tools"
+    _versioned_package_at(base / "live", "live")
+    stale = _stale_dir(base, "old")
+    _install_settings(monkeypatch, tools_dir=str(base))
+    asked: list[tools.PackageRoot] = []
+
+    def nobody_running(package_root: tools.PackageRoot) -> bool:
+        asked.append(package_root)
+        return False
+
+    monkeypatch.setattr(tools, "package_execution_in_flight", nobody_running)
+
+    assert tools.delete_tool("live") is True
+    tool_builder._sweep_stale_backups(base)
+
+    assert len(asked) == 2
+    assert all(isinstance(root, tools.PackageRoot) for root in asked)
+    assert asked[0].path.name.startswith(".live.stale-")
+    assert asked[1].path == stale
+
+
 def test_sweep_collects_what_a_deferred_delete_left_behind(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4957,7 +4438,16 @@ def test_sweep_collects_what_a_deferred_delete_left_behind(
     the same tuple from the directory it is holding."""
     base = tmp_path / "tools"
     marker, gate = tmp_path / "started", tmp_path / "go"
-    _busy_package(base, marker, gate)
+    version = _versioned_package_at(
+        base / "kbsearch",
+        "kbsearch",
+        "import os, sys, time\n"
+        f"open({str(marker)!r}, 'w').write('x')\n"
+        f"while not os.path.exists({str(gate)!r}):\n"
+        "    time.sleep(0.01)\n"
+        "sys.stdout.write(open('data.txt').read())\n",
+    )
+    (version / "data.txt").write_text("PAYLOAD", encoding="utf-8")
     _install_settings(monkeypatch, tools_dir=str(base))
     handler = tools.enabled_llm_tools()[0].handler
 
@@ -4979,28 +4469,6 @@ def test_sweep_collects_what_a_deferred_delete_left_behind(
     assert result["out"] == "PAYLOAD"  # the child read its data file after the delete
     tool_builder._sweep_stale_backups(base)
     assert list(base.iterdir()) == []
-
-
-def test_sweep_never_collects_the_rescue_copy_of_an_unrecoverable_swap(tmp_path: Path) -> None:
-    """A plain ``.bak-`` directory is NOT the sweep's business, and this is the
-    reason the marked namespace exists at all.
-
-    When the publish rename fails AND the roll-back fails, that hidden backup is
-    the operator's ONLY copy of their tool -- ``_ERROR_REVISE_UNRECOVERABLE`` sends
-    them to it by hand. It sits in the tools dir with a readable manifest and
-    nothing executing against it, i.e. it satisfies every "collectable" test except
-    the name. A sweep that keyed on ``.bak-`` would delete it moments later, in the
-    very same job's cleanup."""
-    base = tmp_path / "tools"
-    base.mkdir()
-    rescue = tool_builder._backup_path(base, "kbsearch", uuid4().hex)
-    rescue.mkdir()
-    (rescue / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")), encoding="utf-8")
-    (rescue / "run.py").write_text(_GOOD_RUN_PY, encoding="utf-8")
-
-    tool_builder._sweep_stale_backups(base)
-
-    assert (rescue / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY
 
 
 def test_sweep_keeps_a_marked_backup_whose_identity_cannot_be_read(
@@ -5029,32 +4497,27 @@ def test_sweep_keeps_a_marked_backup_whose_identity_cannot_be_read(
 
     unreadable = tools._stale_backup_path(base, "other", uuid4().hex)
     unreadable.mkdir()
-    monkeypatch.setattr(tools, "directory_identity", lambda _directory: None)
+    monkeypatch.setattr(tools, "package_execution_in_flight", lambda _package: True)
 
     tool_builder._sweep_stale_backups(base)
 
     assert unreadable.is_dir()
 
 
-def test_run_revise_rolls_back_a_failed_publish(
+def test_invariant_d_failed_version_rename_leaves_current_on_the_previous_version(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """If the PUBLISH rename fails AFTER the old package was renamed aside, the
-    backup is renamed home: the installed tool comes back byte-identical, the
-    outcome says so, and nothing hidden is left in the tools directory.
-
-    Only the publish rename is broken here; the roll-back rename still works,
-    which is the whole point -- with the publish being a plain ``os.rename``
-    (R1-2) a failure moved NOTHING, so the target name is free and the backup can
-    always go home. That is what makes ``_ERROR_REVISE_UNRECOVERABLE`` the rare
-    outcome its docstring claims."""
+    """A failed version commit cannot move the sole package pointer."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
     before = _file_bytes(pkg)
+    current_before = (
+        _package_path(pkg) / tools._META_DIRNAME / tools._CURRENT_FILENAME
+    ).read_bytes()
     real_rename = os.rename
 
     def exploding_publish(src: Any, dst: Any) -> Any:
-        if tool_builder._STAGING_DIRNAME in str(src):
+        if Path(dst).parent.name == tools._VERSIONS_DIRNAME:
             raise OSError("no space left on device")
         return real_rename(src, dst)
 
@@ -5064,13 +4527,112 @@ def test_run_revise_rolls_back_a_failed_publish(
     outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
-    assert "置換失敗" in (outcome.error or "")
-    assert "已還原" in (outcome.error or "")
+    assert "無法安裝工具版本" in (outcome.error or "")
     assert "OSError" in (outcome.error or "")  # category only, never str(exc)
     assert "no space left" not in (outcome.error or "")
-    assert _file_bytes(pkg) == before  # every file back, byte for byte
+    assert _file_bytes(pkg) == before
+    assert (
+        _package_path(pkg) / tools._META_DIRNAME / tools._CURRENT_FILENAME
+    ).read_bytes() == current_before
     assert _leftovers(pkg.parent) == []
     assert [(row["name"], row["valid"]) for row in tools.list_tools()] == [("kbsearch", True)]
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["version-tree", "versions-directory", "package-shell", "tools-directory"],
+)
+def test_invariant_d_install_faults_never_report_a_non_durable_package_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fault: str
+) -> None:
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built", "ready": True},
+        files={"tool.json": json.dumps(_package_manifest("kbsearch")), "run.py": _GOOD_RUN_PY},
+    )
+    _no_fetch(monkeypatch)
+    real_tree = tool_builder._fsync_tree
+    real_directory = tool_builder._fsync_directory
+
+    def fault_tree(path: Path) -> bool:
+        if fault == "version-tree" and path.parent.name == tools._VERSIONS_DIRNAME:
+            return False
+        if fault == "package-shell" and path.name == "shell":
+            return False
+        return real_tree(path)
+
+    def fault_directory(path: Path) -> bool:
+        if fault == "versions-directory" and path.name == tools._VERSIONS_DIRNAME:
+            return False
+        if fault == "tools-directory" and path == root:
+            return False
+        return real_directory(path)
+
+    monkeypatch.setattr(tool_builder, "_fsync_tree", fault_tree)
+    monkeypatch.setattr(tool_builder, "_fsync_directory", fault_directory)
+
+    outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build"))
+
+    assert outcome.ok is False
+    installed = root / "kbsearch"
+    if fault == "tools-directory":
+        resolution = tools.resolve_current(tools.PackageRoot(installed))
+        assert isinstance(resolution, tools.Resolved)
+    else:
+        assert not installed.exists()
+
+
+@pytest.mark.parametrize("fault", ["version-tree", "versions-directory"])
+def test_invariant_d_revise_faults_leave_current_on_a_durable_previous_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fault: str
+) -> None:
+    pkg = _seed_package(monkeypatch, tmp_path)
+    current = _package_path(pkg) / tools._META_DIRNAME / tools._CURRENT_FILENAME
+    before = current.read_bytes()
+    real_tree = tool_builder._fsync_tree
+    real_directory = tool_builder._fsync_directory
+
+    def fault_tree(path: Path) -> bool:
+        if fault == "version-tree" and path.name == "shell":
+            return False
+        return real_tree(path)
+
+    def fault_directory(path: Path) -> bool:
+        if fault == "versions-directory" and path.name == tools._VERSIONS_DIRNAME:
+            return False
+        return real_directory(path)
+
+    monkeypatch.setattr(tool_builder, "_fsync_tree", fault_tree)
+    monkeypatch.setattr(tool_builder, "_fsync_directory", fault_directory)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert current.read_bytes() == before
+    assert _current_version(pkg) == pkg
+
+
+def test_vid_collision_checks_every_entry_with_the_candidate_prefix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pkg = _seed_package(monkeypatch, tmp_path)
+    package = _package_path(pkg)
+    collided = "20260728T020304Z-111111"
+    chosen = "20260728T020304Z-222222"
+    parked = package / tools._VERSIONS_DIRNAME / f"{collided}.discarded"
+    parked.mkdir()
+    minted = iter([collided, chosen])
+    monkeypatch.setattr(tool_builder, "_mint_vid", lambda: next(minted))
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert _resolved_version(package).name == chosen
+    assert parked.is_dir()
 
 
 def test_run_revise_publish_is_a_rename_with_no_copy_fallback(
@@ -5090,7 +4652,7 @@ def test_run_revise_publish_is_a_rename_with_no_copy_fallback(
     ``copytree`` (the staging copy) is untouched -- the pin is on ``move``
     specifically, which is the only shutil entry point with that fallback."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
 
     def forbidden_move(src: Any, dst: Any) -> Any:
         raise AssertionError("the revise publish must not use shutil.move")
@@ -5101,7 +4663,7 @@ def test_run_revise_publish_is_a_rename_with_no_copy_fallback(
     outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
-    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert (_current_version(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
     assert _leftovers(pkg.parent) == []
 
 
@@ -5111,19 +4673,19 @@ def test_run_revise_reports_the_original_being_deleted(
     """A delete landing during the build is answered honestly -- the revision is
     NOT installed as a new tool, because 'replace' has nothing to replace."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    root = pkg.parent
+    root = _package_path(pkg).parent
     _fake_generate(
         monkeypatch,
         result=_revise_result(),
         files={"run.py": _REVISED_RUN_PY},
-        side_effect=lambda: shutil.rmtree(pkg),
+        side_effect=lambda: shutil.rmtree(_package_path(pkg)),
     )
 
     outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
     assert outcome.error == tool_builder._ERROR_REVISE_TARGET_MISSING
-    assert not pkg.exists()
+    assert not _package_path(pkg).exists()
     assert tools.list_tools() == []
     assert _leftovers(root) == []
     assert not (root / ".staging").exists()
@@ -5182,7 +4744,7 @@ def test_run_revise_refuses_an_unreadable_env(
     nothing about, and then swap in a package built in that blind spot."""
     pkg = _seed_package(monkeypatch, tmp_path)
     (tmp_path / "elsewhere.env").write_text("KB_API_KEY=live-secret-value\n", encoding="utf-8")
-    (pkg / ".env").symlink_to(tmp_path / "elsewhere.env")
+    (_package_path(pkg) / ".env").symlink_to(tmp_path / "elsewhere.env")
     before = _file_bytes(pkg)
 
     async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
@@ -5195,7 +4757,7 @@ def test_run_revise_refuses_an_unreadable_env(
     assert outcome.ok is False
     assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNREADABLE
     assert _file_bytes(pkg) == before
-    assert (pkg / ".env").is_symlink()  # left exactly as found
+    assert (_package_path(pkg) / ".env").is_symlink()  # left exactly as found
 
 
 def test_run_revise_refuses_a_stat_failure_on_the_env(
@@ -5211,7 +4773,7 @@ def test_run_revise_refuses_a_stat_failure_on_the_env(
     is not evidence of absence, so it takes the same unreadable path a symlinked
     ``.env`` takes above."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
     before = _file_bytes(pkg)
     real_lstat = Path.lstat
     refusing = {"on": True}  # switched off before the package is inspected below
@@ -5238,381 +4800,6 @@ def test_run_revise_refuses_a_stat_failure_on_the_env(
         assert not tools._INFLIGHT_SECRETS  # nothing was registered either
 
 
-def test_run_revise_refuses_a_live_env_that_stopped_being_a_regular_file(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The preserve step guards its SOURCE, and a refusal there aborts BEFORE the
-    swap (R2-1).
-
-    The entry read vetted a regular file, but the session runs for minutes and
-    ``run_shell`` is unjailed (D21), so the live ``.env`` can be a symlink or a
-    FIFO by the time the copy runs. ``shutil.copy2`` would happily read straight
-    through it; the ``lstat`` gate refuses instead, mirroring what the bounded
-    reader's ``O_NOFOLLOW`` refuses at the front door -- and because the copy is
-    the LAST thing before the rename-aside, the working tool is still the working
-    tool."""
-    pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
-    (tmp_path / "elsewhere.env").write_text("KB_API_KEY=someone-elses\n", encoding="utf-8")
-
-    def swap_the_env_for_a_link() -> None:
-        (pkg / ".env").unlink()
-        (pkg / ".env").symlink_to(tmp_path / "elsewhere.env")
-
-    _fake_generate(
-        monkeypatch,
-        result=_revise_result(),
-        files={"run.py": _REVISED_RUN_PY},
-        side_effect=swap_the_env_for_a_link,
-    )
-
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
-
-    assert outcome.ok is False
-    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNREADABLE
-    assert (pkg / "run.py").read_text(encoding="utf-8") == "print('x')\n"  # never swapped
-    assert (pkg / ".env").is_symlink()  # and the raced-in link is left alone
-    assert _leftovers(pkg.parent) == []
-    assert not (pkg.parent / tool_builder._STAGING_DIRNAME).exists()
-
-
-def test_run_revise_refuses_to_copy_the_env_through_a_planted_link(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The preserve step guards its DESTINATION too, and that is load-bearing.
-
-    ``shutil.copy2`` FOLLOWS its destination, so a symlink planted at
-    ``<staging>/.env`` by the unjailed ``run_shell`` (D21) would take the LIVE
-    credentials through it and write them outside staging. The text write this
-    copy replaced refused that outright (``tools._write_regular_file`` opens
-    ``O_NOFOLLOW``), so the ``lstat`` gate is what keeps the refusal set identical
-    rather than quietly widened. The outside file must come back untouched."""
-    pkg = _seed_package(monkeypatch, tmp_path)
-    root = pkg.parent
-    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
-    outside = tmp_path / "outside.txt"
-    outside.write_text("not ours\n", encoding="utf-8")
-
-    def plant_a_link_at_the_staged_env() -> None:
-        os.symlink(outside, _staging_dir(root) / ".env")
-
-    _fake_generate(
-        monkeypatch,
-        result=_revise_result(),
-        files={"run.py": _REVISED_RUN_PY},
-        side_effect=plant_a_link_at_the_staged_env,
-    )
-
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
-
-    assert outcome.ok is False
-    assert outcome.error == tool_builder._ERROR_REVISE_ENV_RESTORE
-    assert outside.read_text(encoding="utf-8") == "not ours\n"  # nothing written through
-    assert (pkg / ".env").read_text(encoding="utf-8") == _TRICKY_ENV
-    assert (pkg / "run.py").read_text(encoding="utf-8") == "print('x')\n"  # never swapped
-    assert _leftovers(root) == []
-
-
-_MODEL_ENV = "KB_API_KEY=made-up-by-the-model\n"
-
-
-def test_run_revise_ships_no_env_when_the_live_one_was_deleted_mid_session(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """R3-1: a live ``.env`` DELETED during the session must not be replaced by the
-    model's placeholder.
-
-    The preserve step treated a missing SOURCE as "nothing to preserve" and
-    returned success, so whatever the builder wrote at ``<staging>/.env`` shipped.
-    The standing acceptance ("a package with no prior ``.env`` may receive a
-    builder-written one") covers packages that NEVER had one; it says nothing
-    about one that existed when the session started and was removed during it.
-    That deletion is a deliberate act on the LIVE package -- the operator pulled
-    the credentials -- while the builder's file is an artifact of a prompt that
-    told it not to write one at all. So the staged ``.env`` is dropped and the
-    published package has none, which is what the deletion asked for.
-
-    Driven from the fake's side effect, which runs after the entry read observed
-    the real ``.env`` and before the promote -- the only window the real
-    multi-minute session leaves for this."""
-    pkg = _seed_package(monkeypatch, tmp_path)
-    root = pkg.parent
-    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
-    _fake_generate(
-        monkeypatch,
-        result=_revise_result(),
-        files={"run.py": _REVISED_RUN_PY, ".env": _MODEL_ENV},
-        side_effect=lambda: (pkg / ".env").unlink(),
-    )
-
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
-
-    assert outcome.ok is True  # the revision itself is fine; only the .env is dropped
-    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY  # it really swapped
-    assert not (pkg / ".env").exists()  # the deletion stands
-    # ... and the model's placeholder is nowhere on disk, not in a leftover staging
-    # dir, not in a backup, not under any other name.
-    assert _MODEL_ENV.encode() not in b"".join(_file_bytes(root).values())
-    assert _leftovers(root) == []
-    assert not (root / tool_builder._STAGING_DIRNAME).exists()
-
-
-def test_run_revise_treats_a_valueless_env_as_having_existed(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """ "It existed" comes from the READ, never from the parsed values (R4-3).
-
-    A comment-only ``.env`` parses to ``{}`` -- exactly what a package with NO
-    ``.env`` parses to -- yet the two mean opposite things when the file is gone by
-    promote time: one is an operator who pulled a credentials file mid-session, the
-    other is a package that may receive the builder's own. Now that the reader
-    hands back an existence BIT plus the values rather than the text the caller
-    tested for None, the bit has to be taken from the read; deriving it from the
-    values would silently collapse this case into the never-had-one branch and let
-    the placeholder ship."""
-    pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / ".env").write_text("# only a comment, no values at all\n", encoding="utf-8")
-    _fake_generate(
-        monkeypatch,
-        result=_revise_result(),
-        files={"run.py": _REVISED_RUN_PY, ".env": _MODEL_ENV},
-        side_effect=lambda: (pkg / ".env").unlink(),
-    )
-
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
-
-    assert outcome.ok is True
-    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY  # it really swapped
-    assert not (pkg / ".env").exists()  # the deletion stands: no placeholder took its place
-
-
-def test_run_revise_ships_the_builder_env_when_the_package_never_had_one(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The standing acceptance, unchanged (R3-1): a package with NO ``.env`` at
-    session start still gets the builder-written one, exactly as an install does
-    -- otherwise a revise could never act on "store the key in .env" feedback.
-
-    This is what makes the deletion case above a real discrimination rather than
-    a blanket "never ship a builder ``.env``".
-
-    Strengthened on two points the acceptance never covered. The file goes out
-    BYTE for byte (nothing normalizes what the builder wrote), and its value is
-    REGISTERED as an in-flight secret while the post-promote summary session runs
-    -- that session reads the freshly published package and writes a sidecar, and
-    the registration is what the redactors have to work with in the window where
-    the ``.env`` is brand new. Observed inside the summary stub because that is
-    the window; the session's ``finally`` discards it, which the last assertion
-    pins."""
-    pkg = _seed_package(monkeypatch, tmp_path)
-    assert not (pkg / ".env").exists()
-    at_summary: dict[str, set[str]] = {}
-    _fake_generate(
-        monkeypatch,
-        result=_revise_result(),
-        files={"run.py": _REVISED_RUN_PY, ".env": _MODEL_ENV},
-    )
-
-    def observe_while_summarizing() -> None:
-        with tools._INFLIGHT_LOCK:
-            at_summary["inflight"] = set(tools._INFLIGHT_SECRETS)
-
-    _fake_summary_generate(monkeypatch, side_effect=observe_while_summarizing)
-
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
-
-    assert outcome.ok is True
-    assert (pkg / ".env").read_bytes() == _MODEL_ENV.encode("utf-8")
-    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
-    assert at_summary["inflight"] == {"made-up-by-the-model"}
-    with tools._INFLIGHT_LOCK:
-        assert not tools._INFLIGHT_SECRETS
-
-
-@pytest.mark.parametrize(
-    ("staged_env", "expected_error"),
-    [
-        ("PIN=1234\n", tool_builder._ERROR_REVISE_ENV_UNMASKABLE),
-        ('TOKEN="abcd\\"efgh"\n', tool_builder._ERROR_REVISE_ENV_UNMATCHABLE),
-    ],
-    ids=["below-the-floor", "reversible-spelling"],
-)
-def test_run_revise_refuses_a_builder_env_the_redactors_could_not_mask(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, staged_env: str, expected_error: str
-) -> None:
-    """A builder-WRITTEN ``.env`` must clear the same policy a preserved one does.
-
-    This is the seam between two rules that were each correct alone. The standing
-    acceptance says a package that never had a ``.env`` MAY receive one the
-    builder wrote; the maskability policy says a ``.env`` value the redactors
-    cannot mask must never be handed to this system. Nothing joined them: the
-    preserve step returned success without ever parsing the staged file, and
-    ``validate_package`` only checks its SIZE and scans for values ALREADY known,
-    so it cannot see a new short value or a reversible spelling.
-
-    So a revise could publish ``PIN=1234`` -- which the 6-char floor then
-    permanently refuses to mask in live tool results, in the AI 日誌 and in the
-    summary -- or ``TOKEN="abcd\\"efgh"``, whose escaped spelling matches no
-    registered value when a ``cat`` prints it. The proof that this is a defect
-    rather than untidiness: the NEXT revise of that package refuses at its entry
-    gate on exactly these two rules, so the system would have produced a state it
-    declines to work with.
-
-    Both refusals are the SAME category-only strings the entry gate uses -- same
-    condition, same remedy -- and they name neither key nor value. Refusing here
-    costs the operator nothing they had: the installed package is untouched, the
-    swap never ran, and no hidden backup is left behind."""
-    pkg = _seed_package(monkeypatch, tmp_path)
-    assert not (pkg / ".env").exists()
-    before = _file_bytes(pkg)
-    captured = _fake_generate(
-        monkeypatch,
-        result=_revise_result(),
-        files={"run.py": _REVISED_RUN_PY, ".env": staged_env},
-    )
-
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
-
-    assert outcome.ok is False
-    assert outcome.error == expected_error
-    assert "PIN" not in (outcome.error or "")  # category only: never the key ...
-    assert "1234" not in (outcome.error or "")  # ... and never the value
-    assert captured  # the session DID run: only the promote could have stopped it
-    assert _file_bytes(pkg) == before  # the installed package is exactly as it was
-    assert not (pkg / ".env").exists()  # ... including having no .env at all
-    assert _leftovers(pkg.parent) == []  # nothing was renamed aside
-    assert not (pkg.parent / tool_builder._STAGING_DIRNAME).exists()
-    with tools._INFLIGHT_LOCK:
-        assert not tools._INFLIGHT_SECRETS
-
-
-def test_run_revise_keeps_an_env_the_operator_added_mid_session(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The MIRROR of the deletion case, and it needs no flag: a ``.env`` created
-    on the live package DURING the session is copied like any other, because the
-    file copied is the one on disk at the instant of the swap (R2-1). "Absent at
-    the start" only decides what happens when it is absent at the END too.
-
-    It is also the COMPLIANT half of R7-2: the promote re-runs the whole ``.env``
-    policy on the bytes it is about to ship, so this file -- which no entry gate
-    ever saw, the package having had none -- is vetted, its value REGISTERED
-    before the copy, and then published byte for byte. The registration is
-    observed at ``copy2`` time because that is the only instant it is visible: the
-    session's ``finally`` discards it again, which the last assertion pins (a
-    registration made here and never dropped would outlive the request)."""
-    pkg = _seed_package(monkeypatch, tmp_path)
-    added = "OPERATOR_KEY=added-during-the-session\n"
-    real_copy2 = shutil.copy2
-    at_copy: dict[str, set[str]] = {}
-
-    def add_an_env_mid_session() -> None:
-        (pkg / ".env").write_text(added, encoding="utf-8")
-
-    def observe_while_copying(source: Any, destination: Any, **kwargs: Any) -> Any:
-        with tools._INFLIGHT_LOCK:
-            at_copy["inflight"] = set(tools._INFLIGHT_SECRETS)
-        return real_copy2(source, destination, **kwargs)
-
-    monkeypatch.setattr(shutil, "copy2", observe_while_copying)
-    _fake_generate(
-        monkeypatch,
-        result=_revise_result(),
-        files={"run.py": _REVISED_RUN_PY, ".env": _MODEL_ENV},
-        side_effect=add_an_env_mid_session,
-    )
-
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
-
-    assert outcome.ok is True
-    assert (pkg / ".env").read_bytes() == added.encode("utf-8")  # the operator's file won
-    # Registered BEFORE the bytes moved, so the post-promote summary/sidecar paths
-    # are redacted against a value nothing had ever registered (R7-2) ...
-    assert at_copy["inflight"] == {"added-during-the-session"}
-    with tools._INFLIGHT_LOCK:
-        assert not tools._INFLIGHT_SECRETS  # ... and discarded again by the finally
-
-
-def test_run_revise_refuses_to_ship_an_env_added_mid_session_that_fails_the_policy(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The spelling/floor/size guards must answer for the bytes that SHIP, not
-    just for the snapshot the session opened with (R7-2).
-
-    This package has NO ``.env`` when the revise starts, so every entry gate
-    passes vacuously; the operator then creates a non-compliant one while the
-    builder session runs. Before this fix ``_preserve_env_file`` copied that
-    never-vetted file straight into the published package -- the guards had
-    checked a file that no longer existed. Now the promote re-reads the source it
-    is about to copy and re-runs the same policy on those exact bytes, so the
-    refusal is the same category-only error the entry gate would have given.
-
-    Refusing means the INSTALLED package keeps running unchanged: the revision is
-    discarded, the operator's own file is left exactly as they wrote it, and no
-    hidden ``.bak-`` backup is left behind, because nothing was ever renamed."""
-    pkg = _seed_package(monkeypatch, tmp_path)
-    hostile = 'TOKEN="abcd\\"efgh"\n'  # the reversible spelling, arriving mid-session
-
-    def add_an_unmaskable_env_mid_session() -> None:
-        (pkg / ".env").write_text(hostile, encoding="utf-8")
-
-    captured = _fake_generate(
-        monkeypatch,
-        result=_revise_result(),
-        files={"run.py": _REVISED_RUN_PY},
-        side_effect=add_an_unmaskable_env_mid_session,
-    )
-
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
-
-    assert outcome.ok is False
-    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
-    assert "TOKEN" not in (outcome.error or "")  # category only, as ever
-    assert captured  # the session DID run: only the entry gate could have stopped it
-    assert (pkg / "run.py").read_text(encoding="utf-8") == "print('x')\n"  # never swapped
-    assert (pkg / ".env").read_bytes() == hostile.encode("utf-8")  # the operator's file, untouched
-    assert _leftovers(pkg.parent) == []  # nothing was renamed aside
-    assert not (pkg.parent / tool_builder._STAGING_DIRNAME).exists()
-    with tools._INFLIGHT_LOCK:
-        assert not tools._INFLIGHT_SECRETS
-
-
-def test_run_revise_refuses_when_the_staged_env_cannot_be_dropped(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """If the staged ``.env`` cannot be REMOVED after a mid-session deletion, the
-    swap must not run (R3-1).
-
-    "We could not make the revision match what the operator asked for" must never
-    resolve to "publish the placeholder anyway". A DIRECTORY at ``<staging>/.env``
-    -- which ``os.remove`` will not take -- is the shape an unjailed ``run_shell``
-    (D21) can leave there, and refusing beats a destructive traversal on something
-    this function neither created nor verified."""
-    pkg = _seed_package(monkeypatch, tmp_path)
-    root = pkg.parent
-    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
-
-    def delete_the_live_env_and_plant_a_directory() -> None:
-        (pkg / ".env").unlink()
-        (_staging_dir(root) / ".env").mkdir()
-
-    _fake_generate(
-        monkeypatch,
-        result=_revise_result(),
-        files={"run.py": _REVISED_RUN_PY},
-        side_effect=delete_the_live_env_and_plant_a_directory,
-    )
-
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
-
-    assert outcome.ok is False
-    assert outcome.error == tool_builder._ERROR_REVISE_ENV_DISCARD
-    assert str(root) not in (outcome.error or "")  # category only: no path ...
-    assert _TRICKY_ENV_VALUE not in (outcome.error or "")  # ... and no value
-    assert (pkg / "run.py").read_text(encoding="utf-8") == "print('x')\n"  # never swapped
-    assert _leftovers(root) == []
-
-
 def test_run_revise_refuses_an_env_value_too_short_to_mask(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -5632,7 +4819,7 @@ def test_run_revise_refuses_an_env_value_too_short_to_mask(
     key or the value in the very error that refuses to expose it would be the leak
     it exists to prevent."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / ".env").write_text("PIN=1234\n", encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text("PIN=1234\n", encoding="utf-8")
     before = _file_bytes(pkg)
     captured = _fake_generate(
         monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
@@ -5664,7 +4851,7 @@ def test_run_revise_allows_env_values_at_the_floor_and_ignores_empty_ones(
     make a package permanently unrevisable."""
     pkg = _seed_package(monkeypatch, tmp_path)
     assert tools._MIN_SECRET_LEN == 6  # the floor the fixture below is written to
-    (pkg / ".env").write_text("EXACT=abcdef\nEMPTY=\n", encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text("EXACT=abcdef\nEMPTY=\n", encoding="utf-8")
     seen: dict[str, Any] = {}
     _fake_generate(
         monkeypatch,
@@ -5677,7 +4864,7 @@ def test_run_revise_allows_env_values_at_the_floor_and_ignores_empty_ones(
 
     assert outcome.ok is True
     assert seen["inflight"] == {"abcdef"}  # the empty value was not registered
-    assert (pkg / ".env").read_text(encoding="utf-8") == "EXACT=abcdef\nEMPTY=\n"
+    assert (_package_path(pkg) / ".env").read_text(encoding="utf-8") == "EXACT=abcdef\nEMPTY=\n"
 
 
 @pytest.mark.parametrize(
@@ -5717,7 +4904,7 @@ def test_run_revise_refuses_an_env_value_the_file_spells_reversibly(
     The message names the CONDITION and the remedy and nothing else -- printing
     the value in the error that refuses to expose it would be the leak itself."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / ".env").write_text(raw, encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text(raw, encoding="utf-8")
     parsed = tools._parse_dotenv_text(raw)["KEY"]
     assert len(parsed) >= tools._MIN_SECRET_LEN  # not the r1 floor: the SPELLING, label
     assert parsed not in raw  # ... and this is what "reversible" means, concretely
@@ -5758,7 +4945,7 @@ def test_run_revise_refuses_a_shadowed_line_that_spells_the_value_reversibly(
     still passes, which the sibling test below pins."""
     pkg = _seed_package(monkeypatch, tmp_path)
     raw = 'KEY="abcd\\"efgh"\nKEY=\'abcd"efgh\'\n'
-    (pkg / ".env").write_text(raw, encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text(raw, encoding="utf-8")
     parsed = tools._parse_dotenv_text(raw)["KEY"]
     assert parsed == 'abcd"efgh'
     # The WINNING line spells it literally -- which is exactly why the per-key
@@ -5794,7 +4981,7 @@ def test_run_revise_refuses_a_backslash_escape_inside_single_quotes(
     redactor matches only the winner, and a ``cat`` hands the model the other."""
     pkg = _seed_package(monkeypatch, tmp_path)
     raw = "TOKEN='abc\\\\defghi'\nTOKEN='abc\\defghi'\n"
-    (pkg / ".env").write_text(raw, encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text(raw, encoding="utf-8")
     parsed = tools._parse_dotenv_text(raw)["TOKEN"]
     assert parsed == "abc\\defghi"  # ONE backslash: the shadowed line is reversible
     before = _file_bytes(pkg)
@@ -5820,13 +5007,13 @@ def test_run_revise_allows_a_single_quoted_backslash_value(
     package permanently unrevisable."""
     pkg = _seed_package(monkeypatch, tmp_path)
     raw = "TOKEN='abc\\defghi'\n"
-    (pkg / ".env").write_text(raw, encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text(raw, encoding="utf-8")
     _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
 
     outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
-    assert (pkg / ".env").read_text(encoding="utf-8") == raw
+    assert (_package_path(pkg) / ".env").read_text(encoding="utf-8") == raw
 
 
 def test_run_revise_refuses_when_the_package_was_reinstalled_mid_session(
@@ -5867,41 +5054,6 @@ def test_run_revise_refuses_when_the_package_was_reinstalled_mid_session(
     assert not any(entry.name.startswith(".kbsearch.bak-") for entry in base.iterdir())
 
 
-def test_run_revise_refuses_a_replacement_that_lands_during_the_env_copy(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The identity re-check has to sit AFTER the ``.env`` copy, not before it
-    (R11-1).
-
-    The copy reads through the target and takes an operator-influenced amount of
-    time, so a check that ran before it left that entire window unguarded: a
-    package replaced DURING the copy would still be renamed aside and overwritten
-    by a revision of the package that no longer exists."""
-    pkg = _seed_package(monkeypatch, tmp_path)
-    base = pkg.parent
-    (pkg / ".env").write_text("TOKEN=abcdefgh\n", encoding="utf-8")
-    keep = "print('installed while the copy ran')"
-    real_copy = shutil.copy2
-
-    def replace_during_copy(src: Any, dst: Any, **kwargs: Any) -> Any:
-        result = real_copy(src, dst, **kwargs)
-        shutil.rmtree(pkg)
-        pkg.mkdir()
-        (pkg / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")), encoding="utf-8")
-        (pkg / "run.py").write_text(keep, encoding="utf-8")
-        return result
-
-    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
-    monkeypatch.setattr(shutil, "copy2", replace_during_copy)
-
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
-
-    assert outcome.ok is False
-    assert outcome.error == tool_builder._ERROR_REVISE_TARGET_REPLACED
-    assert (pkg / "run.py").read_text(encoding="utf-8") == keep
-    assert not any(entry.name.startswith(".kbsearch.bak-") for entry in base.iterdir())
-
-
 def test_run_revise_refuses_a_package_whose_identity_cannot_be_established(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -5926,43 +5078,6 @@ def test_run_revise_refuses_a_package_whose_identity_cannot_be_established(
     assert captured == {}  # refused before the session
 
 
-def test_run_revise_refuses_a_replacement_that_lands_during_the_sidecar_read(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The identity re-check must be the LAST thing before the first rename
-    (R12-1).
-
-    It moved twice for the same reason: r10 placed it before the ``.env`` copy,
-    r11 before the sidecar read, and each left a window in which a replacement
-    still got overwritten. Driven here by replacing the package from inside the
-    origin read, so the test pins the ORDER and not merely the check."""
-    pkg = _seed_package(monkeypatch, tmp_path)
-    base = pkg.parent
-    keep = "print('installed while the sidecar was read')"
-    real_read = tools.read_tool_meta
-
-    def replace_during_read(directory: Any) -> Any:
-        result = real_read(directory)
-        if pkg.exists():
-            shutil.rmtree(pkg)
-            pkg.mkdir()
-            (pkg / "tool.json").write_text(
-                json.dumps(_package_manifest("kbsearch")), encoding="utf-8"
-            )
-            (pkg / "run.py").write_text(keep, encoding="utf-8")
-        return result
-
-    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
-    monkeypatch.setattr(tools, "read_tool_meta", replace_during_read)
-
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
-
-    assert outcome.ok is False
-    assert outcome.error == tool_builder._ERROR_REVISE_TARGET_REPLACED
-    assert (pkg / "run.py").read_text(encoding="utf-8") == keep
-    assert not any(entry.name.startswith(".kbsearch.bak-") for entry in base.iterdir())
-
-
 def test_run_revise_allows_a_plainly_spelled_shadowed_line(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -5971,13 +5086,15 @@ def test_run_revise_allows_a_plainly_spelled_shadowed_line(
     not a leak and must still revise, or the guard would refuse the most common
     hand-edit there is."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / ".env").write_text("KEY=oldvalue\nKEY=newvalue\n", encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text("KEY=oldvalue\nKEY=newvalue\n", encoding="utf-8")
     _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
 
     outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
-    assert (pkg / ".env").read_text(encoding="utf-8") == "KEY=oldvalue\nKEY=newvalue\n"
+    assert (_package_path(pkg) / ".env").read_text(
+        encoding="utf-8"
+    ) == "KEY=oldvalue\nKEY=newvalue\n"
 
 
 def test_run_revise_allows_env_values_the_file_spells_literally(
@@ -6001,7 +5118,7 @@ def test_run_revise_allows_env_values_the_file_spells_literally(
         'PLAIN=abcdef\nQUOTED="ghijkl"\nSINGLE=\'mno"pqr\'\n'
         "export EXPORTED=stuvwx\nSPACED = yzabcd \n"
     )
-    (pkg / ".env").write_text(raw, encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text(raw, encoding="utf-8")
     seen: dict[str, Any] = {}
     _fake_generate(
         monkeypatch,
@@ -6014,8 +5131,8 @@ def test_run_revise_allows_env_values_the_file_spells_literally(
 
     assert outcome.ok is True
     assert seen["inflight"] == {"abcdef", "ghijkl", 'mno"pqr', "stuvwx", "yzabcd"}
-    assert (pkg / ".env").read_text(encoding="utf-8") == raw
-    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert (_package_path(pkg) / ".env").read_text(encoding="utf-8") == raw
+    assert (_current_version(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
 
 
 def test_run_revise_refuses_a_value_only_an_unrelated_line_spells_literally(
@@ -6037,7 +5154,7 @@ def test_run_revise_refuses_a_value_only_an_unrelated_line_spells_literally(
     -- that is precisely what makes it the regression."""
     pkg = _seed_package(monkeypatch, tmp_path)
     raw = 'TOKEN="abcd\\"efgh"\n# abcd"efgh\n'
-    (pkg / ".env").write_text(raw, encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text(raw, encoding="utf-8")
     parsed = tools._parse_dotenv_text(raw)["TOKEN"]
     assert len(parsed) >= tools._MIN_SECRET_LEN  # not the r1 floor: the SPELLING
     assert parsed in raw  # the whole-text search the r5 gate did says "fine"
@@ -6080,7 +5197,7 @@ def test_run_revise_refuses_a_value_a_comment_on_its_own_line_vouches_for(
     have PASSED the r6 gate -- that is what makes it the regression."""
     pkg = _seed_package(monkeypatch, tmp_path)
     raw = 'TOKEN="abcd\\"efgh" # abcd"efgh"\n'
-    (pkg / ".env").write_text(raw, encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text(raw, encoding="utf-8")
     parsed = tools._parse_dotenv_text(raw)["TOKEN"]
     assert len(parsed) >= tools._MIN_SECRET_LEN  # not the r1 floor: the SPELLING
     rhs = tool_builder._env_assignment_rhs(raw)["TOKEN"]
@@ -6127,7 +5244,7 @@ def test_run_revise_refuses_a_plain_value_carrying_a_trailing_comment(
     line plainly, is one edit."""
     pkg = _seed_package(monkeypatch, tmp_path)
     raw = "KEY=abcdef # 這一行結尾的註解\n"
-    (pkg / ".env").write_text(raw, encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text(raw, encoding="utf-8")
     parsed = tools._parse_dotenv_text(raw)["KEY"]
     assert parsed == "abcdef"  # dotenv really does drop the comment
     assert parsed in tool_builder._env_assignment_rhs(raw)["KEY"]  # r6 would have passed it
@@ -6164,7 +5281,7 @@ def test_run_revise_refuses_a_value_its_assignment_line_cannot_vouch_for(
     here too."""
     pkg = _seed_package(monkeypatch, tmp_path)
     raw = 'SPAN="line-one\nline-two"\n'
-    (pkg / ".env").write_text(raw, encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text(raw, encoding="utf-8")
     parsed = tools._parse_dotenv_text(raw)["SPAN"]
     assert parsed == "line-one\nline-two"  # dotenv really does span the two lines
     before = _file_bytes(pkg)
@@ -6215,7 +5332,7 @@ def test_run_revise_checks_the_last_assignment_of_a_duplicated_env_key(
     ``_inject_secret_into_env`` uses to drop prior lines, for this identical
     last-wins reason."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / ".env").write_text(raw, encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text(raw, encoding="utf-8")
     parsed = tools._parse_dotenv_text(raw)["KEY"]
     assert len(parsed) >= tools._MIN_SECRET_LEN  # never the r1 floor, always the SPELLING
     seen: dict[str, Any] = {}
@@ -6235,7 +5352,7 @@ def test_run_revise_checks_the_last_assignment_of_a_duplicated_env_key(
     else:
         assert outcome.ok is True
         assert seen["inflight"] == {parsed}  # the LAST line's value, registered
-        assert (pkg / ".env").read_text(encoding="utf-8") == raw
+        assert (_package_path(pkg) / ".env").read_text(encoding="utf-8") == raw
 
 
 def _case_sensitive_filesystem(root: Path) -> bool:
@@ -6271,14 +5388,14 @@ def test_run_revise_keeps_a_root_env_case_variant_that_is_a_different_file(
     if not _case_sensitive_filesystem(tmp_path):
         pytest.skip("this filesystem folds .env and .ENV into one file")
     pkg = _seed_package(monkeypatch, tmp_path)
-    root = pkg.parent
-    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    root = _package_path(pkg).parent
+    (_package_path(pkg) / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
     # Ordinary content, and deliberately NOT holding a registered value -- one that
     # did would be refused by the embedded-secret gate, which is R2-2's stated and
     # accepted consequence for any second file carrying a live credential.
     variant = b"# the tool's own case-variant file\r\nMODE=verbose\n"
     (pkg / ".ENV").write_bytes(variant)
-    live = (pkg / ".env").read_bytes()
+    live = (_package_path(pkg) / ".env").read_bytes()
     seen: dict[str, set[str]] = {}
     _fake_generate(
         monkeypatch,
@@ -6292,8 +5409,8 @@ def test_run_revise_keeps_a_root_env_case_variant_that_is_a_different_file(
     assert outcome.ok is True
     assert ".ENV" in seen["staged"]  # ordinary content: the builder gets to see it
     assert ".env" not in seen["staged"]  # the managed credentials file is withheld
-    assert (pkg / ".ENV").read_bytes() == variant  # survived, byte for byte
-    assert (pkg / ".env").read_bytes() == live  # ... and the real one came back
+    assert (_current_version(pkg) / ".ENV").read_bytes() == variant
+    assert (_package_path(pkg) / ".env").read_bytes() == live  # ... and the real one came back
 
 
 def test_run_revise_keeps_a_hard_linked_root_env_case_variant(
@@ -6323,11 +5440,11 @@ def test_run_revise_keeps_a_hard_linked_root_env_case_variant(
         # asked for; the branch that covers that world is the unit test after this.
         pytest.skip("this filesystem folds .env and .ENV into one file")
     pkg = _seed_package(monkeypatch, tmp_path)
-    root = pkg.parent
+    root = _package_path(pkg).parent
     shared = "# two names, one inode, no credentials\nMODE=\n"
-    (pkg / ".env").write_text(shared, encoding="utf-8")
-    os.link(pkg / ".env", pkg / ".ENV")  # one file, two names
-    assert (pkg / ".env").stat().st_ino == (pkg / ".ENV").stat().st_ino
+    (_package_path(pkg) / ".env").write_text(shared, encoding="utf-8")
+    os.link(_package_path(pkg) / ".env", pkg / ".ENV")  # one file, two names
+    assert (_package_path(pkg) / ".env").stat().st_ino == (pkg / ".ENV").stat().st_ino
     seen: dict[str, set[str]] = {}
     _fake_generate(
         monkeypatch,
@@ -6341,8 +5458,8 @@ def test_run_revise_keeps_a_hard_linked_root_env_case_variant(
     assert outcome.ok is True
     assert ".ENV" in seen["staged"]  # a distinct entry: the builder sees it
     assert ".env" not in seen["staged"]  # ... the managed one is still withheld
-    assert (pkg / ".ENV").read_text(encoding="utf-8") == shared  # PUBLISHED, not deleted
-    assert (pkg / ".env").read_text(encoding="utf-8") == shared  # ... and restored
+    assert (_current_version(pkg) / ".ENV").read_text(encoding="utf-8") == shared
+    assert (_package_path(pkg) / ".env").read_text(encoding="utf-8") == shared  # ... and restored
 
 
 def test_is_preserved_env_name_excludes_the_variant_a_lone_listing_carries(
@@ -6417,8 +5534,8 @@ def test_run_revise_keeps_a_root_env_case_variant_that_is_a_symlink(
     if not _case_sensitive_filesystem(tmp_path):
         pytest.skip("this filesystem folds .env and .ENV into one file")
     pkg = _seed_package(monkeypatch, tmp_path)
-    root = pkg.parent
-    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    root = _package_path(pkg).parent
+    (_package_path(pkg) / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
     (pkg / ".ENV").symlink_to(".env")
     seen: dict[str, set[str]] = {}
     _fake_generate(
@@ -6433,8 +5550,9 @@ def test_run_revise_keeps_a_root_env_case_variant_that_is_a_symlink(
     assert outcome.ok is True
     assert ".ENV" in seen["staged"]  # the link itself is package content
     assert ".env" not in seen["staged"]
-    assert (pkg / ".ENV").is_symlink()  # still a link, not a materialized copy
-    assert (pkg / ".ENV").read_text(encoding="utf-8") == _TRICKY_ENV  # ... and it resolves
+    revised_variant = _current_version(pkg) / ".ENV"
+    assert revised_variant.is_symlink()  # still a link, not a materialized copy
+    assert not revised_variant.exists()  # its version-local .env target was withheld
 
 
 def test_run_revise_treats_a_lone_env_case_variant_as_having_no_managed_env(
@@ -6458,7 +5576,7 @@ def test_run_revise_treats_a_lone_env_case_variant_as_having_no_managed_env(
     if not _case_sensitive_filesystem(tmp_path):
         pytest.skip("this filesystem folds .env and .ENV into one file")
     pkg = _seed_package(monkeypatch, tmp_path)
-    root = pkg.parent
+    root = _package_path(pkg).parent
     variant = b"# ordinary content, no credentials\r\nMODE=verbose\n"
     (pkg / ".ENV").write_bytes(variant)
     written_by_the_model = "WRITTEN_BY_THE_MODEL=yes-it-really-was\n"
@@ -6474,10 +5592,10 @@ def test_run_revise_treats_a_lone_env_case_variant_as_having_no_managed_env(
 
     assert outcome.ok is True
     assert ".ENV" in seen["staged"]  # copied like any other file
-    assert (pkg / ".ENV").read_bytes() == variant  # ... and published unchanged
-    # "never had one" -> the builder's .env ships, which is only true if the
-    # variant was NOT read as the managed file.
-    assert (pkg / ".env").read_text(encoding="utf-8") == written_by_the_model
+    revised = _current_version(pkg)
+    assert (revised / ".ENV").read_bytes() == variant
+    assert (revised / ".env").read_text(encoding="utf-8") == written_by_the_model
+    assert not (_package_path(pkg) / ".env").exists()
 
 
 def test_run_revise_refuses_an_env_over_the_byte_ceiling_that_fits_in_chars(
@@ -6494,9 +5612,11 @@ def test_run_revise_refuses_an_env_over_the_byte_ceiling_that_fits_in_chars(
     here so the fixture cannot drift into proving something else."""
     pkg = _seed_package(monkeypatch, tmp_path)
     oversized = "# " + "測" * 30_000 + "\nKB_API_KEY=live-secret-value\n"
-    (pkg / ".env").write_text(oversized, encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text(oversized, encoding="utf-8")
     assert len(oversized) <= tools._ENV_FILE_MAX_BYTES  # under the OLD char rule
-    assert (pkg / ".env").stat().st_size > tools._ENV_FILE_MAX_BYTES  # over the real one
+    assert (
+        _package_path(pkg) / ".env"
+    ).stat().st_size > tools._ENV_FILE_MAX_BYTES  # over the real one
     before = _file_bytes(pkg)
     captured = _fake_generate(
         monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
@@ -6527,8 +5647,10 @@ def test_run_revise_accepts_an_env_at_the_byte_ceiling(
     pkg = _seed_package(monkeypatch, tmp_path)
     tail = "KB_API_KEY=live-secret-value\n"
     raw = "#" + "p" * (tools._ENV_FILE_MAX_BYTES - len(tail) - 2) + "\n" + tail
-    (pkg / ".env").write_text(raw, encoding="utf-8")
-    assert (pkg / ".env").stat().st_size == tools._ENV_FILE_MAX_BYTES  # the cap EXACTLY
+    (_package_path(pkg) / ".env").write_text(raw, encoding="utf-8")
+    assert (
+        _package_path(pkg) / ".env"
+    ).stat().st_size == tools._ENV_FILE_MAX_BYTES  # the cap EXACTLY
     seen: dict[str, Any] = {}
     _fake_generate(
         monkeypatch,
@@ -6541,7 +5663,9 @@ def test_run_revise_accepts_an_env_at_the_byte_ceiling(
 
     assert outcome.ok is True
     assert seen["inflight"] == {"live-secret-value"}
-    assert (pkg / ".env").read_text(encoding="utf-8") == raw  # preserved across the swap
+    assert (_package_path(pkg) / ".env").read_text(
+        encoding="utf-8"
+    ) == raw  # preserved across the swap
 
 
 def test_run_revise_prompts_carry_the_feedback_but_never_the_env_values(
@@ -6554,7 +5678,7 @@ def test_run_revise_prompts_carry_the_feedback_but_never_the_env_values(
     current manifest. No ``.env`` VALUE appears in either -- the values reach the
     build only through run_shell's environment."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
     captured = _fake_generate(
         monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
     )
@@ -6635,7 +5759,7 @@ def test_run_revise_never_redacts_or_builds_its_prompt_on_the_event_loop(
     summary hook, stubbed out below so the summary text's LAST redaction is
     unambiguously ``run_revise``'s own."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
     loop_thread = threading.current_thread()
     seen: dict[str, Any] = {}
     calls: list[tuple[str, threading.Thread]] = []
@@ -6707,7 +5831,9 @@ def test_run_revise_exposes_the_env_to_run_shell_only(
     while the meta-tool RESULT that carries them back into the conversation is
     masked -- the same F1 treatment the install-form secret gets."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / ".env").write_text("KB_API_KEY=live-secret-value-123456\n", encoding="utf-8")
+    (_package_path(pkg) / ".env").write_text(
+        "KB_API_KEY=live-secret-value-123456\n", encoding="utf-8"
+    )
     captured: dict[str, Any] = {}
 
     async def fake(
@@ -6757,12 +5883,11 @@ def test_run_revise_regenerates_the_summary_inheriting_the_origin(
     outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
-    meta = _meta(pkg)
+    meta = _meta(_current_version(pkg))
     assert meta["summary"] == "修訂後的說明"
-    assert meta["origin"] == {
-        "openapi_url": "https://kb.example",
-        "instructions": "原始安裝指示",
-    }
+    assert meta["origin"]["openapi_url"] == "https://kb.example"
+    assert meta["origin"]["instructions"] == "原始安裝指示"
+    assert meta["origin"]["previous"] == _TEST_VID
     assert meta["llm_log_id"] == llm_log.last_record_id_for_workflow("tool_summary")
 
 
@@ -6778,7 +5903,7 @@ def test_run_revise_survives_a_failing_summary(
     outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
-    assert (pkg / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert (_current_version(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
 
 
 def test_run_revise_ready_false_keeps_the_package(

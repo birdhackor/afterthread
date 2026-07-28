@@ -31,7 +31,6 @@ not: it queues a background job, so its LLM failures are job state, not a
 response status.
 """
 
-from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException
@@ -292,7 +291,7 @@ async def install_tool(payload: ToolInstallRequest) -> ToolInstallAccepted:
 # its summary read.
 
 
-def _existing_package_dir(name: str) -> Path | None:
+def _existing_package_dir(name: str) -> tools_service.Resolved | None:
     """The package's resolved directory, or None if it is not (usably) there.
 
     One blocking helper for the "does this tool exist?" gate every summary route
@@ -304,7 +303,11 @@ def _existing_package_dir(name: str) -> Path | None:
     and the service it calls can never disagree about which directory a name
     addresses.
     """
-    return tools_service._resolve_package_dir_no_alias(name)
+    package_root = tools_service._resolve_package_dir_no_alias(name)
+    if package_root is None:
+        return None
+    resolution = tools_service.resolve_current(package_root)
+    return resolution if isinstance(resolution, tools_service.Resolved) else None
 
 
 def _summary_detail(meta: dict[str, Any] | None) -> ToolSummaryDetail:
@@ -379,10 +382,12 @@ async def get_tool_summary(name: ToolName) -> ToolSummaryDetail:
     internal symlink alias is deliberately folded into (a summary must be read
     from the package it names, never from an aliased one).
     """
-    directory = await run_in_threadpool(_existing_package_dir, name)
-    if directory is None:
+    resolved = await run_in_threadpool(_existing_package_dir, name)
+    if resolved is None:
         raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
-    return _summary_detail(await run_in_threadpool(tools_service.read_tool_meta, directory))
+    return _summary_detail(
+        await run_in_threadpool(tools_service.read_tool_meta, resolved.version_root)
+    )
 
 
 @router.post(

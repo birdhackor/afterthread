@@ -76,6 +76,7 @@ from afterthread.services.tools import (
 _URL = "http://llm.internal.example/v1"
 _KEY = "sk-super-secret-do-not-leak"
 _MODEL = "test-model"
+_TEST_VID = "20260728T010203Z-abcdef"
 
 
 @pytest.fixture(autouse=True)
@@ -641,7 +642,8 @@ def _make_tool(
     child PATH -- the entry FILE (run.py) still lives inside the package, so
     validation's containment check passes.
     """
-    pkg = tools_root / name
+    package = tools_root / name
+    pkg = package / tools._VERSIONS_DIRNAME / _TEST_VID
     pkg.mkdir(parents=True)
     (pkg / "run.py").write_text(run_py, encoding="utf-8")
     manifest = tool_json
@@ -654,9 +656,58 @@ def _make_tool(
             "enabled": enabled,
         }
     (pkg / "tool.json").write_text(json.dumps(manifest), encoding="utf-8")
+    version_meta = pkg / tools._META_DIRNAME
+    version_meta.mkdir()
+    (version_meta / tools._ORIGIN_FILENAME).write_text(
+        json.dumps(
+            {
+                "source": "test-fixture",
+                "openapi_url": None,
+                "instructions": None,
+                "feedback": None,
+                "previous": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    package_meta = package / tools._META_DIRNAME
+    package_meta.mkdir()
+    (package_meta / tools._CURRENT_FILENAME).write_text(f"{_TEST_VID}\n", encoding="ascii")
+    (package_meta / tools._PACKAGE_STATE_FILENAME).write_text(
+        json.dumps(_state_document(enabled)), encoding="utf-8"
+    )
     if dotenv is not None:
-        (pkg / ".env").write_text(dotenv, encoding="utf-8")
+        (package / ".env").write_text(dotenv, encoding="utf-8")
     return pkg
+
+
+def _package_path(version: Path) -> Path:
+    return version.parents[1]
+
+
+def _package_root(version: Path) -> tools.PackageRoot:
+    return tools.PackageRoot(_package_path(version))
+
+
+def _version_root(version: Path) -> tools.VersionRoot:
+    return tools.VersionRoot(version)
+
+
+def _state_path(version: Path) -> Path:
+    return _package_path(version) / tools._META_DIRNAME / tools._PACKAGE_STATE_FILENAME
+
+
+def _summary_path(version: Path) -> Path:
+    return version / tools._META_DIRNAME / tools._SUMMARY_FILENAME
+
+
+def _resolved_version(package: Path) -> Path:
+    vid = (
+        (package / tools._META_DIRNAME / tools._CURRENT_FILENAME)
+        .read_text(encoding="ascii")
+        .rstrip("\n")
+    )
+    return package / tools._VERSIONS_DIRNAME / vid
 
 
 def _state_document(enabled: bool) -> dict[str, Any]:
@@ -670,9 +721,154 @@ def _state_document(enabled: bool) -> dict[str, Any]:
     return {tools._STATE_MARKER_KEY: tools._STATE_MARKER_VALUE, "enabled": enabled}
 
 
+@pytest.mark.parametrize(
+    "fault",
+    ["absent", "empty", "syntax", "missing", "uncommitted", "version-symlink"],
+)
+def test_invariant_b_every_bad_current_is_unresolved_without_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fault: str
+) -> None:
+    """Every specified pointer failure invalidates the whole installed package."""
+    root = tmp_path / "tools"
+    version = _make_tool(root, "echo", "import sys\nsys.stdout.write('ok')\n")
+    package = _package_path(version)
+    current = package / tools._META_DIRNAME / tools._CURRENT_FILENAME
+    other_vid = "20260728T020304Z-fedcba"
+
+    if fault == "absent":
+        current.unlink()
+    elif fault == "empty":
+        current.write_bytes(b"")
+    elif fault == "syntax":
+        current.write_text("../../.staging/session\n", encoding="ascii")
+    elif fault == "missing":
+        current.write_text(f"{other_vid}\n", encoding="ascii")
+    elif fault == "uncommitted":
+        (version / tools._META_DIRNAME / tools._ORIGIN_FILENAME).unlink()
+    else:
+        (package / tools._VERSIONS_DIRNAME / other_vid).symlink_to(
+            version, target_is_directory=True
+        )
+        current.write_text(f"{other_vid}\n", encoding="ascii")
+
+    _install_tools(monkeypatch, root)
+    resolution = tools.resolve_current(tools.PackageRoot(package))
+    assert isinstance(resolution, tools.Unresolved)
+    row = list_tools()[0]
+    assert row["valid"] is False
+    assert row["enabled"] is False
+    assert enabled_llm_tools() == []
+
+
+def test_invariant_b_current_accepts_at_most_one_trailing_newline(tmp_path: Path) -> None:
+    version = _make_tool(tmp_path / "tools", "echo", "import sys\n")
+    package = _package_path(version)
+    current = package / tools._META_DIRNAME / tools._CURRENT_FILENAME
+    current.write_text(f"{_TEST_VID}\n\n", encoding="ascii")
+
+    assert isinstance(tools.resolve_current(tools.PackageRoot(package)), tools.Unresolved)
+
+
+def _add_committed_version(package: Path, vid: str, *, description: str, output: str) -> Path:
+    previous = _resolved_version(package)
+    version = package / tools._VERSIONS_DIRNAME / vid
+    shutil.copytree(previous, version)
+    manifest = json.loads((version / "tool.json").read_text(encoding="utf-8"))
+    manifest["description"] = description
+    (version / "tool.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (version / "run.py").write_text(f"import sys\nsys.stdout.write({output!r})\n", encoding="utf-8")
+    (version / tools._META_DIRNAME / tools._ORIGIN_FILENAME).write_text(
+        json.dumps(
+            {
+                "source": "test-fixture",
+                "openapi_url": None,
+                "instructions": None,
+                "feedback": "revision",
+                "previous": _TEST_VID,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return version
+
+
+def test_advertisement_binds_the_vid_and_does_not_reread_current(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    first = _make_tool(root, "echo", "import sys\nsys.stdout.write('FIRST')\n")
+    package = _package_path(first)
+    second_vid = "20260728T020304Z-fedcba"
+    _add_committed_version(package, second_vid, description="second", output="SECOND")
+    _install_tools(monkeypatch, root)
+
+    handler = enabled_llm_tools()[0].handler
+    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+
+    assert asyncio.run(handler({})) == "FIRST"
+    assert _resolved_version(package).name == second_vid
+
+
+def test_invariant_a_running_judgement_enumerates_discarded_version_directories(
+    tmp_path: Path,
+) -> None:
+    version = _make_tool(tmp_path / "tools", "echo", "import sys\n")
+    package = _package_path(version)
+    discarded = version.with_name(f"{version.name}.discarded")
+    os.rename(version, discarded)
+    identity = tools.directory_identity(tools.VersionRoot(discarded))
+    assert identity is not None
+
+    with tools._inflight_execution(identity):
+        assert tools.package_execution_in_flight(tools.PackageRoot(package)) is True
+
+
+def test_invariant_g_list_resolves_current_once_and_keeps_one_version_per_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    first = _make_tool(
+        root,
+        "echo",
+        "import sys\n",
+        tool_json={
+            "name": "echo",
+            "description": "first description",
+            "parameters": {"type": "object", "properties": {}},
+            "entry": [sys.executable, "run.py"],
+        },
+    )
+    package = _package_path(first)
+    second_vid = "20260728T020304Z-fedcba"
+    _add_committed_version(package, second_vid, description="second description", output="SECOND")
+    _install_tools(monkeypatch, root)
+    real_resolve = tools.resolve_current
+    calls = 0
+
+    def resolve_then_switch(package_root: tools.PackageRoot) -> tools.Resolution:
+        nonlocal calls
+        calls += 1
+        resolution = real_resolve(package_root)
+        assert tools.publish_current(package_root, second_vid)
+        return resolution
+
+    monkeypatch.setattr(tools, "resolve_current", resolve_then_switch)
+    row = list_tools()[0]
+
+    assert calls == 1
+    assert row == {
+        "name": "echo",
+        "description": "first description",
+        "enabled": True,
+        "valid": True,
+        "error": None,
+    }
+    assert _resolved_version(package).name == second_vid
+
+
 def _write_state_file(pkg: Path, enabled: bool) -> None:
     """Hand-write a state file the backend will recognize as its own."""
-    (pkg / tools._STATE_FILENAME).write_text(json.dumps(_state_document(enabled)), encoding="utf-8")
+    _state_path(pkg).write_text(json.dumps(_state_document(enabled)), encoding="utf-8")
 
 
 def _edit_manifest_in_place(pkg: Path) -> tuple[int, int, int]:
@@ -692,11 +888,11 @@ def _edit_manifest_in_place(pkg: Path) -> tuple[int, int, int]:
     """
     manifest = pkg / "tool.json"
     raw = manifest.read_text(encoding="utf-8")
-    before = tools.package_identity(pkg)
+    before = tools.package_identity(_version_root(pkg))
     deadline = time.monotonic() + 30.0
     while time.monotonic() < deadline:
         manifest.write_text(raw, encoding="utf-8")
-        after = tools.package_identity(pkg)
+        after = tools.package_identity(_version_root(pkg))
         assert after is not None
         if after != before:
             assert manifest.read_text(encoding="utf-8") == raw  # the BYTES never changed
@@ -1014,15 +1210,15 @@ def test_a_toggle_during_the_scan_cannot_advertise_the_tool_it_disabled(
     _make_tool(root, "zzz", "import sys\nsys.stdout.write('z')\n")
     _install_tools(monkeypatch, root)
 
-    real_scan = tools._scan_package
+    real_scan = tools.scan_installed
 
-    def scan_then_toggle(directory: Path, expected_name: str | None = None) -> tools._PackageScan:
-        scan = real_scan(directory, expected_name=expected_name)
-        if directory.name == "zzz":
+    def scan_then_toggle(package_root: tools.PackageRoot) -> tools._PackageScan:
+        scan = real_scan(package_root)
+        if package_root.path.name == "zzz":
             assert set_enabled("aaa", False) is True
         return scan
 
-    monkeypatch.setattr(tools, "_scan_package", scan_then_toggle)
+    monkeypatch.setattr(tools, "scan_installed", scan_then_toggle)
     advertised = {tool.spec["function"]["name"]: tool.handler for tool in enabled_llm_tools()}
 
     assert asyncio.run(advertised["aaa"]({})) == tools._TOOL_DISABLED_RESULT
@@ -1069,7 +1265,7 @@ def test_a_deleted_state_file_falls_back_to_a_manifest_that_disables(
     assert asyncio.run(handler({})) == "ok"  # advertised and runnable, on the state file
     sentinel.unlink()
 
-    (pkg / tools._STATE_FILENAME).unlink()  # the documented repair, mid-conversation
+    _state_path(pkg).unlink()  # the documented repair, mid-conversation
 
     assert asyncio.run(handler({})) == tools._TOOL_DISABLED_RESULT
     assert asyncio.run(handler({})) != tools._TOOL_REPLACED_RESULT  # nothing was replaced
@@ -1078,27 +1274,21 @@ def test_a_deleted_state_file_falls_back_to_a_manifest_that_disables(
     assert list_tools()[0]["enabled"] is False
 
 
-def test_a_deleted_state_file_still_runs_a_tool_whose_manifest_enables_it(
+def test_invariant_c_a_deleted_state_file_disables_even_when_manifest_enables_it(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The other direction of the same fallback, so the fix cannot be "refuse ABSENT".
-
-    Answering the precedence rule means the manifest gets to say YES as well as no.
-    A package whose legacy key is True, toggled (which creates the state file) and
-    then stripped of that file mid-conversation, is ENABLED -- refusing it would
-    take a tool away from a conversation on the strength of a file the operator is
-    explicitly allowed to delete (D21)."""
+    """A missing package-layer state never falls back to manifest ``enabled``."""
     root = tmp_path / "tools"
     pkg = _make_tool(root, "legacy", "import sys\nsys.stdout.write('ok')\n", enabled=True)
     _install_tools(monkeypatch, root)
     assert set_enabled("legacy", True) is True  # migrates it: the file now exists
-    assert (pkg / tools._STATE_FILENAME).is_file()
+    assert _state_path(pkg).is_file()
     handler = enabled_llm_tools()[0].handler
 
-    (pkg / tools._STATE_FILENAME).unlink()
+    _state_path(pkg).unlink()
 
-    assert asyncio.run(handler({})) == "ok"
-    assert list_tools()[0]["enabled"] is True
+    assert asyncio.run(handler({})) == tools._TOOL_DISABLED_RESULT
+    assert list_tools()[0]["enabled"] is False
 
 
 def test_runtime_refuses_a_tool_whose_state_file_became_unreadable(
@@ -1127,7 +1317,7 @@ def test_runtime_refuses_a_tool_whose_state_file_became_unreadable(
     assert asyncio.run(handler({})) == "ok"
     sentinel.unlink()
 
-    (pkg / tools._STATE_FILENAME).write_text(
+    _state_path(pkg).write_text(
         json.dumps({tools._STATE_MARKER_KEY: tools._STATE_MARKER_VALUE, "enabled": None}),
         encoding="utf-8",
     )
@@ -1159,7 +1349,7 @@ def test_a_reader_that_opened_the_state_file_sees_one_whole_published_version(
     pkg = _make_tool(root, "swapped-under", "import sys\n")
     _install_tools(monkeypatch, root)
     assert set_enabled("swapped-under", True) is True
-    state_path = pkg / tools._STATE_FILENAME
+    state_path = _state_path(pkg)
 
     fd = os.open(state_path, os.O_RDONLY)  # the version is chosen HERE
     try:
@@ -1172,58 +1362,27 @@ def test_a_reader_that_opened_the_state_file_sees_one_whole_published_version(
             os.close(fd)
 
     assert json.loads(held) == _state_document(True)  # whole, parseable, the OLD version
-    fresh = tools._read_enabled_state(pkg)
+    fresh = tools._read_enabled_state(_package_root(pkg))
     assert (fresh.ours, fresh.enabled, fresh.error) == (True, False, None)
 
 
-def test_a_toggle_landing_between_the_state_read_and_popen_is_still_caught(
+def test_invariant_c_absent_state_never_reads_the_legacy_manifest_toggle(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """P1R3-1: the check's ANSWER has to be as close to ``Popen`` as the check is.
-
-    Round 2 put ``package_enabled`` on the line above ``Popen`` but spelled it as a
-    whole ``_scan_package``, which reads ``.afterthread-state.json`` FIRST and then parses a
-    manifest, resolves the entry and stats it -- ~0.5 ms of file operations after
-    the value it returns was read. A PATCH landing in that tail shipped a tool the
-    operator had just switched off: the identity check above cannot help (it is
-    older still) and the handler's own check is older again.
-
-    The rule now reads the state file LAST, so on the only path where anything at
-    all separates that read from the ``Popen`` -- no state file, so the manifest's
-    legacy key has to be fetched -- the state is read AGAIN afterwards. That read
-    is the whole fix and this drives a PATCH straight into it: the toggle is
-    performed from inside ``_read_manifest_object``, which is the one step in that
-    gap, and only on the SECOND call so that it lands at the ``Popen`` site rather
-    than at the handler's entry check.
-
-    Without the re-read the manifest's ``enabled: true`` wins and the child starts;
-    with it the freshly published ``false`` does. The sentinel makes "nothing was
-    started" a fact on disk rather than an inference from the returned string."""
+    """The removed legacy fallback is absent from advertisement and execution."""
     root = tmp_path / "tools"
-    sentinel = tmp_path / "ran"
     pkg = _make_tool(
         root,
         "busy",
-        f"import sys\nopen({str(sentinel)!r}, 'w').write('x')\nsys.stdout.write('ok')\n",
-        enabled=True,  # ... and NO state file: the fallback is what answers
+        "import sys\nsys.stdout.write('ok')\n",
+        enabled=True,
     )
     _install_tools(monkeypatch, root)
-    assert not (pkg / tools._STATE_FILENAME).exists()
-    handler = enabled_llm_tools()[0].handler
-    real_read_manifest = tools._read_manifest_object
-    calls: list[Path] = []
+    _state_path(pkg).unlink()
+    assert not _state_path(pkg).exists()
 
-    def toggle_inside_the_gap(directory: Path) -> dict[str, Any] | None:
-        calls.append(directory)
-        if len(calls) == 2:  # the ``Popen`` site, not the handler's entry
-            assert set_enabled("busy", False) is True
-        return real_read_manifest(directory)
-
-    monkeypatch.setattr(tools, "_read_manifest_object", toggle_inside_the_gap)
-
-    assert asyncio.run(handler({})) == tools._TOOL_DISABLED_RESULT
-    assert len(calls) == 2  # the probe really fired at the second site
-    assert not sentinel.exists()  # no child was ever started
+    assert tools.package_enabled(_package_root(pkg)) is False
+    assert enabled_llm_tools() == []
 
 
 def test_the_execution_toggle_check_reads_the_state_file_last_and_scans_nothing(
@@ -1256,23 +1415,23 @@ def test_the_execution_toggle_check_reads_the_state_file_last_and_scans_nothing(
 
     trace: list[str] = []
     real_state = tools._read_enabled_state
-    real_scan = tools._scan_package
+    real_scan = tools.scan_installed
     real_popen = subprocess.Popen
 
-    def traced_state(directory: Path) -> tools._EnabledState:
+    def traced_state(directory: tools.PackageRoot) -> tools._EnabledState:
         trace.append("state")
         return real_state(directory)
 
-    def traced_scan(directory: Path, expected_name: str | None = None) -> tools._PackageScan:
+    def traced_scan(directory: tools.PackageRoot) -> tools._PackageScan:
         trace.append("scan")
-        return real_scan(directory, expected_name=expected_name)
+        return real_scan(directory)
 
     def traced_popen(*args: Any, **kwargs: Any) -> Any:
         trace.append("popen")
         return real_popen(*args, **kwargs)
 
     monkeypatch.setattr(tools, "_read_enabled_state", traced_state)
-    monkeypatch.setattr(tools, "_scan_package", traced_scan)
+    monkeypatch.setattr(tools, "scan_installed", traced_scan)
     monkeypatch.setattr(subprocess, "Popen", traced_popen)
 
     assert asyncio.run(handler({})) == "ok"
@@ -1315,51 +1474,41 @@ def test_the_scan_and_the_execution_check_answer_the_one_rule_identically(
     for the sequence that ran a disabled tool through one). A refusal to look now
     answers the way every other refusal to look in this module answers: closed."""
     root = tmp_path / "tools"
-    absent = _make_tool(root, "absent", "import sys\n", enabled=True)
-    legacy_off = _make_tool(root, "legacy-off", "import sys\n", enabled=False)
-    present_on = _make_tool(root, "present-on", "import sys\n", enabled=False)
-    present_off = _make_tool(root, "present-off", "import sys\n", enabled=True)
-    unreadable = _make_tool(root, "unreadable", "import sys\n", enabled=True)
-    foreign_on = _make_tool(root, "foreign-on", "import sys\n", enabled=True)
-    foreign_off = _make_tool(root, "foreign-off", "import sys\n", enabled=False)
-    not_json = _make_tool(root, "not-json", "import sys\n", enabled=False)
-    oversized = _make_tool(root, "oversized", "import sys\n", enabled=False)
-    _install_tools(monkeypatch, root)
-    assert set_enabled("present-on", True) is True  # state file DISAGREES with each
-    assert set_enabled("present-off", False) is True
-    (unreadable / tools._STATE_FILENAME).write_text(
-        json.dumps({tools._STATE_MARKER_KEY: tools._STATE_MARKER_VALUE, "enabled": "yes"}),
+    absent = _make_tool(root, "absent", "import sys\n")
+    present_on = _make_tool(root, "present-on", "import sys\n", enabled=True)
+    present_off = _make_tool(root, "present-off", "import sys\n", enabled=False)
+    unreadable = _make_tool(root, "unreadable", "import sys\n")
+    foreign = _make_tool(root, "foreign", "import sys\n")
+    _state_path(absent).unlink()
+    _state_path(unreadable).write_text(
+        json.dumps(
+            {
+                tools._STATE_MARKER_KEY: tools._STATE_MARKER_VALUE,
+                "enabled": "yes",
+            }
+        ),
         encoding="utf-8",
     )
-    # A tool's OWN file at our name, saying the opposite of each manifest.
-    (foreign_on / tools._STATE_FILENAME).write_text('{"enabled": false}', encoding="utf-8")
-    (foreign_off / tools._STATE_FILENAME).write_text('{"enabled": true}', encoding="utf-8")
-    (not_json / "tool.json").write_text("{not json", encoding="utf-8")
-    (oversized / "tool.json").write_text("x" * (_MANIFEST_MAX_BYTES + 1), encoding="utf-8")
-    no_manifest = root / "no-manifest"
-    no_manifest.mkdir()
-    # A REAL, otherwise-perfectly-enabled package, reachable only through a link --
-    # so nothing but the refusal to look can produce the answer below.
-    _make_tool(tmp_path, "linked-real", "import sys\n", enabled=True)
-    linked = root / "linked"
-    linked.symlink_to(tmp_path / "linked-real", target_is_directory=True)
+    _state_path(foreign).write_text('{"enabled": true}', encoding="utf-8")
+    _install_tools(monkeypatch, root)
 
     expected = {
-        absent: True,  # ABSENT -> the manifest's legacy key
-        legacy_off: False,  # ... in the other direction
-        present_on: True,  # PRESENT wins over a manifest that disagrees
+        absent: False,
+        present_on: True,
         present_off: False,
-        unreadable: False,  # OURS-but-unreadable is disabled, never the default
-        foreign_on: True,  # FOREIGN -> the manifest answers, as if there were no file
-        foreign_off: False,  # ... in the other direction
-        not_json: True,  # no legacy key to offer -> the same default the scan gives
-        oversized: True,
-        no_manifest: True,
-        linked: False,  # a refusal to LOOK, answered closed on BOTH sides (P1R4-2)
+        unreadable: False,
+        foreign: False,
     }
-    for directory, answer in expected.items():
-        assert tools._scan_package(directory).enabled is answer, directory
-        assert tools.package_enabled(directory) is answer, directory
+    for version, answer in expected.items():
+        package_root = _package_root(version)
+        assert tools.scan_installed(package_root).enabled is answer, version
+        assert tools.package_enabled(package_root) is answer, version
+
+    linked = root / "linked"
+    linked.symlink_to(_package_path(present_on), target_is_directory=True)
+    linked_root = tools.PackageRoot(linked)
+    assert tools.scan_installed(linked_root).enabled is False
+    assert tools.package_enabled(linked_root) is False
 
 
 def test_the_identity_check_is_the_last_thing_before_the_subprocess_starts(
@@ -1398,11 +1547,13 @@ def test_the_identity_check_is_the_last_thing_before_the_subprocess_starts(
     real_identity = tools._still_the_expected_package
     real_popen = subprocess.Popen
 
-    def traced_enabled(directory: Path) -> bool:
+    def traced_enabled(directory: tools.PackageRoot) -> bool:
         trace.append("enabled")
         return real_enabled(directory)
 
-    def traced_identity(directory: Path, expected: tuple[int, int, int] | None) -> bool:
+    def traced_identity(
+        directory: tools.VersionRoot, expected: tuple[int, int, int] | None
+    ) -> bool:
         trace.append("identity")
         return real_identity(directory, expected)
 
@@ -1440,7 +1591,7 @@ def test_a_revise_landing_between_the_toggle_read_and_popen_is_refused_not_run(
     root = tmp_path / "tools"
     sentinel = tmp_path / "new-ran"
     _make_tool(root, "swapped", "import sys\nsys.stdout.write('OLD')\n")
-    replacement = _make_tool(
+    replacement_version = _make_tool(
         tmp_path / "staging",
         "swapped",
         f"import sys\nopen({str(sentinel)!r}, 'w').write('x')\nsys.stdout.write('NEW')\n",
@@ -1453,17 +1604,19 @@ def test_a_revise_landing_between_the_toggle_read_and_popen_is_refused_not_run(
     real_state = tools._read_enabled_state
     reads: list[Path] = []
 
-    def swap_inside_the_gap(directory: Path) -> tools._EnabledState:
-        reads.append(directory)
+    def swap_inside_the_gap(directory: tools.PackageRoot) -> tools._EnabledState:
+        reads.append(directory.path)
         if len(reads) == 2:  # the pre-``Popen`` site, not the handler's entry
             os.rename(pkg, root / ".swapped.bak-probe")
-            os.rename(replacement, pkg)
+            os.rename(_package_path(replacement_version), pkg)
         return real_state(directory)
 
     monkeypatch.setattr(tools, "_read_enabled_state", swap_inside_the_gap)
 
     assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
-    assert (pkg / "run.py").read_text(encoding="utf-8").endswith("'NEW')\n")  # it DID swap
+    assert (
+        _resolved_version(pkg).joinpath("run.py").read_text(encoding="utf-8").endswith("'NEW')\n")
+    )  # it DID swap
     assert not sentinel.exists()  # ... and the new package never ran
 
 
@@ -1496,7 +1649,7 @@ def test_a_symlinked_package_directory_cannot_run_a_tool_disabled_through_the_ap
     )
     _install_tools(monkeypatch, root)
     pkg = root / "sneaky"
-    identity_before = tools.package_identity(pkg)
+    identity_before = tools.package_identity(_version_root(pkg))
     handler = enabled_llm_tools()[0].handler
     assert asyncio.run(handler({})) == "ok"  # a legitimate package still runs
     sentinel.unlink()
@@ -1512,7 +1665,7 @@ def test_a_symlinked_package_directory_cannot_run_a_tool_disabled_through_the_ap
     # the link leads straight back to the same inode -- which is exactly why it is
     # not the check that can answer this.
     assert pkg.is_symlink()
-    assert tools.package_identity(pkg) == identity_before
+    assert tools.package_identity(_version_root(pkg)) == identity_before
 
     assert asyncio.run(handler({})) == tools._TOOL_DISABLED_RESULT
     assert not sentinel.exists()  # nothing was started
@@ -1534,24 +1687,26 @@ def test_a_promote_during_the_scan_cannot_run_the_new_package(
     root = tmp_path / "tools"
     _make_tool(root, "aaa", "import sys\nsys.stdout.write('OLD')\n")
     _make_tool(root, "zzz", "import sys\nsys.stdout.write('z')\n")
-    replacement = _make_tool(tmp_path / "staging", "aaa", "import sys\nsys.stdout.write('NEW')\n")
+    replacement = _package_path(
+        _make_tool(tmp_path / "staging", "aaa", "import sys\nsys.stdout.write('NEW')\n")
+    )
     _install_tools(monkeypatch, root)
 
     pkg = root / "aaa"
-    real_scan = tools._scan_package
+    real_scan = tools.scan_installed
 
-    def scan_then_promote(directory: Path, expected_name: str | None = None) -> tools._PackageScan:
-        scan = real_scan(directory, expected_name=expected_name)
-        if directory.name == "zzz":
+    def scan_then_promote(package_root: tools.PackageRoot) -> tools._PackageScan:
+        scan = real_scan(package_root)
+        if package_root.path.name == "zzz":
             os.rename(pkg, root / ".aaa.bak-r7")
             os.rename(replacement, pkg)
         return scan
 
-    monkeypatch.setattr(tools, "_scan_package", scan_then_promote)
+    monkeypatch.setattr(tools, "scan_installed", scan_then_promote)
     advertised = {tool.spec["function"]["name"]: tool.handler for tool in enabled_llm_tools()}
 
     assert asyncio.run(advertised["aaa"]({})) == tools._TOOL_REPLACED_RESULT
-    assert (pkg / "run.py").read_text(encoding="utf-8").endswith("'NEW')\n")  # it IS the new one
+    assert (_resolved_version(pkg) / "run.py").read_text(encoding="utf-8").endswith("'NEW')\n")
 
 
 def test_the_identity_is_taken_before_the_manifest_read_so_the_gap_refuses(
@@ -1571,7 +1726,9 @@ def test_the_identity_is_taken_before_the_manifest_read_so_the_gap_refuses(
     assertion into ``'NEW'``."""
     root = tmp_path / "tools"
     _make_tool(root, "aaa", "import sys\nsys.stdout.write('OLD')\n")
-    replacement = _make_tool(tmp_path / "staging", "aaa", "import sys\nsys.stdout.write('NEW')\n")
+    replacement = _package_path(
+        _make_tool(tmp_path / "staging", "aaa", "import sys\nsys.stdout.write('NEW')\n")
+    )
     _install_tools(monkeypatch, root)
 
     pkg = root / "aaa"
@@ -1581,7 +1738,7 @@ def test_the_identity_is_taken_before_the_manifest_read_so_the_gap_refuses(
     def read_then_promote(path: Path, cap: int) -> str | None:
         nonlocal swapped
         text = real_read(path, cap)
-        if not swapped and path == pkg / "tool.json":
+        if not swapped and path == _resolved_version(pkg) / "tool.json":
             swapped = True
             os.rename(pkg, root / ".aaa.bak-r7")
             os.rename(replacement, pkg)
@@ -1609,7 +1766,7 @@ def test_runtime_identity_survives_a_summary_sidecar_write(
     handler = enabled_llm_tools()[0].handler
 
     assert tools.write_tool_meta(
-        pkg,
+        _version_root(pkg),
         {"summary": "what it does", "updated_at": "2026-07-27T00:00:00+00:00"},
     )
 
@@ -1644,25 +1801,38 @@ def test_the_two_identities_answer_two_different_questions(
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
-    manifest_before, directory_before = tools.package_identity(pkg), tools.directory_identity(pkg)
+    manifest_before, directory_before = (
+        tools.package_identity(_version_root(pkg)),
+        tools.directory_identity(_version_root(pkg)),
+    )
     assert manifest_before is not None and directory_before is not None
 
     assert _edit_manifest_in_place(pkg) != manifest_before  # the package "changed"
-    assert tools.directory_identity(pkg) == directory_before  # the files did not move
+    assert (
+        tools.directory_identity(_version_root(pkg)) == directory_before
+    )  # the files did not move
 
-    renamed = root / ".echo.stale-x"
-    os.rename(pkg, renamed)
-    assert tools.directory_identity(renamed) == directory_before  # the name moved, not the inode
-    assert tools.directory_identity(pkg) is None  # ... and nothing answers for the old name
+    package = _package_path(pkg)
+    renamed_package = root / ".echo.stale-x"
+    os.rename(package, renamed_package)
+    renamed = _resolved_version(renamed_package)
+    assert (
+        tools.directory_identity(_version_root(renamed)) == directory_before
+    )  # the name moved, not the inode
+    assert (
+        tools.directory_identity(_version_root(pkg)) is None
+    )  # ... and nothing answers for the old name
 
-    shutil.rmtree(renamed)
+    shutil.rmtree(renamed_package)
     reinstalled = _make_tool(root, "echo", "import sys\nsys.stdout.write('y')\n")
-    assert tools.package_identity(reinstalled) != manifest_before  # a NEW package, always
+    assert (
+        tools.package_identity(_version_root(reinstalled)) != manifest_before
+    )  # a NEW package, always
     # The directory inode is routinely REUSED here, which is exactly why the
     # question above cannot be answered with it. Asserted as "may be equal" rather
     # than "is equal" because inode allocation is the filesystem's business: the
     # claim being pinned is that this tuple does not distinguish packages.
-    assert tools.directory_identity(reinstalled) is not None
+    assert tools.directory_identity(_version_root(reinstalled)) is not None
 
 
 def test_runtime_registers_the_execution_for_as_long_as_the_child_runs(
@@ -1695,7 +1865,7 @@ def test_runtime_registers_the_execution_for_as_long_as_the_child_runs(
         "sys.stdout.write('ok')\n",
     )
     _install_tools(monkeypatch, root)
-    identity = tools.directory_identity(pkg)
+    identity = tools.directory_identity(_version_root(pkg))
     assert identity is not None
     handler = enabled_llm_tools()[0].handler
     assert tools.directory_execution_in_flight(identity) is False
@@ -1777,8 +1947,10 @@ def test_a_call_holds_the_dotenv_it_was_given_until_its_output_is_redacted(
     try:
         _wait_for(marker.exists)  # the CHILD is running with the old value in its env
         assert old in tools.known_secret_values()
-        (pkg / ".env").write_text(f"KB_KEY={new}\n", encoding="utf-8")  # rotated mid-call
-        assert tools._cached_env_values(pkg) == frozenset({new})  # the scan moved on...
+        (_package_path(pkg) / ".env").write_text(
+            f"KB_KEY={new}\n", encoding="utf-8"
+        )  # rotated mid-call
+        assert tools._cached_env_values(_package_root(pkg)) == frozenset({new})
         assert old in tools.known_secret_values()  # ... the call's own hold did not
     finally:
         gate.write_text("go", encoding="utf-8")
@@ -1830,7 +2002,7 @@ def test_two_overlapping_calls_keep_a_shared_dotenv_value_maskable(
     first, second = _call("a", gate_a), _call("b", gate_b)
     try:
         _wait_for(lambda: all(Path(f"{g}.started").exists() for g in (gate_a, gate_b)))
-        (pkg / ".env").unlink()  # from here only the holds can answer for this value
+        (_package_path(pkg) / ".env").unlink()  # from here only the holds can answer for this value
         assert shared in tools.known_secret_values()
         gate_a.write_text("go", encoding="utf-8")
         first.join(timeout=30)
@@ -1948,7 +2120,7 @@ def test_runtime_dotenv_does_not_interpolate_parent_env(
     )
     _install_tools(monkeypatch, root)
 
-    env, _ = tools._build_tool_env(pkg)
+    env, _ = tools._build_tool_env(_package_root(pkg))
     assert env["LEAK"] == "${OPENAI_API_KEY}"  # literal, not the resolved parent key
     assert "sk-secret-should-not-leak" not in env.values()
 
@@ -1962,7 +2134,7 @@ def test_build_tool_env_passes_through_tls_no_verify_when_on(
     pkg = _make_tool(root, "envtool", "import sys\nsys.stdout.write('ok')\n")
     _install_tools(monkeypatch, root, tls_no_verify=True)
 
-    env, _ = tools._build_tool_env(pkg)
+    env, _ = tools._build_tool_env(_package_root(pkg))
     assert env["TLS_NO_VERIFY"] == "1"
 
 
@@ -1976,7 +2148,7 @@ def test_build_tool_env_omits_tls_no_verify_when_off(
     pkg = _make_tool(root, "envtool", "import sys\nsys.stdout.write('ok')\n")
     _install_tools(monkeypatch, root)  # tls_no_verify defaults False
 
-    env, _ = tools._build_tool_env(pkg)
+    env, _ = tools._build_tool_env(_package_root(pkg))
     assert "TLS_NO_VERIFY" not in env
 
 
@@ -1995,7 +2167,7 @@ def test_build_tool_env_tool_dotenv_can_override_tls_no_verify(
     )
     _install_tools(monkeypatch, root, tls_no_verify=True)
 
-    env, _ = tools._build_tool_env(pkg)
+    env, _ = tools._build_tool_env(_package_root(pkg))
     assert env["TLS_NO_VERIFY"] == "0"  # the tool's own .env wins
 
 
@@ -2029,7 +2201,7 @@ def test_runtime_background_descendant_reaped_no_thread_leak(
     )
     pkg = _make_tool(root, "descendant", run_py)
     entry = [sys.executable, "run.py"]
-    env, _ = tools._build_tool_env(pkg)
+    env, _ = tools._build_tool_env(_package_root(pkg))
 
     before = threading.active_count()
     try:
@@ -2039,7 +2211,14 @@ def test_runtime_background_descendant_reaped_no_thread_leak(
         # active_count() is a clean before/after measure with no threadpool-worker
         # confound.
         result = tools._run_tool_subprocess(
-            entry, pkg, tools.package_identity(pkg), env, "{}", 30.0, 1000
+            entry,
+            _package_root(pkg),
+            _version_root(pkg),
+            tools.package_identity(_version_root(pkg)),
+            env,
+            "{}",
+            30.0,
+            1000,
         )
         elapsed = time.monotonic() - started
 
@@ -2099,12 +2278,19 @@ def test_runtime_detached_child_closing_pipes_is_killed(
     )
     pkg = _make_tool(root, "detached", run_py)
     entry = [sys.executable, "run.py"]
-    env, _ = tools._build_tool_env(pkg)
+    env, _ = tools._build_tool_env(_package_root(pkg))
 
     try:
         started = time.monotonic()
         result = tools._run_tool_subprocess(
-            entry, pkg, tools.package_identity(pkg), env, "{}", 30.0, 1000
+            entry,
+            _package_root(pkg),
+            _version_root(pkg),
+            tools.package_identity(_version_root(pkg)),
+            env,
+            "{}",
+            30.0,
+            1000,
         )
         elapsed = time.monotonic() - started
 
@@ -2160,12 +2346,15 @@ def test_runtime_fifo_dotenv_degrades_without_hanging(
         "envtool",
         "import os, sys\nsys.stdout.write('SECRET=' + str(os.environ.get('TOOL_SECRET')))\n",
     )
-    os.mkfifo(pkg / ".env")  # a writer-less FIFO -- an ordinary read would block forever
+    os.mkfifo(
+        _package_path(pkg) / ".env"
+    )  # a writer-less FIFO -- an ordinary read would block forever
     _install_tools(monkeypatch, root)
 
     box: dict[str, dict[str, str]] = {}
     worker = threading.Thread(
-        target=lambda: box.__setitem__("env", tools._build_tool_env(pkg)[0]), daemon=True
+        target=lambda: box.__setitem__("env", tools._build_tool_env(_package_root(pkg))[0]),
+        daemon=True,
     )
     worker.start()
     worker.join(timeout=10)
@@ -2185,23 +2374,27 @@ def test_validate_package_flags_oversized_dotenv(
     otherwise-valid staged package is reported invalid so it can never be
     INSTALLED in that state, even though the same package would still RUN
     (degraded) if the .env were mutated oversized AFTER install."""
-    root = tmp_path / "tools"
-    pkg = _make_tool(
-        root,
-        "big",
-        "import sys\nsys.stdout.write('x')\n",
-        dotenv="K=" + "y" * tools._ENV_FILE_MAX_BYTES + "\n",
+    pkg = _staged_pkg(
+        tmp_path,
+        tool_json={
+            "name": "big",
+            "description": "test tool",
+            "parameters": {"type": "object", "properties": {}},
+            "entry": [sys.executable, "run.py"],
+        },
+        run_py="import sys\nsys.stdout.write('x')\n",
     )
-    _install_tools(monkeypatch, root)
+    (pkg / ".env").write_text("K=" + "y" * tools._ENV_FILE_MAX_BYTES + "\n", encoding="utf-8")
 
-    # The scan-equivalent checks pass; it is the install-only .env gate that trips.
-    error = tools.validate_package(pkg, "big")
+    # Build validation owns build-local dotenv policy; installed scans read the
+    # package-layer dotenv separately.
+    error = tools.validate_tool_content(tools.BuildRoot(pkg), "big")
     assert error is not None
     assert "too large" in error
     # With the .env removed the same package validates clean -- pinning that it
     # was the .env size, not some other defect, that failed it.
     (pkg / ".env").unlink()
-    assert tools.validate_package(pkg, "big") is None
+    assert tools.validate_tool_content(tools.BuildRoot(pkg), "big") is None
 
 
 def _staged_pkg(parent: Path, *, tool_json: dict[str, Any], run_py: str) -> Path:
@@ -2222,6 +2415,33 @@ def _kbsearch_manifest(description: str = "searches the KB") -> dict[str, Any]:
     }
 
 
+def test_scan_split_uses_one_content_rules_body_with_distinct_root_types(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    build = _staged_pkg(
+        tmp_path / "session",
+        tool_json=_kbsearch_manifest(),
+        run_py="import sys\n",
+    )
+    installed = _make_tool(tmp_path / "tools", "echo", "import sys\n")
+    real_scan = tools._scan_tool_content
+    roots: list[tools.BuildRoot | tools.VersionRoot] = []
+
+    def watched(
+        root: tools.BuildRoot | tools.VersionRoot, expected_name: str
+    ) -> tools._ContentScan:
+        roots.append(root)
+        return real_scan(root, expected_name)
+
+    monkeypatch.setattr(tools, "_scan_tool_content", watched)
+
+    assert tools.validate_tool_content(tools.BuildRoot(build), "staged") is None
+    assert tools.scan_installed(_package_root(installed)).valid is True
+    assert isinstance(roots[0], tools.BuildRoot)
+    assert isinstance(roots[1], tools.VersionRoot)
+    assert not (build / tools._META_DIRNAME).exists()
+
+
 def test_validate_package_rejects_manifest_with_secret_value(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2240,7 +2460,7 @@ def test_validate_package_rejects_manifest_with_secret_value(
         tool_json=_kbsearch_manifest(description=f"uses {secret} to authenticate"),
         run_py="import sys\nsys.stdout.write('x')\n",
     )
-    error = tools.validate_package(pkg, "staged")
+    error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
     assert error is not None
     assert error.startswith("tool.json ")
     assert "不得包含秘密值" in error
@@ -2263,7 +2483,7 @@ def test_validate_package_rejects_impl_file_with_secret_value(
         tool_json=_kbsearch_manifest(),  # manifest is clean
         run_py=f"API_KEY = '{secret}'\nimport sys\nsys.stdout.write('x')\n",
     )
-    error = tools.validate_package(pkg, "staged")
+    error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
     assert error is not None
     assert error.startswith("run.py ")
     assert "不得包含秘密值" in error
@@ -2289,7 +2509,7 @@ def test_validate_package_clean_of_secrets_passes(
         tool_json=_kbsearch_manifest(),
         run_py="import os, sys\nsys.stdout.write(os.environ.get('OTHER_KEY', ''))\n",
     )
-    assert tools.validate_package(pkg, "staged") is None
+    assert tools.validate_tool_content(tools.BuildRoot(pkg), "staged") is None
 
 
 def test_validate_package_rejection_never_echoes_secret_in_filename(
@@ -2310,7 +2530,7 @@ def test_validate_package_rejection_never_echoes_secret_in_filename(
     )
     # A stray file whose NAME and CONTENT both carry the secret (sorts first: 'a...').
     (pkg / f"{secret}.txt").write_text(f"leaked {secret}", encoding="utf-8")
-    error = tools.validate_package(pkg, "staged")
+    error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
     assert error is not None
     assert "不得包含秘密值" in error
     assert secret not in error  # neither content nor filename echoes the value
@@ -2344,7 +2564,7 @@ def test_known_secret_values_sees_a_same_mtime_replacement(
 
     assert "first-secret-abcdef" in tools.known_secret_values()  # cache populated
 
-    env_file = pkg / ".env"
+    env_file = _package_path(pkg) / ".env"
     before = env_file.stat()
     env_file.write_text("KB_API_KEY=second-secret-abcdef\n", encoding="utf-8")
     os.utime(env_file, ns=(before.st_atime_ns, before.st_mtime_ns))
@@ -2373,8 +2593,8 @@ def test_known_secret_values_still_caches_an_unchanged_env(
     parses: list[Path] = []
     real_loader = tools._load_tool_dotenv
 
-    def counting_loader(directory: Path) -> dict[str, str]:
-        parses.append(directory)
+    def counting_loader(directory: tools.PackageRoot) -> dict[str, str]:
+        parses.append(directory.path)
         return real_loader(directory)
 
     monkeypatch.setattr(tools, "_load_tool_dotenv", counting_loader)
@@ -2660,13 +2880,13 @@ def test_a_toggle_leaves_the_manifest_byte_identical_and_its_identity_unmoved(
     _install_tools(monkeypatch, root)
     manifest = pkg / "tool.json"
     before_bytes = manifest.read_bytes()
-    before_identity = tools.package_identity(pkg)
+    before_identity = tools.package_identity(_version_root(pkg))
     assert before_identity is not None
 
     for value in (False, False, True):
         assert set_enabled("echo", value) is True
         assert manifest.read_bytes() == before_bytes
-        assert tools.package_identity(pkg) == before_identity
+        assert tools.package_identity(_version_root(pkg)) == before_identity
 
     # ... and the toggle really did take effect, so this is not a no-op passing by
     # doing nothing at all.
@@ -2674,7 +2894,7 @@ def test_a_toggle_leaves_the_manifest_byte_identical_and_its_identity_unmoved(
     assert set_enabled("echo", False) is True
     assert list_tools()[0]["enabled"] is False
     assert manifest.read_bytes() == before_bytes
-    assert tools.package_identity(pkg) == before_identity
+    assert tools.package_identity(_version_root(pkg)) == before_identity
 
 
 def test_the_state_file_wins_over_a_manifest_that_disagrees(
@@ -2709,37 +2929,30 @@ def test_the_state_file_wins_over_a_manifest_that_disagrees(
     assert len(enabled_llm_tools()) == 1
 
 
-def test_a_package_with_no_state_file_falls_back_to_its_manifest(
+def test_invariant_c_a_package_with_no_state_file_is_disabled_without_mutation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """R1's migration, and it is the whole of the migration: there is no pass.
-
-    A package installed before web-v5 P1 has ``enabled`` in its ``tool.json`` and
-    no ``.afterthread-state.json``. It keeps reporting exactly what it reported before, and --
-    the part that matters -- the READ does not write: the state file is still
-    absent afterwards, so a scan can never mutate a package. The first toggle is
-    what migrates it, and the manifest is left alone even then."""
+    """Absent state is disabled; reads do not synthesize package metadata."""
     root = tmp_path / "tools"
     off = _make_tool(root, "off", "import sys\nsys.stdout.write('x')\n", enabled=False)
     on = _make_tool(root, "on", "import sys\nsys.stdout.write('x')\n", enabled=True)
     _install_tools(monkeypatch, root)
 
+    _state_path(off).unlink()
+    _state_path(on).unlink()
+    manifest_before = (off / "tool.json").read_bytes()
+
     listed = {t["name"]: t for t in list_tools()}
     assert listed["off"]["enabled"] is False
-    assert listed["on"]["enabled"] is True
-    assert [t.spec["function"]["name"] for t in enabled_llm_tools()] == ["on"]
-    # Reads only: neither package grew a state file, in either direction.
-    assert not (off / tools._STATE_FILENAME).exists()
-    assert not (on / tools._STATE_FILENAME).exists()
+    assert listed["on"]["enabled"] is False
+    assert enabled_llm_tools() == []
+    assert not _state_path(off).exists()
+    assert not _state_path(on).exists()
 
-    # The FIRST toggle is the migration, and it adds a file rather than editing one.
-    manifest_before = (off / "tool.json").read_bytes()
+    # An explicit toggle may create our missing package-layer state file.
     assert set_enabled("off", True) is True
-    assert json.loads((off / tools._STATE_FILENAME).read_text(encoding="utf-8")) == _state_document(
-        True
-    )
+    assert json.loads(_state_path(off).read_text(encoding="utf-8")) == _state_document(True)
     assert (off / "tool.json").read_bytes() == manifest_before  # legacy key left in place
-    assert json.loads(manifest_before)["enabled"] is False  # ... and still saying the old thing
     assert {t["name"]: t["enabled"] for t in list_tools()}["off"] is True
 
 
@@ -2778,7 +2991,7 @@ def test_an_unreadable_state_file_disables_rather_than_defaulting_to_on(
     advertised it."""
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", enabled=True)
-    (pkg / tools._STATE_FILENAME).write_text(content, encoding="utf-8")
+    _state_path(pkg).write_text(content, encoding="utf-8")
     _install_tools(monkeypatch, root)
 
     listed = list_tools()[0]
@@ -2807,10 +3020,11 @@ def test_a_state_file_that_cannot_be_looked_at_is_not_read_as_absent(
     it as "there is no state file" would fall back to the manifest's ``true``."""
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", enabled=True)
-    (pkg / tools._STATE_FILENAME).mkdir()
+    _state_path(pkg).unlink()
+    _state_path(pkg).mkdir()
     _install_tools(monkeypatch, root)
 
-    state = tools._read_enabled_state(pkg)
+    state = tools._read_enabled_state(_package_root(pkg))
     assert state.ours is True  # NOT absent, and read as ours-and-broken
     assert state.enabled is False and state.error is not None
     assert state.notice is None  # ... which is not the same answer a FOREIGN file gets
@@ -2853,29 +3067,27 @@ def test_a_foreign_file_at_the_state_files_name_is_answered_as_absent(
     an execution, and the listing carries something the operator can act on."""
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('ok')\n", enabled=True)
-    (pkg / tools._STATE_FILENAME).write_text(content, encoding="utf-8")
-    before = (pkg / tools._STATE_FILENAME).read_bytes()
+    _state_path(pkg).write_text(content, encoding="utf-8")
+    before = _state_path(pkg).read_bytes()
     _install_tools(monkeypatch, root)
 
-    # The MANIFEST answers -- and it is what answers, not a default: flipping the
-    # legacy key flips the reported state while the file on disk says nothing new.
-    assert tools.package_enabled(pkg) is True
+    assert tools.package_enabled(_package_root(pkg)) is False
     listed = list_tools()[0]
     assert listed["valid"] is True  # a foreign file does not break a working tool
-    assert listed["enabled"] is True
+    assert listed["enabled"] is False
     assert listed["error"] == tools._STATE_FOREIGN_NOTICE  # ... and says so, actionably
-    handler = enabled_llm_tools()[0].handler
-    assert asyncio.run(handler({})) == "ok"  # advertised AND runnable
+    assert enabled_llm_tools() == []
 
+    # Legacy manifest state has no effect in either direction.
     manifest = pkg / "tool.json"
     raw = json.loads(manifest.read_text(encoding="utf-8"))
     raw["enabled"] = False
     manifest.write_text(json.dumps(raw), encoding="utf-8")
-    assert tools.package_enabled(pkg) is False
+    assert tools.package_enabled(_package_root(pkg)) is False
     assert list_tools()[0]["enabled"] is False
     assert enabled_llm_tools() == []
 
-    assert (pkg / tools._STATE_FILENAME).read_bytes() == before  # nothing touched it
+    assert _state_path(pkg).read_bytes() == before  # nothing touched it
 
 
 def test_set_enabled_refuses_rather_than_destroying_a_foreign_state_file(
@@ -2896,20 +3108,18 @@ def test_set_enabled_refuses_rather_than_destroying_a_foreign_state_file(
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", enabled=True)
     theirs = b'{"cursor": 41}\n'
-    (pkg / tools._STATE_FILENAME).write_bytes(theirs)
+    _state_path(pkg).write_bytes(theirs)
     _install_tools(monkeypatch, root)
 
     assert set_enabled("echo", False) is False  # "did not happen" -> 404
-    assert (pkg / tools._STATE_FILENAME).read_bytes() == theirs
-    assert list_tools()[0]["enabled"] is True  # ... and it really did not happen
+    assert _state_path(pkg).read_bytes() == theirs
+    assert list_tools()[0]["enabled"] is False  # ... and it really did not happen
     # No temp file left behind either: the refusal is before the publish, not inside it.
     assert not list(pkg.glob(f"{tools._STATE_FILENAME}.*"))
 
-    (pkg / tools._STATE_FILENAME).unlink()  # the operator moves their file aside
+    _state_path(pkg).unlink()  # the operator moves their file aside
     assert set_enabled("echo", False) is True
-    assert json.loads((pkg / tools._STATE_FILENAME).read_text(encoding="utf-8")) == _state_document(
-        False
-    )
+    assert json.loads(_state_path(pkg).read_text(encoding="utf-8")) == _state_document(False)
     assert list_tools()[0]["enabled"] is False
 
 
@@ -2971,7 +3181,7 @@ def test_delete_during_an_execution_defers_the_removal(
         assert list_tools() == []  # ... and it is gone from the registry at once
         assert enabled_llm_tools() == []
         assert not pkg.exists()  # the NAME is free again
-        assert tools._cached_env_values(pkg) == frozenset()  # its ``.env`` went with it
+        assert tools._cached_env_values(_package_root(pkg)) == frozenset()
         assert secret in tools.known_secret_values()  # only the call's hold answers now
         # The rename runs BEFORE the registry is consulted, which is what makes the
         # set of executions that can exist against this directory closed: an
@@ -3029,7 +3239,7 @@ def test_delete_after_a_manifest_edit_still_defers_a_running_call(
     (pkg / "data.txt").write_text("PAYLOAD", encoding="utf-8")
     _install_tools(monkeypatch, root)
     handler = enabled_llm_tools()[0].handler
-    before = tools.package_identity(pkg)
+    before = tools.package_identity(_version_root(pkg))
 
     result: dict[str, str] = {}
     caller = threading.Thread(target=lambda: result.update(out=asyncio.run(handler({}))))
@@ -3048,7 +3258,7 @@ def test_delete_after_a_manifest_edit_still_defers_a_running_call(
     assert result["out"] == "PAYLOAD"  # the files survived the delete, as intended
     remains = [child for child in root.iterdir()]
     assert len(remains) == 1 and tools._STALE_BACKUP_RE.match(remains[0].name)
-    assert (remains[0] / "data.txt").exists()  # deferred, not destroyed
+    assert (_resolved_version(remains[0]) / "data.txt").exists()  # deferred, not destroyed
 
 
 def test_a_toggle_mid_call_moves_neither_identity(
@@ -3077,8 +3287,8 @@ def test_a_toggle_mid_call_moves_neither_identity(
     (pkg / "data.txt").write_text("PAYLOAD", encoding="utf-8")
     _install_tools(monkeypatch, root)
     handler = enabled_llm_tools()[0].handler
-    manifest_before = tools.package_identity(pkg)
-    directory_before = tools.directory_identity(pkg)
+    manifest_before = tools.package_identity(_version_root(pkg))
+    directory_before = tools.directory_identity(_version_root(pkg))
     manifest_bytes = (pkg / "tool.json").read_bytes()
 
     result: dict[str, str] = {}
@@ -3087,8 +3297,8 @@ def test_a_toggle_mid_call_moves_neither_identity(
     try:
         _wait_for(marker.exists)  # the CHILD is running, not merely queued
         assert set_enabled("toggled", False) is True
-        assert tools.package_identity(pkg) == manifest_before
-        assert tools.directory_identity(pkg) == directory_before
+        assert tools.package_identity(_version_root(pkg)) == manifest_before
+        assert tools.directory_identity(_version_root(pkg)) == directory_before
         assert (pkg / "tool.json").read_bytes() == manifest_bytes
         assert delete_tool("toggled") is True
     finally:
@@ -3126,20 +3336,22 @@ def test_a_delete_landing_while_a_call_prepares_is_registered_for_and_refused(
     handler = enabled_llm_tools()[0].handler
     real_build_env = tools._build_tool_env
 
-    def delete_then_build(directory: Path) -> tuple[dict[str, str], frozenset[str]]:
+    def delete_then_build(
+        directory: tools.PackageRoot,
+    ) -> tuple[dict[str, str], frozenset[str]]:
         assert delete_tool("busy") is True
         return real_build_env(directory)
 
     monkeypatch.setattr(tools, "_build_tool_env", delete_then_build)
 
-    assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
+    assert asyncio.run(handler({})) == tools._TOOL_DISABLED_RESULT
 
     # The delete DEFERRED: it found this call already registered, which it could
     # only do if the registration preceded the ``.env`` read it was driven from.
     remains = [child for child in root.iterdir()]
     assert len(remains) == 1 and tools._STALE_BACKUP_RE.match(remains[0].name)
-    assert (remains[0] / "run.py").exists()  # deferred, not destroyed
-    assert not pkg.exists()  # ... and the NAME went at once, as the route promises
+    assert (_resolved_version(remains[0]) / "run.py").exists()  # deferred, not destroyed
+    assert not _package_path(pkg).exists()  # ... and the NAME went at once, as promised
 
 
 def test_a_toggle_landing_while_a_call_prepares_still_refuses_before_popen(
@@ -3169,7 +3381,9 @@ def test_a_toggle_landing_while_a_call_prepares_still_refuses_before_popen(
     handler = enabled_llm_tools()[0].handler
     real_build_env = tools._build_tool_env
 
-    def toggle_then_build(directory: Path) -> tuple[dict[str, str], frozenset[str]]:
+    def toggle_then_build(
+        directory: tools.PackageRoot,
+    ) -> tuple[dict[str, str], frozenset[str]]:
         assert set_enabled("busy", False) is True
         return real_build_env(directory)
 
@@ -3203,8 +3417,10 @@ def test_a_state_file_deleted_while_a_call_prepares_still_refuses_before_popen(
     handler = enabled_llm_tools()[0].handler
     real_build_env = tools._build_tool_env
 
-    def delete_state_then_build(directory: Path) -> tuple[dict[str, str], frozenset[str]]:
-        (pkg / tools._STATE_FILENAME).unlink()
+    def delete_state_then_build(
+        directory: tools.PackageRoot,
+    ) -> tuple[dict[str, str], frozenset[str]]:
+        _state_path(pkg).unlink()
         return real_build_env(directory)
 
     monkeypatch.setattr(tools, "_build_tool_env", delete_state_then_build)
@@ -3322,9 +3538,7 @@ def test_symlinked_manifest_listed_invalid(monkeypatch: pytest.MonkeyPatch, tmp_
     """A package whose tool.json is a SYMLINK is listed invalid: a scan must
     never read a manifest through a link that could point outside the package."""
     root = tmp_path / "tools"
-    pkg = root / "linky"
-    pkg.mkdir(parents=True)
-    (pkg / "run.py").write_text("import sys\nsys.stdout.write('x')\n")
+    pkg = _make_tool(root, "linky", "import sys\nsys.stdout.write('x')\n")
     real_manifest = tmp_path / "real_tool.json"
     real_manifest.write_text(
         json.dumps(
@@ -3336,6 +3550,7 @@ def test_symlinked_manifest_listed_invalid(monkeypatch: pytest.MonkeyPatch, tmp_
             }
         )
     )
+    (pkg / "tool.json").unlink()
     (pkg / "tool.json").symlink_to(real_manifest)
     _install_tools(monkeypatch, root)
 
@@ -3360,9 +3575,7 @@ def test_set_enabled_never_writes_through_a_symlinked_manifest(
     manifest (so it is never advertised or executed either way), and an operator
     can now switch a broken package OFF -- which is exactly when they want to."""
     root = tmp_path / "tools"
-    pkg = root / "echo"
-    pkg.mkdir(parents=True)
-    (pkg / "run.py").write_text("import sys\nsys.stdout.write('x')\n")
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     outside = tmp_path / "outside.json"
     original = json.dumps(
         {
@@ -3374,12 +3587,13 @@ def test_set_enabled_never_writes_through_a_symlinked_manifest(
         }
     )
     outside.write_text(original)
+    (pkg / "tool.json").unlink()
     (pkg / "tool.json").symlink_to(outside)
     _install_tools(monkeypatch, root)
 
     assert set_enabled("echo", False) is True
     assert outside.read_text() == original  # foreign file untouched (never opened)
-    assert (pkg / tools._STATE_FILENAME).is_file()  # the toggle went to its OWN file
+    assert _state_path(pkg).is_file()  # the toggle went to its OWN file
     listed = {t["name"]: t for t in list_tools()}["echo"]
     assert listed["valid"] is False and listed["enabled"] is False
 
@@ -3399,12 +3613,13 @@ def test_set_enabled_refuses_a_symlinked_state_file(
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     outside = tmp_path / "outside.json"
     outside.write_text("keep", encoding="utf-8")
-    (pkg / tools._STATE_FILENAME).symlink_to(outside)
+    _state_path(pkg).unlink()
+    _state_path(pkg).symlink_to(outside)
     _install_tools(monkeypatch, root)
 
     assert set_enabled("echo", False) is False
     assert outside.read_text(encoding="utf-8") == "keep"  # never written through
-    assert (pkg / tools._STATE_FILENAME).is_symlink()  # the link itself survives
+    assert _state_path(pkg).is_symlink()  # the link itself survives
     # And the READ side agrees: a non-regular state file is UNREADABLE, which is
     # a disabled, invalid row -- never a silent fallback to "on".
     listed = {t["name"]: t for t in list_tools()}["echo"]
@@ -3438,7 +3653,9 @@ def test_set_enabled_publishes_under_the_state_publish_lock(
     real_write = tools.write_package_state
     held: list[bool] = []
 
-    def write_and_report_the_hold(directory: Path, enabled: bool, **kwargs: Any) -> bool:
+    def write_and_report_the_hold(
+        directory: tools.PackageRoot, enabled: bool, **kwargs: Any
+    ) -> bool:
         held.append(not tools._STATE_PUBLISH_LOCK.acquire(blocking=False))
         return real_write(directory, enabled, **kwargs)
 
@@ -3449,9 +3666,7 @@ def test_set_enabled_publishes_under_the_state_publish_lock(
     assert held == [True]  # the write happened INSIDE the hold, not beside it
     assert tools._STATE_PUBLISH_LOCK.acquire(blocking=False) is True  # released again
     tools._STATE_PUBLISH_LOCK.release()
-    assert json.loads((pkg / tools._STATE_FILENAME).read_text(encoding="utf-8")) == _state_document(
-        False
-    )
+    assert json.loads(_state_path(pkg).read_text(encoding="utf-8")) == _state_document(False)
 
 
 def test_a_publish_that_wakes_to_a_symlinked_package_directory_is_refused(
@@ -3484,11 +3699,13 @@ def test_a_publish_that_wakes_to_a_symlinked_package_directory_is_refused(
     by ``test_a_toggle_arriving_during_the_swap_waits_for_it_and_still_wins`` in
     test_tool_builder.py, against the real swap rather than a stand-in."""
     root = tmp_path / "tools"
-    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", enabled=True)
+    version = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", enabled=True)
+    pkg = _package_path(version)
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     _install_tools(monkeypatch, root)
     aside = root / ".moved-aside"
+    before = (pkg / tools._META_DIRNAME / tools._PACKAGE_STATE_FILENAME).read_bytes()
     real_lock = tools._STATE_PUBLISH_LOCK
 
     class _SwapWhileTheToggleWaits:
@@ -3505,7 +3722,9 @@ def test_a_publish_that_wakes_to_a_symlinked_package_directory_is_refused(
     assert set_enabled("echo", False) is False
 
     assert list(elsewhere.iterdir()) == []  # nothing written THROUGH the link
-    assert not (aside / tools._STATE_FILENAME).exists()  # nor into the real package
+    assert (
+        aside / tools._META_DIRNAME / tools._PACKAGE_STATE_FILENAME
+    ).read_bytes() == before  # nor into the real package
     assert (root / "echo").is_symlink()  # the planted link is untouched too
     assert real_lock.acquire(blocking=False) is True  # and the hold was released
     real_lock.release()
@@ -3531,19 +3750,19 @@ def test_a_non_regular_state_file_is_not_repaired_by_the_toggle(
     because it must not HANG (``test_set_enabled_with_a_fifo_manifest_does_not_hang``)."""
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", enabled=True)
-    (pkg / tools._STATE_FILENAME).mkdir()
-    (pkg / tools._STATE_FILENAME / "keep.txt").write_text("operator's", encoding="utf-8")
+    _state_path(pkg).unlink()
+    _state_path(pkg).mkdir()
+    (_state_path(pkg) / "keep.txt").write_text("operator's", encoding="utf-8")
     _install_tools(monkeypatch, root)
 
     assert set_enabled("echo", False) is False  # what the route turns into a 404
     assert set_enabled("echo", True) is False  # neither direction repairs it
 
-    entry = pkg / tools._STATE_FILENAME
+    entry = _state_path(pkg)
     assert entry.is_dir() and (entry / "keep.txt").read_text(encoding="utf-8") == "operator's"
-    assert sorted(child.name for child in pkg.iterdir()) == [
-        tools._STATE_FILENAME,
-        "run.py",
-        "tool.json",
+    assert sorted(child.name for child in _state_path(pkg).parent.iterdir()) == [
+        tools._CURRENT_FILENAME,
+        tools._PACKAGE_STATE_FILENAME,
     ]  # no temp file left behind by the refusal either
     listed = {t["name"]: t for t in list_tools()}["echo"]
     assert listed["valid"] is False and listed["enabled"] is False
@@ -3572,8 +3791,9 @@ def test_delete_internal_alias_removes_only_link(
     assert not (root / "alias").exists()  # the alias link is gone
     assert not (root / "alias").is_symlink()
     # The real package was never followed: its files survive and it still lists.
-    assert (root / "real" / "tool.json").is_file()
-    assert (root / "real" / "run.py").is_file()
+    real_version = _resolved_version(root / "real")
+    assert (real_version / "tool.json").is_file()
+    assert (real_version / "run.py").is_file()
     listed = {t["name"]: t for t in list_tools()}
     assert listed["real"]["valid"] is True
     assert "alias" not in listed  # the phantom invalid row is gone
@@ -3589,14 +3809,14 @@ def test_set_enabled_refuses_internal_alias(
     another name. The alias PATCH is refused (False) and the real package is left
     byte-for-byte untouched, state file included."""
     root = tmp_path / "tools"
-    _make_tool(root, "real", "import sys\nsys.stdout.write('x')\n", enabled=True)
+    real_version = _make_tool(root, "real", "import sys\nsys.stdout.write('x')\n", enabled=True)
     (root / "alias").symlink_to(root / "real", target_is_directory=True)
     _install_tools(monkeypatch, root)
 
-    before = (root / "real" / "tool.json").read_bytes()
+    before = (real_version / "tool.json").read_bytes()
     assert set_enabled("alias", False) is False
-    assert (root / "real" / "tool.json").read_bytes() == before  # real manifest untouched
-    assert not (root / "real" / tools._STATE_FILENAME).exists()  # and no state written
+    assert (real_version / "tool.json").read_bytes() == before  # real manifest untouched
+    assert _state_path(real_version).is_file()  # and package state was untouched
     real = {t["name"]: t for t in list_tools()}["real"]
     assert real["enabled"] is True  # the real package's flag never flipped
 
@@ -3617,7 +3837,7 @@ def test_set_enabled_toggles_a_package_whose_manifest_is_oversized(
     touched, and the package stays invalid -- so nothing became runnable that was
     not runnable before."""
     root = tmp_path / "tools"
-    _make_tool(
+    big_version = _make_tool(
         root,
         "big",
         "import sys\nsys.stdout.write('x')\n",
@@ -3631,9 +3851,9 @@ def test_set_enabled_toggles_a_package_whose_manifest_is_oversized(
     )
     _install_tools(monkeypatch, root)
 
-    before = (root / "big" / "tool.json").read_bytes()
+    before = (big_version / "tool.json").read_bytes()
     assert set_enabled("big", False) is True
-    assert (root / "big" / "tool.json").read_bytes() == before  # untouched
+    assert (big_version / "tool.json").read_bytes() == before  # untouched
     listed = {t["name"]: t for t in list_tools()}["big"]
     assert listed["valid"] is False and listed["enabled"] is False
     assert enabled_llm_tools() == []
@@ -3655,9 +3875,8 @@ def test_set_enabled_with_a_fifo_manifest_does_not_hang(
     can block. Both halves run on a WATCHED daemon thread so a regression fails
     LOUDLY here instead of wedging the whole suite."""
     root = tmp_path / "tools"
-    pkg = root / "fifotool"
-    pkg.mkdir(parents=True)
-    (pkg / "run.py").write_text("import sys\nsys.stdout.write('x')\n", encoding="utf-8")
+    pkg = _make_tool(root, "fifotool", "import sys\nsys.stdout.write('x')\n")
+    (pkg / "tool.json").unlink()
     os.mkfifo(pkg / "tool.json")  # a writer-less FIFO -- read_text() would block forever
     _install_tools(monkeypatch, root)
 
@@ -3674,13 +3893,12 @@ def test_set_enabled_with_a_fifo_manifest_does_not_hang(
     assert toggle("fifotool") is True  # the manifest is never opened at all
     assert (pkg / "tool.json").is_fifo()  # still the FIFO, never overwritten
 
-    fifo_state = root / "fifostate"
-    _make_tool(root, "fifostate", "import sys\nsys.stdout.write('x')\n")
-    (fifo_state / tools._STATE_FILENAME).unlink(missing_ok=True)
-    os.mkfifo(fifo_state / tools._STATE_FILENAME)
+    fifo_state = _make_tool(root, "fifostate", "import sys\nsys.stdout.write('x')\n")
+    _state_path(fifo_state).unlink()
+    os.mkfifo(_state_path(fifo_state))
 
     assert toggle("fifostate") is False  # the publish refuses a non-regular target
-    assert (fifo_state / tools._STATE_FILENAME).is_fifo()
+    assert _state_path(fifo_state).is_fifo()
     listed = {t["name"]: t for t in list_tools()}["fifostate"]
     assert listed["valid"] is False and listed["enabled"] is False
 
@@ -3741,7 +3959,7 @@ def test_parameters_schema_over_size_limit_listed_invalid(
         "type": "object",
         "properties": {"q": {"description": "y" * (_PARAMETERS_SCHEMA_MAX_BYTES + 100)}},
     }
-    _make_tool(
+    big_version = _make_tool(
         root,
         "bigschema",
         "import sys\nsys.stdout.write('x')\n",
@@ -3758,7 +3976,7 @@ def test_parameters_schema_over_size_limit_listed_invalid(
     assert listed["bigschema"]["valid"] is False
     assert "schema is too large" in (listed["bigschema"]["error"] or "")
     # It's the SCHEMA bound that tripped, not the file bound: the file is small.
-    assert (root / "bigschema" / "tool.json").stat().st_size < _MANIFEST_MAX_BYTES
+    assert (big_version / "tool.json").stat().st_size < _MANIFEST_MAX_BYTES
 
 
 def test_hidden_directories_never_listed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -3786,7 +4004,9 @@ def test_feature_off_when_tools_dir_unset(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def _sidecar(pkg: Path) -> Path:
-    return pkg / tools._AI_META_FILENAME
+    meta = pkg / tools._META_DIRNAME
+    meta.mkdir(exist_ok=True)
+    return meta / tools._SUMMARY_FILENAME
 
 
 def _write_meta(pkg: Path, **fields: Any) -> bool:
@@ -3798,7 +4018,25 @@ def _write_meta(pkg: Path, **fields: Any) -> bool:
     inherit a valid stamp here, instead of repeating a timestamp literal
     everywhere or -- worse -- passing a shape no caller ever passes and getting a
     False that hides the reason the test meant to exercise."""
-    return tools.write_tool_meta(pkg, {"updated_at": "2026-01-01T00:00:00+00:00", **fields})
+    if not pkg.is_dir():
+        return False
+    (pkg / tools._META_DIRNAME).mkdir(exist_ok=True)
+    origin = fields.pop("origin", None)
+    if isinstance(origin, dict) and not tools.write_origin_meta(
+        tools.BuildRoot(pkg),
+        {
+            "source": "test-fixture",
+            "openapi_url": origin.get("openapi_url"),
+            "instructions": origin.get("instructions"),
+            "feedback": origin.get("feedback"),
+            "previous": origin.get("previous"),
+        },
+    ):
+        return False
+    return tools.write_tool_meta(
+        _version_root(pkg),
+        {"updated_at": "2026-01-01T00:00:00+00:00", **fields},
+    )
 
 
 def test_tool_meta_round_trips(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -3808,16 +4046,23 @@ def test_tool_meta_round_trips(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
 
-    meta = {
+    origin = {
+        "source": "test-fixture",
+        "openapi_url": "http://kb.example/openapi.json",
+        "instructions": "build",
+        "feedback": None,
+        "previous": None,
+    }
+    assert tools.write_origin_meta(tools.BuildRoot(pkg), origin)
+    summary = {
         "summary": "這個工具會查 KB",
         "updated_at": "2026-07-26T00:00:00+00:00",
         "llm_log_id": 12,
         "llm_log_process": "process-token-from-whoever-wrote-this",
-        "origin": {"openapi_url": "http://kb.example/openapi.json", "instructions": "build"},
     }
-    assert tools.write_tool_meta(pkg, meta) is True
+    assert tools.write_tool_meta(_version_root(pkg), summary) is True
     assert _sidecar(pkg).is_file()
-    assert tools.read_tool_meta(pkg) == meta
+    assert tools.read_tool_meta(_version_root(pkg)) == {**summary, "origin": origin}
 
 
 def test_read_tool_meta_degrades_on_missing_corrupt_and_non_object(tmp_path: Path) -> None:
@@ -3825,13 +4070,13 @@ def test_read_tool_meta_degrades_on_missing_corrupt_and_non_object(tmp_path: Pat
     corrupt one must empty the summary panel, not break the tools list."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
-    assert tools.read_tool_meta(pkg) is None  # absent
+    assert tools.read_tool_meta(_version_root(pkg)) is None  # absent
 
     _sidecar(pkg).write_text("{not json", encoding="utf-8")
-    assert tools.read_tool_meta(pkg) is None  # unparseable
+    assert tools.read_tool_meta(_version_root(pkg)) is None  # unparseable
 
     _sidecar(pkg).write_text('["a list"]', encoding="utf-8")
-    assert tools.read_tool_meta(pkg) is None  # valid JSON, wrong shape
+    assert tools.read_tool_meta(_version_root(pkg)) is None  # valid JSON, wrong shape
 
 
 def test_read_tool_meta_refuses_oversized_sidecar(tmp_path: Path) -> None:
@@ -3839,7 +4084,7 @@ def test_read_tool_meta_refuses_oversized_sidecar(tmp_path: Path) -> None:
     pkg.mkdir()
     padding = "x" * (_AI_META_MAX_BYTES + 100)
     _sidecar(pkg).write_text(json.dumps({"summary": padding}), encoding="utf-8")
-    assert tools.read_tool_meta(pkg) is None
+    assert tools.read_tool_meta(_version_root(pkg)) is None
 
 
 def test_read_tool_meta_survives_pathological_nesting(
@@ -3865,7 +4110,7 @@ def test_read_tool_meta_survives_pathological_nesting(
         json.loads(nested)
     _sidecar(pkg).write_text(nested, encoding="utf-8")
 
-    assert tools.read_tool_meta(pkg) is None
+    assert tools.read_tool_meta(_version_root(pkg)) is None
     listed = list_tools()
     assert [row["name"] for row in listed] == ["echo"]
 
@@ -3883,7 +4128,7 @@ def test_write_tool_meta_redacts_the_summary(
     _install_tools(monkeypatch, root)
 
     assert _write_meta(pkg, summary=f"it authenticates with {secret}") is True
-    stored = tools.read_tool_meta(pkg)
+    stored = tools.read_tool_meta(_version_root(pkg))
     assert stored is not None
     assert secret not in stored["summary"]
     assert tools._REDACTION_MARKER in stored["summary"]
@@ -3919,7 +4164,7 @@ def test_write_tool_meta_redacts_every_string_not_just_the_summary(
 
     raw = _sidecar(pkg).read_text(encoding="utf-8")
     assert secret not in raw
-    stored = tools.read_tool_meta(pkg)
+    stored = tools.read_tool_meta(_version_root(pkg))
     assert stored is not None
     assert tools._REDACTION_MARKER in stored["origin"]["openapi_url"]
     assert tools._REDACTION_MARKER in stored["origin"]["instructions"]
@@ -3953,7 +4198,7 @@ def test_write_tool_meta_keys_survive_a_secret_that_equals_one(
             )
             is True
         )
-        stored = tools.read_tool_meta(pkg)
+        stored = tools.read_tool_meta(_version_root(pkg))
         assert stored is not None, f"a secret equal to the key {key!r} broke the schema"
         assert stored["summary"] == "這個工具會查 KB"
         assert stored["llm_log_id"] == 7
@@ -3989,7 +4234,7 @@ def test_write_tool_meta_drops_unknown_keys_and_containers(
 
     raw = _sidecar(pkg).read_text(encoding="utf-8")
     assert secret not in raw
-    stored = tools.read_tool_meta(pkg)
+    stored = tools.read_tool_meta(_version_root(pkg))
     assert stored is not None
     assert set(stored) == {
         "summary",
@@ -4006,11 +4251,35 @@ def test_write_tool_meta_drops_unknown_keys_and_containers(
         (None, None),
         ("not a dict", None),
         (("openapi_url", "http://x"), None),
-        ({}, {"openapi_url": None, "instructions": None}),
-        ({"openapi_url": 12, "junk": "dropped"}, {"openapi_url": None, "instructions": None}),
+        (
+            {},
+            {
+                "source": "test-fixture",
+                "openapi_url": None,
+                "instructions": None,
+                "feedback": None,
+                "previous": None,
+            },
+        ),
+        (
+            {"openapi_url": 12, "junk": "dropped"},
+            {
+                "source": "test-fixture",
+                "openapi_url": None,
+                "instructions": None,
+                "feedback": None,
+                "previous": None,
+            },
+        ),
         (
             {"openapi_url": "http://kb.example/o.json", "instructions": "查 KB", "junk": "dropped"},
-            {"openapi_url": "http://kb.example/o.json", "instructions": "查 KB"},
+            {
+                "source": "test-fixture",
+                "openapi_url": "http://kb.example/o.json",
+                "instructions": "查 KB",
+                "feedback": None,
+                "previous": None,
+            },
         ),
     ],
     ids=["none", "scalar", "tuple", "empty", "wrong-types", "narrowed"],
@@ -4024,7 +4293,7 @@ def test_write_tool_meta_narrows_the_origin(
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     assert _write_meta(pkg, summary="s", origin=origin) is True
-    stored = tools.read_tool_meta(pkg)
+    stored = tools.read_tool_meta(_version_root(pkg))
     assert stored is not None
     assert stored["origin"] == expected
 
@@ -4067,7 +4336,7 @@ def test_write_tool_meta_refuses_a_non_string_summary(tmp_path: Path) -> None:
         assert not _sidecar(pkg).exists()
 
     assert _write_meta(pkg, summary=None) is True
-    stored = tools.read_tool_meta(pkg)
+    stored = tools.read_tool_meta(_version_root(pkg))
     assert stored is not None
     assert stored["summary"] == ""
 
@@ -4078,8 +4347,8 @@ def test_write_tool_meta_requires_a_string_updated_at(tmp_path: Path) -> None:
     the file that nothing actually observed."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
-    assert tools.write_tool_meta(pkg, {"summary": "s"}) is False
-    assert tools.write_tool_meta(pkg, {"summary": "s", "updated_at": 12}) is False
+    assert tools.write_tool_meta(_version_root(pkg), {"summary": "s"}) is False
+    assert tools.write_tool_meta(_version_root(pkg), {"summary": "s", "updated_at": 12}) is False
     assert not _sidecar(pkg).exists()
 
 
@@ -4103,7 +4372,7 @@ def test_write_tool_meta_coerces_the_scalar_fields(
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     assert _write_meta(pkg, summary="s", **{field: value}) is True
-    stored = tools.read_tool_meta(pkg)
+    stored = tools.read_tool_meta(_version_root(pkg))
     assert stored is not None
     assert stored[field] == expected
 
@@ -4128,28 +4397,18 @@ def test_write_tool_meta_and_read_tool_meta_share_one_size_cap(tmp_path: Path) -
     pkg = tmp_path / "pkg"
     pkg.mkdir()
 
-    # The worst payload the install schema admits: a max-length instructions of
-    # characters that each escape to 6, plus a max-length CJK summary.
-    legal = _write_meta(
-        pkg,
-        summary="說" * 8_000,
-        origin={"openapi_url": "http://kb.example/o.json", "instructions": "\x01" * 20_000},
-    )
+    legal = _write_meta(pkg, summary="說" * 8_000)
     assert legal is True
     serialized = _sidecar(pkg).read_text(encoding="utf-8")
-    # Past the OLD cap on BOTH counts -- the bytes it is named for and the chars
-    # the reader actually compares -- so the old reader answered None for it.
-    assert len(serialized) > _MANIFEST_MAX_BYTES
-    assert len(serialized.encode("utf-8")) > _MANIFEST_MAX_BYTES
-    stored = tools.read_tool_meta(pkg)
+    assert len(serialized.encode("utf-8")) < _AI_META_MAX_BYTES
+    stored = tools.read_tool_meta(_version_root(pkg))
     assert stored is not None
     assert stored["summary"] == "說" * 8_000
-    assert stored["origin"]["instructions"] == "\x01" * 20_000
 
     # Past the shared cap the WRITER refuses, so the reader is never handed a
     # file it would have to answer None for.
     assert _write_meta(pkg, summary="x" * (_AI_META_MAX_BYTES + 10)) is False
-    assert tools.read_tool_meta(pkg) == stored  # the previous sidecar is untouched
+    assert tools.read_tool_meta(_version_root(pkg)) == stored  # the previous sidecar is untouched
 
 
 def test_write_tool_meta_refuses_to_resurrect_a_deleted_package(tmp_path: Path) -> None:
@@ -4231,7 +4490,7 @@ def test_write_tool_meta_keeps_the_old_sidecar_when_the_publish_fails(
     # ... and nothing was left lying around in the package: a stray temp file
     # would be scanned by every later validate_package embedded-secret sweep.
     assert not list(pkg.glob(f"{tools._AI_META_FILENAME}.*"))
-    assert sorted(child.name for child in pkg.iterdir()) == [tools._AI_META_FILENAME]
+    assert sorted(child.name for child in pkg.iterdir()) == [tools._META_DIRNAME]
 
 
 def test_the_publish_fsyncs_the_package_directory_after_the_rename(
@@ -4253,7 +4512,7 @@ def test_the_publish_fsyncs_the_package_directory_after_the_rename(
     publishes, rather than a flag the next backend-authored file has to remember to
     set."""
     pkg = tmp_path / "pkg"
-    pkg.mkdir()
+    (pkg / tools._META_DIRNAME).mkdir(parents=True)
     synced: list[tuple[bool, int]] = []
     real_fsync = os.fsync
 
@@ -4264,13 +4523,19 @@ def test_the_publish_fsyncs_the_package_directory_after_the_rename(
 
     monkeypatch.setattr(os, "fsync", watched)
 
-    assert tools.write_package_state(pkg, False) is True
+    assert tools.write_package_state(tools.PackageRoot(pkg), False) is True
     assert synced[0][0] is False  # the temp FILE's contents first ...
-    assert synced[-1] == (True, pkg.stat().st_ino)  # ... then the name that flipped
+    assert synced[-1] == (
+        True,
+        (pkg / tools._META_DIRNAME).stat().st_ino,
+    )  # ... then the name that flipped
 
     synced.clear()
     assert _write_meta(pkg, summary="說明") is True
-    assert synced[-1] == (True, pkg.stat().st_ino)  # the sidecar publish too
+    assert synced[-1] == (
+        True,
+        (pkg / tools._META_DIRNAME).stat().st_ino,
+    )  # the sidecar publish too
 
 
 def test_a_failed_directory_fsync_does_not_unpublish_a_written_state_file(
@@ -4285,7 +4550,7 @@ def test_a_failed_directory_fsync_does_not_unpublish_a_written_state_file(
     (or unsupported) directory fsync therefore leaves exactly the pre-P1R3-3
     guarantee: atomic, not durable."""
     pkg = tmp_path / "pkg"
-    pkg.mkdir()
+    (pkg / tools._META_DIRNAME).mkdir(parents=True)
     real_fsync = os.fsync
 
     def refuse_directories(fd: int) -> None:
@@ -4295,11 +4560,10 @@ def test_a_failed_directory_fsync_does_not_unpublish_a_written_state_file(
 
     monkeypatch.setattr(os, "fsync", refuse_directories)
 
-    assert tools.write_package_state(pkg, False) is True  # the truth, not a 404
-    assert json.loads((pkg / tools._STATE_FILENAME).read_text(encoding="utf-8")) == _state_document(
-        False
-    )
-    assert not list(pkg.glob(f"{tools._STATE_FILENAME}.*"))  # no temp file orphaned
+    assert tools.write_package_state(tools.PackageRoot(pkg), False) is True
+    state_path = pkg / tools._META_DIRNAME / tools._PACKAGE_STATE_FILENAME
+    assert json.loads(state_path.read_text(encoding="utf-8")) == _state_document(False)
+    assert not list(state_path.parent.glob(f"{tools._PACKAGE_STATE_FILENAME}.*"))
 
 
 def test_write_tool_meta_publishes_atomically(
@@ -4390,6 +4654,7 @@ def test_write_tool_meta_publishes_a_readable_sidecar_under_a_hostile_umask(
     mechanism -- a mocked mkstemp would test the mock."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
+    _sidecar(pkg).parent.mkdir(exist_ok=True)
     previous = os.umask(0o277)  # strips owner write AND every group/other bit
     try:
         assert _write_meta(pkg, summary="總結") is True
@@ -4397,7 +4662,7 @@ def test_write_tool_meta_publishes_a_readable_sidecar_under_a_hostile_umask(
         os.umask(previous)
 
     assert stat.S_IMODE(os.stat(_sidecar(pkg)).st_mode) & 0o600 == 0o600
-    assert tools.read_tool_meta(pkg) is not None  # the invariant this exists for
+    assert tools.read_tool_meta(_version_root(pkg)) is not None  # the invariant this exists for
 
 
 def test_write_tool_meta_adds_owner_rw_to_an_inherited_mode(tmp_path: Path) -> None:
@@ -4416,7 +4681,7 @@ def test_write_tool_meta_adds_owner_rw_to_an_inherited_mode(tmp_path: Path) -> N
     mode = stat.S_IMODE(os.stat(_sidecar(pkg)).st_mode)
     assert mode & 0o600 == 0o600  # owner rw restored
     assert mode & 0o040 == 0o040  # the operator's group-read choice survives
-    assert tools.read_tool_meta(pkg) is not None
+    assert tools.read_tool_meta(_version_root(pkg)) is not None
 
 
 def test_write_tool_meta_replaces_a_read_only_sidecar(tmp_path: Path) -> None:
@@ -4499,6 +4764,20 @@ def test_read_tool_meta_scrubs_lone_surrogates(tmp_path: Path) -> None:
     through our writer -- so the read is its own boundary."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
+    origin_path = pkg / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    origin_path.parent.mkdir()
+    origin_path.write_text(
+        json.dumps(
+            {
+                "source": "hand-edited",
+                "openapi_url": "http://kb.example/\ud800.json",
+                "instructions": None,
+                "feedback": None,
+                "previous": None,
+            }
+        ),
+        encoding="utf-8",
+    )
     # ensure_ascii=True: this is what a hand-edit looks like on disk -- six ASCII
     # characters, a perfectly valid JSON file.
     _sidecar(pkg).write_text(
@@ -4507,13 +4786,12 @@ def test_read_tool_meta_scrubs_lone_surrogates(tmp_path: Path) -> None:
                 "summary": "a\ud800b",
                 "updated_at": "2026-01-01T00:00:00+00:00\udfff",
                 "llm_log_id": 3,
-                "origin": {"openapi_url": "http://kb.example/\ud800.json", "instructions": None},
             }
         ),
         encoding="utf-8",
     )
 
-    meta = tools.read_tool_meta(pkg)
+    meta = tools.read_tool_meta(_version_root(pkg))
     assert meta is not None
     assert meta["summary"] == "a" + _SURROGATE_FFFD + "b"
     assert meta["updated_at"].endswith(_SURROGATE_FFFD)
@@ -4546,7 +4824,7 @@ def test_write_tool_meta_scrubs_a_surrogate_bearing_summary(tmp_path: Path) -> N
         is True
     )
 
-    stored = tools.read_tool_meta(pkg)
+    stored = tools.read_tool_meta(_version_root(pkg))
     assert stored is not None
     assert stored["summary"] == "這個工具會查 KB" + _SURROGATE_FFFD
     assert stored["origin"]["openapi_url"] == "http://kb.example/o.json" + _SURROGATE_FFFD
@@ -4569,7 +4847,10 @@ def test_write_tool_meta_refuses_a_surrogate_bearing_updated_at(tmp_path: Path) 
     assert _write_meta(pkg, summary="好的說明") is True
     before = _sidecar(pkg).read_bytes()
 
-    assert tools.write_tool_meta(pkg, {"summary": "s", "updated_at": "2026\ud800"}) is False
+    assert (
+        tools.write_tool_meta(_version_root(pkg), {"summary": "s", "updated_at": "2026\ud800"})
+        is False
+    )
 
     assert _sidecar(pkg).read_bytes() == before
     assert not list(pkg.glob(f"{tools._AI_META_FILENAME}.*"))
@@ -4583,24 +4864,30 @@ def test_store_summary_meta_outcomes(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
-    identity = tools.package_identity(pkg)
+    identity = tools.package_identity(_version_root(pkg))
 
     # ok: origin inherited from disk, the summary replaced.
     origin = {"openapi_url": "http://kb.example/o.json", "instructions": "查 KB"}
     assert _write_meta(pkg, summary="舊的", origin=origin) is True
     outcome, meta = tools.store_summary_meta(
-        pkg, summary="新的", origin=None, llm_log_id=9, expected_identity=identity
+        _version_root(pkg), summary="新的", origin=None, llm_log_id=9, expected_identity=identity
     )
     assert outcome == "ok"
     assert meta is not None
     assert meta["summary"] == "新的"
-    assert meta["origin"] == origin
-    assert tools.read_tool_meta(pkg) == meta  # what it returned IS what it stored
+    assert meta["origin"] == {
+        "source": "test-fixture",
+        "openapi_url": "http://kb.example/o.json",
+        "instructions": "查 KB",
+        "feedback": None,
+        "previous": None,
+    }
+    assert tools.read_tool_meta(_version_root(pkg)) == meta  # what it returned IS what it stored
 
     # not_stored: the write was refused (here, the ghost guard on a missing dir).
     gone = tmp_path / "nope" / "gone"
     assert tools.store_summary_meta(
-        gone, summary="s", origin=None, llm_log_id=None, expected_identity=None
+        tools.VersionRoot(gone), summary="s", origin=None, llm_log_id=None, expected_identity=None
     ) == (
         "not_stored",
         None,
@@ -4622,10 +4909,10 @@ def test_store_summary_meta_stamps_the_minting_process_beside_the_log_id(
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
-    identity = tools.package_identity(pkg)
+    identity = tools.package_identity(_version_root(pkg))
 
     outcome, meta = tools.store_summary_meta(
-        pkg, summary="說明", origin=None, llm_log_id=7, expected_identity=identity
+        _version_root(pkg), summary="說明", origin=None, llm_log_id=7, expected_identity=identity
     )
     assert outcome == "ok"
     assert meta is not None
@@ -4633,7 +4920,7 @@ def test_store_summary_meta_stamps_the_minting_process_beside_the_log_id(
     assert meta["llm_log_process"] == llm_log.process_token()
 
     outcome, meta = tools.store_summary_meta(
-        pkg, summary="說明", origin=None, llm_log_id=None, expected_identity=identity
+        _version_root(pkg), summary="說明", origin=None, llm_log_id=None, expected_identity=identity
     )
     assert outcome == "ok"
     assert meta is not None
@@ -4650,10 +4937,14 @@ def test_store_summary_meta_strips_and_caps_the_summary(
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
-    identity = tools.package_identity(pkg)
+    identity = tools.package_identity(_version_root(pkg))
 
     outcome, meta = tools.store_summary_meta(
-        pkg, summary="  spaced  ", origin=None, llm_log_id=1, expected_identity=identity
+        _version_root(pkg),
+        summary="  spaced  ",
+        origin=None,
+        llm_log_id=1,
+        expected_identity=identity,
     )
     assert outcome == "ok"
     assert meta is not None
@@ -4661,7 +4952,7 @@ def test_store_summary_meta_strips_and_caps_the_summary(
 
     long_text = "y" * (tools._TOOL_SUMMARY_CAP + 500)
     outcome, meta = tools.store_summary_meta(
-        pkg, summary=long_text, origin=None, llm_log_id=1, expected_identity=identity
+        _version_root(pkg), summary=long_text, origin=None, llm_log_id=1, expected_identity=identity
     )
     assert outcome == "ok"
     assert meta is not None
@@ -4682,13 +4973,13 @@ def test_store_summary_meta_redacts_before_capping(
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
-    identity = tools.package_identity(pkg)
+    identity = tools.package_identity(_version_root(pkg))
     secret = "ZZTOP-live-secret-abcdef"
     monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
 
     padding = "y" * (tools._TOOL_SUMMARY_CAP - 4)
     outcome, meta = tools.store_summary_meta(
-        pkg,
+        _version_root(pkg),
         summary=padding + secret,
         origin=None,
         llm_log_id=1,
@@ -4717,12 +5008,12 @@ def test_store_summary_meta_redacts_before_stripping(
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
-    identity = tools.package_identity(pkg)
+    identity = tools.package_identity(_version_root(pkg))
     secret = " secret-token-abcdef "
     monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
 
     outcome, meta = tools.store_summary_meta(
-        pkg, summary=secret, origin=None, llm_log_id=1, expected_identity=identity
+        _version_root(pkg), summary=secret, origin=None, llm_log_id=1, expected_identity=identity
     )
 
     assert outcome == "ok"
@@ -4781,13 +5072,13 @@ def test_store_summary_meta_refuses_a_package_swapped_inside_the_write(
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
-    identity = tools.package_identity(pkg)
+    identity = tools.package_identity(_version_root(pkg))
     replacement = _swap_the_package_once(
         monkeypatch, root, "echo", "import sys\nsys.stdout.write('B')\n"
     )
 
     assert tools.store_summary_meta(
-        pkg,
+        _version_root(pkg),
         summary="A 這個工具會查 KB",
         origin={"openapi_url": "http://a.example/o.json", "instructions": "A 的指示"},
         llm_log_id=7,
@@ -4795,12 +5086,16 @@ def test_store_summary_meta_refuses_a_package_swapped_inside_the_write(
     ) == ("not_stored", None)
 
     swapped = replacement()
-    assert tools.package_identity(swapped) != identity  # the swap really happened
-    assert tools.read_tool_meta(swapped) is None  # ... and B has no sidecar at all
+    assert tools.package_identity(_version_root(swapped)) != identity  # the swap really happened
+    assert tools.read_tool_meta(_version_root(swapped)) is None  # ... and B has no sidecar at all
     # The temp file was minted in B's directory (the swap lands before mkstemp),
     # so the refusal has to clean it up: a stray one would be scanned by every
     # later embedded-secret sweep of that package.
-    assert sorted(child.name for child in swapped.iterdir()) == ["run.py", "tool.json"]
+    assert sorted(child.name for child in swapped.iterdir()) == [
+        tools._META_DIRNAME,
+        "run.py",
+        "tool.json",
+    ]
 
 
 def test_store_summary_meta_fails_closed_on_a_redaction_failure(
@@ -4812,7 +5107,7 @@ def test_store_summary_meta_fails_closed_on_a_redaction_failure(
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
-    identity = tools.package_identity(pkg)
+    identity = tools.package_identity(_version_root(pkg))
     assert _write_meta(pkg, summary="舊的") is True
     before = _sidecar(pkg).read_bytes()
 
@@ -4822,7 +5117,7 @@ def test_store_summary_meta_fails_closed_on_a_redaction_failure(
     monkeypatch.setattr(tools, "known_secret_values", explode)
 
     assert tools.store_summary_meta(
-        pkg, summary="新的", origin=None, llm_log_id=1, expected_identity=identity
+        _version_root(pkg), summary="新的", origin=None, llm_log_id=1, expected_identity=identity
     ) == (
         "not_stored",
         None,
