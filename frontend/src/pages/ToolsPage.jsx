@@ -71,6 +71,7 @@ const AI_INPUT_MAX = SECTION_MAX_LENGTH;
 const VERSION_WRITE_CODE_COPY = {
 	version_mismatch: "工具版本已變更，正在重新整理最新版本",
 	job_busy: "已有工具任務正在進行中，請稍後再試",
+	ai_job_in_progress: "AI 任務進行中，請稍後再試",
 	lineage_unavailable:
 		"前一版已不存在或版本關係已損壞，無法丟掉目前版本；可改為刪除整個工具",
 };
@@ -787,7 +788,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 		},
 	});
 
-	// The three structured 409 codes are instructions with intentionally
+	// The four structured 409 codes are instructions with intentionally
 	// different side effects. In particular, job_busy and lineage_unavailable
 	// must never fall through to the old broad refetch path.
 	const reactToVersionWriteConflict = (mutationError, instanceKey = null) => {

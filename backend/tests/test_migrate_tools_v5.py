@@ -215,10 +215,12 @@ def _assert_migrated(root: Path, name: str = "alpha") -> Path:
 
 
 def _snapshot_tree(root: Path) -> tuple[tuple[str, str, int, bytes | str], ...]:
-    """Snapshot content/type/mode, intentionally excluding read-mutated atimes."""
+    """Snapshot package state, excluding atimes and the persistent lock inode."""
 
     rows: list[tuple[str, str, int, bytes | str]] = []
     for path in sorted(root.rglob("*")):
+        if path.name == tools._TOOLS_LOCK_FILENAME:
+            continue
         relative = str(path.relative_to(root))
         info = os.lstat(path)
         mode = stat.S_IMODE(info.st_mode)
@@ -280,7 +282,89 @@ def test_dry_run_reports_env_key_names_never_values_and_writes_nothing(tmp_path:
     assert "MODE" in text
     assert "do-not-print" not in text
     assert "override defaults" in text
-    assert _snapshot_tree(tmp_path) == before
+    after = tuple(
+        entry
+        for entry in _snapshot_tree(tmp_path)
+        if entry[0] != f"tools/{tools._TOOLS_LOCK_FILENAME}"
+    )
+    assert after == before
+    assert (root / tools._TOOLS_LOCK_FILENAME).is_file()
+
+
+def test_missing_target_meta_is_damaged_in_runtime_and_migration_preflight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A target package with ``versions/`` is never prescribed legacy migration."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    assert _run(root) == 0
+    package = root / "alpha"
+    (package / migration._META_DIRNAME).rename(package / ".afterthread.meta.moved")
+
+    preflight = migration._fresh_preflight(root)
+    assert preflight.legacy == ()
+    assert any("owns versions/ or .afterthread.meta/" in problem for problem in preflight.problems)
+
+    monkeypatch.setattr(
+        tools,
+        "get_settings",
+        lambda: SimpleNamespace(tools_dir=str(root), openai_api_key=""),
+    )
+    row = tools.list_tools()[0]
+    assert row["error"] == "tool layout is damaged or ambiguous; inspect it before migration"
+    assert "migrate_tools_v5" not in row["error"]
+
+
+def test_lock_file_is_skipped_by_registry_secret_sweep_and_migration_preflight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The reserved hidden file is never mistaken for a package or secret source."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    monkeypatch.setattr(
+        tools,
+        "get_settings",
+        lambda: SimpleNamespace(tools_dir=str(root), openai_api_key=""),
+    )
+    fd = tools.acquire_shared_tools_lock()
+    assert fd is not None
+    tools.release_tools_lock(fd)
+    lock_value = "must-not-be-scanned-abcdef"
+    lock_only_text = f"LOCK_FILE_VALUE={lock_value}"
+    (root / tools._TOOLS_LOCK_FILENAME).write_text(lock_only_text, encoding="utf-8")
+
+    assert [row["name"] for row in tools.list_tools()] == ["alpha"]
+    assert lock_value not in tools.known_secret_values()
+    preflight = migration._fresh_preflight(root)
+    assert [package.name for package in preflight.legacy] == ["alpha"]
+    assert preflight.problems == ()
+
+
+def test_migration_refuses_while_shared_tools_lock_is_held(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The offline precondition is non-blocking and leaves packages untouched."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    monkeypatch.setattr(
+        tools,
+        "get_settings",
+        lambda: SimpleNamespace(tools_dir=str(root), openai_api_key=""),
+    )
+    shared_fd = tools.acquire_shared_tools_lock()
+    assert shared_fd is not None
+    before = _snapshot_tree(root)
+    output: list[str] = []
+    try:
+        assert _run(root, output=output) == 1
+    finally:
+        tools.release_tools_lock(shared_fd)
+
+    assert _snapshot_tree(root) == before
+    assert "tools lock is held or unavailable" in "\n".join(output)
 
 
 @pytest.mark.parametrize("side", ["before", "after"])
@@ -1073,6 +1157,42 @@ def test_content_edited_during_migration_survives_in_retained_quarantine(
     tools._ENV_VALUE_CACHE.clear()
     assert [row["name"] for row in tools.list_tools()] == ["alpha"]
     assert b"late-secret-abcdef".decode() not in tools.known_secret_values()
+
+
+def test_activated_new_package_credential_edit_is_quarantined_on_rollback(
+    tmp_path: Path,
+) -> None:
+    """A new tree that occupied the live name is never treated as partial."""
+
+    root = tmp_path / "tools"
+    old_credential = b"API_KEY=old\n"
+    rotated = b"API_KEY=rotated-after-activation\n"
+    _make_package(root, env=old_credential)
+
+    with pytest.raises(InjectedCrash):
+        _run(
+            root,
+            operations=PointFailureOperations({"after:rename:alpha:activate_new": InjectedCrash()}),
+        )
+
+    activated = root / "alpha"
+    assert migration._is_new_package_at(activated, _VID)
+    (activated / ".env").write_bytes(rotated)
+    output: list[str] = []
+
+    assert _run(root, output=output) == 1
+
+    assert (root / "alpha" / ".env").read_bytes() == old_credential
+    quarantine = _retained_quarantine(root)
+    assert (quarantine / ".env").read_bytes() == rotated
+    marker = json.loads(
+        (quarantine / migration._META_DIRNAME / migration._OWNERSHIP_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert marker["role"] == "shell"
+    assert not (root / migration._JOURNAL_FILENAME).exists()
+    assert str(quarantine) in "\n".join(output)
 
 
 def test_parked_env_recopy_failure_rolls_latest_source_back_to_flat_name(

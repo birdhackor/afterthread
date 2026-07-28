@@ -62,10 +62,8 @@ _TEST_VID = "20260728T010203Z-abcdef"
 
 @pytest.fixture(autouse=True)
 def _reset_singletons() -> Generator[None]:
-    """Empty the job table, the llm_log ring, and the process-wide known-secret
-    in-flight-execution, and advertisement-generation registries around every
-    test (all module-level singletons the installer touches), then DRAIN the
-    single-flight client-construction worker.
+    """Empty the job table, llm_log ring, known-secret and advertisement
+    registries around every test, then DRAIN the single-flight client worker.
 
     The drain is what makes the timing/threading fetch tests deterministic under
     any collection order: a prior test's still-running (or still-queued) fake
@@ -78,23 +76,12 @@ def _reset_singletons() -> Generator[None]:
     tool_builder._reset_jobs_for_tests()
     llm_log._reset_for_tests()
     tools._INFLIGHT_SECRETS.clear()
-    tools._INFLIGHT_EXECUTIONS.clear()
-    tools._LOCAL_EXECUTION_GENERATIONS.clear()
-    tools._LOCAL_EXECUTION_PACKAGES.clear()
-    tools._DEFERRED_EXECUTION_CLEANUPS.clear()
     tools._ADVERTISEMENT_GENERATIONS.clear()
     tools._ENV_VALUE_CACHE.clear()
     yield
     tool_builder._reset_jobs_for_tests()
     llm_log._reset_for_tests()
     tools._INFLIGHT_SECRETS.clear()
-    # The execution registry decides whether a promote drops its backup, so a
-    # registration surviving a test would silently turn the next one's swap into a
-    # deferral -- the same reason the secret set is cleared here.
-    tools._INFLIGHT_EXECUTIONS.clear()
-    tools._LOCAL_EXECUTION_GENERATIONS.clear()
-    tools._LOCAL_EXECUTION_PACKAGES.clear()
-    tools._DEFERRED_EXECUTION_CLEANUPS.clear()
     tools._ADVERTISEMENT_GENERATIONS.clear()
     tools._ENV_VALUE_CACHE.clear()
     tool_builder._drain_setup_worker_for_tests()
@@ -2997,17 +2984,28 @@ def test_router_delete_tool_response_distinguishes_removed_from_retained(
 ) -> None:
     removed_version = _seed_package(monkeypatch, tmp_path, "idle")
     retained_version = _seed_package(monkeypatch, tmp_path, "unknown")
-    tools.remember_local_execution_generation(tools.VersionRoot(removed_version))
-    tools.remember_local_execution_package(_package_root(removed_version))
+    real_rmtree = tools.shutil.rmtree
+
+    def retain_unknown(path: Path, *args: Any, **kwargs: Any) -> None:
+        if Path(path).name.startswith(".unknown.stale-"):
+            return
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(tools.shutil, "rmtree", retain_unknown)
 
     removed = client.delete("/api/tools/idle")
     retained = client.delete("/api/tools/unknown")
 
     assert removed.status_code == 200
-    assert removed.json() == {"outcome": "removed", "retained_path": None}
+    assert removed.json() == {
+        "outcome": "removed",
+        "retained_path": None,
+        "retention_reason": None,
+    }
     assert retained.status_code == 200
     retained_body = retained.json()
     assert retained_body["outcome"] == "retained"
+    assert retained_body["retention_reason"] == "cleanup_failed"
     retained_path = Path(retained_body["retained_path"])
     assert retained_path.parent == tmp_path / "tools"
     assert tools._STALE_BACKUP_RE.match(retained_path.name)
@@ -3017,32 +3015,98 @@ def test_router_delete_tool_response_distinguishes_removed_from_retained(
     assert client.delete("/api/tools/idle").status_code == 404
 
 
+def test_router_delete_and_discard_return_distinct_ai_job_conflict(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Both destructive endpoints expose lock contention as the fourth 409."""
+
+    first = _seed_package(monkeypatch, tmp_path, "busy")
+    current_vid = "20260728T020304Z-fedcba"
+    _copy_committed_version(first, current_vid)
+    assert tools.publish_current(_package_root(first), current_vid)
+    shared_fd = tools.acquire_shared_tools_lock()
+    assert shared_fd is not None
+    try:
+        whole = client.delete("/api/tools/busy")
+        version = client.delete(f"/api/tools/busy/versions/{current_vid}")
+    finally:
+        tools.release_tools_lock(shared_fd)
+
+    for response in (whole, version):
+        assert response.status_code == 409
+        assert response.json()["detail"] == {
+            "code": "ai_job_in_progress",
+            "message": "AI 任務進行中，請稍後再試",  # noqa: RUF001
+        }
+    assert _package_path(first).is_dir()
+    assert _resolved_version(_package_path(first)).name == current_vid
+
+
 def test_router_discard_response_distinguishes_removed_from_retained(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     removed_first = _seed_package(monkeypatch, tmp_path, "discard-idle")
     removed_vid = "20260728T020304Z-fedcba"
-    removed_current = _copy_committed_version(removed_first, removed_vid)
+    _copy_committed_version(removed_first, removed_vid)
     assert tools.publish_current(_package_root(removed_first), removed_vid)
-    tools.remember_local_execution_generation(tools.VersionRoot(removed_current))
 
     retained_first = _seed_package(monkeypatch, tmp_path, "discard-unknown")
     retained_vid = "20260728T030405Z-acdeff"
     retained_current = _copy_committed_version(retained_first, retained_vid)
     assert tools.publish_current(_package_root(retained_first), retained_vid)
+    real_rmtree = tools.shutil.rmtree
+
+    def retain_unknown(path: Path, *args: Any, **kwargs: Any) -> None:
+        if Path(path).name == f"{retained_vid}.discarded":
+            return
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(tools.shutil, "rmtree", retain_unknown)
 
     removed = client.delete(f"/api/tools/discard-idle/versions/{removed_vid}")
     retained = client.delete(f"/api/tools/discard-unknown/versions/{retained_vid}")
 
     assert removed.status_code == 200
-    assert removed.json() == {"outcome": "removed", "retained_path": None}
+    assert removed.json() == {
+        "outcome": "removed",
+        "retained_path": None,
+        "retention_reason": None,
+    }
     assert retained.status_code == 200
     retained_body = retained.json()
     assert retained_body["outcome"] == "retained"
+    assert retained_body["retention_reason"] == "cleanup_failed"
     assert retained_body["retained_path"] == str(
         retained_current.with_name(f"{retained_vid}.discarded")
     )
     assert Path(retained_body["retained_path"]).is_dir()
+
+
+def test_router_discard_marks_unconfirmed_durability_as_unsafe_cleanup(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The API must preserve the reason the UI uses to forbid manual deletion."""
+
+    first = _seed_package(monkeypatch, tmp_path, "nondurable")
+    current_vid = "20260728T020304Z-fedcba"
+    current = _copy_committed_version(first, current_vid)
+    assert tools.publish_current(_package_root(first), current_vid)
+
+    monkeypatch.setattr(
+        tools,
+        "publish_current",
+        lambda package_root, vid: tools.CurrentPublication(published=True, durable=False),
+    )
+
+    response = client.delete(f"/api/tools/nondurable/versions/{current_vid}")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "outcome": "retained",
+        "retained_path": str(current),
+        "retention_reason": "durability_unconfirmed",
+    }
+    assert current.is_dir()
 
 
 def test_router_install_503_when_unconfigured(
@@ -4077,7 +4141,7 @@ def test_invariant_k_stale_vid_starts_no_revise_regenerate_or_discard_work(
     assert tool_builder.any_job_active() is False
 
 
-def test_version_conflicts_have_three_distinct_codes_and_openapi_examples(
+def test_version_conflicts_have_four_distinct_codes_and_openapi_examples(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     pkg = _seed_package(monkeypatch, tmp_path)
@@ -4106,7 +4170,12 @@ def test_version_conflicts_have_three_distinct_codes_and_openapi_examples(
         "delete"
     ]
     examples = operation["responses"]["409"]["content"]["application/json"]["examples"]
-    assert set(examples) == {"version_mismatch", "lineage_unavailable", "job_busy"}
+    assert set(examples) == {
+        "version_mismatch",
+        "lineage_unavailable",
+        "job_busy",
+        "ai_job_in_progress",
+    }
 
 
 def test_version_delete_cannot_remove_package_when_previous_becomes_null(
@@ -4658,8 +4727,6 @@ def _versioned_package_at(package: Path, name: str, run_py: str = _GOOD_RUN_PY) 
     (package_meta / tools._PACKAGE_STATE_FILENAME).write_text(
         json.dumps(_state_document(True)), encoding="utf-8"
     )
-    tools.remember_local_execution_generation(tools.VersionRoot(version))
-    tools.remember_local_execution_package(tools.PackageLayoutRoot(package))
     return version
 
 
@@ -4677,82 +4744,42 @@ def _wait_for(condition: Callable[[], bool], *, timeout: float = 30.0) -> None:
         time.sleep(0.01)
 
 
-def test_sweep_keeps_a_backup_that_is_still_in_use_and_spares_everything_else(
-    tmp_path: Path,
+def test_sweep_skips_while_shared_lock_is_held_then_collects_marked_trees(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The sweep removes only what it can affirmatively say is collectable.
+    """The sweep is non-blocking and retries after the shared holder exits."""
 
-    Four neighbours it must not touch, because it is a destructive traversal in a
-    directory the operator also owns: a marked backup whose files are still being
-    read, a marked tree this process never observed running, a hidden directory
-    that is not one of ours, and a SYMLINK wearing a marked name -- an rmtree
-    through which would delete a tree nobody verified. The eligible tree's
-    DIRECTORY identity is re-derived because that is what its writer recorded."""
     base = tmp_path / "tools"
     base.mkdir()
-    busy = _stale_dir(base, "kbsearch")
-    identity = tools.directory_identity(tools.VersionRoot(_resolved_version(busy)))
-    package_identity = tools.directory_identity(tools.VersionRoot(busy))
-    assert identity is not None
-    assert package_identity is not None
-    unknown = _stale_dir(base, "other")
+    first = _stale_dir(base, "kbsearch")
+    second = _stale_dir(base, "other")
     (base / ".staging").mkdir()
     outside = tmp_path / "elsewhere"
     outside.mkdir()
     (outside / "keep.txt").write_text("keep", encoding="utf-8")
     linked = tools._stale_backup_path(base, "linked", uuid4().hex)
     linked.symlink_to(outside, target_is_directory=True)
+    _install_settings(monkeypatch, tools_dir=str(base))
+    shared_fd = tools.acquire_shared_tools_lock()
+    assert shared_fd is not None
 
-    with tools._inflight_execution(package_identity, identity):
-        tools.remember_running_tree_for_cleanup(busy)
+    try:
         tool_builder._sweep_stale_backups(base)
-        assert busy.is_dir()  # still being read by a live subprocess
-
-    assert unknown.is_dir()  # a fresh process did not observe this tree running
-    assert (base / ".staging").is_dir()  # not ours to collect
-    assert linked.is_symlink() and (outside / "keep.txt").exists()  # never followed
+        assert first.is_dir() and second.is_dir()
+    finally:
+        tools.release_tools_lock(shared_fd)
 
     tool_builder._sweep_stale_backups(base)
-    assert not busy.exists()  # collected once the call it belonged to ended
-    assert unknown.is_dir()  # left for the operator, not inferred idle
-
-
-def test_restart_with_orphan_does_not_sweep_a_tree_the_new_process_never_observed(
-    tmp_path: Path,
-) -> None:
-    """A detached child may outlive both registries that protected its files."""
-
-    base = tmp_path / "tools"
-    base.mkdir()
-    parked = _stale_dir(base, "kbsearch")
-    version_identity = tools.directory_identity(tools.VersionRoot(_resolved_version(parked)))
-    package_identity = tools.directory_identity(tools.VersionRoot(parked))
-    assert version_identity is not None
-    assert package_identity is not None
-
-    # Model the old process: it observed a running version and parked the tree.
-    tools._INFLIGHT_EXECUTIONS[package_identity] = {version_identity: 1}
-    tools.remember_running_tree_for_cleanup(parked)
-    assert tools._DEFERRED_EXECUTION_CLEANUPS
-
-    # A kill -9/restart loses both process-local facts while the detached child
-    # can still hold this cwd and perform a later relative open.
-    tools._INFLIGHT_EXECUTIONS.clear()
-    tools._LOCAL_EXECUTION_GENERATIONS.clear()
-    tools._LOCAL_EXECUTION_PACKAGES.clear()
-    tools._DEFERRED_EXECUTION_CLEANUPS.clear()
-
-    tool_builder._sweep_stale_backups(base)
-
-    assert parked.is_dir()
-    assert (_resolved_version(parked) / "run.py").is_file()
+    assert not first.exists() and not second.exists()
+    assert (base / ".staging").is_dir()
+    assert linked.is_symlink() and (outside / "keep.txt").exists()
 
 
 def test_cleanup_staging_is_where_the_sweep_actually_runs(tmp_path: Path) -> None:
-    """The wiring, pinned: a deferral is only worth as much as the sweep that
-    follows it, and this is the step EVERY tool job reaches unconditionally --
-    install or revise, success or failure -- so a leftover never has to wait for
-    another revise to succeed.
+    """The wiring: cleanup-failure remains need a sweep every tool job reaches.
+
+    Install or revise, success or failure, a leftover does not have to wait for
+    another successful revise.
 
     Second half: a staging root the gate REFUSES makes this function return early
     (deliberately -- a tampered workspace is evidence, not garbage), and the sweep
@@ -4761,7 +4788,6 @@ def test_cleanup_staging_is_where_the_sweep_actually_runs(tmp_path: Path) -> Non
     base = tmp_path / "tools"
     base.mkdir()
     marked = _stale_dir(base, "kbsearch")
-    tools.remember_running_tree_for_cleanup(marked)
     staging = base / tool_builder._STAGING_DIRNAME / "buildid"
     staging.mkdir(parents=True)
 
@@ -4774,7 +4800,6 @@ def test_cleanup_staging_is_where_the_sweep_actually_runs(tmp_path: Path) -> Non
     refused.mkdir(parents=True)
     assert tool_builder._verify_staging_root(refused, base) is not None  # the early-return path
     later = _stale_dir(base, "other")
-    tools.remember_running_tree_for_cleanup(later)
 
     tool_builder._cleanup_staging(refused, base)
 
@@ -4782,63 +4807,7 @@ def test_cleanup_staging_is_where_the_sweep_actually_runs(tmp_path: Path) -> Non
     assert refused.is_dir()  # ... and the refused workspace was left alone
 
 
-def test_invariant_a_delete_discard_and_sweep_share_one_running_package_judgement(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A spy pins all three destructive callers to one package-owner helper."""
-    base = tmp_path / "tools"
-    _versioned_package_at(base / "live", "live")
-    discard_package = base / "discardable"
-    first = _versioned_package_at(discard_package, "discardable")
-    second_vid = "20260728T020304Z-fedcba"
-    second = discard_package / tools._VERSIONS_DIRNAME / second_vid
-    shutil.copytree(first, second)
-    origin_path = second / tools._META_DIRNAME / tools._ORIGIN_FILENAME
-    origin = json.loads(origin_path.read_text(encoding="utf-8"))
-    origin["previous"] = _TEST_VID
-    origin_path.write_text(json.dumps(origin), encoding="utf-8")
-    assert tools.publish_current(tools.PackageRoot(discard_package), second_vid)
-    resolution = tools.resolve_current(tools.PackageRoot(discard_package))
-    assert isinstance(resolution, tools.Resolved)
-    stale = _stale_dir(base, "old")
-    tools.remember_running_tree_for_cleanup(stale)
-    _install_settings(monkeypatch, tools_dir=str(base))
-    asked: list[
-        tuple[
-            tools.PackageLayoutRoot,
-            tools.PackageLayoutRoot | tools.VersionRoot | None,
-        ]
-    ] = []
-
-    def locally_idle(
-        package_root: tools.PackageLayoutRoot,
-        target: tools.PackageLayoutRoot | tools.VersionRoot | None = None,
-    ) -> tools.ExecutionJudgement:
-        asked.append((package_root, target))
-        return "locally-proven-idle"
-
-    monkeypatch.setattr(tools, "package_execution_judgement", locally_idle)
-
-    delete_result = tools.delete_tool("live")
-    assert delete_result is not None and delete_result.outcome == "removed"
-    discard_result = tools.discard_version(resolution)
-    assert isinstance(discard_result, tools.ToolRemovalResult)
-    assert discard_result.outcome == "removed"
-    tool_builder._sweep_stale_backups(base)
-
-    assert len(asked) == 3
-    assert type(asked[0][0]) is tools.PackageLayoutRoot
-    assert asked[0][0].path.name.startswith(".live.stale-")
-    assert asked[0][1] is None
-    assert type(asked[1][0]) is tools.PackageRoot
-    assert asked[1][0].path == discard_package
-    assert asked[1][1] == tools.VersionRoot(second.with_name(f"{second_vid}.discarded"))
-    assert type(asked[2][0]) is tools.PackageLayoutRoot
-    assert asked[2][0].path == stale
-    assert asked[2][1] == tools.PackageLayoutRoot(stale)
-
-
-def test_running_discard_parks_the_version_and_the_existing_sweep_retries(
+def test_running_discard_returns_busy_then_succeeds_after_the_child_exits(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -4865,8 +4834,6 @@ def test_running_discard_parks_the_version_and_the_existing_sweep_retries(
     assert tools.publish_current(tools.PackageRoot(package), second_vid)
     resolution = tools.resolve_current(tools.PackageRoot(package))
     assert isinstance(resolution, tools.Resolved)
-    parked = second.with_name(f"{second_vid}.discarded")
-    tools.remember_local_execution_generation(tools.VersionRoot(second))
     _install_settings(monkeypatch, tools_dir=str(base))
     handler = tools.enabled_llm_tools()[0].handler
     result: dict[str, str] = {}
@@ -4875,113 +4842,33 @@ def test_running_discard_parks_the_version_and_the_existing_sweep_retries(
 
     try:
         _wait_for(marker.exists)
-        discarded = tools.discard_version(resolution)
-        assert isinstance(discarded, tools.ToolRemovalResult)
-        assert discarded == tools.ToolRemovalResult("retained", parked)
-        assert parked.is_dir()
-        assert _resolved_version(package) == first
+        assert tools.discard_version(resolution) == "ai_job_in_progress"
+        assert _resolved_version(package) == second
         tool_builder._sweep_stale_backups(base)
-        assert parked.is_dir()
+        assert second.is_dir()
     finally:
         gate.write_text("go", encoding="utf-8")
         caller.join(timeout=30)
 
     assert result["out"] == "PAYLOAD"
-    tool_builder._sweep_stale_backups(base)
-    assert not parked.exists()
+    discarded = tools.discard_version(resolution)
+    assert isinstance(discarded, tools.ToolRemovalResult)
+    assert discarded.outcome == "removed"
+    assert _resolved_version(package) == first
+    assert not second.exists()
 
 
-def test_sweep_collects_what_a_deferred_delete_left_behind(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The delete side of the deferral, end to end.
+def test_sweep_collects_marked_backup_without_local_provenance(tmp_path: Path) -> None:
+    """The exclusive lock replaces every process-local provenance requirement."""
 
-    ``tools.delete_tool`` mints the SAME marked name a promote does, precisely so
-    it needs no collector of its own: the sweep that every tool job already runs
-    picks it up within the same process. Both halves are pinned here -- it is NOT
-    collected while the call that caused the deferral is still running, and it IS
-    collected on the next pass afterwards because this process observed both
-    states. The restart test above pins the intentionally different cross-process
-    result.
-
-    An ``enabled`` toggle sits between the call and the delete on purpose. It
-    rewrites ``tool.json`` in place, which moves the MANIFEST identity while the
-    child runs -- so with the registry keyed there, neither the delete nor this
-    sweep could match what the running call registered: the delete would destroy
-    the package under its own child, and a deferral that did survive would be
-    collected while still in use. Keyed on the directory, every side re-derives
-    the same tuple from the directory it is holding."""
-    base = tmp_path / "tools"
-    marker, gate = tmp_path / "started", tmp_path / "go"
-    version = _versioned_package_at(
-        base / "kbsearch",
-        "kbsearch",
-        "import os, sys, time\n"
-        f"open({str(marker)!r}, 'w').write('x')\n"
-        f"while not os.path.exists({str(gate)!r}):\n"
-        "    time.sleep(0.01)\n"
-        "sys.stdout.write(open('data.txt').read())\n",
-    )
-    (version / "data.txt").write_text("PAYLOAD", encoding="utf-8")
-    _install_settings(monkeypatch, tools_dir=str(base))
-    handler = tools.enabled_llm_tools()[0].handler
-
-    result: dict[str, str] = {}
-    caller = threading.Thread(target=lambda: result.update(out=asyncio.run(handler({}))))
-    caller.start()
-    try:
-        _wait_for(marker.exists)
-        assert tools.set_enabled("kbsearch", False) is True
-        delete_result = tools.delete_tool("kbsearch")
-        assert delete_result is not None and delete_result.outcome == "retained"
-        deferred = [child for child in base.iterdir() if tools._STALE_BACKUP_RE.match(child.name)]
-        assert len(deferred) == 1
-        tool_builder._sweep_stale_backups(base)
-        assert deferred[0].is_dir()  # a call is still reading it: not ours to collect
-    finally:
-        gate.write_text("go", encoding="utf-8")
-        caller.join(timeout=30)
-
-    assert result["out"] == "PAYLOAD"  # the child read its data file after the delete
-    tool_builder._sweep_stale_backups(base)
-    assert list(base.iterdir()) == []
-
-
-def test_sweep_keeps_a_marked_backup_without_positive_version_evidence(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Refusing to say KEEPS the directory, the documented direction for this call
-    site: the destructive act here is the removal, so a check that cannot speak
-    must not vouch for it (D40 P3b r11's rule, pointed the way this use needs).
-
-    The parked root's directory identity proves only that THIS process observed
-    that exact tree while work was running; it says nothing about which version
-    generations remain inside. A missing ``versions/`` may be an operator rename
-    around a surviving child's cwd, so even a marked tree remains unknown. The
-    second half pins the same result when the shared judgement cannot answer for
-    another reason."""
     base = tmp_path / "tools"
     base.mkdir()
     no_manifest = tools._stale_backup_path(base, "kbsearch", uuid4().hex)
-    no_manifest.mkdir()  # nothing to read a MANIFEST identity from
-    tools.remember_running_tree_for_cleanup(no_manifest)
+    no_manifest.mkdir()
 
     tool_builder._sweep_stale_backups(base)
 
-    assert no_manifest.is_dir()
-
-    unreadable = tools._stale_backup_path(base, "other", uuid4().hex)
-    unreadable.mkdir()
-    tools.remember_running_tree_for_cleanup(unreadable)
-    monkeypatch.setattr(
-        tools,
-        "package_execution_judgement",
-        lambda _package, _target=None: "unknown",
-    )
-
-    tool_builder._sweep_stale_backups(base)
-
-    assert unreadable.is_dir()
+    assert not no_manifest.exists()
 
 
 def test_fsync_tree_skips_directory_symlinks_outside_the_build(
@@ -5126,36 +5013,6 @@ def test_invariant_d_install_faults_never_report_a_non_durable_package_success(
         assert not installed.exists()
 
 
-def test_install_records_local_creation_before_tools_directory_fsync_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    root = tmp_path / "tools"
-    _install_settings(monkeypatch, tools_dir=str(root))
-    _fake_generate(
-        monkeypatch,
-        result={"tool_name": "kbsearch", "summary": "built", "ready": True},
-        files={"tool.json": json.dumps(_package_manifest("kbsearch")), "run.py": _GOOD_RUN_PY},
-    )
-    _no_fetch(monkeypatch)
-    real_directory = tool_builder._fsync_directory
-
-    def fail_tools_directory(path: Path) -> bool:
-        return False if path == root else real_directory(path)
-
-    monkeypatch.setattr(tool_builder, "_fsync_directory", fail_tools_directory)
-
-    outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build"))
-
-    package = tools.PackageRoot(root / "kbsearch")
-    resolution = tools.resolve_current(package)
-    assert outcome.ok is False
-    assert isinstance(resolution, tools.Resolved)
-    assert tools.package_execution_judgement(package) == "locally-proven-idle"
-    assert (
-        tools.package_execution_judgement(package, resolution.version_root) == "locally-proven-idle"
-    )
-
-
 @pytest.mark.parametrize("fault", ["version-tree", "versions-directory"])
 def test_invariant_d_revise_faults_leave_current_on_a_durable_previous_version(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fault: str
@@ -5185,34 +5042,6 @@ def test_invariant_d_revise_faults_leave_current_on_a_durable_previous_version(
     assert outcome.ok is False
     assert current.read_bytes() == before
     assert _current_version(pkg) == pkg
-
-
-def test_revise_records_local_generation_before_versions_directory_fsync_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    previous = _seed_package(monkeypatch, tmp_path)
-    package = _package_path(previous)
-    versions = package / tools._VERSIONS_DIRNAME
-    real_directory = tool_builder._fsync_directory
-
-    def fail_versions_directory(path: Path) -> bool:
-        return False if path == versions else real_directory(path)
-
-    monkeypatch.setattr(tool_builder, "_fsync_directory", fail_versions_directory)
-    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
-
-    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
-
-    orphaned = [entry for entry in versions.iterdir() if entry.is_dir() and entry != previous]
-    assert outcome.ok is False
-    assert len(orphaned) == 1
-    assert _current_version(previous) == previous
-    assert (
-        tools.package_execution_judgement(
-            tools.PackageRoot(package), tools.VersionRoot(orphaned[0])
-        )
-        == "locally-proven-idle"
-    )
 
 
 def test_revise_rechecks_current_after_version_fsync_immediately_before_publish(

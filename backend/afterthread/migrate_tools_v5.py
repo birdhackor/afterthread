@@ -90,6 +90,8 @@ from afterthread.services.tools import (
     PackageLayoutResolved,
     PackageLayoutRoot,
     PreviousNull,
+    exclusive_tools_lock,
+    legacy_preflight_accepts_shape,
     resolution_lineage,
     resolve_layout_current,
 )
@@ -114,6 +116,7 @@ _PREMIGRATE_TOMBSTONE_SUFFIX = ".at-premigrate-tombstone"
 # that recursive deletion will follow.
 _DELETION_SUFFIX = ".at-deletion-"
 _ACTIONS = ("assemble", "copy_env", "publish_shell", "park_old", "activate_new")
+_ACTIVATE_NEW_INDEX = _ACTIONS.index("activate_new")
 _STATUS_VALUES = frozenset({"running", "rolling_back", "rolled_back", "committed"})
 _VID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$")
 _PACKAGE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -546,12 +549,14 @@ def _is_new_package_at(path: Path, vid: str | None = None) -> bool:
 
 
 def _is_retained_quarantine(path: Path) -> bool:
-    """Recognize one old package retained by a completed migration.
+    """Recognize one package tree retained by migration.
 
     This marker is now a classifier, not deletion authority: accepting it only
     makes an already-hidden directory stay ignored by package preflight. No
     destructive operation is licensed by this answer, so a copied or forged
-    marker cannot cause data loss.
+    marker cannot cause data loss. ``premigrate`` is the committed old tree;
+    ``shell`` is a new tree whose activation may have made it operator-writable
+    before rollback.
     """
 
     match = _DELETION_RE.fullmatch(path.name)
@@ -574,7 +579,7 @@ def _is_retained_quarantine(path: Path) -> bool:
         set(raw) == {"afterthread", "name", "role", "vid"}
         and raw.get("afterthread") == _OWNERSHIP_MARKER
         and raw.get("name") == match.group("name")
-        and raw.get("role") == "premigrate"
+        and raw.get("role") in {"premigrate", "shell"}
         and isinstance(raw.get("vid"), str)
         and _VID_RE.fullmatch(raw["vid"]) is not None
     )
@@ -633,9 +638,8 @@ def _fresh_preflight(root: Path) -> Preflight:
         # ``exists()`` follows the last component and answers False for a broken
         # symlink. Ownership is about the directory ENTRY at this reserved name,
         # not whether its target currently resolves, so use the lstat-derived kind.
-        owns_versions = _path_kind(child / _VERSIONS_DIRNAME) != "absent"
-        owns_meta = _path_kind(child / _META_DIRNAME) != "absent"
-        if owns_versions or owns_meta:
+        legacy_shape = legacy_preflight_accepts_shape(child)
+        if not legacy_shape:
             if _is_new_package_at(child):
                 migrated.append(child.name)
                 try:
@@ -1333,6 +1337,7 @@ def _validate_journal(raw: dict[str, Any], root: Path) -> dict[str, Any]:
             package_name: str = name,
             shell_record: object = shell_identity,
             premigrate_record: object = premigrate_identity,
+            package_record: dict[str, Any] = package,
         ) -> bool:
             if value is None:
                 return True
@@ -1371,7 +1376,17 @@ def _validate_journal(raw: dict[str, Any], root: Path) -> dict[str, Any]:
                 and deletion_path.startswith(f".{package_name}{_DELETION_SUFFIX}")
                 and _DELETION_RE.fullmatch(deletion_path) is not None
                 and (
-                    stage in {"planned", "parked"} or (role == "premigrate" and stage == "retained")
+                    stage in {"planned", "parked"}
+                    or (
+                        stage == "retained"
+                        and (
+                            role == "premigrate"
+                            or (
+                                role == "shell"
+                                and _activated_shell_must_be_retained(package_record)
+                            )
+                        )
+                    )
                 )
                 and deletion_identity == recorded_identity
             )
@@ -1395,6 +1410,7 @@ def _validate_journal(raw: dict[str, Any], root: Path) -> dict[str, Any]:
             or (
                 isinstance(deletion, dict)
                 and deletion.get("stage") == "retained"
+                and deletion.get("role") == "premigrate"
                 and not premigrate_deleted
             )
         ):
@@ -1833,9 +1849,10 @@ def _resume_tree_deletion(
 ) -> Path | None:
     """Finish one journaled random disposition and return a retained old tree.
 
-    Partial new shells still need deletion so a pre-commit retry or rollback can
-    proceed. A committed old package takes the same collision-resistant parking
-    route only as far as a durable hidden quarantine, then remains there.
+    Partial new shells that provably never reached the live name still need
+    deletion so a pre-commit retry or rollback can proceed. A committed old
+    package, or a new shell whose activation may have landed, takes the same
+    collision-resistant parking route only as far as a durable hidden quarantine.
     """
 
     authority = package["deletion"]
@@ -1845,6 +1862,9 @@ def _resume_tree_deletion(
     quarantine = root / authority["path"]
     identity = tuple(authority["identity"])
     role = authority["role"]
+    retain = role == "premigrate" or (
+        role == "shell" and _activated_shell_must_be_retained(package)
+    )
 
     if authority["stage"] == "planned":
         source_identity = _directory_identity(source)
@@ -1875,14 +1895,14 @@ def _resume_tree_deletion(
                     )
                 _rename_durable(source, quarantine, root)
 
-            disposition = "retain" if role == "premigrate" else "delete"
+            disposition = "retain" if retain else "delete"
             operations.mutate(f"{disposition}:{package['name']}:{role}:park", park_at_random_name)
         if _directory_identity(quarantine) != identity or source.exists() or source.is_symlink():
             raise MigrationRefused(
                 f"{quarantine.name}: randomized quarantine rename did not preserve identity"
             )
         authority["stage"] = "parked"
-        record = "retention_parked" if role == "premigrate" else "delete_parked"
+        record = "retention_parked" if retain else "delete_parked"
         _atomic_publish_journal(
             root,
             journal,
@@ -1892,7 +1912,7 @@ def _resume_tree_deletion(
 
     if authority["stage"] == "retained":
         if (
-            role != "premigrate"
+            not retain
             or _directory_identity(quarantine) != identity
             or not _is_retained_quarantine(quarantine)
         ):
@@ -1904,7 +1924,7 @@ def _resume_tree_deletion(
     if authority["stage"] != "parked":
         raise AssertionError("validated disposition record has an unknown stage")
 
-    if role == "premigrate":
+    if retain:
         if _directory_identity(quarantine) != identity or not _is_retained_quarantine(quarantine):
             raise MigrationRefused(
                 f"{quarantine.name}: migration quarantine is missing or unrecognizable"
@@ -1915,7 +1935,8 @@ def _resume_tree_deletion(
         # schema field remains named ``premigrate_deleted`` for journal
         # compatibility; True now means the deterministic premigrate spelling has
         # been retired into the durable random quarantine recorded alongside it.
-        package["premigrate_deleted"] = True
+        if role == "premigrate":
+            package["premigrate_deleted"] = True
         authority["stage"] = "retained"
         _atomic_publish_journal(
             root,
@@ -1941,6 +1962,25 @@ def _resume_tree_deletion(
         operations=operations,
     )
     return None
+
+
+def _activated_shell_must_be_retained(package: dict[str, Any]) -> bool:
+    """Whether activation could have exposed this new tree to operator writes.
+
+    A durable ``activate_new`` completion proves it was live. A write-ahead
+    pending record for that action is deliberately treated the same: after an
+    interruption, the deterministic migrated spelling cannot prove whether it
+    was never activated or was moved live and then parked again by rollback.
+    Only an activation action that was never announced is provably never live
+    and remains eligible for automatic partial-shell removal.
+    """
+
+    completed = package.get("completed")
+    pending = package.get("pending")
+    return isinstance(completed, int) and (
+        completed > _ACTIVATE_NEW_INDEX
+        or (completed == _ACTIVATE_NEW_INDEX and pending == "activate_new")
+    )
 
 
 def _authorize_tree_disposition(
@@ -2139,20 +2179,23 @@ def _cleanup_rolled_back(
     root: Path,
     journal: dict[str, Any],
     operations: MigrationOperations,
-) -> None:
-    """Remove only migration-owned new artifacts after every old name is restored."""
+) -> tuple[Path, ...]:
+    """Dispose only migration-owned new artifacts after old names are restored."""
 
+    retained: list[Path] = []
     for package in journal["packages"]:
         name = package["name"]
         vid = package["vid"]
-        _resume_tree_deletion(root, journal, package, operations)
+        resumed = _resume_tree_deletion(root, journal, package, operations)
+        if resumed is not None:
+            retained.append(resumed)
         for artifact in (_shell_path(root, name), _migrated_path(root, name)):
             if artifact.exists() or artifact.is_symlink():
                 shell_identity = package["shell_identity"]
                 # The exact vid proves a complete shell; its recorded inode also
                 # proves an incomplete or partially removed one. A failed proof
                 # stops cleanup rather than disabling either check.
-                _authorize_tree_disposition(
+                disposed = _authorize_tree_disposition(
                     root,
                     journal,
                     package,
@@ -2164,6 +2207,8 @@ def _cleanup_rolled_back(
                     ),
                     operations=operations,
                 )
+                if disposed is not None:
+                    retained.append(disposed)
         premigrate = _premigrate_path(root, name)
         if premigrate.exists() or premigrate.is_symlink():
             raise MigrationRefused(
@@ -2174,6 +2219,7 @@ def _cleanup_rolled_back(
         _remove_owned_journal(root, journal)
 
     operations.mutate("cleanup_rollback:journal", remove_journal)
+    return tuple(dict.fromkeys(retained))
 
 
 def _take_full_backup(
@@ -2253,13 +2299,13 @@ def _report_retained_quarantines(
 
     if not quarantines:
         return
-    output("Retained pre-migration package quarantines:")
+    output("Retained migration package quarantines:")
     for quarantine in quarantines:
         output(f"  - {quarantine}")
     output(
-        "Files edited during the migration may exist only in these quarantines, "
-        "not in the migrated versions. Inspect them first; removal is the operator's "
-        "responsibility."
+        "Files edited while a package name was live may exist only in these "
+        "quarantines, not in the restored or migrated version. Inspect them first; "
+        "removal is the operator's responsibility."
     )
 
 
@@ -2286,19 +2332,21 @@ def _handle_existing_journal(
     if status == "rolling_back":
         try:
             _resume_rollback(root, journal, operations)
-            _cleanup_rolled_back(root, journal, operations)
+            retained = _cleanup_rolled_back(root, journal, operations)
         except Exception as exc:
             output(f"Rollback remains retryable and incomplete: {exc}")
             return 1
         output("The interrupted migration was rolled back; the flat layout is restored.")
+        _report_retained_quarantines(retained, output)
         return 1
     if status == "rolled_back":
         try:
-            _cleanup_rolled_back(root, journal, operations)
+            retained = _cleanup_rolled_back(root, journal, operations)
         except Exception as exc:
             output(f"Rollback is complete; artifact cleanup will be retried: {exc}")
             return 1
         output("The interrupted migration was rolled back; the flat layout is restored.")
+        _report_retained_quarantines(retained, output)
         return 1
 
     try:
@@ -2317,7 +2365,7 @@ def _handle_existing_journal(
         try:
             _publish_rollback_status(root, persisted, operations)
             _resume_rollback(root, persisted, operations)
-            _cleanup_rolled_back(root, persisted, operations)
+            retained = _cleanup_rolled_back(root, persisted, operations)
         except Exception as rollback_exc:
             output(
                 "Migration stopped before commit; the migration journal remains available "
@@ -2326,6 +2374,7 @@ def _handle_existing_journal(
             )
             return 1
         output(f"Migration failed and all package names were rolled back: {exc}")
+        _report_retained_quarantines(retained, output)
         return 1
 
     try:
@@ -2338,7 +2387,7 @@ def _handle_existing_journal(
     return 0
 
 
-def migrate_tools(
+def _migrate_tools_locked(
     root: Path,
     *,
     dry_run: bool = False,
@@ -2466,7 +2515,7 @@ def migrate_tools(
         try:
             _publish_rollback_status(root, persisted, operations)
             _resume_rollback(root, persisted, operations)
-            _cleanup_rolled_back(root, persisted, operations)
+            retained = _cleanup_rolled_back(root, persisted, operations)
         except Exception as rollback_exc:
             output(
                 "Migration stopped before commit; the migration journal remains available "
@@ -2475,6 +2524,7 @@ def migrate_tools(
             )
             return 1
         output(f"Migration failed and all package names were rolled back: {exc}")
+        _report_retained_quarantines(retained, output)
         return 1
 
     try:
@@ -2485,6 +2535,54 @@ def migrate_tools(
     output(f"Migration completed. Full backup: {backup}")
     _report_retained_quarantines(retained, output)
     return 0
+
+
+def migrate_tools(
+    root: Path,
+    *,
+    dry_run: bool = False,
+    operations: MigrationOperations | None = None,
+    output: Callable[[str], None] = print,
+    started_at: datetime | None = None,
+    token_hex: Callable[[int], str] = secrets.token_hex,
+    confirm: Callable[[], bool] = lambda: _confirm_on_stdin(input),
+) -> int:
+    """Take the offline precondition lock, then run migration under it.
+
+    The service is documented to be stopped for migration. A non-blocking
+    exclusive failure is direct proof that a cooperating request or inherited
+    tool child is still alive, so no preflight reconciliation or package move is
+    attempted. The persistent lock file itself is expected migration metadata
+    and is skipped by preflight because its name is hidden.
+    """
+
+    resolved = root.expanduser().resolve()
+    if not resolved.exists() or not resolved.is_dir():
+        return _migrate_tools_locked(
+            resolved,
+            dry_run=dry_run,
+            operations=operations,
+            output=output,
+            started_at=started_at,
+            token_hex=token_hex,
+            confirm=confirm,
+        )
+    with exclusive_tools_lock(resolved) as acquired:
+        if not acquired:
+            output(
+                "Migration refused: the tools lock is held or unavailable. "
+                "Stop the service and every inherited tool process, then retry."
+            )
+            return 1
+        return _migrate_tools_locked(
+            resolved,
+            dry_run=dry_run,
+            operations=operations,
+            output=output,
+            started_at=started_at,
+            token_hex=token_hex,
+            confirm=confirm,
+        )
 
 
 def _confirm_on_stdin(read_line: Callable[[str], str]) -> bool:

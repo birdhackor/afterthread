@@ -150,8 +150,10 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `lineage`（`sole`／`usable`／`broken`）；套件沒有可解析的生效版本時仍會列出，
   但 `description`／`current_vid` 為 `null`、`valid=false`、`lineage=broken`，只能
   整包刪除。`description` 可為空不是把 manifest 契約放寬，而是讓壞掉的套件仍有
-  一列可供清理。若非空套件完全沒有 `.afterthread.meta/`，會辨識為尚未遷移的舊版
-  扁平 layout，錯誤訊息直接提示執行 `python -m afterthread.migrate_tools_v5`。
+  一列可供清理。若非空套件完全沒有 `.afterthread.meta/`，只有 migration legacy
+  preflight 也接受的扁平 shape（尤其不能已經有 `versions/`）才會提示執行
+  `python -m afterthread.migrate_tools_v5`；保有 target namespace 的模糊 shape 會
+  回報損壞、要求人工檢查，不會推薦一條 migration 必然拒絕的指令。
 - `PATCH /api/tools/{name}` — 切換某工具的 `enabled`；找不到回 404。寫的是套件的
   `.afterthread.meta/state.json`（見下方「工具套件格式」），**完全不碰任何版本的
   `tool.json`**——所以一次
@@ -165,28 +167,25 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   因為沒有一個版本可讓該列描述。**另一條 404 的理由**：`state.json` 是可讀但沒有
   backend marker 的 foreign 檔案時，這條路由拒絕而不是覆蓋（見下方）。
 - `DELETE /api/tools/{name}` — 將整個工具套件從 registry 移除；找不到回 404。
-  後端先把套件改名到隱藏名稱，再以套件目錄的 device/inode 直接查 process-local
-  execution registry；每次執行在註冊時已帶著 owning package，因此版本被移出
-  `versions/`、`versions/` 本身改名，或整個套件改成隱藏名稱，都不會把執行移出查詢
-  範圍，也不需枚舉任何目錄名稱。`running` 與 `unknown` 都只停放；只有本程序原子安裝
-  的精確套件殼、目前又沒有套件執行時，才是 `locally-proven-idle` 並可立刻遞迴移除。
-  直接刪可能讓仍活著的子行程在下一次相對開檔時失敗。成功回 200
-  `{outcome: "removed", retained_path: null}` 或
-  `{outcome: "retained", retained_path: "<隱藏目錄的絕對路徑>"}`；工具在兩種回應下
-  都已從清單與模型可見的工具中消失，但後者明確表示設定與金鑰檔仍可能留在磁碟。
-  若後端曾 hard restart，`start_new_session` 子行程可能仍活著；新程序因此會把重啟前
-  已存在的 generation 判成 `unknown` 並保留隱藏目錄，須由操作者確認子行程已結束後
-  自行處理。
+  只有非阻塞 exclusive tools lock 取得成功才會改名或刪除；AI request 或繼承 shared
+  descriptor 的工具子行程仍活著時，回獨立的 `409 ai_job_in_progress`，套件完全不動。
+  取得 lock 後先把套件改成隱藏的 `.stale-` 名稱，再盡力遞迴移除；這個 rename 是為了
+  讓 registry 消失與失敗後清理可重試，不再負責保護執行中的目錄。成功回 200
+  `{outcome: "removed", retained_path: null, retention_reason: null}`；若遞迴清理失敗，
+  回 `{outcome: "retained", retained_path: "<隱藏目錄的絕對路徑>",
+  retention_reason: "cleanup_failed"}`。兩種回應下工具都已不可見；後者表示設定與
+  金鑰檔仍在磁碟，修復權限／檔案系統問題後才手動清理。
 - `DELETE /api/tools/{name}/versions/{vid}` — 丟掉畫面所指的**精確目前版本**。後端先
   取得全域工具名額，再比對 path 裡的 `vid`；不相符回
   `409 version_mismatch`。`lineage=usable` 時把 `current` 原子切回
-  `origin.json.previous`，之後才盡力清掉原版本；原版本一律先改名成
-  `<vid>.discarded`，套件有任何本地執行時判為 `running`；否則只有本程序建立的精確
-  原版本才是 `locally-proven-idle` 並立刻移除，跨程序無法證明的版本是 `unknown`。
-  `running` 會留下本程序稍後清掃的資格，`unknown` 則只停放、交由操作者確認後處理。
-  成功回 200 `{outcome: "removed", retained_path: null}` 或
-  `{outcome: "retained", retained_path: "<原版本保留位置的絕對路徑>"}`；後者也涵蓋
-  `current` 持久化未確認、停放 rename 失敗或遞迴移除失敗，UI 會顯示精確路徑而非泛稱成功。
+  `origin.json.previous`，之後才盡力清掉原版本。和整包刪除一樣，未取得非阻塞
+  exclusive tools lock 時回 `409 ai_job_in_progress`，不發布 pointer、不移動檔案。
+  pointer 的目錄 fsync 已確認後，原版本先改名成 `<vid>.discarded` 再刪除；成功回
+  `{outcome: "removed", retained_path: null, retention_reason: null}`。清理失敗回
+  `retention_reason: "cleanup_failed"`，UI 提示檢查權限／檔案系統後處理；若
+  `current=P` 已換上但目錄 fsync 未確認，V 保留原位並回
+  `retention_reason: "durability_unconfirmed"`，UI 明確禁止手動刪除，要求先修復
+  儲存問題、重啟並確認 pointer 仍指 P。停止行程本身不能補上 durability invariant。
   `lineage=sole` 在 UI 走既有的整包刪除確認；
   前一版缺失、未提交或指回自己則回 `409 lineage_unavailable`，不動任何檔案。
 - `POST /api/tools/install` — 送出 KB 網頁安裝器工作（見下方「工具（KB 網頁
@@ -241,20 +240,22 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 - **磁碟版面與所有權**：
 
   ```text
-  <TOOLS_DIR>/<name>/
-      .afterthread.meta/
-          state.json
-          current
-          migration-owner.json  # 只存在於一次性 web-v5 遷移產物
-      versions/
-          <vid>/
-              .afterthread.meta/
-                  origin.json
-                  summary.json       # 可缺
-              tool.json
-              run.py ...
-          <vid>.discarded/           # 執行中版本的暫停清理名
-      .env
+  <TOOLS_DIR>/
+      .afterthread-tools.lck         # 永久保留的 shared/exclusive lock inode
+      <name>/
+          .afterthread.meta/
+              state.json
+              current
+              migration-owner.json  # 只存在於一次性 web-v5 遷移產物
+          versions/
+              <vid>/
+                  .afterthread.meta/
+                      origin.json
+                      summary.json       # 可缺
+                  tool.json
+                  run.py ...
+              <vid>.discarded/           # cleanup 失敗的隱藏重試名
+          .env
   ```
 
   套件層只有後端狀態與操作者的 `.env`；工具內容全部在版本層。
@@ -333,13 +334,26 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   schema 執行新程式；若操作者在廣告與
   呼叫間親手 discard 該版，呼叫會得到明確拒絕，系統刻意不為這個單人操作引入
   reservation/refcount。
+- **request／子行程與破壞操作互斥**：capture、enrich、assist-update 在掃描並把
+  tools array 交給模型**之前**取得 `.afterthread-tools.lck` 的 shared `flock`，在整個
+  請求（所有模型 round、工具呼叫與錯誤清理）結束後才關閉 descriptor；shared lock
+  彼此相容，所以兩場一般對話不會被序列化。工具使用
+  `Popen(pass_fds=(fd,), start_new_session=True)` 繼承同一個 open-file reference：
+  backend 即使被 `kill -9`，只要 child 還活著，exclusive 仍取不到。整包 delete、
+  discard 與 `.stale-`／`.discarded` 背景清掃都只嘗試非阻塞 exclusive lock；前兩者
+  contention 回 `409 ai_job_in_progress`，清掃則略過、等下次工作再試。
+  lock 檔**不得手動刪除或重建**：新 inode 不會和舊 holder 衝突，保護會無聲失效。
+  `flock` 只協調有檢查它的程式碼，這裡的 checker 都由 afterthread 控制，並不是防止
+  操作者或工具直接改檔的 sandbox。最後，這個 orphan 保護唯一依賴的工具行為是 child
+  不自行關閉繼承的 descriptor。
 - **版本保留、lineage 與 discard**：`origin.json.previous` 是前一版的唯一來源，
   不是目錄排序；沒有自動回收。`lineage=sole` 表示 previous 為 null，
   `usable` 表示 previous 是另一個合法已提交版本，`broken` 表示 pointer 壞掉或
   指回自己。discard 的順序固定為：確認 expected vid → sole 則整包刪除 → 驗前一版
   → 發布 `current=P` → 只有 pointer 的目錄 fsync 已確認才盡力移除 V。V 還在執行
-  時改名 `<vid>.discarded`；無法確認持久化時保留 V 但仍回成功，因為多一個未指向
-  版本比「斷電後 current 指到已刪版本」安全。掃描捕捉一個可解析版本時，就在
+  時 exclusive lock 根本不會取得，discard 回 409 而不動任何檔案；無法確認持久化時
+  保留 V 但仍回成功，因為多一個未指向版本比「斷電後 current 指到已刪版本」安全。
+  掃描捕捉一個可解析版本時，就在
   process-local registry 取得或建立該 `VersionRoot` 的 advertisement generation；
   同一輪稍後建立的每個 handler 都持有這個物件。discard 成功發布 `current=P` 時，
   會在與掃描捕捉共用的 lock 內把 V 當下的 generation 標成 retired 並移出
@@ -347,13 +361,11 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   handler 仍明確拒絕。retired generation 由既有 handler 持有到該對話／handler
   釋放為止；之後從備份恢復並重新掃描同一 vid 會取得新 generation。退役完全不讀
   目錄的 device、inode 或其他可由 rename／刪除／重建影響的磁碟屬性，避免磁碟
-  身分重用或搬回原位使舊廣告復活。執行保護、removal target 的來源證據與
-  deferred-cleanup 資格也都是 process-local：handler 註冊 version inode 時同時登記
-  owning package inode，delete、discard 與 `.stale-` 清掃都直接用 package inode 查
-  `running`，不走訪 `versions/`。沒有執行時，再以「本程序建立了將被破壞的精確 target」
-  判斷 `locally-proven-idle`：整包 delete 要有本地 package-shell 證據，discard 只需本地
-  version-generation 證據；跨程序不把空 registry 當成 idle 證明。新程序無法證明的
-  stale／discarded tree 一律保留給操作者。
+  身分重用或搬回原位使舊廣告復活。這個 generation 只回答「舊 handler 是否已被
+  明確 discard」，不是執行中目錄的 mapping；後者的 package-inode registry、
+  `running/unknown/locally-proven-idle` 判斷、本地建立 provenance 與
+  park-because-running cleanup 資格都已刪除，由跨 restart 的 flock 排他性取代。
+  `.stale-`／`.discarded` 只代表清理失敗，後續 sweep 也必須先取得 exclusive lock。
 - **AI 總結拆成兩份 sidecar**：每版不可變的
   `.afterthread.meta/origin.json` 保存來源、安裝指示、修訂意見與 previous；
   可重新產生的 `.afterthread.meta/summary.json` 保存 summary、updated time 與
@@ -371,7 +383,9 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `PATH`／`HOME`／`LANG`／`LC_ALL`／`TMPDIR`，再加 package `.env` 與正規化的
   TLS 設定，避免不小心把父行程 `OPENAI_API_KEY` 一起交出去；同 UID 行程仍可能
   讀 `/proc`，所以這不是對抗惡意程式的隔離。
-- **一次性 web-v5 遷移**：先停掉 afterthread；為使 migrated version 精確反映開始時
+- **一次性 web-v5 遷移**：先停掉 afterthread；migration 會先以非阻塞方式取得同一個
+  exclusive tools lock 並持有到整體完成，取不到即拒絕開始，這也會抓出 backend 已停
+  但 inherited tool child 尚未結束的情況。為使 migrated version 精確反映開始時
   的內容，仍建議關閉編輯器並暫停手動／同步寫入。即使遷移期間發生 autosave，舊套件
   現在也不會被刪除：那次編輯會留在 retained quarantine，**不保證進入 migrated
   version**，操作者可事後比對與取回。確認 `TOOLS_DIR` 指向舊扁平套件，再於
@@ -384,7 +398,8 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   uv run python -m afterthread.migrate_tools_v5 --yes
   ```
 
-  `--dry-run` 只做唯讀預檢並列出整體計畫；一般執行會逐套件報告 legacy state／
+  `--dry-run` 除了建立（若尚不存在）並鎖住永久的 `.afterthread-tools.lck` inode，
+  只做唯讀預檢並列出整體計畫；一般執行會逐套件報告 legacy state／
   `.ai_meta.json` 分類、enabled 與 `.env` **key 名**（永不列值），然後在第一次
   寫入前最後一次詢問。只有明確 `y`／`yes` 才繼續；拒絕、關閉或無法詢問的 stdin
   都視為 no，tree 保持 byte-identical。`--yes` 只適合計畫已審過的自動化執行。
@@ -402,11 +417,16 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   從 `.at-premigrate` 改名成隨機、隱藏的 quarantine 並永久保留，因此這些 late edits
   可復原，但不會被偷偷合併到 migrated version。
   journal 另持久記錄 shell／舊套件目錄 identity，並在目錄內寫入綁定 package +
-  vid + role 的 marker。對 migration 自己建立的 partial **新 shell**，identity +
-  marker（完整 target-layout 亦可用精確 VID）仍是清理證明；新 shell 在空目錄時先記
+  vid + role 的 marker。對 migration 自己建立且**從未完成 activation** 的 partial
+  新 shell，identity + marker（完整 target-layout 亦可用精確 VID）仍是清理證明；
+  新 shell 在空目錄時先記
   identity，再以目前 journal 的 atomic hard link 暫時充當 bootstrap marker，正式
-  JSON marker 完整落盤後才移除 bootstrap。這套 destructive ownership proof 不再用於
-  committed 舊套件：舊套件只產生 256-bit 隨機 quarantine 名稱、rename 過去並把
+  JSON marker 完整落盤後才移除 bootstrap。一個 shell 只要曾完成 activation（或
+  journal 停在 activation 可能已落地的 pending 狀態），就已可能以 live package
+  身分接受操作者寫入；rollback 不再 `rmtree`，而會改名成 role=`shell` 的隨機 hidden
+  quarantine 並列入報告。這套 destructive ownership proof 不再用於已 activation 的
+  新 shell 或 committed 舊套件：舊套件只產生 256-bit 隨機 quarantine 名稱、rename
+  過去並把
   retained 階段持久寫進 tree 外的 journal，之後**沒有 `rmtree`**。舊套件 marker
   留在 quarantine 內作為 fresh preflight 的持久分類標記；沒有 marker 的同形 sibling
   仍視為 operator-owned 並拒絕。隨機 hidden quarantine 不會被 package scanner、

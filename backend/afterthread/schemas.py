@@ -534,6 +534,7 @@ class ToolDeleteResponse(BaseModel):
 
     outcome: Literal["removed", "retained"]
     retained_path: str | None
+    retention_reason: Literal["durability_unconfirmed", "cleanup_failed"] | None
 
 
 class ToolDiscardResponse(BaseModel):
@@ -541,6 +542,7 @@ class ToolDiscardResponse(BaseModel):
 
     outcome: Literal["removed", "retained"]
     retained_path: str | None
+    retention_reason: Literal["durability_unconfirmed", "cleanup_failed"] | None
 
 
 class ToolSummaryDetail(BaseModel):

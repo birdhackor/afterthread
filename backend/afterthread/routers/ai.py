@@ -15,6 +15,8 @@ the HTTP contract:
   generated clients and docs never overstate or understate what can happen.
 """
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Any
 
@@ -42,7 +44,7 @@ from afterthread.schemas import (
     LLMTokenRatio,
     MemoryItemRead,
 )
-from afterthread.services import llm_log, token_budget
+from afterthread.services import llm_log, token_budget, tools
 from afterthread.services.llm import (
     _UPSTREAM_REASON,
     LLMNotConfiguredError,
@@ -179,6 +181,26 @@ def _conflict() -> HTTPException:
         status_code=409,
         detail={"code": _CONFLICT_CODE, "message": _CONFLICT_MESSAGE},
     )
+
+
+@asynccontextmanager
+async def _advertised_tools_lock() -> AsyncIterator[None]:
+    """Hold the shared tools lock across one complete tool-advertising request.
+
+    Acquisition runs off-loop because a destroyer that won the race may hold the
+    exclusive side briefly. The synchronous binding lets ``enabled_llm_tools``
+    capture this exact descriptor into every handler. The ``finally`` covers
+    normal output, LLM/config errors, validation errors, and request
+    cancellation; a subprocess has its own inherited reference if it outlives
+    the backend-side close.
+    """
+
+    fd = await run_in_threadpool(tools.acquire_shared_tools_lock)
+    try:
+        with tools.bind_request_tools_lock(fd):
+            yield
+    finally:
+        await run_in_threadpool(tools.release_tools_lock, fd)
 
 
 def _conditional_update(
@@ -325,12 +347,13 @@ async def capture(payload: CaptureRequest, session: SessionDep) -> CaptureRespon
     -- no partial rows -- because no write has happened yet. The blocking write
     itself runs in a threadpool (see _capture_persist), off the event loop.
     """
-    try:
-        draft = await capture_draft(payload.raw_text)
-    except LLMNotConfiguredError as exc:
-        raise _service_unavailable() from exc
-    except LLMUpstreamError as exc:
-        raise _bad_gateway(exc) from exc
+    async with _advertised_tools_lock():
+        try:
+            draft = await capture_draft(payload.raw_text)
+        except LLMNotConfiguredError as exc:
+            raise _service_unavailable() from exc
+        except LLMUpstreamError as exc:
+            raise _bad_gateway(exc) from exc
 
     # Building the ORM object is pure in-memory work (no SQL until flush), so it
     # stays on the loop; only the flush/commit segment is handed to the threadpool.
@@ -505,12 +528,13 @@ async def enrich(item_id: ItemId, payload: EnrichRequest, session: SessionDep) -
     """
     item_fields, original_updated = await run_in_threadpool(_snapshot_item_for_ai, session, item_id)
 
-    try:
-        result = await enrich_item(item_fields, payload.additional_context)
-    except LLMNotConfiguredError as exc:
-        raise _service_unavailable() from exc
-    except LLMUpstreamError as exc:
-        raise _bad_gateway(exc) from exc
+    async with _advertised_tools_lock():
+        try:
+            result = await enrich_item(item_fields, payload.additional_context)
+        except LLMNotConfiguredError as exc:
+            raise _service_unavailable() from exc
+        except LLMUpstreamError as exc:
+            raise _bad_gateway(exc) from exc
 
     result_read = await run_in_threadpool(
         _enrich_persist, session, item_id, original_updated, result
@@ -588,12 +612,13 @@ async def assist_update_item(
     """
     item_fields, original_updated = await run_in_threadpool(_snapshot_item_for_ai, session, item_id)
 
-    try:
-        result = await assist_update(item_fields, payload.note)
-    except LLMNotConfiguredError as exc:
-        raise _service_unavailable() from exc
-    except LLMUpstreamError as exc:
-        raise _bad_gateway(exc) from exc
+    async with _advertised_tools_lock():
+        try:
+            result = await assist_update(item_fields, payload.note)
+        except LLMNotConfiguredError as exc:
+            raise _service_unavailable() from exc
+        except LLMUpstreamError as exc:
+            raise _bad_gateway(exc) from exc
 
     result_read = await run_in_threadpool(
         _assist_persist, session, item_id, original_updated, result

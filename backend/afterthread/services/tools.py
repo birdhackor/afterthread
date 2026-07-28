@@ -14,6 +14,7 @@ version identity; a call runs that exact version with its directory as cwd.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -27,6 +28,7 @@ import threading
 import time
 import weakref
 from collections.abc import Awaitable, Callable, Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -54,6 +56,7 @@ _PACKAGE_STATE_FILENAME = "state.json"
 _ORIGIN_FILENAME = "origin.json"
 _SUMMARY_FILENAME = "summary.json"
 _CURRENT_MAX_BYTES = 64
+_TOOLS_LOCK_FILENAME = ".afterthread-tools.lck"
 
 # The ONLY parent-environment variables a tool subprocess inherits VERBATIM.
 # Everything else -- above all OPENAI_API_KEY / OPENAI_BASE_URL -- is withheld by
@@ -406,6 +409,125 @@ def tools_dir() -> Path | None:
     if not raw:
         return None
     return Path(raw).expanduser().resolve()
+
+
+_REQUEST_TOOLS_LOCK_FD: ContextVar[int | None] = ContextVar("_REQUEST_TOOLS_LOCK_FD", default=None)
+
+
+def _open_tools_lock(base: Path) -> int:
+    """Open the one persistent lock inode shared by every cooperating operation.
+
+    The file is intentionally never unlinked. Deleting it by hand and recreating
+    it produces a different inode: holders of the old inode and checkers of the
+    new one no longer conflict, so protection lapses silently. ``O_NOFOLLOW`` and
+    the regular-file gate fail closed if the reserved name is replaced.
+
+    ``flock`` coordinates only code that checks this inode. Every checker in this
+    subsystem is ours; it is not a sandbox against an operator or tool that edits
+    package files directly.
+    """
+
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(base / _TOOLS_LOCK_FILENAME, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("tools lock is not a regular file")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def acquire_shared_tools_lock() -> int | None:
+    """Take the request-wide shared lock, blocking only behind a destroyer.
+
+    ``None`` means the feature is unconfigured or its root does not exist, in
+    which case no installed tool can be advertised. The router calls this on a
+    worker before scanning/advertising and holds the returned descriptor through
+    the complete LLM request.
+    """
+
+    base = tools_dir()
+    if base is None or not base.is_dir():
+        return None
+    fd = _open_tools_lock(base)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def release_tools_lock(fd: int | None) -> None:
+    """Close one parent reference; the kernel releases on the last reference."""
+
+    if fd is not None:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def bind_request_tools_lock(fd: int | None) -> Iterator[None]:
+    """Expose the request's descriptor while its advertised handlers are built."""
+
+    token = _REQUEST_TOOLS_LOCK_FD.set(fd)
+    try:
+        yield
+    finally:
+        _REQUEST_TOOLS_LOCK_FD.reset(token)
+
+
+@contextlib.contextmanager
+def exclusive_tools_lock(base: Path | None = None) -> Iterator[bool]:
+    """Try the destroyer lock once; yield False instead of waiting.
+
+    Delete, discard, stale cleanup, and migration all use this same helper. Any
+    open or lock failure is fail-closed: HTTP callers map False to their distinct
+    retryable 409, while the offline migration refuses to start.
+    """
+
+    root = base if base is not None else tools_dir()
+    if root is None or not root.is_dir():
+        yield False
+        return
+    try:
+        fd = _open_tools_lock(root)
+    except OSError:
+        yield False
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        yield True
+    finally:
+        # Close rather than unlink: this releases our open-file reference while
+        # preserving the one inode every future checker must lock.
+        os.close(fd)
+
+
+def legacy_preflight_accepts_shape(package: Path) -> bool:
+    """Whether migration will treat this root as legacy rather than target/damaged.
+
+    This deliberately answers only the namespace-shape gate shared by runtime
+    diagnostics and migration preflight. Migration still validates the legacy
+    manifest, special files, state, sidecar, and dotenv before accepting it.
+    """
+
+    for reserved in (_VERSIONS_DIRNAME, _META_DIRNAME):
+        try:
+            os.lstat(package / reserved)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+        else:
+            return False
+    return True
 
 
 def _valid_entry(entry: Any) -> bool:
@@ -799,15 +921,20 @@ def _resolve_current_data(
         try:
             os.lstat(package / _META_DIRNAME)
         except FileNotFoundError:
-            # A non-empty flat package is the supported pre-v5 layout, not an
-            # ordinary damaged versioned package. Name the offline recovery
-            # action while the row is still visible and deletable in the UI.
+            # Name the migration only for the SAME namespace shape its preflight
+            # sends to the legacy inspector. In particular, a target package
+            # whose metadata directory was moved aside still owns ``versions/``;
+            # migration refuses that ambiguous shape, so the runtime must not
+            # prescribe a command guaranteed to refuse it.
             try:
                 with os.scandir(package) as entries:
                     if next(entries, None) is not None:
-                        return (
-                            "unmigrated tool layout; run `python -m afterthread.migrate_tools_v5`"
-                        )
+                        if legacy_preflight_accepts_shape(package):
+                            return (
+                                "unmigrated tool layout; "
+                                "run `python -m afterthread.migrate_tools_v5`"
+                            )
+                        return "tool layout is damaged or ambiguous; inspect it before migration"
             except OSError:
                 pass
         except OSError:
@@ -1290,8 +1417,8 @@ def _still_the_expected_package(
     ``expected`` of None is FALSE, never a pass: the caller could not establish an
     identity, and a check that cannot speak must not vouch (D40 P3b r11). The
     identity is the MANIFEST's (``package_identity``) because the question is
-    "same PACKAGE?"; the other identity (``directory_identity``) answers "same
-    FILES?" and is not interchangeable -- see both functions.
+    "same advertised content?". The former directory identity and execution
+    registry are gone: destruction safety is now the tools flock's job.
     """
     return expected is not None and package_identity(version_root) == expected
 
@@ -1789,65 +1916,6 @@ def package_identity(version_root: VersionRoot) -> tuple[int, int, int] | None:
     return (info.st_dev, info.st_ino, info.st_ctime_ns)
 
 
-def directory_identity(version_root: VersionRoot) -> tuple[int, int] | None:
-    """The DIRECTORY's own identity: ``(st_dev, st_ino)``, or None when unreadable.
-
-    The other half of ``package_identity``, and a DIFFERENT question on purpose:
-    that one asks "is this still the same PACKAGE?", this one asks "is anything
-    still running out of these FILES?". One tuple cannot answer both, because the
-    two must survive different things:
-
-    * the manifest identity MUST move when ``tool.json`` is rewritten -- that is
-      exactly how a revision, a reinstall, and an operator's hand-edit of the
-      spec (accepted, stated in ``_make_handler``) are told apart from
-      "unchanged";
-    * an execution's lifetime must survive EVERY edit inside the directory, spec
-      edits included. Keying ``_INFLIGHT_EXECUTIONS`` on the manifest made a
-      handler that registered before such an edit invisible to the delete or
-      promote that queried after it -- and the removal each of them defers for
-      exactly this reason then landed on files a child was still reading. The
-      split lasted from the edit until the child exited, not a syscall pair.
-
-    The SPLIT STAYS even though the case that forced it is gone (web-v5 P1: the
-    ``enabled`` toggle no longer rewrites ``tool.json``, so the commonest way to
-    move the manifest identity under a running child no longer exists). Its own
-    reason is enough on its own and always was: a hand-edit of ``tool.json`` is a
-    SUPPORTED operator action (D21) that moves the manifest identity while a
-    subprocess is still reading the directory, so a registration keyed on the
-    manifest would still be stranded. Collapsing the two back into one tuple is a
-    later phase's decision, once immutable versions make "same package?" answerable
-    without a stat at all; doing it here would entangle two changes.
-
-    MEASURED here rather than assumed (Linux/ext4, this repo's own filesystem):
-
-    * an in-place rewrite of ``tool.json`` (an operator's edit; before web-v5 P1,
-      also every ``set_enabled``) leaves this tuple UNCHANGED while the manifest
-      identity moves (the rewrite pushes ``tool.json``'s ctime);
-    * the replace-mode promote's rename-aside and ``delete_tool``'s rename into
-      the deferred namespace both CARRY it -- a rename moves the name, not the
-      inode, which is the same fact that makes a rename invisible to a running
-      child;
-    * a delete followed by a reinstall of the same name REUSES the directory
-      inode (5/5 rounds measured), which is precisely why this must never be read
-      as "the same package" -- ``package_identity`` records the adjudication that
-      settled that question on the manifest.
-
-    Two SHAPES, not two spellings of one tuple: 2 elements here, 3 there, so a
-    call site reaching for the wrong identity is a type error rather than a
-    silent mismatch.
-
-    ``lstat``, like its sibling: an executable package directory is never a
-    symlink (``_scan_package`` refuses one, so nothing symlinked can be running),
-    and both deferral writers unlink or refuse a symlink long before they ask.
-    None on any error, with each caller stating which way it takes "cannot say".
-    """
-    try:
-        info = os.lstat(version_root.path)
-    except OSError:
-        return None
-    return (info.st_dev, info.st_ino)
-
-
 def _build_llm_tool(scan: _PackageScan) -> LlmTool:
     """Turn a valid ``_PackageScan`` into an executable ``LlmTool``.
 
@@ -1939,13 +2007,14 @@ def enabled_llm_tools() -> list[LlmTool]:
 #   package's ``.env`` into the child's environment, and the child can echo any
 #   of it back -- but the redaction of that output happens when the child
 #   FINISHES, and by then the file may say something else entirely (an operator
-#   rotating a credential, a revise publishing a new package, this module's own
-#   deferred ``delete_tool``). The scan would then only know the NEW value and
-#   the OLD one would ride into the role:"tool" message, the log and the JSONL
-#   sink unmasked. So the values a child actually RECEIVED are held here for
+#   rotating a credential or directly editing/moving package state). The scan
+#   would then only know the NEW value and the OLD one would ride into the
+#   role:"tool" message, the log and the JSONL sink unmasked. So the values a
+#   child actually RECEIVED are held here for
 #   exactly as long as that call can still produce output to mask.
 #
-# COUNTED rather than flagged, for the same reason ``_INFLIGHT_EXECUTIONS`` is:
+# COUNTED rather than flagged because overlapping holders can carry the same
+# value:
 # holders overlap (two workflows calling the same tool, a revise running while an
 # ordinary conversation calls that same tool -- ordinary AI workflows are outside
 # the tool job's single-flight), and they can hold the SAME value, since it is the
@@ -2041,12 +2110,12 @@ def discard_inflight_secret(value: str) -> None:
 def _inflight_secrets(values: frozenset[str]) -> Iterator[None]:
     """Hold ``values`` redactable for the body, and release them again.
 
-    The mate of ``_inflight_execution`` for the OTHER thing one tool call needs
-    to outlive itself, and a context manager for the same reason: the ``finally``
-    is the point. A handler that raises, times out, or is cancelled mid-call must
-    not leave a hold behind -- a leaked one would keep masking a value forever,
-    which is not a leak that shows up anywhere until a redaction starts eating
-    ordinary prose.
+    Execution lifetime is now protected by the inherited flock, not a registry.
+    This independent context manager remains because secret-redaction lifetime
+    is a different question: a handler that raises, times out, or is cancelled
+    mid-call must not leave a hold behind. A leaked one would keep masking a
+    value forever, which is not visible until redaction starts eating ordinary
+    prose.
 
     Registration is INSIDE the try, so a failure part-way through the loop still
     releases the holds already taken (the release of a value never registered is
@@ -2685,6 +2754,7 @@ def _run_tool_subprocess(
     advertised: Resolved,
     expected_identity: tuple[int, int, int] | None,
     advertisement_generation: _AdvertisementGeneration,
+    tools_lock_fd: int,
     env: dict[str, str],
     args_json: str,
     timeout: float,
@@ -2725,6 +2795,11 @@ def _run_tool_subprocess(
             errors="replace",
             # New session/group so the timeout path can kill the whole tree.
             start_new_session=True,
+            # The tool must never close this inherited descriptor itself. This
+            # is the only place mutual exclusion depends on tool behaviour: the
+            # child's reference keeps the request's shared flock alive even if
+            # the backend is killed and its own descriptor disappears.
+            pass_fds=(tools_lock_fd,),
         )
     except OSError as exc:
         # FileNotFoundError (bad interpreter/script), PermissionError (no exec
@@ -2752,31 +2827,6 @@ def _run_tool_subprocess(
         stderr = _cap_output(redact_known_secrets(output.stderr).strip(), output_cap)
         return f"tool failed (exit {proc.returncode}): {stderr}"
     return _cap_output(redact_known_secrets(output.stdout), output_cap)
-
-
-# In-flight executions are keyed first by the owning PACKAGE directory identity,
-# then by VersionRoot directory identity. Hand-editing ``tool.json`` may change
-# its manifest identity while a child still needs the same directory files, and
-# renaming either directory carries both directory identities. The nested count
-# protects overlapping calls while making "is this package running?" one direct
-# registry lookup.
-_INFLIGHT_EXECUTIONS: dict[tuple[int, int], dict[tuple[int, int], int]] = {}
-# These process-local facts are what let absence mean idle for an exact removal
-# target this process CREATED. Absence from ``_INFLIGHT_EXECUTIONS`` alone means
-# UNKNOWN, not idle: a generation that pre-dates this backend may still be in use
-# by a start_new_session child orphaned by the previous backend. Package roots are
-# recorded separately because whole-package deletion destroys a wider target than
-# a discard; creating one revised version does not prove an inherited package safe
-# to remove recursively.
-_LOCAL_EXECUTION_GENERATIONS: set[tuple[int, int]] = set()
-_LOCAL_EXECUTION_PACKAGES: set[tuple[int, int]] = set()
-# A parked tree is eligible for automatic collection only when THIS process saw
-# it while an execution was registered. A backend hard restart empties both
-# registries while start_new_session children may survive; therefore an unknown
-# stale/discarded tree is evidence for the operator, not proof of idleness.
-_DEFERRED_EXECUTION_CLEANUPS: set[tuple[int, int]] = set()
-_EXECUTION_LOCK = threading.Lock()
-type ExecutionJudgement = Literal["running", "locally-proven-idle", "unknown"]
 
 
 @dataclass(slots=True, weakref_slot=True)
@@ -2859,162 +2909,19 @@ def _advertisement_retired(generation: _AdvertisementGeneration) -> bool:
         return generation.retired
 
 
-@contextlib.contextmanager
-def _inflight_execution(
-    package_identity: tuple[int, int],
-    version_identity: tuple[int, int],
-) -> Iterator[None]:
-    """Count one execution under its package and exact VersionRoot, then remove it.
-
-    A context manager rather than a register/discard pair at the call site
-    because the ``finally`` is the point: a handler that raises, or an AI request
-    cancelled mid-call, must not leave a registration behind -- one leaked entry
-    would defer that package's backup on every future promote, forever. The lock
-    is taken for the two dict updates ONLY, never held across the ``yield`` (which
-    spans an ``await`` and the whole subprocess run).
-
-    Both empty counts are dropped by REMOVING their keys, so package membership is
-    the whole query and a stale empty mapping can never read as "still in use".
-    """
-    with _EXECUTION_LOCK:
-        versions = _INFLIGHT_EXECUTIONS.setdefault(package_identity, {})
-        versions[version_identity] = versions.get(version_identity, 0) + 1
-    try:
-        yield
-    finally:
-        with _EXECUTION_LOCK:
-            versions = _INFLIGHT_EXECUTIONS.get(package_identity)
-            if versions is not None:
-                remaining = versions.get(version_identity, 0) - 1
-                if remaining > 0:
-                    versions[version_identity] = remaining
-                else:
-                    versions.pop(version_identity, None)
-                if not versions:
-                    _INFLIGHT_EXECUTIONS.pop(package_identity, None)
-
-
-def directory_execution_in_flight(identity: tuple[int, int]) -> bool:
-    """Return only the positive process-local running fact for one VersionRoot."""
-    with _EXECUTION_LOCK:
-        return any(identity in versions for versions in _INFLIGHT_EXECUTIONS.values())
-
-
-def remember_local_execution_generation(version_root: VersionRoot) -> None:
-    """Record an exact generation as soon as this process installs its directory.
-
-    Such a generation cannot have a child left by an earlier backend process.
-    Therefore, and only therefore, a zero local execution count proves it idle.
-    """
-
-    identity = directory_identity(version_root)
-    if identity is None:
-        return
-    with _EXECUTION_LOCK:
-        _LOCAL_EXECUTION_GENERATIONS.add(identity)
-
-
-def remember_local_execution_package(package_root: PackageLayoutRoot) -> None:
-    """Record a whole package shell this process atomically installed."""
-
-    identity = directory_identity(VersionRoot(package_root.path))
-    if identity is None:
-        return
-    with _EXECUTION_LOCK:
-        _LOCAL_EXECUTION_PACKAGES.add(identity)
-
-
-def package_execution_judgement(
-    package_root: PackageLayoutRoot,
-    removal_target: PackageLayoutRoot | VersionRoot | None = None,
-) -> ExecutionJudgement:
-    """Judge whether one exact removal target under a package is safe to destroy.
-
-    The running question is package-scoped: registration records the package
-    directory identity beside every execution, so a rename of the package or of
-    any version cannot move that execution out of the lookup. The old approach
-    enumerated whatever names happened to remain under ``versions/``; that was
-    the wrong question because an operator-supported rename could hide the busy
-    inode while leaving an idle sibling to authorize recursive deletion.
-
-    No package or version name, and no directory enumeration, participates here.
-    ``locally-proven-idle`` additionally requires positive evidence that THIS
-    process created the exact directory that will be removed: the package shell
-    for recursive delete, or the parked generation for discard. Anything inherited
-    across a restart is ``unknown`` even when this process has no registered call.
-    """
-
-    package_identity = directory_identity(VersionRoot(package_root.path))
-    if package_identity is None:
-        return "unknown"
-    target = removal_target if removal_target is not None else package_root
-    target_identity = directory_identity(VersionRoot(target.path))
-    if target_identity is None:
-        return "unknown"
-    with _EXECUTION_LOCK:
-        if package_identity in _INFLIGHT_EXECUTIONS:
-            return "running"
-        local_targets = (
-            _LOCAL_EXECUTION_PACKAGES
-            if isinstance(target, PackageLayoutRoot) and not isinstance(target, VersionRoot)
-            else _LOCAL_EXECUTION_GENERATIONS
-        )
-        if target_identity in local_targets:
-            return "locally-proven-idle"
-    return "unknown"
-
-
-def remember_running_tree_for_cleanup(path: Path) -> None:
-    """Record that this process observed ``path`` parked while work was running."""
-
-    identity = directory_identity(VersionRoot(path))
-    if identity is None:
-        return
-    with _EXECUTION_LOCK:
-        _DEFERRED_EXECUTION_CLEANUPS.add(identity)
-
-
-def deferred_tree_observed_idle(
-    path: Path,
-    execution_scope: PackageLayoutRoot,
-) -> bool:
-    """Consume this process's permission to collect a parked tree.
-
-    The first gate is deliberately process-local. An empty in-flight registry
-    after restart does not mean a start_new_session child is gone; only the
-    process that observed the parked tree as running may later observe the same
-    execution scope as idle and remove it.
-    """
-
-    identity = directory_identity(VersionRoot(path))
-    if identity is None:
-        return False
-    with _EXECUTION_LOCK:
-        if identity not in _DEFERRED_EXECUTION_CLEANUPS:
-            return False
-    target = PackageLayoutRoot(path) if path == execution_scope.path else VersionRoot(path)
-    if package_execution_judgement(execution_scope, target) != "locally-proven-idle":
-        return False
-    with _EXECUTION_LOCK:
-        # Consume before rmtree. If removal itself fails, the remains stay for
-        # the operator rather than letting inode reuse replay this permission.
-        if identity not in _DEFERRED_EXECUTION_CLEANUPS:
-            return False
-        _DEFERRED_EXECUTION_CLEANUPS.remove(identity)
-    return True
-
-
-# The DEFERRED-REMOVAL namespace: where a package goes when it must stop being a
-# package NOW but cannot be destroyed yet, because a subprocess is still reading
-# it. ``.{name}.stale-<token>`` means "superseded, collect when idle", and it is
-# the only shape ``tool_builder._sweep_stale_backups`` will ever remove.
+# The STALE-CLEANUP namespace: where a package goes when it must stop being a
+# package NOW but its best-effort recursive cleanup may fail. The old execution
+# registry parked running packages here; mutual exclusion makes that path
+# unreachable. ``.{name}.stale-<token>`` remains the only shape
+# ``tool_builder._sweep_stale_backups`` will ever remove, so an interrupted or
+# permission-blocked delete can be retried without exposing a phantom package.
 #
 # ``delete_tool`` mints this name and tool_builder's sweep recognizes it. The
 # shared spelling lives here because tool_builder already imports this module;
 # duplicating the on-disk contract would let writer and collector drift.
 #
 # Dot-prefixed is load-bearing, not cosmetic: ``_scan_all`` and
-# ``known_secret_values`` both skip hidden directories, so deferred remains are
+# ``known_secret_values`` both skip hidden directories, so stale remains are
 # inert litter rather than a phantom package. ``\Z`` rather than ``$`` because
 # the pattern gates an ``rmtree``: ``$`` also matches before a trailing newline,
 # and a filename may legally contain one.
@@ -3044,29 +2951,28 @@ def _make_handler(
 ) -> Callable[[dict[str, Any]], Awaitable[str]]:
     """Bind one advertisement to its package and exact resolved version.
 
-    Directory registration begins before later checks so delete and stale cleanup
-    see the version throughout the call. Package ``.env`` and toggle are read at
-    call time, while manifest identity and subprocess cwd remain VersionRoot data.
+    The request-wide shared lock is captured with the advertisement and inherited
+    by any child. A direct service caller that did not enter the HTTP request
+    scope takes a shared lock for this handler invocation as a fail-safe; normal
+    capture/enrich/assist-update requests already hold one across scan, every
+    model round, every tool call, and error cleanup.
     """
 
-    advertised_directory_identity = directory_identity(advertised.version_root)
-    advertised_package_identity = directory_identity(VersionRoot(advertised.package_root.path))
+    request_lock_fd = _REQUEST_TOOLS_LOCK_FD.get()
 
     async def _handler(arguments: dict[str, Any]) -> str:
         package_root = advertised.package_root
         version_root = advertised.version_root
-        if (
-            identity is None
-            or advertised_directory_identity is None
-            or advertised_package_identity is None
-        ):
+        if identity is None:
             return _TOOL_REPLACED_RESULT
-        # Register the exact VersionRoot before any queued work. A hold nobody can
-        # identify would be invisible to package-wide destructive cleanup.
-        running = directory_identity(version_root)
-        if running is None:
+        owned_lock_fd: int | None = None
+        tools_lock_fd = request_lock_fd
+        if tools_lock_fd is None:
+            owned_lock_fd = await run_in_threadpool(acquire_shared_tools_lock)
+            tools_lock_fd = owned_lock_fd
+        if tools_lock_fd is None:
             return _TOOL_REPLACED_RESULT
-        with _inflight_execution(advertised_package_identity, running):
+        try:
             # Recheck inside the hold, then once more immediately before Popen.
             if not _still_the_expected_package(version_root, identity):
                 return _TOOL_REPLACED_RESULT
@@ -3093,11 +2999,15 @@ def _make_handler(
                     advertised,
                     identity,
                     advertisement_generation,
+                    tools_lock_fd,
                     env,
                     args_json,
                     settings.llm_tool_timeout_seconds,
                     settings.llm_tool_output_max_chars,
                 )
+        finally:
+            if owned_lock_fd is not None:
+                await run_in_threadpool(release_tools_lock, owned_lock_fd)
 
     return _handler
 
@@ -3222,6 +3132,7 @@ def set_enabled(name: str, enabled: bool) -> bool:
 
 
 type ToolRemovalOutcome = Literal["removed", "retained"]
+type ToolRetentionReason = Literal["durability_unconfirmed", "cleanup_failed"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -3230,9 +3141,12 @@ class ToolRemovalResult:
 
     outcome: ToolRemovalOutcome
     retained_path: Path | None
+    retention_reason: ToolRetentionReason | None = None
 
 
-type DiscardOutcome = ToolRemovalResult | Literal["not_found", "lineage_unavailable"]
+type DiscardOutcome = (
+    ToolRemovalResult | Literal["not_found", "lineage_unavailable", "ai_job_in_progress"]
+)
 
 
 def discard_version(resolution: Resolved) -> DiscardOutcome:
@@ -3243,6 +3157,16 @@ def discard_version(resolution: Resolved) -> DiscardOutcome:
     performs only the transition itself, with no second ``current`` resolution
     that could switch versions underneath that comparison.
     """
+
+    package_root = resolution.package_root
+    with exclusive_tools_lock(package_root.path.parent) as acquired:
+        if not acquired:
+            return "ai_job_in_progress"
+        return _discard_version_locked(resolution)
+
+
+def _discard_version_locked(resolution: Resolved) -> DiscardOutcome:
+    """Discard after the non-blocking exclusive tools lock has been acquired."""
 
     package_root = resolution.package_root
     current = resolution.version_root
@@ -3273,51 +3197,31 @@ def discard_version(resolution: Resolved) -> DiscardOutcome:
     # cleanup, but destructive cleanup is forbidden unless the directory fsync
     # confirmed that the new pointer survives a crash.
     #
-    # Publication and retirement occurred under the same lock scan capture uses.
-    # The marker lives in each advertised handler's closure, so no rename,
-    # replacement, delete, or inode reuse can clear it; a later advertisement
-    # gets a new cohort.
+    # The retention reason is part of the API: this path must NOT be presented as
+    # manually cleanable, because a power loss may restore ``current`` to this
+    # version until the parent directory entry is known durable.
     if not publication.durable:
-        return ToolRemovalResult("retained", current.path)
+        return ToolRemovalResult("retained", current.path, "durability_unconfirmed")
 
-    # RENAME FIRST, then decide -- the same order whole-package deletion uses,
-    # for the same structural reason. Asking the registry before the rename
-    # leaves a window in which a handler can pass its identity check, register,
-    # and start a child while ``rmtree`` is already walking this version. Once
-    # parked, every later handler refuses because its captured VersionRoot no
-    # longer exists at that name; the query below therefore sees the complete
-    # set of children that could still be using the directory we now hold.
-    #
-    # Parking is best-effort cleanup after the durable ``current`` publication,
-    # so a failed rename cannot turn a completed discard into a failure or
-    # license an ``rmtree`` against the still-live spelling.
+    # The old execution judgement/park-because-running branch is gone. The
+    # exclusive flock proves no request or orphaned child holds the shared lock,
+    # independent of package/version moves. This rename remains only to put a
+    # cleanup failure in the sweep's inert ``.discarded`` namespace.
     parked = current.path.with_name(f"{resolution.vid}.discarded")
     try:
         os.rename(current.path, parked)
     except Exception:
-        return ToolRemovalResult("retained", current.path)
-
-    try:
-        execution = package_execution_judgement(package_root, VersionRoot(parked))
-    except Exception:
-        # The shared helper is fail-closed already; this backstop keeps cleanup
-        # just as conservative if a test double or future implementation raises.
-        execution = "unknown"
-    if execution == "running":
-        remember_running_tree_for_cleanup(parked)
-        return ToolRemovalResult("retained", parked)
-    if execution == "unknown":
-        return ToolRemovalResult("retained", parked)
+        return ToolRemovalResult("retained", current.path, "cleanup_failed")
 
     with contextlib.suppress(Exception):
         shutil.rmtree(parked)
     if os.path.lexists(parked):
-        return ToolRemovalResult("retained", parked)
-    return ToolRemovalResult("removed", None)
+        return ToolRemovalResult("retained", parked, "cleanup_failed")
+    return ToolRemovalResult("removed", None, None)
 
 
 type DeleteToolOutcome = ToolRemovalOutcome
-type DeleteToolResult = ToolRemovalResult
+type DeleteToolResult = ToolRemovalResult | Literal["ai_job_in_progress"]
 
 
 def delete_tool(name: str) -> DeleteToolResult | None:
@@ -3329,35 +3233,29 @@ def delete_tool(name: str) -> DeleteToolResult | None:
     the name is unsafe, the package is absent, or it could not be taken out of
     the registry at all.
 
-    A package still executing, or inherited from before this process and thus
-    UNKNOWN, is left in the deferred-removal namespace instead of being
-    destroyed. The running case is the same
-    treatment ``tool_builder._promote_staging_replace`` gives the backup it can no
-    longer drop, for the same measured reason (see ``_INFLIGHT_EXECUTIONS``): a
-    running child's cwd is a reference to the INODE, so the rename disturbs
-    NOTHING, while the ``rmtree`` turns every later relative open -- a lazily
-    imported helper, a data file -- into ENOENT. A tool call failing halfway is
-    worse than it sounds: the model sees a failure for an action whose external
-    side effect may already have happened, and may simply retry it.
+    Destruction occurs only under the non-blocking exclusive tools lock. An
+    ordinary request holds the shared side from advertisement through response,
+    and its subprocess inherits the same descriptor, so package moves cannot
+    make running work invisible. Contention returns ``ai_job_in_progress`` and
+    leaves the package untouched.
 
-    The tool is gone from the registry the instant this returns EITHER WAY: the
-    new name is dot-prefixed, which is precisely what ``_scan_all`` (and so
-    ``list_tools`` / ``enabled_llm_tools``) and ``known_secret_values`` skip.
-    The result distinguishes physical removal from retained hidden files so the
-    route can tell the operator when credentials may still be on disk.
-
-    The remains are offered to the SAME sweep
-    (``tool_builder._sweep_stale_backups``, at the end of every tool job), but
-    only this backend process may collect a tree it personally observed while an
-    execution was registered, whose generations this process created, and later
-    observed idle. A hard restart empties both positive facts while a
-    start_new_session child may survive, so the next process leaves unknown
-    remains for the operator. Both forms are hidden, inert litter, never a
-    phantom package.
+    Rename-before-rmtree is retained for atomic registry disappearance and
+    retryable cleanup failure, not as an execution-safety mechanism. A failed
+    rmtree remains hidden under the stale namespace for the later exclusive
+    sweep; no local generation/provenance judgement participates.
     """
     base = tools_dir()
     if base is None or not _NAME_RE.match(name):
         return None
+    with exclusive_tools_lock(base) as acquired:
+        if not acquired:
+            return "ai_job_in_progress"
+        return _delete_tool_locked(base, name)
+
+
+def _delete_tool_locked(base: Path, name: str) -> ToolRemovalResult | None:
+    """Delete one validated name while the exclusive tools lock is held."""
+
     # INTERNAL-alias hard-block (H3), BEFORE resolve: an internal symlink
     # ``tools/<name> -> tools/real`` RESOLVES inside the tools root, so the
     # resolve-then-contain check below would PASS and ``rmtree`` would recurse
@@ -3376,69 +3274,27 @@ def delete_tool(name: str) -> DeleteToolResult | None:
             candidate.unlink()
         except OSError:
             return None
-        return ToolRemovalResult("removed", None)
+        return ToolRemovalResult("removed", None, None)
     directory = _resolve_package_dir(name)
     if directory is None or not directory.is_dir():
         return None
-    # RENAME FIRST, then decide -- the exact order ``_promote_staging_replace``
-    # uses, and for a reason that is structural rather than stylistic. Asking the
-    # registry first and removing second leaves a window: a handler that passes
-    # its own identity check an instant after our answer registers and starts a
-    # child against files the ``rmtree`` is already walking. Moving the rename
-    # ahead closes that window instead of narrowing it, because the rename is what
-    # makes every later handler REFUSE on its own -- ``package_identity`` of the
-    # now-empty path answers None, and a None identity is a refusal (see
-    # ``_make_handler``). After it, the only executions that can exist against
-    # this directory are ones that were already registered, which is exactly the
-    # set the query below can see. The rename itself is the operation MEASURED to
-    # be invisible to a running child (see ``_INFLIGHT_EXECUTIONS``).
-    #
     # ``directory.parent`` rather than ``base``: the containment check above
     # already proved the resolved package sits directly under the resolved tools
     # root, so this is that root -- and taking it FROM the path being renamed is
     # what makes "the new name lands in the same directory" true by construction
     # rather than by re-deriving it. A rename inside one directory is also the
     # only shape that cannot cross a filesystem, and the only one that is atomic.
-    deferred = _stale_backup_path(directory.parent, name, uuid4().hex)
+    stale = _stale_backup_path(directory.parent, name, uuid4().hex)
     try:
-        os.rename(directory, deferred)
+        os.rename(directory, stale)
     except OSError:
         # The package is untouched and still listed, so this is the honest "did
         # not happen" -- the same answer a failed removal gave before.
         return None
-    # The identity is taken from what we now HOLD rather than from the name we
-    # were given, so it describes the very files a child could still be reading
-    # (a rename carries a directory's ``(st_dev, st_ino)`` -- measured). The
-    # DIRECTORY's identity and not its manifest's: that is what the handler
-    # registered, and it is the only one an in-place manifest rewrite mid-call
-    # cannot move (see ``directory_identity``).
-    #
-    # "Cannot read it" DEFERS, the same direction the sweep takes and the
-    # opposite of the manifest read this used to do. The old reasoning -- a
-    # package whose manifest cannot be lstat'ed is one no handler can have
-    # registered -- does not survive the move: an lstat failure on a directory we
-    # just renamed successfully says nothing about what is running inside it, only
-    # that we cannot name it. The tool is already out of the registry either way;
-    # what is left behind is marked remains. The current process records that it
-    # saw the tree running; a later sweep may collect it after observing idle,
-    # while a fresh process deliberately has no such authority.
-    try:
-        execution = package_execution_judgement(PackageLayoutRoot(deferred))
-    except Exception:
-        # The package is already hidden, so an unexpected judgement failure has
-        # the same safe outcome as unknown: retain it for the operator.
-        execution = "unknown"
-    if execution == "running":
-        remember_running_tree_for_cleanup(deferred)
-        return ToolRemovalResult("retained", deferred)
-    if execution == "unknown":
-        return ToolRemovalResult("retained", deferred)
-    # Best-effort from here: the tool is already gone as far as everything that
-    # reads this directory is concerned, so a removal that fails part-way must not
-    # be reported as "did not happen". Because this path was never observed
-    # running it receives no later automatic-cleanup permission; marked remains
-    # are hidden evidence for the operator rather than a restart-unsafe retry.
-    shutil.rmtree(deferred, ignore_errors=True)
-    if os.path.lexists(deferred):
-        return ToolRemovalResult("retained", deferred)
-    return ToolRemovalResult("removed", None)
+    # Best-effort from here: the tool is already gone as far as every registry
+    # reader is concerned, so partial removal is reported as retained and retried
+    # by the exclusive stale sweep.
+    shutil.rmtree(stale, ignore_errors=True)
+    if os.path.lexists(stale):
+        return ToolRemovalResult("retained", stale, "cleanup_failed")
+    return ToolRemovalResult("removed", None, None)

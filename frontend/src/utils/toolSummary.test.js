@@ -182,6 +182,7 @@ describe("versionWriteConflictReaction", () => {
 	it.each([
 		["version_mismatch", "refresh"],
 		["job_busy", "retry"],
+		["ai_job_in_progress", "retry"],
 		["lineage_unavailable", "delete-tool"],
 	])("maps %s to its distinct reaction", (code, reaction) => {
 		expect(versionWriteConflictReaction({ status: 409, code })).toBe(reaction);

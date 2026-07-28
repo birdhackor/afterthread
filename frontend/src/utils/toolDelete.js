@@ -14,10 +14,17 @@ export function toolDeleteNotification(name, result) {
 		typeof result.retained_path === "string" &&
 		result.retained_path !== ""
 	) {
+		if (result.retention_reason === "durability_unconfirmed") {
+			return {
+				color: "orange",
+				title: "工具版本尚未確認安全寫入",
+				message: `「${name}」目前已退回前一版，但無法確認版本指標已持久化。請勿手動刪除 ${result.retained_path}；請先處理檔案系統或儲存裝置問題，重新啟動後確認工具仍指向前一版，再決定是否清理。`,
+			};
+		}
 		return {
 			color: "orange",
 			title: "工具檔案仍保留",
-			message: `已從工具清單移除「${name}」，但工具目錄（含設定與金鑰檔）仍保留在：${result.retained_path}。請確認相關工具程序已停止後，再手動刪除該目錄。`,
+			message: `已從工具清單移除「${name}」，但工具目錄（含設定與金鑰檔）因清理失敗仍保留在：${result.retained_path}。請檢查權限與檔案系統狀態後，再手動刪除該目錄。`,
 		};
 	}
 	return {
@@ -42,10 +49,17 @@ export function toolDiscardNotification(name, result) {
 		typeof result.retained_path === "string" &&
 		result.retained_path !== ""
 	) {
+		if (result.retention_reason === "durability_unconfirmed") {
+			return {
+				color: "orange",
+				title: "已退回前一版，但持久化尚未確認",
+				message: `「${name}」目前已退回前一版，但無法確認版本指標已持久化。請勿手動刪除 ${result.retained_path}；請先處理檔案系統或儲存裝置問題，重新啟動後確認工具仍指向前一版，再決定是否清理。`,
+			};
+		}
 		return {
 			color: "orange",
 			title: "已退回前一版，但原版本檔案仍保留",
-			message: `「${name}」已退回前一版；原版本檔案仍保留在：${result.retained_path}。請確認相關工具程序已停止後，再手動刪除該目錄。`,
+			message: `「${name}」已退回前一版；原版本檔案因清理失敗仍保留在：${result.retained_path}。請檢查權限與檔案系統狀態後，再手動刪除該目錄。`,
 		};
 	}
 	return {

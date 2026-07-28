@@ -235,11 +235,9 @@ _VID_RETRY_LIMIT = 16
 # name this module's three call sites already read as "the revise's identity".
 # See ``tools.package_identity`` for why it is ``tool.json`` and not the directory.
 #
-# The alias covers THIS question only. The other identity in ``tools`` -- the
-# DIRECTORY's own, which answers "is anything still executing out of these
-# files?" -- is spelled ``tools.directory_identity`` at each of its two call
-# sites here, next to the ``tools.``-prefixed registry helpers it belongs with,
-# so the two questions can never be mistaken for each other while reading.
+# The execution-directory identity that used to sit beside this helper is gone.
+# Destructive paths now coordinate on the persistent tools flock, so directory
+# moves no longer need to be mapped back to a process-local registry entry.
 _package_identity = tools.package_identity
 
 
@@ -1630,11 +1628,6 @@ def _promote_staging(
         vid,
         tools.PREVIOUS_NULL,
     )
-    # The rename is the instant both local-creation facts become true. Record them
-    # before the parent fsync, because a durability failure still leaves this exact
-    # package and generation on disk for later delete/discard cleanup.
-    tools.remember_local_execution_generation(published.version_root)
-    tools.remember_local_execution_package(published.package_root)
     if not _fsync_directory(base):
         return None, _ERROR_DURABILITY
     return published, None
@@ -1725,9 +1718,6 @@ def _publish_revised_version(
         except OSError as exc:
             return None, f"無法安裝工具版本（{type(exc).__name__}）。"  # noqa: RUF001
         published_version = tools.VersionRoot(target)
-        # The local provenance exists at rename success, even if the parent fsync,
-        # the target re-check, or current publication below later fails.
-        tools.remember_local_execution_generation(published_version)
         if not _fsync_directory(versions):
             return None, _ERROR_DURABILITY
 
@@ -1760,54 +1750,51 @@ def _publish_revised_version(
 def _sweep_stale_backups(base: Path) -> None:
     """Best-effort collection of marked packages and discarded versions.
 
-    The all-versions judgement is shared with ``tools.delete_tool`` and discard,
-    but an idle answer is not enough after a process boundary: this process must
-    also have observed the exact parked tree while it was running. Hidden entries
-    outside the marked namespace and symlinks are never traversed.
+    One non-blocking exclusive lock replaces the old local-provenance and
+    observed-running judgements. If any request or orphaned tool child still
+    holds the shared side, the whole sweep is skipped and a later tool job
+    retries. Hidden entries outside the marked namespace and symlinks are never
+    traversed.
     """
-    with contextlib.suppress(Exception):
-        for child in sorted(base.iterdir()):
-            if (
-                not tools._STALE_BACKUP_RE.match(child.name)
-                or child.is_symlink()
-                or not child.is_dir()
-            ):
-                continue
-            if not tools.deferred_tree_observed_idle(
-                child,
-                tools.PackageLayoutRoot(child),
-            ):
-                continue
-            shutil.rmtree(child, ignore_errors=True)
-        # A discard that found any version execution in flight parks only its
-        # former current version.  Retry those names during the same cleanup pass
-        # every tool job already reaches; ordinary retained versions never match.
-        for child in sorted(base.iterdir()):
-            if not tools._NAME_RE.fullmatch(child.name) or child.is_symlink() or not child.is_dir():
-                continue
-            versions = child / tools._VERSIONS_DIRNAME
-            try:
-                entries = sorted(versions.iterdir())
-            except OSError:
-                continue
-            discarded = [
-                entry
-                for entry in entries
-                if entry.name.endswith(".discarded")
-                and tools._VID_RE.fullmatch(entry.name.removesuffix(".discarded"))
-                and not entry.is_symlink()
-                and entry.is_dir()
-                # Only discard itself can create a committed version under this
-                # suffix.  A colliding operator entry is part of the vid namespace
-                # but is not ours to collect.
-                and tools.read_origin_meta(tools.VersionRoot(entry)) is not None
-            ]
-            if not discarded:
-                continue
-            package_root = tools.PackageRoot(child)
-            for entry in discarded:
-                if tools.deferred_tree_observed_idle(entry, package_root):
-                    shutil.rmtree(entry, ignore_errors=True)
+    with tools.exclusive_tools_lock(base) as acquired:
+        if not acquired:
+            return
+        with contextlib.suppress(Exception):
+            for child in sorted(base.iterdir()):
+                if (
+                    not tools._STALE_BACKUP_RE.match(child.name)
+                    or child.is_symlink()
+                    or not child.is_dir()
+                ):
+                    continue
+                shutil.rmtree(child, ignore_errors=True)
+            # A durable discard can leave its former current version here when
+            # best-effort cleanup fails. Retry only the exact committed namespace;
+            # ordinary retained versions never match.
+            for child in sorted(base.iterdir()):
+                if (
+                    not tools._NAME_RE.fullmatch(child.name)
+                    or child.is_symlink()
+                    or not child.is_dir()
+                ):
+                    continue
+                versions = child / tools._VERSIONS_DIRNAME
+                try:
+                    entries = sorted(versions.iterdir())
+                except OSError:
+                    continue
+                for entry in entries:
+                    if (
+                        entry.name.endswith(".discarded")
+                        and tools._VID_RE.fullmatch(entry.name.removesuffix(".discarded"))
+                        and not entry.is_symlink()
+                        and entry.is_dir()
+                        # Only discard itself can create a committed version
+                        # under this suffix. A colliding operator entry is not
+                        # ours to collect.
+                        and tools.read_origin_meta(tools.VersionRoot(entry)) is not None
+                    ):
+                        shutil.rmtree(entry, ignore_errors=True)
 
 
 def _cleanup_staging(staging: Path, base: Path) -> None:
@@ -1840,18 +1827,16 @@ def _cleanup_staging(staging: Path, base: Path) -> None:
     The sweep rides HERE rather than at the head of the next promote, and the
     reason is reach: this is the one step EVERY tool job passes through
     unconditionally -- installs as well as revises, failures as well as successes
-    -- so a deferral does not wait for another revise to succeed before anything
-    looks at it. A fresh process deliberately does NOT sweep what a previous one
-    left: its empty process-local registry cannot prove that a detached child
-    died too, so those remains are left for the operator. That reach is what lets
-    ``tools.delete_tool`` defer into the same namespace without a sweep trigger
-    of its own during one process lifetime. It also keeps the
-    promote's pre-swap sequence (which r4/r10/r11/r12 spent four rounds ordering)
-    free of a new destructive traversal. It hangs off a ``finally`` because it is
-    INDEPENDENT of everything above it: a tampered workspace returns early --
-    deliberately, see above -- and that says nothing about whether a deferral
-    elsewhere in ``base`` is collectable. The staging logic itself is untouched
-    by this addition.
+    -- so cleanup-failure remains do not wait for another revise to succeed before
+    anything looks at them. The non-blocking exclusive flock makes the same
+    sweep safe after a restart: an inherited child keeps its shared reference,
+    so the new process skips instead of mistaking an empty local registry for
+    proof. This placement also keeps the promote's pre-swap sequence (which
+    r4/r10/r11/r12 spent four rounds ordering) free of a new destructive
+    traversal. It hangs off a ``finally`` because it is INDEPENDENT of everything
+    above it: a tampered workspace returns early -- deliberately, see above --
+    and that says nothing about whether marked remains elsewhere in ``base`` are
+    collectable. The staging logic itself is untouched by this addition.
     """
     try:
         with contextlib.suppress(Exception):

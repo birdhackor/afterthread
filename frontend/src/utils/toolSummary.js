@@ -111,7 +111,7 @@ export function versionWriteConflictReaction({ status, code } = {}) {
 	if (code === "version_mismatch") {
 		return "refresh";
 	}
-	if (code === "job_busy") {
+	if (code === "job_busy" || code === "ai_job_in_progress") {
 		return "retry";
 	}
 	if (code === "lineage_unavailable") {

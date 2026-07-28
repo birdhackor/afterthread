@@ -142,6 +142,8 @@ _JOB_BUSY_CODE = "job_busy"
 _JOB_BUSY_MESSAGE = "已有工具任務正在進行中，請等待完成"  # noqa: RUF001
 _LINEAGE_UNAVAILABLE_CODE = "lineage_unavailable"
 _LINEAGE_UNAVAILABLE_MESSAGE = "前一版已不存在或版本關係已損壞，請刪除整個工具"  # noqa: RUF001
+_AI_JOB_IN_PROGRESS_CODE = "ai_job_in_progress"
+_AI_JOB_IN_PROGRESS_MESSAGE = "AI 任務進行中，請稍後再試"  # noqa: RUF001
 
 
 def _conflict_response(
@@ -178,6 +180,18 @@ _DISCARD_CONFLICT_RESPONSE = _conflict_response(
         _LINEAGE_UNAVAILABLE_CODE,
         _LINEAGE_UNAVAILABLE_MESSAGE,
         "The previous-version lineage cannot be used",
+    ),
+    (
+        _AI_JOB_IN_PROGRESS_CODE,
+        _AI_JOB_IN_PROGRESS_MESSAGE,
+        "An AI request or inherited tool process holds the shared tools lock",
+    ),
+)
+_DELETE_CONFLICT_RESPONSE = _conflict_response(
+    (
+        _AI_JOB_IN_PROGRESS_CODE,
+        _AI_JOB_IN_PROGRESS_MESSAGE,
+        "An AI request or inherited tool process holds the shared tools lock",
     ),
 )
 
@@ -231,7 +245,7 @@ async def update_tool(name: ToolName, payload: ToolUpdateRequest) -> ToolSummary
 @router.delete(
     "/{name}",
     response_model=ToolDeleteResponse,
-    responses=_TOOL_NOT_FOUND_RESPONSE,
+    responses={**_TOOL_NOT_FOUND_RESPONSE, **_DELETE_CONFLICT_RESPONSE},
 )
 async def delete_installed_tool(name: ToolName) -> ToolDeleteResponse:
     """Delete a tool package (its whole directory).
@@ -241,19 +255,26 @@ async def delete_installed_tool(name: ToolName) -> ToolDeleteResponse:
     path-traversal / symlink-escape hard-block lives THERE, not in this router),
     and returns None for a missing package -> 404.
 
-    "Delete" is not always an immediate rmtree: a package that may still have a
-    tool call executing against it is RENAMED into the hidden deferred namespace
-    instead, so the subprocess keeps the files it is reading while every reader
-    of the tools dir stops seeing the tool at once. The 200 response says
-    ``removed`` after physical deletion or ``retained`` with the exact parked
-    path, so an operator knows whether config and key files may remain on disk.
+    A request or inherited child holding the shared tools lock produces the
+    distinct retryable ``ai_job_in_progress`` 409 without renaming or deleting
+    anything. Otherwise the 200 response says ``removed`` after physical
+    deletion or ``retained`` with the exact cleanup-failure path.
     """
     result = await run_in_threadpool(tools_service.delete_tool, name)
     if result is None:
         raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
+    if result == "ai_job_in_progress":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": _AI_JOB_IN_PROGRESS_CODE,
+                "message": _AI_JOB_IN_PROGRESS_MESSAGE,
+            },
+        )
     return ToolDeleteResponse(
         outcome=result.outcome,
         retained_path=str(result.retained_path) if result.retained_path is not None else None,
+        retention_reason=result.retention_reason,
     )
 
 
@@ -296,6 +317,14 @@ async def discard_tool_version(name: ToolName, vid: ToolVersionId) -> ToolDiscar
                     "message": _LINEAGE_UNAVAILABLE_MESSAGE,
                 },
             )
+        if outcome == "ai_job_in_progress":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": _AI_JOB_IN_PROGRESS_CODE,
+                    "message": _AI_JOB_IN_PROGRESS_MESSAGE,
+                },
+            )
         if outcome == "not_found":
             raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
         return ToolDiscardResponse(
@@ -303,6 +332,7 @@ async def discard_tool_version(name: ToolName, vid: ToolVersionId) -> ToolDiscar
             retained_path=(
                 str(outcome.retained_path) if outcome.retained_path is not None else None
             ),
+            retention_reason=outcome.retention_reason,
         )
     finally:
         tool_builder.release_sync_operation(reservation)
