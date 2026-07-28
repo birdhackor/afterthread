@@ -352,6 +352,27 @@ type Resolution = Resolved | Unresolved
 
 
 @dataclass(frozen=True, slots=True)
+class PackageLayoutResolved:
+    """A package-shaped layout whose ``current`` names a committed version."""
+
+    package_root: PackageLayoutRoot
+    version_root: VersionRoot
+    vid: str
+    previous: Previous
+
+
+@dataclass(frozen=True, slots=True)
+class PackageLayoutUnresolved:
+    """A package-shaped layout with no usable current version."""
+
+    package_root: PackageLayoutRoot
+    reason: str
+
+
+type PackageLayoutResolution = PackageLayoutResolved | PackageLayoutUnresolved
+
+
+@dataclass(frozen=True, slots=True)
 class _ContentScan:
     """The shared manifest/entry/content-policy result for a build or version."""
 
@@ -733,7 +754,7 @@ def _origin_document(version_root: VersionRoot) -> dict[str, Any] | None:
 
 
 def _resolve_version_target(
-    package_root: PackageRoot, vid: object
+    package_root: PackageLayoutRoot, vid: object
 ) -> tuple[VersionRoot, dict[str, Any]] | None:
     """Resolve one committed version target by the exact rule ``current`` uses.
 
@@ -758,32 +779,34 @@ def _resolve_version_target(
     return version_root, origin
 
 
-def resolve_current(package_root: PackageRoot) -> Resolution:
-    """Resolve exactly the bounded ``current`` pointer, or return one refusal."""
+def _resolve_current_data(
+    package_root: PackageLayoutRoot,
+) -> tuple[VersionRoot, str, Previous] | str:
+    """Resolve one package-shaped pointer without deciding that it is installed."""
 
     package = package_root.path
     try:
         package_info = os.lstat(package)
     except OSError:
-        return Unresolved(package_root, "package directory is not readable")
+        return "package directory is not readable"
     if not stat.S_ISDIR(package_info.st_mode):
-        return Unresolved(package_root, "package directory must be a real directory")
+        return "package directory must be a real directory"
 
     data = _read_regular_bytes_capped(
         package / _META_DIRNAME / _CURRENT_FILENAME, _CURRENT_MAX_BYTES
     )
     if data is None:
-        return Unresolved(package_root, "current is missing or unreadable")
+        return "current is missing or unreadable"
     if len(data) > _CURRENT_MAX_BYTES:
-        return Unresolved(package_root, "current is too large")
+        return "current is too large"
     if data.endswith(b"\n"):
         data = data[:-1]
     try:
         vid = data.decode("ascii")
     except UnicodeError:
-        return Unresolved(package_root, "current has invalid syntax")
+        return "current has invalid syntax"
     if not _VID_RE.fullmatch(vid):
-        return Unresolved(package_root, "current has invalid syntax")
+        return "current has invalid syntax"
 
     target = _resolve_version_target(package_root, vid)
     if target is None:
@@ -791,10 +814,10 @@ def resolve_current(package_root: PackageRoot) -> Resolution:
         try:
             version_info = os.lstat(version_path)
         except OSError:
-            return Unresolved(package_root, "current points to a missing version")
+            return "current points to a missing version"
         if not stat.S_ISDIR(version_info.st_mode):
-            return Unresolved(package_root, "current version must be a real directory")
-        return Unresolved(package_root, "current points to an uncommitted version")
+            return "current version must be a real directory"
+        return "current points to an uncommitted version"
     version_root, origin = target
     if "previous" not in origin:
         previous: Previous = PREVIOUS_ABSENT
@@ -802,7 +825,27 @@ def resolve_current(package_root: PackageRoot) -> Resolution:
         previous = PREVIOUS_NULL
     else:
         previous = PreviousValue(origin["previous"])
+    return version_root, vid, previous
+
+
+def resolve_current(package_root: PackageRoot) -> Resolution:
+    """Resolve exactly one installed package's bounded ``current`` pointer."""
+
+    result = _resolve_current_data(package_root)
+    if isinstance(result, str):
+        return Unresolved(package_root, result)
+    version_root, vid, previous = result
     return Resolved(package_root, version_root, vid, previous)
+
+
+def resolve_layout_current(package_root: PackageLayoutRoot) -> PackageLayoutResolution:
+    """Resolve ``current`` without claiming a staging or retired layout is installed."""
+
+    result = _resolve_current_data(package_root)
+    if isinstance(result, str):
+        return PackageLayoutUnresolved(package_root, result)
+    version_root, vid, previous = result
+    return PackageLayoutResolved(package_root, version_root, vid, previous)
 
 
 def _manifest_identity(directory: Path) -> tuple[int, int, int] | None:
@@ -1665,7 +1708,9 @@ def store_summary_meta(
     return ("ok", stored) if stored is not None else ("not_stored", None)
 
 
-def resolution_lineage(resolution: Resolved) -> Literal["sole", "usable", "broken"]:
+def resolution_lineage(
+    resolution: Resolved | PackageLayoutResolved,
+) -> Literal["sole", "usable", "broken"]:
     """Return ``sole``/``usable``/``broken`` from this exact resolution.
 
     Missing is not null: every committed origin published by this service has

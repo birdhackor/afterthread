@@ -252,6 +252,11 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   內容，`Resolution` 則只能是帶有合法 package/version/vid 的 `Resolved`
   或帶原因的 `Unresolved`。餵錯層級通常不會立刻炸掉，而會從錯的位置讀到「缺席」，
   所以用型別讓 package state、version manifest 與 staging 驗證無法混用。
+  一次性 migration 需要辨識 shell／`.at-migrated` 的 package-shaped layout，
+  因此改用 `resolve_layout_current(PackageLayoutRoot)` 與
+  `PackageLayoutResolved`／`PackageLayoutUnresolved`；只有 live installed package
+  才能呼叫 `resolve_current(PackageRoot)`，migration 不會替 staging 或 retired
+  layout 鑄造 `PackageRoot`。
   `validate_tool_content(BuildRoot, expected_name)` 與
   `scan_installed(PackageRoot)` 共用 `_scan_tool_content` 的 manifest／entry／內容
   規則；前者不碰 `current` 或開關，後者先解析一次 `current`，再從同一個
@@ -371,8 +376,11 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   再以目前 journal 的 atomic hard link 暫時充當 bootstrap marker；正式 JSON marker
   完整落盤後才移除 bootstrap。因此任何中斷點的 shell 不是仍為空（可無損移除），
   就是已有 identity + marker；正式 marker 寫到一半也仍有 bootstrap 可供對帳。
-  partial `rmtree` 即使已刪掉 `tool.json` 仍可由留下的 marker 對帳；marker 也已消失
-  且目錄非空、無法建立正證明時則停止並保留殘件。
+  進入 `rmtree` 前會先以 identity + marker（完整 target-layout 亦可用精確 VID）
+  重驗所有權，再把刪除目標名稱、role 與 identity 原子且持久地發布到 tree 外的
+  journal。遞迴刪除即使先刪掉 `migration-owner.json`，重跑仍以這筆外部 authority
+  對帳同一 inode 並完成；成功後才持久清除 authority。從未通過正證明的非空目錄
+  仍會停止並完整保留。
   中斷後以同一指令重跑，journal 會按其狀態續做／回復／清理；不要手動猜測或刪除
   `.at-*` 兄弟目錄。既有 journal 已代表先前確認過的 migration authority，所以
   真實重跑會直接對帳，不再詢問；此時 `--dry-run` 只報 journal status，不做對帳。

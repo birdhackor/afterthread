@@ -380,9 +380,15 @@ def test_each_rollback_journal_write_side_recovers(
     [
         "before_park",
         "after_park",
+        "before_delete_authority",
+        "after_delete_authority",
         "before_delete",
-        "mid_delete",
+        "mid_delete_after_marker",
+        "mid_delete_after_meta",
+        "mid_delete_after_files",
         "after_delete",
+        "before_deleted_record",
+        "after_deleted_record",
     ],
 )
 def test_committed_cleanup_fault_matrix_never_attempts_rollback_and_retries(
@@ -397,14 +403,18 @@ def test_committed_cleanup_fault_matrix_never_attempts_rollback_and_retries(
     failures = {
         "before_park": "before:cleanup:alpha:premigrate:park",
         "after_park": "after:cleanup:alpha:premigrate:park",
+        "before_delete_authority": (f"before:journal:alpha:{tombstone.name}:delete_authority"),
+        "after_delete_authority": (f"after:journal:alpha:{tombstone.name}:delete_authority"),
         "before_delete": "before:cleanup:alpha:premigrate:delete",
         "after_delete": "after:cleanup:alpha:premigrate:delete",
+        "before_deleted_record": f"before:journal:alpha:{tombstone.name}:deleted",
+        "after_deleted_record": f"after:journal:alpha:{tombstone.name}:deleted",
     }
     first = PointFailureOperations(
         {failures[fault]: OSError("injected cleanup interruption")} if fault in failures else {}
     )
 
-    if fault == "mid_delete":
+    if fault.startswith("mid_delete_"):
         real_rmtree = migration.shutil.rmtree
         interrupted = False
 
@@ -412,10 +422,17 @@ def test_committed_cleanup_fault_matrix_never_attempts_rollback_and_retries(
             nonlocal interrupted
             if Path(path) == tombstone and not interrupted:
                 interrupted = True
-                # Remove identifying files while leaving the larger subtree, the
-                # exact partial-rmtree state that defeated _old_package_at.
-                (tombstone / "tool.json").unlink()
-                (tombstone / "run.py").unlink()
+                # Recursive deletion can visit the ownership marker before any
+                # content. Model that hazardous ordering first, then interrupt at
+                # progressively later points instead of preserving the proof.
+                meta = tombstone / migration._META_DIRNAME
+                marker = meta / migration._OWNERSHIP_FILENAME
+                marker.unlink()
+                if fault in {"mid_delete_after_meta", "mid_delete_after_files"}:
+                    meta.rmdir()
+                if fault == "mid_delete_after_files":
+                    (tombstone / "tool.json").unlink()
+                    (tombstone / "run.py").unlink()
                 assert (tombstone / "data").is_dir()
                 raise OSError("injected interruption during recursive delete")
             real_rmtree(path, *args, **kwargs)
@@ -427,18 +444,26 @@ def test_committed_cleanup_fault_matrix_never_attempts_rollback_and_retries(
     journal = json.loads((root / migration._JOURNAL_FILENAME).read_text(encoding="utf-8"))
     assert journal["status"] == "committed"
     assert migration._is_new_package_at(root / "alpha")
+    if fault.startswith("mid_delete_"):
+        assert journal["packages"][0]["deletion"] == {
+            "path": tombstone.name,
+            "role": "premigrate",
+            "identity": journal["packages"][0]["premigrate_identity"],
+        }
     if fault == "before_park":
         assert premigrate.is_dir()
         assert not tombstone.exists()
-    elif fault == "after_delete":
+    elif fault in {"after_delete", "before_deleted_record", "after_deleted_record"}:
         assert not premigrate.exists()
         assert not tombstone.exists()
     else:
         assert not premigrate.exists()
         assert tombstone.is_dir()
-    if fault == "mid_delete":
-        assert not (tombstone / "tool.json").exists()
+    if fault.startswith("mid_delete_"):
+        assert not (tombstone / migration._META_DIRNAME / migration._OWNERSHIP_FILENAME).exists()
         assert (tombstone / "data").is_dir()
+    if fault == "mid_delete_after_files":
+        assert not (tombstone / "tool.json").exists()
 
     seen: list[str] = []
     guard = PointFailureOperations({}, seen=seen)
@@ -582,6 +607,51 @@ def test_partially_written_final_markers_keep_bootstrap_proof_and_rerun(
         with pytest.raises(InjectedCrash):
             _run(root)
         assert migration._has_bootstrap_ownership_marker(owned, name="alpha", vid=_VID, role=role)
+    assert _run(root) == 0
+    _assert_migrated(root)
+
+
+def test_v2_bootstrap_journal_upgrades_without_losing_shell_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A v2 hard-link bootstrap remains valid while resume upgrades its journal."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    shell = migration._shell_path(root, "alpha")
+    marker = shell / migration._META_DIRNAME / migration._OWNERSHIP_FILENAME
+    real_write = migration._write_shell_file
+    interrupted = False
+
+    def interrupt_marker_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+        nonlocal interrupted
+        if path == marker and not interrupted:
+            interrupted = True
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data[:17])
+            raise InjectedCrash()
+        real_write(path, data, mode)
+
+    monkeypatch.setattr(migration, "_write_shell_file", interrupt_marker_write)
+    with pytest.raises(InjectedCrash):
+        _run(root)
+
+    bootstrap = shell / migration._OWNERSHIP_BOOTSTRAP_FILENAME
+    journal_path = root / migration._JOURNAL_FILENAME
+    assert os.path.samefile(bootstrap, journal_path)
+    journal = json.loads(bootstrap.read_text(encoding="utf-8"))
+    journal["version"] = migration._IDENTITY_JOURNAL_VERSION
+    for package in journal["packages"]:
+        package.pop("deletion")
+    bootstrap.write_bytes(migration._json_bytes(journal))
+
+    assert migration._has_bootstrap_ownership_marker(
+        shell,
+        name="alpha",
+        vid=_VID,
+        role="shell",
+    )
     assert _run(root) == 0
     _assert_migrated(root)
 
@@ -952,6 +1022,57 @@ def test_rollback_cleanup_removes_a_genuine_journal_owned_artifact(tmp_path: Pat
     assert not (root / migration._JOURNAL_FILENAME).exists()
 
 
+def test_rolled_back_cleanup_survives_marker_first_partial_delete(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Rollback retries from external authority after rmtree removes the shell marker."""
+
+    root = tmp_path / "tools"
+    original = _make_package(root)
+    before = _snapshot_tree(original)
+    shell = migration._shell_path(root, "alpha")
+    real_rmtree = migration.shutil.rmtree
+    interrupted = False
+
+    def interrupt_shell_delete(path: Path, *args: Any, **kwargs: Any) -> None:
+        nonlocal interrupted
+        if Path(path) == shell and not interrupted:
+            interrupted = True
+            (shell / migration._META_DIRNAME / migration._OWNERSHIP_FILENAME).unlink()
+            raise OSError("injected interruption after deleting shell marker")
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(migration.shutil, "rmtree", interrupt_shell_delete)
+
+    assert (
+        _run(
+            root,
+            operations=PointFailureOperations(
+                {"before:copy_env:alpha": OSError("injected copy failure")}
+            ),
+        )
+        == 1
+    )
+
+    journal = json.loads((root / migration._JOURNAL_FILENAME).read_text(encoding="utf-8"))
+    assert journal["status"] == "rolled_back"
+    assert journal["packages"][0]["deletion"] == {
+        "path": shell.name,
+        "role": "shell",
+        "identity": journal["packages"][0]["shell_identity"],
+    }
+    assert _snapshot_tree(root / "alpha") == before
+    assert shell.is_dir()
+    assert not (shell / migration._META_DIRNAME / migration._OWNERSHIP_FILENAME).exists()
+
+    assert _run(root) == 1
+
+    assert _snapshot_tree(root / "alpha") == before
+    assert not shell.exists()
+    assert not (root / migration._JOURNAL_FILENAME).exists()
+
+
 def test_unannounced_identical_env_copy_is_refused_as_disk_ahead(tmp_path: Path) -> None:
     """Equal present files are a completed copy, not the absent-file no-op."""
 
@@ -1218,6 +1339,43 @@ def test_target_layout_recognition_agrees_with_runtime_resolution(
     assert _snapshot_tree(tmp_path) == before
 
 
+@pytest.mark.parametrize(
+    "artifact_name",
+    [".alpha.at-migration-shell", "alpha.at-migrated"],
+)
+def test_migration_resolution_preserves_package_layout_type(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    artifact_name: str,
+) -> None:
+    """Staging and retired siblings are resolved without minting ``PackageRoot``."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    assert _run(root) == 0
+    artifact = root / artifact_name
+    (root / "alpha").rename(artifact)
+    seen_roots: list[tools.PackageLayoutRoot] = []
+    seen_results: list[tools.PackageLayoutResolution] = []
+    real_resolve = migration.resolve_layout_current
+
+    def traced_resolve(
+        package_root: tools.PackageLayoutRoot,
+    ) -> tools.PackageLayoutResolution:
+        seen_roots.append(package_root)
+        result = real_resolve(package_root)
+        seen_results.append(result)
+        return result
+
+    monkeypatch.setattr(migration, "resolve_layout_current", traced_resolve)
+
+    assert migration._is_new_package_at(artifact) is True
+    assert len(seen_roots) == 1
+    assert type(seen_roots[0]) is tools.PackageLayoutRoot
+    assert isinstance(seen_results[0], tools.PackageLayoutResolved)
+    assert type(seen_results[0].package_root) is tools.PackageLayoutRoot
+
+
 def test_one_package_preflight_failure_means_nothing_anywhere_is_written(
     tmp_path: Path,
 ) -> None:
@@ -1329,6 +1487,7 @@ def test_committed_journal_with_an_incomplete_package_is_refused(tmp_path: Path)
                 "pending": None,
                 "shell_identity": None,
                 "premigrate_identity": None,
+                "deletion": None,
             }
         ],
     }
