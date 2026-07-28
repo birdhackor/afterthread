@@ -3151,6 +3151,89 @@ def test_router_discard_response_distinguishes_removed_from_retained(
     assert Path(retained_body["retained_path"]).is_dir()
 
 
+def test_router_discard_rechecks_expected_vid_after_exclusive_lock(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A route answer for V cannot authorize discard after current moves to Q.
+
+    The injected edit happens after ``_existing_package_dir`` returned V but
+    before the real exclusive lock is acquired. Moving the expected-vid
+    comparison back outside that lock makes this test publish V's P and remove V.
+    """
+
+    first = _seed_package(monkeypatch, tmp_path, "discard-current-race")
+    package = _package_path(first)
+    package_root = _package_root(first)
+    discarded_vid = "20260728T020304Z-fedcba"
+    replacement_vid = "20260728T030405Z-acdeff"
+    discarded = _copy_committed_version(first, discarded_vid)
+    replacement = _copy_committed_version(first, replacement_vid)
+    assert tools.publish_current(package_root, discarded_vid)
+    real_lock = tools.exclusive_tools_lock
+    after_edit: dict[str, bytes] = {}
+
+    @contextlib.contextmanager
+    def move_current_before_lock(base: Path | None = None) -> Generator[bool]:
+        assert base == package.parent
+        assert tools.publish_current(package_root, replacement_vid)
+        after_edit.update(_file_bytes(package))
+        with real_lock(base) as acquired:
+            yield acquired
+
+    monkeypatch.setattr(tools, "exclusive_tools_lock", move_current_before_lock)
+
+    response = client.delete(f"/api/tools/discard-current-race/versions/{discarded_vid}")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "version_mismatch"
+    assert _resolved_version(package) == replacement
+    assert _file_bytes(package) == after_edit
+    assert first.is_dir()
+    assert discarded.is_dir()
+    assert replacement.is_dir()
+
+
+def test_router_discard_uses_lineage_resolved_after_exclusive_lock(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An autosaved V.previous edit in the pre-lock window selects fresh Q."""
+
+    first = _seed_package(monkeypatch, tmp_path, "discard-lineage-race")
+    package = _package_path(first)
+    package_root = _package_root(first)
+    discarded_vid = "20260728T020304Z-fedcba"
+    replacement_vid = "20260728T030405Z-acdeff"
+    discarded = _copy_committed_version(first, discarded_vid)
+    replacement = _copy_committed_version(first, replacement_vid)
+    assert tools.publish_current(package_root, discarded_vid)
+    origin_path = discarded / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    real_lock = tools.exclusive_tools_lock
+
+    @contextlib.contextmanager
+    def edit_previous_before_lock(base: Path | None = None) -> Generator[bool]:
+        assert base == package.parent
+        origin = json.loads(origin_path.read_text(encoding="utf-8"))
+        origin["previous"] = replacement_vid
+        origin_path.write_text(json.dumps(origin), encoding="utf-8")
+        with real_lock(base) as acquired:
+            yield acquired
+
+    monkeypatch.setattr(tools, "exclusive_tools_lock", edit_previous_before_lock)
+
+    response = client.delete(f"/api/tools/discard-lineage-race/versions/{discarded_vid}")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "outcome": "removed",
+        "retained_path": None,
+        "retention_reason": None,
+    }
+    assert _resolved_version(package) == replacement
+    assert first.is_dir()
+    assert replacement.is_dir()
+    assert not discarded.exists()
+
+
 def test_router_discard_marks_unconfirmed_durability_as_unsafe_cleanup(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4182,14 +4265,18 @@ def test_invariant_k_stale_vid_starts_no_revise_regenerate_or_discard_work(
     async def must_not_regenerate(name: str) -> dict[str, Any]:
         raise AssertionError("stale regenerate must not spend an LLM call")
 
-    def must_not_discard(resolution: tools.Resolved) -> str:
+    def must_not_publish(
+        package_root: tools.PackageRoot,
+        previous_vid: str,
+        discarded: tools.VersionRoot,
+    ) -> tools.CurrentPublication:
         raise AssertionError("stale discard must not publish current")
 
     def must_not_launch(*args: Any, **kwargs: Any) -> str:
         raise AssertionError("stale revise must not enqueue or launch a job")
 
     monkeypatch.setattr(tool_meta, "regenerate_summary", must_not_regenerate)
-    monkeypatch.setattr(tools, "discard_version", must_not_discard)
+    monkeypatch.setattr(tools, "_publish_discard_and_retire", must_not_publish)
     monkeypatch.setattr(tool_builder, "_launch_job", must_not_launch)
 
     revise = client.post(
@@ -4940,7 +5027,9 @@ def test_running_discard_returns_busy_then_succeeds_after_the_child_exits(
 
     try:
         _wait_for(marker.exists)
-        assert tools.discard_version(resolution) == "ai_job_in_progress"
+        assert (
+            tools.discard_version(resolution.package_root, resolution.vid) == "ai_job_in_progress"
+        )
         assert _resolved_version(package) == second
         tool_builder._sweep_stale_backups(base)
         assert second.is_dir()
@@ -4949,7 +5038,7 @@ def test_running_discard_returns_busy_then_succeeds_after_the_child_exits(
         caller.join(timeout=30)
 
     assert result["out"] == "PAYLOAD"
-    discarded = tools.discard_version(resolution)
+    discarded = tools.discard_version(resolution.package_root, resolution.vid)
     assert isinstance(discarded, tools.ToolRemovalResult)
     assert discarded.outcome == "removed"
     assert _resolved_version(package) == first

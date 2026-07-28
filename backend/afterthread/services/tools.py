@@ -3228,30 +3228,38 @@ class ToolRemovalResult:
 
 
 type DiscardOutcome = (
-    ToolRemovalResult | Literal["not_found", "lineage_unavailable", "ai_job_in_progress"]
+    ToolRemovalResult
+    | Literal["not_found", "version_mismatch", "lineage_unavailable", "ai_job_in_progress"]
 )
 
 
-def discard_version(resolution: Resolved) -> DiscardOutcome:
-    """Discard exactly the resolved current version, preserving the safe order.
+def discard_version(package_root: PackageRoot, expected_vid: str) -> DiscardOutcome:
+    """Discard exactly the expected current version, preserving the safe order.
 
-    The caller owns the global single-flight reservation and has already
-    compared its expected vid with ``resolution.vid``.  This function therefore
-    performs only the transition itself, with no second ``current`` resolution
-    that could switch versions underneath that comparison.
+    The caller owns the global single-flight reservation, while this boundary
+    owns the filesystem lock. ``current`` must be resolved and compared only
+    after that lock is acquired: otherwise a request can validate V, wait for a
+    running tool, then overwrite a D21 edit that moved ``current`` to Q.
     """
 
-    package_root = resolution.package_root
     with exclusive_tools_lock(package_root.path.parent) as acquired:
         if not acquired:
             return "ai_job_in_progress"
-        return _discard_version_locked(resolution)
+        return _discard_version_locked(package_root, expected_vid)
 
 
-def _discard_version_locked(resolution: Resolved) -> DiscardOutcome:
-    """Discard after the non-blocking exclusive tools lock has been acquired."""
+def _discard_version_locked(package_root: PackageRoot, expected_vid: str) -> DiscardOutcome:
+    """Resolve and discard after the exclusive tools lock has been acquired."""
 
-    package_root = resolution.package_root
+    resolution = resolve_current(package_root)
+    if isinstance(resolution, Unresolved):
+        return "not_found"
+    # This comparison belongs under the same lock as publication and removal.
+    # A lock taken only after a route-level comparison would serialize the write
+    # but leave its authorization stale, allowing old V -> P lineage to overwrite
+    # a newer ``current`` and then remove a version that is no longer current.
+    if resolution.vid != expected_vid:
+        return "version_mismatch"
     current = resolution.version_root
     previous = resolution.previous
 

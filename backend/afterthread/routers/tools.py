@@ -327,11 +327,12 @@ async def delete_installed_tool(name: ToolName) -> ToolDeleteResponse:
 async def discard_tool_version(name: ToolName, vid: ToolVersionId) -> ToolDiscardResponse:
     """Discard the exact current version named by ``vid``.
 
-    The global slot is taken before the expected-version comparison.  That
-    ordering makes the comparison and the subsequent ``current`` publication
-    one serialized action rather than another check-then-write race. The response
-    reports whether the former version's files were removed or retained, with the
-    exact operator cleanup path in the latter case.
+    The global slot is taken before resolving the route target, then the service
+    re-resolves and compares ``vid`` only after taking the exclusive filesystem
+    lock. That second placement is what prevents a route-level answer for V from
+    authorizing an old V -> P publication after ``current`` has moved to Q. The
+    response reports whether the former version's files were removed or retained,
+    with the exact operator cleanup path in the latter case.
     """
 
     reservation = tool_builder.reserve_sync_operation()
@@ -344,15 +345,17 @@ async def discard_tool_version(name: ToolName, vid: ToolVersionId) -> ToolDiscar
         resolved = await run_in_threadpool(_existing_package_dir, name)
         if resolved is None:
             raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
-        if resolved.vid != vid:
+        try:
+            outcome = await run_in_threadpool(
+                tools_service.discard_version, resolved.package_root, vid
+            )
+        except tools_service.ToolsLockUnavailableError as exc:
+            raise _tools_lock_unavailable(exc) from exc
+        if outcome == "version_mismatch":
             raise HTTPException(
                 status_code=409,
                 detail={"code": _VERSION_MISMATCH_CODE, "message": _VERSION_MISMATCH_MESSAGE},
             )
-        try:
-            outcome = await run_in_threadpool(tools_service.discard_version, resolved)
-        except tools_service.ToolsLockUnavailableError as exc:
-            raise _tools_lock_unavailable(exc) from exc
         if outcome == "lineage_unavailable":
             raise HTTPException(
                 status_code=409,

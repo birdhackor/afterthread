@@ -978,7 +978,7 @@ def test_version_discard_refuses_null_lineage_without_calling_whole_tool_delete(
         lambda name: called.append(name) is None or True,
     )
 
-    assert tools.discard_version(resolution) == "lineage_unavailable"
+    assert tools.discard_version(resolution.package_root, resolution.vid) == "lineage_unavailable"
     assert called == []
     assert _package_path(version).is_dir()
 
@@ -1005,7 +1005,7 @@ def test_invariant_e_discard_succeeds_when_old_version_removal_fails(
 
     monkeypatch.setattr(tools.shutil, "rmtree", fail_old_version)
 
-    discarded = tools.discard_version(resolution)
+    discarded = tools.discard_version(resolution.package_root, resolution.vid)
     assert isinstance(discarded, tools.ToolRemovalResult)
     assert discarded.outcome == "retained"
     assert discarded.retained_path == parked
@@ -1051,7 +1051,7 @@ def test_discard_parks_then_removes_under_the_exclusive_lock(
     monkeypatch.setattr(tools.os, "rename", observe_rename)
     monkeypatch.setattr(tools.shutil, "rmtree", observe_remove)
 
-    discarded = tools.discard_version(resolution)
+    discarded = tools.discard_version(resolution.package_root, resolution.vid)
     assert isinstance(discarded, tools.ToolRemovalResult)
     assert discarded.outcome == "removed"
     assert events == ["rename", "remove"]
@@ -1069,7 +1069,7 @@ def test_discard_removes_version_when_exclusive_lock_is_available(tmp_path: Path
     resolution = tools.resolve_current(tools.PackageRoot(package))
     assert isinstance(resolution, tools.Resolved)
 
-    discarded = tools.discard_version(resolution)
+    discarded = tools.discard_version(resolution.package_root, resolution.vid)
     assert isinstance(discarded, tools.ToolRemovalResult)
     assert discarded.outcome == "removed"
 
@@ -1095,7 +1095,7 @@ def test_discard_rename_failure_is_success_and_leaves_the_version_in_place(
 
     monkeypatch.setattr(tools.os, "rename", fail_rename)
 
-    discarded = tools.discard_version(resolution)
+    discarded = tools.discard_version(resolution.package_root, resolution.vid)
     assert isinstance(discarded, tools.ToolRemovalResult)
     assert discarded == tools.ToolRemovalResult("retained", second, "cleanup_failed")
     assert _resolved_version(package) == first
@@ -1135,7 +1135,7 @@ def test_invariant_e_unconfirmed_current_durability_leaves_old_version_intact(
         real_fsync(fd)
 
     monkeypatch.setattr(tools.os, "fsync", fail_current_directory_fsync)
-    discarded = tools.discard_version(resolution)
+    discarded = tools.discard_version(resolution.package_root, resolution.vid)
     assert isinstance(discarded, tools.ToolRemovalResult)
     assert discarded == tools.ToolRemovalResult("retained", second, "durability_unconfirmed")
     assert _resolved_version(package) == first
@@ -1191,7 +1191,9 @@ def test_retired_advertised_version_cannot_run_when_discard_cannot_park_it(
         monkeypatch.setattr(tools, "publish_current", publish_without_confirmed_durability)
 
     reason = "cleanup_failed" if cleanup_failure == "parking" else "durability_unconfirmed"
-    assert tools.discard_version(resolution) == tools.ToolRemovalResult("retained", second, reason)
+    assert tools.discard_version(
+        resolution.package_root, resolution.vid
+    ) == tools.ToolRemovalResult("retained", second, reason)
     assert _resolved_version(package) == first
     assert second.is_dir()
     assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
@@ -1245,9 +1247,9 @@ def test_canonical_tools_base_makes_discard_retire_the_advertised_generation(
 
     monkeypatch.setattr(tools.os, "rename", fail_parking)
 
-    assert tools.discard_version(resolution) == tools.ToolRemovalResult(
-        "retained", second, "cleanup_failed"
-    )
+    assert tools.discard_version(
+        resolution.package_root, resolution.vid
+    ) == tools.ToolRemovalResult("retained", second, "cleanup_failed")
 
     assert second.is_dir()
     assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
@@ -1292,9 +1294,9 @@ def test_discard_between_scan_capture_and_handler_build_retires_handler(
             resolution = tools.resolve_current(package_root)
             assert isinstance(resolution, tools.Resolved)
             assert resolution.version_root == tools.VersionRoot(second)
-            assert tools.discard_version(resolution) == tools.ToolRemovalResult(
-                "retained", second, "cleanup_failed"
-            )
+            assert tools.discard_version(
+                resolution.package_root, resolution.vid
+            ) == tools.ToolRemovalResult("retained", second, "cleanup_failed")
             discarded_during_scan = True
         return scan
 
@@ -1350,9 +1352,9 @@ def test_restored_backup_of_retired_vid_executes_in_the_same_process(
 
     monkeypatch.setattr(tools, "publish_current", publish_without_confirmed_durability)
 
-    assert tools.discard_version(resolution) == tools.ToolRemovalResult(
-        "retained", second, "durability_unconfirmed"
-    )
+    assert tools.discard_version(
+        resolution.package_root, resolution.vid
+    ) == tools.ToolRemovalResult("retained", second, "durability_unconfirmed")
     shutil.rmtree(second)
     os.rename(backup, second)
     restored_info = os.stat(second)
@@ -1413,18 +1415,18 @@ def test_retired_advertisement_survives_rename_aside_and_back(
 
     second_resolution = tools.resolve_current(package_root)
     assert isinstance(second_resolution, tools.Resolved)
-    assert tools.discard_version(second_resolution) == tools.ToolRemovalResult(
-        "retained", second, "cleanup_failed"
-    )
+    assert tools.discard_version(
+        second_resolution.package_root, second_resolution.vid
+    ) == tools.ToolRemovalResult("retained", second, "cleanup_failed")
     assert _resolved_version(package) == first
 
     aside = second.with_name(f".{second_vid}.aside")
     real_rename(second, aside)
     first_resolution = tools.resolve_current(package_root)
     assert isinstance(first_resolution, tools.Resolved)
-    assert tools.discard_version(first_resolution) == tools.ToolRemovalResult(
-        "retained", first, "cleanup_failed"
-    )
+    assert tools.discard_version(
+        first_resolution.package_root, first_resolution.vid
+    ) == tools.ToolRemovalResult("retained", first, "cleanup_failed")
     assert _resolved_version(package) == third
 
     real_rename(aside, second)
@@ -3801,7 +3803,7 @@ def test_destructive_production_paths_preserve_the_persistent_lock_inode(
         else:
             resolution = tools.resolve_current(tools.PackageRoot(package))
             assert isinstance(resolution, tools.Resolved)
-            outcome = tools.discard_version(resolution)
+            outcome = tools.discard_version(resolution.package_root, resolution.vid)
             assert isinstance(outcome, tools.ToolRemovalResult)
             assert outcome.outcome == "removed"
         after = lock_path.stat()
