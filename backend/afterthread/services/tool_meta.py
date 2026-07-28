@@ -27,6 +27,10 @@ from afterthread.services.memory_ai import _coerce_str, _truncate_to
 _SUMMARY_WORKFLOW = "tool_summary"
 
 
+class VersionMismatchError(Exception):
+    """The validated current version changed before explicit regeneration began."""
+
+
 # What a sanitized origin URL says INSTEAD of the parts it dropped (see
 # ``_sanitized_origin_url``). Fixed and visible on purpose: the sidecar is the
 # only record of where a package came from, so a silently shortened URL would
@@ -317,9 +321,9 @@ def _package_files(directory: Path) -> list[tuple[str, str]]:
 
     * every DOT-prefixed name, file or directory -- which is what excludes both
       the tool's ``.env`` (its values are live secrets; only the key NAMES ride
-      in the prompt, see ``_env_key_names``) and this feature's own
-      ``.ai_meta.json`` sidecar (a summary must never be fed its own previous
-      output as if it were source);
+      in the prompt, see ``_env_key_names``) and the version's
+      ``.afterthread.meta/`` directory (a summary must never be fed its own
+      previous output as if it were source);
     * ``tool.json``, rendered separately as the manifest section;
     * anything the bounded reader refuses (a FIFO, a symlinked leaf, an
       unreadable or oversized file) -- it simply does not appear.
@@ -805,17 +809,31 @@ async def generate_and_store_summary(
         return
 
 
-async def regenerate_summary(name: str) -> dict[str, Any] | None:
-    """Regenerate one resolved version's summary synchronously.
+async def regenerate_summary(
+    name: str,
+    resolution: tools.Resolved | None,
+) -> dict[str, Any] | None:
+    """Regenerate exactly the request-validated version's summary synchronously.
 
     LLM configuration and upstream failures propagate to the route. Filesystem or
     identity refusals return None, the previous summary is never blanked on failure,
-    and immutable origin context is read from that same VersionRoot.
+    and immutable origin context is read from that same VersionRoot. ``resolution``
+    is never re-derived from ``name``: its vid is the one the route compared and
+    will put in a successful response.
     """
-    resolved = await run_in_threadpool(_resolve_package, name)
-    if resolved is None:
+    if resolution is None:
         return None
-    package_root, version_root, identity = resolved
+    current = await run_in_threadpool(tools.resolve_current, resolution.package_root)
+    if isinstance(current, tools.Unresolved) or current.vid != resolution.vid:
+        # D21 permits hand-editing ``current`` between the route's comparison
+        # and this coroutine being entered. Following the name to the new vid
+        # would spend the request on a version it never authorized.
+        raise VersionMismatchError
+    package_root = resolution.package_root
+    version_root = resolution.version_root
+    identity = await run_in_threadpool(tools.package_identity, version_root)
+    if identity is None:
+        return None
     origin_document = await run_in_threadpool(tools.read_origin_meta, version_root)
     origin = _stored_origin({"origin": origin_document} if origin_document is not None else None)
     summary = await _generate_summary(

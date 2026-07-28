@@ -1036,15 +1036,15 @@ def _utf8_safe(text: str) -> str:
     docstrings forbid); ``tests/test_tools.py`` pins the two behaviorally equal
     on a probe set so they cannot silently drift.
 
-    Why the sidecar needs it at all: ``.ai_meta.json`` is a plain JSON file the
-    operator is explicitly allowed to hand-edit, and ``"\\ud800"`` is a
-    JSON-LEGAL escape that ``json.loads`` accepts happily -- producing a ``str``
-    that is NOT UTF-8 encodable. Left alone it breaks both boundaries: on the
-    WRITE side ``json.dumps(...).encode("utf-8")`` raises ``UnicodeEncodeError``
-    (a 500 out of a PATCH that should have answered False -> 404), and on the
-    READ side it sails into the summary response and blows up in Starlette's
-    strict ``JSONResponse.render`` encode -- a 500 on a GET that exists to
-    DEGRADE a corrupt sidecar, not to die on one.
+    Why version metadata needs it at all: ``origin.json`` and ``summary.json``
+    are plain JSON files the operator is explicitly allowed to hand-edit, and
+    ``"\\ud800"`` is a JSON-LEGAL escape that ``json.loads`` accepts happily --
+    producing a ``str`` that is NOT UTF-8 encodable. Left alone it breaks both
+    boundaries: on the WRITE side ``json.dumps(...).encode("utf-8")`` raises
+    ``UnicodeEncodeError`` (a 500 out of a PATCH that should have answered False
+    -> 404), and on the READ side it sails into the summary response and blows
+    up in Starlette's strict ``JSONResponse.render`` encode -- a 500 on a GET
+    that exists to DEGRADE corrupt metadata, not to die on it.
     """
     return text.encode("utf-8", errors="surrogatepass").decode("utf-8", errors="replace")
 
@@ -2971,6 +2971,23 @@ def discard_version(resolution: Resolved) -> DiscardOutcome:
     if not publication.durable:
         return "ok"
 
+    # RENAME FIRST, then decide -- the same order whole-package deletion uses,
+    # for the same structural reason. Asking the registry before the rename
+    # leaves a window in which a handler can pass its identity check, register,
+    # and start a child while ``rmtree`` is already walking this version. Once
+    # parked, every later handler refuses because its captured VersionRoot no
+    # longer exists at that name; the query below therefore sees the complete
+    # set of children that could still be using the directory we now hold.
+    #
+    # Parking is best-effort cleanup after the durable ``current`` publication,
+    # so a failed rename cannot turn a completed discard into a failure or
+    # license an ``rmtree`` against the still-live spelling.
+    parked = current.path.with_name(f"{resolution.vid}.discarded")
+    try:
+        os.rename(current.path, parked)
+    except Exception:
+        return "ok"
+
     try:
         running = package_execution_in_flight(package_root)
     except Exception:
@@ -2978,13 +2995,10 @@ def discard_version(resolution: Resolved) -> DiscardOutcome:
         # just as conservative if a test double or future implementation raises.
         running = True
     if running:
-        parked = current.path.with_name(f"{resolution.vid}.discarded")
-        with contextlib.suppress(Exception):
-            os.rename(current.path, parked)
         return "ok"
 
     with contextlib.suppress(Exception):
-        shutil.rmtree(current.path)
+        shutil.rmtree(parked)
     return "ok"
 
 

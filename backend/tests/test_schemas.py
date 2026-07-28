@@ -97,6 +97,19 @@ def test_progress_entry_create_declares_note_length_bound() -> None:
     assert prop["maxLength"] == 20000
 
 
+def test_tool_openapi_describes_the_versioned_metadata_paths() -> None:
+    """Published operator documentation must name the files runtime actually reads."""
+
+    schema = TestClient(app).get("/openapi.json").json()
+    toggle_description = schema["paths"]["/api/tools/{name}"]["patch"]["description"]
+    summary_description = schema["components"]["schemas"]["ToolSummaryDetail"]["description"]
+
+    assert ".afterthread.meta/state.json" in toggle_description
+    assert ".afterthread-state.json" not in toggle_description
+    assert "versions/<vid>/.afterthread.meta/summary.json" in summary_description
+    assert ".ai_meta.json" not in summary_description
+
+
 # --- ToolInstallRequest install-form secret pair (D36) ----------------------
 
 

@@ -945,9 +945,10 @@ def test_invariant_e_discard_succeeds_when_old_version_removal_fails(
         lambda root: asked.append(root) is not None,
     )
     real_rmtree = tools.shutil.rmtree
+    parked = second.with_name(f"{second_vid}.discarded")
 
     def fail_old_version(path: Path, *args: Any, **kwargs: Any) -> None:
-        if Path(path) == second:
+        if Path(path) == parked:
             raise PermissionError("injected removal failure")
         real_rmtree(path, *args, **kwargs)
 
@@ -955,8 +956,91 @@ def test_invariant_e_discard_succeeds_when_old_version_removal_fails(
 
     assert tools.discard_version(resolution) == "ok"
     assert _resolved_version(package) == first
-    assert second.is_dir()
+    assert not second.exists()
+    assert parked.is_dir()
     assert asked == [tools.PackageRoot(package)]
+
+
+def test_discard_parks_before_running_check_then_removes_the_idle_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The rename is the gate, so its order is part of the safety property.
+
+    Once V has moved, a handler still trying to start through V's advertised
+    path refuses on its own identity check. Only then may the shared running
+    judgement say whether the directory we hold can be removed.
+    """
+
+    root = tmp_path / "tools"
+    first = _make_tool(root, "echo", "import sys\n")
+    package = _package_path(first)
+    second_vid = "20260728T020304Z-fedcba"
+    second = _add_committed_version(package, second_vid, description="second", output="SECOND")
+    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    resolution = tools.resolve_current(tools.PackageRoot(package))
+    assert isinstance(resolution, tools.Resolved)
+    parked = second.with_name(f"{second_vid}.discarded")
+    events: list[str] = []
+    real_rename = tools.os.rename
+    real_rmtree = tools.shutil.rmtree
+
+    def observe_rename(source: Path, target: Path) -> None:
+        assert Path(source) == second
+        assert Path(target) == parked
+        assert second.is_dir()
+        events.append("rename")
+        real_rename(source, target)
+
+    def nobody_running(package_root: tools.PackageRoot) -> bool:
+        assert package_root.path == package
+        assert not second.exists()
+        assert parked.is_dir()
+        events.append("running-check")
+        return False
+
+    def observe_remove(path: Path, *args: Any, **kwargs: Any) -> None:
+        assert Path(path) == parked
+        events.append("remove")
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(tools.os, "rename", observe_rename)
+    monkeypatch.setattr(tools, "package_execution_in_flight", nobody_running)
+    monkeypatch.setattr(tools.shutil, "rmtree", observe_remove)
+
+    assert tools.discard_version(resolution) == "ok"
+    assert events == ["rename", "running-check", "remove"]
+    assert _resolved_version(package) == first
+    assert not parked.exists()
+
+
+def test_discard_rename_failure_is_success_and_leaves_the_version_in_place(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    first = _make_tool(root, "echo", "import sys\n")
+    package = _package_path(first)
+    second_vid = "20260728T020304Z-fedcba"
+    second = _add_committed_version(package, second_vid, description="second", output="SECOND")
+    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    resolution = tools.resolve_current(tools.PackageRoot(package))
+    assert isinstance(resolution, tools.Resolved)
+
+    def fail_rename(_source: Path, _target: Path) -> None:
+        raise PermissionError("injected parking failure")
+
+    monkeypatch.setattr(tools.os, "rename", fail_rename)
+    monkeypatch.setattr(
+        tools,
+        "package_execution_in_flight",
+        lambda _root: (_ for _ in ()).throw(
+            AssertionError("a failed rename must not license a running check")
+        ),
+    )
+
+    assert tools.discard_version(resolution) == "ok"
+    assert _resolved_version(package) == first
+    assert second.is_dir()
+    assert not second.with_name(f"{second_vid}.discarded").exists()
 
 
 def test_invariant_e_unconfirmed_current_durability_leaves_old_version_intact(

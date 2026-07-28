@@ -78,6 +78,9 @@ from afterthread.services.tools import (
     _STATE_MARKER_KEY,
     _STATE_MARKER_VALUE,
     _STATE_MAX_BYTES,
+    PackageRoot,
+    Resolved,
+    resolve_current,
 )
 
 _JOURNAL_FILENAME = ".afterthread-migration.json"
@@ -446,15 +449,6 @@ def _inspect_legacy_package(
     )
 
 
-def _read_small_text(path: Path, cap: int) -> str | None:
-    """Best-effort strict text read used only by target-layout recognition."""
-
-    try:
-        return _read_regular_bytes(path, cap=cap).decode("utf-8")
-    except MigrationRefused, UnicodeError:
-        return None
-
-
 def _has_our_state_marker(package: Path) -> bool:
     """Recognize the package-level marker used by the target layout."""
 
@@ -468,7 +462,13 @@ def _has_our_state_marker(package: Path) -> bool:
 
 
 def _is_new_package_at(path: Path, vid: str | None = None) -> bool:
-    """Return whether ``path`` is a complete, committed target-layout package."""
+    """Return whether ``path`` is a complete, committed target-layout package.
+
+    Runtime resolution is the authority for ``current`` syntax, its one optional
+    newline, the real version-directory requirement, and the committed
+    ``origin.json`` shape. Migration adds only its ownership/state marker and
+    target-layout manifest constraints below.
+    """
 
     try:
         info = os.lstat(path)
@@ -476,24 +476,13 @@ def _is_new_package_at(path: Path, vid: str | None = None) -> bool:
         return False
     if not stat.S_ISDIR(info.st_mode) or not _has_our_state_marker(path):
         return False
-    current = _read_small_text(path / _META_DIRNAME / "current", 64)
-    if current is None:
-        return False
-    current = current.rstrip("\n")
-    if not _VID_RE.fullmatch(current) or (vid is not None and current != vid):
-        return False
-    version = path / _VERSIONS_DIRNAME / current
-    try:
-        version_info = os.lstat(version)
-    except OSError:
-        return False
-    if not stat.S_ISDIR(version_info.st_mode):
+    resolution = resolve_current(PackageRoot(path))
+    if not isinstance(resolution, Resolved) or (vid is not None and resolution.vid != vid):
         return False
     try:
-        origin, _mode = _read_json_object(
-            version / _META_DIRNAME / "origin.json", cap=_AI_META_MAX_BYTES
+        manifest, _manifest_mode = _read_json_object(
+            resolution.version_root.path / "tool.json", cap=_MANIFEST_MAX_BYTES
         )
-        manifest, _manifest_mode = _read_json_object(version / "tool.json", cap=_MANIFEST_MAX_BYTES)
     except MigrationRefused:
         return False
     shell_match = _SHELL_RE.fullmatch(path.name)
@@ -506,7 +495,7 @@ def _is_new_package_at(path: Path, vid: str | None = None) -> bool:
         else path.name
     )
     return (
-        origin.get("previous") is None
+        resolution.previous is None
         and "enabled" not in manifest
         and manifest.get("name") == expected_name
     )

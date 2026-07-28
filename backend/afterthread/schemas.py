@@ -526,7 +526,8 @@ class ToolListResponse(BaseModel):
 
 
 class ToolSummaryDetail(BaseModel):
-    """One tool's AI summary sidecar (``.ai_meta.json``), as the 工具 page reads it.
+    """One tool's version summary
+    (``versions/<vid>/.afterthread.meta/summary.json``), as the 工具 page reads it.
 
     The three sidecar fields are nullable and all three are null together for the
     common, non-exceptional case of a tool with no sidecar: a hand-made package,

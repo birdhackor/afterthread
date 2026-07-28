@@ -35,6 +35,7 @@ from typing import Any
 import pytest
 
 from afterthread import migrate_tools_v5 as migration
+from afterthread.services import tools
 
 _START = datetime(2026, 7, 28, 1, 2, 3, tzinfo=UTC)
 _VID = "20260728T010203Z-abcdef"
@@ -577,6 +578,38 @@ def test_second_run_over_already_migrated_root_is_zero_write_noop(tmp_path: Path
 
     assert _snapshot_tree(tmp_path) == before
     assert "nothing to do" in "\n".join(output)
+
+
+@pytest.mark.parametrize("damage", ["two-newlines", "origin-without-source"])
+def test_target_layout_recognition_agrees_with_runtime_resolution(
+    tmp_path: Path, damage: str
+) -> None:
+    """Migration cannot call a package complete when runtime calls it unresolved."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    assert _run(root) == 0
+    package = root / "alpha"
+    current = package / tools._META_DIRNAME / tools._CURRENT_FILENAME
+    vid = current.read_text(encoding="ascii").rstrip("\n")
+    if damage == "two-newlines":
+        current.write_text(f"{vid}\n\n", encoding="ascii")
+    else:
+        origin_path = (
+            package / tools._VERSIONS_DIRNAME / vid / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+        )
+        origin = json.loads(origin_path.read_text(encoding="utf-8"))
+        origin.pop("source")
+        origin_path.write_text(json.dumps(origin), encoding="utf-8")
+
+    runtime = tools.resolve_current(tools.PackageRoot(package))
+    migration_answer = migration._is_new_package_at(package)
+
+    assert isinstance(runtime, tools.Unresolved)
+    assert migration_answer is isinstance(runtime, tools.Resolved)
+    before = _snapshot_tree(tmp_path)
+    assert _run(root) == 1
+    assert _snapshot_tree(tmp_path) == before
 
 
 def test_one_package_preflight_failure_means_nothing_anywhere_is_written(

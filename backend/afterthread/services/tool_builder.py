@@ -1790,7 +1790,16 @@ def _publish_revised_version(
         return None, _ERROR_REVISE_TARGET_ALIAS
     if not stat.S_ISDIR(package_info.st_mode) or not stat.S_ISDIR(versions_info.st_mode):
         return None, _ERROR_REVISE_TARGET_ALIAS
-    if tools.package_identity(previous.version_root) != expected_identity:
+    # Identity alone cannot answer whether the request's V is still current:
+    # moving ``current`` to P leaves V's manifest tuple untouched. Re-resolve at
+    # the publication stage, after the paid build but before assembling anything
+    # into ``versions/``, so a D21 hand edit is preserved rather than overwritten.
+    current = tools.resolve_current(package_root)
+    if (
+        isinstance(current, tools.Unresolved)
+        or current.vid != previous.vid
+        or tools.package_identity(previous.version_root) != expected_identity
+    ):
         return None, _ERROR_REVISE_TARGET_REPLACED
 
     prior_origin = tools.read_origin_meta(previous.version_root) or {}
@@ -1819,7 +1828,15 @@ def _publish_revised_version(
         target = versions / vid
         if _entry_exists(target):
             continue
-        if tools.package_identity(previous.version_root) != expected_identity:
+        # Check both facts again after the durable shell assembly. The work above
+        # can be long enough for an operator to move ``current`` by hand; this is
+        # the last refusal point before the version rename makes new disk state.
+        current = tools.resolve_current(package_root)
+        if (
+            isinstance(current, tools.Unresolved)
+            or current.vid != previous.vid
+            or tools.package_identity(previous.version_root) != expected_identity
+        ):
             return None, _ERROR_REVISE_TARGET_REPLACED
         try:
             os.rename(shell_root, target)
@@ -2522,22 +2539,32 @@ def _current_manifest_text(directory: Path) -> str | None:
     return tools._read_regular_file_capped(directory / "tool.json", tools._MANIFEST_MAX_BYTES)
 
 
-async def run_revise(name: str, feedback: str) -> InstallOutcome:
+async def run_revise(
+    name: str,
+    feedback: str,
+    resolution: tools.Resolved | None,
+) -> InstallOutcome:
     """Build and commit one new version, then publish ``current``.
 
-    The initially resolved version supplies the build content and identity. The
+    ``resolution`` is the exact answer whose vid the request compared, not a
+    package name to resolve a second time after the background task starts. The
+    initially resolved version supplies the build content and identity. The
     package toggle and ``.env`` remain package-layer state throughout.
     """
     base = tools.tools_dir()
     if base is None:
         return InstallOutcome(ok=False, error=_ERROR_TOOLS_DISABLED)
 
-    package_root = await run_in_threadpool(tools._resolve_package_dir_no_alias, name)
-    if package_root is None:
+    if resolution is None:
         return InstallOutcome(ok=False, error=_ERROR_REVISE_NOT_FOUND)
-    resolution = await run_in_threadpool(tools.resolve_current, package_root)
-    if isinstance(resolution, tools.Unresolved):
-        return InstallOutcome(ok=False, error=_ERROR_REVISE_NOT_FOUND)
+    package_root = resolution.package_root
+    current = await run_in_threadpool(tools.resolve_current, package_root)
+    if isinstance(current, tools.Unresolved) or current.vid != resolution.vid:
+        # The request legitimately queued work for V, but D21 permits the
+        # operator to move ``current`` before this task is scheduled. Refuse
+        # before copying files or spending an LLM call; following the name to P
+        # would make the compared vid and the worked-on vid two spellings.
+        return InstallOutcome(ok=False, error=_ERROR_REVISE_TARGET_REPLACED)
     # ONE worker hop does the read AND the dotenv parse (R4-3): the parse is real
     # work on a 64 KiB file and this job shares the loop with every request.
     # VALUES only: the package-layer FILE is never copied or rewritten by revise.
@@ -2993,7 +3020,11 @@ async def start_revise_job(name: str, feedback: str, expected_vid: str) -> Revis
             return ReviseJobStart(refusal="job_busy")
         reservation = ""
         return ReviseJobStart(
-            job_id=_launch_job(job, lambda: run_revise(name, feedback), _ACTION_REVISE)
+            job_id=_launch_job(
+                job,
+                lambda: run_revise(name, feedback, resolution),
+                _ACTION_REVISE,
+            )
         )
     finally:
         if reservation:

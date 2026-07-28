@@ -158,6 +158,19 @@ def _installed_version(root: Path, name: str = "kbsearch") -> tools.VersionRoot:
     return tools.VersionRoot(root / name / tools._VERSIONS_DIRNAME / _TEST_VID)
 
 
+async def _regenerate_summary(name: str) -> dict[str, Any] | None:
+    """Drive explicit regeneration with the same validated resolution as the route."""
+
+    package_root = await tool_meta.run_in_threadpool(tools._resolve_package_dir_no_alias, name)
+    candidate = (
+        await tool_meta.run_in_threadpool(tools.resolve_current, package_root)
+        if package_root is not None
+        else None
+    )
+    resolution = candidate if isinstance(candidate, tools.Resolved) else None
+    return await regenerate_summary(name, resolution)
+
+
 def _fake_generate(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -1063,7 +1076,7 @@ def test_regenerate_summary_returns_the_fresh_meta(
     _write_meta(pkg, summary="舊的", origin={"instructions": "查 KB"})
     _fake_generate(monkeypatch, summary="新的說明")
 
-    meta = asyncio.run(regenerate_summary("kbsearch"))
+    meta = asyncio.run(_regenerate_summary("kbsearch"))
 
     assert isinstance(meta, dict)
     assert meta["summary"] == "新的說明"
@@ -1100,7 +1113,7 @@ def test_regenerate_summary_feeds_the_stored_origin_back_into_the_prompt(
     )
     captured = _fake_generate(monkeypatch, summary="新的說明")
 
-    meta = asyncio.run(regenerate_summary("kbsearch"))
+    meta = asyncio.run(_regenerate_summary("kbsearch"))
 
     assert "ORIGIN-INSTRUCTIONS-MARKER 只查內部 KB" in captured["user_prompt"]
     assert "origin-url-marker.kb.example" in captured["user_prompt"]
@@ -1139,7 +1152,7 @@ def test_regenerate_summary_sanitizes_a_legacy_origin_url(
     )
     captured = _fake_generate(monkeypatch, summary="新的說明")
 
-    meta = asyncio.run(regenerate_summary("kbsearch"))
+    meta = asyncio.run(_regenerate_summary("kbsearch"))
 
     assert "LEGACY-TOKEN" not in captured["user_prompt"]
     assert "LEGACY-BASIC" not in captured["user_prompt"]
@@ -1175,7 +1188,7 @@ def test_regenerate_summary_ignores_an_unusable_stored_origin(
     )
     captured = _fake_generate(monkeypatch, summary="新的說明")
 
-    meta = asyncio.run(regenerate_summary("kbsearch"))
+    meta = asyncio.run(_regenerate_summary("kbsearch"))
 
     assert "JUNK-MARKER" not in captured["user_prompt"]
     assert isinstance(meta, dict)
@@ -1203,7 +1216,7 @@ def test_regenerate_summary_refuses_an_internal_alias(
 
     monkeypatch.setattr("afterthread.services.tool_meta.generate_structured", must_not_generate)
 
-    assert asyncio.run(regenerate_summary("alias")) is None
+    assert asyncio.run(_regenerate_summary("alias")) is None
     meta = tools.read_tool_meta(_version_root(pkg))
     assert meta is not None
     assert meta["summary"] == "真的說明"  # the real sidecar is untouched
@@ -1232,7 +1245,7 @@ def test_regenerate_summary_propagates_llm_failures_without_clobbering(
     _fake_generate(monkeypatch, explode=explode)
 
     with pytest.raises(expected):
-        asyncio.run(regenerate_summary("kbsearch"))
+        asyncio.run(_regenerate_summary("kbsearch"))
 
     meta = tools.read_tool_meta(_version_root(pkg))
     assert meta is not None
@@ -1253,7 +1266,7 @@ def test_regenerate_summary_signals_nothing_stored_when_package_is_gone(
     _summary_settings(monkeypatch, root)
     _fake_generate(monkeypatch)
 
-    assert asyncio.run(regenerate_summary("ghost")) is None
+    assert asyncio.run(_regenerate_summary("ghost")) is None
     assert list(root.iterdir()) == []
 
 
@@ -1271,7 +1284,7 @@ def test_regenerate_summary_signals_nothing_stored_when_the_write_is_refused(
     _fake_generate(monkeypatch, summary="新的說明")
     monkeypatch.setattr(tools, "write_tool_meta", lambda *args, **kwargs: False)
 
-    assert asyncio.run(regenerate_summary("kbsearch")) is None
+    assert asyncio.run(_regenerate_summary("kbsearch")) is None
 
 
 def _replace_package(root: Path, name: str = "kbsearch") -> Path:
@@ -1316,7 +1329,7 @@ def test_regenerate_summary_writes_nothing_when_the_package_was_replaced(
 
     _fake_generate(monkeypatch, summary="A 的新說明", side_effect=replace_mid_call)
 
-    assert asyncio.run(regenerate_summary("kbsearch")) is None
+    assert asyncio.run(_regenerate_summary("kbsearch")) is None
 
     stored = tools.read_tool_meta(_version_root(replaced["pkg"]))
     assert stored is not None
@@ -1483,7 +1496,7 @@ def test_an_enabled_toggle_during_the_generation_now_costs_nothing_at_all(
     # the origin is worth saving: a later regeneration feeds it into its own prompt
     # as first-hand context and keeps it in the sidecar it rewrites.
     captured = _fake_generate(monkeypatch, summary="重新產生的說明")
-    meta = asyncio.run(regenerate_summary("kbsearch"))
+    meta = asyncio.run(_regenerate_summary("kbsearch"))
     assert isinstance(meta, dict)
     assert meta["summary"] == "重新產生的說明"
     assert meta["origin"]["openapi_url"] == origin["openapi_url"]
@@ -1510,7 +1523,7 @@ def test_summary_paths_refuse_a_package_with_no_manifest_before_the_llm_call(
     _summary_settings(monkeypatch, root)
     captured = _fake_generate(monkeypatch, summary="不該被產生")
 
-    assert asyncio.run(regenerate_summary("kbsearch")) is None
+    assert asyncio.run(_regenerate_summary("kbsearch")) is None
     asyncio.run(generate_and_store_summary("kbsearch", origin=None))  # must not raise
 
     assert captured == {}  # no LLM session was started by either path
@@ -1543,7 +1556,7 @@ def test_regenerate_summary_builds_the_prompt_off_the_event_loop(
     monkeypatch.setattr(tool_meta, "_summary_user_prompt", spy)
     _fake_generate(monkeypatch, summary="新的說明")
 
-    asyncio.run(regenerate_summary("kbsearch"))
+    asyncio.run(_regenerate_summary("kbsearch"))
 
     assert seen["thread"] is not loop_thread
 
@@ -1593,7 +1606,7 @@ def test_sidecar_io_never_runs_on_the_event_loop(
     _fake_generate(monkeypatch, summary="新的說明")
 
     if entry_point == "regenerate":
-        asyncio.run(regenerate_summary("kbsearch"))
+        asyncio.run(_regenerate_summary("kbsearch"))
     else:
         asyncio.run(generate_and_store_summary("kbsearch"))
 

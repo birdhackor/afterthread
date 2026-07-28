@@ -3288,6 +3288,18 @@ def _current_version(version: Path) -> Path:
     return _resolved_version(_package_path(version))
 
 
+def _copy_committed_version(version: Path, vid: str) -> Path:
+    """Copy one fixture version and give the copy valid lineage."""
+
+    copied = version.parent / vid
+    shutil.copytree(version, copied)
+    origin_path = copied / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    origin = json.loads(origin_path.read_text(encoding="utf-8"))
+    origin["previous"] = version.name
+    origin_path.write_text(json.dumps(origin), encoding="utf-8")
+    return copied
+
+
 def test_router_get_summary_all_null_without_a_sidecar(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3488,6 +3500,53 @@ def test_router_regenerate_summary_stores_and_returns_the_new_summary(
     # known fields, the absent one an explicit null).
     assert stored["origin"]["openapi_url"] is None
     assert stored["origin"]["instructions"] == "查 KB"
+
+
+def test_regenerate_refuses_if_current_moves_between_request_and_work(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The compared vid, worked-on vid, and response vid are one value.
+
+    D21 permits an operator to edit ``current`` after the route validates V.
+    The service receives that exact Resolution and refuses once it sees P;
+    neither P nor V is summarized and the 409 carries no misleading vid.
+    """
+
+    first = _seed_package(monkeypatch, tmp_path)
+    package_root = _package_root(first)
+    second_vid = "20260728T020304Z-fedcba"
+    second = _copy_committed_version(first, second_vid)
+    before = {
+        first: _file_bytes(first),
+        second: _file_bytes(second),
+    }
+    real_regenerate = tool_meta.regenerate_summary
+
+    async def switch_current_then_work(
+        name: str, resolution: tools.Resolved | None
+    ) -> dict[str, Any] | None:
+        assert resolution is not None
+        assert resolution.vid == _TEST_VID
+        assert tools.publish_current(package_root, second_vid)
+        return await real_regenerate(name, resolution)
+
+    async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a moved current must be refused before the LLM call")
+
+    monkeypatch.setattr(tool_meta, "regenerate_summary", switch_current_then_work)
+    monkeypatch.setattr(tool_meta, "generate_structured", must_not_generate)
+
+    response = client.post(
+        "/api/tools/kbsearch/summary/regenerate",
+        json={"expected_vid": _TEST_VID},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "version_mismatch"
+    assert "current_vid" not in response.text
+    assert _resolved_version(_package_path(first)) == second
+    assert _file_bytes(first) == before[first]
+    assert _file_bytes(second) == before[second]
 
 
 def test_router_regenerate_summary_409_while_a_job_runs(
@@ -3835,6 +3894,58 @@ def test_router_revise_202_queues_job(
     }
 
 
+def test_revise_refuses_if_current_moves_between_request_and_background_work(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The queued closure carries V's Resolution instead of resolving name -> P.
+
+    The response legitimately contains only a job id. Once D21's hand edit moves
+    ``current`` before that job runs, the job refuses before copying or spending
+    an LLM call and leaves both committed versions untouched.
+    """
+
+    first = _seed_package(monkeypatch, tmp_path)
+    package_root = _package_root(first)
+    second_vid = "20260728T020304Z-fedcba"
+    second = _copy_committed_version(first, second_vid)
+    before = {
+        first: _file_bytes(first),
+        second: _file_bytes(second),
+    }
+    captured: dict[str, Any] = {}
+
+    def hold_job(
+        job: tool_builder.InstallJob,
+        run: Callable[[], Any],
+        action: str,
+    ) -> str:
+        captured.update(run=run, action=action)
+        return job.job_id
+
+    async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a moved current must be refused before the LLM call")
+
+    monkeypatch.setattr(tool_builder, "_launch_job", hold_job)
+    monkeypatch.setattr(tool_builder, "generate_structured", must_not_generate)
+
+    response = client.post(
+        "/api/tools/kbsearch/revise",
+        json={"feedback": "只想修改 V", "expected_vid": _TEST_VID},
+    )
+    assert response.status_code == 202
+    assert set(response.json()) == {"job_id"}
+
+    assert tools.publish_current(package_root, second_vid)
+    outcome = asyncio.run(captured["run"]())
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_TARGET_REPLACED
+    assert captured["action"] == tool_builder._ACTION_REVISE
+    assert _resolved_version(_package_path(first)) == second
+    assert _file_bytes(first) == before[first]
+    assert _file_bytes(second) == before[second]
+
+
 def test_router_revise_404_for_unknown_tool(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4001,7 +4112,9 @@ def test_router_job_poll_serves_install_and_revise_jobs(
         ) -> InstallOutcome:
             return InstallOutcome(ok=True, tool_name="kb", summary="裝好了", llm_log_id=1)
 
-        async def fake_run_revise(name: str, feedback: str) -> InstallOutcome:
+        async def fake_run_revise(
+            name: str, feedback: str, _resolution: tools.Resolved | None
+        ) -> InstallOutcome:
             return InstallOutcome(ok=True, tool_name=name, summary="改好了", llm_log_id=2)
 
         monkeypatch.setattr("afterthread.services.tool_builder.run_install", fake_run_install)
@@ -4079,6 +4192,15 @@ def _revise_result(name: str = "kbsearch", *, summary: str = "改好了") -> dic
     return {"tool_name": name, "summary": summary, "ready": True}
 
 
+async def _run_revise(name: str, feedback: str) -> InstallOutcome:
+    """Drive the resolved-only production entry point from direct unit tests."""
+
+    package_root = tools._resolve_package_dir_no_alias(name)
+    candidate = tools.resolve_current(package_root) if package_root is not None else None
+    resolution = candidate if isinstance(candidate, tools.Resolved) else None
+    return await tool_builder.run_revise(name, feedback, resolution)
+
+
 def test_run_revise_copies_the_package_without_the_root_env_or_any_sidecar(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4119,7 +4241,7 @@ def test_run_revise_copies_the_package_without_the_root_env_or_any_sidecar(
         side_effect=lambda: seen.update(staged=_tree(_staging_dir(root))),
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     # The workspace the builder received: everything, minus the ROOT .env and every
@@ -4166,7 +4288,7 @@ def test_run_revise_keeps_the_state_file_out_of_staging_but_carries_it_across(
         side_effect=lambda: seen.update(staged=_tree(_staging_dir(root))),
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     assert tools._META_DIRNAME not in seen["staged"]  # the builder never saw it
@@ -4219,7 +4341,7 @@ def test_a_revise_leaves_a_nested_state_file_alone_and_carries_a_foreign_root_on
         side_effect=lambda: seen.update(staged=_tree(_staging_dir(root))),
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     assert (_current_version(pkg) / "run.py").read_text(
@@ -4258,7 +4380,7 @@ def test_invariant_f_revise_never_touches_the_package_env(
         files={"run.py": _REVISED_RUN_PY, ".env": "KB_API_KEY=made-up-by-the-model\n"},
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     assert env_path.read_bytes() == before
@@ -4281,7 +4403,7 @@ def test_invariant_f_revised_package_immediately_redacts_package_env_from_logs(
     env_inode = env_path.stat().st_ino
     _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     assert env_path.stat().st_ino == env_inode
@@ -4323,7 +4445,7 @@ def test_run_revise_preserves_a_crlf_env_byte_for_byte(
     digest_before = hashlib.sha256(raw).hexdigest()
     _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     assert (_current_version(pkg) / "run.py").read_text(
@@ -4354,7 +4476,7 @@ def test_run_revise_registers_the_live_env_values_for_the_session(
         ),
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     assert _TRICKY_ENV_VALUE in seen["known"]
@@ -4378,7 +4500,7 @@ def test_run_revise_refuses_a_model_rename(monkeypatch: pytest.MonkeyPatch, tmp_
         files={"run.py": _REVISED_RUN_PY},
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
     assert outcome.tool_name == "kbsearch"  # never the model's answer
@@ -4405,7 +4527,7 @@ def test_run_revise_replaces_the_installed_package(
         files={"run.py": _REVISED_RUN_PY, "lib/helper.py": "Y = 2\n"},
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     assert outcome.tool_name == "kbsearch"
@@ -4576,14 +4698,25 @@ def test_invariant_a_delete_discard_and_sweep_share_one_running_package_judgemen
 
 
 def test_running_discard_parks_the_version_and_the_existing_sweep_retries(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     base = tmp_path / "tools"
+    marker, gate = tmp_path / "started", tmp_path / "go"
     package = base / "kbsearch"
     first = _versioned_package_at(package, "kbsearch")
     second_vid = "20260728T020304Z-fedcba"
     second = package / tools._VERSIONS_DIRNAME / second_vid
     shutil.copytree(first, second)
+    (second / "run.py").write_text(
+        "import os, sys, time\n"
+        f"open({str(marker)!r}, 'w').write('x')\n"
+        f"while not os.path.exists({str(gate)!r}):\n"
+        "    time.sleep(0.01)\n"
+        "sys.stdout.write(open('data.txt').read())\n",
+        encoding="utf-8",
+    )
+    (second / "data.txt").write_text("PAYLOAD", encoding="utf-8")
     origin_path = second / tools._META_DIRNAME / tools._ORIGIN_FILENAME
     origin = json.loads(origin_path.read_text(encoding="utf-8"))
     origin["previous"] = _TEST_VID
@@ -4591,17 +4724,25 @@ def test_running_discard_parks_the_version_and_the_existing_sweep_retries(
     assert tools.publish_current(tools.PackageRoot(package), second_vid)
     resolution = tools.resolve_current(tools.PackageRoot(package))
     assert isinstance(resolution, tools.Resolved)
-    identity = tools.directory_identity(tools.VersionRoot(second))
-    assert identity is not None
     parked = second.with_name(f"{second_vid}.discarded")
+    _install_settings(monkeypatch, tools_dir=str(base))
+    handler = tools.enabled_llm_tools()[0].handler
+    result: dict[str, str] = {}
+    caller = threading.Thread(target=lambda: result.update(out=asyncio.run(handler({}))))
+    caller.start()
 
-    with tools._inflight_execution(identity):
+    try:
+        _wait_for(marker.exists)
         assert tools.discard_version(resolution) == "ok"
         assert parked.is_dir()
         assert _resolved_version(package) == first
         tool_builder._sweep_stale_backups(base)
         assert parked.is_dir()
+    finally:
+        gate.write_text("go", encoding="utf-8")
+        caller.join(timeout=30)
 
+    assert result["out"] == "PAYLOAD"
     tool_builder._sweep_stale_backups(base)
     assert not parked.exists()
 
@@ -4713,7 +4854,7 @@ def test_invariant_d_failed_version_rename_leaves_current_on_the_previous_versio
     monkeypatch.setattr(os, "rename", exploding_publish)
     _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
     assert "無法安裝工具版本" in (outcome.error or "")
@@ -4797,7 +4938,7 @@ def test_invariant_d_revise_faults_leave_current_on_a_durable_previous_version(
     monkeypatch.setattr(tool_builder, "_fsync_directory", fault_directory)
     _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
     assert current.read_bytes() == before
@@ -4817,7 +4958,7 @@ def test_vid_collision_checks_every_entry_with_the_candidate_prefix(
     monkeypatch.setattr(tool_builder, "_mint_vid", lambda: next(minted))
     _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     assert _resolved_version(package).name == chosen
@@ -4849,7 +4990,7 @@ def test_run_revise_publish_is_a_rename_with_no_copy_fallback(
     monkeypatch.setattr(shutil, "move", forbidden_move)
     _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     assert (_current_version(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
@@ -4870,7 +5011,7 @@ def test_run_revise_reports_the_original_being_deleted(
         side_effect=lambda: shutil.rmtree(_package_path(pkg)),
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
     assert outcome.error == tool_builder._ERROR_REVISE_TARGET_MISSING
@@ -4893,7 +5034,7 @@ def test_run_revise_never_replaces_on_a_validation_failure(
         files={"tool.json": "{ not json at all"},
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
     assert "驗證失敗" in (outcome.error or "")
@@ -4912,12 +5053,12 @@ def test_run_revise_refuses_a_missing_tool_and_a_disabled_feature(
 
     monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", must_not_generate)
     _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
-    missing = asyncio.run(tool_builder.run_revise("ghost", "改一下"))
+    missing = asyncio.run(_run_revise("ghost", "改一下"))
     assert missing.ok is False
     assert missing.error == tool_builder._ERROR_REVISE_NOT_FOUND
 
     _install_settings(monkeypatch, tools_dir="")
-    off = asyncio.run(tool_builder.run_revise("kbsearch", "改一下"))
+    off = asyncio.run(_run_revise("kbsearch", "改一下"))
     assert off.ok is False
     assert off.error == _ERROR_TOOLS_DISABLED
 
@@ -4941,7 +5082,7 @@ def test_run_revise_refuses_an_unreadable_env(
 
     monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", must_not_generate)
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
     assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNREADABLE
@@ -4978,7 +5119,7 @@ def test_run_revise_refuses_a_stat_failure_on_the_env(
     monkeypatch.setattr(Path, "lstat", flaky_lstat)
     monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", must_not_generate)
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
     refusing["on"] = False
 
     assert outcome.ok is False
@@ -5014,7 +5155,7 @@ def test_run_revise_refuses_an_env_value_too_short_to_mask(
         monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
     assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMASKABLE
@@ -5049,7 +5190,7 @@ def test_run_revise_allows_env_values_at_the_floor_and_ignores_empty_ones(
         side_effect=lambda: seen.update(inflight=set(tools._INFLIGHT_SECRETS)),
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     assert seen["inflight"] == {"abcdef"}  # the empty value was not registered
@@ -5102,7 +5243,7 @@ def test_run_revise_refuses_an_env_value_the_file_spells_reversibly(
         monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
     assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
@@ -5145,7 +5286,7 @@ def test_run_revise_refuses_a_shadowed_line_that_spells_the_value_reversibly(
         monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
     assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
@@ -5178,7 +5319,7 @@ def test_run_revise_refuses_a_backslash_escape_inside_single_quotes(
         monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
     assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
@@ -5199,7 +5340,7 @@ def test_run_revise_allows_a_single_quoted_backslash_value(
     (_package_path(pkg) / ".env").write_text(raw, encoding="utf-8")
     _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     assert (_package_path(pkg) / ".env").read_text(encoding="utf-8") == raw
@@ -5234,7 +5375,7 @@ def test_run_revise_refuses_when_the_package_was_reinstalled_mid_session(
         side_effect=reinstall,
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
     assert outcome.error == tool_builder._ERROR_REVISE_TARGET_REPLACED
@@ -5260,7 +5401,7 @@ def test_run_revise_refuses_a_package_whose_identity_cannot_be_established(
         monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
     assert outcome.error == tool_builder._ERROR_REVISE_IDENTITY_UNKNOWN
@@ -5278,7 +5419,7 @@ def test_run_revise_allows_a_plainly_spelled_shadowed_line(
     (_package_path(pkg) / ".env").write_text("KEY=oldvalue\nKEY=newvalue\n", encoding="utf-8")
     _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     assert (_package_path(pkg) / ".env").read_text(
@@ -5316,7 +5457,7 @@ def test_run_revise_allows_env_values_the_file_spells_literally(
         side_effect=lambda: seen.update(inflight=set(tools._INFLIGHT_SECRETS)),
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     assert seen["inflight"] == {"abcdef", "ghijkl", 'mno"pqr', "stuvwx", "yzabcd"}
@@ -5353,7 +5494,7 @@ def test_run_revise_refuses_a_value_only_an_unrelated_line_spells_literally(
         monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
     assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
@@ -5397,7 +5538,7 @@ def test_run_revise_refuses_a_value_a_comment_on_its_own_line_vouches_for(
         monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
     assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
@@ -5442,7 +5583,7 @@ def test_run_revise_refuses_a_plain_value_carrying_a_trailing_comment(
         monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
     assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
@@ -5478,7 +5619,7 @@ def test_run_revise_refuses_a_value_its_assignment_line_cannot_vouch_for(
         monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
     assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
@@ -5532,7 +5673,7 @@ def test_run_revise_checks_the_last_assignment_of_a_duplicated_env_key(
         side_effect=lambda: seen.update(inflight=set(tools._INFLIGHT_SECRETS)),
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     if refused:
         assert outcome.ok is False
@@ -5593,7 +5734,7 @@ def test_run_revise_keeps_a_root_env_case_variant_that_is_a_different_file(
         side_effect=lambda: seen.update(staged=_tree(_staging_dir(root))),
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     assert ".ENV" in seen["staged"]  # ordinary content: the builder gets to see it
@@ -5642,7 +5783,7 @@ def test_run_revise_keeps_a_hard_linked_root_env_case_variant(
         side_effect=lambda: seen.update(staged=_tree(_staging_dir(root))),
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     assert ".ENV" in seen["staged"]  # a distinct entry: the builder sees it
@@ -5734,7 +5875,7 @@ def test_run_revise_keeps_a_root_env_case_variant_that_is_a_symlink(
         side_effect=lambda: seen.update(staged=_tree(_staging_dir(root))),
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     assert ".ENV" in seen["staged"]  # the link itself is package content
@@ -5769,7 +5910,7 @@ def test_run_revise_keeps_lone_env_variant_but_strips_builder_dotenv(
         side_effect=lambda: seen.update(staged=_tree(_staging_dir(root))),
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     assert ".ENV" in seen["staged"]  # copied like any other file
@@ -5805,7 +5946,7 @@ def test_run_revise_refuses_an_env_over_the_byte_ceiling_that_fits_in_chars(
         monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
     assert outcome.error == tool_builder._ERROR_REVISE_ENV_TOO_LARGE
@@ -5842,7 +5983,7 @@ def test_run_revise_accepts_an_env_at_the_byte_ceiling(
         side_effect=lambda: seen.update(inflight=set(tools._INFLIGHT_SECRETS)),
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     assert seen["inflight"] == {"live-secret-value"}
@@ -5866,7 +6007,7 @@ def test_run_revise_prompts_carry_the_feedback_but_never_the_env_values(
         monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "回傳結果要加上分頁參數"))
+    outcome = asyncio.run(_run_revise("kbsearch", "回傳結果要加上分頁參數"))
 
     assert outcome.ok is True
     system_prompt = captured["system_prompt"]
@@ -5982,7 +6123,7 @@ def test_run_revise_never_redacts_or_builds_its_prompt_on_the_event_loop(
         files={"run.py": _REVISED_RUN_PY},
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is (model_name == "kbsearch")
     assert seen["prompt"] is not loop_thread
@@ -6038,7 +6179,7 @@ def test_run_revise_exposes_the_env_to_run_shell_only(
     monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", fake)
     _fake_summary_generate(monkeypatch)
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     assert "probe=" in captured["shell"]
@@ -6063,7 +6204,7 @@ def test_run_revise_regenerates_the_summary_inheriting_the_origin(
     _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
     _fake_summary_generate(monkeypatch, summary="修訂後的說明")
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     meta = _meta(_current_version(pkg))
@@ -6083,7 +6224,7 @@ def test_run_revise_survives_a_failing_summary(
     _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
     _fake_summary_generate(monkeypatch, explode=LLMUpstreamError("APIConnectionError: nope"))
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
     assert (_current_version(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
@@ -6101,7 +6242,7 @@ def test_run_revise_ready_false_keeps_the_package(
         files={"run.py": _REVISED_RUN_PY},
     )
 
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
     assert "AI 判定修訂尚未完成" in (outcome.error or "")
@@ -6120,7 +6261,9 @@ def test_revise_job_records_its_outcome_and_backstops_bugs(
     _seed_package(monkeypatch, tmp_path)
 
     async def scenario() -> None:
-        async def fake_run_revise(name: str, feedback: str) -> InstallOutcome:
+        async def fake_run_revise(
+            name: str, feedback: str, _resolution: tools.Resolved | None
+        ) -> InstallOutcome:
             return InstallOutcome(
                 ok=True,
                 tool_name=name,
@@ -6146,7 +6289,9 @@ def test_revise_job_records_its_outcome_and_backstops_bugs(
         assert job["env_keys"] == ["KB_API_KEY"]
         assert job["finished_at"] is not None
 
-        async def exploding(name: str, feedback: str) -> InstallOutcome:
+        async def exploding(
+            name: str, feedback: str, _resolution: tools.Resolved | None
+        ) -> InstallOutcome:
             raise RuntimeError("bug with secrets in str()")
 
         monkeypatch.setattr("afterthread.services.tool_builder.run_revise", exploding)
@@ -6191,7 +6336,9 @@ def test_install_and_revise_share_one_single_flight_slot(
             await release.wait()
             return InstallOutcome(ok=True, tool_name="kb")
 
-        async def blocking_revise(name: str, feedback: str) -> InstallOutcome:
+        async def blocking_revise(
+            name: str, feedback: str, _resolution: tools.Resolved | None
+        ) -> InstallOutcome:
             await release.wait()
             return InstallOutcome(ok=True, tool_name=name)
 
