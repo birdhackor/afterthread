@@ -342,6 +342,23 @@ def test_lock_file_is_skipped_by_registry_secret_sweep_and_migration_preflight(
     assert preflight.problems == ()
 
 
+def test_migration_preserves_the_persistent_lock_inode(tmp_path: Path) -> None:
+    """The offline migration locks the existing inode without replacing it."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    lock_fd = tools._open_tools_lock(root)
+    lock_path = root / tools._TOOLS_LOCK_FILENAME
+    before = os.fstat(lock_fd)
+    try:
+        assert _run(root) == 0
+        after = lock_path.stat()
+    finally:
+        tools.release_tools_lock(lock_fd)
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    _assert_migrated(root)
+
+
 def test_migration_refuses_while_shared_tools_lock_is_held(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -668,6 +685,48 @@ def test_shell_creation_and_ownership_boundaries_are_self_recovering(
         assert not any(shell.iterdir())
 
     assert _run(root) == 0
+    _assert_migrated(root)
+
+
+def test_ordinary_error_after_shell_creation_rolls_back_and_allows_a_fresh_rerun(
+    tmp_path: Path,
+) -> None:
+    """The caught-error branch can clean an empty shell with no recorded inode.
+
+    ``InjectedCrash`` deliberately bypasses ``except Exception`` and therefore
+    resumes forward from a running journal. This ordinary exception instead
+    enters rollback after ``mkdir`` but before the following identity lookup and
+    journal publish. The empty directory has no content to preserve; requiring
+    the proof that the failed lookup never recorded would strand the rolled-back
+    journal and every later run at the same hidden name.
+    """
+
+    root = tmp_path / "tools"
+    original = _make_package(root)
+    before = _snapshot_tree(original)
+    shell = migration._shell_path(root, "alpha")
+    output: list[str] = []
+
+    assert (
+        _run(
+            root,
+            operations=PointFailureOperations(
+                {"after:assemble:alpha:create_shell": OSError("injected ordinary failure")}
+            ),
+            output=output,
+        )
+        == 1
+    )
+
+    assert _snapshot_tree(root / "alpha") == before
+    assert not shell.exists()
+    assert not (root / migration._JOURNAL_FILENAME).exists()
+    assert "all package names were rolled back" in "\n".join(output)
+
+    # The failed run's full backup is intentionally retained. Use a distinct
+    # deterministic suffix so this fresh run proves migration itself can finish
+    # rather than waiting forever for the occupied backup name to change.
+    assert _run(root, token_hex=lambda _size: "fedcba") == 0
     _assert_migrated(root)
 
 

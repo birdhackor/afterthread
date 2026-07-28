@@ -55,6 +55,7 @@ the user re-runs the install). Bounded to the most recent ``_MAX_JOBS``.
 import asyncio
 import concurrent.futures
 import contextlib
+import logging
 import os
 import queue
 import secrets
@@ -84,6 +85,8 @@ from afterthread.services.llm import (
 )
 from afterthread.services.memory_ai import _coerce_bool, _coerce_str, _truncate_to
 from afterthread.services.tools import _NAME_RE
+
+_logger = logging.getLogger("afterthread.tool_builder")
 
 # The llm_log workflow name for every builder session -- what the AI 日誌 page
 # shows, and the key `last_record_id_for_workflow` looks the session up by.
@@ -1847,7 +1850,25 @@ def _cleanup_staging(staging: Path, base: Path) -> None:
         with contextlib.suppress(OSError):
             staging.parent.rmdir()
     finally:
-        _sweep_stale_backups(base)
+        try:
+            _sweep_stale_backups(base)
+        except tools.ToolsLockUnavailableError as exc:
+            # This sweep is decoration after the job's real outcome is already
+            # decided. Preserve the actionable lock path/remedy in the backend
+            # console without turning an installed package into a failed job.
+            # Logging is itself an observer and therefore cannot break the
+            # cleanup contract even under a pathological custom handler.
+            with contextlib.suppress(Exception):
+                _logger.warning("Tool cleanup sweep skipped: %s", exc)
+        except Exception as exc:
+            # The sweep is best-effort for every failure class, not only lock
+            # setup. Category-only avoids feeding an arbitrary filesystem
+            # exception string into the operator log.
+            with contextlib.suppress(Exception):
+                _logger.warning(
+                    "Tool cleanup sweep failed (%s); a later tool job will retry.",
+                    type(exc).__name__,
+                )
 
 
 # --- the install run ---------------------------------------------------------

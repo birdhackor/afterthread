@@ -25,6 +25,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import shutil
 import socket
@@ -697,6 +698,44 @@ def test_run_install_happy_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     assert captured["timeout_seconds"] == settings.tool_install_timeout_seconds
     # The operator's instructions and the fetched document ride in the prompt.
     assert "build a search tool" in captured["user_prompt"]
+
+
+def test_run_install_success_survives_an_unusable_cleanup_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A closing best-effort sweep cannot overwrite a successful install.
+
+    The reserved lock name is a directory, so the post-outcome sweep gets the
+    actionable ``ToolsLockUnavailableError`` introduced in round 17. The package
+    has already been published at that point: cleanup must return normally and
+    put the exact path and in-place repair rule in the operator's backend log.
+    """
+
+    root = tmp_path / "tools"
+    root.mkdir()
+    lock_path = root / tools._TOOLS_LOCK_FILENAME
+    lock_path.mkdir()
+    _install_settings(monkeypatch, tools_dir=str(root))
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built and tested", "ready": True},
+        files={"tool.json": json.dumps(_package_manifest("kbsearch")), "run.py": _GOOD_RUN_PY},
+    )
+    _no_fetch(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+        outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build"))
+
+    assert outcome.ok is True
+    assert outcome.error is None
+    assert _resolved_version(root / "kbsearch").is_dir()
+    records = [record for record in caplog.records if record.name == "afterthread.tool_builder"]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert str(lock_path) in message
+    assert "do not delete or recreate it" in message
 
 
 def test_run_install_writes_the_summary_sidecar(
@@ -4803,6 +4842,35 @@ def test_sweep_skips_while_shared_lock_is_held_then_collects_marked_trees(
     assert not first.exists() and not second.exists()
     assert (base / ".staging").is_dir()
     assert linked.is_symlink() and (outside / "keep.txt").exists()
+
+
+@pytest.mark.parametrize("action", ["sweep", "cleanup"])
+def test_cleanup_production_paths_preserve_the_persistent_lock_inode(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    """Both cleanup entry points reopen, but never replace, the reserved inode."""
+
+    base = tmp_path / "tools"
+    base.mkdir()
+    lock_fd = tools._open_tools_lock(base)
+    lock_path = base / tools._TOOLS_LOCK_FILENAME
+    before = os.fstat(lock_fd)
+    marked = _stale_dir(base, "kbsearch")
+
+    try:
+        if action == "sweep":
+            tool_builder._sweep_stale_backups(base)
+        else:
+            staging = base / tool_builder._STAGING_DIRNAME / "buildid"
+            staging.mkdir(parents=True)
+            tool_builder._cleanup_staging(staging, base)
+
+        assert not marked.exists()  # the selected production path actually ran
+        after = lock_path.stat()
+    finally:
+        tools.release_tools_lock(lock_fd)
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
 
 
 def test_cleanup_staging_is_where_the_sweep_actually_runs(tmp_path: Path) -> None:

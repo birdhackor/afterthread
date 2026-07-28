@@ -2234,6 +2234,28 @@ def _cleanup_rolled_back(
         for artifact in (_shell_path(root, name), _migrated_path(root, name)):
             if artifact.exists() or artifact.is_symlink():
                 shell_identity = package["shell_identity"]
+                if shell_identity is None and _is_empty_real_directory(artifact):
+
+                    def discard_empty_unproved_shell(
+                        artifact: Path = artifact,
+                    ) -> None:
+                        if not _is_empty_real_directory(artifact):
+                            raise MigrationRefused(
+                                f"{artifact.name}: empty rollback shell gained content "
+                                "before removal"
+                            )
+                        artifact.rmdir()
+                        _fsync_directory(root)
+
+                    # Match forward reconciliation's sole no-proof exit. A
+                    # literal empty directory contains no operator data to
+                    # preserve; every non-empty directory still needs the vid
+                    # layout or the journaled inode plus ownership marker.
+                    operations.mutate(
+                        f"cleanup_rollback:{name}:discard_empty:{artifact.name}",
+                        discard_empty_unproved_shell,
+                    )
+                    continue
                 # The exact vid proves a complete shell; its recorded inode also
                 # proves an incomplete or partially removed one. A failed proof
                 # stops cleanup rather than disabling either check.

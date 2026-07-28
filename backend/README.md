@@ -346,7 +346,9 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `500 tools_lock_unavailable`，訊息會列出完整路徑與原地修復 ownership／owner
   read-write 權限的方式，不會假稱有 AI job。後端擁有的既存 `0400`／`0000` inode
   會先在原地補回 owner `rw` 再開啟；不同 owner、非 regular file 或修復失敗則明確
-  中止，migration 也會收到同一個具名錯誤。
+  中止，migration 也會收到同一個具名錯誤。安裝／修訂結尾的 best-effort 清掃若遇到
+  此錯誤，不會把已成功發佈的工具回報成失敗；完整路徑與同一套原地修復方式會寫入
+  backend 的 `afterthread.tool_builder` WARNING console log，之後的工具工作仍會重試清掃。
   lock 檔**不得手動刪除或重建**：新 inode 不會和舊 holder 衝突，保護會無聲失效。
   `flock` 只協調有檢查它的程式碼，這裡的 checker 都由 afterthread 控制，並不是防止
   操作者或工具直接改檔的 sandbox。最後，這個 orphan 保護唯一依賴的工具行為是 child

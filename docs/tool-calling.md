@@ -235,10 +235,16 @@ previous 只來自 `origin.json.previous`，不依目錄排序：
 - `usable`：previous 是另一個合法已提交版本；可退回。
 - `broken`：previous 缺失、無效或自指；不提供 discard，只能修檔或整包刪除。
 
-`DELETE /api/tools/{name}/versions/{vid}` 精確定址畫面那版。後端取得全域名額後先比對
-current，再發布 `current=P`；pointer 發布就是 discard 完成。只有 directory fsync
-確認 pointer 持久後才盡力刪 V；V 在執行就改名 `<vid>.discarded` 交給清掃。無法確認
-持久化時保留 V 但仍回成功，因為多留未指向版本比斷電後留下懸空 current 安全。
+`DELETE /api/tools/{name}/versions/{vid}` 精確定址畫面那版。後端**先取得工具目錄的獨佔
+鎖**——有 AI 工作在跑就直接回 `409 ai_job_in_progress`，**`current` 與 V 完全沒有被動到**，
+可以原地重試。拿到鎖之後才比對 current、發布 `current=P`；pointer 發布就是 discard 完成。
+
+只有 directory fsync 確認 pointer 持久後才盡力刪 V。無法確認持久化時保留 V 但仍回成功，
+因為多留一個沒人指向的版本，比斷電後留下懸空 current 安全。
+
+`<vid>.discarded` **只代表「pointer 已持久化、但刪除失敗，等下次重試」**——不再是「V 還在
+執行所以先停放」。互斥鎖讓「執行中被刪」不可能發生，那條路徑因此在 overall review r15
+一併移除。
 
 ### API 身分與衝突
 

@@ -3738,15 +3738,16 @@ def test_preexisting_restrictive_lock_mode_is_repaired_before_open(
     assert stat.S_IMODE(lock_path.stat().st_mode) & 0o600 == 0o600
 
 
-def test_lock_inode_replacement_breaks_exclusion_and_is_never_normal_acquisition(
+def test_replacing_lock_inode_demonstrates_the_kernel_exclusion_hazard(
     tmp_path: Path,
 ) -> None:
-    """Pin both the persistent-inode rule and the concrete replacement hazard.
+    """Demonstrate why the production-path inode measurements below matter.
 
     A normal second opener must contend with the original shared holder. Once
-    this test deliberately unlinks and recreates the reserved name, the fresh
-    inode no longer contends; observing both locks at once is the reason no
-    production acquisition or cleanup may ever treat this file as replaceable.
+    the TEST deliberately unlinks and recreates the reserved name, the fresh
+    inode no longer contends. This documents kernel behaviour only; unlike the
+    production-path tests, it would stay green if real cleanup code later began
+    making the same unsafe replacement.
     """
 
     root = tmp_path / "tools"
@@ -3772,6 +3773,41 @@ def test_lock_inode_replacement_breaks_exclusion_and_is_never_normal_acquisition
             assert acquired_after_replacement is True
     finally:
         tools.release_tools_lock(shared_fd)
+
+
+@pytest.mark.parametrize("action", ["delete", "discard"])
+def test_destructive_production_paths_preserve_the_persistent_lock_inode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    action: str,
+) -> None:
+    """Delete and discard may remove package data, never the shared lock inode."""
+
+    root = tmp_path / "tools"
+    first = _make_tool(root, "echo", "import sys\n")
+    package = _package_path(first)
+    if action == "discard":
+        second_vid = "20260728T020304Z-fedcba"
+        _add_committed_version(package, second_vid, description="second", output="SECOND")
+        assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    _install_tools(monkeypatch, root)
+
+    lock_fd = tools._open_tools_lock(root)
+    lock_path = root / tools._TOOLS_LOCK_FILENAME
+    before = os.fstat(lock_fd)
+    try:
+        if action == "delete":
+            assert _delete_outcome("echo") == "removed"
+        else:
+            resolution = tools.resolve_current(tools.PackageRoot(package))
+            assert isinstance(resolution, tools.Resolved)
+            outcome = tools.discard_version(resolution)
+            assert isinstance(outcome, tools.ToolRemovalResult)
+            assert outcome.outcome == "removed"
+        after = lock_path.stat()
+    finally:
+        tools.release_tools_lock(lock_fd)
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
 
 
 def test_a_toggle_mid_call_moves_neither_identity(
