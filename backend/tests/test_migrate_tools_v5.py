@@ -727,6 +727,88 @@ def test_owned_incomplete_shell_is_removed_before_assembly_retries(
     _assert_migrated(root)
 
 
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "mid_delete_after_marker",
+        "mid_delete_after_meta",
+        "mid_delete_after_files",
+    ],
+)
+def test_pending_assemble_shell_cleanup_fault_matrix_retries_from_external_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fault: str,
+) -> None:
+    """Partial shell rmtree resumes forward using its durable deletion authority."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    shell = migration._shell_path(root, "alpha")
+    real_write = migration._write_shell_file
+    assembly_interrupted = False
+
+    def interrupt_before_current(path: Path, data: bytes, mode: int = 0o600) -> None:
+        nonlocal assembly_interrupted
+        current = shell / migration._META_DIRNAME / "current"
+        if path == current and not assembly_interrupted:
+            assembly_interrupted = True
+            raise InjectedCrash()
+        real_write(path, data, mode)
+
+    monkeypatch.setattr(migration, "_write_shell_file", interrupt_before_current)
+    with pytest.raises(InjectedCrash):
+        _run(root)
+
+    version = shell / migration._VERSIONS_DIRNAME / _VID
+    real_rmtree = migration.shutil.rmtree
+    deletion_interrupted = False
+
+    def interrupt_shell_delete(path: Path, *args: Any, **kwargs: Any) -> None:
+        nonlocal deletion_interrupted
+        if Path(path) == shell and not deletion_interrupted:
+            deletion_interrupted = True
+            # Recursive deletion can visit the ownership marker before any
+            # content. Model that hazardous ordering first, then interrupt at
+            # progressively later points instead of preserving the proof.
+            meta = shell / migration._META_DIRNAME
+            marker = meta / migration._OWNERSHIP_FILENAME
+            marker.unlink()
+            if fault in {"mid_delete_after_meta", "mid_delete_after_files"}:
+                (meta / "state.json").unlink()
+                meta.rmdir()
+            if fault == "mid_delete_after_files":
+                (version / "tool.json").unlink()
+                (version / "run.py").unlink()
+            assert (version / "data").is_dir()
+            raise InjectedCrash()
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(migration.shutil, "rmtree", interrupt_shell_delete)
+    with pytest.raises(InjectedCrash):
+        _run(root)
+
+    journal = json.loads((root / migration._JOURNAL_FILENAME).read_text(encoding="utf-8"))
+    assert journal["status"] == "running"
+    assert journal["packages"][0]["pending"] == "assemble"
+    assert journal["packages"][0]["deletion"] == {
+        "path": shell.name,
+        "role": "shell",
+        "identity": journal["packages"][0]["shell_identity"],
+    }
+    assert shell.is_dir()
+    assert not (shell / migration._META_DIRNAME / migration._OWNERSHIP_FILENAME).exists()
+    assert (version / "data").is_dir()
+    if fault == "mid_delete_after_files":
+        assert not (version / "tool.json").exists()
+
+    seen: list[str] = []
+    guard = PointFailureOperations({}, seen=seen)
+    assert _run(root, operations=guard) == 0
+    assert not any("rollback" in point for point in seen)
+    _assert_migrated(root)
+
+
 def test_foreign_committed_tombstone_survives_and_blocks_cleanup(
     tmp_path: Path,
 ) -> None:
@@ -1022,11 +1104,20 @@ def test_rollback_cleanup_removes_a_genuine_journal_owned_artifact(tmp_path: Pat
     assert not (root / migration._JOURNAL_FILENAME).exists()
 
 
-def test_rolled_back_cleanup_survives_marker_first_partial_delete(
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "mid_delete_after_marker",
+        "mid_delete_after_meta",
+        "mid_delete_after_files",
+    ],
+)
+def test_rolled_back_shell_cleanup_fault_matrix_retries_from_external_authority(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    fault: str,
 ) -> None:
-    """Rollback retries from external authority after rmtree removes the shell marker."""
+    """Rollback retries from external authority after partial shell rmtree."""
 
     root = tmp_path / "tools"
     original = _make_package(root)
@@ -1039,8 +1130,22 @@ def test_rolled_back_cleanup_survives_marker_first_partial_delete(
         nonlocal interrupted
         if Path(path) == shell and not interrupted:
             interrupted = True
-            (shell / migration._META_DIRNAME / migration._OWNERSHIP_FILENAME).unlink()
-            raise OSError("injected interruption after deleting shell marker")
+            # Recursive deletion can visit the ownership marker before any
+            # content. Model that hazardous ordering first, then interrupt at
+            # progressively later points instead of preserving the proof.
+            meta = shell / migration._META_DIRNAME
+            marker = meta / migration._OWNERSHIP_FILENAME
+            marker.unlink()
+            if fault in {"mid_delete_after_meta", "mid_delete_after_files"}:
+                (meta / "current").unlink()
+                (meta / "state.json").unlink()
+                meta.rmdir()
+            if fault == "mid_delete_after_files":
+                version = shell / migration._VERSIONS_DIRNAME / _VID
+                (version / "tool.json").unlink()
+                (version / "run.py").unlink()
+            assert (shell / migration._VERSIONS_DIRNAME / _VID / "data").is_dir()
+            raise OSError("injected interruption during recursive delete")
         real_rmtree(path, *args, **kwargs)
 
     monkeypatch.setattr(migration.shutil, "rmtree", interrupt_shell_delete)
@@ -1065,6 +1170,9 @@ def test_rolled_back_cleanup_survives_marker_first_partial_delete(
     assert _snapshot_tree(root / "alpha") == before
     assert shell.is_dir()
     assert not (shell / migration._META_DIRNAME / migration._OWNERSHIP_FILENAME).exists()
+    assert (shell / migration._VERSIONS_DIRNAME / _VID / "data").is_dir()
+    if fault == "mid_delete_after_files":
+        assert not (shell / migration._VERSIONS_DIRNAME / _VID / "tool.json").exists()
 
     assert _run(root) == 1
 

@@ -128,25 +128,33 @@ P1 已經拆掉其中一個根因（開關就地改寫 manifest）。本設計�
 **「不准碰」不是強制力**：builder 的指示會寫明保留名稱，但 builder session 有 shell。現行的
 `_strip_builder_sidecars` 必須繼續存在，比對對象是「build 根目錄下的 `.afterthread.meta/`」。
 
-## 5. 三種目錄，三個型別
+## 5. 目錄的型別
 
 餵錯目錄**不會報錯，只會安靜地答錯**。第四輪我用了一個 `ResolvedPackage(package_root,
 version_root, vid)`，第五輪指出它**表達不了必須處理的狀態**：`_scan_package` 要處理
 `current` 壞掉、vid 不存在、版本未提交——這些情況下**根本沒有合法的 version_root**；而
 `delete_tool` 與清掃要走訪**所有**版本，一個 version_root 也裝不下。
 
-正確的形狀是**三個型別，其中一個是和型別（sum type）**：
+正確的形狀是**每種目錄一個型別，加上一個和型別（sum type）**。實作過程中又長出兩個
+（overall review r8、r9），原因都一樣：**一個記載了自己不強制的不變量的型別，比誠實的別名
+更糟，因為下一個讀者會相信它。**
 
 | 型別 | 是什麼 | 誰拿它 |
 |---|---|---|
 | `PackageRoot` | 已安裝的套件目錄 | `package_enabled`、`_read_enabled_state`、`.env` 載入與遮蔽、`delete_tool`、discard、清掃 |
 | `VersionRoot` | 一個已安裝的版本目錄 | `package_identity`、子行程 cwd、`directory_identity`、`read_tool_meta` |
 | `BuildRoot` | **還沒安裝的工具內容目錄**（staging 的 build 或 shell 裡的版本） | 安裝前的內容驗證 |
-| `Resolution` | **`Resolved(PackageRoot, VersionRoot, vid)` 或 `Unresolved(PackageRoot, 原因)`** | 解析 `current` 的唯一出口 |
+| `PackageLayoutRoot` | **套件形狀的版面，但不保證已安裝**（遷移的殼、`.at-migrated` 兄弟目錄） | 遷移的解析 |
+| `Resolution` | **`Resolved(PackageRoot, VersionRoot, vid)` 或 `Unresolved(PackageRoot, 原因)`** | 解析已安裝套件的 `current` |
+| `PackageLayoutResolution` | 同上，但針對 `PackageLayoutRoot` | 遷移解析 `current`；與上者共用同一份解析規則 |
 
 - **只有 `Resolved` 那一支帶得出 `VersionRoot`**，所以「沒有生效版本」是型別上的另一支，
   不是一個必須記得檢查的 None。
 - 走訪所有版本的操作收 `PackageRoot`，自己列舉 `VersionRoot`。
+- **`PackageRoot` 只代表真正已安裝的套件。** 遷移曾經把殼與 `.at-migrated` 硬包成它——
+  當時沒壞，只因為 resolver 還沒檢查任何「已安裝」的性質；而契約一旦邀請別人加上那種檢查，
+  帶著完整殼的遷移續跑就會被誤判。`PackageLayoutRoot` 是為此分出來的，**兩條 resolver 共用
+  同一份解析實作**，所以規則不會有第二份拼法。
 
 **`_scan_package` 現在做的是兩件事，必須拆開**（第六輪 finding 3）。它今天同時被兩種呼叫端
 使用：`list_tools` 拿它掃**已安裝的套件**，而 `validate_package` 拿它驗**還沒安裝的 staging
