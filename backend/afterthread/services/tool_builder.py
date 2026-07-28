@@ -1685,7 +1685,7 @@ def _promote_staging(
     origin: dict[str, Any],
     secret_name: str | None = None,
     secret_value: str | None = None,
-) -> str | None:
+) -> tuple[tools.Resolved | None, str | None]:
     """Assemble a complete package shell and atomically install it.
 
     Build validation happens before assembly. The committed version and package
@@ -1694,18 +1694,18 @@ def _promote_staging(
     """
     root_error = _verify_staging_root(build_root.path, base)
     if root_error is not None:
-        return root_error
+        return None, root_error
     if _entry_exists(shell_root):
-        return _ERROR_STAGING_TAMPERED
+        return None, _ERROR_STAGING_TAMPERED
     strip_error = _strip_builder_sidecars(build_root.path)
     if strip_error is not None:
-        return strip_error
+        return None, strip_error
     error = tools.validate_tool_content(build_root, expected_name=name)
     if error is not None:
-        return f"工具包驗證失敗：{error}"  # noqa: RUF001
+        return None, f"工具包驗證失敗：{error}"  # noqa: RUF001
     target = base / name
     if _entry_exists(target):
-        return _ERROR_NAME_TAKEN
+        return None, _ERROR_NAME_TAKEN
 
     try:
         base.mkdir(parents=True, exist_ok=True)
@@ -1714,48 +1714,57 @@ def _promote_staging(
         versions.mkdir()
         (shell_root / tools._META_DIRNAME).mkdir()
     except OSError as exc:
-        return f"無法組裝工具包（{type(exc).__name__}）。"  # noqa: RUF001
+        return None, f"無法組裝工具包（{type(exc).__name__}）。"  # noqa: RUF001
 
     vid = _choose_unused_vid(versions)
     if vid is None:
-        return _ERROR_VERSION_ID_WRITE
+        return None, _ERROR_VERSION_ID_WRITE
     version = versions / vid
     try:
         os.rename(build_root.path, version)
         (version / tools._META_DIRNAME).mkdir()
     except OSError as exc:
-        return f"無法組裝工具包（{type(exc).__name__}）。"  # noqa: RUF001
+        return None, f"無法組裝工具包（{type(exc).__name__}）。"  # noqa: RUF001
     if not tools.write_origin_meta(tools.BuildRoot(version), origin | {"previous": None}):
-        return _ERROR_ORIGIN_WRITE
+        return None, _ERROR_ORIGIN_WRITE
 
     # The committed marker and every entry it describes must survive before the
     # package-level pointer is allowed to name this version.
     if not _fsync_tree(version) or not _fsync_directory(versions):
-        return _ERROR_DURABILITY
+        return None, _ERROR_DURABILITY
     package_root = tools.PackageRoot(shell_root)
     if not tools.write_package_state(package_root, True):
-        return _ERROR_INSTALL_STATE_WRITE
+        return None, _ERROR_INSTALL_STATE_WRITE
     if not tools.publish_current(package_root, vid):
-        return _ERROR_CURRENT_WRITE
+        return None, _ERROR_CURRENT_WRITE
     if secret_name and secret_value:
         inject_error = _inject_secret_into_env(shell_root / ".env", secret_name, secret_value)
         if inject_error is not None:
-            return inject_error
+            return None, inject_error
 
     # Persist the complete package shell, including backend-owned metadata and the
     # operator-supplied package-layer .env, before its one atomic install rename.
     # Then persist the parent entry before success.
     if not _fsync_tree(shell_root):
-        return _ERROR_DURABILITY
+        return None, _ERROR_DURABILITY
     if _entry_exists(target):
-        return _ERROR_NAME_TAKEN
+        return None, _ERROR_NAME_TAKEN
     try:
         os.rename(shell_root, target)
     except OSError as exc:
-        return f"工具包搬移失敗（{type(exc).__name__}）。"  # noqa: RUF001
+        return None, f"工具包搬移失敗（{type(exc).__name__}）。"  # noqa: RUF001
     if not _fsync_directory(base):
-        return _ERROR_DURABILITY
-    return None
+        return None, _ERROR_DURABILITY
+    # Carry the identity established by this publish across later decoration.
+    # Re-resolving ``current`` there would make this last typed-identity guarantee
+    # a caller convention instead of a property of the publisher's return type.
+    published = tools.Resolved(
+        tools.PackageRoot(target),
+        tools.VersionRoot(target / tools._VERSIONS_DIRNAME / vid),
+        vid,
+        tools.PREVIOUS_NULL,
+    )
+    return published, None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2092,7 +2101,7 @@ async def run_install(
                 env_keys=env_keys,
             )
 
-        promote_error = await run_in_threadpool(
+        published, promote_error = await run_in_threadpool(
             _promote_staging,
             build_root,
             shell_root,
@@ -2116,6 +2125,7 @@ async def run_install(
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
             )
+        assert published is not None
         # D40: the package is INSTALLED as of the line above -- everything from
         # here on is decoration. Generate its AI summary sidecar while we still
         # hold the install's context (the OpenAPI url and instructions are
@@ -2139,7 +2149,7 @@ async def run_install(
         # and on a sidecar read-back, which covers hand-edited and pre-fix files;
         # this is what keeps the RAW value from ever being handed over at all.
         await tool_meta.generate_and_store_summary(
-            result.tool_name,
+            published,
             origin={
                 "openapi_url": tool_meta._sanitized_origin_url(openapi_url),
                 "instructions": instructions,

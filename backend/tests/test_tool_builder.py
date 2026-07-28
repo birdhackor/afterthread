@@ -743,6 +743,52 @@ def test_run_install_writes_the_summary_sidecar(
     assert outcome.llm_log_id == llm_log.last_record_id_for_workflow("tool_install")
 
 
+def test_install_summary_stays_on_the_typed_published_version_when_current_moves(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The publish->hook hop carries V; a current edit cannot redirect it."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built and tested", "ready": True},
+        files={"tool.json": json.dumps(_package_manifest("kbsearch")), "run.py": _GOOD_RUN_PY},
+    )
+    _fake_summary_generate(monkeypatch, summary="只描述安裝建立的版本 V")
+    _no_fetch(monkeypatch)
+    real_hook = tool_meta.generate_and_store_summary
+    captured: dict[str, tools.Resolved] = {}
+    alternate_vid = "20260728T020304Z-fedcba"
+
+    async def move_current_before_summary(
+        target: tools.Resolved,
+        *,
+        origin: dict[str, Any] | None = None,
+        builder_summary: str | None = None,
+    ) -> None:
+        captured["target"] = target
+        alternate = target.package_root.path / tools._VERSIONS_DIRNAME / alternate_vid
+        shutil.copytree(target.version_root.path, alternate)
+        assert tools.publish_current(target.package_root, alternate_vid)
+        await real_hook(target, origin=origin, builder_summary=builder_summary)
+
+    monkeypatch.setattr(tool_meta, "generate_and_store_summary", move_current_before_summary)
+
+    outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build a search tool"))
+
+    assert outcome.ok is True
+    published = captured["target"]
+    assert published.package_root.path == root / "kbsearch"
+    assert published.version_root.path.parent.name == tools._VERSIONS_DIRNAME
+    current = tools.resolve_current(published.package_root)
+    assert isinstance(current, tools.Resolved)
+    assert current.vid == alternate_vid
+    published_meta = tools.read_tool_meta(published.version_root)
+    assert published_meta is not None
+    assert published_meta["summary"] == "只描述安裝建立的版本 V"
+    assert tools.read_tool_meta(current.version_root) is None
+
+
 def test_run_install_never_captures_url_credentials(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1251,7 +1297,7 @@ def test_run_install_fails_closed_when_the_forged_sidecar_cannot_be_deleted(
 
 
 def _promote_for_test(staging: Path, name: str, base: Path) -> str | None:
-    return tool_builder._promote_staging(
+    _, error = tool_builder._promote_staging(
         tools.BuildRoot(staging),
         staging.parent / "shell",
         name,
@@ -1263,6 +1309,7 @@ def _promote_for_test(staging: Path, name: str, base: Path) -> str | None:
             "feedback": None,
         },
     )
+    return error
 
 
 def test_promote_staging_refuses_symlinked_staging_root(tmp_path: Path) -> None:

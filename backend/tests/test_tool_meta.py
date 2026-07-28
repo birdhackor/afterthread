@@ -154,6 +154,13 @@ def _version_root(version: Path) -> tools.VersionRoot:
     return tools.VersionRoot(version)
 
 
+def _resolved(version: Path) -> tools.Resolved:
+    resolution = tools.resolve_current(_package_root(version))
+    assert isinstance(resolution, tools.Resolved)
+    assert resolution.version_root == _version_root(version)
+    return resolution
+
+
 def _installed_version(root: Path, name: str = "kbsearch") -> tools.VersionRoot:
     return tools.VersionRoot(root / name / tools._VERSIONS_DIRNAME / _TEST_VID)
 
@@ -781,7 +788,7 @@ def test_generate_and_store_summary_writes_a_sidecar(
 
     asyncio.run(
         generate_and_store_summary(
-            "kbsearch",
+            _resolved(pkg),
             origin=origin,
             builder_summary="built it",
         )
@@ -811,7 +818,7 @@ def test_summary_workflow_never_collides_with_the_install_session(
     summary session finishes, or the install outcome's llm_log_id would point at
     the summary instead of the build."""
     root = tmp_path / "tools"
-    _package(root)
+    pkg = _package(root)
     _summary_settings(monkeypatch, root)
     recorder = llm_log.LlmInteractionRecorder(workflow="tool_install", model="m")
     recorder.begin_attempt([{"role": "user", "content": "build"}])
@@ -819,7 +826,7 @@ def test_summary_workflow_never_collides_with_the_install_session(
     install_record = llm_log.last_record_id_for_workflow("tool_install")
 
     _fake_generate(monkeypatch)
-    asyncio.run(generate_and_store_summary("kbsearch"))
+    asyncio.run(generate_and_store_summary(_resolved(pkg)))
 
     assert llm_log.last_record_id_for_workflow("tool_install") == install_record
     assert llm_log.last_record_id_for_workflow("tool_summary") != install_record
@@ -836,7 +843,7 @@ def test_generate_and_store_summary_preserves_origin(
     _write_meta(pkg, summary="舊的", origin=origin)
 
     _fake_generate(monkeypatch, summary="新的")
-    asyncio.run(generate_and_store_summary("kbsearch", origin=None))
+    asyncio.run(generate_and_store_summary(_resolved(pkg), origin=None))
 
     meta = tools.read_tool_meta(_version_root(pkg))
     assert meta is not None
@@ -855,7 +862,7 @@ def test_generate_and_store_summary_writes_placeholder_when_no_sidecar_yet(
     _summary_settings(monkeypatch, root)
     _fake_generate(monkeypatch, explode=LLMNotConfiguredError("nope"))
 
-    asyncio.run(generate_and_store_summary("kbsearch", origin={"instructions": "查 KB"}))
+    asyncio.run(generate_and_store_summary(_resolved(pkg), origin={"instructions": "查 KB"}))
 
     meta = tools.read_tool_meta(_version_root(pkg))
     assert meta is not None
@@ -921,7 +928,7 @@ def test_placeholder_carries_no_log_id_when_the_prompt_build_failed(
     monkeypatch.setattr(tool_meta, "_summary_user_prompt", boom)
     monkeypatch.setattr("afterthread.services.tool_meta.generate_structured", must_not_generate)
 
-    asyncio.run(generate_and_store_summary("kbsearch", origin={"instructions": "查 KB"}))
+    asyncio.run(generate_and_store_summary(_resolved(pkg), origin={"instructions": "查 KB"}))
 
     meta = tools.read_tool_meta(_version_root(pkg))
     assert meta is not None
@@ -948,7 +955,7 @@ def test_placeholder_carries_its_own_session_when_the_llm_call_failed(
     previous = _seed_previous_summary_session()
     _fake_generate(monkeypatch, explode=LLMUpstreamError("Timeout: slow"))
 
-    asyncio.run(generate_and_store_summary("kbsearch", origin={"instructions": "查 KB"}))
+    asyncio.run(generate_and_store_summary(_resolved(pkg), origin={"instructions": "查 KB"}))
 
     meta = tools.read_tool_meta(_version_root(pkg))
     assert meta is not None
@@ -967,7 +974,7 @@ def test_generate_and_store_summary_never_clobbers_a_good_summary(
     _write_meta(pkg, summary="先前的好總結")
 
     _fake_generate(monkeypatch, explode=LLMUpstreamError("APIConnectionError: unreachable"))
-    asyncio.run(generate_and_store_summary("kbsearch"))
+    asyncio.run(generate_and_store_summary(_resolved(pkg)))
 
     meta = tools.read_tool_meta(_version_root(pkg))
     assert meta is not None
@@ -985,11 +992,11 @@ def test_generate_and_store_summary_never_raises(
     """It runs AFTER the package is already installed, so nothing it hits may
     escape and flip a successful install to failed."""
     root = tmp_path / "tools"
-    _package(root)
+    pkg = _package(root)
     _summary_settings(monkeypatch, root)
     _fake_generate(monkeypatch, explode=explode)
 
-    asyncio.run(generate_and_store_summary("kbsearch"))  # must not raise
+    asyncio.run(generate_and_store_summary(_resolved(pkg)))  # must not raise
 
 
 def test_generate_and_store_summary_never_raises_when_prompt_building_explodes(
@@ -1007,7 +1014,7 @@ def test_generate_and_store_summary_never_raises_when_prompt_building_explodes(
     monkeypatch.setattr(tools, "known_secret_values", boom)
     _fake_generate(monkeypatch)
 
-    asyncio.run(generate_and_store_summary("kbsearch"))  # must not raise
+    asyncio.run(generate_and_store_summary(_resolved(pkg)))  # must not raise
     # Nothing could be written either (the sidecar write is fail-closed too).
     assert not (pkg / tools._META_DIRNAME / tools._SUMMARY_FILENAME).exists()
 
@@ -1020,12 +1027,12 @@ def test_generate_and_store_summary_ignores_a_refused_write(
     the package is already promoted, so a sidecar it could not write must not
     escape and flip a successful install to failed."""
     root = tmp_path / "tools"
-    _package(root)
+    pkg = _package(root)
     _summary_settings(monkeypatch, root)
     _fake_generate(monkeypatch, summary="這個工具會查 KB")
     monkeypatch.setattr(tools, "write_tool_meta", lambda *args, **kwargs: False)
 
-    asyncio.run(generate_and_store_summary("kbsearch"))  # must not raise
+    asyncio.run(generate_and_store_summary(_resolved(pkg)))  # must not raise
 
 
 def test_generate_and_store_summary_silent_when_package_is_gone(
@@ -1034,14 +1041,18 @@ def test_generate_and_store_summary_silent_when_package_is_gone(
     """A racing delete between promote and summary: nothing to summarize, and
     nothing is written (no ghost package directory is resurrected)."""
     root = tmp_path / "tools"
-    root.mkdir()
+    pkg = _package(root, "ghost")
     _summary_settings(monkeypatch, root)
+    resolution = _resolved(pkg)
+    import shutil
+
+    shutil.rmtree(root / "ghost")
 
     async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("no session may start for a package that is gone")
 
     monkeypatch.setattr("afterthread.services.tool_meta.generate_structured", must_not_generate)
-    asyncio.run(generate_and_store_summary("ghost"))
+    asyncio.run(generate_and_store_summary(resolution))
     assert list(root.iterdir()) == []
 
 
@@ -1057,7 +1068,7 @@ def test_generate_and_store_summary_redacts_into_the_sidecar(
     _summary_settings(monkeypatch, root)
     _fake_generate(monkeypatch, summary=f"it authenticates with {secret}")
 
-    asyncio.run(generate_and_store_summary("kbsearch"))
+    asyncio.run(generate_and_store_summary(_resolved(pkg)))
 
     stored = (pkg / tools._META_DIRNAME / tools._SUMMARY_FILENAME).read_text(encoding="utf-8")
     assert secret not in stored
@@ -1350,7 +1361,7 @@ def test_generate_and_store_summary_writes_nothing_when_the_package_was_replaced
     installed from something else entirely, and every later revise of B would read
     that origin back as first-hand context."""
     root = tmp_path / "tools"
-    _package(root)
+    pkg = _package(root)
     _summary_settings(monkeypatch, root)
 
     def replace_mid_call() -> None:
@@ -1358,7 +1369,7 @@ def test_generate_and_store_summary_writes_nothing_when_the_package_was_replaced
 
     _fake_generate(monkeypatch, summary="A 的說明", side_effect=replace_mid_call)
 
-    asyncio.run(generate_and_store_summary("kbsearch", origin={"instructions": "查 A"}))
+    asyncio.run(generate_and_store_summary(_resolved(pkg), origin={"instructions": "查 A"}))
 
     stored = tools.read_tool_meta(_installed_version(root))
     assert stored is not None
@@ -1377,7 +1388,7 @@ def test_generate_and_store_summary_placeholder_respects_the_replacement(
     placeholder's own "only when there is nothing there" precondition is met at
     the target and only the identity can stop the write."""
     root = tmp_path / "tools"
-    _package(root)
+    pkg = _package(root)
     _summary_settings(monkeypatch, root)
 
     def replace_then_fail() -> None:
@@ -1392,7 +1403,7 @@ def test_generate_and_store_summary_placeholder_respects_the_replacement(
         side_effect=replace_then_fail,
     )
 
-    asyncio.run(generate_and_store_summary("kbsearch", origin={"instructions": "查 A"}))
+    asyncio.run(generate_and_store_summary(_resolved(pkg), origin={"instructions": "查 A"}))
 
     assert tools.read_tool_meta(_installed_version(root)) is None  # B got no sidecar at all
 
@@ -1419,7 +1430,9 @@ def test_the_install_origin_reaches_disk_before_the_llm_round_trip(
 
     _fake_generate(monkeypatch, summary="這個工具會查 KB", side_effect=look_at_the_sidecar)
 
-    asyncio.run(generate_and_store_summary("kbsearch", origin=origin, builder_summary="built it"))
+    asyncio.run(
+        generate_and_store_summary(_resolved(pkg), origin=origin, builder_summary="built it")
+    )
 
     early = seen["meta"]
     assert early is not None
@@ -1478,7 +1491,7 @@ def test_an_enabled_toggle_during_the_generation_now_costs_nothing_at_all(
         assert tools.set_enabled("kbsearch", False) is True
 
     _fake_generate(monkeypatch, summary="這個工具會查 KB", side_effect=toggle_mid_call)
-    asyncio.run(generate_and_store_summary("kbsearch", origin=origin))
+    asyncio.run(generate_and_store_summary(_resolved(pkg), origin=origin))
 
     # The premise, measured in place: the toggle really happened, and really moved
     # nothing the sidecar's identity guard looks at.
@@ -1524,7 +1537,7 @@ def test_summary_paths_refuse_a_package_with_no_manifest_before_the_llm_call(
     captured = _fake_generate(monkeypatch, summary="不該被產生")
 
     assert asyncio.run(_regenerate_summary("kbsearch")) is None
-    asyncio.run(generate_and_store_summary("kbsearch", origin=None))  # must not raise
+    asyncio.run(generate_and_store_summary(_resolved(pkg), origin=None))  # must not raise
 
     assert captured == {}  # no LLM session was started by either path
     assert tools.read_tool_meta(_version_root(pkg)) is None
@@ -1608,8 +1621,11 @@ def test_sidecar_io_never_runs_on_the_event_loop(
     if entry_point == "regenerate":
         asyncio.run(_regenerate_summary("kbsearch"))
     else:
-        asyncio.run(generate_and_store_summary("kbsearch"))
+        asyncio.run(generate_and_store_summary(_resolved(pkg)))
 
-    assert seen["resolve"] is not loop_thread
+    if entry_point == "regenerate":
+        assert seen["resolve"] is not loop_thread
+    else:
+        assert "resolve" not in seen
     assert seen["read"] is not loop_thread
     assert seen["store"] is not loop_thread
