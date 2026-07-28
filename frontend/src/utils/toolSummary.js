@@ -25,50 +25,127 @@ export function toolSummaryKeyPrefix(name) {
 	return [TOOL_SUMMARY_KEY_ROOT, name];
 }
 
-// The exact key for ONE tool INSTANCE's summary. `description` is an instance
-// discriminator, not part of the address: the fetch URL only ever carries the
-// name (the backend has no other way to name a tool), exactly as LlmLogsPage
-// folds `started_at` into its `["llm-log", id, started_at]` key while fetching
-// by id alone.
+// A tool NAME is reassignable, while `current_vid` names the exact version the
+// row describes. The old discriminator was `description`, an explicitly
+// heuristic stand-in used only because the list API had no real instance id.
+// That proxy failed when two versions had byte-identical descriptions: React
+// kept the row (and its unsent revise draft) alive across a discard.
 //
-// Why a discriminator is needed at all: a tool NAME is reassignable. Another
-// browser tab -- or any process with filesystem access -- can delete a tool and
-// install a DIFFERENT one under the same name, and this QueryClient sees none of
-// it (deleteMutation's removeQueries only covers deletions THIS client
-// performed). Keyed on the name alone, the new tool's panel would open on the
-// old tool's cached summary/AI-日誌 link.
-//
-// Why `description` specifically: GET /api/tools returns
-// {name, description, enabled, valid, error} per row (backend
-// schemas.ToolSummary) and carries no install id or timestamp, so there is no
-// true instance identity to use. Of those fields, `description` is the only one
-// an INSTALL writes -- it comes from the package's tool.json, authored by that
-// install's own AI builder session -- while `enabled`/`valid`/`error` say
-// nothing about which package this is.
-// It is a heuristic, not a proof: see the residual noted at this key's use site
-// in ToolsPage, which is why the panel ALSO guards what it renders.
-export function toolSummaryQueryKey(name, description) {
-	return [...toolSummaryKeyPrefix(name), description];
+// Keep the canonical identity smaller than a query key: summary-prefix
+// invalidation is address-shaped (`name`), whereas row/cache/job ownership is
+// instance-shaped (`name + currentVid`). JSON.stringify makes the result a
+// stable React key without relying on a delimiter that a name might contain.
+export function toolInstanceKey(name, currentVid) {
+	return JSON.stringify([name, currentVid ?? null]);
 }
 
-// The same instance identity as a STRING, for the row's React `key`. Built FROM
-// toolSummaryQueryKey rather than re-spelled, because the two are ONE question
-// asked in two places: the cache key decides which summary body belongs to this
-// row, the React key decides whether the row -- and the unsent revise feedback
-// typed into it -- survives or is remounted. Keyed on the NAME alone, a row kept
-// its identity across a same-name reinstall while its summary query correctly
-// moved to a new entry: the user could type feedback for tool A, have a
-// background refetch swap in tool B underneath, and submit that text against B.
-// Whatever discriminator this project can prove later, both move together.
+// Invariant H's three surviving consumers are returned by ONE function so the
+// component never gets an opportunity to re-spell one of them:
 //
-// JSON.stringify over an array of primitives is byte-for-byte what TanStack
-// Query's own hashKey does to such a key (query-core utils.js line 85: a
-// JSON.stringify whose replacer only sorts PLAIN OBJECT keys, of which there are
-// none here), so two rows collide on the React key exactly when they would
-// collide on the cache key -- including the residual where two installs produce
-// byte-identical descriptions.
-export function toolInstanceKey(name, description) {
-	return JSON.stringify(toolSummaryQueryKey(name, description));
+// * rowKey remounts the React row and drops its local draft;
+// * summaryQueryKey files the version's summary in its own cache entry;
+// * jobAttributionKey keeps a submitted revise card with that same version.
+//
+// The old finalize write-ordering ledger was removed with finalize in web-v5
+// P2a; nothing reads it, so there is intentionally no fourth field here.
+export function toolIdentityConsumers(name, currentVid) {
+	const instanceKey = toolInstanceKey(name, currentVid);
+	return {
+		rowKey: instanceKey,
+		summaryQueryKey: [...toolSummaryKeyPrefix(name), instanceKey],
+		jobAttributionKey: instanceKey,
+	};
+}
+
+export function toolSummaryQueryKey(name, currentVid) {
+	return toolIdentityConsumers(name, currentVid).summaryQueryKey;
+}
+
+// A GET is addressed by name, so it can start while V is current and actually
+// read P after a concurrent discard. Throwing inside the query function is the
+// only safe outcome: returning the payload would let TanStack Query write P
+// into V's key, while returning a sentinel would itself become cached data and
+// could render as a false "尚無總結".
+export function acceptSummaryForVersion(currentVid, detail) {
+	if (detail?.current_vid === currentVid) {
+		return detail;
+	}
+	const error = new Error("工具版本已變更，已忽略過期的總結回應");
+	error.name = "SummaryVersionMismatchError";
+	error.status = 409;
+	error.code = "version_mismatch";
+	throw error;
+}
+
+// Version-specific request builders live beside the identity they carry. The
+// component consumes these objects directly, so revise/regenerate cannot drift
+// back to an empty body and discard cannot accidentally fall back to the
+// name-only DELETE route.
+export function buildReviseRequest({ name, currentVid, feedback }) {
+	return {
+		path: `/api/tools/${name}/revise`,
+		body: { feedback, expected_vid: currentVid },
+	};
+}
+
+export function buildRegenerateRequest({ name, currentVid }) {
+	return {
+		path: `/api/tools/${name}/summary/regenerate`,
+		body: { expected_vid: currentVid },
+	};
+}
+
+export function buildDiscardRequest({ name, currentVid }) {
+	return {
+		path: `/api/tools/${name}/versions/${currentVid}`,
+	};
+}
+
+// Structured 409s are instructions, not interchangeable conflicts. Keeping the
+// dispatch pure makes it impossible for UI code to branch on translated message
+// text, and gives the no-refetch cases an explicit default.
+export function versionWriteConflictReaction({ status, code } = {}) {
+	if (status !== 409) {
+		return null;
+	}
+	if (code === "version_mismatch") {
+		return "refresh";
+	}
+	if (code === "job_busy") {
+		return "retry";
+	}
+	if (code === "lineage_unavailable") {
+		return "delete-tool";
+	}
+	return null;
+}
+
+// The list exposes exactly three lineage states. A missing current version is
+// the unresolved-row case and overrides even the ordinary controls: there is no
+// version that can be toggled, summarized, revised, regenerated or discarded.
+export function toolLineageControls(
+	{ current_vid: currentVid, lineage },
+	lineageUnavailable = false,
+) {
+	const unresolved = currentVid == null;
+	const effectiveLineage = lineageUnavailable ? "broken" : lineage;
+	let discardAction = "none";
+	let showBrokenLineage = false;
+	if (!unresolved && effectiveLineage === "sole") {
+		discardAction = "delete-tool";
+	} else if (!unresolved && effectiveLineage === "usable") {
+		discardAction = "discard-version";
+	} else if (!unresolved) {
+		// `broken` is the only remaining wire state. An out-of-contract value
+		// degrades to the same safe UI instead of accidentally offering discard.
+		showBrokenLineage = true;
+	}
+	return {
+		unresolved,
+		showVersionControls: !unresolved,
+		discardAction,
+		showBrokenLineage,
+	};
 }
 
 // --- the panel's OWN busy state ----------------------------------------------
@@ -108,9 +185,10 @@ export function ownSummaryBusy({
 // Why it must not create: deleteMutation clears this tool's entries with
 // removeQueries, but it cannot un-send a regenerate request already on the
 // wire. That response then arrived at a plain `setQueryData(key, detail)`,
-// which RESURRECTED the deleted tool's detail entry -- and a same-name,
-// same-description reinstall inside the 5-minute gc window would open its panel
-// on it.
+// which RESURRECTED the deleted version's detail entry. The current_vid key
+// prevents ordinary reinstalls from observing it, but a removed entry should
+// still stay removed rather than retain unreachable data until garbage
+// collection (and a manually restored package can reuse its exact vid).
 //
 // No legitimate write is lost to this. A CREATING write would need the buttons
 // to be pressable while the entry has no data, and they never are: the panel's
@@ -132,36 +210,27 @@ export function writeSummaryDetailIfPresent(detail) {
 // means the failure says nothing about server state and a refetch would be
 // noise (and would hide, not help -- a 502 storm refetching on every retry).
 //
-// The two that prove the world moved are checked against the routes that can
-// raise them:
+// The one generic failure that proves the world moved is checked against every
+// summary route:
 //
 // * 404 -- every summary route resolves the package first and answers the same
 //   fixed 404 when it is gone. The tool this panel is showing does not answer
 //   to that name any more; the copy tells the user the list may be stale, and
 //   this is what makes that remedy real instead of advice.
-// * 409 `tool_job_in_progress` -- ANOTHER actor holds the single-flight slot,
-//   which is a fact about the world we did not know a moment ago: something
-//   outside this page is mid-operation on this backend, and when it finishes it
-//   may have replaced the very package we are looking at. This one used to be
-//   in the list below, on the ground that "that job has not written anything
-//   yet" -- true of the job, and beside the point (D40 P4 r8 inverted it and
-//   recorded why). Revalidating does not make the foreign job observable -- we
-//   hold no id for it and cannot be told when it ends -- so this only re-reads
-//   the CURRENT truth. Acting on a foreign job's COMPLETION is the residual
-//   family bounded by 裁決紀錄 #7 (a name-addressed API plus no instance
-//   identity in GET /api/tools).
 //
 // Deliberately NOT refetching, with the reason each time:
 //
+// * 409 `job_busy` -- the operator's input must remain in place for a retry;
+// * 409 `lineage_unavailable` -- a hand-broken previous pointer does not repair
+//   itself by being read again; the UI instead offers whole-tool deletion;
+// * 409 `version_mismatch` -- handled separately as a LIST-only refresh, whose
+//   changed current_vid remounts the row. It must not use this broad helper;
 // * `llm_not_configured` / 502 -- the call failed BEFORE anything could reach
 //   the sidecar, so the cache is exactly as right (or wrong) as it was;
 // * 5xx and transport failures -- no evidence about server state at all, and a
 //   storm of them would refetch on every retry, hiding rather than helping.
-export function summaryErrorRevalidates({ status, code } = {}) {
-	if (status === 404) {
-		return true;
-	}
-	return status === 409 && code === "tool_job_in_progress";
+export function summaryErrorRevalidates({ status } = {}) {
+	return status === 404;
 }
 
 // --- the AI 日誌 deep link (R9-1) --------------------------------------------

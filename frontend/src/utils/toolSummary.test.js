@@ -1,22 +1,29 @@
+import { QueryClient } from "@tanstack/react-query";
 import { describe, expect, it } from "vitest";
 import {
+	acceptSummaryForVersion,
+	buildDiscardRequest,
+	buildRegenerateRequest,
+	buildReviseRequest,
 	deepLinkTarget,
 	logLinkSearch,
 	ownSummaryBusy,
 	summaryErrorRevalidates,
+	toolIdentityConsumers,
 	toolInstanceKey,
+	toolLineageControls,
 	toolSummaryKeyPrefix,
 	toolSummaryQueryKey,
+	versionWriteConflictReaction,
 	writeSummaryDetailIfPresent,
 } from "./toolSummary.js";
 
 describe("toolSummaryQueryKey / toolSummaryKeyPrefix", () => {
-	it("folds the instance discriminator in after the name", () => {
-		expect(toolSummaryQueryKey("kb_search", "查詢內部知識庫")).toEqual([
-			"tool-summary",
-			"kb_search",
-			"查詢內部知識庫",
-		]);
+	it("folds the canonical version identity in after the name", () => {
+		const instanceKey = toolInstanceKey("kb_search", "20260728T010203Z-abc123");
+		expect(toolSummaryQueryKey("kb_search", "20260728T010203Z-abc123")).toEqual(
+			["tool-summary", "kb_search", instanceKey],
+		);
 	});
 
 	it("keeps the prefix a real prefix of the exact key", () => {
@@ -26,70 +33,216 @@ describe("toolSummaryQueryKey / toolSummaryKeyPrefix", () => {
 		// nothing -- the exact failure mode `exact: true` produced once the key
 		// grew a third element.
 		const prefix = toolSummaryKeyPrefix("kb_search");
-		const exact = toolSummaryQueryKey("kb_search", "任何描述");
+		const exact = toolSummaryQueryKey("kb_search", "20260728T010203Z-abc123");
 		expect(exact.slice(0, prefix.length)).toEqual(prefix);
 	});
 
-	it("separates two tools that differ only by description", () => {
-		// The whole point: same NAME, different install -> different cache entry.
-		expect(toolSummaryQueryKey("kb", "第一次安裝")).not.toEqual(
-			toolSummaryQueryKey("kb", "重裝後的新描述"),
+	it("separates two versions of the same tool", () => {
+		expect(toolSummaryQueryKey("kb", "20260728T010203Z-abc123")).not.toEqual(
+			toolSummaryQueryKey("kb", "20260728T020304Z-def456"),
 		);
 		// ...and the prefix still gathers both, which is what delete must clear.
 		expect(toolSummaryKeyPrefix("kb")).toEqual(toolSummaryKeyPrefix("kb"));
 	});
 });
 
-describe("toolInstanceKey", () => {
+describe("Invariant H — all instance consumers share current_vid", () => {
 	it("is a string (React keys are not arrays)", () => {
-		expect(typeof toolInstanceKey("kb", "描述")).toBe("string");
+		expect(typeof toolInstanceKey("kb", "20260728T010203Z-abc123")).toBe(
+			"string",
+		);
 	});
 
-	it("separates the same name under two different descriptions", () => {
-		// The whole point of keying the ROW on this: a same-name reinstall must
-		// remount the row, so the revise feedback typed for the old instance cannot
-		// be submitted against the new one.
-		expect(toolInstanceKey("kb", "第一次安裝")).not.toBe(
-			toolInstanceKey("kb", "重裝後的新描述"),
+	it("changes when only the vid changes and descriptions are byte-identical", () => {
+		const versionV = {
+			name: "kb",
+			description: "逐位元組相同的描述",
+			current_vid: "20260728T010203Z-abc123",
+		};
+		const versionP = {
+			...versionV,
+			current_vid: "20260727T010203Z-def456",
+		};
+
+		expect(toolInstanceKey(versionV.name, versionV.current_vid)).not.toBe(
+			toolInstanceKey(versionP.name, versionP.current_vid),
+		);
+		expect(versionV.description).toBe(versionP.description);
+	});
+
+	it("returns row, summary-cache and job attribution from one function", () => {
+		const identity = toolIdentityConsumers("kb", "20260728T010203Z-abc123");
+		const canonical = toolInstanceKey("kb", "20260728T010203Z-abc123");
+
+		expect(identity).toEqual({
+			rowKey: canonical,
+			summaryQueryKey: ["tool-summary", "kb", canonical],
+			jobAttributionKey: canonical,
+		});
+		expect(toolSummaryQueryKey("kb", "20260728T010203Z-abc123")).toEqual(
+			identity.summaryQueryKey,
 		);
 	});
 
 	it("separates two different names, and is stable for equal inputs", () => {
-		expect(toolInstanceKey("a", "同一段描述")).not.toBe(
-			toolInstanceKey("b", "同一段描述"),
-		);
-		expect(toolInstanceKey("kb", "描述")).toBe(toolInstanceKey("kb", "描述"));
+		const vid = "20260728T010203Z-abc123";
+		expect(toolInstanceKey("a", vid)).not.toBe(toolInstanceKey("b", vid));
+		expect(toolInstanceKey("kb", vid)).toBe(toolInstanceKey("kb", vid));
 	});
 
-	it("agrees with the summary cache key on every pair it is given", () => {
-		// The invariant that makes the row and its summary ONE identity: two rows
-		// share a React key exactly when they share a cache entry. Pinned as an
-		// equivalence so a future change to either spelling has to break a test.
-		const pairs = [
-			["kb", "描述 A"],
-			["kb", "描述 B"],
-			["other", "描述 A"],
-			["kb", null],
-			["kb", undefined],
-			["kb", ""],
-		];
-		for (const [nameA, descA] of pairs) {
-			for (const [nameB, descB] of pairs) {
-				const sameKey =
-					toolInstanceKey(nameA, descA) === toolInstanceKey(nameB, descB);
-				const sameCacheKey =
-					JSON.stringify(toolSummaryQueryKey(nameA, descA)) ===
-					JSON.stringify(toolSummaryQueryKey(nameB, descB));
-				expect(sameKey).toBe(sameCacheKey);
-			}
-		}
-	});
-
-	it("treats a missing description as one identity, not two", () => {
-		// GET /api/tools may omit description entirely or send null; both mean
-		// "this install wrote no description", so they must not split one tool
-		// into two rows/cache entries that flip as the field appears.
+	it("normalizes a missing current vid for the unresolved row", () => {
 		expect(toolInstanceKey("kb", null)).toBe(toolInstanceKey("kb", undefined));
+	});
+});
+
+describe("Invariant J — wrong-version summaries never enter a cache", () => {
+	const versionV = "20260728T010203Z-abc123";
+	const versionP = "20260727T010203Z-def456";
+
+	it("returns the exact payload when it belongs to the row", () => {
+		const detail = {
+			current_vid: versionV,
+			summary: "V 的總結",
+			updated_at: null,
+			llm_log_id: null,
+		};
+		expect(acceptSummaryForVersion(versionV, detail)).toBe(detail);
+	});
+
+	it("rejects a payload that actually read another version", () => {
+		const detail = {
+			current_vid: versionP,
+			summary: "P 的總結",
+			updated_at: null,
+			llm_log_id: null,
+		};
+		expect(() => acceptSummaryForVersion(versionV, detail)).toThrowError(
+			expect.objectContaining({
+				name: "SummaryVersionMismatchError",
+				code: "version_mismatch",
+			}),
+		);
+	});
+
+	it("leaves the version-keyed TanStack cache without payload data", async () => {
+		const queryClient = new QueryClient({
+			defaultOptions: { queries: { retry: false } },
+		});
+		const queryKey = ["tool-summary", "kb", versionV];
+		const detail = {
+			current_vid: versionP,
+			summary: "P 的總結",
+			updated_at: null,
+			llm_log_id: null,
+		};
+
+		await expect(
+			queryClient.fetchQuery({
+				queryKey,
+				queryFn: () => acceptSummaryForVersion(versionV, detail),
+			}),
+		).rejects.toMatchObject({ code: "version_mismatch" });
+		expect(queryClient.getQueryData(queryKey)).toBeUndefined();
+	});
+});
+
+describe("Invariant K — every version-specific write carries the vid", () => {
+	const name = "kb_search";
+	const currentVid = "20260728T010203Z-abc123";
+
+	it("puts expected_vid in the revise body", () => {
+		expect(
+			buildReviseRequest({ name, currentVid, feedback: "限制為五筆" }),
+		).toEqual({
+			path: "/api/tools/kb_search/revise",
+			body: {
+				feedback: "限制為五筆",
+				expected_vid: currentVid,
+			},
+		});
+	});
+
+	it("puts expected_vid in the regenerate body", () => {
+		expect(buildRegenerateRequest({ name, currentVid })).toEqual({
+			path: "/api/tools/kb_search/summary/regenerate",
+			body: { expected_vid: currentVid },
+		});
+	});
+
+	it("puts the expected vid in the discard path", () => {
+		expect(buildDiscardRequest({ name, currentVid })).toEqual({
+			path: `/api/tools/kb_search/versions/${currentVid}`,
+		});
+	});
+});
+
+describe("versionWriteConflictReaction", () => {
+	it.each([
+		["version_mismatch", "refresh"],
+		["job_busy", "retry"],
+		["lineage_unavailable", "delete-tool"],
+	])("maps %s to its distinct reaction", (code, reaction) => {
+		expect(versionWriteConflictReaction({ status: 409, code })).toBe(reaction);
+	});
+
+	it("never branches on a message or on status alone", () => {
+		expect(
+			versionWriteConflictReaction({
+				status: 409,
+				message: "工具版本已變更，請重新整理後再試",
+			}),
+		).toBeNull();
+		expect(
+			versionWriteConflictReaction({
+				status: 400,
+				code: "version_mismatch",
+			}),
+		).toBeNull();
+	});
+});
+
+describe("toolLineageControls", () => {
+	const current_vid = "20260728T010203Z-abc123";
+
+	it.each([
+		["sole", "delete-tool"],
+		["usable", "discard-version"],
+		["broken", "none"],
+	])("keeps lineage %s as its own control state", (lineage, discardAction) => {
+		expect(toolLineageControls({ current_vid, lineage })).toMatchObject({
+			unresolved: false,
+			discardAction,
+			showBrokenLineage: lineage === "broken",
+		});
+	});
+
+	it("allows only whole-tool deletion when no current version resolves", () => {
+		expect(
+			toolLineageControls({ current_vid: null, lineage: "broken" }),
+		).toEqual({
+			unresolved: true,
+			showVersionControls: false,
+			discardAction: "none",
+			showBrokenLineage: false,
+		});
+	});
+
+	it("turns a late lineage_unavailable into broken without a refetch", () => {
+		expect(
+			toolLineageControls({ current_vid, lineage: "usable" }, true),
+		).toMatchObject({
+			discardAction: "none",
+			showBrokenLineage: true,
+		});
+	});
+
+	it("never offers discard for an out-of-contract lineage value", () => {
+		expect(
+			toolLineageControls({ current_vid, lineage: "future-state" }),
+		).toMatchObject({
+			discardAction: "none",
+			showBrokenLineage: true,
+		});
 	});
 });
 
@@ -162,20 +315,19 @@ describe("summaryErrorRevalidates", () => {
 		expect(summaryErrorRevalidates({ status: 404 })).toBe(true);
 	});
 
-	it("is true for a foreign job holding the single-flight slot", () => {
-		// INVERTED from r4 (see summaryErrorRevalidates' own note). r4 read this
-		// as "the job has written nothing yet, so nothing changed" -- true about
-		// that job, and beside the point: the 409 tells us something OUTSIDE this
-		// page is mid-operation on this backend, which is a fact about the world
-		// we did not have a moment ago. Re-reading cannot make the foreign job
-		// observable (we hold no id for it), so this only refreshes the CURRENT
-		// truth; acting on its COMPLETION is the residual bounded by 裁決紀錄 #7.
-		expect(
-			summaryErrorRevalidates({ status: 409, code: "tool_job_in_progress" }),
-		).toBe(true);
-	});
-
 	it("is false for failures that say nothing about tool state", () => {
+		expect(summaryErrorRevalidates({ status: 409, code: "job_busy" })).toBe(
+			false,
+		);
+		expect(
+			summaryErrorRevalidates({
+				status: 409,
+				code: "lineage_unavailable",
+			}),
+		).toBe(false);
+		expect(
+			summaryErrorRevalidates({ status: 409, code: "version_mismatch" }),
+		).toBe(false);
 		// Configuration and upstream health are not tool state, and a regenerate
 		// raises both BEFORE the sidecar is touched.
 		expect(
@@ -191,19 +343,11 @@ describe("summaryErrorRevalidates", () => {
 		expect(summaryErrorRevalidates()).toBe(false);
 	});
 
-	it("keys the 409s on the CODE, not on the status alone", () => {
-		// A future 409 code must default to "no evidence".
+	it("does not treat any 409 as the generic broad revalidation path", () => {
 		expect(
 			summaryErrorRevalidates({ status: 409, code: "some_future_code" }),
 		).toBe(false);
 		expect(summaryErrorRevalidates({ status: 409 })).toBe(false);
-		// ...and the code does not license a refetch under another status.
-		expect(
-			summaryErrorRevalidates({
-				status: 400,
-				code: "tool_job_in_progress",
-			}),
-		).toBe(false);
 	});
 });
 
