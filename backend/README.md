@@ -331,9 +331,10 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   不用來決定跑哪一版**——否則廣告綁定就沒有意義了。少了這道確認，列表會把
   `current` 壞掉的套件判成 invalid＋停用，而已廣告的 handler 照樣跑得起來，
   同一個問題兩條路徑兩個答案（overall review r2-4）。這避免 pointer 改變後用舊
-  schema 執行新程式；若操作者在廣告與
-  呼叫間親手 discard 該版，呼叫會得到明確拒絕，系統刻意不為這個單人操作引入
-  reservation/refcount。
+  schema 執行新程式。**「廣告與呼叫之間被 discard」已經不可能發生**：請求在送出 tools
+  array 之前就取得 shared lock 並持有到結束，而 discard 需要 exclusive lock，所以那段期間
+  按下 discard 會直接得到 `409 ai_job_in_progress`，`current` 與該版都不會被動到。（先前
+  這裡寫的是「discard 會成功、呼叫再得到拒絕」——那是互斥鎖出現以前的行為，已作廢。）
 - **request／子行程與破壞操作互斥**：capture、enrich、assist-update 在掃描並把
   tools array 交給模型**之前**取得 `.afterthread-tools.lck` 的 shared `flock`，在整個
   請求（所有模型 round、工具呼叫與錯誤清理）結束後才關閉 descriptor；shared lock
