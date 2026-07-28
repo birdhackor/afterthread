@@ -79,7 +79,9 @@ from afterthread.services.tools import (
     _STATE_MARKER_VALUE,
     _STATE_MAX_BYTES,
     PackageRoot,
+    PreviousNull,
     Resolved,
+    resolution_lineage,
     resolve_current,
 )
 
@@ -494,11 +496,17 @@ def _is_new_package_at(path: Path, vid: str | None = None) -> bool:
         if sibling_match is not None
         else path.name
     )
-    return (
-        resolution.previous is None
-        and "enabled" not in manifest
-        and manifest.get("name") == expected_name
+    # Journal reconciliation names the one migration-minted vid, whose origin is
+    # necessarily the explicit-null initial version. Fresh preflight also sees
+    # packages legitimately revised after migration; a usable real predecessor
+    # remains a complete target layout. Missing/invalid lineage is broken in both
+    # modes and must never be mistaken for an explicit null.
+    lineage_complete = (
+        isinstance(resolution.previous, PreviousNull)
+        if vid is not None
+        else resolution_lineage(resolution) in {"sole", "usable"}
     )
+    return lineage_complete and "enabled" not in manifest and manifest.get("name") == expected_name
 
 
 def _fresh_preflight(root: Path) -> Preflight:

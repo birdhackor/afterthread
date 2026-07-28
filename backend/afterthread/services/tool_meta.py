@@ -719,30 +719,46 @@ def _summary_session_log_id(before: int | None) -> int | None:
 
 
 async def generate_and_store_summary(
-    name: str,
+    target: str | tools.Resolved,
     *,
     origin: dict[str, Any] | None = None,
     builder_summary: str | None = None,
 ) -> None:
-    """Best-effort summary publication for one just-installed current version.
+    """Best-effort summary publication for one just-published version.
 
     ``origin.json`` already committed with the version and is never rewritten
     here. A placeholder may record this summary attempt; every write is bound to
-    the resolved VersionRoot identity, and no failure can undo the install.
+    the VersionRoot identity, and no failure can undo the install or revise.
+
+    Install passes a name because its publisher predates typed version returns.
+    Revise passes the exact :class:`Resolved` its publisher constructed, so this
+    hook cannot follow a later ``current`` edit back onto the previous version.
     """
     try:
-        # The resolve and the identity of what was resolved, together (see
-        # _resolve_package): the install hook cannot reach an alias -- it was
-        # handed the name it just promoted -- but going through the ONE helper
-        # costs nothing and keeps both "every summary path refuses an alias" and
-        # "every summary write is identity-guarded" true by construction rather
-        # than by inspection.
-        resolved = await run_in_threadpool(_resolve_package, name)
-        if resolved is None:
-            # The package vanished (a racing delete) between promote and here.
-            # Nothing to summarize and nowhere to write; silence is correct.
-            return
-        package_root, version_root, identity = resolved
+        if isinstance(target, tools.Resolved):
+            # Keep the publisher's typed work->hook identity intact. Capturing
+            # the manifest identity from THAT VersionRoot makes every later write
+            # fail closed if the published version itself is edited or removed;
+            # ``current`` is intentionally irrelevant here.
+            package_root = target.package_root
+            version_root = target.version_root
+            identity = await run_in_threadpool(tools.package_identity, version_root)
+            if identity is None:
+                return
+            name = package_root.path.name
+        else:
+            name = target
+            # The resolve and the identity of what was resolved, together (see
+            # _resolve_package): the install hook cannot reach an alias -- it was
+            # handed the name it just promoted -- but going through the ONE helper
+            # costs nothing and keeps both "every summary path refuses an alias"
+            # and "every summary write is identity-guarded" true by construction.
+            resolved = await run_in_threadpool(_resolve_package, name)
+            if resolved is None:
+                # The package vanished (a racing delete) between promote and here.
+                # Nothing to summarize and nowhere to write; silence is correct.
+                return
+            package_root, version_root, identity = resolved
         # origin.json is already the commit marker. When the caller supplies that
         # context, create an empty summary placeholder before the LLM round trip;
         # no previous workflow id is attached because this session has not run.

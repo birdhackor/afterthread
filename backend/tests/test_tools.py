@@ -81,10 +81,12 @@ _TEST_VID = "20260728T010203Z-abcdef"
 
 @pytest.fixture(autouse=True)
 def _reset_log() -> Generator[None]:
-    """Empty the ring and id counter around every test (it is a singleton)."""
+    """Empty process-local singleton state around every test."""
     llm_log._reset_for_tests()
+    tools._RETIRED_VERSIONS.clear()
     yield
     llm_log._reset_for_tests()
+    tools._RETIRED_VERSIONS.clear()
 
 
 # --- target model + tool-loop stubs ----------------------------------------
@@ -792,9 +794,10 @@ def _add_committed_version(package: Path, vid: str, *, description: str, output:
     return version
 
 
-def test_advertisement_binds_the_vid_and_does_not_reread_current(
+def test_advertisement_binds_the_vid_while_requiring_some_usable_current(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """A normal revise keeps the package usable without redirecting old handlers."""
     root = tmp_path / "tools"
     first = _make_tool(root, "echo", "import sys\nsys.stdout.write('FIRST')\n")
     package = _package_path(first)
@@ -807,6 +810,27 @@ def test_advertisement_binds_the_vid_and_does_not_reread_current(
 
     assert asyncio.run(handler({})) == "FIRST"
     assert _resolved_version(package).name == second_vid
+
+
+def test_advertised_handler_refuses_when_current_becomes_unresolved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Invariant B is checked again at call time, before the final identity guard."""
+    root = tmp_path / "tools"
+    sentinel = tmp_path / "ran"
+    version = _make_tool(
+        root,
+        "echo",
+        f"import sys\nopen({str(sentinel)!r}, 'w').write('x')\nsys.stdout.write('ok')\n",
+    )
+    package = _package_path(version)
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler
+
+    (package / tools._META_DIRNAME / tools._CURRENT_FILENAME).unlink()
+
+    assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
+    assert not sentinel.exists()
 
 
 def test_invariant_a_running_judgement_enumerates_discarded_version_directories(
@@ -880,10 +904,29 @@ def test_list_reports_all_three_lineage_states_including_a_self_loop(
 
     sole = list_tools()[0]
     assert (sole["current_vid"], sole["lineage"]) == (_TEST_VID, "sole")
+    sole_resolution = tools.resolve_current(tools.PackageRoot(package))
+    assert isinstance(sole_resolution, tools.Resolved)
+    assert isinstance(sole_resolution.previous, tools.PreviousNull)
+
+    first_origin = first / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    document = json.loads(first_origin.read_text(encoding="utf-8"))
+    document.pop("previous")
+    first_origin.write_text(json.dumps(document), encoding="utf-8")
+    absent = list_tools()[0]
+    assert (absent["current_vid"], absent["lineage"]) == (_TEST_VID, "broken")
+    absent_resolution = tools.resolve_current(tools.PackageRoot(package))
+    assert isinstance(absent_resolution, tools.Resolved)
+    assert isinstance(absent_resolution.previous, tools.PreviousAbsent)
+    document["previous"] = None
+    first_origin.write_text(json.dumps(document), encoding="utf-8")
 
     assert tools.publish_current(tools.PackageRoot(package), second_vid)
     usable = list_tools()[0]
     assert (usable["current_vid"], usable["lineage"]) == (second_vid, "usable")
+    usable_resolution = tools.resolve_current(tools.PackageRoot(package))
+    assert isinstance(usable_resolution, tools.Resolved)
+    assert isinstance(usable_resolution.previous, tools.PreviousValue)
+    assert usable_resolution.previous.value == _TEST_VID
 
     origin = second / tools._META_DIRNAME / tools._ORIGIN_FILENAME
     document = json.loads(origin.read_text(encoding="utf-8"))
@@ -910,7 +953,7 @@ def test_unresolved_row_is_nullable_broken_and_cannot_be_toggled(
     assert set_enabled("echo", False) is False
 
 
-def test_sole_version_discard_routes_to_whole_tool_delete_before_target_validation(
+def test_version_discard_refuses_null_lineage_without_calling_whole_tool_delete(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     version = _make_tool(tmp_path / "tools", "echo", "import sys\n")
@@ -923,8 +966,9 @@ def test_sole_version_discard_routes_to_whole_tool_delete_before_target_validati
         lambda name: called.append(name) is None or True,
     )
 
-    assert tools.discard_version(resolution) == "ok"
-    assert called == ["echo"]
+    assert tools.discard_version(resolution) == "lineage_unavailable"
+    assert called == []
+    assert _package_path(version).is_dir()
 
 
 def test_invariant_e_discard_succeeds_when_old_version_removal_fails(
@@ -1094,6 +1138,55 @@ def test_invariant_e_unconfirmed_current_durability_leaves_old_version_intact(
     }
     assert after == before
     assert not second.with_name(f"{second_vid}.discarded").exists()
+
+
+@pytest.mark.parametrize("cleanup_failure", ["parking", "durability"])
+def test_retired_advertised_version_cannot_run_when_discard_cannot_park_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cleanup_failure: str
+) -> None:
+    """A successful pointer publication retires V before either cleanup exit."""
+    root = tmp_path / "tools"
+    sentinel = tmp_path / f"ran-{cleanup_failure}"
+    first = _make_tool(root, "echo", "import sys\nsys.stdout.write('FIRST')\n")
+    package = _package_path(first)
+    package_root = tools.PackageRoot(package)
+    second_vid = "20260728T020304Z-fedcba"
+    second = _add_committed_version(package, second_vid, description="second", output="SECOND")
+    second.joinpath("run.py").write_text(
+        f"import sys\nopen({str(sentinel)!r}, 'w').write('x')\nsys.stdout.write('SECOND')\n",
+        encoding="utf-8",
+    )
+    assert tools.publish_current(package_root, second_vid)
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler
+    resolution = tools.resolve_current(package_root)
+    assert isinstance(resolution, tools.Resolved)
+
+    if cleanup_failure == "parking":
+
+        def fail_rename(source: Path, _target: Path) -> None:
+            assert Path(source) == second
+            raise PermissionError("injected parking failure")
+
+        monkeypatch.setattr(tools.os, "rename", fail_rename)
+    else:
+        real_publish = tools.publish_current
+
+        def publish_without_confirmed_durability(
+            root: tools.PackageRoot, vid: str
+        ) -> tools.CurrentPublication:
+            publication = real_publish(root, vid)
+            assert publication.published
+            return tools.CurrentPublication(published=True, durable=False)
+
+        monkeypatch.setattr(tools, "publish_current", publish_without_confirmed_durability)
+
+    assert tools.discard_version(resolution) == "ok"
+    assert _resolved_version(package) == first
+    assert second.is_dir()
+    assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
+    assert not sentinel.exists()
+    assert tools.version_retired(package_root, second_vid) is True
 
 
 def _write_state_file(pkg: Path, enabled: bool) -> None:
@@ -1615,28 +1708,16 @@ def test_invariant_c_absent_state_never_reads_the_legacy_manifest_toggle(
     assert enabled_llm_tools() == []
 
 
-def test_the_execution_toggle_check_reads_the_state_file_last_and_scans_nothing(
+def test_execution_rechecks_toggle_and_current_without_scanning(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """P1R3-1's adjacency, pinned as call ORDER because so little sits in the gap.
+    """Call time rechecks the package toggle and invariant B without a full scan.
 
-    The sibling test above drives a PATCH through the one step that can separate
-    the toggle read from ``Popen``. On the other path -- a package that HAS a state
-    file -- there is nothing to drive from, so what has to be pinned is how little
-    is there: the last file the runtime READS before starting the child is
-    ``.afterthread-state.json``, and it does not run a package SCAN to get there.
-
-    The last file READ, not the last thing done: since P1R4-1 the identity check
-    stands between that read and ``Popen``, because only one of the two can be
-    adjacent and a redirect is the worse failure (see
-    ``test_the_identity_check_is_the_last_thing_before_the_subprocess_starts``,
-    which pins that order). It reads nothing -- one ``lstat`` of ``tool.json`` --
-    so this assertion is about READS and is exactly as strong as it was.
-
-    Both halves matter and neither implies the other. A scan would answer the same
-    question correctly (it is where the rule is defined) while re-introducing the
-    ~0.5 ms of manifest parsing and entry-file resolving between the read and the
-    act -- which is exactly what round 2 shipped."""
+    ``resolve_current`` intentionally follows the toggle read now: listing a
+    package as broken/disabled while an old handler can still run violates the
+    invariant. The advertised vid is not compared here, and the manifest identity
+    check remains the final operation before Popen in the ordering test below.
+    """
     root = tmp_path / "tools"
     _make_tool(root, "traced", "import sys\nsys.stdout.write('ok')\n")
     _install_tools(monkeypatch, root)
@@ -1646,6 +1727,7 @@ def test_the_execution_toggle_check_reads_the_state_file_last_and_scans_nothing(
     trace: list[str] = []
     real_state = tools._read_enabled_state
     real_scan = tools.scan_installed
+    real_resolve = tools.resolve_current
     real_popen = subprocess.Popen
 
     def traced_state(directory: tools.PackageRoot) -> tools._EnabledState:
@@ -1656,19 +1738,25 @@ def test_the_execution_toggle_check_reads_the_state_file_last_and_scans_nothing(
         trace.append("scan")
         return real_scan(directory)
 
+    def traced_resolve(directory: tools.PackageRoot) -> tools.Resolution:
+        trace.append("resolve")
+        return real_resolve(directory)
+
     def traced_popen(*args: Any, **kwargs: Any) -> Any:
         trace.append("popen")
         return real_popen(*args, **kwargs)
 
     monkeypatch.setattr(tools, "_read_enabled_state", traced_state)
     monkeypatch.setattr(tools, "scan_installed", traced_scan)
+    monkeypatch.setattr(tools, "resolve_current", traced_resolve)
     monkeypatch.setattr(subprocess, "Popen", traced_popen)
 
     assert asyncio.run(handler({})) == "ok"
 
-    assert trace[-2:] == ["state", "popen"]  # the toggle read is the LAST READ before it
-    assert "scan" not in trace  # ... and getting it cost no scan at all
+    assert trace[-3:] == ["state", "resolve", "popen"]
+    assert "scan" not in trace
     assert trace.count("state") == 2  # once per site (handler entry, pre-Popen)
+    assert trace.count("resolve") == 1
 
 
 def test_the_scan_and_the_execution_check_answer_the_one_rule_identically(
@@ -1755,11 +1843,10 @@ def test_the_identity_check_is_the_last_thing_before_the_subprocess_starts(
     shows it (an attempt records the NAME, which did not change) -- the hazard D40's
     overall-r6 O6-1 was rated P1 for.
 
-    What the toggle gives up by moving first is one ``lstat``, the identity check's
-    own syscall: a switch flipped inside it starts the tool the operator turned off
-    microseconds earlier -- its own code, its own contract, its own ``.env``. That
-    is the smaller wrong and it is the check-then-act instant this module accepts by
-    name everywhere else.
+    The toggle and invariant-B checks both precede identity. A switch flipped
+    inside those bounded reads can still land in the accepted check-then-act
+    instant; putting either after identity would reopen the more severe redirect
+    window because ``cwd`` is resolved from a path at Popen.
 
     The HANDLER keeps the opposite order, and the full trace pins that too: neither
     of its checks is adjacent to anything (a ``.env`` read, a serialization and a
@@ -1774,6 +1861,7 @@ def test_the_identity_check_is_the_last_thing_before_the_subprocess_starts(
 
     trace: list[str] = []
     real_enabled = tools.package_enabled
+    real_resolve = tools.resolve_current
     real_identity = tools._still_the_expected_package
     real_popen = subprocess.Popen
 
@@ -1787,19 +1875,24 @@ def test_the_identity_check_is_the_last_thing_before_the_subprocess_starts(
         trace.append("identity")
         return real_identity(directory, expected)
 
+    def traced_resolve(directory: tools.PackageRoot) -> tools.Resolution:
+        trace.append("resolve")
+        return real_resolve(directory)
+
     def traced_popen(*args: Any, **kwargs: Any) -> Any:
         trace.append("popen")
         return real_popen(*args, **kwargs)
 
     monkeypatch.setattr(tools, "package_enabled", traced_enabled)
+    monkeypatch.setattr(tools, "resolve_current", traced_resolve)
     monkeypatch.setattr(tools, "_still_the_expected_package", traced_identity)
     monkeypatch.setattr(subprocess, "Popen", traced_popen)
 
     assert asyncio.run(handler({})) == "ok"
 
-    assert trace[-3:] == ["enabled", "identity", "popen"]  # identity is the last word
+    assert trace[-3:] == ["resolve", "identity", "popen"]  # identity is the last word
     # ... and the handler's own pair is deliberately the other way round.
-    assert trace == ["identity", "enabled", "enabled", "identity", "popen"]
+    assert trace == ["identity", "enabled", "enabled", "resolve", "identity", "popen"]
 
 
 def test_a_revise_landing_between_the_toggle_read_and_popen_is_refused_not_run(
@@ -2432,6 +2525,8 @@ def test_runtime_background_descendant_reaped_no_thread_leak(
     pkg = _make_tool(root, "descendant", run_py)
     entry = [sys.executable, "run.py"]
     env, _ = tools._build_tool_env(_package_root(pkg))
+    advertised = tools.resolve_current(_package_root(pkg))
+    assert isinstance(advertised, tools.Resolved)
 
     before = threading.active_count()
     try:
@@ -2442,8 +2537,7 @@ def test_runtime_background_descendant_reaped_no_thread_leak(
         # confound.
         result = tools._run_tool_subprocess(
             entry,
-            _package_root(pkg),
-            _version_root(pkg),
+            advertised,
             tools.package_identity(_version_root(pkg)),
             env,
             "{}",
@@ -2509,13 +2603,14 @@ def test_runtime_detached_child_closing_pipes_is_killed(
     pkg = _make_tool(root, "detached", run_py)
     entry = [sys.executable, "run.py"]
     env, _ = tools._build_tool_env(_package_root(pkg))
+    advertised = tools.resolve_current(_package_root(pkg))
+    assert isinstance(advertised, tools.Resolved)
 
     try:
         started = time.monotonic()
         result = tools._run_tool_subprocess(
             entry,
-            _package_root(pkg),
-            _version_root(pkg),
+            advertised,
             tools.package_identity(_version_root(pkg)),
             env,
             "{}",

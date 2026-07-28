@@ -310,18 +310,42 @@ class BuildRoot:
 
 
 @dataclass(frozen=True, slots=True)
+class PreviousAbsent:
+    """An ``origin.json`` that did not carry the required lineage field."""
+
+
+@dataclass(frozen=True, slots=True)
+class PreviousNull:
+    """An explicit JSON null: this version has no predecessor."""
+
+
+@dataclass(frozen=True, slots=True)
+class PreviousValue:
+    """The JSON value written at ``previous`` (shape validation belongs to lineage)."""
+
+    value: object
+
+
+PREVIOUS_ABSENT = PreviousAbsent()
+PREVIOUS_NULL = PreviousNull()
+type Previous = PreviousAbsent | PreviousNull | PreviousValue
+
+
+@dataclass(frozen=True, slots=True)
 class Resolved:
     """A package whose ``current`` names one committed version.
 
     ``previous`` is captured from that version's commit marker during the same
     resolution.  List rows and discard therefore cannot describe one current
-    version while deriving lineage from a second pointer read.
+    version while deriving lineage from a second pointer read.  The tagged
+    value preserves missing, explicit null, and present JSON values as three
+    different states; a publisher-authored marker always has the field.
     """
 
     package_root: PackageRoot
     version_root: VersionRoot
     vid: str
-    previous: Any
+    previous: Previous
 
 
 @dataclass(frozen=True, slots=True)
@@ -775,7 +799,13 @@ def resolve_current(package_root: PackageRoot) -> Resolution:
             return Unresolved(package_root, "current version must be a real directory")
         return Unresolved(package_root, "current points to an uncommitted version")
     version_root, origin = target
-    return Resolved(package_root, version_root, vid, origin.get("previous"))
+    if "previous" not in origin:
+        previous: Previous = PREVIOUS_ABSENT
+    elif origin["previous"] is None:
+        previous = PREVIOUS_NULL
+    else:
+        previous = PreviousValue(origin["previous"])
+    return Resolved(package_root, version_root, vid, previous)
 
 
 def _manifest_identity(directory: Path) -> tuple[int, int, int] | None:
@@ -1636,22 +1666,27 @@ def store_summary_meta(
     return ("ok", stored) if stored is not None else ("not_stored", None)
 
 
-def _lineage_for_resolution(resolution: Resolved) -> str:
+def resolution_lineage(resolution: Resolved) -> Literal["sole", "usable", "broken"]:
     """Return ``sole``/``usable``/``broken`` from this exact resolution.
 
-    A self-loop is broken even though its directory target validates.  Keeping
-    that comparison beside the target validation prevents the list from
-    offering an action the discard endpoint must reject every time.
+    Missing is not null: every committed origin published by this service has
+    the field, so omission means the document is not a complete marker of ours.
+    A malformed present value and a self-loop are likewise broken.  Keeping all
+    three decisions beside target validation prevents listing, migration and
+    discard from inventing different lineage semantics.
     """
 
     previous = resolution.previous
-    if previous is None:
+    if isinstance(previous, PreviousNull):
         return "sole"
-    if previous == resolution.vid:
+    if isinstance(previous, PreviousAbsent):
+        return "broken"
+    value = previous.value
+    if value == resolution.vid:
         return "broken"
     return (
         "usable"
-        if _resolve_version_target(resolution.package_root, previous) is not None
+        if _resolve_version_target(resolution.package_root, value) is not None
         else "broken"
     )
 
@@ -1671,7 +1706,7 @@ def list_tools() -> list[dict[str, Any]]:
             "error": scan.error if scan.error is not None else scan.notice,
             "current_vid": scan.resolution.vid if isinstance(scan.resolution, Resolved) else None,
             "lineage": (
-                _lineage_for_resolution(scan.resolution)
+                resolution_lineage(scan.resolution)
                 if isinstance(scan.resolution, Resolved)
                 else "broken"
             ),
@@ -1797,8 +1832,7 @@ def _build_llm_tool(scan: _PackageScan) -> LlmTool:
     return LlmTool(
         spec=spec,
         handler=_make_handler(
-            scan.resolution.package_root,
-            scan.resolution.version_root,
+            scan.resolution,
             scan.entry,
             scan.identity,
         ),
@@ -2586,8 +2620,7 @@ _TOOL_DISABLED_RESULT = "tool not run: this tool was disabled after it was offer
 
 def _run_tool_subprocess(
     entry: list[str],
-    package_root: PackageRoot,
-    version_root: VersionRoot,
+    advertised: Resolved,
     expected_identity: tuple[int, int, int] | None,
     env: dict[str, str],
     args_json: str,
@@ -2596,13 +2629,24 @@ def _run_tool_subprocess(
 ) -> str:
     """Run the advertised version and return one agent-visible result string.
 
-    The final ordering is deliberate and compact: read ``package_enabled`` from
-    the PackageRoot, verify the advertised manifest identity on VersionRoot, then
-    call ``Popen`` with nothing between the identity check and process creation.
-    The subprocess cwd is that VersionRoot; it never resolves ``current`` again.
+    The final ordering is deliberate and compact: refuse a version retired by a
+    completed discard, read the PackageRoot toggle, require that ``current`` still
+    resolves to some usable version, verify the ADVERTISED VersionRoot identity,
+    then call ``Popen`` with nothing between that identity check and process
+    creation.  Resolving ``current`` does not compare vids: a normal revise may
+    move it while this call must remain bound to the schema it was shown.
     """
+    package_root = advertised.package_root
+    version_root = advertised.version_root
+    if version_retired(package_root, advertised.vid):
+        return _TOOL_REPLACED_RESULT
     if not package_enabled(package_root):
         return _TOOL_DISABLED_RESULT
+    if isinstance(resolve_current(package_root), Unresolved):
+        return _TOOL_REPLACED_RESULT
+    # This identity check is deliberately LAST. No state read, lineage resolve,
+    # retired-marker lookup, or other fallible operation may be inserted between
+    # its answer and Popen's cwd resolution.
     if not _still_the_expected_package(version_root, expected_identity):
         return _TOOL_REPLACED_RESULT
     try:
@@ -2653,6 +2697,24 @@ def _run_tool_subprocess(
 # lock covers only registry updates and lookups.
 _INFLIGHT_EXECUTIONS: dict[tuple[int, int], int] = {}
 _EXECUTION_LOCK = threading.Lock()
+
+# A discard retires the advertised (package, vid) even when best-effort parking
+# cannot move its directory. Handlers live only in this process, so the marker
+# deliberately has the same lifetime and needs no persistent lease/refcount.
+_RETIRED_VERSIONS: set[tuple[PackageRoot, str]] = set()
+_RETIRED_LOCK = threading.Lock()
+
+
+def _retire_version(package_root: PackageRoot, vid: str) -> None:
+    """Make every process-local handler for one discarded vid inert."""
+    with _RETIRED_LOCK:
+        _RETIRED_VERSIONS.add((package_root, vid))
+
+
+def version_retired(package_root: PackageRoot, vid: str) -> bool:
+    """Return whether discard retired this exact package version."""
+    with _RETIRED_LOCK:
+        return (package_root, vid) in _RETIRED_VERSIONS
 
 
 @contextlib.contextmanager
@@ -2755,8 +2817,7 @@ def _stale_backup_path(base: Path, name: str, token: str) -> Path:
 
 
 def _make_handler(
-    package_root: PackageRoot,
-    version_root: VersionRoot,
+    advertised: Resolved,
     entry: list[str],
     identity: tuple[int, int, int] | None,
 ) -> Callable[[dict[str, Any]], Awaitable[str]]:
@@ -2768,6 +2829,8 @@ def _make_handler(
     """
 
     async def _handler(arguments: dict[str, Any]) -> str:
+        package_root = advertised.package_root
+        version_root = advertised.version_root
         if identity is None:
             return _TOOL_REPLACED_RESULT
         # Register the exact VersionRoot before any queued work. A hold nobody can
@@ -2799,8 +2862,7 @@ def _make_handler(
                 return await run_in_threadpool(
                     _run_tool_subprocess,
                     list(entry),
-                    package_root,
-                    version_root,
+                    advertised,
                     identity,
                     env,
                     args_json,
@@ -2946,26 +3008,35 @@ def discard_version(resolution: Resolved) -> DiscardOutcome:
     current = resolution.version_root
     previous = resolution.previous
 
-    # Null lineage means there is no older version to publish.  This branch must
-    # precede target validation because null can never be a valid vid; discarding
-    # the sole version is exactly whole-package deletion.
-    if previous is None:
-        return "ok" if delete_tool(package_root.path.name) else "not_found"
+    # A version-addressed DELETE is never an entrance to whole-package deletion.
+    # Null may have appeared after the UI rendered a light "go back" confirmation,
+    # and missing is an incomplete marker rather than null; both must return the
+    # same actionable conflict before any package-layer file can be touched.
+    if not isinstance(previous, PreviousValue):
+        return "lineage_unavailable"
+    previous_vid = previous.value
 
     # The previous pointer is operator-editable provenance.  Refuse a self-loop
     # and apply the exact target validator used by current before touching either
     # the pointer or a version directory.
-    if previous == resolution.vid:
+    if previous_vid == resolution.vid:
         return "lineage_unavailable"
-    target = _resolve_version_target(package_root, previous)
+    target = _resolve_version_target(package_root, previous_vid)
     if target is None:
         return "lineage_unavailable"
+    assert isinstance(previous_vid, str)
 
-    publication = publish_current(package_root, previous)
+    publication = publish_current(package_root, previous_vid)
     if not publication:
         return "not_found"
 
-    # Discard is complete at publication.  Everything below is best-effort
+    # Publication retires V whether or not best-effort parking can move it. This
+    # marker MUST precede both early returns below: otherwise the successful-but-
+    # undurable and rename-failed branches would leave an advertised live path
+    # executable after the API reported that V was discarded.
+    _retire_version(package_root, resolution.vid)
+
+    # Discard is complete at publication. Everything below is best-effort
     # cleanup, but destructive cleanup is forbidden unless the directory fsync
     # confirmed that the new pointer survives a crash.
     if not publication.durable:

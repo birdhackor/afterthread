@@ -580,6 +580,57 @@ def test_second_run_over_already_migrated_root_is_zero_write_noop(tmp_path: Path
     assert "nothing to do" in "\n".join(output)
 
 
+def test_previous_absent_null_and_vid_have_distinct_runtime_and_migration_meanings(
+    tmp_path: Path,
+) -> None:
+    """Fresh preflight accepts real history; journal reconciliation accepts only its null root."""
+    root = tmp_path / "tools"
+    _make_package(root)
+    assert _run(root) == 0
+    package = root / "alpha"
+    first_vid = _current_vid(root)
+    first = package / tools._VERSIONS_DIRNAME / first_vid
+    origin_path = first / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    origin = json.loads(origin_path.read_text(encoding="utf-8"))
+
+    explicit_null = tools.resolve_current(tools.PackageRoot(package))
+    assert isinstance(explicit_null, tools.Resolved)
+    assert isinstance(explicit_null.previous, tools.PreviousNull)
+    assert tools.resolution_lineage(explicit_null) == "sole"
+    assert migration._is_new_package_at(package) is True
+    assert migration._is_new_package_at(package, first_vid) is True
+
+    origin.pop("previous")
+    origin_path.write_text(json.dumps(origin), encoding="utf-8")
+    absent = tools.resolve_current(tools.PackageRoot(package))
+    assert isinstance(absent, tools.Resolved)
+    assert isinstance(absent.previous, tools.PreviousAbsent)
+    assert tools.resolution_lineage(absent) == "broken"
+    assert migration._is_new_package_at(package) is False
+    assert migration._is_new_package_at(package, first_vid) is False
+
+    origin["previous"] = None
+    origin_path.write_text(json.dumps(origin), encoding="utf-8")
+    second_vid = "20260728T020304Z-fedcba"
+    second = package / tools._VERSIONS_DIRNAME / second_vid
+    shutil.copytree(first, second)
+    second_origin_path = second / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    second_origin = json.loads(second_origin_path.read_text(encoding="utf-8"))
+    second_origin["previous"] = first_vid
+    second_origin_path.write_text(json.dumps(second_origin), encoding="utf-8")
+    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+
+    real_vid = tools.resolve_current(tools.PackageRoot(package))
+    assert isinstance(real_vid, tools.Resolved)
+    assert isinstance(real_vid.previous, tools.PreviousValue)
+    assert real_vid.previous.value == first_vid
+    assert tools.resolution_lineage(real_vid) == "usable"
+    assert migration._is_new_package_at(package) is True
+    # An in-progress journal names the migration-created initial vid and must not
+    # reconcile a later revision as that exact disk effect.
+    assert migration._is_new_package_at(package, second_vid) is False
+
+
 @pytest.mark.parametrize("damage", ["two-newlines", "origin-without-source"])
 def test_target_layout_recognition_agrees_with_runtime_resolution(
     tmp_path: Path, damage: str

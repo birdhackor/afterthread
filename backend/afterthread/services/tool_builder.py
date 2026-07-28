@@ -1758,6 +1758,14 @@ def _promote_staging(
     return None
 
 
+@dataclass(frozen=True, slots=True)
+class _PublishedRevision:
+    """The exact committed version and provenance one revise put live."""
+
+    resolution: tools.Resolved
+    origin: dict[str, Any]
+
+
 def _publish_revised_version(
     build_root: tools.BuildRoot,
     shell_root: Path,
@@ -1765,7 +1773,7 @@ def _publish_revised_version(
     previous: tools.Resolved,
     expected_identity: tuple[int, int, int],
     feedback: str,
-) -> tuple[dict[str, Any] | None, str | None]:
+) -> tuple[_PublishedRevision | None, str | None]:
     """Install one durable version and only then publish it through ``current``."""
 
     base = package_root.path.parent
@@ -1828,16 +1836,6 @@ def _publish_revised_version(
         target = versions / vid
         if _entry_exists(target):
             continue
-        # Check both facts again after the durable shell assembly. The work above
-        # can be long enough for an operator to move ``current`` by hand; this is
-        # the last refusal point before the version rename makes new disk state.
-        current = tools.resolve_current(package_root)
-        if (
-            isinstance(current, tools.Unresolved)
-            or current.vid != previous.vid
-            or tools.package_identity(previous.version_root) != expected_identity
-        ):
-            return None, _ERROR_REVISE_TARGET_REPLACED
         try:
             os.rename(shell_root, target)
         except FileExistsError:
@@ -1846,9 +1844,30 @@ def _publish_revised_version(
             return None, f"無法安裝工具版本（{type(exc).__name__}）。"  # noqa: RUF001
         if not _fsync_directory(versions):
             return None, _ERROR_DURABILITY
+
+        # Re-check AFTER the rename and its directory fsync, immediately before
+        # publishing ``current``. The earlier placement guarded creation of the
+        # version entry but left that rename+fsync gap free for a D21 hand edit
+        # that publication would overwrite. Check the manifest fact first, then
+        # resolve ``current`` LAST so no other filesystem read sits between the
+        # pointer answer and publish_current.
+        if tools.package_identity(previous.version_root) != expected_identity:
+            return None, _ERROR_REVISE_TARGET_REPLACED
+        current = tools.resolve_current(package_root)
+        if isinstance(current, tools.Unresolved) or current.vid != previous.vid:
+            return None, _ERROR_REVISE_TARGET_REPLACED
         if not tools.publish_current(package_root, vid):
             return None, _ERROR_CURRENT_WRITE
-        return origin, None
+        # Construct the typed target from the exact directory just renamed and
+        # vid just published. Re-resolving by package name here or in the summary
+        # hook would let a later current edit redirect the new version's work.
+        published = tools.Resolved(
+            package_root,
+            tools.VersionRoot(target),
+            vid,
+            tools.PreviousValue(previous.vid),
+        )
+        return _PublishedRevision(published, origin), None
     return None, _ERROR_VERSION_ID_WRITE
 
 
@@ -2721,7 +2740,7 @@ async def run_revise(
 
         # The publisher reads immutable provenance from the version whose identity
         # was captured before the builder session.
-        origin, promote_error = await run_in_threadpool(
+        published, promote_error = await run_in_threadpool(
             _publish_revised_version,
             build_root,
             shell_root,
@@ -2739,13 +2758,20 @@ async def run_revise(
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
             )
+        assert published is not None
         # The revision is LIVE as of the line above; everything after it is
         # decoration and cannot fail the outcome (``generate_and_store_summary``
         # never raises -- see tool_meta). The sidecar was excluded from staging, so
         # the package has NO summary until this regenerates one: the same
         # briefly-absent-sidecar window D40 already accepts right after an install,
-        # and the reason the origin above is carried across rather than re-derived.
-        await tool_meta.generate_and_store_summary(name, origin=origin, builder_summary=summary)
+        # and the reason the publisher's typed Resolution and origin are carried
+        # across rather than dropping back to a name/current lookup. This exact
+        # published vid is the one summarized even if D21 moves current meanwhile.
+        await tool_meta.generate_and_store_summary(
+            published.resolution,
+            origin=published.origin,
+            builder_summary=summary,
+        )
         return InstallOutcome(
             ok=True,
             tool_name=name,

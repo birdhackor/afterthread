@@ -78,6 +78,7 @@ def _reset_singletons() -> Generator[None]:
     llm_log._reset_for_tests()
     tools._INFLIGHT_SECRETS.clear()
     tools._INFLIGHT_EXECUTIONS.clear()
+    tools._RETIRED_VERSIONS.clear()
     tools._ENV_VALUE_CACHE.clear()
     yield
     tool_builder._reset_jobs_for_tests()
@@ -87,6 +88,7 @@ def _reset_singletons() -> Generator[None]:
     # registration surviving a test would silently turn the next one's swap into a
     # deferral -- the same reason the secret set is cleared here.
     tools._INFLIGHT_EXECUTIONS.clear()
+    tools._RETIRED_VERSIONS.clear()
     tools._ENV_VALUE_CACHE.clear()
     tool_builder._drain_setup_worker_for_tests()
 
@@ -4049,6 +4051,35 @@ def test_version_conflicts_have_three_distinct_codes_and_openapi_examples(
     assert set(examples) == {"version_mismatch", "lineage_unavailable", "job_busy"}
 
 
+def test_version_delete_cannot_remove_package_when_previous_becomes_null(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The light version confirmation can never enter whole-package deletion."""
+    first = _seed_package(monkeypatch, tmp_path)
+    package = _package_path(first)
+    package.joinpath(".env").write_text("API_KEY=sole-credential-copy\n", encoding="utf-8")
+    second_vid = "20260728T020304Z-fedcba"
+    second = _copy_committed_version(first, second_vid)
+    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+
+    row = client.get("/api/tools").json()["tools"][0]
+    assert (row["current_vid"], row["lineage"]) == (second_vid, "usable")
+
+    origin_path = second / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    origin = json.loads(origin_path.read_text(encoding="utf-8"))
+    origin["previous"] = None
+    origin_path.write_text(json.dumps(origin), encoding="utf-8")
+    before = _file_bytes(package)
+
+    response = client.delete(f"/api/tools/kbsearch/versions/{second_vid}")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "lineage_unavailable"
+    assert package.is_dir()
+    assert _file_bytes(package) == before
+    assert package.joinpath(".env").read_text(encoding="utf-8") == "API_KEY=sole-credential-copy\n"
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -4943,6 +4974,38 @@ def test_invariant_d_revise_faults_leave_current_on_a_durable_previous_version(
     assert outcome.ok is False
     assert current.read_bytes() == before
     assert _current_version(pkg) == pkg
+
+
+def test_revise_rechecks_current_after_version_fsync_immediately_before_publish(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A hand edit in the rename/fsync gap is preserved, never overwritten."""
+    first = _seed_package(monkeypatch, tmp_path)
+    package = _package_path(first)
+    package_root = tools.PackageRoot(package)
+    other_vid = "20260728T020304Z-fedcba"
+    other = _copy_committed_version(first, other_vid)
+    versions = package / tools._VERSIONS_DIRNAME
+    real_fsync_directory = tool_builder._fsync_directory
+    moved = False
+
+    def move_current_after_versions_fsync(path: Path) -> bool:
+        nonlocal moved
+        result = real_fsync_directory(path)
+        if path == versions and not moved:
+            moved = True
+            assert tools.publish_current(package_root, other_vid)
+        return result
+
+    monkeypatch.setattr(tool_builder, "_fsync_directory", move_current_after_versions_fsync)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert moved is True
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_REVISE_TARGET_REPLACED
+    assert _resolved_version(package) == other
 
 
 def test_vid_collision_checks_every_entry_with_the_candidate_prefix(
@@ -6213,6 +6276,48 @@ def test_run_revise_regenerates_the_summary_inheriting_the_origin(
     assert meta["origin"]["instructions"] == "原始安裝指示"
     assert meta["origin"]["previous"] == _TEST_VID
     assert meta["llm_log_id"] == llm_log.last_record_id_for_workflow("tool_summary")
+
+
+def test_revise_summary_stays_on_the_typed_published_version_when_current_moves(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The work->hook hop carries N; a D21 current edit cannot redirect it to P."""
+    first = _seed_package(monkeypatch, tmp_path)
+    package = _package_path(first)
+    package_root = tools.PackageRoot(package)
+    _write_meta(
+        first,
+        summary="P 的既有總結",
+        origin={"openapi_url": "https://kb.example", "instructions": "原始安裝指示"},
+    )
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+    _fake_summary_generate(monkeypatch, summary="只描述新版本 N")
+    real_hook = tool_meta.generate_and_store_summary
+    captured: dict[str, tools.Resolved] = {}
+
+    async def move_current_before_summary(
+        target: str | tools.Resolved,
+        *,
+        origin: dict[str, Any] | None = None,
+        builder_summary: str | None = None,
+    ) -> None:
+        assert isinstance(target, tools.Resolved)
+        assert target.vid != _TEST_VID
+        assert _resolved_version(package) == target.version_root.path
+        captured["target"] = target
+        assert tools.publish_current(package_root, _TEST_VID)
+        await real_hook(target, origin=origin, builder_summary=builder_summary)
+
+    monkeypatch.setattr(tool_meta, "generate_and_store_summary", move_current_before_summary)
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    published = captured["target"]
+    assert _resolved_version(package) == first
+    assert _meta(first)["summary"] == "P 的既有總結"
+    assert _meta(published.version_root.path)["summary"] == "只描述新版本 N"
+    assert _meta(published.version_root.path)["origin"]["previous"] == _TEST_VID
 
 
 def test_run_revise_survives_a_failing_summary(
