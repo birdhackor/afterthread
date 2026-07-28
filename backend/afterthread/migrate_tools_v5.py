@@ -1484,6 +1484,7 @@ def migrate_tools(
     output: Callable[[str], None] = print,
     started_at: datetime | None = None,
     token_hex: Callable[[int], str] = secrets.token_hex,
+    confirm: Callable[[], bool] = lambda: _confirm_on_stdin(input),
 ) -> int:
     """Migrate one configured tools root; return a process-style exit status."""
 
@@ -1537,6 +1538,16 @@ def migrate_tools(
     if dry_run:
         output("Dry run complete; no backup, journal, or package file was written.")
         return 0
+
+    # The LAST thing before the first write, and the reason the `.env` key listing
+    # above is worth printing at all: migration is the one moment every existing
+    # `.env` is in front of an operator who is sitting at the terminal, and those
+    # values will shadow any default the tool's own code carries from here on.  A
+    # report the operator only reads AFTER the migration has run cannot be acted
+    # on, so the confirmation is what turns it from a notice into a decision.
+    if not confirm():
+        output("Aborted before any write; the tools directory is untouched.")
+        return 1
 
     run_start = started_at or datetime.now(UTC)
     stamp = run_start.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -1607,6 +1618,22 @@ def migrate_tools(
     return 0
 
 
+def _confirm_on_stdin(read_line: Callable[[str], str]) -> bool:
+    """Ask on stdin, and treat anything but an explicit yes as no.
+
+    ``EOFError`` -- a piped or closed stdin -- is a NO rather than a default yes:
+    a run that cannot ask must not migrate silently, which is the same fail-closed
+    direction every refusal in this module takes.  ``--yes`` is how a scripted run
+    says it already decided.
+    """
+
+    try:
+        answer = read_line("Proceed with the migration? [y/N] ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in {"y", "yes"}
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point for ``python -m afterthread.migrate_tools_v5``."""
 
@@ -1618,12 +1645,21 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="run read-only preflight and print the plan without writing anything",
     )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="skip the confirmation prompt (for a run whose plan was already reviewed)",
+    )
     args = parser.parse_args(argv)
     configured = get_settings().tools_dir.strip()
     if not configured:
         print("TOOLS_DIR is not configured; refusing to guess a tools directory.")
         return 1
-    return migrate_tools(Path(configured), dry_run=args.dry_run)
+    return migrate_tools(
+        Path(configured),
+        dry_run=args.dry_run,
+        confirm=(lambda: True) if args.yes else (lambda: _confirm_on_stdin(input)),
+    )
 
 
 if __name__ == "__main__":

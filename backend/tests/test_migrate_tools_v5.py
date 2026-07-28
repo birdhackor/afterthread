@@ -162,6 +162,7 @@ def _run(
     dry_run: bool = False,
     output: list[str] | None = None,
     token_hex: Callable[[int], str] = lambda _size: "abcdef",
+    confirm: Callable[[], bool] = lambda: True,
 ) -> int:
     lines = output if output is not None else []
     return migration.migrate_tools(
@@ -171,6 +172,7 @@ def _run(
         output=lines.append,
         started_at=_START,
         token_hex=token_hex,
+        confirm=confirm,
     )
 
 
@@ -744,6 +746,43 @@ def test_done_journal_with_missing_disk_effect_is_not_silently_replayed(tmp_path
     assert _run(root) == 1
     assert (root / "alpha" / "tool.json").is_file()
     assert not (root / "alpha" / "versions").exists()
+
+
+def test_declining_the_confirmation_writes_nothing_at_all(tmp_path: Path) -> None:
+    """The `.env` key listing is only useful if it can still be acted on.
+
+    Printing the keys and then migrating regardless would put the report AFTER
+    the decision point: the operator would learn which values now shadow their
+    tools' code defaults only once that was already true. So the prompt is the
+    last thing before the first write, and declining leaves the tree byte-identical
+    -- no backup, no journal, no shell, nothing.
+    """
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    before = _snapshot_tree(tmp_path)
+
+    assert _run(root, confirm=lambda: False) == 1
+
+    assert _snapshot_tree(tmp_path) == before
+    assert not list(tmp_path.glob("tools.afterthread-v5-backup-*"))
+
+
+def test_an_unaskable_stdin_is_a_no_not_a_default_yes() -> None:
+    """A piped or closed stdin must refuse, not proceed.
+
+    Same fail-closed direction as every other refusal here: a run that cannot ask
+    has not been authorised, and `--yes` is how a scripted run says it decided.
+    """
+
+    def _eof(_prompt: str) -> str:
+        raise EOFError
+
+    assert migration._confirm_on_stdin(_eof) is False
+    assert migration._confirm_on_stdin(lambda _prompt: "  Y \n") is True
+    assert migration._confirm_on_stdin(lambda _prompt: "yes") is True
+    assert migration._confirm_on_stdin(lambda _prompt: "") is False
+    assert migration._confirm_on_stdin(lambda _prompt: "no") is False
 
 
 def test_cli_reads_tools_dir_from_application_settings(
