@@ -44,8 +44,9 @@ identity。模型可能幾分鐘後才真的呼叫；若那時 `current` 已從 
 模型可回一批 `tool_calls`。後端逐一：
 
 1. 把 arguments JSON 解析成物件；失敗就回固定錯誤文字，不啟動工具。
-2. 登記廣告時那個 `VersionRoot` 正在執行，讓刪除與 discard 不會清掉子行程仍可能
-   相對開啟的檔案。
+2. （**沒有執行登記**。工具目錄的共享鎖在送出工具清單之前就已取得、並由這次請求持有到
+   結束，而子行程會**繼承**它，所以刪除與 discard 在鎖被釋放之前根本進不來——不需要登記
+   誰正在執行。）
 3. 重驗該版 `tool.json` identity；操作者若在廣告後手改 manifest，這次呼叫保守拒絕。
 4. 讀 package-level `.afterthread.meta/state.json`。缺席、foreign、unreadable 都
    fail closed；沒有 `tool.json.enabled` fallback。
@@ -55,9 +56,9 @@ identity。模型可能幾分鐘後才真的呼叫；若那時 `current` 已從 
 7. 套用單工具 timeout、process-group 終止與輸出截斷；成功、非零 exit、timeout
    都收斂成模型可讀的結果字串。
 
-若操作者在廣告後親手 discard V，而 V 尚未進入執行登記，handler 可能在真正呼叫時
-找不到它並明確拒絕。這是明示接受的單人操作邊界；為幾秒內的人為競態引入 reservation
-或 refcount，複雜度不成比例。
+操作者在請求進行中按下 discard 或刪除，會得到 `409 ai_job_in_progress`，**套件與指標
+完全沒有被動到**，可以原地重試。互斥鎖取代了先前那套「登記誰在執行、刪除前去查」的機制
+——那個問題連續四輪被答錯，因為答案綁在目錄位置上，而目錄可以被手動搬走。
 
 ### 結果回到模型
 
