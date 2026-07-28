@@ -384,9 +384,11 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   TLS 設定，避免不小心把父行程 `OPENAI_API_KEY` 一起交出去；同 UID 行程仍可能
   讀 `/proc`，所以這不是對抗惡意程式的隔離。
 - **一次性 web-v5 遷移**：先停掉 afterthread；migration 會先以非阻塞方式取得同一個
-  exclusive tools lock 並持有到整體完成，取不到即拒絕開始，這也會抓出 backend 已停
-  但 inherited tool child 尚未結束的情況。為使 migrated version 精確反映開始時
-  的內容，仍建議關閉編輯器並暫停手動／同步寫入。即使遷移期間發生 autosave，舊套件
+  exclusive tools lock 並持有到整體完成，取不到即拒絕開始。取得 lock **只證明當下
+  沒有 cooperating request 或 inherited tool child 持有它**；idle backend 與已停止
+  backend 無法區分，舊版 backend 也根本不知道這個 lock，因此不能用成功取得 lock
+  取代「先停服務」的操作前提。為使 migrated version 精確反映開始時的內容，仍建議
+  關閉編輯器並暫停手動／同步寫入。即使遷移期間發生 autosave，舊套件
   現在也不會被刪除：那次編輯會留在 retained quarantine，**不保證進入 migrated
   version**，操作者可事後比對與取回。確認 `TOOLS_DIR` 指向舊扁平套件，再於
   `backend/` 執行：
@@ -405,7 +407,9 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   都視為 no，tree 保持 byte-identical。`--yes` 只適合計畫已審過的自動化執行。
   確認後先在 `TOOLS_DIR` 的兄弟位置做完整備份，再建立
   `.afterthread-migration.json` write-ahead journal。預檢一次收集所有問題；任何
-  legacy 套件不可遷移就完全不開始。每包把工具內容搬進單一初始版本、移除
+  legacy 套件不可遷移就完全不開始。程式會在寫入新 package `state.json` 的最後一刻
+  重讀 legacy enabled；若值與預檢不同，代表停在確認畫面時來源仍被修改，整趟會清楚
+  拒絕並 rollback，而不採用未審閱的新值或覆蓋它。每包把工具內容搬進單一初始版本、移除
   manifest legacy `enabled`、把 owned state 搬成 package `state.json`、FOREIGN
   legacy state 原封不動當工具內容、把 `.ai_meta.json` 拆成 origin/summary，並將
   `.env` 位元與 mode 保留在 package 層。所有套件啟用後才持久寫下

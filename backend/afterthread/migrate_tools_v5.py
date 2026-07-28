@@ -1150,9 +1150,10 @@ def _assemble_shell(
         _write_shell_file(version_meta / "summary.json", _json_bytes(package.summary))
 
     package_meta = shell / _META_DIRNAME
+    enabled = _read_enabled_at_publication(package)
     state_document = {
         _STATE_MARKER_KEY: _STATE_MARKER_VALUE,
-        "enabled": package.enabled,
+        "enabled": enabled,
     }
     _write_shell_file(package_meta / "state.json", _json_bytes(state_document))
 
@@ -1161,6 +1162,47 @@ def _assemble_shell(
     _fsync_tree(shell)
     _write_shell_file(package_meta / "current", f"{vid}\n".encode())
     _fsync_tree(shell)
+
+
+def _read_enabled_at_publication(package: LegacyPackage) -> bool:
+    """Re-read the legacy toggle immediately before publishing package state.
+
+    A confirmation prompt can sit between preflight and this write for an
+    arbitrary time. A changed value means the supposedly offline source tree is
+    still being modified, so abort instead of silently migrating either a stale
+    decision or one unreviewed piece of a potentially wider concurrent edit.
+    """
+
+    state_kind, state_enabled, state_error = _inspect_state(package.root)
+    if state_error is not None:
+        raise MigrationRefused(
+            f"{package.name}: enabled state changed or became unreadable after preflight; "
+            "stop the service and retry migration"
+        )
+    if state_kind != package.state_kind:
+        raise MigrationRefused(
+            f"{package.name}: enabled state changed after preflight; "
+            "stop the service and retry migration"
+        )
+    if state_kind == "OURS":
+        if state_enabled is None:
+            raise AssertionError("owned legacy state has no enabled value")
+        enabled = state_enabled
+    else:
+        try:
+            manifest, _mode = _read_json_object(package.root / "tool.json", cap=_MANIFEST_MAX_BYTES)
+        except MigrationRefused as exc:
+            raise MigrationRefused(
+                f"{package.name}: enabled state changed or became unreadable after preflight; "
+                "stop the service and retry migration"
+            ) from exc
+        candidate = manifest.get("enabled", True)
+        enabled = candidate if isinstance(candidate, bool) else True
+    if enabled != package.enabled:
+        raise MigrationRefused(
+            f"{package.name}: enabled changed after preflight; stop the service and retry migration"
+        )
+    return enabled
 
 
 def _copy_env_file(source_root: Path, destination_root: Path) -> None:
@@ -2547,13 +2589,15 @@ def migrate_tools(
     token_hex: Callable[[int], str] = secrets.token_hex,
     confirm: Callable[[], bool] = lambda: _confirm_on_stdin(input),
 ) -> int:
-    """Take the offline precondition lock, then run migration under it.
+    """Take the migration lock, then run migration under it.
 
-    The service is documented to be stopped for migration. A non-blocking
-    exclusive failure is direct proof that a cooperating request or inherited
-    tool child is still alive, so no preflight reconciliation or package move is
-    attempted. The persistent lock file itself is expected migration metadata
-    and is skipped by preflight because its name is hidden.
+    Acquiring this non-blocking exclusive lock proves only that no cooperating
+    request or inherited tool child holds the inode at that instant. An idle
+    backend is indistinguishable from a stopped one, and a pre-lock backend does
+    not cooperate at all, so stopping the service remains an operator
+    precondition. Failure means held or unavailable and prevents any preflight
+    reconciliation or package move. The persistent lock file itself is expected
+    migration metadata and is skipped by preflight because its name is hidden.
     """
 
     resolved = root.expanduser().resolve()

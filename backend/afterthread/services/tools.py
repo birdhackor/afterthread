@@ -432,8 +432,18 @@ def _open_tools_lock(base: Path) -> int:
         flags |= os.O_NOFOLLOW
     fd = os.open(base / _TOOLS_LOCK_FILENAME, flags, 0o600)
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
             raise OSError("tools lock is not a regular file")
+        # open(2)'s mode is filtered through the process umask. Without this
+        # owner-rw floor, a restrictive umask can create the persistent inode
+        # owner-read-only, so every later O_RDWR acquisition fails forever after
+        # this creating descriptor closes. Preserve any group/other bits while
+        # making every backend-owned lock inode reopenable by its owner.
+        current_mode = stat.S_IMODE(info.st_mode)
+        safe_mode = current_mode | _OWNER_RW
+        if safe_mode != current_mode:
+            os.fchmod(fd, safe_mode)
     except BaseException:
         os.close(fd)
         raise

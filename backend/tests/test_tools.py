@@ -3693,6 +3693,32 @@ def test_two_ai_requests_hold_shared_lock_concurrently(
         tools.release_tools_lock(first)
 
 
+def test_lock_created_under_restrictive_umask_is_reopenable(tmp_path: Path) -> None:
+    """The persistent lock cannot strand itself through its creation mode.
+
+    ``os.open(..., 0o600)`` still applies the process umask. Under 0o277 that
+    request creates 0o400 unless the already-open descriptor is explicitly
+    repaired; once it closes, a non-root backend cannot reopen the inode
+    O_RDWR. The mode measurement makes this deterministic even when the test
+    runner itself has permission privileges, and the second acquisition pins
+    the operational invariant.
+    """
+
+    root = tmp_path / "tools"
+    root.mkdir()
+    previous = os.umask(0o277)
+    try:
+        with tools.exclusive_tools_lock(root) as acquired:
+            assert acquired is True
+    finally:
+        os.umask(previous)
+
+    lock_path = root / tools._TOOLS_LOCK_FILENAME
+    assert stat.S_IMODE(lock_path.stat().st_mode) & 0o600 == 0o600
+    with tools.exclusive_tools_lock(root) as acquired_again:
+        assert acquired_again is True
+
+
 def test_a_toggle_mid_call_moves_neither_identity(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

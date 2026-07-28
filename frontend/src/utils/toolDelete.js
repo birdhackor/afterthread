@@ -1,3 +1,20 @@
+// Confirmation copy is kept with the outcome copy so both sides describe the
+// same lock-first removal contract.
+export function toolDeleteConfirmation(name) {
+	return `確定要刪除「${name}」嗎？若有 AI 任務或工具子行程正在使用工具，系統不會從清單移除工具，也不會移動目錄，你可以稍後在此重試。取得排他鎖後，工具才會停止出現在清單與 AI 可用工具中，並嘗試刪除整個工具目錄；若清理失敗，目錄（含設定與金鑰檔）會保留，完成後會顯示保留路徑供你手動處理。`;
+}
+
+export function toolDiscardConfirmation(name) {
+	return `確定要丟掉「${name}」目前這一版並退回前一版嗎？若有 AI 任務或工具子行程正在使用工具，系統不會切換版本，也不會移動檔案，你可以稍後在此重試。成功切換且確認版本指標已持久化後，系統會嘗試刪除原版本；若無法確認持久化或清理失敗，會保留檔案並說明下一步。前一版的內容與總結會重新顯示。`;
+}
+
+// Whole-package deletion has one retry-in-place conflict. Match the structured
+// status+code pair exactly: unrelated 409s and ordinary failures keep their
+// existing close-and-report behavior.
+export function keepDeleteConfirmationOpen(error) {
+	return error?.status === 409 && error?.code === "ai_job_in_progress";
+}
+
 // Translate the whole-tool DELETE wire result into one operator-facing notice.
 // The retained branch deliberately includes the backend's exact parked path:
 // removing a row from the registry is not the same as removing config or key

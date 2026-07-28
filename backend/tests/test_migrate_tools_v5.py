@@ -367,6 +367,43 @@ def test_migration_refuses_while_shared_tools_lock_is_held(
     assert "tools lock is held or unavailable" in "\n".join(output)
 
 
+def test_enabled_change_at_confirmation_aborts_instead_of_using_preflight_value(
+    tmp_path: Path,
+) -> None:
+    """A human-length prompt cannot turn the preflight toggle into write data."""
+
+    root = tmp_path / "tools"
+    package = _make_package(root, enabled=True)
+    output: list[str] = []
+
+    def toggle_then_confirm() -> bool:
+        (package / migration._STATE_FILENAME).write_text(
+            json.dumps(
+                {
+                    migration._STATE_MARKER_KEY: migration._STATE_MARKER_VALUE,
+                    "enabled": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return True
+
+    assert _run(root, output=output, confirm=toggle_then_confirm) == 1
+
+    assert package.is_dir()
+    assert not (package / migration._META_DIRNAME).exists()
+    assert not migration._shell_path(root, "alpha").exists()
+    assert not (root / migration._JOURNAL_FILENAME).exists()
+    assert (
+        json.loads((package / migration._STATE_FILENAME).read_text(encoding="utf-8"))["enabled"]
+        is False
+    )
+    text = "\n".join(output)
+    assert "enabled state changed after preflight" in text
+    assert "stop the service and retry migration" in text
+    assert "all package names were rolled back" in text
+
+
 @pytest.mark.parametrize("side", ["before", "after"])
 @pytest.mark.parametrize("label", _JOURNAL_LABELS)
 def test_each_forward_journal_write_side_recovers(tmp_path: Path, label: str, side: str) -> None:

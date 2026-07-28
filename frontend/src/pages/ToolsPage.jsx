@@ -32,7 +32,10 @@ import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { usePageTitle } from "../hooks/usePageTitle.js";
 import { codePointLength } from "../utils/text.js";
 import {
+	keepDeleteConfirmationOpen,
+	toolDeleteConfirmation,
 	toolDeleteNotification,
+	toolDiscardConfirmation,
 	toolDiscardNotification,
 } from "../utils/toolDelete.js";
 import {
@@ -779,7 +782,9 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 			await queryClient.invalidateQueries({ queryKey: ["tools"] });
 		},
 		onError: (mutationError) => {
-			setDeleteTarget(null);
+			if (!keepDeleteConfirmationOpen(mutationError)) {
+				setDeleteTarget(null);
+			}
 			notifications.show({
 				color: "red",
 				title: "刪除失敗",
@@ -1340,10 +1345,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 				withCloseButton={!discardMutation.isPending}
 			>
 				<Stack gap="md">
-					<Text>
-						確定要丟掉「{discardTarget?.name}
-						」目前這一版並退回前一版嗎？目前版本會停止使用；只有在系統能確認沒有版本執行中時才會刪除檔案，否則會暫留在磁碟。前一版的內容與總結會重新顯示。
-					</Text>
+					<Text>{toolDiscardConfirmation(discardTarget?.name ?? "")}</Text>
 					<Group justify="flex-end">
 						<Button
 							variant="default"
@@ -1382,11 +1384,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 				withCloseButton={!deleteMutation.isPending}
 			>
 				<Stack gap="md">
-					<Text>
-						確定要將「{deleteTarget}
-						」從工具清單移除嗎？工具會立即停止出現在清單與 AI
-						可用工具中。若系統能確認所有版本都未在執行，會刪除整個工具目錄；若無法確認，目錄（含設定與金鑰檔）會保留在磁碟，完成後會顯示保留路徑供你手動處理。
-					</Text>
+					<Text>{toolDeleteConfirmation(deleteTarget ?? "")}</Text>
 					<Group justify="flex-end">
 						<Button
 							variant="default"

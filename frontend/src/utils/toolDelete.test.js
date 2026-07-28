@@ -1,8 +1,50 @@
 import { describe, expect, it } from "vitest";
 import {
+	keepDeleteConfirmationOpen,
+	toolDeleteConfirmation,
 	toolDeleteNotification,
+	toolDiscardConfirmation,
 	toolDiscardNotification,
 } from "./toolDelete.js";
+
+describe("tool removal confirmations", () => {
+	it("says lock contention leaves a whole package untouched and retryable", () => {
+		const copy = toolDeleteConfirmation("kbsearch");
+
+		expect(copy).toContain("不會從清單移除工具，也不會移動目錄");
+		expect(copy).toContain("稍後在此重試");
+		expect(copy).toContain("若清理失敗");
+	});
+
+	it("says lock contention leaves the current version untouched and retryable", () => {
+		const copy = toolDiscardConfirmation("kbsearch");
+
+		expect(copy).toContain("不會切換版本，也不會移動檔案");
+		expect(copy).toContain("稍後在此重試");
+		expect(copy).toContain("若無法確認持久化或清理失敗");
+	});
+
+	it("keeps only the retryable AI-lock delete conflict open", () => {
+		expect(
+			keepDeleteConfirmationOpen({
+				status: 409,
+				code: "ai_job_in_progress",
+			}),
+		).toBe(true);
+		expect(
+			keepDeleteConfirmationOpen({
+				status: 409,
+				code: "lineage_unavailable",
+			}),
+		).toBe(false);
+		expect(
+			keepDeleteConfirmationOpen({
+				status: 400,
+				code: "ai_job_in_progress",
+			}),
+		).toBe(false);
+	});
+});
 
 describe("toolDeleteNotification", () => {
 	it("reports physical removal without a retained-path warning", () => {
