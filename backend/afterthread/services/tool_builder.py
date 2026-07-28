@@ -1621,8 +1621,6 @@ def _promote_staging(
         os.rename(shell_root, target)
     except OSError as exc:
         return None, f"工具包搬移失敗（{type(exc).__name__}）。"  # noqa: RUF001
-    if not _fsync_directory(base):
-        return None, _ERROR_DURABILITY
     # Carry the identity established by this publish across later decoration.
     # Re-resolving ``current`` there would make this last typed-identity guarantee
     # a caller convention instead of a property of the publisher's return type.
@@ -1632,10 +1630,13 @@ def _promote_staging(
         vid,
         tools.PREVIOUS_NULL,
     )
-    # This process assembled the generation before exposing the package name, so
-    # an empty local execution count really is idle rather than a restart-shaped
-    # unknown. Keep that positive fact process-local beside the execution counts.
+    # The rename is the instant both local-creation facts become true. Record them
+    # before the parent fsync, because a durability failure still leaves this exact
+    # package and generation on disk for later delete/discard cleanup.
     tools.remember_local_execution_generation(published.version_root)
+    tools.remember_local_execution_package(published.package_root)
+    if not _fsync_directory(base):
+        return None, _ERROR_DURABILITY
     return published, None
 
 
@@ -1723,6 +1724,10 @@ def _publish_revised_version(
             continue
         except OSError as exc:
             return None, f"無法安裝工具版本（{type(exc).__name__}）。"  # noqa: RUF001
+        published_version = tools.VersionRoot(target)
+        # The local provenance exists at rename success, even if the parent fsync,
+        # the target re-check, or current publication below later fails.
+        tools.remember_local_execution_generation(published_version)
         if not _fsync_directory(versions):
             return None, _ERROR_DURABILITY
 
@@ -1744,11 +1749,10 @@ def _publish_revised_version(
         # hook would let a later current edit redirect the new version's work.
         published = tools.Resolved(
             package_root,
-            tools.VersionRoot(target),
+            published_version,
             vid,
             tools.PreviousValue(previous.vid),
         )
-        tools.remember_local_execution_generation(published.version_root)
         return _PublishedRevision(published, origin), None
     return None, _ERROR_VERSION_ID_WRITE
 

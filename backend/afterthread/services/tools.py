@@ -796,6 +796,22 @@ def _resolve_current_data(
         package / _META_DIRNAME / _CURRENT_FILENAME, _CURRENT_MAX_BYTES
     )
     if data is None:
+        try:
+            os.lstat(package / _META_DIRNAME)
+        except FileNotFoundError:
+            # A non-empty flat package is the supported pre-v5 layout, not an
+            # ordinary damaged versioned package. Name the offline recovery
+            # action while the row is still visible and deletable in the UI.
+            try:
+                with os.scandir(package) as entries:
+                    if next(entries, None) is not None:
+                        return (
+                            "unmigrated tool layout; run `python -m afterthread.migrate_tools_v5`"
+                        )
+            except OSError:
+                pass
+        except OSError:
+            pass
         return "current is missing or unreadable"
     if len(data) > _CURRENT_MAX_BYTES:
         return "current is too large"
@@ -2738,17 +2754,22 @@ def _run_tool_subprocess(
     return _cap_output(redact_known_secrets(output.stdout), output_cap)
 
 
-# In-flight executions are keyed by VersionRoot directory identity, not manifest
-# identity. Hand-editing ``tool.json`` may change the latter while a child still
-# needs the same directory files. The count protects overlapping calls, and the
-# lock covers only registry updates and lookups.
-_INFLIGHT_EXECUTIONS: dict[tuple[int, int], int] = {}
-# This second process-local fact is what lets absence mean idle for a generation
-# this process CREATED.  Absence from ``_INFLIGHT_EXECUTIONS`` alone means
+# In-flight executions are keyed first by the owning PACKAGE directory identity,
+# then by VersionRoot directory identity. Hand-editing ``tool.json`` may change
+# its manifest identity while a child still needs the same directory files, and
+# renaming either directory carries both directory identities. The nested count
+# protects overlapping calls while making "is this package running?" one direct
+# registry lookup.
+_INFLIGHT_EXECUTIONS: dict[tuple[int, int], dict[tuple[int, int], int]] = {}
+# These process-local facts are what let absence mean idle for an exact removal
+# target this process CREATED. Absence from ``_INFLIGHT_EXECUTIONS`` alone means
 # UNKNOWN, not idle: a generation that pre-dates this backend may still be in use
-# by a start_new_session child orphaned by the previous backend. Collapsing that
-# third state into idle was the bug that let delete/discard rmtree such a child.
+# by a start_new_session child orphaned by the previous backend. Package roots are
+# recorded separately because whole-package deletion destroys a wider target than
+# a discard; creating one revised version does not prove an inherited package safe
+# to remove recursively.
 _LOCAL_EXECUTION_GENERATIONS: set[tuple[int, int]] = set()
+_LOCAL_EXECUTION_PACKAGES: set[tuple[int, int]] = set()
 # A parked tree is eligible for automatic collection only when THIS process saw
 # it while an execution was registered. A backend hard restart empties both
 # registries while start_new_session children may survive; therefore an unknown
@@ -2839,9 +2860,11 @@ def _advertisement_retired(generation: _AdvertisementGeneration) -> bool:
 
 
 @contextlib.contextmanager
-def _inflight_execution(identity: tuple[int, int]) -> Iterator[None]:
-    """Count one execution against that DIRECTORY (``directory_identity``) in, and
-    back out again.
+def _inflight_execution(
+    package_identity: tuple[int, int],
+    version_identity: tuple[int, int],
+) -> Iterator[None]:
+    """Count one execution under its package and exact VersionRoot, then remove it.
 
     A context manager rather than a register/discard pair at the call site
     because the ``finally`` is the point: a handler that raises, or an AI request
@@ -2850,30 +2873,35 @@ def _inflight_execution(identity: tuple[int, int]) -> Iterator[None]:
     is taken for the two dict updates ONLY, never held across the ``yield`` (which
     spans an ``await`` and the whole subprocess run).
 
-    The count is dropped to zero by REMOVING the key, so ``in`` is the whole
-    query and a stale zero can never read as "still in use".
+    Both empty counts are dropped by REMOVING their keys, so package membership is
+    the whole query and a stale empty mapping can never read as "still in use".
     """
     with _EXECUTION_LOCK:
-        _INFLIGHT_EXECUTIONS[identity] = _INFLIGHT_EXECUTIONS.get(identity, 0) + 1
+        versions = _INFLIGHT_EXECUTIONS.setdefault(package_identity, {})
+        versions[version_identity] = versions.get(version_identity, 0) + 1
     try:
         yield
     finally:
         with _EXECUTION_LOCK:
-            remaining = _INFLIGHT_EXECUTIONS.get(identity, 0) - 1
-            if remaining > 0:
-                _INFLIGHT_EXECUTIONS[identity] = remaining
-            else:
-                _INFLIGHT_EXECUTIONS.pop(identity, None)
+            versions = _INFLIGHT_EXECUTIONS.get(package_identity)
+            if versions is not None:
+                remaining = versions.get(version_identity, 0) - 1
+                if remaining > 0:
+                    versions[version_identity] = remaining
+                else:
+                    versions.pop(version_identity, None)
+                if not versions:
+                    _INFLIGHT_EXECUTIONS.pop(package_identity, None)
 
 
 def directory_execution_in_flight(identity: tuple[int, int]) -> bool:
     """Return only the positive process-local running fact for one VersionRoot."""
     with _EXECUTION_LOCK:
-        return identity in _INFLIGHT_EXECUTIONS
+        return any(identity in versions for versions in _INFLIGHT_EXECUTIONS.values())
 
 
 def remember_local_execution_generation(version_root: VersionRoot) -> None:
-    """Record a generation this process created before returning it as installed.
+    """Record an exact generation as soon as this process installs its directory.
 
     Such a generation cannot have a child left by an earlier backend process.
     Therefore, and only therefore, a zero local execution count proves it idle.
@@ -2886,56 +2914,52 @@ def remember_local_execution_generation(version_root: VersionRoot) -> None:
         _LOCAL_EXECUTION_GENERATIONS.add(identity)
 
 
+def remember_local_execution_package(package_root: PackageLayoutRoot) -> None:
+    """Record a whole package shell this process atomically installed."""
+
+    identity = directory_identity(VersionRoot(package_root.path))
+    if identity is None:
+        return
+    with _EXECUTION_LOCK:
+        _LOCAL_EXECUTION_PACKAGES.add(identity)
+
+
 def package_execution_judgement(
     package_root: PackageLayoutRoot,
+    removal_target: PackageLayoutRoot | VersionRoot | None = None,
 ) -> ExecutionJudgement:
-    """Judge all real version generations as running, locally idle, or unknown.
+    """Judge whether one exact removal target under a package is safe to destroy.
 
-    Every directory in ``versions/`` is considered, including a future
-    ``<vid>.discarded`` parking name. ``locally-proven-idle`` requires positive
-    evidence that THIS process created every generation and has no execution
-    registered against any of them. A missing registry entry for a generation
-    that pre-dates this process is ``unknown``: a detached child may have survived
-    the restart. Filesystem answers we cannot establish are unknown for the same
-    fail-closed reason.
+    The running question is package-scoped: registration records the package
+    directory identity beside every execution, so a rename of the package or of
+    any version cannot move that execution out of the lookup. The old approach
+    enumerated whatever names happened to remain under ``versions/``; that was
+    the wrong question because an operator-supported rename could hide the busy
+    inode while leaving an idle sibling to authorize recursive deletion.
+
+    No package or version name, and no directory enumeration, participates here.
+    ``locally-proven-idle`` additionally requires positive evidence that THIS
+    process created the exact directory that will be removed: the package shell
+    for recursive delete, or the parked generation for discard. Anything inherited
+    across a restart is ``unknown`` even when this process has no registered call.
     """
 
-    versions = package_root.path / _VERSIONS_DIRNAME
-    try:
-        versions_info = os.lstat(versions)
-    except FileNotFoundError:
-        # Absence cannot be positive evidence: the directory may have been
-        # renamed while a surviving child still holds a version cwd by inode.
+    package_identity = directory_identity(VersionRoot(package_root.path))
+    if package_identity is None:
         return "unknown"
-    except OSError:
-        return "unknown"
-    if not stat.S_ISDIR(versions_info.st_mode):
-        return "unknown"
-    try:
-        entries = list(os.scandir(versions))
-    except OSError:
-        return "unknown"
-    identities: list[tuple[int, int]] = []
-    for entry in entries:
-        try:
-            if not entry.is_dir(follow_symlinks=False):
-                continue
-        except OSError:
-            return "unknown"
-        identity = directory_identity(VersionRoot(Path(entry.path)))
-        if identity is None:
-            return "unknown"
-        identities.append(identity)
-    # An empty versions directory (or one with no real directory entries)
-    # proves nothing about a generation that may have been renamed elsewhere
-    # inside the package. Only identities positively enumerated by this process
-    # can participate in a locally-idle proof.
-    if not identities:
+    target = removal_target if removal_target is not None else package_root
+    target_identity = directory_identity(VersionRoot(target.path))
+    if target_identity is None:
         return "unknown"
     with _EXECUTION_LOCK:
-        if any(identity in _INFLIGHT_EXECUTIONS for identity in identities):
+        if package_identity in _INFLIGHT_EXECUTIONS:
             return "running"
-        if all(identity in _LOCAL_EXECUTION_GENERATIONS for identity in identities):
+        local_targets = (
+            _LOCAL_EXECUTION_PACKAGES
+            if isinstance(target, PackageLayoutRoot) and not isinstance(target, VersionRoot)
+            else _LOCAL_EXECUTION_GENERATIONS
+        )
+        if target_identity in local_targets:
             return "locally-proven-idle"
     return "unknown"
 
@@ -2968,7 +2992,8 @@ def deferred_tree_observed_idle(
     with _EXECUTION_LOCK:
         if identity not in _DEFERRED_EXECUTION_CLEANUPS:
             return False
-    if package_execution_judgement(execution_scope) != "locally-proven-idle":
+    target = PackageLayoutRoot(path) if path == execution_scope.path else VersionRoot(path)
+    if package_execution_judgement(execution_scope, target) != "locally-proven-idle":
         return False
     with _EXECUTION_LOCK:
         # Consume before rmtree. If removal itself fails, the remains stay for
@@ -3025,18 +3050,23 @@ def _make_handler(
     """
 
     advertised_directory_identity = directory_identity(advertised.version_root)
+    advertised_package_identity = directory_identity(VersionRoot(advertised.package_root.path))
 
     async def _handler(arguments: dict[str, Any]) -> str:
         package_root = advertised.package_root
         version_root = advertised.version_root
-        if identity is None or advertised_directory_identity is None:
+        if (
+            identity is None
+            or advertised_directory_identity is None
+            or advertised_package_identity is None
+        ):
             return _TOOL_REPLACED_RESULT
         # Register the exact VersionRoot before any queued work. A hold nobody can
         # identify would be invisible to package-wide destructive cleanup.
         running = directory_identity(version_root)
         if running is None:
             return _TOOL_REPLACED_RESULT
-        with _inflight_execution(running):
+        with _inflight_execution(advertised_package_identity, running):
             # Recheck inside the hold, then once more immediately before Popen.
             if not _still_the_expected_package(version_root, identity):
                 return _TOOL_REPLACED_RESULT
@@ -3191,7 +3221,18 @@ def set_enabled(name: str, enabled: bool) -> bool:
     return write_package_state(package_root, enabled)
 
 
-type DiscardOutcome = Literal["ok", "not_found", "lineage_unavailable"]
+type ToolRemovalOutcome = Literal["removed", "retained"]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRemovalResult:
+    """The observable filesystem result after a tool or version leaves current use."""
+
+    outcome: ToolRemovalOutcome
+    retained_path: Path | None
+
+
+type DiscardOutcome = ToolRemovalResult | Literal["not_found", "lineage_unavailable"]
 
 
 def discard_version(resolution: Resolved) -> DiscardOutcome:
@@ -3237,7 +3278,7 @@ def discard_version(resolution: Resolved) -> DiscardOutcome:
     # replacement, delete, or inode reuse can clear it; a later advertisement
     # gets a new cohort.
     if not publication.durable:
-        return "ok"
+        return ToolRemovalResult("retained", current.path)
 
     # RENAME FIRST, then decide -- the same order whole-package deletion uses,
     # for the same structural reason. Asking the registry before the rename
@@ -3254,34 +3295,29 @@ def discard_version(resolution: Resolved) -> DiscardOutcome:
     try:
         os.rename(current.path, parked)
     except Exception:
-        return "ok"
+        return ToolRemovalResult("retained", current.path)
 
     try:
-        execution = package_execution_judgement(package_root)
+        execution = package_execution_judgement(package_root, VersionRoot(parked))
     except Exception:
         # The shared helper is fail-closed already; this backstop keeps cleanup
         # just as conservative if a test double or future implementation raises.
         execution = "unknown"
     if execution == "running":
         remember_running_tree_for_cleanup(parked)
-        return "ok"
+        return ToolRemovalResult("retained", parked)
     if execution == "unknown":
-        return "ok"
+        return ToolRemovalResult("retained", parked)
 
     with contextlib.suppress(Exception):
         shutil.rmtree(parked)
-    return "ok"
+    if os.path.lexists(parked):
+        return ToolRemovalResult("retained", parked)
+    return ToolRemovalResult("removed", None)
 
 
-type DeleteToolOutcome = Literal["removed", "retained"]
-
-
-@dataclass(frozen=True, slots=True)
-class DeleteToolResult:
-    """The observable filesystem result after a tool leaves the registry."""
-
-    outcome: DeleteToolOutcome
-    retained_path: Path | None
+type DeleteToolOutcome = ToolRemovalOutcome
+type DeleteToolResult = ToolRemovalResult
 
 
 def delete_tool(name: str) -> DeleteToolResult | None:
@@ -3340,7 +3376,7 @@ def delete_tool(name: str) -> DeleteToolResult | None:
             candidate.unlink()
         except OSError:
             return None
-        return DeleteToolResult("removed", None)
+        return ToolRemovalResult("removed", None)
     directory = _resolve_package_dir(name)
     if directory is None or not directory.is_dir():
         return None
@@ -3394,9 +3430,9 @@ def delete_tool(name: str) -> DeleteToolResult | None:
         execution = "unknown"
     if execution == "running":
         remember_running_tree_for_cleanup(deferred)
-        return DeleteToolResult("retained", deferred)
+        return ToolRemovalResult("retained", deferred)
     if execution == "unknown":
-        return DeleteToolResult("retained", deferred)
+        return ToolRemovalResult("retained", deferred)
     # Best-effort from here: the tool is already gone as far as everything that
     # reads this directory is concerned, so a removal that fails part-way must not
     # be reported as "did not happen". Because this path was never observed
@@ -3404,5 +3440,5 @@ def delete_tool(name: str) -> DeleteToolResult | None:
     # are hidden evidence for the operator rather than a restart-unsafe retry.
     shutil.rmtree(deferred, ignore_errors=True)
     if os.path.lexists(deferred):
-        return DeleteToolResult("retained", deferred)
-    return DeleteToolResult("removed", None)
+        return ToolRemovalResult("retained", deferred)
+    return ToolRemovalResult("removed", None)

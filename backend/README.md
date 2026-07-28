@@ -150,7 +150,8 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `lineage`（`sole`／`usable`／`broken`）；套件沒有可解析的生效版本時仍會列出，
   但 `description`／`current_vid` 為 `null`、`valid=false`、`lineage=broken`，只能
   整包刪除。`description` 可為空不是把 manifest 契約放寬，而是讓壞掉的套件仍有
-  一列可供清理。
+  一列可供清理。若非空套件完全沒有 `.afterthread.meta/`，會辨識為尚未遷移的舊版
+  扁平 layout，錯誤訊息直接提示執行 `python -m afterthread.migrate_tools_v5`。
 - `PATCH /api/tools/{name}` — 切換某工具的 `enabled`；找不到回 404。寫的是套件的
   `.afterthread.meta/state.json`（見下方「工具套件格式」），**完全不碰任何版本的
   `tool.json`**——所以一次
@@ -164,11 +165,12 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   因為沒有一個版本可讓該列描述。**另一條 404 的理由**：`state.json` 是可讀但沒有
   backend marker 的 foreign 檔案時，這條路由拒絕而不是覆蓋（見下方）。
 - `DELETE /api/tools/{name}` — 將整個工具套件從 registry 移除；找不到回 404。
-  後端先把套件改名到隱藏名稱，再用三態判斷所有版本：`running` 與 `unknown` 都只停放，
-  只有 `locally-proven-idle` 才會立刻遞迴移除。後者要求本程序確實枚舉到至少一個版本，
-  每一個版本都是本程序建立，而且目前沒有本地執行；`versions/` 缺失、為空、無法完整
-  枚舉，或既有版本在 process-local registry 沒有 entry，都只代表「這個程序不知道」，
-  不能代表 idle。直接刪可能讓仍活著的子行程在下一次相對開檔時失敗。成功回 200
+  後端先把套件改名到隱藏名稱，再以套件目錄的 device/inode 直接查 process-local
+  execution registry；每次執行在註冊時已帶著 owning package，因此版本被移出
+  `versions/`、`versions/` 本身改名，或整個套件改成隱藏名稱，都不會把執行移出查詢
+  範圍，也不需枚舉任何目錄名稱。`running` 與 `unknown` 都只停放；只有本程序原子安裝
+  的精確套件殼、目前又沒有套件執行時，才是 `locally-proven-idle` 並可立刻遞迴移除。
+  直接刪可能讓仍活著的子行程在下一次相對開檔時失敗。成功回 200
   `{outcome: "removed", retained_path: null}` 或
   `{outcome: "retained", retained_path: "<隱藏目錄的絕對路徑>"}`；工具在兩種回應下
   都已從清單與模型可見的工具中消失，但後者明確表示設定與金鑰檔仍可能留在磁碟。
@@ -179,8 +181,12 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   取得全域工具名額，再比對 path 裡的 `vid`；不相符回
   `409 version_mismatch`。`lineage=usable` 時把 `current` 原子切回
   `origin.json.previous`，之後才盡力清掉原版本；原版本一律先改名成
-  `<vid>.discarded`，只有全套件三態判斷為 `locally-proven-idle` 才立刻移除；`running`
-  會留下本程序稍後清掃的資格，`unknown` 則只停放、交由操作者確認後處理。
+  `<vid>.discarded`，套件有任何本地執行時判為 `running`；否則只有本程序建立的精確
+  原版本才是 `locally-proven-idle` 並立刻移除，跨程序無法證明的版本是 `unknown`。
+  `running` 會留下本程序稍後清掃的資格，`unknown` 則只停放、交由操作者確認後處理。
+  成功回 200 `{outcome: "removed", retained_path: null}` 或
+  `{outcome: "retained", retained_path: "<原版本保留位置的絕對路徑>"}`；後者也涵蓋
+  `current` 持久化未確認、停放 rename 失敗或遞迴移除失敗，UI 會顯示精確路徑而非泛稱成功。
   `lineage=sole` 在 UI 走既有的整包刪除確認；
   前一版缺失、未提交或指回自己則回 `409 lineage_unavailable`，不動任何檔案。
 - `POST /api/tools/install` — 送出 KB 網頁安裝器工作（見下方「工具（KB 網頁
@@ -341,11 +347,13 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   handler 仍明確拒絕。retired generation 由既有 handler 持有到該對話／handler
   釋放為止；之後從備份恢復並重新掃描同一 vid 會取得新 generation。退役完全不讀
   目錄的 device、inode 或其他可由 rename／刪除／重建影響的磁碟屬性，避免磁碟
-  身分重用或搬回原位使舊廣告復活。執行保護、generation 來源證據與
-  deferred-cleanup 資格也都是 process-local：delete、discard 與 `.stale-` 清掃共用
-  同一個「所有版本是 running／locally-proven-idle／unknown」判斷。只有本程序建立的
-  所有 generation 都沒有本地執行才是 locally-proven-idle；跨程序不把空 registry
-  當成 idle 證明。新程序無法證明的 stale／discarded tree 一律保留給操作者。
+  身分重用或搬回原位使舊廣告復活。執行保護、removal target 的來源證據與
+  deferred-cleanup 資格也都是 process-local：handler 註冊 version inode 時同時登記
+  owning package inode，delete、discard 與 `.stale-` 清掃都直接用 package inode 查
+  `running`，不走訪 `versions/`。沒有執行時，再以「本程序建立了將被破壞的精確 target」
+  判斷 `locally-proven-idle`：整包 delete 要有本地 package-shell 證據，discard 只需本地
+  version-generation 證據；跨程序不把空 registry 當成 idle 證明。新程序無法證明的
+  stale／discarded tree 一律保留給操作者。
 - **AI 總結拆成兩份 sidecar**：每版不可變的
   `.afterthread.meta/origin.json` 保存來源、安裝指示、修訂意見與 previous；
   可重新產生的 `.afterthread.meta/summary.json` 保存 summary、updated time 與

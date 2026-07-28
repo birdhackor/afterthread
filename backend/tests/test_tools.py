@@ -85,12 +85,14 @@ def _reset_log() -> Generator[None]:
     llm_log._reset_for_tests()
     tools._INFLIGHT_EXECUTIONS.clear()
     tools._LOCAL_EXECUTION_GENERATIONS.clear()
+    tools._LOCAL_EXECUTION_PACKAGES.clear()
     tools._DEFERRED_EXECUTION_CLEANUPS.clear()
     tools._ADVERTISEMENT_GENERATIONS.clear()
     yield
     llm_log._reset_for_tests()
     tools._INFLIGHT_EXECUTIONS.clear()
     tools._LOCAL_EXECUTION_GENERATIONS.clear()
+    tools._LOCAL_EXECUTION_PACKAGES.clear()
     tools._DEFERRED_EXECUTION_CLEANUPS.clear()
     tools._ADVERTISEMENT_GENERATIONS.clear()
 
@@ -704,6 +706,7 @@ def _version_root(version: Path) -> tools.VersionRoot:
 def _remember_package_locally_idle(package: Path) -> None:
     """Model generations assembled by this backend process, as the builder does."""
 
+    tools.remember_local_execution_package(tools.PackageRoot(package))
     for version in (package / tools._VERSIONS_DIRNAME).iterdir():
         if version.is_dir() and not version.is_symlink():
             tools.remember_local_execution_generation(tools.VersionRoot(version))
@@ -792,6 +795,22 @@ def test_invariant_b_current_accepts_at_most_one_trailing_newline(tmp_path: Path
     assert isinstance(tools.resolve_current(tools.PackageRoot(package)), tools.Unresolved)
 
 
+def test_unmigrated_flat_package_points_to_the_offline_migration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    package = root / "echo"
+    package.mkdir(parents=True)
+    (package / "tool.json").write_text("{}", encoding="utf-8")
+    (package / "run.py").write_text("import sys\n", encoding="utf-8")
+    _install_tools(monkeypatch, root)
+
+    row = list_tools()[0]
+
+    assert row["valid"] is False
+    assert row["error"] == ("unmigrated tool layout; run `python -m afterthread.migrate_tools_v5`")
+
+
 def _add_committed_version(package: Path, vid: str, *, description: str, output: str) -> Path:
     previous = _resolved_version(package)
     version = package / tools._VERSIONS_DIRNAME / vid
@@ -854,17 +873,19 @@ def test_advertised_handler_refuses_when_current_becomes_unresolved(
     assert not sentinel.exists()
 
 
-def test_invariant_a_running_judgement_enumerates_discarded_version_directories(
+def test_running_judgement_uses_the_registered_package_owner_after_a_version_rename(
     tmp_path: Path,
 ) -> None:
     version = _make_tool(tmp_path / "tools", "echo", "import sys\n")
     package = _package_path(version)
     discarded = version.with_name(f"{version.name}.discarded")
     os.rename(version, discarded)
-    identity = tools.directory_identity(tools.VersionRoot(discarded))
-    assert identity is not None
+    version_identity = tools.directory_identity(tools.VersionRoot(discarded))
+    package_identity = tools.directory_identity(tools.VersionRoot(package))
+    assert version_identity is not None
+    assert package_identity is not None
 
-    with tools._inflight_execution(identity):
+    with tools._inflight_execution(package_identity, version_identity):
         assert tools.package_execution_judgement(tools.PackageRoot(package)) == "running"
 
 
@@ -873,38 +894,60 @@ def test_execution_judgement_requires_positive_local_idle_evidence(tmp_path: Pat
 
     version = _make_tool(tmp_path / "tools", "echo", "import sys\n")
     package_root = _package_root(version)
-    identity = tools.directory_identity(_version_root(version))
-    assert identity is not None
+    version_identity = tools.directory_identity(_version_root(version))
+    package_identity = tools.directory_identity(tools.VersionRoot(package_root.path))
+    assert version_identity is not None
+    assert package_identity is not None
 
-    assert tools.package_execution_judgement(package_root) == "unknown"
-    with tools._inflight_execution(identity):
-        assert tools.package_execution_judgement(package_root) == "running"
+    assert tools.package_execution_judgement(package_root, _version_root(version)) == "unknown"
+    with tools._inflight_execution(package_identity, version_identity):
+        assert tools.package_execution_judgement(package_root, _version_root(version)) == "running"
     # Watching a NEW local call finish cannot prove that an unregistered child
     # from the prior backend is also gone.
-    assert tools.package_execution_judgement(package_root) == "unknown"
+    assert tools.package_execution_judgement(package_root, _version_root(version)) == "unknown"
 
     tools.remember_local_execution_generation(_version_root(version))
+    assert (
+        tools.package_execution_judgement(package_root, _version_root(version))
+        == "locally-proven-idle"
+    )
+    # Version provenance cannot authorize a wider recursive package deletion.
+    assert tools.package_execution_judgement(package_root) == "unknown"
+    tools.remember_local_execution_package(package_root)
     assert tools.package_execution_judgement(package_root) == "locally-proven-idle"
 
 
-def test_delete_with_running_child_and_renamed_versions_parks_tree(
+def test_delete_running_version_moved_out_while_idle_version_remains_parks(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A missing fixed versions name is not evidence that its inode is idle."""
+    """Package ownership in the execution registry survives every version name."""
 
     root = tmp_path / "tools"
     marker, gate = tmp_path / "started", tmp_path / "go"
-    version = _make_tool(
+    first = _make_tool(
         root,
         "echo",
+        "import sys\nsys.stdout.write('FIRST')\n",
+    )
+    package = _package_path(first)
+    second_vid = "20260728T020304Z-fedcba"
+    second = _add_committed_version(
+        package,
+        second_vid,
+        description="running second",
+        output="SECOND",
+    )
+    second.joinpath("run.py").write_text(
         "import os, sys, time\n"
         f"open({str(marker)!r}, 'w').write('x')\n"
         f"while not os.path.exists({str(gate)!r}):\n"
         "    time.sleep(0.01)\n"
         "sys.stdout.write(open('data.txt').read())\n",
+        encoding="utf-8",
     )
-    (version / "data.txt").write_text("PAYLOAD", encoding="utf-8")
-    package = _package_path(version)
+    (second / "data.txt").write_text("PAYLOAD", encoding="utf-8")
+    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    _remember_package_locally_idle(package)
     _install_tools(monkeypatch, root)
     handler = enabled_llm_tools()[0].handler
 
@@ -913,11 +956,15 @@ def test_delete_with_running_child_and_renamed_versions_parks_tree(
     caller.start()
     try:
         _wait_for(marker.exists)
-        os.rename(package / tools._VERSIONS_DIRNAME, package / "versions.bak")
+        inspection = package / "versions.bak"
+        inspection.mkdir()
+        os.rename(second, inspection / second_vid)
+        assert first.is_dir()  # an idle generation still occupies the fixed name
+        assert tools.package_execution_judgement(tools.PackageRoot(package)) == "running"
         deleted = delete_tool("echo")
         assert deleted is not None and deleted.outcome == "retained"
         assert deleted.retained_path is not None
-        assert (deleted.retained_path / "versions.bak" / _TEST_VID / "data.txt").is_file()
+        assert (deleted.retained_path / "versions.bak" / second_vid / "data.txt").is_file()
     finally:
         gate.write_text("go", encoding="utf-8")
         caller.join(timeout=30)
@@ -953,15 +1000,19 @@ def test_restart_delete_parks_an_unknown_generation(
     version = _make_tool(root, "echo", "import sys\n")
     package = _package_path(version)
     identity = tools.directory_identity(_version_root(version))
+    package_identity = tools.directory_identity(tools.VersionRoot(package))
     assert identity is not None
+    assert package_identity is not None
     _install_tools(monkeypatch, root)
 
     # Model the old process, then its abrupt loss: the child/tree survives while
     # both its running count and its local-generation proof disappear.
-    tools._INFLIGHT_EXECUTIONS[identity] = 1
+    tools._INFLIGHT_EXECUTIONS[package_identity] = {identity: 1}
     tools._LOCAL_EXECUTION_GENERATIONS.add(identity)
+    tools._LOCAL_EXECUTION_PACKAGES.add(package_identity)
     tools._INFLIGHT_EXECUTIONS.clear()
     tools._LOCAL_EXECUTION_GENERATIONS.clear()
+    tools._LOCAL_EXECUTION_PACKAGES.clear()
 
     assert _delete_outcome("echo") == "retained"
 
@@ -982,14 +1033,19 @@ def test_restart_discard_parks_an_unknown_generation(tmp_path: Path) -> None:
     resolution = tools.resolve_current(tools.PackageRoot(package))
     assert isinstance(resolution, tools.Resolved)
     second_identity = tools.directory_identity(tools.VersionRoot(second))
+    package_identity = tools.directory_identity(tools.VersionRoot(package))
     assert second_identity is not None
+    assert package_identity is not None
 
     _remember_package_locally_idle(package)
-    tools._INFLIGHT_EXECUTIONS[second_identity] = 1
+    tools._INFLIGHT_EXECUTIONS[package_identity] = {second_identity: 1}
     tools._INFLIGHT_EXECUTIONS.clear()
     tools._LOCAL_EXECUTION_GENERATIONS.clear()
+    tools._LOCAL_EXECUTION_PACKAGES.clear()
 
-    assert tools.discard_version(resolution) == "ok"
+    discarded = tools.discard_version(resolution)
+    assert isinstance(discarded, tools.ToolRemovalResult)
+    assert discarded.outcome == "retained"
 
     parked = second.with_name(f"{second_vid}.discarded")
     assert _resolved_version(package) == first
@@ -1135,7 +1191,9 @@ def test_invariant_e_discard_succeeds_when_old_version_removal_fails(
     assert isinstance(resolution, tools.Resolved)
     asked: list[tools.PackageRoot] = []
 
-    def locally_idle(root: tools.PackageRoot) -> tools.ExecutionJudgement:
+    def locally_idle(
+        root: tools.PackageRoot, _target: tools.PackageLayoutRoot | tools.VersionRoot
+    ) -> tools.ExecutionJudgement:
         asked.append(root)
         return "locally-proven-idle"
 
@@ -1150,7 +1208,10 @@ def test_invariant_e_discard_succeeds_when_old_version_removal_fails(
 
     monkeypatch.setattr(tools.shutil, "rmtree", fail_old_version)
 
-    assert tools.discard_version(resolution) == "ok"
+    discarded = tools.discard_version(resolution)
+    assert isinstance(discarded, tools.ToolRemovalResult)
+    assert discarded.outcome == "retained"
+    assert discarded.retained_path == parked
     assert _resolved_version(package) == first
     assert not second.exists()
     assert parked.is_dir()
@@ -1190,8 +1251,11 @@ def test_discard_parks_before_running_check_then_removes_the_idle_version(
         events.append("rename")
         real_rename(source, target)
 
-    def locally_idle(package_root: tools.PackageRoot) -> tools.ExecutionJudgement:
+    def locally_idle(
+        package_root: tools.PackageRoot, target: tools.PackageLayoutRoot | tools.VersionRoot
+    ) -> tools.ExecutionJudgement:
         assert package_root.path == package
+        assert target.path == parked
         assert not second.exists()
         assert parked.is_dir()
         events.append("running-check")
@@ -1206,7 +1270,9 @@ def test_discard_parks_before_running_check_then_removes_the_idle_version(
     monkeypatch.setattr(tools, "package_execution_judgement", locally_idle)
     monkeypatch.setattr(tools.shutil, "rmtree", observe_remove)
 
-    assert tools.discard_version(resolution) == "ok"
+    discarded = tools.discard_version(resolution)
+    assert isinstance(discarded, tools.ToolRemovalResult)
+    assert discarded.outcome == "removed"
     assert events == ["rename", "running-check", "remove"]
     assert _resolved_version(package) == first
     assert not parked.exists()
@@ -1223,7 +1289,9 @@ def test_discard_removes_generations_proven_idle_in_this_process(tmp_path: Path)
     assert isinstance(resolution, tools.Resolved)
     _remember_package_locally_idle(package)
 
-    assert tools.discard_version(resolution) == "ok"
+    discarded = tools.discard_version(resolution)
+    assert isinstance(discarded, tools.ToolRemovalResult)
+    assert discarded.outcome == "removed"
 
     assert _resolved_version(package) == first
     assert not second.exists()
@@ -1249,12 +1317,14 @@ def test_discard_rename_failure_is_success_and_leaves_the_version_in_place(
     monkeypatch.setattr(
         tools,
         "package_execution_judgement",
-        lambda _root: (_ for _ in ()).throw(
+        lambda _root, _target=None: (_ for _ in ()).throw(
             AssertionError("a failed rename must not license a running check")
         ),
     )
 
-    assert tools.discard_version(resolution) == "ok"
+    discarded = tools.discard_version(resolution)
+    assert isinstance(discarded, tools.ToolRemovalResult)
+    assert discarded == tools.ToolRemovalResult("retained", second)
     assert _resolved_version(package) == first
     assert second.is_dir()
     assert not second.with_name(f"{second_vid}.discarded").exists()
@@ -1295,12 +1365,14 @@ def test_invariant_e_unconfirmed_current_durability_leaves_old_version_intact(
     monkeypatch.setattr(
         tools,
         "package_execution_judgement",
-        lambda _root: (_ for _ in ()).throw(
+        lambda _root, _target=None: (_ for _ in ()).throw(
             AssertionError("durability gate must precede the running check")
         ),
     )
 
-    assert tools.discard_version(resolution) == "ok"
+    discarded = tools.discard_version(resolution)
+    assert isinstance(discarded, tools.ToolRemovalResult)
+    assert discarded == tools.ToolRemovalResult("retained", second)
     assert _resolved_version(package) == first
     after = {
         str(path.relative_to(second)): (
@@ -1353,7 +1425,7 @@ def test_retired_advertised_version_cannot_run_when_discard_cannot_park_it(
 
         monkeypatch.setattr(tools, "publish_current", publish_without_confirmed_durability)
 
-    assert tools.discard_version(resolution) == "ok"
+    assert tools.discard_version(resolution) == tools.ToolRemovalResult("retained", second)
     assert _resolved_version(package) == first
     assert second.is_dir()
     assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
@@ -1407,7 +1479,7 @@ def test_canonical_tools_base_makes_discard_retire_the_advertised_generation(
 
     monkeypatch.setattr(tools.os, "rename", fail_parking)
 
-    assert tools.discard_version(resolution) == "ok"
+    assert tools.discard_version(resolution) == tools.ToolRemovalResult("retained", second)
 
     assert second.is_dir()
     assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
@@ -1452,7 +1524,7 @@ def test_discard_between_scan_capture_and_handler_build_retires_handler(
             resolution = tools.resolve_current(package_root)
             assert isinstance(resolution, tools.Resolved)
             assert resolution.version_root == tools.VersionRoot(second)
-            assert tools.discard_version(resolution) == "ok"
+            assert tools.discard_version(resolution) == tools.ToolRemovalResult("retained", second)
             discarded_during_scan = True
         return scan
 
@@ -1508,7 +1580,7 @@ def test_restored_backup_of_retired_vid_executes_in_the_same_process(
 
     monkeypatch.setattr(tools, "publish_current", publish_without_confirmed_durability)
 
-    assert tools.discard_version(resolution) == "ok"
+    assert tools.discard_version(resolution) == tools.ToolRemovalResult("retained", second)
     shutil.rmtree(second)
     os.rename(backup, second)
     restored_identity = tools.directory_identity(tools.VersionRoot(second))
@@ -1567,14 +1639,14 @@ def test_retired_advertisement_survives_rename_aside_and_back(
 
     second_resolution = tools.resolve_current(package_root)
     assert isinstance(second_resolution, tools.Resolved)
-    assert tools.discard_version(second_resolution) == "ok"
+    assert tools.discard_version(second_resolution) == tools.ToolRemovalResult("retained", second)
     assert _resolved_version(package) == first
 
     aside = second.with_name(f".{second_vid}.aside")
     real_rename(second, aside)
     first_resolution = tools.resolve_current(package_root)
     assert isinstance(first_resolution, tools.Resolved)
-    assert tools.discard_version(first_resolution) == "ok"
+    assert tools.discard_version(first_resolution) == tools.ToolRemovalResult("retained", first)
     assert _resolved_version(package) == third
 
     real_rename(aside, second)
@@ -2614,18 +2686,19 @@ def test_inflight_execution_is_counted_and_released_on_every_exit() -> None:
     backup forever -- so a handler that raises, and an AI request cancelled
     mid-call (the shape asyncio uses on a timeout), must both come back out. The
     key is REMOVED at zero, so a stale count can never read as "still in use"."""
-    identity = (1, 2)
-    with tools._inflight_execution(identity):
-        with tools._inflight_execution(identity):
-            assert tools.directory_execution_in_flight(identity) is True
+    package_identity = (1, 2)
+    version_identity = (3, 4)
+    with tools._inflight_execution(package_identity, version_identity):
+        with tools._inflight_execution(package_identity, version_identity):
+            assert tools.directory_execution_in_flight(version_identity) is True
         # the outer call still holds it
-        assert tools.directory_execution_in_flight(identity) is True
-    assert tools.directory_execution_in_flight(identity) is False
+        assert tools.directory_execution_in_flight(version_identity) is True
+    assert tools.directory_execution_in_flight(version_identity) is False
 
     for exc in (RuntimeError, asyncio.CancelledError):
-        with pytest.raises(exc), tools._inflight_execution(identity):
+        with pytest.raises(exc), tools._inflight_execution(package_identity, version_identity):
             raise exc()
-        assert tools.directory_execution_in_flight(identity) is False
+        assert tools.directory_execution_in_flight(version_identity) is False
     assert tools._INFLIGHT_EXECUTIONS == {}  # nothing left behind, not even a zero
 
 

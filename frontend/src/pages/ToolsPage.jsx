@@ -31,7 +31,10 @@ import { EmptyState } from "../components/EmptyState.jsx";
 import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { usePageTitle } from "../hooks/usePageTitle.js";
 import { codePointLength } from "../utils/text.js";
-import { toolDeleteNotification } from "../utils/toolDelete.js";
+import {
+	toolDeleteNotification,
+	toolDiscardNotification,
+} from "../utils/toolDelete.js";
 import {
 	isHttpUrl,
 	isTerminalToolJobState,
@@ -808,7 +811,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 			const request = buildDiscardRequest({ name, currentVid });
 			return apiDelete(request.path);
 		},
-		onSuccess: async (_data, variables) => {
+		onSuccess: async (data, variables) => {
 			setDiscardTarget(null);
 			setLineageUnavailableKeys((current) =>
 				clearLineageUnavailable(current, variables.jobAttributionKey),
@@ -822,10 +825,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 				queryKey: ["tools"],
 				exact: true,
 			});
-			notifications.show({
-				color: "green",
-				message: `已丟掉「${variables.name}」的目前版本，並退回前一版`,
-			});
+			notifications.show(toolDiscardNotification(variables.name, data));
 		},
 		onError: (mutationError, variables) => {
 			const reaction = reactToVersionWriteConflict(

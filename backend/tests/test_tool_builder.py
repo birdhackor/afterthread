@@ -80,6 +80,7 @@ def _reset_singletons() -> Generator[None]:
     tools._INFLIGHT_SECRETS.clear()
     tools._INFLIGHT_EXECUTIONS.clear()
     tools._LOCAL_EXECUTION_GENERATIONS.clear()
+    tools._LOCAL_EXECUTION_PACKAGES.clear()
     tools._DEFERRED_EXECUTION_CLEANUPS.clear()
     tools._ADVERTISEMENT_GENERATIONS.clear()
     tools._ENV_VALUE_CACHE.clear()
@@ -92,6 +93,7 @@ def _reset_singletons() -> Generator[None]:
     # deferral -- the same reason the secret set is cleared here.
     tools._INFLIGHT_EXECUTIONS.clear()
     tools._LOCAL_EXECUTION_GENERATIONS.clear()
+    tools._LOCAL_EXECUTION_PACKAGES.clear()
     tools._DEFERRED_EXECUTION_CLEANUPS.clear()
     tools._ADVERTISEMENT_GENERATIONS.clear()
     tools._ENV_VALUE_CACHE.clear()
@@ -2996,6 +2998,7 @@ def test_router_delete_tool_response_distinguishes_removed_from_retained(
     removed_version = _seed_package(monkeypatch, tmp_path, "idle")
     retained_version = _seed_package(monkeypatch, tmp_path, "unknown")
     tools.remember_local_execution_generation(tools.VersionRoot(removed_version))
+    tools.remember_local_execution_package(_package_root(removed_version))
 
     removed = client.delete("/api/tools/idle")
     retained = client.delete("/api/tools/unknown")
@@ -3012,6 +3015,34 @@ def test_router_delete_tool_response_distinguishes_removed_from_retained(
     assert not _package_path(removed_version).exists()
     assert not _package_path(retained_version).exists()
     assert client.delete("/api/tools/idle").status_code == 404
+
+
+def test_router_discard_response_distinguishes_removed_from_retained(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    removed_first = _seed_package(monkeypatch, tmp_path, "discard-idle")
+    removed_vid = "20260728T020304Z-fedcba"
+    removed_current = _copy_committed_version(removed_first, removed_vid)
+    assert tools.publish_current(_package_root(removed_first), removed_vid)
+    tools.remember_local_execution_generation(tools.VersionRoot(removed_current))
+
+    retained_first = _seed_package(monkeypatch, tmp_path, "discard-unknown")
+    retained_vid = "20260728T030405Z-acdeff"
+    retained_current = _copy_committed_version(retained_first, retained_vid)
+    assert tools.publish_current(_package_root(retained_first), retained_vid)
+
+    removed = client.delete(f"/api/tools/discard-idle/versions/{removed_vid}")
+    retained = client.delete(f"/api/tools/discard-unknown/versions/{retained_vid}")
+
+    assert removed.status_code == 200
+    assert removed.json() == {"outcome": "removed", "retained_path": None}
+    assert retained.status_code == 200
+    retained_body = retained.json()
+    assert retained_body["outcome"] == "retained"
+    assert retained_body["retained_path"] == str(
+        retained_current.with_name(f"{retained_vid}.discarded")
+    )
+    assert Path(retained_body["retained_path"]).is_dir()
 
 
 def test_router_install_503_when_unconfigured(
@@ -4628,6 +4659,7 @@ def _versioned_package_at(package: Path, name: str, run_py: str = _GOOD_RUN_PY) 
         json.dumps(_state_document(True)), encoding="utf-8"
     )
     tools.remember_local_execution_generation(tools.VersionRoot(version))
+    tools.remember_local_execution_package(tools.PackageLayoutRoot(package))
     return version
 
 
@@ -4660,7 +4692,9 @@ def test_sweep_keeps_a_backup_that_is_still_in_use_and_spares_everything_else(
     base.mkdir()
     busy = _stale_dir(base, "kbsearch")
     identity = tools.directory_identity(tools.VersionRoot(_resolved_version(busy)))
+    package_identity = tools.directory_identity(tools.VersionRoot(busy))
     assert identity is not None
+    assert package_identity is not None
     unknown = _stale_dir(base, "other")
     (base / ".staging").mkdir()
     outside = tmp_path / "elsewhere"
@@ -4669,7 +4703,7 @@ def test_sweep_keeps_a_backup_that_is_still_in_use_and_spares_everything_else(
     linked = tools._stale_backup_path(base, "linked", uuid4().hex)
     linked.symlink_to(outside, target_is_directory=True)
 
-    with tools._inflight_execution(identity):
+    with tools._inflight_execution(package_identity, identity):
         tools.remember_running_tree_for_cleanup(busy)
         tool_builder._sweep_stale_backups(base)
         assert busy.is_dir()  # still being read by a live subprocess
@@ -4692,10 +4726,12 @@ def test_restart_with_orphan_does_not_sweep_a_tree_the_new_process_never_observe
     base.mkdir()
     parked = _stale_dir(base, "kbsearch")
     version_identity = tools.directory_identity(tools.VersionRoot(_resolved_version(parked)))
+    package_identity = tools.directory_identity(tools.VersionRoot(parked))
     assert version_identity is not None
+    assert package_identity is not None
 
     # Model the old process: it observed a running version and parked the tree.
-    tools._INFLIGHT_EXECUTIONS[version_identity] = 1
+    tools._INFLIGHT_EXECUTIONS[package_identity] = {version_identity: 1}
     tools.remember_running_tree_for_cleanup(parked)
     assert tools._DEFERRED_EXECUTION_CLEANUPS
 
@@ -4703,6 +4739,7 @@ def test_restart_with_orphan_does_not_sweep_a_tree_the_new_process_never_observe
     # can still hold this cwd and perform a later relative open.
     tools._INFLIGHT_EXECUTIONS.clear()
     tools._LOCAL_EXECUTION_GENERATIONS.clear()
+    tools._LOCAL_EXECUTION_PACKAGES.clear()
     tools._DEFERRED_EXECUTION_CLEANUPS.clear()
 
     tool_builder._sweep_stale_backups(base)
@@ -4748,7 +4785,7 @@ def test_cleanup_staging_is_where_the_sweep_actually_runs(tmp_path: Path) -> Non
 def test_invariant_a_delete_discard_and_sweep_share_one_running_package_judgement(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A spy pins all three destructive callers to one all-versions helper."""
+    """A spy pins all three destructive callers to one package-owner helper."""
     base = tmp_path / "tools"
     _versioned_package_at(base / "live", "live")
     discard_package = base / "discardable"
@@ -4766,26 +4803,39 @@ def test_invariant_a_delete_discard_and_sweep_share_one_running_package_judgemen
     stale = _stale_dir(base, "old")
     tools.remember_running_tree_for_cleanup(stale)
     _install_settings(monkeypatch, tools_dir=str(base))
-    asked: list[tools.PackageLayoutRoot] = []
+    asked: list[
+        tuple[
+            tools.PackageLayoutRoot,
+            tools.PackageLayoutRoot | tools.VersionRoot | None,
+        ]
+    ] = []
 
-    def locally_idle(package_root: tools.PackageLayoutRoot) -> tools.ExecutionJudgement:
-        asked.append(package_root)
+    def locally_idle(
+        package_root: tools.PackageLayoutRoot,
+        target: tools.PackageLayoutRoot | tools.VersionRoot | None = None,
+    ) -> tools.ExecutionJudgement:
+        asked.append((package_root, target))
         return "locally-proven-idle"
 
     monkeypatch.setattr(tools, "package_execution_judgement", locally_idle)
 
     delete_result = tools.delete_tool("live")
     assert delete_result is not None and delete_result.outcome == "removed"
-    assert tools.discard_version(resolution) == "ok"
+    discard_result = tools.discard_version(resolution)
+    assert isinstance(discard_result, tools.ToolRemovalResult)
+    assert discard_result.outcome == "removed"
     tool_builder._sweep_stale_backups(base)
 
     assert len(asked) == 3
-    assert type(asked[0]) is tools.PackageLayoutRoot
-    assert asked[0].path.name.startswith(".live.stale-")
-    assert type(asked[1]) is tools.PackageRoot
-    assert asked[1].path == discard_package
-    assert type(asked[2]) is tools.PackageLayoutRoot
-    assert asked[2].path == stale
+    assert type(asked[0][0]) is tools.PackageLayoutRoot
+    assert asked[0][0].path.name.startswith(".live.stale-")
+    assert asked[0][1] is None
+    assert type(asked[1][0]) is tools.PackageRoot
+    assert asked[1][0].path == discard_package
+    assert asked[1][1] == tools.VersionRoot(second.with_name(f"{second_vid}.discarded"))
+    assert type(asked[2][0]) is tools.PackageLayoutRoot
+    assert asked[2][0].path == stale
+    assert asked[2][1] == tools.PackageLayoutRoot(stale)
 
 
 def test_running_discard_parks_the_version_and_the_existing_sweep_retries(
@@ -4825,7 +4875,9 @@ def test_running_discard_parks_the_version_and_the_existing_sweep_retries(
 
     try:
         _wait_for(marker.exists)
-        assert tools.discard_version(resolution) == "ok"
+        discarded = tools.discard_version(resolution)
+        assert isinstance(discarded, tools.ToolRemovalResult)
+        assert discarded == tools.ToolRemovalResult("retained", parked)
         assert parked.is_dir()
         assert _resolved_version(package) == first
         tool_builder._sweep_stale_backups(base)
@@ -4921,7 +4973,11 @@ def test_sweep_keeps_a_marked_backup_without_positive_version_evidence(
     unreadable = tools._stale_backup_path(base, "other", uuid4().hex)
     unreadable.mkdir()
     tools.remember_running_tree_for_cleanup(unreadable)
-    monkeypatch.setattr(tools, "package_execution_judgement", lambda _package: "unknown")
+    monkeypatch.setattr(
+        tools,
+        "package_execution_judgement",
+        lambda _package, _target=None: "unknown",
+    )
 
     tool_builder._sweep_stale_backups(base)
 
@@ -5070,6 +5126,36 @@ def test_invariant_d_install_faults_never_report_a_non_durable_package_success(
         assert not installed.exists()
 
 
+def test_install_records_local_creation_before_tools_directory_fsync_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built", "ready": True},
+        files={"tool.json": json.dumps(_package_manifest("kbsearch")), "run.py": _GOOD_RUN_PY},
+    )
+    _no_fetch(monkeypatch)
+    real_directory = tool_builder._fsync_directory
+
+    def fail_tools_directory(path: Path) -> bool:
+        return False if path == root else real_directory(path)
+
+    monkeypatch.setattr(tool_builder, "_fsync_directory", fail_tools_directory)
+
+    outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build"))
+
+    package = tools.PackageRoot(root / "kbsearch")
+    resolution = tools.resolve_current(package)
+    assert outcome.ok is False
+    assert isinstance(resolution, tools.Resolved)
+    assert tools.package_execution_judgement(package) == "locally-proven-idle"
+    assert (
+        tools.package_execution_judgement(package, resolution.version_root) == "locally-proven-idle"
+    )
+
+
 @pytest.mark.parametrize("fault", ["version-tree", "versions-directory"])
 def test_invariant_d_revise_faults_leave_current_on_a_durable_previous_version(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fault: str
@@ -5099,6 +5185,34 @@ def test_invariant_d_revise_faults_leave_current_on_a_durable_previous_version(
     assert outcome.ok is False
     assert current.read_bytes() == before
     assert _current_version(pkg) == pkg
+
+
+def test_revise_records_local_generation_before_versions_directory_fsync_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    previous = _seed_package(monkeypatch, tmp_path)
+    package = _package_path(previous)
+    versions = package / tools._VERSIONS_DIRNAME
+    real_directory = tool_builder._fsync_directory
+
+    def fail_versions_directory(path: Path) -> bool:
+        return False if path == versions else real_directory(path)
+
+    monkeypatch.setattr(tool_builder, "_fsync_directory", fail_versions_directory)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    orphaned = [entry for entry in versions.iterdir() if entry.is_dir() and entry != previous]
+    assert outcome.ok is False
+    assert len(orphaned) == 1
+    assert _current_version(previous) == previous
+    assert (
+        tools.package_execution_judgement(
+            tools.PackageRoot(package), tools.VersionRoot(orphaned[0])
+        )
+        == "locally-proven-idle"
+    )
 
 
 def test_revise_rechecks_current_after_version_fsync_immediately_before_publish(

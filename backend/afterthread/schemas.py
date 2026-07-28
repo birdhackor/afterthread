@@ -536,6 +536,13 @@ class ToolDeleteResponse(BaseModel):
     retained_path: str | None
 
 
+class ToolDiscardResponse(BaseModel):
+    """Whether discard removed the former version or retained its files."""
+
+    outcome: Literal["removed", "retained"]
+    retained_path: str | None
+
+
 class ToolSummaryDetail(BaseModel):
     """One tool's version summary
     (``versions/<vid>/.afterthread.meta/summary.json``), as the 工具 page reads it.

@@ -45,6 +45,7 @@ from afterthread.routers.ai import (
 )
 from afterthread.schemas import (
     ToolDeleteResponse,
+    ToolDiscardResponse,
     ToolExpectedVersionRequest,
     ToolInstallAccepted,
     ToolInstallRequest,
@@ -258,15 +259,17 @@ async def delete_installed_tool(name: ToolName) -> ToolDeleteResponse:
 
 @router.delete(
     "/{name}/versions/{vid}",
-    status_code=204,
+    response_model=ToolDiscardResponse,
     responses={**_TOOL_NOT_FOUND_RESPONSE, **_DISCARD_CONFLICT_RESPONSE},
 )
-async def discard_tool_version(name: ToolName, vid: ToolVersionId) -> None:
+async def discard_tool_version(name: ToolName, vid: ToolVersionId) -> ToolDiscardResponse:
     """Discard the exact current version named by ``vid``.
 
     The global slot is taken before the expected-version comparison.  That
     ordering makes the comparison and the subsequent ``current`` publication
-    one serialized action rather than another check-then-write race.
+    one serialized action rather than another check-then-write race. The response
+    reports whether the former version's files were removed or retained, with the
+    exact operator cleanup path in the latter case.
     """
 
     reservation = tool_builder.reserve_sync_operation()
@@ -295,6 +298,12 @@ async def discard_tool_version(name: ToolName, vid: ToolVersionId) -> None:
             )
         if outcome == "not_found":
             raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
+        return ToolDiscardResponse(
+            outcome=outcome.outcome,
+            retained_path=(
+                str(outcome.retained_path) if outcome.retained_path is not None else None
+            ),
+        )
     finally:
         tool_builder.release_sync_operation(reservation)
 
