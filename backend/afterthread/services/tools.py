@@ -364,17 +364,22 @@ class _ContentScan:
 
 
 def tools_dir() -> Path | None:
-    """The configured tools directory, or None when the feature is disabled.
+    """The canonical configured tools directory, or None when disabled.
 
     ``settings.tools_dir`` empty ("") means OFF -- None here makes every reader
     (``list_tools`` / ``enabled_llm_tools`` / the mutators) a no-op. Mirrors
     ``llm_log``'s settings-driven pattern; packaged mode's cli.py injects
     ``<data-dir>/tools`` so a uvx install has it set without operator action.
+
+    Canonicalizing the BASE here gives every downstream ``PackageRoot`` and
+    ``VersionRoot`` one spelling. It deliberately does not resolve a package
+    child: package/version symlink refusals still inspect their own final
+    components before anything follows them.
     """
     raw = get_settings().tools_dir.strip()
     if not raw:
         return None
-    return Path(raw).expanduser()
+    return Path(raw).expanduser().resolve()
 
 
 def _valid_entry(entry: Any) -> bool:

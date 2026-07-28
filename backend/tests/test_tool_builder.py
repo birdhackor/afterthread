@@ -4877,6 +4877,68 @@ def test_sweep_keeps_a_marked_backup_whose_identity_cannot_be_read(
     assert unreadable.is_dir()
 
 
+def test_fsync_tree_skips_directory_symlinks_outside_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A listed symlink dir is neither traversed nor opened for directory fsync."""
+
+    root = tmp_path / "build"
+    inside = root / "inside"
+    outside = tmp_path / "outside"
+    inside.mkdir(parents=True)
+    outside.mkdir()
+    (inside / "payload.txt").write_text("durable", encoding="utf-8")
+    (outside / "external.txt").write_text("unrelated", encoding="utf-8")
+    link = root / "system"
+    link.symlink_to(outside, target_is_directory=True)
+    real_fsync_directory = tool_builder._fsync_directory
+    fsynced: list[Path] = []
+
+    def observe_directory(path: Path) -> bool:
+        assert not path.is_symlink()
+        fsynced.append(path)
+        return real_fsync_directory(path)
+
+    monkeypatch.setattr(tool_builder, "_fsync_directory", observe_directory)
+
+    assert tool_builder._fsync_tree(root) is True
+
+    assert fsynced == [inside, root]
+    assert link not in fsynced
+    assert outside not in fsynced
+
+
+def test_fsync_directory_open_refuses_a_symlink(tmp_path: Path) -> None:
+    """O_NOFOLLOW prevents a direct caller from opening an external target."""
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = tmp_path / "linked-directory"
+    link.symlink_to(outside, target_is_directory=True)
+
+    assert tool_builder._fsync_directory(link) is False
+
+
+def test_fsync_tree_does_not_downgrade_a_real_directory_fsync_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An in-tree filesystem refusal still means durability was not established."""
+
+    root = tmp_path / "build"
+    child = root / "real-child"
+    child.mkdir(parents=True)
+    (child / "payload.txt").write_text("content", encoding="utf-8")
+
+    def fail_child(path: Path) -> bool:
+        return path != child
+
+    monkeypatch.setattr(tool_builder, "_fsync_directory", fail_child)
+
+    assert tool_builder._fsync_tree(root) is False
+
+
 def test_invariant_d_failed_version_rename_leaves_current_on_the_previous_version(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

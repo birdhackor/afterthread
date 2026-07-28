@@ -1194,6 +1194,59 @@ def test_retired_advertised_version_cannot_run_when_discard_cannot_park_it(
     assert tools.VersionRoot(second) not in tools._ADVERTISEMENT_GENERATIONS
 
 
+@pytest.mark.parametrize("base_spelling", ["relative", "symlink"])
+def test_canonical_tools_base_makes_discard_retire_the_advertised_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    base_spelling: str,
+) -> None:
+    """One base identity makes scan registration and by-name retirement meet."""
+
+    monkeypatch.chdir(tmp_path)
+    if base_spelling == "relative":
+        physical = tmp_path / "tools"
+        configured = "tools"
+    else:
+        physical = tmp_path / "real-tools"
+        configured_link = tmp_path / "tools-link"
+        configured_link.symlink_to(physical, target_is_directory=True)
+        configured = "tools-link"
+
+    sentinel = tmp_path / f"ran-{base_spelling}"
+    first = _make_tool(physical, "echo", "import sys\nsys.stdout.write('FIRST')\n")
+    package = _package_path(first)
+    second_vid = "20260728T020304Z-fedcba"
+    second = _add_committed_version(package, second_vid, description="second", output="SECOND")
+    second.joinpath("run.py").write_text(
+        f"import sys\nopen({str(sentinel)!r}, 'w').write('x')\nsys.stdout.write('SECOND')\n",
+        encoding="utf-8",
+    )
+    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    settings = Settings(tools_dir=configured)
+    monkeypatch.setattr(tools, "get_settings", lambda: settings)
+
+    handler = enabled_llm_tools()[0].handler
+    package_root = tools._resolve_package_dir_no_alias("echo")
+    assert package_root is not None
+    assert package_root == tools.PackageRoot(package.resolve())
+    resolution = tools.resolve_current(package_root)
+    assert isinstance(resolution, tools.Resolved)
+
+    def fail_parking(source: Path, _target: Path) -> None:
+        assert Path(source) == second
+        raise PermissionError("injected parking failure")
+
+    monkeypatch.setattr(tools.os, "rename", fail_parking)
+
+    assert tools.discard_version(resolution) == "ok"
+
+    assert second.is_dir()
+    assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
+    assert not sentinel.exists()
+    assert tools.VersionRoot(second) not in tools._ADVERTISEMENT_GENERATIONS
+    assert tools.tools_dir() == physical.resolve()
+
+
 def test_discard_between_scan_capture_and_handler_build_retires_handler(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

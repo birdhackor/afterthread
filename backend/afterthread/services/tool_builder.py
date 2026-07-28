@@ -279,7 +279,7 @@ def _entry_exists(path: Path) -> bool:
 def _fsync_directory(path: Path) -> bool:
     """Make the directory entries already created under ``path`` durable."""
 
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
     except OSError:
@@ -294,7 +294,7 @@ def _fsync_directory(path: Path) -> bool:
 
 
 def _fsync_tree(root: Path) -> bool:
-    """Persist regular files first and directories bottom-up."""
+    """Persist regular files and only real directories in this tree, bottom-up."""
 
     try:
         directories = [root]
@@ -302,6 +302,18 @@ def _fsync_tree(root: Path) -> bool:
             here = Path(dirpath)
             dirnames.sort()
             filenames.sort()
+            real_dirnames: list[str] = []
+            for dirname in dirnames:
+                info = os.lstat(here / dirname)
+                if stat.S_ISLNK(info.st_mode):
+                    continue
+                if not stat.S_ISDIR(info.st_mode):
+                    raise OSError(f"{here / dirname} changed out of directory shape")
+                real_dirnames.append(dirname)
+            # ``followlinks=False`` declines to descend through a directory
+            # symlink but still reports it here. Pruning keeps both traversal and
+            # the later fsync list inside the tree.
+            dirnames[:] = real_dirnames
             for filename in filenames:
                 path = here / filename
                 info = os.lstat(path)
@@ -312,7 +324,9 @@ def _fsync_tree(root: Path) -> bool:
                     os.fsync(fd)
                 finally:
                     os.close(fd)
-            directories.extend(here / dirname for dirname in dirnames)
+            directories.extend(here / dirname for dirname in real_dirnames)
+        # A real in-tree directory whose filesystem rejects fsync means the
+        # durability claim was not established, so callers still fail the build.
         return all(_fsync_directory(path) for path in reversed(directories))
     except OSError:
         return False

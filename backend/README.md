@@ -69,7 +69,7 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 | `LLM_LOG_BODY_MAX_CHARS` | `200000` | 單次互動中，任一則請求/回應內容儲存時的字元數上限，邊界 `[1000, 2000000]`；與 `LLM_LOG_MAX_ENTRIES` 一起讓記憶體用量在兩個軸上都有界。 |
 | `LLM_LOG_FILE` | 未設定 | 選填。設定後，每次 LLM 互動會額外追加寫入這個 JSONL 檔案（與記憶體環狀緩衝相同的紀錄，一樣受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；預設關閉——記錄含個人記憶內容，落不落地是使用者自己的隱私選擇。 |
 | `LLM_LOG_FILE_MAX_BYTES` | `50000000` | 上述 JSONL sink 的輪替門檻（位元組）：檔案超過此大小就改名成帶 UTC 時間戳後綴、另開新檔（守磁碟；RAM 由環狀緩衝負責），邊界 `[1000000, 1000000000]`。僅在有設定 `LLM_LOG_FILE` 時有意義；輪替後的舊檔不會自動刪除，交由使用者自行清理。 |
-| `TOOLS_DIR` | dev 未設定／打包模式自動注入 `<data-dir>/tools` | 已安裝工具套件所在目錄；留空＝工具功能整個關閉（`GET /api/tools` 回空清單，AI workflow 不帶任何工具，prompt 與無工具版本逐字相同）。dev 模式要用工具功能，需自行在 `backend/.env` 設定這個變數。 |
+| `TOOLS_DIR` | dev 未設定／打包模式自動注入 `<data-dir>/tools` | 已安裝工具套件所在目錄；留空＝工具功能整個關閉（`GET /api/tools` 回空清單，AI workflow 不帶任何工具，prompt 與無工具版本逐字相同）。相對路徑或指向此基底的 symlink 會在設定邊界 canonicalize 成同一個絕對路徑；這不會跟隨或放寬任何 package/version symlink 的拒絕。dev 模式要用工具功能，需自行在 `backend/.env` 設定這個變數。 |
 | `LLM_TOOL_ROUNDS_MAX` | `8` | 一次 AI workflow 呼叫最多允許幾輪工具呼叫，邊界 `[1, 64]`。 |
 | `LLM_TOOL_TIMEOUT_SECONDS` | `60` | 單次工具子行程的逾時秒數（到期整個 process group 被砍），邊界 `(0, 600]`。 |
 | `LLM_TOOL_OUTPUT_MAX_CHARS` | `50000` | 工具 stdout 餵回給模型的字元數上限，邊界 `[1000, 500000]`。 |
@@ -229,6 +229,7 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
       .afterthread.meta/
           state.json
           current
+          migration-owner.json  # 只存在於一次性 web-v5 遷移產物
       versions/
           <vid>/
               .afterthread.meta/
@@ -277,7 +278,10 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   package-root 檔案才屬於 legacy 後端命名空間。新安裝在 `shell`
   組出完整 package：版本內容、`origin.json(previous=null)`、初始 enabled state、
   `current`，以及表單秘密注入的 package `.env`；所有內容持久化後，以一次
-  `os.rename(shell, <name>)` 上線。目標只要已存在任何內容就拒絕，不覆蓋。
+  `os.rename(shell, <name>)` 上線。durability walker 只 fsync 這棵樹內的真目錄：
+  內容中的 directory symlink 會保留但不跟隨、不 fsync 外部目標；任何真實樹內目錄
+  若所屬 filesystem 拒絕 directory fsync，durability 仍未成立，整次 build 失敗。
+  目標只要已存在任何內容就拒絕，不覆蓋。
   完整互動記在 `workflow="tool_install"`。
 - **builder 不出貨 `.env`**：非秘密預設值應放在該版程式碼，以
   `os.environ.get(KEY, default)`（或其他語言等價寫法）讀取；切換 `current` 時預設
@@ -360,6 +364,10 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   legacy state 原封不動當工具內容、把 `.ai_meta.json` 拆成 origin/summary，並將
   `.env` 位元與 mode 保留在 package 層。所有套件啟用後才持久寫下
   `committed`；commit 前錯誤回復所有名稱，commit 後只重試清理、不再 rollback。
+  journal 另持久記錄 shell／舊套件目錄 identity，並在目錄內寫入綁定 package +
+  vid + role 的 ownership marker；刪除必須同時重驗這些證明（完整 target-layout
+  VID 也是正證明），名稱本身從不授權刪除。partial `rmtree` 即使已刪掉 `tool.json`
+  仍可由留下的 marker 對帳；marker 也已消失而無法建立正證明時則停止並保留殘件。
   中斷後以同一指令重跑，journal 會按其狀態續做／回復／清理；不要手動猜測或刪除
   `.at-*` 兄弟目錄。既有 journal 已代表先前確認過的 migration authority，所以
   真實重跑會直接對帳，不再詢問；此時 `--dry-run` 只報 journal status，不做對帳。

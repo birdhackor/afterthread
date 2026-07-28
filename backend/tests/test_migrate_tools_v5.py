@@ -447,6 +447,274 @@ def test_committed_cleanup_fault_matrix_never_attempts_rollback_and_retries(
     _assert_migrated(root)
 
 
+def test_pending_assemble_does_not_own_a_foreign_shell(
+    tmp_path: Path,
+) -> None:
+    """The write-ahead action is permission to act, not identity of its target."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    with pytest.raises(InjectedCrash):
+        _run(
+            root,
+            operations=PointFailureOperations({"before:assemble:alpha": InjectedCrash()}),
+        )
+
+    foreign = migration._shell_path(root, "alpha")
+    foreign.mkdir()
+    foreign.chmod(0o711)
+    (foreign / "operator.txt").write_bytes(b"only operator copy\x00\n")
+    (foreign / "nested").mkdir()
+    (foreign / "nested" / "payload.bin").write_bytes(b"\xffforeign")
+    before = _snapshot_tree(foreign)
+    output: list[str] = []
+
+    assert _run(root, output=output) == 1
+
+    assert _snapshot_tree(foreign) == before
+    assert stat.S_IMODE(foreign.stat().st_mode) == 0o711
+    assert "cleanup target is not the journal's new package" in "\n".join(output)
+
+
+def test_owned_incomplete_shell_is_removed_before_assembly_retries(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The durable marker plus recorded identity distinguishes our partial shell."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    real_copy = migration._copy_content_path
+    interrupted = False
+
+    def interrupt_first_content_copy(source: Path, destination: Path) -> None:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise InjectedCrash()
+        real_copy(source, destination)
+
+    monkeypatch.setattr(migration, "_copy_content_path", interrupt_first_content_copy)
+    with pytest.raises(InjectedCrash):
+        _run(root)
+
+    shell = migration._shell_path(root, "alpha")
+    assert shell.is_dir()
+    journal = json.loads((root / migration._JOURNAL_FILENAME).read_text(encoding="utf-8"))
+    assert journal["packages"][0]["shell_identity"] is not None
+    assert migration._has_ownership_marker(shell, name="alpha", vid=_VID, role="shell")
+
+    real_rmtree = migration.shutil.rmtree
+    removed: list[Path] = []
+
+    def observe_remove(path: Path, *args: Any, **kwargs: Any) -> None:
+        removed.append(Path(path))
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(migration.shutil, "rmtree", observe_remove)
+
+    assert _run(root) == 0
+
+    assert shell in removed
+    _assert_migrated(root)
+
+
+def test_foreign_committed_tombstone_survives_and_blocks_cleanup(
+    tmp_path: Path,
+) -> None:
+    """Committed chooses cleanup but does not own a deterministic tombstone."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    with pytest.raises(InjectedCrash):
+        _run(
+            root,
+            operations=PointFailureOperations({"after:journal:committed": InjectedCrash()}),
+        )
+
+    premigrate = migration._premigrate_path(root, "alpha")
+    tombstone = migration._premigrate_tombstone_path(root, "alpha")
+    assert premigrate.is_dir()
+    tombstone.mkdir()
+    tombstone.chmod(0o711)
+    (tombstone / "operator.txt").write_bytes(b"only copy\x00\n")
+    (tombstone / "nested").mkdir()
+    (tombstone / "nested" / "payload.bin").write_bytes(b"\xffforeign")
+    before = _snapshot_tree(tombstone)
+    output: list[str] = []
+
+    assert _run(root, output=output) == 1
+
+    assert _snapshot_tree(tombstone) == before
+    assert stat.S_IMODE(tombstone.stat().st_mode) == 0o711
+    assert premigrate.is_dir()
+    assert "cleanup target has no journal ownership proof" in "\n".join(output)
+
+
+def test_owned_committed_tombstone_is_removed_on_retry(tmp_path: Path) -> None:
+    """The marker and pre-rename identity survive rename and authorize deletion."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    assert (
+        _run(
+            root,
+            operations=PointFailureOperations(
+                {"after:cleanup:alpha:premigrate:park": OSError("injected interruption")}
+            ),
+        )
+        == 1
+    )
+    tombstone = migration._premigrate_tombstone_path(root, "alpha")
+    assert tombstone.is_dir()
+    assert migration._has_ownership_marker(
+        tombstone,
+        name="alpha",
+        vid=_VID,
+        role="premigrate",
+    )
+
+    assert _run(root) == 0
+
+    assert not tombstone.exists()
+    _assert_migrated(root)
+
+
+@pytest.mark.parametrize("artifact_name", [".alpha.at-migration-shell", "alpha.at-migrated"])
+def test_foreign_committed_new_artifact_survives_and_is_reported(
+    tmp_path: Path,
+    artifact_name: str,
+) -> None:
+    """Committed cleanup rechecks the same marker/VID proof as rollback cleanup."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    with pytest.raises(InjectedCrash):
+        _run(
+            root,
+            operations=PointFailureOperations({"after:journal:committed": InjectedCrash()}),
+        )
+    foreign = root / artifact_name
+    foreign.mkdir()
+    (foreign / "operator.txt").write_bytes(b"mine\x00\n")
+    before = _snapshot_tree(foreign)
+    output: list[str] = []
+
+    assert _run(root, output=output) == 1
+
+    assert _snapshot_tree(foreign) == before
+    assert "does not match its journal ownership proof" in "\n".join(output)
+
+
+def test_foreign_directory_at_journal_name_is_never_unlinked(tmp_path: Path) -> None:
+    """Journal cleanup only unlinks the validated regular journal it read."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    foreign = root / migration._JOURNAL_FILENAME
+    foreign.mkdir()
+    (foreign / "operator.txt").write_bytes(b"journal-looking name is not ownership")
+    before = _snapshot_tree(tmp_path)
+    output: list[str] = []
+
+    assert _run(root, output=output) == 1
+
+    assert _snapshot_tree(tmp_path) == before
+    assert "Refusing unreadable migration journal" in "\n".join(output)
+
+
+def test_foreign_directory_replacing_journal_before_cleanup_survives_and_is_reported(
+    tmp_path: Path,
+) -> None:
+    """Cleanup re-reads its authority instead of unlinking a deterministic name."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    journal_path = root / migration._JOURNAL_FILENAME
+
+    class ReplaceJournalAtCleanup(migration.MigrationOperations):
+        replaced = False
+        snapshot: tuple[tuple[str, str, int, bytes | str], ...] = ()
+
+        def checkpoint(self, point: str) -> None:
+            if point != "before:cleanup:journal" or self.replaced:
+                return
+            self.replaced = True
+            journal_path.unlink()
+            journal_path.mkdir(mode=0o711)
+            (journal_path / "operator.txt").write_bytes(b"foreign journal directory\x00\n")
+            (journal_path / "nested").mkdir()
+            (journal_path / "nested" / "payload.bin").write_bytes(b"\xffforeign")
+            self.snapshot = _snapshot_tree(journal_path)
+
+    output: list[str] = []
+    operations = ReplaceJournalAtCleanup()
+
+    assert _run(root, operations=operations, output=output) == 1
+
+    assert operations.snapshot
+    assert stat.S_IMODE(journal_path.stat().st_mode) == 0o711
+    assert _snapshot_tree(journal_path) == operations.snapshot
+    assert migration._JOURNAL_FILENAME in "\n".join(output)
+    assert "cleanup will be retried" in "\n".join(output)
+
+
+def test_foreign_directory_replacing_journal_temporary_survives_and_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The mkstemp inode, not its reusable pathname, authorizes temp cleanup."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    real_replace = migration.os.replace
+    foreign_paths: list[Path] = []
+    foreign_snapshots: dict[Path, tuple[tuple[str, str, int, bytes | str], ...]] = {}
+
+    def replace_and_plant_foreign(source: Path, destination: Path) -> None:
+        real_replace(source, destination)
+        foreign = Path(source)
+        foreign.mkdir(mode=0o711)
+        (foreign / "operator.txt").write_bytes(b"foreign temp directory\x00\n")
+        foreign_paths.append(foreign)
+        foreign_snapshots[foreign] = _snapshot_tree(foreign)
+
+    monkeypatch.setattr(migration.os, "replace", replace_and_plant_foreign)
+    output: list[str] = []
+
+    assert _run(root, output=output) == 1
+
+    assert foreign_paths
+    for foreign in foreign_paths:
+        assert foreign.is_dir()
+        assert stat.S_IMODE(foreign.stat().st_mode) == 0o711
+        assert _snapshot_tree(foreign) == foreign_snapshots[foreign]
+    assert "journal temporary cleanup target is foreign" in "\n".join(output)
+
+
+def test_genuine_journal_temporary_is_removed_when_publish_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failed replace still cleans the exact regular file returned by mkstemp."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    temporary_paths: list[Path] = []
+
+    def fail_replace(source: Path, _destination: Path) -> None:
+        temporary_paths.append(Path(source))
+        raise OSError("injected journal publication failure")
+
+    monkeypatch.setattr(migration.os, "replace", fail_replace)
+
+    assert _run(root) == 1
+
+    assert len(temporary_paths) == 1
+    assert not temporary_paths[0].exists()
+    assert not temporary_paths[0].is_symlink()
+
+
 def test_env_bytes_and_nondefault_mode_are_identical_after_migration(tmp_path: Path) -> None:
     root = tmp_path / "tools"
     content = b"\xffbinary\r\nAPI_KEY='literal bytes'\r\n"
@@ -517,7 +785,7 @@ def test_foreign_cleanup_target_survives_rollback_and_is_reported(
     assert _snapshot_tree(foreign) == before
     assert stat.S_IMODE(foreign.stat().st_mode) == 0o711
     report = "\n".join(output)
-    assert "cleanup target is not the journal's new package" in report
+    assert "cleanup target does not match its journal ownership proof" in report
     assert "migration journal remains available for retry" in report
     journal = json.loads((root / migration._JOURNAL_FILENAME).read_text(encoding="utf-8"))
     assert journal["status"] == "rolled_back"
@@ -915,7 +1183,16 @@ def test_committed_journal_with_an_incomplete_package_is_refused(tmp_path: Path)
         "tools_dir": str(root.resolve()),
         "started_at": _START.isoformat(),
         "backup": str(backup),
-        "packages": [{"name": "alpha", "vid": _VID, "completed": 2, "pending": None}],
+        "packages": [
+            {
+                "name": "alpha",
+                "vid": _VID,
+                "completed": 2,
+                "pending": None,
+                "shell_identity": None,
+                "premigrate_identity": None,
+            }
+        ],
     }
     (root / migration._JOURNAL_FILENAME).write_text(json.dumps(payload), encoding="utf-8")
     before = _snapshot_tree(tmp_path)
