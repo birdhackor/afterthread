@@ -1610,7 +1610,7 @@ def test_runtime_identity_survives_a_summary_sidecar_write(
 
     assert tools.write_tool_meta(
         pkg,
-        {"summary": "what it does", "status": "draft", "updated_at": "2026-07-27T00:00:00+00:00"},
+        {"summary": "what it does", "updated_at": "2026-07-27T00:00:00+00:00"},
     )
 
     assert asyncio.run(handler({})) == "ok"
@@ -3810,12 +3810,8 @@ def test_tool_meta_round_trips(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
 
     meta = {
         "summary": "這個工具會查 KB",
-        "status": "draft",
         "updated_at": "2026-07-26T00:00:00+00:00",
         "llm_log_id": 12,
-        # Carried through verbatim, never re-derived: set_summary_status's
-        # round-trip must keep a token minted by an EARLIER process (see
-        # write_tool_meta).
         "llm_log_process": "process-token-from-whoever-wrote-this",
         "origin": {"openapi_url": "http://kb.example/openapi.json", "instructions": "build"},
     }
@@ -3852,11 +3848,8 @@ def test_read_tool_meta_survives_pathological_nesting(
     """A deeply nested sidecar exhausts the stack INSIDE json.loads, which raises
     RecursionError -- not the ValueError the parse guard used to catch alone.
 
-    It is not the summary panel that pays for that: ``summary_status`` runs this
-    once per package on every ``list_tools`` scan, so one hand-edited (or
-    malicious) sidecar escaping as an exception 500s the whole 工具 page and
-    takes every OTHER tool's row down with it. Degrades to None like any other
-    unusable sidecar, and the row still lists."""
+    It degrades to None like any other unusable sidecar, and the row still
+    lists."""
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
@@ -3873,9 +3866,8 @@ def test_read_tool_meta_survives_pathological_nesting(
     _sidecar(pkg).write_text(nested, encoding="utf-8")
 
     assert tools.read_tool_meta(pkg) is None
-    assert tools.summary_status(pkg) is None
     listed = list_tools()
-    assert [(row["name"], row["summary_status"]) for row in listed] == [("echo", None)]
+    assert [row["name"] for row in listed] == ["echo"]
 
 
 def test_write_tool_meta_redacts_the_summary(
@@ -3950,13 +3942,12 @@ def test_write_tool_meta_keys_survive_a_secret_that_equals_one(
     literals this module writes, so there is no key left to mask."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
-    for key in ("summary", "status", "origin", "instructions", "updated_at"):
+    for key in ("summary", "origin", "instructions", "updated_at"):
         monkeypatch.setattr(tools, "known_secret_values", lambda key=key: frozenset({key}))
         assert (
             _write_meta(
                 pkg,
                 summary="這個工具會查 KB",
-                status="final",
                 llm_log_id=7,
                 origin={"openapi_url": "http://kb.example/o.json", "instructions": "查 KB"},
             )
@@ -3965,16 +3956,14 @@ def test_write_tool_meta_keys_survive_a_secret_that_equals_one(
         stored = tools.read_tool_meta(pkg)
         assert stored is not None, f"a secret equal to the key {key!r} broke the schema"
         assert stored["summary"] == "這個工具會查 KB"
-        assert stored["status"] == "final"
         assert stored["llm_log_id"] == 7
         assert stored["origin"]["openapi_url"] == "http://kb.example/o.json"
-        assert tools.summary_status(pkg) == "final"
 
 
 def test_write_tool_meta_drops_unknown_keys_and_containers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The sidecar IS the six schema fields; anything else a caller (or a
+    """The sidecar IS the five schema fields; anything else a caller (or a
     hand-edited file read back in) carries is dropped by the next write.
 
     Round-tripping extra keys was never a contract -- it was a side effect of
@@ -4004,7 +3993,6 @@ def test_write_tool_meta_drops_unknown_keys_and_containers(
     assert stored is not None
     assert set(stored) == {
         "summary",
-        "status",
         "updated_at",
         "llm_log_id",
         "llm_log_process",
@@ -4071,7 +4059,7 @@ def test_write_tool_meta_refuses_a_non_string_summary(tmp_path: Path) -> None:
     refusal: it means the same thing as the empty placeholder a failed generation
     writes, so it lands as ``""`` instead of slipping past the type check as
     "not a string, but not refused either" (which is how a hand-written
-    ``{"summary": null}`` used to become a finalizable nothing)."""
+    ``{"summary": null}`` used to become a malformed empty value)."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     for bad in ({"nested": "object"}, 12, ["a"], True):
@@ -4098,19 +4086,11 @@ def test_write_tool_meta_requires_a_string_updated_at(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "field, value, expected",
     [
-        ("status", "published", "draft"),
-        ("status", ["draft"], "draft"),
-        ("status", None, "draft"),
-        ("status", "final", "final"),
         ("llm_log_id", "three", None),
         ("llm_log_id", True, None),  # bool is an int subclass; never a log link
         ("llm_log_id", 7, 7),
     ],
     ids=[
-        "unknown-status",
-        "wrong-type-status",
-        "absent-status",
-        "final",
         "str-id",
         "bool-id",
         "id",
@@ -4119,9 +4099,7 @@ def test_write_tool_meta_requires_a_string_updated_at(tmp_path: Path) -> None:
 def test_write_tool_meta_coerces_the_scalar_fields(
     tmp_path: Path, field: str, value: Any, expected: Any
 ) -> None:
-    """An unknown status must never survive a write (``summary_status`` already
-    refuses to trust one, so persisting it only keeps a dead value alive), and a
-    non-int ``llm_log_id`` must never render as a link."""
+    """A non-int ``llm_log_id`` must never render as a link."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     assert _write_meta(pkg, summary="s", **{field: value}) is True
@@ -4229,9 +4207,9 @@ def test_write_tool_meta_keeps_the_old_sidecar_when_the_publish_fails(
     already destroyed by the time any failure could be reported.
 
     That is real data loss, not a lost update: on ENOSPC/quota/an I/O error the
-    caller was told False -- "nothing happened" -- while a FINALIZED summary the
-    operator explicitly froze had been truncated to nothing, and the sidecar is
-    the ONLY copy of both that summary and the install's ``origin``. Writing to a
+    caller was told False -- "nothing happened" -- while the existing summary
+    had been truncated to nothing, and the sidecar is the ONLY copy of both that
+    summary and the install's ``origin``. Writing to a
     temp file and publishing with ``os.replace`` means the old content survives
     every failure mode, and the file is never observable half-written.
 
@@ -4240,7 +4218,7 @@ def test_write_tool_meta_keeps_the_old_sidecar_when_the_publish_fails(
     the claim: even a failure at the very END leaves the previous file intact."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
-    assert _write_meta(pkg, summary="定版的說明", status="final") is True
+    assert _write_meta(pkg, summary="原本的說明") is True
     before = _sidecar(pkg).read_bytes()
 
     def boom(*args: Any, **kwargs: Any) -> None:
@@ -4527,7 +4505,6 @@ def test_read_tool_meta_scrubs_lone_surrogates(tmp_path: Path) -> None:
         json.dumps(
             {
                 "summary": "a\ud800b",
-                "status": "draft",
                 "updated_at": "2026-01-01T00:00:00+00:00\udfff",
                 "llm_log_id": 3,
                 "origin": {"openapi_url": "http://kb.example/\ud800.json", "instructions": None},
@@ -4598,120 +4575,27 @@ def test_write_tool_meta_refuses_a_surrogate_bearing_updated_at(tmp_path: Path) 
     assert not list(pkg.glob(f"{tools._AI_META_FILENAME}.*"))
 
 
-# --- compound sidecar operations are serialized (_META_LOCK, D40 r3) ----------
-
-
-def test_set_summary_status_and_store_summary_meta_serialize(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A thread hammer over the two compound sidecar operations.
-
-    Both are read-check-write sequences and both run on THREADPOOL workers in
-    production (every route hops through run_in_threadpool), so they genuinely
-    execute in parallel here too. What this pins is the OBSERVABLE file: under
-    real contention the sidecar is always a complete, legal sidecar with a legal
-    status, every operation returns rather than raising, and no temp file is left
-    behind.
-
-    Scope, stated precisely because the two guarantees are easy to conflate: the
-    watcher thread is a TORN-WRITE detector and it is the ATOMIC publish
-    (``os.replace``) that satisfies it -- reverting to the old truncate-in-place
-    writer makes this fail with a JSONDecodeError on an empty read, verified.
-    It does NOT by itself prove mutual exclusion; a lost update leaves a
-    perfectly legal file. The deterministic proof that ``_META_LOCK`` serializes
-    a finalize against a store lives in test_tool_meta.py
-    (``test_regenerate_summary_cannot_undo_a_finalize_holding_the_lock``)."""
-    root = tmp_path / "tools"
-    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
-    _install_tools(monkeypatch, root)
-    identity = tools.package_identity(pkg)
-    assert _write_meta(pkg, summary="說明", status="draft") is True
-
-    errors: list[BaseException] = []
-    stop = threading.Event()
-
-    def flipper() -> None:
-        try:
-            for index in range(20):
-                tools.set_summary_status("echo", "final" if index % 2 else "draft")
-        except BaseException as exc:  # reported to the main thread, never swallowed
-            errors.append(exc)
-
-    def storer() -> None:
-        try:
-            for index in range(20):
-                tools.store_summary_meta(
-                    pkg,
-                    summary=f"生成 {index}",
-                    origin=None,
-                    llm_log_id=index,
-                    expected_identity=identity,
-                )
-        except BaseException as exc:  # reported to the main thread, never swallowed
-            errors.append(exc)
-
-    def reader() -> None:
-        # The torn-write detector: every observation of the sidecar must be a
-        # complete, parseable file with a legal status -- never a prefix.
-        try:
-            while not stop.is_set():
-                raw = _sidecar(pkg).read_text(encoding="utf-8")
-                parsed = json.loads(raw)
-                assert parsed["status"] in tools._SUMMARY_STATUSES
-                assert isinstance(parsed["summary"], str)
-        except BaseException as exc:  # reported to the main thread, never swallowed
-            errors.append(exc)
-
-    workers = [threading.Thread(target=flipper), threading.Thread(target=storer)]
-    watcher = threading.Thread(target=reader)
-    watcher.start()
-    for worker in workers:
-        worker.start()
-    for worker in workers:
-        worker.join(timeout=30)
-        assert not worker.is_alive()
-    stop.set()
-    watcher.join(timeout=30)
-    assert not watcher.is_alive()
-    assert not errors, errors
-
-    # Whatever order they landed in, the file is a legal sidecar.
-    final = tools.read_tool_meta(pkg)
-    assert final is not None
-    assert final["status"] in tools._SUMMARY_STATUSES
-    assert not list(pkg.glob(f"{tools._AI_META_FILENAME}.*"))
+# --- summary sidecar storage --------------------------------------------------
 
 
 def test_store_summary_meta_outcomes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """The three outcome codes tool_meta maps onto dict / StoreRefusal / None."""
+    """The store distinguishes a successful publish from a refused one."""
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
     identity = tools.package_identity(pkg)
 
-    # ok: status and origin inherited from disk, the summary replaced.
+    # ok: origin inherited from disk, the summary replaced.
     origin = {"openapi_url": "http://kb.example/o.json", "instructions": "查 KB"}
-    assert _write_meta(pkg, summary="舊的", status="draft", origin=origin) is True
+    assert _write_meta(pkg, summary="舊的", origin=origin) is True
     outcome, meta = tools.store_summary_meta(
         pkg, summary="新的", origin=None, llm_log_id=9, expected_identity=identity
     )
     assert outcome == "ok"
     assert meta is not None
     assert meta["summary"] == "新的"
-    assert meta["status"] == "draft"
     assert meta["origin"] == origin
     assert tools.read_tool_meta(pkg) == meta  # what it returned IS what it stored
-
-    # finalized: nothing is written, and the answer is NOT the failure code.
-    assert tools.set_summary_status("echo", "final") == "ok"
-    before = _sidecar(pkg).read_bytes()
-    assert tools.store_summary_meta(
-        pkg, summary="更新的", origin=None, llm_log_id=1, expected_identity=identity
-    ) == (
-        "finalized",
-        None,
-    )
-    assert _sidecar(pkg).read_bytes() == before
 
     # not_stored: the write was refused (here, the ghost guard on a missing dir).
     gone = tmp_path / "nope" / "gone"
@@ -4755,42 +4639,6 @@ def test_store_summary_meta_stamps_the_minting_process_beside_the_log_id(
     assert meta is not None
     assert meta["llm_log_id"] is None
     assert meta["llm_log_process"] is None  # no id, nothing to vouch for
-
-
-def test_set_summary_status_keeps_a_foreign_process_token(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """定版 / 解除定版 carries the id AND its token through untouched.
-
-    The round-trip rebuilds the sidecar from what it just READ, so a summary
-    generated before a restart keeps its (now foreign) token instead of being
-    re-stamped as current -- re-stamping would forge freshness onto a stale id,
-    which is precisely the confusion the token exists to prevent."""
-    root = tmp_path / "tools"
-    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
-    _install_tools(monkeypatch, root)
-    monkeypatch.setattr(tools, "_resolve_package_dir_no_alias", lambda _name: pkg)
-
-    assert (
-        _write_meta(pkg, summary="上一個行程寫的", llm_log_id=4, llm_log_process="an-older-process")
-        is True
-    )
-
-    assert tools.set_summary_status("echo", "final") == "ok"
-
-    stored = tools.read_tool_meta(pkg)
-    assert stored is not None
-    assert stored["status"] == "final"
-    assert stored["llm_log_id"] == 4
-    assert stored["llm_log_process"] == "an-older-process"
-    assert stored["llm_log_process"] != llm_log.process_token()
-
-
-# The SUMMARY's redact -> strip -> cap, at its one choke point (D40 r4). The
-# three properties below used to be pinned on ToolSummaryResult's pydantic
-# validator, which ran them on the EVENT LOOP (the redaction sweeps the tools
-# directory). They moved here as one ordered operation -- splitting them would
-# have put the strip before the redaction, which is itself a leak.
 
 
 def test_store_summary_meta_strips_and_caps_the_summary(
@@ -4922,8 +4770,7 @@ def test_store_summary_meta_refuses_a_package_swapped_inside_the_write(
     The identity check used to be the last line of ``store_summary_meta``, which
     reads as "the last instant" but is not one: ``write_tool_meta`` still had a
     redactor sweep, an encode, an mkstemp, a write and an fsync ahead of it, and
-    NOTHING serializes a promote or a delete against that (``_META_LOCK`` is a
-    sidecar-file lock, and neither of those touches the sidecar). So a package
+    NOTHING serializes a promote or a delete against that. So a package
     swapped inside that window received A's summary AND A's origin -- which every
     later revise of B then reads back as its first-hand context.
 
@@ -4956,38 +4803,6 @@ def test_store_summary_meta_refuses_a_package_swapped_inside_the_write(
     assert sorted(child.name for child in swapped.iterdir()) == ["run.py", "tool.json"]
 
 
-def test_set_summary_status_cannot_finalize_onto_a_package_swapped_inside_the_write(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The other official API call in that window: a PATCH must not freeze A's
-    meta onto B.
-
-    ``set_summary_status`` read A's sidecar, and the rewrite it built from it went
-    to whatever package answered to the name by the time the bytes landed -- so a
-    revise (or a delete + same-name reinstall) landing between the read and the
-    publish left B holding A's text, A's origin and ``status: "final"``. B's own
-    summary hook then REFUSES to update a finalized sidecar, so the wrong
-    explanation is frozen in front of the right implementation until someone
-    thinks to un-finalize it.
-
-    The identity is captured at the resolve and checked above ``os.replace``; the
-    refusal folds into the ``"not_found"`` this function already answers for a
-    write that did not happen."""
-    root = tmp_path / "tools"
-    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
-    _install_tools(monkeypatch, root)
-    assert _write_meta(pkg, summary="A 的說明", status="draft") is True
-    replacement = _swap_the_package_once(
-        monkeypatch, root, "echo", "import sys\nsys.stdout.write('B')\n"
-    )
-
-    assert tools.set_summary_status("echo", "final") == "not_found"
-
-    swapped = replacement()
-    assert tools.read_tool_meta(swapped) is None  # B was never written into
-    assert tools.summary_status(swapped) is None  # ... and certainly never frozen
-
-
 def test_store_summary_meta_fails_closed_on_a_redaction_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4998,7 +4813,7 @@ def test_store_summary_meta_fails_closed_on_a_redaction_failure(
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
     identity = tools.package_identity(pkg)
-    assert _write_meta(pkg, summary="舊的", status="draft") is True
+    assert _write_meta(pkg, summary="舊的") is True
     before = _sidecar(pkg).read_bytes()
 
     def explode() -> Any:
@@ -5014,578 +4829,6 @@ def test_store_summary_meta_fails_closed_on_a_redaction_failure(
     )
     assert _sidecar(pkg).read_bytes() == before
 
-    # ... and a FINALIZED package still answers "finalized", not "not_stored":
-    # the redaction runs after the freeze gate, so "you cannot do this" (409)
-    # keeps outranking "it did not work" (404) even with the provider down.
-    monkeypatch.setattr(tools, "known_secret_values", frozenset)  # restore, to finalize
-    assert tools.set_summary_status("echo", "final") == "ok"
-    monkeypatch.setattr(tools, "known_secret_values", explode)
-    assert tools.store_summary_meta(
-        pkg, summary="新的", origin=None, llm_log_id=1, expected_identity=identity
-    ) == (
-        "finalized",
-        None,
-    )
-
-
-@pytest.mark.parametrize(
-    "meta, expected",
-    [
-        ({"summary": "s", "status": "draft"}, "draft"),
-        ({"summary": "s", "status": "final"}, "final"),
-        ({"summary": "s", "status": "published"}, None),
-        ({"summary": "s", "status": ["draft"]}, None),
-        ({"summary": "s"}, None),
-    ],
-    ids=["draft", "final", "unknown-value", "wrong-type", "absent"],
-)
-def test_summary_status_only_trusts_the_two_known_values(
-    tmp_path: Path, meta: dict[str, Any], expected: str | None
-) -> None:
-    pkg = tmp_path / "pkg"
-    pkg.mkdir()
-    _sidecar(pkg).write_text(json.dumps(meta), encoding="utf-8")
-    assert tools.summary_status(pkg) == expected
-
-
-def test_summary_status_none_without_sidecar(tmp_path: Path) -> None:
-    pkg = tmp_path / "pkg"
-    pkg.mkdir()
-    assert tools.summary_status(pkg) is None
-
-
-# --- the strict reader: UNREADABLE is not ABSENT (D40 r3 / R3-2) ---------------
-
-
-@pytest.mark.parametrize(
-    "meta, expected",
-    [
-        ({"summary": "s", "status": "draft"}, "draft"),
-        ({"summary": "s", "status": "final"}, "final"),
-    ],
-    ids=["draft", "final"],
-)
-def test_summary_status_or_unknown_agrees_on_a_readable_sidecar(
-    tmp_path: Path, meta: dict[str, Any], expected: str
-) -> None:
-    """A sidecar we CAN read gives the strict reader and the total one the same
-    answer -- the split is only about what the failures mean.
-
-    The strict reader also hands the meta it just parsed back (R4-2), which is how
-    its one caller gets the ``origin`` without reading the file a second time. The
-    meta is the WHOLE sidecar, not a re-read of it: asserted by content."""
-    pkg = tmp_path / "pkg"
-    pkg.mkdir()
-    _sidecar(pkg).write_text(json.dumps(meta), encoding="utf-8")
-    assert tools.summary_status_or_unknown(pkg) == (expected, meta)
-    assert tools.summary_status(pkg) == expected
-
-
-def test_summary_status_or_unknown_none_only_when_the_sidecar_is_really_absent(
-    tmp_path: Path,
-) -> None:
-    """None means ENOENT and nothing else: the one case where "not finalized" is
-    a fact rather than a guess. There is no meta to hand back either -- an absent
-    sidecar has no origin to inherit, which is a fact and not a failed look."""
-    pkg = tmp_path / "pkg"
-    pkg.mkdir()
-    assert tools.summary_status_or_unknown(pkg) == (None, None)
-
-
-def test_summary_status_or_unknown_reports_unknown_for_an_unreadable_sidecar(
-    tmp_path: Path,
-) -> None:
-    """A FIFO at the sidecar name: it EXISTS, and the bounded reader refuses it
-    (O_NONBLOCK + the S_ISREG gate). ``summary_status`` folds that into the same
-    None a missing sidecar gives; the strict reader must not, because its caller
-    would read that None as "safe to destroy this package"."""
-    pkg = tmp_path / "pkg"
-    pkg.mkdir()
-    os.mkfifo(_sidecar(pkg))
-
-    assert tools.summary_status(pkg) is None  # the total reader still degrades ...
-    assert tools.summary_status_or_unknown(pkg) == (
-        tools._SUMMARY_STATUS_UNKNOWN,
-        None,  # ... this does not, and it hands back nothing it just refused to trust
-    )
-
-
-@pytest.mark.parametrize(
-    "content",
-    ["not json at all", "[1, 2, 3]", '{"summary": "s"}', '{"summary": "s", "status": "published"}'],
-    ids=["invalid-json", "not-an-object", "no-status", "unknown-status"],
-)
-def test_summary_status_or_unknown_reports_unknown_for_a_corrupt_sidecar(
-    tmp_path: Path, content: str
-) -> None:
-    """Every "the file is there but says nothing we trust" shape is UNKNOWN too.
-
-    ``write_tool_meta`` writes one of exactly two status literals into a JSON
-    object every time, so each of these is a hand-edited or damaged file -- and a
-    status we refused to trust is not evidence that the summary is unfrozen.
-
-    The meta is withheld on every one of them (R4-2): a file whose status we
-    refuse to believe must not have its other fields handed on as if we did."""
-    pkg = tmp_path / "pkg"
-    pkg.mkdir()
-    _sidecar(pkg).write_text(content, encoding="utf-8")
-
-    assert tools.summary_status(pkg) is None
-    assert tools.summary_status_or_unknown(pkg) == (tools._SUMMARY_STATUS_UNKNOWN, None)
-
-
-def test_summary_status_or_unknown_reports_unknown_for_an_oversized_sidecar(
-    tmp_path: Path,
-) -> None:
-    """Over the cap is refused by the reader, so it is UNKNOWN rather than absent
-    -- an oversized sidecar could hold a finalized summary just as easily."""
-    pkg = tmp_path / "pkg"
-    pkg.mkdir()
-    padding = "x" * tools._AI_META_MAX_BYTES
-    _sidecar(pkg).write_text(json.dumps({"summary": padding, "status": "final"}), encoding="utf-8")
-
-    assert tools.summary_status(pkg) is None
-    assert tools.summary_status_or_unknown(pkg) == (tools._SUMMARY_STATUS_UNKNOWN, None)
-
-
-def test_summary_status_unknown_sentinel_is_not_a_real_status(tmp_path: Path) -> None:
-    """The sentinel can never be confused with something a sidecar HOLDS: it is
-    outside ``_SUMMARY_STATUSES``, so the narrowing refuses it on the way in -- a
-    hand-edited ``"status": "unknown"`` reaches a caller as the sentinel only
-    because the file was not trustworthy, which is the same thing it means."""
-    assert tools._SUMMARY_STATUS_UNKNOWN not in tools._SUMMARY_STATUSES
-    pkg = tmp_path / "pkg"
-    pkg.mkdir()
-    _sidecar(pkg).write_text(
-        json.dumps({"summary": "s", "status": tools._SUMMARY_STATUS_UNKNOWN}), encoding="utf-8"
-    )
-    assert tools.summary_status(pkg) is None  # never passed through as a status
-    assert _write_meta(pkg, summary="s", status=tools._SUMMARY_STATUS_UNKNOWN) is True
-    assert tools.summary_status(pkg) == "draft"  # ... and the writer coerces it away too
-
-
-def test_set_summary_status_finalizes_and_preserves_the_summary(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """定版 flips only status + updated_at; the summary and origin survive, and
-    the flip is reversible."""
-    root = tmp_path / "tools"
-    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
-    _install_tools(monkeypatch, root)
-    _write_meta(
-        pkg,
-        summary="說明",
-        status="draft",
-        llm_log_id=5,
-        origin={"openapi_url": "http://kb.example/o.json", "instructions": "i"},
-    )
-
-    assert tools.set_summary_status("echo", "final") == "ok"
-    stored = tools.read_tool_meta(pkg)
-    assert stored is not None
-    assert stored["status"] == "final"
-    assert stored["summary"] == "說明"
-    assert stored["llm_log_id"] == 5
-    assert stored["origin"]["instructions"] == "i"
-    assert stored["updated_at"] != "2026-01-01T00:00:00+00:00"  # refreshed
-    assert tools.summary_status(pkg) == "final"
-
-    # Reversible: 解除定版 puts it back to draft.
-    assert tools.set_summary_status("echo", "draft") == "ok"
-    assert tools.summary_status(pkg) == "draft"
-
-
-def test_set_summary_status_no_meta_when_sidecar_absent(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    root = tmp_path / "tools"
-    _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
-    _install_tools(monkeypatch, root)
-    assert tools.set_summary_status("echo", "final") == "no_meta"
-
-
-@pytest.mark.parametrize("summary", ["", "   ", None, 12], ids=["empty", "blank", "null", "int"])
-def test_set_summary_status_refuses_to_finalize_an_empty_summary(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, summary: Any
-) -> None:
-    """定版 means "freeze THIS explanation", and there is none here.
-
-    Left alone, this was a trap rather than a harmless no-op: a hand-written
-    ``{"summary": null, "status": "draft"}`` finalized with a 200, and the
-    finalized nothing then blocked 重新產生 with ``tool_finalized`` -- the one
-    action that could have filled it. Same "nothing there to freeze" answer as a
-    package with no sidecar at all, so it reuses ``no_meta`` (the 409
-    ``summary_missing``)."""
-    root = tmp_path / "tools"
-    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
-    _install_tools(monkeypatch, root)
-    # Written by hand: the WRITER coerces null->"" and refuses an int, so these
-    # shapes only ever reach the finalize gate from a hand-edited file.
-    _sidecar(pkg).write_text(json.dumps({"summary": summary, "status": "draft"}), encoding="utf-8")
-
-    assert tools.set_summary_status("echo", "final") == "no_meta"
-    assert tools.summary_status(pkg) == "draft"  # nothing was rewritten
-
-
-def test_set_summary_status_draft_is_never_gated(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """解除定版 is the escape hatch out of a frozen state, and an escape hatch
-    that can itself be refused is not one -- so the emptiness gate above applies
-    ONLY to the "final" direction. This is what un-sticks a sidecar that was
-    finalized empty before the gate existed."""
-    root = tmp_path / "tools"
-    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
-    _install_tools(monkeypatch, root)
-    _sidecar(pkg).write_text(json.dumps({"summary": "", "status": "final"}), encoding="utf-8")
-
-    assert tools.set_summary_status("echo", "draft") == "ok"
-    assert tools.summary_status(pkg) == "draft"
-
-
-def test_set_summary_status_draft_survives_a_corrupt_typed_summary(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """R6-2: the escape hatch must survive a corruption ``write_tool_meta``
-    itself would refuse to write. A hand-edited ``{"summary": 123, ...}`` used
-    to ride unchanged into the rewrite, whose own non-str-summary refusal
-    returned False -- which this function folded into ``"not_found"``, 404ing
-    the ONE mutation (解除定版) that exists to recover from exactly this
-    corruption, with no other way to reach it through the API. The summary is
-    now coerced to "" before the write, so 解除定版 always succeeds; a
-    corrupt-typed summary still cannot be finalized afterward -- the emptiness
-    gate re-triggers ``no_meta`` on the very next 定版 attempt."""
-    root = tmp_path / "tools"
-    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
-    _install_tools(monkeypatch, root)
-    _sidecar(pkg).write_text(json.dumps({"summary": 123, "status": "final"}), encoding="utf-8")
-
-    assert tools.set_summary_status("echo", "draft") == "ok"
-    stored = tools.read_tool_meta(pkg)
-    assert stored is not None
-    assert stored["status"] == "draft"
-    assert stored["summary"] == ""  # corrupt TYPE degrades to "no summary yet"
-
-    # The coercion cannot reopen 定版 as a back door: the emptiness gate still
-    # runs first and still refuses an (effectively) empty summary.
-    assert tools.set_summary_status("echo", "final") == "no_meta"
-
-
-def test_set_summary_status_still_reports_not_found_on_a_real_write_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """R6-2 collateral: the new coercion only ever touches the INPUT payload
-    (a non-str ``summary``); it must not change what happens when
-    ``write_tool_meta`` fails for a genuine reason with a perfectly good ``str``
-    summary already on disk -- that must still read as ``"not_found"``, exactly
-    as before this fix."""
-    root = tmp_path / "tools"
-    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
-    _install_tools(monkeypatch, root)
-    _write_meta(pkg, summary="說明", status="draft")
-    monkeypatch.setattr(tools, "write_tool_meta", lambda *args, **kwargs: False)
-
-    assert tools.set_summary_status("echo", "final") == "not_found"
-
-
-def test_set_summary_status_final_to_final_never_rewrites_the_frozen_text(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """R7-2: a repeated 定版 is an idempotent RETRY, and must not touch the file.
-
-    The obvious way to get one is a lost response -- the client resends the same
-    PATCH. That used to run the whole rewrite: back through ``write_tool_meta``,
-    which re-redacts every text field against TODAY's known-secret set. And that
-    set GROWS: installing any other tool registers its ``.env`` values. So a
-    value that appears inside text an operator froze WEEKS ago starts matching,
-    and the retry silently replaces part of the frozen explanation with a
-    redaction marker -- "finalized text is immutable while finalized" broken by
-    the one request that asked for no change at all. Refreshing ``updated_at``
-    was the same lie in miniature.
-
-    Staged with a REAL second package rather than a stubbed registry, because the
-    registry's growth is the whole mechanism: the value only becomes a secret
-    because a later install put it in a ``.env``."""
-    root = tmp_path / "tools"
-    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
-    _install_tools(monkeypatch, root)
-    frozen = "這個工具會查 KB，範例參數寫成 kb-live-token-abcdef"  # noqa: RUF001
-    assert _write_meta(pkg, summary=frozen, status="draft") is True
-    assert tools.set_summary_status("echo", "final") == "ok"
-    before = _sidecar(pkg).read_bytes()
-    assert frozen in before.decode("utf-8")  # frozen whole, nothing masked yet
-
-    # A LATER install registers that exact string: another tool's new .env value.
-    _make_tool(root, "kb", "import sys\n", dotenv="KB_API_KEY=kb-live-token-abcdef\n")
-    assert "kb-live-token-abcdef" in tools.known_secret_values()
-
-    assert tools.set_summary_status("echo", "final") == "ok"  # the retry is answered
-
-    assert _sidecar(pkg).read_bytes() == before  # ... byte-identical: no write at all
-    stored = tools.read_tool_meta(pkg)
-    assert stored is not None
-    assert stored["summary"] == frozen  # the frozen text was never re-redacted
-    assert tools._REDACTION_MARKER not in stored["summary"]
-    assert stored["updated_at"] == json.loads(before.decode("utf-8"))["updated_at"]
-
-
-def test_set_summary_status_draft_to_draft_is_a_no_op_but_a_transition_still_writes(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The symmetry half of R7-2, and its boundary.
-
-    draft->draft is short-circuited too: a same-status rewrite has nothing
-    legitimate to do in EITHER direction (it only ever carries ``status``, which
-    already matches, and ``updated_at``, which nobody asked to change), and one
-    direction behaving differently from the other would be a rule nobody can
-    remember. The second half is the collateral that matters more: the
-    short-circuit fires on EXACT status equality only, so a real transition on
-    the very same sidecar still writes."""
-    root = tmp_path / "tools"
-    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
-    _install_tools(monkeypatch, root)
-    assert _write_meta(pkg, summary="說明", status="draft") is True
-    before = _sidecar(pkg).read_bytes()
-
-    assert tools.set_summary_status("echo", "draft") == "ok"
-    assert _sidecar(pkg).read_bytes() == before
-
-    assert tools.set_summary_status("echo", "final") == "ok"  # a REAL transition
-    assert _sidecar(pkg).read_bytes() != before
-    assert tools.summary_status(pkg) == "final"
-
-
-@pytest.mark.parametrize(
-    "on_disk",
-    [{"summary": "說明"}, {"summary": "說明", "status": "frozen"}],
-    ids=["status-absent", "status-unknown"],
-)
-def test_set_summary_status_short_circuits_only_on_exact_equality(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, on_disk: dict[str, Any]
-) -> None:
-    """R7-2 collateral: nothing but an exact status match skips the write.
-
-    A hand-edited sidecar with no ``status`` at all, or one carrying a value
-    ``_SUMMARY_STATUSES`` does not recognize, must still be REWRITTEN into a
-    legal state by a PATCH -- those are exactly the files a status mutation
-    exists to repair, and folding them into the no-op would strand them."""
-    root = tmp_path / "tools"
-    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
-    _install_tools(monkeypatch, root)
-    _sidecar(pkg).write_text(json.dumps(on_disk), encoding="utf-8")
-
-    assert tools.set_summary_status("echo", "draft") == "ok"
-    assert tools.summary_status(pkg) == "draft"  # rewritten, not short-circuited
-
-
-@pytest.mark.parametrize(
-    "name", ["ghost", "../escape", "UPPER"], ids=["missing", "traversal", "regex"]
-)
-def test_set_summary_status_not_found_for_unknown_or_unsafe_names(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str
-) -> None:
-    root = tmp_path / "tools"
-    _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
-    _install_tools(monkeypatch, root)
-    assert tools.set_summary_status(name, "final") == "not_found"
-
-
-def test_set_summary_status_not_found_when_feature_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("afterthread.services.tools.get_settings", lambda: Settings(tools_dir=""))
-    assert tools.set_summary_status("echo", "final") == "not_found"
-
-
-def test_set_summary_status_refuses_internal_alias(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The same INTERNAL-alias hard-block set_enabled carries (H3), on the
-    summary path: tools/<alias> -> tools/<real> resolves inside the root, so
-    without it a 定版 addressed at the alias would freeze the REAL package's
-    summary. Refused, and the real sidecar is left exactly as it was."""
-    root = tmp_path / "tools"
-    real = _make_tool(root, "real", "import sys\nsys.stdout.write('x')\n")
-    (root / "alias").symlink_to(root / "real", target_is_directory=True)
-    _install_tools(monkeypatch, root)
-    _write_meta(real, summary="說明", status="draft")
-    before = (real / tools._AI_META_FILENAME).read_bytes()
-
-    assert tools.set_summary_status("alias", "final") == "not_found"
-    assert (real / tools._AI_META_FILENAME).read_bytes() == before
-    assert tools.summary_status(real) == "draft"
-
-
-def test_list_tools_reports_summary_status(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Every row carries the sidecar's status (null when there is none), so the
-    page badges the whole list from one request."""
-    root = tmp_path / "tools"
-    finalized = _make_tool(root, "aaa", "import sys\nsys.stdout.write('x')\n")
-    _make_tool(root, "bbb", "import sys\nsys.stdout.write('x')\n")
-    _install_tools(monkeypatch, root)
-    _write_meta(finalized, summary="s", status="final")
-
-    listed = {row["name"]: row["summary_status"] for row in list_tools()}
-    assert listed == {"aaa": "final", "bbb": None}
-
-
-def test_list_tools_reports_no_summary_status_for_an_alias(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """An internal alias row must not badge the REAL package's summary.
-
-    ``tools/alias -> tools/real`` is listed (invalid, so it can be deleted), and
-    the listing was the LAST place still reading through the link: the row showed
-    已定版 because REAL's sidecar says so, while every by-name summary route --
-    GET, PATCH, regenerate -- 404s the name. A badge no request can reproduce,
-    describing a different package than the row it sits on."""
-    root = tmp_path / "tools"
-    real = _make_tool(root, "real", "import sys\nsys.stdout.write('x')\n")
-    (root / "alias").symlink_to(root / "real", target_is_directory=True)
-    _install_tools(monkeypatch, root)
-    assert _write_meta(real, summary="說明", status="final") is True
-
-    rows = {row["name"]: row for row in list_tools()}
-
-    assert rows["alias"]["summary_status"] is None
-    assert rows["alias"]["valid"] is False  # unchanged: a symlinked package is refused
-    assert rows["real"]["summary_status"] == "final"
-
-
-def test_list_tools_row_describes_one_instance_when_a_promote_lands_mid_row(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """R9-2: a row is A's manifest OR B's, never A's description with B's badge.
-
-    The two reads a row is built from -- the manifest scan and the sidecar read --
-    used to be joined by PATH alone, so a revise promote landing between them
-    stitched half of each package into one row. The 工具 page derives a row's
-    instance identity from name + description, so the torn row keeps the panel
-    (and any unsent 修訂意見) mounted against A while the badge beside it reports
-    B: the operator sees nothing change and submits the feedback against B.
-
-    Driven from INSIDE the read rather than by racing a thread (the r6/r7/r8
-    window tests' method): the swap lands in the instant BEFORE the sidecar read,
-    i.e. strictly between the two reads a row is made of. The row must then be
-    fully B -- B is what the name resolves to by the time the sidecar was read,
-    so it is the honest answer, and it is certainly not A's description beside
-    B's badge, which is what ships without the pairing (measured: the row comes
-    back ``("test tool", "final")``)."""
-    root = tmp_path / "tools"
-    old = _make_tool(root, "kb", "import sys\nsys.stdout.write('OLD')\n")
-    _write_meta(old, summary="舊工具的說明", status="draft")
-    replacement = _make_tool(
-        tmp_path / "staging",
-        "kb",
-        "import sys\nsys.stdout.write('NEW')\n",
-        tool_json={
-            "name": "kb",
-            "description": "the replacement",
-            "parameters": {"type": "object", "properties": {}},
-            "entry": [sys.executable, "run.py"],
-            "enabled": True,
-        },
-    )
-    _write_meta(replacement, summary="新工具的說明", status="final")
-    _install_tools(monkeypatch, root)
-
-    pkg = root / "kb"
-    real_status = tools.summary_status
-    swapped = False
-
-    def promote_then_read_status(directory: Path) -> str | None:
-        nonlocal swapped
-        if not swapped:
-            swapped = True
-            os.rename(pkg, root / ".kb.bak-r9")
-            os.rename(replacement, pkg)
-        return real_status(directory)
-
-    monkeypatch.setattr(tools, "summary_status", promote_then_read_status)
-    rows = {row["name"]: row for row in list_tools()}
-
-    assert swapped  # the swap really landed in the gap
-    row = rows["kb"]
-    assert (row["description"], row["summary_status"]) == ("the replacement", "final")
-
-
-def test_list_tools_pairs_each_row_without_rescanning_an_undisturbed_package(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The ordinary listing is what it was: one scan and one sidecar read per
-    package, plus the identity re-check that pairs them.
-
-    The pairing costs a re-scan only when a package really moved, so an untouched
-    tools directory pays exactly one ``_scan_package`` per row -- the assertion
-    that keeps a retry loop from quietly becoming the normal path."""
-    root = tmp_path / "tools"
-    first = _make_tool(root, "aaa", "import sys\nsys.stdout.write('x')\n")
-    _make_tool(root, "bbb", "import sys\nsys.stdout.write('x')\n")
-    _install_tools(monkeypatch, root)
-    _write_meta(first, summary="s", status="final")
-
-    scanned: list[str] = []
-    real_scan = tools._scan_package
-
-    def counting_scan(directory: Path, expected_name: str | None = None) -> tools._PackageScan:
-        scanned.append(directory.name)
-        return real_scan(directory, expected_name=expected_name)
-
-    monkeypatch.setattr(tools, "_scan_package", counting_scan)
-    rows = {row["name"]: row["summary_status"] for row in list_tools()}
-
-    assert rows == {"aaa": "final", "bbb": None}
-    assert scanned == ["aaa", "bbb"]
-
-
-def test_list_tools_reports_no_status_when_the_two_reads_never_agree(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A package replaced on EVERY attempt gets no badge rather than a foreign one.
-
-    The bound exists so one listing cannot spin forever; the answer it degrades to
-    is the same None a missing or corrupt sidecar already produces, not a new
-    vocabulary -- and the row's other fields still come from one scan."""
-    root = tmp_path / "tools"
-    pkg = _make_tool(root, "kb", "import sys\nsys.stdout.write('x')\n")
-    _write_meta(pkg, summary="s", status="final")
-    _install_tools(monkeypatch, root)
-
-    real_status = tools.summary_status
-    manifest = pkg / "tool.json"
-
-    def status_then_replace_the_manifest(directory: Path) -> str | None:
-        status = real_status(directory)
-        # A REPLACED manifest, which is what every install writes (mkstemp then
-        # os.replace) -- a NEW inode, so the identity moves on every attempt no
-        # matter how fast the loop runs. An in-place rewrite would move only the
-        # ctime, and two rewrites inside one timestamp tick are indistinguishable
-        # (the ABA `package_identity` has always accepted), which made this test
-        # pass or fail by timing.
-        fresh = directory / "tool.json.next"
-        fresh.write_text(manifest.read_text(encoding="utf-8"), encoding="utf-8")
-        os.replace(fresh, manifest)
-        return status
-
-    monkeypatch.setattr(tools, "summary_status", status_then_replace_the_manifest)
-    rows = {row["name"]: row for row in list_tools()}
-
-    assert rows["kb"]["summary_status"] is None
-    assert rows["kb"]["valid"] is True  # the rest of the row is still one scan's
-
-
-def test_list_tools_still_reports_none_for_a_corrupt_sidecar(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The pairing must not change what an unreadable sidecar reports: the row is
-    the same one instance, and None is already its answer."""
-    root = tmp_path / "tools"
-    pkg = _make_tool(root, "kb", "import sys\nsys.stdout.write('x')\n")
-    _install_tools(monkeypatch, root)
-    _sidecar(pkg).write_text("{not json", encoding="utf-8")
-
-    rows = {row["name"]: row for row in list_tools()}
-    assert rows["kb"]["summary_status"] is None
-    assert rows["kb"]["valid"] is True
-
 
 def test_sidecar_never_listed_as_a_package(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """The dot-prefixed sidecar is invisible to the registry scan: it is neither
@@ -5593,7 +4836,7 @@ def test_sidecar_never_listed_as_a_package(monkeypatch: pytest.MonkeyPatch, tmp_
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
-    _write_meta(pkg, summary="s", status="draft")
+    _write_meta(pkg, summary="s")
 
     listed = list_tools()
     assert [row["name"] for row in listed] == ["echo"]
@@ -5608,7 +4851,7 @@ def test_delete_tool_takes_the_sidecar_with_it(
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
-    _write_meta(pkg, summary="s", status="final")
+    _write_meta(pkg, summary="s")
     assert _sidecar(pkg).is_file()
 
     assert delete_tool("echo") is True

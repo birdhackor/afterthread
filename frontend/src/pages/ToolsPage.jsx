@@ -22,7 +22,7 @@ import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Controller, useForm } from "react-hook-form";
 import { apiDelete, apiGet, apiPatch, apiPost } from "../api/client.js";
 import { CharCounter } from "../components/CharCounter.jsx";
@@ -41,15 +41,9 @@ import {
 	toolJobRefetchInterval,
 } from "../utils/toolInstall.js";
 import {
-	canFinalizeSummary,
-	claimLatestSummaryWrite,
-	createSummaryWriteLedger,
 	logLinkSearch,
-	nextSummaryWriteStamp,
 	ownSummaryBusy,
-	patchToolRowSummaryStatus,
 	summaryErrorRevalidates,
-	summaryStatusMeta,
 	toolInstanceKey,
 	toolSummaryKeyPrefix,
 	toolSummaryQueryKey,
@@ -67,18 +61,9 @@ const AI_INPUT_MAX = SECTION_MAX_LENGTH;
 // mutation's 404 means the tool row itself is gone (deleted elsewhere, or the
 // backend restarted with a different TOOLS_DIR), so it gets its own wording.
 //
-// `codeCopy` is the opt-in override for a structured code whose BACKEND copy
-// names the wrong action for the caller (see the revise path's tool_finalized
-// below); anything not listed there keeps the backend's own message. Every D40
-// code was checked against the action that can raise it, and only ONE needs
-// local copy:
-//
-// * `tool_finalized` -- _TOOL_FINALIZED_MESSAGE is
-//   「總結已定版，請先解除定版再重新產生」, which names REGENERATE. Correct for
-//   POST .../summary/regenerate, wrong for POST .../revise, where it appeared
-//   under the title 「無法送出修訂」 and told the user to 重新產生 something
-//   they never asked to regenerate. The revise call site supplies its own copy;
-//   the regenerate call site deliberately does not.
+// `codeCopy` is the opt-in override for a structured code whose backend copy
+// names the wrong action for the caller; anything not listed keeps the backend
+// message.
 // * `install_in_progress` -- _INSTALL_IN_PROGRESS_MESSAGE is 「已有安裝正在進行
 //   中，請等待其完成」, which names INSTALL. That was true when only installs
 //   contended for the slot; since D40 the SAME admission (`_JOBS`/`_SYNC_OPS`)
@@ -95,8 +80,6 @@ const AI_INPUT_MAX = SECTION_MAX_LENGTH;
 //   revise and the regenerate titles -- the reverse of the install case above,
 //   which is why only that one needed new copy. No local copy: a branch
 //   reproducing an equally-good string would be dead weight.
-// * `summary_missing` -- 「尚無總結可定版」 is raised ONLY by PATCH .../summary
-//   and already names that one action. No local copy.
 // * `llm_not_configured` (503) / any 502 -- the shared client's messageFor
 //   already renders these ("AI 功能尚未設定" / "AI 服務暫時無法使用，請稍後再
 //   試") and both are action-neutral. No local copy.
@@ -233,20 +216,6 @@ function ToolJobProgress({ kind, jobId, jobQuery }) {
 	);
 }
 
-// draft/final/null -> a small Badge. Shared by the row-level list badge (no
-// extra request -- `summary_status` already rides on GET /api/tools, see
-// ToolRow) and the expanded panel's own freshly-fetched status (ToolSummaryPanel):
-// both read the same three-value vocabulary, so one component keeps the two
-// badges visually identical.
-function SummaryStatusBadge({ status }) {
-	const meta = summaryStatusMeta(status);
-	return (
-		<Badge size="sm" variant="light" color={meta.color}>
-			{meta.label}
-		</Badge>
-	);
-}
-
 // The AI-summary detail for one tool row (D40). Fetched lazily (enabled:
 // expanded) so a collapsed row never pulls its summary body -- mirrors
 // LlmLogsPage's LogDetailPanel, including that component's two-part defence
@@ -270,8 +239,7 @@ function SummaryStatusBadge({ status }) {
 // (重新產生, 送出修訂) must not be issued that this panel cannot see for itself:
 // the panel-wide single-flight mirror, a known-stale tool list, and a just-ended
 // job whose re-read has not landed (see InstalledToolsPanel's
-// summaryWritesBlocked for all three). It deliberately does NOT gate the
-// 定版/解除定版 button -- see that button's own disabled comment below for why.
+// summaryWritesBlocked for all three).
 // 送出修訂 additionally answers to `displayedMayBeStale`, which is what this
 // panel knows first-hand about its OWN summary query.
 //
@@ -289,8 +257,6 @@ function ToolSummaryPanel({
 	settlingJobEnd,
 	isRegenerating,
 	onRegenerate,
-	isUpdatingStatus,
-	onSetStatus,
 	reviseMutation,
 	isSubmittingRevise,
 	reviseJobId,
@@ -328,11 +294,9 @@ function ToolSummaryPanel({
 	// `data` itself being nullish, so every field access below stays safe.
 	const detail = data ?? {
 		summary: null,
-		status: null,
 		updated_at: null,
 		llm_log_id: null,
 	};
-	const isFinal = detail.status === "final";
 
 	// The three ways "what is on screen may not be current" can be true, named
 	// once because TWO controls need the same answer: `settlingJobEnd` (a finished
@@ -341,26 +305,20 @@ function ToolSummaryPanel({
 	// react-query keeps `data` and only flips status, so `isFetching` is back to
 	// false while the content is stale).
 	//
-	// The rule this expresses, because it is now bigger than 定版 (R2-4):
-	// AUTHORING FEEDBACK ABOUT DISPLAYED CONTENT IS THE SAME HAZARD AS FREEZING
-	// DISPLAYED CONTENT. 定版 has been gated on it since R10/R11; the revise form
-	// is the other half. Concretely: while this row was COLLAPSED its summary
+	// Authoring feedback about stale displayed content applies instructions to an
+	// implementation the user is no longer looking at. Concretely: while this row
+	// was collapsed its summary
 	// query was disabled, so the revalidation a finished revise fired resolved
 	// without issuing a GET and cleared the settling gate anyway; re-expanding
 	// then renders the CACHED pre-revise summary (data present, so no Loader)
 	// while a refetch is in flight or has failed. Writing 修訂意見 about that text
 	// and pressing 送出修訂 sends feedback describing the OLD implementation to a
 	// builder session that will apply it to code that has already changed -- and
-	// unlike a mistaken 定版 (one enum field, reversible by pressing the other
-	// direction), that spends minutes of LLM time rewriting a package.
-	//
-	// 解除定版 stays OUT of this, exactly as before (R11-1): freezing needs to see
-	// the current state, RELEASING does not, and a persistent read failure must
-	// never strand an operator on a finalized tool with no way back.
+	// and that spends minutes of LLM time rewriting a package.
 	const displayedMayBeStale = settlingJobEnd || isFetching || isError;
 
 	const submitRevise = handleSubmit((values) => {
-		if (writesBlocked || isFinal || displayedMayBeStale) {
+		if (writesBlocked || displayedMayBeStale) {
 			return;
 		}
 		const feedback = values.feedback.trim();
@@ -382,8 +340,8 @@ function ToolSummaryPanel({
 			    Before this, that state rendered the old body as though it had just
 			    been verified -- silently, and indefinitely, since nothing else
 			    refetches once focus/mount refetches keep failing. The content is
-			    still shown (it is the best available reading, and hiding it would
-			    lose the 定版 controls with it), but it is now labelled. */}
+			    still shown because it is the best available reading, but it is now
+			    labelled. */}
 			{isError ? (
 				<Alert color="orange" title="無法更新總結">
 					<Text size="sm">
@@ -394,7 +352,6 @@ function ToolSummaryPanel({
 			) : null}
 
 			<Group gap="xs" wrap="wrap">
-				<SummaryStatusBadge status={detail.status} />
 				{detail.updated_at ? (
 					// formatDate (components/DateText.jsx) is the app's existing
 					// ISO-datetime -> local YYYY-MM-DD formatter, reused here rather
@@ -436,73 +393,10 @@ function ToolSummaryPanel({
 					// tool_meta._store_meta re-checks (tools._write_package_file_atomic ->
 					// _still_the_expected_package) cannot be moved by a switch at all.
 					// Nothing is left for that term to prevent.
-					disabled={writesBlocked || isFinal}
+					disabled={writesBlocked}
 					onClick={onRegenerate}
 				>
 					重新產生
-				</Button>
-				<Button
-					size="xs"
-					variant="light"
-					color={isFinal ? "gray" : "teal"}
-					loading={isUpdatingStatus}
-					// Deliberately NOT gated by `writesBlocked`, for BOTH of the
-					// reasons that value folds together.
-					//
-					// Not by the busy half: PATCH .../summary (定版/解除定版) does not
-					// touch the backend's job single-flight at all (routers.tools'
-					// update_tool_summary_status never reads `_JOBS`/`_SYNC_OPS`), and
-					// the backend explicitly supports 定版 landing mid-job -- a revise
-					// re-checks it again right before swapping the package
-					// (docs/web-v4-decisions.md D40 P3b self-review), and a
-					// regenerate's own store re-checks it at write time (`_store_meta`
-					// -> StoreRefusal.FINALIZED). Gating this would block a use the
-					// backend was built to support: freezing a tool to stop an
-					// in-flight AI iteration the user has changed their mind about.
-					//
-					// Not by the stale-list half either, and that is a deliberate
-					// asymmetry with 重新產生/送出修訂 rather than an oversight. This
-					// endpoint is name-addressed like they are, so it CAN land on a
-					// tool that is no longer the one this row describes -- but (a) it
-					// is the documented escape hatch (D40 r6: 解除定版 is
-					// unconditional on the backend precisely because it is the one
-					// recovery path for a sidecar nothing else can unstick), and with
-					// 重新產生 and 送出修訂 already refused by tool_finalized on a
-					// frozen tool, disabling this one too leaves an operator with a
-					// flapping GET /api/tools and NO action at all; (b) it writes one
-					// enum field, reversible by pressing the other direction, where a
-					// misdirected revise rebuilds a package from feedback authored for
-					// a different tool; (c) its enablement is computed from
-					// `detail.summary` -- this panel's OWN name-addressed
-					// GET .../summary, whose successful read is always the current
-					// tool's sidecar -- not from the stale list row, so it is the one
-					// control here that is not reasoning from the stale data.
-					//
-					// Only the 定版 direction needs a content gate (nothing to freeze
-					// without text); 解除定版 stays unconditional.
-					//
-					// `displayedMayBeStale` DOES gate it, and that is not a contradiction
-					// of the paragraph above (R8-1/R10-1/R11-1). staleList is a persistent
-					// condition -- gating on it could strand an operator with no action at
-					// all -- while every term of that one is a round trip that clears
-					// itself, and what they protect is specific: a revise just rewrote the
-					// summary, so the text on screen is the PREVIOUS one, and freezing
-					// during that window finalizes content the user has never seen. It is
-					// applied to the 定版 DIRECTION only, never 解除定版: 定版 freezes what
-					// is displayed, 解除定版 RELEASES it and freezes nothing, and a
-					// persistent read failure must not be able to strand an operator with a
-					// finalized tool and no way out -- the same escape-hatch rule staleList
-					// already follows. See `displayedMayBeStale` for the three terms and
-					// for the revise form, which is gated by the same value for the same
-					// reason.
-					disabled={
-						isUpdatingStatus ||
-						(!isFinal &&
-							(displayedMayBeStale || !canFinalizeSummary(detail.summary)))
-					}
-					onClick={() => onSetStatus(isFinal ? "draft" : "final")}
-				>
-					{isFinal ? "解除定版" : "定版"}
 				</Button>
 			</Group>
 
@@ -539,7 +433,7 @@ function ToolSummaryPanel({
 									// deliberate -- letting someone type a paragraph and only then
 									// discover the button is dead is a worse version of the same
 									// refusal.
-									disabled={writesBlocked || isFinal || displayedMayBeStale}
+									disabled={writesBlocked || displayedMayBeStale}
 									error={fieldState.error?.message}
 								/>
 								<CharCounter value={field.value} max={AI_INPUT_MAX} />
@@ -570,14 +464,13 @@ function ToolSummaryPanel({
 							// locked tail) or lands on the already-published package -- both
 							// halves under tools._STATE_PUBLISH_LOCK, so neither can be lost.
 							//
-							// `displayedMayBeStale` is the 定版 gate applied to the OTHER
-							// action that reasons from what is on screen (R2-4): this submit
+							// `displayedMayBeStale` gates this action because it reasons
+							// from what is on screen: this submit
 							// sends feedback the user wrote ABOUT the summary above it, so
 							// issuing it while that text is known to be superseded hands a
 							// builder session instructions for an implementation that no
-							// longer exists. See `displayedMayBeStale` for the rule, and for
-							// why 解除定版 is deliberately not gated the same way.
-							disabled={writesBlocked || isFinal || displayedMayBeStale}
+							// longer exists. See `displayedMayBeStale` for the rule.
+							disabled={writesBlocked || displayedMayBeStale}
 						>
 							送出修訂
 						</Button>
@@ -594,8 +487,8 @@ function ToolSummaryPanel({
 	);
 }
 
-// One installed tool row: name + validity badge + summary-status badge,
-// description, the enable switch, delete, and an inline-expandable AI-summary
+// One installed tool row: name, validity badge, description, the enable switch,
+// delete, and an inline-expandable AI-summary
 // panel (D40). The switch is disabled for an invalid package on purpose -- a
 // broken package is never advertised/executable regardless of its flag
 // (backend contract), so offering the toggle would suggest a state change
@@ -609,8 +502,6 @@ function ToolRow({
 	settlingJobEnd,
 	isRegenerating,
 	onRegenerate,
-	isUpdatingStatus,
-	onSetStatus,
 	reviseMutation,
 	isSubmittingRevise,
 	reviseJobId,
@@ -639,7 +530,6 @@ function ToolRow({
 									無效
 								</Badge>
 							) : null}
-							<SummaryStatusBadge status={tool.summary_status} />
 						</Group>
 						{!tool.valid && tool.error ? (
 							<Text size="xs" c="red">
@@ -719,7 +609,7 @@ function ToolRow({
 					    prop is inert here: it lands in `...others` and is spread onto
 					    the wrapper Box, so `expanded` stayed undefined, the panel was
 					    permanently collapsed, and only the toggle LABEL responded --
-					    taking the summary GET, 重新產生, 定版 and the whole revise form
+					    taking the summary GET, 重新產生 and the whole revise form
 					    down with it. Nothing in this project could catch that: a wrong
 					    prop NAME is valid JS, valid JSX, and valid to Biome, and there
 					    is no jsdom to render against (see the P4 addendum in
@@ -733,8 +623,6 @@ function ToolRow({
 							settlingJobEnd={settlingJobEnd}
 							isRegenerating={isRegenerating}
 							onRegenerate={onRegenerate}
-							isUpdatingStatus={isUpdatingStatus}
-							onSetStatus={onSetStatus}
 							reviseMutation={reviseMutation}
 							isSubmittingRevise={isSubmittingRevise}
 							reviseJobId={reviseJobId}
@@ -748,7 +636,7 @@ function ToolRow({
 }
 
 // The 已安裝工具 tab: list + enable toggle + delete (confirm modal) + each
-// row's AI-summary panel (D40: regenerate / 定版 / 解除定版 / revise).
+// row's AI-summary panel (D40: regenerate / revise).
 function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	const queryClient = useQueryClient();
 	const [deleteTarget, setDeleteTarget] = useState(null);
@@ -758,12 +646,6 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	// reason: the backend's single-flight (D40) admits only ONE install/revise
 	// job at a time across every tool, so there is never more than one to track.
 	const [activeJob, setActiveJob] = useState(null); // { name, description, jobId } | null
-	// Orders the two summary WRITES against each other (see
-	// createSummaryWriteLedger). A ref, not state: nothing renders from it, and a
-	// re-render must never reset it -- it is the only record of which write is the
-	// newest for a given tool instance.
-	const writeLedger = useRef(createSummaryWriteLedger());
-
 	const { data, error, isError, isFetching, refetch } = useQuery({
 		queryKey: ["tools"],
 		queryFn: () => apiGet("/api/tools"),
@@ -799,7 +681,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 			// nothing left to revalidate against -- and a same-name reinstall
 			// inside TanStack Query's default 5-minute gc window is a DIFFERENT
 			// tool, whose panel must start cold rather than pre-populated with the
-			// deleted tool's summary/status/llm_log_id (or, if the reinstall's own
+			// deleted tool's summary/llm_log_id (or, if the reinstall's own
 			// refetch then transiently fails, with the deleted tool's stale data
 			// rendered as though it belonged to the new one).
 			//
@@ -824,47 +706,11 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 		},
 	});
 
-	// Regenerate/finalize/revise (D40) are lifted to this panel rather than
-	// owned by each ToolRow, for the same reason toggle/delete already are: the
-	// backend's single global tool-job slot (see the longer note on
-	// ToolsPage) means only ONE of these can ever be legitimately in flight
-	// across every row at once, so a shared instance is what lets one row's
-	// activity disable every OTHER row's controls (see summaryBusy below).
-	// Both summary-writing mutations end the same way: the response IS the fresh
-	// sidecar, so it is written straight into the detail cache, the ONE list
-	// field it authoritatively settles is patched onto the row, and the list is
-	// still invalidated for everything else. Factored out so the two can never
-	// drift into doing this differently.
-	//
-	// `description` rides in the mutate variables purely as the row's cache
-	// discriminator (toolSummaryQueryKey): the acting ROW is the only place that
-	// knows which instance it is writing for, and reading it back out of the
-	// list cache here would just be the same value fetched less reliably.
-	//
-	// ONE instance identity drives BOTH writes: `summaryKey` addresses the detail
-	// entry, `instanceKey` addresses the row whose badge is patched, and the two
-	// are the same value in two encodings (toolInstanceKey is toolSummaryQueryKey
-	// stringified). That is the whole point -- a response that cannot be proven to
-	// be about a row does not touch that row, instead of being stamped onto
-	// whatever answers to the name now.
-	//
-	// Whether the tool list on screen is known to be stale, read LIVE from the
-	// cache rather than from a render-time snapshot: this runs inside a mutation
-	// callback that may settle several renders after the closure was created, and
-	// the answer must describe the moment of the WRITE. Same shape as the
-	// `staleList` the panel renders its banner from (an error with data still
-	// present), asked of the query client instead of this render's props.
-	const listIsStale = () =>
-		queryClient.getQueryState(["tools"])?.status === "error" &&
-		queryClient.getQueryData(["tools"]) !== undefined;
+	// Regenerate and revise are lifted to this panel so one row's activity can
+	// disable the other rows against the backend's global tool-job slot.
 
-	// Re-read BOTH halves of what a summary response describes: the panel's own
-	// detail entry and the row badge that shows the same sidecar field. By NAME
-	// prefix, because a revalidation asks the name-addressed server to answer
-	// again -- writes address an instance, re-reads address the name.
-	// useCallback because an effect depends on it (see the job-ending effect): an
-	// identity that changed every render would re-run that effect every render,
-	// and it sets state.
+	// Re-read both the detail and list after a revise job settles. The detail uses
+	// a name prefix because the revision may have changed the row discriminator.
 	const revalidateSummaryAndList = useCallback(
 		(name) =>
 			Promise.all([
@@ -874,112 +720,12 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 		[queryClient],
 	);
 
-	// `stamp` orders this write against the OTHER mutation that can be writing the
-	// same entry concurrently (see createSummaryWriteLedger).
-	const applySummaryDetail = async (detail, { name, description }, stamp) => {
-		const summaryKey = toolSummaryQueryKey(name, description);
-		const instanceKey = toolInstanceKey(name, description);
-		// Ordering gate, BEFORE the cancel: a response that a newer write has
-		// already superseded must not even cancel queries -- the newer write's
-		// trailing invalidation is a fresh read of the post-write server, and
-		// cancelling it would throw away the only thing that could still correct
-		// the row.
-		if (!claimLatestSummaryWrite(writeLedger.current, instanceKey, stamp)) {
-			// Superseded by a newer WRITE, but still invalidate (R5-2). An issue
-			// stamp orders our own requests, not the SERVER's writes: two HTTP
-			// requests can reach the sidecar lock in the opposite order, so the
-			// response we are dropping may be the one describing the LATER server
-			// state. Dropping its value is right (we cannot tell), dropping the
-			// re-read too is not -- that is how the panel ends up permanently
-			// showing draft for a tool the server has already finalized, with a
-			// green toast next to it. The re-read costs one GET and can only ever
-			// return the post-write truth.
-			//
-			// BOTH keys, not just the list (R6-1): the entry whose value we just
-			// dropped is the SUMMARY one, so re-reading only the row badge would
-			// leave the expanded panel asserting the state we decided we could not
-			// trust -- the same permanent disagreement one line up, moved from the
-			// badge to the panel.
-			return revalidateSummaryAndList(name);
-		}
-		// Cancel BEFORE writing, for both keys about to be written. A write that
-		// races a read it did not cancel is a write that can be undone by older
-		// data: setQueryData does not touch in-flight fetches, so a GET .../summary
-		// that a window refocus started BEFORE this PATCH -- and that read 「draft」
-		// -- can land AFTER this line and put 「draft」 back over the authoritative
-		// 「final」 we were just handed. Nothing would report it, because that GET
-		// SUCCEEDED: no error banner, no failed refetch, just the panel silently
-		// reverting to the pre-mutation state seconds after a green success toast.
-		// Same hazard for the row badge and its ["tools"] read.
-		//
-		// Verified against @tanstack/query-core 5.101.2 rather than assumed:
-		// queryClient.cancelQueries -> query.cancel({revert: true}) -> the retryer's
-		// `cancel` REJECTS its thenable synchronously (retryer.js lines 29-35), so
-		// query.#fetch takes its CancelledError path and never calls setData with
-		// the late response (query.js lines 308-318) -- and cancelQueries itself
-		// swallows everything (`.then(noop).catch(noop)`, queryClient.js line 146),
-		// so it can never reject this onSuccess. The invalidation at the end then
-		// starts a FRESH read, one that can only have seen the post-write server.
-		await Promise.all([
-			queryClient.cancelQueries({ queryKey: summaryKey }),
-			queryClient.cancelQueries({ queryKey: ["tools"] }),
-		]);
-		// Re-ask the ordering gate: the cancel above is an await, so a newer
-		// response can be admitted and start its own cancel inside this window,
-		// and then whichever cancel settles LAST would write last. Asking twice
-		// with the same stamp is idempotent by construction (only a STRICTLY newer
-		// applied stamp refuses).
-		if (!claimLatestSummaryWrite(writeLedger.current, instanceKey, stamp)) {
-			return revalidateSummaryAndList(name);
-		}
-		// Write only if the entry is still there. removeQueries on delete cannot
-		// stop a request already on the wire, and a plain value write would rebuild
-		// the entry it just cleared (see writeSummaryDetailIfPresent).
-		queryClient.setQueryData(summaryKey, writeSummaryDetailIfPresent(detail));
-		// Patch ONLY summary_status on ONLY the row with this INSTANCE identity --
-		// never fabricate a row, and never a same-name row we cannot prove is the
-		// one this response is about (see patchToolRowSummaryStatus). The value is
-		// safe to cross over: the list's `summary_status` and the detail's `status`
-		// are narrowed through the same backend vocabulary check
-		// (services/tools._narrowed_summary_status vs routers/tools._summary_detail,
-		// both filtering on _SUMMARY_STATUSES), so this can only ever write
-		// "draft" | "final" | null -- exactly what GET /api/tools would have
-		// returned for that field.
-		// ... and NOT while the list is known stale (R5-1). Two reasons, either
-		// alone sufficient: the row we would patch carries an identity we have
-		// already decided not to trust (it is what blocks the AI writes), and a
-		// value write flips the query from error back to success -- clearing the
-		// very `staleList` flag that gate reads, so a permitted 定版 would silently
-		// re-enable a revise submit whose draft belongs to the tool the stale row
-		// describes. The invalidation below is the honest alternative: it re-reads
-		// instead of asserting, and a still-failing refetch keeps the error state.
-		if (!listIsStale()) {
-			queryClient.setQueryData(["tools"], (listBody) =>
-				patchToolRowSummaryStatus(listBody, instanceKey, detail.status),
-			);
-		}
-		// Then re-read BOTH, always (R7-1). The writes above are for immediacy --
-		// they show the answer we were just handed without waiting for a round
-		// trip, and they survive an invalidation whose error TanStack Query
-		// swallows. They are NOT a claim that we know the server's order: two
-		// summary mutations can be in flight together (finalize must stay
-		// available during a regenerate), and neither our issue stamps nor the
-		// arrival order tells us which one the backend applied last -- server
-		// order and response order can interleave in either direction. So the
-		// value we write is the best guess, and this re-read is the truth. It also
-		// covers the REST of the row (enabled, valid, description, error), which
-		// this response says nothing about.
-		return revalidateSummaryAndList(name);
-	};
-
-	// The failure counterpart of applySummaryDetail, shared by all three
-	// name-addressed summary mutations. A refusal is not only a message: some
+	// A refusal is not only a message: some
 	// refusals are the server TELLING us it is no longer what we are showing, and
 	// until r4 every one of them merely raised a toast over a panel that kept
-	// asserting the state the error had just contradicted -- including the case
-	// where the remedy the message names (解除定版) is a button that only appears
-	// once the panel knows the tool is final. summaryErrorRevalidates decides
-	// which ones prove that, code by code, so this is not a blanket refetch.
+	// asserting the state the error had just contradicted.
+	// summaryErrorRevalidates decides which ones prove that, code by code, so this
+	// is not a blanket refetch.
 	//
 	// The summary side uses the NAME PREFIX, not the instance key, and that is the
 	// same split r3 recorded: writes must name an instance, but a REVALIDATION
@@ -996,24 +742,17 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	};
 
 	const regenerateMutation = useMutation({
-		// Stamp taken here, not in onSuccess: onMutate runs before the request is
-		// sent, so the stamps rank the two writes by when the user ISSUED them --
-		// which is the order that has to win when the responses come back swapped.
-		onMutate: () => ({ stamp: nextSummaryWriteStamp(writeLedger.current) }),
 		mutationFn: ({ name }) => apiPost(`/api/tools/${name}/summary/regenerate`),
-		onSuccess: async (detail, variables, context) => {
-			// Written straight into the cache rather than invalidated: this
-			// response body IS the fresh ToolSummaryDetail -- routers.tools'
-			// regenerate_tool_summary returns `_summary_detail(meta)` over the
-			// just-stored sidecar, the exact same builder GET .../summary calls
-			// over the exact same shape (`{summary, status, updated_at,
-			// llm_log_id}`, all four fields always present) -- so there is
-			// nothing an invalidation's background refetch would tell us that we
-			// do not already have in hand, and TanStack Query swallows THAT
-			// refetch's error by default: a transient failure right after this
-			// success would otherwise leave a green toast next to a stale panel
-			// (stuck loading indicator or, worse, the pre-regenerate text/status).
-			await applySummaryDetail(detail, variables, context.stamp);
+		onSuccess: async (detail, variables) => {
+			const summaryKey = toolSummaryQueryKey(
+				variables.name,
+				variables.description,
+			);
+			// Cancel an older GET before writing the authoritative mutation
+			// response, or that GET could land afterwards and restore old text.
+			await queryClient.cancelQueries({ queryKey: summaryKey });
+			// Do not recreate an entry a concurrent delete removed.
+			queryClient.setQueryData(summaryKey, writeSummaryDetailIfPresent(detail));
 			notifications.show({
 				color: "green",
 				message: `已重新產生「${variables.name}」的總結`,
@@ -1029,45 +768,11 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 		},
 	});
 
-	const statusMutation = useMutation({
-		// See regenerateMutation: the two share one cache entry and can be in
-		// flight together (定版 is deliberately outside the busy gate), so both
-		// stamp their writes from the same ledger.
-		onMutate: () => ({ stamp: nextSummaryWriteStamp(writeLedger.current) }),
-		mutationFn: ({ name, status }) =>
-			apiPatch(`/api/tools/${name}/summary`, { status }),
-		onSuccess: async (detail, variables, context) => {
-			// Same reasoning as regenerateMutation above: update_tool_summary_status
-			// also returns `_summary_detail(meta)` over a fresh re-read of the
-			// sidecar it just wrote (routers/tools.py), the identical builder and
-			// shape GET .../summary uses -- so writing it straight into the cache
-			// (rather than relying on an invalidation whose refetch error TanStack
-			// Query would silently drop) is what keeps the 定版/解除定版 button
-			// label, the row's own badge and the AI controls' disabled state from
-			// lagging behind their own success toast.
-			await applySummaryDetail(detail, variables, context.stamp);
-			const { name, status } = variables;
-			notifications.show({
-				color: "green",
-				message:
-					status === "final" ? `已定版「${name}」` : `已解除定版「${name}」`,
-			});
-		},
-		onError: (mutationError, variables) => {
-			notifications.show({
-				color: "red",
-				title: "更新總結狀態失敗",
-				message: toolErrorMessage(mutationError, "無法更新總結狀態"),
-			});
-			revalidateAfterSummaryError(mutationError, variables.name);
-		},
-	});
-
 	const reviseMutation = useMutation({
 		mutationFn: ({ name, feedback }) =>
 			apiPost(`/api/tools/${name}/revise`, { feedback }),
 		onSuccess: (result, { name, description }) => {
-			// `description` is recorded, not sent: like the two summary mutations it
+			// `description` is recorded, not sent: like the summary mutation it
 			// rides in the variables purely as the acting row's instance
 			// discriminator, and it is what lets the progress card stay attached to
 			// the tool the revise was submitted against rather than to whatever
@@ -1078,23 +783,8 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 			notifications.show({
 				color: "red",
 				title: "無法送出修訂",
-				// The backend's tool_finalized copy names 重新產生 because the
-				// SAME code also answers a regenerate; under 「無法送出修訂」 it
-				// prescribed an action the user never took. This is the race path
-				// (the submit button is already disabled on a locally-known
-				// 已定版), so it fires when another browser tab or process froze
-				// the tool first -- exactly when clear copy matters. See
-				// toolErrorMessage for every other code that was checked and
-				// deliberately left on the backend's own wording.
-				message: toolErrorMessage(mutationError, "無法送出修訂", {
-					tool_finalized: "總結已定版，請先解除定版再送出修訂",
-				}),
+				message: toolErrorMessage(mutationError, "無法送出修訂"),
 			});
-			// No stamp here: this mutation never writes the summary caches (its 202
-			// only records the job id), so it has nothing to order. It still owes the
-			// same revalidation on a refusal that proves the server moved -- the
-			// tool_finalized copy right above tells the user to 解除定版, and that
-			// button does not exist until the panel knows the tool is final.
 			revalidateAfterSummaryError(mutationError, variables.name);
 		},
 	});
@@ -1113,8 +803,8 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	});
 	const job = jobQuery.data;
 
-	// A settled revise means the row's own summary detail and the list's
-	// summary_status badge may both be stale -- on SUCCESS because the job
+	// A settled revise means the row's own summary detail and the list may both be
+	// stale -- on SUCCESS because the job
 	// regenerated the sidecar and replaced the package (mirrors InstallPanel's own
 	// transition effect, for the same reason: a row's data the OTHER tab's query
 	// owns), and on FAILURE because most of the ways a revise can fail ARE the
@@ -1129,7 +819,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	// be a gate that silently opens. What CAN be said precisely is the failure
 	// vocabulary: of tool_builder's revise outcomes, 找不到要修訂的工具 / 原工具已被刪除 /
 	// 原工具目錄已被替換為連結 / 原工具在修訂期間被改動或重新安裝 /
-	// 總結已定版 / 無法確認總結是否已定版 / 無法確認原工具的內容 all assert a
+	// 無法確認原工具的內容 all assert a
 	// change we are not showing, and the `.env` ones say the package was
 	// hand-edited; only the build/LLM failures assert nothing. Refetching on the
 	// whole terminal transition is therefore mostly right and never wasteful in
@@ -1212,10 +902,6 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	// backend's single-flight first and make the user's OWN revise request --
 	// already in flight -- the one that comes back 409.
 	//
-	// Deliberately does NOT include statusMutation.isPending: see the
-	// 定版/解除定版 button's own disabled comment in ToolSummaryPanel for why
-	// PATCH .../summary is exempt from this gate entirely.
-	//
 	// TWO values, not one, and the split is what stops the mirror from echoing.
 	// `ownBusy` is what this panel knows FIRST-HAND and is the only thing it
 	// reports upward (see ownSummaryBusy); `summaryBusy` additionally honours the
@@ -1268,12 +954,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	//
 	// Reading is NOT gated: expanding a panel and its GET .../summary write
 	// nothing, and the panel's own banner already labels what it shows.
-	// 定版/解除定版 is NOT gated either -- see that button's own comment for the
-	// full argument; the short version is that it is the documented escape hatch
-	// (D40 r6: 解除定版 is unconditional on the backend precisely because it is
-	// the one recovery path), it is reversible by pressing it again, and its
-	// enablement is computed from the summary query's own name-addressed response
-	// rather than from the stale list row. 啟用/停用 and 刪除 stay outside too:
+	// 啟用/停用 and 刪除 stay outside too:
 	// both are name-addressed by intent ("the tool called X"), both are
 	// reversible or confirmed, and neither carries content authored against one
 	// specific instance the way a revise draft does.
@@ -1367,7 +1048,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 
 			    Mixtures still possible after this banner, now all announced rather
 			    than silent: (a) exactly the one above -- the row fields (description,
-			    enabled, valid, error, summary_status) are from before the failure
+			    enabled, valid, error) are from before the failure
 			    while an expanded panel's summary is current, because the summary
 			    query keeps succeeding independently; (b) the reverse, list current
 			    and summary stale, which the panel's own orange banner announces;
@@ -1386,7 +1067,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 						{error?.message ?? "請稍後再試"}
 						。以下清單是先前讀到的內容，可能已過期（工具可能已被刪除或重新安裝），展開的
 						AI
-						總結則可能來自更新後的工具。在清單重新讀取成功前，「重新產生」與「送出修訂」已暫時停用——這兩個動作都以工具名稱送到後端，無法確認清單是否仍對應同一個工具時送出，可能會改到別的工具；「定版／解除定版」仍可使用。
+						總結則可能來自更新後的工具。在清單重新讀取成功前，「重新產生」與「送出修訂」已暫時停用——這兩個動作都以工具名稱送到後端，無法確認清單是否仍對應同一個工具時送出，可能會改到別的工具。
 					</Text>
 				</Alert>
 			) : null}
@@ -1481,17 +1162,6 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 								description: tool.description,
 							});
 						}}
-						isUpdatingStatus={
-							statusMutation.isPending &&
-							statusMutation.variables?.name === tool.name
-						}
-						onSetStatus={(status) =>
-							statusMutation.mutate({
-								name: tool.name,
-								description: tool.description,
-								status,
-							})
-						}
 						reviseMutation={reviseMutation}
 						isSubmittingRevise={isSubmittingRevise}
 						// Instance match, so the card follows the tool it was submitted
@@ -1578,7 +1248,7 @@ function InstallPanel({ externalBusy = false, onBusyChange }) {
 			// job cannot start yet.
 			//
 			// Local copy, via toolErrorMessage's opt-in codeCopy override (the same
-			// mechanism the revise path uses for tool_finalized): the backend's
+			// mechanism used by other name-addressed mutation conflicts): the backend's
 			// message for this code says 「已有安裝正在進行中」, but since D40 the
 			// slot it reports on is shared with AI 修訂 and 重新產生總結 -- so the
 			// most common way to see this is an install refused because the OTHER
@@ -1648,8 +1318,8 @@ function InstallPanel({ externalBusy = false, onBusyChange }) {
 			// tool someone else just deleted to a BRAND NEW package, and when the
 			// AI-authored description happens to match, the row key and the summary
 			// key are unchanged -- so the list would rerender into the new tool
-			// while an open panel kept showing the previous one's summary, status
-			// and AI 日誌 link. The whole prefix, because this form does not know
+			// while an open panel kept showing the previous one's summary and
+			// AI 日誌 link. The whole prefix, because this form does not know
 			// which panels are open, and revalidating a closed one is free (its
 			// query is disabled).
 			Promise.all([

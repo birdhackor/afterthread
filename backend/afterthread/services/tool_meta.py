@@ -5,9 +5,8 @@ The installer (``tool_builder``) answers "did it build?"; this module answers
 the promoted package (manifest + implementation files) and writes a user-facing
 explanation into the package's own ``.ai_meta.json`` sidecar. The sidecar itself
 belongs to ``tools``: this module composes the summary and hands it to
-``tools.store_summary_meta``, which owns the merge, the finalize refusal, the
-``_META_LOCK`` critical section and the atomic write. Nothing here touches the
-file directly.
+``tools.store_summary_meta``, which owns the merge and atomic write. Nothing
+here touches the file directly.
 
 Three properties are deliberate, and each has a failure mode behind it:
 
@@ -54,7 +53,6 @@ rather than being swallowed into a silent no-op.
 
 import os
 import re
-from enum import Enum
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -72,24 +70,6 @@ from afterthread.services.memory_ai import _coerce_str, _truncate_to
 # last_record_id_for_workflow note; that separation is the whole reason this is
 # a named constant rather than an inline string.
 _SUMMARY_WORKFLOW = "tool_summary"
-
-
-class StoreRefusal(Enum):
-    """Why a sidecar store did not happen, when ``None`` would under-report it.
-
-    ``_store_meta`` (and therefore ``regenerate_summary``) already uses None for
-    "the write did not land" -- a racing delete, a refused sidecar -- which the
-    route folds into its did-not-happen 404. A store refused because the package
-    was FINALIZED underneath the generation is a different fact and deserves a
-    different answer (the 409 the up-front gate gives), so it gets its own value
-    rather than being flattened into that None.
-
-    An Enum rather than a bare sentinel string so the type checker can tell the
-    two apart in the return union: ``dict | StoreRefusal | None`` narrows, where
-    ``dict | str | None`` would quietly admit any string.
-    """
-
-    FINALIZED = "finalized"
 
 
 # What a sanitized origin URL says INSTEAD of the parts it dropped (see
@@ -182,7 +162,7 @@ class ToolSummaryResult(BaseModel):
 
     Redaction and the ``_TOOL_SUMMARY_CAP`` cut are STORAGE-boundary concerns and
     now live at the storage boundary -- ``tools.store_summary_meta``, already on a
-    worker, already under ``_META_LOCK``, already the sidecar's write path -- in
+    worker, already the sidecar's write path -- in
     the SAME order they ran here (redact while the text is whole, then strip, then
     slice). One choke point instead of two; see that function for why each step
     sits where it does.
@@ -653,23 +633,12 @@ def _store_meta(
     origin: dict[str, Any] | None,
     llm_log_id: int | None,
     identity: tuple[int, int, int],
-) -> dict[str, Any] | StoreRefusal | None:
-    """Store the new summary, mapping the registry's outcome onto this module's.
+) -> dict[str, Any] | None:
+    """Store the new summary and return the sidecar that landed.
 
-    A thin wrapper, and thin ON PURPOSE. The merge itself -- re-read the sidecar,
-    refuse a finalized one, inherit status/origin, write, re-read what landed --
-    is ``tools.store_summary_meta``, which runs the whole sequence under
-    ``tools._META_LOCK``. It has to live over there: the lock and the file
-    helpers do, and a critical section split across two modules is one nobody can
-    verify by reading either.
-
-    What is left here is the translation. The registry answers with an outcome
-    CODE (the same shape ``set_summary_status`` uses, since tools.py must not
-    import this module's ``StoreRefusal``), and this maps it onto the
-    ``dict | StoreRefusal | None`` union the route already branches on:
-    ``"finalized"`` -> ``StoreRefusal.FINALIZED`` (409 ``tool_finalized``),
-    ``"not_stored"`` -> None (the did-not-happen 404), ``"ok"`` -> the sidecar as
-    it now reads back.
+    The registry re-reads the sidecar to inherit its origin, writes through the
+    schema/redaction boundary, and re-reads what landed. This wrapper narrows
+    ``"not_stored"`` to None and returns the stored dictionary otherwise.
 
     ``identity`` is what ``_resolve_package`` saw when it resolved ``directory``,
     threaded through unchanged: the store re-checks it against the path in the
@@ -678,20 +647,16 @@ def _store_meta(
     summary. It is a required argument all the way down for that reason -- there
     is no call shape in which "I did not think about the identity" is spellable.
 
-    BLOCKING: this does filesystem I/O and takes a lock, so every caller reaches
-    it through ``run_in_threadpool`` -- never inline on the event loop.
+    BLOCKING: this does filesystem I/O, so every caller reaches it through
+    ``run_in_threadpool`` -- never inline on the event loop.
     """
-    outcome, meta = tools.store_summary_meta(
+    _outcome, meta = tools.store_summary_meta(
         directory,
         summary=summary,
         origin=origin,
         llm_log_id=llm_log_id,
         expected_identity=identity,
     )
-    if outcome == "finalized":
-        return StoreRefusal.FINALIZED
-    # ``meta`` is None for every "not_stored" case and a dict for "ok" -- the two
-    # answers the route already tells apart, so no third branch is needed here.
     return meta
 
 
@@ -852,27 +817,10 @@ async def generate_and_store_summary(
     identity of the package this hook resolved, so none can land in a package that
     took the name during the generation.
 
-    ``_store_meta``'s ``StoreRefusal.FINALIZED`` is a silent no-op here, like
-    every other store outcome: this path already ignores the write result
-    because it must never fail an install, and a package finalized between
-    promote and here is one whose summary the operator has explicitly frozen --
-    declining to overwrite it IS the right outcome, not an error to report. That
-    now covers the placeholder branch too: it used to be unreachable there (it
-    only wrote when there was NO sidecar, and a sidecar is what carries a status),
-    but the origin write above leaves one, so a 定版 landing in the round trip can
-    reach it. Nothing needs to change for that -- the frozen text is preserved and
-    the refusal is swallowed like every other outcome. It stays hard to reach at
-    all: ``tools.set_summary_status`` refuses to freeze an absent/empty summary
-    (``no_meta``), which is exactly what the origin-only file has, so it takes a
-    hand-edited sidecar to get there.
-
     Every filesystem step -- the resolve, the sidecar read, the store -- runs via
     ``run_in_threadpool``. This is called from the install JOB's task, which
     shares the event loop with every HTTP request in the process, so its blocking
-    work is exactly as unwelcome on the loop as a route's would be. Taking
-    ``tools._META_LOCK`` from a worker (never from the loop) is also what keeps
-    the hook incapable of deadlocking anything: the loop itself never waits on
-    that lock.
+    work is exactly as unwelcome on the loop as a route's would be.
     """
     try:
         # The resolve and the identity of what was resolved, together (see
@@ -889,12 +837,12 @@ async def generate_and_store_summary(
         directory, identity = resolved
         # The ORIGIN, on disk, on the line ABOVE the round trip (see this
         # function's contract for why the order is the fix). Empty summary,
-        # ordinary draft status, and llm_log_id=None because no summary session
+        # llm_log_id=None because no summary session
         # has run yet -- reading the workflow's last id HERE would link this
         # package to some previous tool's generation.
         #
         # Only when there IS an origin: with nothing un-regenerable to save, the
-        # write's whole effect would be to create a sidecar (and a 草稿 badge) for
+        # write's whole effect would be to create a sidecar for
         # a package that has no summary metadata to show.
         origin_stored = origin is not None and isinstance(
             await run_in_threadpool(
@@ -922,9 +870,7 @@ async def generate_and_store_summary(
             # authored, not a good one worth protecting. Nothing else can have
             # replaced it meanwhile: a running install/revise job holds the single
             # flight, so a synchronous regenerate cannot be admitted inside this
-            # window (``tool_builder._admit_job`` / ``reserve_sync_operation``),
-            # and a 定版 landing here writes no summary of its own and is refused
-            # by the store's finalize gate anyway.
+            # window (``tool_builder._admit_job`` / ``reserve_sync_operation``).
             if origin_stored or await run_in_threadpool(tools.read_tool_meta, directory) is None:
                 # Best-effort, so the write result is DELIBERATELY ignored here
                 # and below: a refused sidecar must never fail an install that
@@ -956,7 +902,7 @@ async def generate_and_store_summary(
         return
 
 
-async def regenerate_summary(name: str) -> dict[str, Any] | StoreRefusal | None:
+async def regenerate_summary(name: str) -> dict[str, Any] | None:
     """Regenerate one package's summary SYNCHRONOUSLY; returns the fresh meta.
 
     The user-driven counterpart of the install hook, and the deliberate mirror
@@ -969,17 +915,8 @@ async def regenerate_summary(name: str) -> dict[str, Any] | StoreRefusal | None:
     vanished under us, the package that now holds this name is no longer the one
     this summary describes, or the sidecar write was refused. All three mean the
     regeneration did not happen, and the route folds them into its
-    did-not-happen 404 exactly as ``set_summary_status`` folds its own failed
-    rewrite into ``not_found``. Answering 200 with a summary that is nowhere on
+    did-not-happen 404. Answering 200 with a summary that is nowhere on
     disk would leave the user reading text that disappears on their next visit.
-
-    ``StoreRefusal.FINALIZED`` is the third answer and is NOT folded into that
-    None, because "you cannot do this" and "it did not work" are different things
-    to tell a user: the package was finalized while this generation was in
-    flight, so the route answers the same 409 ``tool_finalized`` its up-front
-    gate does. That gate still runs (it is what keeps a finalized package from
-    burning an LLM call at all); this is what makes the refusal hold across the
-    await.
 
     What it does NOT change is the no-clobber rule -- the sidecar is only
     rewritten after a successful generation, so a failed regenerate leaves the
@@ -994,8 +931,8 @@ async def regenerate_summary(name: str) -> dict[str, Any] | StoreRefusal | None:
     the returned meta equal to what is on disk; a sidecar with no usable origin
     yields None and the store's inheritance still covers it.
 
-    The caller (the route) has already checked that the tool exists and is not
-    finalized, and HOLDS a reservation in the job admission domain for the whole
+    The caller (the route) has checked that the tool exists and HOLDS a
+    reservation in the job admission domain for the whole
     of this call (R7-3) -- not merely a "no job is active" reading taken before
     it. That distinction is what protects the store below: the read that builds
     the prompt and the write that lands the result are separated by an LLM round
@@ -1015,9 +952,8 @@ async def regenerate_summary(name: str) -> dict[str, Any] | StoreRefusal | None:
     each hop through ``run_in_threadpool``, mirroring how ``routers.tools`` calls
     every registry function. Only the LLM round trip stays on the loop, which is
     the one thing there that is genuinely async. This matters twice over for the
-    store: it holds ``tools._META_LOCK`` for the length of a read-write-read, and
-    a lock held on the event loop would block the whole process rather than one
-    worker.
+    store does blocking filesystem work that belongs on a worker rather than the
+    event loop.
     """
     resolved = await run_in_threadpool(_resolve_package, name)
     if resolved is None:

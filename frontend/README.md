@@ -53,7 +53,7 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
 | `/items/new` | `ItemNewPage` | 手動新增項目的表單頁（沿用 `ItemForm` 元件）。 |
 | `/items/$itemId` | `ItemDetailPage` | 單筆項目詳情：完整欄位、progress 歷史（可追加一筆）、狀態/階段快速修改、`ItemAiActions` 提供的「AI 補齊」（enrich）／「AI 進度更新」（assist-update）兩個操作、刪除。 |
 | `/items/$itemId/edit` | `ItemEditPage` | 手動編輯項目的表單頁（沿用 `ItemForm` 元件）。 |
-| `/tools` | `ToolsPage` | 「已安裝工具」（清單／啟停／刪除，每列可展開讀取／重新產生／定版／解除定版 AI 總結，並可提意見送出 AI 修訂）與「安裝新工具」（貼 OpenAPI JSON 網址 + 指示，AI 背景建置、輪詢進度）兩個分頁；細節見根目錄 README「KB 工具安裝指南」。 |
+| `/tools` | `ToolsPage` | 「已安裝工具」（清單／啟停／刪除，每列可展開讀取／重新產生 AI 總結，並可提意見送出 AI 修訂）與「安裝新工具」（貼 OpenAPI JSON 網址 + 指示，AI 背景建置、輪詢進度）兩個分頁；細節見根目錄 README「KB 工具安裝指南」。 |
 | `/llm-logs` | `LlmLogsPage` | AI 日誌：呼叫 `GET /api/llm/logs` 列出最近的 LLM 互動，每筆可展開讀取 `GET /api/llm/logs/{id}` 取得的請求/回應內容（每則受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；支援 `?log=<id>` 深連結（`工具` 頁的安裝／修訂結果會連過來）：在清單裡就自動展開該列，不在清單裡（比最近 50 筆更舊）就直接向詳情端點取那一筆、單獨顯示在清單上方，真的被擠出保留區才說明它已經不在；連結若標明自己來自**另一個**後端行程（`?logProcess=`，見下方慣例）則一律不展開，只說明編號已被重新配發。 |
 | （其他） | `NotFoundPage` | 404 fallback（router 的 `defaultNotFoundComponent`）。 |
 
@@ -122,12 +122,7 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   同時間只開一項；展開 prop 是 `Collapse` 自己的 `expanded`，**不是** React
   Transition Group 的 `in`——寫錯只會被靜默吞進 `...others`，見下面「沒有 jsdom」
   那條），總結內容以 `enabled: expanded` 延遲讀取（比照
-  `LlmLogsPage.LogDetailPanel`，收合的列從不打 API）。定版／解除定版
-  （`PATCH .../summary`）刻意**不**受這個 busy gate 管制：後端這個端點本來就
-  沒有查 single-flight，且刻意支援「AI 修訂進行中先定版，換裝前重新檢查會擋下
-  取代」這種中途操作，在前端補一個它不需要的鎖只會擋掉後端特地支援的動作。
-  （這說的是 busy gate；**「定版」方向另有自己的一組閘**，見下面「定版／解除定版
-  不吃 `writesBlocked`」那條——不受這個 gate 管制不等於不受任何 gate 管制。）
+  `LlmLogsPage.LogDetailPanel`，收合的列從不打 API）。
 - **`ToolsPage` 的 per-row 閘：啟用開關 ⇄ 進行中的修訂／重新產生——web-v5 P1
   之後已經拆掉**。這一條留著是因為它同時記著「當初為什麼需要」與「現在為什麼不
   需要」，照舊文重構的人才不會把鎖裝回去。舊理由是 per-row 的檔案系統競態：
@@ -161,46 +156,32 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   'error'，那正是舊內容原本會無聲留在畫面上的狀態。做 invalidate／removeQueries
   時一律用 `toolSummaryKeyPrefix(name)` 前綴比對，**不可以**加 `exact`（鍵是三段，
   `exact` 會一個都比對不到）。
-- **同一個判別子必須同時管快取鍵、列的 React key、工作卡的歸屬與列徽章的補寫**：
-  四者是同一個「這還是同一個工具嗎」的問題。列的 key 用
+- **同一個判別子必須同時管快取鍵、列的 React key 與工作卡的歸屬**：
+  三者是同一個「這還是同一個工具嗎」的問題。列的 key 用
   `toolInstanceKey(name, description)`
   （＝把 `toolSummaryQueryKey` 那把鍵 `JSON.stringify`，所以兩者不可能各自漂移），
   身分一變就 remount、列內未送出的修訂意見不會跨過同名重裝被送給別的工具；修訂
-  工作卡也以同一把鍵決定歸屬（`activeJob` 記下送出當下那一列的 `description`）；
-  `patchToolRowSummaryStatus(listBody, instanceKey, status)` 同樣**按實例身分**找
-  列——一個回應同時要寫詳情快取與列徽章，兩邊必須指同一個工具，否則同名重裝之後
-  詳情寫進 A 的項、徽章卻蓋到 B 的列，而且沒有任何請求失敗來說明。**規則是：寫入
-  用實例身分，重新讀取（invalidate／removeQueries）用名稱前綴**——後者只是叫伺服器
-  再答一次，只可能拿到當下的答案，涵蓋得寬鬆才是保守方向。
+  工作卡也以同一把鍵決定歸屬（`activeJob` 記下送出當下那一列的 `description`）。
+  重新讀取（invalidate／removeQueries）用名稱前綴——它只是叫伺服器再答一次，
+  只可能拿到當下的答案，涵蓋得寬鬆才是保守方向。
   **當初刻意按名稱比對的是「閘」**（`reviseBusyForThisTool`／
   `isTogglingThisTool`）：`PATCH /api/tools/{name}` 與 `POST .../revise` 都按名稱
   定址，它們防的檔案系統競態會落在「當下叫這個名字的套件」，比對得寬鬆才是保守
   方向。這兩個閘在 web-v5 P1 之後已經移除（見上面那條），同一條理由現在只剩下按
-  名稱比對的**忙碌指示**（`isSubmittingRevise`／`isRegenerating`／
-  `isUpdatingStatus`，只決定按鈕的 loading）。決定「卡片屬於哪一列」「徽章要蓋
-  哪一列」則相反，一律用實例身分。
+  名稱比對的**忙碌指示**（`isSubmittingRevise`／`isRegenerating`，只決定按鈕的
+  loading）。決定「卡片屬於哪一列」則相反，一律用實例身分。
 - **權威回應寫進快取前，一定要先取消同一把鍵上在飛的讀**：`setQueryData` 不會動
   in-flight 的 fetch，所以一個在 mutation 之前因視窗對焦發出、讀到舊值的 GET
   可以在寫入之後才落地，把畫面翻回舊資料，而且**不會有任何錯誤提示**（那個 GET
   是成功的）。共用的寫入路徑一律先 `await cancelQueries({queryKey})` 再
   `setQueryData`。`removeQueries` 不需要這道手續：`queryCache.remove()` 會
   `query.destroy()` → `cancel({silent: true})`，本來就取消得掉。
-- **取消只排序了「寫 vs 讀」，寫與寫要另外排**：「重新產生」與「定版／解除定版」
-  可以同時在飛（定版刻意不受忙碌閘管制，見上），寫同一個快取項時**先回來的不一定
-  是先送出的**，落後的那個會把畫面永久留在舊答案上，而兩個請求都成功、沒有任何提示。
-  作法是**發出當下**取一個單調遞增的號碼（`createSummaryWriteLedger` /
-  `nextSummaryWriteStamp`，比照 `atoms/llm.js` 的世代計數器），套用前用
-  `claimLatestSummaryWrite` 比對；**嚴格較舊**的回應直接丟掉。刻意**不**改成「兩個
-  mutation 互鎖」：那正是後端特地不需要的鎖，會把定版這條逃生路在最需要的時候關掉。
-  問兩次是有意的——`cancelQueries` 是一個 await，較新的回應可能在那個窗口內插進來，
-  所以取消前問一次（避免落後的回應去取消較新寫入剛啟動的重新讀取）、取消後再問一次。
 - **寫進快取只能「改已存在的項」，不能「建出新的項」**：`removeQueries` 攔不住
-  已經在飛的請求，所以刪除之後才落地的 regenerate／定版回應會把剛清掉的項**重建**
+  已經在飛的請求，所以刪除之後才落地的 regenerate 回應會把剛清掉的項**重建**
   出來，之後同名同描述的重裝一展開就撞到它。用 query-core 自己的規則解：
   `setQueryData` 的 updater 回傳 `undefined` 時，它會在 `queryCache.build()` **之前**
   就 return（`build/modern/queryClient.js` 第 99-101 行），等於「只在已存在時寫」。
-  `writeSummaryDetailIfPresent` 就是這個 updater；`patchToolRowSummaryStatus` 因為
-  看不懂的 body 原樣返回，本來就已經符合同一條規則。
+  `writeSummaryDetailIfPresent` 就是這個 updater。
 - **「還有東西看不見」是這頁的一類 bug，不是個案**：清單背景 refetch 失敗時列會
   留在畫面上（react-query 保留 `data` 只翻 status），必須用非阻擋的橘色 Alert
   講明清單可能過期；修訂中的工具被刪掉／被同名重裝換掉時，列內的進度卡會跟著
@@ -214,38 +195,17 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   `disabled` **和**送出處的提前 return（`disabled` 只是渲染，不是閘），Alert 也要寫明
   控制項已停用。**讀取不受管制**（展開面板只會 GET）。啟用開關與刪除不納入（意圖本來
   就是「叫這個名字的工具」，可還原或有確認 Modal，也沒有夾帶為某個實例寫的內容）。
-- **定版／解除定版不吃 `writesBlocked`，但「定版」這個方向另有自己的閘**——這一條
-  是規則，不是這顆按鈕的特例，照著 README 重構的人必須先讀懂它才不會把洞裝回去：
-  **凍結需要看得到現況，釋放不需要**。「定版」的語意是「把我正在看的內容凍起來」，
-  所以只要畫面上的東西**已知可能不是現況**就不能按；「解除定版」只是把凍結放掉，
-  它不凍結任何內容，而且是後端刻意做成無條件的逃生路（D40 r6）——一個持久的讀取
-  失敗若能鎖住它，操作者就會卡在「已定版且無路可退」。因此：
-  - **不納入 `writesBlocked`**：那個值折進了 `staleList` 這種**持久**條件，一個已定版
-    的工具本來就被 `tool_finalized` 擋掉另外兩個動作，連它也鎖住等於讓操作者無路可走；
-    而且它只改一個列舉欄位、按反方向就能還原，其啟用條件是算自面板自己那個**按名稱**
-    讀回來的總結，不是算自過期的列。
-  - **但只有「定版」方向另外受三個「畫面可能不是現況」的條件管制**（面板裡收斂成
-    一個具名的 `displayedMayBeStale`）：`settlingJobEnd`（剛結束的工作讓它過期，
-    一次往返會自己清掉）、`isFetching`（任何背景更新還沒落地——收合的列 query 是
-    disabled，那次 invalidation 根本沒發 GET，展開時會先渲染修訂前的快取內容）、
-    `isError`（重讀**失敗**：TanStack Query 保留舊 `data`、`isFetching` 回到 false，
-    閘會全開而畫面是舊的）。這三個都套在 `!isFinal` 這一側，**解除定版永遠不受它們
-    影響**（D40 r8／r10／r11）。
-- **「對著畫面上的內容寫意見」與「凍結畫面上的內容」是同一種危險**，所以
-  `displayedMayBeStale` 同時管**修訂意見輸入框與「送出修訂」**，不只管定版。收合的
+- **「對著畫面上的內容寫意見」要求畫面是最新的**，所以
+  `displayedMayBeStale` 同時管**修訂意見輸入框與「送出修訂」**。收合的
   列 query 是 disabled，所以修訂結束時那次 invalidation 沒發出任何 GET 就 resolve 了、
   settling 閘照樣解除；使用者稍後展開，看到的是**修訂前**的快取總結（有 data、所以
   沒有 Loader），在那份文字底下寫的意見會被 AI 套到**已經改過**的程式碼上，而那要花掉
-  好幾分鐘的 LLM 重寫（比按錯一次定版嚴重得多——後者只寫一個列舉欄位、按反方向就還原）。
+  好幾分鐘的 LLM 重寫。
   輸入框跟著一起停用而不是只停按鈕：讓人打完一整段才發現按鈕是死的，是同一個拒絕更
-  糟的版本。**「解除定版」仍然不納入**：它釋放而不凍結，也不夾帶任何為某個實例寫的
-  內容，逃生路的規則不變。
+  糟的版本。
 - **哪些失敗要重新讀取，要逐碼講清楚**：一個拒絕不只是訊息，有些拒絕本身就是伺服器
-  在說「我已經不是你畫面上那個樣子了」——`404`（工具已不叫這個名字）、409
-  `tool_finalized`（我們的控制項是開著的，代表快取說它不是 final）、409
-  `summary_missing`（定版是拿快取裡的文字判斷可不可按的）三者都證明快取過期，就
-  重新讀總結＋清單（列徽章與詳情 status 是同一個側檔欄位）。第四個是 409
-  `tool_job_in_progress`：它證明的不是快取過期，而是**這個頁面之外有東西正在對這個
+  在說「我已經不是你畫面上那個樣子了」——`404`（工具已不叫這個名字）會重新讀
+  總結與清單。409 `tool_job_in_progress` 證明的不是快取過期，而是**這個頁面之外有東西正在對這個
   後端動作**——那是一秒前還不知道的事實，而那個工作完成時可能已經換掉我們正在看的
   套件，所以**也要重讀**（D40 r8 推翻了 r4「那個工作還沒寫任何東西」的判定：對那個
   工作而言為真，但沒抓到重點）。`llm_not_configured`／502（在寫側檔之前就失敗）與
@@ -259,13 +219,10 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   （`isToolJobActive`／`toolJobRefetchInterval`／`isTerminalToolJobState`——
   D40 之前只服務安裝工作，現在安裝與修訂共用同一張後端 job 表與同一個輪詢
   路由，因此改用不含「install」字樣的名稱，並更新了每個呼叫點與測試）；後者
-  是 AI 總結網域的純邏輯（狀態→badge 對映 `summaryStatusMeta`、是否可定版
-  `canFinalizeSummary`、快取鍵 `toolSummaryQueryKey`／`toolSummaryKeyPrefix`／
-  列的 `toolInstanceKey`、面板自己的忙碌旗標 `ownSummaryBusy`、
-  列徽章的快取更新器 `patchToolRowSummaryStatus`、詳情的「只在已存在時寫」updater
-  `writeSummaryDetailIfPresent`、寫入排序帳本
-  `createSummaryWriteLedger`／`nextSummaryWriteStamp`／`claimLatestSummaryWrite`、
-  失敗要不要重讀的判準 `summaryErrorRevalidates`），因為那與「安裝」無關，硬塞
+  是 AI 總結網域的純邏輯（快取鍵 `toolSummaryQueryKey`／`toolSummaryKeyPrefix`／
+  列的 `toolInstanceKey`、面板自己的忙碌旗標 `ownSummaryBusy`、詳情的「只在已存在
+  時寫」updater `writeSummaryDetailIfPresent`、失敗要不要重讀的判準
+  `summaryErrorRevalidates`），因為那與「安裝」無關，硬塞
   進前者的檔名只會誤導之後的讀者——這個專案的 vitest 在 node 環境跑、沒有
   jsdom，元件本身測不到，抽出的純函式是唯一能自動化驗證的介面，所以新邏輯一律
   先問「這算安裝，還是總結」再決定放哪個檔案。**唯一的例外寫在

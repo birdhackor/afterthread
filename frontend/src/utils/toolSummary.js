@@ -1,7 +1,6 @@
-// Pure helpers for the 工具 page's AI-summary panel (D40): the sidecar's
-// draft/final vocabulary and whether there is anything to freeze. A SIBLING of
+// Pure helpers for the 工具 page's AI-summary panel (D40). A SIBLING of
 // toolInstall.js rather than an extension of it -- this is genuinely new
-// domain (the summary sidecar's status/content), not the install/job-polling
+// domain (the summary sidecar's content), not the install/job-polling
 // flow that file already owns, and "toolInstall" would be a flatly wrong name
 // for logic that has nothing to do with installing. Kept out of the component
 // for the same reason as toolInstall.js: vitest runs these in node with no
@@ -11,36 +10,6 @@
 // The last section is the one thing here the 工具 page does not own alone: the
 // AI 日誌 deep link it hands out, and the AI 日誌 page's rule for resolving one.
 // Both halves live together deliberately -- see that section's header.
-
-// draft/final -> {label, color} for the summary-status Badge. Mirrors
-// constants/labels.js's STATUS_META + StatusBadge shape (a Mantine
-// label/color pair keyed by backend vocabulary), but lives here as a
-// FUNCTION rather than an exported lookup object with its own Badge
-// component: this phase's allowed files do not include constants/labels.js
-// or a new components/ file, and a function gives the real, common `null`
-// case (a tool with no sidecar yet, or one whose generation never ran/wrote
-// anything) one explicit fallback arm instead of a silent lookup miss.
-const SUMMARY_STATUS_META = {
-	draft: { label: "草稿", color: "yellow" },
-	final: { label: "已定版", color: "green" },
-};
-
-export function summaryStatusMeta(status) {
-	return SUMMARY_STATUS_META[status] ?? { label: "尚無總結", color: "gray" };
-}
-
-// Whether a summary has any text worth freezing. Mirrors the backend's own
-// finalize gate exactly (PATCH .../summary -> 409 summary_missing covers BOTH
-// no sidecar and a sidecar whose summary is absent/empty -- one answer,
-// because they are the same answer to the user; see routers.tools'
-// `update_tool_summary_status` docstring). Gates ONLY the 定版 direction:
-// 解除定版 (final -> draft) is deliberately UNCONDITIONAL on the backend --
-// the one recovery path for a sidecar a bad hand-edit or a failed generation
-// left with no usable text (docs/web-v4-decisions.md D40 addendum r6) -- so a
-// caller must never run that direction's enablement through this function.
-export function canFinalizeSummary(summary) {
-	return typeof summary === "string" && summary.trim() !== "";
-}
 
 // --- react-query cache keys for one tool's summary ---------------------------
 
@@ -67,16 +36,15 @@ export function toolSummaryKeyPrefix(name) {
 // install a DIFFERENT one under the same name, and this QueryClient sees none of
 // it (deleteMutation's removeQueries only covers deletions THIS client
 // performed). Keyed on the name alone, the new tool's panel would open on the
-// old tool's cached summary/status/AI-日誌 link.
+// old tool's cached summary/AI-日誌 link.
 //
 // Why `description` specifically: GET /api/tools returns
-// {name, description, enabled, valid, error, summary_status} per row (backend
+// {name, description, enabled, valid, error} per row (backend
 // schemas.ToolSummary) and carries no install id or timestamp, so there is no
 // true instance identity to use. Of those fields, `description` is the only one
 // an INSTALL writes -- it comes from the package's tool.json, authored by that
 // install's own AI builder session -- while `enabled`/`valid`/`error` say
-// nothing about which package this is, and `summary_status` changes under
-// ordinary use (定版/解除定版 would churn the key on a tool that never moved).
+// nothing about which package this is.
 // It is a heuristic, not a proof: see the residual noted at this key's use site
 // in ToolsPage, which is why the panel ALSO guards what it renders.
 export function toolSummaryQueryKey(name, description) {
@@ -125,56 +93,6 @@ export function ownSummaryBusy({
 
 // --- ["tools"] list-cache patch ----------------------------------------------
 
-// Return the GET /api/tools body with ONE row's `summary_status` replaced, or
-// the body untouched when there is nothing to patch. A pure updater for
-// `setQueryData`, so the write is testable without a QueryClient.
-//
-// The row is addressed by the INSTANCE identity (toolInstanceKey), NOT by name.
-// One summary response drives TWO cache writes -- the detail entry and this row
-// badge -- and they must name the same tool or the page shows a mixture no
-// request was wrong about. Keyed by name, a response for instance A landing
-// after a same-name reinstall stamped A's status onto B's row while the detail
-// write (which has always been instance-keyed, see toolSummaryQueryKey) went to
-// A's entry: the badge and the panel then disagreed permanently, with no error
-// anywhere. Taking the identity as a STRING built by toolInstanceKey -- rather
-// than re-deriving `row.description === description` here -- is what makes the
-// two consumers provably the same question: if the discriminator ever changes,
-// both move with it or neither does.
-//
-// Deliberately narrow: it only ever REWRITES ONE FIELD OF AN EXISTING ROW. An
-// identity with no row is left alone rather than appended, because the other
-// five fields of a tool row (enabled, valid, error, description...) are not
-// knowable from a summary response and a fabricated row would be a shape
-// GET /api/tools never produces. An unexpected body (undefined before the list
-// has loaded, or anything without a `tools` array) is returned as-is for the
-// same reason -- which also makes this updater write-only-if-present in
-// TanStack Query's own terms (returning the same `undefined` it was handed
-// makes setQueryData bail before building an entry; see
-// writeSummaryDetailIfPresent for the citation).
-//
-// This exists because 重新產生 and 定版/解除定版 both learn the new status
-// authoritatively from their own response, while the row BADGE was left to
-// `invalidateQueries(["tools"])` -- whose background refetch error TanStack
-// Query swallows by default. One transient GET /api/tools failure was enough to
-// leave a green 「已定版」 toast beside a row badge still reading 草稿. The
-// invalidation stays as the eventual-consistency backstop for the rest of the
-// row -- and for THIS field too whenever no row matches the identity; this just
-// stops the one field we already know from lagging behind its own success toast
-// for the rows we can prove we are talking about.
-export function patchToolRowSummaryStatus(listBody, instanceKey, status) {
-	if (!listBody || !Array.isArray(listBody.tools)) {
-		return listBody;
-	}
-	return {
-		...listBody,
-		tools: listBody.tools.map((row) =>
-			toolInstanceKey(row?.name, row?.description) === instanceKey
-				? { ...row, summary_status: status }
-				: row,
-		),
-	};
-}
-
 // A `setQueryData` updater that writes `detail` ONLY IF the entry already holds
 // data -- never one that CREATES it.
 //
@@ -188,7 +106,7 @@ export function patchToolRowSummaryStatus(listBody, instanceKey, status) {
 // observer is notified.
 //
 // Why it must not create: deleteMutation clears this tool's entries with
-// removeQueries, but it cannot un-send a regenerate/定版 request already on the
+// removeQueries, but it cannot un-send a regenerate request already on the
 // wire. That response then arrived at a plain `setQueryData(key, detail)`,
 // which RESURRECTED the deleted tool's detail entry -- and a same-name,
 // same-description reinstall inside the 5-minute gc window would open its panel
@@ -207,62 +125,6 @@ export function writeSummaryDetailIfPresent(detail) {
 	return (previous) => (previous === undefined ? undefined : detail);
 }
 
-// --- write ordering: last write by ISSUE time wins ---------------------------
-
-// 重新產生 (POST .../summary/regenerate) and 定版/解除定版 (PATCH .../summary)
-// can be in flight at the SAME time by design -- the 定版 button is
-// deliberately exempt from the busy gate so an operator can freeze a tool to
-// stop an AI iteration mid-flight (D40 P4 r1; the backend supports this on
-// purpose, re-checking finalization at write time). Two concurrent writes to
-// one cache entry means arrival order decides what the cache ends up holding,
-// and the loser is silent: both requests SUCCEEDED, so no banner and no toast
-// says the panel is now showing the older of two answers while the row badge
-// (refreshed by the trailing list invalidation) shows the newer one.
-//
-// Serializing them was the other option and is ruled out by that same D40 rule:
-// a shared in-flight flag gating BOTH is exactly the lock the backend was built
-// not to need, and it would take the escape hatch away at the one moment it
-// exists for. So the writes stay concurrent and are ORDERED instead: each takes
-// a monotonic stamp when it is issued, and a response is applied only if no
-// strictly newer write for the same instance has been applied already.
-//
-// Same shape as `atoms/llm.js`'s module-level generation counter (and the
-// requestId pattern the list pages use): claim at request start, re-check
-// before writing. The ledger is per-panel state (a ref) rather than module
-// state because the stamps are only ever compared within one panel's own
-// writes; `applied` is keyed by toolInstanceKey, so two different tools never
-// order each other, and it grows only with the number of distinct instances a
-// session actually writes to.
-export function createSummaryWriteLedger() {
-	return { issued: 0, applied: new Map() };
-}
-
-// Claim the next stamp. Called synchronously from the mutation's `onMutate`,
-// which query-core invokes before `mutationFn` (mutation.js: `await
-// this.options.onMutate?.(...)` precedes `this.#retryer.start()`), so stamps
-// are in the wall-clock order the user pressed the buttons -- not the order the
-// responses came back.
-export function nextSummaryWriteStamp(ledger) {
-	ledger.issued += 1;
-	return ledger.issued;
-}
-
-// May this response still be written for `instanceKey`? Records the claim when
-// it may. STRICTLY older writes are refused; re-asking with the SAME stamp
-// always answers the same thing, because the caller has to ask twice: once
-// before `cancelQueries` (so a stale response never cancels the fresh read a
-// newer write just started) and once after that await (because a newer response
-// can land inside it, and whichever cancel settles last would otherwise write
-// last).
-export function claimLatestSummaryWrite(ledger, instanceKey, stamp) {
-	const applied = ledger.applied.get(instanceKey);
-	if (applied !== undefined && stamp < applied) {
-		return false;
-	}
-	ledger.applied.set(instanceKey, stamp);
-	return true;
-}
-
 // --- which failures prove the server state moved -----------------------------
 
 // Does this failed summary mutation prove the server is no longer what the
@@ -270,30 +132,13 @@ export function claimLatestSummaryWrite(ledger, instanceKey, stamp) {
 // means the failure says nothing about server state and a refetch would be
 // noise (and would hide, not help -- a 502 storm refetching on every retry).
 //
-// The row badge is never separated from the summary here: `summary_status` on a
-// GET /api/tools row and `status` in the sidecar detail are the same sidecar
-// field read twice (backend services/tools._narrowed_summary_status vs
-// routers/tools._summary_detail), so anything that proves one stale proves the
-// other.
-//
-// The three that PROVE it, each checked against the route that can raise it
-// (backend routers/tools.py):
+// The two that prove the world moved are checked against the routes that can
+// raise them:
 //
 // * 404 -- every summary route resolves the package first and answers the same
 //   fixed 404 when it is gone. The tool this panel is showing does not answer
 //   to that name any more; the copy tells the user the list may be stale, and
 //   this is what makes that remedy real instead of advice.
-// * 409 `tool_finalized` (regenerate, revise) -- raised only when the sidecar
-//   is ALREADY 已定版. Our controls were enabled, so our cached detail said
-//   otherwise: somebody else finalized it. The error names 解除定版 as the
-//   remedy, and the 解除定版 button only appears once the panel knows the tool
-//   is final -- so without this refetch the prescribed remedy is not reachable.
-// * 409 `summary_missing` (PATCH .../summary) -- raised only when there is
-//   nothing to freeze. 定版 is enabled by canFinalizeSummary over the CACHED
-//   text, so this refusal is proof the cached text is gone.
-//
-// The FOURTH, which proves something different and revalidates anyway:
-//
 // * 409 `tool_job_in_progress` -- ANOTHER actor holds the single-flight slot,
 //   which is a fact about the world we did not know a moment ago: something
 //   outside this page is mid-operation on this backend, and when it finishes it
@@ -316,12 +161,7 @@ export function summaryErrorRevalidates({ status, code } = {}) {
 	if (status === 404) {
 		return true;
 	}
-	return (
-		status === 409 &&
-		(code === "tool_finalized" ||
-			code === "summary_missing" ||
-			code === "tool_job_in_progress")
-	);
+	return status === 409 && code === "tool_job_in_progress";
 }
 
 // --- the AI 日誌 deep link (R9-1) --------------------------------------------

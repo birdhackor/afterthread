@@ -117,7 +117,7 @@ def _fake_generate(
 
     ``side_effect`` runs INSIDE the stubbed call, which is the only place a test
     can act "while the generation is in flight": the real thing awaits an LLM for
-    seconds, and every store-time race (a concurrent 定版, a racing delete) lives
+    seconds, and every store-time race (such as a racing delete) lives
     in exactly that window.
     """
     captured: dict[str, Any] = {}
@@ -403,7 +403,7 @@ def test_user_prompt_skips_the_sidecar_and_dot_files(
     root = tmp_path / "tools"
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
-    _write_meta(pkg, summary="PREVIOUS-SUMMARY-TEXT", status="draft")
+    _write_meta(pkg, summary="PREVIOUS-SUMMARY-TEXT")
     (pkg / ".hidden-note").write_text("HIDDEN-FILE-TEXT", encoding="utf-8")
 
     prompt = tool_meta._summary_user_prompt("kbsearch", pkg, origin=None, builder_summary=None)
@@ -668,10 +668,10 @@ def test_user_prompt_bounds_the_file_count(monkeypatch: pytest.MonkeyPatch, tmp_
 # --- generation + storage -----------------------------------------------------
 
 
-def test_generate_and_store_summary_writes_a_draft_sidecar(
+def test_generate_and_store_summary_writes_a_sidecar(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The happy path: a draft sidecar carrying the summary, the origin, and a
+    """The happy path: a sidecar carrying the summary, the origin, and a
     link to the summary session's own AI 日誌 record."""
     root = tmp_path / "tools"
     pkg = _package(root)
@@ -689,7 +689,6 @@ def test_generate_and_store_summary_writes_a_draft_sidecar(
     meta = tools.read_tool_meta(pkg)
     assert meta is not None
     assert meta["summary"] == "這個工具會查 KB"
-    assert meta["status"] == "draft"
     assert meta["origin"] == {
         "openapi_url": "http://kb.example/openapi.json",
         "instructions": "查 KB",
@@ -728,16 +727,15 @@ def test_summary_workflow_never_collides_with_the_install_session(
     assert llm_log.last_record_id_for_workflow("tool_summary") != install_record
 
 
-def test_generate_and_store_summary_preserves_status_and_origin(
+def test_generate_and_store_summary_preserves_origin(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A regeneration keeps the status it had and inherits the origin the
-    INSTALL captured (the only copy of the OpenAPI url / instructions)."""
+    """A regeneration inherits the origin the install captured."""
     root = tmp_path / "tools"
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
     origin = {"openapi_url": "http://kb.example/openapi.json", "instructions": "查 KB"}
-    _write_meta(pkg, summary="舊的", status="draft", origin=origin)
+    _write_meta(pkg, summary="舊的", origin=origin)
 
     _fake_generate(monkeypatch, summary="新的")
     asyncio.run(generate_and_store_summary("kbsearch", origin=None))
@@ -745,39 +743,7 @@ def test_generate_and_store_summary_preserves_status_and_origin(
     meta = tools.read_tool_meta(pkg)
     assert meta is not None
     assert meta["summary"] == "新的"
-    assert meta["status"] == "draft"  # preserved, never reset by the write
     assert meta["origin"] == origin  # inherited, never erased
-
-
-def test_store_meta_refuses_a_finalized_sidecar(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A finalized summary is never rewritten -- not even by the install hook.
-
-    _store_meta used to PRESERVE the "final" status while still overwriting the
-    summary TEXT, which satisfies the letter of 定版 and breaks its meaning: the
-    operator froze one explanation and would get a different one back. The store
-    re-reads the status and refuses outright."""
-    root = tmp_path / "tools"
-    pkg = _package(root)
-    _summary_settings(monkeypatch, root)
-    origin = {"openapi_url": "http://kb.example/openapi.json", "instructions": "查 KB"}
-    _write_meta(pkg, summary="定版的說明", status="final", origin=origin)
-    before = (pkg / tools._AI_META_FILENAME).read_bytes()
-
-    identity = tools.package_identity(pkg)
-    assert identity is not None
-    assert (
-        tool_meta._store_meta(pkg, summary="新的", origin=None, llm_log_id=9, identity=identity)
-        is tool_meta.StoreRefusal.FINALIZED
-    )
-    assert (pkg / tools._AI_META_FILENAME).read_bytes() == before  # byte-for-byte
-
-    # And the install hook swallows that refusal like every other store outcome:
-    # it must never fail an install that already succeeded.
-    _fake_generate(monkeypatch, summary="新的")
-    asyncio.run(generate_and_store_summary("kbsearch", origin=None))  # must not raise
-    assert (pkg / tools._AI_META_FILENAME).read_bytes() == before
 
 
 def test_generate_and_store_summary_writes_placeholder_when_no_sidecar_yet(
@@ -795,7 +761,6 @@ def test_generate_and_store_summary_writes_placeholder_when_no_sidecar_yet(
     meta = tools.read_tool_meta(pkg)
     assert meta is not None
     assert meta["summary"] == ""
-    assert meta["status"] == "draft"
     # Narrowed on the way to disk: both known fields, the absent one null.
     assert meta["origin"] == {"openapi_url": None, "instructions": "查 KB"}
     # The failed session's TRACE is linked too -- and that is what makes this a
@@ -898,7 +863,7 @@ def test_generate_and_store_summary_never_clobbers_a_good_summary(
     root = tmp_path / "tools"
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
-    _write_meta(pkg, summary="先前的好總結", status="draft")
+    _write_meta(pkg, summary="先前的好總結")
 
     _fake_generate(monkeypatch, explode=LLMUpstreamError("APIConnectionError: unreachable"))
     asyncio.run(generate_and_store_summary("kbsearch"))
@@ -1007,14 +972,13 @@ def test_regenerate_summary_returns_the_fresh_meta(
     root = tmp_path / "tools"
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
-    _write_meta(pkg, summary="舊的", status="draft", origin={"instructions": "查 KB"})
+    _write_meta(pkg, summary="舊的", origin={"instructions": "查 KB"})
     _fake_generate(monkeypatch, summary="新的說明")
 
     meta = asyncio.run(regenerate_summary("kbsearch"))
 
     assert isinstance(meta, dict)
     assert meta["summary"] == "新的說明"
-    assert meta["status"] == "draft"
     # Carried back from the install, in the narrowed shape the writer stores
     # (both known fields, the absent one explicitly null).
     assert meta["origin"] == {"openapi_url": None, "instructions": "查 KB"}
@@ -1040,7 +1004,6 @@ def test_regenerate_summary_feeds_the_stored_origin_back_into_the_prompt(
     _write_meta(
         pkg,
         summary="舊的",
-        status="draft",
         origin={
             "openapi_url": "http://origin-url-marker.kb.example/o.json",
             "instructions": "ORIGIN-INSTRUCTIONS-MARKER 只查內部 KB",
@@ -1077,7 +1040,6 @@ def test_regenerate_summary_sanitizes_a_legacy_origin_url(
         json.dumps(
             {
                 "summary": "舊的",
-                "status": "draft",
                 "origin": {
                     "openapi_url": "https://ops:LEGACY-BASIC@kb.example/o.json?token=LEGACY-TOKEN",
                     "instructions": "ORIGIN-INSTRUCTIONS-MARKER",
@@ -1117,7 +1079,7 @@ def test_regenerate_summary_ignores_an_unusable_stored_origin(
     _summary_settings(monkeypatch, root)
     origin = {"openapi_url": 12, "junk": "JUNK-MARKER"}
     (pkg / tools._AI_META_FILENAME).write_text(
-        json.dumps({"summary": "舊的", "status": "draft", "origin": origin}), encoding="utf-8"
+        json.dumps({"summary": "舊的", "origin": origin}), encoding="utf-8"
     )
     captured = _fake_generate(monkeypatch, summary="新的說明")
 
@@ -1141,7 +1103,7 @@ def test_regenerate_summary_refuses_an_internal_alias(
     pkg = _package(root, "real")
     (root / "alias").symlink_to(root / "real", target_is_directory=True)
     _summary_settings(monkeypatch, root)
-    _write_meta(pkg, summary="真的說明", status="draft")
+    _write_meta(pkg, summary="真的說明")
 
     async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("no session may start for an aliased package")
@@ -1173,7 +1135,7 @@ def test_regenerate_summary_propagates_llm_failures_without_clobbering(
     root = tmp_path / "tools"
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
-    _write_meta(pkg, summary="先前的好總結", status="draft")
+    _write_meta(pkg, summary="先前的好總結")
     _fake_generate(monkeypatch, explode=explode)
 
     with pytest.raises(expected):
@@ -1212,46 +1174,11 @@ def test_regenerate_summary_signals_nothing_stored_when_the_write_is_refused(
     root = tmp_path / "tools"
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
-    _write_meta(pkg, summary="先前的好總結", status="draft")
+    _write_meta(pkg, summary="先前的好總結")
     _fake_generate(monkeypatch, summary="新的說明")
     monkeypatch.setattr(tools, "write_tool_meta", lambda *args, **kwargs: False)
 
     assert asyncio.run(regenerate_summary("kbsearch")) is None
-
-
-def test_regenerate_summary_refuses_a_finalize_that_lands_mid_generation(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The finalize TOCTOU: the route's 定版 gate runs BEFORE an await that lasts
-    as long as an LLM round trip, so a PATCH landing inside that window used to
-    have its frozen summary overwritten anyway (the status was preserved; the
-    TEXT was not). The generation flips the sidecar itself here, which is exactly
-    what a concurrent PATCH does.
-
-    The refusal is its own signal, NOT the None a failed write gives: "you cannot
-    do this" and "it did not work" are different answers to the user, and the
-    route turns them into a 409 and a 404 respectively."""
-    root = tmp_path / "tools"
-    pkg = _package(root)
-    _summary_settings(monkeypatch, root)
-    _write_meta(pkg, summary="定版的說明", status="draft")
-
-    frozen: dict[str, bytes] = {}
-
-    def finalize_mid_call() -> None:
-        assert tools.set_summary_status("kbsearch", "final") == "ok"
-        frozen["bytes"] = (pkg / tools._AI_META_FILENAME).read_bytes()
-
-    _fake_generate(monkeypatch, summary="新的說明", side_effect=finalize_mid_call)
-
-    assert asyncio.run(regenerate_summary("kbsearch")) is tool_meta.StoreRefusal.FINALIZED
-    # Byte-for-byte what 定版 froze -- the generation that was already in flight
-    # left no trace, not even a refreshed updated_at.
-    assert (pkg / tools._AI_META_FILENAME).read_bytes() == frozen["bytes"]
-    stored = tools.read_tool_meta(pkg)
-    assert stored is not None
-    assert stored["summary"] == "定版的說明"
-    assert stored["status"] == "final"
 
 
 def _replace_package(root: Path, name: str = "kbsearch") -> Path:
@@ -1267,7 +1194,7 @@ def _replace_package(root: Path, name: str = "kbsearch") -> Path:
 
     shutil.rmtree(root / name)
     replacement = _package(root, name, run_py="import sys\nsys.stdout.write('B')\n")
-    _write_meta(replacement, summary="新工具自己的總結", status="draft")
+    _write_meta(replacement, summary="新工具自己的總結")
     return replacement
 
 
@@ -1288,7 +1215,7 @@ def test_regenerate_summary_writes_nothing_when_the_package_was_replaced(
     root = tmp_path / "tools"
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
-    _write_meta(pkg, summary="A 的總結", status="draft")
+    _write_meta(pkg, summary="A 的總結")
     replaced: dict[str, Path] = {}
 
     def replace_mid_call() -> None:
@@ -1394,7 +1321,6 @@ def test_the_install_origin_reaches_disk_before_the_llm_round_trip(
     # ORIGIN ONLY: nothing has been generated yet, and no summary session has
     # finished, so there is no log id to vouch for either.
     assert early["summary"] == ""
-    assert early["status"] == "draft"
     assert early["llm_log_id"] is None
     assert early["llm_log_process"] is None
 
@@ -1403,7 +1329,6 @@ def test_the_install_origin_reaches_disk_before_the_llm_round_trip(
     final = tools.read_tool_meta(pkg)
     assert final is not None
     assert final["summary"] == "這個工具會查 KB"
-    assert final["status"] == "draft"
     assert final["origin"] == origin
     assert final["llm_log_id"] == llm_log.last_record_id_for_workflow("tool_summary")
     assert final["llm_log_process"] == llm_log.process_token()
@@ -1495,108 +1420,6 @@ def test_summary_paths_refuse_a_package_with_no_manifest_before_the_llm_call(
     assert tools.read_tool_meta(pkg) is None
 
 
-class _ContendedLock:
-    """A ``threading.Lock`` that REPORTS when an acquirer finds it already held.
-
-    Substituted for ``tools._META_LOCK`` so the interleave test below can be
-    deterministic instead of sleep-timed: the ``blocked`` event fires at the
-    exact moment a second thread tries to enter the critical section and cannot,
-    which IS the mutual exclusion under test. It also makes the test fail loudly
-    (rather than flakily pass) if the lock is ever removed -- with no lock there
-    is no contention to observe, so ``blocked`` never fires and the parked
-    finalize times out."""
-
-    def __init__(self, blocked: threading.Event) -> None:
-        self._inner = threading.Lock()
-        self._blocked = blocked
-
-    def __enter__(self) -> _ContendedLock:
-        if not self._inner.acquire(blocking=False):
-            self._blocked.set()
-            self._inner.acquire()
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        self._inner.release()
-
-
-def test_regenerate_summary_cannot_undo_a_finalize_holding_the_lock(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The finalize re-check is a READ-then-WRITE, and by itself it guards nothing.
-
-    Both sequences run on THREADPOOL workers in production -- the PATCH's
-    ``set_summary_status`` on one, a regenerate's store on another -- so they
-    genuinely execute in parallel. Unserialized, both read ``"draft"``, the PATCH
-    writes ``"final"``, and the store then writes its OWN composed meta carrying
-    the stale ``"draft"`` plus the new summary: the operator's 定版 silently
-    undone, and the frozen text replaced by exactly the generation the freeze
-    existed to stop. The re-check only means something while nothing can land
-    between the read and the write.
-
-    Driven through the REAL lock with two real threads, sequenced by events
-    rather than sleeps: the finalize parks INSIDE its own hold until the store
-    has demonstrably contended for the lock, then completes. The store must
-    therefore observe ``final`` and refuse."""
-    root = tmp_path / "tools"
-    pkg = _package(root)
-    _summary_settings(monkeypatch, root)
-    _write_meta(pkg, summary="定版的說明", status="draft")
-
-    blocked = threading.Event()  # set when the store finds the lock already held
-    inside = threading.Event()  # set once the finalize is inside its hold
-    monkeypatch.setattr(tools, "_META_LOCK", _ContendedLock(blocked))
-
-    frozen: dict[str, bytes] = {}
-    failures: list[BaseException] = []
-    real_write = tools.write_tool_meta
-
-    def write_then_park(directory: Path, meta: dict[str, Any], **kwargs: Any) -> bool:
-        # Runs INSIDE set_summary_status's lock hold. Parking here is what forces
-        # the store to arrive while the finalize is mid-sequence -- the exact
-        # window the r2 code lost the race in. ``**kwargs`` keeps this double
-        # TRANSPARENT to the identity the caller now hands the writer (R6-3): this
-        # test is about the lock, and a double that dropped that argument would be
-        # testing a call shape production no longer makes.
-        if meta.get("status") == "final":
-            inside.set()
-            assert blocked.wait(timeout=5), "the store never contended for _META_LOCK"
-        return real_write(directory, meta, **kwargs)
-
-    monkeypatch.setattr(tools, "write_tool_meta", write_then_park)
-
-    def finalize() -> None:
-        try:
-            assert tools.set_summary_status("kbsearch", "final") == "ok"
-            frozen["bytes"] = (pkg / tools._AI_META_FILENAME).read_bytes()
-        except BaseException as exc:  # reported to the main thread, never swallowed
-            failures.append(exc)
-
-    finalizer = threading.Thread(target=finalize)
-
-    def start_finalize_mid_call() -> None:
-        # "While the generation is in flight" -- the only place a concurrent
-        # PATCH can actually land in production.
-        finalizer.start()
-        assert inside.wait(timeout=10), "the finalize never reached its lock hold"
-
-    _fake_generate(monkeypatch, summary="新的說明", side_effect=start_finalize_mid_call)
-
-    outcome = asyncio.run(regenerate_summary("kbsearch"))
-
-    finalizer.join(timeout=10)
-    assert not finalizer.is_alive()
-    assert not failures, failures
-    assert outcome is tool_meta.StoreRefusal.FINALIZED
-    # Byte-for-byte what 定版 froze: the in-flight generation left no trace, not
-    # even a refreshed updated_at.
-    assert (pkg / tools._AI_META_FILENAME).read_bytes() == frozen["bytes"]
-    stored = tools.read_tool_meta(pkg)
-    assert stored is not None
-    assert stored["summary"] == "定版的說明"
-    assert stored["status"] == "final"
-
-
 def test_regenerate_summary_builds_the_prompt_off_the_event_loop(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1638,10 +1461,8 @@ def test_sidecar_io_never_runs_on_the_event_loop(
     """The resolve, the sidecar read and the STORE are blocking work, and both
     entry points hop them onto a worker.
 
-    The store is the one that matters most now: it holds ``tools._META_LOCK``
-    across a read-write-read, and a lock taken on the event loop parks the WHOLE
-    process (every other request in flight) behind one package's sidecar I/O
-    rather than one threadpool worker. The install hook is included because it
+    The store performs a read-write-read and belongs on a threadpool worker.
+    The install hook is included because it
     runs from a background task that shares the same loop -- its blocking work is
     exactly as unwelcome there as a route's.
 
@@ -1650,7 +1471,7 @@ def test_sidecar_io_never_runs_on_the_event_loop(
     root = tmp_path / "tools"
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
-    _write_meta(pkg, summary="舊的", status="draft")
+    _write_meta(pkg, summary="舊的")
     loop_thread = threading.current_thread()
     seen: dict[str, Any] = {}
     real_store = tool_meta._store_meta

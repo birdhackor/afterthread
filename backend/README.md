@@ -146,16 +146,7 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 **Tools**（`afterthread/routers/tools.py`，前綴 `/api/tools`；即「工具」頁的
 後端）
 - `GET /api/tools` — 列出所有已安裝工具套件（含無效的），依名稱排序；`TOOLS_DIR`
-  未設定或尚無工具時回空清單（非錯誤）。每一列附帶
-  `summary_status`（`"draft"`／`"final"`／`null`＝尚無可讀的總結 sidecar），
-  列表頁靠它直接標示每個工具的總結狀態，不必逐一再打一次總結 API。內部別名
-  （`tools/alias -> tools/real` 這種 symlink）那一列固定回 `null`，與 by-name 的三條
-  總結路由一致（它們對別名都回 404）——否則列表會標示**真包**的狀態，而那個標示
-  任何請求都重現不出來。一列的六個欄位**一定出自同一個套件實例**：manifest 掃描
-  與 sidecar 讀取是兩次讀，中間夾著一次修訂換裝就可能拼出「A 的說明配 B 的徽章」，
-  所以掃描捕捉的身分會在 sidecar 讀完之後重驗，不符就把那一包重掃一次（實例真的
-  換掉時列的是**新**那一包）；重驗一直不成立就只把 `summary_status` 降成 `null`
-  ——與「沒有／讀不懂 sidecar」同一個答案，不另立詞彙。
+  未設定或尚無工具時回空清單（非錯誤）。
 - `PATCH /api/tools/{name}` — 切換某工具的 `enabled`；找不到回 404。寫的是套件的
   `.afterthread-state.json`（見下方「工具套件格式」），**完全不碰 `tool.json`**——所以一次
   切換不會移動 manifest 身分，不會讓進行中的修訂作廢、也不會讓一趟總結往返的
@@ -191,35 +182,25 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   連結走，AI 日誌頁才拒絕得掉。安裝與修訂共用同一張工作表、同一個輪詢端點，回應形狀完全
   相同（前身是 `GET /api/tools/install/{job_id}`，改名後舊路徑**直接移除**、不留
   相容別名——前後端同一個 wheel 出貨，不會有版本偏斜）。
-- `GET /api/tools/{name}/summary` — 該工具的 AI 總結（`summary`／`status`／
-  `updated_at`／`llm_log_id`，見下方「安裝後的 AI 總結與定版」）；尚無總結時
-  四個欄位皆為 `null` 的 200（不是錯誤），工具不存在（含 `TOOLS_DIR` 未設定）
+- `GET /api/tools/{name}/summary` — 該工具的 AI 總結（`summary`／
+  `updated_at`／`llm_log_id`，見下方「安裝後的 AI 總結」）；尚無總結時
+  三個欄位皆為 `null` 的 200（不是錯誤），工具不存在（含 `TOOLS_DIR` 未設定）
   才回 404。`llm_log_id` 另外在**後端重啟過**（側檔記的是前一個行程的 id）時
   一律回 `null`，理由見下方同一節。
-- `PATCH /api/tools/{name}/summary` — body `{status: "draft"|"final"}`，定版／
-  解除定版；成功回更新後的總結。工具不存在回 404；**沒有東西可定版**回
-  `409 summary_missing`——包含「還沒有 sidecar」與「sidecar 的 `summary` 是空的
-  ／只有空白」兩種，因為對使用者是同一個答案（而且定版一個空總結不是無害的
-  no-op：之後重新產生會被 `tool_finalized` 擋住，唯一能補內容的動作反而被鎖
-  死）。反方向的 `draft`（解除定版）**永遠不設條件**——逃生門不能自己被擋住。
 - `POST /api/tools/{name}/summary/regenerate` — **同步**重新產生總結（不是背景
-  工作），成功回新的總結。工具不存在回 404；已定版回 `409 tool_finalized`
-  （要先解除定版）；有工具工作正在進行時回 `409 tool_job_in_progress`——而且它
+  工作），成功回新的總結。工具不存在回 404；有工具工作正在進行時回
+  `409 tool_job_in_progress`——而且它
   **自己也會佔住那個名額**（整趟 LLM 往返期間，install／revise 送出一律 409），
   否則窗內被放行的修訂會換掉整包、寫下新的 sidecar，再被這次較舊的總結蓋回去；LLM 未
   設定／上游失敗與捕捉、補齊等同步 AI 動作共用同一組錯誤（`503
   llm_not_configured`／`502 llm_upstream_error`），失敗時不會覆蓋既有總結。
-  `tool_finalized` 有**兩個發生點**、同一個代碼：呼叫前的檢查，以及等 LLM 回來
-  要寫檔時的再檢查——中途被 `PATCH` 定版的話，剛產生的文字**不會寫進去**，一樣
-  回 409。
 - `POST /api/tools/{name}/revise` — body `{feedback: 1..20000}`，依使用者意見
   送出一次 **AI 修訂**工作（見下方「依意見修訂既有工具」）；202 + `job_id`，
-  用上面的 `GET /api/tools/jobs/{job_id}` 輪詢。工具不存在回 404；已定版回
-  `409 tool_finalized`（定版就是凍結 AI 迭代）；已有工具工作在跑回
-  `409 tool_job_in_progress`。**不宣告** `502`／`503`：修訂是背景工作，LLM 沒
+  用上面的 `GET /api/tools/jobs/{job_id}` 輪詢。工具不存在回 404；已有工具工作
+  在跑回 `409 tool_job_in_progress`。**不宣告** `502`／`503`：修訂是背景工作，LLM 沒
   設定或上游失敗都封在工作狀態裡（失敗的 job + 友善訊息 + AI 日誌連結），與
   安裝送出同一套契約。
-  這四條路由都**不宣告** `503 tools_not_configured`：`TOOLS_DIR` 未設定時
+  這三條路由都**不宣告** `503 tools_not_configured`：`TOOLS_DIR` 未設定時
   任何名稱都解析不到工具，404 已經是誠實答案。
 
 ## 工具（KB 網頁安裝器）
@@ -376,7 +357,7 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   （`tools.validate_package`）檢查暫存內容，通過才搬進 `<TOOLS_DIR>/<name>`。
   全程互動記錄進 AI 日誌（`workflow="tool_install"`），失敗時這是主要除錯
   入口。
-- **安裝後的 AI 總結與定版**（`services/tool_meta.py`，設計依據見
+- **安裝後的 AI 總結**（`services/tool_meta.py`，設計依據見
   `docs/web-v4-decisions.md` D40）：搬進正式目錄之後，安裝工作會再跑一次**獨立
   的**短 AI session（`workflow="tool_summary"`，與 `tool_install` 分開，
   日誌連結才不會互相認錯）讀這個套件的檔案，產生「做了什麼／原理／輸入輸出／
@@ -388,17 +369,17 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   之後才呼叫 LLM 的，所以失敗可能發生在**還沒有任何 session** 的前半段，而那時
   「這個 workflow 最新的一筆」是**上一個工具**的總結——寧可沒有連結，也不要把別的
   套件的提示與回應當成這一次的失敗軌跡。sidecar **不是把呼叫端的 dict 直接
-  序列化**，而是照固定 schema（`summary`／`status`／`updated_at`／`llm_log_id`／
+  序列化**，而是照固定 schema（`summary`／`updated_at`／`llm_log_id`／
   `llm_log_process`／`origin`）重建：檔案裡每一個 key 都是後端寫死的字面值，值也
-  一律被收斂到約定的型別（未知 `status` → `draft`、非 int 的 `llm_log_id` →
-  `null`、`origin` 只留看得懂的兩個字串欄位），手動加的多餘 key 下一次寫入就會被
+  一律被收斂到約定的型別（非 int 的 `llm_log_id` → `null`、`origin` 只留看得懂的
+  兩個字串欄位），手動加的多餘 key 下一次寫入就會被
   丟掉（這本來就不是契約）。`llm_log_process` 是**寫下那個 `llm_log_id` 的行程**
   的識別碼：AI 日誌的 id 是每個行程各自從 0 開始的計數器、環狀緩衝重啟即空，而
   這個檔案會把整數永久留著，所以重啟之後同一個 id 指到的是**現在**佔著它的那次
   互動（別的工具的總結，甚至別的 workflow）。`GET .../summary` 因此只在 token 等
   於當前行程時才把 `llm_log_id` 交出去，否則回 `null`（＝沒有可連的紀錄，前端本來
-  就是這樣渲染的）；token 由 `store_summary_meta` 在寫下 id 的同一個動作裡蓋章，
-  定版／解除定版的重寫則**原樣沿用**磁碟上的那一組，絕不重新蓋章。三個可能帶操作者／LLM 文字的**值**（`summary`、`origin.openapi_url`、
+  就是這樣渲染的）；token 由 `store_summary_meta` 在寫下 id 的同一個動作裡蓋章。
+  三個可能帶操作者／LLM 文字的**值**（`summary`、`origin.openapi_url`、
   `origin.instructions`）一律過 `redact_known_secrets` 且**遮蔽失敗就不寫**——
   而這道遮蔽是這個檔案**唯一**的防線，不是「反正後面還有一關」。（舊版本這裡寫
   「sidecar 之後會被修訂流程複製進暫存目錄接受『檔案不得內嵌秘密值』檢查」——那不
@@ -425,11 +406,7 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   這個檔案允許你手動編輯，所以讀寫**兩端**都會把落單的 Unicode surrogate
   （`"\ud800"` 是合法 JSON，但不能編成 UTF-8）換成 U+FFFD——否則它會在
   GET 回應序列化時炸成 500。
-  總結有 `draft`／`final`（定版）兩種狀態；定版後 `regenerate` 一律
-  `409 tool_finalized`，要先解除定版——而且**定版後的總結永遠不會被覆寫**，連
-  在 LLM 產生期間才被定版的那一次也會在寫檔前放棄（「定版」與「寫入總結」兩段
-  read-modify-write 由 `tools._META_LOCK` 互斥，否則兩邊各讀到 `draft` 就會把定版
-  蓋掉）。餵給模型的內容排除 `.env` 的**值**（只給 key 名）與 sidecar 自己，
+  餵給模型的內容排除 `.env` 的**值**（只給 key 名）與 sidecar 自己，
   並且**先放套件本身（`tool.json`、實作檔）、後放安裝脈絡**：提示總量受
   `LLM_PROMPT_BUDGET_TOKENS` 限制，這個順序讓截斷先吃背景資訊，模型不會在小預算
   下拿到零份套件內容然後憑空編造說明。
@@ -486,21 +463,13 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
     （run_shell 以本服務權限執行、v1 不做沙箱隔離——見下方「安全立場」）。因此
     **某個套件的 AI 修訂正在進行時，請不要新增或編輯該套件的 `.env`**；要換憑證就等
     修訂結束再改（完整裁決見 repo 根目錄 `裁決紀錄.md` #6）。
-  - 修訂**工作**開工前會用嚴格讀取器再確認一次定版狀態：已定版拒絕（`tool_finalized`
-    的同一組訊息），**sidecar 讀不出可信狀態**（壞掉、被手改成不是 JSON、讀取被拒）
-    也拒絕，用的是換裝前那道閘的同一條訊息（兩種補救分開：修好／移除損壞的 sidecar
-    vs. 解除定版）。同一把嚴格尺放在**工作**這一側而不是路由：換裝前那關本來就會拒同
-    一種檔案，不先擋掉就是白燒一整場多輪 session、還佔住「一次只跑一個」的名額；路由
-    的入口檢查刻意維持寬鬆版本（路由回答的是資源目前**已知**的狀態，猜錯的代價只是
-    這個拒絕改以工作結果呈現）。
   - 模型**不能改名**：回報的 `tool_name` 必須等於被修訂的套件名，否則整次修訂作廢
     （`tool_name` 決定的是「要替換哪一包」，不是模型的自由欄位）。
   - 換裝是「舊包改名成隱藏備份 → 新包**以單一 `os.rename` 就位** → 成功刪備份／
     失敗把備份改回來」：驗證不過、原套件中途被刪、就位失敗，**都不會**動到正在
     服役的那一包（`rename` 失敗代表什麼都沒搬，名字仍然空著，備份一定回得去；
     `shutil.move` 會退化成複製，半套目錄佔住名字就連還原都做不到）。修訂成功之後
-    同樣會 best-effort 重新產生總結（狀態回到 `draft`，並沿用原本 sidecar 記下的
-    安裝出處）。
+    同樣會 best-effort 重新產生總結，並沿用原本 sidecar 記下的安裝出處。
   修訂與安裝共用同一張工作表，**同一時間只允許一個工具工作**（任何 queued／
   running 的工作都會擋下新的），輪詢端點也是同一個；**同步的「重新產生總結」
   也佔同一個名額**（見上面該路由），所以三者彼此互斥。輪詢不到工作時的 404 訊息

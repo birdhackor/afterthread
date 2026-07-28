@@ -52,13 +52,12 @@ from afterthread.schemas import (
     ToolReviseRequest,
     ToolSummary,
     ToolSummaryDetail,
-    ToolSummaryStatusUpdate,
     ToolUpdateRequest,
 )
 from afterthread.services import llm_log, tool_builder, tool_meta
 from afterthread.services import tools as tools_service
 from afterthread.services.llm import LLMNotConfiguredError, LLMUpstreamError
-from afterthread.services.tools import _NAME_RE, _SUMMARY_STATUSES
+from afterthread.services.tools import _NAME_RE
 
 router = APIRouter(prefix="/tools", tags=["tools"])
 
@@ -132,28 +131,12 @@ _INSTALL_IN_PROGRESS_RESPONSE: dict[int | str, dict[str, Any]] = {
     }
 }
 
-# The three summary conflicts (D40). All USER-facing (rendered by the 工具
-# page), hence zh-TW, and all distinct CODES so the FE can branch without
-# string-matching a message:
-#
-# * `summary_missing` -- PATCH tried to 定版 a tool that has no sidecar yet.
-#   Deliberately a 409, not a 404: the TOOL exists, there is just nothing to
-#   freeze, and the fix (產生總結) is a different action from "wrong tool";
-# * `tool_finalized` -- a regenerate or a revise on a 已定版 package. Freezing
-#   AI iteration is exactly what 定版 means, so the answer is a conflict telling
-#   the user to unfreeze first, never a silent regeneration or revision;
-# * `tool_job_in_progress` -- an install/revise job is queued or running. A
+# A summary operation conflicts when an install/revise job is queued or running. A
 #   promote MOVES a package directory into place, so touching a package's
 #   sidecar across that swap races a directory being replaced. A NEW code
 #   rather than reusing `install_in_progress`: that one is the install FORM's
 #   conflict with its own pinned FE branch, and this one can be raised by a job
 #   the user did not start from this control.
-_SUMMARY_MISSING_CODE = "summary_missing"
-_SUMMARY_MISSING_MESSAGE = "尚無總結可定版"
-
-_TOOL_FINALIZED_CODE = "tool_finalized"
-_TOOL_FINALIZED_MESSAGE = "總結已定版，請先解除定版再重新產生"  # noqa: RUF001
-
 _TOOL_JOB_IN_PROGRESS_CODE = "tool_job_in_progress"
 _TOOL_JOB_IN_PROGRESS_MESSAGE = "已有工具任務正在進行中，請等待完成"  # noqa: RUF001
 
@@ -172,20 +155,10 @@ def _conflict_response(
     }
 
 
-_SUMMARY_MISSING_RESPONSE = _conflict_response(
-    _SUMMARY_MISSING_CODE, _SUMMARY_MISSING_MESSAGE, "The tool has no summary to finalize"
-)
-
-# ONE 409 slot in OpenAPI, two runtime codes: both AI-iteration operations
-# (regenerate and revise) can conflict either way, and both examples cannot
-# occupy the same status key -- so the declared example names the finalized case
-# and the description names both. Shared by the two routes because it is
-# literally the same pair of answers: "this tool is frozen" and "a tool job is
-# already running".
 _AI_ITERATION_CONFLICT_RESPONSE = _conflict_response(
-    _TOOL_FINALIZED_CODE,
-    _TOOL_FINALIZED_MESSAGE,
-    "The summary is finalized (tool_finalized), or a tool job is running (tool_job_in_progress)",
+    _TOOL_JOB_IN_PROGRESS_CODE,
+    _TOOL_JOB_IN_PROGRESS_MESSAGE,
+    "A tool job is running (tool_job_in_progress)",
 )
 
 
@@ -342,8 +315,7 @@ def _summary_detail(meta: dict[str, Any] | None) -> ToolSummaryDetail:
     manual-editing note) -- so nothing here TRUSTS its types. A hand-written
     ``"llm_log_id": "three"`` must render as a null link, not a 500 on the read
     path, exactly as ``read_tool_meta`` treats an unparseable sidecar as no
-    sidecar. ``status`` is filtered against the registry's own vocabulary so an
-    unknown value can never reach the FE's badge (or, worse, read as 定版).
+    sidecar.
 
     ``llm_log_id`` is additionally filtered by WHOSE id it is. The AI log's ids
     are a per-process counter and its ring is wiped on restart, while the sidecar
@@ -358,7 +330,7 @@ def _summary_detail(meta: dict[str, Any] | None) -> ToolSummaryDetail:
 
     NULLING the id rather than adding an "is it still valid" boolean, for three
     reasons that all point the same way: ``ToolSummaryDetail`` is already a
-    four-field all-nullable shape whose null ``llm_log_id`` means exactly "there
+    three-field all-nullable shape whose null ``llm_log_id`` means exactly "there
     is no record to link", the FE already renders precisely that (no 查看 AI 日誌
     anchor), and shipping the integer alongside a false flag would hand a client
     an id that resolves -- to the wrong interaction -- and make every consumer
@@ -375,13 +347,11 @@ def _summary_detail(meta: dict[str, Any] | None) -> ToolSummaryDetail:
     """
     data = meta or {}
     summary = data.get("summary")
-    status = data.get("status")
     updated_at = data.get("updated_at")
     log_id = data.get("llm_log_id")
     from_this_process = data.get("llm_log_process") == llm_log.process_token()
     return ToolSummaryDetail(
         summary=summary if isinstance(summary, str) else None,
-        status=status if isinstance(status, str) and status in _SUMMARY_STATUSES else None,
         updated_at=updated_at if isinstance(updated_at, str) else None,
         # `bool` is an `int` subclass; excluding it keeps a stray `true` from
         # rendering as a link to log record 1.
@@ -399,7 +369,7 @@ def _summary_detail(meta: dict[str, Any] | None) -> ToolSummaryDetail:
     responses=_TOOL_NOT_FOUND_RESPONSE,
 )
 async def get_tool_summary(name: ToolName) -> ToolSummaryDetail:
-    """One tool's AI summary and its draft/final status.
+    """One tool's AI summary.
 
     A tool with no sidecar is an all-null 200, NOT a 404 (see
     ``ToolSummaryDetail``): the resource being addressed is the tool's summary,
@@ -411,48 +381,6 @@ async def get_tool_summary(name: ToolName) -> ToolSummaryDetail:
     """
     directory = await run_in_threadpool(_existing_package_dir, name)
     if directory is None:
-        raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
-    return _summary_detail(await run_in_threadpool(tools_service.read_tool_meta, directory))
-
-
-@router.patch(
-    "/{name}/summary",
-    response_model=ToolSummaryDetail,
-    responses={**_TOOL_NOT_FOUND_RESPONSE, **_SUMMARY_MISSING_RESPONSE},
-)
-async def update_tool_summary_status(
-    name: ToolName, payload: ToolSummaryStatusUpdate
-) -> ToolSummaryDetail:
-    """定版 / 解除定版 one tool's summary; returns the updated sidecar.
-
-    The three registry outcomes map straight onto the three answers:
-    ``not_found`` (bad name, missing package, an internal symlink alias, feature
-    off, or the rewrite failed) -> the same fixed 404 every other tool route
-    uses; ``no_meta`` -> 409 ``summary_missing``, since the tool exists but has
-    nothing to freeze; ``ok`` -> the sidecar re-read from disk, so the response
-    reports exactly what the next GET would rather than an optimistic echo
-    (mirroring ``update_tool``'s re-scan discipline, including its
-    racing-delete 404).
-
-    "Nothing to freeze" covers BOTH no sidecar and a sidecar whose summary is
-    absent/empty -- one 409, because they are the same answer to the user.
-    Finalizing an empty summary is not a harmless no-op: it then blocks
-    ``regenerate`` with ``tool_finalized``, so the tool ends up frozen around
-    text that was never written. 解除定版 (``status: "draft"``) is never gated
-    this way; the escape hatch has to work unconditionally.
-    """
-    outcome = await run_in_threadpool(tools_service.set_summary_status, name, payload.status)
-    if outcome == "not_found":
-        raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
-    if outcome == "no_meta":
-        raise HTTPException(
-            status_code=409,
-            detail={"code": _SUMMARY_MISSING_CODE, "message": _SUMMARY_MISSING_MESSAGE},
-        )
-    directory = await run_in_threadpool(_existing_package_dir, name)
-    if directory is None:
-        # The write landed but the package vanished before the re-read (a racing
-        # delete). The resource is gone, so the honest answer is the same 404.
         raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
     return _summary_detail(await run_in_threadpool(tools_service.read_tool_meta, directory))
 
@@ -477,10 +405,9 @@ async def regenerate_tool_summary(name: ToolName) -> ToolSummaryDetail:
     from ``routers.ai``. The installer's asynchronous, job-shaped contract stays
     what it is precisely because a builder session cannot fit in a request.
 
-    Two gates run before the LLM is touched, both cheap and both refusing rather
-    than doing something surprising: a 已定版 summary is frozen by definition
-    (409 ``tool_finalized``), and a queued/running job means a package directory
-    may be swapped underneath us mid-promote (409 ``tool_job_in_progress``).
+    Before the LLM is touched, a queued/running job is refused because a package
+    directory may be swapped underneath us mid-promote (409
+    ``tool_job_in_progress``).
 
     The job gate TAKES a reservation rather than merely asking (R7-3), and the
     difference is what makes it a gate at all: this handler then awaits a full
@@ -492,13 +419,6 @@ async def regenerate_tool_summary(name: ToolName) -> ToolSummaryDetail:
     the duration instead; the reservation is released in the ``finally`` below on
     every path, success or exception. The 409 the caller sees is unchanged.
 
-    The finalize gate is NOT left at check-then-act, because there the loser
-    would be the frozen summary itself: a PATCH landing while the generation
-    awaits the LLM used to see its text overwritten anyway. ``_store_meta``
-    re-checks at write time and answers ``StoreRefusal.FINALIZED``, which maps
-    HERE to the SAME 409 ``tool_finalized`` -- one refusal, one code, whichever
-    side of the await the user's 定版 arrived on.
-
     A generation that produced text but STORED nothing (``regenerate_summary``
     -> None: the package vanished mid-request, or the sidecar write was refused)
     is a 404 rather than a 200, so this route can never report a summary that
@@ -508,11 +428,6 @@ async def regenerate_tool_summary(name: ToolName) -> ToolSummaryDetail:
     directory = await run_in_threadpool(_existing_package_dir, name)
     if directory is None:
         raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
-    if await run_in_threadpool(tools_service.summary_status, directory) == "final":
-        raise HTTPException(
-            status_code=409,
-            detail={"code": _TOOL_FINALIZED_CODE, "message": _TOOL_FINALIZED_MESSAGE},
-        )
     reservation = tool_builder.reserve_sync_operation()
     if reservation is None:
         raise HTTPException(
@@ -530,15 +445,6 @@ async def regenerate_tool_summary(name: ToolName) -> ToolSummaryDetail:
         # exit including the two raises above -- a reservation that outlived its
         # request would wedge the single flight for the life of the process.
         tool_builder.release_sync_operation(reservation)
-    if meta is tool_meta.StoreRefusal.FINALIZED:
-        # 定版 landed while we were awaiting the LLM. The generated text was
-        # deliberately NOT written (see _store_meta), so the answer is the same
-        # conflict the up-front gate gives -- not the 404 below, which would tell
-        # the user their tool disappeared.
-        raise HTTPException(
-            status_code=409,
-            detail={"code": _TOOL_FINALIZED_CODE, "message": _TOOL_FINALIZED_MESSAGE},
-        )
     if meta is None:
         # The generation ran but nothing was stored: the package vanished under
         # us (a racing delete), or the sidecar write was refused (the ghost
@@ -569,15 +475,11 @@ async def revise_tool(name: ToolName, payload: ToolReviseRequest) -> ToolInstall
     That 503 has no counterpart here: with TOOLS_DIR unset no name resolves, so
     this route's existence gate already answers 404.
 
-    Three refusals, in the order that spends the least:
+    Two refusals, in the order that spends the least:
 
     * 404 -- the tool does not exist, resolved through the SAME helper every
       summary route uses, so an internal symlink alias is refused here too (a
       revise addressed through an alias would REPLACE the real package);
-    * 409 ``tool_finalized`` -- 定版 freezes AI iteration on the tool by
-      definition, so a revise is refused until it is unfrozen, exactly as a
-      regenerate is. ``run_revise`` re-checks this itself: this gate is a
-      microsecond stale by the time the job starts;
     * 409 ``tool_job_in_progress`` -- taken from ``start_revise_job`` returning
       None rather than from an ``any_job_active()`` pre-check. Both express the
       same rule (one tool job at a time), but the None return decides it INSIDE
@@ -588,11 +490,6 @@ async def revise_tool(name: ToolName, payload: ToolReviseRequest) -> ToolInstall
     directory = await run_in_threadpool(_existing_package_dir, name)
     if directory is None:
         raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
-    if await run_in_threadpool(tools_service.summary_status, directory) == "final":
-        raise HTTPException(
-            status_code=409,
-            detail={"code": _TOOL_FINALIZED_CODE, "message": _TOOL_FINALIZED_MESSAGE},
-        )
     job_id = tool_builder.start_revise_job(name, payload.feedback)
     if job_id is None:
         raise HTTPException(

@@ -22,7 +22,7 @@ A tool package is a directory ``<tools_dir>/<name>/`` holding:
 * an OPTIONAL ``.env`` (``KEY=VALUE`` lines) holding THAT tool's own secrets
   (e.g. a KB API key), which are injected into the subprocess environment;
 * an OPTIONAL ``.ai_meta.json`` sidecar (D40) holding the AI-written summary of
-  the package and its draft/final status. It is backend-authored metadata, NOT
+  the package. It is backend-authored metadata, NOT
   part of the executable contract: nothing in the runtime reads it, so a missing
   or corrupt one only empties the summary panel (see ``_AI_META_FILENAME``).
 
@@ -145,7 +145,7 @@ _PARAMETERS_SCHEMA_MAX_BYTES = 16 * 1024
 _ENV_FILE_MAX_BYTES = 64 * 1024
 
 # The per-package AI sidecar (D40): the summary an LLM writes about the package
-# after a successful install, plus its draft/final status. DOT-PREFIXED on
+# after a successful install. DOT-PREFIXED on
 # purpose -- that single leading character is what makes the sidecar fit the
 # EXISTING conventions instead of needing four new special cases:
 #
@@ -310,14 +310,6 @@ _RESERVED_AT_EVERY_DEPTH: tuple[str, ...] = (_AI_META_FILENAME,)
 # not operator content.
 _OWNER_RW = 0o600
 
-# The only two summary statuses that mean anything. "draft" is what generation
-# writes; "final" (定版) is the operator freezing AI iteration on this tool --
-# revise and regenerate both refuse a finalized package until it is un-finalized.
-# Anything else on disk (a hand-edited sidecar, a future/older shape) reads as
-# "no usable status" rather than being trusted, so the freeze can never be
-# bypassed by writing a garbage value into the file.
-_SUMMARY_STATUSES: tuple[str, ...] = ("draft", "final")
-
 # Cap on the STORED summary text (D40). Generous next to InstallResult's 2000-char
 # progress note because this text is the tool's user-facing DOCUMENTATION -- what
 # it does, how it runs, its inputs/outputs and limits -- and it is rendered on
@@ -392,7 +384,7 @@ class _PackageScan:
     from its manifest and refuses a PATCH. ``error`` remains "why this package is
     not executable", which is the meaning ``validate_package`` gates an install on;
     folding an advisory into it would have made an install fail for something that
-    breaks nothing. ``_listed_row`` is where the two meet the UI's single field.
+    breaks nothing. ``list_tools`` is where the two meet the UI's single field.
     """
 
     name: str
@@ -763,8 +755,7 @@ def _effective_enabled(state: _EnabledState, manifest: dict[str, Any] | None) ->
 def _read_manifest_object(directory: Path) -> dict[str, Any] | None:
     """The package's ``tool.json`` as a plain object, or None. Never raises.
 
-    The TOTAL reader standing beside ``_scan_package``'s strict one, in the same
-    relation ``read_tool_meta`` has to ``summary_status_or_unknown``: every shape
+    The TOTAL reader standing beside ``_scan_package``'s strict one: every shape
     the scan turns into its own operator-facing ``error`` -- not a readable regular
     file (the one bounded reader's ``O_NOFOLLOW``/``S_ISREG`` gate refuses a
     symlinked or non-regular manifest), past ``_MANIFEST_MAX_BYTES``, not JSON, not
@@ -1177,36 +1168,6 @@ def validate_package(directory: Path, expected_name: str) -> str | None:
 
 # --- AI summary sidecar (D40) ------------------------------------------------
 
-# Serializes every COMPOUND sidecar operation -- the read-check-write sequences
-# ``set_summary_status`` and ``store_summary_meta`` run. Modeled on
-# ``llm_log._FILE_SINK_LOCK``: a lock whose ONLY job is making one
-# read-modify-write FILE sequence atomic w.r.t. other writers of that same file,
-# deliberately NOT any other lock in this module (``_INFLIGHT_LOCK`` /
-# ``_ENV_VALUE_CACHE_LOCK`` guard in-memory registries read on hot paths) and not
-# one borrowed from another module.
-#
-# The race it closes is not theoretical, and the finalize re-check inside
-# ``store_summary_meta`` does NOT close it on its own. Both compound operations
-# run on THREADPOOL workers (every route hops through ``run_in_threadpool``), so
-# a PATCH's ``set_summary_status`` genuinely runs in parallel with a regenerate's
-# store on another worker: both read ``"draft"``, the PATCH writes ``"final"``,
-# and the regenerate then writes its own composed meta carrying the STALE
-# ``"draft"`` plus the new summary -- 定版 silently undone, with the operator's
-# frozen text replaced by the very generation the freeze was meant to stop. Two
-# in-place writers interleaving on the same file is the second half of the same
-# hazard. Holding this lock across BOTH sequences is what makes the re-check
-# mean something: nothing can land between the read and the write.
-#
-# Two invariants keep it safe rather than merely present:
-#
-# * it is NEVER held across an ``await`` -- both acquirers are plain synchronous
-#   functions that callers reach through ``run_in_threadpool``, so the event loop
-#   is never parked on it;
-# * it NEVER nests. ``write_tool_meta`` / ``read_tool_meta`` stay lock-FREE and
-#   are called from INSIDE a hold; only the two compound entry points acquire, and
-#   neither calls the other.
-_META_LOCK = threading.Lock()
-
 
 def _utf8_safe(text: str) -> str:
     """Replace any lone (unpaired) Unicode surrogate in ``text`` with U+FFFD.
@@ -1286,10 +1247,8 @@ def read_tool_meta(directory: Path) -> dict[str, Any] | None:
     ``RecursionError`` is caught next to ``ValueError`` rather than left to
     escape (the same pairing ``llm._parse_json_object`` documents, for the same
     reason): thousands of nested brackets exhaust the interpreter's recursion
-    limit INSIDE ``json.loads``, and ``summary_status`` runs this once per
-    package on every ``list_tools`` scan -- so a single hand-edited or malicious
-    sidecar escaping as an exception would 500 the whole 工具 page, not just its
-    own row.
+    limit INSIDE ``json.loads``. A hand-edited or malicious sidecar must degrade
+    its own summary panel rather than escaping as an exception.
 
     Reads through the ONE bounded, FIFO/symlink-hardened helper -- the cap+1 read
     plus the ``len > cap`` check is how an oversized sidecar is refused without
@@ -1414,10 +1373,9 @@ def _write_package_file_atomic(
     destroyed the instant the open succeeds and only THEN is the new content
     written. Every failure past that point -- ENOSPC, a quota hit, an I/O error,
     a UnicodeEncodeError partway through -- returns False with the sidecar
-    already truncated: the caller is told "did not happen" while a FINALIZED
-    summary the operator explicitly froze is gone. Nothing anywhere can restore
-    it, because the sidecar is the only copy of both the summary and the
-    install's ``origin``.
+    already truncated: the caller is told "did not happen" while the previous
+    summary and the install's ``origin`` are gone. The sidecar is their only
+    durable copy, so nothing anywhere can restore them.
 
     Write-to-temp + ``os.replace`` removes the whole class rather than the
     reported instance: the old content survives EVERY failure mode, and the file
@@ -1516,8 +1474,8 @@ def _write_package_file_atomic(
     is where the guarantee is: everything between a caller's own check and this
     line is real work (a sidecar read, a redactor sweep of the whole tools
     directory, a JSON encode, mkstemp, write, fsync), and a package can be
-    replaced inside it -- after which A's summary, A's origin or A's frozen status
-    would be published into B. Both compound operations above take their identity
+    replaced inside it -- after which A's summary or A's origin would be
+    published into B. Both compound operations above take their identity
     from the resolve that produced ``directory`` and hand it down here unchanged,
     so the comparison spans the whole operation rather than the last few lines of
     it. None means the caller asserts NO identity and the publish is unguarded --
@@ -1659,7 +1617,7 @@ def write_tool_meta(
 ) -> bool:
     """Write the sidecar from the KNOWN SCHEMA, redacting its text. Returns success.
 
-    This does NOT serialize ``meta``. It reads the six fields it understands out
+    This does NOT serialize ``meta``. It reads the five fields it understands out
     of ``meta``, coerces each to the shape the sidecar's contract promises, and
     writes THAT -- so every KEY on disk is a literal from this function and every
     VALUE is one this function chose or refused:
@@ -1670,10 +1628,6 @@ def write_tool_meta(
       either"). Any OTHER type refuses the write: ``summary`` is a string by
       contract, the read path renders anything else as "no summary", and writing
       one would make the file lie about whether a summary exists;
-    * ``status`` -- ``"draft"`` or ``"final"``, anything else ``"draft"``. An
-      unknown value must never survive a write; ``summary_status`` already
-      refuses to trust one on the read side, so persisting it would only keep a
-      dead value alive;
     * ``updated_at`` -- a ``str``, else the write is REFUSED. Every caller stamps
       its own (``_now_iso`` / ``datetime.now``), so a missing or out-of-shape one
       is a caller bug, and inventing a timestamp on their behalf would put a
@@ -1730,8 +1684,8 @@ def write_tool_meta(
     deliberately propagates rather than degrading to unmasked, see
     ``redact_known_secrets``) writes NOTHING and returns False. It is applied to
     the three fields that can carry operator/LLM text and to nothing else,
-    because nothing else CAN: ``status`` is one of two literals chosen above,
-    ``llm_log_id`` is an int, ``llm_log_process`` is an opaque token this backend
+    because nothing else CAN: ``llm_log_id`` is an int,
+    ``llm_log_process`` is an opaque token this backend
     generated for itself, and ``updated_at`` is a machine timestamp its caller
     just produced (no on-disk one ever round-trips -- both callers overwrite it).
 
@@ -1756,7 +1710,7 @@ def write_tool_meta(
     The write itself is ATOMIC (``_write_package_file_atomic``): the previous sidecar
     survives every failure and the file is never observable half-written. See
     that helper for why the truncate-then-write shape was a real data-loss
-    vector for a FINALIZED summary.
+    vector for an existing summary.
 
     ``expected_identity`` is carried STRAIGHT THROUGH to that helper, which checks
     it on the line above ``os.replace``; this function does not read it, and the
@@ -1771,15 +1725,12 @@ def write_tool_meta(
     hand-edited sidecar carries are DROPPED by the next write. Round-tripping
     them was never a contract -- it was a side effect of serializing the caller's
     dict, and it is precisely what let a stray key/value carry unmasked text into
-    the file. The six fields above are the sidecar.
+    the file. The five fields above are the sidecar.
 
     ``llm_log_id`` and ``llm_log_process`` are carried through from ``meta``
-    rather than re-derived, and that is load-bearing for ``set_summary_status``:
-    its round-trip hands back what it just READ, so a 定版 in a LATER process must
-    keep the id's original (now foreign) token. Stamping the current token here
-    would forge freshness onto a stale id -- precisely the confusion the token
-    exists to prevent -- so minting happens at exactly one call site, next to the
-    id itself (``store_summary_meta``).
+    rather than re-derived. Stamping the current token here would forge freshness
+    onto a stale id, so minting happens at exactly one call site, next to the id
+    itself (``store_summary_meta``).
 
     The ``is_dir`` precondition is kept as the EXPLICIT answer to a racing
     ``delete_tool``: a summary landing just after one must not re-create the
@@ -1803,9 +1754,6 @@ def write_tool_meta(
     updated_at = meta.get("updated_at")
     if not isinstance(updated_at, str):
         return False
-    status = meta.get("status")
-    if not (isinstance(status, str) and status in _SUMMARY_STATUSES):
-        status = "draft"
     log_id = meta.get("llm_log_id")
     if not isinstance(log_id, int) or isinstance(log_id, bool):
         log_id = None
@@ -1816,7 +1764,6 @@ def write_tool_meta(
     try:
         payload: dict[str, Any] = {
             "summary": _redacted(summary),
-            "status": status,
             "updated_at": updated_at,
             "llm_log_id": log_id,
             "llm_log_process": log_process,
@@ -1872,7 +1819,7 @@ def write_tool_meta(
 # another lock.
 #
 # What it does NOT cover, stated so it is not read as more than it is: it is an
-# IN-PROCESS lock, exactly like ``_META_LOCK``. A second afterthread process on the
+# IN-PROCESS lock. A second afterthread process on the
 # same tools directory, or an operator editing ``.afterthread-state.json`` by hand (D21's
 # supported action), is not serialized by it and never was -- this app runs as ONE
 # process (the console script serves the API and the UI together) and its only
@@ -1881,8 +1828,8 @@ def write_tool_meta(
 # build, the validation and the ``.env`` copy all run outside it, so a toggle during
 # a revise is answered immediately, as it is today.
 #
-# Two invariants, the same pair ``_META_LOCK`` states: never held across an
-# ``await`` (both acquirers are plain sync functions reached through
+# Two invariants keep it safe: it is never held across an ``await`` (both
+# acquirers are plain sync functions reached through
 # ``run_in_threadpool``), and it NEVER nests -- ``write_package_state`` /
 # ``carry_package_state`` / ``_write_package_file_atomic`` are all lock-FREE and are
 # called from INSIDE a hold.
@@ -2055,279 +2002,6 @@ def _copy_foreign_state_file(source: Path, destination: Path) -> bool:
     return True
 
 
-def _narrowed_summary_status(meta: dict[str, Any] | None) -> str | None:
-    """The trustworthy ``status`` inside an ALREADY-READ sidecar meta, or None.
-
-    Pure, and shared by both readers below so the narrowing exists ONCE: a meta we
-    could not read at all, one without a ``status``, and one whose ``status`` is
-    not in ``_SUMMARY_STATUSES`` all collapse to None here, and each reader then
-    decides what that None MEANS to it. Extracted (R4-2) so
-    ``summary_status_or_unknown`` can hand its caller the very meta it judged
-    without reading the file a second time to get it.
-    """
-    if meta is None:
-        return None
-    status = meta.get("status")
-    return status if isinstance(status, str) and status in _SUMMARY_STATUSES else None
-
-
-def summary_status(directory: Path) -> str | None:
-    """The package's summary status (``"draft"``/``"final"``), or None.
-
-    None covers every "no trustworthy status" case at once: no sidecar, an
-    unreadable/corrupt one, or a ``status`` that is not one of the two known
-    values (see ``_SUMMARY_STATUSES`` for why an unknown value must not be
-    trusted rather than passed through). Called once per package by
-    ``list_tools`` so the 工具 page can badge every row without an N+1 of
-    per-tool summary requests.
-    """
-    return _narrowed_summary_status(read_tool_meta(directory))
-
-
-# ``summary_status_or_unknown``'s third answer: "there IS a sidecar and we could
-# not get a trustworthy status out of it". Deliberately NOT a member of
-# ``_SUMMARY_STATUSES``, so it can never be mistaken for something a sidecar
-# actually holds -- every read path narrows to that tuple, so a hand-edited
-# ``"status": "unknown"`` is refused by the narrowing and reaches a caller as this
-# sentinel only because the file could not be trusted, never because it said so.
-# (The two therefore agree anyway: both mean "cannot tell".)
-_SUMMARY_STATUS_UNKNOWN = "unknown"
-
-
-def summary_status_or_unknown(directory: Path) -> tuple[str | None, dict[str, Any] | None]:
-    """``(status, meta)`` for the callers that must not guess (R3-2, R4-2, R6-3).
-
-    The same two real answers (``"draft"`` / ``"final"``), but the None that
-    ``summary_status`` folds every failure into is SPLIT in two:
-
-    * None -- there is DEFINITIVELY no sidecar (the ``lstat`` said ENOENT). This
-      is the only case where "not finalized" is a fact rather than a guess;
-    * ``_SUMMARY_STATUS_UNKNOWN`` -- a sidecar IS there and we cannot trust what
-      it says: the bounded reader declined it (a symlink, a FIFO, ``chmod 000``,
-      EIO on a failing disk), it is over the cap, it is not JSON, it is not an
-      object, or its ``status`` is not one of ``_SUMMARY_STATUSES``.
-      ``write_tool_meta`` produces NONE of those shapes, so every one of them
-      means the file was hand-edited or damaged -- and "we could not read it" is
-      not evidence of "not finalized".
-
-    ``summary_status``'s own contract is deliberately UNCHANGED, and this is an
-    ADDITIONAL reader rather than a replacement. Its remaining callers genuinely
-    want the total, degrade-to-None behaviour: ``list_tools`` badges a row (a
-    corrupt sidecar must degrade one badge, never 500 the whole 工具 page) and the
-    summary routes -- INCLUDING the revise submit -- decide whether to answer 409
-    without queueing anything (there, guessing "not finalized" costs a regenerate
-    that would REPLACE the unreadable file anyway, or a job that refuses itself).
-    A ROUTE answers about a resource's KNOWN state, and may cheaply guess.
-
-    The two callers here are the two that ACT on the answer:
-    ``_promote_staging_replace``, whose wrong guess is DESTRUCTIVE -- it goes on to
-    delete the very package the sidecar lives in, frozen text included -- and
-    ``tool_builder.run_revise``'s entry gate (R6-3), whose wrong guess is
-    EXPENSIVE: it admits a package whose already-corrupt sidecar makes the promote
-    refusal a foregone conclusion, then spends a full multi-round builder session
-    holding the global single-flight before collecting it, once per retry. Both
-    therefore fail CLOSED on uncertainty, and they report it with the SAME two
-    error strings so one condition never grows two vocabularies.
-
-    The ENOENT-vs-every-other-``OSError`` discrimination is the same one
-    ``tool_builder._read_env_for_values`` makes about the ``.env`` (R2-3), for the
-    same reason: a failure to LOOK is not evidence of absence.
-
-    The ``lstat`` and the read are two syscalls, so a sidecar deleted BETWEEN them
-    answers UNKNOWN rather than None. That direction is the safe one (it refuses),
-    it takes a concurrent delete of the package to reach at all, and the opposite
-    direction -- a sidecar created in between -- simply reports the real status.
-    Both sit in the check-then-act residual class D40 already accepts.
-
-    The SECOND element is the meta this call actually parsed, and it exists so the
-    caller does not have to read the same file again to use its other contents
-    (R4-2). ``_promote_staging_replace`` needs the sidecar's ``origin`` -- the only
-    copy of the OpenAPI url and the operator's install instructions -- and it needs
-    it from a read it can TRUST: a second, total read (``read_tool_meta`` alone,
-    which answers None for absent and unreadable alike) turned a transient EIO into
-    ``origin=None``, after which the swap destroyed the sidecar and the
-    regenerated one carried the loss forever. Handing back what was just judged
-    makes that impossible by construction rather than by a second discrimination
-    kept in step with this one. The entry gate DISCARDS it, and should: minutes
-    pass before the swap acts, so the origin must come from the read the swap
-    itself makes, not from this one.
-
-    The meta is None on BOTH failure answers, deliberately: for ENOENT there is
-    nothing to hand back, and for UNKNOWN the whole verdict is "this file cannot be
-    trusted" -- returning its contents anyway would invite a caller to use what
-    this function just refused to believe.
-    """
-    try:
-        os.lstat(directory / _AI_META_FILENAME)
-    except FileNotFoundError:
-        return None, None
-    except OSError:
-        return _SUMMARY_STATUS_UNKNOWN, None
-    meta = read_tool_meta(directory)
-    status = _narrowed_summary_status(meta)
-    if status is None:
-        return _SUMMARY_STATUS_UNKNOWN, None
-    return status, meta
-
-
-def set_summary_status(name: str, status: str) -> str:
-    """Set the sidecar's ``status`` (定版 / 解除定版). Returns the outcome code.
-
-    Three outcomes, mapped by the router onto three HTTP answers:
-
-    * ``"not_found"`` -- the name is unsafe, the package is missing, the
-      directory is an internal ALIAS, the feature is off (all of them
-      ``_resolve_package_dir_no_alias`` -> None), OR the rewrite itself failed.
-      That last one is folded in DELIBERATELY, exactly as ``set_enabled`` folds
-      every did-not-happen case into one False: from the caller's view the
-      addressable resource did not (usably) change;
-    * ``"no_meta"`` -- there is nothing to freeze. TWO cases, deliberately one
-      answer: the package has no readable sidecar at all, OR it has one whose
-      ``summary`` is absent/empty/whitespace. 定版 means "freeze THIS
-      explanation"; freezing an absent explanation is the same "there is nothing
-      there" as having no sidecar, and it is not harmless -- a finalized empty
-      summary then blocks ``regenerate`` with ``tool_finalized``, so the one
-      action that could FILL it is refused until the user thinks to un-finalize.
-      A distinct 409 rather than a 404: the TOOL exists either way;
-    * ``"ok"`` -- the sidecar now HAS the requested status. Either it was
-      rewritten (a real transition), or it already held that status and nothing
-      was written at all -- see the idempotent-retry rule below.
-
-    IDEMPOTENT RETRY (R7-2): a request whose target status is ALREADY the status
-    on disk returns ``"ok"`` without touching the file, in BOTH directions
-    (final->final and draft->draft). The client that resends a PATCH after a lost
-    response must not be punished for it, and a same-status rewrite has literally
-    nothing legitimate to do -- the write only ever carries ``status`` (already
-    equal) and ``updated_at`` (a fact nobody asked to change).
-
-    What it did instead was violate "finalized text is immutable while
-    finalized". The rewrite goes back through ``write_tool_meta``, which
-    re-redacts every text field against TODAY's secret set -- and that set GROWS
-    (another tool's install registers a new ``.env`` value). So a second
-    final->final PATCH could rewrite the frozen summary the moment some unrelated
-    value happened to appear inside it: the operator froze one explanation and a
-    retry silently replaced part of it with a redaction marker. Refreshing
-    ``updated_at`` on a no-op was the same lie in miniature. The write is
-    RESERVED for actual transitions; both directions are short-circuited for
-    symmetry, since draft->draft has exactly the same nothing to do.
-
-    Ordering is deliberate: the short-circuit sits AFTER the emptiness gate, so a
-    finalized-but-empty sidecar still answers ``"no_meta"`` to a repeat 定版
-    rather than being newly promoted to ``"ok"``. That answer is what this
-    function gives today (the gate already returns before any write), and this
-    fix is about removing a WRITE, not about relaxing a gate.
-
-    The emptiness gate applies ONLY when the target is ``"final"``. Setting
-    ``"draft"`` stays unconditional on purpose: 解除定版 is the escape hatch out
-    of a frozen state, and an escape hatch that can itself be refused is not one.
-
-    That unconditional-ness had a hole (R6-2): ``write_tool_meta`` refuses to
-    write ANY non-``str`` ``summary`` (its own contract), and a hand-corrupted
-    sidecar -- ``{"summary": 123, "status": "final"}``, the sidecar being a
-    plain JSON file the operator is explicitly allowed to hand-edit -- carried
-    that refusal straight through a 解除定版 attempt: the rewrite below got a
-    ``meta`` whose ``summary`` was still the bare ``int``, ``write_tool_meta``
-    returned False, and THIS function's own not-a-real-change fold turned
-    "un-finalize a broken sidecar" into ``"not_found"`` -- 404ing the one
-    mutation that exists to recover from exactly this corruption, with no
-    other way to reach it through the API at all. A non-``str`` summary is now
-    coerced to ``""`` in the rewrite payload before it ever reaches
-    ``write_tool_meta``: the sidecar is ours to rebuild, so a corrupt TYPE
-    degrades to "no summary yet" (the same shape a missing one gets) rather
-    than bricking the STATUS mutation. The escape hatch outranks type
-    strictness for the one field the user cannot repair through the API any
-    other way. This cannot reopen 定版 as a back door: the emptiness gate
-    above already requires a non-empty ``str`` summary BEFORE this coercion
-    ever runs (and returns ``"no_meta"`` first if that fails), so a
-    corrupt-typed summary coerced to ``""`` still cannot be finalized -- it
-    re-hits ``"no_meta"`` on the very next 定版 attempt -- only 解除定版 was
-    ever blocked, and only 解除定版 is fixed. The coercion is also a
-    structural no-op for every ALREADY-valid sidecar (a real ``str`` summary,
-    corrupt or not, is left exactly as read), so this changes nothing for the
-    byte-unchanged common case.
-
-    ``status`` is trusted to be one of ``_SUMMARY_STATUSES``: the PATCH schema's
-    ``Literal`` is the gate, the same way ``set_enabled`` trusts its bool. The
-    rewrite goes through ``write_tool_meta``, so the sidecar is rebuilt from the
-    known schema and re-redacted on the way back out -- a status flip can never
-    un-mask a value that a newly registered secret would now match. It also means
-    any EXTRA key a hand-edited sidecar carried is dropped by this write; see
-    ``write_tool_meta``'s consequence note (round-tripping them was never a
-    contract).
-
-    Resolved through ``_resolve_package_dir_no_alias``: a 定版 addressed at
-    ``tools/alias`` must not freeze the REAL package's summary (see that
-    helper).
-
-    The read-check-write runs entirely under ``_META_LOCK``, which is what makes
-    the emptiness gate and the flip one decision instead of two: this runs on a
-    threadpool worker, and a regenerate's store runs on ANOTHER one, so without
-    the hold the two interleave and one of them writes a state neither ever saw.
-    The RESOLVE stays outside the hold -- it is ordinary path work, not part of
-    the sidecar's read-modify-write, so there is no reason to serialize it.
-
-    What ``_META_LOCK`` does NOT serialize is a revise's promote or a delete: both
-    are DIRECTORY operations that take no sidecar lock (see that lock's own
-    comment for why a file-sequence lock is the wrong instrument for them). So the
-    package this PATCH resolved can be swapped for a same-named one while the read
-    above is in flight, and A's meta -- its text, its status, its origin -- would
-    then be written into B and frozen there, after which B's own summary hook
-    refuses to update the sidecar it does not recognize. The identity is therefore
-    CAPTURED at the resolve, next to the path it describes, and re-checked at the
-    only instant that settles it, the line above ``os.replace``
-    (``_write_package_file_atomic``). A mismatch is a failed write, which this function
-    already folds into ``"not_found"`` -- honest either way: the tool the caller
-    addressed is not the tool at that path any more.
-
-    An unreadable identity (no ``tool.json`` to lstat) is likewise ``"not_found"``,
-    the same "a check that cannot speak must not vouch" rule ``store_summary_meta``
-    and ``_make_handler`` apply. Stated cost, and how it sits with the escape
-    hatch above: 解除定版 stays unconditional on the SIDECAR -- an empty, corrupt
-    or corruptly-TYPED summary can still be un-frozen, which is the whole class
-    that gate was written for -- but a package whose MANIFEST cannot be read is
-    not addressable at all, and that has always been a ``"not_found"`` here (the
-    resolve above answers the same way for a missing directory). Such a package is
-    invalid on the listing, cannot be executed, cannot be revised, and cannot have
-    a summary generated for it (D40 r5 O5-3 accepted that last one); the frozen
-    text on it describes a tool that will not run either way, and deleting it
-    still works.
-    """
-    directory = _resolve_package_dir_no_alias(name)
-    if directory is None:
-        return "not_found"
-    identity = package_identity(directory)
-    if identity is None:
-        return "not_found"
-    with _META_LOCK:
-        meta = read_tool_meta(directory)
-        if meta is None:
-            return "no_meta"
-        if status == "final":
-            summary = meta.get("summary")
-            if not (isinstance(summary, str) and summary.strip()):
-                return "no_meta"
-        # R7-2: the sidecar already holds the requested status, so this is an
-        # idempotent retry and there is nothing to write. Returning BEFORE the
-        # payload is built is the point: the rewrite would re-redact the frozen
-        # text against a secret set that has grown since finalization, and would
-        # refresh updated_at for a change nobody made (see the docstring).
-        if meta.get("status") == status:
-            return "ok"
-        # R6-2: coerce a non-str summary to "" before it ever reaches
-        # write_tool_meta, whose own contract refuses to write one. A no-op
-        # on the "final" branch above (that check already forced summary to a
-        # non-empty str, or returned "no_meta" first) -- see the docstring's
-        # escape-hatch note for why this must fire unconditionally on every
-        # other status rather than only when the write would otherwise fail.
-        if not isinstance(meta.get("summary"), str):
-            meta["summary"] = ""
-        meta["status"] = status
-        meta["updated_at"] = datetime.now(UTC).isoformat()
-        # The identity goes with the write, not before it: the guard belongs on
-        # the line above the publish (see the docstring and _write_package_file_atomic).
-        return "ok" if write_tool_meta(directory, meta, expected_identity=identity) else "not_found"
-
-
 def store_summary_meta(
     directory: Path,
     *,
@@ -2336,302 +2010,51 @@ def store_summary_meta(
     llm_log_id: int | None,
     expected_identity: tuple[int, int, int] | None,
 ) -> tuple[str, dict[str, Any] | None]:
-    """Merge a freshly generated summary into the sidecar. Returns ``(outcome, meta)``.
+    """Merge a freshly generated summary into the sidecar.
 
-    The OTHER compound sidecar operation, and ``set_summary_status``'s
-    counterpart: the whole read (status/origin inheritance) + finalize refusal +
-    write + post-write re-read happens under ONE ``_META_LOCK`` hold, so a 定版
-    can neither land inside it nor be undone by it. It lives HERE rather than in
-    ``tool_meta`` because the lock and the sidecar helpers do
-    (``tool_meta._store_meta`` is now a thin mapping wrapper); putting the
-    critical section next to the file it protects is what keeps "every compound
-    sidecar operation is serialized" checkable by reading one module.
-
-    Three outcomes, so the caller can tell "you cannot do this" from "it did not
-    work" -- the distinction the route turns into a 409 vs a 404:
-
-    * ``("finalized", None)`` -- the status on disk is ``final``. NOTHING is
-      written. Both regeneration callers check 定版 UP FRONT, but that check
-      happens before an ``await`` that lasts as long as an LLM round trip and a
-      PATCH can finalize inside that window, so the up-front gate is a courtesy
-      and THIS is the one that holds. Preserving the ``final`` status while still
-      overwriting the summary TEXT (what this did before) satisfied the letter of
-      定版 and broke its meaning: the operator froze an explanation and got a
-      different one;
-    * ``("not_stored", None)`` -- the write was refused (the package is no longer
-      the one this summary was generated for, a fail-closed redaction, the ghost
-      guard on a racing delete, a symlinked/non-regular sidecar, a payload past
-      the size cap), or it landed and the re-read still found nothing (a delete
-      racing in behind it). One did-not-happen answer, because from the caller's
-      view nothing usable is on disk either way;
-    * ``("ok", meta)`` -- the sidecar AS IT NOW READS BACK. Re-reading rather
-      than returning the composed dict is not belt-and-braces: ``write_tool_meta``
-      rebuilds the file from its OWN schema (a narrowed ``origin``, coerced
-      scalars, redacted text), so what we asked for and what landed genuinely
-      differ in shape, and the synchronous route promises "what the next GET
-      would show".
-
-    Past the finalize gate, two fields are PRESERVED from what is already on disk
-    rather than reset:
-
-    * ``status`` -- a regenerate on a 草稿 stays 草稿. With ``final`` refused
-      above, ``"draft"`` is the only value that can actually survive today; the
-      preserve-known-else-draft shape is kept anyway so this stays correct if the
-      vocabulary ever grows, and so an unknown value on disk is never persisted;
-    * ``origin`` -- only the install captures the OpenAPI URL and instructions,
-      so a caller with nothing to pass (``origin=None``) must inherit them
-      instead of erasing the only copy.
-
-    ``summary`` is REDACTED, stripped and capped HERE, and this is the only place
-    that happens (D40 r4). It used to happen in ``ToolSummaryResult``'s pydantic
-    validator -- i.e. inside ``generate_structured``'s ``model_validate``, which
-    runs ON THE EVENT LOOP, while ``redact_known_secrets``'s provider sweeps the
-    tools directory (an ``iterdir`` + a ``stat`` per package, plus a ``.env`` read
-    on every cache miss). That is blocking filesystem work on the loop, in a
-    feature whose every other filesystem step is deliberately hopped onto a
-    threadpool worker; THIS function is already on one, and already the sidecar's
-    write path. The ORDER is preserved exactly as it was: redact while the text is
-    still WHOLE, then strip, then slice. Each step earns its place --
-    * redact first, because a value straddling the slice edge must be masked
-      before the cut, or the cut leaves an interior fragment no later pass can
-      match;
-    * strip after the redaction, not before, because the redactor matches the
-      REGISTERED value against untouched text: a secret whose value carries edge
-      whitespace (a hand-edited ``.env`` with a quoted ``" secret-token "``)
-      stops matching the moment ``strip`` eats that edge, and the rest of the
-      value would ride to disk unmasked;
-    * the cut last, a bare slice with no marker, exactly as before.
-
-    ``write_tool_meta`` still redacts every text value it writes and remains the
-    LAST choke point for other callers (``set_summary_status``'s round-trip, any
-    future programmatic write); running over already-masked text is a no-op, since
-    the marker carries nothing to match. A redaction FAILURE here is the same
-    fail-closed refusal it is there -- ``("not_stored", None)``, never an
-    exception -- because ``regenerate_summary``'s route maps this return, and a
-    raised provider error would turn a 404 into a 500.
-
-    ``expected_identity`` is the caller's ``package_identity`` of ``directory``,
-    taken when it RESOLVED that directory, and carried down to the line above
-    ``os.replace``. It is required rather than defaulted because the whole
-    hazard is a caller forgetting it: a summary generation resolves the package,
-    spends an LLM round trip, and then writes -- so a delete plus a reinstall of
-    the same NAME inside that window would otherwise persist package A's summary,
-    and A's origin, into package B. Refusing is ``("not_stored", None)``: the
-    generation did not happen as far as any package on disk is concerned, which
-    is the answer a vanished package already produces and which both callers
-    already handle (the install hook swallows it, the synchronous route folds it
-    into its did-not-happen 404). None is likewise a refusal -- the same
-    "a check that cannot speak must not vouch" rule the revise flow (D40 P3b r11)
-    and ``_make_handler`` apply to this identity, and one that costs nothing real:
-    a package with no readable ``tool.json`` cannot be executed or revised either.
-
-    Where the COMPARISON happens moved in R6-2: it used to be the last line of
-    this function, which read as "the last instant" but is not one --
-    ``write_tool_meta`` still had a redactor sweep of the tools directory, a JSON
-    encode, an mkstemp, a write and an fsync to do before it published anything,
-    and a promote takes no ``_META_LOCK``, so a package swapped inside THAT window
-    received this summary. The identity is now handed down and checked on the line
-    above ``os.replace``. What stays here is the None refusal: "the caller has no
-    identity" is a property of the call rather than a race, so it is answered
-    where the vocabulary for it lives, and in the same slot it always occupied so
-    the outcome ORDER is unchanged (a finalized package still answers
-    ``finalized``, a redaction failure still answers ``not_stored``).
-
-    The stated cost of that order: if the package that TOOK the name is itself
-    finalized, the caller is told ``finalized`` rather than ``not_stored``.
-    Nothing is written either way, and both mean "your summary was not stored";
-    only the code differs, and it is honest about the package that now holds the
-    name.
-
-    ``llm_log_process`` is stamped HERE, and only here, from
-    ``llm_log.process_token()``. It is the token of the process whose id space
-    ``llm_log_id`` was drawn from, and taking it at the store rather than
-    accepting it as a parameter is what makes that structurally true instead of
-    merely conventional: the caller read the id from ``last_record_id_for_workflow``
-    microseconds ago, in THIS process, so there is no arrangement of arguments
-    that can pair an id with someone else's token. It is stored only WITH an id
-    -- no id, no token -- so the two fields can never disagree about whether
-    there is a link to vouch for.
+    The existing sidecar is re-read at store time because its ``origin`` is the
+    only durable copy of the install URL and instructions. The package identity
+    captured before generation is still checked on the line above publication,
+    so a delete and same-name reinstall during the LLM round trip cannot receive
+    the old package's summary or origin. The post-write read returns exactly what
+    the next GET will serve after schema narrowing and redaction.
     """
-    with _META_LOCK:
-        existing = read_tool_meta(directory) or {}
-        if existing.get("status") == "final":
-            return ("finalized", None)
-        # AFTER the finalize gate, so a refusal stays a refusal (the 409 outranks
-        # a redaction failure's 404) and a frozen package costs no sweep at all.
-        # Inside the hold introduces NO new locking property: write_tool_meta runs
-        # the identical redaction under this same lock a few lines down.
-        try:
-            summary = redact_known_secrets(summary).strip()[:_TOOL_SUMMARY_CAP]
-        except Exception:
-            # Fail-closed, matching write_tool_meta's own guard: nothing is
-            # written rather than something unmasked (see redact_known_secrets --
-            # the LIVE path propagates a provider failure instead of degrading).
-            return ("not_stored", None)
-        status = existing.get("status")
-        if not (isinstance(status, str) and status in _SUMMARY_STATUSES):
-            status = "draft"
-        meta: dict[str, Any] = {
-            "summary": summary,
-            "status": status,
-            "updated_at": datetime.now(UTC).isoformat(),
-            "llm_log_id": llm_log_id,
-            "llm_log_process": llm_log.process_token() if llm_log_id is not None else None,
-            "origin": origin if origin is not None else existing.get("origin"),
-        }
-        # "Nothing to assert" is refused here; "is it still the same package" is
-        # asserted at the publish, where the answer cannot go stale before it is
-        # used (see this function's docstring and _write_package_file_atomic).
-        if expected_identity is None:
-            return ("not_stored", None)
-        if not write_tool_meta(directory, meta, expected_identity=expected_identity):
-            return ("not_stored", None)
-        stored = read_tool_meta(directory)
-        return ("ok", stored) if stored is not None else ("not_stored", None)
-
-
-def _listed_summary_status(directory: Path) -> str | None:
-    """``summary_status`` for one LISTED row -- None when the row is an ALIAS.
-
-    ``tools/<alias> -> tools/<real>`` is an internal symlink, and every by-name
-    summary route refuses it (``_resolve_package_dir_no_alias``: a GET/PATCH/
-    regenerate addressed at the alias must not read or freeze the REAL package's
-    sidecar). The LISTING was the one place still reading through it: the scan
-    resolves nothing, so ``summary_status(scan.directory)`` followed the link and
-    reported REAL's status on the alias row -- a row whose 已定版 badge no summary
-    request can then reproduce, since every one of them 404s the name. The badge
-    was describing a different package than the row it sat on.
-
-    None instead, which is exactly what the row would report if the alias were an
-    ordinary package with no sidecar -- the same "nothing to show here" the
-    refusing routes give. The row itself is unaffected and stays ``valid=False``
-    (``_scan_package`` refuses a symlinked package directory outright), so this
-    only removes the read-through, not the row.
-
-    Answers about the package AT THIS PATH, which is not the same thing as "the
-    package the rest of the row describes" -- ``_listed_row`` is what makes those
-    one and the same, by re-checking the scan's identity around this call.
-    """
-    if directory.is_symlink():
-        return None
-    return summary_status(directory)
-
-
-# How many times ``_listed_row`` may take its two reads of one package before it
-# gives up on pairing them. The first pass answers every ordinary listing; the
-# second exists for the swap this bound is here to survive; the third for a swap
-# landing inside that retry. A package being replaced faster than it can be read
-# twice is one this call has nothing true to say about, and an UNBOUNDED retry
-# would put a hang on the one request the whole 工具 page waits for.
-_LISTING_SCAN_ATTEMPTS = 3
-
-
-def _listed_row(scan: _PackageScan) -> dict[str, Any]:
-    """One LISTING row whose every field describes ONE package instance (R9-2).
-
-    A row is built from TWO reads -- the manifest scan (name/description/enabled/
-    valid/error) and the sidecar read behind ``summary_status`` -- and they used
-    to be joined by PATH alone: ``_scan_all`` materializes every scan first, and
-    only then did the comprehension re-read each package's sidecar. A revise
-    promote landing between them stitched package A's description into a row
-    carrying package B's badge, and that mixture is worse than either half being
-    stale: the 工具 page derives a row's instance identity from `name` +
-    `description` (`toolInstanceKey`), so A's description keeps the panel mounted
-    and its query key unchanged while the badge beside it is B's -- an operator
-    with unsent feedback about A sees nothing change and submits it against B.
-    (NOT 裁決紀錄 #7, where the two descriptions are byte-identical and the
-    ambiguity is unavoidable; here they DIFFER, and the torn row is what hides
-    it.)
-
-    The pairing is the identity ``_scan_package`` already captured on the line
-    above the manifest read (R7-1, ``_PackageScan.identity``), re-checked AFTER
-    the sidecar read: finding it unmoved means no install or revise landed across
-    EITHER read, so both describe the same instance. A mismatch
-    re-scans that one package and takes both reads again, so a swap landing
-    mid-listing yields a row that is fully B (the instance that now holds the
-    name) -- never A's manifest beside B's badge.
-
-    A TOGGLE is deliberately outside what this pairing detects, and it is not a
-    hole: since web-v5 P1 a toggle moves no identity, so a switch flipped between
-    the scan's state read and the sidecar read yields a row whose ``enabled`` is
-    one request stale -- the same one-request-stale registry D40 already accepts
-    for the advertisement, and a mixture of one instance's fields, not two.
-
-    Pairing HERE rather than capturing the status inside ``_scan_package``, and
-    the cost is the whole reason: ``enabled_llm_tools`` shares that function and
-    calls it for every package on EVERY capture/enrich/assist-update, so moving
-    the sidecar read into the scan would charge every AI request one extra file
-    read per installed package for a field it never looks at -- or add a flag
-    that makes "the scan is one operation" true only on some calls. The listing
-    pays instead, and pays one ``lstat`` per valid row (measured: the scan's own
-    reads are unchanged, and ``enabled_llm_tools`` issues exactly what it did
-    before).
-
-    Two scans cannot be paired at all and are returned on the first pass:
-    ``scan.identity`` is None on every INVALID scan by convention (the alias row
-    among them, whose status ``_listed_summary_status`` decides without reading
-    anything), and on the valid-but-lstat-failed scan that ``_make_handler``
-    already refuses to run. Neither has an identity that a re-scan could make
-    appear, so retrying could only spin. Their rows are what the two reads saw,
-    exactly as before this function existed.
-
-    Exhausting ``_LISTING_SCAN_ATTEMPTS`` reports ``summary_status`` None -- the
-    SAME "no trustworthy status" answer a missing or corrupt sidecar already
-    gives (``summary_status``), rather than a second vocabulary for "we could not
-    pair one". The other five fields still come from one scan, so the row is
-    still one instance's.
-
-    The row's ``error`` is where the scan's ``error`` and its ``notice`` meet, and
-    the fatal one wins (P1R5-1). Two fields inside, one on the wire: the API shape
-    is fixed (``schemas.ToolSummary``) and this is its one free-text channel to the
-    operator, while the two must stay apart INSIDE because ``validate_package``
-    gates an install on ``error`` alone. A row can therefore now be ``valid=True``
-    with a non-null ``error``, which is new and is exactly one shape: a package
-    holding a file at the state file's name that is not ours. Honest limitation:
-    the 工具 page renders a row's error only when the row is INVALID
-    (``ToolsPage.jsx``), so this note is visible through ``GET /api/tools`` and in
-    the refusal an attempted toggle gets, not on the card -- showing advisories on
-    valid rows is a UI decision of its own (the same shape as P1R4-4's).
-    """
-    paired = False
-    status: str | None = None
-    for attempt in range(_LISTING_SCAN_ATTEMPTS):
-        if attempt:
-            scan = _scan_package(scan.directory)
-        status = _listed_summary_status(scan.directory)
-        if scan.identity is None or _still_the_expected_package(scan.directory, scan.identity):
-            paired = True
-            break
-    return {
-        "name": scan.name,
-        "description": scan.description,
-        "enabled": scan.enabled,
-        "valid": scan.valid,
-        "error": scan.error if scan.error is not None else scan.notice,
-        "summary_status": status if paired else None,
+    existing = read_tool_meta(directory) or {}
+    try:
+        summary = redact_known_secrets(summary).strip()[:_TOOL_SUMMARY_CAP]
+    except Exception:
+        return ("not_stored", None)
+    meta: dict[str, Any] = {
+        "summary": summary,
+        "updated_at": datetime.now(UTC).isoformat(),
+        "llm_log_id": llm_log_id,
+        "llm_log_process": llm_log.process_token() if llm_log_id is not None else None,
+        "origin": origin if origin is not None else existing.get("origin"),
     }
+    if expected_identity is None:
+        return ("not_stored", None)
+    if not write_tool_meta(directory, meta, expected_identity=expected_identity):
+        return ("not_stored", None)
+    stored = read_tool_meta(directory)
+    return ("ok", stored) if stored is not None else ("not_stored", None)
 
 
 def list_tools() -> list[dict[str, Any]]:
     """List every installed package as a UI-facing summary.
 
-    Each entry is ``{name, description, enabled, valid, error, summary_status}``.
-    A broken package (bad JSON, name mismatch, bad schema shape, missing entry
-    file) is included with ``valid=False`` and a safe ``error`` reason, and is
-    never executable; a missing/unset tools dir yields [].
-
-    ``summary_status`` (D40) is read from each package's sidecar HERE rather
-    than through a per-tool request, so the 工具 page can badge 草稿 / 已定版 on
-    every row from the one listing call it already makes. It costs one small
-    bounded read per package, on the same scan that already reads every
-    ``tool.json``; a package with no (or a corrupt) sidecar reports None, and so
-    does an internal ALIAS row (see ``_listed_summary_status``).
-
-    Each row is assembled by ``_listed_row``, which pairs that read with the
-    scan's own identity so a package replaced mid-listing cannot leave a row
-    stitched from two instances.
+    A broken package is included with ``valid=False`` and a safe error reason,
+    but is never executable; a missing or unset tools directory yields [].
     """
-    return [_listed_row(scan) for scan in _scan_all()]
+    return [
+        {
+            "name": scan.name,
+            "description": scan.description,
+            "enabled": scan.enabled,
+            "valid": scan.valid,
+            "error": scan.error if scan.error is not None else scan.notice,
+        }
+        for scan in _scan_all()
+    ]
 
 
 def package_identity(directory: Path) -> tuple[int, int, int] | None:

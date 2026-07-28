@@ -205,19 +205,6 @@ _ERROR_STAGING_TAMPERED = "暫存工作區已被移動或替換，安裝已取�
 # D40 revise-only outcomes. Category-only by the same construction as the install
 # ones above: a fixed zh-TW string, never a path and never a value.
 _ERROR_REVISE_NOT_FOUND = "找不到要修訂的工具（可能已被刪除）。"  # noqa: RUF001
-_ERROR_REVISE_FINALIZED = "總結已定版，請先解除定版再送出修訂。"  # noqa: RUF001
-# The pre-swap 定版 re-check could not get an ANSWER out of the sidecar (R3-2).
-# A DISTINCT string rather than reusing ``_ERROR_REVISE_FINALIZED``, because that
-# one carries an INSTRUCTION -- 解除定版 -- which is exactly wrong here: nothing
-# may be finalized at all, so following it would leave the operator toggling a
-# state that is not the problem while every retry refuses again for a reason the
-# message never named. The two refusals have different remedies (repair or remove
-# a damaged sidecar vs. un-freeze a summary), so they need different messages;
-# this is the same "same refusal point, different actionable cause" split
-# ``_ERROR_REVISE_TARGET_MISSING`` and ``_ERROR_REVISE_TARGET_ALIAS`` already are.
-# Category-only like the rest: it names what could not be determined, never the
-# path and never what the file contained.
-_ERROR_REVISE_SUMMARY_UNREADABLE = "無法確認總結是否已定版（AI 總結側檔讀取失敗），修訂已取消。"  # noqa: RUF001
 # The ``.env`` is READ before the build -- for its VALUES, which have to be
 # registered and exported -- and the FILE itself is copied back into staging after
 # validation (R2-1). Both failure modes refuse the whole revise. UNREADABLE: a
@@ -1486,8 +1473,8 @@ def _remove_reserved_sidecar_path(path: Path) -> None:
     EISDIR). It is not a forged file -- both readers refuse a non-regular one --
     but it would permanently BRICK what that name is for:
     ``_write_package_file_atomic``'s lstat gate refuses to publish over anything
-    non-regular, so at ``.ai_meta.json`` the install hook, every later regenerate
-    and 定版 would fail forever, and at ``.afterthread-state.json`` the package would list
+    non-regular, so at ``.ai_meta.json`` the install hook and every later regenerate
+    would fail forever, and at ``.afterthread-state.json`` the package would list
     INVALID with a toggle that cannot be written either -- on a package the
     operator has no API path to repair. The name is the backend's; nothing of the
     builder's may occupy it in any form.
@@ -1529,14 +1516,13 @@ def _strip_builder_sidecars(staging: Path) -> str | None:
       yet -- ``known_secret_values`` scans installed packages only (it skips the
       dot-prefixed ``.staging`` shell), so the value is unknown for the whole
       build window;
-    * it writes ``.ai_meta.json`` = ``{"summary": "<that same value>", "status":
-      "final"}``. ``validate_package``'s embedded-secret sweep cannot see a secret
-      it does not know, so the package passes;
+    * it writes ``.ai_meta.json`` with that value as the summary.
+      ``validate_package``'s embedded-secret sweep cannot see a secret it does not
+      know, so the package passes;
     * promote moves the whole staging directory, sidecar included;
-    * and then the install hook's OWN protections finish the job for the
-      attacker: ``store_summary_meta`` reads ``status == "final"``, honors 定版,
-      and declines to overwrite -- so the forged, finalized, secret-bearing
-      sidecar is what every later GET/list serves, verbatim, forever.
+    * the install hook is best-effort, so any later summary-generation or storage
+      failure would leave that forged secret-bearing sidecar as the value GET
+      serves.
 
     DELETION, not rejection, is the adjudicated answer, and the distinction is
     real: the PACKAGE may be perfectly good work. The sidecar is decoration the
@@ -1619,7 +1605,7 @@ def _verify_staging_root(staging: Path, base: Path) -> str | None:
     ``_strip_builder_sidecars``'s ``os.walk`` never checked its OWN root for a
     symlink -- R7-1 only prunes a symlink found DURING the walk -- so unchecked it
     would walk every INSTALLED package and delete its ``.ai_meta.json``,
-    destroying finalized summaries and their only origin copies, before
+    destroying summaries and their only origin copies, before
     ``validate_package`` ever ran.
 
     Two independent layers, mirroring the resolve-then-contain house pattern
@@ -1840,15 +1826,8 @@ def _preserve_env_file(
     afterwards costs nothing, and the original file is still the original file
     rather than a rewrite of it. It must run AFTER the target existence/symlink
     checks, because it reads through ``target`` and the caller has to have
-    established that ``target`` is the real installed directory first. It now runs
-    BEFORE the 定版 re-check, which is the point of R4-1: this copy is UNBOUNDED IN
-    TIME (an operator can put an arbitrarily large regular file at ``.env``
-    mid-session), so with it last, a finalization landing DURING the copy was
-    missed by a gate that had already run, and the swap then overwrote a finalized
-    package. The accepted check-then-act residual covers INSTANTS, not a copy of
-    unbounded duration -- moving this ahead of the gate is what keeps the two the
-    same size, and the size ceiling below is what keeps THIS step's own duration
-    bounded (see there).
+    established that ``target`` is the real installed directory first. The size
+    ceiling below keeps this operator-controlled copy bounded.
 
     Both ends are guarded by an ``lstat``, mirroring the pre-write ``lstat``
     ``tools._write_package_file_atomic`` makes and the ``O_NOFOLLOW`` + ``S_ISREG`` gate
@@ -2071,8 +2050,8 @@ def _promote_staging_replace(
 
     Returns ``(origin, error)``: the error is the usual category-only zh-TW string
     (None = the revision is live), and the origin is the OLD sidecar's
-    ``origin`` block, read here rather than by the caller for the reason R4-2
-    gives -- see the 定版 gate below, which is the read it comes from. Both are
+    ``origin`` block, read here immediately before the swap so a long-running
+    revision inherits the latest durable install context. Both are
     None on a refusal, and ``(None, None)`` on a success whose package simply had
     no origin to inherit; the caller only consults the origin after the error is
     None. The ``(value, error)`` shape mirrors ``_read_env_for_values``, the
@@ -2109,7 +2088,7 @@ def _promote_staging_replace(
       package orphaned under a name nothing addresses.
 
     The live ``.env`` is then copied into staging (``_preserve_env_file``) AFTER
-    validation and BEFORE the 定版 gate -- the same slot, for the same reason, as
+    validation -- the same slot, for the same reason, as
     the install's ``_inject_secret_into_env``: ``validate_package`` judges what the
     BUILDER produced (and its embedded-secret gate would reject the live values on
     sight), and the backend's own bytes are layered on top of a package that has
@@ -2130,16 +2109,9 @@ def _promote_staging_replace(
     being handed back: a value is made redactable and recorded in the same breath,
     so no error path can leave one registered with nobody to discard it.
 
-    It runs BEFORE the 定版 gate rather than after it, and the order is the
-    decision (R4-1): the copy is the only pre-swap step whose duration is
-    UNBOUNDED FROM OUTSIDE -- the ceiling above bounds the bytes, but an operator
-    still chooses them -- so with it last, a finalization landing WHILE it ran was
-    invisible to a gate that had already passed, and the swap then destroyed a
-    finalized package. Putting it first costs nothing, because everything it does
-    lands in STAGING, which no other actor reads: if the gate refuses afterwards,
-    the staged ``.env`` dies with the abandoned build. What it depends on --
-    ``target`` being a real, non-symlink installed directory -- is established by
-    the two checks ABOVE it, which stay where they are.
+    Everything it writes lands in STAGING, which no other actor reads. What it
+    depends on -- ``target`` being a real, non-symlink installed directory -- is
+    established by the two checks above.
 
     A package that NEVER had a ``.env`` preserves nothing, and then a
     builder-written one SHIPS -- deliberately, and identically to an install,
@@ -2214,15 +2186,8 @@ def _promote_staging_replace(
     one of them is an INSTANT between two syscalls, which is the property R4-1
     restored by moving the one step that was not (the ``.env`` copy) off the end.
 
-    ONE window is wider than that, and it is a trade taken with its eyes open
-    (R1-1): the 啟用 carry now sits between the 定版 gate and the first rename, so
-    a finalization landing inside a small write + ``fsync`` is missed the way one
-    landing inside the identity lstat always was. What that buys is the toggle
-    window going to ZERO instead of spanning a full scan, a sidecar read and a
-    gate. The asymmetry is why: 定版 is an operator action landing inside OUR
-    bounded write (the same accepted class, one step longer), while the toggle was
-    being reverted by an operation the operator did not connect to it, every time,
-    over a window an LLM session's leftovers made wide.
+    The 啟用 carry stays in the locked tail immediately before the rename, which
+    keeps the toggle window at zero instead of spanning validation and file copies.
     """
     root_error = _verify_staging_root(staging, base)
     if root_error is not None:
@@ -2238,64 +2203,17 @@ def _promote_staging_replace(
         return None, _ERROR_REVISE_TARGET_ALIAS
     if not target.is_dir():
         return None, _ERROR_REVISE_TARGET_MISSING
-    # The live ``.env`` is copied into staging BEFORE the 定版 gate below, and the
-    # order is the fix R4-1 asked for: this is the only pre-swap step that can take
-    # an operator-chosen amount of TIME, and a gate that runs before it cannot see a
-    # finalization that lands during it. Everything it writes goes into STAGING, so
-    # running it early is free -- an abandoned build takes the staged ``.env`` with
-    # it. See ``_preserve_env_file`` for the size ceiling that bounds it and for
-    # why the target checks above are all it depends on.
+    # Copy the live ``.env`` only after the target checks. Everything it writes
+    # goes into staging, so an abandoned build takes the copy with it.
     env_error = _preserve_env_file(
         target, staging, existed_at_start=env_existed_at_start, registered=registered
     )
     if env_error is not None:
         return None, env_error
-    # 定版 is re-checked HERE, at the last moment before the swap, not only at
-    # the entry gates -- the same store-time re-check ``tools.store_summary_meta``
-    # makes for regenerate (D40 r2), and for the same reason at a much longer
-    # timescale: a revise session runs for MINUTES, so a user finalizing during
-    # one is ordinary, not exotic. Without this the swap would replace the whole
-    # package -- including the finalized sidecar's frozen text, which the revise
-    # does not even carry forward (the sidecar is excluded from staging and
-    # regenerated as a draft afterwards), so 定版 would be silently undone by a
-    # session that started before it. The two earlier checks stay where they are:
-    # the ROUTE's (on the TOTAL reader) is what answers 409 without queueing a job
-    # at all, and ``run_revise``'s entry gate (on THIS strict one, R6-3) is what
-    # stops an already-corrupt sidecar from buying a whole session before arriving
-    # here to be refused anyway.
-    #
-    # Through ``summary_status_or_unknown``, not ``summary_status``, and the whole
-    # point is the difference (R3-2): ``summary_status`` folds "no sidecar" and
-    # "there IS one but it is unreadable/corrupt" into the SAME None, so a gate
-    # keyed on an explicit "final" is FAIL-OPEN -- a user finalizes mid-session,
-    # the sidecar then hits a transient read error, and this gate waves the swap
-    # through and destroys the frozen text it exists to protect. UNKNOWN therefore
-    # refuses exactly like "final". The two get DIFFERENT messages because their
-    # remedies differ (see ``_ERROR_REVISE_SUMMARY_UNREADABLE``).
-    #
-    # It is the LAST pre-swap step (R4-1): everything after it is a rename, so the
-    # window between deciding "not finalized" and acting on it is the instant
-    # between two syscalls -- the residual class this module already accepts, and
-    # the size a check-then-act gate has to be to mean anything.
-    #
-    # The SAME read also yields the origin (R4-2), which is why this reader hands
-    # its meta back. The origin -- the OpenAPI url and the operator's original
-    # install instructions -- lives ONLY in this sidecar, and the swap below
-    # destroys it; the post-swap summary inherits it so a revised tool still knows
-    # what it was built from. Reading it separately through the TOTAL
-    # ``read_tool_meta`` (all errors -> None) is what R4-2 found: a transient EIO
-    # answered "no origin", the strict gate then read the file fine, and the swap
-    # published a regenerated sidecar with the only copy of that context gone for
-    # good. One trusted read cannot disagree with itself. There is deliberately no
-    # unreadable-sidecar branch on the origin side either: this gate has already
-    # refused every shape in which the file could not be read, so by the line that
-    # narrows the origin there is nothing left to discriminate.
-    status, meta = tools.summary_status_or_unknown(target)
-    if status == "final":
-        return None, _ERROR_REVISE_FINALIZED
-    if status == tools._SUMMARY_STATUS_UNKNOWN:
-        return None, _ERROR_REVISE_SUMMARY_UNREADABLE
-    origin = _existing_origin(meta)
+    # Read the live sidecar immediately before the swap so the post-revise
+    # summary inherits the latest durable install origin. A missing, corrupt, or
+    # unreadable sidecar has no usable origin and does not block publication.
+    origin = _existing_origin(tools.read_tool_meta(target))
     # THE TAIL, and it runs under ``tools._STATE_PUBLISH_LOCK`` (TRANSITIONAL,
     # web-v5 P1 -- P2's layout deletes the need, see that lock). Everything from the
     # 啟用 carry to the second rename is what a ``PATCH /api/tools/{name}`` must not
@@ -2326,8 +2244,8 @@ def _promote_staging_replace(
         # used to sit up beside the ``.env`` copy, where its comment called that
         # position "free" because the step itself is bounded and tiny. That claim was
         # the defect (R1-1). Bounded is not the same as EARLY -- everything it stood
-        # before (the 定版 gate, the sidecar read, and this call's own
-        # ``_scan_package``) was window between reading the operator's toggle and
+        # before (the sidecar read and this call's own ``_scan_package``) was
+        # window between reading the operator's toggle and
         # shipping it. ``carry_package_state`` also brings the live file's MODE
         # across (R1-3), which the publisher cannot inherit on its own here because
         # it writes into staging, where there is no state file to inherit from.
@@ -3198,9 +3116,8 @@ def _unmaskable_env_error(text: str, values: dict[str, str]) -> str | None:
 
     A key with NO locatable assignment line refuses too -- a value spanning lines,
     a continuation, any shape this line-based reading cannot account for. We
-    verify what we can READ and refuse what we cannot, which is the direction
-    ``_read_env_for_values`` (an unreadable ``.env`` stops the revise) and the
-    pre-swap 定版 gate (an untrustworthy sidecar stops the swap) already take. It
+    verify what we can READ and refuse what we cannot, the same direction
+    ``_read_env_for_values`` takes when an unreadable ``.env`` stops the revise. It
     narrows what r5 accepted -- a genuinely MULTI-LINE quoted value used to pass,
     because its newlines are real newlines in the file and the whole value really
     was a substring of the whole text -- and that narrowing is deliberate: a
@@ -3282,24 +3199,11 @@ def _current_manifest_text(directory: Path) -> str | None:
 def _existing_origin(meta: dict[str, Any] | None) -> dict[str, Any] | None:
     """The install ORIGIN inside an ALREADY-READ sidecar meta, or None.
 
-    Pure. It takes the meta rather than a directory (R4-2) because the origin must
-    come from the SAME read that decided the package was not 已定版, not from a
-    second one of its own. That sidecar is the ONLY copy of the OpenAPI url and
-    the operator's original instructions (nothing else persists them), the swap
-    deletes it along with the old package, and the post-revise summary inherits it
-    so a revised tool keeps knowing what it was built from -- so a read that
-    answers "no origin" when it means "I could not look" loses that context
-    IRREVERSIBLY. The old shape did exactly that: ``tools.read_tool_meta`` folds
-    every failure into None, so one transient EIO was indistinguishable from a
-    package that never had an origin, while the strict gate's own read then
-    succeeded and let the swap proceed.
-
-    There is no unreadable-vs-absent branch HERE, and that is not an omission: the
-    caller's 定版 gate refuses on every unreadable shape before this is reached, so
-    a None meta arriving here can only mean the sidecar was definitively ABSENT --
-    a package with genuinely nothing to inherit, which proceeds with no origin.
-    Narrowed and re-sanitized by ``tool_meta._stored_origin``, the same reader the
-    synchronous regenerate uses.
+    Pure. It takes the already-read meta rather than opening the sidecar itself,
+    so the promote path controls when its one origin read happens. The sidecar is
+    the only copy of the OpenAPI URL and original instructions; a usable origin
+    is narrowed and re-sanitized by ``tool_meta._stored_origin``, while a missing,
+    corrupt, or unreadable sidecar yields None and does not block publication.
     """
     return tool_meta._stored_origin(meta)
 
@@ -3312,27 +3216,9 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
     OUTCOME (zh-TW ``error``) and never an exception, and ``llm_log_id`` is
     captured right after the builder call on success and failure alike.
 
-    The two gates before any work: the package must resolve through
-    ``tools._resolve_package_dir_no_alias`` (the shared by-name resolver, so an
-    internal alias is refused here exactly as it is by every summary route), and
-    its sidecar must yield a TRUSTWORTHY status that is not 已定版 -- the STRICT
-    ``summary_status_or_unknown``, refusing an unreadable/corrupt sidecar exactly
-    as it refuses a finalized one (R6-3). The router checks the finalized case too;
-    re-checking is defence in depth against a 定版 that landed between the two, and
-    it costs one sidecar read. A 定版 landing LATER -- mid-session, after this check
-    -- IS caught, by ``_promote_staging_replace``'s own re-check at the last moment
-    before the swap. (This paragraph used to claim the opposite -- that a
-    mid-session 定版 was an accepted residual -- which stopped being true when the
-    P3b self-review added that re-check, and the stale text survived the fix.
-    Corrected alongside R3-2, which makes the same re-check fail CLOSED.)
-
-    Strict HERE and total at the ROUTE is the whole point, not an inconsistency
-    (R6-3): a route answers about a resource's KNOWN state and may cheaply guess,
-    but this job is what ACTS -- it spends a multi-round builder session and holds
-    the single-flight while it does -- and an already-corrupt sidecar was certain to
-    be refused by the pre-swap gate at the END of that session anyway. Paying in
-    full for a foregone refusal, on every retry, is what the strict entry gate
-    removes; the refusal itself was never in doubt.
+    Before any work the package must resolve through
+    ``tools._resolve_package_dir_no_alias``. The shared by-name resolver refuses
+    an internal alias exactly as every summary route does.
 
     The ``.env`` is read for its VALUES (and refused if unreadable, or over the
     BYTE ceiling promote itself applies -- R5-3, so a ``.env`` promote would refuse
@@ -3386,32 +3272,6 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
     directory = await run_in_threadpool(tools._resolve_package_dir_no_alias, name)
     if directory is None:
         return InstallOutcome(ok=False, error=_ERROR_REVISE_NOT_FOUND)
-    # Through the STRICT reader, and refusing on UNKNOWN as well as on final
-    # (R6-3): a sidecar that is ALREADY corrupt when the request arrives used
-    # to pass this gate on ``summary_status``'s total None, burn a whole multi-round
-    # builder session, and then be refused by ``_promote_staging_replace``'s strict
-    # read at the end -- guaranteed-to-fail work charged in full, on every retry,
-    # while the global single-flight was held. This job is the thing that ACTS, so
-    # it is the thing that must fail closed; the two error strings are the SAME two
-    # promote uses, so the operator sees one refusal per remedy (repair/remove a
-    # damaged sidecar vs. 解除定版) wherever it was decided.
-    #
-    # The ROUTER's own admission gate deliberately STAYS on the total
-    # ``summary_status``: a route answers about the resource's KNOWN state, and
-    # guessing "not finalized" there costs at most this refusal, arriving as a job
-    # outcome instead of a 409. The authoritative, fail-closed check belongs to the
-    # job that is about to act -- here, and again at the last moment before the swap.
-    #
-    # The meta this read parsed is dropped on purpose: the origin must come from the
-    # read the PRE-SWAP gate makes, minutes later, because that is the one whose
-    # answer the swap acts on (R4-2). Carrying this one down would reintroduce the
-    # two-reads-can-disagree bug at a much longer timescale.
-    status, _ = await run_in_threadpool(tools.summary_status_or_unknown, directory)
-    if status == "final":
-        return InstallOutcome(ok=False, error=_ERROR_REVISE_FINALIZED)
-    if status == tools._SUMMARY_STATUS_UNKNOWN:
-        return InstallOutcome(ok=False, error=_ERROR_REVISE_SUMMARY_UNREADABLE)
-
     # ONE worker hop does the read AND the dotenv parse (R4-3): the parse is real
     # work on a 64 KiB file and this job shares the loop with every request.
     # ``env_existed_at_start`` is the READ's answer, not the parse's -- an empty or
@@ -3547,10 +3407,8 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
                 llm_log_id=llm_log_id,
             )
 
-        # The origin comes back FROM the promote, not from a read of our own
-        # (R4-2): it has to be the sidecar the 定版 gate just vetted, because a
-        # separate total read turns a transient failure into "no origin" and the
-        # swap then destroys the only copy. See ``_existing_origin``.
+        # The origin comes back from the promote's last-moment sidecar read, not
+        # from an earlier read that could go stale during the builder session.
         origin, promote_error = await run_in_threadpool(
             _promote_staging_replace,
             staging,

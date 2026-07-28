@@ -567,8 +567,7 @@ def _fake_summary_generate(
 
     ``side_effect`` runs INSIDE the stubbed call, which is the only place a test
     can act "while the generation is in flight": the real thing awaits an LLM for
-    seconds, and the store-time races (above all a 定版 landing mid-regenerate)
-    live in exactly that window."""
+    seconds, and store-time races live in exactly that window."""
 
     async def fake(
         system_prompt: str,
@@ -716,7 +715,6 @@ def test_run_install_writes_the_summary_sidecar(
     meta = tools.read_tool_meta(root / "kbsearch")
     assert meta is not None
     assert meta["summary"] == "這個工具會查 KB"
-    assert meta["status"] == "draft"
     assert meta["origin"] == {
         "openapi_url": "http://kb.example" + tool_meta._ORIGIN_URL_TRIMMED_MARKER,
         "instructions": "build a search tool",
@@ -949,11 +947,11 @@ def test_run_install_feature_off(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _forged_meta(value: str) -> str:
-    """A finalized sidecar carrying ``value`` as its summary -- the forgery."""
-    return json.dumps({"summary": value, "status": "final", "updated_at": "2026-01-01T00:00:00Z"})
+    """A builder-authored sidecar carrying ``value`` as its summary."""
+    return json.dumps({"summary": value, "updated_at": "2026-01-01T00:00:00Z"})
 
 
-def test_run_install_strips_a_forged_finalized_sidecar(
+def test_run_install_strips_a_forged_summary_sidecar(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """R7-1, the whole attack chain: a builder session can smuggle a secret out
@@ -963,12 +961,11 @@ def test_run_install_strips_a_forged_finalized_sidecar(
     ``.env`` holding a value nobody has registered -- ``known_secret_values``
     scans installed packages only and skips the dot-prefixed ``.staging`` shell,
     so the value is unknown for the whole build. It then writes
-    ``.ai_meta.json`` = ``{"summary": "<that value>", "status": "final"}``:
+    ``.ai_meta.json`` = ``{"summary": "<that value>"}``:
     ``validate_package``'s embedded-secret sweep cannot match a secret it does
     not know, so the package passes; promote moves the staging directory whole;
-    and then the install hook's own 定版 protection finishes the job --
-    ``store_summary_meta`` sees ``final``, refuses to overwrite, and the forged
-    sidecar is what every later GET serves, verbatim.
+    and if the best-effort install hook then fails, the forged sidecar is what
+    every later GET serves, verbatim.
 
     The sidecar's only legitimate writer is ``write_tool_meta``, so promote now
     deletes the builder's copy BEFORE validation. What must hold afterwards is
@@ -1002,11 +999,10 @@ def test_run_install_strips_a_forged_finalized_sidecar(
     assert (pkg / "run.py").is_file()
     assert (pkg / ".env").is_file()
 
-    # A sidecar EXISTS -- and it is the hook's, written through write_tool_meta:
-    # draft (never the forged "final"), and the stubbed generation's text.
+    # A sidecar EXISTS -- and it is the hook's, written through write_tool_meta
+    # with the stubbed generation's text.
     meta = tools.read_tool_meta(pkg)
     assert meta is not None
-    assert meta["status"] == "draft"
     assert meta["summary"] == "這個工具會查 KB"
 
     # The forged content is nowhere in the installed package: walking every file,
@@ -1067,7 +1063,6 @@ def test_run_install_strips_forged_sidecars_at_every_depth(
     # ... and the ROOT sidecar is the hook's, not any of the plants.
     meta = tools.read_tool_meta(pkg)
     assert meta is not None
-    assert meta["status"] == "draft"
     assert meta["summary"] == "這個工具會查 KB"
 
 
@@ -1083,7 +1078,7 @@ def test_strip_builder_sidecars_matches_the_reserved_name_case_insensitively(
     builder had no business writing is removed too, which this pins directly."""
     staging = tmp_path / "staging"
     staging.mkdir()
-    (staging / ".AI_META.JSON").write_text('{"status": "final"}', encoding="utf-8")
+    (staging / ".AI_META.JSON").write_text('{"summary": "forged"}', encoding="utf-8")
     (staging / ".Ai_Meta.Json.abc123.TMP").write_text("{}", encoding="utf-8")
     (staging / "run.py").write_text("print(1)", encoding="utf-8")
 
@@ -1156,8 +1151,8 @@ def test_strip_builder_sidecars_handles_links_and_directories(tmp_path: Path) ->
     A real DIRECTORY at the name is not a forged sidecar -- ``read_tool_meta``
     refuses a non-regular file -- but leaving it would permanently BRICK the
     package's summary: ``_write_package_file_atomic``'s lstat gate refuses to publish
-    over anything non-regular, so the install hook, every later regenerate and
-    定版 would all fail forever, with no API path to repair it.
+    over anything non-regular, so the install hook and every later regenerate
+    would fail forever, with no API path to repair it.
 
     Driven directly rather than through ``run_install`` because the meta-tools
     cannot produce these shapes -- only a ``run_shell`` (or an operator) can."""
@@ -1189,8 +1184,8 @@ def test_run_install_fails_closed_when_the_forged_sidecar_cannot_be_deleted(
     """A deletion the filesystem refuses CANCELS the install.
 
     "We could not remove it" must never degrade into "so we shipped it": the
-    forged sidecar reaching the package is the one unacceptable outcome, and it
-    is unrecoverable once there (the hook's 定版 refusal makes it permanent). The
+    forged sidecar reaching the package is the one unacceptable outcome: if the
+    best-effort install hook fails, the forged content remains served. The
     refusal is injected at ``Path.unlink`` -- the real syscall boundary, the same
     style ``os.replace`` is failed at in test_tools -- because weird permissions
     and immutable attributes are not reproducible in a tmp dir.
@@ -1264,15 +1259,14 @@ def test_promote_staging_refuses_staging_replaced_by_symlink_to_real_tools_dir(
     ORIGINAL path pointing at ``base`` -- the real, live tools directory -- itself.
     Unguarded, the strip's os.walk would land in ``base`` and delete every
     installed package's sidecar; refused here before that walk ever starts, so an
-    existing package's finalized sidecar survives untouched."""
+    an existing package's summary sidecar survives untouched."""
     base = tmp_path / "tools"
     base.mkdir()
     existing_pkg = base / "existing-tool"
     existing_pkg.mkdir()
     existing_meta = json.dumps(
         {
-            "summary": "already finalized, do not touch",
-            "status": "final",
+            "summary": "existing summary, do not touch",
             "updated_at": "2026-01-01T00:00:00Z",
         }
     )
@@ -1308,8 +1302,7 @@ def test_promote_staging_refuses_ancestor_staging_shell_replaced_by_symlink(
     existing_pkg.mkdir()
     existing_meta = json.dumps(
         {
-            "summary": "already finalized, do not touch",
-            "status": "final",
+            "summary": "existing summary, do not touch",
             "updated_at": "2026-01-01T00:00:00Z",
         }
     )
@@ -2894,31 +2887,9 @@ def test_router_list_tools(
                 "enabled": True,
                 "valid": True,
                 "error": None,
-                # D40: null here means "no readable summary sidecar" -- this
-                # hand-made package has none.
-                "summary_status": None,
             }
         ]
     }
-
-
-def test_router_list_tools_carries_summary_status(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The listing badges every row from its own sidecar, so the 工具 page needs
-    no per-tool summary request to render the list."""
-    root = tmp_path / "tools"
-    pkg = root / "kbsearch"
-    pkg.mkdir(parents=True)
-    (pkg / "run.py").write_text("print('x')\n")
-    (pkg / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")))
-    _install_settings(monkeypatch, tools_dir=str(root))
-    _write_meta(pkg, summary="說明", status="final")
-
-    body = client.get("/api/tools").json()
-    assert [(row["name"], row["summary_status"]) for row in body["tools"]] == [
-        ("kbsearch", "final")
-    ]
 
 
 def test_router_list_tools_empty_when_unconfigured(
@@ -3227,7 +3198,6 @@ def test_router_get_summary_all_null_without_a_sidecar(
     assert response.status_code == 200
     assert response.json() == {
         "summary": None,
-        "status": None,
         "updated_at": None,
         "llm_log_id": None,
     }
@@ -3241,7 +3211,6 @@ def test_router_get_summary_returns_the_sidecar(
         pkg,
         {
             "summary": "這個工具會查 KB",
-            "status": "draft",
             "updated_at": "2026-07-26T00:00:00+00:00",
             "llm_log_id": 7,
             # The token a real store stamps beside the id (store_summary_meta).
@@ -3255,11 +3224,10 @@ def test_router_get_summary_returns_the_sidecar(
 
     response = client.get("/api/tools/kbsearch/summary")
     assert response.status_code == 200
-    # The response carries the four display fields ONLY -- `origin` is install
+    # The response carries the three display fields ONLY -- `origin` is install
     # context for the next AI session, not something the UI shows.
     assert response.json() == {
         "summary": "這個工具會查 KB",
-        "status": "draft",
         "updated_at": "2026-07-26T00:00:00+00:00",
         "llm_log_id": 7,
     }
@@ -3286,7 +3254,6 @@ def test_router_get_summary_drops_a_log_link_a_restart_invalidated(
     _write_meta(
         pkg,
         summary="這個工具會查 KB",
-        status="draft",
         llm_log_id=3,
         llm_log_process=llm_log.process_token(),
     )
@@ -3297,7 +3264,6 @@ def test_router_get_summary_drops_a_log_link_a_restart_invalidated(
     body = client.get("/api/tools/kbsearch/summary").json()
     assert body["llm_log_id"] is None
     assert body["summary"] == "這個工具會查 KB"  # only the link is withheld
-    assert body["status"] == "draft"
     # The id is still on disk -- this is a READ-side judgement, not a rewrite.
     assert _meta(pkg)["llm_log_id"] == 3
 
@@ -3313,7 +3279,7 @@ def test_router_get_summary_treats_a_tokenless_sidecar_as_foreign(
     "current" is the answer that produces a wrong link. The next regenerate
     re-stamps id and token together."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    _write_meta(pkg, summary="舊格式的側檔", status="draft", llm_log_id=3)
+    _write_meta(pkg, summary="舊格式的側檔", llm_log_id=3)
 
     body = client.get("/api/tools/kbsearch/summary").json()
     assert body["llm_log_id"] is None
@@ -3327,7 +3293,7 @@ def test_router_get_summary_degrades_a_hand_edited_sidecar(
     values render as nulls rather than 500ing the read."""
     pkg = _seed_package(monkeypatch, tmp_path)
     (pkg / tools._AI_META_FILENAME).write_text(
-        json.dumps({"summary": 12, "status": "published", "updated_at": [], "llm_log_id": "three"}),
+        json.dumps({"summary": 12, "updated_at": [], "llm_log_id": "three"}),
         encoding="utf-8",
     )
 
@@ -3335,7 +3301,6 @@ def test_router_get_summary_degrades_a_hand_edited_sidecar(
     assert response.status_code == 200
     assert response.json() == {
         "summary": None,
-        "status": None,
         "updated_at": None,
         "llm_log_id": None,
     }
@@ -3344,26 +3309,19 @@ def test_router_get_summary_degrades_a_hand_edited_sidecar(
 def test_router_summary_survives_a_lone_surrogate_in_the_sidecar(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A hand-edited ``"\\ud800"`` broke BOTH summary verbs, and neither failure
-    was the fixed, honest answer the routes promise.
+    """A hand-edited ``"\\ud800"`` broke the summary GET rather than degrading.
 
     ``\\ud800`` is a legal JSON escape, so ``json.loads`` happily produces a
     ``str`` for it -- one that is NOT UTF-8 encodable. On the GET that value rode
     into ``ToolSummaryDetail`` and raised ``UnicodeEncodeError`` inside
     Starlette's strict ``JSONResponse.render``: a 500 out of the one route whose
-    whole job is to DEGRADE a corrupt sidecar. On the PATCH the write path's
-    byte-size ``.encode("utf-8")`` sat outside the fail-closed try, so the same
-    value 500'd a request whose contract is False -> 404.
-
-    Both boundaries scrub now, so the GET renders U+FFFD and the PATCH behaves
-    like any other finalize. The read-side scrub is not redundant with the write
-    side: this file never passed through our writer."""
+    whole job is to DEGRADE a corrupt sidecar. The read boundary scrubs now, so
+    the GET renders U+FFFD; this file never passed through our writer."""
     pkg = _seed_package(monkeypatch, tmp_path)
     (pkg / tools._AI_META_FILENAME).write_text(
         json.dumps(
             {
                 "summary": "a\ud800b",
-                "status": "draft",
                 "updated_at": "2026-07-26T00:00:00+00:00",
                 "llm_log_id": 7,
                 "llm_log_process": llm_log.process_token(),
@@ -3382,17 +3340,7 @@ def test_router_summary_survives_a_lone_surrogate_in_the_sidecar(
     assert body["summary"].endswith("b")
     assert "�" in body["summary"]
     assert "\ud800" not in body["summary"]
-    assert body["status"] == "draft"
     assert body["llm_log_id"] == 7
-
-    # ... and the finalize path, whose summary is non-empty after the scrub, is a
-    # plain 200 rather than a 500 (or a 409 for a summary that is really there).
-    patched = client.patch("/api/tools/kbsearch/summary", json={"status": "final"})
-    assert patched.status_code == 200
-    assert patched.json()["status"] == "final"
-    assert client.get("/api/tools/kbsearch/summary").json()["status"] == "final"
-    # The sidecar the PATCH rewrote is now real UTF-8 on disk.
-    (pkg / tools._AI_META_FILENAME).read_text(encoding="utf-8").encode("utf-8")
 
 
 def test_router_get_summary_404_for_unknown_tool(
@@ -3413,97 +3361,6 @@ def test_router_get_summary_404_when_feature_off(
     assert client.get("/api/tools/kbsearch/summary").status_code == 404
 
 
-def test_router_patch_summary_finalizes_and_unfinalizes(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    pkg = _seed_package(monkeypatch, tmp_path)
-    _write_meta(
-        pkg,
-        summary="說明",
-        status="draft",
-        llm_log_id=4,
-        llm_log_process=llm_log.process_token(),
-    )
-
-    response = client.patch("/api/tools/kbsearch/summary", json={"status": "final"})
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "final"
-    assert body["summary"] == "說明"  # the summary is preserved by the flip
-    assert body["llm_log_id"] == 4
-    # Persisted, not just echoed -- and visible on the listing too.
-    assert client.get("/api/tools/kbsearch/summary").json()["status"] == "final"
-    assert client.get("/api/tools").json()["tools"][0]["summary_status"] == "final"
-
-    assert client.patch("/api/tools/kbsearch/summary", json={"status": "draft"}).status_code == 200
-    assert client.get("/api/tools/kbsearch/summary").json()["status"] == "draft"
-
-
-def test_router_patch_summary_409_without_a_sidecar(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Nothing to freeze is a conflict, not a 404 -- the tool itself is fine."""
-    _seed_package(monkeypatch, tmp_path)
-    response = client.patch("/api/tools/kbsearch/summary", json={"status": "final"})
-    assert response.status_code == 409
-    detail = response.json()["detail"]
-    assert detail["code"] == "summary_missing"
-    assert "message" in detail
-
-
-@pytest.mark.parametrize("summary", ["", "   ", None], ids=["empty", "blank", "null"])
-def test_router_patch_summary_409_when_the_summary_is_empty(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, summary: str | None
-) -> None:
-    """Freezing an absent explanation is the same "nothing there" as having no
-    sidecar, so it is the SAME 409 -- and it is not harmless: a finalized empty
-    summary then blocks 重新產生 with tool_finalized, so the one action that
-    could fill it is refused until the user thinks to un-finalize."""
-    pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / tools._AI_META_FILENAME).write_text(
-        json.dumps({"summary": summary, "status": "draft"}), encoding="utf-8"
-    )
-
-    response = client.patch("/api/tools/kbsearch/summary", json={"status": "final"})
-    assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "summary_missing"
-    assert client.get("/api/tools/kbsearch/summary").json()["status"] == "draft"
-
-
-def test_router_patch_summary_can_always_unfinalize(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """解除定版 is the escape hatch, so it is never gated on content -- including
-    for a sidecar finalized empty before that gate existed."""
-    pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / tools._AI_META_FILENAME).write_text(
-        json.dumps({"summary": "", "status": "final"}), encoding="utf-8"
-    )
-
-    assert client.patch("/api/tools/kbsearch/summary", json={"status": "draft"}).status_code == 200
-    assert client.get("/api/tools/kbsearch/summary").json()["status"] == "draft"
-
-
-def test_router_patch_summary_404_for_unknown_tool(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
-    response = client.patch("/api/tools/ghost/summary", json={"status": "final"})
-    assert response.status_code == 404
-    assert response.json() == {"detail": "Tool not found"}
-
-
-@pytest.mark.parametrize(
-    "payload", [{"status": "published"}, {"status": ""}, {}], ids=["unknown", "empty", "missing"]
-)
-def test_router_patch_summary_422_on_bad_status(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, payload: dict[str, Any]
-) -> None:
-    """The Literal is the gate: an unknown status never reaches the registry."""
-    _seed_package(monkeypatch, tmp_path)
-    assert client.patch("/api/tools/kbsearch/summary", json=payload).status_code == 422
-
-
 def test_router_regenerate_summary_stores_and_returns_the_new_summary(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3511,14 +3368,13 @@ def test_router_regenerate_summary_stores_and_returns_the_new_summary(
     is stubbed), so the whole synchronous path -- prompt, sanitize, sidecar
     write -- runs for this route."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    _write_meta(pkg, summary="舊的", status="draft", origin={"instructions": "查 KB"})
+    _write_meta(pkg, summary="舊的", origin={"instructions": "查 KB"})
     _fake_summary_generate(monkeypatch, summary="新的說明")
 
     response = client.post("/api/tools/kbsearch/summary/regenerate")
     assert response.status_code == 200
     body = response.json()
     assert body["summary"] == "新的說明"
-    assert body["status"] == "draft"
     assert body["llm_log_id"] is not None
     stored = tools.read_tool_meta(pkg)
     assert stored is not None
@@ -3526,60 +3382,6 @@ def test_router_regenerate_summary_stores_and_returns_the_new_summary(
     # Inherited from the install, in the narrowed shape the writer stores (both
     # known fields, the absent one an explicit null).
     assert stored["origin"] == {"openapi_url": None, "instructions": "查 KB"}
-
-
-def test_router_regenerate_summary_409_when_finalized(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """定版 means the AI stops iterating on this tool: the regenerate is refused
-    before the LLM is ever touched."""
-    pkg = _seed_package(monkeypatch, tmp_path)
-    _write_meta(pkg, summary="定版的說明", status="final")
-
-    async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("a finalized tool must never reach the LLM")
-
-    monkeypatch.setattr("afterthread.services.tool_meta.generate_structured", must_not_generate)
-
-    response = client.post("/api/tools/kbsearch/summary/regenerate")
-    assert response.status_code == 409
-    detail = response.json()["detail"]
-    assert detail["code"] == "tool_finalized"
-    assert "message" in detail
-    assert _meta(pkg)["summary"] == "定版的說明"  # untouched
-
-
-def test_router_regenerate_summary_409_when_finalized_mid_generation(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The THIRD 409-able outcome, and the one the up-front gate cannot give.
-
-    That gate runs before an await that lasts as long as an LLM round trip; a
-    PATCH landing inside the window used to have its frozen summary overwritten
-    anyway (the status was preserved, the TEXT was not). The store re-checks and
-    refuses, and the route answers the SAME tool_finalized code -- one refusal,
-    whichever side of the await the 定版 arrived on.
-
-    The finalize is driven THROUGH THE ROUTE from inside the stubbed generation,
-    which is what a concurrent PATCH actually is."""
-    pkg = _seed_package(monkeypatch, tmp_path)
-    _write_meta(pkg, summary="定版的說明", status="draft")
-    frozen: dict[str, bytes] = {}
-
-    def finalize_mid_call() -> None:
-        assert (
-            client.patch("/api/tools/kbsearch/summary", json={"status": "final"}).status_code == 200
-        )
-        frozen["bytes"] = (pkg / tools._AI_META_FILENAME).read_bytes()
-
-    _fake_summary_generate(monkeypatch, summary="新的說明", side_effect=finalize_mid_call)
-
-    response = client.post("/api/tools/kbsearch/summary/regenerate")
-    assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "tool_finalized"
-    # Byte-for-byte what 定版 froze: the in-flight generation left no trace.
-    assert (pkg / tools._AI_META_FILENAME).read_bytes() == frozen["bytes"]
-    assert _meta(pkg)["summary"] == "定版的說明"
 
 
 def test_router_regenerate_summary_409_while_a_job_runs(
@@ -3624,7 +3426,7 @@ def test_router_regenerate_summary_holds_the_single_flight_across_the_llm_call(
     where the race lived; the assertions after the response pin the release, so
     the reservation cannot wedge the single flight for the life of the process."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    _write_meta(pkg, summary="舊的", status="draft")
+    _write_meta(pkg, summary="舊的")
     refusals: dict[str, Any] = {}
 
     def submit_work_mid_generation() -> None:
@@ -3667,7 +3469,7 @@ def test_router_regenerate_summary_releases_the_reservation_on_failure(
     the process. The ``finally`` covers it, and the follow-up regenerate below is
     the proof: it is admitted, and it succeeds."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    _write_meta(pkg, summary="先前的好總結", status="draft")
+    _write_meta(pkg, summary="先前的好總結")
     _fake_summary_generate(
         monkeypatch, explode=LLMUpstreamError("APIConnectionError: could not reach the endpoint")
     )
@@ -3697,7 +3499,7 @@ def test_router_regenerate_summary_503_when_llm_unconfigured(
     """Synchronous AI op, so it degrades like capture/enrich do -- the SHARED
     llm_not_configured 503, and the previous summary survives."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    _write_meta(pkg, summary="先前的好總結", status="draft")
+    _write_meta(pkg, summary="先前的好總結")
     _fake_summary_generate(monkeypatch, explode=LLMNotConfiguredError("off"))
 
     response = client.post("/api/tools/kbsearch/summary/regenerate")
@@ -3712,7 +3514,7 @@ def test_router_regenerate_summary_502_on_upstream_failure(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     pkg = _seed_package(monkeypatch, tmp_path)
-    _write_meta(pkg, summary="先前的好總結", status="draft")
+    _write_meta(pkg, summary="先前的好總結")
     _fake_summary_generate(
         monkeypatch,
         explode=LLMUpstreamError("APIConnectionError: could not reach the LLM endpoint"),
@@ -3733,10 +3535,6 @@ def test_router_summary_routes_reject_invalid_names_as_422(
     _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
     for bad_name in ("UPPER", "bad name", ".hidden"):
         assert client.get(f"/api/tools/{bad_name}/summary").status_code == 422
-        assert (
-            client.patch(f"/api/tools/{bad_name}/summary", json={"status": "final"}).status_code
-            == 422
-        )
         assert client.post(f"/api/tools/{bad_name}/summary/regenerate").status_code == 422
 
 
@@ -3744,17 +3542,17 @@ def test_router_summary_routes_refuse_an_internal_alias(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """An INTERNAL alias tools/<alias> -> tools/<real> resolves INSIDE the tools
-    root, so resolve-then-contain PASSES and every by-name summary operation
-    would silently act on the REAL package -- a PATCH freezing its summary, a
-    regenerate spending an LLM session rewriting it, a REVISE replacing it
-    wholesale. All four refuse (404) and the real sidecar is left byte-for-byte
+    root, so resolve-then-contain PASSES and every by-name operation would
+    silently act on the REAL package -- a regenerate spending an LLM session
+    rewriting its summary, or a REVISE replacing it wholesale. All three refuse
+    (404) and the real sidecar is left byte-for-byte
     as it was.
 
     This is the same hard-block set_enabled/delete_tool have carried since H3,
     now shared by every summary/revise path through one resolver."""
     pkg = _seed_package(monkeypatch, tmp_path, "real")
     (pkg.parent / "alias").symlink_to(pkg, target_is_directory=True)
-    _write_meta(pkg, summary="真的說明", status="draft")
+    _write_meta(pkg, summary="真的說明")
     before = (pkg / tools._AI_META_FILENAME).read_bytes()
 
     async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
@@ -3767,12 +3565,10 @@ def test_router_summary_routes_refuse_an_internal_alias(
     monkeypatch.setattr("afterthread.services.tool_builder.start_revise_job", must_not_start)
 
     assert client.get("/api/tools/alias/summary").status_code == 404
-    assert client.patch("/api/tools/alias/summary", json={"status": "final"}).status_code == 404
     assert client.post("/api/tools/alias/summary/regenerate").status_code == 404
     assert client.post("/api/tools/alias/revise", json={"feedback": "改"}).status_code == 404
 
     assert (pkg / tools._AI_META_FILENAME).read_bytes() == before
-    assert _meta(pkg)["status"] == "draft"  # the real package was never finalized
 
 
 def test_router_regenerate_summary_404_when_the_sidecar_write_is_refused(
@@ -3781,9 +3577,9 @@ def test_router_regenerate_summary_404_when_the_sidecar_write_is_refused(
     """A generation that produced text but persisted NOTHING (a racing delete
     hitting the ghost guard, a FIFO/symlink swapped in for the sidecar, an
     unwritable directory) must not answer 200 with a summary the next GET will
-    not find. Same did-not-happen fold the PATCH uses for its failed rewrite."""
+    not find."""
     pkg = _seed_package(monkeypatch, tmp_path)
-    _write_meta(pkg, summary="先前的好總結", status="draft")
+    _write_meta(pkg, summary="先前的好總結")
     _fake_summary_generate(monkeypatch, summary="新的說明")
     monkeypatch.setattr(tools, "write_tool_meta", lambda *args, **kwargs: False)
 
@@ -3805,21 +3601,16 @@ def test_router_a_tool_named_jobs_can_serve_its_summary(
     directions: a job id is uuid4().hex, so the literal segment "summary" can
     never be one."""
     pkg = _seed_package(monkeypatch, tmp_path, "jobs")
-    _write_meta(pkg, summary="名叫 jobs 的工具", status="draft")
+    _write_meta(pkg, summary="名叫 jobs 的工具")
 
     response = client.get("/api/tools/jobs/summary")
     assert response.status_code == 200
     assert response.json()["summary"] == "名叫 jobs 的工具"
-    assert response.json()["status"] == "draft"
 
     # ... and a real (uuid4().hex-shaped) job id still reaches the job handler.
     poll = client.get("/api/tools/jobs/0123456789abcdef0123456789abcdef")
     assert poll.status_code == 404
     assert poll.json() == {"detail": "Tool job not found"}
-
-    # The other two summary verbs address the same tool, not the job route.
-    assert client.patch("/api/tools/jobs/summary", json={"status": "final"}).status_code == 200
-    assert _meta(pkg)["status"] == "final"
 
 
 def test_any_job_active_tracks_the_job_table() -> None:
@@ -3910,26 +3701,6 @@ def test_router_revise_404_for_unknown_tool(
     response = client.post("/api/tools/ghost/revise", json={"feedback": "改一下"})
     assert response.status_code == 404
     assert response.json() == {"detail": "Tool not found"}
-
-
-def test_router_revise_409_when_finalized(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """定版 freezes AI iteration, so a revise is refused before any job is
-    created -- the same code and the same meaning the regenerate route uses."""
-    pkg = _seed_package(monkeypatch, tmp_path)
-    _write_meta(pkg, summary="已定版的說明", status="final")
-
-    def must_not_start(name: str, feedback: str) -> str:
-        raise AssertionError("no revise job may start for a finalized tool")
-
-    monkeypatch.setattr("afterthread.services.tool_builder.start_revise_job", must_not_start)
-
-    response = client.post("/api/tools/kbsearch/revise", json={"feedback": "改一下"})
-    assert response.status_code == 409
-    detail = response.json()["detail"]
-    assert detail["code"] == "tool_finalized"
-    assert "message" in detail
 
 
 def test_router_revise_409_while_a_job_runs(
@@ -4113,7 +3884,7 @@ def test_run_revise_copies_the_package_without_the_root_env_or_any_sidecar(
     (pkg / "config").mkdir()
     nested_env = b"# the tool's own nested config\r\nPAGE_SIZE=25\n"
     (pkg / "config" / ".env").write_bytes(nested_env)
-    _write_meta(pkg, summary="舊的說明", status="draft")
+    _write_meta(pkg, summary="舊的說明")
     seen: dict[str, set[str]] = {}
     _fake_generate(
         monkeypatch,
@@ -4435,217 +4206,6 @@ def _replace_fixture(base: Path) -> tuple[Path, Path]:
     return installed, staging
 
 
-def test_promote_replace_refuses_a_finalization_that_landed_mid_session(
-    tmp_path: Path,
-) -> None:
-    """A revise session runs for MINUTES, so a user finalizing DURING one is
-    ordinary. The entry gate cannot see that: it ran before the LLM call. Without
-    a last-moment re-check the swap would replace the whole package -- and since
-    the sidecar is excluded from staging and regenerated as a DRAFT afterwards,
-    定版 would be silently undone, frozen text and all, by a session that started
-    before it. Mirrors store_summary_meta's own store-time re-check (D40 r2)."""
-    base = tmp_path / "tools"
-    installed, staging = _replace_fixture(base)
-    assert tools.write_tool_meta(
-        installed,
-        {"summary": "凍結的總結", "status": "final", "updated_at": "2026-07-27T00:00:00+00:00"},
-    )
-
-    origin, error = tool_builder._promote_staging_replace(
-        staging,
-        "kbsearch",
-        base,
-        env_existed_at_start=False,
-        package_identity=tool_builder._package_identity(base / "kbsearch"),
-        registered=[],
-    )
-
-    assert error == tool_builder._ERROR_REVISE_FINALIZED
-    assert origin is None  # a refusal hands nothing back
-    # the installed package -- and its frozen summary -- are untouched
-    assert (installed / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY
-    meta = tools.read_tool_meta(installed)
-    assert meta is not None
-    assert meta["summary"] == "凍結的總結"
-    assert meta["status"] == "final"
-    assert not any(entry.name.startswith(".kbsearch.bak-") for entry in base.iterdir())
-
-
-@pytest.mark.skipif(
-    _permission_tests_unreliable(), reason="chmod 000 does not block access (root or non-POSIX)"
-)
-def test_promote_replace_refuses_when_the_sidecar_cannot_be_read(tmp_path: Path) -> None:
-    """R3-2: the pre-swap 定版 re-check must fail CLOSED on uncertainty.
-
-    ``tools.summary_status`` folds "no sidecar" and "there IS one but it could
-    not be read" into the SAME None, so a gate keyed on an explicit ``"final"``
-    was FAIL-OPEN: a user finalizes mid-session, the sidecar then hits a transient
-    read error (a chmod, an EIO, a symlink raced in), and the swap proceeded --
-    replacing the package, taking the frozen summary with it and regenerating a
-    draft. Exactly the destruction this gate exists to prevent, reached through
-    the failure of the check rather than around it.
-
-    The sidecar here IS finalized, and the point is that the gate never gets to
-    see that: it refuses on "cannot tell" alone. The message is its own, because
-    telling this operator to 解除定版 would send them after the wrong thing."""
-    base = tmp_path / "tools"
-    installed, staging = _replace_fixture(base)
-    assert tools.write_tool_meta(
-        installed,
-        {"summary": "凍結的總結", "status": "final", "updated_at": "2026-07-27T00:00:00+00:00"},
-    )
-    sidecar = installed / tools._AI_META_FILENAME
-    sidecar.chmod(0o000)
-    try:
-        assert tools.summary_status(installed) is None  # the fail-OPEN input, pinned
-        _origin, error = tool_builder._promote_staging_replace(
-            staging,
-            "kbsearch",
-            base,
-            env_existed_at_start=False,
-            package_identity=tool_builder._package_identity(base / "kbsearch"),
-            registered=[],
-        )
-    finally:
-        # Guarded so the ASSERTIONS report a regression: if the gate ever goes
-        # fail-open again the swap consumes the package, the sidecar is gone, and
-        # an unguarded chmod would mask the real failure with a FileNotFoundError
-        # raised out of the teardown.
-        if sidecar.exists():
-            sidecar.chmod(0o600)
-
-    assert error == tool_builder._ERROR_REVISE_SUMMARY_UNREADABLE
-    assert error != tool_builder._ERROR_REVISE_FINALIZED  # a different remedy, a different message
-    assert (installed / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY  # never swapped
-    meta = tools.read_tool_meta(installed)
-    assert meta is not None
-    assert meta["summary"] == "凍結的總結"  # the frozen text survived
-    assert _leftovers(base) == []  # and no .bak- residue from a half-started swap
-
-
-def test_promote_replace_refuses_a_sidecar_that_is_not_a_regular_file(tmp_path: Path) -> None:
-    """The same refusal without any permission bits: a FIFO at the sidecar name is
-    refused by the bounded reader on EVERY platform, so "cannot tell" is reached
-    the way an unjailed ``run_shell`` (D21) could actually arrange it."""
-    base = tmp_path / "tools"
-    installed, staging = _replace_fixture(base)
-    os.mkfifo(installed / tools._AI_META_FILENAME)
-
-    _origin, error = tool_builder._promote_staging_replace(
-        staging,
-        "kbsearch",
-        base,
-        env_existed_at_start=False,
-        package_identity=tool_builder._package_identity(base / "kbsearch"),
-        registered=[],
-    )
-
-    assert error == tool_builder._ERROR_REVISE_SUMMARY_UNREADABLE
-    assert (installed / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY
-    assert _leftovers(base) == []
-
-
-@pytest.mark.parametrize("status", ["draft", None], ids=["draft", "no-sidecar"])
-def test_promote_replace_proceeds_when_the_status_is_knowable(
-    tmp_path: Path, status: str | None
-) -> None:
-    """Fail-closed must not become refuse-everything: a DRAFT sidecar and a
-    genuinely ABSENT one are both definite answers of "not finalized", and both
-    still publish. ENOENT is the one case where "not finalized" is a fact.
-
-    Both also pin what the gate HANDS BACK (R4-2): the draft's origin comes out of
-    the very read that cleared the swap, and a package with no sidecar at all has
-    nothing to inherit and says so with None -- the one place where "no origin" is
-    a fact rather than a failed look."""
-    base = tmp_path / "tools"
-    installed, staging = _replace_fixture(base)
-    if status is not None:
-        assert tools.write_tool_meta(
-            installed,
-            {
-                "summary": "草稿",
-                "status": status,
-                "origin": {"openapi_url": "https://kb.example", "instructions": "原始安裝指示"},
-                "updated_at": "2026-07-27T00:00:00+00:00",
-            },
-        )
-
-    origin, error = tool_builder._promote_staging_replace(
-        staging,
-        "kbsearch",
-        base,
-        env_existed_at_start=False,
-        package_identity=tool_builder._package_identity(base / "kbsearch"),
-        registered=[],
-    )
-
-    assert error is None
-    assert (installed / "run.py").read_text(encoding="utf-8") == "print('revised')"
-    assert _leftovers(base) == []
-    if status is None:
-        assert origin is None
-    else:
-        assert origin == {"openapi_url": "https://kb.example", "instructions": "原始安裝指示"}
-
-
-def test_promote_replace_refuses_a_finalization_that_lands_during_the_env_copy(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The 定版 gate must be the LAST pre-swap step, not merely a late one (R4-1).
-
-    Every other pre-swap step finishes in a bounded moment; the ``.env`` copy does
-    not -- an operator chooses the file, so its duration is theirs, not ours. With
-    the copy AFTER the gate, a finalization landing while the bytes moved was
-    invisible to a check that had already passed, and the swap then replaced the
-    package, took the frozen text with it and regenerated a draft. That is not the
-    instants-wide check-then-act residual this module accepts; it is a window an
-    outside party sets the size of.
-
-    So the copy now runs FIRST (it only writes into staging, which nothing else
-    observes) and the gate runs last. Driven by finalizing from INSIDE the copy,
-    which is the exact window the finding names: under the old ordering this test
-    would swap and the frozen summary would be gone."""
-    base = tmp_path / "tools"
-    installed, staging = _replace_fixture(base)
-    (installed / ".env").write_text("KB_API_KEY=live-secret-value\n", encoding="utf-8")
-    real_copy2 = shutil.copy2
-    copies: list[str] = []
-
-    def finalize_while_copying(source: Any, destination: Any, **kwargs: Any) -> Any:
-        copies.append(str(source))
-        result = real_copy2(source, destination, **kwargs)
-        assert tools.write_tool_meta(
-            installed,
-            {"summary": "凍結的總結", "status": "final", "updated_at": "2026-07-27T00:00:00+00:00"},
-        )
-        return result
-
-    monkeypatch.setattr(shutil, "copy2", finalize_while_copying)
-    registered: list[str] = []
-
-    origin, error = tool_builder._promote_staging_replace(
-        staging,
-        "kbsearch",
-        base,
-        env_existed_at_start=True,
-        package_identity=tool_builder._package_identity(base / "kbsearch"),
-        registered=registered,
-    )
-
-    assert copies  # the window is real: the copy ran, and 定版 landed inside it
-    # The shipped bytes were vetted and their values registered BEFORE the copy
-    # (R7-2), so the refusal below happens with the credentials already redactable.
-    assert registered == ["live-secret-value"]
-    assert error == tool_builder._ERROR_REVISE_FINALIZED
-    assert origin is None
-    assert (installed / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY  # never swapped
-    meta = tools.read_tool_meta(installed)
-    assert meta is not None
-    assert meta["summary"] == "凍結的總結"  # the frozen text survived
-    assert meta["status"] == "final"
-    assert _leftovers(base) == []
-
-
 def test_promote_replace_refuses_an_oversized_live_env(tmp_path: Path) -> None:
     """The copy is bounded by the SAME ceiling the rest of the system applies to a
     ``.env`` (R4-1), and refuses BEFORE anything is moved.
@@ -4731,9 +4291,9 @@ def test_a_toggle_that_lands_before_the_swap_is_carried_across_not_reverted(
 ) -> None:
     """R1-1: the live toggle is read at the LAST moment, not at the first (web-v5 P1).
 
-    The carry used to sit beside the ``.env`` copy, before the 定版 gate, the
-    sidecar read and its own ``_scan_package`` -- and its comment called that
-    position "free" because the step itself is bounded and tiny. Bounded is not
+    The carry used to sit beside the ``.env`` copy, before the sidecar read and
+    its own ``_scan_package`` -- and its comment called that position "free"
+    because the step itself is bounded and tiny. Bounded is not
     EARLY: a ``PATCH /api/tools/{name}`` landing anywhere after that read was
     SILENTLY REVERTED, because the staging copy already held the old value and the
     swap then published it over the operator's newer one.
@@ -4743,22 +4303,22 @@ def test_a_toggle_that_lands_before_the_swap_is_carried_across_not_reverted(
     the accident (that is the whole point of it) and nothing replaced it, so the
     re-check now passes and the stale boolean ships. Both operations report success.
 
-    Driven from INSIDE the 定版 gate, the way the r6/r7/r8 window tests drive
-    theirs: with the old ordering the published state file comes out ``true`` and
-    the tool the operator just switched off is offered to the model again."""
+    Driven from INSIDE the last sidecar read: with the old ordering the published
+    state file comes out ``true`` and the tool the operator just switched off is
+    offered to the model again."""
     base = tmp_path / "tools"
     installed, staging = _replace_fixture(base)
     _install_settings(monkeypatch, tools_dir=str(base))
     assert tools.package_enabled(installed) is True  # the value the carry would read
-    real_gate = tools.summary_status_or_unknown
+    real_read = tools.read_tool_meta
     toggled: list[bool] = []
 
-    def toggle_off_inside_the_gate(directory: Path) -> tuple[str | None, dict[str, Any] | None]:
-        result = real_gate(directory)
+    def toggle_off_inside_the_read(directory: Path) -> dict[str, Any] | None:
+        result = real_read(directory)
         toggled.append(tools.set_enabled("kbsearch", False))
         return result
 
-    monkeypatch.setattr(tools, "summary_status_or_unknown", toggle_off_inside_the_gate)
+    monkeypatch.setattr(tools, "read_tool_meta", toggle_off_inside_the_read)
 
     origin, error = tool_builder._promote_staging_replace(
         staging,
@@ -5590,65 +5150,6 @@ def test_run_revise_never_replaces_on_a_validation_failure(
     assert _leftovers(pkg.parent) == []
 
 
-def test_run_revise_refuses_a_finalized_package(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """定版 is checked HERE too, not only at the route: the two are seconds apart
-    and freezing AI iteration is the whole meaning of 定版. No session starts."""
-    pkg = _seed_package(monkeypatch, tmp_path)
-    _write_meta(pkg, summary="已定版", status="final")
-
-    async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("no builder session may start for a finalized tool")
-
-    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", must_not_generate)
-
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
-
-    assert outcome.ok is False
-    assert outcome.error == tool_builder._ERROR_REVISE_FINALIZED
-    assert outcome.llm_log_id is None
-
-
-def test_run_revise_refuses_an_unreadable_sidecar_before_the_session(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A sidecar that is ALREADY corrupt when the request arrives is refused at the
-    entry gate, not after a whole builder session (R6-3).
-
-    The gate used to read through the TOTAL ``summary_status``, where "no sidecar"
-    and "there IS one and it cannot be trusted" are the same None -- so this package
-    was admitted, spent a full multi-round session holding the global single-flight,
-    and was then refused by ``_promote_staging_replace``'s STRICT read at the very
-    end. The refusal was never in doubt; only the bill was, and every retry paid it
-    again. The job is the thing that ACTS, so the job is the thing that fails
-    closed; the ROUTE keeps the cheap total reader on purpose, because a route
-    answers about a resource's known state and guessing there costs at most this
-    outcome arriving as a job result instead of a 409.
-
-    The message is the one promote uses for the same condition, and it is NOT the
-    finalized one: the remedies differ (repair or remove a damaged sidecar vs.
-    解除定版), and following the wrong one would leave the operator toggling a state
-    that is not the problem."""
-    pkg = _seed_package(monkeypatch, tmp_path)
-    (pkg / tools._AI_META_FILENAME).write_text("{ not json at all", encoding="utf-8")
-    before = _file_bytes(pkg)
-
-    async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("no builder session may start for an unreadable sidecar")
-
-    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", must_not_generate)
-
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
-
-    assert outcome.ok is False
-    assert outcome.error == tool_builder._ERROR_REVISE_SUMMARY_UNREADABLE
-    assert outcome.error != tool_builder._ERROR_REVISE_FINALIZED  # two remedies, two messages
-    assert outcome.llm_log_id is None
-    assert _file_bytes(pkg) == before  # the damaged sidecar is left exactly as found
-    assert not (pkg.parent / tool_builder._STAGING_DIRNAME).exists()
-
-
 def test_run_revise_refuses_a_missing_tool_and_a_disabled_feature(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -6334,8 +5835,8 @@ def test_run_revise_refuses_when_the_package_was_reinstalled_mid_session(
     """A package of the same NAME is not the same package (R10-1).
 
     An operator can delete and reinstall the tool during the minutes a build
-    runs. Every earlier gate still passes -- the directory exists, is no symlink,
-    has no finalized sidecar -- so without an identity check the revise would
+    runs. Every earlier gate still passes -- the directory exists and is no
+    symlink -- so without an identity check the revise would
     rename the operator's NEW package aside, publish a revision of the OLD
     snapshot, and then delete the backup: the new package's files gone, silently.
     The identity is the directory's own inode, captured before the session."""
@@ -6433,17 +5934,15 @@ def test_run_revise_refuses_a_replacement_that_lands_during_the_sidecar_read(
 
     It moved twice for the same reason: r10 placed it before the ``.env`` copy,
     r11 before the sidecar read, and each left a window in which a replacement
-    still got overwritten. The sidecar read is the sharpest version of the
-    problem -- it can answer ``draft`` from the OLD package's file for the very
-    swap it is meant to guard. Driven here by replacing the package from inside
-    the status read, so the test pins the ORDER and not merely the check."""
+    still got overwritten. Driven here by replacing the package from inside the
+    origin read, so the test pins the ORDER and not merely the check."""
     pkg = _seed_package(monkeypatch, tmp_path)
     base = pkg.parent
     keep = "print('installed while the sidecar was read')"
-    real_status = tools.summary_status_or_unknown
+    real_read = tools.read_tool_meta
 
-    def replace_during_status(directory: Any) -> Any:
-        result = real_status(directory)
+    def replace_during_read(directory: Any) -> Any:
+        result = real_read(directory)
         if pkg.exists():
             shutil.rmtree(pkg)
             pkg.mkdir()
@@ -6454,7 +5953,7 @@ def test_run_revise_refuses_a_replacement_that_lands_during_the_sidecar_read(
         return result
 
     _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
-    monkeypatch.setattr(tools, "summary_status_or_unknown", replace_during_status)
+    monkeypatch.setattr(tools, "read_tool_meta", replace_during_read)
 
     outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
 
@@ -7243,14 +6742,13 @@ def test_run_revise_regenerates_the_summary_inheriting_the_origin(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The sidecar was excluded from staging, so the revised package has none
-    until the post-swap hook writes one: a fresh DRAFT summary carrying the
+    until the post-swap hook writes one: a fresh summary carrying the
     ORIGIN of the original install, which lives nowhere else and is read before
     the old package (and its sidecar) is destroyed."""
     pkg = _seed_package(monkeypatch, tmp_path)
     _write_meta(
         pkg,
         summary="舊的說明",
-        status="draft",
         origin={"openapi_url": "https://kb.example", "instructions": "原始安裝指示"},
     )
     _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
@@ -7261,64 +6759,11 @@ def test_run_revise_regenerates_the_summary_inheriting_the_origin(
     assert outcome.ok is True
     meta = _meta(pkg)
     assert meta["summary"] == "修訂後的說明"
-    assert meta["status"] == "draft"
     assert meta["origin"] == {
         "openapi_url": "https://kb.example",
         "instructions": "原始安裝指示",
     }
     assert meta["llm_log_id"] == llm_log.last_record_id_for_workflow("tool_summary")
-
-
-def test_run_revise_refuses_rather_than_losing_the_origin_to_one_bad_read(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A SINGLE transient sidecar read failure must not cost the origin (R4-2).
-
-    The origin -- the OpenAPI url and the operator's original install instructions
-    -- exists ONLY in this sidecar, and the swap destroys it. It used to be read
-    through the TOTAL ``read_tool_meta``, where every failure is None, while the
-    pre-swap gate re-read the same file through the STRICT one. So one EIO on the
-    first read said "no origin", the second read then said "draft", the swap went
-    ahead, and the regenerated sidecar carried the loss forever -- unrecoverably,
-    because nothing else persists either field.
-
-    Pinned by making exactly ONE read fail, armed once the session is under way.
-    That failure lands on whichever read comes first afterwards: under the old
-    code that was the separate origin read (silent loss, revise reports success),
-    and under the fix there is no such read -- the origin comes from the gate's own
-    parse -- so the failure lands on the GATE, which fails closed. The refusal
-    keeping the package AND the origin is the property; that only one read is left
-    to fail is how it is achieved."""
-    pkg = _seed_package(monkeypatch, tmp_path)
-    root = pkg.parent
-    origin = {"openapi_url": "https://kb.example", "instructions": "原始安裝指示"}
-    _write_meta(pkg, summary="舊的說明", status="draft", origin=origin)
-    before = _file_bytes(pkg)
-    real_read = tools.read_tool_meta
-    state = {"armed": False, "used": False}
-
-    def one_transient_failure(directory: Path) -> dict[str, Any] | None:
-        if state["armed"] and not state["used"]:
-            state["used"] = True
-            return None  # one EIO/ESTALE-shaped read, exactly once
-        return real_read(directory)
-
-    monkeypatch.setattr(tools, "read_tool_meta", one_transient_failure)
-    _fake_generate(
-        monkeypatch,
-        result=_revise_result(),
-        files={"run.py": _REVISED_RUN_PY},
-        side_effect=lambda: state.update(armed=True),
-    )
-
-    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁"))
-
-    assert state["used"] is True  # the transient failure really happened
-    assert outcome.ok is False
-    assert outcome.error == tool_builder._ERROR_REVISE_SUMMARY_UNREADABLE
-    assert _file_bytes(pkg) == before  # the package never swapped ...
-    assert _meta(pkg)["origin"] == origin  # ... and its only copy of the origin stands
-    assert _leftovers(root) == []
 
 
 def test_run_revise_survives_a_failing_summary(
