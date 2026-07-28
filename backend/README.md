@@ -313,10 +313,15 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   指回自己。discard 的順序固定為：確認 expected vid → sole 則整包刪除 → 驗前一版
   → 發布 `current=P` → 只有 pointer 的目錄 fsync 已確認才盡力移除 V。V 還在執行
   時改名 `<vid>.discarded`；無法確認持久化時保留 V 但仍回成功，因為多一個未指向
-  版本比「斷電後 current 指到已刪版本」安全。只有無法確認持久化或停放 rename
-  失敗、使 V 仍留在原廣告路徑時，才以該目錄的 `(device, inode)` 暫記退役；
-  停放成功時原路徑已消失，handler 自己的 identity check 已足夠，不留下 marker。
-  因此同 vid 從備份恢復成另一個 inode 時可在同一行程重新廣告與執行。
+  版本比「斷電後 current 指到已刪版本」安全。掃描捕捉一個可解析版本時，就在
+  process-local registry 取得或建立該 `VersionRoot` 的 advertisement generation；
+  同一輪稍後建立的每個 handler 都持有這個物件。discard 成功發布 `current=P` 時，
+  會在與掃描捕捉共用的 lock 內把 V 當下的 generation 標成 retired 並移出
+  registry；因此即使持久化未確認或停放 rename 失敗、使 V 留在原廣告路徑，舊
+  handler 仍明確拒絕。retired generation 由既有 handler 持有到該對話／handler
+  釋放為止；之後從備份恢復並重新掃描同一 vid 會取得新 generation。退役完全不讀
+  目錄的 device、inode 或其他可由 rename／刪除／重建影響的磁碟屬性，避免磁碟
+  身分重用或搬回原位使舊廣告復活。
 - **AI 總結拆成兩份 sidecar**：每版不可變的
   `.afterthread.meta/origin.json` 保存來源、安裝指示、修訂意見與 previous；
   可重新產生的 `.afterthread.meta/summary.json` 保存 summary、updated time 與

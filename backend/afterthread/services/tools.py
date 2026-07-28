@@ -271,6 +271,7 @@ class _PackageScan:
     parameters: dict[str, Any] | None
     entry: list[str] | None
     identity: tuple[int, int, int] | None
+    advertisement_generation: _AdvertisementGeneration | None = None
     notice: str | None = None
 
 
@@ -883,7 +884,7 @@ def scan_installed(package_root: PackageRoot) -> _PackageScan:
     """Resolve one installed package once, then scan only that resolved version."""
 
     name = package_root.path.name
-    resolution = resolve_current(package_root)
+    resolution, advertisement_generation = _resolve_and_register_advertisement(package_root)
     if isinstance(resolution, Unresolved):
         return _PackageScan(
             name=name,
@@ -912,6 +913,7 @@ def scan_installed(package_root: PackageRoot) -> _PackageScan:
             parameters=None,
             entry=None,
             identity=None,
+            advertisement_generation=advertisement_generation,
             notice=state.notice,
         )
     content = _scan_tool_content(resolution.version_root, name)
@@ -926,6 +928,7 @@ def scan_installed(package_root: PackageRoot) -> _PackageScan:
         parameters=content.parameters,
         entry=content.entry,
         identity=content.identity,
+        advertisement_generation=advertisement_generation,
         notice=state.notice,
     )
 
@@ -1806,6 +1809,7 @@ def _build_llm_tool(scan: _PackageScan) -> LlmTool:
     assert scan.parameters is not None
     assert scan.entry is not None
     assert isinstance(scan.resolution, Resolved)
+    assert scan.advertisement_generation is not None
     spec: dict[str, Any] = {
         "type": "function",
         "function": {
@@ -1821,6 +1825,7 @@ def _build_llm_tool(scan: _PackageScan) -> LlmTool:
             scan.resolution,
             scan.entry,
             scan.identity,
+            scan.advertisement_generation,
         ),
     )
 
@@ -2709,24 +2714,54 @@ _ADVERTISEMENT_GENERATIONS: weakref.WeakValueDictionary[VersionRoot, _Advertisem
 _ADVERTISEMENT_LOCK = threading.Lock()
 
 
+def _advertisement_generation_locked(
+    version_root: VersionRoot,
+) -> _AdvertisementGeneration:
+    """Return/create a cohort while the caller holds ``_ADVERTISEMENT_LOCK``."""
+
+    generation = _ADVERTISEMENT_GENERATIONS.get(version_root)
+    if generation is None:
+        generation = _AdvertisementGeneration()
+        _ADVERTISEMENT_GENERATIONS[version_root] = generation
+    return generation
+
+
 def _advertisement_generation(version_root: VersionRoot) -> _AdvertisementGeneration:
     """Return the live handler cohort for one advertised VersionRoot."""
 
     with _ADVERTISEMENT_LOCK:
-        generation = _ADVERTISEMENT_GENERATIONS.get(version_root)
-        if generation is None:
-            generation = _AdvertisementGeneration()
-            _ADVERTISEMENT_GENERATIONS[version_root] = generation
-        return generation
+        return _advertisement_generation_locked(version_root)
 
 
-def _retire_advertisements(version_root: VersionRoot) -> None:
-    """Retire exactly the handlers created before this discard."""
+def _resolve_and_register_advertisement(
+    package_root: PackageRoot,
+) -> tuple[Resolution, _AdvertisementGeneration | None]:
+    """Capture a resolution together with the cohort a discard must retire."""
 
     with _ADVERTISEMENT_LOCK:
-        generation = _ADVERTISEMENT_GENERATIONS.pop(version_root, None)
-        if generation is not None:
-            generation.retired = True
+        resolution = resolve_current(package_root)
+        if isinstance(resolution, Unresolved):
+            return resolution, None
+        # Registration shares the discard publication lock, so the guard exists
+        # from the instant this scan captures V: discard either retires this exact
+        # cohort afterward, or publishes first and the scan captures its successor.
+        return resolution, _advertisement_generation_locked(resolution.version_root)
+
+
+def _publish_discard_and_retire(
+    package_root: PackageRoot,
+    previous_vid: str,
+    discarded: VersionRoot,
+) -> CurrentPublication:
+    """Commit one discard and retire every scan that captured its old current."""
+
+    with _ADVERTISEMENT_LOCK:
+        publication = publish_current(package_root, previous_vid)
+        if publication:
+            generation = _ADVERTISEMENT_GENERATIONS.pop(discarded, None)
+            if generation is not None:
+                generation.retired = True
+        return publication
 
 
 def _advertisement_retired(generation: _AdvertisementGeneration) -> bool:
@@ -2839,6 +2874,7 @@ def _make_handler(
     advertised: Resolved,
     entry: list[str],
     identity: tuple[int, int, int] | None,
+    advertisement_generation: _AdvertisementGeneration,
 ) -> Callable[[dict[str, Any]], Awaitable[str]]:
     """Bind one advertisement to its package and exact resolved version.
 
@@ -2848,7 +2884,6 @@ def _make_handler(
     """
 
     advertised_directory_identity = directory_identity(advertised.version_root)
-    advertisement_generation = _advertisement_generation(advertised.version_root)
 
     async def _handler(arguments: dict[str, Any]) -> str:
         package_root = advertised.package_root
@@ -3048,7 +3083,7 @@ def discard_version(resolution: Resolved) -> DiscardOutcome:
     if target is None:
         return "lineage_unavailable"
     assert isinstance(previous_vid, str)
-    publication = publish_current(package_root, previous_vid)
+    publication = _publish_discard_and_retire(package_root, previous_vid, current)
     if not publication:
         return "not_found"
 
@@ -3056,11 +3091,10 @@ def discard_version(resolution: Resolved) -> DiscardOutcome:
     # cleanup, but destructive cleanup is forbidden unless the directory fsync
     # confirmed that the new pointer survives a crash.
     #
-    # Retire the handler cohort exactly once, after the successful publication
-    # that commits this discard and before either cleanup exit. The marker lives
-    # in each advertised handler's closure, so no rename, replacement, delete, or
-    # inode reuse can clear it; a later advertisement gets a new cohort.
-    _retire_advertisements(current)
+    # Publication and retirement occurred under the same lock scan capture uses.
+    # The marker lives in each advertised handler's closure, so no rename,
+    # replacement, delete, or inode reuse can clear it; a later advertisement
+    # gets a new cohort.
     if not publication.durable:
         return "ok"
 

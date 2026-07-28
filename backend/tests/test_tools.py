@@ -1194,6 +1194,57 @@ def test_retired_advertised_version_cannot_run_when_discard_cannot_park_it(
     assert tools.VersionRoot(second) not in tools._ADVERTISEMENT_GENERATIONS
 
 
+def test_discard_between_scan_capture_and_handler_build_retires_handler(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A scan owns its cohort before the later full-list handler build begins."""
+
+    root = tmp_path / "tools"
+    sentinel = tmp_path / "discarded-version-ran"
+    first = _make_tool(root, "aaa", "import sys\nsys.stdout.write('FIRST')\n")
+    package = _package_path(first)
+    package_root = tools.PackageRoot(package)
+    second_vid = "20260728T020304Z-fedcba"
+    second = _add_committed_version(package, second_vid, description="second", output="SECOND")
+    second.joinpath("run.py").write_text(
+        f"import sys\nopen({str(sentinel)!r}, 'w').write('x')\nsys.stdout.write('SECOND')\n",
+        encoding="utf-8",
+    )
+    assert tools.publish_current(package_root, second_vid)
+    _make_tool(root, "zzz", "import sys\nsys.stdout.write('Z')\n")
+    _install_tools(monkeypatch, root)
+
+    real_scan = tools.scan_installed
+    real_rename = tools.os.rename
+    discarded_during_scan = False
+
+    def fail_discard_parking(source: Path, target: Path) -> None:
+        if Path(source) == second:
+            raise PermissionError("injected parking failure")
+        real_rename(source, target)
+
+    def scan_then_discard(candidate: tools.PackageRoot) -> tools._PackageScan:
+        nonlocal discarded_during_scan
+        scan = real_scan(candidate)
+        if candidate.path.name == "zzz":
+            resolution = tools.resolve_current(package_root)
+            assert isinstance(resolution, tools.Resolved)
+            assert resolution.version_root == tools.VersionRoot(second)
+            assert tools.discard_version(resolution) == "ok"
+            discarded_during_scan = True
+        return scan
+
+    monkeypatch.setattr(tools.os, "rename", fail_discard_parking)
+    monkeypatch.setattr(tools, "scan_installed", scan_then_discard)
+
+    advertised = {tool.spec["function"]["name"]: tool.handler for tool in enabled_llm_tools()}
+
+    assert discarded_during_scan
+    assert second.is_dir()  # parking failed, so only the generation can refuse this call
+    assert asyncio.run(advertised["aaa"]({})) == tools._TOOL_REPLACED_RESULT
+    assert not sentinel.exists()
+
+
 def test_restored_backup_of_retired_vid_executes_in_the_same_process(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

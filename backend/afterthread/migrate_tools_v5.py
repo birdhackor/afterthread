@@ -1011,6 +1011,22 @@ def _same_env(old_root: Path, new_root: Path) -> bool:
         return False
 
 
+def _copy_env_is_absent_noop(root: Path, package: dict[str, Any]) -> bool:
+    """Return whether copy_env has no disk effect because both files are absent."""
+
+    name = package["name"]
+    old_live = root / name
+    premigrate = _premigrate_path(root, name)
+    old = premigrate if _old_package_at(premigrate) else old_live
+    new = _new_location(root, name, package["vid"])
+    return (
+        new is not None
+        and _old_package_at(old)
+        and _path_kind(old / ".env") == "absent"
+        and _path_kind(new / ".env") == "absent"
+    )
+
+
 def _disk_step_done(root: Path, package: dict[str, Any], action: str) -> bool:
     """Return the monotonic disk predicate for one journal action."""
 
@@ -1177,8 +1193,10 @@ def _resume_forward(
             disk_done = _disk_step_done(root, package, action)
             if pending is None:
                 # copy_env for a package with no .env is intentionally a no-op, so
-                # absence on both sides cannot prove an unannounced mutation.
-                no_op_env = action == "copy_env" and disk_done
+                # ONLY measured absence on both sides excuses a completed disk
+                # predicate. Equal files are a real copy and therefore evidence
+                # that the disk is ahead of its missing pending journal record.
+                no_op_env = action == "copy_env" and _copy_env_is_absent_noop(root, package)
                 if disk_done and not no_op_env:
                     raise MigrationRefused(
                         f"{package['name']}: disk is ahead of the journal at {action}"
@@ -1345,11 +1363,14 @@ def _cleanup_rolled_back(
         vid = package["vid"]
         for artifact in (_shell_path(root, name), _migrated_path(root, name)):
             if artifact.exists() or artifact.is_symlink():
+                # Always pass the journal vid: this keeps the ownership guard
+                # present precisely when a foreign replacement would fail it.
+                # A failed proof must stop cleanup, never disable verification.
                 operations.mutate(
                     f"cleanup_rollback:{name}:{artifact.name}",
                     lambda path=artifact, expected=vid: _remove_owned_tree(
                         path,
-                        require_new_vid=(expected if _is_new_package_at(path, expected) else None),
+                        require_new_vid=expected,
                     ),
                 )
         premigrate = _premigrate_path(root, name)

@@ -481,6 +481,100 @@ def test_injected_env_copy_failure_rolls_every_package_back_to_flat_layout(
 
 
 @pytest.mark.parametrize(
+    "artifact_name",
+    [".alpha.at-migration-shell", "alpha.at-migrated"],
+)
+def test_foreign_cleanup_target_survives_rollback_and_is_reported(
+    tmp_path: Path, artifact_name: str
+) -> None:
+    """A failed ownership proof leaves either deterministic cleanup name alone."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    with pytest.raises(InjectedCrash):
+        _run(
+            root,
+            operations=PointFailureOperations(
+                {"after:journal:alpha:copy_env:done": InjectedCrash()}
+            ),
+        )
+
+    shell = root / ".alpha.at-migration-shell"
+    foreign = root / artifact_name
+    if foreign == shell:
+        shutil.rmtree(shell)
+    foreign.mkdir()
+    foreign.chmod(0o711)
+    (foreign / "operator.txt").write_bytes(b"only operator copy\x00\n")
+    (foreign / "operator.txt").chmod(0o604)
+    (foreign / "nested").mkdir()
+    (foreign / "nested" / "payload.bin").write_bytes(b"\xffforeign")
+    before = _snapshot_tree(foreign)
+    output: list[str] = []
+
+    assert _run(root, output=output) == 1
+
+    assert _snapshot_tree(foreign) == before
+    assert stat.S_IMODE(foreign.stat().st_mode) == 0o711
+    report = "\n".join(output)
+    assert "cleanup target is not the journal's new package" in report
+    assert "migration journal remains available for retry" in report
+    journal = json.loads((root / migration._JOURNAL_FILENAME).read_text(encoding="utf-8"))
+    assert journal["status"] == "rolled_back"
+    assert (root / "alpha" / "tool.json").is_file()
+    if foreign != shell:
+        assert not shell.exists()  # the genuine journal-owned artifact was removed first
+
+
+def test_rollback_cleanup_removes_a_genuine_journal_owned_artifact(tmp_path: Path) -> None:
+    root = tmp_path / "tools"
+    original = _make_package(root)
+    before = _snapshot_tree(original)
+
+    assert (
+        _run(
+            root,
+            operations=PointFailureOperations(
+                {"before:copy_env:alpha": OSError("injected copy failure")}
+            ),
+        )
+        == 1
+    )
+
+    assert _snapshot_tree(root / "alpha") == before
+    assert not (root / ".alpha.at-migration-shell").exists()
+    assert not (root / migration._JOURNAL_FILENAME).exists()
+
+
+def test_unannounced_identical_env_copy_is_refused_as_disk_ahead(tmp_path: Path) -> None:
+    """Equal present files are a completed copy, not the absent-file no-op."""
+
+    root = tmp_path / "tools"
+    package = _make_package(root, env=b"API_KEY=operator-copy\n", env_mode=0o604)
+    before = _snapshot_tree(package)
+    with pytest.raises(InjectedCrash):
+        _run(
+            root,
+            operations=PointFailureOperations(
+                {"after:journal:alpha:assemble:done": InjectedCrash()}
+            ),
+        )
+
+    source_env = package / ".env"
+    shell_env = root / ".alpha.at-migration-shell" / ".env"
+    shutil.copyfile(source_env, shell_env)
+    shutil.copymode(source_env, shell_env)
+    output: list[str] = []
+
+    assert _run(root, output=output) == 1
+
+    assert "disk is ahead of the journal at copy_env" in "\n".join(output)
+    assert _snapshot_tree(root / "alpha") == before
+    assert not (root / ".alpha.at-migration-shell").exists()
+    assert not (root / migration._JOURNAL_FILENAME).exists()
+
+
+@pytest.mark.parametrize(
     ("state", "manifest_enabled", "expected_enabled", "foreign_survives"),
     [
         ("ours", True, False, False),
