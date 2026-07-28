@@ -476,6 +476,78 @@ def test_pending_assemble_does_not_own_a_foreign_shell(
     assert "cleanup target is not the journal's new package" in "\n".join(output)
 
 
+@pytest.mark.parametrize(
+    "point",
+    [
+        "before:assemble:alpha:create_shell",
+        "after:assemble:alpha:create_shell",
+        "before:journal:alpha:assemble:ownership",
+        "after:journal:alpha:assemble:ownership",
+        "before:assemble:alpha:establish_ownership",
+        "after:assemble:alpha:establish_ownership",
+    ],
+)
+def test_shell_creation_and_ownership_boundaries_are_self_recovering(
+    tmp_path: Path, point: str
+) -> None:
+    """Every side is absent, literally empty, or protected by both proofs."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+
+    with pytest.raises(InjectedCrash):
+        _run(root, operations=PointFailureOperations({point: InjectedCrash()}))
+
+    shell = migration._shell_path(root, "alpha")
+    if point == "before:assemble:alpha:create_shell":
+        assert not shell.exists()
+    elif point == "after:assemble:alpha:establish_ownership":
+        journal = json.loads((root / migration._JOURNAL_FILENAME).read_text(encoding="utf-8"))
+        identity = migration._directory_identity(shell)
+        assert identity is not None
+        assert journal["packages"][0]["shell_identity"] == list(identity)
+        assert migration._has_ownership_marker(shell, name="alpha", vid=_VID, role="shell")
+    else:
+        assert shell.is_dir()
+        assert not any(shell.iterdir())
+
+    assert _run(root) == 0
+    _assert_migrated(root)
+
+
+def test_partially_written_final_marker_keeps_bootstrap_proof_and_reruns(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The atomic journal link remains proof until the JSON marker is durable."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    shell = migration._shell_path(root, "alpha")
+    marker = shell / migration._META_DIRNAME / migration._OWNERSHIP_FILENAME
+    real_write = migration._write_shell_file
+    interrupted = False
+
+    def interrupt_marker_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+        nonlocal interrupted
+        if path == marker and not interrupted:
+            interrupted = True
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data[:17])
+            raise InjectedCrash()
+        real_write(path, data, mode)
+
+    monkeypatch.setattr(migration, "_write_shell_file", interrupt_marker_write)
+    with pytest.raises(InjectedCrash):
+        _run(root)
+
+    assert marker.is_file()
+    assert not migration._has_final_ownership_marker(shell, name="alpha", vid=_VID, role="shell")
+    assert migration._has_bootstrap_ownership_marker(shell, name="alpha", vid=_VID, role="shell")
+    assert _run(root) == 0
+    _assert_migrated(root)
+
+
 def test_owned_incomplete_shell_is_removed_before_assembly_retries(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1237,6 +1309,78 @@ def test_journal_with_two_pending_actions_is_refused_as_more_than_one_step_ahead
     assert _run(root) == 1
 
     assert _snapshot_tree(tmp_path) == before
+
+
+def test_v1_markerless_nonempty_shell_requires_operator_action_without_writes(
+    tmp_path: Path,
+) -> None:
+    """An ambiguous v1 artifact gets instructions, never forged ownership."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    backup = tmp_path / "full-backup"
+    shutil.copytree(root, backup)
+    payload = {
+        "version": migration._LEGACY_JOURNAL_VERSION,
+        "status": "running",
+        "tools_dir": str(root.resolve()),
+        "started_at": _START.isoformat(),
+        "backup": str(backup),
+        "packages": [
+            {
+                "name": "alpha",
+                "vid": _VID,
+                "completed": 0,
+                "pending": "assemble",
+            }
+        ],
+    }
+    (root / migration._JOURNAL_FILENAME).write_text(json.dumps(payload), encoding="utf-8")
+    shell = migration._shell_path(root, "alpha")
+    shell.mkdir()
+    (shell / "copied-before-v1-crashed.bin").write_bytes(b"\x00partial\xff")
+    before = _snapshot_tree(tmp_path)
+    output: list[str] = []
+
+    assert _run(root, output=output) == 1
+
+    assert _snapshot_tree(tmp_path) == before
+    report = "\n".join(output)
+    assert "Migration requires operator action; nothing was changed" in report
+    assert str(shell) in report
+    assert "v1 migration interruption" in report
+    assert "cannot prove whether it owns this directory" in report
+    assert "remove it, otherwise move it" in report
+    assert "then rerun" in report
+
+
+def test_v1_journal_without_shell_upgrades_and_completes(tmp_path: Path) -> None:
+    """The ambiguity exit does not block the ordinary readable-v1 upgrade."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    backup = tmp_path / "full-backup"
+    shutil.copytree(root, backup)
+    payload = {
+        "version": migration._LEGACY_JOURNAL_VERSION,
+        "status": "running",
+        "tools_dir": str(root.resolve()),
+        "started_at": _START.isoformat(),
+        "backup": str(backup),
+        "packages": [
+            {
+                "name": "alpha",
+                "vid": _VID,
+                "completed": 0,
+                "pending": "assemble",
+            }
+        ],
+    }
+    (root / migration._JOURNAL_FILENAME).write_text(json.dumps(payload), encoding="utf-8")
+
+    assert _run(root) == 0
+
+    _assert_migrated(root)
 
 
 def test_done_journal_with_missing_disk_effect_is_not_silently_replayed(tmp_path: Path) -> None:

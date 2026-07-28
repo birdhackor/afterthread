@@ -366,11 +366,18 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `committed`；commit 前錯誤回復所有名稱，commit 後只重試清理、不再 rollback。
   journal 另持久記錄 shell／舊套件目錄 identity，並在目錄內寫入綁定 package +
   vid + role 的 ownership marker；刪除必須同時重驗這些證明（完整 target-layout
-  VID 也是正證明），名稱本身從不授權刪除。partial `rmtree` 即使已刪掉 `tool.json`
-  仍可由留下的 marker 對帳；marker 也已消失而無法建立正證明時則停止並保留殘件。
+  VID 也是正證明），名稱本身從不授權刪除。新 shell 在仍為空目錄時先記錄 identity，
+  再以目前 journal 的 atomic hard link 暫時充當 bootstrap marker；正式 JSON marker
+  完整落盤後才移除 bootstrap。因此任何中斷點的 shell 不是仍為空（可無損移除），
+  就是已有 identity + marker；正式 marker 寫到一半也仍有 bootstrap 可供對帳。
+  partial `rmtree` 即使已刪掉 `tool.json` 仍可由留下的 marker 對帳；marker 也已消失
+  且目錄非空、無法建立正證明時則停止並保留殘件。
   中斷後以同一指令重跑，journal 會按其狀態續做／回復／清理；不要手動猜測或刪除
   `.at-*` 兄弟目錄。既有 journal 已代表先前確認過的 migration authority，所以
   真實重跑會直接對帳，不再詢問；此時 `--dry-run` 只報 journal status，不做對帳。
+  唯一需要 operator 決定的是 v1 journal 搭配非空、markerless 且未完成的 shell：
+  v1 沒留下可驗 ownership，程式會保持所有內容不變，列出確切路徑，並要求先檢查後
+  將可丟棄的 v1 partial shell 刪除，或把要保留的資料移出 reserved 名稱，再重跑。
 - **安全立場（v1）**：這是單人本機工具，shell 能力是明確需求（比照 Claude
   Code 建 skill 的能力/風險模型）——`run_shell` 是以**本服務自身權限**執行的
   真實 bash，只是預設從暫存目錄開始（工作慣例，不是圍籬），v1 刻意不做容器

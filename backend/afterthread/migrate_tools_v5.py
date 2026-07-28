@@ -96,6 +96,7 @@ _JOURNAL_VERSION = 2
 _JOURNAL_MAX_BYTES = 1024 * 1024
 _META_DIRNAME = ".afterthread.meta"
 _OWNERSHIP_FILENAME = "migration-owner.json"
+_OWNERSHIP_BOOTSTRAP_FILENAME = ".migration-owner-journal"
 _OWNERSHIP_MARKER = "tools-v5-migration-owner"
 _VERSIONS_DIRNAME = "versions"
 _SHELL_SUFFIX = ".at-migration-shell"
@@ -114,6 +115,10 @@ _ENV_KEY_RE = re.compile(rb"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*=")
 
 class MigrationRefused(Exception):
     """A category-only refusal safe to show to the operator."""
+
+
+class LegacyShellNeedsOperator(MigrationRefused):
+    """A v1 artifact whose ownership cannot honestly be reconstructed."""
 
 
 class MigrationOperations:
@@ -762,8 +767,8 @@ def _directory_identity(path: Path) -> tuple[int, int] | None:
     return info.st_dev, info.st_ino
 
 
-def _has_ownership_marker(path: Path, *, name: str, vid: str, role: str) -> bool:
-    """Recognize one journal-bound marker without following a foreign entry."""
+def _has_final_ownership_marker(path: Path, *, name: str, vid: str, role: str) -> bool:
+    """Recognize the final JSON marker without following a foreign entry."""
 
     try:
         raw, _mode = _read_json_object(
@@ -780,12 +785,63 @@ def _has_ownership_marker(path: Path, *, name: str, vid: str, role: str) -> bool
     }
 
 
+def _has_bootstrap_ownership_marker(path: Path, *, name: str, vid: str, role: str) -> bool:
+    """Recognize the atomic journal link that protects final-marker creation."""
+
+    if role != "shell":
+        return False
+    try:
+        raw, _mode = _read_json_object(
+            path / _OWNERSHIP_BOOTSTRAP_FILENAME,
+            cap=_JOURNAL_MAX_BYTES,
+        )
+    except MigrationRefused:
+        return False
+    if (
+        set(raw) != {"version", "status", "tools_dir", "started_at", "backup", "packages"}
+        or raw.get("version") != _JOURNAL_VERSION
+        or raw.get("status") != "running"
+        or raw.get("tools_dir") != str(path.parent)
+        or not isinstance(raw.get("packages"), list)
+    ):
+        return False
+    identity = _directory_identity(path)
+    if identity is None:
+        return False
+    expected_keys = {
+        "name",
+        "vid",
+        "completed",
+        "pending",
+        "shell_identity",
+        "premigrate_identity",
+    }
+    return any(
+        isinstance(package, dict)
+        and set(package) == expected_keys
+        and package["name"] == name
+        and package["vid"] == vid
+        and package["completed"] == 0
+        and package["pending"] == "assemble"
+        and package["shell_identity"] == list(identity)
+        for package in raw["packages"]
+    )
+
+
+def _has_ownership_marker(path: Path, *, name: str, vid: str, role: str) -> bool:
+    """Recognize either durable marker used while a shell is being born."""
+
+    return _has_final_ownership_marker(
+        path, name=name, vid=vid, role=role
+    ) or _has_bootstrap_ownership_marker(path, name=name, vid=vid, role=role)
+
+
 def _ensure_ownership_marker(path: Path, *, name: str, vid: str, role: str) -> None:
     """Create one marker, or accept only the exact marker this journal owns."""
 
     marker = path / _META_DIRNAME / _OWNERSHIP_FILENAME
     if marker.exists() or marker.is_symlink():
-        if _has_ownership_marker(path, name=name, vid=vid, role=role):
+        if _has_final_ownership_marker(path, name=name, vid=vid, role=role):
             return
         raise MigrationRefused(f"{path.name}: migration ownership marker is foreign")
     _write_shell_file(
@@ -799,6 +855,60 @@ def _ensure_ownership_marker(path: Path, *, name: str, vid: str, role: str) -> N
             }
         ),
     )
+
+
+def _is_empty_real_directory(path: Path) -> bool:
+    """An empty real directory contains no operator data that cleanup could lose."""
+
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISDIR(info.st_mode):
+            return False
+        with os.scandir(path) as entries:
+            return next(entries, None) is None
+    except OSError:
+        return False
+
+
+def _establish_shell_ownership(
+    root: Path,
+    shell: Path,
+    *,
+    name: str,
+    vid: str,
+    operations: MigrationOperations,
+) -> None:
+    """Atomically bridge an identified empty shell to its final JSON marker."""
+
+    bootstrap = shell / _OWNERSHIP_BOOTSTRAP_FILENAME
+    if bootstrap.exists() or bootstrap.is_symlink():
+        if not _has_bootstrap_ownership_marker(shell, name=name, vid=vid, role="shell"):
+            raise MigrationRefused(f"{shell.name}: migration ownership bootstrap is foreign")
+    elif not _has_final_ownership_marker(shell, name=name, vid=vid, role="shell"):
+
+        def link_current_journal() -> None:
+            journal_path = root / _JOURNAL_FILENAME
+            try:
+                journal_info = os.lstat(journal_path)
+            except OSError as exc:
+                raise MigrationRefused(
+                    f"{shell.name}: migration journal cannot establish shell ownership"
+                ) from exc
+            if not stat.S_ISREG(journal_info.st_mode):
+                raise MigrationRefused(
+                    f"{shell.name}: migration journal cannot establish shell ownership"
+                )
+            os.link(journal_path, bootstrap, follow_symlinks=False)
+            _fsync_directory(shell)
+
+        operations.mutate(f"assemble:{name}:establish_ownership", link_current_journal)
+
+    if not _has_ownership_marker(shell, name=name, vid=vid, role="shell"):
+        raise MigrationRefused(f"{shell.name}: migration could not establish shell ownership")
+    _ensure_ownership_marker(shell, name=name, vid=vid, role="shell")
+    if bootstrap.exists():
+        bootstrap.unlink()
+        _fsync_directory(shell)
 
 
 def _record_directory_identity(
@@ -846,25 +956,50 @@ def _assemble_shell(
                 )
             return
         if not _has_ownership_marker(shell, name=package.name, vid=vid, role="shell"):
-            raise MigrationRefused(f"{shell.name}: incomplete shell has no journal ownership proof")
-        shell_identity = package_record["shell_identity"]
-        if shell_identity is None:
-            shell_identity = _record_directory_identity(
-                root,
-                journal,
-                package_record,
-                "shell_identity",
-                shell,
-                label=f"{package.name}:assemble:ownership",
-                operations=operations,
+            if not _is_empty_real_directory(shell):
+                raise MigrationRefused(
+                    f"{shell.name}: incomplete shell has no journal ownership proof"
+                )
+
+            def discard_empty_shell() -> None:
+                if not _is_empty_real_directory(shell):
+                    raise MigrationRefused(
+                        f"{shell.name}: empty shell gained content before removal"
+                    )
+                shell.rmdir()
+                _fsync_directory(root)
+
+            # The sole no-proof exit is literal emptiness: no operator content
+            # exists to preserve, regardless of what pending=assemble says.
+            operations.mutate(
+                f"assemble:{package.name}:discard_empty_shell",
+                discard_empty_shell,
             )
-        _remove_owned_tree(
-            shell,
-            require_identity=tuple(shell_identity),
-            require_marker=(package.name, vid, "shell"),
-        )
-    shell.mkdir(mode=0o700)
-    _ensure_ownership_marker(shell, name=package.name, vid=vid, role="shell")
+        else:
+            shell_identity = package_record["shell_identity"]
+            if shell_identity is None:
+                shell_identity = _record_directory_identity(
+                    root,
+                    journal,
+                    package_record,
+                    "shell_identity",
+                    shell,
+                    label=f"{package.name}:assemble:ownership",
+                    operations=operations,
+                )
+            _remove_owned_tree(
+                shell,
+                require_identity=tuple(shell_identity),
+                require_marker=(package.name, vid, "shell"),
+            )
+    if shell.exists() or shell.is_symlink():
+        raise AssertionError("shell reconciliation returned without removing its artifact")
+
+    def create_empty_shell() -> None:
+        shell.mkdir(mode=0o700)
+        _fsync_directory(root)
+
+    operations.mutate(f"assemble:{package.name}:create_shell", create_empty_shell)
     _record_directory_identity(
         root,
         journal,
@@ -872,6 +1007,13 @@ def _assemble_shell(
         "shell_identity",
         shell,
         label=f"{package.name}:assemble:ownership",
+        operations=operations,
+    )
+    _establish_shell_ownership(
+        root,
+        shell,
+        name=package.name,
+        vid=vid,
         operations=operations,
     )
     version = shell / _VERSIONS_DIRNAME / vid
@@ -1095,6 +1237,20 @@ def _validate_journal(raw: dict[str, Any], root: Path) -> dict[str, Any]:
             # incomplete, every later package must still be wholly untouched.
             raise MigrationRefused("migration journal package progress is out of order")
         if version == _LEGACY_JOURNAL_VERSION:
+            shell = _shell_path(root, name)
+            if (
+                (shell.exists() or shell.is_symlink())
+                and not _is_new_package_at(shell, vid)
+                and not _has_ownership_marker(shell, name=name, vid=vid, role="shell")
+                and not _is_empty_real_directory(shell)
+            ):
+                raise LegacyShellNeedsOperator(
+                    f"{shell}: a v1 migration interruption left a non-empty shell "
+                    "without ownership proof. The migration cannot prove whether it owns "
+                    "this directory, so it was left untouched. Inspect this exact path; "
+                    "if it is the disposable partial v1 shell, remove it, otherwise move "
+                    "it to a safe operator-owned name, then rerun the migration."
+                )
             package["shell_identity"] = None
             package["premigrate_identity"] = None
         names.add(name)
@@ -1450,6 +1606,9 @@ def _remove_owned_tree(
     info = os.lstat(path)
     if not stat.S_ISDIR(info.st_mode):
         raise MigrationRefused(f"{path.name}: cleanup target is not a real directory")
+    if _is_empty_real_directory(path):
+        path.rmdir()
+        return
     if require_new_vid is None and require_identity is None:
         raise MigrationRefused(f"{path.name}: cleanup target has no journal ownership proof")
     identity_matches = require_identity == (info.st_dev, info.st_ino)
@@ -1795,6 +1954,9 @@ def migrate_tools(
         if dry_run:
             try:
                 journal = _read_journal(root)
+            except LegacyShellNeedsOperator as exc:
+                output(f"Migration requires operator action; nothing was changed: {exc}")
+                return 1
             except MigrationRefused as exc:
                 output(f"Refusing unreadable migration journal: {exc}")
                 return 1
@@ -1805,6 +1967,9 @@ def migrate_tools(
             return 0
         try:
             journal = _read_journal(root)
+        except LegacyShellNeedsOperator as exc:
+            output(f"Migration requires operator action; nothing was changed: {exc}")
+            return 1
         except MigrationRefused as exc:
             output(f"Refusing unreadable migration journal: {exc}")
             return 1
