@@ -2904,7 +2904,9 @@ def package_execution_judgement(
     try:
         versions_info = os.lstat(versions)
     except FileNotFoundError:
-        return "locally-proven-idle"
+        # Absence cannot be positive evidence: the directory may have been
+        # renamed while a surviving child still holds a version cwd by inode.
+        return "unknown"
     except OSError:
         return "unknown"
     if not stat.S_ISDIR(versions_info.st_mode):
@@ -2924,6 +2926,12 @@ def package_execution_judgement(
         if identity is None:
             return "unknown"
         identities.append(identity)
+    # An empty versions directory (or one with no real directory entries)
+    # proves nothing about a generation that may have been renamed elsewhere
+    # inside the package. Only identities positively enumerated by this process
+    # can participate in a locally-idle proof.
+    if not identities:
+        return "unknown"
     with _EXECUTION_LOCK:
         if any(identity in _INFLIGHT_EXECUTIONS for identity in identities):
             return "running"
@@ -3265,12 +3273,23 @@ def discard_version(resolution: Resolved) -> DiscardOutcome:
     return "ok"
 
 
-def delete_tool(name: str) -> bool:
-    """Delete a package (``rmtree``), or an alias (``unlink``). Returns success.
+type DeleteToolOutcome = Literal["removed", "retained"]
+
+
+@dataclass(frozen=True, slots=True)
+class DeleteToolResult:
+    """The observable filesystem result after a tool leaves the registry."""
+
+    outcome: DeleteToolOutcome
+    retained_path: Path | None
+
+
+def delete_tool(name: str) -> DeleteToolResult | None:
+    """Delete a package (``rmtree``), or unlink an alias; return its outcome.
 
     Name-validated and containment-checked exactly like ``set_enabled`` (the
     traversal hard-block is what makes an ``rmtree`` here safe), so it can only
-    ever remove a directory that genuinely sits inside ``tools_dir``. False when
+    ever remove a directory that genuinely sits inside ``tools_dir``. None when
     the name is unsafe, the package is absent, or it could not be taken out of
     the registry at all.
 
@@ -3285,12 +3304,11 @@ def delete_tool(name: str) -> bool:
     worse than it sounds: the model sees a failure for an action whose external
     side effect may already have happened, and may simply retry it.
 
-    Deferring changes nothing the caller can observe. The tool is gone from the
-    registry the instant this returns EITHER WAY: the new name is dot-prefixed,
-    which is precisely what ``_scan_all`` (and so ``list_tools`` /
-    ``enabled_llm_tools``) and ``known_secret_values`` skip. The route's contract
-    is untouched -- True is a genuine deletion of what the user saw, False still
-    folds every "did not happen" into one 404.
+    The tool is gone from the registry the instant this returns EITHER WAY: the
+    new name is dot-prefixed, which is precisely what ``_scan_all`` (and so
+    ``list_tools`` / ``enabled_llm_tools``) and ``known_secret_values`` skip.
+    The result distinguishes physical removal from retained hidden files so the
+    route can tell the operator when credentials may still be on disk.
 
     The remains are offered to the SAME sweep
     (``tool_builder._sweep_stale_backups``, at the end of every tool job), but
@@ -3303,7 +3321,7 @@ def delete_tool(name: str) -> bool:
     """
     base = tools_dir()
     if base is None or not _NAME_RE.match(name):
-        return False
+        return None
     # INTERNAL-alias hard-block (H3), BEFORE resolve: an internal symlink
     # ``tools/<name> -> tools/real`` RESOLVES inside the tools root, so the
     # resolve-then-contain check below would PASS and ``rmtree`` would recurse
@@ -3313,7 +3331,7 @@ def delete_tool(name: str) -> bool:
     # detects the alias itself; ``unlink`` removes ONLY the link (its target,
     # internal OR external, is never touched), so the phantom row disappears and
     # the real package survives. This is a genuine deletion of what the user saw
-    # (the alias row), so it returns True. It runs before resolve precisely
+    # (the alias row), so it reports removed. It runs before resolve precisely
     # because ``resolve()`` would erase the alias/real distinction; the
     # resolve-then-contain check below still guards a non-symlink external escape.
     candidate = base / name
@@ -3321,11 +3339,11 @@ def delete_tool(name: str) -> bool:
         try:
             candidate.unlink()
         except OSError:
-            return False
-        return True
+            return None
+        return DeleteToolResult("removed", None)
     directory = _resolve_package_dir(name)
     if directory is None or not directory.is_dir():
-        return False
+        return None
     # RENAME FIRST, then decide -- the exact order ``_promote_staging_replace``
     # uses, and for a reason that is structural rather than stylistic. Asking the
     # registry first and removing second leaves a window: a handler that passes
@@ -3351,7 +3369,7 @@ def delete_tool(name: str) -> bool:
     except OSError:
         # The package is untouched and still listed, so this is the honest "did
         # not happen" -- the same answer a failed removal gave before.
-        return False
+        return None
     # The identity is taken from what we now HOLD rather than from the name we
     # were given, so it describes the very files a child could still be reading
     # (a rename carries a directory's ``(st_dev, st_ino)`` -- measured). The
@@ -3364,11 +3382,10 @@ def delete_tool(name: str) -> bool:
     # package whose manifest cannot be lstat'ed is one no handler can have
     # registered -- does not survive the move: an lstat failure on a directory we
     # just renamed successfully says nothing about what is running inside it, only
-    # that we cannot name it. Nothing observable changes either way (the tool is
-    # already out of the registry and this still returns True); what is left
-    # behind is marked remains. The current process records that it saw the tree
-    # running; a later sweep may collect it after observing idle, while a fresh
-    # process deliberately has no such authority.
+    # that we cannot name it. The tool is already out of the registry either way;
+    # what is left behind is marked remains. The current process records that it
+    # saw the tree running; a later sweep may collect it after observing idle,
+    # while a fresh process deliberately has no such authority.
     try:
         execution = package_execution_judgement(PackageLayoutRoot(deferred))
     except Exception:
@@ -3377,13 +3394,15 @@ def delete_tool(name: str) -> bool:
         execution = "unknown"
     if execution == "running":
         remember_running_tree_for_cleanup(deferred)
-        return True
+        return DeleteToolResult("retained", deferred)
     if execution == "unknown":
-        return True
+        return DeleteToolResult("retained", deferred)
     # Best-effort from here: the tool is already gone as far as everything that
     # reads this directory is concerned, so a removal that fails part-way must not
     # be reported as "did not happen". Because this path was never observed
     # running it receives no later automatic-cleanup permission; marked remains
     # are hidden evidence for the operator rather than a restart-unsafe retry.
     shutil.rmtree(deferred, ignore_errors=True)
-    return True
+    if os.path.lexists(deferred):
+        return DeleteToolResult("retained", deferred)
+    return DeleteToolResult("removed", None)

@@ -709,6 +709,13 @@ def _remember_package_locally_idle(package: Path) -> None:
             tools.remember_local_execution_generation(tools.VersionRoot(version))
 
 
+def _delete_outcome(name: str) -> tools.DeleteToolOutcome | None:
+    """Project the service result for assertions that do not need its path."""
+
+    result = delete_tool(name)
+    return result.outcome if result is not None else None
+
+
 def _state_path(version: Path) -> Path:
     return _package_path(version) / tools._META_DIRNAME / tools._PACKAGE_STATE_FILENAME
 
@@ -880,6 +887,63 @@ def test_execution_judgement_requires_positive_local_idle_evidence(tmp_path: Pat
     assert tools.package_execution_judgement(package_root) == "locally-proven-idle"
 
 
+def test_delete_with_running_child_and_renamed_versions_parks_tree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A missing fixed versions name is not evidence that its inode is idle."""
+
+    root = tmp_path / "tools"
+    marker, gate = tmp_path / "started", tmp_path / "go"
+    version = _make_tool(
+        root,
+        "echo",
+        "import os, sys, time\n"
+        f"open({str(marker)!r}, 'w').write('x')\n"
+        f"while not os.path.exists({str(gate)!r}):\n"
+        "    time.sleep(0.01)\n"
+        "sys.stdout.write(open('data.txt').read())\n",
+    )
+    (version / "data.txt").write_text("PAYLOAD", encoding="utf-8")
+    package = _package_path(version)
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler
+
+    result: dict[str, str] = {}
+    caller = threading.Thread(target=lambda: result.update(out=asyncio.run(handler({}))))
+    caller.start()
+    try:
+        _wait_for(marker.exists)
+        os.rename(package / tools._VERSIONS_DIRNAME, package / "versions.bak")
+        deleted = delete_tool("echo")
+        assert deleted is not None and deleted.outcome == "retained"
+        assert deleted.retained_path is not None
+        assert (deleted.retained_path / "versions.bak" / _TEST_VID / "data.txt").is_file()
+    finally:
+        gate.write_text("go", encoding="utf-8")
+        caller.join(timeout=30)
+
+    assert result["out"] == "PAYLOAD"
+
+
+def test_delete_with_empty_versions_parks_tree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An empty collection supplies no locally-created generation evidence."""
+
+    root = tmp_path / "tools"
+    version = _make_tool(root, "echo", "import sys\n")
+    package = _package_path(version)
+    shutil.rmtree(package / tools._VERSIONS_DIRNAME)
+    (package / tools._VERSIONS_DIRNAME).mkdir()
+    _install_tools(monkeypatch, root)
+
+    deleted = delete_tool("echo")
+
+    assert deleted is not None and deleted.outcome == "retained"
+    assert deleted.retained_path is not None
+    assert list((deleted.retained_path / tools._VERSIONS_DIRNAME).iterdir()) == []
+
+
 def test_restart_delete_parks_an_unknown_generation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -899,7 +963,7 @@ def test_restart_delete_parks_an_unknown_generation(
     tools._INFLIGHT_EXECUTIONS.clear()
     tools._LOCAL_EXECUTION_GENERATIONS.clear()
 
-    assert delete_tool("echo") is True
+    assert _delete_outcome("echo") == "retained"
 
     remains = [child for child in root.iterdir() if tools._STALE_BACKUP_RE.match(child.name)]
     assert len(remains) == 1
@@ -3793,10 +3857,10 @@ def test_delete_tool_removes_package(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     _remember_package_locally_idle(_package_path(version))
     _install_tools(monkeypatch, root)
 
-    assert delete_tool("echo") is True
+    assert _delete_outcome("echo") == "removed"
     assert list_tools() == []
     assert list(root.iterdir()) == []  # destroyed by the time it returned, not left marked
-    assert delete_tool("echo") is False  # already gone
+    assert _delete_outcome("echo") is None  # already gone
 
 
 def test_delete_during_an_execution_defers_the_removal(
@@ -3839,7 +3903,7 @@ def test_delete_during_an_execution_defers_the_removal(
     caller.start()
     try:
         _wait_for(marker.exists)  # the CHILD is running, not merely queued
-        assert delete_tool("busy") is True  # the route still reports success (204)
+        assert _delete_outcome("busy") == "retained"
         assert list_tools() == []  # ... and it is gone from the registry at once
         assert enabled_llm_tools() == []
         assert not pkg.exists()  # the NAME is free again
@@ -3912,7 +3976,7 @@ def test_delete_after_a_manifest_edit_still_defers_a_running_call(
         # the manifest identity (so a manifest-keyed lookup would miss) while the
         # directory identity the call registered under is unchanged.
         assert _edit_manifest_in_place(pkg) != before
-        assert delete_tool("toggled") is True
+        assert _delete_outcome("toggled") == "retained"
     finally:
         gate.write_text("go", encoding="utf-8")
         caller.join(timeout=30)
@@ -3962,7 +4026,7 @@ def test_a_toggle_mid_call_moves_neither_identity(
         assert tools.package_identity(_version_root(pkg)) == manifest_before
         assert tools.directory_identity(_version_root(pkg)) == directory_before
         assert (pkg / "tool.json").read_bytes() == manifest_bytes
-        assert delete_tool("toggled") is True
+        assert _delete_outcome("toggled") == "retained"
     finally:
         gate.write_text("go", encoding="utf-8")
         caller.join(timeout=30)
@@ -4001,7 +4065,7 @@ def test_a_delete_landing_while_a_call_prepares_is_registered_for_and_refused(
     def delete_then_build(
         directory: tools.PackageRoot,
     ) -> tuple[dict[str, str], frozenset[str]]:
-        assert delete_tool("busy") is True
+        assert _delete_outcome("busy") == "retained"
         return real_build_env(directory)
 
     monkeypatch.setattr(tools, "_build_tool_env", delete_then_build)
@@ -4124,7 +4188,7 @@ def test_deferred_delete_remains_are_invisible_to_every_registry_path(
     assert [tool.spec["function"]["name"] for tool in enabled_llm_tools()] == ["alive"]
     known = tools.known_secret_values()
     assert "live-abcdef" in known and "ghost-secret-abcdef" not in known
-    assert delete_tool("ghost") is False  # not addressable by name either
+    assert _delete_outcome("ghost") is None  # not addressable by name either
 
 
 @pytest.mark.parametrize(
@@ -4141,7 +4205,7 @@ def test_mutators_reject_bad_names(
     _install_tools(monkeypatch, root)
 
     assert set_enabled(bad_name, False) is False
-    assert delete_tool(bad_name) is False
+    assert _delete_outcome(bad_name) is None
     assert list_tools()[0]["name"] == "echo"  # the real package is untouched
 
 
@@ -4162,7 +4226,7 @@ def test_delete_symlink_escape_unlinks_only_the_alias(
     (root / "evil").symlink_to(precious, target_is_directory=True)
     _install_tools(monkeypatch, root)
 
-    assert delete_tool("evil") is True  # the alias row is removed...
+    assert _delete_outcome("evil") == "removed"  # the alias row is removed...
     assert not (root / "evil").exists()  # ...the link itself is gone...
     assert not (root / "evil").is_symlink()
     assert precious.exists()  # ...but the external target was never followed
@@ -4389,7 +4453,7 @@ def test_delete_internal_alias_removes_only_link(
     (root / "alias").symlink_to(root / "real", target_is_directory=True)
     _install_tools(monkeypatch, root)
 
-    assert delete_tool("alias") is True
+    assert _delete_outcome("alias") == "removed"
     assert not (root / "alias").exists()  # the alias link is gone
     assert not (root / "alias").is_symlink()
     # The real package was never followed: its files survive and it still lists.
@@ -4599,7 +4663,7 @@ def test_feature_off_when_tools_dir_unset(monkeypatch: pytest.MonkeyPatch) -> No
     assert list_tools() == []
     assert enabled_llm_tools() == []
     assert set_enabled("x", True) is False
-    assert delete_tool("x") is False
+    assert _delete_outcome("x") is None
 
 
 # --- AI summary sidecar (D40) ----------------------------------------------
@@ -5751,7 +5815,7 @@ def test_delete_tool_takes_the_sidecar_with_it(
     _write_meta(pkg, summary="s")
     assert _sidecar(pkg).is_file()
 
-    assert delete_tool("echo") is True
+    assert _delete_outcome("echo") == "retained"
     assert not pkg.exists()
 
 

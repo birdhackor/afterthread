@@ -14,7 +14,7 @@ Layers:
   feature-off, fetch failures (a real local HTTP server), oversized body;
 * JOBS -- the queued -> running -> succeeded/failed state machine, driven with
   a controllable fake run_install on a real event loop;
-* ROUTER -- the five endpoints' 200/202/204/404/422/503 contracts.
+* ROUTER -- the endpoints' 200/202/204/404/422/503 contracts.
 
 Async entry points are driven with ``asyncio.run`` (no pytest-asyncio plugin,
 matching the suite). Jobs and the llm_log ring are process-wide singletons, so
@@ -2990,20 +2990,28 @@ def test_router_rejects_invalid_names_as_422(
     assert client.delete(f"/api/tools/{bad_name}").status_code == 422
 
 
-def test_router_delete_tool(
+def test_router_delete_tool_response_distinguishes_removed_from_retained(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    root = tmp_path / "tools"
-    pkg = root / "kbsearch"
-    pkg.mkdir(parents=True)
-    (pkg / "run.py").write_text("print('x')\n")
-    (pkg / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")))
-    _install_settings(monkeypatch, tools_dir=str(root))
+    removed_version = _seed_package(monkeypatch, tmp_path, "idle")
+    retained_version = _seed_package(monkeypatch, tmp_path, "unknown")
+    tools.remember_local_execution_generation(tools.VersionRoot(removed_version))
 
-    response = client.delete("/api/tools/kbsearch")
-    assert response.status_code == 204
-    assert not pkg.exists()
-    assert client.delete("/api/tools/kbsearch").status_code == 404
+    removed = client.delete("/api/tools/idle")
+    retained = client.delete("/api/tools/unknown")
+
+    assert removed.status_code == 200
+    assert removed.json() == {"outcome": "removed", "retained_path": None}
+    assert retained.status_code == 200
+    retained_body = retained.json()
+    assert retained_body["outcome"] == "retained"
+    retained_path = Path(retained_body["retained_path"])
+    assert retained_path.parent == tmp_path / "tools"
+    assert tools._STALE_BACKUP_RE.match(retained_path.name)
+    assert (_resolved_version(retained_path) / "run.py").is_file()
+    assert not _package_path(removed_version).exists()
+    assert not _package_path(retained_version).exists()
+    assert client.delete("/api/tools/idle").status_code == 404
 
 
 def test_router_install_503_when_unconfigured(
@@ -4766,7 +4774,8 @@ def test_invariant_a_delete_discard_and_sweep_share_one_running_package_judgemen
 
     monkeypatch.setattr(tools, "package_execution_judgement", locally_idle)
 
-    assert tools.delete_tool("live") is True
+    delete_result = tools.delete_tool("live")
+    assert delete_result is not None and delete_result.outcome == "removed"
     assert tools.discard_version(resolution) == "ok"
     tool_builder._sweep_stale_backups(base)
 
@@ -4871,7 +4880,8 @@ def test_sweep_collects_what_a_deferred_delete_left_behind(
     try:
         _wait_for(marker.exists)
         assert tools.set_enabled("kbsearch", False) is True
-        assert tools.delete_tool("kbsearch") is True
+        delete_result = tools.delete_tool("kbsearch")
+        assert delete_result is not None and delete_result.outcome == "retained"
         deferred = [child for child in base.iterdir() if tools._STALE_BACKUP_RE.match(child.name)]
         assert len(deferred) == 1
         tool_builder._sweep_stale_backups(base)
@@ -4885,21 +4895,19 @@ def test_sweep_collects_what_a_deferred_delete_left_behind(
     assert list(base.iterdir()) == []
 
 
-def test_sweep_keeps_a_marked_backup_whose_identity_cannot_be_read(
+def test_sweep_keeps_a_marked_backup_without_positive_version_evidence(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Refusing to say KEEPS the directory, the documented direction for this call
     site: the destructive act here is the removal, so a check that cannot speak
     must not vouch for it (D40 P3b r11's rule, pointed the way this use needs).
 
-    What "cannot say" MEANS moved with the key. The sweep now asks the DIRECTORY
-    (that is what a deferral is registered under -- a manifest-keyed answer misses
-    a child that registered before an ``enabled`` toggle), so a marked backup
-    whose ``tool.json`` is gone is now ordinary collectable litter rather than the
-    permanent residue it used to be, and only a genuine ``lstat`` failure on the
-    directory itself still holds one back. Both halves are pinned here, since one
-    is a behaviour change: the manifest-less backup goes, the unnameable one
-    stays."""
+    The parked root's directory identity proves only that THIS process observed
+    that exact tree while work was running; it says nothing about which version
+    generations remain inside. A missing ``versions/`` may be an operator rename
+    around a surviving child's cwd, so even a marked tree remains unknown. The
+    second half pins the same result when the shared judgement cannot answer for
+    another reason."""
     base = tmp_path / "tools"
     base.mkdir()
     no_manifest = tools._stale_backup_path(base, "kbsearch", uuid4().hex)
@@ -4908,7 +4916,7 @@ def test_sweep_keeps_a_marked_backup_whose_identity_cannot_be_read(
 
     tool_builder._sweep_stale_backups(base)
 
-    assert not no_manifest.exists()  # the directory answers for itself
+    assert no_manifest.is_dir()
 
     unreadable = tools._stale_backup_path(base, "other", uuid4().hex)
     unreadable.mkdir()

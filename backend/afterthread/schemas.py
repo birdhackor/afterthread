@@ -525,6 +525,17 @@ class ToolListResponse(BaseModel):
     tools: list[ToolSummary]
 
 
+class ToolDeleteResponse(BaseModel):
+    """Whether DELETE removed the files or retained a hidden parked tree.
+
+    ``retained_path`` is the exact operator-facing path when ``outcome`` is
+    ``retained``; it is null after physical removal.
+    """
+
+    outcome: Literal["removed", "retained"]
+    retained_path: str | None
+
+
 class ToolSummaryDetail(BaseModel):
     """One tool's version summary
     (``versions/<vid>/.afterthread.meta/summary.json``), as the 工具 page reads it.

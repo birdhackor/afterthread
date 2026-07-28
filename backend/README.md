@@ -163,14 +163,18 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   切換；它照樣列成無效、照樣不會被端給模型。`current` 無法解析時則拒絕切換，
   因為沒有一個版本可讓該列描述。**另一條 404 的理由**：`state.json` 是可讀但沒有
   backend marker 的 foreign 檔案時，這條路由拒絕而不是覆蓋（見下方）。
-- `DELETE /api/tools/{name}` — 刪除整個工具套件目錄；找不到回 404。後端先把套件改名
-  到隱藏名稱，再用三態判斷所有版本：`running` 與 `unknown` 都只停放，只有
-  `locally-proven-idle` 才會立刻遞迴移除。後者要求每一個版本都是本程序建立，而且目前沒有
-  本地執行；既有版本在 process-local registry 沒有 entry 只代表「這個程序不知道」，不能
-  代表 idle。直接刪可能讓仍活著的子行程在下一次相對開檔時失敗。工具在回應那一刻就已經從
-  清單與模型可見的工具中消失，行為與立即刪除沒有差別。若後端曾 hard restart，
-  `start_new_session` 子行程可能仍活著；新程序因此會把重啟前已存在的 generation 判成
-  `unknown` 並保留隱藏目錄，須由操作者確認子行程已結束後自行處理。
+- `DELETE /api/tools/{name}` — 將整個工具套件從 registry 移除；找不到回 404。
+  後端先把套件改名到隱藏名稱，再用三態判斷所有版本：`running` 與 `unknown` 都只停放，
+  只有 `locally-proven-idle` 才會立刻遞迴移除。後者要求本程序確實枚舉到至少一個版本，
+  每一個版本都是本程序建立，而且目前沒有本地執行；`versions/` 缺失、為空、無法完整
+  枚舉，或既有版本在 process-local registry 沒有 entry，都只代表「這個程序不知道」，
+  不能代表 idle。直接刪可能讓仍活著的子行程在下一次相對開檔時失敗。成功回 200
+  `{outcome: "removed", retained_path: null}` 或
+  `{outcome: "retained", retained_path: "<隱藏目錄的絕對路徑>"}`；工具在兩種回應下
+  都已從清單與模型可見的工具中消失，但後者明確表示設定與金鑰檔仍可能留在磁碟。
+  若後端曾 hard restart，`start_new_session` 子行程可能仍活著；新程序因此會把重啟前
+  已存在的 generation 判成 `unknown` 並保留隱藏目錄，須由操作者確認子行程已結束後
+  自行處理。
 - `DELETE /api/tools/{name}/versions/{vid}` — 丟掉畫面所指的**精確目前版本**。後端先
   取得全域工具名額，再比對 path 裡的 `vid`；不相符回
   `409 version_mismatch`。`lineage=usable` 時把 `current` 原子切回

@@ -31,6 +31,7 @@ import { EmptyState } from "../components/EmptyState.jsx";
 import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { usePageTitle } from "../hooks/usePageTitle.js";
 import { codePointLength } from "../utils/text.js";
+import { toolDeleteNotification } from "../utils/toolDelete.js";
 import {
 	isHttpUrl,
 	isTerminalToolJobState,
@@ -751,9 +752,9 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 
 	const deleteMutation = useMutation({
 		mutationFn: (name) => apiDelete(`/api/tools/${name}`),
-		onSuccess: async (_data, name) => {
+		onSuccess: async (data, name) => {
 			setDeleteTarget(null);
-			notifications.show({ color: "green", message: `已刪除「${name}」` });
+			notifications.show(toolDeleteNotification(name, data));
 			// removeQueries, not invalidateQueries: the tool is GONE, so there is
 			// nothing left to revalidate against -- and a same-name reinstall
 			// inside TanStack Query's default 5-minute gc window is a DIFFERENT
@@ -1340,7 +1341,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 				<Stack gap="md">
 					<Text>
 						確定要丟掉「{discardTarget?.name}
-						」目前這一版並退回前一版嗎？目前版本會被移除；前一版的內容與總結會重新顯示。
+						」目前這一版並退回前一版嗎？目前版本會停止使用；只有在系統能確認沒有版本執行中時才會刪除檔案，否則會暫留在磁碟。前一版的內容與總結會重新顯示。
 					</Text>
 					<Group justify="flex-end">
 						<Button
@@ -1381,8 +1382,9 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 			>
 				<Stack gap="md">
 					<Text>
-						確定要刪除「{deleteTarget}
-						」嗎？整個工具目錄（含其設定與金鑰檔）將被移除，此動作無法復原。
+						確定要將「{deleteTarget}
+						」從工具清單移除嗎？工具會立即停止出現在清單與 AI
+						可用工具中。若系統能確認所有版本都未在執行，會刪除整個工具目錄；若無法確認，目錄（含設定與金鑰檔）會保留在磁碟，完成後會顯示保留路徑供你手動處理。
 					</Text>
 					<Group justify="flex-end">
 						<Button

@@ -44,6 +44,7 @@ from afterthread.routers.ai import (
     _service_unavailable,
 )
 from afterthread.schemas import (
+    ToolDeleteResponse,
     ToolExpectedVersionRequest,
     ToolInstallAccepted,
     ToolInstallRequest,
@@ -226,27 +227,33 @@ async def update_tool(name: ToolName, payload: ToolUpdateRequest) -> ToolSummary
     raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
 
 
-@router.delete("/{name}", status_code=204, responses=_TOOL_NOT_FOUND_RESPONSE)
-async def delete_installed_tool(name: ToolName) -> None:
+@router.delete(
+    "/{name}",
+    response_model=ToolDeleteResponse,
+    responses=_TOOL_NOT_FOUND_RESPONSE,
+)
+async def delete_installed_tool(name: ToolName) -> ToolDeleteResponse:
     """Delete a tool package (its whole directory).
 
     The registry's ``delete_tool`` re-validates the name AND resolved-path
     containment under the tools dir before it touches anything (the
     path-traversal / symlink-escape hard-block lives THERE, not in this router),
-    and returns False for a missing package -> 404.
+    and returns None for a missing package -> 404.
 
-    "Delete" is not always an immediate rmtree any more, and the difference is
-    invisible from here on purpose: a package with a tool call still executing
-    against it is RENAMED into the hidden deferred namespace instead, so the
-    running subprocess keeps the files it is reading while every reader of the
-    tools dir stops seeing the tool at once (see ``tools.delete_tool`` and the
-    D40 overall-r4 addendum). Either way the resource is gone as far as this API
-    is concerned, so both answer 204 -- reporting "did not happen" for the
-    deferred case would be the one dishonest option.
+    "Delete" is not always an immediate rmtree: a package that may still have a
+    tool call executing against it is RENAMED into the hidden deferred namespace
+    instead, so the subprocess keeps the files it is reading while every reader
+    of the tools dir stops seeing the tool at once. The 200 response says
+    ``removed`` after physical deletion or ``retained`` with the exact parked
+    path, so an operator knows whether config and key files may remain on disk.
     """
-    removed = await run_in_threadpool(tools_service.delete_tool, name)
-    if not removed:
+    result = await run_in_threadpool(tools_service.delete_tool, name)
+    if result is None:
         raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
+    return ToolDeleteResponse(
+        outcome=result.outcome,
+        retained_path=str(result.retained_path) if result.retained_path is not None else None,
+    )
 
 
 @router.delete(
