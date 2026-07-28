@@ -79,6 +79,7 @@ def _reset_singletons() -> Generator[None]:
     llm_log._reset_for_tests()
     tools._INFLIGHT_SECRETS.clear()
     tools._INFLIGHT_EXECUTIONS.clear()
+    tools._LOCAL_EXECUTION_GENERATIONS.clear()
     tools._DEFERRED_EXECUTION_CLEANUPS.clear()
     tools._ADVERTISEMENT_GENERATIONS.clear()
     tools._ENV_VALUE_CACHE.clear()
@@ -90,6 +91,7 @@ def _reset_singletons() -> Generator[None]:
     # registration surviving a test would silently turn the next one's swap into a
     # deferral -- the same reason the secret set is cleared here.
     tools._INFLIGHT_EXECUTIONS.clear()
+    tools._LOCAL_EXECUTION_GENERATIONS.clear()
     tools._DEFERRED_EXECUTION_CLEANUPS.clear()
     tools._ADVERTISEMENT_GENERATIONS.clear()
     tools._ENV_VALUE_CACHE.clear()
@@ -4617,6 +4619,7 @@ def _versioned_package_at(package: Path, name: str, run_py: str = _GOOD_RUN_PY) 
     (package_meta / tools._PACKAGE_STATE_FILENAME).write_text(
         json.dumps(_state_document(True)), encoding="utf-8"
     )
+    tools.remember_local_execution_generation(tools.VersionRoot(version))
     return version
 
 
@@ -4691,6 +4694,7 @@ def test_restart_with_orphan_does_not_sweep_a_tree_the_new_process_never_observe
     # A kill -9/restart loses both process-local facts while the detached child
     # can still hold this cwd and perform a later relative open.
     tools._INFLIGHT_EXECUTIONS.clear()
+    tools._LOCAL_EXECUTION_GENERATIONS.clear()
     tools._DEFERRED_EXECUTION_CLEANUPS.clear()
 
     tool_builder._sweep_stale_backups(base)
@@ -4756,11 +4760,11 @@ def test_invariant_a_delete_discard_and_sweep_share_one_running_package_judgemen
     _install_settings(monkeypatch, tools_dir=str(base))
     asked: list[tools.PackageLayoutRoot] = []
 
-    def nobody_running(package_root: tools.PackageLayoutRoot) -> bool:
+    def locally_idle(package_root: tools.PackageLayoutRoot) -> tools.ExecutionJudgement:
         asked.append(package_root)
-        return False
+        return "locally-proven-idle"
 
-    monkeypatch.setattr(tools, "package_execution_in_flight", nobody_running)
+    monkeypatch.setattr(tools, "package_execution_judgement", locally_idle)
 
     assert tools.delete_tool("live") is True
     assert tools.discard_version(resolution) == "ok"
@@ -4803,6 +4807,7 @@ def test_running_discard_parks_the_version_and_the_existing_sweep_retries(
     resolution = tools.resolve_current(tools.PackageRoot(package))
     assert isinstance(resolution, tools.Resolved)
     parked = second.with_name(f"{second_vid}.discarded")
+    tools.remember_local_execution_generation(tools.VersionRoot(second))
     _install_settings(monkeypatch, tools_dir=str(base))
     handler = tools.enabled_llm_tools()[0].handler
     result: dict[str, str] = {}
@@ -4908,7 +4913,7 @@ def test_sweep_keeps_a_marked_backup_whose_identity_cannot_be_read(
     unreadable = tools._stale_backup_path(base, "other", uuid4().hex)
     unreadable.mkdir()
     tools.remember_running_tree_for_cleanup(unreadable)
-    monkeypatch.setattr(tools, "package_execution_in_flight", lambda _package: True)
+    monkeypatch.setattr(tools, "package_execution_judgement", lambda _package: "unknown")
 
     tool_builder._sweep_stale_backups(base)
 

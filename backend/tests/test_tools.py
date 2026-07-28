@@ -84,11 +84,13 @@ def _reset_log() -> Generator[None]:
     """Empty process-local singleton state around every test."""
     llm_log._reset_for_tests()
     tools._INFLIGHT_EXECUTIONS.clear()
+    tools._LOCAL_EXECUTION_GENERATIONS.clear()
     tools._DEFERRED_EXECUTION_CLEANUPS.clear()
     tools._ADVERTISEMENT_GENERATIONS.clear()
     yield
     llm_log._reset_for_tests()
     tools._INFLIGHT_EXECUTIONS.clear()
+    tools._LOCAL_EXECUTION_GENERATIONS.clear()
     tools._DEFERRED_EXECUTION_CLEANUPS.clear()
     tools._ADVERTISEMENT_GENERATIONS.clear()
 
@@ -699,6 +701,14 @@ def _version_root(version: Path) -> tools.VersionRoot:
     return tools.VersionRoot(version)
 
 
+def _remember_package_locally_idle(package: Path) -> None:
+    """Model generations assembled by this backend process, as the builder does."""
+
+    for version in (package / tools._VERSIONS_DIRNAME).iterdir():
+        if version.is_dir() and not version.is_symlink():
+            tools.remember_local_execution_generation(tools.VersionRoot(version))
+
+
 def _state_path(version: Path) -> Path:
     return _package_path(version) / tools._META_DIRNAME / tools._PACKAGE_STATE_FILENAME
 
@@ -848,7 +858,80 @@ def test_invariant_a_running_judgement_enumerates_discarded_version_directories(
     assert identity is not None
 
     with tools._inflight_execution(identity):
-        assert tools.package_execution_in_flight(tools.PackageRoot(package)) is True
+        assert tools.package_execution_judgement(tools.PackageRoot(package)) == "running"
+
+
+def test_execution_judgement_requires_positive_local_idle_evidence(tmp_path: Path) -> None:
+    """Registry absence is unknown for a generation inherited across a restart."""
+
+    version = _make_tool(tmp_path / "tools", "echo", "import sys\n")
+    package_root = _package_root(version)
+    identity = tools.directory_identity(_version_root(version))
+    assert identity is not None
+
+    assert tools.package_execution_judgement(package_root) == "unknown"
+    with tools._inflight_execution(identity):
+        assert tools.package_execution_judgement(package_root) == "running"
+    # Watching a NEW local call finish cannot prove that an unregistered child
+    # from the prior backend is also gone.
+    assert tools.package_execution_judgement(package_root) == "unknown"
+
+    tools.remember_local_execution_generation(_version_root(version))
+    assert tools.package_execution_judgement(package_root) == "locally-proven-idle"
+
+
+def test_restart_delete_parks_an_unknown_generation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A detached child and its local proof can outlive different durations."""
+
+    root = tmp_path / "tools"
+    version = _make_tool(root, "echo", "import sys\n")
+    package = _package_path(version)
+    identity = tools.directory_identity(_version_root(version))
+    assert identity is not None
+    _install_tools(monkeypatch, root)
+
+    # Model the old process, then its abrupt loss: the child/tree survives while
+    # both its running count and its local-generation proof disappear.
+    tools._INFLIGHT_EXECUTIONS[identity] = 1
+    tools._LOCAL_EXECUTION_GENERATIONS.add(identity)
+    tools._INFLIGHT_EXECUTIONS.clear()
+    tools._LOCAL_EXECUTION_GENERATIONS.clear()
+
+    assert delete_tool("echo") is True
+
+    remains = [child for child in root.iterdir() if tools._STALE_BACKUP_RE.match(child.name)]
+    assert len(remains) == 1
+    assert (_resolved_version(remains[0]) / "run.py").is_file()
+    assert not tools._DEFERRED_EXECUTION_CLEANUPS
+    assert not package.exists()
+
+
+def test_restart_discard_parks_an_unknown_generation(tmp_path: Path) -> None:
+    root = tmp_path / "tools"
+    first = _make_tool(root, "echo", "import sys\n")
+    package = _package_path(first)
+    second_vid = "20260728T020304Z-fedcba"
+    second = _add_committed_version(package, second_vid, description="second", output="SECOND")
+    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    resolution = tools.resolve_current(tools.PackageRoot(package))
+    assert isinstance(resolution, tools.Resolved)
+    second_identity = tools.directory_identity(tools.VersionRoot(second))
+    assert second_identity is not None
+
+    _remember_package_locally_idle(package)
+    tools._INFLIGHT_EXECUTIONS[second_identity] = 1
+    tools._INFLIGHT_EXECUTIONS.clear()
+    tools._LOCAL_EXECUTION_GENERATIONS.clear()
+
+    assert tools.discard_version(resolution) == "ok"
+
+    parked = second.with_name(f"{second_vid}.discarded")
+    assert _resolved_version(package) == first
+    assert parked.is_dir()
+    assert (parked / "run.py").is_file()
+    assert not tools._DEFERRED_EXECUTION_CLEANUPS
 
 
 def test_invariant_g_list_resolves_current_once_and_keeps_one_version_per_row(
@@ -987,11 +1070,12 @@ def test_invariant_e_discard_succeeds_when_old_version_removal_fails(
     resolution = tools.resolve_current(tools.PackageRoot(package))
     assert isinstance(resolution, tools.Resolved)
     asked: list[tools.PackageRoot] = []
-    monkeypatch.setattr(
-        tools,
-        "package_execution_in_flight",
-        lambda root: asked.append(root) is not None,
-    )
+
+    def locally_idle(root: tools.PackageRoot) -> tools.ExecutionJudgement:
+        asked.append(root)
+        return "locally-proven-idle"
+
+    monkeypatch.setattr(tools, "package_execution_judgement", locally_idle)
     real_rmtree = tools.shutil.rmtree
     parked = second.with_name(f"{second_vid}.discarded")
 
@@ -1042,12 +1126,12 @@ def test_discard_parks_before_running_check_then_removes_the_idle_version(
         events.append("rename")
         real_rename(source, target)
 
-    def nobody_running(package_root: tools.PackageRoot) -> bool:
+    def locally_idle(package_root: tools.PackageRoot) -> tools.ExecutionJudgement:
         assert package_root.path == package
         assert not second.exists()
         assert parked.is_dir()
         events.append("running-check")
-        return False
+        return "locally-proven-idle"
 
     def observe_remove(path: Path, *args: Any, **kwargs: Any) -> None:
         assert Path(path) == parked
@@ -1055,7 +1139,7 @@ def test_discard_parks_before_running_check_then_removes_the_idle_version(
         real_rmtree(path, *args, **kwargs)
 
     monkeypatch.setattr(tools.os, "rename", observe_rename)
-    monkeypatch.setattr(tools, "package_execution_in_flight", nobody_running)
+    monkeypatch.setattr(tools, "package_execution_judgement", locally_idle)
     monkeypatch.setattr(tools.shutil, "rmtree", observe_remove)
 
     assert tools.discard_version(resolution) == "ok"
@@ -1063,6 +1147,23 @@ def test_discard_parks_before_running_check_then_removes_the_idle_version(
     assert _resolved_version(package) == first
     assert not parked.exists()
     assert not tools._ADVERTISEMENT_GENERATIONS
+
+
+def test_discard_removes_generations_proven_idle_in_this_process(tmp_path: Path) -> None:
+    first = _make_tool(tmp_path / "tools", "echo", "import sys\n")
+    package = _package_path(first)
+    second_vid = "20260728T020304Z-fedcba"
+    second = _add_committed_version(package, second_vid, description="second", output="SECOND")
+    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    resolution = tools.resolve_current(tools.PackageRoot(package))
+    assert isinstance(resolution, tools.Resolved)
+    _remember_package_locally_idle(package)
+
+    assert tools.discard_version(resolution) == "ok"
+
+    assert _resolved_version(package) == first
+    assert not second.exists()
+    assert not second.with_name(f"{second_vid}.discarded").exists()
 
 
 def test_discard_rename_failure_is_success_and_leaves_the_version_in_place(
@@ -1083,7 +1184,7 @@ def test_discard_rename_failure_is_success_and_leaves_the_version_in_place(
     monkeypatch.setattr(tools.os, "rename", fail_rename)
     monkeypatch.setattr(
         tools,
-        "package_execution_in_flight",
+        "package_execution_judgement",
         lambda _root: (_ for _ in ()).throw(
             AssertionError("a failed rename must not license a running check")
         ),
@@ -1129,7 +1230,7 @@ def test_invariant_e_unconfirmed_current_durability_leaves_old_version_intact(
     monkeypatch.setattr(tools.os, "fsync", fail_current_directory_fsync)
     monkeypatch.setattr(
         tools,
-        "package_execution_in_flight",
+        "package_execution_judgement",
         lambda _root: (_ for _ in ()).throw(
             AssertionError("durability gate must precede the running check")
         ),
@@ -3688,7 +3789,8 @@ def test_delete_tool_removes_package(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     the spot -- the deferral below is the exception, not the new normal, and it
     leaves no hidden remains for a sweep to find."""
     root = tmp_path / "tools"
-    _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    version = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _remember_package_locally_idle(_package_path(version))
     _install_tools(monkeypatch, root)
 
     assert delete_tool("echo") is True

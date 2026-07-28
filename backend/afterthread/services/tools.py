@@ -2743,12 +2743,19 @@ def _run_tool_subprocess(
 # needs the same directory files. The count protects overlapping calls, and the
 # lock covers only registry updates and lookups.
 _INFLIGHT_EXECUTIONS: dict[tuple[int, int], int] = {}
+# This second process-local fact is what lets absence mean idle for a generation
+# this process CREATED.  Absence from ``_INFLIGHT_EXECUTIONS`` alone means
+# UNKNOWN, not idle: a generation that pre-dates this backend may still be in use
+# by a start_new_session child orphaned by the previous backend. Collapsing that
+# third state into idle was the bug that let delete/discard rmtree such a child.
+_LOCAL_EXECUTION_GENERATIONS: set[tuple[int, int]] = set()
 # A parked tree is eligible for automatic collection only when THIS process saw
 # it while an execution was registered. A backend hard restart empties both
 # registries while start_new_session children may survive; therefore an unknown
 # stale/discarded tree is evidence for the operator, not proof of idleness.
 _DEFERRED_EXECUTION_CLEANUPS: set[tuple[int, int]] = set()
 _EXECUTION_LOCK = threading.Lock()
+type ExecutionJudgement = Literal["running", "locally-proven-idle", "unknown"]
 
 
 @dataclass(slots=True, weakref_slot=True)
@@ -2860,42 +2867,69 @@ def _inflight_execution(identity: tuple[int, int]) -> Iterator[None]:
 
 
 def directory_execution_in_flight(identity: tuple[int, int]) -> bool:
-    """Return whether one VersionRoot directory identity is registered."""
+    """Return only the positive process-local running fact for one VersionRoot."""
     with _EXECUTION_LOCK:
         return identity in _INFLIGHT_EXECUTIONS
 
 
-def package_execution_in_flight(package_root: PackageLayoutRoot) -> bool:
-    """Answer once whether any real version directory under a package layout is running.
+def remember_local_execution_generation(version_root: VersionRoot) -> None:
+    """Record a generation this process created before returning it as installed.
+
+    Such a generation cannot have a child left by an earlier backend process.
+    Therefore, and only therefore, a zero local execution count proves it idle.
+    """
+
+    identity = directory_identity(version_root)
+    if identity is None:
+        return
+    with _EXECUTION_LOCK:
+        _LOCAL_EXECUTION_GENERATIONS.add(identity)
+
+
+def package_execution_judgement(
+    package_root: PackageLayoutRoot,
+) -> ExecutionJudgement:
+    """Judge all real version generations as running, locally idle, or unknown.
 
     Every directory in ``versions/`` is considered, including a future
-    ``<vid>.discarded`` parking name.  A filesystem answer we cannot establish
-    fails closed because the caller is deciding whether destructive removal is safe.
+    ``<vid>.discarded`` parking name. ``locally-proven-idle`` requires positive
+    evidence that THIS process created every generation and has no execution
+    registered against any of them. A missing registry entry for a generation
+    that pre-dates this process is ``unknown``: a detached child may have survived
+    the restart. Filesystem answers we cannot establish are unknown for the same
+    fail-closed reason.
     """
 
     versions = package_root.path / _VERSIONS_DIRNAME
     try:
         versions_info = os.lstat(versions)
     except FileNotFoundError:
-        return False
+        return "locally-proven-idle"
     except OSError:
-        return True
+        return "unknown"
     if not stat.S_ISDIR(versions_info.st_mode):
-        return True
+        return "unknown"
     try:
         entries = list(os.scandir(versions))
     except OSError:
-        return True
+        return "unknown"
+    identities: list[tuple[int, int]] = []
     for entry in entries:
         try:
             if not entry.is_dir(follow_symlinks=False):
                 continue
         except OSError:
-            return True
+            return "unknown"
         identity = directory_identity(VersionRoot(Path(entry.path)))
-        if identity is None or directory_execution_in_flight(identity):
-            return True
-    return False
+        if identity is None:
+            return "unknown"
+        identities.append(identity)
+    with _EXECUTION_LOCK:
+        if any(identity in _INFLIGHT_EXECUTIONS for identity in identities):
+            return "running"
+        if all(identity in _LOCAL_EXECUTION_GENERATIONS for identity in identities):
+            return "locally-proven-idle"
+    return "unknown"
 
 
 def remember_running_tree_for_cleanup(path: Path) -> None:
@@ -2926,7 +2960,7 @@ def deferred_tree_observed_idle(
     with _EXECUTION_LOCK:
         if identity not in _DEFERRED_EXECUTION_CLEANUPS:
             return False
-    if package_execution_in_flight(execution_scope):
+    if package_execution_judgement(execution_scope) != "locally-proven-idle":
         return False
     with _EXECUTION_LOCK:
         # Consume before rmtree. If removal itself fails, the remains stay for
@@ -3215,13 +3249,15 @@ def discard_version(resolution: Resolved) -> DiscardOutcome:
         return "ok"
 
     try:
-        running = package_execution_in_flight(package_root)
+        execution = package_execution_judgement(package_root)
     except Exception:
         # The shared helper is fail-closed already; this backstop keeps cleanup
         # just as conservative if a test double or future implementation raises.
-        running = True
-    if running:
+        execution = "unknown"
+    if execution == "running":
         remember_running_tree_for_cleanup(parked)
+        return "ok"
+    if execution == "unknown":
         return "ok"
 
     with contextlib.suppress(Exception):
@@ -3238,8 +3274,9 @@ def delete_tool(name: str) -> bool:
     the name is unsafe, the package is absent, or it could not be taken out of
     the registry at all.
 
-    A package a subprocess is STILL EXECUTING against is left in the
-    deferred-removal namespace instead of being destroyed, which is the same
+    A package still executing, or inherited from before this process and thus
+    UNKNOWN, is left in the deferred-removal namespace instead of being
+    destroyed. The running case is the same
     treatment ``tool_builder._promote_staging_replace`` gives the backup it can no
     longer drop, for the same measured reason (see ``_INFLIGHT_EXECUTIONS``): a
     running child's cwd is a reference to the INODE, so the rename disturbs
@@ -3258,10 +3295,11 @@ def delete_tool(name: str) -> bool:
     The remains are offered to the SAME sweep
     (``tool_builder._sweep_stale_backups``, at the end of every tool job), but
     only this backend process may collect a tree it personally observed while an
-    execution was registered and later observed idle. A hard restart empties that
-    permission while a start_new_session child may survive, so the next process
-    leaves unknown remains for the operator. Both forms are hidden, inert litter,
-    never a phantom package.
+    execution was registered, whose generations this process created, and later
+    observed idle. A hard restart empties both positive facts while a
+    start_new_session child may survive, so the next process leaves unknown
+    remains for the operator. Both forms are hidden, inert litter, never a
+    phantom package.
     """
     base = tools_dir()
     if base is None or not _NAME_RE.match(name):
@@ -3331,8 +3369,16 @@ def delete_tool(name: str) -> bool:
     # behind is marked remains. The current process records that it saw the tree
     # running; a later sweep may collect it after observing idle, while a fresh
     # process deliberately has no such authority.
-    if package_execution_in_flight(PackageLayoutRoot(deferred)):
+    try:
+        execution = package_execution_judgement(PackageLayoutRoot(deferred))
+    except Exception:
+        # The package is already hidden, so an unexpected judgement failure has
+        # the same safe outcome as unknown: retain it for the operator.
+        execution = "unknown"
+    if execution == "running":
         remember_running_tree_for_cleanup(deferred)
+        return True
+    if execution == "unknown":
         return True
     # Best-effort from here: the tool is already gone as far as everything that
     # reads this directory is concerned, so a removal that fails part-way must not

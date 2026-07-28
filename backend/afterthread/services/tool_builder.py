@@ -1632,6 +1632,10 @@ def _promote_staging(
         vid,
         tools.PREVIOUS_NULL,
     )
+    # This process assembled the generation before exposing the package name, so
+    # an empty local execution count really is idle rather than a restart-shaped
+    # unknown. Keep that positive fact process-local beside the execution counts.
+    tools.remember_local_execution_generation(published.version_root)
     return published, None
 
 
@@ -1744,6 +1748,7 @@ def _publish_revised_version(
             vid,
             tools.PreviousValue(previous.vid),
         )
+        tools.remember_local_execution_generation(published.version_root)
         return _PublishedRevision(published, origin), None
     return None, _ERROR_VERSION_ID_WRITE
 

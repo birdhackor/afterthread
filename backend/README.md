@@ -163,19 +163,21 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   切換；它照樣列成無效、照樣不會被端給模型。`current` 無法解析時則拒絕切換，
   因為沒有一個版本可讓該列描述。**另一條 404 的理由**：`state.json` 是可讀但沒有
   backend marker 的 foreign 檔案時，這條路由拒絕而不是覆蓋（見下方）。
-- `DELETE /api/tools/{name}` — 刪除整個工具套件目錄；找不到回 404。若刪除當下**正好
-  有工具子行程在跑任一版本**，套件目錄不會被直接刪掉，而是改名成一個隱藏名稱、等該次
-  呼叫結束後，由**同一個後端程序**稍後觀察到 idle 時才可在工具工作的收尾清掃中收走——
-  直接刪會讓那個子行程的相對開檔全部失敗。工具在回應那一刻就已經從清單與模型可見的工具中
-  消失，行為與立即刪除沒有差別。若後端在兩者之間被 hard restart，
-  `start_new_session` 子行程可能仍活著，但 process-local registry 已清空；新程序因此不會
-  自動清掉前一程序留下的隱藏目錄，須由操作者確認子行程已結束後自行處理。
+- `DELETE /api/tools/{name}` — 刪除整個工具套件目錄；找不到回 404。後端先把套件改名
+  到隱藏名稱，再用三態判斷所有版本：`running` 與 `unknown` 都只停放，只有
+  `locally-proven-idle` 才會立刻遞迴移除。後者要求每一個版本都是本程序建立，而且目前沒有
+  本地執行；既有版本在 process-local registry 沒有 entry 只代表「這個程序不知道」，不能
+  代表 idle。直接刪可能讓仍活著的子行程在下一次相對開檔時失敗。工具在回應那一刻就已經從
+  清單與模型可見的工具中消失，行為與立即刪除沒有差別。若後端曾 hard restart，
+  `start_new_session` 子行程可能仍活著；新程序因此會把重啟前已存在的 generation 判成
+  `unknown` 並保留隱藏目錄，須由操作者確認子行程已結束後自行處理。
 - `DELETE /api/tools/{name}/versions/{vid}` — 丟掉畫面所指的**精確目前版本**。後端先
   取得全域工具名額，再比對 path 裡的 `vid`；不相符回
   `409 version_mismatch`。`lineage=usable` 時把 `current` 原子切回
-  `origin.json.previous`，之後才盡力清掉原版本；若原版本仍在執行則先改名成
-  `<vid>.discarded`，同樣只允許觀察過 running→idle 的原後端程序清掃；跨程序留下者
-  交由操作者確認後處理。`lineage=sole` 在 UI 走既有的整包刪除確認；
+  `origin.json.previous`，之後才盡力清掉原版本；原版本一律先改名成
+  `<vid>.discarded`，只有全套件三態判斷為 `locally-proven-idle` 才立刻移除；`running`
+  會留下本程序稍後清掃的資格，`unknown` 則只停放、交由操作者確認後處理。
+  `lineage=sole` 在 UI 走既有的整包刪除確認；
   前一版缺失、未提交或指回自己則回 `409 lineage_unavailable`，不動任何檔案。
 - `POST /api/tools/install` — 送出 KB 網頁安裝器工作（見下方「工具（KB 網頁
   安裝器）」）；202 + `job_id`，建置在背景執行。`TOOLS_DIR` 未設定回 `503
@@ -335,10 +337,11 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   handler 仍明確拒絕。retired generation 由既有 handler 持有到該對話／handler
   釋放為止；之後從備份恢復並重新掃描同一 vid 會取得新 generation。退役完全不讀
   目錄的 device、inode 或其他可由 rename／刪除／重建影響的磁碟屬性，避免磁碟
-  身分重用或搬回原位使舊廣告復活。執行保護與 deferred-cleanup 資格也都是
-  process-local：同一程序內，delete、discard 與 `.stale-` 清掃共用「所有版本是否
-  running」判斷；跨程序則不把空 registry 當成 idle 證明。新程序從未親眼看過
-  running→idle 的 stale／discarded tree 一律保留給操作者。
+  身分重用或搬回原位使舊廣告復活。執行保護、generation 來源證據與
+  deferred-cleanup 資格也都是 process-local：delete、discard 與 `.stale-` 清掃共用
+  同一個「所有版本是 running／locally-proven-idle／unknown」判斷。只有本程序建立的
+  所有 generation 都沒有本地執行才是 locally-proven-idle；跨程序不把空 registry
+  當成 idle 證明。新程序無法證明的 stale／discarded tree 一律保留給操作者。
 - **AI 總結拆成兩份 sidecar**：每版不可變的
   `.afterthread.meta/origin.json` 保存來源、安裝指示、修訂意見與 previous；
   可重新產生的 `.afterthread.meta/summary.json` 保存 summary、updated time 與
