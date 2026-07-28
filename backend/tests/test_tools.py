@@ -23,6 +23,7 @@ ring is process-wide, so an autouse fixture resets it around every test.
 """
 
 import asyncio
+import fcntl
 import inspect
 import json
 import os
@@ -3717,6 +3718,60 @@ def test_lock_created_under_restrictive_umask_is_reopenable(tmp_path: Path) -> N
     assert stat.S_IMODE(lock_path.stat().st_mode) & 0o600 == 0o600
     with tools.exclusive_tools_lock(root) as acquired_again:
         assert acquired_again is True
+
+
+@pytest.mark.parametrize("mode", (0o400, 0o000))
+def test_preexisting_restrictive_lock_mode_is_repaired_before_open(
+    tmp_path: Path, mode: int
+) -> None:
+    """An owner-controlled old inode is repaired before O_RDWR can reject it."""
+
+    root = tmp_path / "tools"
+    root.mkdir()
+    lock_path = root / tools._TOOLS_LOCK_FILENAME
+    lock_path.touch()
+    lock_path.chmod(mode)
+
+    with tools.exclusive_tools_lock(root) as acquired:
+        assert acquired is True
+
+    assert stat.S_IMODE(lock_path.stat().st_mode) & 0o600 == 0o600
+
+
+def test_lock_inode_replacement_breaks_exclusion_and_is_never_normal_acquisition(
+    tmp_path: Path,
+) -> None:
+    """Pin both the persistent-inode rule and the concrete replacement hazard.
+
+    A normal second opener must contend with the original shared holder. Once
+    this test deliberately unlinks and recreates the reserved name, the fresh
+    inode no longer contends; observing both locks at once is the reason no
+    production acquisition or cleanup may ever treat this file as replaceable.
+    """
+
+    root = tmp_path / "tools"
+    root.mkdir()
+    shared_fd = tools._open_tools_lock(root)
+    fcntl.flock(shared_fd, fcntl.LOCK_SH)
+    lock_path = root / tools._TOOLS_LOCK_FILENAME
+    original = os.fstat(shared_fd)
+    try:
+        with tools.exclusive_tools_lock(root) as acquired_before_replacement:
+            assert acquired_before_replacement is False
+
+        lock_path.unlink()
+        replacement_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        os.close(replacement_fd)
+        replacement = lock_path.stat()
+        assert (replacement.st_dev, replacement.st_ino) != (
+            original.st_dev,
+            original.st_ino,
+        )
+
+        with tools.exclusive_tools_lock(root) as acquired_after_replacement:
+            assert acquired_after_replacement is True
+    finally:
+        tools.release_tools_lock(shared_fd)
 
 
 def test_a_toggle_mid_call_moves_neither_identity(

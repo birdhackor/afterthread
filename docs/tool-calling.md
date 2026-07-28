@@ -267,8 +267,14 @@ uv run python -m afterthread.migrate_tools_v5 --yes
 
 `--dry-run` 唯讀預檢並列出 legacy state／`.ai_meta.json` 分類、enabled、`.env` **key
 名稱**與計畫，永不列 value。一般執行在第一次寫入前最後詢問；只有明確 `y`／`yes`
-繼續。拒絕、closed 或 piped stdin 都是 no，tree byte-identical。`--yes` 表示計畫已
-先審過，不是預設同意。
+繼續。拒絕、closed 或 piped stdin 都是 no，**套件與其內容一個 byte 都不會變**。
+
+**一個誠實的例外**：互斥用的 `.afterthread-tools.lck` 會在預檢**之前**就被建立（腳本要先
+確認沒有東西握著鎖才開始看），所以在一個還沒有鎖檔的舊 tools 目錄上第一次跑 `--dry-run`，
+**會多出這個檔案**。「什麼都不寫」指的是套件內容，不含這個鎖檔。如果你用雜湊或備份工具
+核對唯讀性，會看到它；如果整個目錄是唯讀的，腳本會在預檢前就因為建不出鎖檔而停下。
+
+`--yes` 表示計畫已先審過，不是預設同意。
 
 確認後才建立 tools 目錄的完整兄弟 backup，再發布
 `<TOOLS_DIR>/.afterthread-migration.json` write-ahead journal。任何 legacy package

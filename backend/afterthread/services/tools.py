@@ -414,6 +414,52 @@ def tools_dir() -> Path | None:
 _REQUEST_TOOLS_LOCK_FD: ContextVar[int | None] = ContextVar("_REQUEST_TOOLS_LOCK_FD", default=None)
 
 
+class ToolsLockUnavailableError(RuntimeError):
+    """The persistent lock path cannot be used by this backend process."""
+
+    def __init__(self, path: Path, reason: str) -> None:
+        self.path = path
+        self.reason = reason
+        super().__init__(
+            f"Tools lock {path} is unavailable: {reason}. "
+            "Repair ownership and owner read/write permissions on this existing inode; "
+            "do not delete or recreate it."
+        )
+
+
+def _repair_existing_tools_lock_mode(lock_path: Path) -> None:
+    """Restore the owner-rw floor before an O_RDWR open can reject the inode."""
+
+    try:
+        info = os.stat(lock_path, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        reason = exc.strerror or str(exc)
+        raise ToolsLockUnavailableError(lock_path, f"cannot inspect it: {reason}") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise ToolsLockUnavailableError(lock_path, "the reserved path is not a regular file")
+
+    current_mode = stat.S_IMODE(info.st_mode)
+    safe_mode = current_mode | _OWNER_RW
+    if safe_mode == current_mode:
+        return
+    effective_uid = os.geteuid()
+    if info.st_uid != effective_uid:
+        raise ToolsLockUnavailableError(
+            lock_path,
+            f"it is owned by uid {info.st_uid}, but the backend runs as uid {effective_uid}",
+        )
+    try:
+        os.chmod(lock_path, safe_mode, follow_symlinks=False)
+    except OSError as exc:
+        reason = exc.strerror or str(exc)
+        raise ToolsLockUnavailableError(
+            lock_path,
+            f"owner read/write mode repair failed: {reason}",
+        ) from exc
+
+
 def _open_tools_lock(base: Path) -> int:
     """Open the one persistent lock inode shared by every cooperating operation.
 
@@ -427,14 +473,30 @@ def _open_tools_lock(base: Path) -> int:
     package files directly.
     """
 
+    lock_path = base / _TOOLS_LOCK_FILENAME
+    # A pre-existing owner-read-only/no-access inode rejects O_RDWR before an
+    # opened descriptor exists to fchmod. Repair the backend-owned inode in place
+    # first; a foreign owner or an unusable reserved path fails with its own
+    # actionable condition rather than masquerading as lock contention.
+    _repair_existing_tools_lock_mode(lock_path)
     flags = os.O_RDWR | os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    fd = os.open(base / _TOOLS_LOCK_FILENAME, flags, 0o600)
     try:
-        info = os.fstat(fd)
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        reason = exc.strerror or str(exc)
+        raise ToolsLockUnavailableError(lock_path, f"open failed: {reason}") from exc
+    try:
+        try:
+            info = os.fstat(fd)
+        except OSError as exc:
+            reason = exc.strerror or str(exc)
+            raise ToolsLockUnavailableError(
+                lock_path, f"descriptor inspection failed: {reason}"
+            ) from exc
         if not stat.S_ISREG(info.st_mode):
-            raise OSError("tools lock is not a regular file")
+            raise ToolsLockUnavailableError(lock_path, "the opened inode is not a regular file")
         # open(2)'s mode is filtered through the process umask. Without this
         # owner-rw floor, a restrictive umask can create the persistent inode
         # owner-read-only, so every later O_RDWR acquisition fails forever after
@@ -443,7 +505,14 @@ def _open_tools_lock(base: Path) -> int:
         current_mode = stat.S_IMODE(info.st_mode)
         safe_mode = current_mode | _OWNER_RW
         if safe_mode != current_mode:
-            os.fchmod(fd, safe_mode)
+            try:
+                os.fchmod(fd, safe_mode)
+            except OSError as exc:
+                reason = exc.strerror or str(exc)
+                raise ToolsLockUnavailableError(
+                    lock_path,
+                    f"descriptor mode repair failed: {reason}",
+                ) from exc
     except BaseException:
         os.close(fd)
         raise
@@ -494,25 +563,29 @@ def exclusive_tools_lock(base: Path | None = None) -> Iterator[bool]:
     """Try the destroyer lock once; yield False instead of waiting.
 
     Delete, discard, stale cleanup, and migration all use this same helper. Any
-    open or lock failure is fail-closed: HTTP callers map False to their distinct
-    retryable 409, while the offline migration refuses to start.
+    genuine contention yields False for the retryable HTTP 409. An unusable lock
+    path or another flock failure raises ``ToolsLockUnavailableError`` so callers
+    cannot misreport a permanent operator/configuration problem as active work.
     """
 
     root = base if base is not None else tools_dir()
     if root is None or not root.is_dir():
         yield False
         return
-    try:
-        fd = _open_tools_lock(root)
-    except OSError:
-        yield False
-        return
+    fd = _open_tools_lock(root)
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except BlockingIOError:
             yield False
             return
+        except OSError as exc:
+            lock_path = root / _TOOLS_LOCK_FILENAME
+            reason = exc.strerror or str(exc)
+            raise ToolsLockUnavailableError(
+                lock_path,
+                f"exclusive flock failed: {reason}",
+            ) from exc
         yield True
     finally:
         # Close rather than unlink: this releases our open-file reference while

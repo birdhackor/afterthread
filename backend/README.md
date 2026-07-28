@@ -341,7 +341,12 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `Popen(pass_fds=(fd,), start_new_session=True)` 繼承同一個 open-file reference：
   backend 即使被 `kill -9`，只要 child 還活著，exclusive 仍取不到。整包 delete、
   discard 與 `.stale-`／`.discarded` 背景清掃都只嘗試非阻塞 exclusive lock；前兩者
-  contention 回 `409 ai_job_in_progress`，清掃則略過、等下次工作再試。
+  真正的 contention 回 `409 ai_job_in_progress`，清掃則略過、等下次工作再試。若 lock
+  path 無法開啟或鎖定，delete／discard 改回非 retryable 的
+  `500 tools_lock_unavailable`，訊息會列出完整路徑與原地修復 ownership／owner
+  read-write 權限的方式，不會假稱有 AI job。後端擁有的既存 `0400`／`0000` inode
+  會先在原地補回 owner `rw` 再開啟；不同 owner、非 regular file 或修復失敗則明確
+  中止，migration 也會收到同一個具名錯誤。
   lock 檔**不得手動刪除或重建**：新 inode 不會和舊 holder 衝突，保護會無聲失效。
   `flock` 只協調有檢查它的程式碼，這裡的 checker 都由 afterthread 控制，並不是防止
   操作者或工具直接改檔的 sandbox。最後，這個 orphan 保護唯一依賴的工具行為是 child

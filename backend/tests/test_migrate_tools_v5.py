@@ -367,6 +367,30 @@ def test_migration_refuses_while_shared_tools_lock_is_held(
     assert "tools lock is held or unavailable" in "\n".join(output)
 
 
+def test_migration_distinguishes_unusable_lock_path_from_contention(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An ownership problem names the persistent inode instead of claiming held."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    lock_path = root / tools._TOOLS_LOCK_FILENAME
+    lock_path.touch()
+    lock_path.chmod(0o000)
+    real_uid = os.geteuid()
+    monkeypatch.setattr(tools.os, "geteuid", lambda: real_uid + 1)
+    output: list[str] = []
+
+    with pytest.raises(tools.ToolsLockUnavailableError) as raised:
+        _run(root, output=output)
+
+    message = str(raised.value)
+    assert str(lock_path) in message
+    assert f"owned by uid {real_uid}" in message
+    assert "do not delete or recreate it" in message
+    assert output == []
+
+
 def test_enabled_change_at_confirmation_aborts_instead_of_using_preflight_value(
     tmp_path: Path,
 ) -> None:

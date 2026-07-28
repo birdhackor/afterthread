@@ -144,6 +144,16 @@ _LINEAGE_UNAVAILABLE_CODE = "lineage_unavailable"
 _LINEAGE_UNAVAILABLE_MESSAGE = "前一版已不存在或版本關係已損壞，請刪除整個工具"  # noqa: RUF001
 _AI_JOB_IN_PROGRESS_CODE = "ai_job_in_progress"
 _AI_JOB_IN_PROGRESS_MESSAGE = "AI 任務進行中，請稍後再試"  # noqa: RUF001
+_TOOLS_LOCK_UNAVAILABLE_CODE = "tools_lock_unavailable"
+
+
+def _tools_lock_unavailable(exc: tools_service.ToolsLockUnavailableError) -> HTTPException:
+    """Expose the operator-actionable lock path without calling it contention."""
+
+    return HTTPException(
+        status_code=500,
+        detail={"code": _TOOLS_LOCK_UNAVAILABLE_CODE, "message": str(exc)},
+    )
 
 
 def _conflict_response(
@@ -194,6 +204,26 @@ _DELETE_CONFLICT_RESPONSE = _conflict_response(
         "An AI request or inherited tool process holds the shared tools lock",
     ),
 )
+_TOOLS_LOCK_UNAVAILABLE_RESPONSE: dict[int | str, dict[str, Any]] = {
+    500: {
+        "description": "The persistent tools lock path cannot be opened or locked",
+        "content": {
+            "application/json": {
+                "example": {
+                    "detail": {
+                        "code": _TOOLS_LOCK_UNAVAILABLE_CODE,
+                        "message": (
+                            "Tools lock /path/to/tools/.afterthread-tools.lck is unavailable: "
+                            "open failed: Permission denied. Repair ownership and owner "
+                            "read/write permissions on this existing inode; do not delete or "
+                            "recreate it."
+                        ),
+                    }
+                }
+            }
+        },
+    }
+}
 
 
 @router.get("", response_model=ToolListResponse)
@@ -245,7 +275,11 @@ async def update_tool(name: ToolName, payload: ToolUpdateRequest) -> ToolSummary
 @router.delete(
     "/{name}",
     response_model=ToolDeleteResponse,
-    responses={**_TOOL_NOT_FOUND_RESPONSE, **_DELETE_CONFLICT_RESPONSE},
+    responses={
+        **_TOOL_NOT_FOUND_RESPONSE,
+        **_DELETE_CONFLICT_RESPONSE,
+        **_TOOLS_LOCK_UNAVAILABLE_RESPONSE,
+    },
 )
 async def delete_installed_tool(name: ToolName) -> ToolDeleteResponse:
     """Delete a tool package (its whole directory).
@@ -260,7 +294,10 @@ async def delete_installed_tool(name: ToolName) -> ToolDeleteResponse:
     anything. Otherwise the 200 response says ``removed`` after physical
     deletion or ``retained`` with the exact cleanup-failure path.
     """
-    result = await run_in_threadpool(tools_service.delete_tool, name)
+    try:
+        result = await run_in_threadpool(tools_service.delete_tool, name)
+    except tools_service.ToolsLockUnavailableError as exc:
+        raise _tools_lock_unavailable(exc) from exc
     if result is None:
         raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
     if result == "ai_job_in_progress":
@@ -281,7 +318,11 @@ async def delete_installed_tool(name: ToolName) -> ToolDeleteResponse:
 @router.delete(
     "/{name}/versions/{vid}",
     response_model=ToolDiscardResponse,
-    responses={**_TOOL_NOT_FOUND_RESPONSE, **_DISCARD_CONFLICT_RESPONSE},
+    responses={
+        **_TOOL_NOT_FOUND_RESPONSE,
+        **_DISCARD_CONFLICT_RESPONSE,
+        **_TOOLS_LOCK_UNAVAILABLE_RESPONSE,
+    },
 )
 async def discard_tool_version(name: ToolName, vid: ToolVersionId) -> ToolDiscardResponse:
     """Discard the exact current version named by ``vid``.
@@ -308,7 +349,10 @@ async def discard_tool_version(name: ToolName, vid: ToolVersionId) -> ToolDiscar
                 status_code=409,
                 detail={"code": _VERSION_MISMATCH_CODE, "message": _VERSION_MISMATCH_MESSAGE},
             )
-        outcome = await run_in_threadpool(tools_service.discard_version, resolved)
+        try:
+            outcome = await run_in_threadpool(tools_service.discard_version, resolved)
+        except tools_service.ToolsLockUnavailableError as exc:
+            raise _tools_lock_unavailable(exc) from exc
         if outcome == "lineage_unavailable":
             raise HTTPException(
                 status_code=409,

@@ -3042,6 +3042,36 @@ def test_router_delete_and_discard_return_distinct_ai_job_conflict(
     assert _resolved_version(_package_path(first)).name == current_vid
 
 
+def test_router_delete_and_discard_report_unusable_lock_as_operator_error(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A foreign restrictive inode is a path/configuration error, never busy."""
+
+    first = _seed_package(monkeypatch, tmp_path, "locked")
+    current_vid = "20260728T020304Z-fedcba"
+    _copy_committed_version(first, current_vid)
+    assert tools.publish_current(_package_root(first), current_vid)
+    lock_path = tmp_path / "tools" / tools._TOOLS_LOCK_FILENAME
+    lock_path.touch()
+    lock_path.chmod(0o000)
+    real_uid = os.geteuid()
+    monkeypatch.setattr(tools.os, "geteuid", lambda: real_uid + 1)
+
+    whole = client.delete("/api/tools/locked")
+    version = client.delete(f"/api/tools/locked/versions/{current_vid}")
+
+    for response in (whole, version):
+        assert response.status_code == 500
+        detail = response.json()["detail"]
+        assert detail["code"] == "tools_lock_unavailable"
+        assert str(lock_path) in detail["message"]
+        assert f"owned by uid {real_uid}" in detail["message"]
+        assert "do not delete or recreate it" in detail["message"]
+        assert detail["code"] != "ai_job_in_progress"
+    assert _package_path(first).is_dir()
+    assert _resolved_version(_package_path(first)).name == current_vid
+
+
 def test_router_discard_response_distinguishes_removed_from_retained(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
