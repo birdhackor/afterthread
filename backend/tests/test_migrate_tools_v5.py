@@ -181,6 +181,18 @@ def _current_vid(root: Path, name: str = "alpha") -> str:
     return (root / name / ".afterthread.meta" / "current").read_text(encoding="utf-8").strip()
 
 
+def _retained_quarantine(root: Path, name: str = "alpha") -> Path:
+    quarantines = [
+        child
+        for child in root.iterdir()
+        if migration._DELETION_RE.fullmatch(child.name)
+        and migration._is_retained_quarantine(child)
+        and child.name.startswith(f".{name}{migration._DELETION_SUFFIX}")
+    ]
+    assert len(quarantines) == 1
+    return quarantines[0]
+
+
 def _assert_migrated(root: Path, name: str = "alpha") -> Path:
     package = root / name
     vid = _current_vid(root, name)
@@ -198,6 +210,7 @@ def _assert_migrated(root: Path, name: str = "alpha") -> Path:
     assert not (root / f"{name}.at-migrated").exists()
     assert not (root / f".{name}.at-migration-shell").exists()
     assert not (root / migration._JOURNAL_FILENAME).exists()
+    _retained_quarantine(root, name)
     return version
 
 
@@ -248,7 +261,10 @@ def test_happy_path_writes_target_layout_full_backup_and_minimal_origin(tmp_path
     backups = list(tmp_path.glob("tools.afterthread-v5-backup-*"))
     assert len(backups) == 1
     assert _snapshot_tree(backups[0] / "alpha") == old_snapshot
-    assert str(backups[0]) in "\n".join(output)
+    text = "\n".join(output)
+    assert str(backups[0]) in text
+    assert str(_retained_quarantine(root)) in text
+    assert "operator's responsibility" in text
 
 
 def test_dry_run_reports_env_key_names_never_values_and_writes_nothing(tmp_path: Path) -> None:
@@ -375,211 +391,71 @@ def test_each_rollback_journal_write_side_recovers(
         assert not (root / migration._JOURNAL_FILENAME).exists()
 
 
+@pytest.mark.parametrize("side", ["before", "after"])
 @pytest.mark.parametrize(
-    "fault",
+    "label",
     [
-        "before_delete_authority",
-        "after_delete_authority",
-        "before_random_park",
-        "after_random_park",
-        "before_parked_record",
-        "after_parked_record",
-        "before_delete",
-        "mid_delete_after_marker",
-        "mid_delete_after_meta",
-        "mid_delete_after_files",
-        "after_delete",
-        "before_deleted_record",
-        "after_deleted_record",
+        "journal:alpha:premigrate:retention_authority",
+        "retain:alpha:premigrate:park",
+        "journal:alpha:premigrate:retention_parked",
+        "journal:alpha:premigrate:retained",
     ],
 )
 def test_committed_cleanup_fault_matrix_never_attempts_rollback_and_retries(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fault: str
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    label: str,
+    side: str,
 ) -> None:
-    """Every cleanup boundary, including partial rmtree, resumes from committed."""
+    """Every old-package retention boundary resumes from committed."""
 
     root = tmp_path / "tools"
     _make_package(root)
-    premigrate = root / "alpha.at-premigrate"
     monkeypatch.setattr(migration.secrets, "token_hex", lambda _size: "a" * 64)
     quarantine = root / f".alpha{migration._DELETION_SUFFIX}{'a' * 64}"
-    failures = {
-        "before_delete_authority": "before:journal:alpha:premigrate:delete_authority",
-        "after_delete_authority": "after:journal:alpha:premigrate:delete_authority",
-        "before_random_park": "before:delete:alpha:premigrate:park",
-        "after_random_park": "after:delete:alpha:premigrate:park",
-        "before_parked_record": "before:journal:alpha:premigrate:delete_parked",
-        "after_parked_record": "after:journal:alpha:premigrate:delete_parked",
-        "before_delete": "before:delete:alpha:premigrate:tree",
-        "after_delete": "after:delete:alpha:premigrate:tree",
-        "before_deleted_record": "before:journal:alpha:premigrate:deleted",
-        "after_deleted_record": "after:journal:alpha:premigrate:deleted",
-    }
-    first = PointFailureOperations(
-        {failures[fault]: OSError("injected cleanup interruption")} if fault in failures else {}
-    )
-
-    if fault.startswith("mid_delete_"):
-        real_rmtree = migration.shutil.rmtree
-        interrupted = False
-
-        def interrupt_quarantine_delete(path: Path, *args: Any, **kwargs: Any) -> None:
-            nonlocal interrupted
-            if Path(path) == quarantine and not interrupted:
-                interrupted = True
-                # Recursive deletion can visit the ownership marker before any
-                # content. Model that hazardous ordering first, then interrupt at
-                # progressively later points instead of preserving the proof.
-                meta = quarantine / migration._META_DIRNAME
-                marker = meta / migration._OWNERSHIP_FILENAME
-                marker.unlink()
-                if fault in {"mid_delete_after_meta", "mid_delete_after_files"}:
-                    meta.rmdir()
-                if fault == "mid_delete_after_files":
-                    (quarantine / "tool.json").unlink()
-                    (quarantine / "run.py").unlink()
-                assert (quarantine / "data").is_dir()
-                raise OSError("injected interruption during recursive delete")
-            real_rmtree(path, *args, **kwargs)
-
-        monkeypatch.setattr(migration.shutil, "rmtree", interrupt_quarantine_delete)
+    first = PointFailureOperations({f"{side}:{label}": OSError("injected interruption")})
 
     assert _run(root, operations=first) == 1
-
     journal = json.loads((root / migration._JOURNAL_FILENAME).read_text(encoding="utf-8"))
     assert journal["status"] == "committed"
     assert migration._is_new_package_at(root / "alpha")
-    if fault.startswith("mid_delete_"):
-        assert journal["packages"][0]["deletion"] == {
-            "source": premigrate.name,
-            "path": quarantine.name,
-            "role": "premigrate",
-            "identity": journal["packages"][0]["premigrate_identity"],
-            "stage": "parked",
-        }
-    if fault in {"before_delete_authority", "after_delete_authority", "before_random_park"}:
-        assert premigrate.is_dir()
-        assert not quarantine.exists()
-    elif fault in {"after_delete", "before_deleted_record", "after_deleted_record"}:
-        assert not premigrate.exists()
-        assert not quarantine.exists()
-    else:
-        assert not premigrate.exists()
-        assert quarantine.is_dir()
-    if fault.startswith("mid_delete_"):
-        assert not (quarantine / migration._META_DIRNAME / migration._OWNERSHIP_FILENAME).exists()
-        assert (quarantine / "data").is_dir()
-    if fault == "mid_delete_after_files":
-        assert not (quarantine / "tool.json").exists()
 
     seen: list[str] = []
     guard = PointFailureOperations({}, seen=seen)
     assert _run(root, operations=guard) == 0
     assert not any("rollback" in point for point in seen)
+    assert quarantine.is_dir()
+    assert (quarantine / "run.py").read_bytes() == b'print("ok")\n'
     _assert_migrated(root)
 
 
-def test_completed_delete_authority_cannot_claim_restored_same_name_with_reused_inode(
+@pytest.mark.parametrize("side", ["before", "after"])
+def test_cleanup_journal_fault_still_ends_with_a_reportable_retained_quarantine(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    side: str,
 ) -> None:
-    """A restore reproduces the deterministic source, never the random deletion key."""
-
     root = tmp_path / "tools"
     _make_package(root)
     monkeypatch.setattr(migration.secrets, "token_hex", lambda _size: "e" * 64)
-
-    assert (
-        _run(
-            root,
-            operations=PointFailureOperations(
-                {"before:journal:alpha:premigrate:deleted": OSError("injected interruption")}
-            ),
-        )
-        == 1
-    )
-
-    journal = json.loads((root / migration._JOURNAL_FILENAME).read_text(encoding="utf-8"))
-    package = journal["packages"][0]
-    authority = package["deletion"]
-    assert authority["stage"] == "parked"
-    quarantine = root / authority["path"]
-    premigrate = migration._premigrate_path(root, "alpha")
-    assert migration._DELETION_RE.fullmatch(quarantine.name)
-    assert not quarantine.exists()
-    assert not premigrate.exists()
-
-    # Measure the review's ext4 premise rather than mocking it: restore the full
-    # backup repeatedly until the just-freed package-directory inode is reused.
-    backup_package = Path(journal["backup"]) / "alpha"
-    expected_identity = tuple(authority["identity"])
-    for _attempt in range(100):
-        shutil.copytree(backup_package, premigrate)
-        if migration._directory_identity(premigrate) == expected_identity:
-            break
-        shutil.rmtree(premigrate)
-    else:
-        pytest.fail("filesystem did not reuse the deleted directory inode in 100 restores")
-    restored_before = _snapshot_tree(premigrate)
-
-    assert _run(root) == 0
-
-    assert migration._directory_identity(premigrate) == expected_identity
-    assert _snapshot_tree(premigrate) == restored_before
-    assert migration._is_new_package_at(root / "alpha", _VID)
-    assert not quarantine.exists()
-    assert not (root / migration._JOURNAL_FILENAME).exists()
-
-
-def test_v3_authority_refuses_recreated_same_target_name_with_reused_inode(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """A stale v3 key is never replayed when its deterministic target reappears."""
-
-    root = tmp_path / "tools"
-    _make_package(root)
-    monkeypatch.setattr(migration.secrets, "token_hex", lambda _size: "f" * 64)
-    assert (
-        _run(
-            root,
-            operations=PointFailureOperations(
-                {"before:journal:alpha:premigrate:deleted": OSError("injected interruption")}
-            ),
-        )
-        == 1
-    )
-
-    journal_path = root / migration._JOURNAL_FILENAME
-    journal = json.loads(journal_path.read_text(encoding="utf-8"))
-    package = journal["packages"][0]
-    identity = tuple(package["deletion"]["identity"])
-    tombstone = migration._premigrate_tombstone_path(root, "alpha")
-    backup_package = Path(journal["backup"]) / "alpha"
-    for _attempt in range(100):
-        shutil.copytree(backup_package, tombstone)
-        if migration._directory_identity(tombstone) == identity:
-            break
-        shutil.rmtree(tombstone)
-    else:
-        pytest.fail("filesystem did not reuse the deleted directory inode in 100 restores")
-
-    journal["version"] = migration._REPLAYABLE_DELETION_JOURNAL_VERSION
-    package.pop("premigrate_deleted")
-    package["deletion"] = {
-        "path": tombstone.name,
-        "role": "premigrate",
-        "identity": list(identity),
-    }
-    journal_path.write_bytes(migration._json_bytes(journal))
-    restored_before = _snapshot_tree(tombstone)
     output: list[str] = []
 
-    assert _run(root, output=output) == 1
+    assert (
+        _run(
+            root,
+            operations=PointFailureOperations(
+                {f"{side}:cleanup:journal": OSError("injected interruption")}
+            ),
+        )
+        == 1
+    )
+    quarantine = root / f".alpha{migration._DELETION_SUFFIX}{'e' * 64}"
+    assert quarantine.is_dir()
 
-    assert migration._directory_identity(tombstone) == identity
-    assert _snapshot_tree(tombstone) == restored_before
-    assert "v3 deletion authority is replayable" in "\n".join(output)
+    assert _run(root, output=output) == 0
+
+    assert str(quarantine) in "\n".join(output)
+    _assert_migrated(root)
 
 
 def test_pending_assemble_does_not_own_a_foreign_shell(
@@ -834,7 +710,7 @@ def test_owned_incomplete_shell_is_removed_before_assembly_retries(
 
     assert _run(root) == 0
 
-    assert len(removed) == 2  # partial shell, then committed premigrate cleanup
+    assert len(removed) == 1  # partial shell only; committed old package is retained
     assert all(migration._DELETION_RE.fullmatch(path.name) for path in removed)
     assert shell not in removed
     _assert_migrated(root)
@@ -959,7 +835,7 @@ def test_foreign_committed_tombstone_survives_and_blocks_cleanup(
     assert "cleanup target has no journal ownership proof" in "\n".join(output)
 
 
-def test_owned_randomized_quarantine_is_removed_on_retry(
+def test_owned_randomized_quarantine_is_retained_on_retry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The marker and pre-rename identity survive the random quarantine rename."""
@@ -971,7 +847,7 @@ def test_owned_randomized_quarantine_is_removed_on_retry(
         _run(
             root,
             operations=PointFailureOperations(
-                {"after:delete:alpha:premigrate:park": OSError("injected interruption")}
+                {"after:retain:alpha:premigrate:park": OSError("injected interruption")}
             ),
         )
         == 1
@@ -987,7 +863,8 @@ def test_owned_randomized_quarantine_is_removed_on_retry(
 
     assert _run(root) == 0
 
-    assert not quarantine.exists()
+    assert quarantine.is_dir()
+    assert migration._is_retained_quarantine(quarantine)
     _assert_migrated(root)
 
 
@@ -1157,6 +1034,45 @@ def test_env_save_after_first_copy_is_recopied_from_parked_package(tmp_path: Pat
     carried = root / "alpha" / ".env"
     assert carried.read_bytes() == rotated
     assert stat.S_IMODE(carried.stat().st_mode) == 0o600
+
+
+def test_content_edited_during_migration_survives_in_retained_quarantine(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A late autosave is recoverable even though the migrated copy predates it."""
+
+    root = tmp_path / "tools"
+    package = _make_package(root)
+    edited = b'print("edited during migration")\n'
+    quarantine_only_secret = b"QUARANTINE_ONLY=late-secret-abcdef\n"
+
+    class SaveBeforePark(PointFailureOperations):
+        def checkpoint(self, point: str) -> None:
+            if point == "before:rename:alpha:park_old":
+                (package / "run.py").write_bytes(edited)
+            if point == "before:journal:alpha:activate_new:done":
+                parked = migration._premigrate_path(root, "alpha")
+                (parked / ".env").write_bytes(quarantine_only_secret)
+            super().checkpoint(point)
+
+    assert _run(root, operations=SaveBeforePark({})) == 0
+
+    migrated = _assert_migrated(root)
+    quarantine = _retained_quarantine(root)
+    assert (migrated / "run.py").read_bytes() == b'print("ok")\n'
+    assert (quarantine / "run.py").read_bytes() == edited
+    assert (root / "alpha" / ".env").read_bytes() != quarantine_only_secret
+    assert (quarantine / ".env").read_bytes() == quarantine_only_secret
+
+    monkeypatch.setattr(
+        tools,
+        "get_settings",
+        lambda: SimpleNamespace(tools_dir=str(root), openai_api_key=""),
+    )
+    tools._ENV_VALUE_CACHE.clear()
+    assert [row["name"] for row in tools.list_tools()] == ["alpha"]
+    assert b"late-secret-abcdef".decode() not in tools.known_secret_values()
 
 
 def test_parked_env_recopy_failure_rolls_latest_source_back_to_flat_name(
@@ -1538,7 +1454,32 @@ def test_second_run_over_already_migrated_root_is_zero_write_noop(tmp_path: Path
     assert _run(root, output=output) == 0
 
     assert _snapshot_tree(tmp_path) == before
-    assert "nothing to do" in "\n".join(output)
+    text = "\n".join(output)
+    assert "nothing to do" in text
+    assert str(_retained_quarantine(root)) in text
+
+
+def test_retained_quarantine_marker_changes_fresh_preflight_from_refusal_to_ignore(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Pin both sides of the policy change from the pre-retention implementation."""
+
+    root = tmp_path / "tools"
+    _make_package(root)
+    assert _run(root) == 0
+    quarantine = _retained_quarantine(root)
+
+    accepted = migration._fresh_preflight(root)
+    assert accepted.problems == ()
+    assert accepted.retained_quarantines == (quarantine,)
+
+    monkeypatch.setattr(migration, "_is_retained_quarantine", lambda _path: False)
+    old_policy = migration._fresh_preflight(root)
+    assert any(
+        quarantine.name in problem and "treated as operator-owned" in problem
+        for problem in old_policy.problems
+    )
 
 
 def test_previous_absent_null_and_vid_have_distinct_runtime_and_migration_meanings(

@@ -2743,6 +2743,11 @@ def _run_tool_subprocess(
 # needs the same directory files. The count protects overlapping calls, and the
 # lock covers only registry updates and lookups.
 _INFLIGHT_EXECUTIONS: dict[tuple[int, int], int] = {}
+# A parked tree is eligible for automatic collection only when THIS process saw
+# it while an execution was registered. A backend hard restart empties both
+# registries while start_new_session children may survive; therefore an unknown
+# stale/discarded tree is evidence for the operator, not proof of idleness.
+_DEFERRED_EXECUTION_CLEANUPS: set[tuple[int, int]] = set()
 _EXECUTION_LOCK = threading.Lock()
 
 
@@ -2891,6 +2896,45 @@ def package_execution_in_flight(package_root: PackageLayoutRoot) -> bool:
         if identity is None or directory_execution_in_flight(identity):
             return True
     return False
+
+
+def remember_running_tree_for_cleanup(path: Path) -> None:
+    """Record that this process observed ``path`` parked while work was running."""
+
+    identity = directory_identity(VersionRoot(path))
+    if identity is None:
+        return
+    with _EXECUTION_LOCK:
+        _DEFERRED_EXECUTION_CLEANUPS.add(identity)
+
+
+def deferred_tree_observed_idle(
+    path: Path,
+    execution_scope: PackageLayoutRoot,
+) -> bool:
+    """Consume this process's permission to collect a parked tree.
+
+    The first gate is deliberately process-local. An empty in-flight registry
+    after restart does not mean a start_new_session child is gone; only the
+    process that observed the parked tree as running may later observe the same
+    execution scope as idle and remove it.
+    """
+
+    identity = directory_identity(VersionRoot(path))
+    if identity is None:
+        return False
+    with _EXECUTION_LOCK:
+        if identity not in _DEFERRED_EXECUTION_CLEANUPS:
+            return False
+    if package_execution_in_flight(execution_scope):
+        return False
+    with _EXECUTION_LOCK:
+        # Consume before rmtree. If removal itself fails, the remains stay for
+        # the operator rather than letting inode reuse replay this permission.
+        if identity not in _DEFERRED_EXECUTION_CLEANUPS:
+            return False
+        _DEFERRED_EXECUTION_CLEANUPS.remove(identity)
+    return True
 
 
 # The DEFERRED-REMOVAL namespace: where a package goes when it must stop being a
@@ -3177,6 +3221,7 @@ def discard_version(resolution: Resolved) -> DiscardOutcome:
         # just as conservative if a test double or future implementation raises.
         running = True
     if running:
+        remember_running_tree_for_cleanup(parked)
         return "ok"
 
     with contextlib.suppress(Exception):
@@ -3210,13 +3255,13 @@ def delete_tool(name: str) -> bool:
     is untouched -- True is a genuine deletion of what the user saw, False still
     folds every "did not happen" into one 404.
 
-    The remains are collected by the SAME sweep the promote's deferrals go
-    through (``tool_builder._sweep_stale_backups``, at the end of every tool job),
-    which re-derives everything it needs from disk. Residuals, stated rather than
-    discovered later, and identical to the promote's: a pathologically long call
-    postpones the collection to a later job, and a process that exits in between
-    leaves the marked directory for the next run to sweep. Both are hidden, inert
-    litter, never a phantom package.
+    The remains are offered to the SAME sweep
+    (``tool_builder._sweep_stale_backups``, at the end of every tool job), but
+    only this backend process may collect a tree it personally observed while an
+    execution was registered and later observed idle. A hard restart empties that
+    permission while a start_new_session child may survive, so the next process
+    leaves unknown remains for the operator. Both forms are hidden, inert litter,
+    never a phantom package.
     """
     base = tools_dir()
     if base is None or not _NAME_RE.match(name):
@@ -3283,13 +3328,16 @@ def delete_tool(name: str) -> bool:
     # just renamed successfully says nothing about what is running inside it, only
     # that we cannot name it. Nothing observable changes either way (the tool is
     # already out of the registry and this still returns True); what is left
-    # behind is marked remains the next tool job's sweep re-derives from disk.
+    # behind is marked remains. The current process records that it saw the tree
+    # running; a later sweep may collect it after observing idle, while a fresh
+    # process deliberately has no such authority.
     if package_execution_in_flight(PackageLayoutRoot(deferred)):
+        remember_running_tree_for_cleanup(deferred)
         return True
     # Best-effort from here: the tool is already gone as far as everything that
     # reads this directory is concerned, so a removal that fails part-way must not
-    # be reported as "did not happen" -- it leaves MARKED remains the sweep retries
-    # on every later tool job, which is a self-healing residue rather than the
-    # half-deleted, still-listed package a failing ``rmtree`` used to leave.
+    # be reported as "did not happen". Because this path was never observed
+    # running it receives no later automatic-cleanup permission; marked remains
+    # are hidden evidence for the operator rather than a restart-unsafe retry.
     shutil.rmtree(deferred, ignore_errors=True)
     return True

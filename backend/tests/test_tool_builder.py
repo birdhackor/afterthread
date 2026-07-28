@@ -79,6 +79,7 @@ def _reset_singletons() -> Generator[None]:
     llm_log._reset_for_tests()
     tools._INFLIGHT_SECRETS.clear()
     tools._INFLIGHT_EXECUTIONS.clear()
+    tools._DEFERRED_EXECUTION_CLEANUPS.clear()
     tools._ADVERTISEMENT_GENERATIONS.clear()
     tools._ENV_VALUE_CACHE.clear()
     yield
@@ -89,6 +90,7 @@ def _reset_singletons() -> Generator[None]:
     # registration surviving a test would silently turn the next one's swap into a
     # deferral -- the same reason the secret set is cleared here.
     tools._INFLIGHT_EXECUTIONS.clear()
+    tools._DEFERRED_EXECUTION_CLEANUPS.clear()
     tools._ADVERTISEMENT_GENERATIONS.clear()
     tools._ENV_VALUE_CACHE.clear()
     tool_builder._drain_setup_worker_for_tests()
@@ -4639,17 +4641,16 @@ def test_sweep_keeps_a_backup_that_is_still_in_use_and_spares_everything_else(
 
     Four neighbours it must not touch, because it is a destructive traversal in a
     directory the operator also owns: a marked backup whose files are still being
-    read (a process exit between deferral and sweep is why this is driven off the
-    DISK, so it must re-derive that identity itself -- the DIRECTORY's, which is
-    what the writers deferred under), a hidden directory that is not one of ours,
-    and a SYMLINK wearing a marked name -- an rmtree through which would delete a
-    tree nobody verified."""
+    read, a marked tree this process never observed running, a hidden directory
+    that is not one of ours, and a SYMLINK wearing a marked name -- an rmtree
+    through which would delete a tree nobody verified. The eligible tree's
+    DIRECTORY identity is re-derived because that is what its writer recorded."""
     base = tmp_path / "tools"
     base.mkdir()
     busy = _stale_dir(base, "kbsearch")
     identity = tools.directory_identity(tools.VersionRoot(_resolved_version(busy)))
     assert identity is not None
-    idle = _stale_dir(base, "other")
+    unknown = _stale_dir(base, "other")
     (base / ".staging").mkdir()
     outside = tmp_path / "elsewhere"
     outside.mkdir()
@@ -4658,15 +4659,44 @@ def test_sweep_keeps_a_backup_that_is_still_in_use_and_spares_everything_else(
     linked.symlink_to(outside, target_is_directory=True)
 
     with tools._inflight_execution(identity):
+        tools.remember_running_tree_for_cleanup(busy)
         tool_builder._sweep_stale_backups(base)
         assert busy.is_dir()  # still being read by a live subprocess
 
-    assert not idle.exists()  # ... while an idle one goes in the same pass
+    assert unknown.is_dir()  # a fresh process did not observe this tree running
     assert (base / ".staging").is_dir()  # not ours to collect
     assert linked.is_symlink() and (outside / "keep.txt").exists()  # never followed
 
     tool_builder._sweep_stale_backups(base)
     assert not busy.exists()  # collected once the call it belonged to ended
+    assert unknown.is_dir()  # left for the operator, not inferred idle
+
+
+def test_restart_with_orphan_does_not_sweep_a_tree_the_new_process_never_observed(
+    tmp_path: Path,
+) -> None:
+    """A detached child may outlive both registries that protected its files."""
+
+    base = tmp_path / "tools"
+    base.mkdir()
+    parked = _stale_dir(base, "kbsearch")
+    version_identity = tools.directory_identity(tools.VersionRoot(_resolved_version(parked)))
+    assert version_identity is not None
+
+    # Model the old process: it observed a running version and parked the tree.
+    tools._INFLIGHT_EXECUTIONS[version_identity] = 1
+    tools.remember_running_tree_for_cleanup(parked)
+    assert tools._DEFERRED_EXECUTION_CLEANUPS
+
+    # A kill -9/restart loses both process-local facts while the detached child
+    # can still hold this cwd and perform a later relative open.
+    tools._INFLIGHT_EXECUTIONS.clear()
+    tools._DEFERRED_EXECUTION_CLEANUPS.clear()
+
+    tool_builder._sweep_stale_backups(base)
+
+    assert parked.is_dir()
+    assert (_resolved_version(parked) / "run.py").is_file()
 
 
 def test_cleanup_staging_is_where_the_sweep_actually_runs(tmp_path: Path) -> None:
@@ -4682,6 +4712,7 @@ def test_cleanup_staging_is_where_the_sweep_actually_runs(tmp_path: Path) -> Non
     base = tmp_path / "tools"
     base.mkdir()
     marked = _stale_dir(base, "kbsearch")
+    tools.remember_running_tree_for_cleanup(marked)
     staging = base / tool_builder._STAGING_DIRNAME / "buildid"
     staging.mkdir(parents=True)
 
@@ -4694,6 +4725,7 @@ def test_cleanup_staging_is_where_the_sweep_actually_runs(tmp_path: Path) -> Non
     refused.mkdir(parents=True)
     assert tool_builder._verify_staging_root(refused, base) is not None  # the early-return path
     later = _stale_dir(base, "other")
+    tools.remember_running_tree_for_cleanup(later)
 
     tool_builder._cleanup_staging(refused, base)
 
@@ -4720,6 +4752,7 @@ def test_invariant_a_delete_discard_and_sweep_share_one_running_package_judgemen
     resolution = tools.resolve_current(tools.PackageRoot(discard_package))
     assert isinstance(resolution, tools.Resolved)
     stale = _stale_dir(base, "old")
+    tools.remember_running_tree_for_cleanup(stale)
     _install_settings(monkeypatch, tools_dir=str(base))
     asked: list[tools.PackageLayoutRoot] = []
 
@@ -4799,10 +4832,11 @@ def test_sweep_collects_what_a_deferred_delete_left_behind(
 
     ``tools.delete_tool`` mints the SAME marked name a promote does, precisely so
     it needs no collector of its own: the sweep that every tool job already runs
-    picks it up. Both halves are pinned here -- it is NOT collected while the call
-    that caused the deferral is still running (the sweep re-derives that from the
-    directory itself, since the deferral may have happened in an earlier process),
-    and it IS collected on the next pass afterwards.
+    picks it up within the same process. Both halves are pinned here -- it is NOT
+    collected while the call that caused the deferral is still running, and it IS
+    collected on the next pass afterwards because this process observed both
+    states. The restart test above pins the intentionally different cross-process
+    result.
 
     An ``enabled`` toggle sits between the call and the delete on purpose. It
     rewrites ``tool.json`` in place, which moves the MANIFEST identity while the
@@ -4865,6 +4899,7 @@ def test_sweep_keeps_a_marked_backup_whose_identity_cannot_be_read(
     base.mkdir()
     no_manifest = tools._stale_backup_path(base, "kbsearch", uuid4().hex)
     no_manifest.mkdir()  # nothing to read a MANIFEST identity from
+    tools.remember_running_tree_for_cleanup(no_manifest)
 
     tool_builder._sweep_stale_backups(base)
 
@@ -4872,6 +4907,7 @@ def test_sweep_keeps_a_marked_backup_whose_identity_cannot_be_read(
 
     unreadable = tools._stale_backup_path(base, "other", uuid4().hex)
     unreadable.mkdir()
+    tools.remember_running_tree_for_cleanup(unreadable)
     monkeypatch.setattr(tools, "package_execution_in_flight", lambda _package: True)
 
     tool_builder._sweep_stale_backups(base)

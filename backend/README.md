@@ -165,13 +165,17 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   backend marker 的 foreign 檔案時，這條路由拒絕而不是覆蓋（見下方）。
 - `DELETE /api/tools/{name}` — 刪除整個工具套件目錄；找不到回 404。若刪除當下**正好
   有工具子行程在跑任一版本**，套件目錄不會被直接刪掉，而是改名成一個隱藏名稱、等該次
-  呼叫結束後由下一個工具工作的收尾清掃收走——直接刪會讓那個子行程的相對開檔全部失敗。工具
-  在回應那一刻就已經從清單與模型可見的工具中消失，行為與立即刪除沒有差別。
+  呼叫結束後，由**同一個後端程序**稍後觀察到 idle 時才可在工具工作的收尾清掃中收走——
+  直接刪會讓那個子行程的相對開檔全部失敗。工具在回應那一刻就已經從清單與模型可見的工具中
+  消失，行為與立即刪除沒有差別。若後端在兩者之間被 hard restart，
+  `start_new_session` 子行程可能仍活著，但 process-local registry 已清空；新程序因此不會
+  自動清掉前一程序留下的隱藏目錄，須由操作者確認子行程已結束後自行處理。
 - `DELETE /api/tools/{name}/versions/{vid}` — 丟掉畫面所指的**精確目前版本**。後端先
   取得全域工具名額，再比對 path 裡的 `vid`；不相符回
   `409 version_mismatch`。`lineage=usable` 時把 `current` 原子切回
   `origin.json.previous`，之後才盡力清掉原版本；若原版本仍在執行則先改名成
-  `<vid>.discarded`，留給清掃。`lineage=sole` 在 UI 走既有的整包刪除確認；
+  `<vid>.discarded`，同樣只允許觀察過 running→idle 的原後端程序清掃；跨程序留下者
+  交由操作者確認後處理。`lineage=sole` 在 UI 走既有的整包刪除確認；
   前一版缺失、未提交或指回自己則回 `409 lineage_unavailable`，不動任何檔案。
 - `POST /api/tools/install` — 送出 KB 網頁安裝器工作（見下方「工具（KB 網頁
   安裝器）」）；202 + `job_id`，建置在背景執行。`TOOLS_DIR` 未設定回 `503
@@ -331,7 +335,10 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   handler 仍明確拒絕。retired generation 由既有 handler 持有到該對話／handler
   釋放為止；之後從備份恢復並重新掃描同一 vid 會取得新 generation。退役完全不讀
   目錄的 device、inode 或其他可由 rename／刪除／重建影響的磁碟屬性，避免磁碟
-  身分重用或搬回原位使舊廣告復活。
+  身分重用或搬回原位使舊廣告復活。執行保護與 deferred-cleanup 資格也都是
+  process-local：同一程序內，delete、discard 與 `.stale-` 清掃共用「所有版本是否
+  running」判斷；跨程序則不把空 registry 當成 idle 證明。新程序從未親眼看過
+  running→idle 的 stale／discarded tree 一律保留給操作者。
 - **AI 總結拆成兩份 sidecar**：每版不可變的
   `.afterthread.meta/origin.json` 保存來源、安裝指示、修訂意見與 previous；
   可重新產生的 `.afterthread.meta/summary.json` 保存 summary、updated time 與
@@ -349,9 +356,11 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `PATH`／`HOME`／`LANG`／`LC_ALL`／`TMPDIR`，再加 package `.env` 與正規化的
   TLS 設定，避免不小心把父行程 `OPENAI_API_KEY` 一起交出去；同 UID 行程仍可能
   讀 `/proc`，所以這不是對抗惡意程式的隔離。
-- **一次性 web-v5 遷移**：先停掉 afterthread，關閉所有仍開著套件 `.env` 的編輯器，
-  並確保遷移期間不會手動或由同步程式改寫 `.env`；確認 `TOOLS_DIR` 指向舊扁平套件，
-  再於 `backend/` 執行：
+- **一次性 web-v5 遷移**：先停掉 afterthread；為使 migrated version 精確反映開始時
+  的內容，仍建議關閉編輯器並暫停手動／同步寫入。即使遷移期間發生 autosave，舊套件
+  現在也不會被刪除：那次編輯會留在 retained quarantine，**不保證進入 migrated
+  version**，操作者可事後比對與取回。確認 `TOOLS_DIR` 指向舊扁平套件，再於
+  `backend/` 執行：
 
   ```bash
   uv run python -m afterthread.migrate_tools_v5 --dry-run
@@ -373,23 +382,25 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `committed`；commit 前錯誤回復所有名稱，commit 後只重試清理、不再 rollback。
   為縮短第一次複製後仍可能收到編輯器 autosave 的窗口，程式會先把舊套件停放到
   `.at-premigrate`，再從該停放來源重抄一次 `.env`，成功才啟用新套件；重抄失敗會
-  走 commit 前 rollback。這仍無法消除最後一次重抄／一致性檢查與後續啟用、commit、
-  cleanup 之間的 check-then-act 瞬間：若寫入恰好落在該瞬間，仍可能只存在於隨後被
-  清理的舊副本，且遷移前備份不含那次新寫入。因此「停服務」之外仍必須關閉編輯器並
-  停止同步寫入。
+  走 commit 前 rollback。其他內容只在組 shell 時複製一次；之後對 `run.py`、
+  `tool.json` 或任何工具內容的編輯可能只出現在舊套件。commit 後程式會把整棵舊套件
+  從 `.at-premigrate` 改名成隨機、隱藏的 quarantine 並永久保留，因此這些 late edits
+  可復原，但不會被偷偷合併到 migrated version。
   journal 另持久記錄 shell／舊套件目錄 identity，並在目錄內寫入綁定 package +
-  vid + role 的 ownership marker；刪除必須同時重驗這些證明（完整 target-layout
-  VID 也是正證明），名稱本身從不授權刪除。新 shell 在仍為空目錄時先記錄 identity，
-  再以目前 journal 的 atomic hard link 暫時充當 bootstrap marker；正式 JSON marker
-  完整落盤後才移除 bootstrap。因此任何中斷點的 shell 不是仍為空（可無損移除），
-  就是已有 identity + marker；正式 marker 寫到一半也仍有 bootstrap 可供對帳。
-  進入 `rmtree` 前會先以 identity + marker（完整 target-layout 亦可用精確 VID）
-  重驗所有權，再產生 256-bit 隨機 quarantine 名稱，將來源 rename 過去，並把
-  source、隨機名稱、role、identity 與已完成 rename 的階段原子且持久地發布到 tree
-  外的 journal。名稱在備份後才隨機產生，不由 package 名或 inode 推導，也不存在於
-  一般 restore/sync 的來源，因此 restore 即使在原名稱重建並重用 inode，也無法重製
-  deletion key。遞迴刪除即使先刪掉 `migration-owner.json`，重跑仍能沿隨機名稱完成；
-  成功後才持久清除 authority。從未通過正證明的非空目錄仍會停止並完整保留。
+  vid + role 的 marker。對 migration 自己建立的 partial **新 shell**，identity +
+  marker（完整 target-layout 亦可用精確 VID）仍是清理證明；新 shell 在空目錄時先記
+  identity，再以目前 journal 的 atomic hard link 暫時充當 bootstrap marker，正式
+  JSON marker 完整落盤後才移除 bootstrap。這套 destructive ownership proof 不再用於
+  committed 舊套件：舊套件只產生 256-bit 隨機 quarantine 名稱、rename 過去並把
+  retained 階段持久寫進 tree 外的 journal，之後**沒有 `rmtree`**。舊套件 marker
+  留在 quarantine 內作為 fresh preflight 的持久分類標記；沒有 marker 的同形 sibling
+  仍視為 operator-owned 並拒絕。隨機 hidden quarantine 不會被 package scanner、
+  `.env` redaction scan 或 by-name API 當成 phantom package，且 `.at-premigrate`
+  不會成為 terminal 名稱。
+  成功報告會逐一列出 retained quarantine 的完整路徑，提醒其中可能有遷移期間才寫入
+  的內容，並明說檢查後是否移除由操作者決定。第二次 fresh run 也會辨識、列出並忽略
+  這些 quarantine，成為乾淨 no-op。舊的「quarantine 已刪但 journal 尚未記錄」空窗
+  已不存在，所以 restore 出來的 `.at-premigrate` 不可能再被該空窗藏在成功結果後面。
   中斷後以同一指令重跑，journal 會按其狀態續做／回復／清理；不要手動猜測或刪除
   `.at-*` 兄弟目錄。既有 journal 已代表先前確認過的 migration authority，所以
   真實重跑會直接對帳，不再詢問；此時 `--dry-run` 只報 journal status，不做對帳。

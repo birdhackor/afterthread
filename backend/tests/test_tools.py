@@ -83,9 +83,13 @@ _TEST_VID = "20260728T010203Z-abcdef"
 def _reset_log() -> Generator[None]:
     """Empty process-local singleton state around every test."""
     llm_log._reset_for_tests()
+    tools._INFLIGHT_EXECUTIONS.clear()
+    tools._DEFERRED_EXECUTION_CLEANUPS.clear()
     tools._ADVERTISEMENT_GENERATIONS.clear()
     yield
     llm_log._reset_for_tests()
+    tools._INFLIGHT_EXECUTIONS.clear()
+    tools._DEFERRED_EXECUTION_CLEANUPS.clear()
     tools._ADVERTISEMENT_GENERATIONS.clear()
 
 

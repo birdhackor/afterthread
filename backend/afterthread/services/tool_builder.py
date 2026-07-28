@@ -1751,8 +1751,10 @@ def _publish_revised_version(
 def _sweep_stale_backups(base: Path) -> None:
     """Best-effort collection of marked packages and discarded versions.
 
-    The all-versions judgement is shared with ``tools.delete_tool`` and discard.
-    Hidden entries outside the marked namespace and symlinks are never traversed.
+    The all-versions judgement is shared with ``tools.delete_tool`` and discard,
+    but an idle answer is not enough after a process boundary: this process must
+    also have observed the exact parked tree while it was running. Hidden entries
+    outside the marked namespace and symlinks are never traversed.
     """
     with contextlib.suppress(Exception):
         for child in sorted(base.iterdir()):
@@ -1762,7 +1764,10 @@ def _sweep_stale_backups(base: Path) -> None:
                 or not child.is_dir()
             ):
                 continue
-            if tools.package_execution_in_flight(tools.PackageLayoutRoot(child)):
+            if not tools.deferred_tree_observed_idle(
+                child,
+                tools.PackageLayoutRoot(child),
+            ):
                 continue
             shutil.rmtree(child, ignore_errors=True)
         # A discard that found any version execution in flight parks only its
@@ -1791,10 +1796,9 @@ def _sweep_stale_backups(base: Path) -> None:
             if not discarded:
                 continue
             package_root = tools.PackageRoot(child)
-            if tools.package_execution_in_flight(package_root):
-                continue
             for entry in discarded:
-                shutil.rmtree(entry, ignore_errors=True)
+                if tools.deferred_tree_observed_idle(entry, package_root):
+                    shutil.rmtree(entry, ignore_errors=True)
 
 
 def _cleanup_staging(staging: Path, base: Path) -> None:
@@ -1828,9 +1832,11 @@ def _cleanup_staging(staging: Path, base: Path) -> None:
     reason is reach: this is the one step EVERY tool job passes through
     unconditionally -- installs as well as revises, failures as well as successes
     -- so a deferral does not wait for another revise to succeed before anything
-    looks at it, and a fresh process sweeps what the previous one left the first
-    time any job runs. That reach is what lets ``tools.delete_tool`` defer into
-    the same namespace without a sweep trigger of its own. It also keeps the
+    looks at it. A fresh process deliberately does NOT sweep what a previous one
+    left: its empty process-local registry cannot prove that a detached child
+    died too, so those remains are left for the operator. That reach is what lets
+    ``tools.delete_tool`` defer into the same namespace without a sweep trigger
+    of its own during one process lifetime. It also keeps the
     promote's pre-swap sequence (which r4/r10/r11/r12 spent four rounds ordering)
     free of a new destructive traversal. It hangs off a ``finally`` because it is
     INDEPENDENT of everything above it: a tampered workspace returns early --
