@@ -2,7 +2,7 @@
 
 import re
 from datetime import UTC, datetime, timedelta
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import (
     BaseModel,
@@ -511,10 +511,12 @@ class ToolSummary(BaseModel):
     """
 
     name: str
-    description: str
+    description: str | None
     enabled: bool
     valid: bool
     error: str | None
+    current_vid: str | None
+    lineage: Literal["sole", "usable", "broken"]
 
 
 class ToolListResponse(BaseModel):
@@ -526,11 +528,13 @@ class ToolListResponse(BaseModel):
 class ToolSummaryDetail(BaseModel):
     """One tool's AI summary sidecar (``.ai_meta.json``), as the 工具 page reads it.
 
-    EVERY field is nullable, and all three are null together for the common,
-    non-exceptional case of a tool with no sidecar: a hand-made package, or one
-    whose summary generation has not run (or failed) yet. That is a 200, not a
-    404 -- the TOOL exists, it just has no summary -- so the page renders 尚無
-    總結 plus a 重新產生 action rather than an error.
+    The three sidecar fields are nullable and all three are null together for the
+    common, non-exceptional case of a tool with no sidecar: a hand-made package,
+    or one whose summary generation has not run (or failed) yet. That is a 200,
+    not a 404 -- the TOOL exists, it just has no summary -- so the page renders
+    尚無總結 plus a 重新產生 action rather than an error. ``current_vid`` is
+    always present and identifies the version that was actually read, so a
+    response that crossed a pointer change cannot poison another version's cache.
 
     ``llm_log_id`` links to the summary session's AI 日誌 record (the
     ``tool_summary`` workflow, distinct from the builder's ``tool_install``), so
@@ -545,12 +549,22 @@ class ToolSummaryDetail(BaseModel):
     summary: str | None
     updated_at: str | None
     llm_log_id: int | None
+    current_vid: str
 
 
 class ToolUpdateRequest(BaseModel):
     """PATCH payload for a tool: only the enabled toggle is mutable."""
 
     enabled: bool
+
+
+_TOOL_VID_PATTERN = r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$"
+
+
+class ToolExpectedVersionRequest(BaseModel):
+    """Required optimistic identity for a version-specific synchronous write."""
+
+    expected_vid: str = Field(pattern=_TOOL_VID_PATTERN)
 
 
 # An install-form secret NAME must be a valid environment-variable name: it
@@ -646,16 +660,15 @@ class ToolInstallRequest(BaseModel):
 class ToolReviseRequest(BaseModel):
     """Payload for an AI revise job (D40): what the user wants changed.
 
-    One free-text field, carrying the SAME bound every other AI free-text input
-    has (20000 chars, stripped-non-empty) -- it becomes the user turn of a
-    builder session exactly as ``ToolInstallRequest.instructions`` does. Which
-    tool is being revised is the PATH's job, not this body's: the name is
-    validated by the router's shared path regex and resolved by the same
-    existence gate the summary routes use, so it can never arrive as an
-    unvalidated field here.
+    ``feedback`` carries the SAME bound every other AI free-text input has
+    (20000 chars, stripped-non-empty) and becomes the builder session's user
+    turn. ``expected_vid`` is the required optimistic identity checked only
+    after global single-flight admission. Which tool is being revised remains
+    the PATH's job: the shared path regex validates its name.
     """
 
     feedback: str = Field(min_length=1, max_length=_MAX_AI_INPUT_CHARS)
+    expected_vid: str = Field(pattern=_TOOL_VID_PATTERN)
 
     @field_validator("feedback")
     @classmethod
@@ -693,7 +706,8 @@ class ToolJobStatus(BaseModel):
     One model for BOTH job kinds (D40 renamed it from ``ToolInstallJobStatus``
     without touching a field): an install and a revise both end in a package
     being written into the tools directory, they share one job table and one
-    poll endpoint, and nothing in this shape would differ between them.
+    poll endpoint. ``env_keys`` names assignments from a builder-written
+    ``.env`` that the backend stripped; values never enter the result.
     """
 
     job_id: str
@@ -705,3 +719,4 @@ class ToolJobStatus(BaseModel):
     summary: str | None
     llm_log_id: int | None
     llm_log_process: str | None
+    env_keys: list[str]

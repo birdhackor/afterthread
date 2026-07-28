@@ -862,8 +862,154 @@ def test_invariant_g_list_resolves_current_once_and_keeps_one_version_per_row(
         "enabled": True,
         "valid": True,
         "error": None,
+        "current_vid": _TEST_VID,
+        "lineage": "sole",
     }
     assert _resolved_version(package).name == second_vid
+
+
+def test_list_reports_all_three_lineage_states_including_a_self_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    first = _make_tool(root, "echo", "import sys\n")
+    package = _package_path(first)
+    second_vid = "20260728T020304Z-fedcba"
+    second = _add_committed_version(package, second_vid, description="second", output="SECOND")
+    _install_tools(monkeypatch, root)
+
+    sole = list_tools()[0]
+    assert (sole["current_vid"], sole["lineage"]) == (_TEST_VID, "sole")
+
+    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    usable = list_tools()[0]
+    assert (usable["current_vid"], usable["lineage"]) == (second_vid, "usable")
+
+    origin = second / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    document = json.loads(origin.read_text(encoding="utf-8"))
+    document["previous"] = second_vid
+    origin.write_text(json.dumps(document), encoding="utf-8")
+    broken = list_tools()[0]
+    assert (broken["current_vid"], broken["lineage"]) == (second_vid, "broken")
+
+
+def test_unresolved_row_is_nullable_broken_and_cannot_be_toggled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    version = _make_tool(root, "echo", "import sys\n")
+    package = _package_path(version)
+    (package / tools._META_DIRNAME / tools._CURRENT_FILENAME).unlink()
+    _install_tools(monkeypatch, root)
+
+    row = list_tools()[0]
+    assert row["description"] is None
+    assert row["current_vid"] is None
+    assert row["lineage"] == "broken"
+    assert row["valid"] is False
+    assert set_enabled("echo", False) is False
+
+
+def test_sole_version_discard_routes_to_whole_tool_delete_before_target_validation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    version = _make_tool(tmp_path / "tools", "echo", "import sys\n")
+    resolution = tools.resolve_current(_package_root(version))
+    assert isinstance(resolution, tools.Resolved)
+    called: list[str] = []
+    monkeypatch.setattr(
+        tools,
+        "delete_tool",
+        lambda name: called.append(name) is None or True,
+    )
+
+    assert tools.discard_version(resolution) == "ok"
+    assert called == ["echo"]
+
+
+def test_invariant_e_discard_succeeds_when_old_version_removal_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    first = _make_tool(root, "echo", "import sys\n")
+    package = _package_path(first)
+    second_vid = "20260728T020304Z-fedcba"
+    second = _add_committed_version(package, second_vid, description="second", output="SECOND")
+    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    resolution = tools.resolve_current(tools.PackageRoot(package))
+    assert isinstance(resolution, tools.Resolved)
+    asked: list[tools.PackageRoot] = []
+    monkeypatch.setattr(
+        tools,
+        "package_execution_in_flight",
+        lambda root: asked.append(root) is not None,
+    )
+    real_rmtree = tools.shutil.rmtree
+
+    def fail_old_version(path: Path, *args: Any, **kwargs: Any) -> None:
+        if Path(path) == second:
+            raise PermissionError("injected removal failure")
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(tools.shutil, "rmtree", fail_old_version)
+
+    assert tools.discard_version(resolution) == "ok"
+    assert _resolved_version(package) == first
+    assert second.is_dir()
+    assert asked == [tools.PackageRoot(package)]
+
+
+def test_invariant_e_unconfirmed_current_durability_leaves_old_version_intact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    first = _make_tool(root, "echo", "import sys\n")
+    package = _package_path(first)
+    second_vid = "20260728T020304Z-fedcba"
+    second = _add_committed_version(package, second_vid, description="second", output="SECOND")
+    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    resolution = tools.resolve_current(tools.PackageRoot(package))
+    assert isinstance(resolution, tools.Resolved)
+
+    before = {
+        str(path.relative_to(second)): (
+            stat.S_IMODE(path.lstat().st_mode),
+            path.read_bytes() if path.is_file() else None,
+        )
+        for path in [second, *sorted(second.rglob("*"))]
+    }
+    meta_info = os.stat(package / tools._META_DIRNAME)
+    real_fsync = os.fsync
+
+    def fail_current_directory_fsync(fd: int) -> None:
+        info = os.fstat(fd)
+        if stat.S_ISDIR(info.st_mode) and (info.st_dev, info.st_ino) == (
+            meta_info.st_dev,
+            meta_info.st_ino,
+        ):
+            raise OSError("injected current directory fsync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(tools.os, "fsync", fail_current_directory_fsync)
+    monkeypatch.setattr(
+        tools,
+        "package_execution_in_flight",
+        lambda _root: (_ for _ in ()).throw(
+            AssertionError("durability gate must precede the running check")
+        ),
+    )
+
+    assert tools.discard_version(resolution) == "ok"
+    assert _resolved_version(package) == first
+    after = {
+        str(path.relative_to(second)): (
+            stat.S_IMODE(path.lstat().st_mode),
+            path.read_bytes() if path.is_file() else None,
+        )
+        for path in [second, *sorted(second.rglob("*"))]
+    }
+    assert after == before
+    assert not second.with_name(f"{second_vid}.discarded").exists()
 
 
 def _write_state_file(pkg: Path, enabled: bool) -> None:
@@ -3627,77 +3773,23 @@ def test_set_enabled_refuses_a_symlinked_state_file(
     assert listed["error"] == tools._STATE_UNREADABLE_ERROR
 
 
-def test_set_enabled_publishes_under_the_state_publish_lock(
+def test_a_publish_whose_package_becomes_a_symlink_at_the_boundary_is_refused(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The toggle's half of the mutual exclusion (web-v5 P1, R1-1).
+    """The last containment re-check refuses an ancestor swapped for a symlink.
 
-    A revise's swap replaces the WHOLE package directory, so it carries the live
-    toggle into staging first -- and a PATCH landing between that read and the
-    rename is silently REVERTED, with both operations reporting success. Since P1 a
-    toggle no longer moves the manifest identity, so the swap's identity re-check
-    (which used to refuse that case by accident) passes and ships the stale value.
-    Ordering cannot close the window on its own, so both sides take
-    ``_STATE_PUBLISH_LOCK``; this pins THIS side, and
-    ``test_a_toggle_arriving_during_the_swap_waits_for_it_and_still_wins`` pins the
-    swap's.
+    The publisher's own pre-write ``lstat`` protects the FINAL component but not
+    its ancestors: it -- like ``mkstemp(dir=...)`` and ``os.replace`` -- follows
+    directories above the state filename. ``set_enabled`` therefore resolves the
+    package once to identify it, then checks containment again immediately before
+    calling the publisher.
 
-    Asserted from inside the publish rather than by racing the swap:
-    ``acquire(blocking=False)`` fails on a held non-reentrant lock even for its own
-    holder, so the hold is measured in one thread. The RESOLVE stays outside the
-    hold deliberately -- a toggle that resolves before a swap and publishes after
-    one lands on the package that now owns the name, which is the right answer."""
-    root = tmp_path / "tools"
-    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", enabled=True)
-    _install_tools(monkeypatch, root)
-    real_write = tools.write_package_state
-    held: list[bool] = []
-
-    def write_and_report_the_hold(
-        directory: tools.PackageRoot, enabled: bool, **kwargs: Any
-    ) -> bool:
-        held.append(not tools._STATE_PUBLISH_LOCK.acquire(blocking=False))
-        return real_write(directory, enabled, **kwargs)
-
-    monkeypatch.setattr(tools, "write_package_state", write_and_report_the_hold)
-
-    assert set_enabled("echo", False) is True
-
-    assert held == [True]  # the write happened INSIDE the hold, not beside it
-    assert tools._STATE_PUBLISH_LOCK.acquire(blocking=False) is True  # released again
-    tools._STATE_PUBLISH_LOCK.release()
-    assert json.loads(_state_path(pkg).read_text(encoding="utf-8")) == _state_document(False)
-
-
-def test_a_publish_that_wakes_to_a_symlinked_package_directory_is_refused(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """P1R3-2: the containment re-check P1 retired was not structurally replaced.
-
-    P1 dropped ``set_enabled``'s write-boundary containment check on the grounds
-    that the publisher's own pre-write ``lstat`` enforces it. That is true of the
-    FINAL component and false of every ANCESTOR: ``lstat`` does not follow a
-    symlinked ``.afterthread-state.json``, but it -- like ``mkstemp(dir=...)`` and
-    ``os.replace`` -- follows the directories above it. The resolved path is a
-    STRING re-interpreted at each of those syscalls, and ``set_enabled`` resolves
-    it BEFORE waiting on ``_STATE_PUBLISH_LOCK``, a wait that can last a whole
-    revise tail.
-
-    Driven at exactly that instant rather than by racing a revise: the lock is
-    replaced by a context manager that performs the swap as it is entered, which is
-    "the directory was replaced while this toggle waited" with no timing in it.
+    Driven at exactly that instant rather than by timing a filesystem race: the
+    re-check is replaced by a wrapper that swaps the package before delegating.
 
     What must hold is BOTH halves -- the toggle reports "did not happen" (the route
     turns that into a 404) and the link's target is left without so much as a temp
-    file in it. The hazard itself is 裁決紀錄 #5's class (an actor who can plant
-    that symlink already runs as the service uid), which is why this test exists
-    for the JUSTIFICATION rather than for the threat: a retired guard whose stated
-    replacement does not exist is what gets budgeted for and is not there.
-
-    The legitimate re-interpretation this must NOT break -- a toggle that wakes
-    after a real revise swap and lands on the newly published package -- is pinned
-    by ``test_a_toggle_arriving_during_the_swap_waits_for_it_and_still_wins`` in
-    test_tool_builder.py, against the real swap rather than a stand-in."""
+    file in it."""
     root = tmp_path / "tools"
     version = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", enabled=True)
     pkg = _package_path(version)
@@ -3706,18 +3798,14 @@ def test_a_publish_that_wakes_to_a_symlinked_package_directory_is_refused(
     _install_tools(monkeypatch, root)
     aside = root / ".moved-aside"
     before = (pkg / tools._META_DIRNAME / tools._PACKAGE_STATE_FILENAME).read_bytes()
-    real_lock = tools._STATE_PUBLISH_LOCK
+    real_resolve = tools._resolve_package_dir_no_alias
 
-    class _SwapWhileTheToggleWaits:
-        def __enter__(self) -> None:
-            os.rename(pkg, aside)  # the package the toggle resolved, moved away
-            pkg.symlink_to(elsewhere, target_is_directory=True)
-            real_lock.acquire()
+    def swap_before_recheck(name: str) -> tools.PackageRoot | None:
+        os.rename(pkg, aside)  # the package the toggle resolved, moved away
+        pkg.symlink_to(elsewhere, target_is_directory=True)
+        return real_resolve(name)
 
-        def __exit__(self, *_exc: object) -> None:
-            real_lock.release()
-
-    monkeypatch.setattr(tools, "_STATE_PUBLISH_LOCK", _SwapWhileTheToggleWaits())
+    monkeypatch.setattr(tools, "_resolve_package_dir_no_alias", swap_before_recheck)
 
     assert set_enabled("echo", False) is False
 
@@ -3726,8 +3814,6 @@ def test_a_publish_that_wakes_to_a_symlinked_package_directory_is_refused(
         aside / tools._META_DIRNAME / tools._PACKAGE_STATE_FILENAME
     ).read_bytes() == before  # nor into the real package
     assert (root / "echo").is_symlink()  # the planted link is untouched too
-    assert real_lock.acquire(blocking=False) is True  # and the hold was released
-    real_lock.release()
 
 
 def test_a_non_regular_state_file_is_not_repaired_by_the_toggle(

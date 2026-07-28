@@ -181,7 +181,7 @@ def test_only_by_id_routes_declare_404() -> None:
     for an unknown/evicted/post-restart job, the two AI-summary routes
     under /api/tools/{name}/summary -- D40 -- which 404 when the named tool does
     not exist, TOOLS_DIR being unset included, and POST /api/tools/{name}/revise,
-    which is by-name and 404s on the same gate). The collection, review, health,
+    plus the version-addressed discard, which 404 on the same gate). The collection, review, health,
     status, capture, log-list, tool-list and install-submit routes cannot 404
     and must not declare it.
 
@@ -208,6 +208,7 @@ def test_only_by_id_routes_declare_404() -> None:
         ("/api/llm/logs/{log_id}", "get"),
         ("/api/tools/{name}", "patch"),
         ("/api/tools/{name}", "delete"),
+        ("/api/tools/{name}/versions/{vid}", "delete"),
         ("/api/tools/jobs/{job_id}", "get"),
         ("/api/tools/{name}/summary", "get"),
         ("/api/tools/{name}/summary/regenerate", "post"),

@@ -154,6 +154,10 @@ _ERROR_SECRET_ENV_UNSERIALIZABLE = "秘密值含特殊字元，無法安全寫�
 # Category-only by construction: a fixed string, never a path or a value, since
 # the very name that failed to delete could have been chosen to embed a secret.
 _ERROR_SIDECAR_STRIP = "無法清除工具包內的 AI 總結側檔，安裝已取消。"  # noqa: RUF001
+# A builder-authored root .env is never version content.  Failure to remove it
+# must stop publication; otherwise one filesystem edge case silently revives the
+# configuration mechanism the prompt and package layout explicitly removed.
+_ERROR_BUILDER_ENV_STRIP = "無法清除建置器寫入的 .env，操作已取消。"  # noqa: RUF001
 # D40/R8-1: raised when staging itself fails ``_verify_staging_root``'s re-check --
 # either the path IS a symlink, or its RESOLVED location no longer sits inside the
 # resolved ``<tools_dir>/.staging`` shell (an ancestor swapped for a symlink). A
@@ -317,7 +321,7 @@ def _fsync_tree(root: Path) -> bool:
 
 # The builder's system prompt. English, like every prompt in this codebase.
 # It must carry the ENTIRE package contract (tool.json fields, the name regex,
-# the stdin/stdout execution contract, .env for secrets) because the model has
+# the stdin/stdout execution contract, and environment configuration) because the model has
 # no other way to learn it -- the runtime that will execute the finished tool
 # is not in the conversation. The suggested loop (write -> test via run_shell
 # -> fix -> ready) is what makes max_tool_rounds=24 a working budget.
@@ -341,10 +345,11 @@ least one element must be a file inside the package.
 directory; the arguments arrive as ONE JSON object on STDIN; whatever it \
 prints to STDOUT is the result shown to the AI assistant; a non-zero exit \
 code means failure (STDERR is shown as the error).
-- Secrets (API keys, tokens) go into a `.env` file (KEY=VALUE lines) in the \
-workspace; at runtime those values are injected into the tool's environment. \
-They are NOT auto-loaded inside your run_shell tests -- source them yourself \
-when testing: `set -a; . ./.env 2>/dev/null; set +a; ...`.
+- Put non-secret configuration defaults in the tool's own code, using \
+`os.environ.get("KEY", "default")` (or the equivalent in another language), so \
+the defaults remain part of this version. Do NOT write a `.env` file. If the \
+tool needs a credential, name the required environment variable clearly in \
+tool.json's description; the operator supplies its value outside this build.
 - Two filenames belong to the backend, and anything you write at them is DELETED \
 before the tool is installed: `.ai_meta.json` anywhere in the package, and \
 `.afterthread-state.json` at the workspace ROOT (that one is the operator's \
@@ -373,7 +378,8 @@ echo '{"query":"test"}' | python3 run.py
 Recommended flow:
 1. Read the user's instructions and the OpenAPI document; pick the endpoint(s) \
 that serve the user's goal.
-2. Write run.py and tool.json (and .env if the user supplied credentials).
+2. Write run.py and tool.json. Keep configuration defaults in code; never write \
+.env.
 3. Test with run_shell: pipe a realistic JSON argument object into your entry \
 command; verify the output is genuinely useful to an AI assistant (compact, \
 relevant, plain text or small JSON).
@@ -438,9 +444,8 @@ def _builder_system_prompt(secret_name: str | None) -> str:
 #
 # * the workspace is not empty and the goal is not "build a tool" -- it already
 #   holds the installed package, and untouched files must stay untouched;
-# * the base prompt tells the model to `. ./.env` when testing. There IS no
-#   ``.env`` in a revise workspace (it is withheld precisely because its values
-#   would trip the embedded-secret gate), so the addendum says where those values
+# * there is no ``.env`` in a revise workspace (it is package-layer operator
+#   state), so the addendum says where those values
 #   actually are: already exported into run_shell's environment under their own
 #   names. Without this the model reads the absence as "the tool has no
 #   credentials" and starts inventing them;
@@ -456,11 +461,10 @@ address the user's feedback below, and leave everything the feedback does not \
 ask you to change exactly as you found it.
 
 Three facts about this workspace that differ from a fresh build:
-- The package's `.env` has been WITHHELD from your workspace and the backend \
-restores the original after you finish. Do not write one, do not invent \
-placeholder values, and do not make your changes depend on rewriting it -- if \
-this package has a `.env`, any you write is REPLACED by the preserved original. \
-Those values are \
+- The package's operator-owned `.env` remains outside this version workspace. \
+Do not write one, do not invent placeholder values, and do not make your changes \
+depend on rewriting it -- any `.env` you write is stripped before publication. \
+Its values are \
 already exported into your run_shell environment under their own names, so you \
 can still live-test the real API (e.g. `echo '{"query":"test"}' | python3 \
 run.py`) without ever seeing them. If the user's feedback asks to CHANGE a \
@@ -586,6 +590,9 @@ class InstallOutcome:
     summary: str | None = None
     error: str | None = None
     llm_log_id: int | None = None
+    # Names extracted from a builder-written .env before that file was stripped.
+    # Values are intentionally not representable in the outcome or job schema.
+    env_keys: tuple[str, ...] = ()
 
 
 # --- staging containment + meta-tools ---------------------------------------
@@ -1482,6 +1489,44 @@ def _remove_reserved_sidecar_path(path: Path) -> None:
     path.unlink(missing_ok=True)
 
 
+def _strip_builder_env(
+    build_root: tools.BuildRoot, base: Path
+) -> tuple[tuple[str, ...], str | None]:
+    """Extract root ``.env`` key names, then remove the builder-owned entry.
+
+    Values never leave this function.  The exact lowercase path is deliberate:
+    on a case-sensitive filesystem a copied ``.ENV`` is ordinary version
+    content, while on a case-insensitive filesystem opening ``.env`` naturally
+    addresses the same entry.  The staging-root guard runs first because removal
+    is destructive and the builder has unjailed shell access.
+    """
+
+    root_error = _verify_staging_root(build_root.path, base)
+    if root_error is not None:
+        return (), root_error
+    env_file = build_root.path / ".env"
+    try:
+        info = os.lstat(env_file)
+    except FileNotFoundError:
+        return (), None
+    except OSError:
+        return (), _ERROR_BUILDER_ENV_STRIP
+
+    keys: set[str] = set()
+    if stat.S_ISREG(info.st_mode):
+        data = tools._read_regular_bytes_capped(env_file, tools._ENV_FILE_MAX_BYTES)
+        if data is not None:
+            text = data[: tools._ENV_FILE_MAX_BYTES].decode("utf-8", errors="replace")
+            keys.update(
+                key for line in text.splitlines() if (key := _env_line_key(line)) is not None
+            )
+    try:
+        _remove_reserved_sidecar_path(env_file)
+    except OSError:
+        return tuple(sorted(keys)), _ERROR_BUILDER_ENV_STRIP
+    return tuple(sorted(keys)), None
+
+
 def _reraise_walk_error(exc: OSError) -> None:
     """``os.walk``'s ``onerror`` callback, wired to make a scan failure FATAL (R8-2).
 
@@ -1507,13 +1552,11 @@ def _strip_builder_sidecars(staging: Path) -> str | None:
     session has real shell capability (D21), so it can write one too, and doing so
     is a complete bypass of that choke point rather than a cosmetic liberty:
 
-    * the builder writes a staging ``.env`` holding a value NOBODY has registered
-      yet -- ``known_secret_values`` scans installed packages only (it skips the
-      dot-prefixed ``.staging`` shell), so the value is unknown for the whole
-      build window;
+    * the builder writes a value into some ordinary staging file which no
+      installed-package scan could have registered yet;
     * it writes ``.ai_meta.json`` with that value as the summary.
-      ``validate_package``'s embedded-secret sweep cannot see a secret it does not
-      know, so the package passes;
+      ``validate_package``'s embedded-secret sweep cannot see a secret it does
+      not know, so the package passes;
     * promote moves the whole staging directory, sidecar included;
     * the install hook is best-effort, so any later summary-generation or storage
       failure would leave that forged secret-bearing sidecar as the value GET
@@ -1699,8 +1742,9 @@ def _promote_staging(
         if inject_error is not None:
             return inject_error
 
-    # Persist the complete shell, including package metadata and .env, before its
-    # one atomic install rename. Then persist the parent entry before success.
+    # Persist the complete package shell, including backend-owned metadata and the
+    # operator-supplied package-layer .env, before its one atomic install rename.
+    # Then persist the parent entry before success.
     if not _fsync_tree(shell_root):
         return _ERROR_DURABILITY
     if _entry_exists(target):
@@ -1792,10 +1836,10 @@ def _publish_revised_version(
 
 
 def _sweep_stale_backups(base: Path) -> None:
-    """Best-effort collection of marked packages with no running version.
+    """Best-effort collection of marked packages and discarded versions.
 
-    The all-versions judgement is shared with ``tools.delete_tool``. Hidden
-    entries outside the marked namespace and symlinks are never traversed.
+    The all-versions judgement is shared with ``tools.delete_tool`` and discard.
+    Hidden entries outside the marked namespace and symlinks are never traversed.
     """
     with contextlib.suppress(Exception):
         for child in sorted(base.iterdir()):
@@ -1808,6 +1852,36 @@ def _sweep_stale_backups(base: Path) -> None:
             if tools.package_execution_in_flight(tools.PackageRoot(child)):
                 continue
             shutil.rmtree(child, ignore_errors=True)
+        # A discard that found any version execution in flight parks only its
+        # former current version.  Retry those names during the same cleanup pass
+        # every tool job already reaches; ordinary retained versions never match.
+        for child in sorted(base.iterdir()):
+            if not tools._NAME_RE.fullmatch(child.name) or child.is_symlink() or not child.is_dir():
+                continue
+            versions = child / tools._VERSIONS_DIRNAME
+            try:
+                entries = sorted(versions.iterdir())
+            except OSError:
+                continue
+            discarded = [
+                entry
+                for entry in entries
+                if entry.name.endswith(".discarded")
+                and tools._VID_RE.fullmatch(entry.name.removesuffix(".discarded"))
+                and not entry.is_symlink()
+                and entry.is_dir()
+                # Only discard itself can create a committed version under this
+                # suffix.  A colliding operator entry is part of the vid namespace
+                # but is not ours to collect.
+                and tools.read_origin_meta(tools.VersionRoot(entry)) is not None
+            ]
+            if not discarded:
+                continue
+            package_root = tools.PackageRoot(child)
+            if tools.package_execution_in_flight(package_root):
+                continue
+            for entry in discarded:
+                shutil.rmtree(entry, ignore_errors=True)
 
 
 def _cleanup_staging(staging: Path, base: Path) -> None:
@@ -1941,9 +2015,22 @@ async def run_install(
         # The builder session ran (even a not-configured exit records one), so
         # link its AI 日誌 record to the outcome NOW -- error paths included.
         llm_log_id = llm_log.last_record_id_for_workflow(_WORKFLOW)
+        env_keys, env_strip_error = await run_in_threadpool(_strip_builder_env, build_root, base)
 
+        if env_strip_error is not None:
+            return InstallOutcome(
+                ok=False,
+                error=env_strip_error,
+                llm_log_id=llm_log_id,
+                env_keys=env_keys,
+            )
         if llm_error is not None:
-            return InstallOutcome(ok=False, error=llm_error, llm_log_id=llm_log_id)
+            return InstallOutcome(
+                ok=False,
+                error=llm_error,
+                llm_log_id=llm_log_id,
+                env_keys=env_keys,
+            )
         assert result is not None  # exactly one of result/llm_error is set above
 
         # F1/D36: the model is told never to print the secret in its summary, but a
@@ -1966,6 +2053,7 @@ async def run_install(
                 summary=summary,
                 error=f"AI 判定工具尚未完成：{reason}",  # noqa: RUF001
                 llm_log_id=llm_log_id,
+                env_keys=env_keys,
             )
 
         promote_error = await run_in_threadpool(
@@ -1990,6 +2078,7 @@ async def run_install(
                 summary=summary,
                 error=promote_error,
                 llm_log_id=llm_log_id,
+                env_keys=env_keys,
             )
         # D40: the package is INSTALLED as of the line above -- everything from
         # here on is decoration. Generate its AI summary sidecar while we still
@@ -2026,6 +2115,7 @@ async def run_install(
             tool_name=result.tool_name,
             summary=summary,
             llm_log_id=llm_log_id,
+            env_keys=env_keys,
         )
     finally:
         # Discard the in-flight secret first (its .env now carries it post-move,
@@ -2538,8 +2628,23 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
             llm_error = f"AI 修訂工具失敗（{exc}）。"  # noqa: RUF001
 
         llm_log_id = llm_log.last_record_id_for_workflow(_WORKFLOW)
+        env_keys, env_strip_error = await run_in_threadpool(_strip_builder_env, build_root, base)
+        if env_strip_error is not None:
+            return InstallOutcome(
+                ok=False,
+                tool_name=name,
+                error=env_strip_error,
+                llm_log_id=llm_log_id,
+                env_keys=env_keys,
+            )
         if llm_error is not None:
-            return InstallOutcome(ok=False, error=llm_error, llm_log_id=llm_log_id)
+            return InstallOutcome(
+                ok=False,
+                tool_name=name,
+                error=llm_error,
+                llm_log_id=llm_log_id,
+                env_keys=env_keys,
+            )
         assert result is not None  # exactly one of result/llm_error is set above
 
         # The SAME single choke point run_install uses, and for the same reason:
@@ -2564,6 +2669,7 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
                 summary=summary,
                 error=f"AI 判定修訂尚未完成：{reason}",  # noqa: RUF001
                 llm_log_id=llm_log_id,
+                env_keys=env_keys,
             )
         if result.tool_name != name:
             # D40: ``InstallResult._ready_requires_valid_name`` only checks the
@@ -2583,6 +2689,7 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
                 summary=summary,
                 error=f"AI 試圖將工具改名為「{attempted}」，修訂已取消。",  # noqa: RUF001
                 llm_log_id=llm_log_id,
+                env_keys=env_keys,
             )
 
         # The publisher reads immutable provenance from the version whose identity
@@ -2603,6 +2710,7 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
                 summary=summary,
                 error=promote_error,
                 llm_log_id=llm_log_id,
+                env_keys=env_keys,
             )
         # The revision is LIVE as of the line above; everything after it is
         # decoration and cannot fail the outcome (``generate_and_store_summary``
@@ -2611,7 +2719,13 @@ async def run_revise(name: str, feedback: str) -> InstallOutcome:
         # briefly-absent-sidecar window D40 already accepts right after an install,
         # and the reason the origin above is carried across rather than re-derived.
         await tool_meta.generate_and_store_summary(name, origin=origin, builder_summary=summary)
-        return InstallOutcome(ok=True, tool_name=name, summary=summary, llm_log_id=llm_log_id)
+        return InstallOutcome(
+            ok=True,
+            tool_name=name,
+            summary=summary,
+            llm_log_id=llm_log_id,
+            env_keys=env_keys,
+        )
     finally:
         # The package .env was untouched, so its live scan keeps covering these
         # values after the temporary registrations are dropped. Cleanup always
@@ -2670,6 +2784,7 @@ class InstallJob:
     tool_name: str | None = None
     summary: str | None = None
     llm_log_id: int | None = None
+    env_keys: tuple[str, ...] = ()
 
 
 def _now_iso() -> str:
@@ -2686,6 +2801,7 @@ def _job_dict(job: InstallJob) -> dict[str, Any]:
         "tool_name": job.tool_name,
         "summary": job.summary,
         "llm_log_id": job.llm_log_id,
+        "env_keys": list(job.env_keys),
     }
 
 
@@ -2743,6 +2859,7 @@ async def _run_job(
         tool_name=outcome.tool_name,
         summary=outcome.summary,
         llm_log_id=outcome.llm_log_id,
+        env_keys=outcome.env_keys,
         finished_at=_now_iso(),
     )
 
@@ -2763,7 +2880,7 @@ def _single_flight_held() -> bool:
     return bool(_SYNC_OPS) or any(job.state in ("queued", "running") for job in _JOBS.values())
 
 
-def _admit_job() -> InstallJob | None:
+def _admit_job(*, reservation_token: str | None = None) -> InstallJob | None:
     """Register one queued job, or None when another is already active (M7/D40).
 
     The single-flight admission, written ONCE for both kinds: the active-check
@@ -2782,8 +2899,17 @@ def _admit_job() -> InstallJob | None:
     """
     job = InstallJob(job_id=uuid4().hex, state="queued", created_at=_now_iso())
     with _JOBS_LOCK:
-        if _single_flight_held():
-            return None
+        if reservation_token is None:
+            if _single_flight_held():
+                return None
+        else:
+            # A revise first reserves the slot, checks expected_vid without
+            # enqueuing anything, then atomically converts that exact lease into
+            # its queued job.  A missing/stale token can never steal another
+            # operation's slot.
+            if reservation_token not in _SYNC_OPS:
+                return None
+            _SYNC_OPS.remove(reservation_token)
         _JOBS[job.job_id] = job
         while len(_JOBS) > _MAX_JOBS:
             oldest = min(_JOBS.values(), key=lambda j: (j.created_at, j.job_id))
@@ -2834,21 +2960,44 @@ def start_install_job(
     )
 
 
-def start_revise_job(name: str, feedback: str) -> str | None:
-    """Create a revise job and launch it; returns the job id, or None when a job
-    is ALREADY active (queued|running) -- which the router maps to a 409 (D40).
+@dataclass(frozen=True, slots=True)
+class ReviseJobStart:
+    """A revise submit result with machine-distinct pre-job refusals."""
 
-    Same table, same single-flight admission and same task machinery as an
-    install: from here down the two kinds are indistinguishable, which is what
-    lets one poll endpoint serve both. ``name`` has already been validated
-    (path-layer regex) and resolved (the route's existence gate); ``run_revise``
-    re-resolves it anyway, because the route's check and this task are seconds
-    apart.
+    job_id: str | None = None
+    refusal: str | None = None
+
+
+async def start_revise_job(name: str, feedback: str, expected_vid: str) -> ReviseJobStart:
+    """Take the global slot, compare ``expected_vid``, then enqueue a revise.
+
+    The stale path never creates an ``InstallJob`` and never launches a task.
+    The reservation is converted into a queued job atomically only after the
+    comparison passes, so no other current writer can race that check.
     """
-    job = _admit_job()
-    if job is None:
-        return None
-    return _launch_job(job, lambda: run_revise(name, feedback), _ACTION_REVISE)
+
+    reservation = reserve_sync_operation()
+    if reservation is None:
+        return ReviseJobStart(refusal="job_busy")
+    try:
+        package_root = await run_in_threadpool(tools._resolve_package_dir_no_alias, name)
+        if package_root is None:
+            return ReviseJobStart(refusal="not_found")
+        resolution = await run_in_threadpool(tools.resolve_current, package_root)
+        if isinstance(resolution, tools.Unresolved):
+            return ReviseJobStart(refusal="not_found")
+        if resolution.vid != expected_vid:
+            return ReviseJobStart(refusal="version_mismatch")
+        job = _admit_job(reservation_token=reservation)
+        if job is None:
+            return ReviseJobStart(refusal="job_busy")
+        reservation = ""
+        return ReviseJobStart(
+            job_id=_launch_job(job, lambda: run_revise(name, feedback), _ACTION_REVISE)
+        )
+    finally:
+        if reservation:
+            release_sync_operation(reservation)
 
 
 def any_job_active() -> bool:

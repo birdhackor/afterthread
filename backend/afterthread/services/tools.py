@@ -29,7 +29,7 @@ from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Literal
 from uuid import uuid4
 
 from dotenv import dotenv_values
@@ -280,7 +280,7 @@ class _PackageScan:
     resolution: Resolution
     valid: bool
     enabled: bool
-    description: str
+    description: str | None
     error: str | None
     parameters: dict[str, Any] | None
     entry: list[str] | None
@@ -311,11 +311,17 @@ class BuildRoot:
 
 @dataclass(frozen=True, slots=True)
 class Resolved:
-    """A package whose ``current`` names one committed version."""
+    """A package whose ``current`` names one committed version.
+
+    ``previous`` is captured from that version's commit marker during the same
+    resolution.  List rows and discard therefore cannot describe one current
+    version while deriving lineage from a second pointer read.
+    """
 
     package_root: PackageRoot
     version_root: VersionRoot
     vid: str
+    previous: Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -677,7 +683,15 @@ def package_enabled(package_root: PackageRoot) -> bool:
 
 
 def _origin_document(version_root: VersionRoot) -> dict[str, Any] | None:
-    """Read and validate the committed-version marker without guessing."""
+    """Read and validate the committed-version marker without guessing.
+
+    ``previous`` is deliberately not shape-validated here.  The marker still
+    commits this version when an operator hand-edits only that field into a bad
+    value; lineage then becomes ``broken`` and discard can answer the actionable
+    ``lineage_unavailable`` conflict.  Treating that edit as an uncommitted
+    current version would erase ``current_vid`` and collapse two different
+    repair paths into the unresolved-row state.
+    """
 
     data = _read_regular_bytes_capped(
         version_root.path / _META_DIRNAME / _ORIGIN_FILENAME, _AI_META_MAX_BYTES
@@ -690,14 +704,37 @@ def _origin_document(version_root: VersionRoot) -> dict[str, Any] | None:
         return None
     if not isinstance(raw, dict) or not isinstance(raw.get("source"), str):
         return None
-    previous = raw.get("previous")
-    if previous is not None and (not isinstance(previous, str) or not _VID_RE.fullmatch(previous)):
-        return None
     for key in ("openapi_url", "instructions", "feedback"):
         value = raw.get(key)
         if value is not None and not isinstance(value, str):
             return None
     return _utf8_safe_meta(raw)
+
+
+def _resolve_version_target(
+    package_root: PackageRoot, vid: object
+) -> tuple[VersionRoot, dict[str, Any]] | None:
+    """Resolve one committed version target by the exact rule ``current`` uses.
+
+    The vid syntax, real-directory check, and committed ``origin.json`` check
+    live here once so ``current``, lineage, and discard cannot drift into three
+    subtly different definitions of a usable version.
+    """
+
+    if not isinstance(vid, str) or not _VID_RE.fullmatch(vid):
+        return None
+    version_path = package_root.path / _VERSIONS_DIRNAME / vid
+    try:
+        version_info = os.lstat(version_path)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(version_info.st_mode):
+        return None
+    version_root = VersionRoot(version_path)
+    origin = _origin_document(version_root)
+    if origin is None:
+        return None
+    return version_root, origin
 
 
 def resolve_current(package_root: PackageRoot) -> Resolution:
@@ -727,17 +764,18 @@ def resolve_current(package_root: PackageRoot) -> Resolution:
     if not _VID_RE.fullmatch(vid):
         return Unresolved(package_root, "current has invalid syntax")
 
-    version_path = package / _VERSIONS_DIRNAME / vid
-    try:
-        version_info = os.lstat(version_path)
-    except OSError:
-        return Unresolved(package_root, "current points to a missing version")
-    if not stat.S_ISDIR(version_info.st_mode):
-        return Unresolved(package_root, "current version must be a real directory")
-    version_root = VersionRoot(version_path)
-    if _origin_document(version_root) is None:
+    target = _resolve_version_target(package_root, vid)
+    if target is None:
+        version_path = package / _VERSIONS_DIRNAME / vid
+        try:
+            version_info = os.lstat(version_path)
+        except OSError:
+            return Unresolved(package_root, "current points to a missing version")
+        if not stat.S_ISDIR(version_info.st_mode):
+            return Unresolved(package_root, "current version must be a real directory")
         return Unresolved(package_root, "current points to an uncommitted version")
-    return Resolved(package_root, version_root, vid)
+    version_root, origin = target
+    return Resolved(package_root, version_root, vid, origin.get("previous"))
 
 
 def _manifest_identity(directory: Path) -> tuple[int, int, int] | None:
@@ -837,7 +875,7 @@ def scan_installed(package_root: PackageRoot) -> _PackageScan:
             resolution=resolution,
             valid=False,
             enabled=False,
-            description="",
+            description=None,
             error=resolution.reason,
             parameters=None,
             entry=None,
@@ -1188,13 +1226,16 @@ def _write_package_file_atomic(
     *,
     default_mode: int = _OWNER_RW,
     identity_root: VersionRoot | None = None,
+    durability_out: list[bool] | None = None,
 ) -> bool:
     """Atomically publish one backend-owned file and preserve its safe mode.
 
     The publisher refuses non-regular existing targets, writes and fsyncs a temp
     file in the destination directory, checks an optional version identity at the
     last instant, replaces the target, and fsyncs the directory. Its bool contract
-    is shared by state, current, origin, and summary callers.
+    is shared by state, current, origin, and summary callers and reports whether
+    publication happened; the optional one-item out parameter exists solely so
+    ``publish_current`` can expose confirmed directory durability to discard.
     """
     path = directory / filename
     # The mode to publish under. There is ALWAYS one now (R11): a fresh file
@@ -1276,12 +1317,18 @@ def _write_package_file_atomic(
     # it would unlink a temp file that no longer exists and report a toggle that
     # DID take effect as "did not happen". O_DIRECTORY so a path that is somehow
     # not a directory is refused rather than fsynced as whatever it is.
-    with contextlib.suppress(OSError):
+    durable = False
+    try:
         dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(dir_fd)
         finally:
             os.close(dir_fd)
+        durable = True
+    except OSError:
+        pass
+    if durability_out is not None:
+        durability_out.append(durable)
     return True
 
 
@@ -1495,25 +1542,43 @@ def write_origin_meta(build_root: BuildRoot, origin: dict[str, Any]) -> bool:
     return _write_package_file_atomic(meta_root, _ORIGIN_FILENAME, data, None)
 
 
-def publish_current(package_root: PackageRoot, vid: str) -> bool:
-    """Publish one syntactically valid vid through the shared atomic publisher."""
+@dataclass(frozen=True, slots=True)
+class CurrentPublication:
+    """The one publication result whose durability a caller is allowed to read.
+
+    Truthiness means the ``current`` name was replaced, preserving the existing
+    ``if not publish_current(...)`` call shape.  ``durable`` is intentionally a
+    separate fact: discard succeeds on publication, but may destroy the previous
+    target only when the containing-directory fsync was confirmed.
+    """
+
+    published: bool
+    durable: bool
+
+    def __bool__(self) -> bool:
+        return self.published
+
+
+def publish_current(package_root: PackageRoot, vid: str) -> CurrentPublication:
+    """Publish one syntactically valid vid and expose only its durability."""
 
     if not _VID_RE.fullmatch(vid):
-        return False
+        return CurrentPublication(published=False, durable=False)
     meta_root = package_root.path / _META_DIRNAME
     if not meta_root.is_dir():
-        return False
-    return _write_package_file_atomic(
+        return CurrentPublication(published=False, durable=False)
+    durability: list[bool] = []
+    published = _write_package_file_atomic(
         meta_root,
         _CURRENT_FILENAME,
         f"{vid}\n".encode("ascii"),
         None,
+        durability_out=durability,
     )
-
-
-# Serializes package-state publications inside this process. It is held only
-# across bounded filesystem checks and the atomic publisher, never across await.
-_STATE_PUBLISH_LOCK = threading.Lock()
+    return CurrentPublication(
+        published=published,
+        durable=published and bool(durability) and durability[0],
+    )
 
 
 def write_package_state(
@@ -1571,6 +1636,26 @@ def store_summary_meta(
     return ("ok", stored) if stored is not None else ("not_stored", None)
 
 
+def _lineage_for_resolution(resolution: Resolved) -> str:
+    """Return ``sole``/``usable``/``broken`` from this exact resolution.
+
+    A self-loop is broken even though its directory target validates.  Keeping
+    that comparison beside the target validation prevents the list from
+    offering an action the discard endpoint must reject every time.
+    """
+
+    previous = resolution.previous
+    if previous is None:
+        return "sole"
+    if previous == resolution.vid:
+        return "broken"
+    return (
+        "usable"
+        if _resolve_version_target(resolution.package_root, previous) is not None
+        else "broken"
+    )
+
+
 def list_tools() -> list[dict[str, Any]]:
     """List every installed package as a UI-facing summary.
 
@@ -1584,6 +1669,12 @@ def list_tools() -> list[dict[str, Any]]:
             "enabled": scan.enabled,
             "valid": scan.valid,
             "error": scan.error if scan.error is not None else scan.notice,
+            "current_vid": scan.resolution.vid if isinstance(scan.resolution, Resolved) else None,
+            "lineage": (
+                _lineage_for_resolution(scan.resolution)
+                if isinstance(scan.resolution, Resolved)
+                else "broken"
+            ),
         }
         for scan in _scan_all()
     ]
@@ -2816,20 +2907,85 @@ def set_enabled(name: str, enabled: bool) -> bool:
     # state file is an UNREADABLE one, and an unreadable one takes the package out
     # of the registry (see ``_read_enabled_state``), so publishing this by
     # truncate-then-write would make a failed toggle strictly worse than no toggle.
-    with _STATE_PUBLISH_LOCK:
-        # Recheck containment inside the publication hold. The publisher refuses
-        # a symlink only at its final filename; this also protects its ancestors.
-        if _resolve_package_dir_no_alias(name) != package_root:
-            return False
-        # NOT OURS, NOT OVERWRITTEN (P1R5-1). One read, on the line above the
-        # publish for the reason every other check here sits there: what remains
-        # after it is the publisher's own lstat/mkstemp/replace, the syscall run
-        # this module accepts by name. Only a FOREIGN file stops the write -- an
-        # unreadable one is read as ours and publishing over it is the documented
-        # repair, and an absent one is the ordinary first write.
-        if _read_enabled_state(package_root).notice is not None:
-            return False
-        return write_package_state(package_root, enabled)
+    # P2 intentionally has no state-publication lock: revise now publishes only
+    # ``versions/<vid>`` plus ``current``, so no promote tail can replace this
+    # package-layer state.  The old lock had lost its second participant.
+    #
+    # Recheck containment immediately before publication. The publisher refuses
+    # a symlink only at its final filename; this also protects its ancestors.
+    if _resolve_package_dir_no_alias(name) != package_root:
+        return False
+    # An unresolved package has no version whose row this toggle could describe.
+    # Its sole recovery action is whole-package deletion; allowing PATCH here
+    # would mutate hidden state behind a row whose current_vid is null and whose
+    # version-specific actions must all refuse.
+    if isinstance(resolve_current(package_root), Unresolved):
+        return False
+    # NOT OURS, NOT OVERWRITTEN (P1R5-1). One read, on the line above the publish:
+    # what remains after it is the publisher's own lstat/mkstemp/replace. Only a
+    # FOREIGN file stops the write -- an unreadable one is read as ours and
+    # publishing over it is the documented repair, and an absent one is ordinary.
+    if _read_enabled_state(package_root).notice is not None:
+        return False
+    return write_package_state(package_root, enabled)
+
+
+type DiscardOutcome = Literal["ok", "not_found", "lineage_unavailable"]
+
+
+def discard_version(resolution: Resolved) -> DiscardOutcome:
+    """Discard exactly the resolved current version, preserving the safe order.
+
+    The caller owns the global single-flight reservation and has already
+    compared its expected vid with ``resolution.vid``.  This function therefore
+    performs only the transition itself, with no second ``current`` resolution
+    that could switch versions underneath that comparison.
+    """
+
+    package_root = resolution.package_root
+    current = resolution.version_root
+    previous = resolution.previous
+
+    # Null lineage means there is no older version to publish.  This branch must
+    # precede target validation because null can never be a valid vid; discarding
+    # the sole version is exactly whole-package deletion.
+    if previous is None:
+        return "ok" if delete_tool(package_root.path.name) else "not_found"
+
+    # The previous pointer is operator-editable provenance.  Refuse a self-loop
+    # and apply the exact target validator used by current before touching either
+    # the pointer or a version directory.
+    if previous == resolution.vid:
+        return "lineage_unavailable"
+    target = _resolve_version_target(package_root, previous)
+    if target is None:
+        return "lineage_unavailable"
+
+    publication = publish_current(package_root, previous)
+    if not publication:
+        return "not_found"
+
+    # Discard is complete at publication.  Everything below is best-effort
+    # cleanup, but destructive cleanup is forbidden unless the directory fsync
+    # confirmed that the new pointer survives a crash.
+    if not publication.durable:
+        return "ok"
+
+    try:
+        running = package_execution_in_flight(package_root)
+    except Exception:
+        # The shared helper is fail-closed already; this backstop keeps cleanup
+        # just as conservative if a test double or future implementation raises.
+        running = True
+    if running:
+        parked = current.path.with_name(f"{resolution.vid}.discarded")
+        with contextlib.suppress(Exception):
+            os.rename(current.path, parked)
+        return "ok"
+
+    with contextlib.suppress(Exception):
+        shutil.rmtree(current.path)
+    return "ok"
 
 
 def delete_tool(name: str) -> bool:

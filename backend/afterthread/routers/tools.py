@@ -44,6 +44,7 @@ from afterthread.routers.ai import (
     _service_unavailable,
 )
 from afterthread.schemas import (
+    ToolExpectedVersionRequest,
     ToolInstallAccepted,
     ToolInstallRequest,
     ToolJobStatus,
@@ -65,6 +66,7 @@ router = APIRouter(prefix="/tools", tags=["tools"])
 # validation. The pattern is READ FROM the registry's own compiled regex, so
 # the two layers can never drift apart.
 ToolName = Annotated[str, PathParam(pattern=_NAME_RE.pattern)]
+ToolVersionId = Annotated[str, PathParam(pattern=tools_service._VID_RE.pattern)]
 
 # Fixed, config-free error details, following items.py's `_NOT_FOUND` pattern
 # (the OpenAPI examples derive from the same constants the handlers raise).
@@ -130,34 +132,51 @@ _INSTALL_IN_PROGRESS_RESPONSE: dict[int | str, dict[str, Any]] = {
     }
 }
 
-# A summary operation conflicts when an install/revise job is queued or running. A
-#   promote MOVES a package directory into place, so touching a package's
-#   sidecar across that swap races a directory being replaced. A NEW code
-#   rather than reusing `install_in_progress`: that one is the install FORM's
-#   conflict with its own pinned FE branch, and this one can be raised by a job
-#   the user did not start from this control.
-_TOOL_JOB_IN_PROGRESS_CODE = "tool_job_in_progress"
-_TOOL_JOB_IN_PROGRESS_MESSAGE = "已有工具任務正在進行中，請等待完成"  # noqa: RUF001
+# Version-specific writes need three machine-distinct conflicts.  The messages
+# are for people; clients branch only on these codes.
+_VERSION_MISMATCH_CODE = "version_mismatch"
+_VERSION_MISMATCH_MESSAGE = "工具版本已變更，請重新整理後再試"  # noqa: RUF001
+_JOB_BUSY_CODE = "job_busy"
+_JOB_BUSY_MESSAGE = "已有工具任務正在進行中，請等待完成"  # noqa: RUF001
+_LINEAGE_UNAVAILABLE_CODE = "lineage_unavailable"
+_LINEAGE_UNAVAILABLE_MESSAGE = "前一版已不存在或版本關係已損壞，請刪除整個工具"  # noqa: RUF001
 
 
 def _conflict_response(
-    code: str, message: str, description: str
+    *conflicts: tuple[str, str, str],
 ) -> dict[int | str, dict[str, Any]]:
-    """One 409 declaration, built FROM the constants the handler raises."""
+    """One OpenAPI 409 response with machine-distinct named examples."""
+
     return {
         409: {
-            "description": description,
+            "description": "Version-specific tool operation conflict",
             "content": {
-                "application/json": {"example": {"detail": {"code": code, "message": message}}}
+                "application/json": {
+                    "examples": {
+                        code: {
+                            "summary": description,
+                            "value": {"detail": {"code": code, "message": message}},
+                        }
+                        for code, message, description in conflicts
+                    }
+                }
             },
         }
     }
 
 
 _AI_ITERATION_CONFLICT_RESPONSE = _conflict_response(
-    _TOOL_JOB_IN_PROGRESS_CODE,
-    _TOOL_JOB_IN_PROGRESS_MESSAGE,
-    "A tool job is running (tool_job_in_progress)",
+    (_VERSION_MISMATCH_CODE, _VERSION_MISMATCH_MESSAGE, "The requested version is stale"),
+    (_JOB_BUSY_CODE, _JOB_BUSY_MESSAGE, "Another tool operation holds the global slot"),
+)
+_DISCARD_CONFLICT_RESPONSE = _conflict_response(
+    (_VERSION_MISMATCH_CODE, _VERSION_MISMATCH_MESSAGE, "The requested version is stale"),
+    (_JOB_BUSY_CODE, _JOB_BUSY_MESSAGE, "Another tool operation holds the global slot"),
+    (
+        _LINEAGE_UNAVAILABLE_CODE,
+        _LINEAGE_UNAVAILABLE_MESSAGE,
+        "The previous-version lineage cannot be used",
+    ),
 )
 
 
@@ -228,6 +247,49 @@ async def delete_installed_tool(name: ToolName) -> None:
     removed = await run_in_threadpool(tools_service.delete_tool, name)
     if not removed:
         raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
+
+
+@router.delete(
+    "/{name}/versions/{vid}",
+    status_code=204,
+    responses={**_TOOL_NOT_FOUND_RESPONSE, **_DISCARD_CONFLICT_RESPONSE},
+)
+async def discard_tool_version(name: ToolName, vid: ToolVersionId) -> None:
+    """Discard the exact current version named by ``vid``.
+
+    The global slot is taken before the expected-version comparison.  That
+    ordering makes the comparison and the subsequent ``current`` publication
+    one serialized action rather than another check-then-write race.
+    """
+
+    reservation = tool_builder.reserve_sync_operation()
+    if reservation is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": _JOB_BUSY_CODE, "message": _JOB_BUSY_MESSAGE},
+        )
+    try:
+        resolved = await run_in_threadpool(_existing_package_dir, name)
+        if resolved is None:
+            raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
+        if resolved.vid != vid:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": _VERSION_MISMATCH_CODE, "message": _VERSION_MISMATCH_MESSAGE},
+            )
+        outcome = await run_in_threadpool(tools_service.discard_version, resolved)
+        if outcome == "lineage_unavailable":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": _LINEAGE_UNAVAILABLE_CODE,
+                    "message": _LINEAGE_UNAVAILABLE_MESSAGE,
+                },
+            )
+        if outcome == "not_found":
+            raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
+    finally:
+        tool_builder.release_sync_operation(reservation)
 
 
 @router.post(
@@ -310,7 +372,7 @@ def _existing_package_dir(name: str) -> tools_service.Resolved | None:
     return resolution if isinstance(resolution, tools_service.Resolved) else None
 
 
-def _summary_detail(meta: dict[str, Any] | None) -> ToolSummaryDetail:
+def _summary_detail(meta: dict[str, Any] | None, current_vid: str) -> ToolSummaryDetail:
     """Build the response from a sidecar dict; every field degrades to null.
 
     The sidecar is backend-authored, but it is a plain JSON file sitting inside
@@ -363,6 +425,7 @@ def _summary_detail(meta: dict[str, Any] | None) -> ToolSummaryDetail:
             if from_this_process and isinstance(log_id, int) and not isinstance(log_id, bool)
             else None
         ),
+        current_vid=current_vid,
     )
 
 
@@ -386,7 +449,8 @@ async def get_tool_summary(name: ToolName) -> ToolSummaryDetail:
     if resolved is None:
         raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
     return _summary_detail(
-        await run_in_threadpool(tools_service.read_tool_meta, resolved.version_root)
+        await run_in_threadpool(tools_service.read_tool_meta, resolved.version_root),
+        resolved.vid,
     )
 
 
@@ -400,7 +464,9 @@ async def get_tool_summary(name: ToolName) -> ToolSummaryDetail:
         **_LLM_UPSTREAM_RESPONSE,
     },
 )
-async def regenerate_tool_summary(name: ToolName) -> ToolSummaryDetail:
+async def regenerate_tool_summary(
+    name: ToolName, payload: ToolExpectedVersionRequest
+) -> ToolSummaryDetail:
     """Re-run the summary generation for one tool and return the new sidecar.
 
     SYNCHRONOUS, unlike the installer: this is one short single-turn generation
@@ -412,7 +478,9 @@ async def regenerate_tool_summary(name: ToolName) -> ToolSummaryDetail:
 
     Before the LLM is touched, a queued/running job is refused because a package
     directory may be swapped underneath us mid-promote (409
-    ``tool_job_in_progress``).
+    ``job_busy``).  After taking that slot, ``expected_vid`` is compared with the
+    resolved current version; a stale caller gets ``version_mismatch`` without an
+    LLM request.
 
     The job gate TAKES a reservation rather than merely asking (R7-3), and the
     difference is what makes it a gate at all: this handler then awaits a full
@@ -422,7 +490,7 @@ async def regenerate_tool_summary(name: ToolName) -> ToolSummaryDetail:
     the package that no longer exists. ``reserve_sync_operation`` decides and
     takes under the SAME lock ``_admit_job`` uses, so the revise is refused for
     the duration instead; the reservation is released in the ``finally`` below on
-    every path, success or exception. The 409 the caller sees is unchanged.
+    every path, success or exception.
 
     A generation that produced text but STORED nothing (``regenerate_summary``
     -> None: the package vanished mid-request, or the sidecar write was refused)
@@ -430,16 +498,21 @@ async def regenerate_tool_summary(name: ToolName) -> ToolSummaryDetail:
     the next GET will not find. That is the same fold the PATCH above applies to
     its own failed rewrite.
     """
-    directory = await run_in_threadpool(_existing_package_dir, name)
-    if directory is None:
-        raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
     reservation = tool_builder.reserve_sync_operation()
     if reservation is None:
         raise HTTPException(
             status_code=409,
-            detail={"code": _TOOL_JOB_IN_PROGRESS_CODE, "message": _TOOL_JOB_IN_PROGRESS_MESSAGE},
+            detail={"code": _JOB_BUSY_CODE, "message": _JOB_BUSY_MESSAGE},
         )
     try:
+        resolved = await run_in_threadpool(_existing_package_dir, name)
+        if resolved is None:
+            raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
+        if resolved.vid != payload.expected_vid:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": _VERSION_MISMATCH_CODE, "message": _VERSION_MISMATCH_MESSAGE},
+            )
         meta = await tool_meta.regenerate_summary(name)
     except LLMNotConfiguredError:
         raise _service_unavailable() from None
@@ -458,7 +531,7 @@ async def regenerate_tool_summary(name: ToolName) -> ToolSummaryDetail:
         # GET, so answering 200 with it would be a lie -- fold it into the same
         # did-not-happen 404 the PATCH above uses for its own failed rewrite.
         raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
-    return _summary_detail(meta)
+    return _summary_detail(meta, resolved.vid)
 
 
 @router.post(
@@ -480,28 +553,27 @@ async def revise_tool(name: ToolName, payload: ToolReviseRequest) -> ToolInstall
     That 503 has no counterpart here: with TOOLS_DIR unset no name resolves, so
     this route's existence gate already answers 404.
 
-    Two refusals, in the order that spends the least:
-
-    * 404 -- the tool does not exist, resolved through the SAME helper every
-      summary route uses, so an internal symlink alias is refused here too (a
-      revise addressed through an alias would REPLACE the real package);
-    * 409 ``tool_job_in_progress`` -- taken from ``start_revise_job`` returning
-      None rather than from an ``any_job_active()`` pre-check. Both express the
-      same rule (one tool job at a time), but the None return decides it INSIDE
-      the admission lock, so two simultaneous submits cannot both be admitted.
-      An in-flight synchronous regenerate holds a reservation in that same lock
-      (R7-3), so it refuses a revise here exactly as a running job would.
+    ``start_revise_job`` first reserves the global slot, then resolves the package
+    and compares the required ``expected_vid``.  Missing/aliased packages return
+    404, a stale version returns ``version_mismatch``, and an occupied slot returns
+    ``job_busy``.  Only a matching version is converted into a queued job, so a
+    stale submit has neither an LLM charge nor even a pollable job id.
     """
-    directory = await run_in_threadpool(_existing_package_dir, name)
-    if directory is None:
+    started = await tool_builder.start_revise_job(name, payload.feedback, payload.expected_vid)
+    if started.refusal == "not_found":
         raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
-    job_id = tool_builder.start_revise_job(name, payload.feedback)
-    if job_id is None:
+    if started.refusal == "version_mismatch":
         raise HTTPException(
             status_code=409,
-            detail={"code": _TOOL_JOB_IN_PROGRESS_CODE, "message": _TOOL_JOB_IN_PROGRESS_MESSAGE},
+            detail={"code": _VERSION_MISMATCH_CODE, "message": _VERSION_MISMATCH_MESSAGE},
         )
-    return ToolInstallAccepted(job_id=job_id)
+    if started.refusal == "job_busy":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": _JOB_BUSY_CODE, "message": _JOB_BUSY_MESSAGE},
+        )
+    assert started.job_id is not None
+    return ToolInstallAccepted(job_id=started.job_id)
 
 
 # --- tool job poll -----------------------------------------------------------

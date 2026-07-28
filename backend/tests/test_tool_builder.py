@@ -472,6 +472,15 @@ def test_install_result_ready_is_strictly_coerced() -> None:
     assert InstallResult.model_validate({"ready": "true", "tool_name": "t"}).ready is True
 
 
+def test_builder_prompt_puts_defaults_in_code_and_forbids_dotenv() -> None:
+    prompt = tool_builder._builder_system_prompt(None)
+
+    assert 'os.environ.get("KEY", "default")' in prompt
+    assert "Do NOT write a `.env` file" in prompt
+    assert "Secrets (API keys, tokens) go into a `.env` file" not in prompt
+    assert "and .env if the user supplied credentials" not in prompt
+
+
 def test_install_result_redacts_secret_straddling_summary_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -978,8 +987,8 @@ def test_run_install_strips_a_forged_summary_sidecar(
     deletes the builder's copy BEFORE validation. What must hold afterwards is
     not "no sidecar" but "the BACKEND's sidecar": the hook regenerates one
     through the proper choke point moments later, so the summary panel still
-    works and the forged text is nowhere on disk. The secret survives in exactly
-    one place -- the ``.env``, which is where a tool's own credential belongs."""
+    works and the forged text is nowhere on disk. The builder-written ``.env``
+    is stripped too; only its key name is reported."""
     root = tmp_path / "tools"
     _install_settings(monkeypatch, tools_dir=str(root))
     smuggled = "smuggled-kb-value-abcdef123456"
@@ -1005,7 +1014,9 @@ def test_run_install_strips_a_forged_summary_sidecar(
     pkg = _resolved_version(package)
     assert (pkg / "tool.json").is_file()
     assert (pkg / "run.py").is_file()
-    assert (pkg / ".env").is_file()
+    assert not (pkg / ".env").exists()
+    assert outcome.env_keys == ("KB_API_KEY",)
+    assert smuggled not in repr(outcome)
 
     # A sidecar EXISTS -- and it is the hook's, written through write_tool_meta
     # with the stubbed generation's text.
@@ -1013,14 +1024,13 @@ def test_run_install_strips_a_forged_summary_sidecar(
     assert meta is not None
     assert meta["summary"] == "這個工具會查 KB"
 
-    # The forged content is nowhere in the installed package: walking every file,
-    # the smuggled value appears in the ``.env`` and in nothing else.
+    # The forged content is nowhere in the installed package.
     bearers = sorted(
         str(path.relative_to(package))
         for path in package.rglob("*")
         if path.is_file() and smuggled in path.read_text(encoding="utf-8", errors="replace")
     )
-    assert bearers == [f"versions/{pkg.name}/.env"]
+    assert bearers == []
     assert not (root / ".staging").exists()
 
 
@@ -1769,7 +1779,7 @@ def test_run_install_registers_and_discards_inflight_secret(
         assert secret_value not in tools._INFLIGHT_SECRETS
 
 
-def test_run_install_injects_only_the_form_secret_at_the_package_layer(
+def test_run_install_strips_builder_env_and_injects_only_form_secret_at_package_layer(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Builder content stays version-local while the form secret is package state."""
@@ -1786,7 +1796,7 @@ def test_run_install_injects_only_the_form_secret_at_the_package_layer(
     )
     _no_fetch(monkeypatch)
 
-    asyncio.run(
+    outcome = asyncio.run(
         run_install(
             "http://kb.example/openapi.json",
             "build",
@@ -1797,7 +1807,9 @@ def test_run_install_injects_only_the_form_secret_at_the_package_layer(
     env_text = (root / "kbsearch" / ".env").read_text(encoding="utf-8")
     assert env_text == "KB_API_KEY=real-secret-value-123456\n"
     version_env = _resolved_version(root / "kbsearch") / ".env"
-    assert "OTHER=keep" in version_env.read_text(encoding="utf-8")
+    assert not version_env.exists()
+    assert outcome.env_keys == ("KB_API_KEY", "OTHER")
+    assert "placeholder-the-model-wrote" not in repr(outcome)
 
 
 def test_install_rechecks_package_env_size_before_rename(
@@ -2907,6 +2919,8 @@ def test_router_list_tools(
                 "enabled": True,
                 "valid": True,
                 "error": None,
+                "current_vid": _TEST_VID,
+                "lineage": "sole",
             }
         ]
     }
@@ -3134,6 +3148,7 @@ def test_router_job_status_and_404(client: TestClient) -> None:
         tool_name="kb",
         summary="done",
         llm_log_id=3,
+        env_keys=("KB_API_KEY",),
     )
     with tool_builder._JOBS_LOCK:
         tool_builder._JOBS[job.job_id] = job
@@ -3152,6 +3167,7 @@ def test_router_job_status_and_404(client: TestClient) -> None:
         # The id's id SPACE, stamped by the route because the job table cannot
         # outlive it (R9-1; see the token's own tests in test_llm_log).
         "llm_log_process": llm_log.process_token(),
+        "env_keys": ["KB_API_KEY"],
     }
 
     missing = client.get("/api/tools/jobs/ghost")
@@ -3284,6 +3300,7 @@ def test_router_get_summary_all_null_without_a_sidecar(
         "summary": None,
         "updated_at": None,
         "llm_log_id": None,
+        "current_vid": _TEST_VID,
     }
 
 
@@ -3314,6 +3331,7 @@ def test_router_get_summary_returns_the_sidecar(
         "summary": "這個工具會查 KB",
         "updated_at": "2026-07-26T00:00:00+00:00",
         "llm_log_id": 7,
+        "current_vid": _TEST_VID,
     }
 
 
@@ -3387,6 +3405,7 @@ def test_router_get_summary_degrades_a_hand_edited_sidecar(
         "summary": None,
         "updated_at": None,
         "llm_log_id": None,
+        "current_vid": _TEST_VID,
     }
 
 
@@ -3455,7 +3474,9 @@ def test_router_regenerate_summary_stores_and_returns_the_new_summary(
     _write_meta(pkg, summary="舊的", origin={"instructions": "查 KB"})
     _fake_summary_generate(monkeypatch, summary="新的說明")
 
-    response = client.post("/api/tools/kbsearch/summary/regenerate")
+    response = client.post(
+        "/api/tools/kbsearch/summary/regenerate", json={"expected_vid": _TEST_VID}
+    )
     assert response.status_code == 200
     body = response.json()
     assert body["summary"] == "新的說明"
@@ -3486,10 +3507,12 @@ def test_router_regenerate_summary_409_while_a_job_runs(
 
     monkeypatch.setattr("afterthread.services.tool_meta.generate_structured", must_not_generate)
 
-    response = client.post("/api/tools/kbsearch/summary/regenerate")
+    response = client.post(
+        "/api/tools/kbsearch/summary/regenerate", json={"expected_vid": _TEST_VID}
+    )
     assert response.status_code == 409
     detail = response.json()["detail"]
-    assert detail["code"] == "tool_job_in_progress"
+    assert detail["code"] == "job_busy"
     assert "message" in detail
 
 
@@ -3515,7 +3538,10 @@ def test_router_regenerate_summary_holds_the_single_flight_across_the_llm_call(
     refusals: dict[str, Any] = {}
 
     def submit_work_mid_generation() -> None:
-        revise = client.post("/api/tools/kbsearch/revise", json={"feedback": "加上分頁"})
+        revise = client.post(
+            "/api/tools/kbsearch/revise",
+            json={"feedback": "加上分頁", "expected_vid": _TEST_VID},
+        )
         install = client.post(
             "/api/tools/install",
             json={"openapi_url": "https://kb.example/openapi.json", "instructions": "裝一個"},
@@ -3529,12 +3555,14 @@ def test_router_regenerate_summary_holds_the_single_flight_across_the_llm_call(
 
     _fake_summary_generate(monkeypatch, summary="新的說明", side_effect=submit_work_mid_generation)
 
-    response = client.post("/api/tools/kbsearch/summary/regenerate")
+    response = client.post(
+        "/api/tools/kbsearch/summary/regenerate", json={"expected_vid": _TEST_VID}
+    )
 
     assert response.status_code == 200
     assert response.json()["summary"] == "新的說明"
     assert refusals["revise_status"] == 409
-    assert refusals["revise_code"] == "tool_job_in_progress"
+    assert refusals["revise_code"] == "job_busy"
     assert refusals["install_status"] == 409
     assert refusals["install_code"] == "install_in_progress"
     assert tool_builder._JOBS == {}  # neither submit left a job behind
@@ -3559,11 +3587,16 @@ def test_router_regenerate_summary_releases_the_reservation_on_failure(
         monkeypatch, explode=LLMUpstreamError("APIConnectionError: could not reach the endpoint")
     )
 
-    assert client.post("/api/tools/kbsearch/summary/regenerate").status_code == 502
+    assert (
+        client.post(
+            "/api/tools/kbsearch/summary/regenerate", json={"expected_vid": _TEST_VID}
+        ).status_code
+        == 502
+    )
     assert tool_builder.any_job_active() is False
 
     _fake_summary_generate(monkeypatch, summary="這次成功了")
-    retry = client.post("/api/tools/kbsearch/summary/regenerate")
+    retry = client.post("/api/tools/kbsearch/summary/regenerate", json={"expected_vid": _TEST_VID})
     assert retry.status_code == 200
     assert retry.json()["summary"] == "這次成功了"
     assert tool_builder.any_job_active() is False
@@ -3573,7 +3606,7 @@ def test_router_regenerate_summary_404_for_unknown_tool(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
-    response = client.post("/api/tools/ghost/summary/regenerate")
+    response = client.post("/api/tools/ghost/summary/regenerate", json={"expected_vid": _TEST_VID})
     assert response.status_code == 404
     assert response.json() == {"detail": "Tool not found"}
 
@@ -3587,7 +3620,9 @@ def test_router_regenerate_summary_503_when_llm_unconfigured(
     _write_meta(pkg, summary="先前的好總結")
     _fake_summary_generate(monkeypatch, explode=LLMNotConfiguredError("off"))
 
-    response = client.post("/api/tools/kbsearch/summary/regenerate")
+    response = client.post(
+        "/api/tools/kbsearch/summary/regenerate", json={"expected_vid": _TEST_VID}
+    )
     assert response.status_code == 503
     detail = response.json()["detail"]
     assert detail["code"] == "llm_not_configured"
@@ -3605,7 +3640,9 @@ def test_router_regenerate_summary_502_on_upstream_failure(
         explode=LLMUpstreamError("APIConnectionError: could not reach the LLM endpoint"),
     )
 
-    response = client.post("/api/tools/kbsearch/summary/regenerate")
+    response = client.post(
+        "/api/tools/kbsearch/summary/regenerate", json={"expected_vid": _TEST_VID}
+    )
     assert response.status_code == 502
     detail = response.json()["detail"]
     assert detail["code"] == "llm_upstream_error"
@@ -3643,15 +3680,22 @@ def test_router_summary_routes_refuse_an_internal_alias(
     async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("no session may start for an aliased package")
 
-    def must_not_start(name: str, feedback: str) -> str:
-        raise AssertionError("no revise job may start for an aliased package")
-
     monkeypatch.setattr("afterthread.services.tool_meta.generate_structured", must_not_generate)
-    monkeypatch.setattr("afterthread.services.tool_builder.start_revise_job", must_not_start)
 
     assert client.get("/api/tools/alias/summary").status_code == 404
-    assert client.post("/api/tools/alias/summary/regenerate").status_code == 404
-    assert client.post("/api/tools/alias/revise", json={"feedback": "改"}).status_code == 404
+    assert (
+        client.post(
+            "/api/tools/alias/summary/regenerate", json={"expected_vid": _TEST_VID}
+        ).status_code
+        == 404
+    )
+    assert (
+        client.post(
+            "/api/tools/alias/revise",
+            json={"feedback": "改", "expected_vid": _TEST_VID},
+        ).status_code
+        == 404
+    )
 
     assert _summary_path(pkg).read_bytes() == before
 
@@ -3668,7 +3712,9 @@ def test_router_regenerate_summary_404_when_the_sidecar_write_is_refused(
     _fake_summary_generate(monkeypatch, summary="新的說明")
     monkeypatch.setattr(tools, "write_tool_meta", lambda *args, **kwargs: False)
 
-    response = client.post("/api/tools/kbsearch/summary/regenerate")
+    response = client.post(
+        "/api/tools/kbsearch/summary/regenerate", json={"expected_vid": _TEST_VID}
+    )
     assert response.status_code == 404
     assert response.json() == {"detail": "Tool not found"}
 
@@ -3766,24 +3812,37 @@ def test_router_revise_202_queues_job(
     _seed_package(monkeypatch, tmp_path)
     seen: dict[str, str] = {}
 
-    def fake_start(name: str, feedback: str) -> str:
+    async def fake_start(
+        name: str, feedback: str, expected_vid: str
+    ) -> tool_builder.ReviseJobStart:
         seen["name"] = name
         seen["feedback"] = feedback
-        return "job-rev"
+        seen["expected_vid"] = expected_vid
+        return tool_builder.ReviseJobStart(job_id="job-rev")
 
     monkeypatch.setattr("afterthread.services.tool_builder.start_revise_job", fake_start)
-    response = client.post("/api/tools/kbsearch/revise", json={"feedback": "  加上分頁參數  "})
+    response = client.post(
+        "/api/tools/kbsearch/revise",
+        json={"feedback": "  加上分頁參數  ", "expected_vid": _TEST_VID},
+    )
 
     assert response.status_code == 202
     assert response.json() == {"job_id": "job-rev"}
-    assert seen == {"name": "kbsearch", "feedback": "加上分頁參數"}
+    assert seen == {
+        "name": "kbsearch",
+        "feedback": "加上分頁參數",
+        "expected_vid": _TEST_VID,
+    }
 
 
 def test_router_revise_404_for_unknown_tool(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
-    response = client.post("/api/tools/ghost/revise", json={"feedback": "改一下"})
+    response = client.post(
+        "/api/tools/ghost/revise",
+        json={"feedback": "改一下", "expected_vid": _TEST_VID},
+    )
     assert response.status_code == 404
     assert response.json() == {"detail": "Tool not found"}
 
@@ -3800,17 +3859,94 @@ def test_router_revise_409_while_a_job_runs(
             job_id="active", state="running", created_at="2026-07-16T00:00:00+00:00"
         )
 
-    response = client.post("/api/tools/kbsearch/revise", json={"feedback": "改一下"})
+    response = client.post(
+        "/api/tools/kbsearch/revise",
+        json={"feedback": "改一下", "expected_vid": _TEST_VID},
+    )
     assert response.status_code == 409
     detail = response.json()["detail"]
-    assert detail["code"] == "tool_job_in_progress"
+    assert detail["code"] == "job_busy"
     assert "message" in detail
+
+
+def test_invariant_k_stale_vid_starts_no_revise_regenerate_or_discard_work(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _seed_package(monkeypatch, tmp_path)
+    stale_vid = "20260728T020304Z-fedcba"
+
+    async def must_not_regenerate(name: str) -> dict[str, Any]:
+        raise AssertionError("stale regenerate must not spend an LLM call")
+
+    def must_not_discard(resolution: tools.Resolved) -> str:
+        raise AssertionError("stale discard must not publish current")
+
+    def must_not_launch(*args: Any, **kwargs: Any) -> str:
+        raise AssertionError("stale revise must not enqueue or launch a job")
+
+    monkeypatch.setattr(tool_meta, "regenerate_summary", must_not_regenerate)
+    monkeypatch.setattr(tools, "discard_version", must_not_discard)
+    monkeypatch.setattr(tool_builder, "_launch_job", must_not_launch)
+
+    revise = client.post(
+        "/api/tools/kbsearch/revise",
+        json={"feedback": "改一下", "expected_vid": stale_vid},
+    )
+    regenerate = client.post(
+        "/api/tools/kbsearch/summary/regenerate",
+        json={"expected_vid": stale_vid},
+    )
+    discard = client.delete(f"/api/tools/kbsearch/versions/{stale_vid}")
+
+    for response in (revise, regenerate, discard):
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "version_mismatch"
+    assert tool_builder._JOBS == {}
+    assert not tool_builder._TASKS
+    assert tool_builder.any_job_active() is False
+
+
+def test_version_conflicts_have_three_distinct_codes_and_openapi_examples(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pkg = _seed_package(monkeypatch, tmp_path)
+    stale_vid = "20260728T020304Z-fedcba"
+    mismatch = client.delete(f"/api/tools/kbsearch/versions/{stale_vid}")
+
+    origin_path = pkg / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    origin = json.loads(origin_path.read_text(encoding="utf-8"))
+    origin["previous"] = _TEST_VID
+    origin_path.write_text(json.dumps(origin), encoding="utf-8")
+    lineage = client.delete(f"/api/tools/kbsearch/versions/{_TEST_VID}")
+
+    with tool_builder._JOBS_LOCK:
+        tool_builder._JOBS["active"] = tool_builder.InstallJob(
+            job_id="active", state="running", created_at="2026-07-16T00:00:00+00:00"
+        )
+    busy = client.delete(f"/api/tools/kbsearch/versions/{_TEST_VID}")
+
+    assert {
+        mismatch.json()["detail"]["code"],
+        lineage.json()["detail"]["code"],
+        busy.json()["detail"]["code"],
+    } == {"version_mismatch", "lineage_unavailable", "job_busy"}
+
+    operation = client.get("/openapi.json").json()["paths"]["/api/tools/{name}/versions/{vid}"][
+        "delete"
+    ]
+    examples = operation["responses"]["409"]["content"]["application/json"]["examples"]
+    assert set(examples) == {"version_mismatch", "lineage_unavailable", "job_busy"}
 
 
 @pytest.mark.parametrize(
     "payload",
-    [{"feedback": "   "}, {"feedback": "x" * 20001}, {}],
-    ids=["blank", "oversized", "missing-field"],
+    [
+        {"feedback": "   ", "expected_vid": _TEST_VID},
+        {"feedback": "x" * 20001, "expected_vid": _TEST_VID},
+        {"feedback": "改一下"},
+        {},
+    ],
+    ids=["blank", "oversized", "missing-expected-vid", "missing-field"],
 )
 def test_router_revise_validates_request(
     client: TestClient,
@@ -3828,18 +3964,32 @@ def test_router_revise_rejects_invalid_names_as_422(
 ) -> None:
     _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
     for bad_name in ("UPPER", "bad name", ".hidden"):
-        response = client.post(f"/api/tools/{bad_name}/revise", json={"feedback": "改"})
+        response = client.post(
+            f"/api/tools/{bad_name}/revise",
+            json={"feedback": "改", "expected_vid": _TEST_VID},
+        )
         assert response.status_code == 422, bad_name
 
 
 def test_router_job_poll_serves_install_and_revise_jobs(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """ONE endpoint for both kinds (D40): jobs created by the install path and by
     the revise path are polled through the SAME renamed route, with the same
     body. Both jobs here are REAL -- created through the real start_* functions
     with stubbed runs on a real loop -- rather than hand-seeded records, so the
     id the FE would poll is the id these produce."""
+
+    _seed_package(monkeypatch, tmp_path, "kb")
+
+    async def wait_for_job(job_id: str) -> None:
+        for _ in range(200):
+            job = tool_builder.get_job(job_id)
+            assert job is not None
+            if job["state"] not in ("queued", "running"):
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("job did not finish")
 
     async def scenario() -> tuple[str, str]:
         async def fake_run_install(
@@ -3856,23 +4006,14 @@ def test_router_job_poll_serves_install_and_revise_jobs(
 
         monkeypatch.setattr("afterthread.services.tool_builder.run_install", fake_run_install)
         monkeypatch.setattr("afterthread.services.tool_builder.run_revise", fake_run_revise)
-        ids: list[str] = []
-        for start in (
-            lambda: tool_builder.start_install_job("http://x/openapi.json", "i"),
-            lambda: tool_builder.start_revise_job("kb", "改一下"),
-        ):
-            job_id = start()
-            assert job_id is not None
-            ids.append(job_id)
-            # Single-flight: drain to terminal before the next submit.
-            for _ in range(200):
-                job = tool_builder.get_job(job_id)
-                assert job is not None
-                if job["state"] not in ("queued", "running"):
-                    break
-                await asyncio.sleep(0.01)
+        install_id = tool_builder.start_install_job("http://x/openapi.json", "i")
+        assert install_id is not None
+        await wait_for_job(install_id)
+        revised = await tool_builder.start_revise_job("kb", "改一下", _TEST_VID)
+        assert revised.job_id is not None
+        await wait_for_job(revised.job_id)
         await asyncio.gather(*list(tool_builder._TASKS), return_exceptions=True)
-        return ids[0], ids[1]
+        return install_id, revised.job_id
 
     install_id, revise_id = asyncio.run(scenario())
 
@@ -4113,7 +4254,7 @@ def test_invariant_f_revise_never_touches_the_package_env(
     _fake_generate(
         monkeypatch,
         result=_revise_result(),
-        # The builder disobeys and writes its own .env; the backend's restore wins.
+        # The builder disobeys and writes its own .env; the backend strips it.
         files={"run.py": _REVISED_RUN_PY, ".env": "KB_API_KEY=made-up-by-the-model\n"},
     )
 
@@ -4125,6 +4266,9 @@ def test_invariant_f_revise_never_touches_the_package_env(
         identity_before
     )
     assert (_current_version(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert not (_current_version(pkg) / ".env").exists()
+    assert outcome.env_keys == ("KB_API_KEY",)
+    assert "made-up-by-the-model" not in repr(outcome)
 
 
 def test_invariant_f_revised_package_immediately_redacts_package_env_from_logs(
@@ -4392,12 +4536,24 @@ def test_cleanup_staging_is_where_the_sweep_actually_runs(tmp_path: Path) -> Non
     assert refused.is_dir()  # ... and the refused workspace was left alone
 
 
-def test_invariant_a_delete_and_stale_sweep_share_one_running_package_judgement(
+def test_invariant_a_delete_discard_and_sweep_share_one_running_package_judgement(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A spy pins both destructive callers to the one all-versions helper."""
+    """A spy pins all three destructive callers to one all-versions helper."""
     base = tmp_path / "tools"
     _versioned_package_at(base / "live", "live")
+    discard_package = base / "discardable"
+    first = _versioned_package_at(discard_package, "discardable")
+    second_vid = "20260728T020304Z-fedcba"
+    second = discard_package / tools._VERSIONS_DIRNAME / second_vid
+    shutil.copytree(first, second)
+    origin_path = second / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    origin = json.loads(origin_path.read_text(encoding="utf-8"))
+    origin["previous"] = _TEST_VID
+    origin_path.write_text(json.dumps(origin), encoding="utf-8")
+    assert tools.publish_current(tools.PackageRoot(discard_package), second_vid)
+    resolution = tools.resolve_current(tools.PackageRoot(discard_package))
+    assert isinstance(resolution, tools.Resolved)
     stale = _stale_dir(base, "old")
     _install_settings(monkeypatch, tools_dir=str(base))
     asked: list[tools.PackageRoot] = []
@@ -4409,12 +4565,45 @@ def test_invariant_a_delete_and_stale_sweep_share_one_running_package_judgement(
     monkeypatch.setattr(tools, "package_execution_in_flight", nobody_running)
 
     assert tools.delete_tool("live") is True
+    assert tools.discard_version(resolution) == "ok"
     tool_builder._sweep_stale_backups(base)
 
-    assert len(asked) == 2
+    assert len(asked) == 3
     assert all(isinstance(root, tools.PackageRoot) for root in asked)
     assert asked[0].path.name.startswith(".live.stale-")
-    assert asked[1].path == stale
+    assert asked[1].path == discard_package
+    assert asked[2].path == stale
+
+
+def test_running_discard_parks_the_version_and_the_existing_sweep_retries(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "tools"
+    package = base / "kbsearch"
+    first = _versioned_package_at(package, "kbsearch")
+    second_vid = "20260728T020304Z-fedcba"
+    second = package / tools._VERSIONS_DIRNAME / second_vid
+    shutil.copytree(first, second)
+    origin_path = second / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    origin = json.loads(origin_path.read_text(encoding="utf-8"))
+    origin["previous"] = _TEST_VID
+    origin_path.write_text(json.dumps(origin), encoding="utf-8")
+    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    resolution = tools.resolve_current(tools.PackageRoot(package))
+    assert isinstance(resolution, tools.Resolved)
+    identity = tools.directory_identity(tools.VersionRoot(second))
+    assert identity is not None
+    parked = second.with_name(f"{second_vid}.discarded")
+
+    with tools._inflight_execution(identity):
+        assert tools.discard_version(resolution) == "ok"
+        assert parked.is_dir()
+        assert _resolved_version(package) == first
+        tool_builder._sweep_stale_backups(base)
+        assert parked.is_dir()
+
+    tool_builder._sweep_stale_backups(base)
+    assert not parked.exists()
 
 
 def test_sweep_collects_what_a_deferred_delete_left_behind(
@@ -5555,24 +5744,16 @@ def test_run_revise_keeps_a_root_env_case_variant_that_is_a_symlink(
     assert not revised_variant.exists()  # its version-local .env target was withheld
 
 
-def test_run_revise_treats_a_lone_env_case_variant_as_having_no_managed_env(
+def test_run_revise_keeps_lone_env_variant_but_strips_builder_dotenv(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A package with ``.ENV`` and NO ``.env`` keeps the variant and counts as
     having no managed ``.env`` at all (R5-2).
 
     Nothing here is the credentials file: ``tools._load_tool_dotenv`` opens the
-    exact ``.env`` on this filesystem and finds none, so nothing was registered and
-    nothing has to be restored. The standing R3-1 acceptance therefore applies in
-    its "never had one" branch -- the builder's own ``.env`` ships, exactly as it
-    does on an install -- and it is asserted here because it is the observable
-    proof that the variant was not mistaken for the managed file.
-
-    The builder's value is a MASKABLE one on purpose: that branch now runs the
-    same ``.env`` policy over what it is about to ship, so a short or reversibly
-    spelled value would be refused (see
-    ``test_run_revise_refuses_a_builder_env_the_redactors_could_not_mask``) and
-    this test would stop being about case variants at all."""
+    exact ``.env`` on this filesystem and finds none. The exact builder-written
+    ``.env`` is nevertheless stripped and only its key name is reported, proving
+    the variant was not mistaken for managed state."""
     if not _case_sensitive_filesystem(tmp_path):
         pytest.skip("this filesystem folds .env and .ENV into one file")
     pkg = _seed_package(monkeypatch, tmp_path)
@@ -5594,7 +5775,9 @@ def test_run_revise_treats_a_lone_env_case_variant_as_having_no_managed_env(
     assert ".ENV" in seen["staged"]  # copied like any other file
     revised = _current_version(pkg)
     assert (revised / ".ENV").read_bytes() == variant
-    assert (revised / ".env").read_text(encoding="utf-8") == written_by_the_model
+    assert not (revised / ".env").exists()
+    assert outcome.env_keys == ("WRITTEN_BY_THE_MODEL",)
+    assert "yes-it-really-was" not in repr(outcome)
     assert not (_package_path(pkg) / ".env").exists()
 
 
@@ -5928,18 +6111,28 @@ def test_run_revise_ready_false_keeps_the_package(
 
 def test_revise_job_records_its_outcome_and_backstops_bugs(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """A revise job walks the same state machine and copies out the same fields
     as an install (one ``_run_job`` body drives both), and a bug escaping
     ``run_revise`` lands as a category-only failure naming the REVISE action."""
 
+    _seed_package(monkeypatch, tmp_path)
+
     async def scenario() -> None:
         async def fake_run_revise(name: str, feedback: str) -> InstallOutcome:
-            return InstallOutcome(ok=True, tool_name=name, summary="改好了", llm_log_id=5)
+            return InstallOutcome(
+                ok=True,
+                tool_name=name,
+                summary="改好了",
+                llm_log_id=5,
+                env_keys=("KB_API_KEY",),
+            )
 
         monkeypatch.setattr("afterthread.services.tool_builder.run_revise", fake_run_revise)
-        job_id = tool_builder.start_revise_job("kbsearch", "加上分頁")
-        assert job_id is not None
+        started = await tool_builder.start_revise_job("kbsearch", "加上分頁", _TEST_VID)
+        assert started.job_id is not None
+        job_id = started.job_id
         for _ in range(200):
             job = tool_builder.get_job(job_id)
             assert job is not None
@@ -5950,14 +6143,16 @@ def test_revise_job_records_its_outcome_and_backstops_bugs(
         assert job["tool_name"] == "kbsearch"
         assert job["summary"] == "改好了"
         assert job["llm_log_id"] == 5
+        assert job["env_keys"] == ["KB_API_KEY"]
         assert job["finished_at"] is not None
 
         async def exploding(name: str, feedback: str) -> InstallOutcome:
             raise RuntimeError("bug with secrets in str()")
 
         monkeypatch.setattr("afterthread.services.tool_builder.run_revise", exploding)
-        bug_id = tool_builder.start_revise_job("kbsearch", "再改")
-        assert bug_id is not None
+        bug = await tool_builder.start_revise_job("kbsearch", "再改", _TEST_VID)
+        assert bug.job_id is not None
+        bug_id = bug.job_id
         for _ in range(200):
             job = tool_builder.get_job(bug_id)
             assert job is not None
@@ -5975,10 +6170,13 @@ def test_revise_job_records_its_outcome_and_backstops_bugs(
 
 def test_install_and_revise_share_one_single_flight_slot(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """ONE tool job at a time, across BOTH kinds (D40): an active install refuses
     a revise and an active revise refuses an install, because either one can be
     moving a package directory into place."""
+
+    _seed_package(monkeypatch, tmp_path, "kb")
 
     async def scenario() -> None:
         release = asyncio.Event()
@@ -6003,7 +6201,8 @@ def test_install_and_revise_share_one_single_flight_slot(
         first = tool_builder.start_install_job("http://x/openapi.json", "i")
         assert first is not None
         await asyncio.sleep(0)
-        assert tool_builder.start_revise_job("kb", "改一下") is None  # install blocks revise
+        refused = await tool_builder.start_revise_job("kb", "改一下", _TEST_VID)
+        assert refused.refusal == "job_busy"  # install blocks revise
 
         release.set()
         for _ in range(200):
@@ -6014,8 +6213,8 @@ def test_install_and_revise_share_one_single_flight_slot(
             await asyncio.sleep(0.01)
 
         release.clear()
-        second = tool_builder.start_revise_job("kb", "改一下")
-        assert second is not None
+        second = await tool_builder.start_revise_job("kb", "改一下", _TEST_VID)
+        assert second.job_id is not None
         await asyncio.sleep(0)
         assert tool_builder.start_install_job("http://x/openapi.json", "i") is None  # and back
 
