@@ -112,7 +112,8 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   的任務進行中時，另一分頁的送出控制項也會停用——純粹是本地端對後端那個
   single-flight 的樂觀鏡像（只涵蓋這個分頁實例自己送出/得知的任務），後端仍是
   權威，鏡像沒接住的競態（例如另一個瀏覽分頁送出的任務）一樣會用既有的
-  409（`tool_job_in_progress`）錯誤處理接住。**分頁往上報的只能是它第一手知道的
+  結構化 409（版本寫入為 `job_busy`；安裝送出維持 `install_in_progress`）接住。
+  **分頁往上報的只能是它第一手知道的
   忙碌**（`ownSummaryBusy`），絕不可把收到的 `externalBusy` 折進去再報回對方——那
   會讓鏡像回聲，安裝表單自己送出的那段窗口會被自己指控成「另一分頁有 AI
   任務正在進行中」；本地的閘（自己的 ＋ 對方的）才是疊加的那一層。每個工具列的
@@ -130,12 +131,11 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   同步的「重新產生總結」都是以 `tool.json` 的 `(st_dev, st_ino, st_ctime_ns)`
   當「還是同一個套件嗎」的身分、在一整趟 LLM 往返之後才重驗——所以一次切換會讓
   整場修訂作廢（「原工具在修訂期間被改動或重新安裝」）、或讓一趟總結往返換到
-  404。web-v5 P1 把 `enabled` 搬進套件自己的 `.afterthread-state.json`，`tools.set_enabled`
-  從此**完全不開 `tool.json`**，那個身分不可能被一次切換推走；而落在修訂裡的
-  切換由後端換裝前的 `tools.carry_package_state` 帶過去、落在換裝那一瞬間的則由
-  `tools._STATE_PUBLISH_LOCK` 排到換裝之後、寫到剛發佈的那一包（`set_enabled`
-  在**取鎖之前**就把名稱解析完，所以它寫的是當下叫這個名字的套件）。兩邊都算數，
-  因此：**該列的 `Switch` 不再看修訂／重新產生，兩個 AI 寫入也不再看該列的
+  404。web-v5 把 `enabled` 搬進套件自己的 `.afterthread.meta/state.json`，
+  `tools.set_enabled` 從此**完全不開任何版本的 `tool.json`**，而修訂只新增
+  `versions/<vid>` 再切換 `current`，不再替換套件層。因此 state 根本不需要
+  搬運或發布鎖：toggle 與版本發布各改自己的名字，
+  互不覆蓋。因此：**該列的 `Switch` 不再看修訂／重新產生，兩個 AI 寫入也不再看該列的
   toggle**（`onRegenerate` 裡那個重檢一起拿掉——`disabled` 只是渲染，閘與重檢必須
   同進同退）。使用者拿回來的是：修訂／重新產生跑到一半才決定「這個工具該關掉」時，
   現在按得下去。`Switch` 還留著的兩個條件跟身分無關、各自成立：`!tool.valid`
@@ -148,28 +148,34 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   `refetchOnWindowFocus: true` ＋ `staleTime: 5s`，`enabled` 留著 true 的查詢會在
   每次視窗對焦重打，而後端工作表是行程內有界的，於是幾分鐘後一張「修訂完成」會被
   換成 404 錯誤卡。
-- **總結快取鍵帶實例判別子**：`toolSummaryQueryKey(name, description)`。工具名稱
-  是可以被重新指派的（別的分頁刪掉再用同名裝一個不同的工具），而
-  `GET /api/tools` 的列裡沒有任何安裝 id／時間戳可用，`description` 是唯一由安裝
-  寫出來的欄位。判別子是啟發式而非證明，所以面板另外在 `isError` 但**有**舊資料時
-  加一張「內容可能已過期」的 Alert——react-query 會保留 `data` 只把 status 翻成
-  'error'，那正是舊內容原本會無聲留在畫面上的狀態。做 invalidate／removeQueries
-  時一律用 `toolSummaryKeyPrefix(name)` 前綴比對，**不可以**加 `exact`（鍵是三段，
-  `exact` 會一個都比對不到）。
-- **同一個判別子必須同時管快取鍵、列的 React key 與工作卡的歸屬**：
-  三者是同一個「這還是同一個工具嗎」的問題。列的 key 用
-  `toolInstanceKey(name, description)`
-  （＝把 `toolSummaryQueryKey` 那把鍵 `JSON.stringify`，所以兩者不可能各自漂移），
-  身分一變就 remount、列內未送出的修訂意見不會跨過同名重裝被送給別的工具；修訂
-  工作卡也以同一把鍵決定歸屬（`activeJob` 記下送出當下那一列的 `description`）。
+- **真實版本身分取代 `name + description` 代理**：`GET /api/tools` 現在提供
+  `current_vid`，所以 `toolInstanceKey(name, currentVid)` 與
+  `toolSummaryQueryKey(name, currentVid)` 不再猜測。舊代理在 discard 前後兩版
+  description 相同時不會 remount，寫給 V 的修訂草稿就可能被送給 P；vid 直接表達
+  畫面所描述的版本，才關得掉這個單一分頁內就能發生的錯誤。
+- **版本身分的三個消費端一起移動**：`toolIdentityConsumers` 從同一把
+  `name + current_vid` 身分一次產生列的 React key、summary query key 與修訂工作卡
+  歸屬。身分一變就 remount、清掉列內草稿；總結不跨版本重用；工作卡留在送出時的
+  版本，若該列消失就移到 panel 層顯示。這裡是**三個**完整消費端：以前所稱的第四個
+  是「定版」寫入排序 ledger，已隨功能移除，不能為了維持數字留一份無人讀的 state。
   重新讀取（invalidate／removeQueries）用名稱前綴——它只是叫伺服器再答一次，
   只可能拿到當下的答案，涵蓋得寬鬆才是保守方向。
-  **當初刻意按名稱比對的是「閘」**（`reviseBusyForThisTool`／
-  `isTogglingThisTool`）：`PATCH /api/tools/{name}` 與 `POST .../revise` 都按名稱
-  定址，它們防的檔案系統競態會落在「當下叫這個名字的套件」，比對得寬鬆才是保守
-  方向。這兩個閘在 web-v5 P1 之後已經移除（見上面那條），同一條理由現在只剩下按
-  名稱比對的**忙碌指示**（`isSubmittingRevise`／`isRegenerating`，只決定按鈕的
-  loading）。決定「卡片屬於哪一列」則相反，一律用實例身分。
+  按名稱比對只剩 loading 指示；決定「卡片屬於哪一列」一律用實例身分。
+- **name-addressed summary GET 也要驗版本**：query key 含 vid 還不夠，因為請求送出
+  時 V 是 current、後端真正解析時可能已切到 P。`ToolSummaryDetail.current_vid`
+  是後端實際讀到的版本；`acceptSummaryForVersion` 不符就 throw，不把 payload
+  交給 TanStack Query，避免 P 的內容寫進 V 的 cache。
+- **所有版本寫入都帶 optimistic identity**：revise 與 regenerate body 帶
+  `expected_vid`，discard path 帶 vid。前端 key 只保護本分頁的畫面，保護不了另一
+  分頁或終端機改動 `current`；後端在取得 global slot 後比對，才保證不會對已不是
+  畫面那一版的程式花掉一場 LLM 或切錯 pointer。`versionWritesBlocked` 同時管
+  regenerate／revise／discard，在 list 已知 stale、正在 refetch、single-flight busy
+  或 job 終局重讀尚未落地時停用；讀取、toggle 與整包刪除仍可用。
+- **lineage 控制是三態**：`sole` 顯示「丟掉這一版」但走既有整包刪除確認；
+  `usable` 提供輕量的「丟掉並退回」確認；`broken` 不送 discard，顯示前一版缺失／
+  無效／自指與整包刪除的補救。若 `current_vid=null`，那是 unresolved row：
+  顯示後端原因、隱藏 toggle／summary／revise／regenerate／discard，只留整包刪除；
+  `description` 也可能為 null，不能拿它當身分或假定一定可 render。
 - **權威回應寫進快取前，一定要先取消同一把鍵上在飛的讀**：`setQueryData` 不會動
   in-flight 的 fetch，所以一個在 mutation 之前因視窗對焦發出、讀到舊值的 GET
   可以在寫入之後才落地，把畫面翻回舊資料，而且**不會有任何錯誤提示**（那個 GET
@@ -187,13 +193,13 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   講明清單可能過期；修訂中的工具被刪掉／被同名重裝換掉時，列內的進度卡會跟著
   消失但輪詢與忙碌閘還在，所以沒有任何一列擁有那個工作時，改由面板層渲染同一張
   卡（兩個條件是同一把鍵上的互補，卡片永遠恰好顯示一次）。
-- **警告不等於保證：清單已知過期時，按名稱定址的 AI 寫入要真的停用**：清單背景
+- **警告不等於保證：清單已知過期時，版本寫入要真的停用**：清單背景
   refetch 失敗時列的實例身分跟列本身一樣是過期的，列不會 remount、未送出的修訂
-  意見留著，而「送出修訂」是打到 `/api/tools/{名稱}/revise`——同名重裝之後那就是
-  另一個工具。所以 `summaryWritesBlocked = summaryBusy || staleList || settlingJobEnd`
+  意見留著。後端 `expected_vid` 會拒絕錯版，但畫面既然無法知道目前版本，仍不應
+  提供必然可能失敗的動作。所以 `versionWritesBlocked`
   是**一個值、一個 prop**（`writesBlocked`），同時管「重新產生」與「送出修訂」的
-  `disabled` **和**送出處的提前 return（`disabled` 只是渲染，不是閘），Alert 也要寫明
-  控制項已停用。**讀取不受管制**（展開面板只會 GET）。啟用開關與刪除不納入（意圖本來
+  `disabled` **和**送出處的提前 return，並延伸到 discard（`disabled` 只是渲染，不是
+  閘），Alert 也要寫明控制項已停用。**讀取不受管制**（展開面板只會 GET）。啟用開關與刪除不納入（意圖本來
   就是「叫這個名字的工具」，可還原或有確認 Modal，也沒有夾帶為某個實例寫的內容）。
 - **「對著畫面上的內容寫意見」要求畫面是最新的**，所以
   `displayedMayBeStale` 同時管**修訂意見輸入框與「送出修訂」**。收合的
@@ -203,14 +209,15 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   好幾分鐘的 LLM 重寫。
   輸入框跟著一起停用而不是只停按鈕：讓人打完一整段才發現按鈕是死的，是同一個拒絕更
   糟的版本。
-- **哪些失敗要重新讀取，要逐碼講清楚**：一個拒絕不只是訊息，有些拒絕本身就是伺服器
-  在說「我已經不是你畫面上那個樣子了」——`404`（工具已不叫這個名字）會重新讀
-  總結與清單。409 `tool_job_in_progress` 證明的不是快取過期，而是**這個頁面之外有東西正在對這個
-  後端動作**——那是一秒前還不知道的事實，而那個工作完成時可能已經換掉我們正在看的
-  套件，所以**也要重讀**（D40 r8 推翻了 r4「那個工作還沒寫任何東西」的判定：對那個
-  工作而言為真，但沒抓到重點）。`llm_not_configured`／502（在寫側檔之前就失敗）與
-  5xx／傳輸失敗（沒有任何證據）才是刻意**不**重讀的——規則寫在純函式
-  `summaryErrorRevalidates` 裡並逐條測試。修訂**工作**是唯一的例外：`ToolJobStatus` 沒有結構化原因、只有一段
+- **三種結構化 409 是三個不同動作**：`version_mismatch` 只重抓列表，讓新的
+  `current_vid` remount 列並清掉草稿；`job_busy` 保留輸入與 discard confirmation，
+  讓操作者稍後重試，不 refetch；`lineage_unavailable` 不重試、不 refetch，把該列
+  本地標成 broken 並顯示整包刪除。分支只看結構化 code，不解析 zh-TW 訊息。
+  其他錯誤中，`404`（工具已不叫這個名字）才重新讀總結與清單；
+  `llm_not_configured`／502／5xx／傳輸失敗沒有證據證明 server state 已移動，刻意
+  不重讀。規則分別在 `versionWriteConflictReaction` 與
+  `summaryErrorRevalidates` 並逐條測試。修訂**工作**是唯一的例外：
+  `ToolJobStatus` 沒有結構化原因、只有一段
   後端每輪都在改寫的 zh-TW `error` 字串，字串比對是會靜默失效的閘，所以改成「終局
   轉換（成功或失敗）就重讀」——那是每個工作最多一次、且發生在數分鐘工作之後，不是
   「每個錯誤都重抓」。
