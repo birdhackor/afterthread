@@ -5,8 +5,10 @@ import {
 	buildDiscardRequest,
 	buildRegenerateRequest,
 	buildReviseRequest,
+	clearLineageUnavailable,
 	deepLinkTarget,
 	logLinkSearch,
+	markLineageUnavailable,
 	ownSummaryBusy,
 	summaryErrorRevalidates,
 	toolIdentityConsumers,
@@ -198,6 +200,34 @@ describe("versionWriteConflictReaction", () => {
 				code: "version_mismatch",
 			}),
 		).toBeNull();
+	});
+});
+
+describe("locally broken lineage instances", () => {
+	it("keeps two independently marked instances broken", () => {
+		const first = toolInstanceKey("alpha", "20260728T010203Z-abc123");
+		const second = toolInstanceKey("bravo", "20260728T020304Z-def456");
+
+		const afterFirst = markLineageUnavailable(new Set(), first);
+		const afterSecond = markLineageUnavailable(afterFirst, second);
+
+		expect([...afterSecond]).toEqual([first, second]);
+		expect(afterSecond.has(first)).toBe(true);
+		expect(afterSecond.has(second)).toBe(true);
+		// State updaters are immutable: React receives a new collection each time.
+		expect(afterFirst).not.toBe(afterSecond);
+		expect(afterFirst.has(second)).toBe(false);
+	});
+
+	it("clears only the successful instance", () => {
+		const first = toolInstanceKey("alpha", "20260728T010203Z-abc123");
+		const second = toolInstanceKey("bravo", "20260728T020304Z-def456");
+		const marked = new Set([first, second]);
+
+		const cleared = clearLineageUnavailable(marked, second);
+
+		expect([...cleared]).toEqual([first]);
+		expect(marked.has(second)).toBe(true);
 	});
 });
 

@@ -147,13 +147,12 @@ _ERROR_SECRET_ENV_WRITE = "工具包 .env 無法寫入秘密值，安裝已取�
 # back to something other than the submitted value. Refusing beats writing a value the
 # runtime would parse differently from -- or expose more of than -- what the user submitted.
 _ERROR_SECRET_ENV_UNSERIALIZABLE = "秘密值含特殊字元，無法安全寫入工具包 .env，安裝已取消。"  # noqa: RUF001
-# D40/R7-1: raised when a builder-written ``.ai_meta.json`` (or a file in that
-# reserved temp namespace) cannot be REMOVED from staging before validation. The
-# strip is fail-closed -- shipping a forged sidecar is the one unacceptable
-# outcome -- so a deletion the filesystem refuses cancels the whole install.
+# Raised when a builder-written root ``.afterthread.meta/`` cannot be removed
+# before validation. The strip is fail-closed because that directory will hold
+# backend-authored provenance and the version's commit marker.
 # Category-only by construction: a fixed string, never a path or a value, since
 # the very name that failed to delete could have been chosen to embed a secret.
-_ERROR_SIDECAR_STRIP = "無法清除工具包內的 AI 總結側檔，安裝已取消。"  # noqa: RUF001
+_ERROR_SIDECAR_STRIP = "無法清除工具包內的後端版本中繼資料，安裝已取消。"  # noqa: RUF001
 # A builder-authored root .env is never version content.  Failure to remove it
 # must stop publication; otherwise one filesystem edge case silently revives the
 # configuration mechanism the prompt and package layout explicitly removed.
@@ -350,13 +349,10 @@ code means failure (STDERR is shown as the error).
 the defaults remain part of this version. Do NOT write a `.env` file. If the \
 tool needs a credential, name the required environment variable clearly in \
 tool.json's description; the operator supplies its value outside this build.
-- Two filenames belong to the backend, and anything you write at them is DELETED \
-before the tool is installed: `.ai_meta.json` anywhere in the package, and \
-`.afterthread-state.json` at the workspace ROOT (that one is the operator's \
-enabled switch and only the operator sets it). A file of your own named \
-`.afterthread-state.json` inside a SUBDIRECTORY is yours and is kept, so put any \
-state your tool needs there (e.g. `data/.afterthread-state.json`) or under any \
-other name.
+- The workspace-root `.afterthread.meta/` directory belongs to the backend and \
+is DELETED before the tool is installed; do not create it. Legacy flat filenames \
+such as `.ai_meta.json` and `.afterthread-state.json` are ordinary tool content \
+inside this version workspace.
 - Prefer Python 3 with ONLY its standard library (urllib.request for HTTP), \
 so the tool runs anywhere without installing dependencies. If the environment \
 variable TLS_NO_VERIFY is set to a truthy value, skip TLS certificate \
@@ -471,12 +467,10 @@ run.py`) without ever seeing them. If the user's feedback asks to CHANGE a \
 secret value, say so in your summary -- that is done by hand, not here.
 - Never write a secret value into any file. A package that embeds a known \
 secret is REFUSED, and that refusal discards your whole revision.
-- The two backend-owned filenames named in the contract above are missing from \
-this workspace for the same reason `.env` is, and the backend puts them back \
-after you finish: the AI summary file, and `.afterthread-state.json` at the \
-workspace ROOT. Do not create or edit either -- a root one you write is deleted. \
-A nested `.afterthread-state.json` you find in the workspace is the package's \
-own file: leave it alone unless the feedback asks you to change it.
+- The backend-owned root `.afterthread.meta/` directory is missing from this \
+workspace and is rebuilt after you finish; do not create or edit it. Any legacy \
+flat `.ai_meta.json` or `.afterthread-state.json` file you find here is this \
+version's tool content: leave it alone unless the feedback asks you to change it.
 
 Finish exactly as described above, with one added rule: "tool_name" MUST be \
 exactly {name}, because it names the installed package this revision replaces \
@@ -1393,93 +1387,17 @@ def _inject_secret_into_env(env_file: Path, name: str, value: str) -> str | None
     return None
 
 
-def _is_reserved_sidecar_name(filename: str, *, at_root: bool) -> bool:
-    """True for a filename inside the BACKEND's RESERVED namespace (D40, web-v5 P1).
-
-    Driven off ``tools._RESERVED_PACKAGE_FILENAMES`` -- a SET rather than one
-    hard-coded name, because there are now two backend-authored files in a
-    package: the AI summary sidecar (``.ai_meta.json``) and the mutable state file
-    the enabled toggle lives in (``.afterthread-state.json``). Reading the tuple from ``tools``
-    rather than restating the names here is what keeps the side that WRITES them
-    and the side that REFUSES them from drifting apart; the symbol keeps the word
-    "sidecar" for the same reason ``tools._STALE_BACKUP_RE`` keeps the word
-    "backup" (the D40 addenda point at these names, and the on-disk contract is
-    what actually matters).
-
-    ``at_root`` is REQUIRED and keyword-only, because the two namespaces have
-    different DEPTHS and a default would silently pick one (P1R5-2). At the package
-    root every reserved name applies; below it only
-    ``tools._RESERVED_AT_EVERY_DEPTH`` does, which the state file is deliberately
-    not in. The rule this follows is the one ``_revise_copy_ignore`` already made
-    about a nested ``.env`` (R2-2): nothing of OURS ever reads or writes below the
-    root, so a nested file at that name is the package's own content -- and a
-    builder that created its tool's initial state at ``data/<that name>``, verified
-    it with ``run_shell`` and shipped it had the file deleted here, with the
-    manifest still validating and the install still reporting success. The tool then
-    failed on its first real call.
-    ``.ai_meta.json`` keeps its every-depth reservation, which is pre-existing and
-    separately adjudicated -- see ``_strip_builder_sidecars`` for the reason (a
-    nested copy bricks every later revise through the embedded-secret gate), and
-    ``tools._RESERVED_AT_EVERY_DEPTH`` for why that argument is about that file
-    rather than about reserved names in general.
-
-    Two shapes per name, and the temp one is not padding:
-    ``tools._write_package_file_atomic`` publishes through
-    ``mkstemp(prefix=f"{filename}.", suffix=".tmp")``, so a leftover from an
-    interrupted publish is a legitimate inhabitant of this namespace -- and
-    therefore just as legitimate a thing for a builder to imitate. Matching the
-    prefix+suffix pair (rather than the exact name only) means the strip covers
-    the whole namespace the backend claims, not just the one filename an attacker
-    would have to be naive enough to use.
-
-    What a builder-shipped ``.afterthread-state.json`` would buy, so the extension is not read
-    as symmetry for its own sake: the file the RUNTIME consults at call time to
-    decide whether a tool may run (``tools._make_handler``). A revise session that
-    wrote one would be answering, in the operator's own vocabulary, a question only
-    the operator gets to answer -- switching a tool the operator had disabled back
-    on, at promote, with no mutation API call anywhere in the record.
-
-    Matched CASE-INSENSITIVELY (R10-2), which is not pedantry on a project that
-    supports macOS: the default macOS filesystem is case-INSENSITIVE, so a
-    builder writing ``.AI_META.JSON`` creates the very file a later
-    ``read_tool_meta`` opens as ``.ai_meta.json`` -- while a case-SENSITIVE
-    match here would sail right past it and promote the forgery, reopening the
-    exact choke-point bypass R7-1 closed. The comparison must therefore be at
-    least as loose as the loosest filesystem this can run on; on a
-    case-sensitive filesystem the only cost is deleting a differently-cased
-    name a builder had no business writing either. ``casefold`` (not ``lower``)
-    because it is the Unicode-correct full-case-folding operation, and these
-    names are compared, never displayed.
-    """
-    reserved_here = (
-        (*tools._RESERVED_PACKAGE_FILENAMES, tools._META_DIRNAME)
-        if at_root
-        else tools._RESERVED_AT_EVERY_DEPTH
-    )
-    folded = filename.casefold()
-    return any(
-        folded == reserved or (folded.startswith(reserved) and folded.endswith(".tmp"))
-        for reserved in (name.casefold() for name in reserved_here)
-    )
-
-
 def _remove_reserved_sidecar_path(path: Path) -> None:
-    """Delete ONE reserved-name entry, whatever kind of thing it turned out to be.
+    """Delete one backend metadata entry without following a symlink.
 
     ``unlink`` is the whole answer for the cases that matter (a regular file, a
     symlink of any target) and it removes the LINK rather than following it, so a
-    ``.ai_meta.json -> /etc/passwd`` planted in staging costs its target nothing.
+    ``.afterthread.meta -> /etc`` planted in staging costs its target nothing.
     ``missing_ok`` covers the entry vanishing between the walk and here.
 
-    A real DIRECTORY at the reserved name needs ``rmtree`` (``unlink`` answers
-    EISDIR). It is not a forged file -- both readers refuse a non-regular one --
-    but it would permanently BRICK what that name is for:
-    ``_write_package_file_atomic``'s lstat gate refuses to publish over anything
-    non-regular, so at ``.ai_meta.json`` the install hook and every later regenerate
-    would fail forever, and at ``.afterthread-state.json`` the package would list
-    INVALID with a toggle that cannot be written either -- on a package the
-    operator has no API path to repair. The name is the backend's; nothing of the
-    builder's may occupy it in any form.
+    A real DIRECTORY needs ``rmtree`` (``unlink`` answers EISDIR). The build-root
+    metadata directory is always backend-owned because promote creates its
+    ``origin.json`` commit marker there; nothing builder-authored may occupy it.
 
     Raises ``OSError`` on a refusal, which is what makes the caller fail-closed.
     """
@@ -1528,102 +1446,41 @@ def _strip_builder_env(
 
 
 def _reraise_walk_error(exc: OSError) -> None:
-    """``os.walk``'s ``onerror`` callback, wired to make a scan failure FATAL (R8-2).
+    """Make an incomplete staging traversal fail closed instead of disappearing.
 
-    ``os.walk`` defaults to ``onerror=None``, which means "SWALLOW any
-    ``scandir``/``listdir`` failure and just skip that subtree" -- so a builder that
-    ``chmod 000``s a directory holding a nested sidecar would otherwise sail through
-    the walk with that subtree silently unvisited: the strip reports success, and
-    the forged nested sidecar rides into the installed package. Passing this
-    callback as ``onerror`` makes ``os.walk`` re-raise instead, so the surrounding
-    ``try``/``except OSError`` in ``_strip_builder_sidecars`` sees it and fails
-    closed. An unreadable subtree in a builder-produced package is either sabotage
-    or breakage -- both are install-stopping, and silence was the only wrong
-    answer.
+    ``os.walk`` otherwise swallows a subtree ``scandir`` failure. The v5 scope
+    fix narrows WHAT is backend-owned to the root metadata directory; it does not
+    make an unreadable builder tree safe to publish without having inspected it.
     """
     raise exc
 
 
 def _strip_builder_sidecars(staging: Path) -> str | None:
-    """Delete every builder-written AI sidecar from staging; None = ok (R7-1).
+    """Delete builder-written metadata at a VERSION root; None means success.
 
-    Blocking (runs inside ``_promote_staging``). The sidecar is a BACKEND-AUTHORED
-    artifact whose only legitimate writer is ``tools.write_tool_meta``; a builder
-    session has real shell capability (D21), so it can write one too, and doing so
-    is a complete bypass of that choke point rather than a cosmetic liberty:
+    The v5 ownership boundary is the scope rule: ``BuildRoot`` becomes
+    ``versions/<vid>``, where only the root ``.afterthread.meta/`` belongs to the
+    backend. Legacy flat names such as ``.ai_meta.json`` and
+    ``.afterthread-state.json`` belong to the tool at this scope, at every depth;
+    migration can deliberately place the latter here byte-for-byte.
 
-    * the builder writes a value into some ordinary staging file which no
-      installed-package scan could have registered yet;
-    * it writes ``.ai_meta.json`` with that value as the summary.
-      ``validate_package``'s embedded-secret sweep cannot see a secret it does
-      not know, so the package passes;
-    * promote moves the whole staging directory, sidecar included;
-    * the install hook is best-effort, so any later summary-generation or storage
-      failure would leave that forged secret-bearing sidecar as the value GET
-      serves.
-
-    DELETION, not rejection, is the adjudicated answer, and the distinction is
-    real: the PACKAGE may be perfectly good work. The sidecar is decoration the
-    install hook regenerates through the proper choke point seconds later, so
-    dropping it costs the operator nothing, while failing the install would
-    punish them for something the model did unasked.
-
-    It runs BEFORE ``validate_package`` because validation must judge exactly what
-    will SHIP -- a gate that vets a file the promote then deletes (or, worse,
-    keeps) is describing a package that never existed.
-
-    EVERY DEPTH, via ``os.walk``, for the SIDECAR. A nested ``sub/.ai_meta.json``
-    is inert for ``read_tool_meta`` (which only ever reads the package ROOT), so
-    this is not the smuggling path -- but it still rides into the installed package,
-    where a future revise copies it into a fresh staging build that
-    ``validate_package``'s embedded-secret gate DOES scan against the by-then-
-    registered value: a planted nested copy would brick every later revise of that
-    tool with a rejection naming a file the operator never wrote. The walk is a
-    handful of stats over a small tree; the sidecar's name belongs to the backend at
-    every depth, and saying so once here is cheaper than a caveat every future
-    reader has to re-derive.
-
-    The STATE FILE is the package ROOT's only (P1R5-2), which is why the walk asks
-    ``_is_reserved_sidecar_name`` where it is as well as what it found. Deleting a
-    nested one destroyed ordinary package content: a builder may legitimately write
-    its tool's own initial state at ``data/<that name>``, and nothing of ours ever
-    looks below the root. The root one is still stripped unconditionally, and that
-    half is load-bearing -- it is what leaves the name free for the initial state
-    ``_promote_staging`` publishes (P1R5-3), and a builder allowed to occupy the
-    root name could make the toggle unsettable and then decide it from the manifest
-    it also writes.
-
-    Fail-closed: any ``OSError`` (weird perms, an immutable attribute, a
-    directory that will not empty) cancels the install with a category-only
-    zh-TW error. Shipping the forged file is the one unacceptable outcome, and
-    "we could not delete it" must never degrade into "so we kept it". This now
-    ALSO covers the WALK itself failing to scan a subtree (R8-2): ``os.walk``'s
-    default ``onerror=None`` swallows a ``scandir``/``listdir`` OSError and just
-    skips that subtree, so an unreadable directory (permissions, or anything
-    else that blocks listing it) would otherwise vanish from the walk entirely --
-    the loop finishes, this function returns None, and any sidecar hidden inside
-    ships unexamined. ``_reraise_walk_error`` turns that default silence into the
-    same fatal ``OSError`` a failed deletion already raises below, so incomplete
-    traversal and failed deletion share one fail-closed outcome.
+    The exact metadata directory is still removed before validation and recreated
+    by the publisher with ``origin.json`` as the commit marker. A symlink or odd
+    directory shape is removed without following it. The preliminary walk deletes
+    nothing; it preserves the existing fail-closed rule that an unreadable subtree
+    cannot be silently omitted from inspection.
     """
+    metadata = staging / tools._META_DIRNAME
     try:
-        for dirpath, dirnames, filenames in os.walk(staging, onerror=_reraise_walk_error):
-            here = Path(dirpath)
-            # WHERE we are, not just what we found: the state file is reserved at
-            # the root only (P1R5-2). ``os.walk`` yields its own argument as the
-            # first dirpath, so this is that comparison and nothing subtler.
-            at_root = here == staging
-            # dirnames is walked over a COPY and pruned in place: a symlink-to-
-            # directory at the reserved name lands here (os.walk classifies by a
-            # following is_dir), and a pruned entry must not then be descended
-            # into after it has been removed.
-            for dirname in list(dirnames):
-                if _is_reserved_sidecar_name(dirname, at_root=at_root):
-                    dirnames.remove(dirname)
-                    _remove_reserved_sidecar_path(here / dirname)
-            for filename in filenames:
-                if _is_reserved_sidecar_name(filename, at_root=at_root):
-                    _remove_reserved_sidecar_path(here / filename)
+        for _entry in os.walk(staging, onerror=_reraise_walk_error):
+            pass
+        os.lstat(metadata)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return _ERROR_SIDECAR_STRIP
+    try:
+        _remove_reserved_sidecar_path(metadata)
     except OSError:
         return _ERROR_SIDECAR_STRIP
     return None
@@ -1633,18 +1490,15 @@ def _verify_staging_root(staging: Path, base: Path) -> str | None:
     """Re-verify ``staging`` is still the real, contained directory it was given;
     None = ok (R8-1).
 
-    Called FIRST in ``_promote_staging``, before ANY destructive traversal --
-    including the sidecar strip's ``os.walk`` -- and therefore before validate and
-    move too. The builder's ``run_shell`` runs with the SERVICE'S OWN uid and
-    merely STARTS in staging (D21: deliberately unjailed, unlike the file
+    Called FIRST in ``_promote_staging``, before the metadata strip and therefore
+    before validate and move too. The builder's ``run_shell`` runs with the
+    SERVICE'S OWN uid and merely STARTS in staging (D21: deliberately unjailed,
+    unlike the file
     meta-tools), so between the LLM session ending and promote running, a builder
     command can ``mv`` staging ASIDE and plant a SYMLINK at the original staging
-    path pointing at ``base`` (the real, live tools directory) itself.
-    ``_strip_builder_sidecars``'s ``os.walk`` never checked its OWN root for a
-    symlink -- R7-1 only prunes a symlink found DURING the walk -- so unchecked it
-    would walk every INSTALLED package and delete its ``.ai_meta.json``,
-    destroying summaries and their only origin copies, before
-    ``validate_package`` ever ran.
+    path pointing at ``base`` (the real, live tools directory) itself. The strip
+    would otherwise remove a live backend metadata directory through that link,
+    before ``validate_package`` ever ran.
 
     Two independent layers, mirroring the resolve-then-contain house pattern
     (``tools._resolve_package_dir_no_alias``'s is_symlink-before-resolve
@@ -1663,9 +1517,9 @@ def _verify_staging_root(staging: Path, base: Path) -> str | None:
     This narrows a window rather than closing one, and is the SAME accepted
     residual class ``_promote_staging``'s own docstring names for its
     check-then-move exists-check (a race against a second concurrent actor with
-    the service's uid) -- just one step earlier: check-then-WALK instead of
+    the service's uid) -- just one step earlier: check-then-REMOVE instead of
     check-then-move. A swap landing in the instant between this check and the
-    strip's first ``os.walk`` syscall is still possible in principle; what this
+    strip's ``lstat`` syscall is still possible in principle; what this
     closes is the window the finding actually reported -- the ENTIRE builder
     session, start to finish -- down to that one syscall gap.
     """
@@ -2195,17 +2049,28 @@ def _is_preserved_env_name(root: Path, filename: str, *, exact_present: bool) ->
 
 
 def _revise_copy_ignore(root: Path, source_dir: Any, names: list[str]) -> set[str]:
-    """Exclude package metadata and package ``.env`` from a version build copy.
+    """Exclude backend metadata and the package ``.env`` from a version copy.
 
-    Nested names remain tool content. The package-layer files stay in place and
-    therefore never enter the builder session or the newly committed version.
+    The source root is a VersionRoot, not a PackageRoot. At this scope the two
+    legacy package-reserved filenames are ordinary tool content: migration may
+    have put a FOREIGN ``.afterthread-state.json`` here byte-for-byte, and
+    ``.ai_meta.json`` has no v5 reader here either. Applying the package-root
+    reserved-name tuple here silently deleted those files on the next revise.
+
+    Only the root ``.afterthread.meta/`` is backend-owned version data. The exact
+    package-layer ``.env`` is withheld as well; nested names and distinct
+    case-variants remain tool content.
     """
     at_root = Path(source_dir) == root
+    exact_env_present = ".env" in names
     return {
         name
         for name in names
-        if (at_root and name.casefold() == tools._META_DIRNAME.casefold())
-        or _is_reserved_sidecar_name(name, at_root=at_root)
+        if at_root
+        and (
+            name == tools._META_DIRNAME
+            or _is_preserved_env_name(root, name, exact_present=exact_env_present)
+        )
     }
 
 
@@ -2227,8 +2092,7 @@ def _copy_package_into_staging(source: tools.VersionRoot, staging: tools.BuildRo
     Any ``OSError`` -- including ``shutil.Error``, which subclasses it and is
     what ``copytree`` raises for per-file failures collected during the walk --
     becomes the friendly outcome. An unreadable subtree therefore FAILS the
-    revise loudly here (裁決紀錄 #4 noted this path would surface exactly that,
-    where the install-side ``os.walk`` gate stays as adjudicated).
+    revise loudly here (裁決紀錄 #4 noted this path would surface exactly that).
     """
     try:
         shutil.copytree(

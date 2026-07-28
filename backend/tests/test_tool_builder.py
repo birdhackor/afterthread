@@ -22,6 +22,7 @@ an autouse fixture resets both around every test.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -1007,7 +1008,7 @@ def test_run_install_feature_off(monkeypatch: pytest.MonkeyPatch) -> None:
     assert outcome.llm_log_id is None
 
 
-# --- the forged-sidecar strip (D40 r7 / R7-1) ----------------------------------
+# --- version-root metadata ownership -------------------------------------------
 
 
 def _forged_meta(value: str) -> str:
@@ -1015,28 +1016,15 @@ def _forged_meta(value: str) -> str:
     return json.dumps({"summary": value, "updated_at": "2026-01-01T00:00:00Z"})
 
 
-def test_run_install_strips_a_forged_summary_sidecar(
+def test_run_install_treats_legacy_sidecar_name_as_version_content(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """R7-1, the whole attack chain: a builder session can smuggle a secret out
-    through a sidecar it writes itself, and every gate on the path HELPS it.
+    """A BuildRoot becomes a VersionRoot, where the legacy flat name is content.
 
-    The builder (a half-trusted actor with a real shell, D21/H3) writes a staging
-    ``.env`` holding a value nobody has registered -- ``known_secret_values``
-    scans installed packages only and skips the dot-prefixed ``.staging`` shell,
-    so the value is unknown for the whole build. It then writes
-    ``.ai_meta.json`` = ``{"summary": "<that value>"}``:
-    ``validate_package``'s embedded-secret sweep cannot match a secret it does
-    not know, so the package passes; promote moves the staging directory whole;
-    and if the best-effort install hook then fails, the forged sidecar is what
-    every later GET serves, verbatim.
-
-    The sidecar's only legitimate writer is ``write_tool_meta``, so promote now
-    deletes the builder's copy BEFORE validation. What must hold afterwards is
-    not "no sidecar" but "the BACKEND's sidecar": the hook regenerates one
-    through the proper choke point moments later, so the summary panel still
-    works and the forged text is nowhere on disk. The builder-written ``.env``
-    is stripped too; only its key name is reported."""
+    The backend summary lives under root ``.afterthread.meta/`` in v5, so a tool
+    may use ``.ai_meta.json`` for its own purposes without impersonating it. The
+    builder-written package ``.env`` remains a different scope and is stripped.
+    """
     root = tmp_path / "tools"
     _install_settings(monkeypatch, tools_dir=str(root))
     smuggled = "smuggled-kb-value-abcdef123456"
@@ -1066,40 +1054,19 @@ def test_run_install_strips_a_forged_summary_sidecar(
     assert outcome.env_keys == ("KB_API_KEY",)
     assert smuggled not in repr(outcome)
 
-    # A sidecar EXISTS -- and it is the hook's, written through write_tool_meta
-    # with the stubbed generation's text.
+    assert (pkg / tools._AI_META_FILENAME).read_text(encoding="utf-8") == _forged_meta(smuggled)
+    # The backend summary independently exists under its v5 metadata directory.
     meta = tools.read_tool_meta(tools.VersionRoot(pkg))
     assert meta is not None
     assert meta["summary"] == "這個工具會查 KB"
 
-    # The forged content is nowhere in the installed package.
-    bearers = sorted(
-        str(path.relative_to(package))
-        for path in package.rglob("*")
-        if path.is_file() and smuggled in path.read_text(encoding="utf-8", errors="replace")
-    )
-    assert bearers == []
     assert not (root / ".staging").exists()
 
 
-def test_run_install_strips_forged_sidecars_at_every_depth(
+def test_run_install_keeps_legacy_names_at_every_version_depth(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The strip walks the whole staged tree, and covers the temp namespace too.
-
-    A NESTED ``lib/.ai_meta.json`` is inert for ``read_tool_meta`` (which only
-    ever reads the package root), so it is not the smuggling path -- but it still
-    rides into the installed package, where a later revise copies it into a fresh
-    staging build that ``validate_package``'s embedded-secret gate DOES scan
-    against the by-then-registered value: a planted nested copy would brick every
-    later revise with a rejection naming a file the operator never wrote.
-
-    ``.ai_meta.json.<x>.tmp`` is the namespace ``_write_package_file_atomic``'s
-    ``mkstemp`` publishes through, so a leftover there is a legitimate artifact
-    -- and therefore just as legitimate a thing for a builder to imitate.
-
-    The collateral half of the same test: NOTHING else is touched. Every other
-    file the builder produced, at every depth, arrives in the package intact."""
+    """Package-root legacy reservations never recurse into version content."""
     root = tmp_path / "tools"
     _install_settings(monkeypatch, tools_dir=str(root))
     _fake_generate(
@@ -1120,28 +1087,25 @@ def test_run_install_strips_forged_sidecars_at_every_depth(
 
     assert outcome.ok is True
     pkg = _resolved_version(root / "kbsearch")
-    assert not (pkg / "lib" / tools._AI_META_FILENAME).exists()
-    assert not list(pkg.glob(f"{tools._AI_META_FILENAME}*.tmp"))
-    # Everything the builder legitimately produced survived the walk untouched.
+    assert (pkg / "lib" / tools._AI_META_FILENAME).read_text(encoding="utf-8") == _forged_meta(
+        "nested forgery"
+    )
+    assert (pkg / f"{tools._AI_META_FILENAME}.7f3a.tmp").read_text(
+        encoding="utf-8"
+    ) == _forged_meta("temp-namespace forgery")
     assert (pkg / "lib" / "helper.py").read_text(encoding="utf-8") == "VALUE = 1\n"
     assert (pkg / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY
     assert json.loads((pkg / "tool.json").read_text(encoding="utf-8"))["name"] == "kbsearch"
-    # ... and the ROOT sidecar is the hook's, not any of the plants.
+    # The backend summary remains in the separate v5 metadata namespace.
     meta = tools.read_tool_meta(tools.VersionRoot(pkg))
     assert meta is not None
     assert meta["summary"] == "這個工具會查 KB"
 
 
-def test_strip_builder_sidecars_matches_the_reserved_name_case_insensitively(
+def test_strip_builder_sidecars_leaves_legacy_case_variants_as_content(
     tmp_path: Path,
 ) -> None:
-    """R10-2: on a case-INSENSITIVE filesystem (the macOS default, a supported
-    platform) a builder-written ``.AI_META.JSON`` IS the file ``read_tool_meta``
-    later opens as ``.ai_meta.json`` -- so a case-sensitive strip would promote
-    the forgery and reopen the choke-point bypass R7-1 closed. The match is
-    therefore case-insensitive everywhere; on a case-sensitive filesystem (this
-    test's own likely host) the only effect is that a differently-cased name the
-    builder had no business writing is removed too, which this pins directly."""
+    """No v5 reader claims the flat legacy namespace inside a version."""
     staging = tmp_path / "staging"
     staging.mkdir()
     (staging / ".AI_META.JSON").write_text('{"summary": "forged"}', encoding="utf-8")
@@ -1150,114 +1114,59 @@ def test_strip_builder_sidecars_matches_the_reserved_name_case_insensitively(
 
     assert tool_builder._strip_builder_sidecars(staging) is None
 
-    remaining = sorted(entry.name for entry in staging.iterdir())
-    assert remaining == ["run.py"]
+    assert sorted(entry.name for entry in staging.iterdir()) == [
+        ".AI_META.JSON",
+        ".Ai_Meta.Json.abc123.TMP",
+        "run.py",
+    ]
 
 
-def test_strip_builder_sidecars_covers_the_state_file_namespace(tmp_path: Path) -> None:
-    """R5 (web-v5 P1): the state file joins the namespace -- at the ROOT, in any case.
+def test_strip_builder_sidecars_removes_only_root_version_metadata(tmp_path: Path) -> None:
+    """BuildRoot scope owns only root ``.afterthread.meta/``.
 
-    What a builder-shipped state file would buy is not symmetry for its own sake:
-    it is the file the RUNTIME consults at call time to decide whether a tool may
-    run. A revise session that wrote one would be switching a tool the operator had
-    DISABLED back on, at promote, with no mutation API call anywhere in the record.
-    It is also the name ``_promote_staging`` publishes the initial state at, so the
-    root has to be free (P1R5-3).
-
-    ROOT ONLY, which P1R5-2 narrowed from every depth: nothing of ours reads or
-    writes below the package root, so a nested file at that name is the package's
-    own content -- and a builder writing its tool's initial state at
-    ``data/<that name>`` had it deleted here, with the manifest still validating and
-    the install still reporting success. ``.ai_meta.json`` keeps every depth for its
-    own separately-adjudicated reason; the sibling test below pins that half.
-
-    The publish temporaries are covered for the same reason the sidecar's are --
-    ``_write_package_file_atomic`` mints ``<name>.<x>.tmp`` in the package, so a
-    leftover is a legitimate inhabitant of the namespace and therefore just as
-    legitimate a thing to imitate."""
+    Both legacy flat names are tool content even at the version root. A nested
+    metadata name is content too because the backend never reads below the root.
+    """
     staging = tmp_path / "staging"
-    (staging / "sub").mkdir(parents=True)
+    (staging / "sub" / tools._META_DIRNAME).mkdir(parents=True)
+    (staging / tools._META_DIRNAME).mkdir(parents=True)
+    (staging / tools._META_DIRNAME / "origin.json").write_text("forged", encoding="utf-8")
     (staging / tools._STATE_FILENAME).write_text('{"enabled": true}', encoding="utf-8")
-    (staging / f"{tools._STATE_FILENAME}.abc123.tmp").write_text("{}", encoding="utf-8")
-    (staging / tools._STATE_FILENAME.upper()).write_text('{"enabled": true}', encoding="utf-8")
     (staging / "sub" / tools._STATE_FILENAME).write_text('{"enabled": true}', encoding="utf-8")
-    (staging / "sub" / f"{tools._STATE_FILENAME}.abc123.tmp").write_text("{}", encoding="utf-8")
-    (staging / "run.py").write_text("print(1)", encoding="utf-8")
-    (staging / "sub" / "keep.py").write_text("K = 1\n", encoding="utf-8")
+    (staging / tools._AI_META_FILENAME).write_text("legacy", encoding="utf-8")
+    (staging / "sub" / tools._META_DIRNAME / "keep").write_text("content", encoding="utf-8")
 
     assert tool_builder._strip_builder_sidecars(staging) is None
 
-    assert sorted(entry.name for entry in staging.iterdir()) == ["run.py", "sub"]
-    # The nested ones are the package's own files and SURVIVE (P1R5-2).
-    assert sorted(entry.name for entry in (staging / "sub").iterdir()) == [
-        tools._STATE_FILENAME,
-        f"{tools._STATE_FILENAME}.abc123.tmp",
-        "keep.py",
-    ]
-    # And the predicate itself agrees on both namespaces at the root, so neither
-    # can be dropped by a future edit that only looks at one of them -- while below
-    # the root only the every-depth subset applies.
-    for reserved in tools._RESERVED_PACKAGE_FILENAMES:
-        assert tool_builder._is_reserved_sidecar_name(reserved, at_root=True) is True
-        assert tool_builder._is_reserved_sidecar_name(f"{reserved}.x.tmp", at_root=True) is True
-        nested = tool_builder._is_reserved_sidecar_name(reserved, at_root=False)
-        assert nested is (reserved in tools._RESERVED_AT_EVERY_DEPTH)
-    assert tools._STATE_FILENAME not in tools._RESERVED_AT_EVERY_DEPTH
-    assert tool_builder._is_reserved_sidecar_name("state.json", at_root=True) is False
+    assert not (staging / tools._META_DIRNAME).exists()
+    assert (staging / tools._STATE_FILENAME).is_file()
+    assert (staging / tools._AI_META_FILENAME).is_file()
+    assert (staging / "sub" / tools._STATE_FILENAME).is_file()
+    assert (staging / "sub" / tools._META_DIRNAME / "keep").read_text(encoding="utf-8") == "content"
 
 
-def test_strip_builder_sidecars_handles_links_and_directories(tmp_path: Path) -> None:
-    """The reserved name belongs to the backend in EVERY form it can take.
-
-    A SYMLINK at the name is unlinked rather than followed, so a
-    ``.ai_meta.json -> <somewhere else>`` plant costs its target nothing. (One
-    pointing at a DIRECTORY is the awkward shape: ``os.walk`` classifies it as a
-    directory, so it has to be pruned from the walk as well as removed.)
-
-    A real DIRECTORY at the name is not a forged sidecar -- ``read_tool_meta``
-    refuses a non-regular file -- but leaving it would permanently BRICK the
-    package's summary: ``_write_package_file_atomic``'s lstat gate refuses to publish
-    over anything non-regular, so the install hook and every later regenerate
-    would fail forever, with no API path to repair it.
-
-    Driven directly rather than through ``run_install`` because the meta-tools
-    cannot produce these shapes -- only a ``run_shell`` (or an operator) can."""
+def test_strip_builder_sidecars_unlinks_root_metadata_symlink_only(tmp_path: Path) -> None:
+    """The backend metadata link is removed without following its target."""
     staging = tmp_path / "staging"
-    (staging / "sub" / "deep").mkdir(parents=True)
+    (staging / "sub").mkdir(parents=True)
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "kept.txt").write_text("untouched", encoding="utf-8")
 
-    (staging / tools._AI_META_FILENAME).symlink_to(outside)  # walked as a DIRECTORY
-    nested_dir = staging / "sub" / tools._AI_META_FILENAME
-    nested_dir.mkdir()
-    (nested_dir / "payload.json").write_text("{}", encoding="utf-8")
-    (staging / "sub" / "deep" / tools._AI_META_FILENAME).write_text("{}", encoding="utf-8")
-    (staging / "sub" / "keep.py").write_text("K = 1\n", encoding="utf-8")
+    (staging / tools._META_DIRNAME).symlink_to(outside, target_is_directory=True)
+    (staging / "sub" / tools._META_DIRNAME).symlink_to(outside, target_is_directory=True)
 
     assert tool_builder._strip_builder_sidecars(staging) is None
 
-    assert not (staging / tools._AI_META_FILENAME).is_symlink()
-    assert (outside / "kept.txt").read_text(encoding="utf-8") == "untouched"  # never followed
-    assert not nested_dir.exists()
-    assert not (staging / "sub" / "deep" / tools._AI_META_FILENAME).exists()
-    assert (staging / "sub" / "keep.py").read_text(encoding="utf-8") == "K = 1\n"
+    assert not (staging / tools._META_DIRNAME).is_symlink()
+    assert (staging / "sub" / tools._META_DIRNAME).is_symlink()
+    assert (outside / "kept.txt").read_text(encoding="utf-8") == "untouched"
 
 
-def test_run_install_fails_closed_when_the_forged_sidecar_cannot_be_deleted(
+def test_run_install_fails_closed_when_builder_metadata_cannot_be_deleted(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A deletion the filesystem refuses CANCELS the install.
-
-    "We could not remove it" must never degrade into "so we shipped it": the
-    forged sidecar reaching the package is the one unacceptable outcome: if the
-    best-effort install hook fails, the forged content remains served. The
-    refusal is injected at ``Path.unlink`` -- the real syscall boundary, the same
-    style ``os.replace`` is failed at in test_tools -- because weird permissions
-    and immutable attributes are not reproducible in a tmp dir.
-
-    The error is category-only: a fixed zh-TW string, never the path that failed,
-    since a builder chooses its own filenames and could embed a secret in one."""
+    """Failure to clear backend-owned provenance cancels the install."""
     root = tmp_path / "tools"
     _install_settings(monkeypatch, tools_dir=str(root))
     _fake_generate(
@@ -1266,18 +1175,18 @@ def test_run_install_fails_closed_when_the_forged_sidecar_cannot_be_deleted(
         files={
             "tool.json": json.dumps(_package_manifest("kbsearch")),
             "run.py": _GOOD_RUN_PY,
-            tools._AI_META_FILENAME: _forged_meta("undeletable forgery"),
+            f"{tools._META_DIRNAME}/origin.json": "forged",
         },
     )
     _no_fetch(monkeypatch)
-    real_unlink = Path.unlink
+    real_rmtree = tool_builder.shutil.rmtree
 
-    def refuse(self: Path, *, missing_ok: bool = False) -> None:
-        if self.name == tools._AI_META_FILENAME:
+    def refuse(path: Path, *args: Any, **kwargs: Any) -> None:
+        if Path(path).name == tools._META_DIRNAME:
             raise PermissionError(1, "Operation not permitted")
-        real_unlink(self, missing_ok=missing_ok)
+        real_rmtree(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "unlink", refuse)
+    monkeypatch.setattr(tool_builder.shutil, "rmtree", refuse)
 
     outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build a search tool"))
 
@@ -1297,6 +1206,33 @@ def test_run_install_fails_closed_when_the_forged_sidecar_cannot_be_deleted(
 
 
 def _promote_for_test(staging: Path, name: str, base: Path) -> str | None:
+    # Production calls _promote_staging inside a `finally` that cleans the whole
+    # session root; this helper calls it directly, so it owns that cleanup itself.
+    # Without it a refused promote leaves its assembled shell under tmp_path and
+    # pytest's teardown reports a wall of "Directory not empty" warnings that bury
+    # the one real warning this suite has.
+    # The sealed-subtree tests chmod a directory to 0o000 and restore only the
+    # ORIGINAL in their own finally; the promote copied it, so the shell holds an
+    # unenterable duplicate that defeats rmtree (and pytest's own retrying
+    # teardown) with a cascade of ENOTEMPTY. Walk it open first.
+    shell = staging.parent / "shell"
+
+    def _reopen_and_retry(func: Any, path: str, _exc: BaseException) -> None:
+        # os.walk cannot reach an unenterable directory to chmod it -- it is
+        # exactly the entry it fails to descend into -- so the fix has to be
+        # reactive: rmtree tells us which path it could not handle, we open that
+        # one and let it try again.
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o700)
+            func(path)
+
+    try:
+        return _promote_for_test_inner(staging, name, base)
+    finally:
+        shutil.rmtree(shell, onexc=_reopen_and_retry)
+
+
+def _promote_for_test_inner(staging: Path, name: str, base: Path) -> str | None:
     _, error = tool_builder._promote_staging(
         tools.BuildRoot(staging),
         staging.parent / "shell",
@@ -1593,6 +1529,38 @@ def test_cleanup_staging_still_removes_an_honest_staging(tmp_path: Path) -> None
     tool_builder._cleanup_staging(staging, base)
 
     assert not staging.exists()
+    assert not (base / tool_builder._STAGING_DIRNAME).exists()
+
+
+def test_cleanup_takes_the_whole_session_including_a_shell_holding_env(tmp_path: Path) -> None:
+    """The reason cleanup targets ``session_root`` and not the build directory.
+
+    A session is ``<uuid>/{build,shell}``. The assembled shell is where the
+    package-layer ``.env`` lives before it lands, so a cleanup aimed one level too
+    deep would remove the workspace and leave a credentials file behind for the
+    life of the machine -- an orphan nothing later collects, since only the
+    ``.staging`` shell and ``.stale-`` names are ever swept. Both lifecycles pass
+    ``session_root`` here (``run_install`` and ``run_revise``, each in a
+    ``finally``); this pins that, because the control above only proves an
+    ordinary staging directory is removed and would pass just as well if the
+    shell were missed.
+    """
+
+    base = tmp_path / "tools"
+    base.mkdir()
+    session_root = base / tool_builder._STAGING_DIRNAME / "sessionid"
+    (session_root / "build").mkdir(parents=True)
+    (session_root / "build" / "run.py").write_text("x", encoding="utf-8")
+    version = session_root / "shell" / "versions" / "20260728T010203Z-abcdef"
+    version.mkdir(parents=True)
+    (version / "tool.json").write_text("{}", encoding="utf-8")
+    secrets_file = session_root / "shell" / ".env"
+    secrets_file.write_text("API_KEY=must-not-survive\n", encoding="utf-8")
+
+    tool_builder._cleanup_staging(session_root, base)
+
+    assert not secrets_file.exists()
+    assert not session_root.exists()
     assert not (base / tool_builder._STAGING_DIRNAME).exists()
 
 
@@ -4279,18 +4247,16 @@ async def _run_revise(name: str, feedback: str) -> InstallOutcome:
     return await tool_builder.run_revise(name, feedback, resolution)
 
 
-def test_run_revise_copies_the_package_without_the_root_env_or_any_sidecar(
+def test_run_revise_copies_version_content_without_root_env_or_backend_metadata(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The staging copy is the installed package MINUS the ROOT ``.env`` and MINUS
-    the sidecar namespace at every depth -- and identical otherwise.
+    """The staging copy excludes only root backend metadata and the package env.
 
     The root ``.env`` exclusion is not tidiness (D40): its values are in
     ``known_secret_values``, so a copied one would make ``validate_package``'s
-    embedded-secret gate reject every revise of the tool. The sidecar namespace is
-    backend-authored and regenerated after the swap; a nested one is dropped for
-    the reason R7-1 gives -- matched case-INSENSITIVELY, so the ``.AI_META.JSON``
-    spelling that IS the same file on macOS cannot ride in either.
+    embedded-secret gate reject every revise of the tool. Root
+    ``.afterthread.meta/`` is backend-authored and regenerated after publication.
+    A nested legacy `.AI_META.JSON` is version content and therefore survives.
 
     A NESTED ``.env`` is ordinary package content and is COPIED (R2-2). The r1 rule
     excluded every ``.env``-casefolded name at EVERY depth, so a tool that reads its
@@ -4322,19 +4288,22 @@ def test_run_revise_copies_the_package_without_the_root_env_or_any_sidecar(
     outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is True
-    # The workspace the builder received: everything, minus the ROOT .env and every
-    # sidecar. ``sub`` survives as an empty directory -- only the NAMES are excluded.
+    # The workspace gets all tool content, including the nested legacy name.
     assert seen["staged"] == {
         "tool.json",
         "run.py",
         "lib",
         "lib/util.py",
         "sub",
+        "sub/.AI_META.JSON",
         "config",
         "config/.env",
     }
     # ... and the file an unrelated revise used to delete is still there, untouched.
     assert (_current_version(pkg) / "config" / ".env").read_bytes() == nested_env
+    assert (_current_version(pkg) / "sub" / ".AI_META.JSON").read_text(
+        encoding="utf-8"
+    ) == '{"summary": "forged"}'
 
 
 def test_run_revise_keeps_the_state_file_out_of_staging_but_carries_it_across(
@@ -4385,32 +4354,27 @@ def test_run_revise_keeps_the_state_file_out_of_staging_but_carries_it_across(
     assert "enabled" not in json.loads((revised / "tool.json").read_text(encoding="utf-8"))
 
 
-def test_a_revise_leaves_a_nested_state_file_alone_and_carries_a_foreign_root_one(
+def test_revise_preserves_migrated_foreign_state_as_version_content_byte_identical(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """P1R5-2 and P1R5-1 on the revise path, which is where both were destructive.
+    """The migration output is version content, not package-layer backend state.
 
-    A NESTED file at the reserved name is ordinary package content: it is copied
-    into the workspace like any other file and comes back unchanged, exactly as the
-    nested ``.env`` does (R2-2, whose reasoning this follows).
-
-    A ROOT one that is not OURS -- no ownership marker, so it is the package's own
-    cursor/cache/settings -- is a different problem with the same requirement. It is
-    withheld from the builder like ours would be, and the promote's carry copies it
-    back BYTE-FOR-BYTE instead of publishing a ``{"enabled": ...}`` over it. Before
-    P1R5-1 the first revise of such a package destroyed it, and the toggle it was
-    mistaken for was never the operator's to begin with.
-
-    The toggle for such a package answers from the MANIFEST, which is what
-    ``package_enabled`` reports here -- the file at our name got no vote in either
-    direction."""
+    A FOREIGN legacy state file has no ownership marker, so migration moves its
+    bytes into ``versions/<vid>/.afterthread-state.json``. The next revise must
+    give that content to the builder and publish it unchanged. The same scope
+    ruling applies to ``.ai_meta.json``: v5 reads summary metadata only from the
+    root ``.afterthread.meta/`` directory, so the flat name inside a version is
+    the tool's own content.
+    """
     pkg = _seed_package(monkeypatch, tmp_path)
     root = _package_path(pkg).parent
     (pkg / "data").mkdir()
     nested = b"cursor=41\r\n\x00binary tail"
     (pkg / "data" / tools._STATE_FILENAME).write_bytes(nested)
     theirs = b'{"cursor": 41, "enabled": true}\n'
-    _state_path(pkg).write_bytes(theirs)
+    (pkg / tools._STATE_FILENAME).write_bytes(theirs)
+    legacy_ai = b'{"tool_owned": true}\r\n'
+    (pkg / tools._AI_META_FILENAME).write_bytes(legacy_ai)
     seen: dict[str, set[str]] = {}
     _fake_generate(
         monkeypatch,
@@ -4425,15 +4389,16 @@ def test_a_revise_leaves_a_nested_state_file_alone_and_carries_a_foreign_root_on
     assert (_current_version(pkg) / "run.py").read_text(
         encoding="utf-8"
     ) == _REVISED_RUN_PY  # really revised
-    # The nested one went THROUGH the workspace; the root one never entered it.
+    # All three legacy-name entries went through the version workspace.
     assert f"data/{tools._STATE_FILENAME}" in seen["staged"]
-    assert tools._STATE_FILENAME not in seen["staged"]
-    # Both are byte-identical on the other side of the swap.
+    assert tools._STATE_FILENAME in seen["staged"]
+    assert tools._AI_META_FILENAME in seen["staged"]
+    # They are byte-identical on the other side of the publication.
     assert (_current_version(pkg) / "data" / tools._STATE_FILENAME).read_bytes() == nested
-    assert _state_path(pkg).read_bytes() == theirs
-    # ... and the foreign file still does not answer the toggle: the manifest does,
-    # and this fixture's manifest has no legacy key, so the default stands.
-    assert tools.package_enabled(_package_root(pkg)) is False
+    assert (_current_version(pkg) / tools._STATE_FILENAME).read_bytes() == theirs
+    assert (_current_version(pkg) / tools._AI_META_FILENAME).read_bytes() == legacy_ai
+    # Version content has no vote in the package-layer enabled state.
+    assert tools.package_enabled(_package_root(pkg)) is True
 
 
 def test_invariant_f_revise_never_touches_the_package_env(

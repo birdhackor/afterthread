@@ -176,32 +176,17 @@ _STATE_MARKER_VALUE = "tool-state"
 # and is refused as UNREADABLE rather than parsed (see ``_read_enabled_state``).
 _STATE_MAX_BYTES = 4 * 1024
 
-# Every filename at a package's ROOT that belongs to the BACKEND rather than to the
-# package's content. A builder session must not be able to ship one and a revise
-# copy must not carry one into staging -- both enforced from this ONE tuple by
-# ``tool_builder._is_reserved_sidecar_name`` (which also covers each name's
-# ``<name>.*.tmp`` publish temporaries, since ``_write_package_file_atomic``
-# mints them). A set rather than a hard-coded name because there are now two, and
-# a second hard-coded spelling is how the next one gets forgotten.
-_RESERVED_PACKAGE_FILENAMES: tuple[str, ...] = (_AI_META_FILENAME, _STATE_FILENAME)
-
-# The subset of the above that is reserved at EVERY DEPTH, not just at the root.
-# The state file is deliberately NOT in it (P1R5-2), following the ruling this
-# module's own revise-copy filter already made about a NESTED ``.env``
-# (``tool_builder._revise_copy_ignore``, R2-2): the ROOT one is the backend's,
-# because the root is the only place anything of ours reads or writes; a nested one
-# is ordinary package content, and the tool -- which runs with its package
-# directory as cwd -- may open ``data/.afterthread-state.json`` for its own reasons.
-# Reserving it at every depth meant a builder that created its tool's own initial
-# state there, and verified it worked with ``run_shell``, had the file silently
-# deleted at promote: the manifest still validated, the install reported success,
-# and the tool failed on its first real call.
+# Every filename at a PACKAGE ROOT that belongs to the backend rather than to the
+# package's content. This tuple must never be applied to a BuildRoot or VersionRoot:
+# v5 puts all tool content there, and only ``.afterthread.meta/`` is backend-owned
+# at that scope. In particular, migration deliberately carries a FOREIGN legacy
+# state file into the first version byte-for-byte; treating this package-root
+# namespace as a recursive or version-root namespace makes the next revise delete
+# ordinary tool content.
 #
-# ``.ai_meta.json`` stays every-depth. That is a PRE-EXISTING and separately
-# adjudicated rule (D40 r7-1 / R8-2, restated in ``_strip_builder_sidecars``) with
-# its own reason -- a nested copy bricks every later revise through the
-# embedded-secret gate -- and this finding does not reopen it.
-_RESERVED_AT_EVERY_DEPTH: tuple[str, ...] = (_AI_META_FILENAME,)
+# A tuple rather than separate literals still keeps the two legacy package-layer
+# names together for code that reasons about that old namespace.
+_RESERVED_PACKAGE_FILENAMES: tuple[str, ...] = (_AI_META_FILENAME, _STATE_FILENAME)
 
 # The mode floor every published sidecar carries (R11). The backend MUST be able
 # to read back what it just wrote -- that is the same writer-accepts-implies-
@@ -2622,6 +2607,7 @@ def _run_tool_subprocess(
     entry: list[str],
     advertised: Resolved,
     expected_identity: tuple[int, int, int] | None,
+    advertised_directory_identity: tuple[int, int] | None,
     env: dict[str, str],
     args_json: str,
     timeout: float,
@@ -2636,10 +2622,10 @@ def _run_tool_subprocess(
     creation.  Resolving ``current`` does not compare vids: a normal revise may
     move it while this call must remain bound to the schema it was shown.
     """
-    package_root = advertised.package_root
     version_root = advertised.version_root
-    if version_retired(package_root, advertised.vid):
+    if version_retired(version_root, advertised_directory_identity):
         return _TOOL_REPLACED_RESULT
+    package_root = advertised.package_root
     if not package_enabled(package_root):
         return _TOOL_DISABLED_RESULT
     if isinstance(resolve_current(package_root), Unresolved):
@@ -2698,23 +2684,61 @@ def _run_tool_subprocess(
 _INFLIGHT_EXECUTIONS: dict[tuple[int, int], int] = {}
 _EXECUTION_LOCK = threading.Lock()
 
-# A discard retires the advertised (package, vid) even when best-effort parking
-# cannot move its directory. Handlers live only in this process, so the marker
-# deliberately has the same lifetime and needs no persistent lease/refcount.
-_RETIRED_VERSIONS: set[tuple[PackageRoot, str]] = set()
+# A marker is about one DIRECTORY INSTANCE, never the reusable ``(package, vid)``
+# address at which it happened to be advertised. A backup restored at the same
+# path has another inode and must be executable; the already-advertised handlers
+# retain this identity and remain refused. The VersionRoot beside it is only the
+# pruning address: once that path no longer names this inode, the marker has no
+# remaining job because the ordinary identity guard refuses every old handler.
+#
+# Markers are retained only while failed parking (or unconfirmed durability)
+# leaves the directory at its advertised path. Successful parking clears the
+# provisional marker immediately, so ordinary discards cannot grow this
+# process-local set without bound.
+_RETIRED_VERSIONS: set[tuple[VersionRoot, tuple[int, int]]] = set()
 _RETIRED_LOCK = threading.Lock()
 
 
-def _retire_version(package_root: PackageRoot, vid: str) -> None:
-    """Make every process-local handler for one discarded vid inert."""
+def _retire_version(version_root: VersionRoot, identity: tuple[int, int] | None) -> None:
+    """Make handlers bound to one still-present discarded directory inert."""
+    if identity is None:
+        return
     with _RETIRED_LOCK:
-        _RETIRED_VERSIONS.add((package_root, vid))
+        # Reclaim markers whose inode has left its advertised path. Remaining
+        # markers correspond to directories that still consume filesystem space,
+        # rather than an append-only history of every vid this process discarded.
+        stale = {
+            marker for marker in _RETIRED_VERSIONS if directory_identity(marker[0]) != marker[1]
+        }
+        _RETIRED_VERSIONS.difference_update(stale)
+        _RETIRED_VERSIONS.add((version_root, identity))
 
 
-def version_retired(package_root: PackageRoot, vid: str) -> bool:
-    """Return whether discard retired this exact package version."""
+def _unretire_version(version_root: VersionRoot, identity: tuple[int, int] | None) -> None:
+    """Drop the provisional marker after parking removed the advertised path."""
+    if identity is None:
+        return
     with _RETIRED_LOCK:
-        return (package_root, vid) in _RETIRED_VERSIONS
+        _RETIRED_VERSIONS.discard((version_root, identity))
+
+
+def version_retired(version_root: VersionRoot, identity: tuple[int, int] | None) -> bool:
+    """Return whether discard retired this exact directory identity."""
+    if identity is None:
+        return False
+    marker = (version_root, identity)
+    with _RETIRED_LOCK:
+        marked = marker in _RETIRED_VERSIONS
+    if not marked:
+        return False
+    if directory_identity(version_root) == identity:
+        return True
+    # A restored backup at the same vid is a new directory. The stale handler's
+    # manifest identity check still refuses it, while this removal keeps the
+    # process marker proportional to directories that remain at their old paths.
+    with _RETIRED_LOCK:
+        _RETIRED_VERSIONS.discard(marker)
+    return False
 
 
 @contextlib.contextmanager
@@ -2828,10 +2852,12 @@ def _make_handler(
     call time, while manifest identity and subprocess cwd remain VersionRoot data.
     """
 
+    advertised_directory_identity = directory_identity(advertised.version_root)
+
     async def _handler(arguments: dict[str, Any]) -> str:
         package_root = advertised.package_root
         version_root = advertised.version_root
-        if identity is None:
+        if identity is None or advertised_directory_identity is None:
             return _TOOL_REPLACED_RESULT
         # Register the exact VersionRoot before any queued work. A hold nobody can
         # identify would be invisible to package-wide destructive cleanup.
@@ -2864,6 +2890,7 @@ def _make_handler(
                     list(entry),
                     advertised,
                     identity,
+                    advertised_directory_identity,
                     env,
                     args_json,
                     settings.llm_tool_timeout_seconds,
@@ -3025,21 +3052,20 @@ def discard_version(resolution: Resolved) -> DiscardOutcome:
     if target is None:
         return "lineage_unavailable"
     assert isinstance(previous_vid, str)
+    retired_identity = directory_identity(current)
 
     publication = publish_current(package_root, previous_vid)
     if not publication:
         return "not_found"
 
-    # Publication retires V whether or not best-effort parking can move it. This
-    # marker MUST precede both early returns below: otherwise the successful-but-
-    # undurable and rename-failed branches would leave an advertised live path
-    # executable after the API reported that V was discarded.
-    _retire_version(package_root, resolution.vid)
-
     # Discard is complete at publication. Everything below is best-effort
     # cleanup, but destructive cleanup is forbidden unless the directory fsync
     # confirmed that the new pointer survives a crash.
     if not publication.durable:
+        # V still occupies the exact advertised path, so its pre-discard handlers
+        # need the directory-identity marker in addition to their ordinary path
+        # and manifest checks.
+        _retire_version(current, retired_identity)
         return "ok"
 
     # RENAME FIRST, then decide -- the same order whole-package deletion uses,
@@ -3054,10 +3080,15 @@ def discard_version(resolution: Resolved) -> DiscardOutcome:
     # so a failed rename cannot turn a completed discard into a failure or
     # license an ``rmtree`` against the still-live spelling.
     parked = current.path.with_name(f"{resolution.vid}.discarded")
+    # Close the publish-to-rename window before attempting the best-effort move.
+    # A successful rename makes the ordinary path identity check sufficient and
+    # clears this marker; a failed rename leaves it as the required refusal.
+    _retire_version(current, retired_identity)
     try:
         os.rename(current.path, parked)
     except Exception:
         return "ok"
+    _unretire_version(current, retired_identity)
 
     try:
         running = package_execution_in_flight(package_root)

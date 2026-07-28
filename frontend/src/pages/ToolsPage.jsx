@@ -45,7 +45,9 @@ import {
 	buildDiscardRequest,
 	buildRegenerateRequest,
 	buildReviseRequest,
+	clearLineageUnavailable,
 	logLinkSearch,
+	markLineageUnavailable,
 	ownSummaryBusy,
 	summaryErrorRevalidates,
 	toolIdentityConsumers,
@@ -710,8 +712,11 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	const [discardTarget, setDiscardTarget] = useState(null);
 	// A late lineage_unavailable means the row's previously "usable" lineage was
 	// hand-broken after the list read. It will not heal by refetching, so remember
-	// that exact instance locally and render the same controls as `broken`.
-	const [lineageUnavailableKey, setLineageUnavailableKey] = useState(null);
+	// every independently proven instance locally and render those controls as
+	// `broken`; one tool's later 409 must not erase another tool's evidence.
+	const [lineageUnavailableKeys, setLineageUnavailableKeys] = useState(
+		() => new Set(),
+	);
 	// The one revise job this panel is currently tracking, and which tool
 	// INSTANCE it belongs to (the canonical job attribution key captured at
 	// submit time -- see activeJobKey). Mirrors InstallPanel's single `jobId` for the same
@@ -790,7 +795,9 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 			queryClient.invalidateQueries({ queryKey: ["tools"], exact: true });
 		} else if (reaction === "delete-tool" && instanceKey !== null) {
 			// No refetch: a broken previous pointer is stable filesystem state.
-			setLineageUnavailableKey(instanceKey);
+			setLineageUnavailableKeys((current) =>
+				markLineageUnavailable(current, instanceKey),
+			);
 		}
 		return reaction;
 	};
@@ -802,7 +809,9 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 		},
 		onSuccess: async (_data, variables) => {
 			setDiscardTarget(null);
-			setLineageUnavailableKey(null);
+			setLineageUnavailableKeys((current) =>
+				clearLineageUnavailable(current, variables.jobAttributionKey),
+			);
 			// V is no longer current and may already be removed. Clear every
 			// version of this name; P will fetch into its own current_vid key.
 			queryClient.removeQueries({
@@ -1280,7 +1289,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 								jobAttributionKey: targetIdentity.jobAttributionKey,
 							})
 						}
-						lineageUnavailable={lineageUnavailableKey === rowKey}
+						lineageUnavailable={lineageUnavailableKeys.has(rowKey)}
 						writesBlocked={versionWritesBlocked}
 						settlingJobEnd={settlingJobEnd}
 						isRegenerating={

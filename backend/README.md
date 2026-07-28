@@ -272,8 +272,9 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 - **安裝器與提交順序**：每場工作用
   `<TOOLS_DIR>/.staging/<uuid>/{build,shell}`；`finally` 永遠清完整 session root。
   builder 在 `build` 工作，後端先擷取並剝除 builder 寫的根層 `.env`，再剝除
-  `.afterthread.meta`、legacy `.ai_meta.json` 與根層 legacy
-  `.afterthread-state.json` 等保留內容，然後驗證 `BuildRoot`。新安裝在 `shell`
+  版本根層的 `.afterthread.meta/`，然後驗證 `BuildRoot`。legacy
+  `.ai_meta.json` 與 `.afterthread-state.json` 在版本層是一般工具內容；同名的舊
+  package-root 檔案才屬於 legacy 後端命名空間。新安裝在 `shell`
   組出完整 package：版本內容、`origin.json(previous=null)`、初始 enabled state、
   `current`，以及表單秘密注入的 package `.env`；所有內容持久化後，以一次
   `os.rename(shell, <name>)` 上線。目標只要已存在任何內容就拒絕，不覆蓋。
@@ -286,8 +287,11 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `secret_name`／`secret_value` 是另一條後端受控路徑：值注入 `run_shell`、全程
   遮蔽，最後才由後端寫進 package `.env`，從未交給 builder。
 - **修訂只新增版本，不再換整包**：`run_revise` 從目前的 `VersionRoot` 複製工具
-  內容到 `build`；package `.env` 從未進工作區、也不被複製或改寫，只把解析後的值
-  注入 `run_shell` 供實測與遮蔽。builder 寫出的 `.env` 同樣被剝除。通過驗證後，
+  內容到 `build`；只排除該版後端自己的根層 `.afterthread.meta/` 與 package
+  `.env`。版本中的 legacy `.ai_meta.json`、FOREIGN
+  `.afterthread-state.json`（包含 migration 帶入者）及其巢狀同名檔都是工具內容，
+  會進工作區並隨新版本保留。package `.env` 不被複製或改寫，只把解析後的值注入
+  `run_shell` 供實測與遮蔽；builder 寫出的 `.env` 同樣被剝除。通過驗證後，
   `shell` 被組成一個版本目錄並先寫
   `origin.json(previous=<舊 vid>, feedback=<本次意見>)`；版本持久化、rename 到
   `versions/<新 vid>` 後才原子發布 `current`。因此舊版本永久保留、套件 state 與
@@ -295,8 +299,12 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   會避開 `versions/` 下所有以候選 vid 開頭的項目，包括 `.discarded`。
 - **執行綁定廣告時的版本**：registry 廣告工具時把 `PackageRoot`、
   `VersionRoot`、entry 與 manifest identity 一起封進 handler；模型稍後真的呼叫時
-  直接以那個 `VersionRoot` 當 cwd，**不再重讀 `current`**。package `.env` 與開關
-  則在呼叫當下讀。這避免 pointer 改變後用舊 schema 執行新程式；若操作者在廣告與
+  直接以那個 `VersionRoot` 當 cwd。package `.env` 與開關則在呼叫當下讀。
+  **`current` 在呼叫當下仍會解析一次，但只用來確認「這個套件還有可用的版本」，
+  不用來決定跑哪一版**——否則廣告綁定就沒有意義了。少了這道確認，列表會把
+  `current` 壞掉的套件判成 invalid＋停用，而已廣告的 handler 照樣跑得起來，
+  同一個問題兩條路徑兩個答案（overall review r2-4）。這避免 pointer 改變後用舊
+  schema 執行新程式；若操作者在廣告與
   呼叫間親手 discard 該版，呼叫會得到明確拒絕，系統刻意不為這個單人操作引入
   reservation/refcount。
 - **版本保留、lineage 與 discard**：`origin.json.previous` 是前一版的唯一來源，
@@ -305,7 +313,10 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   指回自己。discard 的順序固定為：確認 expected vid → sole 則整包刪除 → 驗前一版
   → 發布 `current=P` → 只有 pointer 的目錄 fsync 已確認才盡力移除 V。V 還在執行
   時改名 `<vid>.discarded`；無法確認持久化時保留 V 但仍回成功，因為多一個未指向
-  版本比「斷電後 current 指到已刪版本」安全。
+  版本比「斷電後 current 指到已刪版本」安全。只有無法確認持久化或停放 rename
+  失敗、使 V 仍留在原廣告路徑時，才以該目錄的 `(device, inode)` 暫記退役；
+  停放成功時原路徑已消失，handler 自己的 identity check 已足夠，不留下 marker。
+  因此同 vid 從備份恢復成另一個 inode 時可在同一行程重新廣告與執行。
 - **AI 總結拆成兩份 sidecar**：每版不可變的
   `.afterthread.meta/origin.json` 保存來源、安裝指示、修訂意見與 previous；
   可重新產生的 `.afterthread.meta/summary.json` 保存 summary、updated time 與

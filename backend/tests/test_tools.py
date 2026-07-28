@@ -1003,6 +1003,9 @@ def test_invariant_e_discard_succeeds_when_old_version_removal_fails(
     assert not second.exists()
     assert parked.is_dir()
     assert asked == [tools.PackageRoot(package)]
+    # Parking removed the advertised path, so its own identity guard is enough;
+    # even failed destruction of the parked directory must not leave a marker.
+    assert not tools._RETIRED_VERSIONS
 
 
 def test_discard_parks_before_running_check_then_removes_the_idle_version(
@@ -1055,6 +1058,7 @@ def test_discard_parks_before_running_check_then_removes_the_idle_version(
     assert events == ["rename", "running-check", "remove"]
     assert _resolved_version(package) == first
     assert not parked.exists()
+    assert not tools._RETIRED_VERSIONS
 
 
 def test_discard_rename_failure_is_success_and_leaves_the_version_in_place(
@@ -1161,6 +1165,8 @@ def test_retired_advertised_version_cannot_run_when_discard_cannot_park_it(
     handler = enabled_llm_tools()[0].handler
     resolution = tools.resolve_current(package_root)
     assert isinstance(resolution, tools.Resolved)
+    retired_identity = tools.directory_identity(tools.VersionRoot(second))
+    assert retired_identity is not None
 
     if cleanup_failure == "parking":
 
@@ -1186,7 +1192,61 @@ def test_retired_advertised_version_cannot_run_when_discard_cannot_park_it(
     assert second.is_dir()
     assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
     assert not sentinel.exists()
-    assert tools.version_retired(package_root, second_vid) is True
+    assert tools.version_retired(tools.VersionRoot(second), retired_identity) is True
+
+
+def test_restored_backup_of_retired_vid_executes_in_the_same_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The marker follows V's directory inode, not its reusable vid/path.
+
+    Force the unconfirmed-durability outcome so V remains at the advertised path
+    and therefore really receives a marker. Restoring a pre-discard backup creates
+    another directory identity at that same path; a fresh advertisement must run,
+    while the old handler remains bound to the replaced manifest identity.
+    """
+    root = tmp_path / "tools"
+    first = _make_tool(root, "echo", "import sys\nsys.stdout.write('FIRST')\n")
+    package = _package_path(first)
+    package_root = tools.PackageRoot(package)
+    second_vid = "20260728T020304Z-fedcba"
+    second = _add_committed_version(package, second_vid, description="second", output="SECOND")
+    assert tools.publish_current(package_root, second_vid)
+    backup = tmp_path / "second-backup"
+    shutil.copytree(second, backup)
+    retired_identity = tools.directory_identity(tools.VersionRoot(second))
+    backup_identity = tools.directory_identity(tools.VersionRoot(backup))
+    assert retired_identity is not None
+    assert backup_identity is not None
+    assert backup_identity != retired_identity
+
+    _install_tools(monkeypatch, root)
+    stale_handler = enabled_llm_tools()[0].handler
+    resolution = tools.resolve_current(package_root)
+    assert isinstance(resolution, tools.Resolved)
+    real_publish = tools.publish_current
+
+    def publish_without_confirmed_durability(
+        target_root: tools.PackageRoot, vid: str
+    ) -> tools.CurrentPublication:
+        publication = real_publish(target_root, vid)
+        assert publication.published
+        return tools.CurrentPublication(published=True, durable=False)
+
+    monkeypatch.setattr(tools, "publish_current", publish_without_confirmed_durability)
+
+    assert tools.discard_version(resolution) == "ok"
+    assert tools.version_retired(tools.VersionRoot(second), retired_identity) is True
+    shutil.rmtree(second)
+    os.rename(backup, second)
+    restored_identity = tools.directory_identity(tools.VersionRoot(second))
+    assert restored_identity == backup_identity
+    assert restored_identity != retired_identity
+    assert real_publish(package_root, second_vid)
+
+    fresh_handler = enabled_llm_tools()[0].handler
+    assert asyncio.run(fresh_handler({})) == "SECOND"
+    assert asyncio.run(stale_handler({})) == tools._TOOL_REPLACED_RESULT
 
 
 def _write_state_file(pkg: Path, enabled: bool) -> None:
@@ -2539,6 +2599,7 @@ def test_runtime_background_descendant_reaped_no_thread_leak(
             entry,
             advertised,
             tools.package_identity(_version_root(pkg)),
+            tools.directory_identity(_version_root(pkg)),
             env,
             "{}",
             30.0,
@@ -2612,6 +2673,7 @@ def test_runtime_detached_child_closing_pipes_is_killed(
             entry,
             advertised,
             tools.package_identity(_version_root(pkg)),
+            tools.directory_identity(_version_root(pkg)),
             env,
             "{}",
             30.0,

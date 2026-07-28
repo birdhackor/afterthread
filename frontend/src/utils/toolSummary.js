@@ -120,6 +120,21 @@ export function versionWriteConflictReaction({ status, code } = {}) {
 	return null;
 }
 
+// Locally-proven broken lineage is per tool INSTANCE, not a panel-wide slot.
+// React state must be replaced rather than mutating the previous Set in place so
+// marking B both re-renders and leaves A's independent 409 evidence intact.
+export function markLineageUnavailable(instanceKeys, instanceKey) {
+	const next = new Set(instanceKeys);
+	next.add(instanceKey);
+	return next;
+}
+
+export function clearLineageUnavailable(instanceKeys, instanceKey) {
+	const next = new Set(instanceKeys);
+	next.delete(instanceKey);
+	return next;
+}
+
 // The list exposes exactly three lineage states. A missing current version is
 // the unresolved-row case and overrides even the ordinary controls: there is no
 // version that can be toggled, summarized, revised, regenerated or discarded.
