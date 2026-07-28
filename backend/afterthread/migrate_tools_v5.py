@@ -3,7 +3,8 @@
 The journal is the authority for every migration-owned sibling.  A deterministic
 name by itself never grants permission to overwrite or remove anything.  With no
 journal, preflight refuses ``<name>.at-migrated``,
-``<name>.at-premigrate``, and ``.<name>.at-migration-shell`` as operator-owned.
+``<name>.at-premigrate``, ``.<name>.at-premigrate-tombstone``, and
+``.<name>.at-migration-shell`` as operator-owned.
 
 Each package has five ordered actions.  ``completed`` is the number of actions
 whose durable ``done`` record was published, and ``pending`` is either null or the
@@ -42,8 +43,10 @@ and then restores old package names using rename only.  Rollback can be resumed
 after any interruption and never needs to delete an old or sole copy.  Removal
 of migration-owned shells is a later, explicitly journaled maintenance phase.
 After every package is active, ``committed`` is published atomically and durably
-before the first ``.at-premigrate`` removal.  Once read, ``committed`` permits
-cleanup only; no error path may attempt rollback.
+before the first ``.at-premigrate`` cleanup rename. Once read, ``committed``
+permits cleanup only; no error path may attempt rollback. Cleanup first renames
+each verified old package to its journal-owned tombstone, whose identity remains
+valid while ``rmtree`` progressively removes the package's own identifying files.
 
 Tests inject failures through :class:`MigrationOperations`, at both sides of
 every journal publish and filesystem action.  The indirection is deliberately
@@ -93,12 +96,14 @@ _VERSIONS_DIRNAME = "versions"
 _SHELL_SUFFIX = ".at-migration-shell"
 _MIGRATED_SUFFIX = ".at-migrated"
 _PREMIGRATE_SUFFIX = ".at-premigrate"
+_PREMIGRATE_TOMBSTONE_SUFFIX = ".at-premigrate-tombstone"
 _ACTIONS = ("assemble", "copy_env", "publish_shell", "park_old", "activate_new")
 _STATUS_VALUES = frozenset({"running", "rolling_back", "rolled_back", "committed"})
 _VID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$")
 _PACKAGE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _SIBLING_RE = re.compile(r"^(.+)\.at-(?:migrated|premigrate)$")
 _SHELL_RE = re.compile(r"^\.(.+)\.at-migration-shell$")
+_PREMIGRATE_TOMBSTONE_RE = re.compile(r"^\.[a-z0-9][a-z0-9_-]{0,63}\.at-premigrate-tombstone$")
 _ENV_KEY_RE = re.compile(rb"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*=")
 
 
@@ -525,7 +530,11 @@ def _fresh_preflight(root: Path) -> Preflight:
     # before skipping hidden/non-package entries so an old crash artifact cannot be
     # silently adopted by a fresh run.
     for child in children:
-        if _SIBLING_RE.fullmatch(child.name) or _SHELL_RE.fullmatch(child.name):
+        if (
+            _SIBLING_RE.fullmatch(child.name)
+            or _SHELL_RE.fullmatch(child.name)
+            or _PREMIGRATE_TOMBSTONE_RE.fullmatch(child.name)
+        ):
             problems.append(
                 f"{child.name}: migration sibling exists without {_JOURNAL_FILENAME}; "
                 "it is treated as operator-owned"
@@ -730,6 +739,10 @@ def _migrated_path(root: Path, name: str) -> Path:
 
 def _premigrate_path(root: Path, name: str) -> Path:
     return root / f"{name}{_PREMIGRATE_SUFFIX}"
+
+
+def _premigrate_tombstone_path(root: Path, name: str) -> Path:
+    return root / f".{name}{_PREMIGRATE_TOMBSTONE_SUFFIX}"
 
 
 def _assemble_shell(root: Path, package: LegacyPackage, vid: str) -> None:
@@ -1270,6 +1283,21 @@ def _cleanup_committed(
     for package in journal["packages"]:
         name = package["name"]
         premigrate = _premigrate_path(root, name)
+        tombstone = _premigrate_tombstone_path(root, name)
+
+        # ``committed`` proves every swap completed and permanently rules out
+        # rollback. Fresh preflight proved this deterministic tombstone absent;
+        # the only migration operation that can create it is the durable rename
+        # immediately below, after _old_package_at verified the complete residue.
+        # A rerun therefore removes an existing tombstone without re-reading
+        # tool.json: that file may be exactly what an interrupted rmtree already
+        # deleted, while the journal-owned NAME survives until the final entry is
+        # gone.
+        if tombstone.exists() or tombstone.is_symlink():
+            operations.mutate(
+                f"cleanup:{name}:premigrate:delete",
+                lambda path=tombstone: _remove_owned_tree(path),
+            )
         if premigrate.exists() or premigrate.is_symlink():
             if not _old_package_at(premigrate):
                 raise MigrationRefused(
@@ -1277,8 +1305,12 @@ def _cleanup_committed(
                     "the old package"
                 )
             operations.mutate(
-                f"cleanup:{name}:premigrate",
-                lambda path=premigrate: _remove_owned_tree(path),
+                f"cleanup:{name}:premigrate:park",
+                lambda source=premigrate, target=tombstone: _rename_durable(source, target, root),
+            )
+            operations.mutate(
+                f"cleanup:{name}:premigrate:delete",
+                lambda path=tombstone: _remove_owned_tree(path),
             )
         # These should normally be absent after activation.  A crash can leave a
         # shell only before commit, but validating/removing them here makes cleanup

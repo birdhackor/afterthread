@@ -194,6 +194,7 @@ def _assert_migrated(root: Path, name: str = "alpha") -> Path:
     state = json.loads((package / ".afterthread.meta" / "state.json").read_text(encoding="utf-8"))
     assert state[migration._STATE_MARKER_KEY] == migration._STATE_MARKER_VALUE
     assert not (root / f"{name}.at-premigrate").exists()
+    assert not migration._premigrate_tombstone_path(root, name).exists()
     assert not (root / f"{name}.at-migrated").exists()
     assert not (root / f".{name}.at-migration-shell").exists()
     assert not (root / migration._JOURNAL_FILENAME).exists()
@@ -374,21 +375,70 @@ def test_each_rollback_journal_write_side_recovers(
         assert not (root / migration._JOURNAL_FILENAME).exists()
 
 
-def test_committed_cleanup_failure_never_attempts_rollback_and_retries(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "before_park",
+        "after_park",
+        "before_delete",
+        "mid_delete",
+        "after_delete",
+    ],
+)
+def test_committed_cleanup_fault_matrix_never_attempts_rollback_and_retries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fault: str
 ) -> None:
+    """Every cleanup boundary, including partial rmtree, resumes from committed."""
+
     root = tmp_path / "tools"
     _make_package(root)
+    premigrate = root / "alpha.at-premigrate"
+    tombstone = migration._premigrate_tombstone_path(root, "alpha")
+    failures = {
+        "before_park": "before:cleanup:alpha:premigrate:park",
+        "after_park": "after:cleanup:alpha:premigrate:park",
+        "before_delete": "before:cleanup:alpha:premigrate:delete",
+        "after_delete": "after:cleanup:alpha:premigrate:delete",
+    }
     first = PointFailureOperations(
-        {"before:cleanup:alpha:premigrate": OSError("injected cleanup failure")}
+        {failures[fault]: OSError("injected cleanup interruption")} if fault in failures else {}
     )
+
+    if fault == "mid_delete":
+        real_rmtree = migration.shutil.rmtree
+        interrupted = False
+
+        def interrupt_tombstone_delete(path: Path, *args: Any, **kwargs: Any) -> None:
+            nonlocal interrupted
+            if Path(path) == tombstone and not interrupted:
+                interrupted = True
+                # Remove identifying files while leaving the larger subtree, the
+                # exact partial-rmtree state that defeated _old_package_at.
+                (tombstone / "tool.json").unlink()
+                (tombstone / "run.py").unlink()
+                assert (tombstone / "data").is_dir()
+                raise OSError("injected interruption during recursive delete")
+            real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(migration.shutil, "rmtree", interrupt_tombstone_delete)
 
     assert _run(root, operations=first) == 1
 
     journal = json.loads((root / migration._JOURNAL_FILENAME).read_text(encoding="utf-8"))
     assert journal["status"] == "committed"
     assert migration._is_new_package_at(root / "alpha")
-    assert (root / "alpha.at-premigrate").is_dir()
+    if fault == "before_park":
+        assert premigrate.is_dir()
+        assert not tombstone.exists()
+    elif fault == "after_delete":
+        assert not premigrate.exists()
+        assert not tombstone.exists()
+    else:
+        assert not premigrate.exists()
+        assert tombstone.is_dir()
+    if fault == "mid_delete":
+        assert not (tombstone / "tool.json").exists()
+        assert (tombstone / "data").is_dir()
 
     seen: list[str] = []
     guard = PointFailureOperations({}, seen=seen)
@@ -550,7 +600,12 @@ def test_broken_symlink_at_target_layout_name_is_still_operator_owned(
 
 @pytest.mark.parametrize(
     "sibling_name",
-    ["alpha.at-migrated", "alpha.at-premigrate", ".alpha.at-migration-shell"],
+    [
+        "alpha.at-migrated",
+        "alpha.at-premigrate",
+        ".alpha.at-premigrate-tombstone",
+        ".alpha.at-migration-shell",
+    ],
 )
 def test_deterministic_sibling_without_journal_is_operator_owned_and_refused(
     tmp_path: Path, sibling_name: str

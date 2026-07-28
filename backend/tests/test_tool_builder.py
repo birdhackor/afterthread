@@ -63,9 +63,9 @@ _TEST_VID = "20260728T010203Z-abcdef"
 @pytest.fixture(autouse=True)
 def _reset_singletons() -> Generator[None]:
     """Empty the job table, the llm_log ring, and the process-wide known-secret
-    and in-flight-execution registries around every test (all module-level
-    singletons the installer touches), then DRAIN the single-flight
-    client-construction worker.
+    in-flight-execution, and advertisement-generation registries around every
+    test (all module-level singletons the installer touches), then DRAIN the
+    single-flight client-construction worker.
 
     The drain is what makes the timing/threading fetch tests deterministic under
     any collection order: a prior test's still-running (or still-queued) fake
@@ -79,7 +79,7 @@ def _reset_singletons() -> Generator[None]:
     llm_log._reset_for_tests()
     tools._INFLIGHT_SECRETS.clear()
     tools._INFLIGHT_EXECUTIONS.clear()
-    tools._RETIRED_VERSIONS.clear()
+    tools._ADVERTISEMENT_GENERATIONS.clear()
     tools._ENV_VALUE_CACHE.clear()
     yield
     tool_builder._reset_jobs_for_tests()
@@ -89,7 +89,7 @@ def _reset_singletons() -> Generator[None]:
     # registration surviving a test would silently turn the next one's swap into a
     # deferral -- the same reason the secret set is cleared here.
     tools._INFLIGHT_EXECUTIONS.clear()
-    tools._RETIRED_VERSIONS.clear()
+    tools._ADVERTISEMENT_GENERATIONS.clear()
     tools._ENV_VALUE_CACHE.clear()
     tool_builder._drain_setup_worker_for_tests()
 

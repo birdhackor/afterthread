@@ -83,10 +83,10 @@ _TEST_VID = "20260728T010203Z-abcdef"
 def _reset_log() -> Generator[None]:
     """Empty process-local singleton state around every test."""
     llm_log._reset_for_tests()
-    tools._RETIRED_VERSIONS.clear()
+    tools._ADVERTISEMENT_GENERATIONS.clear()
     yield
     llm_log._reset_for_tests()
-    tools._RETIRED_VERSIONS.clear()
+    tools._ADVERTISEMENT_GENERATIONS.clear()
 
 
 # --- target model + tool-loop stubs ----------------------------------------
@@ -1005,7 +1005,7 @@ def test_invariant_e_discard_succeeds_when_old_version_removal_fails(
     assert asked == [tools.PackageRoot(package)]
     # Parking removed the advertised path, so its own identity guard is enough;
     # even failed destruction of the parked directory must not leave a marker.
-    assert not tools._RETIRED_VERSIONS
+    assert not tools._ADVERTISEMENT_GENERATIONS
 
 
 def test_discard_parks_before_running_check_then_removes_the_idle_version(
@@ -1058,7 +1058,7 @@ def test_discard_parks_before_running_check_then_removes_the_idle_version(
     assert events == ["rename", "running-check", "remove"]
     assert _resolved_version(package) == first
     assert not parked.exists()
-    assert not tools._RETIRED_VERSIONS
+    assert not tools._ADVERTISEMENT_GENERATIONS
 
 
 def test_discard_rename_failure_is_success_and_leaves_the_version_in_place(
@@ -1165,9 +1165,6 @@ def test_retired_advertised_version_cannot_run_when_discard_cannot_park_it(
     handler = enabled_llm_tools()[0].handler
     resolution = tools.resolve_current(package_root)
     assert isinstance(resolution, tools.Resolved)
-    retired_identity = tools.directory_identity(tools.VersionRoot(second))
-    assert retired_identity is not None
-
     if cleanup_failure == "parking":
 
         def fail_rename(source: Path, _target: Path) -> None:
@@ -1192,18 +1189,21 @@ def test_retired_advertised_version_cannot_run_when_discard_cannot_park_it(
     assert second.is_dir()
     assert asyncio.run(handler({})) == tools._TOOL_REPLACED_RESULT
     assert not sentinel.exists()
-    assert tools.version_retired(tools.VersionRoot(second), retired_identity) is True
+    # Discard removed the cohort from the lookup table; the old handler itself
+    # owns the retired generation for as long as the conversation owns it.
+    assert tools.VersionRoot(second) not in tools._ADVERTISEMENT_GENERATIONS
 
 
 def test_restored_backup_of_retired_vid_executes_in_the_same_process(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The marker follows V's directory inode, not its reusable vid/path.
+    """A restored V gets a fresh advertisement generation in the same process.
 
     Force the unconfirmed-durability outcome so V remains at the advertised path
-    and therefore really receives a marker. Restoring a pre-discard backup creates
-    another directory identity at that same path; a fresh advertisement must run,
-    while the old handler remains bound to the replaced manifest identity.
+    and its already-created handler is retired. Restoring a pre-discard backup
+    creates another directory identity at that same path; a fresh advertisement
+    must run, while the old handler remains retired independently of both
+    manifest and directory identities.
     """
     root = tmp_path / "tools"
     first = _make_tool(root, "echo", "import sys\nsys.stdout.write('FIRST')\n")
@@ -1236,7 +1236,6 @@ def test_restored_backup_of_retired_vid_executes_in_the_same_process(
     monkeypatch.setattr(tools, "publish_current", publish_without_confirmed_durability)
 
     assert tools.discard_version(resolution) == "ok"
-    assert tools.version_retired(tools.VersionRoot(second), retired_identity) is True
     shutil.rmtree(second)
     os.rename(backup, second)
     restored_identity = tools.directory_identity(tools.VersionRoot(second))
@@ -1247,6 +1246,72 @@ def test_restored_backup_of_retired_vid_executes_in_the_same_process(
     fresh_handler = enabled_llm_tools()[0].handler
     assert asyncio.run(fresh_handler({})) == "SECOND"
     assert asyncio.run(stale_handler({})) == tools._TOOL_REPLACED_RESULT
+
+
+def test_retired_advertisement_survives_rename_aside_and_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No filesystem identity can revive an old handler or poison a fresh one.
+
+    V2's first discard cannot park it, so its advertised handler is retired while
+    the directory stays put. Rename that exact directory aside, discard V1, then
+    rename V2 back and make it current. The inode and manifest identity are both
+    unchanged: the old handler must still refuse because its process-local
+    advertisement generation is retired, while a newly advertised handler over
+    those SAME filesystem attributes must execute.
+    """
+
+    root = tmp_path / "tools"
+    first = _make_tool(root, "echo", "import sys\nsys.stdout.write('FIRST')\n")
+    package = _package_path(first)
+    package_root = tools.PackageRoot(package)
+    second_vid = "20260728T020304Z-fedcba"
+    second = _add_committed_version(package, second_vid, description="second", output="SECOND")
+    third_vid = "20260728T030405Z-acdeff"
+    third = package / tools._VERSIONS_DIRNAME / third_vid
+    shutil.copytree(first, third)
+    first_origin = first / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    first_origin_document = json.loads(first_origin.read_text(encoding="utf-8"))
+    first_origin_document["previous"] = third_vid
+    first_origin.write_text(json.dumps(first_origin_document), encoding="utf-8")
+    assert tools.publish_current(package_root, second_vid)
+
+    _install_tools(monkeypatch, root)
+    stale_handler = enabled_llm_tools()[0].handler
+    second_identity = tools.directory_identity(tools.VersionRoot(second))
+    second_manifest_identity = tools.package_identity(tools.VersionRoot(second))
+    assert second_identity is not None
+    assert second_manifest_identity is not None
+
+    real_rename = tools.os.rename
+
+    def fail_discard_parking(source: Path, target: Path) -> None:
+        assert Path(source) in {first, second}
+        assert Path(target).name.endswith(".discarded")
+        raise PermissionError("injected parking failure")
+
+    monkeypatch.setattr(tools.os, "rename", fail_discard_parking)
+
+    second_resolution = tools.resolve_current(package_root)
+    assert isinstance(second_resolution, tools.Resolved)
+    assert tools.discard_version(second_resolution) == "ok"
+    assert _resolved_version(package) == first
+
+    aside = second.with_name(f".{second_vid}.aside")
+    real_rename(second, aside)
+    first_resolution = tools.resolve_current(package_root)
+    assert isinstance(first_resolution, tools.Resolved)
+    assert tools.discard_version(first_resolution) == "ok"
+    assert _resolved_version(package) == third
+
+    real_rename(aside, second)
+    assert tools.directory_identity(tools.VersionRoot(second)) == second_identity
+    assert tools.package_identity(tools.VersionRoot(second)) == second_manifest_identity
+    assert tools.publish_current(package_root, second_vid)
+
+    fresh_handler = enabled_llm_tools()[0].handler
+    assert asyncio.run(stale_handler({})) == tools._TOOL_REPLACED_RESULT
+    assert asyncio.run(fresh_handler({})) == "SECOND"
 
 
 def _write_state_file(pkg: Path, enabled: bool) -> None:
@@ -2599,7 +2664,7 @@ def test_runtime_background_descendant_reaped_no_thread_leak(
             entry,
             advertised,
             tools.package_identity(_version_root(pkg)),
-            tools.directory_identity(_version_root(pkg)),
+            tools._advertisement_generation(advertised.version_root),
             env,
             "{}",
             30.0,
@@ -2673,7 +2738,7 @@ def test_runtime_detached_child_closing_pipes_is_killed(
             entry,
             advertised,
             tools.package_identity(_version_root(pkg)),
-            tools.directory_identity(_version_root(pkg)),
+            tools._advertisement_generation(advertised.version_root),
             env,
             "{}",
             30.0,

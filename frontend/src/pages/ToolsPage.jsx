@@ -1163,7 +1163,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 						// Refresh means refresh EVERYTHING on screen, not just the list
 						// (R5-3). The current_vid key prevents cross-version reuse, while
 						// the name prefix still reaches every expanded version entry.
-						setLineageUnavailableKey(null);
+						setLineageUnavailableKeys(new Set());
 						refetch();
 						queryClient.invalidateQueries({ queryKey: ["tool-summary"] });
 					}}

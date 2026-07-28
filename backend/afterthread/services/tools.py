@@ -25,6 +25,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import weakref
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -2607,7 +2608,7 @@ def _run_tool_subprocess(
     entry: list[str],
     advertised: Resolved,
     expected_identity: tuple[int, int, int] | None,
-    advertised_directory_identity: tuple[int, int] | None,
+    advertisement_generation: _AdvertisementGeneration,
     env: dict[str, str],
     args_json: str,
     timeout: float,
@@ -2623,7 +2624,7 @@ def _run_tool_subprocess(
     move it while this call must remain bound to the schema it was shown.
     """
     version_root = advertised.version_root
-    if version_retired(version_root, advertised_directory_identity):
+    if _advertisement_retired(advertisement_generation):
         return _TOOL_REPLACED_RESULT
     package_root = advertised.package_root
     if not package_enabled(package_root):
@@ -2684,61 +2685,55 @@ def _run_tool_subprocess(
 _INFLIGHT_EXECUTIONS: dict[tuple[int, int], int] = {}
 _EXECUTION_LOCK = threading.Lock()
 
-# A marker is about one DIRECTORY INSTANCE, never the reusable ``(package, vid)``
-# address at which it happened to be advertised. A backup restored at the same
-# path has another inode and must be executable; the already-advertised handlers
-# retain this identity and remain refused. The VersionRoot beside it is only the
-# pruning address: once that path no longer names this inode, the marker has no
-# remaining job because the ordinary identity guard refuses every old handler.
+
+@dataclass(slots=True, weakref_slot=True)
+class _AdvertisementGeneration:
+    """One cohort of handlers offered for the same VersionRoot between discards."""
+
+    retired: bool = False
+
+
+# Retirement belongs to the ADVERTISEMENT, not to any recreatable filesystem
+# attribute. Every handler closure holds its cohort strongly; this weak map only
+# lets discard find the CURRENT cohort for a VersionRoot. Discard pops that cohort
+# before marking it, so a legitimately restored/current version receives a fresh
+# cohort while every old handler keeps its own retired object forever.
 #
-# Markers are retained only while failed parking (or unconfirmed durability)
-# leaves the directory at its advertised path. Successful parking clears the
-# provisional marker immediately, so ordinary discards cannot grow this
-# process-local set without bound.
-_RETIRED_VERSIONS: set[tuple[VersionRoot, tuple[int, int]]] = set()
-_RETIRED_LOCK = threading.Lock()
+# The map is bounded by live, not-yet-discarded advertisement cohorts: when the
+# last handler for a cohort is collected, WeakValueDictionary removes its entry;
+# discarded cohorts are removed eagerly. It therefore cannot grow with vid,
+# directory, inode, or discard history.
+_ADVERTISEMENT_GENERATIONS: weakref.WeakValueDictionary[VersionRoot, _AdvertisementGeneration] = (
+    weakref.WeakValueDictionary()
+)
+_ADVERTISEMENT_LOCK = threading.Lock()
 
 
-def _retire_version(version_root: VersionRoot, identity: tuple[int, int] | None) -> None:
-    """Make handlers bound to one still-present discarded directory inert."""
-    if identity is None:
-        return
-    with _RETIRED_LOCK:
-        # Reclaim markers whose inode has left its advertised path. Remaining
-        # markers correspond to directories that still consume filesystem space,
-        # rather than an append-only history of every vid this process discarded.
-        stale = {
-            marker for marker in _RETIRED_VERSIONS if directory_identity(marker[0]) != marker[1]
-        }
-        _RETIRED_VERSIONS.difference_update(stale)
-        _RETIRED_VERSIONS.add((version_root, identity))
+def _advertisement_generation(version_root: VersionRoot) -> _AdvertisementGeneration:
+    """Return the live handler cohort for one advertised VersionRoot."""
+
+    with _ADVERTISEMENT_LOCK:
+        generation = _ADVERTISEMENT_GENERATIONS.get(version_root)
+        if generation is None:
+            generation = _AdvertisementGeneration()
+            _ADVERTISEMENT_GENERATIONS[version_root] = generation
+        return generation
 
 
-def _unretire_version(version_root: VersionRoot, identity: tuple[int, int] | None) -> None:
-    """Drop the provisional marker after parking removed the advertised path."""
-    if identity is None:
-        return
-    with _RETIRED_LOCK:
-        _RETIRED_VERSIONS.discard((version_root, identity))
+def _retire_advertisements(version_root: VersionRoot) -> None:
+    """Retire exactly the handlers created before this discard."""
+
+    with _ADVERTISEMENT_LOCK:
+        generation = _ADVERTISEMENT_GENERATIONS.pop(version_root, None)
+        if generation is not None:
+            generation.retired = True
 
 
-def version_retired(version_root: VersionRoot, identity: tuple[int, int] | None) -> bool:
-    """Return whether discard retired this exact directory identity."""
-    if identity is None:
-        return False
-    marker = (version_root, identity)
-    with _RETIRED_LOCK:
-        marked = marker in _RETIRED_VERSIONS
-    if not marked:
-        return False
-    if directory_identity(version_root) == identity:
-        return True
-    # A restored backup at the same vid is a new directory. The stale handler's
-    # manifest identity check still refuses it, while this removal keeps the
-    # process marker proportional to directories that remain at their old paths.
-    with _RETIRED_LOCK:
-        _RETIRED_VERSIONS.discard(marker)
-    return False
+def _advertisement_retired(generation: _AdvertisementGeneration) -> bool:
+    """Read one process-local handler generation under its mutation lock."""
+
+    with _ADVERTISEMENT_LOCK:
+        return generation.retired
 
 
 @contextlib.contextmanager
@@ -2853,6 +2848,7 @@ def _make_handler(
     """
 
     advertised_directory_identity = directory_identity(advertised.version_root)
+    advertisement_generation = _advertisement_generation(advertised.version_root)
 
     async def _handler(arguments: dict[str, Any]) -> str:
         package_root = advertised.package_root
@@ -2890,7 +2886,7 @@ def _make_handler(
                     list(entry),
                     advertised,
                     identity,
-                    advertised_directory_identity,
+                    advertisement_generation,
                     env,
                     args_json,
                     settings.llm_tool_timeout_seconds,
@@ -3052,8 +3048,6 @@ def discard_version(resolution: Resolved) -> DiscardOutcome:
     if target is None:
         return "lineage_unavailable"
     assert isinstance(previous_vid, str)
-    retired_identity = directory_identity(current)
-
     publication = publish_current(package_root, previous_vid)
     if not publication:
         return "not_found"
@@ -3061,11 +3055,13 @@ def discard_version(resolution: Resolved) -> DiscardOutcome:
     # Discard is complete at publication. Everything below is best-effort
     # cleanup, but destructive cleanup is forbidden unless the directory fsync
     # confirmed that the new pointer survives a crash.
+    #
+    # Retire the handler cohort exactly once, after the successful publication
+    # that commits this discard and before either cleanup exit. The marker lives
+    # in each advertised handler's closure, so no rename, replacement, delete, or
+    # inode reuse can clear it; a later advertisement gets a new cohort.
+    _retire_advertisements(current)
     if not publication.durable:
-        # V still occupies the exact advertised path, so its pre-discard handlers
-        # need the directory-identity marker in addition to their ordinary path
-        # and manifest checks.
-        _retire_version(current, retired_identity)
         return "ok"
 
     # RENAME FIRST, then decide -- the same order whole-package deletion uses,
@@ -3080,15 +3076,10 @@ def discard_version(resolution: Resolved) -> DiscardOutcome:
     # so a failed rename cannot turn a completed discard into a failure or
     # license an ``rmtree`` against the still-live spelling.
     parked = current.path.with_name(f"{resolution.vid}.discarded")
-    # Close the publish-to-rename window before attempting the best-effort move.
-    # A successful rename makes the ordinary path identity check sufficient and
-    # clears this marker; a failed rename leaves it as the required refusal.
-    _retire_version(current, retired_identity)
     try:
         os.rename(current.path, parked)
     except Exception:
         return "ok"
-    _unretire_version(current, retired_identity)
 
     try:
         running = package_execution_in_flight(package_root)
