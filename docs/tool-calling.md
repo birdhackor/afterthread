@@ -141,8 +141,12 @@ temp file、fsync、`os.replace`、directory fsync 原子發布。
 session root。
 
 1. builder 在 `build/` 建立 `tool.json` 與實作並以 `run_shell` 測試。
-2. 後端擷取 builder 根層 `.env` 的 KEY 名後刪檔，再剝除 `.afterthread.meta`、
-   legacy `.ai_meta.json` 與根層 legacy `.afterthread-state.json`。
+2. 後端擷取 builder 根層 `.env` 的 KEY 名後刪檔，再剝除**根層 `.afterthread.meta/`**
+   ——**只有它**。`.ai_meta.json` 與 `.afterthread-state.json` 這兩個 legacy 扁平名稱
+   在**版本層是工具自己的東西**，任何深度都保留原樣：保留字描述的是**套件層**，而
+   `BuildRoot` 會變成 `versions/<vid>`。這條在 overall review r3 修正過——原本連版本層
+   一起剝除，導致遷移剛保住的 FOREIGN 狀態檔（工具自己的游標）在第一次修訂時被丟掉，
+   工具下一次執行才壞。
 3. `validate_tool_content` 驗 manifest、entry、containment、`.env` 大小與已知秘密
    內嵌政策。
 4. `shell/` 組成完整 package：單一 version、`origin.json(previous=null)`、初始
