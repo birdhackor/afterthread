@@ -28,6 +28,9 @@ const mockedApiDelete = vi.mocked(apiDelete) as unknown as Mock<
 const mockedApiGet = vi.mocked(apiGet) as unknown as Mock<
 	(path: string, options?: MockApiOptions) => Promise<unknown>
 >;
+const mockedApiPatch = vi.mocked(apiPatch) as unknown as Mock<
+	(path: string, options: MockApiOptions) => Promise<unknown>
+>;
 const mockedApiPost = vi.mocked(apiPost) as unknown as Mock<
 	(path: string, options: MockApiOptions) => Promise<unknown>
 >;
@@ -118,6 +121,26 @@ describe("ItemDetailPage destructive and rewriting requests", () => {
 		expect(
 			await screen.findByText(`已刪除「${item.title}」`),
 		).toBeInTheDocument();
+	});
+
+	it("patches status on the item identified by the route", async () => {
+		const user = userEvent.setup();
+		mockedApiPatch.mockResolvedValue({ ...item, status: "active" });
+		renderDetailPage();
+
+		expect(
+			await screen.findByRole("heading", { name: item.title }),
+		).toBeInTheDocument();
+		const status = screen.getByRole("combobox", { name: "狀態" });
+		await user.click(status);
+		await user.keyboard("{ArrowDown}{ArrowDown}{Enter}");
+
+		await waitFor(() => {
+			expect(apiPatch).toHaveBeenCalledWith("/api/items/{item_id}", {
+				path: { item_id: routeItemId },
+				body: { status: "active" },
+			});
+		});
 	});
 
 	it("posts a progress rewrite to the route item with the submitted note", async () => {

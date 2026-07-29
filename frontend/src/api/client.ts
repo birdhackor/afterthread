@@ -22,7 +22,6 @@ import type { components, paths } from "./schema.gen.js";
 
 type SchemaPath = keyof paths & string;
 type ApiMethod = "get" | "post" | "patch" | "delete";
-type FetchMethod = Uppercase<ApiMethod>;
 type QueryValue = string | number | boolean | null | undefined;
 
 // All endpoint request/response types below are projections of schema.gen.ts,
@@ -131,7 +130,17 @@ type RuntimeRequestParameters = {
 type ValidationError = components["schemas"]["ValidationError"];
 type ValidationMessage = Pick<ValidationError, "msg">;
 
-export interface ApiFetchOptions extends RequestInit {
+// The only direct callers are GET probes that need fetch-level controls such
+// as AbortSignal and passive-connectivity opt-out. JSON writes go through the
+// schema-typed helpers below; excluding method/body here prevents this lower
+// level surface from becoming an untyped write escape hatch.
+export interface ApiFetchOptions extends Omit<RequestInit, "body" | "method"> {
+	method: "GET";
+	body?: never;
+	reportConnectivity?: boolean;
+}
+
+interface RawApiFetchOptions extends RequestInit {
 	reportConnectivity?: boolean;
 }
 
@@ -311,16 +320,10 @@ function normalizeError(status: number, body: unknown): ApiError {
 // reports entirely, in both directions -- api/health.ts sets it for probe
 // traffic so its generation-guarded semantic verdict is structurally the
 // only connectivity writer for probes.
-export function apiFetch<
-	Method extends FetchMethod,
-	Path extends PathsForMethod<Lowercase<Method>>,
->(
+export function apiFetch<Path extends PathsForMethod<"get">>(
 	template: Path,
-	options: ApiFetchOptions & { method: Method } & ApiRequestParameters<
-			Path,
-			Lowercase<Method>
-		>,
-): Promise<ApiSuccessResponse<Path, Lowercase<Method>>> {
+	options: ApiFetchOptions & ApiRequestParameters<Path, "get">,
+): Promise<ApiSuccessResponse<Path, "get">> {
 	const {
 		path: pathParameters,
 		query,
@@ -332,12 +335,12 @@ export function apiFetch<
 			...fetchOptions,
 			method: options.method,
 		},
-	) as Promise<ApiSuccessResponse<Path, Lowercase<Method>>>;
+	) as Promise<ApiSuccessResponse<Path, "get">>;
 }
 
 async function rawApiFetch(
 	path: string,
-	options: ApiFetchOptions = {},
+	options: RawApiFetchOptions = {},
 ): Promise<unknown> {
 	const { reportConnectivity = true, ...fetchOptions } = options;
 	let response: Response;

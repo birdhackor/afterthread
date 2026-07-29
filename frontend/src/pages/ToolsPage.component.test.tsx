@@ -34,6 +34,9 @@ const mockedApiDelete = vi.mocked(apiDelete) as unknown as Mock<
 const mockedApiGet = vi.mocked(apiGet) as unknown as Mock<
 	(path: string, options?: MockApiOptions) => Promise<unknown>
 >;
+const mockedApiPatch = vi.mocked(apiPatch) as unknown as Mock<
+	(path: string, options: MockApiOptions) => Promise<unknown>
+>;
 const mockedApiPost = vi.mocked(apiPost) as unknown as Mock<
 	(path: string, options: MockApiOptions) => Promise<unknown>
 >;
@@ -48,6 +51,7 @@ type ToolDiscardResponse = ApiSuccessResponse<
 	"delete"
 >;
 type ToolDeleteResponse = ApiSuccessResponse<"/api/tools/{name}", "delete">;
+type ToolToggleResponse = ApiSuccessResponse<"/api/tools/{name}", "patch">;
 type ToolRegenerateResponse = ApiSuccessResponse<
 	"/api/tools/{name}/summary/regenerate",
 	"post"
@@ -183,6 +187,28 @@ describe("ToolsPage component", () => {
 		expect(screen.getByText("依城市查詢即時天氣")).toBeInTheDocument();
 		await waitFor(() => {
 			expect(screen.getByRole("button", { name: "重新整理" })).toBeEnabled();
+		});
+	});
+
+	it("toggles the tool identity supplied by the tools response", async () => {
+		const user = userEvent.setup();
+		const list = toolListWith({ name: "request-assertion-tool-37" });
+		const tool = list.tools[0];
+		mockToolReads(list);
+		mockedApiPatch.mockResolvedValue({
+			...tool,
+			enabled: false,
+		} satisfies ToolToggleResponse);
+
+		renderWithAppProviders(<ToolsPage />);
+		await waitForTool(tool.name);
+		await user.click(screen.getByRole("switch", { name: "啟用" }));
+
+		await waitFor(() => {
+			expect(apiPatch).toHaveBeenCalledWith("/api/tools/{name}", {
+				path: { name: tool.name },
+				body: { enabled: false },
+			});
 		});
 	});
 
@@ -444,7 +470,10 @@ describe("ToolsPage component", () => {
 		await user.click(screen.getByRole("button", { name: "丟掉並退回" }));
 
 		expect(apiDelete).toHaveBeenCalledWith("/api/tools/{name}/versions/{vid}", {
-			path: { name: "weather-search", vid: "v-weather-1" },
+			path: {
+				name: list.tools[0].name,
+				vid: list.tools[0].current_vid,
+			},
 		});
 		expect(
 			await screen.findByText(
@@ -689,8 +718,8 @@ describe("ToolsPage component", () => {
 		expect(apiPost).toHaveBeenCalledWith(
 			"/api/tools/{name}/summary/regenerate",
 			{
-				path: { name: "weather-search" },
-				body: { expected_vid: "v-weather-1" },
+				path: { name: list.tools[0].name },
+				body: { expected_vid: list.tools[0].current_vid },
 			},
 		);
 
@@ -979,10 +1008,10 @@ describe("ToolsPage component", () => {
 			expect(apiPost).toHaveBeenCalledTimes(1);
 		});
 		expect(apiPost).toHaveBeenCalledWith("/api/tools/{name}/revise", {
-			path: { name: "weather-search" },
+			path: { name: list.tools[0].name },
 			body: {
 				feedback: "調整第一個工具",
-				expected_vid: "v-weather-1",
+				expected_vid: list.tools[0].current_vid,
 			},
 		});
 		expect(
@@ -1073,13 +1102,12 @@ describe("ToolsPage component", () => {
 
 	it("blocks an invalid toggle and sends the exact whole-tool delete request", async () => {
 		const user = userEvent.setup();
-		mockToolReads(
-			toolListWith({
-				valid: false,
-				error: "tool.json 無效",
-				lineage: "broken",
-			}),
-		);
+		const list = toolListWith({
+			valid: false,
+			error: "tool.json 無效",
+			lineage: "broken",
+		});
+		mockToolReads(list);
 		mockedApiDelete.mockResolvedValue({
 			outcome: "removed",
 			retained_path: null,
@@ -1097,7 +1125,7 @@ describe("ToolsPage component", () => {
 		const dialog = await screen.findByRole("dialog", { name: "刪除工具" });
 		await user.click(within(dialog).getByRole("button", { name: "刪除" }));
 		expect(apiDelete).toHaveBeenCalledWith("/api/tools/{name}", {
-			path: { name: "weather-search" },
+			path: { name: list.tools[0].name },
 		});
 	});
 });

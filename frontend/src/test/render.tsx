@@ -19,10 +19,11 @@ afterEach(cleanup);
 // Every shim here was added because a test CRASHED without it, and the crash is
 // named beside it. That policy is the point: a speculative no-op is exercised by
 // nothing, so it can drift into a wrong answer while every test stays green.
-// It also tells us exactly which shims are needed instead of guessing — mounting
-// ItemDetailPage produced `ResizeObserver is not defined` and nothing else that
-// blocked, so ResizeObserver was added and IntersectionObserver, scrollIntoView
-// and getComputedStyle still are NOT, despite Mantine's guide listing them.
+// It also tells us exactly which shims are needed instead of guessing: mounting
+// ItemDetailPage needed ResizeObserver, and asserting its Select then needed
+// scrollIntoView — two of the five Mantine's guide lists, each added only when a
+// real error named it. IntersectionObserver and getComputedStyle still are NOT
+// here, and should stay absent until something actually crashes without them.
 //
 // A boundary we have not crossed is not a gap to pre-fill: an unshimmed API
 // throws loudly and names itself, which is self-detecting and needs no upkeep.
@@ -75,10 +76,23 @@ if (typeof globalThis.ResizeObserver === "undefined") {
 	} as unknown as typeof ResizeObserver;
 }
 
+// Mantine's Combobox scrolls the highlighted option into view when the keyboard
+// or a click moves the selection. jsdom implements no scrolling, so asserting a
+// Select on ItemDetailPage threw `TypeError: items[index]?.scrollIntoView is not
+// a function` from use-combobox — measured, like the two above, not assumed.
+//
+// A no-op is again the honest shape: with no layout there is nothing to scroll,
+// so this makes the interaction complete and asserts nothing about what ends up
+// visible. A test that depended on visibility after scrolling would be testing
+// the shim, not the app.
+if (typeof Element.prototype.scrollIntoView !== "function") {
+	Element.prototype.scrollIntoView = () => {};
+}
+
 interface AppRenderOptions extends Omit<RenderOptions, "wrapper"> {
 	initialEntries?: string[];
 	queryClient?: QueryClient;
-	routePath?: "/items/$itemId";
+	routePath?: "/items/$itemId" | "/items/$itemId/edit";
 }
 
 function createTestQueryClient() {

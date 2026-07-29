@@ -1,0 +1,3281 @@
+{
+  "components": {
+    "schemas": {
+      "AssistUpdateRequest": {
+        "description": "Payload for AI assisted update: a progress note to record.",
+        "properties": {
+          "note": {
+            "maxLength": 20000,
+            "minLength": 1,
+            "title": "Note",
+            "type": "string"
+          }
+        },
+        "required": [
+          "note"
+        ],
+        "title": "AssistUpdateRequest",
+        "type": "object"
+      },
+      "AssistUpdateResponse": {
+        "description": "AI assisted-update result: the updated item.",
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/MemoryItemRead"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "title": "AssistUpdateResponse",
+        "type": "object"
+      },
+      "CaptureRequest": {
+        "description": "Payload for AI quick capture: the raw discussion text to structure.",
+        "properties": {
+          "raw_text": {
+            "maxLength": 20000,
+            "minLength": 1,
+            "title": "Raw Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "raw_text"
+        ],
+        "title": "CaptureRequest",
+        "type": "object"
+      },
+      "CaptureResponse": {
+        "description": "AI quick-capture result: the created item plus follow-up questions.",
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/MemoryItemRead"
+          },
+          "questions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Questions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "item",
+          "questions"
+        ],
+        "title": "CaptureResponse",
+        "type": "object"
+      },
+      "EnrichRequest": {
+        "description": "Payload for AI full enrichment: new context to integrate.",
+        "properties": {
+          "additional_context": {
+            "maxLength": 20000,
+            "minLength": 1,
+            "title": "Additional Context",
+            "type": "string"
+          }
+        },
+        "required": [
+          "additional_context"
+        ],
+        "title": "EnrichRequest",
+        "type": "object"
+      },
+      "EnrichResponse": {
+        "description": "AI enrichment result: the updated item plus remaining checklist gaps.",
+        "properties": {
+          "gaps": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Gaps",
+            "type": "array"
+          },
+          "item": {
+            "$ref": "#/components/schemas/MemoryItemRead"
+          }
+        },
+        "required": [
+          "item",
+          "gaps"
+        ],
+        "title": "EnrichResponse",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "ItemListResponse": {
+        "description": "Paginated list of memory items.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryItemRead"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total"
+        ],
+        "title": "ItemListResponse",
+        "type": "object"
+      },
+      "LLMStatus": {
+        "description": "Whether an LLM endpoint is configured, the model name, and the ratio state.\n\nDeliberately excludes the base URL and API key -- only the boolean, the\nnon-secret model name, and the char<->token ratio estimator's state are\nsurfaced. ``model`` is genuinely null exactly when unconfigured, so its\nnullability is honest rather than a schema artifact. ``token_ratio`` is always\npresent (the estimator always has a state to report, even cold-started).",
+        "properties": {
+          "configured": {
+            "title": "Configured",
+            "type": "boolean"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "token_ratio": {
+            "$ref": "#/components/schemas/LLMTokenRatio"
+          }
+        },
+        "required": [
+          "configured",
+          "model",
+          "token_ratio"
+        ],
+        "title": "LLMStatus",
+        "type": "object"
+      },
+      "LLMTokenRatio": {
+        "description": "The live char<->token ratio estimator's public view (P4).\n\nSurfaced on ``LLMStatus.token_ratio`` from\nafterthread.services.token_budget.snapshot(). ``samples`` is how many\nrecent (chars, tokens) observations the rolling window holds; and\n``tokens_per_char`` is the learned ratio rounded to 4dp, genuinely null while\nthe window is still below the minimum-sample threshold (the cold-start default\nis in force and there is no observed ratio yet), so its nullability is honest.\nCarries no config value -- purely the internal estimator state.",
+        "properties": {
+          "samples": {
+            "title": "Samples",
+            "type": "integer"
+          },
+          "tokens_per_char": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tokens Per Char"
+          }
+        },
+        "required": [
+          "samples",
+          "tokens_per_char"
+        ],
+        "title": "LLMTokenRatio",
+        "type": "object"
+      },
+      "LlmLogAttempt": {
+        "description": "One request/response round: the full messages sent, the raw reply (or\nnull), this attempt's OWN token usage, and a SAFE failure category (or\nnull) if that attempt failed.\n\n``request_chars``/``response_chars`` are the STORED (post ``_stored_body``:\nUTF-8-safe, then size-capped) lengths, not the original size --\n``response_chars`` is null exactly when ``response_content`` is (no\nresponse ever landed on this attempt), never 0 for that case. ``usage`` is\nTHIS attempt's own reading, distinct from ``LlmLogBase.usage``'s\ninteraction-level aggregate (see the module comment above). ``truncated``\nis true the moment ANY stored text on this attempt -- a request message, the\nresponse, or an advertised tool name -- was cut for size; the FE shows a\nsmall badge for it.\n``tools_advertised`` is the NAMES of the tools this attempt offered the\nmodel, or null when it sent no ``tools`` parameter at all (see\n``LlmAttempt`` in services/llm_log.py) -- declaring it here is what keeps it\non the wire, since pydantic's default ``extra=\"ignore\"`` would otherwise\ndrop the key silently at the router's ``model_validate``. Like every other\nstored text here it has been through the log's redaction choke point, since\na tool NAME can itself equal a registered secret value.",
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "request_chars": {
+            "title": "Request Chars",
+            "type": "integer"
+          },
+          "request_messages": {
+            "items": {
+              "$ref": "#/components/schemas/LlmLogMessage"
+            },
+            "title": "Request Messages",
+            "type": "array"
+          },
+          "response_chars": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Response Chars"
+          },
+          "response_content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Response Content"
+          },
+          "tools_advertised": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tools Advertised"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LlmLogUsage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "request_messages",
+          "request_chars",
+          "response_content",
+          "response_chars",
+          "error",
+          "usage",
+          "truncated"
+        ],
+        "title": "LlmLogAttempt",
+        "type": "object"
+      },
+      "LlmLogDetail": {
+        "description": "A full log record: every attempt's request messages and response body.",
+        "properties": {
+          "attempts": {
+            "items": {
+              "$ref": "#/components/schemas/LlmLogAttempt"
+            },
+            "title": "Attempts",
+            "type": "array"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Ms"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Outcome"
+          },
+          "started_at": {
+            "title": "Started At",
+            "type": "string"
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LlmLogUsage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "workflow": {
+            "title": "Workflow",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "workflow",
+          "model",
+          "started_at",
+          "finished_at",
+          "duration_ms",
+          "outcome",
+          "error",
+          "usage",
+          "attempts"
+        ],
+        "title": "LlmLogDetail",
+        "type": "object"
+      },
+      "LlmLogListResponse": {
+        "description": "Newest-first page of LLM interaction summaries.\n\n``process_token`` is the ANSWERING process's opaque identity for the id space\nevery ``id`` on this page belongs to (``llm_log.process_token()``). Log ids\nare a per-process counter over a ring that dies with the process, so an id a\nclient is HOLDING -- a ``?log=<id>`` deep link built from a job response the\nbrowser cached before a restart -- may name a completely different\ninteraction here. Only the minting process's token can tell those apart, and\nthis is the reading the AI 日誌 page compares a link's claim against.\n\nIt rides on the ENVELOPE rather than on the rows: it is a property of the\nprocess that answered, not of any record, so ``LlmLogBase`` (shared by the\nrow and the detail, one entry per RECORD) would be both the wrong shape and\n50 copies of one string. The list is also the response that arrives BEFORE\nthe page decides what a deep link points at, while the detail is fetched\nlazily per record -- an in-list link would have had to open the row first to\nlearn whether it should have.",
+        "properties": {
+          "logs": {
+            "items": {
+              "$ref": "#/components/schemas/LlmLogSummary"
+            },
+            "title": "Logs",
+            "type": "array"
+          },
+          "process_token": {
+            "title": "Process Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "logs",
+          "process_token"
+        ],
+        "title": "LlmLogListResponse",
+        "type": "object"
+      },
+      "LlmLogMessage": {
+        "description": "One request message exactly as sent (role + full content).",
+        "properties": {
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          }
+        },
+        "required": [
+          "role",
+          "content"
+        ],
+        "title": "LlmLogMessage",
+        "type": "object"
+      },
+      "LlmLogSummary": {
+        "description": "One log row WITHOUT attempt bodies: ``attempts`` is the count only.\n\nThe list view shows how many attempts a call took; the full bodies (tens of\nKB each) load only on row expansion via the detail endpoint.",
+        "properties": {
+          "attempts": {
+            "title": "Attempts",
+            "type": "integer"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Ms"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Outcome"
+          },
+          "started_at": {
+            "title": "Started At",
+            "type": "string"
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LlmLogUsage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "workflow": {
+            "title": "Workflow",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "workflow",
+          "model",
+          "started_at",
+          "finished_at",
+          "duration_ms",
+          "outcome",
+          "error",
+          "usage",
+          "attempts"
+        ],
+        "title": "LlmLogSummary",
+        "type": "object"
+      },
+      "LlmLogUsage": {
+        "description": "Token usage read defensively from a completion; any field may be null.",
+        "properties": {
+          "completion_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completion Tokens"
+          },
+          "prompt_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt Tokens"
+          },
+          "total_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Tokens"
+          }
+        },
+        "required": [
+          "prompt_tokens",
+          "completion_tokens",
+          "total_tokens"
+        ],
+        "title": "LlmLogUsage",
+        "type": "object"
+      },
+      "MemoryItemCreate": {
+        "description": "Payload for creating a memory item. Only ``title`` is mandatory.\n\ntitle/tags/every section text field carry explicit upper bounds (see the\n``_CRUD_*`` constants above) that MemoryItemContent itself does not, so\nMemoryItemRead is unaffected -- this is the source-side half of bounding\nthe enrich/assist-update prompt header; the other half is the defensive\nper-field cap in ``memory_ai._serialize_item_for_prompt``.",
+        "properties": {
+          "alternatives": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Alternatives",
+            "type": "string"
+          },
+          "assumptions": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Assumptions",
+            "type": "string"
+          },
+          "confidence": {
+            "default": "mixed",
+            "title": "Confidence",
+            "type": "string"
+          },
+          "consequences": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Consequences",
+            "type": "string"
+          },
+          "constraints": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Constraints",
+            "type": "string"
+          },
+          "decisions": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Decisions",
+            "type": "string"
+          },
+          "evidence": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Evidence",
+            "type": "string"
+          },
+          "inferred": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Inferred",
+            "type": "string"
+          },
+          "known": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Known",
+            "type": "string"
+          },
+          "next_actions": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Next Actions",
+            "type": "string"
+          },
+          "open_questions": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Open Questions",
+            "type": "string"
+          },
+          "rationale": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Rationale",
+            "type": "string"
+          },
+          "recovery_files": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Recovery Files",
+            "type": "string"
+          },
+          "recovery_keywords": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Recovery Keywords",
+            "type": "string"
+          },
+          "recovery_people": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Recovery People",
+            "type": "string"
+          },
+          "resume_trigger": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Resume Trigger",
+            "type": "string"
+          },
+          "risks": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Risks",
+            "type": "string"
+          },
+          "snapshot": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Snapshot",
+            "type": "string"
+          },
+          "source": {
+            "default": "manual",
+            "title": "Source",
+            "type": "string"
+          },
+          "stage": {
+            "$ref": "#/components/schemas/MemoryStage",
+            "default": "quick"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MemoryStatus",
+            "default": "capture-quick"
+          },
+          "tags": {
+            "items": {
+              "maxLength": 100,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 20,
+            "title": "Tags",
+            "type": "array"
+          },
+          "title": {
+            "maxLength": 300,
+            "title": "Title",
+            "type": "string"
+          },
+          "unknown": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Unknown",
+            "type": "string"
+          },
+          "why_matters": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Why Matters",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "title": "MemoryItemCreate",
+        "type": "object"
+      },
+      "MemoryItemRead": {
+        "description": "A memory item as returned by the API, including derived staleness.",
+        "properties": {
+          "alternatives": {
+            "default": "",
+            "title": "Alternatives",
+            "type": "string"
+          },
+          "assumptions": {
+            "default": "",
+            "title": "Assumptions",
+            "type": "string"
+          },
+          "confidence": {
+            "default": "mixed",
+            "title": "Confidence",
+            "type": "string"
+          },
+          "consequences": {
+            "default": "",
+            "title": "Consequences",
+            "type": "string"
+          },
+          "constraints": {
+            "default": "",
+            "title": "Constraints",
+            "type": "string"
+          },
+          "created": {
+            "format": "date-time",
+            "title": "Created",
+            "type": "string"
+          },
+          "decisions": {
+            "default": "",
+            "title": "Decisions",
+            "type": "string"
+          },
+          "evidence": {
+            "default": "",
+            "title": "Evidence",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "inferred": {
+            "default": "",
+            "title": "Inferred",
+            "type": "string"
+          },
+          "is_stale": {
+            "description": "True for a stale-eligible (non-terminal) item whose `updated` is\npast the configured threshold; always False for terminal items.\n\nStale-eligibility is the shared models.STALE_ELIGIBLE_STATUSES set\n(all five non-terminal statuses), not a schema-local subset.",
+            "readOnly": true,
+            "title": "Is Stale",
+            "type": "boolean"
+          },
+          "known": {
+            "default": "",
+            "title": "Known",
+            "type": "string"
+          },
+          "next_actions": {
+            "default": "",
+            "title": "Next Actions",
+            "type": "string"
+          },
+          "open_questions": {
+            "default": "",
+            "title": "Open Questions",
+            "type": "string"
+          },
+          "rationale": {
+            "default": "",
+            "title": "Rationale",
+            "type": "string"
+          },
+          "recovery_files": {
+            "default": "",
+            "title": "Recovery Files",
+            "type": "string"
+          },
+          "recovery_keywords": {
+            "default": "",
+            "title": "Recovery Keywords",
+            "type": "string"
+          },
+          "recovery_people": {
+            "default": "",
+            "title": "Recovery People",
+            "type": "string"
+          },
+          "resume_trigger": {
+            "default": "",
+            "title": "Resume Trigger",
+            "type": "string"
+          },
+          "risks": {
+            "default": "",
+            "title": "Risks",
+            "type": "string"
+          },
+          "snapshot": {
+            "default": "",
+            "title": "Snapshot",
+            "type": "string"
+          },
+          "source": {
+            "default": "manual",
+            "title": "Source",
+            "type": "string"
+          },
+          "stage": {
+            "$ref": "#/components/schemas/MemoryStage",
+            "default": "quick"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MemoryStatus",
+            "default": "capture-quick"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tags",
+            "type": "array"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "unknown": {
+            "default": "",
+            "title": "Unknown",
+            "type": "string"
+          },
+          "updated": {
+            "format": "date-time",
+            "title": "Updated",
+            "type": "string"
+          },
+          "why_matters": {
+            "default": "",
+            "title": "Why Matters",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "id",
+          "created",
+          "updated",
+          "is_stale"
+        ],
+        "title": "MemoryItemRead",
+        "type": "object"
+      },
+      "MemoryItemReadWithProgress": {
+        "description": "A memory item plus its full progress history (oldest first).",
+        "properties": {
+          "alternatives": {
+            "default": "",
+            "title": "Alternatives",
+            "type": "string"
+          },
+          "assumptions": {
+            "default": "",
+            "title": "Assumptions",
+            "type": "string"
+          },
+          "confidence": {
+            "default": "mixed",
+            "title": "Confidence",
+            "type": "string"
+          },
+          "consequences": {
+            "default": "",
+            "title": "Consequences",
+            "type": "string"
+          },
+          "constraints": {
+            "default": "",
+            "title": "Constraints",
+            "type": "string"
+          },
+          "created": {
+            "format": "date-time",
+            "title": "Created",
+            "type": "string"
+          },
+          "decisions": {
+            "default": "",
+            "title": "Decisions",
+            "type": "string"
+          },
+          "evidence": {
+            "default": "",
+            "title": "Evidence",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "inferred": {
+            "default": "",
+            "title": "Inferred",
+            "type": "string"
+          },
+          "is_stale": {
+            "description": "True for a stale-eligible (non-terminal) item whose `updated` is\npast the configured threshold; always False for terminal items.\n\nStale-eligibility is the shared models.STALE_ELIGIBLE_STATUSES set\n(all five non-terminal statuses), not a schema-local subset.",
+            "readOnly": true,
+            "title": "Is Stale",
+            "type": "boolean"
+          },
+          "known": {
+            "default": "",
+            "title": "Known",
+            "type": "string"
+          },
+          "next_actions": {
+            "default": "",
+            "title": "Next Actions",
+            "type": "string"
+          },
+          "open_questions": {
+            "default": "",
+            "title": "Open Questions",
+            "type": "string"
+          },
+          "progress": {
+            "items": {
+              "$ref": "#/components/schemas/ProgressEntryRead"
+            },
+            "title": "Progress",
+            "type": "array"
+          },
+          "rationale": {
+            "default": "",
+            "title": "Rationale",
+            "type": "string"
+          },
+          "recovery_files": {
+            "default": "",
+            "title": "Recovery Files",
+            "type": "string"
+          },
+          "recovery_keywords": {
+            "default": "",
+            "title": "Recovery Keywords",
+            "type": "string"
+          },
+          "recovery_people": {
+            "default": "",
+            "title": "Recovery People",
+            "type": "string"
+          },
+          "resume_trigger": {
+            "default": "",
+            "title": "Resume Trigger",
+            "type": "string"
+          },
+          "risks": {
+            "default": "",
+            "title": "Risks",
+            "type": "string"
+          },
+          "snapshot": {
+            "default": "",
+            "title": "Snapshot",
+            "type": "string"
+          },
+          "source": {
+            "default": "manual",
+            "title": "Source",
+            "type": "string"
+          },
+          "stage": {
+            "$ref": "#/components/schemas/MemoryStage",
+            "default": "quick"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MemoryStatus",
+            "default": "capture-quick"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tags",
+            "type": "array"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "unknown": {
+            "default": "",
+            "title": "Unknown",
+            "type": "string"
+          },
+          "updated": {
+            "format": "date-time",
+            "title": "Updated",
+            "type": "string"
+          },
+          "why_matters": {
+            "default": "",
+            "title": "Why Matters",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "id",
+          "created",
+          "updated",
+          "is_stale"
+        ],
+        "title": "MemoryItemReadWithProgress",
+        "type": "object"
+      },
+      "MemoryItemUpdate": {
+        "description": "Partial update payload; every field is optional via omission.\n\nEvery field is typed as its ordinary, non-nullable type with a\n`default_factory` that is never actually applied: the router\n(`update_item`) always calls `model_dump(exclude_unset=True)`, so an\nomitted field's default is never read or written, and pydantic v2 does\nnot validate defaults unless `validate_default` is set (it isn't here).\nUsing `default_factory` rather than a literal default is deliberate:\npydantic v2 omits `default_factory`-sourced values from the generated\nJSON schema entirely, so every property below is optional but carries\nneither a `default` key nor `null` in its type. A literal default (e.g.\n`title: str = \"\"`) would instead surface as `\"default\": \"\"` in the\nOpenAPI schema; a client that honestly materialises schema defaults\nwould then send `title=\"\"` on every PATCH, tripping the not-blank\nvalidator or silently resetting fields the caller never meant to touch.\nThe payoff is that the generated OpenAPI schema advertises each field's\nreal type -- not nullable, no phantom default -- so an explicit JSON\n`null`, which no field here legitimately accepts, now fails ordinary\ntype validation (422) instead of requiring a bespoke validator to catch\nit after the fact.",
+        "properties": {
+          "alternatives": {
+            "maxLength": 20000,
+            "title": "Alternatives",
+            "type": "string"
+          },
+          "assumptions": {
+            "maxLength": 20000,
+            "title": "Assumptions",
+            "type": "string"
+          },
+          "confidence": {
+            "title": "Confidence",
+            "type": "string"
+          },
+          "consequences": {
+            "maxLength": 20000,
+            "title": "Consequences",
+            "type": "string"
+          },
+          "constraints": {
+            "maxLength": 20000,
+            "title": "Constraints",
+            "type": "string"
+          },
+          "decisions": {
+            "maxLength": 20000,
+            "title": "Decisions",
+            "type": "string"
+          },
+          "evidence": {
+            "maxLength": 20000,
+            "title": "Evidence",
+            "type": "string"
+          },
+          "inferred": {
+            "maxLength": 20000,
+            "title": "Inferred",
+            "type": "string"
+          },
+          "known": {
+            "maxLength": 20000,
+            "title": "Known",
+            "type": "string"
+          },
+          "next_actions": {
+            "maxLength": 20000,
+            "title": "Next Actions",
+            "type": "string"
+          },
+          "open_questions": {
+            "maxLength": 20000,
+            "title": "Open Questions",
+            "type": "string"
+          },
+          "rationale": {
+            "maxLength": 20000,
+            "title": "Rationale",
+            "type": "string"
+          },
+          "recovery_files": {
+            "maxLength": 20000,
+            "title": "Recovery Files",
+            "type": "string"
+          },
+          "recovery_keywords": {
+            "maxLength": 20000,
+            "title": "Recovery Keywords",
+            "type": "string"
+          },
+          "recovery_people": {
+            "maxLength": 20000,
+            "title": "Recovery People",
+            "type": "string"
+          },
+          "resume_trigger": {
+            "maxLength": 20000,
+            "title": "Resume Trigger",
+            "type": "string"
+          },
+          "risks": {
+            "maxLength": 20000,
+            "title": "Risks",
+            "type": "string"
+          },
+          "snapshot": {
+            "maxLength": 20000,
+            "title": "Snapshot",
+            "type": "string"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "stage": {
+            "$ref": "#/components/schemas/MemoryStage"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MemoryStatus"
+          },
+          "tags": {
+            "items": {
+              "maxLength": 100,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 20,
+            "title": "Tags",
+            "type": "array"
+          },
+          "title": {
+            "maxLength": 300,
+            "title": "Title",
+            "type": "string"
+          },
+          "unknown": {
+            "maxLength": 20000,
+            "title": "Unknown",
+            "type": "string"
+          },
+          "why_matters": {
+            "maxLength": 20000,
+            "title": "Why Matters",
+            "type": "string"
+          }
+        },
+        "title": "MemoryItemUpdate",
+        "type": "object"
+      },
+      "MemoryStage": {
+        "description": "Two-stage capture workflow marker.",
+        "enum": [
+          "quick",
+          "full"
+        ],
+        "title": "MemoryStage",
+        "type": "string"
+      },
+      "MemoryStatus": {
+        "description": "Lifecycle status of a memory item (see docs/methodology.md).",
+        "enum": [
+          "capture-quick",
+          "needs-enrichment",
+          "active",
+          "waiting",
+          "parked",
+          "done",
+          "superseded"
+        ],
+        "title": "MemoryStatus",
+        "type": "string"
+      },
+      "ProgressEntryCreate": {
+        "description": "Payload for appending a progress-log entry.",
+        "properties": {
+          "note": {
+            "maxLength": 20000,
+            "title": "Note",
+            "type": "string"
+          }
+        },
+        "required": [
+          "note"
+        ],
+        "title": "ProgressEntryCreate",
+        "type": "object"
+      },
+      "ProgressEntryRead": {
+        "description": "A single progress-log entry.",
+        "properties": {
+          "date": {
+            "format": "date-time",
+            "title": "Date",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "item_id": {
+            "title": "Item Id",
+            "type": "integer"
+          },
+          "note": {
+            "title": "Note",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "item_id",
+          "date",
+          "note"
+        ],
+        "title": "ProgressEntryRead",
+        "type": "object"
+      },
+      "ReviewResponse": {
+        "description": "Disjoint groups of items that need attention, oldest first per group.",
+        "properties": {
+          "active": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryItemRead"
+            },
+            "title": "Active",
+            "type": "array"
+          },
+          "needs_enrichment": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryItemRead"
+            },
+            "title": "Needs Enrichment",
+            "type": "array"
+          },
+          "parked": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryItemRead"
+            },
+            "title": "Parked",
+            "type": "array"
+          },
+          "waiting": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryItemRead"
+            },
+            "title": "Waiting",
+            "type": "array"
+          }
+        },
+        "required": [
+          "needs_enrichment",
+          "active",
+          "waiting",
+          "parked"
+        ],
+        "title": "ReviewResponse",
+        "type": "object"
+      },
+      "ToolDeleteResponse": {
+        "description": "Whether DELETE removed the files or retained a hidden parked tree.\n\n``retained_path`` is the exact operator-facing path when ``outcome`` is\n``retained``; it is null after physical removal.",
+        "properties": {
+          "outcome": {
+            "enum": [
+              "removed",
+              "retained"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "retained_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retained Path"
+          },
+          "retention_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "durability_unconfirmed",
+                  "cleanup_failed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retention Reason"
+          }
+        },
+        "required": [
+          "outcome",
+          "retained_path",
+          "retention_reason"
+        ],
+        "title": "ToolDeleteResponse",
+        "type": "object"
+      },
+      "ToolDiscardResponse": {
+        "description": "Whether discard removed the former version or retained its files.",
+        "properties": {
+          "outcome": {
+            "enum": [
+              "removed",
+              "retained"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "retained_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retained Path"
+          },
+          "retention_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "durability_unconfirmed",
+                  "cleanup_failed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retention Reason"
+          }
+        },
+        "required": [
+          "outcome",
+          "retained_path",
+          "retention_reason"
+        ],
+        "title": "ToolDiscardResponse",
+        "type": "object"
+      },
+      "ToolExpectedVersionRequest": {
+        "description": "Required optimistic identity for a version-specific synchronous write.",
+        "properties": {
+          "expected_vid": {
+            "pattern": "^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$",
+            "title": "Expected Vid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_vid"
+        ],
+        "title": "ToolExpectedVersionRequest",
+        "type": "object"
+      },
+      "ToolInstallAccepted": {
+        "description": "202 body for a queued install or revise: the id to poll.",
+        "properties": {
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "title": "ToolInstallAccepted",
+        "type": "object"
+      },
+      "ToolInstallRequest": {
+        "description": "Payload for the web installer: where the API lives, and what to build.\n\n``openapi_url`` is a pydantic HttpUrl, so a non-http(s) scheme or a\nhostless string is a 422 before any job starts. ``instructions`` shares the\nAI input bound every other AI free-text field carries (20000 chars,\nstripped-non-empty).\n\n``secret_name``/``secret_value`` are the OPTIONAL install-form secret (D36):\na credential the user would otherwise paste into ``instructions`` (where it\nis recorded verbatim into the builder's AI-log prompts). Supplied HERE, the\nVALUE never enters the LLM conversation at all -- the backend injects it into\nrun_shell's env so the builder can live-test the real API, and writes it into\nthe finished tool's ``.env`` at install time (see tool_builder); llm_log\nredacts it besides. Both-or-neither, and the name must be a valid env-var\nname (it becomes one). ``secret_value`` is NEVER echoed back in any response\n(this is a request-only model, and no response schema carries the field).",
+        "properties": {
+          "instructions": {
+            "maxLength": 20000,
+            "minLength": 1,
+            "title": "Instructions",
+            "type": "string"
+          },
+          "openapi_url": {
+            "format": "uri",
+            "maxLength": 2083,
+            "minLength": 1,
+            "title": "Openapi Url",
+            "type": "string"
+          },
+          "secret_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Secret Name"
+          },
+          "secret_value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Secret Value"
+          }
+        },
+        "required": [
+          "openapi_url",
+          "instructions"
+        ],
+        "title": "ToolInstallRequest",
+        "type": "object"
+      },
+      "ToolJobStatus": {
+        "description": "One install/revise job's visible state, as polled by the 工具 page.\n\n``state`` walks queued -> running -> succeeded | failed. ``error`` is the\nfriendly zh-TW failure text (failed only); ``tool_name``/``summary`` are\nwhat the builder reported; ``llm_log_id`` links to the builder session's\nAI 日誌 record whenever a session actually ran, so both success and failure\nare debuggable from the UI. Jobs are process-local and unpersisted: after a\nbackend restart every previous job id is a 404.\n\n``llm_log_process`` names the process whose id space that ``llm_log_id``\nbelongs to -- the same both-or-neither pairing the sidecar keeps on disk\n(``tools.store_summary_meta``), for the same reason: log ids restart from\nzero in every process, so an id that OUTLIVES its process resolves to\nwhatever now occupies the number. A job never outlives its process (the 404\nabove), but a browser TAB does: the 工具 page stops polling a terminal job\nand keeps its response cached, so the outcome card -- and the ``查看 AI 日誌``\nlink on it -- can still be on screen after a restart. The token travels with\nthe link so the AI 日誌 page can refuse to resolve it (R9-1); the backend\ncannot catch this one alone, because it never SERVES a stale id.\n\nOne model for BOTH job kinds (D40 renamed it from ``ToolInstallJobStatus``\nwithout touching a field): an install writes a package into the tools\ndirectory and a revise adds a version to one and moves ``current``, and both\nreport through one job table and one poll endpoint. ``env_keys`` names\nassignments from a builder-written ``.env`` that the backend stripped;\nvalues never enter the result.",
+        "properties": {
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "env_keys": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Env Keys",
+            "type": "array"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          },
+          "llm_log_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llm Log Id"
+          },
+          "llm_log_process": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llm Log Process"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Summary"
+          },
+          "tool_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Name"
+          }
+        },
+        "required": [
+          "job_id",
+          "state",
+          "created_at",
+          "finished_at",
+          "error",
+          "tool_name",
+          "summary",
+          "llm_log_id",
+          "llm_log_process",
+          "env_keys"
+        ],
+        "title": "ToolJobStatus",
+        "type": "object"
+      },
+      "ToolListResponse": {
+        "description": "Every installed tool package, in name order.",
+        "properties": {
+          "tools": {
+            "items": {
+              "$ref": "#/components/schemas/ToolSummary"
+            },
+            "title": "Tools",
+            "type": "array"
+          }
+        },
+        "required": [
+          "tools"
+        ],
+        "title": "ToolListResponse",
+        "type": "object"
+      },
+      "ToolReviseRequest": {
+        "description": "Payload for an AI revise job (D40): what the user wants changed.\n\n``feedback`` carries the SAME bound every other AI free-text input has\n(20000 chars, stripped-non-empty) and becomes the builder session's user\nturn. ``expected_vid`` is the required optimistic identity checked only\nafter global single-flight admission. Which tool is being revised remains\nthe PATH's job: the shared path regex validates its name.",
+        "properties": {
+          "expected_vid": {
+            "pattern": "^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$",
+            "title": "Expected Vid",
+            "type": "string"
+          },
+          "feedback": {
+            "maxLength": 20000,
+            "minLength": 1,
+            "title": "Feedback",
+            "type": "string"
+          }
+        },
+        "required": [
+          "feedback",
+          "expected_vid"
+        ],
+        "title": "ToolReviseRequest",
+        "type": "object"
+      },
+      "ToolSummary": {
+        "description": "One installed tool package as the 工具 page lists it.\n\n``valid=False`` rows carry the safe ``error`` reason from the registry scan\n(bad manifest, name mismatch, missing entry file); such a package is listed\nso it can be deleted, but is never advertised to the model or executable.\n\nThe summary text itself is fetched per tool on demand\n(``ToolSummaryDetail``), since it is far too long for a list row.",
+        "properties": {
+          "current_vid": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Vid"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "lineage": {
+            "enum": [
+              "sole",
+              "usable",
+              "broken"
+            ],
+            "title": "Lineage",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "valid": {
+            "title": "Valid",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "enabled",
+          "valid",
+          "error",
+          "current_vid",
+          "lineage"
+        ],
+        "title": "ToolSummary",
+        "type": "object"
+      },
+      "ToolSummaryDetail": {
+        "description": "One tool's version summary\n(``versions/<vid>/.afterthread.meta/summary.json``), as the 工具 page reads it.\n\nThe three sidecar fields are nullable and all three are null together for the\ncommon, non-exceptional case of a tool with no sidecar: a hand-made package,\nor one whose summary generation has not run (or failed) yet. That is a 200,\nnot a 404 -- the TOOL exists, it just has no summary -- so the page renders\n尚無總結 plus a 重新產生 action rather than an error. ``current_vid`` is\nalways present and identifies the version that was actually read, so a\nresponse that crossed a pointer change cannot poison another version's cache.\n\n``llm_log_id`` links to the summary session's AI 日誌 record (the\n``tool_summary`` workflow, distinct from the builder's ``tool_install``), so\na wrong or missing summary is debuggable from the UI. It is null whenever the\nid on disk was minted by a PREVIOUS process: log ids are a per-process counter\nover a ring that is wiped on restart, so a persisted id only means something\nwhile that process lives (see ``routers.tools._summary_detail``, which nulls\nit rather than adding a fifth field -- a null here already means \"no record to\nlink\", and the FE already renders exactly that).",
+        "properties": {
+          "current_vid": {
+            "title": "Current Vid",
+            "type": "string"
+          },
+          "llm_log_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llm Log Id"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Summary"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "summary",
+          "updated_at",
+          "llm_log_id",
+          "current_vid"
+        ],
+        "title": "ToolSummaryDetail",
+        "type": "object"
+      },
+      "ToolUpdateRequest": {
+        "description": "PATCH payload for a tool: only the enabled toggle is mutable.",
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "title": "ToolUpdateRequest",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "afterthread API",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/capture": {
+      "post": {
+        "description": "Quick-capture raw text into a structured memory item.\n\nThe LLM call runs first, entirely outside any DB transaction. Only after a\nsuccessful draft does ONE transaction create the item (source \"llm-capture\",\nstage quick, status from the model's suggestion) and seed its progress log.\nA 502 (unparseable or failed draft) therefore leaves the database untouched\n-- no partial rows -- because no write has happened yet. The blocking write\nitself runs in a threadpool (see _capture_persist), off the event loop.",
+        "operationId": "capture_api_capture_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CaptureRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CaptureResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": {
+                    "code": "llm_upstream_error",
+                    "message": "APIConnectionError: the upstream LLM request failed"
+                  }
+                }
+              }
+            },
+            "description": "LLM upstream call failed or returned unusable output"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": {
+                    "code": "llm_not_configured",
+                    "message": "The LLM endpoint is not configured."
+                  }
+                }
+              }
+            },
+            "description": "LLM endpoint is not configured"
+          }
+        },
+        "summary": "Capture",
+        "tags": [
+          "ai"
+        ]
+      }
+    },
+    "/api/health": {
+      "get": {
+        "description": "Liveness/readiness probe.",
+        "operationId": "health_api_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Health Api Health Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health"
+      }
+    },
+    "/api/items": {
+      "get": {
+        "description": "List items (newest first) with optional filtering and pagination.",
+        "operationId": "list_items_api_items_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/MemoryStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "stage",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/MemoryStage"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Stage"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tag",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tag"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "maximum": 9223372036854775807,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ItemListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Items",
+        "tags": [
+          "items"
+        ]
+      },
+      "post": {
+        "description": "Create an item and seed its history with the first progress entry.",
+        "operationId": "create_item_api_items_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryItemCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryItemRead"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Item",
+        "tags": [
+          "items"
+        ]
+      }
+    },
+    "/api/items/{item_id}": {
+      "delete": {
+        "description": "Delete an item; its progress entries are removed via cascade.",
+        "operationId": "delete_item_api_items__item_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "Item Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Memory item not found"
+                }
+              }
+            },
+            "description": "Memory item not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Item",
+        "tags": [
+          "items"
+        ]
+      },
+      "get": {
+        "description": "Return a single item with its full progress history (oldest first).",
+        "operationId": "get_item_api_items__item_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "Item Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryItemReadWithProgress"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Memory item not found"
+                }
+              }
+            },
+            "description": "Memory item not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Item",
+        "tags": [
+          "items"
+        ]
+      },
+      "patch": {
+        "description": "Apply a partial update; bump `updated` only when a field is provided.",
+        "operationId": "update_item_api_items__item_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "Item Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryItemUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryItemRead"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Memory item not found"
+                }
+              }
+            },
+            "description": "Memory item not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Item",
+        "tags": [
+          "items"
+        ]
+      }
+    },
+    "/api/items/{item_id}/assist-update": {
+      "post": {
+        "description": "Assist an update: merge whitelisted section refreshes and append progress.\n\nSame discipline as enrich (404 first, snapshot including `updated`, LLM\noutside any transaction, then a SINGLE conditional UPDATE guarded on the\npre-await `updated` that resolves a mid-await writer to 409 or a delete to\n404, supersede-not-delete on history sections, writes only on a matching\nUPDATE, a response snapshot built from the written values after a race-wrapped\nflush before commit), but records a progress note without touching stage or\nreturning gaps. The two blocking DB segments run in a threadpool (see\n_snapshot_item_for_ai / _assist_persist), off the event loop, using the\ndependency's session sequentially.",
+        "operationId": "assist_update_item_api_items__item_id__assist_update_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "Item Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssistUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssistUpdateResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Memory item not found"
+                }
+              }
+            },
+            "description": "Memory item not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": {
+                    "code": "conflict",
+                    "message": "項目在 AI 處理期間已被其他變更修改。請重新載入後再試一次。"
+                  }
+                }
+              }
+            },
+            "description": "Item changed during AI processing (optimistic concurrency)"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": {
+                    "code": "llm_upstream_error",
+                    "message": "APIConnectionError: the upstream LLM request failed"
+                  }
+                }
+              }
+            },
+            "description": "LLM upstream call failed or returned unusable output"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": {
+                    "code": "llm_not_configured",
+                    "message": "The LLM endpoint is not configured."
+                  }
+                }
+              }
+            },
+            "description": "LLM endpoint is not configured"
+          }
+        },
+        "summary": "Assist Update Item",
+        "tags": [
+          "ai"
+        ]
+      }
+    },
+    "/api/items/{item_id}/enrich": {
+      "post": {
+        "description": "Full-enrich an item: merge whitelisted section updates and append progress.\n\nOrder (constraint): 404 first, then snapshot the item fields (and its\n`updated` timestamp), then run the LLM strictly OUTSIDE any transaction (the\nread transaction is released before the await). Writes then land through a\nSINGLE conditional UPDATE guarded on the pre-await `updated`: merge the\nreturned sections (untouched fields stay as they were; history-bearing\nsections are superseded, never overwritten) and, on a complete checklist,\nflip stage to full and graduate a still-capturing item\n(capture-quick/needs-enrichment) to active. If that UPDATE matches no row a\nwriter touched the item mid-await and NOTHING is written -- a concurrent\nUPDATE (`updated` moved, row present) is 409, a concurrent DELETE (row gone)\nis 404. Closing the check with the write (rather than comparing `updated`\nthen flushing) leaves no window a competing PATCH could slip through. On a\nmatch the progress entry is appended and the flush is race-wrapped so a\ndelete landing in the remaining window still resolves to 404, not a 500. The\nresponse snapshot is built (after flush, before commit) from the values just\nwritten -- not a re-read. A 503/502/409 (or an item deleted mid-await) leaves\nthe row unchanged. The two blocking DB segments run in a threadpool (see\n_snapshot_item_for_ai / _enrich_persist) so they never sit on the event loop;\nthe session created by the dependency is used sequentially, never concurrently.",
+        "operationId": "enrich_api_items__item_id__enrich_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "Item Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnrichRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnrichResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Memory item not found"
+                }
+              }
+            },
+            "description": "Memory item not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": {
+                    "code": "conflict",
+                    "message": "項目在 AI 處理期間已被其他變更修改。請重新載入後再試一次。"
+                  }
+                }
+              }
+            },
+            "description": "Item changed during AI processing (optimistic concurrency)"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": {
+                    "code": "llm_upstream_error",
+                    "message": "APIConnectionError: the upstream LLM request failed"
+                  }
+                }
+              }
+            },
+            "description": "LLM upstream call failed or returned unusable output"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": {
+                    "code": "llm_not_configured",
+                    "message": "The LLM endpoint is not configured."
+                  }
+                }
+              }
+            },
+            "description": "LLM endpoint is not configured"
+          }
+        },
+        "summary": "Enrich",
+        "tags": [
+          "ai"
+        ]
+      }
+    },
+    "/api/items/{item_id}/progress": {
+      "post": {
+        "description": "Append a progress entry and bump the item's `updated` timestamp.",
+        "operationId": "add_progress_api_items__item_id__progress_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "Item Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProgressEntryCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProgressEntryRead"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Memory item not found"
+                }
+              }
+            },
+            "description": "Memory item not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Add Progress",
+        "tags": [
+          "items"
+        ]
+      }
+    },
+    "/api/llm/logs": {
+      "get": {
+        "description": "List recent LLM interaction summaries, newest first, WITHOUT bodies.\n\nEach summary carries only non-secret scalars (workflow, model name, timing,\noutcome, token usage) plus the attempt COUNT; the full prompt/response\nbodies load lazily via the by-id endpoint below. ``limit`` is bounded to\n[1, 500] at the query layer so an oversized page cannot be requested. The\nring is process-wide and dies with the process, so an empty list is the\nnormal state right after a restart.\n\nThat restart is also why the page needs ``process_token`` (see\n``LlmLogListResponse``): the ids here are a per-process counter, and a client\nholding an OLDER one -- a ``?log=<id>`` deep link built from a cached job\nresponse -- must be able to find out that its id was re-issued rather than\nhave this page open whatever now answers to the number.",
+        "operationId": "llm_logs_api_llm_logs_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LlmLogListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Llm Logs",
+        "tags": [
+          "ai"
+        ]
+      }
+    },
+    "/api/llm/logs/{log_id}": {
+      "get": {
+        "description": "Return one full LLM interaction record, attempt bodies included.\n\n404 (fixed, config-free ``{\"detail\": \"LLM log not found\"}``) when no record\nwith that id is in the ring -- it was evicted past ``llm_log_max_entries``,\nthe interaction is still in flight (recorded only on finish), or the id\nnever existed. The bodies here can run to tens of KB per attempt (the full\nschema-injected prompt and the model's reply), which is why they are behind\nthis by-id fetch rather than in the list above.",
+        "operationId": "llm_log_detail_api_llm_logs__log_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "log_id",
+            "required": true,
+            "schema": {
+              "title": "Log Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LlmLogDetail"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "LLM log not found"
+                }
+              }
+            },
+            "description": "No LLM interaction log with that id"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Llm Log Detail",
+        "tags": [
+          "ai"
+        ]
+      }
+    },
+    "/api/llm/status": {
+      "get": {
+        "description": "Report whether an LLM endpoint is configured, the model name, and the\nchar<->token ratio estimator's state.\n\nNever returns the base URL or API key -- only the boolean, the non-secret\nmodel name (null when unconfigured), and the ratio snapshot. The model is run\nthrough the same `normalized_model` helper `generate_json` uses for the actual\nrequest, so a whitespace-padded override is never echoed back padded while the\nreal call underneath sends the trimmed value. ``token_ratio`` is additive\nobservability (P4): the estimator's window size and learned ratio (see\nafterthread.services.token_budget), carrying no config value.",
+        "operationId": "llm_status_api_llm_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LLMStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Llm Status",
+        "tags": [
+          "ai"
+        ]
+      }
+    },
+    "/api/review": {
+      "get": {
+        "description": "Group non-terminal items into disjoint buckets, oldest first per group.\n\nThe reviewable statuses are exactly the five non-terminal ones\n(models.STALE_ELIGIBLE_STATUSES); ``done`` and ``superseded`` are terminal\nand excluded entirely. A single query fetches every reviewable item so the\nbuckets reflect one consistent snapshot. Building each bucket from its own\nquery would let a status PATCH race between them and double-place or\nmisplace an item (and the ORM identity map could hand back stale state for\na row re-read across queries). Staleness is surfaced per item via\n``MemoryItemRead.is_stale`` rather than as a separate group.",
+        "operationId": "review_api_review_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Review",
+        "tags": [
+          "review"
+        ]
+      }
+    },
+    "/api/tools": {
+      "get": {
+        "description": "List every installed tool package (valid or broken), in name order.\n\nWith the feature off (TOOLS_DIR unset) or nothing installed this is an\nempty list, NOT an error: the 工具 page distinguishes \"feature off\" via the\ninstall endpoint's 503, while an empty listing is a normal state.",
+        "operationId": "list_installed_tools_api_tools_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Installed Tools",
+        "tags": [
+          "tools"
+        ]
+      }
+    },
+    "/api/tools/install": {
+      "post": {
+        "description": "Queue a web-installer job; poll its state via the endpoint below.\n\n202 + job id: the build is a long LLM session (minutes), far past any sane\nrequest timeout, so it runs as a background task. The 503 gate mirrors\n``llm_not_configured``'s shape under its own code -- checked HERE, before a\njob is created, so a misconfigured deployment fails the submit itself\nrather than minting a job doomed to fail asynchronously. The LLM being\nunconfigured is deliberately NOT pre-checked: that state is already\nrepresented as a failed job with a friendly error (and its own AI 日誌\nrecord), and duplicating the gate here would just create two sources of\ntruth for it.\n\n409 when an install is already active: ``start_install_job`` admits only ONE\nqueued/running install at a time (M7) and returns None when one is in\nflight, which maps to a fixed ``install_in_progress`` conflict here.",
+        "operationId": "install_tool_api_tools_install_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ToolInstallRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolInstallAccepted"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": {
+                    "code": "install_in_progress",
+                    "message": "已有安裝正在進行中，請等待其完成"
+                  }
+                }
+              }
+            },
+            "description": "Another install is already queued or running"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": {
+                    "code": "tools_not_configured",
+                    "message": "The tools directory is not configured."
+                  }
+                }
+              }
+            },
+            "description": "Tool feature is not configured (TOOLS_DIR unset)"
+          }
+        },
+        "summary": "Install Tool",
+        "tags": [
+          "tools"
+        ]
+      }
+    },
+    "/api/tools/jobs/{job_id}": {
+      "get": {
+        "description": "One install/revise job's state. 404: unknown id, evicted, or a backend\nrestart (jobs are process-local and unpersisted -- see tool_builder).\n\nONE endpoint for both kinds (D40): they share a job table, a single-flight\nadmission and a response shape, so a second endpoint would only give the FE\ntwo identical pollers to keep in sync. The old `/install/{job_id}` spelling\nis REMOVED rather than aliased -- the FE and the backend ship in the same\nwheel, so there is no version skew for an alias to protect.\n\n``llm_log_process`` is stamped HERE rather than stored on the job, and that\nis sound STRUCTURALLY rather than by convention: the job table is in-process\nmemory that dies with the log ring and its id counter (a restart 404s every\njob above), so any ``llm_log_id`` a job can still be served with was minted\nin THIS process. The sidecar needs its token written down because the FILE\noutlives the process; a job cannot. Both keep the same both-or-neither rule\n-- no id, no token -- so the pair can never disagree about whether there is a\nlink worth vouching for (``ToolJobStatus``, ``tools.store_summary_meta``).",
+        "operationId": "tool_job_status_api_tools_jobs__job_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolJobStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Tool job not found"
+                }
+              }
+            },
+            "description": "Tool job not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Tool Job Status",
+        "tags": [
+          "tools"
+        ]
+      }
+    },
+    "/api/tools/{name}": {
+      "delete": {
+        "description": "Delete a tool package (its whole directory).\n\nThe registry's ``delete_tool`` re-validates the name AND resolved-path\ncontainment under the tools dir before it touches anything (the\npath-traversal / symlink-escape hard-block lives THERE, not in this router),\nand returns None for a missing package -> 404.\n\nA request or inherited child holding the shared tools lock produces the\ndistinct retryable ``ai_job_in_progress`` 409 without renaming or deleting\nanything. Otherwise the 200 response says ``removed`` after physical\ndeletion or ``retained`` with the exact cleanup-failure path.",
+        "operationId": "delete_installed_tool_api_tools__name__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolDeleteResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Tool not found"
+                }
+              }
+            },
+            "description": "Tool not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "ai_job_in_progress": {
+                    "summary": "An AI request or inherited tool process holds the shared tools lock",
+                    "value": {
+                      "detail": {
+                        "code": "ai_job_in_progress",
+                        "message": "AI 任務進行中，請稍後再試"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "description": "Version-specific tool operation conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": {
+                    "code": "tools_lock_unavailable",
+                    "message": "Tools lock /path/to/tools/.afterthread-tools.lck is unavailable: open failed: Permission denied. Repair ownership and owner read/write permissions on this existing inode; do not delete or recreate it."
+                  }
+                }
+              }
+            },
+            "description": "The persistent tools lock path cannot be opened or locked"
+          }
+        },
+        "summary": "Delete Installed Tool",
+        "tags": [
+          "tools"
+        ]
+      },
+      "patch": {
+        "description": "Toggle a tool's ``enabled`` flag; returns the updated row.\n\n``set_enabled`` returning False collapses every did-not-happen case into one\n404 with a fixed detail: from the caller's view the addressable tool resource\ndoes not (usably) exist. Those cases are the feature being off, a name that\nresolves to nothing installed (or out of the tools dir, or through an internal\nalias), and a failed publish of the package's ``.afterthread.meta/state.json`` -- something\nthat is not a regular file sitting at that name, an unwritable package\ndirectory, a package replaced between the resolve and the write.\n\nThe MANIFEST is not among them any more, and the difference is visible to a\ncaller: since web-v5 P1 the toggle writes ``.afterthread.meta/state.json`` and never opens\n``tool.json``, so a package whose manifest is a FIFO, oversized or unreadable\nnow toggles successfully with a 200 while its row stays ``valid: false``. That\nis the intended behaviour (an operator can switch OFF a broken package, which\nis when they most want to) and it is what backend/README.md documents; a broken\npackage is never advertised to the model either way.\n\nThe response is re-read from a fresh registry scan so it reports exactly what\nthe next GET would.",
+        "operationId": "update_tool_api_tools__name__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ToolUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolSummary"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Tool not found"
+                }
+              }
+            },
+            "description": "Tool not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Tool",
+        "tags": [
+          "tools"
+        ]
+      }
+    },
+    "/api/tools/{name}/revise": {
+      "post": {
+        "description": "Queue an AI revise job for one installed tool; poll it via `/jobs/{id}`.\n\n202 + job id, exactly like the installer's submit and for the same reason: a\nrevise IS a builder session (minutes of tool rounds and shell tests), so it\ncannot live inside a request. It therefore declares NEITHER 502 NOR 503: an\nLLM that is unconfigured or failing is represented as a FAILED job carrying a\nfriendly error and its own AI 日誌 link, so the submit itself has no LLM\noutcome to report -- the same contract split test_ai_contract pins for the\ninstall submit (which does declare a 503, but for TOOLS_DIR, not the LLM).\nThat 503 has no counterpart here: with TOOLS_DIR unset no name resolves, so\nthis route's existence gate already answers 404.\n\n``start_revise_job`` first reserves the global slot, then resolves the package\nand compares the required ``expected_vid``.  Missing/aliased packages return\n404, a stale version returns ``version_mismatch``, and an occupied slot returns\n``job_busy``.  Only a matching version is converted into a queued job, so a\nstale submit has neither an LLM charge nor even a pollable job id.",
+        "operationId": "revise_tool_api_tools__name__revise_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ToolReviseRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolInstallAccepted"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Tool not found"
+                }
+              }
+            },
+            "description": "Tool not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "job_busy": {
+                    "summary": "Another tool operation holds the global slot",
+                    "value": {
+                      "detail": {
+                        "code": "job_busy",
+                        "message": "已有工具任務正在進行中，請等待完成"
+                      }
+                    }
+                  },
+                  "version_mismatch": {
+                    "summary": "The requested version is stale",
+                    "value": {
+                      "detail": {
+                        "code": "version_mismatch",
+                        "message": "工具版本已變更，請重新整理後再試"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "description": "Version-specific tool operation conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revise Tool",
+        "tags": [
+          "tools"
+        ]
+      }
+    },
+    "/api/tools/{name}/summary": {
+      "get": {
+        "description": "One tool's AI summary.\n\nA tool with no sidecar is an all-null 200, NOT a 404 (see\n``ToolSummaryDetail``): the resource being addressed is the tool's summary,\nand \"this tool has no summary yet\" is a normal state with its own UI. The\n404 is reserved for the tool itself not existing -- which, with TOOLS_DIR\nunset, is also what the whole feature being off looks like, and which an\ninternal symlink alias is deliberately folded into (a summary must be read\nfrom the package it names, never from an aliased one).",
+        "operationId": "get_tool_summary_api_tools__name__summary_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolSummaryDetail"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Tool not found"
+                }
+              }
+            },
+            "description": "Tool not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Tool Summary",
+        "tags": [
+          "tools"
+        ]
+      }
+    },
+    "/api/tools/{name}/summary/regenerate": {
+      "post": {
+        "description": "Re-run the summary generation for one tool and return the new sidecar.\n\nSYNCHRONOUS, unlike the installer: this is one short single-turn generation\n(no tool loop, no shell, ordinary timeout), so it fits a request the way\n捕捉/補齊 do -- and it therefore follows THEIR error contract, declaring and\nraising the shared 503 ``llm_not_configured`` / 502 ``llm_upstream_error``\nfrom ``routers.ai``. The installer's asynchronous, job-shaped contract stays\nwhat it is precisely because a builder session cannot fit in a request.\n\nBefore the LLM is touched, a queued/running job is refused under the shared\none-at-a-time builder/regenerate policy (409 ``job_busy``). After taking that\nslot, ``expected_vid`` is compared with the resolved current version; a stale\ncaller gets ``version_mismatch`` without an LLM request.\n\nThe job gate TAKES a reservation rather than merely asking (R7-3), and the\ndifference is what makes it a gate at all: this handler then awaits a full\nLLM round trip, and a bare ``any_job_active()`` read released the shared\nadmission policy before that work finished. ``reserve_sync_operation`` decides\nand takes under the SAME lock ``_admit_job`` uses, so builder work is refused\nfor the duration instead; the reservation is released in the ``finally`` below\non every path, success or exception.\n\nA generation that produced text but STORED nothing (``regenerate_summary``\n-> None: the package vanished mid-request, or the sidecar write was refused)\nis a 404 rather than a 200, so this route can never report a summary that\nthe next GET will not find. That is the same fold the PATCH above applies to\nits own failed rewrite.",
+        "operationId": "regenerate_tool_summary_api_tools__name__summary_regenerate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ToolExpectedVersionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolSummaryDetail"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Tool not found"
+                }
+              }
+            },
+            "description": "Tool not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "job_busy": {
+                    "summary": "Another tool operation holds the global slot",
+                    "value": {
+                      "detail": {
+                        "code": "job_busy",
+                        "message": "已有工具任務正在進行中，請等待完成"
+                      }
+                    }
+                  },
+                  "version_mismatch": {
+                    "summary": "The requested version is stale",
+                    "value": {
+                      "detail": {
+                        "code": "version_mismatch",
+                        "message": "工具版本已變更，請重新整理後再試"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "description": "Version-specific tool operation conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": {
+                    "code": "llm_upstream_error",
+                    "message": "APIConnectionError: the upstream LLM request failed"
+                  }
+                }
+              }
+            },
+            "description": "LLM upstream call failed or returned unusable output"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": {
+                    "code": "llm_not_configured",
+                    "message": "The LLM endpoint is not configured."
+                  }
+                }
+              }
+            },
+            "description": "LLM endpoint is not configured"
+          }
+        },
+        "summary": "Regenerate Tool Summary",
+        "tags": [
+          "tools"
+        ]
+      }
+    },
+    "/api/tools/{name}/versions/{vid}": {
+      "delete": {
+        "description": "Discard the exact current version named by ``vid``.\n\nThe global slot is taken before resolving the route target, then the service\nre-resolves and compares ``vid`` only after taking the exclusive filesystem\nlock. That second placement is what prevents a route-level answer for V from\nauthorizing an old V -> P publication after ``current`` has moved to Q. The\nresponse reports whether the former version's files were removed or retained,\nwith the exact operator cleanup path in the latter case.",
+        "operationId": "discard_tool_version_api_tools__name__versions__vid__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "vid",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$",
+              "title": "Vid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolDiscardResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Tool not found"
+                }
+              }
+            },
+            "description": "Tool not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "ai_job_in_progress": {
+                    "summary": "An AI request or inherited tool process holds the shared tools lock",
+                    "value": {
+                      "detail": {
+                        "code": "ai_job_in_progress",
+                        "message": "AI 任務進行中，請稍後再試"
+                      }
+                    }
+                  },
+                  "job_busy": {
+                    "summary": "Another tool operation holds the global slot",
+                    "value": {
+                      "detail": {
+                        "code": "job_busy",
+                        "message": "已有工具任務正在進行中，請等待完成"
+                      }
+                    }
+                  },
+                  "lineage_unavailable": {
+                    "summary": "The previous-version lineage cannot be used",
+                    "value": {
+                      "detail": {
+                        "code": "lineage_unavailable",
+                        "message": "前一版已不存在或版本關係已損壞，請刪除整個工具"
+                      }
+                    }
+                  },
+                  "version_mismatch": {
+                    "summary": "The requested version is stale",
+                    "value": {
+                      "detail": {
+                        "code": "version_mismatch",
+                        "message": "工具版本已變更，請重新整理後再試"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "description": "Version-specific tool operation conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": {
+                    "code": "tools_lock_unavailable",
+                    "message": "Tools lock /path/to/tools/.afterthread-tools.lck is unavailable: open failed: Permission denied. Repair ownership and owner read/write permissions on this existing inode; do not delete or recreate it."
+                  }
+                }
+              }
+            },
+            "description": "The persistent tools lock path cannot be opened or locked"
+          }
+        },
+        "summary": "Discard Tool Version",
+        "tags": [
+          "tools"
+        ]
+      }
+    }
+  }
+}

@@ -7,6 +7,7 @@
 			"!dist",
 			"!node_modules",
 			"!public",
+			"!src/api/openapi.gen.json",
 			"!src/api/schema.gen.ts"
 		]
 	},
