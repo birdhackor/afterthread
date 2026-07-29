@@ -2629,9 +2629,12 @@ async def run_revise(
             )
         if result.tool_name != name:
             # D40: ``InstallResult._ready_requires_valid_name`` only checks the
-            # SHAPE of the name, never its identity -- so a model that decided to
-            # "fix" the name would otherwise have its work promoted over whatever
-            # package that other name addresses. Refuse, and say which name was
+            # SHAPE of the name, never its identity. The destination is NOT at
+            # risk -- ``_publish_revised_version`` is handed the typed
+            # ``PackageRoot`` resolved at entry, so a renamed result cannot be
+            # published anywhere else -- but a result that names a different tool
+            # than the one requested breaks the contract every caller reads it
+            # under, and describes files it did not build. Refuse, and say which name was
             # attempted so the operator can see what the model tried; the attempted
             # name is run through the redactor first, exactly as ``validate_package``
             # does with the offending path it names, because it is model-authored

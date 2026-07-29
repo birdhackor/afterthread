@@ -4799,10 +4799,11 @@ def test_run_revise_registers_the_live_env_values_for_the_session(
 
 
 def test_run_revise_refuses_a_model_rename(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """``tool_name`` addresses WHICH package gets replaced, so a model that
-    renames the tool is refused: ``InstallResult`` only validates the SHAPE of
-    the name, and promoting under another name would overwrite whatever package
-    that name addresses. The original is left exactly as it was."""
+    """A model that renames the tool is refused: ``InstallResult`` validates only
+    the SHAPE of the name, and a result naming a different tool than the one
+    requested breaks the contract its callers read it under. The destination
+    itself was never reachable by that name -- publication takes the typed
+    ``PackageRoot`` resolved at entry. The original is left exactly as it was."""
     pkg = _seed_package(monkeypatch, tmp_path)
     before = _file_bytes(pkg)
     _fake_generate(

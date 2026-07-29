@@ -1000,16 +1000,16 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	// STATE -- the cached body may still say "running" -- but it is the end of
 	// what we can observe, and the reason for it is usually that the backend
 	// restarted (jobs are process-local) or that the bounded table evicted this
-	// one. Either way the work may well have completed: a revise that promoted
-	// its package and then lost its job row leaves us holding a stale row and a
-	// stale summary while the gate re-opens, so the user's next action lands on
-	// the package the vanished job already replaced.
+	// one. Either way the work may well have completed: a revise that published a
+	// new version and moved `current` onto it, then lost its job row, leaves us
+	// holding a row and a summary for the vid that was live BEFORE it, so the
+	// user's next action would address a version the vanished job superseded.
 	const jobEnded =
 		isTerminalToolJobState(job?.state) || jobQuery.error?.status === 404;
 	// The gate must stay CLOSED until that re-read lands (R7-2). A job ending
 	// releases isToolJobActive immediately, but what is on screen at that instant
 	// is still the pre-job row and the pre-job summary -- and after a revise that
-	// is exactly the data the job just invalidated by rebuilding the package. Left
+	// is exactly the data the job just invalidated by publishing a newer vid. Left
 	// open, the user can regenerate or submit new feedback against the OLD tool's
 	// state during the refetch, which the 404 card actively invites them to do
 	// ("送出修訂" is its stated remedy). So this flag is set with the ending and

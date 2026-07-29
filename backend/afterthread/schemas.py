@@ -725,10 +725,11 @@ class ToolJobStatus(BaseModel):
     cannot catch this one alone, because it never SERVES a stale id.
 
     One model for BOTH job kinds (D40 renamed it from ``ToolInstallJobStatus``
-    without touching a field): an install and a revise both end in a package
-    being written into the tools directory, they share one job table and one
-    poll endpoint. ``env_keys`` names assignments from a builder-written
-    ``.env`` that the backend stripped; values never enter the result.
+    without touching a field): an install writes a package into the tools
+    directory and a revise adds a version to one and moves ``current``, and both
+    report through one job table and one poll endpoint. ``env_keys`` names
+    assignments from a builder-written ``.env`` that the backend stripped;
+    values never enter the result.
     """
 
     job_id: str
