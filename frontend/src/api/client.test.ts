@@ -1,7 +1,22 @@
 import { getDefaultStore, type PrimitiveAtom } from "jotai";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	type Mock,
+	vi,
+} from "vitest";
 import { backendStatusAtom } from "../atoms/connectivity.js";
-import { ApiError, apiDelete, apiFetch, apiGet } from "./client.js";
+import {
+	ApiError,
+	apiDelete,
+	apiFetch,
+	apiGet,
+	apiPatch,
+	apiPost,
+} from "./client.js";
 
 // client.ts reports connectivity through jotai's default store (the app has
 // no <Provider>), so assertions must read backendStatusAtom from that same
@@ -21,8 +36,32 @@ type FetchStub = (
 // These unit tests only exercise the three Response members apiFetch reads.
 // Keeping the cast in one helper makes that intentionally partial browser
 // double explicit while leaving every individual scenario concise.
-function stubFetch(implementation: FetchStub): void {
-	globalThis.fetch = implementation as typeof fetch;
+function stubFetch(implementation: FetchStub): Mock<FetchStub> {
+	const spy = vi.fn(implementation);
+	globalThis.fetch = spy as unknown as typeof fetch;
+	return spy;
+}
+
+function expectTransportCall(
+	fetchSpy: Mock<FetchStub>,
+	expected: {
+		path: string;
+		method: string;
+		body?: unknown;
+	},
+): void {
+	expect(fetchSpy).toHaveBeenCalledTimes(1);
+	const [path, options] = fetchSpy.mock.calls[0] ?? [];
+	expect(path).toBe(expected.path);
+	expect(options?.method).toBe(expected.method);
+	if ("body" in expected) {
+		expect(options?.body).toBe(JSON.stringify(expected.body));
+	} else {
+		expect(options).not.toHaveProperty("body");
+	}
+	const headers = new Headers(options?.headers);
+	expect(headers.get("Accept")).toBe("application/json");
+	expect(headers.get("Content-Type")).toBe("application/json");
 }
 
 // Await a promise that MUST reject and hand back its rejection reason. A
@@ -52,6 +91,166 @@ beforeEach(() => {
 afterEach(() => {
 	// Undo the per-test fetch stub so no test depends on a predecessor's.
 	globalThis.fetch = originalFetch;
+});
+
+// Component tests intentionally stop at mocked client helpers. These tests
+// live at the next boundary down so URL expansion, verbs, bodies, and fetch
+// options cannot drift while every caller-facing assertion remains green.
+describe("transport contracts", () => {
+	it("apiFetch sends one expanded GET with fetch options and no body", async () => {
+		const controller = new AbortController();
+		const fetchSpy = stubFetch(async () => ({
+			ok: true,
+			status: 200,
+			text: async () => JSON.stringify({ items: [], total: 0 }),
+		}));
+
+		await expect(
+			apiFetch("/api/items", {
+				method: "GET",
+				query: { status: "active", q: "", limit: 20, offset: 0 },
+				headers: { "X-Transport-Contract": "apiFetch" },
+				signal: controller.signal,
+				reportConnectivity: false,
+			}),
+		).resolves.toEqual({ items: [], total: 0 });
+
+		expectTransportCall(fetchSpy, {
+			path: "/api/items?status=active&limit=20&offset=0",
+			method: "GET",
+		});
+		const [, options] = fetchSpy.mock.calls[0] ?? [];
+		expect(options?.signal).toBe(controller.signal);
+		expect(new Headers(options?.headers).get("X-Transport-Contract")).toBe(
+			"apiFetch",
+		);
+		expect(options).not.toHaveProperty("reportConnectivity");
+	});
+
+	it("apiGet sends one expanded GET with no body", async () => {
+		const fetchSpy = stubFetch(async () => ({
+			ok: true,
+			status: 200,
+			text: async () =>
+				JSON.stringify({
+					current_vid: "v1",
+					llm_log_id: null,
+					summary: "sunny",
+					updated_at: null,
+				}),
+		}));
+
+		await apiGet("/api/tools/{name}/summary", {
+			path: { name: "weather/search" },
+		});
+
+		expectTransportCall(fetchSpy, {
+			path: "/api/tools/weather%2Fsearch/summary",
+			method: "GET",
+		});
+	});
+
+	it("apiPost sends one expanded POST with a JSON body", async () => {
+		const fetchSpy = stubFetch(async () => ({
+			ok: true,
+			status: 201,
+			text: async () =>
+				JSON.stringify({
+					id: 8,
+					item_id: 37,
+					note: "transport contract",
+					date: "2026-07-29T00:00:00Z",
+				}),
+		}));
+
+		await apiPost("/api/items/{item_id}/progress", {
+			path: { item_id: 37 },
+			body: { note: "transport contract" },
+		});
+
+		expectTransportCall(fetchSpy, {
+			path: "/api/items/37/progress",
+			method: "POST",
+			body: { note: "transport contract" },
+		});
+	});
+
+	it("apiPatch sends one expanded PATCH with a JSON body", async () => {
+		const fetchSpy = stubFetch(async () => ({
+			ok: true,
+			status: 200,
+			text: async () => JSON.stringify({ id: 37, status: "waiting" }),
+		}));
+
+		await apiPatch("/api/items/{item_id}", {
+			path: { item_id: 37 },
+			body: { status: "waiting" },
+		});
+
+		expectTransportCall(fetchSpy, {
+			path: "/api/items/37",
+			method: "PATCH",
+			body: { status: "waiting" },
+		});
+	});
+
+	it("apiDelete sends one expanded DELETE with no body and maps 204 to null", async () => {
+		const fetchSpy = stubFetch(async () => ({
+			ok: true,
+			status: 204,
+			text: async () => {
+				throw new Error("a 204 body must not be read");
+			},
+		}));
+
+		await expect(
+			apiDelete("/api/items/{item_id}", { path: { item_id: 37 } }),
+		).resolves.toBeNull();
+
+		expectTransportCall(fetchSpy, {
+			path: "/api/items/37",
+			method: "DELETE",
+		});
+	});
+
+	it("apiFetch builds a caller-facing validation ApiError", async () => {
+		const fetchSpy = stubFetch(async () => ({
+			ok: false,
+			status: 422,
+			text: async () =>
+				JSON.stringify({
+					detail: [
+						{
+							loc: ["query", "limit"],
+							msg: "Input should be greater than or equal to 1",
+							type: "greater_than_equal",
+						},
+					],
+				}),
+		}));
+
+		const error = await rejectionOf(
+			apiFetch("/api/items", {
+				method: "GET",
+				query: { limit: 0 },
+				reportConnectivity: false,
+			}),
+		);
+
+		expect(error).toMatchObject({
+			name: "ApiError",
+			status: 422,
+			code: "validation_error",
+			message: "輸入資料有誤，請檢查後再試",
+			fieldErrors: {
+				limit: "Input should be greater than or equal to 1",
+			},
+		});
+		expectTransportCall(fetchSpy, {
+			path: "/api/items?limit=0",
+			method: "GET",
+		});
+	});
 });
 
 describe("apiFetch passive connectivity reporting", () => {
