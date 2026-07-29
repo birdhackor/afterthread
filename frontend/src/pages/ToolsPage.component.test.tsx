@@ -1088,10 +1088,12 @@ describe("ToolsPage component", () => {
 		for (const button of screen.getAllByRole("button", { name: "AI 總結" })) {
 			await user.click(button);
 		}
-		await user.type(
-			screen.getAllByRole("textbox", { name: "修訂意見" })[0],
-			"調整第一個工具",
-		);
+		// Expanding the panels starts lazy summary reads; wait for the first
+		// revise form before using DOM order to select the first tool.
+		const feedbackFields = await screen.findAllByRole("textbox", {
+			name: "修訂意見",
+		});
+		await user.type(feedbackFields[0], "調整第一個工具");
 		await user.click(screen.getAllByRole("button", { name: "送出修訂" })[0]);
 		await waitFor(() => {
 			expectOnlyWriteCall(writeApiMocks, mockedApiPost, [
