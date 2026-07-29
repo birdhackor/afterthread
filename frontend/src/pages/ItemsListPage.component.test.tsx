@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { getDefaultStore } from "jotai";
 import {
@@ -32,6 +32,11 @@ type ReadStep =
 	| {
 			call: readonly unknown[];
 			error: Error;
+	  }
+	| {
+			call: readonly unknown[];
+			promise: Promise<ItemListResponse>;
+			onStart: () => void;
 	  };
 
 const mockedApiGet = vi.mocked(apiGet) as unknown as Mock<
@@ -100,6 +105,14 @@ function itemRead(
 	] as const;
 }
 
+function deferred<T>() {
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((_resolve, fail) => {
+		reject = fail;
+	});
+	return { promise, reject };
+}
+
 function mockReadSequence(...steps: ReadStep[]) {
 	expectedReadCalls = steps.map((step) => step.call);
 	mockedApiGet.mockImplementation((...call) => {
@@ -113,9 +126,14 @@ function mockReadSequence(...steps: ReadStep[]) {
 				`Unexpected GET #${index + 1} ${JSON.stringify(call)}; expected ${JSON.stringify(step?.call ?? "no additional read")}`,
 			);
 		}
-		return "error" in step
-			? Promise.reject(step.error)
-			: Promise.resolve(step.response);
+		if ("error" in step) {
+			return Promise.reject(step.error);
+		}
+		if ("promise" in step) {
+			step.onStart();
+			return step.promise;
+		}
+		return Promise.resolve(step.response);
 	});
 }
 
@@ -142,19 +160,34 @@ afterEach(() => {
 describe("ItemsListPage display correctness", () => {
 	it("shows a network read failure instead of claiming there are no items", async () => {
 		const message = "無法連線伺服器，請確認網路後再試";
+		const failure = Object.assign(new Error(message), {
+			status: 0,
+			code: "network_error",
+		});
+		const request = deferred<ItemListResponse>();
+		let markStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
 		mockReadSequence({
 			call: itemRead(),
-			error: Object.assign(new Error(message), {
-				status: 0,
-				code: "network_error",
-			}),
+			promise: request.promise,
+			onStart: markStarted,
 		});
 
 		renderWithAppProviders(<ItemsListPage />, {
 			initialEntries: ["/items"],
 		});
 
-		expect((await screen.findAllByText(message)).length).toBeGreaterThan(0);
+		// RouterProvider mounts the route asynchronously. Wait until useQuery has
+		// started this controlled request before rejecting it inside React's act.
+		await started;
+		await act(async () => {
+			request.reject(failure);
+			await expect(request.promise).rejects.toBe(failure);
+		});
+
+		expect(screen.getAllByText(message).length).toBeGreaterThan(0);
 		expect(screen.getByRole("button", { name: "重試" })).toBeInTheDocument();
 		expect(screen.queryByText("尚無記憶項目")).not.toBeInTheDocument();
 		expect(screen.queryByText("找不到符合條件的項目")).not.toBeInTheDocument();
