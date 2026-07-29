@@ -3196,7 +3196,13 @@ def test_router_discard_rechecks_expected_vid_after_exclusive_lock(
 def test_router_discard_uses_lineage_resolved_after_exclusive_lock(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """An autosaved V.previous edit in the pre-lock window selects fresh Q."""
+    """The service uses the lineage IT resolved under the lock, not the route's.
+
+    This is not a defence against an edit racing the write -- 裁決 #15 rules that
+    class out. It pins the ordinary case the in-lock resolution exists for: the
+    route's answer can be stale by the time the worker runs, so the authorization
+    and the lineage must both come from the resolution taken under the lock.
+    """
 
     first = _seed_package(monkeypatch, tmp_path, "discard-lineage-race")
     package = _package_path(first)
