@@ -22,7 +22,7 @@ type HealthResponse = ApiSuccessResponse<"/api/health", "get">;
 const statusAtom = backendStatusAtom as PrimitiveAtom<{
 	reachable: boolean | null;
 }>;
-const mockedApiFetch = vi.mocked(apiFetch) as Mock<
+const mockedApiFetch = vi.mocked(apiFetch) as unknown as Mock<
 	(path: string, options: RequestInit) => Promise<HealthResponse>
 >;
 

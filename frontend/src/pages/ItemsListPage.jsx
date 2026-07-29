@@ -20,7 +20,7 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useAtom, useSetAtom } from "jotai";
 import { useEffect, useRef } from "react";
-import { apiGet, buildQuery } from "../api/client.js";
+import { apiGet } from "../api/client.js";
 import {
 	DEFAULT_LIMIT,
 	pageAtom,
@@ -151,7 +151,7 @@ export function ItemsListPage() {
 	// Trimmed once here, shared by the query key, the request URL and hasFilters
 	// -- backend tags are stored trimmed and matched exactly, and q's whitespace
 	// would otherwise become part of the LIKE pattern, so whitespace-only
-	// input must mean "no filter" (buildQuery drops the resulting "", and
+	// input must mean "no filter" (the API client drops the resulting "", and
 	// hasFilters must agree or an empty DB would show 找不到符合條件的項目
 	// instead of 尚無記憶項目). The atoms/debounced values themselves stay
 	// untrimmed (see changeTag/changeQ) so the input's caret/typing is never
@@ -176,7 +176,7 @@ export function ItemsListPage() {
 	const { data, error, isError, isFetching, isPlaceholderData, refetch } =
 		useQuery({
 			queryKey: ["items", filters],
-			queryFn: () => apiGet(`/api/items${buildQuery(filters)}`),
+			queryFn: () => apiGet("/api/items", { query: filters }),
 			// keepPreviousData keeps the prior page's rows on screen (under the
 			// LoadingOverlay below) while a filter/page change refetches, instead of
 			// flashing empty -- the react-query equivalent of the old "keep

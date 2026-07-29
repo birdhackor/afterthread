@@ -156,7 +156,8 @@ describe("Invariant K — every version-specific write carries the vid", () => {
 		expect(
 			buildReviseRequest({ name, currentVid, feedback: "限制為五筆" }),
 		).toEqual({
-			path: "/api/tools/kb_search/revise",
+			path: "/api/tools/{name}/revise",
+			pathParams: { name: "kb_search" },
 			body: {
 				feedback: "限制為五筆",
 				expected_vid: currentVid,
@@ -166,14 +167,16 @@ describe("Invariant K — every version-specific write carries the vid", () => {
 
 	it("puts expected_vid in the regenerate body", () => {
 		expect(buildRegenerateRequest({ name, currentVid })).toEqual({
-			path: "/api/tools/kb_search/summary/regenerate",
+			path: "/api/tools/{name}/summary/regenerate",
+			pathParams: { name: "kb_search" },
 			body: { expected_vid: currentVid },
 		});
 	});
 
 	it("puts the expected vid in the discard path", () => {
 		expect(buildDiscardRequest({ name, currentVid })).toEqual({
-			path: `/api/tools/kb_search/versions/${currentVid}`,
+			path: "/api/tools/{name}/versions/{vid}",
+			pathParams: { name: "kb_search", vid: currentVid },
 		});
 	});
 });

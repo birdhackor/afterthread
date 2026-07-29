@@ -87,6 +87,42 @@ describe("apiFetch passive connectivity reporting", () => {
 		expect(headers.get("Content-Type")).toBe("application/json");
 	});
 
+	it("materializes typed path parameters and URL-encodes their values", async () => {
+		let seenPath: RequestInfo | URL | undefined;
+		stubFetch(async (path) => {
+			seenPath = path;
+			return {
+				ok: true,
+				status: 200,
+				text: async () => JSON.stringify({ id: 1 }),
+			};
+		});
+
+		await apiGet("/api/tools/{name}/summary", {
+			path: { name: "weather/search" },
+		});
+
+		expect(seenPath).toBe("/api/tools/weather%2Fsearch/summary");
+	});
+
+	it("serializes only schema-named query parameters and drops empty values", async () => {
+		let seenPath: RequestInfo | URL | undefined;
+		stubFetch(async (path) => {
+			seenPath = path;
+			return {
+				ok: true,
+				status: 200,
+				text: async () => JSON.stringify({ items: [], total: 0 }),
+			};
+		});
+
+		await apiGet("/api/items", {
+			query: { status: "active", q: "", limit: 20, offset: 0 },
+		});
+
+		expect(seenPath).toBe("/api/items?status=active&limit=20&offset=0");
+	});
+
 	it("throws ApiError(500) and reports nothing -- a 5xx may be an intermediary, not the backend", async () => {
 		stubFetch(async () => ({
 			ok: false,
@@ -121,7 +157,9 @@ describe("apiFetch passive connectivity reporting", () => {
 		// only application logic produces sub-5xx responses, so even an error
 		// status is proof of life.
 		store.set(statusAtom, { reachable: false });
-		const error = await rejectionOf(apiGet("/api/items/999"));
+		const error = await rejectionOf(
+			apiGet("/api/items/{item_id}", { path: { item_id: 999 } }),
+		);
 		expect(error).toBeInstanceOf(ApiError);
 		expect(error.status).toBe(404);
 		expect(store.get(statusAtom)).toEqual({ reachable: true });
@@ -177,7 +215,9 @@ describe("apiFetch passive connectivity reporting", () => {
 		// even though the body-read path (where the usual up-report lives) is
 		// skipped entirely.
 		store.set(statusAtom, { reachable: false });
-		await expect(apiDelete("/api/items/1")).resolves.toBeNull();
+		await expect(
+			apiDelete("/api/items/{item_id}", { path: { item_id: 1 } }),
+		).resolves.toBeNull();
 		expect(store.get(statusAtom)).toEqual({ reachable: true });
 	});
 

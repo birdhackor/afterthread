@@ -70,7 +70,8 @@ export function ItemEditPage() {
 		isFetching,
 	} = useQuery({
 		queryKey: ["item", itemId],
-		queryFn: () => apiGet(`/api/items/${itemId}`),
+		queryFn: () =>
+			apiGet("/api/items/{item_id}", { path: { item_id: itemId } }),
 		refetchOnMount: "always",
 		refetchOnWindowFocus: false,
 		refetchOnReconnect: false,
@@ -132,7 +133,11 @@ export function ItemEditPage() {
 		navigate({ to: "/items/$itemId", params: { itemId } });
 
 	const updateMutation = useMutation({
-		mutationFn: (patch) => apiPatch(`/api/items/${itemId}`, patch),
+		mutationFn: (patch) =>
+			apiPatch("/api/items/{item_id}", {
+				path: { item_id: itemId },
+				body: patch,
+			}),
 		onSuccess: () => {
 			notifications.show({
 				color: "green",

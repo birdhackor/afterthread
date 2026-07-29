@@ -275,7 +275,8 @@ function AttemptCard({ attempt, index }) {
 function LogDetailPanel({ log, expanded }) {
 	const { data, error, isError, isFetching, refetch } = useQuery({
 		queryKey: ["llm-log", log.id, log.started_at],
-		queryFn: () => apiGet(`/api/llm/logs/${log.id}`),
+		queryFn: () =>
+			apiGet("/api/llm/logs/{log_id}", { path: { log_id: log.id } }),
 		enabled: expanded,
 	});
 
@@ -388,7 +389,8 @@ function OffListRecord({ logId }) {
 		// know before the fetch, so a shared key could hand one query the other's
 		// cached record.
 		queryKey: ["llm-log", logId, "deep-link"],
-		queryFn: () => apiGet(`/api/llm/logs/${logId}`),
+		queryFn: () =>
+			apiGet("/api/llm/logs/{log_id}", { path: { log_id: logId } }),
 	});
 
 	if (data === undefined && isFetching) {
@@ -491,7 +493,7 @@ export function LlmLogsPage() {
 
 	const { data, error, isError, isFetching, refetch } = useQuery({
 		queryKey: ["llm-logs"],
-		queryFn: () => apiGet(`/api/llm/logs?limit=${LIST_LIMIT}`),
+		queryFn: () => apiGet("/api/llm/logs", { query: { limit: LIST_LIMIT } }),
 	});
 
 	// Same first-load / retry discipline as HomePage: react-query keeps status

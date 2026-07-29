@@ -254,7 +254,8 @@ export function ItemDetailPage() {
 		refetch,
 	} = useQuery({
 		queryKey: ["item", itemId],
-		queryFn: () => apiGet(`/api/items/${itemId}`),
+		queryFn: () =>
+			apiGet("/api/items/{item_id}", { path: { item_id: itemId } }),
 	});
 
 	// Reflect the loaded item's title in the document title, falling back while
@@ -294,7 +295,10 @@ export function ItemDetailPage() {
 	// refetch) settle.
 	const patchMutation = useMutation({
 		mutationFn: ({ field, value }) =>
-			apiPatch(`/api/items/${itemId}`, { [field]: value }),
+			apiPatch("/api/items/{item_id}", {
+				path: { item_id: itemId },
+				body: { [field]: value },
+			}),
 		onSuccess: async (_data, variables) => {
 			notifications.show({ color: "green", message: variables.successMessage });
 			await invalidateItemAndLists();
@@ -309,7 +313,11 @@ export function ItemDetailPage() {
 	});
 
 	const progressMutation = useMutation({
-		mutationFn: (note) => apiPost(`/api/items/${itemId}/progress`, { note }),
+		mutationFn: (note) =>
+			apiPost("/api/items/{item_id}/progress", {
+				path: { item_id: itemId },
+				body: { note },
+			}),
 		onSuccess: async () => {
 			notifications.show({ color: "green", message: "已新增進度" });
 			await invalidateItemAndLists();
@@ -326,7 +334,8 @@ export function ItemDetailPage() {
 	// Delete is intentionally NOT part of the mutation gate: it navigates away on
 	// success, so it can't race an in-place update the way a PATCH/POST can.
 	const deleteMutation = useMutation({
-		mutationFn: () => apiDelete(`/api/items/${itemId}`),
+		mutationFn: () =>
+			apiDelete("/api/items/{item_id}", { path: { item_id: itemId } }),
 		onSuccess: () => {
 			notifications.show({
 				color: "green",

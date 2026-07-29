@@ -6,6 +6,7 @@ import {
 	screen,
 	waitFor,
 	waitForElementToBeRemoved,
+	within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
@@ -21,11 +22,20 @@ vi.mock("../api/client.js", () => ({
 	apiPost: vi.fn(),
 }));
 
-const mockedApiDelete = vi.mocked(apiDelete) as Mock<
-	(path: string) => Promise<unknown>
+type MockApiOptions = {
+	path?: Record<string, string | number>;
+	query?: Record<string, unknown>;
+	body?: unknown;
+};
+
+const mockedApiDelete = vi.mocked(apiDelete) as unknown as Mock<
+	(path: string, options?: MockApiOptions) => Promise<unknown>
+>;
+const mockedApiGet = vi.mocked(apiGet) as unknown as Mock<
+	(path: string, options?: MockApiOptions) => Promise<unknown>
 >;
 const mockedApiPost = vi.mocked(apiPost) as unknown as Mock<
-	(path: string, body: unknown) => Promise<unknown>
+	(path: string, options: MockApiOptions) => Promise<unknown>
 >;
 
 type ToolListResponse = ApiSuccessResponse<"/api/tools", "get">;
@@ -37,7 +47,16 @@ type ToolDiscardResponse = ApiSuccessResponse<
 	"/api/tools/{name}/versions/{vid}",
 	"delete"
 >;
-type ToolJobAccepted = ApiSuccessResponse<"/api/tools/{name}/revise", "post">;
+type ToolDeleteResponse = ApiSuccessResponse<"/api/tools/{name}", "delete">;
+type ToolRegenerateResponse = ApiSuccessResponse<
+	"/api/tools/{name}/summary/regenerate",
+	"post"
+>;
+type ToolReviseAccepted = ApiSuccessResponse<
+	"/api/tools/{name}/revise",
+	"post"
+>;
+type ToolInstallAccepted = ApiSuccessResponse<"/api/tools/install", "post">;
 type ToolJobResponse = ApiSuccessResponse<"/api/tools/jobs/{job_id}", "get">;
 
 const toolListResponse = {
@@ -76,6 +95,12 @@ function summaryFor(
 	};
 }
 
+function regenerateResponseFor(
+	tool: ToolListResponse["tools"][number],
+): ToolRegenerateResponse {
+	return summaryFor(tool);
+}
+
 function apiError(code: string) {
 	return Object.assign(new Error(`測試衝突：${code}`), {
 		status: 409,
@@ -94,17 +119,19 @@ function deferred<T>() {
 }
 
 function toolListRequestCount() {
-	return vi.mocked(apiGet).mock.calls.filter(([path]) => path === "/api/tools")
+	return mockedApiGet.mock.calls.filter(([path]) => path === "/api/tools")
 		.length;
 }
 
 function mockToolReads(list: ToolListResponse) {
-	vi.mocked(apiGet).mockImplementation((path) => {
+	mockedApiGet.mockImplementation((path, options) => {
 		if (path === "/api/tools") {
 			return Promise.resolve(list);
 		}
 		const tool = list.tools.find(
-			(candidate) => path === `/api/tools/${candidate.name}/summary`,
+			(candidate) =>
+				path === "/api/tools/{name}/summary" &&
+				options?.path?.name === candidate.name,
 		);
 		if (tool) {
 			return Promise.resolve(summaryFor(tool));
@@ -138,7 +165,7 @@ describe("ToolsPage component", () => {
 
 	it("transitions from loading to the mocked tools response", async () => {
 		const request = deferred<ToolListResponse>();
-		vi.mocked(apiGet).mockImplementation(() => request.promise);
+		mockedApiGet.mockImplementation(() => request.promise);
 
 		renderWithAppProviders(<ToolsPage />);
 
@@ -192,11 +219,14 @@ describe("ToolsPage component", () => {
 		let currentList = versionV;
 		let currentSummary = summaryV;
 
-		vi.mocked(apiGet).mockImplementation((path) => {
+		mockedApiGet.mockImplementation((path, options) => {
 			if (path === "/api/tools") {
 				return Promise.resolve(currentList);
 			}
-			if (path === "/api/tools/weather-search/summary") {
+			if (
+				path === "/api/tools/{name}/summary" &&
+				options?.path?.name === "weather-search"
+			) {
 				return Promise.resolve(currentSummary);
 			}
 			throw new Error(`Unexpected GET ${path}`);
@@ -244,7 +274,7 @@ describe("ToolsPage component", () => {
 		const user = userEvent.setup();
 		const list = toolListWith({ lineage: "usable" });
 		mockToolReads(list);
-		vi.mocked(apiDelete).mockRejectedValue(apiError("version_mismatch"));
+		mockedApiDelete.mockRejectedValue(apiError("version_mismatch"));
 
 		const { queryClient } = renderWithAppProviders(<ToolsPage />);
 		await waitForTool();
@@ -271,7 +301,7 @@ describe("ToolsPage component", () => {
 			current_vid: "v-weather-parent",
 			lineage: "usable",
 		});
-		vi.mocked(apiGet)
+		mockedApiGet
 			.mockImplementationOnce(() => Promise.resolve(versionV))
 			.mockImplementation(() => Promise.resolve(versionP));
 
@@ -302,7 +332,7 @@ describe("ToolsPage component", () => {
 		const user = userEvent.setup();
 		const list = toolListWith({ lineage: "usable" });
 		mockToolReads(list);
-		vi.mocked(apiDelete).mockRejectedValue(apiError(code));
+		mockedApiDelete.mockRejectedValue(apiError(code));
 
 		renderWithAppProviders(<ToolsPage />);
 		await waitForTool();
@@ -325,7 +355,7 @@ describe("ToolsPage component", () => {
 		const user = userEvent.setup();
 		const list = toolListWith({ lineage: "usable" });
 		mockToolReads(list);
-		vi.mocked(apiDelete).mockRejectedValue(apiError("lineage_unavailable"));
+		mockedApiDelete.mockRejectedValue(apiError("lineage_unavailable"));
 
 		const { queryClient } = renderWithAppProviders(<ToolsPage />);
 		await waitForTool();
@@ -398,7 +428,7 @@ describe("ToolsPage component", () => {
 		).toBeInTheDocument();
 	});
 
-	it("renders a physically removed discard as completed removal", async () => {
+	it("sends the exact version-discard request and renders a physical removal", async () => {
 		const user = userEvent.setup();
 		const list = toolListWith({ lineage: "usable" });
 		mockToolReads(list);
@@ -413,6 +443,9 @@ describe("ToolsPage component", () => {
 		await openDiscardConfirmation(user);
 		await user.click(screen.getByRole("button", { name: "丟掉並退回" }));
 
+		expect(apiDelete).toHaveBeenCalledWith("/api/tools/{name}/versions/{vid}", {
+			path: { name: "weather-search", vid: "v-weather-1" },
+		});
 		expect(
 			await screen.findByText(
 				"已丟掉「weather-search」的目前版本並退回前一版；原版本檔案已移除",
@@ -454,12 +487,15 @@ describe("ToolsPage component", () => {
 		const list = toolListWith({ lineage: "usable" });
 		const listRefresh = deferred<ToolListResponse>();
 		let listReads = 0;
-		vi.mocked(apiGet).mockImplementation((path) => {
+		mockedApiGet.mockImplementation((path, options) => {
 			if (path === "/api/tools") {
 				listReads += 1;
 				return listReads === 1 ? Promise.resolve(list) : listRefresh.promise;
 			}
-			if (path === "/api/tools/weather-search/summary") {
+			if (
+				path === "/api/tools/{name}/summary" &&
+				options?.path?.name === "weather-search"
+			) {
 				return Promise.resolve(summaryFor(list.tools[0]));
 			}
 			throw new Error(`Unexpected GET ${path}`);
@@ -507,14 +543,17 @@ describe("ToolsPage component", () => {
 		const user = userEvent.setup();
 		const list = toolListWith({ lineage: "usable" });
 		let listReads = 0;
-		vi.mocked(apiGet).mockImplementation((path) => {
+		mockedApiGet.mockImplementation((path, options) => {
 			if (path === "/api/tools") {
 				listReads += 1;
 				return listReads === 1
 					? Promise.resolve(list)
 					: Promise.reject(new Error("工具清單重讀失敗"));
 			}
-			if (path === "/api/tools/weather-search/summary") {
+			if (
+				path === "/api/tools/{name}/summary" &&
+				options?.path?.name === "weather-search"
+			) {
 				return Promise.resolve(summaryFor(list.tools[0]));
 			}
 			throw new Error(`Unexpected GET ${path}`);
@@ -544,11 +583,14 @@ describe("ToolsPage component", () => {
 		const list = toolListWith({ lineage: "usable" });
 		const summaryRefresh = deferred<ToolSummaryResponse>();
 		let summaryReads = 0;
-		vi.mocked(apiGet).mockImplementation((path) => {
+		mockedApiGet.mockImplementation((path, options) => {
 			if (path === "/api/tools") {
 				return Promise.resolve(list);
 			}
-			if (path === "/api/tools/weather-search/summary") {
+			if (
+				path === "/api/tools/{name}/summary" &&
+				options?.path?.name === "weather-search"
+			) {
 				summaryReads += 1;
 				return summaryReads === 1
 					? Promise.resolve(summaryFor(list.tools[0]))
@@ -597,7 +639,7 @@ describe("ToolsPage component", () => {
 		expect(apiPost).not.toHaveBeenCalled();
 	});
 
-	it("propagates a pending regenerate gate to other tools and the install form", async () => {
+	it("sends the exact regenerate request and gates other tools while pending", async () => {
 		const user = userEvent.setup();
 		const list = {
 			tools: [
@@ -610,10 +652,13 @@ describe("ToolsPage component", () => {
 				},
 			],
 		} satisfies ToolListResponse;
-		const regenerate = deferred<ToolSummaryResponse>();
+		const regenerate = deferred<ToolRegenerateResponse>();
 		mockToolReads(list);
-		mockedApiPost.mockImplementation((path) => {
-			if (path === "/api/tools/weather-search/summary/regenerate") {
+		mockedApiPost.mockImplementation((path, options) => {
+			if (
+				path === "/api/tools/{name}/summary/regenerate" &&
+				options.path?.name === "weather-search"
+			) {
 				return regenerate.promise;
 			}
 			throw new Error(`Unexpected POST ${path}`);
@@ -641,6 +686,13 @@ describe("ToolsPage component", () => {
 		await waitFor(() => {
 			expect(apiPost).toHaveBeenCalledTimes(1);
 		});
+		expect(apiPost).toHaveBeenCalledWith(
+			"/api/tools/{name}/summary/regenerate",
+			{
+				path: { name: "weather-search" },
+				body: { expected_vid: "v-weather-1" },
+			},
+		);
 
 		expect(
 			screen.getAllByRole("button", { name: "重新產生" })[1],
@@ -666,15 +718,15 @@ describe("ToolsPage component", () => {
 		expect(apiPost).toHaveBeenCalledTimes(1);
 
 		await act(async () => {
-			regenerate.resolve(summaryFor(list.tools[0]));
+			regenerate.resolve(regenerateResponseFor(list.tools[0]));
 			await regenerate.promise;
 		});
 	});
 
-	it("propagates a pending install gate to all version writes", async () => {
+	it("sends the exact install request and gates every version write while pending", async () => {
 		const user = userEvent.setup();
 		const list = toolListWith({ lineage: "usable" });
-		const install = deferred<ToolJobAccepted>();
+		const install = deferred<ToolInstallAccepted>();
 		mockToolReads(list);
 		mockedApiPost.mockImplementation((path) => {
 			if (path === "/api/tools/install") {
@@ -701,6 +753,12 @@ describe("ToolsPage component", () => {
 		await user.click(screen.getByRole("button", { name: "開始安裝" }));
 		await waitFor(() => {
 			expect(apiPost).toHaveBeenCalledTimes(1);
+		});
+		expect(apiPost).toHaveBeenCalledWith("/api/tools/install", {
+			body: {
+				openapi_url: "https://example.test/openapi.json",
+				instructions: "建立測試工具",
+			},
 		});
 		expect(
 			screen.getByRole("textbox", { name: "OpenAPI JSON 網址" }),
@@ -747,21 +805,27 @@ describe("ToolsPage component", () => {
 			summary: "安裝完成摘要",
 		} satisfies ToolJobResponse;
 		let currentJob: ToolJobResponse = runningJob;
-		vi.mocked(apiGet).mockImplementation((path) => {
+		mockedApiGet.mockImplementation((path, options) => {
 			if (path === "/api/tools") {
 				return Promise.resolve(list);
 			}
-			if (path === "/api/tools/weather-search/summary") {
+			if (
+				path === "/api/tools/{name}/summary" &&
+				options?.path?.name === "weather-search"
+			) {
 				return Promise.resolve(summaryFor(list.tools[0]));
 			}
-			if (path === "/api/tools/jobs/job-install-1") {
+			if (
+				path === "/api/tools/jobs/{job_id}" &&
+				options?.path?.job_id === "job-install-1"
+			) {
 				return Promise.resolve(currentJob);
 			}
 			throw new Error(`Unexpected GET ${path}`);
 		});
 		mockedApiPost.mockResolvedValue({
 			job_id: "job-install-1",
-		} satisfies ToolJobAccepted);
+		} satisfies ToolInstallAccepted);
 
 		const { queryClient } = renderWithAppProviders(<ToolsPage />);
 		await waitForTool();
@@ -845,7 +909,7 @@ describe("ToolsPage component", () => {
 		});
 	});
 
-	it("keeps the version-write gate closed from revise submission through its active job", async () => {
+	it("sends the exact revise request and keeps the write gate closed through its job", async () => {
 		const user = userEvent.setup();
 		const list = {
 			tools: [
@@ -858,7 +922,7 @@ describe("ToolsPage component", () => {
 				},
 			],
 		} satisfies ToolListResponse;
-		const revise = deferred<ToolJobAccepted>();
+		const revise = deferred<ToolReviseAccepted>();
 		const runningJob = {
 			job_id: "job-revise-1",
 			state: "running",
@@ -871,23 +935,31 @@ describe("ToolsPage component", () => {
 			llm_log_process: null,
 			env_keys: [],
 		} satisfies ToolJobResponse;
-		vi.mocked(apiGet).mockImplementation((path) => {
+		mockedApiGet.mockImplementation((path, options) => {
 			if (path === "/api/tools") {
 				return Promise.resolve(list);
 			}
 			const tool = list.tools.find(
-				(candidate) => path === `/api/tools/${candidate.name}/summary`,
+				(candidate) =>
+					path === "/api/tools/{name}/summary" &&
+					options?.path?.name === candidate.name,
 			);
 			if (tool) {
 				return Promise.resolve(summaryFor(tool));
 			}
-			if (path === "/api/tools/jobs/job-revise-1") {
+			if (
+				path === "/api/tools/jobs/{job_id}" &&
+				options?.path?.job_id === "job-revise-1"
+			) {
 				return Promise.resolve(runningJob);
 			}
 			throw new Error(`Unexpected GET ${path}`);
 		});
-		mockedApiPost.mockImplementation((path) => {
-			if (path === "/api/tools/weather-search/revise") {
+		mockedApiPost.mockImplementation((path, options) => {
+			if (
+				path === "/api/tools/{name}/revise" &&
+				options.path?.name === "weather-search"
+			) {
 				return revise.promise;
 			}
 			throw new Error(`Unexpected POST ${path}`);
@@ -905,6 +977,13 @@ describe("ToolsPage component", () => {
 		await user.click(screen.getAllByRole("button", { name: "送出修訂" })[0]);
 		await waitFor(() => {
 			expect(apiPost).toHaveBeenCalledTimes(1);
+		});
+		expect(apiPost).toHaveBeenCalledWith("/api/tools/{name}/revise", {
+			path: { name: "weather-search" },
+			body: {
+				feedback: "調整第一個工具",
+				expected_vid: "v-weather-1",
+			},
 		});
 		expect(
 			screen.getAllByRole("button", { name: "重新產生" })[1],
@@ -943,21 +1022,27 @@ describe("ToolsPage component", () => {
 			llm_log_process: null,
 			env_keys: [],
 		} satisfies ToolJobResponse;
-		vi.mocked(apiGet).mockImplementation((path) => {
+		mockedApiGet.mockImplementation((path, options) => {
 			if (path === "/api/tools") {
 				return Promise.resolve(list);
 			}
-			if (path === "/api/tools/weather-search/summary") {
+			if (
+				path === "/api/tools/{name}/summary" &&
+				options?.path?.name === "weather-search"
+			) {
 				return Promise.resolve(summaryFor(list.tools[0]));
 			}
-			if (path === "/api/tools/jobs/job-revise-finished") {
+			if (
+				path === "/api/tools/jobs/{job_id}" &&
+				options?.path?.job_id === "job-revise-finished"
+			) {
 				return Promise.resolve(terminalJob);
 			}
 			throw new Error(`Unexpected GET ${path}`);
 		});
 		mockedApiPost.mockResolvedValue({
 			job_id: "job-revise-finished",
-		} satisfies ToolJobAccepted);
+		} satisfies ToolReviseAccepted);
 
 		const { queryClient } = renderWithAppProviders(<ToolsPage />);
 		await waitForTool();
@@ -986,7 +1071,7 @@ describe("ToolsPage component", () => {
 		});
 	});
 
-	it("blocks toggling an invalid tool while preserving whole-tool deletion", async () => {
+	it("blocks an invalid toggle and sends the exact whole-tool delete request", async () => {
 		const user = userEvent.setup();
 		mockToolReads(
 			toolListWith({
@@ -995,6 +1080,11 @@ describe("ToolsPage component", () => {
 				lineage: "broken",
 			}),
 		);
+		mockedApiDelete.mockResolvedValue({
+			outcome: "removed",
+			retained_path: null,
+			retention_reason: null,
+		} satisfies ToolDeleteResponse);
 
 		renderWithAppProviders(<ToolsPage />);
 		await waitForTool();
@@ -1003,5 +1093,11 @@ describe("ToolsPage component", () => {
 		await user.click(screen.getByRole("switch", { name: "啟用" }));
 		expect(apiPatch).not.toHaveBeenCalled();
 		expect(screen.getByRole("button", { name: "刪除" })).toBeEnabled();
+		await user.click(screen.getByRole("button", { name: "刪除" }));
+		const dialog = await screen.findByRole("dialog", { name: "刪除工具" });
+		await user.click(within(dialog).getByRole("button", { name: "刪除" }));
+		expect(apiDelete).toHaveBeenCalledWith("/api/tools/{name}", {
+			path: { name: "weather-search" },
+		});
 	});
 });

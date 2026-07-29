@@ -280,7 +280,7 @@ function ToolSummaryPanel({
 		queryFn: async () =>
 			acceptSummaryForVersion(
 				currentVid,
-				await apiGet(`/api/tools/${name}/summary`),
+				await apiGet("/api/tools/{name}/summary", { path: { name } }),
 			),
 		enabled: expanded,
 	});
@@ -740,7 +740,10 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 
 	const toggleMutation = useMutation({
 		mutationFn: ({ name, enabled }) =>
-			apiPatch(`/api/tools/${name}`, { enabled }),
+			apiPatch("/api/tools/{name}", {
+				path: { name },
+				body: { enabled },
+			}),
 		onSuccess: async (updated) => {
 			notifications.show({
 				color: "green",
@@ -760,7 +763,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	});
 
 	const deleteMutation = useMutation({
-		mutationFn: (name) => apiDelete(`/api/tools/${name}`),
+		mutationFn: (name) => apiDelete("/api/tools/{name}", { path: { name } }),
 		onSuccess: async (data, name) => {
 			setDeleteTarget(null);
 			notifications.show(toolDeleteNotification(name, data));
@@ -817,7 +820,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	const discardMutation = useMutation({
 		mutationFn: ({ name, currentVid }) => {
 			const request = buildDiscardRequest({ name, currentVid });
-			return apiDelete(request.path);
+			return apiDelete(request.path, { path: request.pathParams });
 		},
 		onSuccess: async (data, variables) => {
 			setDiscardTarget(null);
@@ -895,7 +898,10 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	const regenerateMutation = useMutation({
 		mutationFn: ({ name, currentVid }) => {
 			const request = buildRegenerateRequest({ name, currentVid });
-			return apiPost(request.path, request.body);
+			return apiPost(request.path, {
+				path: request.pathParams,
+				body: request.body,
+			});
 		},
 		onSuccess: async (detail, variables) => {
 			const summaryKey = variables.summaryQueryKey;
@@ -932,7 +938,10 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	const reviseMutation = useMutation({
 		mutationFn: ({ name, currentVid, feedback }) => {
 			const request = buildReviseRequest({ name, currentVid, feedback });
-			return apiPost(request.path, request.body);
+			return apiPost(request.path, {
+				path: request.pathParams,
+				body: request.body,
+			});
 		},
 		onSuccess: (result, { name, jobAttributionKey }) => {
 			// Captured from toolIdentityConsumers at submit time, so the card stays
@@ -961,7 +970,10 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 
 	const jobQuery = useQuery({
 		queryKey: ["tool-job", activeJob?.jobId],
-		queryFn: () => apiGet(`/api/tools/jobs/${activeJob.jobId}`),
+		queryFn: () =>
+			apiGet("/api/tools/jobs/{job_id}", {
+				path: { job_id: activeJob.jobId },
+			}),
 		// Functional `enabled`, computed by the SAME rule that stops the poll (see
 		// toolJobQueryEnabled): a plain `activeJob !== null` stayed true forever
 		// after the job settled, and with the app's refetchOnWindowFocus + 5s
@@ -1427,7 +1439,10 @@ function InstallPanel({ externalBusy = false, onBusyChange }) {
 	});
 
 	const installMutation = useMutation({
-		mutationFn: (payload) => apiPost("/api/tools/install", payload),
+		mutationFn: (payload) =>
+			apiPost("/api/tools/install", {
+				body: payload,
+			}),
 		onSuccess: (data) => {
 			setJobId(data.job_id);
 		},
@@ -1473,7 +1488,8 @@ function InstallPanel({ externalBusy = false, onBusyChange }) {
 
 	const jobQuery = useQuery({
 		queryKey: ["tool-install", jobId],
-		queryFn: () => apiGet(`/api/tools/jobs/${jobId}`),
+		queryFn: () =>
+			apiGet("/api/tools/jobs/{job_id}", { path: { job_id: jobId } }),
 		// Same rule as the revise poll's own `enabled` (see InstalledToolsPanel):
 		// once the install has settled -- or its id has 404'd -- nothing more can
 		// be learned by asking again, and leaving it enabled meant every window

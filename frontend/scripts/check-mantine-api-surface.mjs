@@ -1,10 +1,26 @@
 // Offline guard for browser-API references in Mantine's installed ESM.
 //
-// LIMIT: this detects CHANGE, not correctness. It cannot tell whether an
-// existing test shim has become semantically wrong, and "referenced by
-// Mantine" does not imply "needs a stub". A diff is a prompt for a human to
-// inspect the affected component and a real failing test, never an instruction
-// to add a shim.
+// WHAT THIS DOES AND DOES NOT GUARANTEE -- read before trusting it.
+//
+// It monitors a FIXED INVENTORY of the six API names below and reports which
+// installed Mantine modules mention each. That is all. Specifically:
+//
+//   * A SEVENTH browser API -- one not in MONITORED_APIS -- is invisible to it.
+//     Mantine could start calling `visualViewport` tomorrow and this stays
+//     silent. The defence against that is not here: an unshimmed API throws a
+//     loud TypeError in the component tests, which is self-detecting and needs
+//     no maintenance. This check exists for the quieter case where a name we
+//     ALREADY care about spreads to new modules.
+//   * It records which files mention an API, not how many times. A second use
+//     site inside a module already listed does not move the snapshot.
+//   * It is a substring match, so an API named in a comment or a local variable
+//     counts as a mention. That errs toward telling a human to look, which is
+//     the safe direction for a prompt.
+//
+// And the standing limit: it detects CHANGE, not correctness. It cannot tell
+// whether an existing test shim has become semantically wrong, and "referenced
+// by Mantine" never implies "needs a shim". A diff is a prompt to inspect the
+// affected component and a real failing test, never an instruction to add one.
 
 import { readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";

@@ -41,28 +41,6 @@ type OperationFor<
 	Method extends ApiMethod,
 > = Method extends keyof paths[Path] ? NonNullable<paths[Path][Method]> : never;
 
-type ConcretePath<Path extends string> =
-	Path extends `${infer Head}{${string}}${infer Tail}`
-		? `${Head}${string}${ConcretePath<Tail>}`
-		: Path;
-
-type RuntimePath<Path extends string> = Path extends unknown
-	? ConcretePath<Path> | `${ConcretePath<Path>}?${string}`
-	: never;
-
-type RuntimePathsForMethod<Method extends ApiMethod> = RuntimePath<
-	PathsForMethod<Method>
->;
-
-type StripQuery<Path extends string> =
-	Path extends `${infer WithoutQuery}?${string}` ? WithoutQuery : Path;
-
-type SchemaPathForRuntime<Method extends ApiMethod, Path extends string> = {
-	[SchemaPath in PathsForMethod<Method>]: StripQuery<Path> extends ConcretePath<SchemaPath>
-		? SchemaPath
-		: never;
-}[PathsForMethod<Method>];
-
 type JsonRequestBody<Operation> = Operation extends {
 	requestBody: {
 		content: {
@@ -107,10 +85,48 @@ export type ApiSuccessResponse<
 	>]
 >;
 
-type ResponseForRuntime<
+type OperationParameters<Path extends SchemaPath, Method extends ApiMethod> =
+	OperationFor<Path, Method> extends {
+		parameters: infer Parameters;
+	}
+		? Parameters
+		: never;
+
+type ParameterGroup<
+	Path extends SchemaPath,
 	Method extends ApiMethod,
-	Path extends RuntimePathsForMethod<Method>,
-> = ApiSuccessResponse<SchemaPathForRuntime<Method, Path>, Method>;
+	Group extends "path" | "query",
+> = Group extends keyof OperationParameters<Path, Method>
+	? Exclude<OperationParameters<Path, Method>[Group], undefined>
+	: never;
+
+export type ApiRequestParameters<
+	Path extends SchemaPath,
+	Method extends ApiMethod,
+> = ([ParameterGroup<Path, Method, "path">] extends [never]
+	? { path?: never }
+	: { path: ParameterGroup<Path, Method, "path"> }) &
+	([ParameterGroup<Path, Method, "query">] extends [never]
+		? { query?: never }
+		: { query?: ParameterGroup<Path, Method, "query"> });
+
+type ApiParameterArgs<Path extends SchemaPath, Method extends ApiMethod> = [
+	ParameterGroup<Path, Method, "path">,
+] extends [never]
+	? [parameters?: ApiRequestParameters<Path, Method>]
+	: [parameters: ApiRequestParameters<Path, Method>];
+
+export type ApiJsonRequestOptions<
+	Path extends SchemaPath,
+	Method extends ApiMethod,
+> = ApiRequestParameters<Path, Method> & {
+	body: ApiRequestBody<Path, Method>;
+};
+
+type RuntimeRequestParameters = {
+	path?: Readonly<Record<string, string | number>>;
+	query?: Readonly<Record<string, QueryValue>>;
+};
 
 type ValidationError = components["schemas"]["ValidationError"];
 type ValidationMessage = Pick<ValidationError, "msg">;
@@ -198,6 +214,20 @@ export function buildQuery(
 	return query ? `?${query}` : "";
 }
 
+function buildRequestPath(
+	template: string,
+	parameters: RuntimeRequestParameters = {},
+): string {
+	const path = template.replace(/\{([^}]+)\}/g, (_placeholder, name) => {
+		const value = parameters.path?.[name];
+		if (value === undefined) {
+			throw new Error(`Missing path parameter: ${name}`);
+		}
+		return encodeURIComponent(String(value));
+	});
+	return `${path}${buildQuery(parameters.query)}`;
+}
+
 // Map a (status, code, raw server message) triple to the user-facing zh-TW
 // message defined by the shared UX rules. Falls back to the server message,
 // then to a generic notice for anything unexpected.
@@ -283,17 +313,26 @@ function normalizeError(status: number, body: unknown): ApiError {
 // only connectivity writer for probes.
 export function apiFetch<
 	Method extends FetchMethod,
-	Path extends RuntimePathsForMethod<Lowercase<Method>>,
+	Path extends PathsForMethod<Lowercase<Method>>,
 >(
-	path: Path,
-	options: ApiFetchOptions & { method: Method },
-): Promise<ResponseForRuntime<Lowercase<Method>, Path>>;
-
-export function apiFetch(
-	path: string,
-	options: ApiFetchOptions = {},
-): Promise<unknown> {
-	return rawApiFetch(path, options);
+	template: Path,
+	options: ApiFetchOptions & { method: Method } & ApiRequestParameters<
+			Path,
+			Lowercase<Method>
+		>,
+): Promise<ApiSuccessResponse<Path, Lowercase<Method>>> {
+	const {
+		path: pathParameters,
+		query,
+		...fetchOptions
+	} = options as ApiFetchOptions & RuntimeRequestParameters;
+	return rawApiFetch(
+		buildRequestPath(template, { path: pathParameters, query }),
+		{
+			...fetchOptions,
+			method: options.method,
+		},
+	) as Promise<ApiSuccessResponse<Path, Lowercase<Method>>>;
 }
 
 async function rawApiFetch(
@@ -392,42 +431,56 @@ async function rawApiFetch(
 	return body;
 }
 
-export function apiGet<Path extends RuntimePathsForMethod<"get">>(
-	path: Path,
-): Promise<ResponseForRuntime<"get", Path>>;
-
-export function apiGet(path: string): Promise<unknown> {
-	return rawApiFetch(path, { method: "GET" });
+export function apiGet<Path extends PathsForMethod<"get">>(
+	template: Path,
+	...parameters: ApiParameterArgs<Path, "get">
+): Promise<ApiSuccessResponse<Path, "get">> {
+	return rawApiFetch(
+		buildRequestPath(
+			template,
+			parameters[0] as RuntimeRequestParameters | undefined,
+		),
+		{ method: "GET" },
+	) as Promise<ApiSuccessResponse<Path, "get">>;
 }
 
-export function apiPost<Path extends RuntimePathsForMethod<"post">>(
-	path: Path,
-	body: ApiRequestBody<SchemaPathForRuntime<"post", Path>, "post">,
-): Promise<ResponseForRuntime<"post", Path>>;
-
-export function apiPost(path: string, body: unknown): Promise<unknown> {
-	return rawApiFetch(path, {
-		method: "POST",
-		body: body === undefined ? undefined : JSON.stringify(body),
-	});
+export function apiPost<Path extends PathsForMethod<"post">>(
+	template: Path,
+	options: ApiJsonRequestOptions<Path, "post">,
+): Promise<ApiSuccessResponse<Path, "post">> {
+	const { body, ...parameters } = options;
+	return rawApiFetch(
+		buildRequestPath(template, parameters as RuntimeRequestParameters),
+		{
+			method: "POST",
+			body: body === undefined ? undefined : JSON.stringify(body),
+		},
+	) as Promise<ApiSuccessResponse<Path, "post">>;
 }
 
-export function apiPatch<Path extends RuntimePathsForMethod<"patch">>(
-	path: Path,
-	body: ApiRequestBody<SchemaPathForRuntime<"patch", Path>, "patch">,
-): Promise<ResponseForRuntime<"patch", Path>>;
-
-export function apiPatch(path: string, body: unknown): Promise<unknown> {
-	return rawApiFetch(path, {
-		method: "PATCH",
-		body: body === undefined ? undefined : JSON.stringify(body),
-	});
+export function apiPatch<Path extends PathsForMethod<"patch">>(
+	template: Path,
+	options: ApiJsonRequestOptions<Path, "patch">,
+): Promise<ApiSuccessResponse<Path, "patch">> {
+	const { body, ...parameters } = options;
+	return rawApiFetch(
+		buildRequestPath(template, parameters as RuntimeRequestParameters),
+		{
+			method: "PATCH",
+			body: body === undefined ? undefined : JSON.stringify(body),
+		},
+	) as Promise<ApiSuccessResponse<Path, "patch">>;
 }
 
-export function apiDelete<Path extends RuntimePathsForMethod<"delete">>(
-	path: Path,
-): Promise<ResponseForRuntime<"delete", Path>>;
-
-export function apiDelete(path: string): Promise<unknown> {
-	return rawApiFetch(path, { method: "DELETE" });
+export function apiDelete<Path extends PathsForMethod<"delete">>(
+	template: Path,
+	...parameters: ApiParameterArgs<Path, "delete">
+): Promise<ApiSuccessResponse<Path, "delete">> {
+	return rawApiFetch(
+		buildRequestPath(
+			template,
+			parameters[0] as RuntimeRequestParameters | undefined,
+		),
+		{ method: "DELETE" },
+	) as Promise<ApiSuccessResponse<Path, "delete">>;
 }

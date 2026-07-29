@@ -311,7 +311,10 @@ export function ItemAiActions({ item, pending, onPendingChange, queryItemId }) {
 	// the "closed until the item refetch lands" contract noted above.
 	const enrichMutation = useMutation({
 		mutationFn: (value) =>
-			apiPost(`/api/items/${itemId}/enrich`, { additional_context: value }),
+			apiPost("/api/items/{item_id}/enrich", {
+				path: { item_id: itemId },
+				body: { additional_context: value },
+			}),
 		onSuccess: async (result) => {
 			// Store only the gaps array -- GapsChecklist reads stage live off the
 			// `item` prop below, not a snapshot taken here, so a later stage change
@@ -327,7 +330,10 @@ export function ItemAiActions({ item, pending, onPendingChange, queryItemId }) {
 
 	const assistMutation = useMutation({
 		mutationFn: (value) =>
-			apiPost(`/api/items/${itemId}/assist-update`, { note: value }),
+			apiPost("/api/items/{item_id}/assist-update", {
+				path: { item_id: itemId },
+				body: { note: value },
+			}),
 		onSuccess: async () => {
 			// An assist-update can resolve (or otherwise make stale) the gaps the
 			// last AI 補齊 flagged, so clear that checklist rather than leave a

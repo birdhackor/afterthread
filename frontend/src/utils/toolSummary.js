@@ -83,21 +83,24 @@ export function acceptSummaryForVersion(currentVid, detail) {
 // name-only DELETE route.
 export function buildReviseRequest({ name, currentVid, feedback }) {
 	return {
-		path: `/api/tools/${name}/revise`,
+		path: "/api/tools/{name}/revise",
+		pathParams: { name },
 		body: { feedback, expected_vid: currentVid },
 	};
 }
 
 export function buildRegenerateRequest({ name, currentVid }) {
 	return {
-		path: `/api/tools/${name}/summary/regenerate`,
+		path: "/api/tools/{name}/summary/regenerate",
+		pathParams: { name },
 		body: { expected_vid: currentVid },
 	};
 }
 
 export function buildDiscardRequest({ name, currentVid }) {
 	return {
-		path: `/api/tools/${name}/versions/${currentVid}`,
+		path: "/api/tools/{name}/versions/{vid}",
+		pathParams: { name, vid: currentVid },
 	};
 }
 
