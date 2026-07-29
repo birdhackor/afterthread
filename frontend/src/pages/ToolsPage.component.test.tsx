@@ -13,6 +13,7 @@ import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import type { ApiSuccessResponse } from "../api/client.js";
 import { apiDelete, apiGet, apiPatch, apiPost } from "../api/client.js";
 import { renderWithAppProviders } from "../test/render.js";
+import { expectOnlyWriteCall } from "../test/writeCalls.js";
 import { ToolsPage } from "./ToolsPage.jsx";
 
 vi.mock("../api/client.js", () => ({
@@ -40,6 +41,7 @@ const mockedApiPatch = vi.mocked(apiPatch) as unknown as Mock<
 const mockedApiPost = vi.mocked(apiPost) as unknown as Mock<
 	(path: string, options: MockApiOptions) => Promise<unknown>
 >;
+const writeApiMocks = [mockedApiDelete, mockedApiPatch, mockedApiPost];
 
 type ToolListResponse = ApiSuccessResponse<"/api/tools", "get">;
 type ToolSummaryResponse = ApiSuccessResponse<
@@ -205,10 +207,13 @@ describe("ToolsPage component", () => {
 		await user.click(screen.getByRole("switch", { name: "啟用" }));
 
 		await waitFor(() => {
-			expect(apiPatch).toHaveBeenCalledWith("/api/tools/{name}", {
-				path: { name: tool.name },
-				body: { enabled: false },
-			});
+			expectOnlyWriteCall(writeApiMocks, mockedApiPatch, [
+				"/api/tools/{name}",
+				{
+					path: { name: tool.name },
+					body: { enabled: false },
+				},
+			]);
 		});
 	});
 
@@ -469,12 +474,15 @@ describe("ToolsPage component", () => {
 		await openDiscardConfirmation(user);
 		await user.click(screen.getByRole("button", { name: "丟掉並退回" }));
 
-		expect(apiDelete).toHaveBeenCalledWith("/api/tools/{name}/versions/{vid}", {
-			path: {
-				name: list.tools[0].name,
-				vid: list.tools[0].current_vid,
+		expectOnlyWriteCall(writeApiMocks, mockedApiDelete, [
+			"/api/tools/{name}/versions/{vid}",
+			{
+				path: {
+					name: list.tools[0].name,
+					vid: list.tools[0].current_vid,
+				},
 			},
-		});
+		]);
 		expect(
 			await screen.findByText(
 				"已丟掉「weather-search」的目前版本並退回前一版；原版本檔案已移除",
@@ -713,15 +721,14 @@ describe("ToolsPage component", () => {
 		await user.click(screen.getByRole("tab", { name: "已安裝工具" }));
 		await user.click(screen.getAllByRole("button", { name: "重新產生" })[0]);
 		await waitFor(() => {
-			expect(apiPost).toHaveBeenCalledTimes(1);
+			expectOnlyWriteCall(writeApiMocks, mockedApiPost, [
+				"/api/tools/{name}/summary/regenerate",
+				{
+					path: { name: list.tools[0].name },
+					body: { expected_vid: list.tools[0].current_vid },
+				},
+			]);
 		});
-		expect(apiPost).toHaveBeenCalledWith(
-			"/api/tools/{name}/summary/regenerate",
-			{
-				path: { name: list.tools[0].name },
-				body: { expected_vid: list.tools[0].current_vid },
-			},
-		);
 
 		expect(
 			screen.getAllByRole("button", { name: "重新產生" })[1],
@@ -781,13 +788,15 @@ describe("ToolsPage component", () => {
 		);
 		await user.click(screen.getByRole("button", { name: "開始安裝" }));
 		await waitFor(() => {
-			expect(apiPost).toHaveBeenCalledTimes(1);
-		});
-		expect(apiPost).toHaveBeenCalledWith("/api/tools/install", {
-			body: {
-				openapi_url: "https://example.test/openapi.json",
-				instructions: "建立測試工具",
-			},
+			expectOnlyWriteCall(writeApiMocks, mockedApiPost, [
+				"/api/tools/install",
+				{
+					body: {
+						openapi_url: "https://example.test/openapi.json",
+						instructions: "建立測試工具",
+					},
+				},
+			]);
 		});
 		expect(
 			screen.getByRole("textbox", { name: "OpenAPI JSON 網址" }),
@@ -1005,14 +1014,16 @@ describe("ToolsPage component", () => {
 		);
 		await user.click(screen.getAllByRole("button", { name: "送出修訂" })[0]);
 		await waitFor(() => {
-			expect(apiPost).toHaveBeenCalledTimes(1);
-		});
-		expect(apiPost).toHaveBeenCalledWith("/api/tools/{name}/revise", {
-			path: { name: list.tools[0].name },
-			body: {
-				feedback: "調整第一個工具",
-				expected_vid: list.tools[0].current_vid,
-			},
+			expectOnlyWriteCall(writeApiMocks, mockedApiPost, [
+				"/api/tools/{name}/revise",
+				{
+					path: { name: list.tools[0].name },
+					body: {
+						feedback: "調整第一個工具",
+						expected_vid: list.tools[0].current_vid,
+					},
+				},
+			]);
 		});
 		expect(
 			screen.getAllByRole("button", { name: "重新產生" })[1],
@@ -1124,8 +1135,9 @@ describe("ToolsPage component", () => {
 		await user.click(screen.getByRole("button", { name: "刪除" }));
 		const dialog = await screen.findByRole("dialog", { name: "刪除工具" });
 		await user.click(within(dialog).getByRole("button", { name: "刪除" }));
-		expect(apiDelete).toHaveBeenCalledWith("/api/tools/{name}", {
-			path: { name: list.tools[0].name },
-		});
+		expectOnlyWriteCall(writeApiMocks, mockedApiDelete, [
+			"/api/tools/{name}",
+			{ path: { name: list.tools[0].name } },
+		]);
 	});
 });

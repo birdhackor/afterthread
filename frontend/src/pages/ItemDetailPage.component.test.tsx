@@ -8,6 +8,7 @@ import type { ApiSuccessResponse } from "../api/client.js";
 import { apiDelete, apiGet, apiPatch, apiPost } from "../api/client.js";
 import { llmStatusAtom } from "../atoms/llm.js";
 import { renderWithAppProviders } from "../test/render.js";
+import { expectOnlyWriteCall } from "../test/writeCalls.js";
 import { ItemDetailPage } from "./ItemDetailPage.jsx";
 
 vi.mock("../api/client.js", () => ({
@@ -34,6 +35,7 @@ const mockedApiPatch = vi.mocked(apiPatch) as unknown as Mock<
 const mockedApiPost = vi.mocked(apiPost) as unknown as Mock<
 	(path: string, options: MockApiOptions) => Promise<unknown>
 >;
+const writeApiMocks = [mockedApiDelete, mockedApiPatch, mockedApiPost];
 
 type ItemDetailResponse = ApiSuccessResponse<"/api/items/{item_id}", "get">;
 type ItemDeleteResponse = ApiSuccessResponse<"/api/items/{item_id}", "delete">;
@@ -114,9 +116,10 @@ describe("ItemDetailPage destructive and rewriting requests", () => {
 		await user.click(within(dialog).getByRole("button", { name: "刪除" }));
 
 		await waitFor(() => {
-			expect(apiDelete).toHaveBeenCalledWith("/api/items/{item_id}", {
-				path: { item_id: routeItemId },
-			});
+			expectOnlyWriteCall(writeApiMocks, mockedApiDelete, [
+				"/api/items/{item_id}",
+				{ path: { item_id: routeItemId } },
+			]);
 		});
 		expect(
 			await screen.findByText(`已刪除「${item.title}」`),
@@ -136,10 +139,13 @@ describe("ItemDetailPage destructive and rewriting requests", () => {
 		await user.keyboard("{ArrowDown}{ArrowDown}{Enter}");
 
 		await waitFor(() => {
-			expect(apiPatch).toHaveBeenCalledWith("/api/items/{item_id}", {
-				path: { item_id: routeItemId },
-				body: { status: "active" },
-			});
+			expectOnlyWriteCall(writeApiMocks, mockedApiPatch, [
+				"/api/items/{item_id}",
+				{
+					path: { item_id: routeItemId },
+					body: { status: "active" },
+				},
+			]);
 		});
 	});
 
@@ -159,10 +165,13 @@ describe("ItemDetailPage destructive and rewriting requests", () => {
 		await user.click(screen.getByRole("button", { name: "新增進度" }));
 
 		await waitFor(() => {
-			expect(apiPost).toHaveBeenCalledWith("/api/items/{item_id}/progress", {
-				path: { item_id: routeItemId },
-				body: { note },
-			});
+			expectOnlyWriteCall(writeApiMocks, mockedApiPost, [
+				"/api/items/{item_id}/progress",
+				{
+					path: { item_id: routeItemId },
+					body: { note },
+				},
+			]);
 		});
 	});
 });

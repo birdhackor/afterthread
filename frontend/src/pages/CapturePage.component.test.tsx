@@ -3,14 +3,17 @@
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { getDefaultStore } from "jotai";
-import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
+import { beforeEach, describe, it, type Mock, vi } from "vitest";
 import type { ApiSuccessResponse } from "../api/client.js";
-import { apiPost } from "../api/client.js";
+import { apiDelete, apiPatch, apiPost } from "../api/client.js";
 import { llmStatusAtom } from "../atoms/llm.js";
 import { renderWithAppProviders } from "../test/render.js";
+import { expectOnlyWriteCall } from "../test/writeCalls.js";
 import { CapturePage } from "./CapturePage.jsx";
 
 vi.mock("../api/client.js", () => ({
+	apiDelete: vi.fn(),
+	apiPatch: vi.fn(),
 	apiPost: vi.fn(),
 }));
 
@@ -21,6 +24,11 @@ type MockApiOptions = {
 const mockedApiPost = vi.mocked(apiPost) as unknown as Mock<
 	(path: string, options: MockApiOptions) => Promise<unknown>
 >;
+const writeApiMocks = [
+	vi.mocked(apiDelete),
+	vi.mocked(apiPatch),
+	mockedApiPost,
+];
 
 type CaptureResponse = ApiSuccessResponse<"/api/capture", "post">;
 
@@ -62,7 +70,9 @@ const captureResponse = {
 
 describe("CapturePage money-spending request", () => {
 	beforeEach(() => {
-		mockedApiPost.mockReset();
+		for (const apiMock of writeApiMocks) {
+			apiMock.mockReset();
+		}
 		getDefaultStore().set(llmStatusAtom, {
 			loaded: true,
 			loading: false,
@@ -84,9 +94,10 @@ describe("CapturePage money-spending request", () => {
 		await user.click(screen.getByRole("button", { name: "AI 快速捕捉" }));
 
 		await waitFor(() => {
-			expect(apiPost).toHaveBeenCalledWith("/api/capture", {
-				body: { raw_text: rawText },
-			});
+			expectOnlyWriteCall(writeApiMocks, mockedApiPost, [
+				"/api/capture",
+				{ body: { raw_text: rawText } },
+			]);
 		});
 	});
 });

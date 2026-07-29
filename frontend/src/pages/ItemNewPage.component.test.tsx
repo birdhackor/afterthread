@@ -1,13 +1,16 @@
 // @vitest-environment jsdom
 
 import { fireEvent, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
-import { apiPost } from "../api/client.js";
+import { beforeEach, describe, it, type Mock, vi } from "vitest";
+import { apiDelete, apiPatch, apiPost } from "../api/client.js";
 import { SECTION_FIELD_KEYS } from "../constants/sections.js";
 import { renderWithAppProviders } from "../test/render.js";
+import { expectOnlyWriteCall } from "../test/writeCalls.js";
 import { ItemNewPage } from "./ItemNewPage.jsx";
 
 vi.mock("../api/client.js", () => ({
+	apiDelete: vi.fn(),
+	apiPatch: vi.fn(),
 	apiPost: vi.fn(),
 }));
 
@@ -18,10 +21,17 @@ type MockApiOptions = {
 const mockedApiPost = vi.mocked(apiPost) as unknown as Mock<
 	(path: string, options: MockApiOptions) => Promise<unknown>
 >;
+const writeApiMocks = [
+	vi.mocked(apiDelete),
+	vi.mocked(apiPatch),
+	mockedApiPost,
+];
 
 describe("ItemNewPage create request", () => {
 	beforeEach(() => {
-		mockedApiPost.mockReset();
+		for (const apiMock of writeApiMocks) {
+			apiMock.mockReset();
+		}
 	});
 
 	// Full-form Mantine mounts approach Vitest's 5 s default under parallel
@@ -42,15 +52,18 @@ describe("ItemNewPage create request", () => {
 		fireEvent.click(screen.getByRole("button", { name: "建立" }));
 
 		await waitFor(() => {
-			expect(apiPost).toHaveBeenCalledWith("/api/items", {
-				body: {
-					title,
-					status: "capture-quick",
-					stage: "quick",
-					tags: [],
-					...emptySections,
+			expectOnlyWriteCall(writeApiMocks, mockedApiPost, [
+				"/api/items",
+				{
+					body: {
+						title,
+						status: "capture-quick",
+						stage: "quick",
+						tags: [],
+						...emptySections,
+					},
 				},
-			});
+			]);
 		});
 	}, 10_000);
 });

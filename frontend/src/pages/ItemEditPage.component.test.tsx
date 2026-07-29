@@ -1,15 +1,18 @@
 // @vitest-environment jsdom
 
 import { fireEvent, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
+import { beforeEach, describe, it, type Mock, vi } from "vitest";
 import type { ApiSuccessResponse } from "../api/client.js";
-import { apiGet, apiPatch } from "../api/client.js";
+import { apiDelete, apiGet, apiPatch, apiPost } from "../api/client.js";
 import { renderWithAppProviders } from "../test/render.js";
+import { expectOnlyWriteCall } from "../test/writeCalls.js";
 import { ItemEditPage } from "./ItemEditPage.jsx";
 
 vi.mock("../api/client.js", () => ({
+	apiDelete: vi.fn(),
 	apiGet: vi.fn(),
 	apiPatch: vi.fn(),
+	apiPost: vi.fn(),
 }));
 
 type MockApiOptions = {
@@ -23,6 +26,11 @@ const mockedApiGet = vi.mocked(apiGet) as unknown as Mock<
 const mockedApiPatch = vi.mocked(apiPatch) as unknown as Mock<
 	(path: string, options: MockApiOptions) => Promise<unknown>
 >;
+const writeApiMocks = [
+	vi.mocked(apiDelete),
+	mockedApiPatch,
+	vi.mocked(apiPost),
+];
 
 type ItemDetailResponse = ApiSuccessResponse<"/api/items/{item_id}", "get">;
 
@@ -70,7 +78,9 @@ function renderEditPage() {
 describe("ItemEditPage sole-copy rewrite request", () => {
 	beforeEach(() => {
 		mockedApiGet.mockReset();
-		mockedApiPatch.mockReset();
+		for (const apiMock of writeApiMocks) {
+			apiMock.mockReset();
+		}
 		mockedApiGet.mockResolvedValue(item);
 	});
 
@@ -86,10 +96,13 @@ describe("ItemEditPage sole-copy rewrite request", () => {
 		fireEvent.click(screen.getByRole("button", { name: "儲存變更" }));
 
 		await waitFor(() => {
-			expect(apiPatch).toHaveBeenCalledWith("/api/items/{item_id}", {
-				path: { item_id: routeItemId },
-				body: { title: editedTitle },
-			});
+			expectOnlyWriteCall(writeApiMocks, mockedApiPatch, [
+				"/api/items/{item_id}",
+				{
+					path: { item_id: routeItemId },
+					body: { title: editedTitle },
+				},
+			]);
 		});
 	}, 10_000);
 });

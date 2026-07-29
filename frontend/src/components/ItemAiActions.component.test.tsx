@@ -3,14 +3,17 @@
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { getDefaultStore } from "jotai";
-import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
+import { beforeEach, describe, it, type Mock, vi } from "vitest";
 import type { ApiSuccessResponse } from "../api/client.js";
-import { apiPost } from "../api/client.js";
+import { apiDelete, apiPatch, apiPost } from "../api/client.js";
 import { llmStatusAtom } from "../atoms/llm.js";
 import { renderWithAppProviders } from "../test/render.js";
+import { expectOnlyWriteCall } from "../test/writeCalls.js";
 import { ItemAiActions } from "./ItemAiActions.jsx";
 
 vi.mock("../api/client.js", () => ({
+	apiDelete: vi.fn(),
+	apiPatch: vi.fn(),
 	apiPost: vi.fn(),
 }));
 
@@ -22,6 +25,11 @@ type MockApiOptions = {
 const mockedApiPost = vi.mocked(apiPost) as unknown as Mock<
 	(path: string, options: MockApiOptions) => Promise<unknown>
 >;
+const writeApiMocks = [
+	vi.mocked(apiDelete),
+	vi.mocked(apiPatch),
+	mockedApiPost,
+];
 
 type ItemDetailResponse = ApiSuccessResponse<"/api/items/{item_id}", "get">;
 type EnrichResponse = ApiSuccessResponse<"/api/items/{item_id}/enrich", "post">;
@@ -77,7 +85,9 @@ function renderActions() {
 
 describe("ItemAiActions money-spending requests", () => {
 	beforeEach(() => {
-		mockedApiPost.mockReset();
+		for (const apiMock of writeApiMocks) {
+			apiMock.mockReset();
+		}
 		getDefaultStore().set(llmStatusAtom, {
 			loaded: true,
 			loading: false,
@@ -103,10 +113,13 @@ describe("ItemAiActions money-spending requests", () => {
 		await user.click(screen.getByRole("button", { name: "AI 補齊" }));
 
 		await waitFor(() => {
-			expect(apiPost).toHaveBeenCalledWith("/api/items/{item_id}/enrich", {
-				path: { item_id: String(propItemId) },
-				body: { additional_context: context },
-			});
+			expectOnlyWriteCall(writeApiMocks, mockedApiPost, [
+				"/api/items/{item_id}/enrich",
+				{
+					path: { item_id: String(propItemId) },
+					body: { additional_context: context },
+				},
+			]);
 		});
 	});
 
@@ -125,13 +138,13 @@ describe("ItemAiActions money-spending requests", () => {
 		await user.click(screen.getByRole("button", { name: "AI 進度更新" }));
 
 		await waitFor(() => {
-			expect(apiPost).toHaveBeenCalledWith(
+			expectOnlyWriteCall(writeApiMocks, mockedApiPost, [
 				"/api/items/{item_id}/assist-update",
 				{
 					path: { item_id: String(propItemId) },
 					body: { note },
 				},
-			);
+			]);
 		});
 	});
 });
