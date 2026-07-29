@@ -2,6 +2,7 @@
 
 import {
 	act,
+	cleanup,
 	fireEvent,
 	screen,
 	waitFor,
@@ -9,7 +10,15 @@ import {
 	within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	type Mock,
+	vi,
+} from "vitest";
 import type { ApiSuccessResponse } from "../api/client.js";
 import { apiDelete, apiGet, apiPatch, apiPost } from "../api/client.js";
 import { renderWithAppProviders } from "../test/render.js";
@@ -129,21 +138,99 @@ function toolListRequestCount() {
 		.length;
 }
 
-function mockToolReads(list: ToolListResponse) {
-	mockedApiGet.mockImplementation((path, options) => {
-		if (path === "/api/tools") {
-			return Promise.resolve(list);
-		}
-		const tool = list.tools.find(
-			(candidate) =>
-				path === "/api/tools/{name}/summary" &&
-				options?.path?.name === candidate.name,
+type ExpectedRead = {
+	call: readonly unknown[];
+	minCalls: number;
+	maxCalls: number;
+	respond: (callNumber: number) => Promise<unknown>;
+};
+
+const toolsListRead = ["/api/tools"] as const;
+
+function toolSummaryRead(name: string) {
+	return ["/api/tools/{name}/summary", { path: { name } }] as const;
+}
+
+function toolJobRead(jobId: string) {
+	return ["/api/tools/jobs/{job_id}", { path: { job_id: jobId } }] as const;
+}
+
+function expectedRead(
+	call: readonly unknown[],
+	respond: ExpectedRead["respond"],
+	calls = 1,
+): ExpectedRead {
+	return { call, minCalls: calls, maxCalls: calls, respond };
+}
+
+function pollingRead(
+	call: readonly unknown[],
+	respond: ExpectedRead["respond"],
+	minCalls: number,
+): ExpectedRead {
+	return { call, minCalls, maxCalls: Number.POSITIVE_INFINITY, respond };
+}
+
+let assertExpectedReads: (() => void) | undefined;
+
+function mockStrictReads(...rules: ExpectedRead[]) {
+	const counts = rules.map(() => 0);
+	mockedApiGet.mockImplementation((...call) => {
+		// A permissive fixture hides both a wrong target and an additive read of a
+		// neighbouring resource by returning plausible data for either request.
+		const ruleIndex = rules.findIndex(
+			(rule) => JSON.stringify(call) === JSON.stringify(rule.call),
 		);
-		if (tool) {
-			return Promise.resolve(summaryFor(tool));
+		if (ruleIndex === -1) {
+			throw new Error(
+				`Unexpected GET ${JSON.stringify(call)}; expected one of ${JSON.stringify(
+					rules.map((rule) => rule.call),
+				)}`,
+			);
 		}
-		throw new Error(`Unexpected GET ${path}`);
+		counts[ruleIndex] += 1;
+		const rule = rules[ruleIndex];
+		if (counts[ruleIndex] > rule.maxCalls) {
+			throw new Error(`Unexpected additional GET ${JSON.stringify(call)}`);
+		}
+		return rule.respond(counts[ruleIndex]);
 	});
+	assertExpectedReads = () => {
+		for (const call of mockedApiGet.mock.calls) {
+			expect(
+				rules.some(
+					(rule) => JSON.stringify(call) === JSON.stringify(rule.call),
+				),
+				`Unexpected GET ${JSON.stringify(call)}`,
+			).toBe(true);
+		}
+		for (const [index, rule] of rules.entries()) {
+			expect(counts[index]).toBeGreaterThanOrEqual(rule.minCalls);
+			expect(counts[index]).toBeLessThanOrEqual(rule.maxCalls);
+		}
+	};
+}
+
+function mockToolReads(
+	list: ToolListResponse,
+	{
+		listReads = 1,
+		summaryNames = [],
+	}: { listReads?: number; summaryNames?: string[] } = {},
+) {
+	const summaryRules = summaryNames.map((name) => {
+		const tool = list.tools.find((candidate) => candidate.name === name);
+		if (!tool) {
+			throw new Error(`Unknown fixture tool ${name}`);
+		}
+		return expectedRead(toolSummaryRead(name), () =>
+			Promise.resolve(summaryFor(tool)),
+		);
+	});
+	mockStrictReads(
+		expectedRead(toolsListRead, () => Promise.resolve(list), listReads),
+		...summaryRules,
+	);
 }
 
 async function waitForTool(name = "weather-search") {
@@ -164,14 +251,22 @@ async function openDiscardConfirmation(
 
 describe("ToolsPage component", () => {
 	beforeEach(() => {
+		assertExpectedReads = undefined;
 		for (const apiMock of [apiDelete, apiGet, apiPatch, apiPost]) {
 			vi.mocked(apiMock).mockReset();
 		}
 	});
 
+	afterEach(() => {
+		// Clean portals before a strict-read assertion can throw and contaminate
+		// the next case; renderWithAppProviders also cleans up on the green path.
+		cleanup();
+		assertExpectedReads?.();
+	});
+
 	it("transitions from loading to the mocked tools response", async () => {
 		const request = deferred<ToolListResponse>();
-		mockedApiGet.mockImplementation(() => request.promise);
+		mockStrictReads(expectedRead(toolsListRead, () => request.promise));
 
 		renderWithAppProviders(<ToolsPage />);
 
@@ -196,7 +291,7 @@ describe("ToolsPage component", () => {
 		const user = userEvent.setup();
 		const list = toolListWith({ name: "request-assertion-tool-37" });
 		const tool = list.tools[0];
-		mockToolReads(list);
+		mockToolReads(list, { listReads: 2 });
 		mockedApiPatch.mockResolvedValue({
 			...tool,
 			enabled: false,
@@ -214,6 +309,7 @@ describe("ToolsPage component", () => {
 					body: { enabled: false },
 				},
 			]);
+			expect(toolListRequestCount()).toBe(2);
 		});
 	});
 
@@ -247,21 +343,18 @@ describe("ToolsPage component", () => {
 			current_vid: versionP.tools[0].current_vid,
 			summary: "版本 P 的工具總結",
 		} satisfies ToolSummaryResponse;
-		let currentList = versionV;
-		let currentSummary = summaryV;
-
-		mockedApiGet.mockImplementation((path, options) => {
-			if (path === "/api/tools") {
-				return Promise.resolve(currentList);
-			}
-			if (
-				path === "/api/tools/{name}/summary" &&
-				options?.path?.name === "weather-search"
-			) {
-				return Promise.resolve(currentSummary);
-			}
-			throw new Error(`Unexpected GET ${path}`);
-		});
+		mockStrictReads(
+			expectedRead(
+				toolsListRead,
+				(callNumber) => Promise.resolve(callNumber === 1 ? versionV : versionP),
+				2,
+			),
+			expectedRead(
+				toolSummaryRead("weather-search"),
+				(callNumber) => Promise.resolve(callNumber < 3 ? summaryV : summaryP),
+				3,
+			),
+		);
 
 		renderWithAppProviders(<ToolsPage />);
 
@@ -276,8 +369,6 @@ describe("ToolsPage component", () => {
 		await user.type(feedback, "只適用於版本 V 的修訂方向");
 		expect(feedback).toHaveValue("只適用於版本 V 的修訂方向");
 
-		currentList = versionP;
-		currentSummary = summaryP;
 		await user.click(screen.getByRole("button", { name: "重新整理" }));
 		await waitFor(() => {
 			const listRequests = vi
@@ -304,7 +395,7 @@ describe("ToolsPage component", () => {
 	it("refetches the tools list after a discard version mismatch", async () => {
 		const user = userEvent.setup();
 		const list = toolListWith({ lineage: "usable" });
-		mockToolReads(list);
+		mockToolReads(list, { listReads: 2 });
 		mockedApiDelete.mockRejectedValue(apiError("version_mismatch"));
 
 		const { queryClient } = renderWithAppProviders(<ToolsPage />);
@@ -332,9 +423,13 @@ describe("ToolsPage component", () => {
 			current_vid: "v-weather-parent",
 			lineage: "usable",
 		});
-		mockedApiGet
-			.mockImplementationOnce(() => Promise.resolve(versionV))
-			.mockImplementation(() => Promise.resolve(versionP));
+		mockStrictReads(
+			expectedRead(
+				toolsListRead,
+				(callNumber) => Promise.resolve(callNumber === 1 ? versionV : versionP),
+				2,
+			),
+		);
 
 		const { queryClient } = renderWithAppProviders(<ToolsPage />);
 		await waitForTool();
@@ -462,7 +557,7 @@ describe("ToolsPage component", () => {
 	it("sends the exact version-discard request and renders a physical removal", async () => {
 		const user = userEvent.setup();
 		const list = toolListWith({ lineage: "usable" });
-		mockToolReads(list);
+		mockToolReads(list, { listReads: 2 });
 		mockedApiDelete.mockResolvedValue({
 			outcome: "removed",
 			retained_path: null,
@@ -496,7 +591,7 @@ describe("ToolsPage component", () => {
 		const list = toolListWith({ lineage: "usable" });
 		const retainedPath =
 			"/srv/afterthread/tools/weather-search/versions/v-weather-1";
-		mockToolReads(list);
+		mockToolReads(list, { listReads: 2 });
 		mockedApiDelete.mockResolvedValue({
 			outcome: "retained",
 			retained_path: retainedPath,
@@ -523,20 +618,19 @@ describe("ToolsPage component", () => {
 		const user = userEvent.setup();
 		const list = toolListWith({ lineage: "usable" });
 		const listRefresh = deferred<ToolListResponse>();
-		let listReads = 0;
-		mockedApiGet.mockImplementation((path, options) => {
-			if (path === "/api/tools") {
-				listReads += 1;
-				return listReads === 1 ? Promise.resolve(list) : listRefresh.promise;
-			}
-			if (
-				path === "/api/tools/{name}/summary" &&
-				options?.path?.name === "weather-search"
-			) {
-				return Promise.resolve(summaryFor(list.tools[0]));
-			}
-			throw new Error(`Unexpected GET ${path}`);
-		});
+		mockStrictReads(
+			expectedRead(
+				toolsListRead,
+				(callNumber) =>
+					callNumber === 1 ? Promise.resolve(list) : listRefresh.promise,
+				2,
+			),
+			expectedRead(
+				toolSummaryRead("weather-search"),
+				() => Promise.resolve(summaryFor(list.tools[0])),
+				2,
+			),
+		);
 
 		renderWithAppProviders(<ToolsPage />);
 		await waitForTool();
@@ -579,22 +673,21 @@ describe("ToolsPage component", () => {
 	it("blocks every version write after a background tools-list failure", async () => {
 		const user = userEvent.setup();
 		const list = toolListWith({ lineage: "usable" });
-		let listReads = 0;
-		mockedApiGet.mockImplementation((path, options) => {
-			if (path === "/api/tools") {
-				listReads += 1;
-				return listReads === 1
-					? Promise.resolve(list)
-					: Promise.reject(new Error("工具清單重讀失敗"));
-			}
-			if (
-				path === "/api/tools/{name}/summary" &&
-				options?.path?.name === "weather-search"
-			) {
-				return Promise.resolve(summaryFor(list.tools[0]));
-			}
-			throw new Error(`Unexpected GET ${path}`);
-		});
+		mockStrictReads(
+			expectedRead(
+				toolsListRead,
+				(callNumber) =>
+					callNumber === 1
+						? Promise.resolve(list)
+						: Promise.reject(new Error("工具清單重讀失敗")),
+				2,
+			),
+			expectedRead(
+				toolSummaryRead("weather-search"),
+				() => Promise.resolve(summaryFor(list.tools[0])),
+				2,
+			),
+		);
 
 		renderWithAppProviders(<ToolsPage />);
 		await waitForTool();
@@ -619,22 +712,17 @@ describe("ToolsPage component", () => {
 		const user = userEvent.setup();
 		const list = toolListWith({ lineage: "usable" });
 		const summaryRefresh = deferred<ToolSummaryResponse>();
-		let summaryReads = 0;
-		mockedApiGet.mockImplementation((path, options) => {
-			if (path === "/api/tools") {
-				return Promise.resolve(list);
-			}
-			if (
-				path === "/api/tools/{name}/summary" &&
-				options?.path?.name === "weather-search"
-			) {
-				summaryReads += 1;
-				return summaryReads === 1
-					? Promise.resolve(summaryFor(list.tools[0]))
-					: summaryRefresh.promise;
-			}
-			throw new Error(`Unexpected GET ${path}`);
-		});
+		mockStrictReads(
+			expectedRead(toolsListRead, () => Promise.resolve(list)),
+			expectedRead(
+				toolSummaryRead("weather-search"),
+				(callNumber) =>
+					callNumber === 1
+						? Promise.resolve(summaryFor(list.tools[0]))
+						: summaryRefresh.promise,
+				2,
+			),
+		);
 
 		const { queryClient } = renderWithAppProviders(<ToolsPage />);
 		await waitForTool();
@@ -651,7 +739,11 @@ describe("ToolsPage component", () => {
 			queryKey: ["tool-summary", "weather-search"],
 		});
 		await waitFor(() => {
-			expect(summaryReads).toBe(2);
+			expect(
+				mockedApiGet.mock.calls.filter(
+					([path]) => path === "/api/tools/{name}/summary",
+				),
+			).toHaveLength(2);
 		});
 		expect(screen.getByRole("textbox", { name: "修訂意見" })).toBeDisabled();
 		expect(screen.getByRole("button", { name: "送出修訂" })).toBeDisabled();
@@ -690,7 +782,9 @@ describe("ToolsPage component", () => {
 			],
 		} satisfies ToolListResponse;
 		const regenerate = deferred<ToolRegenerateResponse>();
-		mockToolReads(list);
+		mockToolReads(list, {
+			summaryNames: list.tools.map((tool) => tool.name),
+		});
 		mockedApiPost.mockImplementation((path, options) => {
 			if (
 				path === "/api/tools/{name}/summary/regenerate" &&
@@ -763,7 +857,7 @@ describe("ToolsPage component", () => {
 		const user = userEvent.setup();
 		const list = toolListWith({ lineage: "usable" });
 		const install = deferred<ToolInstallAccepted>();
-		mockToolReads(list);
+		mockToolReads(list, { summaryNames: [list.tools[0].name] });
 		mockedApiPost.mockImplementation((path) => {
 			if (path === "/api/tools/install") {
 				return install.promise;
@@ -843,24 +937,17 @@ describe("ToolsPage component", () => {
 			summary: "安裝完成摘要",
 		} satisfies ToolJobResponse;
 		let currentJob: ToolJobResponse = runningJob;
-		mockedApiGet.mockImplementation((path, options) => {
-			if (path === "/api/tools") {
-				return Promise.resolve(list);
-			}
-			if (
-				path === "/api/tools/{name}/summary" &&
-				options?.path?.name === "weather-search"
-			) {
-				return Promise.resolve(summaryFor(list.tools[0]));
-			}
-			if (
-				path === "/api/tools/jobs/{job_id}" &&
-				options?.path?.job_id === "job-install-1"
-			) {
-				return Promise.resolve(currentJob);
-			}
-			throw new Error(`Unexpected GET ${path}`);
-		});
+		mockStrictReads(
+			expectedRead(toolsListRead, () => Promise.resolve(list)),
+			expectedRead(toolSummaryRead("weather-search"), () =>
+				Promise.resolve(summaryFor(list.tools[0])),
+			),
+			pollingRead(
+				toolJobRead("job-install-1"),
+				() => Promise.resolve(currentJob),
+				2,
+			),
+		);
 		mockedApiPost.mockResolvedValue({
 			job_id: "job-install-1",
 		} satisfies ToolInstallAccepted);
@@ -973,26 +1060,19 @@ describe("ToolsPage component", () => {
 			llm_log_process: null,
 			env_keys: [],
 		} satisfies ToolJobResponse;
-		mockedApiGet.mockImplementation((path, options) => {
-			if (path === "/api/tools") {
-				return Promise.resolve(list);
-			}
-			const tool = list.tools.find(
-				(candidate) =>
-					path === "/api/tools/{name}/summary" &&
-					options?.path?.name === candidate.name,
-			);
-			if (tool) {
-				return Promise.resolve(summaryFor(tool));
-			}
-			if (
-				path === "/api/tools/jobs/{job_id}" &&
-				options?.path?.job_id === "job-revise-1"
-			) {
-				return Promise.resolve(runningJob);
-			}
-			throw new Error(`Unexpected GET ${path}`);
-		});
+		mockStrictReads(
+			expectedRead(toolsListRead, () => Promise.resolve(list)),
+			...list.tools.map((tool) =>
+				expectedRead(toolSummaryRead(tool.name), () =>
+					Promise.resolve(summaryFor(tool)),
+				),
+			),
+			pollingRead(
+				toolJobRead("job-revise-1"),
+				() => Promise.resolve(runningJob),
+				1,
+			),
+		);
 		mockedApiPost.mockImplementation((path, options) => {
 			if (
 				path === "/api/tools/{name}/revise" &&
@@ -1062,24 +1142,15 @@ describe("ToolsPage component", () => {
 			llm_log_process: null,
 			env_keys: [],
 		} satisfies ToolJobResponse;
-		mockedApiGet.mockImplementation((path, options) => {
-			if (path === "/api/tools") {
-				return Promise.resolve(list);
-			}
-			if (
-				path === "/api/tools/{name}/summary" &&
-				options?.path?.name === "weather-search"
-			) {
-				return Promise.resolve(summaryFor(list.tools[0]));
-			}
-			if (
-				path === "/api/tools/jobs/{job_id}" &&
-				options?.path?.job_id === "job-revise-finished"
-			) {
-				return Promise.resolve(terminalJob);
-			}
-			throw new Error(`Unexpected GET ${path}`);
-		});
+		mockStrictReads(
+			expectedRead(toolsListRead, () => Promise.resolve(list)),
+			expectedRead(toolSummaryRead("weather-search"), () =>
+				Promise.resolve(summaryFor(list.tools[0])),
+			),
+			expectedRead(toolJobRead("job-revise-finished"), () =>
+				Promise.resolve(terminalJob),
+			),
+		);
 		mockedApiPost.mockResolvedValue({
 			job_id: "job-revise-finished",
 		} satisfies ToolReviseAccepted);
@@ -1118,7 +1189,7 @@ describe("ToolsPage component", () => {
 			error: "tool.json 無效",
 			lineage: "broken",
 		});
-		mockToolReads(list);
+		mockToolReads(list, { listReads: 2 });
 		mockedApiDelete.mockResolvedValue({
 			outcome: "removed",
 			retained_path: null,
@@ -1139,5 +1210,8 @@ describe("ToolsPage component", () => {
 			"/api/tools/{name}",
 			{ path: { name: list.tools[0].name } },
 		]);
+		await waitFor(() => {
+			expect(toolListRequestCount()).toBe(2);
+		});
 	});
 });

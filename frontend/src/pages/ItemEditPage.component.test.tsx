@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { fireEvent, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, it, type Mock, vi } from "vitest";
+import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import type { ApiSuccessResponse } from "../api/client.js";
 import { apiDelete, apiGet, apiPatch, apiPost } from "../api/client.js";
 import { renderWithAppProviders } from "../test/render.js";
@@ -68,6 +68,24 @@ const item = {
 	why_matters: "",
 } satisfies ItemDetailResponse;
 
+const expectedItemReadCall = [
+	"/api/items/{item_id}",
+	{ path: { item_id: routeItemId } },
+] as const;
+
+function mockExpectedItemRead() {
+	mockedApiGet.mockImplementation((...call) => {
+		// A permissive fixture hides a wrong route target by pre-filling this form
+		// with believable content that belongs to a different item.
+		expect(call).toEqual(expectedItemReadCall);
+		return Promise.resolve(item);
+	});
+}
+
+function expectItemRead() {
+	expect(mockedApiGet.mock.calls).toEqual([expectedItemReadCall]);
+}
+
 function renderEditPage() {
 	return renderWithAppProviders(<ItemEditPage />, {
 		initialEntries: [`/items/${routeItemId}/edit`],
@@ -81,7 +99,7 @@ describe("ItemEditPage sole-copy rewrite request", () => {
 		for (const apiMock of writeApiMocks) {
 			apiMock.mockReset();
 		}
-		mockedApiGet.mockResolvedValue(item);
+		mockExpectedItemRead();
 	});
 
 	// Full-form Mantine mounts approach Vitest's 5 s default under parallel
@@ -91,6 +109,7 @@ describe("ItemEditPage sole-copy rewrite request", () => {
 		mockedApiPatch.mockImplementation(() => new Promise(() => {}));
 		renderEditPage();
 
+		await waitFor(expectItemRead);
 		const title = await screen.findByRole("textbox", { name: "標題" });
 		fireEvent.change(title, { target: { value: `  ${editedTitle}  ` } });
 		fireEvent.click(screen.getByRole("button", { name: "儲存變更" }));
@@ -104,5 +123,6 @@ describe("ItemEditPage sole-copy rewrite request", () => {
 				},
 			]);
 		});
+		expectItemRead();
 	}, 10_000);
 });

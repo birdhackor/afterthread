@@ -78,6 +78,26 @@ const item = {
 	why_matters: "",
 } satisfies ItemDetailResponse;
 
+const expectedItemReadCall = [
+	"/api/items/{item_id}",
+	{ path: { item_id: routeItemId } },
+] as const;
+
+function mockExpectedItemRead() {
+	mockedApiGet.mockImplementation((...call) => {
+		// A permissive fixture hides a wrong route target by rendering plausible
+		// content for it, even while the later write still targets this route.
+		expect(call).toEqual(expectedItemReadCall);
+		return Promise.resolve(item);
+	});
+}
+
+function expectItemReads(count = 1) {
+	expect(mockedApiGet.mock.calls).toEqual(
+		Array.from({ length: count }, () => expectedItemReadCall),
+	);
+}
+
 function renderDetailPage() {
 	return renderWithAppProviders(<ItemDetailPage />, {
 		initialEntries: [`/items/${routeItemId}`],
@@ -100,7 +120,7 @@ describe("ItemDetailPage destructive and rewriting requests", () => {
 			model: null,
 			error: null,
 		});
-		mockedApiGet.mockResolvedValue(item);
+		mockExpectedItemRead();
 	});
 
 	it("deletes the item identified by the route and names that item in the success notification", async () => {
@@ -108,6 +128,7 @@ describe("ItemDetailPage destructive and rewriting requests", () => {
 		mockedApiDelete.mockResolvedValue(null satisfies ItemDeleteResponse);
 		renderDetailPage();
 
+		await waitFor(() => expectItemReads());
 		expect(
 			await screen.findByRole("heading", { name: item.title }),
 		).toBeInTheDocument();
@@ -124,6 +145,7 @@ describe("ItemDetailPage destructive and rewriting requests", () => {
 		expect(
 			await screen.findByText(`已刪除「${item.title}」`),
 		).toBeInTheDocument();
+		expectItemReads();
 	});
 
 	it("patches status on the item identified by the route", async () => {
@@ -131,6 +153,7 @@ describe("ItemDetailPage destructive and rewriting requests", () => {
 		mockedApiPatch.mockResolvedValue({ ...item, status: "active" });
 		renderDetailPage();
 
+		await waitFor(() => expectItemReads());
 		expect(
 			await screen.findByRole("heading", { name: item.title }),
 		).toBeInTheDocument();
@@ -147,6 +170,7 @@ describe("ItemDetailPage destructive and rewriting requests", () => {
 				},
 			]);
 		});
+		expectItemReads(2);
 	});
 
 	it("posts a progress rewrite to the route item with the submitted note", async () => {
@@ -160,6 +184,7 @@ describe("ItemDetailPage destructive and rewriting requests", () => {
 		} satisfies ProgressResponse);
 		renderDetailPage();
 
+		await waitFor(() => expectItemReads());
 		const input = await screen.findByRole("textbox", { name: "新增進度" });
 		await user.type(input, `  ${note}  `);
 		await user.click(screen.getByRole("button", { name: "新增進度" }));
@@ -173,5 +198,6 @@ describe("ItemDetailPage destructive and rewriting requests", () => {
 				},
 			]);
 		});
+		expectItemReads(2);
 	});
 });
