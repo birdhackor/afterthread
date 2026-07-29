@@ -185,8 +185,8 @@ _STATE_MAX_BYTES = 4 * 1024
 # v5 puts all tool content there, and only ``.afterthread.meta/`` is backend-owned
 # at that scope. In particular, migration deliberately carries a FOREIGN legacy
 # state file into the first version byte-for-byte; treating this package-root
-# namespace as a recursive or version-root namespace makes the next revise delete
-# ordinary tool content.
+# namespace as a recursive or version-root namespace makes the next revise omit
+# ordinary tool content from the newly published version.
 #
 # A tuple rather than separate literals still keeps the two legacy package-layer
 # names together for code that reasons about that old namespace.
@@ -1358,18 +1358,18 @@ def _utf8_safe_meta(meta: dict[str, Any]) -> dict[str, Any]:
     ``_utf8_safe``).
 
     Bounded at DEPTH 2 -- top-level values plus one level inside a dict value --
-    on purpose, not for lack of ambition. That is the entire sidecar schema (four
-    scalars plus ``origin``'s two strings), it covers every field any consumer
-    reads, and a general recursive walk would re-open precisely the hazard
+    on purpose, not for lack of ambition. The published summary and origin
+    documents are both flat, so this covers every field any consumer reads plus
+    one defensive hand-edit level. A general recursive walk would re-open the hazard
     ``read_tool_meta``'s ``RecursionError`` guard exists to close: a hand-edited
     file that PARSES (json.loads recursing in C, on the C stack) can still be
     nested far deeper than a Python-frame recursion can follow, which would turn
     a corrupt sidecar back into a 500 for the whole 工具 page.
 
     KEYS are deliberately left alone. A key carrying a surrogate can never equal
-    one of the five schema names, so it is dropped by every consumer AND by the
-    next ``write_tool_meta`` (which builds the file from its own literals) -- it
-    can therefore never reach a response or a re-serialization.
+    one of either document's schema names, so it is dropped by every consumer AND
+    by the next writer (which builds files from its own literals) -- it can
+    therefore never reach a response or a re-serialization.
     """
     scrubbed: dict[str, Any] = {}
     for key, value in meta.items():
@@ -1439,11 +1439,11 @@ def read_tool_meta(version_root: VersionRoot) -> dict[str, Any] | None:
 
 
 def _meta_str(value: Any) -> str | None:
-    """One sidecar string field, narrowed: a ``str`` survives, anything else is None.
+    """One origin string field, narrowed: a ``str`` survives, anything else is None.
 
-    Used only on the ``origin`` sub-fields, whose absence is meaningful (the
-    sidecar is the ONLY copy of the install's URL/instructions, and "we do not
-    have one" has to be representable). ``summary`` deliberately does NOT go
+    Used only in ``origin.json``, whose nullable URL/instruction fields are
+    meaningful: that immutable document is the install provenance copy, and "we
+    do not have one" must be representable. ``summary`` deliberately does NOT go
     through here -- see ``write_tool_meta`` for why a non-string summary refuses
     the write instead of degrading to None.
     """
@@ -1638,7 +1638,7 @@ def write_tool_meta(
 ) -> bool:
     """Publish typed, bounded, sanitized ``summary.json``. Returns success.
 
-    This does NOT serialize ``meta``. It reads the five fields it understands out
+    This does NOT serialize ``meta``. It reads the four fields it understands out
     of ``meta``, coerces each to the shape the sidecar's contract promises, and
     writes THAT -- so every KEY on disk is a literal from this function and every
     VALUE is one this function chose or refused:
@@ -1665,9 +1665,6 @@ def write_tool_meta(
       that id). The token is what lets a reader ask "is this id still mine?"; see
       ``store_summary_meta`` for why it is minted next to the id rather than here,
       and ``routers.tools._summary_detail`` for what a foreign or absent one costs;
-    * ``origin`` -- None, or the two fields we understand narrowed to ``str``/
-      None. It is the install's only record of where the package came from, so
-      it is kept; it is also free operator text, so it is kept NARROW.
 
     Building rather than copying is the FIX for a real leak, not a tidiness
     preference. The previous version redacted the whole caller structure with a
@@ -1746,7 +1743,7 @@ def write_tool_meta(
     hand-edited sidecar carries are DROPPED by the next write. Round-tripping
     them was never a contract -- it was a side effect of serializing the caller's
     dict, and it is precisely what let a stray key/value carry unmasked text into
-    the file. The five fields above are the sidecar.
+    the file. The four fields above are the sidecar.
 
     ``llm_log_id`` and ``llm_log_process`` are carried through from ``meta``
     rather than re-derived. Stamping the current token here would forge freshness
@@ -1907,7 +1904,6 @@ def store_summary_meta(
     version_root: VersionRoot,
     *,
     summary: str,
-    origin: dict[str, Any] | None,
     llm_log_id: int | None,
     expected_identity: tuple[int, int, int] | None,
 ) -> tuple[str, dict[str, Any] | None]:
@@ -2006,17 +2002,17 @@ def _build_llm_tool(scan: _PackageScan) -> LlmTool:
     the assertions document that precondition and keep the type checker happy
     without an ``Any`` escape hatch.
 
-    The identity handed to ``_make_handler`` is the one ``_scan_package`` took on
-    the line above the manifest read (``scan.identity``), NOT a fresh ``lstat``
+    The identity handed to ``_make_handler`` is the one ``_scan_tool_content`` took
+    immediately before the manifest read (``scan.identity``), NOT a fresh ``lstat``
     taken here -- and that is the point rather than an optimization. This
     function does not run until ``_scan_all`` has returned, i.e. until EVERY
     package has been scanned, so an ``lstat`` here would be separated from the
-    read it vouches for by an unbounded number of file reads: a promote landing
-    in that gap pinned the NEW identity against the OLD spec, and
+    read it vouches for by an unbounded number of file reads: an operator package
+    replacement landing in that gap pinned the NEW identity against the OLD spec, and
     every downstream guard -- this handler's own, and the one above ``Popen`` --
     then compared EQUAL and ran it. Pairing them at the read leaves a window of
     exactly one ``lstat``/``open`` pair, and leaves it on the side that REFUSES
-    (see ``_scan_package`` for the measurement of both orderings).
+    (see ``_scan_tool_content`` for the measurement of both orderings).
 
     A TOGGLE landing in that same gap was the OTHER half of R7-1's finding, and it
     is no longer this pairing's to catch: since web-v5 P1 a toggle moves nothing,
@@ -2128,19 +2124,17 @@ _INFLIGHT_LOCK = threading.Lock()
 # replacing a file preserve it on purpose. Measured on this repo's filesystem
 # (ext4) rather than assumed, each against a cached entry:
 #
-# * ``shutil.copy2`` over the existing path -- which is what the revise flow
-#   itself uses to put a ``.env`` back -- changes ONLY ``st_ctime_ns``;
+# * ``shutil.copy2`` over the existing path changes ONLY ``st_ctime_ns``;
 # * a rewrite followed by ``os.utime`` restoring the old stamps (a
 #   timestamp-preserving restore, a backup rollout, ``cp -p``) changes ONLY
 #   ``st_ctime_ns``, even when the new content is the same LENGTH;
-# * write-to-temp + rename with the mtime carried over (``rsync -t``, and the
-#   revise flow's own publish) changes ``st_ino`` and ``st_ctime_ns``;
+# * write-to-temp + rename with the mtime carried over (``rsync -t``) changes
+#   ``st_ino`` and ``st_ctime_ns``;
 # * ``unlink`` + recreate REUSES the inode here, so ``st_ino`` alone would not
 #   have caught the case above either -- which is why ctime is in the tag and not
 #   just the inode;
-# * renaming the parent DIRECTORY (the last step of a revise publish) changes
-#   nothing about the file, so a roll-back that puts the original package back is
-#   still a cache HIT, correctly.
+# * renaming the parent DIRECTORY changes nothing about the file, so moving an
+#   unchanged package tree away and back is still a cache HIT, correctly.
 #
 # Under the old tag every one of those left the redactor serving the PREVIOUS
 # values: the tool then emits the new secret and neither the live tool-result
@@ -3192,8 +3186,8 @@ def set_enabled(name: str, enabled: bool) -> bool:
     # of the registry (see ``_read_enabled_state``), so publishing this by
     # truncate-then-write would make a failed toggle strictly worse than no toggle.
     # P2 intentionally has no state-publication lock: revise now publishes only
-    # ``versions/<vid>`` plus ``current``, so no promote tail can replace this
-    # package-layer state.  The old lock had lost its second participant.
+    # ``versions/<vid>`` plus ``current``, so version publication never replaces
+    # this package-layer state. The old lock had lost its second participant.
     #
     # Recheck containment immediately before publication. The publisher refuses
     # a symlink only at its final filename; this also protects its ancestors.
@@ -3280,6 +3274,16 @@ def _discard_version_locked(package_root: PackageRoot, expected_vid: str) -> Dis
     if target is None:
         return "lineage_unavailable"
     assert isinstance(previous_vid, str)
+
+    # This is not redundant with the first resolution: the flock excludes other
+    # backend operations, not an operator's supported hand edit.  Resolving after
+    # predecessor validation closes that late editor/autosave window; the compare
+    # is the last statement before publication so no new service work can stale it.
+    final_resolution = resolve_current(package_root)
+    if isinstance(final_resolution, Unresolved) or final_resolution.vid != resolution.vid:
+        return "version_mismatch"
+    if final_resolution.previous != previous:
+        return "lineage_unavailable"
     publication = _publish_discard_and_retire(package_root, previous_vid, current)
     if not publication:
         return "not_found"

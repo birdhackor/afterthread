@@ -32,8 +32,8 @@ class VersionMismatchError(Exception):
 
 
 # What a sanitized origin URL says INSTEAD of the parts it dropped (see
-# ``_sanitized_origin_url``). Fixed and visible on purpose: the sidecar is the
-# only record of where a package came from, so a silently shortened URL would
+# ``_sanitized_origin_url``). Fixed and visible on purpose: ``origin.json`` is the
+# provenance record of where a package came from, so a silently shortened URL would
 # read as the whole truth -- an operator comparing it against the address they
 # typed has to be able to tell "this URL had nothing beyond its host" from
 # "something was removed". One marker for every dropped part (userinfo, path,
@@ -504,35 +504,30 @@ def _summary_user_prompt(
 
 
 def _stored_origin(meta: dict[str, Any] | None) -> dict[str, Any] | None:
-    """The sidecar's ``origin``, narrowed to the two fields we understand.
+    """The immutable origin view, narrowed to the two prompt fields we understand.
 
     Only the INSTALL ever captures the OpenAPI URL and the operator's
-    instructions, so the sidecar is the only copy -- and it is exactly the
-    first-hand context a regeneration wants back in its prompt (why the tool was
-    built, from which document), which is why this is read rather than
-    regenerating from the files alone.
+    instructions, and ``origin.json`` is their durable copy. ``read_tool_meta``
+    combines that document with ``summary.json`` for callers; this helper extracts
+    the first-hand context a regeneration wants back in its prompt (why the tool
+    was built, from which document).
 
-    Defensive because the sidecar is a plain JSON file the operator is allowed
+    Defensive because ``origin.json`` is a plain JSON file the operator is allowed
     to hand-edit (the README says so): a non-dict ``origin``, a non-string
     ``openapi_url``, an extra key -- none of them may reach the prompt as if the
     backend had written it. What survives is the two known string fields.
 
-    Returning None when NOTHING survives is load-bearing, not tidiness: None is
-    ``_store_meta``'s "inherit whatever is on disk" signal, so a sidecar whose
-    origin we cannot make sense of keeps its only copy instead of having it
-    overwritten by an empty dict.
+    Returning None when NOTHING survives means no origin context enters the
+    prompt. Summary publication never rewrites immutable provenance, so an origin
+    this helper cannot use remains untouched on disk.
 
     The URL is re-sanitized on the way back IN, not merely trusted. Installs
     sanitize at capture (``tool_builder`` hands us a host-only URL: no path,
-    userinfo, query or fragment), but a sidecar written BEFORE r4/r5 -- or
+    userinfo, query or fragment), but an origin written BEFORE r4/r5 -- or
     hand-edited since -- can hold the raw ``?token=...`` form or a
     path-borne capability token, and this is the door either would come
-    back through: into the regeneration's prompt, and then back onto disk
-    when the store rewrites the origin it was given. Sanitizing here closes
-    both, and heals the file in passing: the first regeneration of a legacy
-    package rewrites its origin in the reduced form. Re-sanitizing an
-    already-sanitized URL is a no-op, so this costs nothing on the normal
-    path.
+    back through into the regeneration's prompt. Sanitizing this prompt view
+    closes that disclosure path without mutating committed provenance.
     """
     if meta is None:
         return None
@@ -561,7 +556,7 @@ def _resolve_package(
     the same shape: resolve a directory, spend an LLM round trip, write into that
     directory. Between those two moments the operator can delete the package and
     install a DIFFERENT one under the same name -- and a write addressed by path
-    alone would then persist package A's summary, and A's origin, into package B.
+    alone would then persist package A's summary into package B.
     So the identity of what was resolved is captured here, at the resolve, and
     carried to the store, which re-checks it in the instant before it writes (see
     ``tools.store_summary_meta``).
@@ -596,7 +591,6 @@ def _store_meta(
     version_root: tools.VersionRoot,
     *,
     summary: str,
-    origin: dict[str, Any] | None,
     llm_log_id: int | None,
     identity: tuple[int, int, int],
 ) -> dict[str, Any] | None:
@@ -619,7 +613,6 @@ def _store_meta(
     _outcome, meta = tools.store_summary_meta(
         version_root,
         summary=summary,
-        origin=origin,
         llm_log_id=llm_log_id,
         expected_identity=identity,
     )
@@ -753,7 +746,6 @@ async def generate_and_store_summary(
                 _store_meta,
                 version_root,
                 summary="",
-                origin=origin,
                 llm_log_id=None,
                 identity=identity,
             ),
@@ -792,7 +784,6 @@ async def generate_and_store_summary(
                     _store_meta,
                     version_root,
                     summary="",
-                    origin=origin,
                     llm_log_id=_summary_session_log_id(log_id_before),
                     identity=identity,
                 )
@@ -801,7 +792,6 @@ async def generate_and_store_summary(
             _store_meta,
             version_root,
             summary=summary,
-            origin=origin,
             llm_log_id=llm_log.last_record_id_for_workflow(_SUMMARY_WORKFLOW),
             identity=identity,
         )
@@ -849,7 +839,6 @@ async def regenerate_summary(
         _store_meta,
         version_root,
         summary=summary,
-        origin=origin,
         llm_log_id=llm_log.last_record_id_for_workflow(_SUMMARY_WORKFLOW),
         identity=identity,
     )

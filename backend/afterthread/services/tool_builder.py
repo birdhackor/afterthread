@@ -209,16 +209,16 @@ _ERROR_INSTALL_STATE_WRITE = "無法寫入工具的啟用狀態，安裝已取�
 # the version identity captured before the paid builder session.
 _ERROR_REVISE_TARGET_MISSING = "原工具已被刪除，修訂結果未安裝。"  # noqa: RUF001
 _ERROR_REVISE_TARGET_ALIAS = "原工具目錄已被替換為連結，修訂已取消。"  # noqa: RUF001
-# R10-1: the package of that NAME is still there, but it is not the one this
-# session copied from -- an operator deleted and reinstalled it, or replaced it
-# wholesale, during the minutes the build ran. Publishing the old snapshot's
-# revision over it would rename the new package aside and then delete it. The
-# remedy is to re-send the feedback against what is installed now, which is what
-# the message says; like every outcome error here it names the condition only.
+# R10-1: the package of that NAME is still there, but its current version or the
+# version this session copied from changed during the minutes the build ran.
+# Publishing the old snapshot as a fresh successor would attach it to stale
+# lineage and overwrite a supported D21 ``current`` edit. The remedy is to
+# re-send the feedback against what is installed now, which is what the message
+# says; like every outcome error here it names the condition only.
 _ERROR_REVISE_TARGET_REPLACED = "原工具在修訂期間被改動或重新安裝，請確認現況後重新送出意見。"  # noqa: RUF001
 # R11-2: we could not establish WHICH package this is before starting -- a missing
 # or unreadable ``tool.json``. Refused up front rather than after a full build,
-# because the pre-swap identity check would have nothing to compare against.
+# because the pre-publication identity check would have nothing to compare against.
 _ERROR_REVISE_IDENTITY_UNKNOWN = "無法確認原工具的內容（`tool.json` 讀取失敗），修訂已取消。"  # noqa: RUF001
 _ERROR_VERSION_ID_WRITE = "無法為工具建立不重複的版本編號，操作已取消。"  # noqa: RUF001
 _ERROR_ORIGIN_WRITE = "無法寫入工具版本的來源資料，操作已取消。"  # noqa: RUF001
@@ -488,7 +488,7 @@ flat `.ai_meta.json` or `.afterthread-state.json` file you find here is this \
 version's tool content: leave it alone unless the feedback asks you to change it.
 
 Finish exactly as described above, with one added rule: "tool_name" MUST be \
-exactly {name}, because it names the installed package this revision replaces \
+exactly {name}, because it names the installed package this revision updates \
 -- any other value is treated as an attempt to rename the tool and the revision \
 is discarded. "summary" reports what you CHANGED and how you verified it."""
 
@@ -1834,7 +1834,7 @@ def _cleanup_staging(staging: Path, base: Path) -> None:
     anything looks at them. The non-blocking exclusive flock makes the same
     sweep safe after a restart: an inherited child keeps its shared reference,
     so the new process skips instead of mistaking an empty local registry for
-    proof. This placement also keeps the promote's pre-swap sequence (which
+    proof. This placement also keeps the promote's pre-publication sequence (which
     r4/r10/r11/r12 spent four rounds ordering) free of a new destructive
     traversal. It hangs off a ``finally`` because it is INDEPENDENT of everything
     above it: a tampered workspace returns early -- deliberately, see above --
@@ -2090,7 +2090,8 @@ def _revise_copy_ignore(root: Path, source_dir: Any, names: list[str]) -> set[st
     legacy package-reserved filenames are ordinary tool content: migration may
     have put a FOREIGN ``.afterthread-state.json`` here byte-for-byte, and
     ``.ai_meta.json`` has no v5 reader here either. Applying the package-root
-    reserved-name tuple here silently deleted those files on the next revise.
+    reserved-name tuple here silently omitted those files from the next current
+    version.
 
     Only the root ``.afterthread.meta/`` is backend-owned version data. The exact
     package-layer ``.env`` is withheld as well; nested names and distinct
@@ -2500,7 +2501,7 @@ async def run_revise(
     # matching tools._cached_env_values' own "a KEY= line contributes nothing"
     # rule.
     # R10-1: the identity of the package we are about to revise, taken BEFORE the
-    # session and re-checked before the swap. An operator can delete and reinstall
+    # session and re-checked before publication. An operator can delete and reinstall
     # the tool during the minutes a build runs, and a name is not an identity.
     package_identity = await run_in_threadpool(_package_identity, resolution.version_root)
     if package_identity is None:
@@ -2508,8 +2509,8 @@ async def run_revise(
         # package whose manifest we cannot even stat is either broken (the
         # resolver admits a directory with no tool.json) or momentarily
         # unreadable, and in both cases we would be starting a session we could
-        # never safely publish: with no identity to compare, the pre-swap check
-        # would have to either wave the swap through -- exactly the loss R10-1
+        # never safely publish: with no identity to compare, the pre-publication
+        # check would have to either wave stale work through -- exactly the loss R10-1
         # closed -- or refuse after burning the whole build.
         return InstallOutcome(ok=False, error=_ERROR_REVISE_IDENTITY_UNKNOWN)
     _env_existed, env_values, env_text, env_error = await run_in_threadpool(
@@ -2991,14 +2992,12 @@ def reserve_sync_operation() -> str | None:
 
     The counterpart of ``_admit_job`` for work that is not a job: the summary
     regenerate runs inside a request, but it spends a full LLM round trip between
-    reading a package and writing that package's sidecar. Its old gate was a bare
-    ``any_job_active()`` read, which is a check-then-act across an await that
-    lasts as long as an LLM call -- long enough for a revise to be admitted,
-    replace the whole package and write a fresh sidecar, which the older
-    regenerate then OVERWROTE with a summary describing the package that no
-    longer exists. Taking a reservation puts it in the same admission domain as
-    the jobs: while one is held ``_admit_job`` refuses, so the revise never
-    starts.
+    reading a version and writing that version's sidecar. The operation remains
+    part of the one-at-a-time builder/regenerate policy, so its admission must be
+    held for that whole interval. Its old gate was a bare ``any_job_active()``
+    read, which released the policy before the await and allowed a builder job to
+    be admitted concurrently. Taking a reservation keeps it in the same admission
+    domain as the jobs: while one is held ``_admit_job`` refuses.
 
     The test and the take happen under ONE acquisition of ``_JOBS_LOCK``, exactly
     as ``_admit_job`` does, which is the whole reason this is a function and not

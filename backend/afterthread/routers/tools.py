@@ -569,21 +569,18 @@ async def regenerate_tool_summary(
     from ``routers.ai``. The installer's asynchronous, job-shaped contract stays
     what it is precisely because a builder session cannot fit in a request.
 
-    Before the LLM is touched, a queued/running job is refused because a package
-    directory may be swapped underneath us mid-promote (409
-    ``job_busy``).  After taking that slot, ``expected_vid`` is compared with the
-    resolved current version; a stale caller gets ``version_mismatch`` without an
-    LLM request.
+    Before the LLM is touched, a queued/running job is refused under the shared
+    one-at-a-time builder/regenerate policy (409 ``job_busy``). After taking that
+    slot, ``expected_vid`` is compared with the resolved current version; a stale
+    caller gets ``version_mismatch`` without an LLM request.
 
     The job gate TAKES a reservation rather than merely asking (R7-3), and the
     difference is what makes it a gate at all: this handler then awaits a full
-    LLM round trip, and a bare ``any_job_active()`` read left that whole window
-    open -- a revise could be admitted inside it, replace the package, write its
-    own sidecar, and have this older generation overwrite it with a summary of
-    the package that no longer exists. ``reserve_sync_operation`` decides and
-    takes under the SAME lock ``_admit_job`` uses, so the revise is refused for
-    the duration instead; the reservation is released in the ``finally`` below on
-    every path, success or exception.
+    LLM round trip, and a bare ``any_job_active()`` read released the shared
+    admission policy before that work finished. ``reserve_sync_operation`` decides
+    and takes under the SAME lock ``_admit_job`` uses, so builder work is refused
+    for the duration instead; the reservation is released in the ``finally`` below
+    on every path, success or exception.
 
     A generation that produced text but STORED nothing (``regenerate_summary``
     -> None: the package vanished mid-request, or the sidecar write was refused)

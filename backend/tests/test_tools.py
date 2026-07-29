@@ -983,6 +983,111 @@ def test_version_discard_refuses_null_lineage_without_calling_whole_tool_delete(
     assert _package_path(version).is_dir()
 
 
+def test_discard_rechecks_current_after_predecessor_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A current edit after P validates must remain the final operator answer.
+
+    The one-shot wrapper calls the real ``_resolve_version_target(P)`` first and
+    only then writes Q into ``current``. This is the late window after predecessor
+    validation, not the already-covered wait-before-lock window.
+    """
+
+    first = _make_tool(tmp_path / "tools", "echo", "import sys\n")
+    package = _package_path(first)
+    package_root = tools.PackageRoot(package)
+    discarded_vid = "20260728T020304Z-fedcba"
+    replacement_vid = "20260728T030405Z-acdeff"
+    discarded = _add_committed_version(
+        package, discarded_vid, description="discarded", output="DISCARDED"
+    )
+    replacement = _add_committed_version(
+        package, replacement_vid, description="replacement", output="REPLACEMENT"
+    )
+    assert tools.publish_current(package_root, discarded_vid)
+    real_resolve_target = tools._resolve_version_target
+    after_edit: dict[str, bytes] = {}
+
+    def resolve_predecessor_then_edit_current(
+        root: tools.PackageLayoutRoot, vid: object
+    ) -> tuple[tools.VersionRoot, dict[str, Any]] | None:
+        target = real_resolve_target(root, vid)
+        if vid == first.name and not after_edit:
+            current = package / tools._META_DIRNAME / tools._CURRENT_FILENAME
+            current.write_text(f"{replacement_vid}\n", encoding="ascii")
+            after_edit.update(
+                {
+                    str(path.relative_to(package)): path.read_bytes()
+                    for path in package.rglob("*")
+                    if path.is_file()
+                }
+            )
+        return target
+
+    monkeypatch.setattr(tools, "_resolve_version_target", resolve_predecessor_then_edit_current)
+
+    assert tools.discard_version(package_root, discarded_vid) == "version_mismatch"
+    assert after_edit  # the edit landed in the intended late window
+    assert _resolved_version(package) == replacement
+    assert all(path.is_dir() for path in (first, discarded, replacement))
+    assert {
+        str(path.relative_to(package)): path.read_bytes()
+        for path in package.rglob("*")
+        if path.is_file()
+    } == after_edit
+
+
+def test_discard_rechecks_previous_after_predecessor_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A V.previous edit after old P validates cannot publish that stale P."""
+
+    first = _make_tool(tmp_path / "tools", "echo", "import sys\n")
+    package = _package_path(first)
+    package_root = tools.PackageRoot(package)
+    discarded_vid = "20260728T020304Z-fedcba"
+    replacement_vid = "20260728T030405Z-acdeff"
+    discarded = _add_committed_version(
+        package, discarded_vid, description="discarded", output="DISCARDED"
+    )
+    replacement = _add_committed_version(
+        package, replacement_vid, description="replacement", output="REPLACEMENT"
+    )
+    assert tools.publish_current(package_root, discarded_vid)
+    discarded_origin = discarded / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    real_resolve_target = tools._resolve_version_target
+    after_edit: dict[str, bytes] = {}
+
+    def resolve_predecessor_then_edit_previous(
+        root: tools.PackageLayoutRoot, vid: object
+    ) -> tuple[tools.VersionRoot, dict[str, Any]] | None:
+        target = real_resolve_target(root, vid)
+        if vid == first.name and not after_edit:
+            origin = json.loads(discarded_origin.read_text(encoding="utf-8"))
+            origin["previous"] = replacement_vid
+            discarded_origin.write_text(json.dumps(origin), encoding="utf-8")
+            after_edit.update(
+                {
+                    str(path.relative_to(package)): path.read_bytes()
+                    for path in package.rglob("*")
+                    if path.is_file()
+                }
+            )
+        return target
+
+    monkeypatch.setattr(tools, "_resolve_version_target", resolve_predecessor_then_edit_previous)
+
+    assert tools.discard_version(package_root, discarded_vid) == "lineage_unavailable"
+    assert after_edit  # the edit landed after old P resolved successfully
+    assert _resolved_version(package) == discarded
+    assert all(path.is_dir() for path in (first, discarded, replacement))
+    assert {
+        str(path.relative_to(package)): path.read_bytes()
+        for path in package.rglob("*")
+        if path.is_file()
+    } == after_edit
+
+
 def test_invariant_e_discard_succeeds_when_old_version_removal_fails(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1604,13 +1709,13 @@ def test_runtime_refuses_a_package_replaced_after_it_was_advertised(
     refuses instead of running, and the unchanged package still runs normally.
 
     ``enabled_llm_tools()`` snapshots each tool's schema at the START of an AI
-    workflow, but the handler resolves and executes from the PATH minutes later --
-    and an ordinary capture/enrich is NOT inside the tool job's single-flight, so a
-    revise can swap the package underneath a conversation that already advertised
-    the old one. The model would then be answering against a schema the running
-    entry no longer implements.
+    workflow, but the handler resolves and executes from the PATH minutes later.
+    An operator may replace the advertised version's manifest during that interval
+    under D21, and the exclusive tools flock does not constrain their editor. The
+    model would then be answering against a schema the running entry no longer
+    implements.
 
-    The swap here is revise-shaped: a fresh ``tool.json`` written into place (a
+    The edit here is a fresh ``tool.json`` written into place (a
     different inode, and a different ctime even if it were not), leaving the name
     and the entry file alone -- so nothing but the manifest identity can tell.
     The sentinel is what proves the refusal happened INSTEAD of a run rather than
@@ -1749,7 +1854,7 @@ def test_runtime_refuses_after_a_hand_edit_rewrites_the_manifest(
 def test_a_toggle_during_the_scan_cannot_advertise_the_tool_it_disabled(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The window the identity capture had to move INTO ``_scan_package`` to close.
+    """The window the identity capture had to move INTO ``_scan_tool_content`` to close.
 
     ``enabled_llm_tools`` materializes ``_scan_all()`` in full before the FIRST
     handler is built, so with the identity taken at BUILD time the gap between
@@ -2015,7 +2120,7 @@ def test_the_scan_and_the_execution_check_answer_the_one_rule_identically(
 ) -> None:
     """One spelling, demonstrated rather than asserted (P1R3-1).
 
-    ``package_enabled`` stopped BEING ``_scan_package(directory).enabled``, so
+    ``package_enabled`` stopped BEING ``scan_installed(package_root).enabled``, so
     "they cannot disagree" stopped being true by construction and became true by
     both calling ``_effective_enabled`` with the reads they are already holding.
     That is only worth having if it is checked, so this walks every shape the two
@@ -2088,11 +2193,11 @@ def test_the_identity_check_is_the_last_thing_before_the_subprocess_starts(
     Round 3 left the order ``identity -> toggle -> Popen``, which put a state-file
     read -- and on the ABSENT path a manifest read as well -- between the identity
     ANSWER and the exec that acts on it. ``cwd`` is resolved by the KERNEL from the
-    PATH at exec time, so a revise landing in that gap does not merely race: the
-    child starts inside the NEW package carrying the OLD entry argv, the old
-    schema's arguments and the old package's ``.env`` values, and nothing afterwards
-    shows it (an attempt records the NAME, which did not change) -- the hazard D40's
-    overall-r6 O6-1 was rated P1 for.
+    PATH at exec time, so an operator package replacement landing in that gap does
+    not merely race: the child starts inside the NEW package carrying the OLD entry
+    argv, the old schema's arguments and the old package's ``.env`` values, and
+    nothing afterwards shows it (an attempt records the NAME, which did not change)
+    -- the hazard D40's overall-r6 O6-1 was rated P1 for.
 
     The toggle and invariant-B checks both precede identity. A switch flipped
     inside those bounded reads can still land in the accepted check-then-act
@@ -2146,18 +2251,18 @@ def test_the_identity_check_is_the_last_thing_before_the_subprocess_starts(
     assert trace == ["identity", "enabled", "enabled", "resolve", "identity", "popen"]
 
 
-def test_a_revise_landing_between_the_toggle_read_and_popen_is_refused_not_run(
+def test_a_package_replacement_between_the_toggle_read_and_popen_is_refused_not_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The order above, driven rather than traced: the gap must REFUSE a swap.
 
-    The probe replaces the package the way ``_promote_staging_replace`` does (rename
-    the live one aside, rename the new one in) from inside the pre-``Popen`` toggle
-    read -- i.e. after the handler's checks and strictly before the identity check
-    that now follows it. With the identity check second the swap is caught and the
-    call answers ``_TOOL_REPLACED_RESULT``; with round 3's order it was the identity
-    check that ran first and this exact probe measured ``'NEW'`` coming back to the
-    model, the replacement's code executed under the old contract.
+    The probe performs an operator-style rename swap (live package aside, new
+    package in) from inside the pre-``Popen`` toggle read -- i.e. after the
+    handler's checks and strictly before the identity check that now follows it.
+    With the identity check second the swap is caught and the call answers
+    ``_TOOL_REPLACED_RESULT``; with round 3's order it was the identity check that
+    ran first and this exact probe measured ``'NEW'`` coming back to the model,
+    the replacement's code executed under the old contract.
 
     The state file is created up front so ``package_enabled`` takes its PRESENT path
     and reads once per site -- the ABSENT path reads twice, which would land the
@@ -2245,19 +2350,18 @@ def test_a_symlinked_package_directory_cannot_run_a_tool_disabled_through_the_ap
     assert not sentinel.exists()  # nothing was started
 
 
-def test_a_promote_during_the_scan_cannot_run_the_new_package(
+def test_a_package_replacement_during_the_scan_cannot_run_the_new_package(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The same window with a replace-mode promote, which is the redirect hazard.
+    """The same window with an operator package replacement: the redirect hazard.
 
     A ``cwd`` is resolved by the kernel from the PATH at exec, so pairing A's old
     entry argv and old parameter schema with the identity of the package that
     replaced A does not merely race -- it runs the NEW package's files under the
     OLD contract, with the new package's ``.env``, and the AI log records only the
-    NAME, which did not change. The swap is spelled the way ``_promote_staging_
-    replace`` spells it (rename the old package aside, rename the new one in), and
-    it is performed from inside a later package's scan for the same determinism as
-    the toggle above."""
+    NAME, which did not change. The swap renames the old package aside and the new
+    one in, and is performed from inside a later package's scan for the same
+    determinism as the toggle above."""
     root = tmp_path / "tools"
     _make_tool(root, "aaa", "import sys\nsys.stdout.write('OLD')\n")
     _make_tool(root, "zzz", "import sys\nsys.stdout.write('z')\n")
@@ -2269,14 +2373,14 @@ def test_a_promote_during_the_scan_cannot_run_the_new_package(
     pkg = root / "aaa"
     real_scan = tools.scan_installed
 
-    def scan_then_promote(package_root: tools.PackageRoot) -> tools._PackageScan:
+    def scan_then_replace(package_root: tools.PackageRoot) -> tools._PackageScan:
         scan = real_scan(package_root)
         if package_root.path.name == "zzz":
             os.rename(pkg, root / ".aaa.bak-r7")
             os.rename(replacement, pkg)
         return scan
 
-    monkeypatch.setattr(tools, "scan_installed", scan_then_promote)
+    monkeypatch.setattr(tools, "scan_installed", scan_then_replace)
     advertised = {tool.spec["function"]["name"]: tool.handler for tool in enabled_llm_tools()}
 
     assert asyncio.run(advertised["aaa"]({})) == tools._TOOL_REPLACED_RESULT
@@ -2286,7 +2390,7 @@ def test_a_promote_during_the_scan_cannot_run_the_new_package(
 def test_the_identity_is_taken_before_the_manifest_read_so_the_gap_refuses(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The ORDER inside ``_scan_package``, which is the whole of R7-1 rather than
+    """The ORDER inside ``_scan_tool_content``, the whole of R7-1 rather than
     a detail of it -- and the one thing the two tests above cannot see, since a
     swap landing after the whole scan is caught under either ordering.
 
@@ -3001,8 +3105,7 @@ def test_known_secret_values_sees_a_same_mtime_replacement(
 
     The tag used to be the ``st_mtime_ns`` alone, and mtime is the one timestamp
     userspace can set to anything: a timestamp-preserving restore (``cp -p``, a
-    backup rollout, ``shutil.copy2`` -- which is exactly what the revise flow uses
-    to put a ``.env`` back) leaves it untouched. The cache then kept serving the
+    backup rollout, ``shutil.copy2``) leaves it untouched. The cache then kept serving the
     OLD value, so the tool emitted the NEW secret and nothing masked it -- not the
     live tool-result redactor, not llm_log, not the summary writer.
 
@@ -4581,8 +4684,8 @@ def test_write_tool_meta_redacts_the_summary(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A secret that reached the summary is masked BEFORE it lands on disk --
-    the sidecar rides into a later revise's staging copy, where the
-    embedded-secret gate would reject the whole package over it."""
+    ``summary.json`` is served back to the UI and has no later embedded-secret
+    gate to catch a value this storage boundary missed."""
     root = tmp_path / "tools"
     secret = "another-tools-live-secret-abcdef"
     _make_tool(root, "other", "import sys\nsys.stdout.write('x')\n", dotenv=f"OTHER_KEY={secret}\n")
@@ -4929,8 +5032,7 @@ def test_write_tool_meta_keeps_the_old_sidecar_when_the_publish_fails(
 
     That is real data loss, not a lost update: on ENOSPC/quota/an I/O error the
     caller was told False -- "nothing happened" -- while the existing summary
-    had been truncated to nothing, and the sidecar is the ONLY copy of both that
-    summary and the install's ``origin``. Writing to a
+    had been truncated to nothing. Writing to a
     temp file and publishing with ``os.replace`` means the old content survives
     every failure mode, and the file is never observable half-written.
 
@@ -5331,8 +5433,9 @@ def test_store_summary_meta_outcomes(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     # ok: origin inherited from disk, the summary replaced.
     origin = {"openapi_url": "http://kb.example/o.json", "instructions": "查 KB"}
     assert _write_meta(pkg, summary="舊的", origin=origin) is True
+    assert "origin" not in inspect.signature(tools.store_summary_meta).parameters
     outcome, meta = tools.store_summary_meta(
-        _version_root(pkg), summary="新的", origin=None, llm_log_id=9, expected_identity=identity
+        _version_root(pkg), summary="新的", llm_log_id=9, expected_identity=identity
     )
     assert outcome == "ok"
     assert meta is not None
@@ -5349,7 +5452,7 @@ def test_store_summary_meta_outcomes(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     # not_stored: the write was refused (here, the ghost guard on a missing dir).
     gone = tmp_path / "nope" / "gone"
     assert tools.store_summary_meta(
-        tools.VersionRoot(gone), summary="s", origin=None, llm_log_id=None, expected_identity=None
+        tools.VersionRoot(gone), summary="s", llm_log_id=None, expected_identity=None
     ) == (
         "not_stored",
         None,
@@ -5374,7 +5477,7 @@ def test_store_summary_meta_stamps_the_minting_process_beside_the_log_id(
     identity = tools.package_identity(_version_root(pkg))
 
     outcome, meta = tools.store_summary_meta(
-        _version_root(pkg), summary="說明", origin=None, llm_log_id=7, expected_identity=identity
+        _version_root(pkg), summary="說明", llm_log_id=7, expected_identity=identity
     )
     assert outcome == "ok"
     assert meta is not None
@@ -5382,7 +5485,7 @@ def test_store_summary_meta_stamps_the_minting_process_beside_the_log_id(
     assert meta["llm_log_process"] == llm_log.process_token()
 
     outcome, meta = tools.store_summary_meta(
-        _version_root(pkg), summary="說明", origin=None, llm_log_id=None, expected_identity=identity
+        _version_root(pkg), summary="說明", llm_log_id=None, expected_identity=identity
     )
     assert outcome == "ok"
     assert meta is not None
@@ -5404,7 +5507,6 @@ def test_store_summary_meta_strips_and_caps_the_summary(
     outcome, meta = tools.store_summary_meta(
         _version_root(pkg),
         summary="  spaced  ",
-        origin=None,
         llm_log_id=1,
         expected_identity=identity,
     )
@@ -5414,7 +5516,7 @@ def test_store_summary_meta_strips_and_caps_the_summary(
 
     long_text = "y" * (tools._TOOL_SUMMARY_CAP + 500)
     outcome, meta = tools.store_summary_meta(
-        _version_root(pkg), summary=long_text, origin=None, llm_log_id=1, expected_identity=identity
+        _version_root(pkg), summary=long_text, llm_log_id=1, expected_identity=identity
     )
     assert outcome == "ok"
     assert meta is not None
@@ -5443,7 +5545,6 @@ def test_store_summary_meta_redacts_before_capping(
     outcome, meta = tools.store_summary_meta(
         _version_root(pkg),
         summary=padding + secret,
-        origin=None,
         llm_log_id=1,
         expected_identity=identity,
     )
@@ -5475,7 +5576,7 @@ def test_store_summary_meta_redacts_before_stripping(
     monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
 
     outcome, meta = tools.store_summary_meta(
-        _version_root(pkg), summary=secret, origin=None, llm_log_id=1, expected_identity=identity
+        _version_root(pkg), summary=secret, llm_log_id=1, expected_identity=identity
     )
 
     assert outcome == "ok"
@@ -5523,9 +5624,8 @@ def test_store_summary_meta_refuses_a_package_swapped_inside_the_write(
     The identity check used to be the last line of ``store_summary_meta``, which
     reads as "the last instant" but is not one: ``write_tool_meta`` still had a
     redactor sweep, an encode, an mkstemp, a write and an fsync ahead of it, and
-    NOTHING serializes a promote or a delete against that. So a package
-    swapped inside that window received A's summary AND A's origin -- which every
-    later revise of B then reads back as its first-hand context.
+    NOTHING serializes a delete-and-reinstall against that. So a replacement
+    version at the same path received A's summary.
 
     The check now sits on the line above ``os.replace``. What must hold: nothing
     is published, the answer is the did-not-happen one the route already maps,
@@ -5542,7 +5642,6 @@ def test_store_summary_meta_refuses_a_package_swapped_inside_the_write(
     assert tools.store_summary_meta(
         _version_root(pkg),
         summary="A 這個工具會查 KB",
-        origin={"openapi_url": "http://a.example/o.json", "instructions": "A 的指示"},
         llm_log_id=7,
         expected_identity=identity,
     ) == ("not_stored", None)
@@ -5579,7 +5678,7 @@ def test_store_summary_meta_fails_closed_on_a_redaction_failure(
     monkeypatch.setattr(tools, "known_secret_values", explode)
 
     assert tools.store_summary_meta(
-        _version_root(pkg), summary="新的", origin=None, llm_log_id=1, expected_identity=identity
+        _version_root(pkg), summary="新的", llm_log_id=1, expected_identity=identity
     ) == (
         "not_stored",
         None,

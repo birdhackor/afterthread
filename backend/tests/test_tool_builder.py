@@ -1244,8 +1244,8 @@ def _promote_for_test(staging: Path, name: str, base: Path) -> str | None:
     # pytest's teardown reports a wall of "Directory not empty" warnings that bury
     # the one real warning this suite has.
     # The sealed-subtree tests chmod a directory to 0o000 and restore only the
-    # ORIGINAL in their own finally; the promote copied it, so the shell holds an
-    # unenterable duplicate that defeats rmtree (and pytest's own retrying
+    # ORIGINAL in their own finally; the assembled shell holds the staged
+    # unenterable entry, which defeats rmtree (and pytest's own retrying
     # teardown) with a cascade of ENOTEMPTY. Walk it open first.
     shell = staging.parent / "shell"
 
@@ -3858,12 +3858,10 @@ def test_router_regenerate_summary_holds_the_single_flight_across_the_llm_call(
     (R7-3), and gives the reservation back when it finishes.
 
     The old gate read ``any_job_active()`` and then awaited a full LLM round trip
-    -- a check-then-act whose window is one LLM call wide. A revise admitted
-    inside it replaced the whole package and wrote its own fresh sidecar, which
-    this older generation then overwrote with a summary built from the REPLACED
-    package's contents: the newer, correct sidecar silently lost to the older
-    one. Now the route TAKES a reservation in the same lock ``_admit_job`` uses,
-    so nothing can be admitted while it runs.
+    -- a check-then-act whose window is one LLM call wide. That released the
+    shared one-at-a-time builder/regenerate policy before regeneration finished.
+    Now the route TAKES a reservation in the same lock ``_admit_job`` uses, so
+    nothing can be admitted while it runs.
 
     Both submits are driven from INSIDE the stubbed generation, which is exactly
     where the race lived; the assertions after the response pin the release, so
@@ -4001,9 +3999,8 @@ def test_router_summary_routes_refuse_an_internal_alias(
     """An INTERNAL alias tools/<alias> -> tools/<real> resolves INSIDE the tools
     root, so resolve-then-contain PASSES and every by-name operation would
     silently act on the REAL package -- a regenerate spending an LLM session
-    rewriting its summary, or a REVISE replacing it wholesale. All three refuse
-    (404) and the real sidecar is left byte-for-byte
-    as it was.
+    rewriting its summary, or a REVISE publishing a successor for it. All three
+    refuse (404) and the real sidecar is left byte-for-byte as it was.
 
     This is the same hard-block set_enabled/delete_tool have carried since H3,
     now shared by every summary/revise path through one resolver."""
@@ -4098,11 +4095,10 @@ def test_any_job_active_tracks_the_job_table() -> None:
 def test_a_sync_reservation_occupies_the_same_single_flight() -> None:
     """A held reservation is worth exactly one job, in BOTH directions (R7-3).
 
-    The synchronous regenerate is not a job, but it reads a package and then
-    writes that package's sidecar across a full LLM round trip, so it has to
-    occupy the same admission domain -- otherwise the two decide independently
-    and a revise admitted mid-generation replaces the very package the summary is
-    being written about. The check and the take happen under ONE acquisition of
+    The synchronous regenerate is not a job, but it reads a version and then
+    writes that version's sidecar across a full LLM round trip. The declared
+    one-at-a-time builder/regenerate policy therefore puts it in the same
+    admission domain. The check and the take happen under ONE acquisition of
     ``_JOBS_LOCK`` (the reservation function does both), which is what makes this
     a gate rather than a hint.
 
@@ -4498,7 +4494,7 @@ def _staging_dir(root: Path) -> Path:
 
 
 def _leftovers(root: Path) -> list[str]:
-    """Hidden backup directories left behind by a swap (there must be none)."""
+    """Marked stale package directories left behind by cleanup (normally none)."""
     return sorted(child.name for child in root.iterdir() if ".bak-" in child.name)
 
 
@@ -4529,9 +4525,10 @@ def test_run_revise_copies_version_content_without_root_env_or_backend_metadata(
     A NESTED ``.env`` is ordinary package content and is COPIED (R2-2). The r1 rule
     excluded every ``.env``-casefolded name at EVERY depth, so a tool that reads its
     own ``config/.env`` -- its entry runs with the package directory as cwd, and
-    nothing stops it -- had that file silently DELETED by an unrelated revise, with
-    validation then passing on the mutilated package. Pinned on both sides here: the
-    builder sees it, and the revised INSTALLED package still has it, byte for byte."""
+    nothing stops it -- had that file silently OMITTED from the next current
+    version by an unrelated revise, with validation then passing on the mutilated
+    content. Pinned on both sides here: the builder sees it, and the revised
+    INSTALLED version still has it, byte for byte."""
     pkg = _seed_package(monkeypatch, tmp_path)
     root = _package_path(pkg).parent
     (_package_path(pkg) / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
@@ -4567,30 +4564,26 @@ def test_run_revise_copies_version_content_without_root_env_or_backend_metadata(
         "config",
         "config/.env",
     }
-    # ... and the file an unrelated revise used to delete is still there, untouched.
+    # ... and the file an unrelated revise used to omit is still there, untouched.
     assert (_current_version(pkg) / "config" / ".env").read_bytes() == nested_env
     assert (_current_version(pkg) / "sub" / ".AI_META.JSON").read_text(
         encoding="utf-8"
     ) == '{"summary": "forged"}'
 
 
-def test_run_revise_keeps_the_state_file_out_of_staging_but_carries_it_across(
+def test_run_revise_keeps_the_package_state_file_out_of_version_staging(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """R5 both ways: the builder never SEES the state file, and a revise never
     silently re-enables the tool.
 
-    The two halves are one decision. ``.afterthread-state.json`` is backend-authored, so it is
-    excluded from the copy -- a session with real shell capability (D21) must not
-    be handed the file that decides whether its own tool may run. But the swap
-    REPLACES the whole package directory, so excluding it and stopping there would
-    make every revise publish a package with no state file at all, read through the
-    manifest fallback as ENABLED: an operator's deliberate 停用 undone by a revise
-    about pagination, with nothing anywhere reporting it.
-
-    So the promote re-publishes it from the LIVE package through the same choke
-    point ``set_enabled`` uses. The tool is disabled going in and disabled coming
-    out, and the builder's staging never had one to read or rewrite."""
+    ``.afterthread-state.json`` is backend-authored package state, so it is
+    excluded from the version copy: a session with real shell capability (D21)
+    must not be handed the file that decides whether its own tool may run. A
+    revise now publishes only a new ``versions/<vid>`` entry and ``current``;
+    package-layer state stays in place without being copied or re-published. The
+    tool is disabled going in and disabled coming out, and the builder's staging
+    never had the state file to read or rewrite."""
     pkg = _seed_package(monkeypatch, tmp_path)
     root = _package_path(pkg).parent
     assert tools.set_enabled("kbsearch", False) is True
@@ -4772,9 +4765,10 @@ def test_run_revise_registers_the_live_env_values_for_the_session(
     """Every value of the existing ``.env`` is registered as an in-flight secret
     for the whole revise, then discarded.
 
-    The registration -- not the on-disk scan -- is what matters: the scan already
-    covers the package while it sits there, but it skips dot-directories, and the
-    swap parks the old package in one (see the swap-window test below)."""
+    The registration -- not the on-disk scan -- is what matters: the scan covers
+    the package only while that exact ``.env`` value remains on disk. D21 lets an
+    operator edit or remove it while the session is still producing text that
+    needs the original value redacted."""
     pkg = _seed_package(monkeypatch, tmp_path)
     (_package_path(pkg) / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
     seen: dict[str, Any] = {}
@@ -4823,12 +4817,12 @@ def test_run_revise_refuses_a_model_rename(monkeypatch: pytest.MonkeyPatch, tmp_
     assert _leftovers(pkg.parent) == []
 
 
-def test_run_revise_replaces_the_installed_package(
+def test_run_revise_publishes_a_new_current_version(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The happy path end to end: the revision goes live under the SAME name, the
-    registry still sees exactly one valid package, and the swap leaves no hidden
-    backup or staging residue behind."""
+    """The happy path end to end: one new version goes live under the SAME package
+    name, the registry still sees exactly one valid package, and publication
+    leaves no hidden backup or staging residue behind."""
     pkg = _seed_package(monkeypatch, tmp_path)
     root = _package_path(pkg).parent
     (_package_path(pkg) / ".env").write_text(_TRICKY_ENV, encoding="utf-8")
@@ -5286,16 +5280,14 @@ def test_vid_collision_checks_every_entry_with_the_candidate_prefix(
 def test_run_revise_publish_is_a_rename_with_no_copy_fallback(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The swap NEVER goes through ``shutil.move`` (R1-2).
+    """Publishing the committed version NEVER goes through ``shutil.move`` (R1-2).
 
     ``move`` falls back to copytree-then-delete whenever ``os.rename`` raises --
     it catches every ``OSError``, not just EXDEV -- so a publish through it is not
-    atomic: with the old package already parked in the hidden backup, a partial
-    copy leaves a half-built directory AT the tool's name, and the roll-back's
-    ``os.rename(backup, target)`` then fails because that name is occupied. The
-    result is a half-replaced tool plus a hidden backup, which is exactly the
-    state the roll-back exists to prevent. Pinned by making any call fatal: this
-    passes only while the publish is a plain rename.
+    atomic: a partial fallback copy can leave a half-built directory under the
+    chosen ``versions/<vid>`` name while consuming or partially deleting its
+    source. Pinned by making any call fatal: this passes only while version
+    publication is a plain rename.
 
     ``copytree`` (the staging copy) is untouched -- the pin is on ``move``
     specifically, which is the only shutil entry point with that fallback."""
@@ -5315,11 +5307,11 @@ def test_run_revise_publish_is_a_rename_with_no_copy_fallback(
     assert _leftovers(pkg.parent) == []
 
 
-def test_run_revise_reports_the_original_being_deleted(
+def test_run_revise_reports_the_target_package_being_deleted(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A delete landing during the build is answered honestly -- the revision is
-    NOT installed as a new tool, because 'replace' has nothing to replace."""
+    NOT installed as a new tool because its predecessor package vanished."""
     pkg = _seed_package(monkeypatch, tmp_path)
     root = _package_path(pkg).parent
     _fake_generate(
@@ -5339,11 +5331,11 @@ def test_run_revise_reports_the_original_being_deleted(
     assert not (root / ".staging").exists()
 
 
-def test_run_revise_never_replaces_on_a_validation_failure(
+def test_run_revise_never_publishes_on_a_validation_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A revision that no longer validates keeps the WORKING tool running: the
-    swap is downstream of the same gate a fresh install passes."""
+    """A revision that no longer validates keeps the WORKING tool current:
+    publication is downstream of the same gate a fresh install passes."""
     pkg = _seed_package(monkeypatch, tmp_path)
     before = _file_bytes(pkg)
     _fake_generate(
@@ -5664,23 +5656,22 @@ def test_run_revise_allows_a_single_quoted_backslash_value(
     assert (_package_path(pkg) / ".env").read_text(encoding="utf-8") == raw
 
 
-def test_run_revise_refuses_when_the_package_was_reinstalled_mid_session(
+def test_run_revise_refuses_when_the_target_version_was_replaced_mid_session(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A package of the same NAME is not the same package (R10-1).
+    """A version at the same path is not necessarily the version we read (R10-1).
 
-    An operator can delete and reinstall the tool during the minutes a build
-    runs. Every earlier gate still passes -- the directory exists and is no
-    symlink -- so without an identity check the revise would
-    rename the operator's NEW package aside, publish a revision of the OLD
-    snapshot, and then delete the backup: the new package's files gone, silently.
-    The identity is the directory's own inode, captured before the session."""
+    An operator can replace the target version during the minutes a build runs.
+    Every earlier gate still passes -- the directory exists and is no symlink --
+    so without an identity check the revise would publish the OLD snapshot as a
+    successor of content it never read. The identity is the manifest's tuple,
+    captured before the session."""
     pkg = _seed_package(monkeypatch, tmp_path)
     base = pkg.parent
     keep = "print('the operator reinstalled this')"
 
     def reinstall(*_args: object, **_kwargs: object) -> None:
-        # Delete-and-reinstall: a NEW directory under the SAME name.
+        # Replace the target version: a NEW directory at the SAME path.
         shutil.rmtree(pkg)
         pkg.mkdir()
         (pkg / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")), encoding="utf-8")
@@ -5697,7 +5688,7 @@ def test_run_revise_refuses_when_the_package_was_reinstalled_mid_session(
 
     assert outcome.ok is False
     assert outcome.error == tool_builder._ERROR_REVISE_TARGET_REPLACED
-    # the operator's reinstalled package is exactly as they left it
+    # the operator's replacement version is exactly as they left it
     assert (pkg / "run.py").read_text(encoding="utf-8") == keep
     assert not any(entry.name.startswith(".kbsearch.bak-") for entry in base.iterdir())
 
@@ -5710,8 +5701,8 @@ def test_run_revise_refuses_a_package_whose_identity_cannot_be_established(
 
     The resolver admits a directory with no ``tool.json`` (a broken package), and
     a transient stat failure looks the same. Starting anyway would leave the
-    pre-swap check with nothing to compare against -- so it would either wave the
-    swap through, which is precisely the loss R10-1 closed, or refuse after the
+    pre-publication check with nothing to compare against -- so it would either
+    wave stale work through, precisely the loss R10-1 closed, or refuse after the
     whole build had already been paid for."""
     pkg = _seed_package(monkeypatch, tmp_path)
     (pkg / "tool.json").unlink()
@@ -6027,10 +6018,11 @@ def test_run_revise_keeps_a_root_env_case_variant_that_is_a_different_file(
     The r2 rule excluded every root name that casefolded to ``.env``, which is the
     right answer only where the two names ARE one file. Here they are two, and
     ``_preserve_env_file`` only ever restores the exact ``.env`` -- so the variant
-    was copied nowhere, restored nowhere, and an unrelated revise DELETED it while
-    ``validate_package`` passed the mutilated package. That is the same failure
-    R2-2 removed for nested ``.env`` files, surviving at the root under a different
-    name. Both sides are pinned: the builder SEES the variant (it is content), the
+    was copied nowhere, restored nowhere, and an unrelated revise OMITTED it from
+    the new current version while ``validate_package`` passed the mutilated
+    content. That is the same failure R2-2 removed for nested ``.env`` files,
+    surviving at the root under a different name. Both sides are pinned: the
+    builder SEES the variant (it is content), the
     managed ``.env`` is still withheld from it, and the published package has
     both, byte for byte."""
     if not _case_sensitive_filesystem(tmp_path):
@@ -6069,8 +6061,8 @@ def test_run_revise_keeps_a_hard_linked_root_env_case_variant(
 
     This is the case the r5 inode rule got wrong. ``.env`` and ``.ENV`` here share
     ``st_dev``/``st_ino``, so "same file" said yes and BOTH names were withheld from
-    the copy -- while ``_preserve_env_file`` restores only the exact ``.env``. After
-    a successful publish and the backup drop, ``.ENV`` was simply GONE: the very
+    the copy -- while only the package-layer exact ``.env`` stays outside version
+    content. After a successful version publish, ``.ENV`` was simply GONE: the very
     failure R5-2 set out to remove, arriving through the test it chose. The
     filesystem's own LISTING answers the real question: it carries BOTH names here,
     so the variant is the package's content and is copied.
@@ -6282,8 +6274,8 @@ def test_run_revise_accepts_an_env_at_the_byte_ceiling(
     """The refusal above is the ceiling EXACTLY: a ``.env`` AT
     ``_ENV_FILE_MAX_BYTES`` still revises, and its credentials come back.
 
-    The same edge the promote-side copy is pinned at, at the other end of the
-    session -- an entry gate that crept one byte past the property it enforces
+    The same edge the publication-side environment handling is pinned at, at the
+    other end of the session -- an entry gate that crept one byte past the property it enforces
     would make a working package unrevisable with a message that names no key and
     no value to explain why."""
     pkg = _seed_package(monkeypatch, tmp_path)
@@ -6397,7 +6389,7 @@ def test_run_revise_never_redacts_or_builds_its_prompt_on_the_event_loop(
 
     Two calls are deliberately NOT asserted off-loop here: ``InstallResult``'s own
     validator redaction (裁決紀錄 #2's consciously deferred instance, which runs
-    inside pydantic validation during ``generate_structured``), and the post-swap
+    inside pydantic validation during ``generate_structured``), and the post-publication
     summary hook, stubbed out below so the summary text's LAST redaction is
     unambiguously ``run_revise``'s own."""
     pkg = _seed_package(monkeypatch, tmp_path)
@@ -6509,10 +6501,10 @@ def test_run_revise_exposes_the_env_to_run_shell_only(
 def test_run_revise_regenerates_the_summary_inheriting_the_origin(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The sidecar was excluded from staging, so the revised package has none
-    until the post-swap hook writes one: a fresh summary carrying the
-    ORIGIN of the original install, which lives nowhere else and is read before
-    the old package (and its sidecar) is destroyed."""
+    """Version metadata is excluded from staging, so the new version has no
+    summary until the post-publication hook writes one. Its immutable
+    ``origin.json`` inherits the original install context before ``current`` is
+    moved; the predecessor version remains available for discard."""
     pkg = _seed_package(monkeypatch, tmp_path)
     _write_meta(
         pkg,

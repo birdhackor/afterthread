@@ -772,8 +772,8 @@ def test_user_prompt_bounds_the_file_count(monkeypatch: pytest.MonkeyPatch, tmp_
 def test_generate_and_store_summary_writes_a_sidecar(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The happy path: a sidecar carrying the summary, the origin, and a
-    link to the summary session's own AI 日誌 record."""
+    """The happy path: a summary sidecar and the immutable origin combine into a
+    result linked to the summary session's own AI 日誌 record."""
     root = tmp_path / "tools"
     origin = {
         "source": "builder-install",
@@ -855,8 +855,9 @@ def test_generate_and_store_summary_preserves_origin(
 def test_generate_and_store_summary_writes_placeholder_when_no_sidecar_yet(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A failed FIRST generation still leaves a sidecar (empty summary + origin
-    + the failed session's log id), so the page can offer 重新產生."""
+    """A failed FIRST generation leaves an empty summary plus the failed session's
+    log id; the combined read still includes immutable origin, so the page can
+    offer 重新產生."""
     root = tmp_path / "tools"
     pkg = _package(root, origin={"instructions": "查 KB"})
     _summary_settings(monkeypatch, root)
@@ -1133,17 +1134,16 @@ def test_regenerate_summary_feeds_the_stored_origin_back_into_the_prompt(
     assert meta["origin"]["instructions"] == "ORIGIN-INSTRUCTIONS-MARKER 只查內部 KB"
 
 
-def test_regenerate_summary_sanitizes_a_legacy_origin_url(
+def test_regenerate_summary_sanitizes_legacy_origin_only_for_the_prompt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A sidecar written BEFORE the URL was reduced (or hand-edited since) is the
-    other door the credential comes back through.
+    """An ``origin.json`` written before URL reduction (or hand-edited since) is
+    another door a credential could come back through.
 
-    The install sanitizes at capture, but the sidecar on disk is the only copy of
-    the origin and regenerate reads it back -- into the prompt, and then back onto
-    disk when the store rewrites the origin it was handed. Both are covered here,
-    which is also what heals the file: no migration, the first regeneration
-    rewrites the origin in the reduced form."""
+    The install sanitizes at capture, while regeneration must defensively sanitize
+    legacy provenance before putting it in a prompt. ``origin.json`` is immutable,
+    so the reduced value is a prompt view only and the hand-edited document stays
+    byte-for-byte provenance rather than being rewritten as a side effect."""
     root = tmp_path / "tools"
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
@@ -1180,16 +1180,15 @@ def test_regenerate_summary_sanitizes_a_legacy_origin_url(
     )
 
 
-def test_regenerate_summary_ignores_an_unusable_stored_origin(
+def test_regenerate_summary_ignores_origin_smuggled_into_summary(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The sidecar is hand-editable, so an origin we cannot make sense of never
-    reaches the prompt as if the backend had written it -- and the regeneration
-    never ERASES what it could not read either: _store_meta's inheritance carries
-    the stored origin forward untouched.
+    """A hand-edited ``summary.json.origin`` is extra data, not provenance.
 
-    Written by HAND here, because the writer itself narrows an origin now: an
-    unusable one only survives on disk if the operator put it there."""
+    ``read_tool_meta`` overlays immutable ``origin.json`` onto the parsed summary,
+    so the forged field never reaches the prompt. The next summary publication
+    builds its four-field payload and drops the extra key.
+    """
     root = tmp_path / "tools"
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
@@ -1203,11 +1202,14 @@ def test_regenerate_summary_ignores_an_unusable_stored_origin(
 
     assert "JUNK-MARKER" not in captured["user_prompt"]
     assert isinstance(meta, dict)
-    # Inherited (never overwritten by {}), then narrowed on the way to disk: the
-    # junk key is dropped and the unreadable field lands as an explicit null.
+    # These are the fixture's immutable origin values, not the forged summary key.
     assert meta["origin"]["openapi_url"] is None
     assert meta["origin"]["instructions"] is None
     assert tools.read_tool_meta(_version_root(pkg)) == meta
+    summary = json.loads(
+        (pkg / tools._META_DIRNAME / tools._SUMMARY_FILENAME).read_text(encoding="utf-8")
+    )
+    assert "origin" not in summary
 
 
 def test_regenerate_summary_refuses_an_internal_alias(
@@ -1323,8 +1325,8 @@ def test_regenerate_summary_writes_nothing_when_the_package_was_replaced(
     The generation resolves a directory, spends an LLM round trip, then writes --
     and a delete plus a same-name install inside that window is not blocked by
     anything (the job single-flight does not cover it). Without the identity the
-    resolve captured, package A's summary AND A's origin would be persisted into
-    package B, over B's own.
+    resolve captured, package A's summary would be persisted into package B over
+    B's own.
 
     The answer is the same None a vanished package gives, because from the
     caller's side both mean "the regeneration did not happen" -- and the route
@@ -1354,12 +1356,9 @@ def test_generate_and_store_summary_writes_nothing_when_the_package_was_replaced
     other store outcome -- an install that already succeeded must never be failed
     by its summary.
 
-    Both of its writes are covered, because both carry this session's origin and
-    log id: the SUMMARY here, and the PLACEHOLDER (below) which is written when the
-    generation failed. A placeholder landing in package B would attach A's install
-    origin -- the URL and the operator's instructions -- to a package B that was
-    installed from something else entirely, and every later revise of B would read
-    that origin back as first-hand context."""
+    Both of its writes are covered: the SUMMARY here, and the PLACEHOLDER (below)
+    written when generation fails. Immutable provenance is already committed in
+    each version's own ``origin.json`` and is never part of either summary write."""
     root = tmp_path / "tools"
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
@@ -1382,9 +1381,9 @@ def test_generate_and_store_summary_placeholder_respects_the_replacement(
 ) -> None:
     """The FAILURE path writes too, so it is guarded too.
 
-    A failed generation leaves an empty summary plus the origin and the failed
-    session's log id -- the same misattribution with a shorter body if it lands in
-    the wrong package. Driven with a replacement that has NO sidecar, so the
+    A failed generation leaves an empty summary plus the failed session's log id
+    -- the same misattribution with a shorter body if it lands in the wrong
+    package. Driven with a replacement that has NO sidecar, so the
     placeholder's own "only when there is nothing there" precondition is met at
     the target and only the identity can stop the write."""
     root = tmp_path / "tools"
@@ -1466,16 +1465,13 @@ def test_an_enabled_toggle_during_the_generation_now_costs_nothing_at_all(
     which MOVED the manifest identity this hook captured at its resolve (D40 r5).
     The sidecar write at the end was then correctly REFUSED, the install hook
     swallowed the refusal as it swallows every store outcome, and the job still
-    reported success. r8's fix was to persist the un-regenerable half (the
-    ``origin``) BEFORE the round trip, so a toggle cost the summary TEXT -- which
-    any later regeneration rebuilds -- instead of the OpenAPI url and the
-    operator's instructions, which are captured nowhere else in the system.
+    reported success. Older layouts had to protect origin during that window.
 
-    web-v5 P1 removes the mechanism rather than the instance: a toggle writes
+    The versioned layout commits immutable ``origin.json`` before this hook, and
+    web-v5 P1 removes the remaining toggle mechanism: a toggle writes
     ``.afterthread-state.json`` and leaves the manifest byte-identical, so the identity the
     hook is holding does not move, the guard has nothing to refuse, and the FULL
-    sidecar lands. r8's early write stays exactly where it is -- it closes the same
-    window against a genuine mid-round-trip REPLACEMENT, which still moves the
+    summary sidecar lands. A genuine mid-round-trip REPLACEMENT still moves the
     identity and still must be refused.
 
     Driven from INSIDE the generation, not by racing a thread, so it is the window
@@ -1505,9 +1501,8 @@ def test_an_enabled_toggle_during_the_generation_now_costs_nothing_at_all(
     assert after["origin"]["openapi_url"] == origin["openapi_url"]
     assert after["origin"]["instructions"] == origin["instructions"]
 
-    # And the recovery path really can read it back -- which is the whole reason
-    # the origin is worth saving: a later regeneration feeds it into its own prompt
-    # as first-hand context and keeps it in the sidecar it rewrites.
+    # And the recovery path really can read immutable provenance back as
+    # first-hand prompt context without copying it into ``summary.json``.
     captured = _fake_generate(monkeypatch, summary="重新產生的說明")
     meta = asyncio.run(_regenerate_summary("kbsearch"))
     assert isinstance(meta, dict)
