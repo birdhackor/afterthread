@@ -1,0 +1,145 @@
+// @vitest-environment jsdom
+
+import { screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { getDefaultStore } from "jotai";
+import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
+import type { ApiSuccessResponse } from "../api/client.js";
+import { apiDelete, apiGet, apiPatch, apiPost } from "../api/client.js";
+import { llmStatusAtom } from "../atoms/llm.js";
+import { renderWithAppProviders } from "../test/render.js";
+import { ItemDetailPage } from "./ItemDetailPage.jsx";
+
+vi.mock("../api/client.js", () => ({
+	apiDelete: vi.fn(),
+	apiGet: vi.fn(),
+	apiPatch: vi.fn(),
+	apiPost: vi.fn(),
+}));
+
+type MockApiOptions = {
+	path?: Record<string, string | number>;
+	body?: unknown;
+};
+
+const mockedApiDelete = vi.mocked(apiDelete) as unknown as Mock<
+	(path: string, options?: MockApiOptions) => Promise<unknown>
+>;
+const mockedApiGet = vi.mocked(apiGet) as unknown as Mock<
+	(path: string, options?: MockApiOptions) => Promise<unknown>
+>;
+const mockedApiPost = vi.mocked(apiPost) as unknown as Mock<
+	(path: string, options: MockApiOptions) => Promise<unknown>
+>;
+
+type ItemDetailResponse = ApiSuccessResponse<"/api/items/{item_id}", "get">;
+type ItemDeleteResponse = ApiSuccessResponse<"/api/items/{item_id}", "delete">;
+type ProgressResponse = ApiSuccessResponse<
+	"/api/items/{item_id}/progress",
+	"post"
+>;
+
+const routeItemId = "37";
+const item = {
+	alternatives: "",
+	assumptions: "",
+	confidence: "mixed",
+	consequences: "",
+	constraints: "",
+	created: "2026-07-28T09:00:00Z",
+	decisions: "",
+	evidence: "",
+	id: Number(routeItemId),
+	inferred: "",
+	is_stale: false,
+	known: "",
+	next_actions: "",
+	open_questions: "",
+	progress: [],
+	rationale: "",
+	recovery_files: "",
+	recovery_keywords: "",
+	recovery_people: "",
+	resume_trigger: "",
+	risks: "",
+	snapshot: "保留這份唯一記憶",
+	source: "manual",
+	stage: "quick",
+	status: "capture-quick",
+	tags: ["round-2"],
+	title: `第 ${routeItemId} 號唯一記憶`,
+	unknown: "",
+	updated: "2026-07-28T09:00:00Z",
+	why_matters: "",
+} satisfies ItemDetailResponse;
+
+function renderDetailPage() {
+	return renderWithAppProviders(<ItemDetailPage />, {
+		initialEntries: [`/items/${routeItemId}`],
+		routePath: "/items/$itemId",
+	});
+}
+
+describe("ItemDetailPage destructive and rewriting requests", () => {
+	beforeEach(() => {
+		for (const apiMock of [apiDelete, apiGet, apiPatch, apiPost]) {
+			vi.mocked(apiMock).mockReset();
+		}
+		getDefaultStore().set(llmStatusAtom, {
+			loaded: true,
+			loading: false,
+			configured: true,
+			// The atom is authored in JS with `model: null`, so its inferred type is
+			// the literal null -- and a model name is irrelevant here anyway: these
+			// tests assert requests, not anything the model name renders.
+			model: null,
+			error: null,
+		});
+		mockedApiGet.mockResolvedValue(item);
+	});
+
+	it("deletes the item identified by the route and names that item in the success notification", async () => {
+		const user = userEvent.setup();
+		mockedApiDelete.mockResolvedValue(null satisfies ItemDeleteResponse);
+		renderDetailPage();
+
+		expect(
+			await screen.findByRole("heading", { name: item.title }),
+		).toBeInTheDocument();
+		await user.click(screen.getByRole("button", { name: "刪除" }));
+		const dialog = await screen.findByRole("dialog", { name: "刪除項目" });
+		await user.click(within(dialog).getByRole("button", { name: "刪除" }));
+
+		await waitFor(() => {
+			expect(apiDelete).toHaveBeenCalledWith("/api/items/{item_id}", {
+				path: { item_id: routeItemId },
+			});
+		});
+		expect(
+			await screen.findByText(`已刪除「${item.title}」`),
+		).toBeInTheDocument();
+	});
+
+	it("posts a progress rewrite to the route item with the submitted note", async () => {
+		const user = userEvent.setup();
+		const note = `第 ${routeItemId} 號項目的新進度`;
+		mockedApiPost.mockResolvedValue({
+			date: "2026-07-29T08:30:00Z",
+			id: 501,
+			item_id: item.id,
+			note,
+		} satisfies ProgressResponse);
+		renderDetailPage();
+
+		const input = await screen.findByRole("textbox", { name: "新增進度" });
+		await user.type(input, `  ${note}  `);
+		await user.click(screen.getByRole("button", { name: "新增進度" }));
+
+		await waitFor(() => {
+			expect(apiPost).toHaveBeenCalledWith("/api/items/{item_id}/progress", {
+				path: { item_id: routeItemId },
+				body: { note },
+			});
+		});
+	});
+});

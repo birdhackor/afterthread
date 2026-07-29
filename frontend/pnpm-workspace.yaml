@@ -1,0 +1,25 @@
+# TEMPORARY, AND IT IS MEANT TO BE DELETED — see the TODO at the bottom.
+#
+# pnpm refuses packages published inside its release-age cooldown, because a
+# compromised npm publish is usually caught days later, not hours. jsdom 30.0.1
+# was published 2026-07-29T04:18Z and installed the same day, so pnpm created
+# this exclusion to let it through. That is a deliberate, operator-approved hole
+# in a supply-chain protection, not an oversight — recorded here so the next
+# reader does not have to guess whether it was intended.
+#
+# Why it was accepted: jsdom 30.0.0 has a bug in getComputedStyle's font-size
+# resolution (`object null is not iterable`, reached from @floating-ui/utils via
+# Mantine's positioning) that raised four unhandled rejections on every
+# ItemDetailPage component test. Vitest flags those as a false-positive risk, and
+# noise on every run is how a real failure gets overlooked later. Two cheaper
+# fixes were measured and rejected first: Mantine's own prescribed
+# getComputedStyle shim does NOT fix it, and faking getComputedStyle outright
+# would have put a large lie in the test harness. 30.0.1 fixes it upstream —
+# measured, four errors to zero. jsdom is a devDependency and never ships.
+#
+# TODO: DELETE THIS FILE once jsdom 30.0.1 is past the cooldown (2026-07-30
+# onward). Nothing else changes — the version stays pinned by pnpm-lock.yaml, and
+# removing this file simply restores the protection for it. Confirm afterwards
+# with `pnpm install --frozen-lockfile`.
+minimumReleaseAgeExclude:
+  - jsdom@30.0.1

@@ -4,7 +4,9 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	createMemoryHistory,
 	createRootRoute,
+	createRoute,
 	createRouter,
+	Outlet,
 	RouterProvider,
 } from "@tanstack/react-router";
 import "@testing-library/jest-dom/vitest";
@@ -14,12 +16,18 @@ import { afterEach } from "vitest";
 
 afterEach(cleanup);
 
-// These measured shims match the installed Mantine 9.4.1 ESM. ResizeObserver,
-// IntersectionObserver, scrollIntoView, and getComputedStyle are deliberately
-// omitted: no component test has crossed those boundaries. Adding speculative
-// no-ops would let an inaccurate browser model silently age behind green tests.
-// scripts/check-mantine-api-surface.mjs separately flags upstream reference
-// changes; a reference there is only a prompt to inspect a real test failure.
+// Every shim here was added because a test CRASHED without it, and the crash is
+// named beside it. That policy is the point: a speculative no-op is exercised by
+// nothing, so it can drift into a wrong answer while every test stays green.
+// It also tells us exactly which shims are needed instead of guessing — mounting
+// ItemDetailPage produced `ResizeObserver is not defined` and nothing else that
+// blocked, so ResizeObserver was added and IntersectionObserver, scrollIntoView
+// and getComputedStyle still are NOT, despite Mantine's guide listing them.
+//
+// A boundary we have not crossed is not a gap to pre-fill: an unshimmed API
+// throws loudly and names itself, which is self-detecting and needs no upkeep.
+// scripts/check-mantine-api-surface.mjs watches upstream references separately;
+// a reference there is only a prompt to go look at a real failing test.
 //
 // jsdom exposes no media-query evaluator, while MantineProvider reads
 // matchMedia during mount even when the test does not exercise color schemes.
@@ -50,9 +58,27 @@ if (document.fonts === undefined) {
 	});
 }
 
+// Mantine's ScrollArea observes its viewport to size the scrollbar. Mounting
+// ItemDetailPage without this threw `ReferenceError: ResizeObserver is not
+// defined` from inside <Scrollbar>, four times, before any interaction could
+// run -- so this is a measured requirement, not a precaution.
+//
+// A no-op is the honest shape: nothing here can produce a real resize, because
+// jsdom has no layout to resize. It therefore keeps the component mountable and
+// asserts nothing about geometry. A test that needed to TRIGGER a resize would
+// need a real fake (jsdom-testing-mocks' mockResizeObserver) — we have none.
+if (typeof globalThis.ResizeObserver === "undefined") {
+	globalThis.ResizeObserver = class {
+		observe() {}
+		unobserve() {}
+		disconnect() {}
+	} as unknown as typeof ResizeObserver;
+}
+
 interface AppRenderOptions extends Omit<RenderOptions, "wrapper"> {
 	initialEntries?: string[];
 	queryClient?: QueryClient;
+	routePath?: "/items/$itemId";
 }
 
 function createTestQueryClient() {
@@ -76,16 +102,27 @@ export function renderWithAppProviders(
 	{
 		initialEntries = ["/"],
 		queryClient = createTestQueryClient(),
+		routePath,
 		...renderOptions
 	}: AppRenderOptions = {},
 ) {
 	// RouterProvider owns the route tree instead of accepting children, so the
-	// component under test is the root route for this isolated memory router.
-	const rootRoute = createRootRoute({
-		component: () => ui,
-	});
+	// component under test is either the root route or a declared child when it
+	// needs real path params from the isolated memory router.
+	const rootRoute = createRootRoute(
+		routePath ? { component: Outlet } : { component: () => ui },
+	);
+	const routeTree = routePath
+		? rootRoute.addChildren([
+				createRoute({
+					getParentRoute: () => rootRoute,
+					path: routePath,
+					component: () => ui,
+				}),
+			])
+		: rootRoute;
 	const router = createRouter({
-		routeTree: rootRoute,
+		routeTree,
 		history: createMemoryHistory({ initialEntries }),
 	});
 
