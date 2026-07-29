@@ -1601,10 +1601,15 @@ def _promote_staging(
     # package-level pointer is allowed to name this version.
     if not _fsync_tree(version) or not _fsync_directory(versions):
         return None, _ERROR_DURABILITY
-    package_layout = tools.PackageLayoutRoot(shell_root)
-    if not tools.write_package_state(package_layout, True):
+    staging_package = tools._staging_package_root_for_install_assembly(shell_root)
+    if not tools.write_package_state(staging_package, True):
         return None, _ERROR_INSTALL_STATE_WRITE
-    if not tools.publish_staging_current(package_layout, vid):
+    publication = tools.publish_staging_current(staging_package, vid)
+    if (
+        not publication
+        or publication.current_identity is None
+        or publication.destination_origin_identity is None
+    ):
         return None, _ERROR_CURRENT_WRITE
     if secret_name and secret_value:
         inject_error = _inject_secret_into_env(shell_root / ".env", secret_name, secret_value)
@@ -1630,6 +1635,8 @@ def _promote_staging(
         tools.VersionRoot(target / tools._VERSIONS_DIRNAME / vid),
         vid,
         tools.PREVIOUS_NULL,
+        publication.current_identity,
+        publication.destination_origin_identity,
     )
     if not _fsync_directory(base):
         return None, _ERROR_DURABILITY
@@ -1741,7 +1748,12 @@ def _publish_revised_version(
             or current.previous != previous.previous
         ):
             return None, _ERROR_REVISE_TARGET_REPLACED
-        if not tools.publish_current(package_root, vid, previous):
+        publication = tools.publish_current(package_root, vid, previous)
+        if (
+            not publication
+            or publication.current_identity is None
+            or publication.destination_origin_identity is None
+        ):
             return None, _ERROR_CURRENT_WRITE
         # Construct the typed target from the exact directory just renamed and
         # vid just published. Re-resolving by package name here or in the summary
@@ -1751,6 +1763,8 @@ def _publish_revised_version(
             published_version,
             vid,
             tools.PreviousValue(previous.vid),
+            publication.current_identity,
+            publication.destination_origin_identity,
         )
         return _PublishedRevision(published, origin), None
     return None, _ERROR_VERSION_ID_WRITE

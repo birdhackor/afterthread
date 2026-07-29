@@ -290,6 +290,27 @@ class PackageRoot(PackageLayoutRoot):
     """A real installed package directory, never a version or staging build."""
 
 
+_STAGING_PACKAGE_ROOT_TOKEN = object()
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class StagingPackageRoot:
+    """A package shell that only the install assembly path may mint."""
+
+    path: Path
+
+    def __init__(self, path: Path, *, _assembly_token: object) -> None:
+        if _assembly_token is not _STAGING_PACKAGE_ROOT_TOKEN:
+            raise TypeError("StagingPackageRoot is reserved for install assembly")
+        object.__setattr__(self, "path", path)
+
+
+def _staging_package_root_for_install_assembly(path: Path) -> StagingPackageRoot:
+    """Mint the staging-only root after the builder has assembled its shell."""
+
+    return StagingPackageRoot(path, _assembly_token=_STAGING_PACKAGE_ROOT_TOKEN)
+
+
 @dataclass(frozen=True, slots=True)
 class VersionRoot:
     """One committed installed version directory."""
@@ -324,6 +345,7 @@ class PreviousValue:
 PREVIOUS_ABSENT = PreviousAbsent()
 PREVIOUS_NULL = PreviousNull()
 type Previous = PreviousAbsent | PreviousNull | PreviousValue
+type _FileIdentity = tuple[int, int, int, int, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,6 +363,8 @@ class Resolved:
     version_root: VersionRoot
     vid: str
     previous: Previous
+    current_identity: _FileIdentity
+    origin_identity: _FileIdentity
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,6 +386,8 @@ class PackageLayoutResolved:
     version_root: VersionRoot
     vid: str
     previous: Previous
+    current_identity: _FileIdentity
+    origin_identity: _FileIdentity
 
 
 @dataclass(frozen=True, slots=True)
@@ -373,6 +399,27 @@ class PackageLayoutUnresolved:
 
 
 type PackageLayoutResolution = PackageLayoutResolved | PackageLayoutUnresolved
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedVersionTarget:
+    """One usable version plus the identities that made that judgement."""
+
+    version_root: VersionRoot
+    vid: str
+    origin: dict[str, Any]
+    version_identity: _FileIdentity
+    origin_identity: _FileIdentity
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentPublicationExpectation:
+    """The installed source and committed destination one pointer write expects."""
+
+    current: Resolved
+    destination: VersionRoot
+    destination_identity: _FileIdentity
+    destination_origin_identity: _FileIdentity
 
 
 @dataclass(frozen=True, slots=True)
@@ -710,8 +757,28 @@ def _read_regular_file_capped(path: Path, cap: int) -> str | None:
             os.close(fd)
 
 
-def _read_regular_bytes_capped(path: Path, cap: int) -> bytes | None:
-    """Read at most ``cap + 1`` bytes from one real file without following it."""
+def _file_identity(info: os.stat_result) -> _FileIdentity:
+    """Return the cheap metadata identity used by late publication guards."""
+
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+        info.st_size,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _RegularFileRead:
+    """Bytes and the open inode identity captured immediately before their read."""
+
+    data: bytes
+    identity: _FileIdentity
+
+
+def _read_regular_bytes_capped_with_identity(path: Path, cap: int) -> _RegularFileRead | None:
+    """Read ``cap + 1`` bytes and bind them to the opened regular-file inode."""
 
     flags = os.O_RDONLY | os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
@@ -722,16 +789,24 @@ def _read_regular_bytes_capped(path: Path, cap: int) -> bytes | None:
         return None
     fd_owned = True
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
             return None
         with os.fdopen(fd, "rb") as handle:
             fd_owned = False
-            return handle.read(cap + 1)
+            return _RegularFileRead(handle.read(cap + 1), _file_identity(info))
     except OSError:
         return None
     finally:
         if fd_owned:
             os.close(fd)
+
+
+def _read_regular_bytes_capped(path: Path, cap: int) -> bytes | None:
+    """Read at most ``cap + 1`` bytes from one real file without following it."""
+
+    result = _read_regular_bytes_capped_with_identity(path, cap)
+    return None if result is None else result.data
 
 
 def _write_regular_file(path: Path, content: str) -> bool:
@@ -929,7 +1004,9 @@ def package_enabled(package_root: PackageRoot) -> bool:
     return _effective_enabled(_read_enabled_state(package_root))
 
 
-def _origin_document(version_root: VersionRoot) -> dict[str, Any] | None:
+def _origin_document_with_identity(
+    version_root: VersionRoot,
+) -> tuple[dict[str, Any], _FileIdentity] | None:
     """Read and validate the committed-version marker without guessing.
 
     ``previous`` is deliberately not shape-validated here.  The marker still
@@ -940,10 +1017,13 @@ def _origin_document(version_root: VersionRoot) -> dict[str, Any] | None:
     repair paths into the unresolved-row state.
     """
 
-    data = _read_regular_bytes_capped(
+    result = _read_regular_bytes_capped_with_identity(
         version_root.path / _META_DIRNAME / _ORIGIN_FILENAME, _AI_META_MAX_BYTES
     )
-    if data is None or len(data) > _AI_META_MAX_BYTES:
+    if result is None:
+        return None
+    data = result.data
+    if len(data) > _AI_META_MAX_BYTES:
         return None
     try:
         raw = json.loads(data.decode("utf-8"))
@@ -955,12 +1035,19 @@ def _origin_document(version_root: VersionRoot) -> dict[str, Any] | None:
         value = raw.get(key)
         if value is not None and not isinstance(value, str):
             return None
-    return _utf8_safe_meta(raw)
+    return _utf8_safe_meta(raw), result.identity
+
+
+def _origin_document(version_root: VersionRoot) -> dict[str, Any] | None:
+    """Return only the validated marker for readers that do not publish."""
+
+    result = _origin_document_with_identity(version_root)
+    return None if result is None else result[0]
 
 
 def _resolve_version_target(
-    package_root: PackageLayoutRoot, vid: object
-) -> tuple[VersionRoot, dict[str, Any]] | None:
+    package_root: PackageLayoutRoot | StagingPackageRoot, vid: object
+) -> _ResolvedVersionTarget | None:
     """Resolve one committed version target by the exact rule ``current`` uses.
 
     The vid syntax, real-directory check, and committed ``origin.json`` check
@@ -978,15 +1065,22 @@ def _resolve_version_target(
     if not stat.S_ISDIR(version_info.st_mode):
         return None
     version_root = VersionRoot(version_path)
-    origin = _origin_document(version_root)
-    if origin is None:
+    origin_result = _origin_document_with_identity(version_root)
+    if origin_result is None:
         return None
-    return version_root, origin
+    origin, origin_identity = origin_result
+    return _ResolvedVersionTarget(
+        version_root,
+        vid,
+        origin,
+        _file_identity(version_info),
+        origin_identity,
+    )
 
 
 def _resolve_current_data(
     package_root: PackageLayoutRoot,
-) -> tuple[VersionRoot, str, Previous] | str:
+) -> tuple[VersionRoot, str, Previous, _FileIdentity, _FileIdentity] | str:
     """Resolve one package-shaped pointer without deciding that it is installed."""
 
     package = package_root.path
@@ -997,10 +1091,10 @@ def _resolve_current_data(
     if not stat.S_ISDIR(package_info.st_mode):
         return "package directory must be a real directory"
 
-    data = _read_regular_bytes_capped(
+    current_result = _read_regular_bytes_capped_with_identity(
         package / _META_DIRNAME / _CURRENT_FILENAME, _CURRENT_MAX_BYTES
     )
-    if data is None:
+    if current_result is None:
         try:
             os.lstat(package / _META_DIRNAME)
         except FileNotFoundError:
@@ -1023,6 +1117,7 @@ def _resolve_current_data(
         except OSError:
             pass
         return "current is missing or unreadable"
+    data = current_result.data
     if len(data) > _CURRENT_MAX_BYTES:
         return "current is too large"
     if data.endswith(b"\n"):
@@ -1044,14 +1139,21 @@ def _resolve_current_data(
         if not stat.S_ISDIR(version_info.st_mode):
             return "current version must be a real directory"
         return "current points to an uncommitted version"
-    version_root, origin = target
+    version_root = target.version_root
+    origin = target.origin
     if "previous" not in origin:
         previous: Previous = PREVIOUS_ABSENT
     elif origin["previous"] is None:
         previous = PREVIOUS_NULL
     else:
         previous = PreviousValue(origin["previous"])
-    return version_root, vid, previous
+    return (
+        version_root,
+        vid,
+        previous,
+        current_result.identity,
+        target.origin_identity,
+    )
 
 
 def resolve_current(package_root: PackageRoot) -> Resolution:
@@ -1060,8 +1162,15 @@ def resolve_current(package_root: PackageRoot) -> Resolution:
     result = _resolve_current_data(package_root)
     if isinstance(result, str):
         return Unresolved(package_root, result)
-    version_root, vid, previous = result
-    return Resolved(package_root, version_root, vid, previous)
+    version_root, vid, previous, current_identity, origin_identity = result
+    return Resolved(
+        package_root,
+        version_root,
+        vid,
+        previous,
+        current_identity,
+        origin_identity,
+    )
 
 
 def resolve_layout_current(package_root: PackageLayoutRoot) -> PackageLayoutResolution:
@@ -1070,8 +1179,15 @@ def resolve_layout_current(package_root: PackageLayoutRoot) -> PackageLayoutReso
     result = _resolve_current_data(package_root)
     if isinstance(result, str):
         return PackageLayoutUnresolved(package_root, result)
-    version_root, vid, previous = result
-    return PackageLayoutResolved(package_root, version_root, vid, previous)
+    version_root, vid, previous, current_identity, origin_identity = result
+    return PackageLayoutResolved(
+        package_root,
+        version_root,
+        vid,
+        previous,
+        current_identity,
+        origin_identity,
+    )
 
 
 def _manifest_identity(directory: Path) -> tuple[int, int, int] | None:
@@ -1516,6 +1632,25 @@ class _PackageReplaced(Exception):
     """
 
 
+type CurrentPublicationRefusal = Literal["current_changed", "destination_unavailable"]
+
+
+def _path_still_has_identity(
+    path: Path,
+    expected: _FileIdentity,
+    *,
+    directory: bool,
+) -> bool:
+    """Compare one path to a captured inode identity without opening its content."""
+
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    expected_kind = stat.S_ISDIR if directory else stat.S_ISREG
+    return expected_kind(info.st_mode) and _file_identity(info) == expected
+
+
 def _write_package_file_atomic(
     directory: Path,
     filename: str,
@@ -1524,8 +1659,10 @@ def _write_package_file_atomic(
     *,
     default_mode: int = _OWNER_RW,
     identity_root: VersionRoot | None = None,
-    expected_current: Resolved | None = None,
+    expected_current: CurrentPublicationExpectation | None = None,
     durability_out: list[bool] | None = None,
+    refusal_out: list[CurrentPublicationRefusal] | None = None,
+    published_identity_out: list[_FileIdentity] | None = None,
 ) -> bool:
     """Atomically publish one backend-owned file and preserve its safe mode.
 
@@ -1567,6 +1704,8 @@ def _write_package_file_atomic(
         return False
     tmp_path = Path(tmp_name)
     fd_owned = True  # we own the raw fd until fdopen takes it over
+    published_fd: int | None = None
+    published_identity: _FileIdentity | None = None
     try:
         # On the FD, before publish: the replacement must already carry its final
         # mode at the instant the name flips, so no reader ever sees the temp
@@ -1584,12 +1723,25 @@ def _write_package_file_atomic(
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        # The LAST instant: the applicable identity/current re-resolution, then
-        # the publish. Nothing but these compares separates them, so what a swap
-        # can still reach is the syscall PAIR this module accepts by name elsewhere
-        # -- and even a directory swap lands harmlessly, since the temp file was
-        # minted inside the directory that moved and the rename below would then
-        # fail with ENOENT (measured; False, nothing published).
+            # ``rename`` changes ctime on supported filesystems (measured on ext4),
+            # so a pre-replace fstat is not the identity readers will later see.
+            # Keep this inode pinned across the rename; a post-replace pathname
+            # lstat would introduce a new race with the operator replacing current.
+            if published_identity_out is not None:
+                published_fd = os.dup(handle.fileno())
+        # The LAST interval: the applicable content/current re-resolution, then
+        # cheap lstats over every identity that authorizes this pointer change, then
+        # the publish. Four independently editable names cannot all be adjacent to
+        # one replace: their exact order is destination directory, destination
+        # marker, source marker, current pointer, os.replace. Current is last because
+        # it is the operator's direct answer; its residual is the syscall PAIR this
+        # module accepts by name elsewhere. The earlier identities necessarily also
+        # have the later lstats in their residual -- POSIX offers no conditional
+        # multi-inode rename with which to collapse them.
+        #
+        # Even a package metadata-directory swap lands harmlessly, since the temp
+        # file was minted inside the directory that moved and the rename below would
+        # then fail with ENOENT (measured; False, nothing published).
         # None is skipped rather than refused, because at THIS layer it means "the
         # caller asserted nothing" -- the callers that have an identity to assert
         # refuse their own None long before they get here.
@@ -1605,18 +1757,57 @@ def _write_package_file_atomic(
         # discard can destroy the newly selected lineage and revise can overwrite
         # the operator's current answer.
         if expected_current is not None:
-            current = resolve_current(expected_current.package_root)
+            expected_resolution = expected_current.current
+            current = resolve_current(expected_resolution.package_root)
             if (
                 isinstance(current, Unresolved)
-                or current.vid != expected_current.vid
-                or current.previous != expected_current.previous
+                or current.vid != expected_resolution.vid
+                or current.previous != expected_resolution.previous
             ):
+                if refusal_out is not None:
+                    refusal_out.append("current_changed")
+                raise _PackageReplaced
+            if not _path_still_has_identity(
+                expected_current.destination.path,
+                expected_current.destination_identity,
+                directory=True,
+            ) or not _path_still_has_identity(
+                expected_current.destination.path / _META_DIRNAME / _ORIGIN_FILENAME,
+                expected_current.destination_origin_identity,
+                directory=False,
+            ):
+                if refusal_out is not None:
+                    refusal_out.append("destination_unavailable")
+                raise _PackageReplaced
+            if not _path_still_has_identity(
+                expected_resolution.version_root.path / _META_DIRNAME / _ORIGIN_FILENAME,
+                expected_resolution.origin_identity,
+                directory=False,
+            ) or not _path_still_has_identity(
+                expected_resolution.package_root.path / _META_DIRNAME / _CURRENT_FILENAME,
+                expected_resolution.current_identity,
+                directory=False,
+            ):
+                if refusal_out is not None:
+                    refusal_out.append("current_changed")
                 raise _PackageReplaced
         os.replace(tmp_path, path)
+        if published_fd is not None:
+            try:
+                published_identity = _file_identity(os.fstat(published_fd))
+            except OSError:
+                pass
+            finally:
+                with contextlib.suppress(OSError):
+                    os.close(published_fd)
+                published_fd = None
     except OSError, _PackageReplaced:
         if fd_owned:
             with contextlib.suppress(OSError):
                 os.close(fd)
+        if published_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(published_fd)
         # Safe unconditionally: tmp_path is a name mkstemp invented for THIS call
         # alone, never a path a caller passed in (cli.py's same argument). By PATH,
         # so it finds nothing when the package DIRECTORY was renamed aside under us
@@ -1644,6 +1835,8 @@ def _write_package_file_atomic(
         pass
     if durability_out is not None:
         durability_out.append(durable)
+    if published_identity_out is not None and published_identity is not None:
+        published_identity_out.append(published_identity)
     return True
 
 
@@ -1866,60 +2059,120 @@ class CurrentPublication:
 
     published: bool
     durable: bool
+    refusal: CurrentPublicationRefusal | None = None
+    current_identity: _FileIdentity | None = None
+    destination_origin_identity: _FileIdentity | None = None
 
     def __bool__(self) -> bool:
         return self.published
 
 
-def publish_staging_current(package_root: PackageLayoutRoot, vid: str) -> CurrentPublication:
+def publish_staging_current(package_root: StagingPackageRoot, vid: str) -> CurrentPublication:
     """Publish the first ``current`` inside a not-yet-installed package layout."""
 
+    # The exact-type gate catches a PackageRoot hidden behind ``cast`` at runtime.
+    # The path-shape gate independently catches a staging capability deliberately
+    # forged for an installed direct child. The builder's shell is two levels under
+    # ``<tools>/.staging`` and can satisfy neither installed shape.
+    base = tools_dir()
+    if type(package_root) is not StagingPackageRoot or (
+        base is not None
+        and package_root.path.parent == base
+        and _NAME_RE.fullmatch(package_root.path.name)
+    ):
+        return CurrentPublication(published=False, durable=False)
     if not _VID_RE.fullmatch(vid):
         return CurrentPublication(published=False, durable=False)
+    destination = _resolve_version_target(package_root, vid)
+    if destination is None:
+        return CurrentPublication(
+            published=False,
+            durable=False,
+            refusal="destination_unavailable",
+        )
     meta_root = package_root.path / _META_DIRNAME
     if not meta_root.is_dir():
         return CurrentPublication(published=False, durable=False)
     durability: list[bool] = []
+    published_identities: list[_FileIdentity] = []
     published = _write_package_file_atomic(
         meta_root,
         _CURRENT_FILENAME,
         f"{vid}\n".encode("ascii"),
         None,
         durability_out=durability,
+        published_identity_out=published_identities,
     )
     return CurrentPublication(
         published=published,
         durable=published and bool(durability) and durability[0],
+        current_identity=published_identities[0] if published_identities else None,
+        destination_origin_identity=destination.origin_identity,
     )
 
 
 def publish_current(
-    package_root: PackageRoot, vid: str, expected_current: Resolved
+    package_root: PackageRoot,
+    vid: str,
+    expected_current: Resolved | CurrentPublicationExpectation,
 ) -> CurrentPublication:
     """Publish ``vid`` only while an installed current and its lineage stay expected."""
 
-    if expected_current.package_root != package_root or not _VID_RE.fullmatch(vid):
+    if not _VID_RE.fullmatch(vid):
         return CurrentPublication(published=False, durable=False)
+    if isinstance(expected_current, Resolved):
+        if expected_current.package_root != package_root:
+            return CurrentPublication(published=False, durable=False)
+        destination = _resolve_version_target(package_root, vid)
+        if destination is None:
+            return CurrentPublication(
+                published=False,
+                durable=False,
+                refusal="destination_unavailable",
+            )
+        expectation = CurrentPublicationExpectation(
+            expected_current,
+            destination.version_root,
+            destination.version_identity,
+            destination.origin_identity,
+        )
+    else:
+        expectation = expected_current
+        if (
+            expectation.current.package_root != package_root
+            or expectation.destination.path != package_root.path / _VERSIONS_DIRNAME / vid
+        ):
+            return CurrentPublication(published=False, durable=False)
     meta_root = package_root.path / _META_DIRNAME
     if not meta_root.is_dir():
         return CurrentPublication(published=False, durable=False)
     durability: list[bool] = []
+    refusals: list[CurrentPublicationRefusal] = []
+    published_identities: list[_FileIdentity] = []
     published = _write_package_file_atomic(
         meta_root,
         _CURRENT_FILENAME,
         f"{vid}\n".encode("ascii"),
         None,
-        expected_current=expected_current,
+        expected_current=expectation,
         durability_out=durability,
+        refusal_out=refusals,
+        published_identity_out=published_identities,
     )
     return CurrentPublication(
         published=published,
         durable=published and bool(durability) and durability[0],
+        refusal=refusals[0] if refusals else None,
+        current_identity=published_identities[0] if published_identities else None,
+        destination_origin_identity=expectation.destination_origin_identity,
     )
 
 
 def write_package_state(
-    package_root: PackageLayoutRoot, enabled: bool, *, default_mode: int = _OWNER_RW
+    package_root: PackageRoot | StagingPackageRoot,
+    enabled: bool,
+    *,
+    default_mode: int = _OWNER_RW,
 ) -> bool:
     """Atomically publish the owned toggle into a package-shaped layout."""
     # Trailing newline so the file is a well-formed text line like every other
@@ -3009,12 +3262,12 @@ def _publish_discard_and_retire(
     package_root: PackageRoot,
     previous_vid: str,
     discarded: VersionRoot,
-    expected_current: Resolved,
+    expectation: CurrentPublicationExpectation,
 ) -> CurrentPublication:
     """Commit one discard and retire every scan that captured its old current."""
 
     with _ADVERTISEMENT_LOCK:
-        publication = publish_current(package_root, previous_vid, expected_current)
+        publication = publish_current(package_root, previous_vid, expectation)
         if publication:
             generation = _ADVERTISEMENT_GENERATIONS.pop(discarded, None)
             if generation is not None:
@@ -3329,9 +3582,19 @@ def _discard_version_locked(package_root: PackageRoot, expected_vid: str) -> Dis
         return "version_mismatch"
     if final_resolution.previous != previous:
         return "lineage_unavailable"
-    publication = _publish_discard_and_retire(package_root, previous_vid, current, final_resolution)
+    expectation = CurrentPublicationExpectation(
+        final_resolution,
+        target.version_root,
+        target.version_identity,
+        target.origin_identity,
+    )
+    publication = _publish_discard_and_retire(package_root, previous_vid, current, expectation)
     if not publication:
-        return "not_found"
+        return (
+            "lineage_unavailable"
+            if publication.refusal == "destination_unavailable"
+            else "not_found"
+        )
 
     # Discard is complete at publication. Everything below is best-effort
     # cleanup, but destructive cleanup is forbidden unless the directory fsync
