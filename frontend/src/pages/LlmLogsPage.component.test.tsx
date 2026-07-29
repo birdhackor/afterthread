@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, screen, within } from "@testing-library/react";
+import { act, cleanup, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import {
 	afterEach,
@@ -235,21 +235,26 @@ describe("LlmLogsPage display correctness", () => {
 		expect(mockedApiGet).toHaveBeenCalledTimes(2);
 	});
 
-	it("warns that retained log rows are stale after a background refetch fails", async () => {
+	it("shows the retained-log warning only while a background refetch is failing", async () => {
 		const row = logSummary(41, "capture", "ok");
 		const message = "AI 日誌背景更新失敗";
-		expectedReadCalls = [listRead, listRead];
+		expectedReadCalls = [listRead, listRead, listRead];
 		mockedApiGet
 			.mockResolvedValueOnce({
 				logs: [row],
 				process_token: "process-stale-list",
 			} satisfies LogListResponse)
-			.mockRejectedValueOnce(new Error(message));
+			.mockRejectedValueOnce(new Error(message))
+			.mockResolvedValueOnce({
+				logs: [row],
+				process_token: "process-stale-list",
+			} satisfies LogListResponse);
 		const { queryClient } = renderWithAppProviders(<LlmLogsPage />, {
 			initialEntries: ["/llm-logs"],
 		});
 
 		expect(await screen.findByText("快速捕捉")).toBeInTheDocument();
+		expect(screen.queryByText("無法更新 AI 日誌")).not.toBeInTheDocument();
 		await act(async () => {
 			await queryClient.refetchQueries({
 				queryKey: ["llm-logs"],
@@ -262,5 +267,15 @@ describe("LlmLogsPage display correctness", () => {
 			"以下內容是先前讀到的結果，可能已過期",
 		);
 		expect(screen.getByText("快速捕捉")).toBeInTheDocument();
+
+		await act(async () => {
+			await queryClient.refetchQueries({
+				queryKey: ["llm-logs"],
+				exact: true,
+			});
+		});
+		await waitFor(() => {
+			expect(screen.queryByText("無法更新 AI 日誌")).not.toBeInTheDocument();
+		});
 	});
 });

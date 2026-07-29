@@ -464,11 +464,17 @@ async function rawApiFetch(
 		throw normalizeError(response.status, body);
 	}
 
-	// Every body-bearing success in the generated API contract is JSON. The
-	// only legitimate no-body success is handled above by its explicit HTTP 204
-	// status; an empty 2xx here is therefore a broken/truncated response, not
-	// the schema object the typed helper promises.
-	if (!text) {
+	// Every body-bearing success in the generated API contract is parseable JSON
+	// with a non-null, non-array object at the top level. The only legitimate
+	// no-body success is handled above by its explicit HTTP 204 status; an empty
+	// or differently shaped 2xx here cannot be any current success response.
+	// This deliberately checks only that shared outer shape, not endpoint fields.
+	if (
+		!text ||
+		body === null ||
+		typeof body !== "object" ||
+		Array.isArray(body)
+	) {
 		throw invalidResponseError(response.status);
 	}
 

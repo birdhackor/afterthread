@@ -653,6 +653,74 @@ describe("apiFetch passive connectivity reporting", () => {
 		expect(store.get(statusAtom)).toEqual({ reachable: true });
 	});
 
+	it("rejects a null body-bearing 2xx as an ApiError", async () => {
+		stubFetch(async () => ({
+			ok: true,
+			status: 200,
+			text: async () => "null",
+		}));
+
+		const error = await rejectionOf(apiGet("/api/health"));
+
+		expect(error).toMatchObject({
+			name: "ApiError",
+			status: 200,
+			code: "invalid_response",
+			message: "伺服器回應格式有誤，請稍後再試",
+			fieldErrors: null,
+		});
+		expect(store.get(statusAtom)).toEqual({ reachable: true });
+	});
+
+	it("rejects an array body-bearing 2xx as an ApiError", async () => {
+		stubFetch(async () => ({
+			ok: true,
+			status: 200,
+			text: async () => "[]",
+		}));
+
+		const error = await rejectionOf(apiGet("/api/health"));
+
+		expect(error).toMatchObject({
+			name: "ApiError",
+			status: 200,
+			code: "invalid_response",
+			message: "伺服器回應格式有誤，請稍後再試",
+			fieldErrors: null,
+		});
+		expect(store.get(statusAtom)).toEqual({ reachable: true });
+	});
+
+	it("rejects a primitive body-bearing 2xx as an ApiError", async () => {
+		stubFetch(async () => ({
+			ok: true,
+			status: 200,
+			text: async () => JSON.stringify("a string"),
+		}));
+
+		const error = await rejectionOf(apiGet("/api/health"));
+
+		expect(error).toMatchObject({
+			name: "ApiError",
+			status: 200,
+			code: "invalid_response",
+			message: "伺服器回應格式有誤，請稍後再試",
+			fieldErrors: null,
+		});
+		expect(store.get(statusAtom)).toEqual({ reachable: true });
+	});
+
+	it("keeps an empty object body-bearing 2xx as an accepted outer shape", async () => {
+		stubFetch(async () => ({
+			ok: true,
+			status: 200,
+			text: async () => "{}",
+		}));
+
+		await expect(apiGet("/api/health")).resolves.toEqual({});
+		expect(store.get(statusAtom)).toEqual({ reachable: true });
+	});
+
 	it("returns null and reports up on a 204 -- a bodiless response is already fully delivered", async () => {
 		stubFetch(async () => ({
 			ok: true,

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, screen } from "@testing-library/react";
+import { act, cleanup, screen, waitFor } from "@testing-library/react";
 import { getDefaultStore, type PrimitiveAtom } from "jotai";
 import {
 	afterEach,
@@ -159,15 +159,17 @@ describe("HomePage operator guidance", () => {
 		).not.toBeInTheDocument();
 	});
 
-	it("warns that retained review content is stale after a background refetch fails", async () => {
+	it("shows the retained-review warning only while a background refetch is failing", async () => {
 		const message = "回顧背景更新失敗";
-		expectedReviewReadCount = 2;
+		expectedReviewReadCount = 3;
 		mockedApiGet
 			.mockResolvedValueOnce(reviewResponse)
-			.mockRejectedValueOnce(new Error(message));
+			.mockRejectedValueOnce(new Error(message))
+			.mockResolvedValueOnce(reviewResponse);
 		const { queryClient } = renderWithAppProviders(<HomePage />);
 
 		expect(await screen.findByText("沒有待補齊的項目")).toBeInTheDocument();
+		expect(screen.queryByText("無法更新回顧")).not.toBeInTheDocument();
 		await act(async () => {
 			await queryClient.refetchQueries({
 				queryKey: ["review"],
@@ -180,5 +182,15 @@ describe("HomePage operator guidance", () => {
 			"以下內容是先前讀到的結果，可能已過期",
 		);
 		expect(screen.getByText("沒有待補齊的項目")).toBeInTheDocument();
+
+		await act(async () => {
+			await queryClient.refetchQueries({
+				queryKey: ["review"],
+				exact: true,
+			});
+		});
+		await waitFor(() => {
+			expect(screen.queryByText("無法更新回顧")).not.toBeInTheDocument();
+		});
 	});
 });
