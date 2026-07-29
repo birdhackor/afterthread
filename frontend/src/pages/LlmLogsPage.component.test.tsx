@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, screen, within } from "@testing-library/react";
+import { act, cleanup, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import {
 	afterEach,
@@ -233,5 +233,34 @@ describe("LlmLogsPage display correctness", () => {
 		).toBeVisible();
 		expect(screen.queryByText("紀錄 17 第一輪要求")).not.toBeInTheDocument();
 		expect(mockedApiGet).toHaveBeenCalledTimes(2);
+	});
+
+	it("warns that retained log rows are stale after a background refetch fails", async () => {
+		const row = logSummary(41, "capture", "ok");
+		const message = "AI 日誌背景更新失敗";
+		expectedReadCalls = [listRead, listRead];
+		mockedApiGet
+			.mockResolvedValueOnce({
+				logs: [row],
+				process_token: "process-stale-list",
+			} satisfies LogListResponse)
+			.mockRejectedValueOnce(new Error(message));
+		const { queryClient } = renderWithAppProviders(<LlmLogsPage />, {
+			initialEntries: ["/llm-logs"],
+		});
+
+		expect(await screen.findByText("快速捕捉")).toBeInTheDocument();
+		await act(async () => {
+			await queryClient.refetchQueries({
+				queryKey: ["llm-logs"],
+				exact: true,
+			});
+		});
+
+		expect(await screen.findByText("無法更新 AI 日誌")).toBeInTheDocument();
+		expect(screen.getByText(new RegExp(message))).toHaveTextContent(
+			"以下內容是先前讀到的結果，可能已過期",
+		);
+		expect(screen.getByText("快速捕捉")).toBeInTheDocument();
 	});
 });

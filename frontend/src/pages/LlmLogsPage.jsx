@@ -500,8 +500,11 @@ export function LlmLogsPage() {
 	// 'error' (not 'pending') while refetching after a failure, so
 	// `data === undefined && isFetching` re-shows the Loader on 重新整理, and a
 	// failed background refetch that still has prior rows falls through to them.
+	// Match ToolsPage's orange retained-data warning so those rows cannot look
+	// like the result of a successful refresh.
 	const loading = data === undefined && isFetching;
 	const showError = isError && data === undefined && !isFetching;
+	const staleLogs = isError && data !== undefined;
 	const logs = data?.logs ?? [];
 	// The token comes from THIS response, so it and the rows it is compared for
 	// are one reading of one process (backend schemas.LlmLogListResponse).
@@ -548,6 +551,15 @@ export function LlmLogsPage() {
 							重試
 						</Button>
 					</Stack>
+				</Alert>
+			) : null}
+
+			{staleLogs ? (
+				<Alert color="orange" title="無法更新 AI 日誌">
+					<Text size="sm">
+						{error?.message ?? "請稍後再試"}
+						。以下內容是先前讀到的結果，可能已過期。
+					</Text>
 				</Alert>
 			) : null}
 

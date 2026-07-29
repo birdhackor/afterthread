@@ -1,8 +1,10 @@
 // Central fetch wrapper for every backend call. Responsibilities:
 //   - JSON serialization / parsing (and 204 No Content handling);
 //   - error normalization into a single ApiError shape {status, code,
-//     message, fieldErrors} following the shared UX rules, so callers only
-//     ever deal with one error type and already-localized (zh-TW) messages;
+//     message, fieldErrors} following the shared UX rules, so callers get one
+//     already-localized (zh-TW) error type for server/transport failures;
+//     caller-owned aborts are the deliberate exception and keep their original
+//     signal reason so superseded work can be ignored;
 //   - a query-string helper that skips empty filter values;
 //   - passive connectivity reporting: unambiguous call outcomes feed the
 //     shared backendStatusAtom (fully delivered sub-5xx response =
@@ -158,10 +160,12 @@ interface ApiErrorOptions {
 // the dependency edge one-way: client -> atoms, no cycle.)
 const store = getDefaultStore();
 
-// Normalized error thrown by every helper below. `status` is the HTTP status
-// (0 for a network/transport failure), `code` is the machine code from the
-// backend detail object when present, `message` is a user-facing zh-TW string,
-// and `fieldErrors` maps a field name to its message for 422 responses.
+// Normalized error thrown by every helper below for server/transport failures.
+// A caller-owned AbortSignal keeps its original reason instead. `status` is
+// the HTTP status (0 for a network/transport failure), `code` is the machine
+// code from the backend detail object when present, `message` is a user-facing
+// zh-TW string, and `fieldErrors` maps a field name to its message for 422
+// responses.
 export class ApiError extends Error {
 	status: number;
 	code: string | null;
@@ -193,6 +197,14 @@ function networkError(): ApiError {
 	});
 }
 
+function invalidResponseError(status: number): ApiError {
+	return new ApiError({
+		status,
+		code: "invalid_response",
+		message: "伺服器回應格式有誤，請稍後再試",
+	});
+}
+
 // Shared deadline for the two lightweight status probes (the /api/health
 // connectivity probe in api/health.ts and the /api/llm/status load in
 // atoms/llm.js). Both endpoints are trivial -- no DB, no LLM call -- so a
@@ -202,8 +214,9 @@ function networkError(): ApiError {
 // deadline a server that accepts connections but never responds would let
 // pending requests accumulate without limit (superseded requests are dropped
 // via generation counters but never cancelled; the timeout is what puts a
-// hard ceiling on how long any of them can hold a connection). The abort
-// surfaces as a fetch rejection -> the ordinary networkError path.
+// hard ceiling on how long any of them can hold a connection). An abort keeps
+// the signal's original reason rather than pretending the backend went down;
+// both probes opt out of passive connectivity and interpret their own result.
 export const PROBE_TIMEOUT_MS = 10000;
 
 // Build a `?a=1&b=2` query string from a plain object. null / undefined /
@@ -314,7 +327,9 @@ function normalizeError(status: number, body: unknown): ApiError {
 }
 
 // Core request helper. Resolves to the parsed JSON body (or null for 204),
-// and throws an ApiError for transport failures and non-OK responses.
+// and throws an ApiError for transport failures, malformed body-bearing
+// successes, and non-OK responses. Caller-owned aborts preserve their signal
+// reason so cancellation is distinguishable from an outage.
 // Options pass through to fetch(), except `reportConnectivity` (default
 // true): false keeps this call's outcome out of the passive connectivity
 // reports entirely, in both directions -- api/health.ts sets it for probe
@@ -365,6 +380,12 @@ async function rawApiFetch(
 			headers,
 		});
 	} catch (_cause) {
+		// Cancellation belongs to the caller, not the network. Preserve the exact
+		// reason (normally DOMException/AbortError) so a superseding navigation can
+		// ignore its own request without painting the backend offline.
+		if (fetchOptions.signal?.aborted) {
+			throw fetchOptions.signal.reason;
+		}
 		if (reportConnectivity) {
 			store.set(reportBackendDownAtom);
 		}
@@ -385,6 +406,12 @@ async function rawApiFetch(
 	try {
 		text = await response.text();
 	} catch (_cause) {
+		// An abort can arrive after headers while response.text() is still
+		// consuming the stream. It has the same caller-owned semantics as an
+		// abort rejected directly by fetch(), including no connectivity report.
+		if (fetchOptions.signal?.aborted) {
+			throw fetchOptions.signal.reason;
+		}
 		// Headers arrived (response.ok / response.status are already known),
 		// but the connection dropped before the body finished streaming --
 		// still a transport failure from the caller's point of view, so it
@@ -421,17 +448,28 @@ async function rawApiFetch(
 		store.set(reportBackendUpAtom);
 	}
 
-	let body = null;
+	let body: unknown = null;
 	if (text) {
 		try {
 			body = JSON.parse(text);
 		} catch (_parseError) {
+			if (response.ok) {
+				throw invalidResponseError(response.status);
+			}
 			body = text;
 		}
 	}
 
 	if (!response.ok) {
 		throw normalizeError(response.status, body);
+	}
+
+	// Every body-bearing success in the generated API contract is JSON. The
+	// only legitimate no-body success is handled above by its explicit HTTP 204
+	// status; an empty 2xx here is therefore a broken/truncated response, not
+	// the schema object the typed helper promises.
+	if (!text) {
+		throw invalidResponseError(response.status);
 	}
 
 	return body;

@@ -124,5 +124,5 @@ describe("ItemEditPage sole-copy rewrite request", () => {
 			]);
 		});
 		expectItemRead();
-	}, 10_000);
+	});
 });

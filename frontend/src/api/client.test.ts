@@ -480,7 +480,7 @@ describe("apiFetch passive connectivity reporting", () => {
 		expect(store.get(statusAtom)).toEqual({ reachable: false });
 	});
 
-	it("normalizes an AbortSignal rejection exactly like a network failure and reports down", async () => {
+	it("preserves an AbortSignal rejection and does not report a connectivity outage", async () => {
 		const controller = new AbortController();
 		const fetchSpy = stubFetch(
 			(_path, options) =>
@@ -501,14 +501,52 @@ describe("apiFetch passive connectivity reporting", () => {
 			method: "GET",
 			signal: controller.signal,
 		});
-		controller.abort(
-			new DOMException("operator abandoned request", "AbortError"),
+		const abortReason = new DOMException(
+			"operator abandoned request",
+			"AbortError",
 		);
+		controller.abort(abortReason);
 
-		const error = await rejectionOf(request);
-		expectNetworkError(error);
+		await expect(request).rejects.toBe(abortReason);
 		expect(fetchSpy.mock.calls[0]?.[1]?.signal).toBe(controller.signal);
-		expect(store.get(statusAtom)).toEqual({ reachable: false });
+		expect(store.get(statusAtom)).toEqual({ reachable: true });
+	});
+
+	it("preserves an abort during body reading and does not report a connectivity outage", async () => {
+		const controller = new AbortController();
+		let markBodyReadStarted: (() => void) | undefined;
+		const bodyReadStarted = new Promise<void>((resolve) => {
+			markBodyReadStarted = resolve;
+		});
+		stubFetch(async () => ({
+			ok: true,
+			status: 200,
+			text: () => {
+				markBodyReadStarted?.();
+				return new Promise<string>((_resolve, reject) => {
+					controller.signal.addEventListener(
+						"abort",
+						() => reject(controller.signal.reason),
+						{ once: true },
+					);
+				});
+			},
+		}));
+		store.set(statusAtom, { reachable: true });
+
+		const request = apiFetch("/api/health", {
+			method: "GET",
+			signal: controller.signal,
+		});
+		await bodyReadStarted;
+		const abortReason = new DOMException(
+			"operator abandoned response body",
+			"AbortError",
+		);
+		controller.abort(abortReason);
+
+		await expect(request).rejects.toBe(abortReason);
+		expect(store.get(statusAtom)).toEqual({ reachable: true });
 	});
 
 	it("emits ONLY a down signal when the connection drops mid-body (no transient up)", async () => {
@@ -575,6 +613,44 @@ describe("apiFetch passive connectivity reporting", () => {
 			fieldErrors: null,
 		});
 		expect(store.get(statusAtom)).toEqual({ reachable: null });
+	});
+
+	it("rejects malformed JSON from a body-bearing 2xx as an ApiError", async () => {
+		stubFetch(async () => ({
+			ok: true,
+			status: 200,
+			text: async () => '{"status":"ok"',
+		}));
+
+		const error = await rejectionOf(apiGet("/api/health"));
+
+		expect(error).toMatchObject({
+			name: "ApiError",
+			status: 200,
+			code: "invalid_response",
+			message: "伺服器回應格式有誤，請稍後再試",
+			fieldErrors: null,
+		});
+		expect(store.get(statusAtom)).toEqual({ reachable: true });
+	});
+
+	it("rejects an empty body-bearing 2xx as an ApiError", async () => {
+		stubFetch(async () => ({
+			ok: true,
+			status: 200,
+			text: async () => "",
+		}));
+
+		const error = await rejectionOf(apiGet("/api/health"));
+
+		expect(error).toMatchObject({
+			name: "ApiError",
+			status: 200,
+			code: "invalid_response",
+			message: "伺服器回應格式有誤，請稍後再試",
+			fieldErrors: null,
+		});
+		expect(store.get(statusAtom)).toEqual({ reachable: true });
 	});
 
 	it("returns null and reports up on a 204 -- a bodiless response is already fully delivered", async () => {

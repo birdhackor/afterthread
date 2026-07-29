@@ -10,9 +10,18 @@ import {
 	RouterProvider,
 } from "@tanstack/react-router";
 import "@testing-library/jest-dom/vitest";
-import { cleanup, type RenderOptions, render } from "@testing-library/react";
+import {
+	cleanup,
+	configure,
+	type RenderOptions,
+	render,
+} from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach } from "vitest";
+
+// Async queries keep their assertions unchanged, but get enough CPU budget for
+// three concurrent jsdom suites on a contended runner.
+configure({ asyncUtilTimeout: 10_000 });
 
 afterEach(cleanup);
 

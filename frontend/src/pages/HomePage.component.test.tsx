@@ -46,8 +46,10 @@ const reviewResponse = {
 	parked: [],
 } satisfies ReviewResponse;
 const expectedReviewRead = ["/api/review"] as const;
+let expectedReviewReadCount = 1;
 
 beforeEach(() => {
+	expectedReviewReadCount = 1;
 	mockedApiGet.mockReset();
 	vi.mocked(apiFetch).mockReset();
 	mockedApiGet.mockImplementation((...call) => {
@@ -72,7 +74,9 @@ afterEach(() => {
 	cleanup();
 	// React Query turns a thrown queryFn error into query state. Re-scan the raw
 	// call log so an unexpected read cannot be swallowed into a green UI test.
-	expect(mockedApiGet.mock.calls).toEqual([expectedReviewRead]);
+	expect(mockedApiGet.mock.calls).toEqual(
+		Array.from({ length: expectedReviewReadCount }, () => expectedReviewRead),
+	);
 	expect(apiFetch).not.toHaveBeenCalled();
 	store.set(homeBackendStatusAtom, { reachable: null });
 	store.set(homeLlmStatusAtom, {
@@ -153,5 +157,28 @@ describe("HomePage operator guidance", () => {
 		expect(
 			screen.queryByRole("button", { name: "重試" }),
 		).not.toBeInTheDocument();
+	});
+
+	it("warns that retained review content is stale after a background refetch fails", async () => {
+		const message = "回顧背景更新失敗";
+		expectedReviewReadCount = 2;
+		mockedApiGet
+			.mockResolvedValueOnce(reviewResponse)
+			.mockRejectedValueOnce(new Error(message));
+		const { queryClient } = renderWithAppProviders(<HomePage />);
+
+		expect(await screen.findByText("沒有待補齊的項目")).toBeInTheDocument();
+		await act(async () => {
+			await queryClient.refetchQueries({
+				queryKey: ["review"],
+				exact: true,
+			});
+		});
+
+		expect(await screen.findByText("無法更新回顧")).toBeInTheDocument();
+		expect(screen.getByText(new RegExp(message))).toHaveTextContent(
+			"以下內容是先前讀到的結果，可能已過期",
+		);
+		expect(screen.getByText("沒有待補齊的項目")).toBeInTheDocument();
 	});
 });

@@ -270,7 +270,7 @@ describe("ItemsListPage display correctness", () => {
 		await user.type(screen.getByRole("textbox", { name: "搜尋" }), query);
 		expect(await findDisplayedText("完整篩選結果")).toBeInTheDocument();
 		expect(mockedApiGet).toHaveBeenCalledTimes(5);
-	}, 10_000);
+	});
 
 	it("uses the selected page offset and renders the response's exact total", async () => {
 		const user = userEvent.setup();

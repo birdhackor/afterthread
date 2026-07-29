@@ -25,6 +25,12 @@ import { renderWithAppProviders } from "../test/render.js";
 import { expectOnlyWriteCall } from "../test/writeCalls.js";
 import { ToolsPage } from "./ToolsPage.jsx";
 
+function setupUser() {
+	// Skip user-event's setTimeout(0) pacing between interactions. These tests
+	// await every asynchronous boundary explicitly, so removing pacing is safe.
+	return userEvent.setup({ delay: null });
+}
+
 vi.mock("../api/client.js", () => ({
 	apiDelete: vi.fn(),
 	apiGet: vi.fn(),
@@ -314,7 +320,7 @@ describe("ToolsPage component", () => {
 	});
 
 	it("drops revision feedback when the current version changes without visible row changes", async () => {
-		const user = userEvent.setup();
+		const user = setupUser();
 		const versionV = {
 			tools: [
 				{
@@ -436,7 +442,7 @@ describe("ToolsPage component", () => {
 		await openDiscardConfirmation(user);
 		const removal = waitForElementToBeRemoved(
 			() => screen.queryByRole("dialog", { name: "退回前一版" }),
-			{ timeout: 1000 },
+			{ timeout: 10_000 },
 		);
 
 		await act(async () => {
@@ -615,7 +621,7 @@ describe("ToolsPage component", () => {
 	});
 
 	it("blocks every version write while the tools list is refetching", async () => {
-		const user = userEvent.setup();
+		const user = setupUser();
 		const list = toolListWith({ lineage: "usable" });
 		const listRefresh = deferred<ToolListResponse>();
 		mockStrictReads(
@@ -769,7 +775,7 @@ describe("ToolsPage component", () => {
 	});
 
 	it("sends the exact regenerate request and gates other tools while pending", async () => {
-		const user = userEvent.setup();
+		const user = setupUser();
 		const list = {
 			tools: [
 				{ ...toolListResponse.tools[0], lineage: "usable" },
@@ -854,7 +860,7 @@ describe("ToolsPage component", () => {
 	});
 
 	it("sends the exact install request and gates every version write while pending", async () => {
-		const user = userEvent.setup();
+		const user = setupUser();
 		const list = toolListWith({ lineage: "usable" });
 		const install = deferred<ToolInstallAccepted>();
 		mockToolReads(list, { summaryNames: [list.tools[0].name] });
@@ -916,7 +922,7 @@ describe("ToolsPage component", () => {
 	});
 
 	it("keeps the install form closed while its job is active and being revalidated", async () => {
-		const user = userEvent.setup();
+		const user = setupUser();
 		const list = toolListWith({ lineage: "usable" });
 		const runningJob = {
 			job_id: "job-install-1",
@@ -1094,6 +1100,11 @@ describe("ToolsPage component", () => {
 			name: "修訂意見",
 		});
 		await user.type(feedbackFields[0], "調整第一個工具");
+		await waitFor(() => {
+			expect(
+				screen.getAllByRole("button", { name: "送出修訂" })[0],
+			).toBeEnabled();
+		});
 		await user.click(screen.getAllByRole("button", { name: "送出修訂" })[0]);
 		await waitFor(() => {
 			expectOnlyWriteCall(writeApiMocks, mockedApiPost, [

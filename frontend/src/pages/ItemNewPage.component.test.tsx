@@ -120,5 +120,5 @@ describe("ItemNewPage create request", () => {
 				expectedOptions,
 			]);
 		});
-	}, 10_000);
+	});
 });
