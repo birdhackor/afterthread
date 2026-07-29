@@ -26,6 +26,7 @@ pnpm preview       # 本機預覽 production build（見下方「已知限制」
 pnpm lint          # biome check .
 pnpm format        # biome check --write .（自動修正）
 pnpm test          # vitest run（單元測試，node 環境、無 jsdom）
+pnpm typecheck     # 僅檢查已撰寫的 .ts；既有 .js/.jsx 暫不做語意型別檢查
 ```
 
 以上指令皆已在本機實際執行過並確認通過：`pnpm install`、`pnpm lint`（無錯誤，
@@ -40,6 +41,24 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
 即因此在 preview 階段只驗證 SPA 外殼有被正確提供，不透過 preview 打任何 API；細節
 見 `e2e/README.md`）。開發時請用 `pnpm dev`，其代理設定與 `pnpm preview` 相同但通
 常搭配本機真的跑在 8000 埠的後端。
+
+## API schema 型別
+
+`src/api/schema.gen.ts` 是從後端 FastAPI/Pydantic 的真實 OpenAPI schema 產生並
+提交的 API contract；瀏覽器 build 只讀這個 TypeScript 檔，不需要 Python，也不會
+啟動後端。後端的 request／response schema 有任何異動後，請在 repo 已安裝
+`uv` 與 `pnpm` 依賴的環境執行：
+
+```bash
+pnpm generate:api-types
+pnpm typecheck
+```
+
+產生器位於 repo 共用的 `scripts/generate-api-types.sh`，會直接 import FastAPI
+`app`、呼叫 `app.openapi()` 寫入暫存 JSON，再由 `openapi-typescript` 更新已提交的
+型別；它不會啟動 server 或 curl `/openapi.json`。CI 的 full-stack job 另執行
+`pnpm --dir frontend check:api-types`，以同一路徑重產並在 committed output 有任何
+diff 時失敗。
 
 ## 頁面總覽
 
@@ -77,7 +96,7 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
 - **zh-TW 文案**：所有面向使用者的文字（標籤、按鈕、通知、錯誤訊息）一律使用正體
   中文，狀態／階段的顯示文字集中在 `constants/labels.js`（`STATUS_META` /
   `STAGE_META`）避免各處重覆定義；API 錯誤訊息的 zh-TW 映射集中在
-  `api/client.js` 的 `messageFor`。
+  `api/client.ts` 的 `messageFor`。
 - **Code-point 長度計數**：任何鏡射後端長度上限的前端驗證，一律用
   `utils/text.js` 的 `codePointLength`，而不是 JS 原生的 `.length` /
   `maxLength`。原生 `.length` 數的是 UTF-16 code unit，多數 emoji 與部分 CJK

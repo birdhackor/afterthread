@@ -1,37 +1,47 @@
-import { getDefaultStore } from "jotai";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { getDefaultStore, type PrimitiveAtom } from "jotai";
+import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import { backendStatusAtom } from "../atoms/connectivity.js";
-import { ApiError, apiFetch } from "./client.js";
+import { ApiError, type ApiSuccessResponse, apiFetch } from "./client.js";
 import { probeBackendHealth } from "./health.js";
 
 // probeBackendHealth's contract is "interpret whatever apiFetch settles
 // with", so apiFetch is stubbed with test-controlled promises -- the tests
 // dictate settle order directly and no real fetch machinery runs (probe
 // traffic opts out of passive reporting anyway via reportConnectivity:
-// false, which is asserted below). Everything else from client.js
+// false, which is asserted below). Everything else from client.ts
 // (ApiError) stays real.
 vi.mock("./client.js", async (importOriginal) => {
-	const actual = await importOriginal();
+	const actual = await importOriginal<typeof import("./client.js")>();
 	return { ...actual, apiFetch: vi.fn() };
 });
 
-// health.js writes through jotai's default store (the app has no
+// health.ts writes through jotai's default store (the app has no
 // <Provider>), so assertions read backendStatusAtom from that same store.
 const store = getDefaultStore();
+type HealthResponse = ApiSuccessResponse<"/api/health", "get">;
+const statusAtom = backendStatusAtom as PrimitiveAtom<{
+	reachable: boolean | null;
+}>;
+const mockedApiFetch = vi.mocked(apiFetch) as Mock<
+	(path: string, options: RequestInit) => Promise<HealthResponse>
+>;
 
 // The probe is fire-and-forget (returns nothing), so tests wait for its
 // internal promise chain by yielding a macrotask, which runs strictly after
 // every already-settled microtask.
-function flush() {
+function flush(): Promise<void> {
 	return new Promise((resolve) => {
 		setTimeout(resolve, 0);
 	});
 }
 
 // A promise plus its out-of-band settle handle, for the ordering test.
-function deferred() {
-	let resolve;
-	const promise = new Promise((res) => {
+function deferred<Value>(): {
+	promise: Promise<Value>;
+	resolve: (value: Value | PromiseLike<Value>) => void;
+} {
+	let resolve!: (value: Value | PromiseLike<Value>) => void;
+	const promise = new Promise<Value>((res) => {
 		resolve = res;
 	});
 	return { promise, resolve };
@@ -40,13 +50,13 @@ function deferred() {
 beforeEach(() => {
 	// Reset the shared default-store state and the mock's queued results so
 	// no test depends on a predecessor's.
-	store.set(backendStatusAtom, { reachable: null });
-	apiFetch.mockReset();
+	store.set(statusAtom, { reachable: null });
+	mockedApiFetch.mockReset();
 });
 
 describe("probeBackendHealth", () => {
 	it("reports up when the health body says ok", async () => {
-		apiFetch.mockResolvedValueOnce({ status: "ok" });
+		mockedApiFetch.mockResolvedValueOnce({ status: "ok" });
 		probeBackendHealth();
 		await flush();
 		// The probe must exempt itself from the passive layer (so its
@@ -62,7 +72,7 @@ describe("probeBackendHealth", () => {
 				signal: expect.any(AbortSignal),
 			}),
 		);
-		expect(store.get(backendStatusAtom)).toEqual({ reachable: true });
+		expect(store.get(statusAtom)).toEqual({ reachable: true });
 	});
 
 	it("reports down on an ApiError 500 -- the dev proxy answers 500 for a dead backend", async () => {
@@ -70,39 +80,39 @@ describe("probeBackendHealth", () => {
 		// trivial /api/health endpoint a 5xx is never a legitimate answer,
 		// only a middleman covering for a dead upstream, so the probe must
 		// rule it down.
-		apiFetch.mockRejectedValueOnce(
+		mockedApiFetch.mockRejectedValueOnce(
 			new ApiError({ status: 500, message: "proxy error" }),
 		);
-		store.set(backendStatusAtom, { reachable: true });
+		store.set(statusAtom, { reachable: true });
 		probeBackendHealth();
 		await flush();
-		expect(store.get(backendStatusAtom)).toEqual({ reachable: false });
+		expect(store.get(statusAtom)).toEqual({ reachable: false });
 	});
 
 	it("reports down on a transport failure (status 0 network_error)", async () => {
 		// Fetch rejections AND the probe's own AbortSignal timeout both land
 		// here: apiFetch's catch normalizes either into this ApiError shape.
-		apiFetch.mockRejectedValueOnce(
+		mockedApiFetch.mockRejectedValueOnce(
 			new ApiError({
 				status: 0,
 				code: "network_error",
 				message: "無法連線伺服器，請確認網路後再試",
 			}),
 		);
-		store.set(backendStatusAtom, { reachable: true });
+		store.set(statusAtom, { reachable: true });
 		probeBackendHealth();
 		await flush();
-		expect(store.get(backendStatusAtom)).toEqual({ reachable: false });
+		expect(store.get(statusAtom)).toEqual({ reachable: false });
 	});
 
 	it("reports down when the body resolves with the wrong shape", async () => {
 		// A 2xx whose body is not the health payload is not our backend
 		// talking (captive portal, misrouted proxy) -- it must read as down.
-		apiFetch.mockResolvedValueOnce({ status: "weird" });
-		store.set(backendStatusAtom, { reachable: true });
+		mockedApiFetch.mockResolvedValueOnce({ status: "weird" });
+		store.set(statusAtom, { reachable: true });
 		probeBackendHealth();
 		await flush();
-		expect(store.get(backendStatusAtom)).toEqual({ reachable: false });
+		expect(store.get(statusAtom)).toEqual({ reachable: false });
 	});
 
 	it("discards a stale slow probe that settles after a newer one already ruled", async () => {
@@ -111,17 +121,17 @@ describe("probeBackendHealth", () => {
 		// stale (B claimed a newer one), so its up-verdict must be dropped --
 		// otherwise a pre-outage "ok" landing late would repaint a freshly
 		// confirmed-dead backend green until the next poll tick.
-		const slow = deferred();
-		apiFetch.mockReturnValueOnce(slow.promise); // probe A
-		apiFetch.mockRejectedValueOnce(
+		const slow = deferred<HealthResponse>();
+		mockedApiFetch.mockReturnValueOnce(slow.promise); // probe A
+		mockedApiFetch.mockRejectedValueOnce(
 			new ApiError({ status: 500, message: "proxy error" }),
 		); // probe B
 		probeBackendHealth(); // A claims the older generation
 		probeBackendHealth(); // B claims the newer generation
 		await flush();
-		expect(store.get(backendStatusAtom)).toEqual({ reachable: false });
+		expect(store.get(statusAtom)).toEqual({ reachable: false });
 		slow.resolve({ status: "ok" });
 		await flush();
-		expect(store.get(backendStatusAtom)).toEqual({ reachable: false });
+		expect(store.get(statusAtom)).toEqual({ reachable: false });
 	});
 });

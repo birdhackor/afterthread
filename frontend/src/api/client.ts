@@ -18,6 +18,113 @@ import {
 	reportBackendDownAtom,
 	reportBackendUpAtom,
 } from "../atoms/connectivity.js";
+import type { components, paths } from "./schema.gen.js";
+
+type SchemaPath = keyof paths & string;
+type ApiMethod = "get" | "post" | "patch" | "delete";
+type FetchMethod = Uppercase<ApiMethod>;
+type QueryValue = string | number | boolean | null | undefined;
+
+// All endpoint request/response types below are projections of schema.gen.ts,
+// never parallel handwritten payload interfaces. A backend schema rename
+// therefore changes the types at this boundary on the next regeneration.
+type PathsForMethod<Method extends ApiMethod> = {
+	[Path in SchemaPath]: Method extends keyof paths[Path]
+		? NonNullable<paths[Path][Method]> extends never
+			? never
+			: Path
+		: never;
+}[SchemaPath];
+
+type OperationFor<
+	Path extends SchemaPath,
+	Method extends ApiMethod,
+> = Method extends keyof paths[Path] ? NonNullable<paths[Path][Method]> : never;
+
+type ConcretePath<Path extends string> =
+	Path extends `${infer Head}{${string}}${infer Tail}`
+		? `${Head}${string}${ConcretePath<Tail>}`
+		: Path;
+
+type RuntimePath<Path extends string> = Path extends unknown
+	? ConcretePath<Path> | `${ConcretePath<Path>}?${string}`
+	: never;
+
+type RuntimePathsForMethod<Method extends ApiMethod> = RuntimePath<
+	PathsForMethod<Method>
+>;
+
+type StripQuery<Path extends string> =
+	Path extends `${infer WithoutQuery}?${string}` ? WithoutQuery : Path;
+
+type SchemaPathForRuntime<Method extends ApiMethod, Path extends string> = {
+	[SchemaPath in PathsForMethod<Method>]: StripQuery<Path> extends ConcretePath<SchemaPath>
+		? SchemaPath
+		: never;
+}[PathsForMethod<Method>];
+
+type JsonRequestBody<Operation> = Operation extends {
+	requestBody: {
+		content: {
+			"application/json": infer Body;
+		};
+	};
+}
+	? Body
+	: never;
+
+type ResponsesFor<Operation> = Operation extends {
+	responses: infer Responses;
+}
+	? Responses
+	: never;
+
+type SuccessStatus<Responses> = {
+	[Status in keyof Responses]: `${Status & (string | number)}` extends `2${string}`
+		? Status
+		: never;
+}[keyof Responses];
+
+type JsonResponseBody<Response> = Response extends {
+	content: {
+		"application/json": infer Body;
+	};
+}
+	? Body
+	: null;
+
+export type ApiRequestBody<
+	Path extends SchemaPath,
+	Method extends ApiMethod,
+> = JsonRequestBody<OperationFor<Path, Method>>;
+
+export type ApiSuccessResponse<
+	Path extends SchemaPath,
+	Method extends ApiMethod,
+> = JsonResponseBody<
+	ResponsesFor<OperationFor<Path, Method>>[SuccessStatus<
+		ResponsesFor<OperationFor<Path, Method>>
+	>]
+>;
+
+type ResponseForRuntime<
+	Method extends ApiMethod,
+	Path extends RuntimePathsForMethod<Method>,
+> = ApiSuccessResponse<SchemaPathForRuntime<Method, Path>, Method>;
+
+type ValidationError = components["schemas"]["ValidationError"];
+type ValidationMessage = Pick<ValidationError, "msg">;
+
+export interface ApiFetchOptions extends RequestInit {
+	reportConnectivity?: boolean;
+}
+
+interface ApiErrorOptions {
+	status: number;
+	code?: string | null;
+	message: string;
+	fieldErrors?: Record<string, string> | null;
+}
 
 // The app renders without a jotai <Provider>, so components read atoms from
 // jotai's default store -- writing the connectivity reports to that same
@@ -31,7 +138,16 @@ const store = getDefaultStore();
 // backend detail object when present, `message` is a user-facing zh-TW string,
 // and `fieldErrors` maps a field name to its message for 422 responses.
 export class ApiError extends Error {
-	constructor({ status, code = null, message, fieldErrors = null }) {
+	status: number;
+	code: string | null;
+	fieldErrors: Record<string, string> | null;
+
+	constructor({
+		status,
+		code = null,
+		message,
+		fieldErrors = null,
+	}: ApiErrorOptions) {
 		super(message);
 		this.name = "ApiError";
 		this.status = status;
@@ -44,7 +160,7 @@ export class ApiError extends Error {
 // zh-TW copy) -- also used when the connection drops mid-response, after
 // headers arrive but before the body finishes reading. Either way the
 // request never delivered a usable response, so it reads as one error kind.
-function networkError() {
+function networkError(): ApiError {
 	return new ApiError({
 		status: 0,
 		code: "network_error",
@@ -53,7 +169,7 @@ function networkError() {
 }
 
 // Shared deadline for the two lightweight status probes (the /api/health
-// connectivity probe in api/health.js and the /api/llm/status load in
+// connectivity probe in api/health.ts and the /api/llm/status load in
 // atoms/llm.js). Both endpoints are trivial -- no DB, no LLM call -- so a
 // working backend answers them near-instantly and anything slower than this
 // generous bound is not usable. Bounding them matters beyond UX: probe-shaped
@@ -68,7 +184,9 @@ export const PROBE_TIMEOUT_MS = 10000;
 // Build a `?a=1&b=2` query string from a plain object. null / undefined /
 // empty-string values are dropped so a page can hand over its whole filter
 // state without pruning cleared fields first. Returns "" when nothing is set.
-export function buildQuery(params) {
+export function buildQuery(
+	params?: Readonly<Record<string, QueryValue>>,
+): string {
 	const search = new URLSearchParams();
 	for (const [key, value] of Object.entries(params ?? {})) {
 		if (value === null || value === undefined || value === "") {
@@ -83,7 +201,11 @@ export function buildQuery(params) {
 // Map a (status, code, raw server message) triple to the user-facing zh-TW
 // message defined by the shared UX rules. Falls back to the server message,
 // then to a generic notice for anything unexpected.
-function messageFor(status, code, rawMessage) {
+function messageFor(
+	status: number,
+	code: string | null,
+	rawMessage: string | null,
+): string {
 	if (status === 503 && code === "llm_not_configured") {
 		return "AI 功能尚未設定";
 	}
@@ -103,19 +225,29 @@ function messageFor(status, code, rawMessage) {
 //   - a plain string (e.g. CRUD 404 -> "Memory item not found");
 //   - a {code, message} object (AI 409 / 502 / 503);
 //   - a list of {loc, msg, type} validation errors (422).
-function normalizeError(status, body) {
-	const detail = body && typeof body === "object" ? body.detail : body;
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object";
+}
+
+function hasValidationMessage(value: unknown): value is ValidationMessage {
+	return isRecord(value) && typeof value.msg === "string";
+}
+
+function normalizeError(status: number, body: unknown): ApiError {
+	const detail = isRecord(body) ? body.detail : body;
 
 	if (status === 422 && Array.isArray(detail)) {
-		const fieldErrors = {};
+		const fieldErrors: Record<string, string> = {};
 		for (const entry of detail) {
-			const loc = Array.isArray(entry?.loc) ? entry.loc : [];
+			const loc = isRecord(entry) && Array.isArray(entry.loc) ? entry.loc : [];
 			// Drop the leading "body"/"query" segment; keep the field path.
 			const field =
 				loc.filter((part) => part !== "body" && part !== "query").join(".") ||
 				"_";
 			if (!(field in fieldErrors)) {
-				fieldErrors[field] = entry?.msg ?? "欄位資料有誤";
+				fieldErrors[field] = hasValidationMessage(entry)
+					? entry.msg
+					: "欄位資料有誤";
 			}
 		}
 		return new ApiError({
@@ -128,7 +260,7 @@ function normalizeError(status, body) {
 
 	let code = null;
 	let rawMessage = null;
-	if (detail && typeof detail === "object") {
+	if (isRecord(detail)) {
 		code = typeof detail.code === "string" ? detail.code : null;
 		rawMessage = typeof detail.message === "string" ? detail.message : null;
 	} else if (typeof detail === "string") {
@@ -146,12 +278,30 @@ function normalizeError(status, body) {
 // and throws an ApiError for transport failures and non-OK responses.
 // Options pass through to fetch(), except `reportConnectivity` (default
 // true): false keeps this call's outcome out of the passive connectivity
-// reports entirely, in both directions -- api/health.js sets it for probe
+// reports entirely, in both directions -- api/health.ts sets it for probe
 // traffic so its generation-guarded semantic verdict is structurally the
 // only connectivity writer for probes.
-export async function apiFetch(path, options = {}) {
+export function apiFetch<
+	Method extends FetchMethod,
+	Path extends RuntimePathsForMethod<Lowercase<Method>>,
+>(
+	path: Path,
+	options: ApiFetchOptions & { method: Method },
+): Promise<ResponseForRuntime<Lowercase<Method>, Path>>;
+
+export function apiFetch(
+	path: string,
+	options: ApiFetchOptions = {},
+): Promise<unknown> {
+	return rawApiFetch(path, options);
+}
+
+async function rawApiFetch(
+	path: string,
+	options: ApiFetchOptions = {},
+): Promise<unknown> {
 	const { reportConnectivity = true, ...fetchOptions } = options;
-	let response;
+	let response: Response;
 	try {
 		response = await fetch(path, {
 			...fetchOptions,
@@ -186,7 +336,7 @@ export async function apiFetch(path, options = {}) {
 		return null;
 	}
 
-	let text;
+	let text: string;
 	try {
 		text = await response.text();
 	} catch (_cause) {
@@ -214,7 +364,7 @@ export async function apiFetch(path, options = {}) {
 	//     down-report either, because a real backend also legitimately 5xxes
 	//     (LLM upstream failures return 502/503) and treating those as
 	//     outages would flap the badge during normal AI errors -- the
-	//     authoritative /api/health probe (api/health.js) settles what a 5xx
+	//     authoritative /api/health probe (api/health.ts) settles what a 5xx
 	//     means, and until it rules the badge keeps its last verdict;
 	//   - only after the body, because reporting on headers alone let a
 	//     request that died mid-body emit a contradictory up-then-down pair,
@@ -242,24 +392,42 @@ export async function apiFetch(path, options = {}) {
 	return body;
 }
 
-export function apiGet(path) {
-	return apiFetch(path, { method: "GET" });
+export function apiGet<Path extends RuntimePathsForMethod<"get">>(
+	path: Path,
+): Promise<ResponseForRuntime<"get", Path>>;
+
+export function apiGet(path: string): Promise<unknown> {
+	return rawApiFetch(path, { method: "GET" });
 }
 
-export function apiPost(path, body) {
-	return apiFetch(path, {
+export function apiPost<Path extends RuntimePathsForMethod<"post">>(
+	path: Path,
+	body: ApiRequestBody<SchemaPathForRuntime<"post", Path>, "post">,
+): Promise<ResponseForRuntime<"post", Path>>;
+
+export function apiPost(path: string, body: unknown): Promise<unknown> {
+	return rawApiFetch(path, {
 		method: "POST",
 		body: body === undefined ? undefined : JSON.stringify(body),
 	});
 }
 
-export function apiPatch(path, body) {
-	return apiFetch(path, {
+export function apiPatch<Path extends RuntimePathsForMethod<"patch">>(
+	path: Path,
+	body: ApiRequestBody<SchemaPathForRuntime<"patch", Path>, "patch">,
+): Promise<ResponseForRuntime<"patch", Path>>;
+
+export function apiPatch(path: string, body: unknown): Promise<unknown> {
+	return rawApiFetch(path, {
 		method: "PATCH",
 		body: body === undefined ? undefined : JSON.stringify(body),
 	});
 }
 
-export function apiDelete(path) {
-	return apiFetch(path, { method: "DELETE" });
+export function apiDelete<Path extends RuntimePathsForMethod<"delete">>(
+	path: Path,
+): Promise<ResponseForRuntime<"delete", Path>>;
+
+export function apiDelete(path: string): Promise<unknown> {
+	return rawApiFetch(path, { method: "DELETE" });
 }
