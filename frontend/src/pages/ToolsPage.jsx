@@ -974,8 +974,9 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	const job = jobQuery.data;
 
 	// A settled revise means the row's own summary detail and the list may both be
-	// stale -- on SUCCESS because the job
-	// regenerated the sidecar and replaced the package (mirrors InstallPanel's own
+	// stale -- on SUCCESS because the job published a new version and moved
+	// `current` onto it, so both the row and its summary now describe the version
+	// that was live before this revise (mirrors InstallPanel's own
 	// transition effect, for the same reason: a row's data the OTHER tab's query
 	// owns), and on FAILURE because most of the ways a revise can fail ARE the
 	// server saying it is no longer what we are showing.

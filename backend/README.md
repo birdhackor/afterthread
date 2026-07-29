@@ -220,7 +220,8 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   工作），body 必須帶 `{expected_vid}`，成功回新的總結與實際版本。工具不存在回
   404；有工具工作正在進行時回 `409 job_busy`——而且它
   **自己也會佔住那個名額**（整趟 LLM 往返期間，install／revise 送出一律 409），
-  否則窗內被放行的修訂會換掉整包、寫下新的 sidecar，再被這次較舊的總結蓋回去；LLM 未
+  否則窗內被放行的修訂會發布一個新版本並把 `current` 移過去，這趟已經付過錢的總結
+  就落在一個不再生效的版本上，畫面上永遠不會出現；LLM 未
   設定／上游失敗與捕捉、補齊等同步 AI 動作共用同一組錯誤（`503
   llm_not_configured`／`502 llm_upstream_error`），失敗時不會覆蓋既有總結；
   取得名額後若目前版本不是 `expected_vid`，回 `409 version_mismatch`，不花 LLM。

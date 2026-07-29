@@ -2849,12 +2849,13 @@ def _admit_job(*, reservation_token: str | None = None) -> InstallJob | None:
     The single-flight admission, written ONCE for both kinds: the active-check
     and the insert happen under the SAME lock acquisition, so there is no
     check-then-start race, and a caller maps None onto its route's 409. ANY
-    queued/running job blocks ANY new one -- an install and a revise both end in
-    a package directory being moved into place, so letting them overlap would
-    race a directory being replaced (and would make the two sessions'
-    same-workflow log records ambiguous to ``last_record_id_for_workflow``). A
-    held SYNCHRONOUS reservation blocks one too (R7-3): a regenerate in flight is
-    about to write the sidecar of a package this job may be replacing.
+    queued/running job blocks ANY new one -- an install renames a package
+    directory into place and a revise renames a version into ``versions/`` and
+    then moves ``current``, so letting them overlap would race two writers over
+    one package tree (and would make the two sessions' same-workflow log records
+    ambiguous to ``last_record_id_for_workflow``). A held SYNCHRONOUS reservation
+    blocks one too (R7-3): a regenerate in flight is about to write the summary
+    of a version this job may be superseding.
 
     Eviction keeps the newest ``_MAX_JOBS`` by creation time (job_id as a
     deterministic tiebreak for identical timestamps); a TERMINAL (succeeded/

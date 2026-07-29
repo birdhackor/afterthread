@@ -3128,8 +3128,8 @@ def _resolve_package_dir_no_alias(name: str) -> PackageRoot | None:
     alias/real distinction is erased by that ``resolve()``, so a caller handed
     the result cannot tell it was addressed through an alias, and every
     by-name operation on it silently acts on the REAL package instead
-    (``PATCH /api/tools/alias/summary`` finalizing REAL's sidecar, a regenerate
-    spending an LLM session rewriting REAL's summary). ``set_enabled`` calls
+    (a regenerate spending an LLM session rewriting the summary of REAL's live
+    version, a discard by that name retiring it). ``set_enabled`` calls
     that out at length and hard-blocks it before its own resolve, for exactly
     this reason (see its H3 comment); ``delete_tool`` carries its own variant
     because it has a SAFE alias action (unlink just the link).
