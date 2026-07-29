@@ -17,9 +17,15 @@
 # would have put a large lie in the test harness. 30.0.1 fixes it upstream —
 # measured, four errors to zero. jsdom is a devDependency and never ships.
 #
-# TODO: DELETE THIS FILE once jsdom 30.0.1 is past the cooldown (2026-07-30
-# onward). Nothing else changes — the version stays pinned by pnpm-lock.yaml, and
-# removing this file simply restores the protection for it. Confirm afterwards
-# with `pnpm install --frozen-lockfile`.
+# TODO: DELETE THIS FILE once jsdom 30.0.1 is past the cooldown. The cooldown is
+# 24 hours from publication, so that is **2026-07-30T04:18Z (12:18 CST)** — an
+# earlier version of this note said only "2026-07-30 onward", and deleting the
+# file at 00:21 CST made `pnpm install --frozen-lockfile` refuse the lockfile
+# outright. Removing it too early breaks installs; there is no partial state.
+#
+# Nothing else changes when the time comes — the version stays pinned by
+# pnpm-lock.yaml, so deleting this file cannot downgrade anything. Confirm with
+# `pnpm install --frozen-lockfile`, which is exactly the command that fails while
+# the exclusion is still needed.
 minimumReleaseAgeExclude:
   - jsdom@30.0.1
