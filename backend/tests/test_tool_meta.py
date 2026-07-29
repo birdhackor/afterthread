@@ -19,6 +19,7 @@ process-wide singletons, so an autouse fixture resets them around every test.
 """
 
 import asyncio
+import errno
 import json
 import os
 import sys
@@ -652,12 +653,27 @@ def test_user_prompt_scrubs_a_non_utf8_filename_header(
     (``b"note-\\xff.txt"``); ``os.walk`` decodes that name through the OS's own
     surrogateescape convention into a ``str`` carrying a LONE surrogate, which no
     substring-based mask touches and which a strict UTF-8 encode (what the LLM
-    request ultimately performs) refuses outright."""
+    request ultimately performs) refuses outright.
+
+    Whether such a name can EXIST is a property of the filesystem, not of POSIX:
+    ext4 stores filenames as opaque bytes, while APFS/HFS+ enforce valid UTF-8 and
+    reject this one with EILSEQ at creation. So the skip below is derived by
+    ATTEMPTING the fixture rather than by naming a platform -- a UTF-8-enforcing
+    mount under Linux would refuse it too, and a hard-coded ``!= "darwin"`` would
+    then fail for a reason that has nothing to do with the OS. Where the name
+    cannot be created the hazard cannot arise either, so skipping loses no
+    coverage; only EILSEQ is treated this way, and every other OSError still
+    fails the test."""
     root = tmp_path / "tools"
     pkg = _package(root)
     _summary_settings(monkeypatch, root)
     raw_name = b"note-\xff.txt"
-    fd = os.open(os.fsencode(pkg) + b"/" + raw_name, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fd = os.open(os.fsencode(pkg) + b"/" + raw_name, os.O_WRONLY | os.O_CREAT, 0o600)
+    except OSError as exc:
+        if exc.errno != errno.EILSEQ:
+            raise
+        pytest.skip(f"filesystem refuses non-UTF-8 filenames ({exc.strerror})")
     os.write(fd, b"hello\n")
     os.close(fd)
     decoded_name = os.fsdecode(raw_name)
