@@ -1,8 +1,13 @@
 // @vitest-environment jsdom
 
 import { fireEvent, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, it, type Mock, vi } from "vitest";
-import { apiDelete, apiPatch, apiPost } from "../api/client.js";
+import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
+import {
+	type ApiJsonRequestOptions,
+	apiDelete,
+	apiPatch,
+	apiPost,
+} from "../api/client.js";
 import { SECTION_FIELD_KEYS } from "../constants/sections.js";
 import { renderWithAppProviders } from "../test/render.js";
 import { expectOnlyWriteCall } from "../test/writeCalls.js";
@@ -14,8 +19,11 @@ vi.mock("../api/client.js", () => ({
 	apiPost: vi.fn(),
 }));
 
-type MockApiOptions = {
-	body?: unknown;
+type ItemCreateOptions = ApiJsonRequestOptions<"/api/items", "post">;
+type MockApiOptions = Omit<ItemCreateOptions, "body"> & {
+	// OpenAPI marks fields with backend defaults as required, while this form
+	// intentionally lets the backend supply source/confidence.
+	body: Partial<ItemCreateOptions["body"]>;
 };
 
 const mockedApiPost = vi.mocked(apiPost) as unknown as Mock<
@@ -34,14 +42,66 @@ describe("ItemNewPage create request", () => {
 		}
 	});
 
+	it("keeps the section fields on the canonical API wire names", () => {
+		// This oracle is intentionally literal and independent of SECTION_GROUPS.
+		// Never tidy it into a loop over the shared production constant: a typo
+		// there must make this test fail instead of changing both sides together.
+		expect(SECTION_FIELD_KEYS).toEqual([
+			"snapshot",
+			"why_matters",
+			"known",
+			"inferred",
+			"unknown",
+			"decisions",
+			"alternatives",
+			"rationale",
+			"consequences",
+			"constraints",
+			"assumptions",
+			"risks",
+			"evidence",
+			"open_questions",
+			"next_actions",
+			"recovery_keywords",
+			"recovery_people",
+			"recovery_files",
+			"resume_trigger",
+		]);
+	});
+
 	// Full-form Mantine mounts approach Vitest's 5 s default under parallel
 	// jsdom load; waitFor keeps the request assertion's own deadline short.
 	it("posts the complete form payload to the item collection", async () => {
 		const createdItemId = 37;
 		const title = `第 ${createdItemId} 號手動項目`;
-		const emptySections = Object.fromEntries(
-			SECTION_FIELD_KEYS.map((key) => [key, ""]),
-		);
+		const snapshot = "這是唯一一份快照內容";
+		const expectedOptions = {
+			body: {
+				title,
+				status: "capture-quick",
+				stage: "quick",
+				tags: [],
+				snapshot,
+				why_matters: "",
+				known: "",
+				inferred: "",
+				unknown: "",
+				decisions: "",
+				alternatives: "",
+				rationale: "",
+				consequences: "",
+				constraints: "",
+				assumptions: "",
+				risks: "",
+				evidence: "",
+				open_questions: "",
+				next_actions: "",
+				recovery_keywords: "",
+				recovery_people: "",
+				recovery_files: "",
+				resume_trigger: "",
+			},
+		} satisfies MockApiOptions;
 		mockedApiPost.mockImplementation(() => new Promise(() => {}));
 		renderWithAppProviders(<ItemNewPage />, {
 			initialEntries: ["/items/new"],
@@ -49,20 +109,15 @@ describe("ItemNewPage create request", () => {
 
 		const titleInput = await screen.findByRole("textbox", { name: "標題" });
 		fireEvent.change(titleInput, { target: { value: `  ${title}  ` } });
+		fireEvent.change(screen.getByPlaceholderText("捕捉快照"), {
+			target: { value: snapshot },
+		});
 		fireEvent.click(screen.getByRole("button", { name: "建立" }));
 
 		await waitFor(() => {
 			expectOnlyWriteCall(writeApiMocks, mockedApiPost, [
 				"/api/items",
-				{
-					body: {
-						title,
-						status: "capture-quick",
-						stage: "quick",
-						tags: [],
-						...emptySections,
-					},
-				},
+				expectedOptions,
 			]);
 		});
 	}, 10_000);

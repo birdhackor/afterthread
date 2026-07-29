@@ -22,9 +22,8 @@ import {
 
 describe("toolSummaryQueryKey / toolSummaryKeyPrefix", () => {
 	it("folds the canonical version identity in after the name", () => {
-		const instanceKey = toolInstanceKey("kb_search", "20260728T010203Z-abc123");
 		expect(toolSummaryQueryKey("kb_search", "20260728T010203Z-abc123")).toEqual(
-			["tool-summary", "kb_search", instanceKey],
+			["tool-summary", "kb_search", '["kb_search","20260728T010203Z-abc123"]'],
 		);
 	});
 
@@ -40,11 +39,14 @@ describe("toolSummaryQueryKey / toolSummaryKeyPrefix", () => {
 	});
 
 	it("separates two versions of the same tool", () => {
-		expect(toolSummaryQueryKey("kb", "20260728T010203Z-abc123")).not.toEqual(
-			toolSummaryQueryKey("kb", "20260728T020304Z-def456"),
-		);
+		const versionV = toolSummaryQueryKey("kb", "20260728T010203Z-abc123");
+		const versionP = toolSummaryQueryKey("kb", "20260728T020304Z-def456");
+		expect(versionV).not.toEqual(versionP);
 		// ...and the prefix still gathers both, which is what delete must clear.
-		expect(toolSummaryKeyPrefix("kb")).toEqual(toolSummaryKeyPrefix("kb"));
+		const prefix = toolSummaryKeyPrefix("kb");
+		expect(prefix).toEqual(["tool-summary", "kb"]);
+		expect(versionV.slice(0, prefix.length)).toEqual(prefix);
+		expect(versionP.slice(0, prefix.length)).toEqual(prefix);
 	});
 });
 
@@ -74,7 +76,7 @@ describe("Invariant H — all instance consumers share current_vid", () => {
 
 	it("returns row, summary-cache and job attribution from one function", () => {
 		const identity = toolIdentityConsumers("kb", "20260728T010203Z-abc123");
-		const canonical = toolInstanceKey("kb", "20260728T010203Z-abc123");
+		const canonical = '["kb","20260728T010203Z-abc123"]';
 
 		expect(identity).toEqual({
 			rowKey: canonical,
@@ -89,11 +91,12 @@ describe("Invariant H — all instance consumers share current_vid", () => {
 	it("separates two different names, and is stable for equal inputs", () => {
 		const vid = "20260728T010203Z-abc123";
 		expect(toolInstanceKey("a", vid)).not.toBe(toolInstanceKey("b", vid));
-		expect(toolInstanceKey("kb", vid)).toBe(toolInstanceKey("kb", vid));
+		expect(toolInstanceKey("kb", vid)).toBe('["kb","20260728T010203Z-abc123"]');
 	});
 
 	it("normalizes a missing current vid for the unresolved row", () => {
-		expect(toolInstanceKey("kb", null)).toBe(toolInstanceKey("kb", undefined));
+		expect(toolInstanceKey("kb", null)).toBe('["kb",null]');
+		expect(toolInstanceKey("kb", undefined)).toBe('["kb",null]');
 	});
 });
 
