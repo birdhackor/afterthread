@@ -1760,12 +1760,9 @@ def test_previous_absent_null_and_vid_have_distinct_runtime_and_migration_meanin
     second_origin = json.loads(second_origin_path.read_text(encoding="utf-8"))
     second_origin["previous"] = first_vid
     second_origin_path.write_text(json.dumps(second_origin), encoding="utf-8")
-    package_root = tools.PackageRoot(package)
-    expected = tools.resolve_current(package_root)
-    assert isinstance(expected, tools.Resolved)
-    assert tools.publish_current(package_root, second_vid, expected)
+    assert tools.publish_current(tools.PackageRoot(package), second_vid)
 
-    real_vid = tools.resolve_current(package_root)
+    real_vid = tools.resolve_current(tools.PackageRoot(package))
     assert isinstance(real_vid, tools.Resolved)
     assert isinstance(real_vid.previous, tools.PreviousValue)
     assert real_vid.previous.value == first_vid

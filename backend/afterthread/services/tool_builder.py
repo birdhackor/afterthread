@@ -1601,15 +1601,10 @@ def _promote_staging(
     # package-level pointer is allowed to name this version.
     if not _fsync_tree(version) or not _fsync_directory(versions):
         return None, _ERROR_DURABILITY
-    staging_package = tools._staging_package_root_for_install_assembly(shell_root)
-    if not tools.write_package_state(staging_package, True):
+    package_layout = tools.PackageLayoutRoot(shell_root)
+    if not tools.write_package_state(package_layout, True):
         return None, _ERROR_INSTALL_STATE_WRITE
-    publication = tools.publish_staging_current(staging_package, vid)
-    if (
-        not publication
-        or publication.current_identity is None
-        or publication.destination_origin_identity is None
-    ):
+    if not tools.publish_current(package_layout, vid):
         return None, _ERROR_CURRENT_WRITE
     if secret_name and secret_value:
         inject_error = _inject_secret_into_env(shell_root / ".env", secret_name, secret_value)
@@ -1635,8 +1630,6 @@ def _promote_staging(
         tools.VersionRoot(target / tools._VERSIONS_DIRNAME / vid),
         vid,
         tools.PREVIOUS_NULL,
-        publication.current_identity,
-        publication.destination_origin_identity,
     )
     if not _fsync_directory(base):
         return None, _ERROR_DURABILITY
@@ -1736,24 +1729,13 @@ def _publish_revised_version(
         # version entry but left that rename+fsync gap free for a D21 hand edit
         # that publication would overwrite. Check the manifest fact first, then
         # resolve ``current`` LAST so no other filesystem read sits between the
-        # pointer answer and publish_current. This caller-side guard is not the
-        # final guard: publish_current repeats both current and lineage after its
-        # temp file fsync, immediately before replacing the pointer.
+        # pointer answer and publish_current.
         if tools.package_identity(previous.version_root) != expected_identity:
             return None, _ERROR_REVISE_TARGET_REPLACED
         current = tools.resolve_current(package_root)
-        if (
-            isinstance(current, tools.Unresolved)
-            or current.vid != previous.vid
-            or current.previous != previous.previous
-        ):
+        if isinstance(current, tools.Unresolved) or current.vid != previous.vid:
             return None, _ERROR_REVISE_TARGET_REPLACED
-        publication = tools.publish_current(package_root, vid, previous)
-        if (
-            not publication
-            or publication.current_identity is None
-            or publication.destination_origin_identity is None
-        ):
+        if not tools.publish_current(package_root, vid):
             return None, _ERROR_CURRENT_WRITE
         # Construct the typed target from the exact directory just renamed and
         # vid just published. Re-resolving by package name here or in the summary
@@ -1763,8 +1745,6 @@ def _publish_revised_version(
             published_version,
             vid,
             tools.PreviousValue(previous.vid),
-            publication.current_identity,
-            publication.destination_origin_identity,
         )
         return _PublishedRevision(published, origin), None
     return None, _ERROR_VERSION_ID_WRITE
