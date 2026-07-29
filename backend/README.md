@@ -464,7 +464,8 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   指示」，不是程式碼在幫你圍出一個對抗式安全沙箱。安裝指示文字（作為提示）與
   工具呼叫參數的摘要／預覽（約前 200 字元）都會進 AI 日誌（見上方
   `LLM_LOG_FILE`，兩者同樣受 `LLM_LOG_BODY_MAX_CHARS` 逐則截斷），而指示文字
-  還會被存進側檔的 `origin` 供之後的修訂 session 使用——**打進 `instructions`
+  還會被存進該版本自己的 `versions/<vid>/.afterthread.meta/origin.json` 供之後的
+  修訂 session 使用——**打進 `instructions`
   的東西一律當成「模型看得到、日誌留得住」處理**。憑證因此走
   `secret_name`／`secret_value` 這對欄位（下一條），不是寫進指示：貼在指示裡的
   值在它還不是「已知秘密」的那一刻就落地了，遮蔽器事後補登記救不回既有紀錄。

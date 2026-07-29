@@ -398,18 +398,18 @@ function ToolSummaryPanel({
 					loading={isRegenerating}
 					// NOT gated by an in-flight 啟用 toggle any more, and the gate that
 					// stood here is worth naming because its reasoning was sound until P1
-					// (R7-2): POST .../summary/regenerate resolves the package and
-					// captures its manifest identity up front
-					// (tool_meta.regenerate_summary -> _resolve_package), then awaits a
-					// whole LLM round trip before the sidecar write re-checks that
-					// identity -- and PATCH /api/tools/{name} used to rewrite tool.json in
-					// place to flip `enabled`, MOVING it, so a toggle landing inside the
-					// round trip turned a finished generation into 404「工具不存在」.
+					// (R7-2): POST .../summary/regenerate captured a manifest identity up
+					// front, then awaited a whole LLM round trip before the write
+					// re-checked it -- and PATCH /api/tools/{name} used to rewrite
+					// tool.json in place to flip `enabled`, MOVING it, so a toggle landing
+					// inside the round trip turned a finished generation into 404
+					// 「工具不存在」.
 					// web-v5 P1 moved the toggle out of the manifest; it now lives in the
-					// package's own .afterthread.meta/state.json.
-					// tools.set_enabled never opens tool.json, so the identity
-					// tool_meta._store_meta re-checks (tools._write_package_file_atomic ->
-					// _still_the_expected_package) cannot be moved by a switch at all.
+					// package's own .afterthread.meta/state.json, and tools.set_enabled
+					// never opens tool.json. The chain is now router-resolves-`Resolved` ->
+					// regenerate_summary(name, resolved) -> a write guarded by the
+					// VersionRoot's OWN manifest identity, so what the write protects is
+					// version-level and a package-level switch cannot move it.
 					// Nothing is left for that term to prevent.
 					disabled={writesBlocked}
 					onClick={onRegenerate}

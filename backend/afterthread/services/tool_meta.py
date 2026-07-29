@@ -404,7 +404,8 @@ def _summary_user_prompt(
 
     EVERY piece is redacted on its UNTOUCHED text, before any strip or cut.
     ``origin`` is what the install captured (the OpenAPI URL and the user's
-    instructions -- neither is persisted anywhere else), and ``builder_summary``
+    instructions, read back from the version's own immutable ``origin.json``),
+    and ``builder_summary``
     is the builder's own report of what it did; both are CONTEXT for reading the
     files, capped tightly (``_CONTEXT_CAP``) so they can never displace the files
     themselves -- the cap bounds their SIZE, the ordering bounds what they can

@@ -2016,12 +2016,13 @@ async def run_install(
             )
         assert published is not None
         # D40: the package is INSTALLED as of the line above -- everything from
-        # here on is decoration. Generate its AI summary sidecar while we still
-        # hold the install's context (the OpenAPI url and instructions are
-        # captured NOWHERE else, so this is the only chance to persist them for
-        # a later revise session -- which is why the hook writes them to disk
-        # BEFORE its own LLM round trip rather than only after it, see
-        # ``generate_and_store_summary``), and while the in-flight secret is still
+        # here on is decoration. Generate the version's AI summary while we still
+        # hold the install's context. Provenance itself is NOT at stake here: the
+        # OpenAPI url and instructions were already written into the version's own
+        # ``origin.json`` by ``_promote_staging`` before ``current`` named it (see
+        # ``write_origin_meta``), so a later revise session reads them from there
+        # whatever this hook does. What this placement buys is the summary's
+        # quality and its redaction: the in-flight secret is still
         # registered, so the summary is redacted against it as well as against
         # the now-installed .env. ``generate_and_store_summary`` cannot raise
         # (see tool_meta): a summary that fails must never flip this outcome.
@@ -2718,8 +2719,10 @@ _TASKS: set[asyncio.Task[None]] = set()
 
 # The SYNCHRONOUS side of the same single-flight (R7-3). A summary regenerate is
 # not a job -- it lives inside one request -- but it spans a full LLM round trip
-# during which it reads a package and then writes that package's sidecar, so it
-# occupies the admission domain for exactly the same reason a job does. A token
+# during which it reads the request-validated version and then writes THAT
+# version's ``summary.json``, so it occupies the admission domain for the same
+# reason a job does: a revise let through meanwhile publishes a newer version and
+# moves ``current``, leaving this paid-for summary on one no longer live. A token
 # per holder rather than a flag: release names the reservation it took, so it can
 # never drop somebody else's, and the set needs no ``global`` to mutate.
 _SYNC_OPS: set[str] = set()
@@ -2985,7 +2988,8 @@ def any_job_active() -> bool:
     exactly as much as a job.
 
     It reports True for a held reservation as well as for a job, since both mean
-    "a package directory or its sidecar is being written by something else".
+    "something else is writing this package tree" -- a job installs a package or
+    publishes a new version into one, a reservation writes one version's summary.
     """
     with _JOBS_LOCK:
         return _single_flight_held()
