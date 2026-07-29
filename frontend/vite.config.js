@@ -4,6 +4,10 @@ import { defineConfig } from "vite";
 // https://vite.dev/config/
 export default defineConfig({
 	plugins: [react()],
+	test: {
+		// Keep pure unit tests in Node; component files opt into jsdom explicitly.
+		environment: "node",
+	},
 	server: {
 		proxy: {
 			"/api": {

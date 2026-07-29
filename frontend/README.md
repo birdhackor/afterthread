@@ -25,7 +25,7 @@ pnpm build         # production build 到 dist/
 pnpm preview       # 本機預覽 production build（見下方「已知限制」）
 pnpm lint          # biome check .
 pnpm format        # biome check --write .（自動修正）
-pnpm test          # vitest run（單元測試，node 環境、無 jsdom）
+pnpm test          # vitest run（純函式測試用 node；元件測試逐檔使用 jsdom）
 pnpm typecheck     # 僅檢查已撰寫的 .ts；既有 .js/.jsx 暫不做語意型別檢查
 ```
 
@@ -41,6 +41,39 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
 即因此在 preview 階段只驗證 SPA 外殼有被正確提供，不透過 preview 打任何 API；細節
 見 `e2e/README.md`）。開發時請用 `pnpm dev`，其代理設定與 `pnpm preview` 相同但通
 常搭配本機真的跑在 8000 埠的後端。
+
+## 元件測試
+
+元件測試使用 jsdom、React Testing Library 與
+`src/test/render.tsx` 的 `renderWithAppProviders`。測試檔使用
+`.test.tsx`，並在第一行加上：
+
+```tsx
+// @vitest-environment jsdom
+```
+
+Vitest 的全域預設仍明確設為 `node`；只有帶上述 pragma 的檔案才建立 DOM，既有純函式
+測試不會載入 jsdom。測試從 `@testing-library/react` 使用 `screen`／`waitFor`，
+互動則用 `@testing-library/user-event` 的 `userEvent.setup()`，不要直接呼叫 DOM
+元素的 `.click()`。
+
+`renderWithAppProviders` 依 `src/main.jsx` 的實際組裝提供
+`MantineProvider`、`Notifications`、每次 render 獨立的
+`QueryClientProvider`，以及使用 memory history 的 `RouterProvider`。測試 helper
+刻意不加 `StrictMode`，避免每個 smoke／行為規格都被開發期 double mount 混淆；也
+不加 jotai `Provider`，因為正式 app 明確使用 jotai default store。helper
+另補 jsdom 本身沒有、但 Mantine mount 時會讀取的 `matchMedia` 與
+`document.fonts`；兩者只提供事件介面的 no-op，不模擬 layout 或字型載入結果。
+API 一律 mock `src/api/client.ts`，mock response 則以產生的 schema 型別檢查，例如：
+
+```tsx
+import type { ApiSuccessResponse } from "../api/client.js";
+
+type ToolListResponse = ApiSuccessResponse<"/api/tools", "get">;
+const response = {
+	tools: [],
+} satisfies ToolListResponse;
+```
 
 ## API schema 型別
 
@@ -140,8 +173,8 @@ diff 時失敗。
   展開（`@mantine/core` 的 `Collapse` + `useDisclosure`，零新依賴，比照 D38
   選用 Mantine 內建元件的理由；每列獨立展開，不像 `LlmLogsPage` 的 Accordion
   同時間只開一項；展開 prop 是 `Collapse` 自己的 `expanded`，**不是** React
-  Transition Group 的 `in`——寫錯只會被靜默吞進 `...others`，見下面「沒有 jsdom」
-  那條），總結內容以 `enabled: expanded` 延遲讀取（比照
+  Transition Group 的 `in`——寫錯只會被靜默吞進 `...others`，見下面「jsdom
+  元件測試」那條），總結內容以 `enabled: expanded` 延遲讀取（比照
   `LlmLogsPage.LogDetailPanel`，收合的列從不打 API）。
 - **`ToolsPage` 的 per-row 閘：啟用開關 ⇄ 進行中的修訂／重新產生——web-v5 P1
   之後已經拆掉**。這一條留著是因為它同時記著「當初為什麼需要」與「現在為什麼不
@@ -249,8 +282,8 @@ diff 時失敗。
   列的 `toolInstanceKey`、面板自己的忙碌旗標 `ownSummaryBusy`、詳情的「只在已存在
   時寫」updater `writeSummaryDetailIfPresent`、失敗要不要重讀的判準
   `summaryErrorRevalidates`），因為那與「安裝」無關，硬塞
-  進前者的檔名只會誤導之後的讀者——這個專案的 vitest 在 node 環境跑、沒有
-  jsdom，元件本身測不到，抽出的純函式是唯一能自動化驗證的介面，所以新邏輯一律
+  進前者的檔名只會誤導之後的讀者。這些純邏輯仍留在 node 環境的快速單元測試；
+  需要驗證元件組裝與互動時，另以逐檔 jsdom 測試搭配共用 render helper。新邏輯一律
   先問「這算安裝，還是總結」再決定放哪個檔案。**唯一的例外寫在
   `toolSummary.js` 的最後一節**：AI 日誌深連結的**兩半**（`工具` 頁產生連結的
   `logLinkSearch`、`AI 日誌` 頁解讀連結的 `deepLinkTarget`）刻意放在同一個檔案，
@@ -267,12 +300,11 @@ diff 時失敗。
   token 的連結維持原本行為**（`工具` 頁總結面板的連結就是這種：後端在**回應當下**
   就把非本行程的 `llm_log_id` 改成 `null`，所以它不需要也無從提出主張；使用者自己
   存下來的網址同理——「說不出來」不可以被講成「我確定它過期了」）。
-- **沒有 jsdom ⇒ 寫錯的 prop 名稱沒有任何閘門擋得住**：`pnpm lint`（Biome）不做
-  型別檢查、`pnpm build`（Vite）只轉譯不檢型別、`pnpm test`（vitest）在 node 環境
-  下完全不 render 元件。一個拼錯的 Mantine prop 是合法 JS／合法 JSX，會被靜默
-  spread 進 `...others`，三個閘門依然全綠而功能是零（P4 的
-  `<Collapse in={…}>` 就是這樣讓整個 AI 總結面板從未打開過）。改動 Mantine 元件的
-  props 時，唯一可靠的驗證是**對照安裝版原始碼**——
+- **jsdom 元件測試補上渲染行為閘門**：`pnpm lint`（Biome）不做
+  型別檢查、`pnpm build`（Vite）只轉譯不檢型別；一個拼錯的 Mantine prop 仍是合法
+  JS／合法 JSX，會被靜默 spread 進 `...others`（P4 的
+  `<Collapse in={…}>` 就是這樣讓整個 AI 總結面板從未打開過）。現在可用逐檔 jsdom
+  元件測試斷言實際展開／互動結果；改動 Mantine 元件 props 時仍要先**對照安裝版原始碼**——
   `node_modules/@mantine/core/lib/components/<Name>/<Name>.d.ts` 的介面宣告，或
   `esm/.../<Name>.mjs` 的解構，style props 則見
   `lib/core/Box/style-props/style-props.types.d.ts`。憑記憶或憑線上文件都不算。
