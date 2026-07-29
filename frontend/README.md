@@ -53,8 +53,8 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
 | `/items/new` | `ItemNewPage` | 手動新增項目的表單頁（沿用 `ItemForm` 元件）。 |
 | `/items/$itemId` | `ItemDetailPage` | 單筆項目詳情：完整欄位、progress 歷史（可追加一筆）、狀態/階段快速修改、`ItemAiActions` 提供的「AI 補齊」（enrich）／「AI 進度更新」（assist-update）兩個操作、刪除。 |
 | `/items/$itemId/edit` | `ItemEditPage` | 手動編輯項目的表單頁（沿用 `ItemForm` 元件）。 |
-| `/tools` | `ToolsPage` | 「已安裝工具」（清單／啟停／刪除）與「安裝新工具」（貼 OpenAPI JSON 網址 + 指示，AI 背景建置、輪詢進度）兩個分頁；細節見根目錄 README「KB 工具安裝指南」。 |
-| `/llm-logs` | `LlmLogsPage` | AI 日誌：呼叫 `GET /api/llm/logs` 列出最近的 LLM 互動，每筆可展開讀取 `GET /api/llm/logs/{id}` 取得的請求/回應內容（每則受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；支援 `?log=<id>` 深連結自動展開（`工具` 頁的安裝結果會連過來）。 |
+| `/tools` | `ToolsPage` | 「已安裝工具」（清單／啟停／刪除，每列可展開讀取／重新產生 AI 總結，並可提意見送出 AI 修訂）與「安裝新工具」（貼 OpenAPI JSON 網址 + 指示，AI 背景建置、輪詢進度）兩個分頁；細節見根目錄 README「KB 工具安裝指南」。 |
+| `/llm-logs` | `LlmLogsPage` | AI 日誌：呼叫 `GET /api/llm/logs` 列出最近的 LLM 互動，每筆可展開讀取 `GET /api/llm/logs/{id}` 取得的請求/回應內容（每則受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；支援 `?log=<id>` 深連結（`工具` 頁的安裝／修訂結果會連過來）：在清單裡就自動展開該列，不在清單裡（比最近 50 筆更舊）就直接向詳情端點取那一筆、單獨顯示在清單上方，真的被擠出保留區才說明它已經不在；連結若標明自己來自**另一個**後端行程（`?logProcess=`，見下方慣例）則一律不展開，只說明編號已被重新配發。 |
 | （其他） | `NotFoundPage` | 404 fallback（router 的 `defaultNotFoundComponent`）。 |
 
 ## 慣例
@@ -97,3 +97,163 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   開關才會跟對應的 mutation 落在同一個 render，不晚一拍。（`@mantine/hooks` 的
   `useDisclosure` 在這個頁面上是用來控制刪除確認 Modal 的開關，與這個
   mutation gate 是兩回事。）
+- **`ToolsPage` 的跨分頁 busy gate（D40）**：後端的工具任務（安裝、AI
+  修訂）與同步的「重新產生總結」共用同一個全域 single-flight，任一個進行中都會
+  讓其他兩者收到 409。`ToolsPage` 的兩個分頁（`InstalledToolsPanel`／
+  `InstallPanel`）常駐掛載且維持 effect 存活：`Tabs` 除了 Mantine 預設就開的
+  `keepMounted`，還額外指定 `keepMountedMode="display-none"`——Mantine 另一個
+  預設值 `"activity"` 會把非現用分頁的內容包進 React 的 `Activity`
+  （`mode="hidden"`），隱藏時保留元件 state 但拆掉 effect，等於讓被切走那一
+  分頁的 react-query 輪詢與這裡的 `onBusyChange` effect 一起靜默停擺（細節與
+  Mantine 原始碼引用見 `ToolsPage` 該 prop 上方的註解）；`display-none` 改用
+  純 CSS `display: none` 隱藏未啟用分頁，兩分頁的 effect 因此永遠跟現用分頁
+  一樣持續運作。兩分頁各自把自己算出的忙碌旗標經
+  `onBusyChange` 回報給 `ToolsPage`，再以 `externalBusy` 傳回給對方，讓一個分頁
+  的任務進行中時，另一分頁的送出控制項也會停用——純粹是本地端對後端那個
+  single-flight 的樂觀鏡像（只涵蓋這個分頁實例自己送出/得知的任務），後端仍是
+  權威，鏡像沒接住的競態（例如另一個瀏覽分頁送出的任務）一樣會用既有的
+  結構化 409（版本寫入為 `job_busy`；安裝送出維持 `install_in_progress`）接住。
+  **分頁往上報的只能是它第一手知道的
+  忙碌**（`ownSummaryBusy`），絕不可把收到的 `externalBusy` 折進去再報回對方——那
+  會讓鏡像回聲，安裝表單自己送出的那段窗口會被自己指控成「另一分頁有 AI
+  任務正在進行中」；本地的閘（自己的 ＋ 對方的）才是疊加的那一層。每個工具列的
+  AI 總結面板走 inline
+  展開（`@mantine/core` 的 `Collapse` + `useDisclosure`，零新依賴，比照 D38
+  選用 Mantine 內建元件的理由；每列獨立展開，不像 `LlmLogsPage` 的 Accordion
+  同時間只開一項；展開 prop 是 `Collapse` 自己的 `expanded`，**不是** React
+  Transition Group 的 `in`——寫錯只會被靜默吞進 `...others`，見下面「沒有 jsdom」
+  那條），總結內容以 `enabled: expanded` 延遲讀取（比照
+  `LlmLogsPage.LogDetailPanel`，收合的列從不打 API）。
+- **`ToolsPage` 的 per-row 閘：啟用開關 ⇄ 進行中的修訂／重新產生——web-v5 P1
+  之後已經拆掉**。這一條留著是因為它同時記著「當初為什麼需要」與「現在為什麼不
+  需要」，照舊文重構的人才不會把鎖裝回去。舊理由是 per-row 的檔案系統競態：
+  `PATCH /api/tools/{name}` 會原地改寫該套件的 `tool.json`，而修訂 session 與
+  同步的「重新產生總結」都是以 `tool.json` 的 `(st_dev, st_ino, st_ctime_ns)`
+  當「還是同一個套件嗎」的身分、在一整趟 LLM 往返之後才重驗——所以一次切換會讓
+  整場修訂作廢（「原工具在修訂期間被改動或重新安裝」）、或讓一趟總結往返換到
+  404。web-v5 把 `enabled` 搬進套件自己的 `.afterthread.meta/state.json`，
+  `tools.set_enabled` 從此**完全不開任何版本的 `tool.json`**，而修訂只新增
+  `versions/<vid>` 再切換 `current`，不再替換套件層。因此 state 根本不需要
+  搬運或發布鎖：toggle 與版本發布各改自己的名字，
+  互不覆蓋。因此：**該列的 `Switch` 不再看修訂／重新產生，兩個 AI 寫入也不再看該列的
+  toggle**（`onRegenerate` 裡那個重檢一起拿掉——`disabled` 只是渲染，閘與重檢必須
+  同進同退）。使用者拿回來的是：修訂／重新產生跑到一半才決定「這個工具該關掉」時，
+  現在按得下去。`Switch` 還留著的兩個條件跟身分無關、各自成立：`!tool.valid`
+  （無效套件本來就不會被端給模型，開關對它沒有意義）與 `mutating`（同一列已有
+  PATCH／DELETE 在飛，那是重複送出的問題）。**刪除**一樣不受修訂管制（由後端的
+  目標不存在拒絕回答，且它走自己的確認 Modal）。
+- **`ToolsPage` 的兩個工作查詢在終局後會關掉自己**：`enabled` 用
+  `toolJobQueryEnabled(jobId)`（函式型 `enabled`），跟停止輪詢的
+  `toolJobRefetchInterval` 共用同一條規則。只停輪詢不夠：app 的 query 預設是
+  `refetchOnWindowFocus: true` ＋ `staleTime: 5s`，`enabled` 留著 true 的查詢會在
+  每次視窗對焦重打，而後端工作表是行程內有界的，於是幾分鐘後一張「修訂完成」會被
+  換成 404 錯誤卡。
+- **真實版本身分取代 `name + description` 代理**：`GET /api/tools` 現在提供
+  `current_vid`，所以 `toolInstanceKey(name, currentVid)` 與
+  `toolSummaryQueryKey(name, currentVid)` 不再猜測。舊代理在 discard 前後兩版
+  description 相同時不會 remount，寫給 V 的修訂草稿就可能被送給 P；vid 直接表達
+  畫面所描述的版本，才關得掉這個單一分頁內就能發生的錯誤。
+- **版本身分的三個消費端一起移動**：`toolIdentityConsumers` 從同一把
+  `name + current_vid` 身分一次產生列的 React key、summary query key 與修訂工作卡
+  歸屬。身分一變就 remount、清掉列內草稿；總結不跨版本重用；工作卡留在送出時的
+  版本，若該列消失就移到 panel 層顯示。這裡是**三個**完整消費端：以前所稱的第四個
+  是「定版」寫入排序 ledger，已隨功能移除，不能為了維持數字留一份無人讀的 state。
+  重新讀取（invalidate／removeQueries）用名稱前綴——它只是叫伺服器再答一次，
+  只可能拿到當下的答案，涵蓋得寬鬆才是保守方向。
+  按名稱比對只剩 loading 指示；決定「卡片屬於哪一列」一律用實例身分。
+- **name-addressed summary GET 也要驗版本**：query key 含 vid 還不夠，因為請求送出
+  時 V 是 current、後端真正解析時可能已切到 P。`ToolSummaryDetail.current_vid`
+  是後端實際讀到的版本；`acceptSummaryForVersion` 不符就 throw，不把 payload
+  交給 TanStack Query，避免 P 的內容寫進 V 的 cache。
+- **所有版本寫入都帶 optimistic identity**：revise 與 regenerate body 帶
+  `expected_vid`，discard path 帶 vid。前端 key 只保護本分頁的畫面，保護不了另一
+  分頁或終端機改動 `current`；後端在取得 global slot 後比對，才保證不會對已不是
+  畫面那一版的程式花掉一場 LLM 或切錯 pointer。`versionWritesBlocked` 同時管
+  regenerate／revise／discard，在 list 已知 stale、正在 refetch、single-flight busy
+  或 job 終局重讀尚未落地時停用；讀取、toggle 與整包刪除仍可用。
+- **lineage 控制是三態**：`sole` 顯示「丟掉這一版」但走既有整包刪除確認；
+  `usable` 提供輕量的「丟掉並退回」確認；`broken` 不送 discard，顯示前一版缺失／
+  無效／自指與整包刪除的補救。若 `current_vid=null`，那是 unresolved row：
+  顯示後端原因、隱藏 toggle／summary／revise／regenerate／discard，只留整包刪除；
+  `description` 也可能為 null，不能拿它當身分或假定一定可 render。
+- **權威回應寫進快取前，一定要先取消同一把鍵上在飛的讀**：`setQueryData` 不會動
+  in-flight 的 fetch，所以一個在 mutation 之前因視窗對焦發出、讀到舊值的 GET
+  可以在寫入之後才落地，把畫面翻回舊資料，而且**不會有任何錯誤提示**（那個 GET
+  是成功的）。共用的寫入路徑一律先 `await cancelQueries({queryKey})` 再
+  `setQueryData`。`removeQueries` 不需要這道手續：`queryCache.remove()` 會
+  `query.destroy()` → `cancel({silent: true})`，本來就取消得掉。
+- **寫進快取只能「改已存在的項」，不能「建出新的項」**：`removeQueries` 攔不住
+  已經在飛的請求，所以刪除之後才落地的 regenerate 回應會把剛清掉的項**重建**
+  出來，之後同名同描述的重裝一展開就撞到它。用 query-core 自己的規則解：
+  `setQueryData` 的 updater 回傳 `undefined` 時，它會在 `queryCache.build()` **之前**
+  就 return（`build/modern/queryClient.js` 第 99-101 行），等於「只在已存在時寫」。
+  `writeSummaryDetailIfPresent` 就是這個 updater。
+- **「還有東西看不見」是這頁的一類 bug，不是個案**：清單背景 refetch 失敗時列會
+  留在畫面上（react-query 保留 `data` 只翻 status），必須用非阻擋的橘色 Alert
+  講明清單可能過期；修訂中的工具被刪掉／被同名重裝換掉時，列內的進度卡會跟著
+  消失但輪詢與忙碌閘還在，所以沒有任何一列擁有那個工作時，改由面板層渲染同一張
+  卡（兩個條件是同一把鍵上的互補，卡片永遠恰好顯示一次）。
+- **警告不等於保證：清單已知過期時，版本寫入要真的停用**：清單背景
+  refetch 失敗時列的實例身分跟列本身一樣是過期的，列不會 remount、未送出的修訂
+  意見留著。後端 `expected_vid` 會拒絕錯版，但畫面既然無法知道目前版本，仍不應
+  提供必然可能失敗的動作。所以 `versionWritesBlocked`
+  是**一個值、一個 prop**（`writesBlocked`），同時管「重新產生」與「送出修訂」的
+  `disabled` **和**送出處的提前 return，並延伸到 discard（`disabled` 只是渲染，不是
+  閘），Alert 也要寫明控制項已停用。**讀取不受管制**（展開面板只會 GET）。啟用開關與刪除不納入（意圖本來
+  就是「叫這個名字的工具」，可還原或有確認 Modal，也沒有夾帶為某個實例寫的內容）。
+- **「對著畫面上的內容寫意見」要求畫面是最新的**，所以
+  `displayedMayBeStale` 同時管**修訂意見輸入框與「送出修訂」**。收合的
+  列 query 是 disabled，所以修訂結束時那次 invalidation 沒發出任何 GET 就 resolve 了、
+  settling 閘照樣解除；使用者稍後展開，看到的是**修訂前**的快取總結（有 data、所以
+  沒有 Loader），在那份文字底下寫的意見會被 AI 套到**已經改過**的程式碼上，而那要花掉
+  好幾分鐘的 LLM 重寫。
+  輸入框跟著一起停用而不是只停按鈕：讓人打完一整段才發現按鈕是死的，是同一個拒絕更
+  糟的版本。
+- **三種結構化 409 是三個不同動作**：`version_mismatch` 只重抓列表，讓新的
+  `current_vid` remount 列並清掉草稿；`job_busy` 保留輸入與 discard confirmation，
+  讓操作者稍後重試，不 refetch；`lineage_unavailable` 不重試、不 refetch，把該列
+  本地標成 broken 並顯示整包刪除。分支只看結構化 code，不解析 zh-TW 訊息。
+  其他錯誤中，`404`（工具已不叫這個名字）才重新讀總結與清單；
+  `llm_not_configured`／502／5xx／傳輸失敗沒有證據證明 server state 已移動，刻意
+  不重讀。規則分別在 `versionWriteConflictReaction` 與
+  `summaryErrorRevalidates` 並逐條測試。修訂**工作**是唯一的例外：
+  `ToolJobStatus` 沒有結構化原因、只有一段
+  後端每輪都在改寫的 zh-TW `error` 字串，字串比對是會靜默失效的閘，所以改成「終局
+  轉換（成功或失敗）就重讀」——那是每個工作最多一次、且發生在數分鐘工作之後，不是
+  「每個錯誤都重抓」。
+- **`utils/toolInstall.js` 與 `utils/toolSummary.js` 的分工**：前者是安裝表單
+  驗證（URL／秘密名稱與值）＋工具任務輪詢共用的純函式
+  （`isToolJobActive`／`toolJobRefetchInterval`／`isTerminalToolJobState`——
+  D40 之前只服務安裝工作，現在安裝與修訂共用同一張後端 job 表與同一個輪詢
+  路由，因此改用不含「install」字樣的名稱，並更新了每個呼叫點與測試）；後者
+  是 AI 總結網域的純邏輯（快取鍵 `toolSummaryQueryKey`／`toolSummaryKeyPrefix`／
+  列的 `toolInstanceKey`、面板自己的忙碌旗標 `ownSummaryBusy`、詳情的「只在已存在
+  時寫」updater `writeSummaryDetailIfPresent`、失敗要不要重讀的判準
+  `summaryErrorRevalidates`），因為那與「安裝」無關，硬塞
+  進前者的檔名只會誤導之後的讀者——這個專案的 vitest 在 node 環境跑、沒有
+  jsdom，元件本身測不到，抽出的純函式是唯一能自動化驗證的介面，所以新邏輯一律
+  先問「這算安裝，還是總結」再決定放哪個檔案。**唯一的例外寫在
+  `toolSummary.js` 的最後一節**：AI 日誌深連結的**兩半**（`工具` 頁產生連結的
+  `logLinkSearch`、`AI 日誌` 頁解讀連結的 `deepLinkTarget`）刻意放在同一個檔案，
+  因為它們是同一份約定；拆開的話，發出主張的那一頁和依主張行動的那一頁會各自漂移，
+  而且只有其中一半會有測試（`LlmLogsPage` 因此從這裡 import 它那一半）。
+- **`?log=` 深連結帶著它的行程 token**：AI 日誌的 id 是**每個後端行程各自從 0 開始**
+  的計數器，而 `工具` 頁的工作卡片在工作終局後就停止輪詢、快取無限期留著——分頁跨過
+  一次後端重啟，那張卡片的「查看 AI 日誌」還在，`llm_log_id` 卻已經被重新配發給
+  另一次互動。所以工作回應多帶一個 `llm_log_process`，連結變成
+  `?log=<id>&logProcess=<token>`（`logProcess` 不在 route 的 `validateSearch` 裡，
+  但 TanStack Router 會把解析到的其他 search 併進 match，`useSearch({strict:false})`
+  讀得到——已對安裝版 1.170.17 實測）；`AI 日誌` 頁拿清單回應的 `process_token` 比對，
+  **不符就不展開任何列**，改在清單上方說明這個連結來自先前的後端執行。**沒有帶
+  token 的連結維持原本行為**（`工具` 頁總結面板的連結就是這種：後端在**回應當下**
+  就把非本行程的 `llm_log_id` 改成 `null`，所以它不需要也無從提出主張；使用者自己
+  存下來的網址同理——「說不出來」不可以被講成「我確定它過期了」）。
+- **沒有 jsdom ⇒ 寫錯的 prop 名稱沒有任何閘門擋得住**：`pnpm lint`（Biome）不做
+  型別檢查、`pnpm build`（Vite）只轉譯不檢型別、`pnpm test`（vitest）在 node 環境
+  下完全不 render 元件。一個拼錯的 Mantine prop 是合法 JS／合法 JSX，會被靜默
+  spread 進 `...others`，三個閘門依然全綠而功能是零（P4 的
+  `<Collapse in={…}>` 就是這樣讓整個 AI 總結面板從未打開過）。改動 Mantine 元件的
+  props 時，唯一可靠的驗證是**對照安裝版原始碼**——
+  `node_modules/@mantine/core/lib/components/<Name>/<Name>.d.ts` 的介面宣告，或
+  `esm/.../<Name>.mjs` 的解構，style props 則見
+  `lib/core/Box/style-props/style-props.types.d.ts`。憑記憶或憑線上文件都不算。

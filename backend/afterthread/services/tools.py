@@ -1,56 +1,20 @@
-"""Tool runtime: discover, validate, and execute installed tool packages
-(see D21 in docs/web-v2-decisions.md).
+"""Discover, validate, and execute versioned local tool packages.
 
-A tool package is a directory ``<tools_dir>/<name>/`` holding:
+An installed package owns package-layer ``.env`` and
+``.afterthread.meta/{state.json,current}``; executable content and its
+``origin.json``/``summary.json`` live under ``versions/<vid>/``. ``current`` is
+the only resolver: invalid pointers never guess another version.
 
-* ``tool.json`` -- ``{"name", "description", "parameters", "entry", "enabled"?}``
-  where ``name`` MUST equal the directory name and match
-  ``^[a-z0-9][a-z0-9_-]{0,63}$``, ``description`` is a nonempty string,
-  ``parameters`` is a JSON-Schema object for the arguments, ``entry`` is an argv
-  list (e.g. ``["python3", "run.py"]``), and ``enabled`` (optional, default
-  true) gates whether the tool is advertised to the model;
-* the implementation files ``entry`` runs;
-* an OPTIONAL ``.env`` (``KEY=VALUE`` lines) holding THAT tool's own secrets
-  (e.g. a KB API key), which are injected into the subprocess environment.
-
-Execution contract (``_run_tool_subprocess``): the runner invokes ``entry`` with
-``cwd`` = the tool directory, writes the arguments JSON to the child's STDIN,
-reads STDOUT as the tool result (capped at ``settings.llm_tool_output_max_chars``
-behind a truncation marker), and enforces ``settings.llm_tool_timeout_seconds``
-by killing the child's whole PROCESS GROUP on expiry. A non-zero exit becomes an
-agent-visible ``"tool failed (exit N): <stderr>"`` result -- a failure the model
-can react to, never an exception that 502s the interaction.
-
-SECURITY STANCE (D21, v1). These are the operator's OWN local tools and shell
-capability is an explicit requirement (same nature as a Claude Code skill), so
-v1 does NOT sandbox with a container. What it DOES guarantee:
-
-* the subprocess environment is built FROM SCRATCH -- only PATH/HOME/LANG/LC_ALL/
-  TMPDIR are passed through from the parent, plus the tool's own ``.env``. The
-  parent environment is NEVER inherited wholesale, because it carries
-  ``OPENAI_API_KEY`` (and any other backend secret): a generated, possibly
-  half-trusted tool must not be able to read our LLM credentials out of its own
-  ``os.environ``. This is the single most important guarantee in this module.
-  Be honest about its reach, though: scrubbing prevents ACCIDENTAL leakage (the
-  key is simply not in the child's ``os.environ``), but a same-UID subprocess
-  can in principle read ``/proc/<ppid>/environ`` of the parent, so this is not
-  adversarial isolation -- the real trust boundary is the operator only
-  installing tool instructions they trust (D21), not the scrub;
-* every mutating entry point (``set_enabled`` / ``delete_tool``) validates the
-  name against the package-name regex AND re-checks resolved-path containment
-  under ``tools_dir`` before touching the filesystem, so a traversal name like
-  ``"../.."`` (or a symlinked package escaping the tools dir) can never make us
-  rewrite or ``rmtree`` a path outside the tools directory;
-* runtime and output are bounded (timeout + process-group kill, output cap), so
-  a hung or runaway tool cannot pin the interaction or blow the prompt/log.
-
-Settings-driven, exactly like ``llm_log``: ``tools_dir`` unset ("") means the
-whole feature is OFF -- ``list_tools()`` / ``enabled_llm_tools()`` return empty,
-so the AI workflows advertise no tools and their prompts stay byte-identical to
-the tool-less build.
+Tools are operator-authorized local code, not a sandbox boundary. Child
+environments are nevertheless built from a small allowlist plus the package
+``.env``, and execution has timeout/output bounds. Advertisement captures one
+version identity; a call runs that exact version with its directory as cwd.
 """
 
+from __future__ import annotations
+
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -59,17 +23,23 @@ import shutil
 import signal
 import stat
 import subprocess
+import tempfile
 import threading
 import time
-from collections.abc import Awaitable, Callable
+import weakref
+from collections.abc import Awaitable, Callable, Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Literal
+from uuid import uuid4
 
 from dotenv import dotenv_values
 from starlette.concurrency import run_in_threadpool
 
 from afterthread.config import get_settings
+from afterthread.services import llm_log
 from afterthread.services.llm import LlmTool
 
 # A package (and directory) name: lowercase alnum start, then up to 63 more of
@@ -78,6 +48,15 @@ from afterthread.services.llm import LlmTool
 # the first line of the path-traversal defense, backed by the resolved-path
 # containment check in ``_resolve_package_dir``.
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_VID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$")
+_META_DIRNAME = ".afterthread.meta"
+_VERSIONS_DIRNAME = "versions"
+_CURRENT_FILENAME = "current"
+_PACKAGE_STATE_FILENAME = "state.json"
+_ORIGIN_FILENAME = "origin.json"
+_SUMMARY_FILENAME = "summary.json"
+_CURRENT_MAX_BYTES = 64
+_TOOLS_LOCK_FILENAME = ".afterthread-tools.lck"
 
 # The ONLY parent-environment variables a tool subprocess inherits VERBATIM.
 # Everything else -- above all OPENAI_API_KEY / OPENAI_BASE_URL -- is withheld by
@@ -97,9 +76,9 @@ _PASSTHROUGH_ENV: tuple[str, ...] = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
 _DESCRIPTION_CAP = 1000
 
 # Hard ceiling on the tool.json FILE size. tool.json is re-read on EVERY registry
-# scan (list_tools / enabled_llm_tools / every mutation), so an unbounded one is a
+# scan (list_tools / enabled_llm_tools), so an unbounded one is a
 # per-scan I/O + memory hazard; a manifest over this is listed invalid rather than
-# parsed. BOTH the scan AND set_enabled enforce it through the bounded
+# parsed. The scan enforces it through the bounded
 # ``_read_regular_file_capped`` read (at most cap+1 chars ever enter memory, then a
 # len check), so an oversized manifest is never slurped whole at ANY read entry --
 # and that same read's O_NONBLOCK+S_ISREG gate is what refuses a FIFO swapped in for
@@ -123,9 +102,127 @@ _PARAMETERS_SCHEMA_MAX_BYTES = 16 * 1024
 # ``_load_tool_dotenv`` reads through the bounded ``_read_regular_file_capped``
 # (at most cap+1 chars, then a len check) and degrades to "no extra env" ({}, the
 # same contract a malformed ``.env`` gets); the installer stat-gates it and refuses
-# the package outright (``validate_package``). 64 KiB dwarfs any real secrets file
+# the package outright (``validate_tool_content``). 64 KiB dwarfs any real secrets file
 # (a handful of KEY=VALUE lines).
 _ENV_FILE_MAX_BYTES = 64 * 1024
+
+# Legacy flat-layout name retained for the offline migration reader and for
+# stripping builder-authored forgeries. New summaries live at
+# ``versions/<vid>/.afterthread.meta/summary.json``.
+_AI_META_FILENAME = ".ai_meta.json"
+
+# Hard ceiling on the sidecar, enforced on BOTH sides: ``read_tool_meta`` refuses
+# anything longer, and ``write_tool_meta`` refuses to PRODUCE anything longer.
+# The symmetry is the whole point and it is a correctness property, not tidiness:
+# the sidecar used to be read at ``_MANIFEST_MAX_BYTES`` (64 KiB) while the writer
+# checked NOTHING, so a payload the writer happily produced could read back as
+# None forever -- the write reporting success while the summary silently vanished
+# from every later GET, with nothing anywhere reporting a failure.
+#
+# What overruns 64 KiB is worth stating precisely, because the obvious arithmetic
+# does not get there and a wrong number here would send the next reader hunting
+# the wrong thing. The reader's cap is compared against the DECODED text's
+# length, so raw CJK is not the problem: a max-length 20 000-char
+# ``origin.instructions`` plus an 8 000-char ``summary`` is ~30 000 CHARACTERS
+# however many bytes it occupies. SERIALIZATION is the problem. Control
+# characters are legal in that free-text install field (``str.strip`` does not
+# remove them and the schema only bounds length), and ``json.dumps`` escapes each
+# one to a 6-char ``\uXXXX`` -- so a legal payload serializes to six times its
+# length. Redaction is the second expander, on a different axis: each masked
+# value collapses to a 13-char / 35-byte marker, so text alternating 6-char
+# secrets with separators roughly doubles in chars and nearly triples in bytes.
+#
+# Sized off those, not off a round number: worst legal serialization is
+# ~120 KB (instructions) + ~48 KB (summary) + ~2 KB (URL) + keys ~= 170 KB, and
+# the redaction path lands in the same range rather than multiplying with it (a
+# marker is not itself escapable). 256 KiB clears that with headroom and still
+# bounds the per-scan cost -- ``list_tools`` reads one sidecar per package on
+# every scan, which is why an UNBOUNDED read was never an option either.
+#
+# NB the two sides count different UNITS and that is deliberate: the reader's
+# check is on CHARS (the bounded reader is a text read), the writer's is on the
+# serialized payload's UTF-8 BYTES. UTF-8 never encodes a char in less than one
+# byte, so ``bytes <= cap`` implies ``chars <= cap`` -- the writer is the
+# STRICTER side, which is the only direction that keeps the invariant true:
+# anything the writer accepts, the reader can read back. The cost of that slack
+# is bounded and accepted: a hand-written all-CJK file can make the reader buffer
+# up to ~3x the cap transiently before the length check rejects it, the same
+# property (at the same ratio) every other capped read in this module has.
+_AI_META_MAX_BYTES = 256 * 1024
+
+# Legacy flat-layout state name retained for migration and builder-content policy.
+# The live toggle now belongs to package-layer
+# ``.afterthread.meta/state.json`` and never falls back to ``tool.json``.
+_STATE_FILENAME = ".afterthread-state.json"
+
+# The OWNERSHIP MARKER, and the half of P1R5-1 that does the work. Our writer puts
+# this key/value at the front of every state file it publishes, and every reader
+# requires it before treating the document as a statement of ANYTHING: a file at
+# our name that does not carry it is somebody else's and is answered exactly as a
+# missing one is (disabled), never overwritten by ``set_enabled``.
+#
+# Why a marker at all when the name already says "afterthread": an operator or a
+# future tool can still create a file under ANY name we pick, and the name alone
+# gives the reader no way to tell that from our own. The marker is the difference
+# between "we assume this is ours" and "this file says it is". The pair is spelled
+# as two constants rather than one literal dict so the writer and the recognizer
+# cannot drift, which is the same argument ``_RESERVED_PACKAGE_FILENAMES`` makes
+# about the names themselves.
+_STATE_MARKER_KEY = "afterthread"
+_STATE_MARKER_VALUE = "tool-state"
+
+# Hard ceiling on the state file, far tighter than the manifest's or the sidecar's
+# and for a reason that is theirs inverted: this file is read on EVERY scan of
+# EVERY package (``scan_installed``, so every ``list_tools`` AND every advertisement
+# for every AI request) and it carries ONE boolean. Our writer emits ~20 bytes, so
+# 4 KiB is three orders of magnitude of headroom for a hand-edited file with
+# generous whitespace, while anything past it is by definition not our shape --
+# and is refused as UNREADABLE rather than parsed (see ``_read_enabled_state``).
+_STATE_MAX_BYTES = 4 * 1024
+
+# Every filename at a PACKAGE ROOT that belongs to the backend rather than to the
+# package's content. This tuple must never be applied to a BuildRoot or VersionRoot:
+# v5 puts all tool content there, and only ``.afterthread.meta/`` is backend-owned
+# at that scope. In particular, migration deliberately carries a FOREIGN legacy
+# state file into the first version byte-for-byte; treating this package-root
+# namespace as a recursive or version-root namespace makes the next revise omit
+# ordinary tool content from the newly published version.
+#
+# A tuple rather than separate literals still keeps the two legacy package-layer
+# names together for code that reasons about that old namespace.
+_RESERVED_PACKAGE_FILENAMES: tuple[str, ...] = (_AI_META_FILENAME, _STATE_FILENAME)
+
+# The mode floor every published sidecar carries (R11). The backend MUST be able
+# to read back what it just wrote -- that is the same writer-accepts-implies-
+# reader-reads-back invariant _AI_META_MAX_BYTES states for SIZE, now stated for
+# PERMISSIONS. Two holes made it not hold: mkstemp's 0o600 is masked by the
+# process umask, so a service started under a umask that strips owner bits (an
+# operator's 0o277, a wrapper's 0o777) published a sidecar the very next
+# read_tool_meta could not open -- write_tool_meta returning True while every
+# later GET answered "no summary", and every regenerate spending a whole LLM call
+# to rewrite a file it would then fail to read; and inheriting an existing file's
+# mode verbatim (R7-3) propagated the same hole once a sidecar had ever landed
+# without owner-read. So the fd is fchmod'd to (inherited | this) before publish:
+# the operator's GROUP/OTHER customization is honored exactly as R7-3 intended,
+# while owner read+write is not negotiable -- this file is backend-owned state,
+# not operator content.
+_OWNER_RW = 0o600
+
+# Cap on the STORED summary text (D40). Generous next to InstallResult's 2000-char
+# progress note because this text is the tool's user-facing DOCUMENTATION -- what
+# it does, how it runs, its inputs/outputs and limits -- and it is rendered on
+# demand in one panel, not carried in any prompt or tool spec.
+#
+# It lives HERE, next to the sidecar it bounds, rather than in ``tool_meta`` where
+# it started, because the CUT does (see ``store_summary_meta``): the LLM result
+# model used to redact-and-cap inside its pydantic validator, which runs on the
+# EVENT LOOP, and the redaction half of that pair reads the filesystem. Both
+# halves moved to the storage boundary together -- they are one ordered operation
+# (redact while the text is whole, THEN slice) and splitting them across two
+# modules would be splitting an invariant nobody can then verify by reading
+# either. tool_meta is the importer of this module, so the constant could not
+# live there and be used here without a cycle.
+_TOOL_SUMMARY_CAP = 8000
 
 # Appended when a tool's stdout (or a failure's stderr) is cut for size. Mirrors
 # the truncation markers in memory_ai / llm_log so an operator who has seen those
@@ -160,38 +257,360 @@ _READ_CHUNK_CHARS = 64 * 1024
 class _PackageScan:
     """The result of validating one candidate package directory.
 
-    ``valid`` gates execution: an invalid package is listed (so the UI can show
-    WHY, via ``error``) but never advertised to the model or executed.
-    ``parameters`` / ``entry`` are populated only when ``valid`` is True.
-    ``enabled`` is read as early as possible (right after the JSON parses) so
-    even an otherwise-invalid package reports the toggle state the operator set.
+    One ``Resolution`` owns every version-derived field in the row. ``valid`` gates
+    advertisement and execution; ``enabled`` is package-layer state and is false
+    whenever resolution or state is unusable. ``identity`` vouches for the
+    resolved version's manifest, while ``notice`` carries the non-fatal FOREIGN
+    state-file diagnostic.
     """
+
+    name: str
+    package_root: PackageRoot
+    resolution: Resolution
+    valid: bool
+    enabled: bool
+    description: str | None
+    error: str | None
+    parameters: dict[str, Any] | None
+    entry: list[str] | None
+    identity: tuple[int, int, int] | None
+    advertisement_generation: _AdvertisementGeneration | None = None
+    notice: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PackageLayoutRoot:
+    """A package-shaped layout that may still be staging or already retired."""
+
+    path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class PackageRoot(PackageLayoutRoot):
+    """A real installed package directory, never a version or staging build."""
+
+
+@dataclass(frozen=True, slots=True)
+class VersionRoot:
+    """One committed installed version directory."""
+
+    path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class BuildRoot:
+    """Tool content that has not been installed yet."""
+
+    path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class PreviousAbsent:
+    """An ``origin.json`` that did not carry the required lineage field."""
+
+
+@dataclass(frozen=True, slots=True)
+class PreviousNull:
+    """An explicit JSON null: this version has no predecessor."""
+
+
+@dataclass(frozen=True, slots=True)
+class PreviousValue:
+    """The JSON value written at ``previous`` (shape validation belongs to lineage)."""
+
+    value: object
+
+
+PREVIOUS_ABSENT = PreviousAbsent()
+PREVIOUS_NULL = PreviousNull()
+type Previous = PreviousAbsent | PreviousNull | PreviousValue
+
+
+@dataclass(frozen=True, slots=True)
+class Resolved:
+    """A package whose ``current`` names one committed version.
+
+    ``previous`` is captured from that version's commit marker during the same
+    resolution.  List rows and discard therefore cannot describe one current
+    version while deriving lineage from a second pointer read.  The tagged
+    value preserves missing, explicit null, and present JSON values as three
+    different states; a publisher-authored marker always has the field.
+    """
+
+    package_root: PackageRoot
+    version_root: VersionRoot
+    vid: str
+    previous: Previous
+
+
+@dataclass(frozen=True, slots=True)
+class Unresolved:
+    """An installed package with no usable current version."""
+
+    package_root: PackageRoot
+    reason: str
+
+
+type Resolution = Resolved | Unresolved
+
+
+@dataclass(frozen=True, slots=True)
+class PackageLayoutResolved:
+    """A package-shaped layout whose ``current`` names a committed version."""
+
+    package_root: PackageLayoutRoot
+    version_root: VersionRoot
+    vid: str
+    previous: Previous
+
+
+@dataclass(frozen=True, slots=True)
+class PackageLayoutUnresolved:
+    """A package-shaped layout with no usable current version."""
+
+    package_root: PackageLayoutRoot
+    reason: str
+
+
+type PackageLayoutResolution = PackageLayoutResolved | PackageLayoutUnresolved
+
+
+@dataclass(frozen=True, slots=True)
+class _ContentScan:
+    """The shared manifest/entry/content-policy result for a build or version."""
 
     name: str
     directory: Path
     valid: bool
-    enabled: bool
     description: str
     error: str | None
     parameters: dict[str, Any] | None
     entry: list[str] | None
+    identity: tuple[int, int, int] | None
 
 
 # --- discovery / validation ------------------------------------------------
 
 
 def tools_dir() -> Path | None:
-    """The configured tools directory, or None when the feature is disabled.
+    """The canonical configured tools directory, or None when disabled.
 
     ``settings.tools_dir`` empty ("") means OFF -- None here makes every reader
     (``list_tools`` / ``enabled_llm_tools`` / the mutators) a no-op. Mirrors
     ``llm_log``'s settings-driven pattern; packaged mode's cli.py injects
     ``<data-dir>/tools`` so a uvx install has it set without operator action.
+
+    Canonicalizing the BASE here gives every downstream ``PackageRoot`` and
+    ``VersionRoot`` one spelling. It deliberately does not resolve a package
+    child: package/version symlink refusals still inspect their own final
+    components before anything follows them.
     """
     raw = get_settings().tools_dir.strip()
     if not raw:
         return None
-    return Path(raw).expanduser()
+    return Path(raw).expanduser().resolve()
+
+
+_REQUEST_TOOLS_LOCK_FD: ContextVar[int | None] = ContextVar("_REQUEST_TOOLS_LOCK_FD", default=None)
+
+
+class ToolsLockUnavailableError(RuntimeError):
+    """The persistent lock path cannot be used by this backend process."""
+
+    def __init__(self, path: Path, reason: str) -> None:
+        self.path = path
+        self.reason = reason
+        super().__init__(
+            f"Tools lock {path} is unavailable: {reason}. "
+            "Repair ownership and owner read/write permissions on this existing inode; "
+            "do not delete or recreate it."
+        )
+
+
+def _repair_existing_tools_lock_mode(lock_path: Path) -> None:
+    """Restore the owner-rw floor before an O_RDWR open can reject the inode."""
+
+    try:
+        info = os.stat(lock_path, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        reason = exc.strerror or str(exc)
+        raise ToolsLockUnavailableError(lock_path, f"cannot inspect it: {reason}") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise ToolsLockUnavailableError(lock_path, "the reserved path is not a regular file")
+
+    current_mode = stat.S_IMODE(info.st_mode)
+    safe_mode = current_mode | _OWNER_RW
+    if safe_mode == current_mode:
+        return
+    effective_uid = os.geteuid()
+    if info.st_uid != effective_uid:
+        raise ToolsLockUnavailableError(
+            lock_path,
+            f"it is owned by uid {info.st_uid}, but the backend runs as uid {effective_uid}",
+        )
+    try:
+        os.chmod(lock_path, safe_mode, follow_symlinks=False)
+    except OSError as exc:
+        reason = exc.strerror or str(exc)
+        raise ToolsLockUnavailableError(
+            lock_path,
+            f"owner read/write mode repair failed: {reason}",
+        ) from exc
+
+
+def _open_tools_lock(base: Path) -> int:
+    """Open the one persistent lock inode shared by every cooperating operation.
+
+    The file is intentionally never unlinked. Deleting it by hand and recreating
+    it produces a different inode: holders of the old inode and checkers of the
+    new one no longer conflict, so protection lapses silently. ``O_NOFOLLOW`` and
+    the regular-file gate fail closed if the reserved name is replaced.
+
+    ``flock`` coordinates only code that checks this inode. Every checker in this
+    subsystem is ours; it is not a sandbox against an operator or tool that edits
+    package files directly.
+    """
+
+    lock_path = base / _TOOLS_LOCK_FILENAME
+    # A pre-existing owner-read-only/no-access inode rejects O_RDWR before an
+    # opened descriptor exists to fchmod. Repair the backend-owned inode in place
+    # first; a foreign owner or an unusable reserved path fails with its own
+    # actionable condition rather than masquerading as lock contention.
+    _repair_existing_tools_lock_mode(lock_path)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        reason = exc.strerror or str(exc)
+        raise ToolsLockUnavailableError(lock_path, f"open failed: {reason}") from exc
+    try:
+        try:
+            info = os.fstat(fd)
+        except OSError as exc:
+            reason = exc.strerror or str(exc)
+            raise ToolsLockUnavailableError(
+                lock_path, f"descriptor inspection failed: {reason}"
+            ) from exc
+        if not stat.S_ISREG(info.st_mode):
+            raise ToolsLockUnavailableError(lock_path, "the opened inode is not a regular file")
+        # open(2)'s mode is filtered through the process umask. Without this
+        # owner-rw floor, a restrictive umask can create the persistent inode
+        # owner-read-only, so every later O_RDWR acquisition fails forever after
+        # this creating descriptor closes. Preserve any group/other bits while
+        # making every backend-owned lock inode reopenable by its owner.
+        current_mode = stat.S_IMODE(info.st_mode)
+        safe_mode = current_mode | _OWNER_RW
+        if safe_mode != current_mode:
+            try:
+                os.fchmod(fd, safe_mode)
+            except OSError as exc:
+                reason = exc.strerror or str(exc)
+                raise ToolsLockUnavailableError(
+                    lock_path,
+                    f"descriptor mode repair failed: {reason}",
+                ) from exc
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def acquire_shared_tools_lock() -> int | None:
+    """Take the request-wide shared lock, blocking only behind a destroyer.
+
+    ``None`` means the feature is unconfigured or its root does not exist, in
+    which case no installed tool can be advertised. The router calls this on a
+    worker before scanning/advertising and holds the returned descriptor through
+    the complete LLM request.
+    """
+
+    base = tools_dir()
+    if base is None or not base.is_dir():
+        return None
+    fd = _open_tools_lock(base)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def release_tools_lock(fd: int | None) -> None:
+    """Close one parent reference; the kernel releases on the last reference."""
+
+    if fd is not None:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def bind_request_tools_lock(fd: int | None) -> Iterator[None]:
+    """Expose the request's descriptor while its advertised handlers are built."""
+
+    token = _REQUEST_TOOLS_LOCK_FD.set(fd)
+    try:
+        yield
+    finally:
+        _REQUEST_TOOLS_LOCK_FD.reset(token)
+
+
+@contextlib.contextmanager
+def exclusive_tools_lock(base: Path | None = None) -> Iterator[bool]:
+    """Try the destroyer lock once; yield False instead of waiting.
+
+    Delete, discard, stale cleanup, and migration all use this same helper. Any
+    genuine contention yields False for the retryable HTTP 409. An unusable lock
+    path or another flock failure raises ``ToolsLockUnavailableError`` so callers
+    cannot misreport a permanent operator/configuration problem as active work.
+    """
+
+    root = base if base is not None else tools_dir()
+    if root is None or not root.is_dir():
+        yield False
+        return
+    fd = _open_tools_lock(root)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        except OSError as exc:
+            lock_path = root / _TOOLS_LOCK_FILENAME
+            reason = exc.strerror or str(exc)
+            raise ToolsLockUnavailableError(
+                lock_path,
+                f"exclusive flock failed: {reason}",
+            ) from exc
+        yield True
+    finally:
+        # Close rather than unlink: this releases our open-file reference while
+        # preserving the one inode every future checker must lock.
+        os.close(fd)
+
+
+def legacy_preflight_accepts_shape(package: Path) -> bool:
+    """Whether migration will treat this root as legacy rather than target/damaged.
+
+    This deliberately answers only the namespace-shape gate shared by runtime
+    diagnostics and migration preflight. Migration still validates the legacy
+    manifest, special files, state, sidecar, and dotenv before accepting it.
+    """
+
+    for reserved in (_VERSIONS_DIRNAME, _META_DIRNAME):
+        try:
+            os.lstat(package / reserved)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+        else:
+            return False
+    return True
 
 
 def _valid_entry(entry: Any) -> bool:
@@ -291,13 +710,39 @@ def _read_regular_file_capped(path: Path, cap: int) -> str | None:
             os.close(fd)
 
 
+def _read_regular_bytes_capped(path: Path, cap: int) -> bytes | None:
+    """Read at most ``cap + 1`` bytes from one real file without following it."""
+
+    flags = os.O_RDONLY | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    fd_owned = True
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "rb") as handle:
+            fd_owned = False
+            return handle.read(cap + 1)
+    except OSError:
+        return None
+    finally:
+        if fd_owned:
+            os.close(fd)
+
+
 def _write_regular_file(path: Path, content: str) -> bool:
     """Write ``content`` as utf-8 to ``path``, but ONLY if it is a regular file.
 
-    The WRITE-side mirror of ``_read_regular_file_capped`` -- ``write_file``
-    (tool_builder) and ``set_enabled``'s manifest write both funnel through it, so
-    the same jail-hardening holds on every write the tool subsystem does instead of
-    being re-derived per call site. Returns True on success; False (never raises)
+    The WRITE-side mirror of ``_read_regular_file_capped`` -- ``write_file`` and
+    ``write_secret`` (tool_builder) funnel through it, so the same jail-hardening
+    holds on every un-published write the tool subsystem does instead of being
+    re-derived per call site (the backend's OWN package files go through
+    ``_write_package_file_atomic`` instead, which needs a publish rather than a
+    truncating open). Returns True on success; False (never raises)
     on ANY ``OSError``, so a caller degrades cleanly onto its own error string /
     False contract rather than 500ing.
 
@@ -320,7 +765,7 @@ def _write_regular_file(path: Path, content: str) -> bool:
       there is no reason to widen the mode on a file we author).
 
     Parent directories are created BEFORE the open (the meta-tool contract
-    auto-creates them for ``write_file``; for ``set_enabled``'s manifest write the
+    auto-creates them for ``write_file``; for ``write_secret``'s ``.env`` the
     parent already exists, so ``makedirs(exist_ok=True)`` is a no-op). The
     ``fstat`` after open is the HARD regular-file gate (S_ISREG): a pre-existing
     device/socket/FIFO that somehow opened is still refused before a single byte is
@@ -356,56 +801,321 @@ def _write_regular_file(path: Path, content: str) -> bool:
             os.close(fd)
 
 
-def _scan_package(directory: Path, expected_name: str | None = None) -> _PackageScan:
-    """Validate one candidate directory into a ``_PackageScan``.
+# The operator-facing reason a backend-owned state slot cannot be read. It is
+# category-only and never exposes a filesystem error string.
+_STATE_UNREADABLE_ERROR = ".afterthread.meta/state.json exists but is not readable"
 
-    Every failure path returns ``valid=False`` with a short, safe reason (never
-    a raw filesystem error string), so a single broken package can never break
-    the scan of the others and is never executable.
+# The operator-facing note for a file at our name that is NOT ours (P1R5-1): it has
+# no ownership marker, so it is somebody else's -- a tool's own cursor/cache/
+# settings, or a hand-written file that omitted the marker. Content may stay valid,
+# but the package is disabled and PATCH refuses; the backend never touches the
+# foreign file.
+_STATE_FOREIGN_NOTICE = (
+    ".afterthread.meta/state.json is not this backend's state file (no "
+    f'"{_STATE_MARKER_KEY}": "{_STATE_MARKER_VALUE}" marker) and is being left '
+    "alone: the package is disabled and its toggle cannot be changed. Add the "
+    "marker, or move that file to another name."
+)
 
-    ``expected_name`` is the name the manifest's ``name`` field must equal; it
-    defaults to the directory's own name (the installed-package invariant). The
-    installer's staging validation passes the FUTURE name instead -- its staging
-    directory is a throwaway uuid, but the manifest must already carry the name
-    the package is about to be installed under (see ``validate_package``).
+
+@dataclass(frozen=True, slots=True)
+class _EnabledState:
+    """One package-layer state result.
+
+    OURS with a boolean is authoritative. ABSENT and FOREIGN are disabled;
+    UNREADABLE is disabled and invalid. Keeping ownership separate prevents a
+    foreign document from being overwritten while eliminating the legacy
+    manifest fallback.
     """
-    name = expected_name if expected_name is not None else directory.name
 
-    def invalid(error: str, *, enabled: bool = True) -> _PackageScan:
-        return _PackageScan(
-            name=name,
+    ours: bool
+    enabled: bool
+    error: str | None
+    notice: str | None
+
+
+# The three CONSTANT answers, minted once rather than per call: this runs for every
+# package on every scan and twice per tool call, and the class is frozen, so there
+# is nothing a shared instance can be mutated into. Only the fourth shape (ours, and
+# readable) carries a value and has to be built.
+_ABSENT_STATE = _EnabledState(ours=False, enabled=False, error=None, notice=None)
+_UNREADABLE_STATE = _EnabledState(
+    ours=True, enabled=False, error=_STATE_UNREADABLE_ERROR, notice=None
+)
+_FOREIGN_STATE = _EnabledState(ours=False, enabled=False, error=None, notice=_STATE_FOREIGN_NOTICE)
+
+
+def _read_enabled_state(package_root: PackageRoot) -> _EnabledState:
+    """Read package-layer ``state.json``. Total: never raises, always answers.
+
+    ABSENT, FOREIGN and UNREADABLE are DIFFERENT QUESTIONS and are answered
+    differently (see ``_EnabledState``), so this cannot go through
+    ``_read_regular_file_capped`` alone -- that helper folds "no such file" and
+    "refused to read it" into the same None. The ``lstat`` above it is what tells
+    those two apart, and its error handling copies an adjudication this subsystem
+    has already made once, for ``.env`` at promote time (D40 P3b r2-3):
+    ``FileNotFoundError`` is the ONLY evidence of absence; every other ``OSError``
+    (EIO, ESTALE, EACCES, a parent that is not a directory) is a failure to LOOK,
+    and treating a failure to look as "there is nothing here" is what would
+    silently re-enable a disabled tool. A non-regular file at the name (a symlink
+    aimed out of the package, a FIFO, a directory) is likewise UNREADABLE rather
+    than absent.
+
+    The MARKER is what tells FOREIGN from ours, and it is checked before a single
+    field is believed (P1R5-1). A document we could read that does not carry
+    ``{"afterthread": "tool-state"}`` is not ours -- whether it is a tool's own
+    JSON settings, a plain-text cursor, or a hand-written ``{"enabled": false}``
+    that omitted the marker -- and "not ours" is answered as ABSENT is, with a
+    ``notice`` the listing can show. Nothing here writes, so the file is untouched
+    either way; ``set_enabled`` is where the refusal to overwrite it lives.
+
+    What stays UNREADABLE rather than becoming FOREIGN is the set we cannot read AT
+    ALL: refused by the OS, non-regular, past ``_STATE_MAX_BYTES``. There is no
+    marker to find in a file we never decoded, and at a name that says "afterthread"
+    the fail-closed reading -- ours, broken, listed invalid and switched off (R2) --
+    is the one that cannot re-enable something by accident. A marker-bearing
+    document with a missing or non-``bool`` ``enabled`` joins them for the R2 reason
+    unchanged: it is OUR file failing to say anything about the operator's intent,
+    which is exactly as silent as a truncated one.
+
+    ``RecursionError`` is caught next to ``ValueError`` for the reason
+    ``read_tool_meta`` documents: this runs once per package on EVERY scan, so a
+    single hand-edited file escaping as an exception would break the whole 工具
+    page and every AI request's advertisement, not just its own row. A document
+    that will not parse is FOREIGN rather than unreadable, because "not JSON at
+    all" is the shape a tool's own cursor or cache file has.
+    """
+    path = package_root.path / _META_DIRNAME / _PACKAGE_STATE_FILENAME
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return _ABSENT_STATE
+    except OSError:
+        return _UNREADABLE_STATE
+    if not stat.S_ISREG(info.st_mode):
+        return _UNREADABLE_STATE
+    text = _read_regular_file_capped(path, _STATE_MAX_BYTES)
+    if text is None or len(text) > _STATE_MAX_BYTES:
+        return _UNREADABLE_STATE
+    try:
+        raw = json.loads(text)
+    except ValueError, RecursionError:
+        return _FOREIGN_STATE
+    if not isinstance(raw, dict) or raw.get(_STATE_MARKER_KEY) != _STATE_MARKER_VALUE:
+        return _FOREIGN_STATE
+    enabled = raw.get("enabled")
+    if not isinstance(enabled, bool):
+        return _UNREADABLE_STATE
+    return _EnabledState(ours=True, enabled=enabled, error=None, notice=None)
+
+
+def _effective_enabled(state: _EnabledState) -> bool:
+    """Return the package-layer toggle, failing closed for every non-OURS state.
+
+    Migration is all-or-nothing, so there is no legacy manifest fallback in the
+    versioned reader.  In particular, an absent or foreign state file cannot turn a
+    half-published package on merely because package-layer ``tool.json`` is absent.
+    """
+
+    return state.enabled if state.ours else False
+
+
+def package_enabled(package_root: PackageRoot) -> bool:
+    """Read the package-layer toggle, failing closed for every unusable shape."""
+    if package_root.path.is_symlink():
+        # O_NOFOLLOW protects only the final state-file component; refusing the
+        # package symlink first prevents parent traversal and agrees with scanning.
+        return False
+    return _effective_enabled(_read_enabled_state(package_root))
+
+
+def _origin_document(version_root: VersionRoot) -> dict[str, Any] | None:
+    """Read and validate the committed-version marker without guessing.
+
+    ``previous`` is deliberately not shape-validated here.  The marker still
+    commits this version when an operator hand-edits only that field into a bad
+    value; lineage then becomes ``broken`` and discard can answer the actionable
+    ``lineage_unavailable`` conflict.  Treating that edit as an uncommitted
+    current version would erase ``current_vid`` and collapse two different
+    repair paths into the unresolved-row state.
+    """
+
+    data = _read_regular_bytes_capped(
+        version_root.path / _META_DIRNAME / _ORIGIN_FILENAME, _AI_META_MAX_BYTES
+    )
+    if data is None or len(data) > _AI_META_MAX_BYTES:
+        return None
+    try:
+        raw = json.loads(data.decode("utf-8"))
+    except UnicodeError, ValueError, RecursionError:
+        return None
+    if not isinstance(raw, dict) or not isinstance(raw.get("source"), str):
+        return None
+    for key in ("openapi_url", "instructions", "feedback"):
+        value = raw.get(key)
+        if value is not None and not isinstance(value, str):
+            return None
+    return _utf8_safe_meta(raw)
+
+
+def _resolve_version_target(
+    package_root: PackageLayoutRoot, vid: object
+) -> tuple[VersionRoot, dict[str, Any]] | None:
+    """Resolve one committed version target by the exact rule ``current`` uses.
+
+    The vid syntax, real-directory check, and committed ``origin.json`` check
+    live here once so ``current``, lineage, and discard cannot drift into three
+    subtly different definitions of a usable version.
+    """
+
+    if not isinstance(vid, str) or not _VID_RE.fullmatch(vid):
+        return None
+    version_path = package_root.path / _VERSIONS_DIRNAME / vid
+    try:
+        version_info = os.lstat(version_path)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(version_info.st_mode):
+        return None
+    version_root = VersionRoot(version_path)
+    origin = _origin_document(version_root)
+    if origin is None:
+        return None
+    return version_root, origin
+
+
+def _resolve_current_data(
+    package_root: PackageLayoutRoot,
+) -> tuple[VersionRoot, str, Previous] | str:
+    """Resolve one package-shaped pointer without deciding that it is installed."""
+
+    package = package_root.path
+    try:
+        package_info = os.lstat(package)
+    except OSError:
+        return "package directory is not readable"
+    if not stat.S_ISDIR(package_info.st_mode):
+        return "package directory must be a real directory"
+
+    data = _read_regular_bytes_capped(
+        package / _META_DIRNAME / _CURRENT_FILENAME, _CURRENT_MAX_BYTES
+    )
+    if data is None:
+        try:
+            os.lstat(package / _META_DIRNAME)
+        except FileNotFoundError:
+            # Name the migration only for the SAME namespace shape its preflight
+            # sends to the legacy inspector. In particular, a target package
+            # whose metadata directory was moved aside still owns ``versions/``;
+            # migration refuses that ambiguous shape, so the runtime must not
+            # prescribe a command guaranteed to refuse it.
+            try:
+                with os.scandir(package) as entries:
+                    if next(entries, None) is not None:
+                        if legacy_preflight_accepts_shape(package):
+                            return (
+                                "unmigrated tool layout; "
+                                "run `python -m afterthread.migrate_tools_v5`"
+                            )
+                        return "tool layout is damaged or ambiguous; inspect it before migration"
+            except OSError:
+                pass
+        except OSError:
+            pass
+        return "current is missing or unreadable"
+    if len(data) > _CURRENT_MAX_BYTES:
+        return "current is too large"
+    if data.endswith(b"\n"):
+        data = data[:-1]
+    try:
+        vid = data.decode("ascii")
+    except UnicodeError:
+        return "current has invalid syntax"
+    if not _VID_RE.fullmatch(vid):
+        return "current has invalid syntax"
+
+    target = _resolve_version_target(package_root, vid)
+    if target is None:
+        version_path = package / _VERSIONS_DIRNAME / vid
+        try:
+            version_info = os.lstat(version_path)
+        except OSError:
+            return "current points to a missing version"
+        if not stat.S_ISDIR(version_info.st_mode):
+            return "current version must be a real directory"
+        return "current points to an uncommitted version"
+    version_root, origin = target
+    if "previous" not in origin:
+        previous: Previous = PREVIOUS_ABSENT
+    elif origin["previous"] is None:
+        previous = PREVIOUS_NULL
+    else:
+        previous = PreviousValue(origin["previous"])
+    return version_root, vid, previous
+
+
+def resolve_current(package_root: PackageRoot) -> Resolution:
+    """Resolve exactly one installed package's bounded ``current`` pointer."""
+
+    result = _resolve_current_data(package_root)
+    if isinstance(result, str):
+        return Unresolved(package_root, result)
+    version_root, vid, previous = result
+    return Resolved(package_root, version_root, vid, previous)
+
+
+def resolve_layout_current(package_root: PackageLayoutRoot) -> PackageLayoutResolution:
+    """Resolve ``current`` without claiming a staging or retired layout is installed."""
+
+    result = _resolve_current_data(package_root)
+    if isinstance(result, str):
+        return PackageLayoutUnresolved(package_root, result)
+    version_root, vid, previous = result
+    return PackageLayoutResolved(package_root, version_root, vid, previous)
+
+
+def _manifest_identity(directory: Path) -> tuple[int, int, int] | None:
+    """The manifest identity shared by build validation and installed scans."""
+
+    try:
+        info = os.lstat(directory / "tool.json")
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino, info.st_ctime_ns)
+
+
+def _scan_tool_content(root: BuildRoot | VersionRoot, expected_name: str) -> _ContentScan:
+    """One implementation of manifest, entry, containment, and content rules."""
+
+    directory = root.path
+
+    def invalid(error: str) -> _ContentScan:
+        return _ContentScan(
+            name=expected_name,
             directory=directory,
             valid=False,
-            enabled=enabled,
             description="",
             error=error,
             parameters=None,
             entry=None,
+            identity=None,
         )
 
-    # A package directory that is itself a SYMLINK is refused (listed invalid,
-    # never executed): _scan_all's ``is_dir()`` filter FOLLOWS the link, so
-    # without this a symlink to any real directory would be scanned -- and
-    # potentially run -- as a package. Real directories only (H3 / D21). Staging
-    # validation is unaffected: its directory is a real ``mkdir``ed uuid dir.
-    if directory.is_symlink():
-        return invalid("package directory must be a real directory (not a symlink)")
+    try:
+        info = os.lstat(directory)
+    except OSError:
+        return invalid("tool content directory is not readable")
+    if not stat.S_ISDIR(info.st_mode):
+        return invalid("tool content directory must be a real directory")
 
     tool_json = directory / "tool.json"
-    # tool.json must be a REAL file too: a symlinked manifest is refused (listed
-    # invalid) so a scan can never READ -- and set_enabled can never REWRITE --
-    # a file outside the package through it (H3). Checked BEFORE ``is_file()``,
-    # which follows the link and would otherwise accept it.
-    if tool_json.is_symlink():
-        return invalid("tool.json must be a real file (not a symlink)")
-    if not tool_json.is_file():
+    try:
+        manifest_info = os.lstat(tool_json)
+    except OSError:
         return invalid("missing tool.json")
-    # Read the manifest through the ONE bounded-regular-file helper (F3b): its
-    # fstat gate refuses a FIFO/socket/device swapped in for tool.json and its
-    # O_NOFOLLOW backstops the is_symlink() fast path above against a symlink
-    # raced in after it, while the cap+1 read means an oversized manifest is never
-    # slurped whole into memory (the per-scan hazard _MANIFEST_MAX_BYTES exists
-    # for). None is every refusal/read failure; a len past the cap is "too large".
+    if not stat.S_ISREG(manifest_info.st_mode):
+        return invalid("tool.json must be a readable real file")
+    identity = _manifest_identity(directory)
     text = _read_regular_file_capped(tool_json, _MANIFEST_MAX_BYTES)
     if text is None:
         return invalid("tool.json is not a readable regular file")
@@ -413,52 +1123,92 @@ def _scan_package(directory: Path, expected_name: str | None = None) -> _Package
         return invalid("tool.json is too large")
     try:
         raw = json.loads(text)
-    except ValueError:
+    except ValueError, RecursionError:
         return invalid("tool.json is not valid JSON")
     if not isinstance(raw, dict):
         return invalid("tool.json is not a JSON object")
 
-    # Read `enabled` as soon as the JSON is a dict so even an invalid package
-    # (name mismatch, bad schema) still reports the operator's intended toggle.
-    enabled_raw = raw.get("enabled", True)
-    enabled = enabled_raw if isinstance(enabled_raw, bool) else True
-
     name_field = raw.get("name")
-    if not isinstance(name_field, str) or not _NAME_RE.match(name_field):
-        return invalid("name is missing or not a valid tool name", enabled=enabled)
-    if name_field != name:
-        return invalid("name does not match the package name", enabled=enabled)
-
+    if not isinstance(name_field, str) or not _NAME_RE.fullmatch(name_field):
+        return invalid("name is missing or not a valid tool name")
+    if name_field != expected_name:
+        return invalid("name does not match the package name")
     description = raw.get("description")
     if not isinstance(description, str) or not description.strip():
-        return invalid("description is missing or empty", enabled=enabled)
-
+        return invalid("description is missing or empty")
     parameters = raw.get("parameters")
     if not isinstance(parameters, dict):
-        return invalid("parameters is not a JSON Schema object", enabled=enabled)
-    # Bound the parameters schema (see _PARAMETERS_SCHEMA_MAX_BYTES): it is
-    # re-serialized into the tools array of EVERY LLM request that has this tool
-    # enabled, so an oversized one is a recurring token/prompt-bloat hazard, not
-    # just a big file. ``parameters`` came from json.loads, so json.dumps of it
-    # cannot raise.
+        return invalid("parameters is not a JSON Schema object")
     if len(json.dumps(parameters)) > _PARAMETERS_SCHEMA_MAX_BYTES:
-        return invalid("parameters schema is too large", enabled=enabled)
-
+        return invalid("parameters schema is too large")
     entry = raw.get("entry")
     if not _valid_entry(entry):
-        return invalid("entry is not a non-empty list of command strings", enabled=enabled)
+        return invalid("entry is not a non-empty list of command strings")
     if not _entry_file_exists(directory, entry):
-        return invalid("entry does not reference a file inside the tool package", enabled=enabled)
+        return invalid("entry does not reference a file inside the tool package")
 
-    return _PackageScan(
-        name=name,
+    return _ContentScan(
+        name=expected_name,
         directory=directory,
         valid=True,
-        enabled=enabled,
         description=description.strip()[:_DESCRIPTION_CAP],
         error=None,
         parameters=parameters,
         entry=list(entry),
+        identity=identity,
+    )
+
+
+def scan_installed(package_root: PackageRoot) -> _PackageScan:
+    """Resolve one installed package once, then scan only that resolved version."""
+
+    name = package_root.path.name
+    resolution, advertisement_generation = _resolve_and_register_advertisement(package_root)
+    if isinstance(resolution, Unresolved):
+        return _PackageScan(
+            name=name,
+            package_root=package_root,
+            resolution=resolution,
+            valid=False,
+            enabled=False,
+            description=None,
+            error=resolution.reason,
+            parameters=None,
+            entry=None,
+            identity=None,
+        )
+
+    state = _read_enabled_state(package_root)
+    enabled = _effective_enabled(state)
+    if state.error is not None:
+        return _PackageScan(
+            name=name,
+            package_root=package_root,
+            resolution=resolution,
+            valid=False,
+            enabled=False,
+            description="",
+            error=state.error,
+            parameters=None,
+            entry=None,
+            identity=None,
+            advertisement_generation=advertisement_generation,
+            notice=state.notice,
+        )
+    content = _scan_tool_content(resolution.version_root, name)
+    return _PackageScan(
+        name=name,
+        package_root=package_root,
+        resolution=resolution,
+        valid=content.valid,
+        enabled=enabled,
+        description=content.description,
+        error=content.error,
+        parameters=content.parameters,
+        entry=content.entry,
+        identity=content.identity,
+        advertisement_generation=advertisement_generation,
+        notice=state.notice,
     )
 
 
@@ -477,13 +1227,13 @@ def _scan_all() -> list[_PackageScan]:
     if base is None or not base.is_dir():
         return []
     return [
-        _scan_package(child)
+        scan_installed(PackageRoot(child))
         for child in sorted(base.iterdir())
         if child.is_dir() and not child.name.startswith(".")
     ]
 
 
-def _find_embedded_secret_file(directory: Path) -> str | None:
+def _find_embedded_secret_file(build_root: BuildRoot) -> str | None:
     """Relative path of the first staged file that embeds a known secret VALUE, or None.
 
     The install-only H3 gate. A builder session has real shell capability (run_shell,
@@ -509,7 +1259,7 @@ def _find_embedded_secret_file(directory: Path) -> str | None:
     secrets = [value for value in known_secret_values() if len(value) >= _MIN_SECRET_LEN]
     if not secrets:
         return None
-    base = directory.resolve()
+    base = build_root.path.resolve()
     for dirpath, dirnames, filenames in os.walk(base):
         dirnames.sort()
         filenames.sort()
@@ -524,19 +1274,16 @@ def _find_embedded_secret_file(directory: Path) -> str | None:
     return None
 
 
-def validate_package(directory: Path, expected_name: str) -> str | None:
-    """Validate a candidate package OUTSIDE the tools dir; None means valid.
+def validate_tool_content(build_root: BuildRoot, expected_name: str) -> str | None:
+    """Validate not-yet-installed tool content; None means valid.
 
-    The installer's pre-move gate: ``directory`` is its staging build (a uuid
-    directory name, hence the explicit ``expected_name`` -- the name the package
-    is about to be installed under, which the manifest must already carry).
-    Runs the exact same checks an installed package faces on every scan
-    (manifest shape, name regex + match, entry-file containment), so a package
-    that passes here can never turn up ``valid=False`` after the move -- PLUS the
-    STRICTER install-only gates below.
+    ``expected_name`` supplies the package identity because a staging build has a
+    session-generated directory name. Manifest, entry, containment, and content
+    policy are shared with installed scanning without touching package metadata,
+    ``current``, or the toggle.
 
-    The .env size gate is deliberately NOT part of ``_scan_package`` (which the
-    registry runs on every scan): an oversized ``.env`` must BLOCK a fresh install
+    The .env size gate is deliberately NOT part of installed scanning: an
+    oversized build ``.env`` must BLOCK a fresh install
     here, but a package whose ``.env`` is MUTATED oversized AFTER install should
     keep running under the runtime degrade (``_load_tool_dotenv`` -> {}), not
     vanish from the registry as invalid. So this gate lives on the installer's
@@ -547,14 +1294,14 @@ def validate_package(directory: Path, expected_name: str) -> str | None:
     that baked a known key into any file, but is never re-run on installed packages
     (whose ``.env`` legitimately holds the injected secret post-install).
     """
-    error = _scan_package(directory, expected_name=expected_name).error
+    error = _scan_tool_content(build_root, expected_name).error
     if error is not None:
         return error
     # Install-only .env size gate (see _ENV_FILE_MAX_BYTES). Mirrors
     # _load_tool_dotenv's own is_file()-then-stat() shape; a stat failure is
     # treated as "not oversized" (the scan above already vetted the package, and
     # the runtime degrade remains the post-install defense).
-    env_file = directory / ".env"
+    env_file = build_root.path / ".env"
     try:
         oversized = env_file.is_file() and env_file.stat().st_size > _ENV_FILE_MAX_BYTES
     except OSError:
@@ -566,19 +1313,655 @@ def validate_package(directory: Path, expected_name: str) -> str | None:
     # The path is itself run through the redactor before it lands in the message, in case
     # a builder wrote a file whose very NAME embeds an expanded ``$SECRET`` -- so the
     # rejection can never echo the value even via the path.
-    offender = _find_embedded_secret_file(directory)
+    offender = _find_embedded_secret_file(build_root)
     if offender is not None:
         return f"{redact_known_secrets(offender)} 不得包含秘密值（請改由環境變數讀取）"  # noqa: RUF001
     return None
 
 
+# --- AI summary sidecar (D40) ------------------------------------------------
+
+
+def _utf8_safe(text: str) -> str:
+    """Replace any lone (unpaired) Unicode surrogate in ``text`` with U+FFFD.
+
+    A three-line duplicate of ``llm_log._utf8_safe``, which is the CANONICAL
+    twin -- read its docstring for why ``surrogatepass``-encode + ``replace``-
+    decode is the only pairing that actually yields U+FFFD. Duplicated rather
+    than imported for the SAME leaf/layering reason ``_REDACTION_MARKER`` is
+    (llm_log is a leaf observability module that must not import this capability
+    module, and the reverse edge would create exactly the coupling both modules'
+    docstrings forbid); ``tests/test_tools.py`` pins the two behaviorally equal
+    on a probe set so they cannot silently drift.
+
+    Why version metadata needs it at all: ``origin.json`` and ``summary.json``
+    are plain JSON files the operator is explicitly allowed to hand-edit, and
+    ``"\\ud800"`` is a JSON-LEGAL escape that ``json.loads`` accepts happily --
+    producing a ``str`` that is NOT UTF-8 encodable. Left alone it breaks both
+    boundaries: on the WRITE side ``json.dumps(...).encode("utf-8")`` raises
+    ``UnicodeEncodeError`` (a 500 out of a PATCH that should have answered False
+    -> 404), and on the READ side it sails into the summary response and blows
+    up in Starlette's strict ``JSONResponse.render`` encode -- a 500 on a GET
+    that exists to DEGRADE corrupt metadata, not to die on it.
+    """
+    return text.encode("utf-8", errors="surrogatepass").decode("utf-8", errors="replace")
+
+
+def _utf8_safe_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    """Every string a sidecar read hands back, surrogate-scrubbed. Depth-bounded.
+
+    Applied to the parsed sidecar on the way OUT of ``read_tool_meta``, because a
+    hand-edited file bypasses our writer entirely: the write side can scrub what
+    IT produces, but only this covers a surrogate an operator typed straight into
+    the file. Without it a ``"\\ud800"`` in ``summary`` or ``updated_at`` reaches
+    ``ToolSummaryDetail`` and 500s the GET at response-encode time (see
+    ``_utf8_safe``).
+
+    Bounded at DEPTH 2 -- top-level values plus one level inside a dict value --
+    on purpose, not for lack of ambition. The published summary and origin
+    documents are both flat, so this covers every field any consumer reads plus
+    one defensive hand-edit level. A general recursive walk would re-open the hazard
+    ``read_tool_meta``'s ``RecursionError`` guard exists to close: a hand-edited
+    file that PARSES (json.loads recursing in C, on the C stack) can still be
+    nested far deeper than a Python-frame recursion can follow, which would turn
+    a corrupt sidecar back into a 500 for the whole 工具 page.
+
+    KEYS are deliberately left alone. A key carrying a surrogate can never equal
+    one of either document's schema names, so it is dropped by every consumer AND
+    by the next writer (which builds files from its own literals) -- it can
+    therefore never reach a response or a re-serialization.
+    """
+    scrubbed: dict[str, Any] = {}
+    for key, value in meta.items():
+        if isinstance(value, str):
+            scrubbed[key] = _utf8_safe(value)
+        elif isinstance(value, dict):
+            scrubbed[key] = {
+                sub_key: _utf8_safe(sub_value) if isinstance(sub_value, str) else sub_value
+                for sub_key, sub_value in value.items()
+            }
+        else:
+            scrubbed[key] = value
+    return scrubbed
+
+
+def read_origin_meta(version_root: VersionRoot) -> dict[str, Any] | None:
+    """Return one committed version's typed, bounded origin document."""
+
+    return _origin_document(version_root)
+
+
+def read_tool_meta(version_root: VersionRoot) -> dict[str, Any] | None:
+    """Parse a version's ``summary.json`` and combine it with immutable origin.
+
+    Deliberately TOTAL: a missing sidecar, a FIFO/symlink swapped in for one, an
+    oversized one, invalid JSON, PATHOLOGICALLY NESTED JSON, and a JSON value
+    that is not an object ALL come back None -- the one "no usable summary
+    metadata" answer every caller already has to handle, since a freshly
+    installed tool legitimately has no sidecar until its summary generation
+    finishes. A corrupt sidecar therefore degrades the summary panel to empty; it
+    never breaks a tool listing or a mutation.
+
+    That totality is load-bearing well beyond the summary panel, which is why
+    ``RecursionError`` is caught next to ``ValueError`` rather than left to
+    escape (the same pairing ``llm._parse_json_object`` documents, for the same
+    reason): thousands of nested brackets exhaust the interpreter's recursion
+    limit INSIDE ``json.loads``. A hand-edited or malicious sidecar must degrade
+    its own summary panel rather than escaping as an exception.
+
+    Reads through the ONE bounded, FIFO/symlink-hardened helper -- the cap+1 read
+    plus the ``len > cap`` check is how an oversized sidecar is refused without
+    ever slurping it whole. The cap is the sidecar's OWN
+    ``_AI_META_MAX_BYTES``, and it is the same number ``write_tool_meta``
+    refuses to exceed: ANYTHING THE WRITER ACCEPTS, THIS READS BACK. Sharing the
+    manifest's 64 KiB cap while the writer checked nothing is exactly how a legal
+    sidecar became permanently unreadable (see ``_AI_META_MAX_BYTES``).
+
+    Every string that survives is surrogate-scrubbed on the way out
+    (``_utf8_safe_meta``): a hand-edited ``"\\ud800"`` is JSON-legal but not
+    UTF-8 encodable, and this is the boundary where a file our writer never
+    touched becomes safe to serialize into a response.
+    """
+    text = _read_regular_file_capped(
+        version_root.path / _META_DIRNAME / _SUMMARY_FILENAME, _AI_META_MAX_BYTES
+    )
+    if text is None or len(text) > _AI_META_MAX_BYTES:
+        return None
+    try:
+        raw = json.loads(text)
+    except ValueError, RecursionError:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    summary = _utf8_safe_meta(raw)
+    summary["origin"] = read_origin_meta(version_root)
+    return summary
+
+
+def _meta_str(value: Any) -> str | None:
+    """One origin string field, narrowed: a ``str`` survives, anything else is None.
+
+    Used only in ``origin.json``, whose nullable URL/instruction fields are
+    meaningful: that immutable document is the install provenance copy, and "we
+    do not have one" must be representable. ``summary`` deliberately does NOT go
+    through here -- see ``write_tool_meta`` for why a non-string summary refuses
+    the write instead of degrading to None.
+    """
+    return value if isinstance(value, str) else None
+
+
+def _redacted(value: str | None) -> str | None:
+    """One sidecar string VALUE, masked THEN surrogate-scrubbed; None stays None.
+
+    The whole redaction surface of the sidecar, now that ``write_tool_meta``
+    builds the file from a fixed schema instead of serializing a caller's dict:
+    exactly three string VALUES can carry operator/LLM text, and this is applied
+    to each of them by name.
+
+    Redact BEFORE the scrub, the same order ``llm_log._stored_body`` runs its two
+    passes in: the redactor must match the REGISTERED value against untouched
+    text, and the scrub must not be undone afterwards (it only ever replaces a
+    lone surrogate with U+FFFD, which carries nothing to mask).
+
+    The scrub is what keeps the write path's own encode from raising: an LLM
+    reply or a hand-edited field can carry a lone surrogate, which is a legal
+    ``str`` that ``.encode("utf-8")`` refuses. Scrubbing rather than REFUSING is
+    the adjudicated choice -- one bad code point is a display-level defect in a
+    summary that is otherwise a genuine, useful explanation, and refusing would
+    lose the whole generation over it (and, on the install hook's placeholder
+    path, leave the operator with no sidecar and no 重新產生 button at all).
+    U+FFFD is exactly what the reader would show anyway, so scrubbing makes the
+    file agree with the render. The read side scrubs INDEPENDENTLY regardless
+    (see ``_utf8_safe_meta``), because a hand-edited file never passes here.
+
+    Raises whatever ``redact_known_secrets`` raises: the LIVE redactor
+    deliberately propagates a provider failure rather than degrading to
+    unmasked, and ``write_tool_meta`` turns that into its fail-closed refusal.
+    """
+    return None if value is None else _utf8_safe(redact_known_secrets(value))
+
+
+def _still_the_expected_package(
+    version_root: VersionRoot, expected: tuple[int, int, int] | None
+) -> bool:
+    """Is the package at ``directory`` still the one ``expected`` names?
+
+    The ONE spelling of "nothing swapped under us", shared by the three places
+    that act irreversibly on a package they looked at earlier: the runtime just
+    before ``Popen`` (``_run_tool_subprocess``), the sidecar just before
+    ``os.replace`` (``_write_package_file_atomic``), and ``_make_handler``'s refusal
+    before it does any work at all. Each of those used to check somewhere
+    EARLIER and then do real work -- a ``.env`` read, an argument serialization, a
+    redactor sweep, an mkstemp+fsync -- between the check and the act it was
+    guarding, which is a window rather than the check-then-act INSTANT this
+    module accepts elsewhere. One helper does not make them one call site, but it
+    does make "the check is the line above the act" the recognizable shape.
+
+    ``expected`` of None is FALSE, never a pass: the caller could not establish an
+    identity, and a check that cannot speak must not vouch (D40 P3b r11). The
+    identity is the MANIFEST's (``package_identity``) because the question is
+    "same advertised content?". The former directory identity and execution
+    registry are gone: destruction safety is now the tools flock's job.
+    """
+    return expected is not None and package_identity(version_root) == expected
+
+
+class _PackageReplaced(Exception):
+    """Raised INSIDE ``_write_package_file_atomic`` when the guard refuses the publish.
+
+    Never escapes that function, and exists only so the refusal leaves through
+    the same ``except`` that already unlinks the temp file: the alternative is a
+    second copy of that cleanup, kept in step by hand, on the one path that runs
+    when something is already going wrong.
+    """
+
+
+def _write_package_file_atomic(
+    directory: Path,
+    filename: str,
+    data: bytes,
+    expected_identity: tuple[int, int, int] | None,
+    *,
+    default_mode: int = _OWNER_RW,
+    identity_root: VersionRoot | None = None,
+    durability_out: list[bool] | None = None,
+) -> bool:
+    """Atomically publish one backend-owned file and preserve its safe mode.
+
+    The publisher refuses non-regular existing targets, writes and fsyncs a temp
+    file in the destination directory, checks an optional version identity at the
+    last instant, replaces the target, and fsyncs the directory. Its bool contract
+    is shared by state, current, origin, and summary callers and reports whether
+    publication happened; the optional one-item out parameter exists solely so
+    ``publish_current`` can expose confirmed directory durability to discard.
+    """
+    path = directory / filename
+    # The mode to publish under. There is ALWAYS one now (R11): a fresh file
+    # gets _OWNER_RW explicitly rather than mkstemp's umask-masked default (or the
+    # caller's ``default_mode``, normalized by the same rule), and an inherited
+    # mode is OR'd with it below.
+    preserve_mode: int = (default_mode & 0o777) | _OWNER_RW
+    try:
+        existing_mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        pass  # no file yet -- the ordinary first-write case, not a refusal
+    except OSError:
+        return False
+    else:
+        # lstat does NOT follow the final component, so a symlinked target shows
+        # up as one here (S_ISLNK), exactly as O_NOFOLLOW used to refuse it.
+        if not stat.S_ISREG(existing_mode):
+            return False
+        # R7-3: the SAME lstat that refused a symlink supplies the bits to keep.
+        # Low 9 only -- setuid/setgid/sticky are not inherited (see docstring).
+        # OR'd with _OWNER_RW (R11): the operator's group/other customization is
+        # honored, but OWNER read+write is not negotiable -- see that constant.
+        preserve_mode = (existing_mode & 0o777) | _OWNER_RW
+    try:
+        fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=f"{filename}.", suffix=".tmp")
+    except OSError:
+        # A vanished/unwritable package directory (the ghost-guard race, EACCES,
+        # a read-only mount): nothing was created, nothing to clean up.
+        return False
+    tmp_path = Path(tmp_name)
+    fd_owned = True  # we own the raw fd until fdopen takes it over
+    try:
+        # On the FD, before publish: the replacement must already carry its final
+        # mode at the instant the name flips, so no reader ever sees the temp
+        # file's umask-dependent creation mode under the sidecar's name.
+        os.fchmod(fd, preserve_mode)
+        handle = os.fdopen(fd, "wb")
+        fd_owned = False  # fdopen now owns fd; closing the handle closes it
+        with handle:
+            # BINARY, and the bytes were encoded ONCE by the caller: the size
+            # check and the file must be measured on the identical payload, and a
+            # text handle would re-encode (and could raise) at flush time instead.
+            # BufferedWriter loops over short writes internally, so `write` +
+            # `flush` is the complete-write guarantee cli.py's `_write_all` spells
+            # out by hand over raw os.write.
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # The LAST instant: one lstat, then the publish. Nothing but the compare
+        # separates them, so what a swap can still reach is the syscall PAIR this
+        # module accepts by name elsewhere -- and even that lands harmlessly, since
+        # the temp file was minted inside the directory that moved and the rename
+        # below would then fail with ENOENT (measured; False, nothing published).
+        # None is skipped rather than refused, because at THIS layer it means "the
+        # caller asserted nothing" -- the callers that have an identity to assert
+        # refuse their own None long before they get here.
+        if expected_identity is not None and (
+            identity_root is None
+            or not _still_the_expected_package(identity_root, expected_identity)
+        ):
+            raise _PackageReplaced
+        os.replace(tmp_path, path)
+    except OSError, _PackageReplaced:
+        if fd_owned:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        # Safe unconditionally: tmp_path is a name mkstemp invented for THIS call
+        # alone, never a path a caller passed in (cli.py's same argument). By PATH,
+        # so it finds nothing when the package DIRECTORY was renamed aside under us
+        # -- that ENOENT is the suppressed case, and what happens to the file
+        # instead is measured in the docstring (it rides into the collected
+        # namespace with the directory). Not worth a directory fd: the only way to
+        # reach that branch is a rename that already hands the file to a collector.
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        return False
+    # The rename made durable (see docstring). OUTSIDE the try on purpose: the
+    # publish has already happened, so no failure here may turn it into a False --
+    # it would unlink a temp file that no longer exists and report a toggle that
+    # DID take effect as "did not happen". O_DIRECTORY so a path that is somehow
+    # not a directory is refused rather than fsynced as whatever it is.
+    durable = False
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+        durable = True
+    except OSError:
+        pass
+    if durability_out is not None:
+        durability_out.append(durable)
+    return True
+
+
+def write_tool_meta(
+    version_root: VersionRoot,
+    meta: dict[str, Any],
+    *,
+    expected_identity: tuple[int, int, int] | None = None,
+) -> bool:
+    """Publish typed, bounded, sanitized ``summary.json``. Returns success.
+
+    This does NOT serialize ``meta``. It reads the four fields it understands out
+    of ``meta``, coerces each to the shape the sidecar's contract promises, and
+    writes THAT -- so every KEY on disk is a literal from this function and every
+    VALUE is one this function chose or refused:
+
+    * ``summary`` -- a ``str``; None becomes ``""`` (the placeholder a failed
+      generation leaves, and the shape a hand-edited ``"summary": null`` should
+      collapse to rather than sneaking past as "not a string, but not refused
+      either"). Any OTHER type refuses the write: ``summary`` is a string by
+      contract, the read path renders anything else as "no summary", and writing
+      one would make the file lie about whether a summary exists;
+    * ``updated_at`` -- a ``str``, else the write is REFUSED. Every caller stamps
+      its own (``_now_iso`` / ``datetime.now``), so a missing or out-of-shape one
+      is a caller bug, and inventing a timestamp on their behalf would put a
+      fact in the file that nothing actually observed;
+    * ``llm_log_id`` -- an ``int`` (``bool`` excluded, since it is an ``int``
+      subclass and a stray ``true`` would render as a link to log record 1), else
+      None;
+    * ``llm_log_process`` -- a ``str``, else None: the ``llm_log.process_token()``
+      of the process that MINTED the id above. The AI log's ids are a per-process
+      counter and its ring dies with the process, while this file keeps the
+      integer forever -- so after a restart a stored id resolves to whatever
+      interaction now holds it, a different tool's summary or a different workflow
+      altogether, and nothing downstream can tell (the row really was selected by
+      that id). The token is what lets a reader ask "is this id still mine?"; see
+      ``store_summary_meta`` for why it is minted next to the id rather than here,
+      and ``routers.tools._summary_detail`` for what a foreign or absent one costs;
+
+    Building rather than copying is the FIX for a real leak, not a tidiness
+    preference. The previous version redacted the whole caller structure with a
+    generic walk that masked dict KEYS as well as values, which turned the
+    redactor's own success into corruption: register a secret whose VALUE
+    happens to equal a schema key (``secret_value="summary"`` clears the 6-char
+    floor), and the write "succeeded" with the fixed key rewritten to the
+    redaction marker -- a file that no longer parses as our schema, so the
+    summary silently disappeared from every later read. The same walk also had
+    no case for a tuple, which JSON serializes as an array perfectly happily, so
+    a tuple of strings rode to disk UNMASKED. Both are gone by construction
+    here: there are no caller-supplied keys and no caller-supplied containers to
+    walk.
+
+    The redaction that remains is FAIL-CLOSED, and that is the load-bearing part
+    of this helper. The summary is LLM output about a package whose ``.env`` holds
+    live values, and this file is served back to the UI -- the same class
+    ``redact_known_secrets`` closes everywhere raw model/tool text enters
+    persisted state.
+
+    It is also the ONLY thing standing between a secret and this file, which is
+    why the fail-closed part is stated so loudly. An earlier version of this
+    docstring named a second line of defence -- a revise copies the installed
+    package into a staging build, and ``validate_package``'s embedded-secret gate
+    scans EVERY file there -- and that has not been true since the revise flow
+    took its final shape: ``tool_builder._revise_copy_ignore`` withholds the
+    sidecar's reserved namespace at EVERY depth, and ``_strip_builder_sidecars``
+    deletes any sidecar found in staging BEFORE validation runs, so no sidecar
+    ever reaches that gate. The correction matters rather than being pedantic: a
+    maintainer who believed a downstream gate would catch an unmasked value could
+    reasonably relax the refusal below into "write it unmasked", and nothing
+    downstream would catch anything.
+
+    So a redaction failure (``known_secret_values`` raising -- the LIVE path
+    deliberately propagates rather than degrading to unmasked, see
+    ``redact_known_secrets``) writes NOTHING and returns False. It is applied to
+    the three fields that can carry operator/LLM text and to nothing else,
+    because nothing else CAN: ``llm_log_id`` is an int,
+    ``llm_log_process`` is an opaque token this backend
+    generated for itself, and ``updated_at`` is a machine timestamp its caller
+    just produced (no on-disk one ever round-trips -- both callers overwrite it).
+
+    The serialized payload is bounded by ``_AI_META_MAX_BYTES``, the SAME cap
+    ``read_tool_meta`` refuses past, so this can never produce a file that reads
+    back as None. Every other failure (an unwritable path, a symlinked/FIFO
+    sidecar refused by ``_write_package_file_atomic``'s lstat gate) is False too, so
+    callers get one "did-not-happen" answer and never an exception -- summary
+    metadata is best-effort by design.
+
+    The serialize + encode + size check live INSIDE the fail-closed ``try``, and
+    that placement is load-bearing rather than tidy. They used to sit outside it,
+    so a lone surrogate reaching any string field raised ``UnicodeEncodeError``
+    straight out of this function -- turning a PATCH that should have answered
+    False (-> 404) into a 500. ``_redacted`` now scrubs the three text fields
+    before ``dumps`` sees them, so the surrogate case is HANDLED rather than
+    merely caught; the guard still covers ``updated_at``, the one caller-supplied
+    string this function passes through verbatim (every real caller stamps a
+    machine timestamp, so scrubbing it would only paper over a caller bug -- a
+    refusal is the honest answer there).
+
+    The write itself is ATOMIC (``_write_package_file_atomic``): the previous sidecar
+    survives every failure and the file is never observable half-written. See
+    that helper for why the truncate-then-write shape was a real data-loss
+    vector for an existing summary.
+
+    ``expected_identity`` is carried STRAIGHT THROUGH to that helper, which checks
+    it on the line above ``os.replace``; this function does not read it, and the
+    redaction/encode/cap work below deliberately runs BEFORE the check rather than
+    after it (that ordering is the whole point -- see ``_write_package_file_atomic``).
+    It defaults to "assert nothing" so a caller that just created the package
+    itself need not invent one; every production caller passes the identity its
+    own resolve captured, and both of them refuse a None identity in their own
+    vocabulary before they get here.
+
+    CONSEQUENCE, stated so it is not rediscovered as a bug: extra keys a
+    hand-edited sidecar carries are DROPPED by the next write. Round-tripping
+    them was never a contract -- it was a side effect of serializing the caller's
+    dict, and it is precisely what let a stray key/value carry unmasked text into
+    the file. The four fields above are the sidecar.
+
+    ``llm_log_id`` and ``llm_log_process`` are carried through from ``meta``
+    rather than re-derived. Stamping the current token here would forge freshness
+    onto a stale id, so minting happens at exactly one call site, next to the id
+    itself (``store_summary_meta``).
+
+    The ``is_dir`` precondition is kept as the EXPLICIT answer to a racing
+    ``delete_tool``: a summary landing just after one must not re-create the
+    deleted package's directory holding nothing but a sidecar, which the registry
+    would then list as a broken package named after the tool the user just
+    removed. It was load-bearing when the sidecar rode ``_write_regular_file``,
+    which CREATES missing parents (the meta-tool contract needs that);
+    ``_write_package_file_atomic``'s ``mkstemp`` in the package directory now fails
+    with ENOENT instead, so the check states the rule rather than being the only
+    thing enforcing it. It narrows, but cannot close, that window (the delete can
+    still land between this check and the write); the remaining race is the same
+    single-user local-tool edge install/delete already accepts (D21/D40).
+    """
+    if not version_root.path.is_dir():
+        return False
+    summary = meta.get("summary")
+    if summary is None:
+        summary = ""
+    if not isinstance(summary, str):
+        return False
+    updated_at = meta.get("updated_at")
+    if not isinstance(updated_at, str):
+        return False
+    log_id = meta.get("llm_log_id")
+    if not isinstance(log_id, int) or isinstance(log_id, bool):
+        log_id = None
+    log_process = meta.get("llm_log_process")
+    if not isinstance(log_process, str):
+        log_process = None
+    try:
+        payload: dict[str, Any] = {
+            "summary": _redacted(summary),
+            "updated_at": updated_at,
+            "llm_log_id": log_id,
+            "llm_log_process": log_process,
+        }
+        # ensure_ascii=False keeps CJK readable in the file (and is what the byte
+        # cap below is measured against). Every value is a str/int/None we just
+        # built, so dumps cannot fail on an unserializable type -- but the ENCODE
+        # can still raise on a surrogate-bearing ``updated_at``, which is why both
+        # steps sit inside this guard (see the docstring). The cap is checked on
+        # the ENCODED length, because that is the unit the writer's half of the
+        # read/write symmetry is stated in (see _AI_META_MAX_BYTES).
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    except Exception:
+        return False
+    if len(data) > _AI_META_MAX_BYTES:
+        return False
+    meta_root = version_root.path / _META_DIRNAME
+    if not meta_root.is_dir():
+        return False
+    return _write_package_file_atomic(
+        meta_root,
+        _SUMMARY_FILENAME,
+        data,
+        expected_identity,
+        identity_root=version_root,
+    )
+
+
+def write_origin_meta(build_root: BuildRoot, origin: dict[str, Any]) -> bool:
+    """Publish immutable, sanitized ``origin.json`` before a version is installed."""
+
+    source = origin.get("source")
+    previous = origin.get("previous")
+    if not isinstance(source, str):
+        return False
+    if previous is not None and (not isinstance(previous, str) or not _VID_RE.fullmatch(previous)):
+        return False
+    try:
+        payload = {
+            "source": _redacted(source),
+            "openapi_url": _redacted(_meta_str(origin.get("openapi_url"))),
+            "instructions": _redacted(_meta_str(origin.get("instructions"))),
+            "feedback": _redacted(_meta_str(origin.get("feedback"))),
+            "previous": previous,
+        }
+        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+    except Exception:
+        return False
+    if len(data) > _AI_META_MAX_BYTES:
+        return False
+    meta_root = build_root.path / _META_DIRNAME
+    if not meta_root.is_dir():
+        return False
+    return _write_package_file_atomic(meta_root, _ORIGIN_FILENAME, data, None)
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentPublication:
+    """The one publication result whose durability a caller is allowed to read.
+
+    Truthiness means the ``current`` name was replaced, preserving the existing
+    ``if not publish_current(...)`` call shape.  ``durable`` is intentionally a
+    separate fact: discard succeeds on publication, but may destroy the previous
+    target only when the containing-directory fsync was confirmed.
+    """
+
+    published: bool
+    durable: bool
+
+    def __bool__(self) -> bool:
+        return self.published
+
+
+def publish_current(package_root: PackageLayoutRoot, vid: str) -> CurrentPublication:
+    """Publish one syntactically valid vid into a package-shaped layout."""
+
+    if not _VID_RE.fullmatch(vid):
+        return CurrentPublication(published=False, durable=False)
+    meta_root = package_root.path / _META_DIRNAME
+    if not meta_root.is_dir():
+        return CurrentPublication(published=False, durable=False)
+    durability: list[bool] = []
+    published = _write_package_file_atomic(
+        meta_root,
+        _CURRENT_FILENAME,
+        f"{vid}\n".encode("ascii"),
+        None,
+        durability_out=durability,
+    )
+    return CurrentPublication(
+        published=published,
+        durable=published and bool(durability) and durability[0],
+    )
+
+
+def write_package_state(
+    package_root: PackageLayoutRoot, enabled: bool, *, default_mode: int = _OWNER_RW
+) -> bool:
+    """Atomically publish the owned toggle into a package-shaped layout."""
+    # Trailing newline so the file is a well-formed text line like every other
+    # small file this project publishes (cli.py's .env, set_enabled's old manifest
+    # rewrite). ensure_ascii is irrelevant to a bool but is passed for uniformity
+    # with the sidecar's encode. The payload is three ASCII tokens, so neither the
+    # dumps nor the encode can raise and neither needs a guard. The marker is FIRST
+    # so an operator opening the file reads whose it is before what it says.
+    document = {_STATE_MARKER_KEY: _STATE_MARKER_VALUE, "enabled": enabled}
+    data = (json.dumps(document, ensure_ascii=False) + "\n").encode("utf-8")
+    meta_root = package_root.path / _META_DIRNAME
+    if not meta_root.is_dir():
+        return False
+    return _write_package_file_atomic(
+        meta_root,
+        _PACKAGE_STATE_FILENAME,
+        data,
+        None,
+        default_mode=default_mode,
+    )
+
+
+def store_summary_meta(
+    version_root: VersionRoot,
+    *,
+    summary: str,
+    llm_log_id: int | None,
+    expected_identity: tuple[int, int, int] | None,
+) -> tuple[str, dict[str, Any] | None]:
+    """Publish a version summary without modifying immutable ``origin.json``.
+
+    The version identity captured before generation is checked immediately before
+    publication. The post-write read returns exactly what the next GET serves.
+    """
+    try:
+        summary = redact_known_secrets(summary).strip()[:_TOOL_SUMMARY_CAP]
+    except Exception:
+        return ("not_stored", None)
+    meta: dict[str, Any] = {
+        "summary": summary,
+        "updated_at": datetime.now(UTC).isoformat(),
+        "llm_log_id": llm_log_id,
+        "llm_log_process": llm_log.process_token() if llm_log_id is not None else None,
+    }
+    if expected_identity is None:
+        return ("not_stored", None)
+    if not write_tool_meta(version_root, meta, expected_identity=expected_identity):
+        return ("not_stored", None)
+    stored = read_tool_meta(version_root)
+    return ("ok", stored) if stored is not None else ("not_stored", None)
+
+
+def resolution_lineage(
+    resolution: Resolved | PackageLayoutResolved,
+) -> Literal["sole", "usable", "broken"]:
+    """Return ``sole``/``usable``/``broken`` from this exact resolution.
+
+    Missing is not null: every committed origin published by this service has
+    the field, so omission means the document is not a complete marker of ours.
+    A malformed present value and a self-loop are likewise broken.  Keeping all
+    three decisions beside target validation prevents listing, migration and
+    discard from inventing different lineage semantics.
+    """
+
+    previous = resolution.previous
+    if isinstance(previous, PreviousNull):
+        return "sole"
+    if isinstance(previous, PreviousAbsent):
+        return "broken"
+    value = previous.value
+    if value == resolution.vid:
+        return "broken"
+    return (
+        "usable"
+        if _resolve_version_target(resolution.package_root, value) is not None
+        else "broken"
+    )
+
+
 def list_tools() -> list[dict[str, Any]]:
     """List every installed package as a UI-facing summary.
 
-    Each entry is ``{name, description, enabled, valid, error}``. A broken
-    package (bad JSON, name mismatch, bad schema shape, missing entry file) is
-    included with ``valid=False`` and a safe ``error`` reason, and is never
-    executable; a missing/unset tools dir yields [].
+    A broken package is included with ``valid=False`` and a safe error reason,
+    but is never executable; a missing or unset tools directory yields [].
     """
     return [
         {
@@ -586,10 +1969,30 @@ def list_tools() -> list[dict[str, Any]]:
             "description": scan.description,
             "enabled": scan.enabled,
             "valid": scan.valid,
-            "error": scan.error,
+            "error": scan.error if scan.error is not None else scan.notice,
+            "current_vid": scan.resolution.vid if isinstance(scan.resolution, Resolved) else None,
+            "lineage": (
+                resolution_lineage(scan.resolution)
+                if isinstance(scan.resolution, Resolved)
+                else "broken"
+            ),
         }
         for scan in _scan_all()
     ]
+
+
+def package_identity(version_root: VersionRoot) -> tuple[int, int, int] | None:
+    """Return one version manifest's ``(dev, ino, ctime_ns)`` identity.
+
+    Scanning binds this identity to the advertised specification. Execution and
+    summary publication compare it again so hand edits or replacement cannot make
+    an operation composed for one manifest land on another.
+    """
+    try:
+        info = os.lstat(version_root.path / "tool.json")
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino, info.st_ctime_ns)
 
 
 def _build_llm_tool(scan: _PackageScan) -> LlmTool:
@@ -598,9 +2001,33 @@ def _build_llm_tool(scan: _PackageScan) -> LlmTool:
     Callers pass only ``valid`` scans, so ``parameters`` / ``entry`` are present;
     the assertions document that precondition and keep the type checker happy
     without an ``Any`` escape hatch.
+
+    The identity handed to ``_make_handler`` is the one ``_scan_tool_content`` took
+    immediately before the manifest read (``scan.identity``), NOT a fresh ``lstat``
+    taken here -- and that is the point rather than an optimization. This
+    function does not run until ``_scan_all`` has returned, i.e. until EVERY
+    package has been scanned, so an ``lstat`` here would be separated from the
+    read it vouches for by an unbounded number of file reads: an operator package
+    replacement landing in that gap pinned the NEW identity against the OLD spec, and
+    every downstream guard -- this handler's own, and the one above ``Popen`` --
+    then compared EQUAL and ran it. Pairing them at the read leaves a window of
+    exactly one ``lstat``/``open`` pair, and leaves it on the side that REFUSES
+    (see ``_scan_tool_content`` for the measurement of both orderings).
+
+    A TOGGLE landing in that same gap was the OTHER half of R7-1's finding, and it
+    is no longer this pairing's to catch: since web-v5 P1 a toggle moves nothing,
+    so the stale ``scan.enabled`` this function reads can advertise a tool that was
+    switched off a moment ago. That is answered where it now belongs -- the handler
+    re-derives the effective toggle at CALL time (``package_enabled``) and refuses
+    (``_make_handler``).
+
+    A ``scan.identity`` of None still reaches ``_make_handler``, which refuses
+    every call rather than treating "cannot say" as "unchanged" (D40 P3b r11).
     """
     assert scan.parameters is not None
     assert scan.entry is not None
+    assert isinstance(scan.resolution, Resolved)
+    assert scan.advertisement_generation is not None
     spec: dict[str, Any] = {
         "type": "function",
         "function": {
@@ -610,7 +2037,15 @@ def _build_llm_tool(scan: _PackageScan) -> LlmTool:
             "parameters": scan.parameters,
         },
     }
-    return LlmTool(spec=spec, handler=_make_handler(scan.directory, scan.entry))
+    return LlmTool(
+        spec=spec,
+        handler=_make_handler(
+            scan.resolution,
+            scan.entry,
+            scan.identity,
+            scan.advertisement_generation,
+        ),
+    )
 
 
 def enabled_llm_tools() -> list[LlmTool]:
@@ -629,62 +2064,168 @@ def enabled_llm_tools() -> list[LlmTool]:
 # stores, at its storage choke point. But llm_log is a leaf observability module
 # and must not import THIS one -- so it takes a provider CALLABLE and main wires
 # in ``known_secret_values`` below (the same leaf/provider inversion llm_log's
-# own logger config uses). The set is computed at CALL time, never cached as a
+# own logger config uses). The inversion is about THAT direction only: this
+# module imports llm_log directly (for ``process_token``, see
+# ``store_summary_meta``), which is the direction that keeps llm_log a leaf.
+# The set is computed at CALL time, never cached as a
 # static value, because it genuinely CHANGES at runtime: an install writes a new
 # tool ``.env``, and an in-flight install registers its form secret before that
 # ``.env`` even exists.
 
-# In-flight install secrets. A web-installer form secret (secret_value) is
-# registered here for the DURATION of one install (tool_builder add/discards
-# around run_install), so it is already redactable during the builder session --
-# the window BEFORE promote writes it into the package ``.env``, after which the
-# per-package ``.env`` scan below is what covers it. This registry lives HERE,
-# not in tool_builder, on purpose: ``known_secret_values`` must read it, and
-# tool_builder already imports us, so putting it in tool_builder would force a
-# reverse import (a cycle) -- the SAME inversion llm_log applies to us. Its own
-# lock guards it because ``known_secret_values`` can run on a threadpool recorder
-# thread while an install mutates the set on the event loop.
-_INFLIGHT_SECRETS: set[str] = set()
+# In-flight secrets: values that must stay redactable for the DURATION of one
+# operation, independently of what the ``.env`` scan below can see AT THE MOMENT
+# a body is recorded. Three kinds of holder register here:
+#
+# * a web-installer form secret (``secret_value``), for the whole install
+#   (tool_builder registers/discards around ``run_install``) -- the window BEFORE
+#   promote writes it into the package ``.env``, after which the per-package
+#   ``.env`` scan below is what covers it;
+# * a revise session's ``.env`` values, for the whole builder session, plus
+#   whatever the promote re-vets on its way out;
+# * the ``.env`` values ONE TOOL CALL was handed. ``_build_tool_env`` copies the
+#   package's ``.env`` into the child's environment, and the child can echo any
+#   of it back -- but the redaction of that output happens when the child
+#   FINISHES, and by then the file may say something else entirely (an operator
+#   rotating a credential or directly editing/moving package state). The scan
+#   would then only know the NEW value and the OLD one would ride into the
+#   role:"tool" message, the log and the JSONL sink unmasked. So the values a
+#   child actually RECEIVED are held here for
+#   exactly as long as that call can still produce output to mask.
+#
+# COUNTED rather than flagged because overlapping holders can carry the same
+# value:
+# holders overlap (two workflows calling the same tool, a revise running while an
+# ordinary conversation calls that same tool -- ordinary AI workflows are outside
+# the tool job's single-flight), and they can hold the SAME value, since it is the
+# same ``.env``. With a plain set the first holder to finish would strip the
+# protection the survivor still needs.
+#
+# This registry lives HERE, not in tool_builder, on purpose: ``known_secret_values``
+# must read it, and tool_builder already imports us, so putting it in tool_builder
+# would force a reverse import (a cycle) -- the SAME inversion llm_log applies to
+# us. Its own lock guards it because ``known_secret_values`` can run on a
+# threadpool recorder thread while an install mutates the mapping on the event loop.
+_INFLIGHT_SECRETS: dict[str, int] = {}
 _INFLIGHT_LOCK = threading.Lock()
 
 # Cache of one package's parsed ``.env`` VALUES, keyed by the ``.env`` path and
-# tagged with the file's ``mtime_ns``, so ``known_secret_values`` re-parses a
-# package only when its ``.env`` actually changed. This matters because the
-# provider runs once PER STORED LOG BODY (every request message + every response
-# of every attempt), and a busy installer session records the whole GROWING
-# conversation on each of dozens of rounds -- without the cache, every one of
-# those records would re-read every installed tool's ``.env`` from disk.
-_ENV_VALUE_CACHE: dict[str, tuple[int, frozenset[str]]] = {}
+# tagged with a FILE IDENTITY taken from its ``stat``, so ``known_secret_values``
+# re-parses a package only when its ``.env`` actually changed. This matters
+# because the provider runs once PER STORED LOG BODY (every request message +
+# every response of every attempt), and a busy installer session records the
+# whole GROWING conversation on each of dozens of rounds -- without the cache,
+# every one of those records would re-read every installed tool's ``.env`` from
+# disk.
+#
+# The tag is ``(st_dev, st_ino, st_mtime_ns, st_ctime_ns, st_size)`` and it used
+# to be the ``st_mtime_ns`` alone, which describes WHEN a path was last written
+# rather than WHICH FILE is there now -- and mtime is the one timestamp userspace
+# can set to anything (``utime``), while several perfectly ordinary ways of
+# replacing a file preserve it on purpose. Measured on this repo's filesystem
+# (ext4) rather than assumed, each against a cached entry:
+#
+# * ``shutil.copy2`` over the existing path changes ONLY ``st_ctime_ns``;
+# * a rewrite followed by ``os.utime`` restoring the old stamps (a
+#   timestamp-preserving restore, a backup rollout, ``cp -p``) changes ONLY
+#   ``st_ctime_ns``, even when the new content is the same LENGTH;
+# * write-to-temp + rename with the mtime carried over (``rsync -t``) changes
+#   ``st_ino`` and ``st_ctime_ns``;
+# * ``unlink`` + recreate REUSES the inode here, so ``st_ino`` alone would not
+#   have caught the case above either -- which is why ctime is in the tag and not
+#   just the inode;
+# * renaming the parent DIRECTORY changes nothing about the file, so moving an
+#   unchanged package tree away and back is still a cache HIT, correctly.
+#
+# Under the old tag every one of those left the redactor serving the PREVIOUS
+# values: the tool then emits the new secret and neither the live tool-result
+# redactor, nor llm_log, nor the summary writer masks it. ``st_ctime_ns`` is the
+# field that carries the weight (no syscall sets it backwards; every content or
+# metadata change moves it), with dev/ino catching a replacement that reuses the
+# timestamps and size catching one that reuses the tick. The residual, stated
+# rather than implied: the file-timestamp clock advances in ~1 ms steps here
+# (measured), so a same-inode, same-size, mtime-preserving replacement landing
+# INSIDE the millisecond of the cached read is still a hit. That is one syscall
+# pair wide -- the same check-then-act instant this subsystem accepts everywhere
+# else -- and it cannot be closed by any stat-based tag, only by re-reading every
+# ``.env`` on every log body, which is the cost this cache exists to avoid.
+_ENV_VALUE_CACHE: dict[str, tuple[tuple[int, int, int, int, int], frozenset[str]]] = {}
 _ENV_VALUE_CACHE_LOCK = threading.Lock()
 
 
 def register_inflight_secret(value: str) -> None:
-    """Mark ``value`` redactable for the current install (see ``_INFLIGHT_SECRETS``)."""
+    """Take ONE hold on ``value`` being redactable (see ``_INFLIGHT_SECRETS``).
+
+    Every call must be matched by exactly one ``discard_inflight_secret`` from a
+    ``finally``: the count is what lets overlapping holders of the same value
+    (two calls to the same tool, a revise session and a tool call reading the
+    same ``.env``) each release only their OWN hold.
+    """
     if not value:
         return
     with _INFLIGHT_LOCK:
-        _INFLIGHT_SECRETS.add(value)
+        _INFLIGHT_SECRETS[value] = _INFLIGHT_SECRETS.get(value, 0) + 1
 
 
 def discard_inflight_secret(value: str) -> None:
-    """Drop ``value`` from the in-flight set once its install ends (try/finally)."""
+    """Release ONE hold on ``value``; it stays redactable while others remain.
+
+    The count is dropped to zero by REMOVING the key, so ``known_secret_values``
+    can read the mapping as a plain set of values and a stale zero can never
+    keep a value in it. Releasing a value nobody holds is a no-op (never a
+    negative count), which keeps this as forgiving as the ``set.discard`` it
+    replaced for a caller whose registration was skipped.
+    """
     with _INFLIGHT_LOCK:
-        _INFLIGHT_SECRETS.discard(value)
+        remaining = _INFLIGHT_SECRETS.get(value, 0) - 1
+        if remaining > 0:
+            _INFLIGHT_SECRETS[value] = remaining
+        else:
+            _INFLIGHT_SECRETS.pop(value, None)
 
 
-def _cached_env_values(directory: Path) -> frozenset[str]:
-    """The redactable VALUES of one package's ``.env``, cached per (path, mtime).
+@contextlib.contextmanager
+def _inflight_secrets(values: frozenset[str]) -> Iterator[None]:
+    """Hold ``values`` redactable for the body, and release them again.
+
+    Execution lifetime is now protected by the inherited flock, not a registry.
+    This independent context manager remains because secret-redaction lifetime
+    is a different question: a handler that raises, times out, or is cancelled
+    mid-call must not leave a hold behind. A leaked one would keep masking a
+    value forever, which is not visible until redaction starts eating ordinary
+    prose.
+
+    Registration is INSIDE the try, so a failure part-way through the loop still
+    releases the holds already taken (the release of a value never registered is
+    a no-op, so releasing them all is safe).
+    """
+    try:
+        for value in values:
+            register_inflight_secret(value)
+        yield
+    finally:
+        for value in values:
+            discard_inflight_secret(value)
+
+
+def _cached_env_values(package_root: PackageRoot) -> frozenset[str]:
+    """The redactable VALUES of one package's ``.env``, cached per (path, identity).
 
     Reuses the ONE bounded ``.env`` loader (``_load_tool_dotenv``) rather than
     hand-rolling a second parser, so the FIFO/symlink/oversize hardening and the
     drop-bare-keys behavior are inherited unchanged. Empty values are dropped so
     a ``KEY=`` line contributes nothing (``_redact`` also guards empties, but not
     seeding them keeps the set tidy).
+
+    The path is the cache KEY and the file's identity is the TAG (see
+    ``_ENV_VALUE_CACHE`` for what is in it and for the measurements that chose
+    the fields): a path answers "whose ``.env`` is this", and only the identity
+    can answer "is it still the same file with the same contents". Both come out
+    of the one ``stat`` this function already made.
     """
-    env_file = directory / ".env"
+    env_file = package_root.path / ".env"
     key = str(env_file)
     try:
-        mtime = env_file.stat().st_mtime_ns
+        info = env_file.stat()
     except OSError:
         # No ``.env`` (the common case) or an unstattable path: nothing to
         # contribute. Forget any stale cache entry so a LATER-created ``.env`` is
@@ -692,15 +2233,16 @@ def _cached_env_values(directory: Path) -> frozenset[str]:
         with _ENV_VALUE_CACHE_LOCK:
             _ENV_VALUE_CACHE.pop(key, None)
         return frozenset()
+    identity = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size)
     with _ENV_VALUE_CACHE_LOCK:
         cached = _ENV_VALUE_CACHE.get(key)
-        if cached is not None and cached[0] == mtime:
+        if cached is not None and cached[0] == identity:
             return cached[1]
-    # Parse OUTSIDE the lock (it does file I/O); the (path, mtime) key makes a
+    # Parse OUTSIDE the lock (it does file I/O); the (path, identity) key makes a
     # concurrent double-parse harmless -- both produce the identical set.
-    values = frozenset(value for value in _load_tool_dotenv(directory).values() if value)
+    values = frozenset(value for value in _load_tool_dotenv(package_root).values() if value)
     with _ENV_VALUE_CACHE_LOCK:
-        _ENV_VALUE_CACHE[key] = (mtime, values)
+        _ENV_VALUE_CACHE[key] = (identity, values)
     return values
 
 
@@ -714,8 +2256,12 @@ def known_secret_values() -> frozenset[str]:
       it into a body), but redacting it too means even a tool that somehow echoed
       it back cannot surface it in the log;
     * every VALUE in every installed tool package's ``.env`` (a KB API key etc.),
-      cached per (path, mtime) so a call per record stays cheap;
-    * the in-flight install secrets registered above (the pre-promote window).
+      cached per (path, file identity) so a call per record stays cheap;
+    * every value currently HELD in-flight (see ``_INFLIGHT_SECRETS``) -- an
+      install's form secret before promote writes it, a revise session's values,
+      and the values a running tool call handed its child. Each covers a window
+      the directory scan above cannot answer for, because the file it reads is
+      whatever is on disk NOW rather than what the holder was given.
 
     Wired as llm_log's secret provider by main. llm_log calls this INSIDE its own
     ``except Exception`` guard (the no-observer-failure invariant), so a hiccup
@@ -729,7 +2275,7 @@ def known_secret_values() -> frozenset[str]:
     if base is not None and base.is_dir():
         for child in sorted(base.iterdir()):
             if child.is_dir() and not child.name.startswith("."):
-                secrets |= _cached_env_values(child)
+                secrets |= _cached_env_values(PackageRoot(child))
     with _INFLIGHT_LOCK:
         secrets |= set(_INFLIGHT_SECRETS)
     return frozenset(secrets)
@@ -937,7 +2483,7 @@ def _parse_dotenv_text(text: str) -> dict[str, str]:
     return {key: value for key, value in values.items() if isinstance(value, str)}
 
 
-def _load_tool_dotenv(directory: Path) -> dict[str, str]:
+def _load_tool_dotenv(package_root: PackageRoot) -> dict[str, str]:
     """Parse the package's optional ``.env`` into a plain env dict.
 
     Uses ``dotenv_values`` (already a project dependency, used by cli.py) to
@@ -955,7 +2501,7 @@ def _load_tool_dotenv(directory: Path) -> dict[str, str]:
     off the value is kept as the literal string ``${OPENAI_API_KEY}``, so a
     generated tool can never exfiltrate a parent secret through its own manifest.
     """
-    env_file = directory / ".env"
+    env_file = package_root.path / ".env"
     # Read through the ONE bounded-regular-file helper (F3a): its O_NONBLOCK+S_ISREG
     # gate refuses a FIFO an operator (or a post-install mutation) could `mkfifo` in
     # place of .env -- which dotenv_values(path) would reopen and BLOCK on forever --
@@ -975,7 +2521,7 @@ def _load_tool_dotenv(directory: Path) -> dict[str, str]:
     return _parse_dotenv_text(text)
 
 
-def _build_tool_env(directory: Path) -> dict[str, str]:
+def _build_tool_env(package_root: PackageRoot) -> tuple[dict[str, str], frozenset[str]]:
     """Build the child environment FROM SCRATCH: passthrough allowlist + tool .env.
 
     The parent environment is NEVER copied wholesale -- see the module docstring.
@@ -990,12 +2536,23 @@ def _build_tool_env(directory: Path) -> dict[str, str]:
     MAY skip TLS certificate verification the same way this backend's own
     outbound connections do (see config.py), without that trust decision being
     silently forced on every tool regardless of the operator's setting.
+
+    Returns the env AND the (non-empty) ``.env`` VALUES that went into it, from
+    the SAME read -- which is the whole point of handing them back rather than
+    letting the caller re-read the file: a second read could see a rotated
+    ``.env`` and register values the child never got, leaving the ones it DID get
+    unmaskable. The passthrough names are deliberately NOT in that set: PATH and
+    HOME are not secrets, and masking them would shred every result that mentions
+    a path. The values are handed to ``_inflight_secrets`` by ``_make_handler``.
     """
     env = {name: os.environ[name] for name in _PASSTHROUGH_ENV if name in os.environ}
     if get_settings().tls_no_verify:
         env["TLS_NO_VERIFY"] = "1"
-    env.update(_load_tool_dotenv(directory))
-    return env
+    dotenv = _load_tool_dotenv(package_root)
+    env.update(dotenv)
+    # Empty values are dropped for the SAME reason ``_cached_env_values`` drops
+    # them: a ``KEY=`` line contributes no secret to anything.
+    return env, frozenset(value for value in dotenv.values() if value)
 
 
 def _cap_output(text: str, cap: int) -> str:
@@ -1251,37 +2808,61 @@ def _communicate_bounded(
     )
 
 
+# Returned INSTEAD of running anything when the package is no longer the one
+# whose schema was advertised (see ``_make_handler``). Category only -- no name,
+# no path, no identity values -- because this string goes straight into the
+# conversation as a role:"tool" message, the same discipline every other outcome
+# string in this module follows.
+_TOOL_REPLACED_RESULT = "tool not run: this tool's package changed after it was offered"
+
+# Returned INSTEAD of running anything when the tool was switched OFF between the
+# advertisement and the call (see ``_make_handler``). Its OWN string rather than a
+# second use of the one above, because that one asserts something that would not
+# be true here: nothing about the package CHANGED -- the manifest is byte-identical
+# and its identity has not moved (that is the whole of web-v5 P1) -- the operator
+# simply revoked the tool. Telling the model the package was replaced would send it
+# to re-read a spec that is still exactly what it was given. Category only, same
+# discipline as its sibling: this string goes straight into the conversation.
+_TOOL_DISABLED_RESULT = "tool not run: this tool was disabled after it was offered"
+
+
 def _run_tool_subprocess(
     entry: list[str],
-    directory: Path,
+    advertised: Resolved,
+    expected_identity: tuple[int, int, int] | None,
+    advertisement_generation: _AdvertisementGeneration,
+    tools_lock_fd: int,
     env: dict[str, str],
     args_json: str,
     timeout: float,
     output_cap: int,
 ) -> str:
-    """Run one tool entry to completion (or timeout) and return its result STRING.
+    """Run the advertised version and return one agent-visible result string.
 
-    Blocking; the async handler runs it via ``run_in_threadpool``. Every outcome
-    is an agent-visible string, never an exception:
-
-    * cannot even start (bad interpreter/entry, no exec bit) -> a "failed to
-      start" category;
-    * exceeded ``timeout`` -> the process GROUP is SIGKILLed and a "timed out"
-      message returned;
-    * non-zero exit -> ``"tool failed (exit N): <stderr>"`` (stderr size-capped);
-    * success -> stdout, size-capped at ``output_cap``.
-
-    ``shell=False`` (argv list, never a shell string) so nothing in the model's
-    arguments or a tool name can be shell-injected. ``errors="replace"`` on the
-    text pipes keeps a tool that emits invalid UTF-8 from crashing the reader.
-    Output is drained by ``_communicate_bounded`` (NOT ``communicate``), which
-    caps each stream in memory as it reads rather than slurping it whole first --
-    a runaway tool is killed at the cap instead of OOMing the service.
+    The final ordering is deliberate and compact: refuse a version retired by a
+    completed discard, read the PackageRoot toggle, require that ``current`` still
+    resolves to some usable version, verify the ADVERTISED VersionRoot identity,
+    then call ``Popen`` with nothing between that identity check and process
+    creation.  Resolving ``current`` does not compare vids: a normal revise may
+    move it while this call must remain bound to the schema it was shown.
     """
+    version_root = advertised.version_root
+    if _advertisement_retired(advertisement_generation):
+        return _TOOL_REPLACED_RESULT
+    package_root = advertised.package_root
+    if not package_enabled(package_root):
+        return _TOOL_DISABLED_RESULT
+    if isinstance(resolve_current(package_root), Unresolved):
+        return _TOOL_REPLACED_RESULT
+    # This identity check is deliberately LAST. No state read, lineage resolve,
+    # retired-marker lookup, or other fallible operation may be inserted between
+    # its answer and Popen's cwd resolution.
+    if not _still_the_expected_package(version_root, expected_identity):
+        return _TOOL_REPLACED_RESULT
     try:
         proc = subprocess.Popen(
             entry,
-            cwd=directory,
+            cwd=version_root.path,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1291,6 +2872,11 @@ def _run_tool_subprocess(
             errors="replace",
             # New session/group so the timeout path can kill the whole tree.
             start_new_session=True,
+            # The tool must never close this inherited descriptor itself. This
+            # is the only place mutual exclusion depends on tool behaviour: the
+            # child's reference keeps the request's shared flock alive even if
+            # the backend is killed and its own descriptor disappears.
+            pass_fds=(tools_lock_fd,),
         )
     except OSError as exc:
         # FileNotFoundError (bad interpreter/script), PermissionError (no exec
@@ -1320,31 +2906,185 @@ def _run_tool_subprocess(
     return _cap_output(redact_known_secrets(output.stdout), output_cap)
 
 
-def _make_handler(directory: Path, entry: list[str]) -> Callable[[dict[str, Any]], Awaitable[str]]:
-    """Build the async handler an ``LlmTool`` runs, closing over its package.
+@dataclass(slots=True, weakref_slot=True)
+class _AdvertisementGeneration:
+    """One cohort of handlers offered for the same VersionRoot between discards."""
 
-    Settings (timeout, output cap) and the child environment are read at CALL
-    time, not build time, so a settings override or an edited ``.env`` is
-    honored on the next invocation. The blocking subprocess is off-loaded to the
-    threadpool (the house pattern), so a slow tool never sits on the event loop.
-    The handler honors ``LlmTool``'s no-raise contract: ``_run_tool_subprocess``
-    turns every failure into a string, and the llm loop's own ``except`` is the
-    final backstop.
+    retired: bool = False
+
+
+# Retirement belongs to the ADVERTISEMENT, not to any recreatable filesystem
+# attribute. Every handler closure holds its cohort strongly; this weak map only
+# lets discard find the CURRENT cohort for a VersionRoot. Discard pops that cohort
+# before marking it, so a legitimately restored/current version receives a fresh
+# cohort while every old handler keeps its own retired object forever.
+#
+# The map is bounded by live, not-yet-discarded advertisement cohorts: when the
+# last handler for a cohort is collected, WeakValueDictionary removes its entry;
+# discarded cohorts are removed eagerly. It therefore cannot grow with vid,
+# directory, inode, or discard history.
+_ADVERTISEMENT_GENERATIONS: weakref.WeakValueDictionary[VersionRoot, _AdvertisementGeneration] = (
+    weakref.WeakValueDictionary()
+)
+_ADVERTISEMENT_LOCK = threading.Lock()
+
+
+def _advertisement_generation_locked(
+    version_root: VersionRoot,
+) -> _AdvertisementGeneration:
+    """Return/create a cohort while the caller holds ``_ADVERTISEMENT_LOCK``."""
+
+    generation = _ADVERTISEMENT_GENERATIONS.get(version_root)
+    if generation is None:
+        generation = _AdvertisementGeneration()
+        _ADVERTISEMENT_GENERATIONS[version_root] = generation
+    return generation
+
+
+def _advertisement_generation(version_root: VersionRoot) -> _AdvertisementGeneration:
+    """Return the live handler cohort for one advertised VersionRoot."""
+
+    with _ADVERTISEMENT_LOCK:
+        return _advertisement_generation_locked(version_root)
+
+
+def _resolve_and_register_advertisement(
+    package_root: PackageRoot,
+) -> tuple[Resolution, _AdvertisementGeneration | None]:
+    """Capture a resolution together with the cohort a discard must retire."""
+
+    with _ADVERTISEMENT_LOCK:
+        resolution = resolve_current(package_root)
+        if isinstance(resolution, Unresolved):
+            return resolution, None
+        # Registration shares the discard publication lock, so the guard exists
+        # from the instant this scan captures V: discard either retires this exact
+        # cohort afterward, or publishes first and the scan captures its successor.
+        return resolution, _advertisement_generation_locked(resolution.version_root)
+
+
+def _publish_discard_and_retire(
+    package_root: PackageRoot,
+    previous_vid: str,
+    discarded: VersionRoot,
+) -> CurrentPublication:
+    """Commit one discard and retire every scan that captured its old current."""
+
+    with _ADVERTISEMENT_LOCK:
+        publication = publish_current(package_root, previous_vid)
+        if publication:
+            generation = _ADVERTISEMENT_GENERATIONS.pop(discarded, None)
+            if generation is not None:
+                generation.retired = True
+        return publication
+
+
+def _advertisement_retired(generation: _AdvertisementGeneration) -> bool:
+    """Read one process-local handler generation under its mutation lock."""
+
+    with _ADVERTISEMENT_LOCK:
+        return generation.retired
+
+
+# The STALE-CLEANUP namespace: where a package goes when it must stop being a
+# package NOW but its best-effort recursive cleanup may fail. The old execution
+# registry parked running packages here; mutual exclusion makes that path
+# unreachable. ``.{name}.stale-<token>`` remains the only shape
+# ``tool_builder._sweep_stale_backups`` will ever remove, so an interrupted or
+# permission-blocked delete can be retried without exposing a phantom package.
+#
+# ``delete_tool`` mints this name and tool_builder's sweep recognizes it. The
+# shared spelling lives here because tool_builder already imports this module;
+# duplicating the on-disk contract would let writer and collector drift.
+#
+# Dot-prefixed is load-bearing, not cosmetic: ``_scan_all`` and
+# ``known_secret_values`` both skip hidden directories, so stale remains are
+# inert litter rather than a phantom package. ``\Z`` rather than ``$`` because
+# the pattern gates an ``rmtree``: ``$`` also matches before a trailing newline,
+# and a filename may legally contain one.
+#
+# The identifiers keep the word BACKUP even though a delete's remains are not a
+# backup of anything, and that is a decision: the on-disk name -- the actual
+# contract, the thing one side writes and the other reads -- says ``stale``,
+# which is true of both writers, and renaming the Python symbols would leave the
+# D40 r3 addendum pointing at names that no longer exist.
+_STALE_BACKUP_RE = re.compile(r"^\.[a-z0-9][a-z0-9_-]{0,63}\.stale-[0-9a-f]{32}\Z")
+
+
+def _stale_backup_path(base: Path, name: str, token: str) -> Path:
+    """Where a package goes to await collection (see ``_STALE_BACKUP_RE``).
+
+    The mate of that pattern: what this writes, the sweep must recognize, so a
+    test pins the pair (including at the longest legal package name).
+    """
+    return base / f".{name}.stale-{token}"
+
+
+def _make_handler(
+    advertised: Resolved,
+    entry: list[str],
+    identity: tuple[int, int, int] | None,
+    advertisement_generation: _AdvertisementGeneration,
+) -> Callable[[dict[str, Any]], Awaitable[str]]:
+    """Bind one advertisement to its package and exact resolved version.
+
+    The request-wide shared lock is captured with the advertisement and inherited
+    by any child. A direct service caller that did not enter the HTTP request
+    scope takes a shared lock for this handler invocation as a fail-safe; normal
+    capture/enrich/assist-update requests already hold one across scan, every
+    model round, every tool call, and error cleanup.
     """
 
+    request_lock_fd = _REQUEST_TOOLS_LOCK_FD.get()
+
     async def _handler(arguments: dict[str, Any]) -> str:
-        settings = get_settings()
-        env = _build_tool_env(directory)
-        args_json = json.dumps(arguments, ensure_ascii=False)
-        return await run_in_threadpool(
-            _run_tool_subprocess,
-            list(entry),
-            directory,
-            env,
-            args_json,
-            settings.llm_tool_timeout_seconds,
-            settings.llm_tool_output_max_chars,
-        )
+        package_root = advertised.package_root
+        version_root = advertised.version_root
+        if identity is None:
+            return _TOOL_REPLACED_RESULT
+        owned_lock_fd: int | None = None
+        tools_lock_fd = request_lock_fd
+        if tools_lock_fd is None:
+            owned_lock_fd = await run_in_threadpool(acquire_shared_tools_lock)
+            tools_lock_fd = owned_lock_fd
+        if tools_lock_fd is None:
+            return _TOOL_REPLACED_RESULT
+        try:
+            # Recheck inside the hold, then once more immediately before Popen.
+            if not _still_the_expected_package(version_root, identity):
+                return _TOOL_REPLACED_RESULT
+            # Toggle and .env are PackageRoot state, intentionally read at call
+            # time. Missing, foreign, or unreadable state all fail closed.
+            if not package_enabled(package_root):
+                return _TOOL_DISABLED_RESULT
+            settings = get_settings()
+            env, env_secrets = _build_tool_env(package_root)
+            args_json = json.dumps(arguments, ensure_ascii=False)
+            # The ``.env`` VALUES this child is about to be handed, held so they
+            # stay redactable no matter what the file says by the time the child
+            # finishes. The scope has to reach past the subprocess: the masking of
+            # the child's output happens INSIDE ``_run_tool_subprocess`` (F1/D36),
+            # so releasing on the child's exit would still be too early. It ends
+            # where the awaited call returns, which is after that redaction and
+            # before the string is handed to the llm loop -- everything downstream
+            # (the role:"tool" message, the log, the JSONL sink) sees the masked
+            # copy.
+            with _inflight_secrets(env_secrets):
+                return await run_in_threadpool(
+                    _run_tool_subprocess,
+                    list(entry),
+                    advertised,
+                    identity,
+                    advertisement_generation,
+                    tools_lock_fd,
+                    env,
+                    args_json,
+                    settings.llm_tool_timeout_seconds,
+                    settings.llm_tool_output_max_chars,
+                )
+        finally:
+            if owned_lock_fd is not None:
+                await run_in_threadpool(release_tools_lock, owned_lock_fd)
 
     return _handler
 
@@ -1379,98 +3119,239 @@ def _resolve_package_dir(name: str) -> Path | None:
     return candidate
 
 
-def set_enabled(name: str, enabled: bool) -> bool:
-    """Flip a package's ``enabled`` flag in its ``tool.json``. Returns success.
+def _resolve_package_dir_no_alias(name: str) -> PackageRoot | None:
+    """``_resolve_package_dir`` PLUS the INTERNAL-alias refusal, in one helper.
 
-    False when the name is unsafe (see ``_resolve_package_dir``), the package
-    directory is an alias (see below), the package or its ``tool.json`` is
-    missing/unreadable/oversized, or the write fails -- so the caller (a future
-    PATCH route) maps a bad name and a missing package alike to a clean "did not
-    happen" rather than a 500.
+    ``_resolve_package_dir`` resolves ``tools/<name>`` and then checks
+    containment -- which an INTERNAL symlink ``tools/alias -> tools/real``
+    PASSES, because it resolves to a path genuinely inside the tools root. The
+    alias/real distinction is erased by that ``resolve()``, so a caller handed
+    the result cannot tell it was addressed through an alias, and every
+    by-name operation on it silently acts on the REAL package instead
+    (a regenerate spending an LLM session rewriting the summary of REAL's live
+    version, a discard by that name retiring it). ``set_enabled`` calls
+    that out at length and hard-blocks it before its own resolve, for exactly
+    this reason (see its H3 comment); ``delete_tool`` carries its own variant
+    because it has a SAFE alias action (unlink just the link).
+
+    Every route/service that addresses a package BY NAME with no such special
+    case goes through here instead of composing the three steps itself, so the
+    hard-block cannot be forgotten by the next one added: name regex + tools_dir
+    gate, then ``is_symlink`` (which does NOT follow the final component, so it
+    sees the alias itself) BEFORE the resolve, then the containment resolve, and
+    finally the "is anything actually installed there" ``is_dir``. None is the
+    single did-not-happen answer for all four.
+
+    ``_resolve_package_dir`` is deliberately left alone: ``delete_tool`` must
+    keep reaching an alias to unlink it, so the refusal belongs in this
+    composition, not in the shared resolve.
+    """
+    base = tools_dir()
+    if base is None or not _NAME_RE.match(name):
+        return None
+    if (base / name).is_symlink():
+        return None
+    directory = _resolve_package_dir(name)
+    return PackageRoot(directory) if directory is not None and directory.is_dir() else None
+
+
+def set_enabled(name: str, enabled: bool) -> bool:
+    """Atomically update package-layer ``state.json`` for one real package.
+
+    The manifest and every version directory remain untouched. FOREIGN state is
+    never overwritten; unsafe names, aliases, missing packages, and failed writes
+    return False.
     """
     base = tools_dir()
     if base is None or not _NAME_RE.match(name):
         return False
     # INTERNAL-alias hard-block (H3), BEFORE resolve: an internal symlink
     # ``tools/<name> -> tools/real`` RESOLVES inside the tools root, so the
-    # resolve-then-contain check below would PASS and this toggle would rewrite
-    # the REAL package's manifest THROUGH the alias. ``is_symlink`` does not
-    # follow the final component, so it detects the alias itself; refuse outright
-    # -- set_enabled has no safe action on an alias (reading or writing a manifest
-    # through it is exactly the escape we are stopping), unlike delete_tool which
-    # can at least drop just the dangling link. Checked before resolve precisely
-    # because ``resolve()`` erases the alias/real distinction. External-symlink
-    # escapes are still separately caught by the containment check further down.
+    # resolve-then-contain check below would PASS and this toggle would write the
+    # state file INTO the REAL package THROUGH the alias -- switching off a tool
+    # the operator addressed by another name. ``is_symlink`` does not follow the
+    # final component, so it detects the alias itself; refuse outright -- set_enabled
+    # has no safe action on an alias, unlike delete_tool which can at least drop
+    # just the dangling link. Checked before resolve precisely because
+    # ``resolve()`` erases the alias/real distinction. External-symlink escapes are
+    # separately caught by ``_resolve_package_dir``'s containment check.
     if (base / name).is_symlink():
         return False
     directory = _resolve_package_dir(name)
     if directory is None or not directory.is_dir():
         return False
-    tool_json = directory / "tool.json"
-    # Re-verify containment at the WRITE boundary: ``directory`` is already the
-    # RESOLVED package dir, but ``tool.json`` could be a SYMLINK pointing outside
-    # it, and ``write_text`` follows symlinks -- so a symlinked manifest would
-    # otherwise let this rewrite an arbitrary file the service can reach. Require
-    # the RESOLVED manifest path to stay inside the resolved package dir before
-    # touching it (mirrors _resolve_package_dir's own resolve-then-contain, H3).
-    # The scan already lists such a package invalid, but set_enabled must not
-    # trust that -- it is reached directly by the mutation API.
-    if not _is_within(directory, tool_json.resolve()):
+    package_root = PackageRoot(directory)
+    # The one write is atomic: a torn
+    # state file is an UNREADABLE one, and an unreadable one takes the package out
+    # of the registry (see ``_read_enabled_state``), so publishing this by
+    # truncate-then-write would make a failed toggle strictly worse than no toggle.
+    # P2 intentionally has no state-publication lock: revise now publishes only
+    # ``versions/<vid>`` plus ``current``, so version publication never replaces
+    # this package-layer state. The old lock had lost its second participant.
+    #
+    # Recheck containment immediately before publication. The publisher refuses
+    # a symlink only at its final filename; this also protects its ancestors.
+    if _resolve_package_dir_no_alias(name) != package_root:
         return False
-    # Read the manifest through the ONE bounded-regular-file helper (F3b), exactly
-    # as the scan does -- this is the FIFO fix for the write path. A plain
-    # ``read_text()`` here would ``open(O_RDONLY)`` the manifest, and a FIFO
-    # ``mkfifo``'d in place of tool.json (a tool package can ship one; run_shell can
-    # create one) BLOCKS that open until a writer appears -- wedging the PATCH
-    # worker FOREVER. The helper's O_NONBLOCK+S_ISREG gate refuses the FIFO at once,
-    # its O_NOFOLLOW backstops the is_symlink() fast path above against a symlink
-    # raced in after it, and its cap+1 read SUBSUMES the old manual stat size-cap:
-    # an oversized manifest comes back longer than the cap and is refused here, the
-    # SAME observable refusal in the SAME char unit the scan uses -- so no separate
-    # stat is needed. None (every refusal/read failure) and an over-cap length BOTH
-    # map to set_enabled's "did not happen" False contract.
-    text = _read_regular_file_capped(tool_json, _MANIFEST_MAX_BYTES)
-    if text is None or len(text) > _MANIFEST_MAX_BYTES:
+    # An unresolved package has no version whose row this toggle could describe.
+    # Its sole recovery action is whole-package deletion; allowing PATCH here
+    # would mutate hidden state behind a row whose current_vid is null and whose
+    # version-specific actions must all refuse.
+    if isinstance(resolve_current(package_root), Unresolved):
         return False
+    # NOT OURS, NOT OVERWRITTEN (P1R5-1). One read, on the line above the publish:
+    # what remains after it is the publisher's own lstat/mkstemp/replace. Only a
+    # FOREIGN file stops the write -- an unreadable one is read as ours and
+    # publishing over it is the documented repair, and an absent one is ordinary.
+    if _read_enabled_state(package_root).notice is not None:
+        return False
+    return write_package_state(package_root, enabled)
+
+
+type ToolRemovalOutcome = Literal["removed", "retained"]
+type ToolRetentionReason = Literal["durability_unconfirmed", "cleanup_failed"]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRemovalResult:
+    """The observable filesystem result after a tool or version leaves current use."""
+
+    outcome: ToolRemovalOutcome
+    retained_path: Path | None
+    retention_reason: ToolRetentionReason | None = None
+
+
+type DiscardOutcome = (
+    ToolRemovalResult
+    | Literal["not_found", "version_mismatch", "lineage_unavailable", "ai_job_in_progress"]
+)
+
+
+def discard_version(package_root: PackageRoot, expected_vid: str) -> DiscardOutcome:
+    """Discard exactly the expected current version, preserving the safe order.
+
+    The caller owns the global single-flight reservation, while this boundary
+    owns the filesystem lock. ``current`` must be resolved and compared only
+    after that lock is acquired: otherwise a request can validate V, wait for a
+    running tool, then overwrite a D21 edit that moved ``current`` to Q.
+    """
+
+    with exclusive_tools_lock(package_root.path.parent) as acquired:
+        if not acquired:
+            return "ai_job_in_progress"
+        return _discard_version_locked(package_root, expected_vid)
+
+
+def _discard_version_locked(package_root: PackageRoot, expected_vid: str) -> DiscardOutcome:
+    """Resolve and discard after the exclusive tools lock has been acquired."""
+
+    resolution = resolve_current(package_root)
+    if isinstance(resolution, Unresolved):
+        return "not_found"
+    # This comparison belongs under the same lock as publication and removal.
+    # A lock taken only after a route-level comparison would serialize the write
+    # but leave its authorization stale, allowing old V -> P lineage to overwrite
+    # a newer ``current`` and then remove a version that is no longer current.
+    if resolution.vid != expected_vid:
+        return "version_mismatch"
+    current = resolution.version_root
+    previous = resolution.previous
+
+    # A version-addressed DELETE is never an entrance to whole-package deletion.
+    # Null may have appeared after the UI rendered a light "go back" confirmation,
+    # and missing is an incomplete marker rather than null; both must return the
+    # same actionable conflict before any package-layer file can be touched.
+    if not isinstance(previous, PreviousValue):
+        return "lineage_unavailable"
+    previous_vid = previous.value
+
+    # The previous pointer is operator-editable provenance.  Refuse a self-loop
+    # and apply the exact target validator used by current before touching either
+    # the pointer or a version directory.
+    if previous_vid == resolution.vid:
+        return "lineage_unavailable"
+    target = _resolve_version_target(package_root, previous_vid)
+    if target is None:
+        return "lineage_unavailable"
+    assert isinstance(previous_vid, str)
+
+    # Everything above was resolved under the exclusive lock, which excludes every
+    # OTHER backend operation, and the whole discard runs in well under a second.
+    # What it does NOT exclude is the operator's own editor, and rounds 21-23 spent
+    # three attempts trying to: each guard closed one window and revealed a smaller
+    # one inside it, because the state to compare lives across several files and
+    # POSIX has no rename conditioned on more than one of them.  The operator ruled
+    # that class out of scope (裁決 #15): hand-editing a version pointer DURING the
+    # sub-second window of one's own discard is not a sequence this single user
+    # produces.  A stale REQUEST is a different matter and is still refused above,
+    # against ``expected_vid``, under the lock.
+    publication = _publish_discard_and_retire(package_root, previous_vid, current)
+    if not publication:
+        return "not_found"
+
+    # Discard is complete at publication. Everything below is best-effort
+    # cleanup, but destructive cleanup is forbidden unless the directory fsync
+    # confirmed that the new pointer survives a crash.
+    #
+    # The retention reason is part of the API: this path must NOT be presented as
+    # manually cleanable, because a power loss may restore ``current`` to this
+    # version until the parent directory entry is known durable.
+    if not publication.durable:
+        return ToolRemovalResult("retained", current.path, "durability_unconfirmed")
+
+    # The old execution judgement/park-because-running branch is gone. The
+    # exclusive flock proves no request or orphaned child holds the shared lock,
+    # independent of package/version moves. This rename remains only to put a
+    # cleanup failure in the sweep's inert ``.discarded`` namespace.
+    parked = current.path.with_name(f"{resolution.vid}.discarded")
     try:
-        raw = json.loads(text)
-    except ValueError:
-        return False
-    if not isinstance(raw, dict):
-        return False
-    raw["enabled"] = enabled
-    # Refuse to WRITE if the re-serialized manifest would exceed the cap (N2).
-    # ``indent=2`` pretty-prints, which EXPANDS a compact-but-legal manifest: a
-    # manifest that sat just under the cap in its compact on-disk form can cross
-    # it once pretty-printed, which would flip the tool ``valid=False`` on the very
-    # next scan after a mere enable/disable toggle. Measure the ENCODED size (UTF-8
-    # bytes, the on-disk unit _MANIFEST_MAX_BYTES bounds) and, when it would not fit,
-    # leave the file byte-for-byte untouched and report failure rather than corrupt
-    # the row.
-    new_text = json.dumps(raw, ensure_ascii=False, indent=2) + "\n"
-    if len(new_text.encode("utf-8")) > _MANIFEST_MAX_BYTES:
-        return False
-    # Write the manifest back through the symmetric bounded WRITE helper (F3c). The
-    # read above just confirmed tool_json is a regular file, so the static FIFO
-    # hazard is already closed on this path; converting the WRITE too is symmetry +
-    # defense in depth -- its O_NONBLOCK makes a reader-less FIFO raced into the path
-    # fail with ENXIO instead of blocking, and its O_NOFOLLOW refuses a symlinked
-    # leaf, so this rewrite can never escape the package. Its bool (True written /
-    # False on any refusal) IS set_enabled's success/"did not happen" contract.
-    return _write_regular_file(tool_json, new_text)
+        os.rename(current.path, parked)
+    except Exception:
+        return ToolRemovalResult("retained", current.path, "cleanup_failed")
+
+    with contextlib.suppress(Exception):
+        shutil.rmtree(parked)
+    if os.path.lexists(parked):
+        return ToolRemovalResult("retained", parked, "cleanup_failed")
+    return ToolRemovalResult("removed", None, None)
 
 
-def delete_tool(name: str) -> bool:
-    """Delete a package (``rmtree``), or an alias (``unlink``). Returns success.
+type DeleteToolOutcome = ToolRemovalOutcome
+type DeleteToolResult = ToolRemovalResult | Literal["ai_job_in_progress"]
+
+
+def delete_tool(name: str) -> DeleteToolResult | None:
+    """Delete a package (``rmtree``), or unlink an alias; return its outcome.
 
     Name-validated and containment-checked exactly like ``set_enabled`` (the
     traversal hard-block is what makes an ``rmtree`` here safe), so it can only
-    ever remove a directory that genuinely sits inside ``tools_dir``. False when
-    the name is unsafe, the package is absent, or the removal fails.
+    ever remove a directory that genuinely sits inside ``tools_dir``. None when
+    the name is unsafe, the package is absent, or it could not be taken out of
+    the registry at all.
+
+    Destruction occurs only under the non-blocking exclusive tools lock. An
+    ordinary request holds the shared side from advertisement through response,
+    and its subprocess inherits the same descriptor, so package moves cannot
+    make running work invisible. Contention returns ``ai_job_in_progress`` and
+    leaves the package untouched.
+
+    Rename-before-rmtree is retained for atomic registry disappearance and
+    retryable cleanup failure, not as an execution-safety mechanism. A failed
+    rmtree remains hidden under the stale namespace for the later exclusive
+    sweep; no local generation/provenance judgement participates.
     """
     base = tools_dir()
     if base is None or not _NAME_RE.match(name):
-        return False
+        return None
+    with exclusive_tools_lock(base) as acquired:
+        if not acquired:
+            return "ai_job_in_progress"
+        return _delete_tool_locked(base, name)
+
+
+def _delete_tool_locked(base: Path, name: str) -> ToolRemovalResult | None:
+    """Delete one validated name while the exclusive tools lock is held."""
+
     # INTERNAL-alias hard-block (H3), BEFORE resolve: an internal symlink
     # ``tools/<name> -> tools/real`` RESOLVES inside the tools root, so the
     # resolve-then-contain check below would PASS and ``rmtree`` would recurse
@@ -1480,7 +3361,7 @@ def delete_tool(name: str) -> bool:
     # detects the alias itself; ``unlink`` removes ONLY the link (its target,
     # internal OR external, is never touched), so the phantom row disappears and
     # the real package survives. This is a genuine deletion of what the user saw
-    # (the alias row), so it returns True. It runs before resolve precisely
+    # (the alias row), so it reports removed. It runs before resolve precisely
     # because ``resolve()`` would erase the alias/real distinction; the
     # resolve-then-contain check below still guards a non-symlink external escape.
     candidate = base / name
@@ -1488,13 +3369,28 @@ def delete_tool(name: str) -> bool:
         try:
             candidate.unlink()
         except OSError:
-            return False
-        return True
+            return None
+        return ToolRemovalResult("removed", None, None)
     directory = _resolve_package_dir(name)
     if directory is None or not directory.is_dir():
-        return False
+        return None
+    # ``directory.parent`` rather than ``base``: the containment check above
+    # already proved the resolved package sits directly under the resolved tools
+    # root, so this is that root -- and taking it FROM the path being renamed is
+    # what makes "the new name lands in the same directory" true by construction
+    # rather than by re-deriving it. A rename inside one directory is also the
+    # only shape that cannot cross a filesystem, and the only one that is atomic.
+    stale = _stale_backup_path(directory.parent, name, uuid4().hex)
     try:
-        shutil.rmtree(directory)
+        os.rename(directory, stale)
     except OSError:
-        return False
-    return True
+        # The package is untouched and still listed, so this is the honest "did
+        # not happen" -- the same answer a failed removal gave before.
+        return None
+    # Best-effort from here: the tool is already gone as far as every registry
+    # reader is concerned, so partial removal is reported as retained and retried
+    # by the exclusive stale sweep.
+    shutil.rmtree(stale, ignore_errors=True)
+    if os.path.lexists(stale):
+        return ToolRemovalResult("retained", stale, "cleanup_failed")
+    return ToolRemovalResult("removed", None, None)

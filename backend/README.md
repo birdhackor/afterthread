@@ -69,7 +69,7 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 | `LLM_LOG_BODY_MAX_CHARS` | `200000` | 單次互動中，任一則請求/回應內容儲存時的字元數上限，邊界 `[1000, 2000000]`；與 `LLM_LOG_MAX_ENTRIES` 一起讓記憶體用量在兩個軸上都有界。 |
 | `LLM_LOG_FILE` | 未設定 | 選填。設定後，每次 LLM 互動會額外追加寫入這個 JSONL 檔案（與記憶體環狀緩衝相同的紀錄，一樣受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；預設關閉——記錄含個人記憶內容，落不落地是使用者自己的隱私選擇。 |
 | `LLM_LOG_FILE_MAX_BYTES` | `50000000` | 上述 JSONL sink 的輪替門檻（位元組）：檔案超過此大小就改名成帶 UTC 時間戳後綴、另開新檔（守磁碟；RAM 由環狀緩衝負責），邊界 `[1000000, 1000000000]`。僅在有設定 `LLM_LOG_FILE` 時有意義；輪替後的舊檔不會自動刪除，交由使用者自行清理。 |
-| `TOOLS_DIR` | dev 未設定／打包模式自動注入 `<data-dir>/tools` | 已安裝工具套件所在目錄；留空＝工具功能整個關閉（`GET /api/tools` 回空清單，AI workflow 不帶任何工具，prompt 與無工具版本逐字相同）。dev 模式要用工具功能，需自行在 `backend/.env` 設定這個變數。 |
+| `TOOLS_DIR` | dev 未設定／打包模式自動注入 `<data-dir>/tools` | 已安裝工具套件所在目錄；留空＝工具功能整個關閉（`GET /api/tools` 回空清單，AI workflow 不帶任何工具，prompt 與無工具版本逐字相同）。相對路徑或指向此基底的 symlink 會在設定邊界 canonicalize 成同一個絕對路徑；這不會跟隨或放寬任何 package/version symlink 的拒絕。dev 模式要用工具功能，需自行在 `backend/.env` 設定這個變數。 |
 | `LLM_TOOL_ROUNDS_MAX` | `8` | 一次 AI workflow 呼叫最多允許幾輪工具呼叫，邊界 `[1, 64]`。 |
 | `LLM_TOOL_TIMEOUT_SECONDS` | `60` | 單次工具子行程的逾時秒數（到期整個 process group 被砍），邊界 `(0, 600]`。 |
 | `LLM_TOOL_OUTPUT_MAX_CHARS` | `50000` | 工具 stdout 餵回給模型的字元數上限，邊界 `[1000, 500000]`。 |
@@ -126,11 +126,17 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 - `POST /api/items/{id}/assist-update` — 依一段近況文字追加 progress 並局部更新
   項目內容。
 - `GET /api/llm/logs` — 「AI 日誌」頁用：最近的 LLM 互動摘要清單（`limit`
-  1–500，預設 50），新到舊排序。
+  1–500，預設 50），新到舊排序。回應另外帶一個 `process_token`：**這一頁的 id
+  屬於哪一個行程**。AI 日誌的 id 是每個行程各自從 0 開始的計數器（環狀緩衝隨
+  重啟清空），所以客戶端手上那個 id——例如瀏覽器快取住的工具工作卡片給出的
+  `?log=<id>` 深連結——重啟後照樣解析得到，只是指到另一次互動；token 是前端唯一
+  能分辨的依據。它掛在**外層信封**而不是每一列上：那是「回答這次請求的行程」的
+  性質，不是任何一筆紀錄的欄位。
 - `GET /api/llm/logs/{log_id}` — 單筆互動的內容（每次嘗試的請求訊息與回應，
   每則受 `LLM_LOG_BODY_MAX_CHARS` 截斷、超過每次嘗試總量預算的較早訊息會被
-  省略成一則標記、工具呼叫參數只保留約 200 字元預覽）；記錄已被環狀緩衝擠出
-  （見 `LLM_LOG_MAX_ENTRIES`）或程序重啟過則 404。
+  省略成一則標記、工具呼叫參數只保留約 200 字元預覽，並另記當輪廣告給模型的
+  工具名單）；記錄已被環狀緩衝擠出（見 `LLM_LOG_MAX_ENTRIES`）或程序重啟過則
+  404。
 
 AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 `502 llm_upstream_error`（上游呼叫失敗或輸出無法解析，即使重試一次後仍失敗）、
@@ -140,42 +146,315 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 **Tools**（`afterthread/routers/tools.py`，前綴 `/api/tools`；即「工具」頁的
 後端）
 - `GET /api/tools` — 列出所有已安裝工具套件（含無效的），依名稱排序；`TOOLS_DIR`
-  未設定或尚無工具時回空清單（非錯誤）。
-- `PATCH /api/tools/{name}` — 切換某工具的 `enabled`；找不到回 404。
-- `DELETE /api/tools/{name}` — 刪除整個工具套件目錄；找不到回 404。
+  未設定或尚無工具時回空清單（非錯誤）。每列帶 `current_vid` 與三態
+  `lineage`（`sole`／`usable`／`broken`）；套件沒有可解析的生效版本時仍會列出，
+  但 `description`／`current_vid` 為 `null`、`valid=false`、`lineage=broken`，只能
+  整包刪除。`description` 可為空不是把 manifest 契約放寬，而是讓壞掉的套件仍有
+  一列可供清理。若非空套件完全沒有 `.afterthread.meta/`，只有 migration legacy
+  preflight 也接受的扁平 shape（尤其不能已經有 `versions/`）才會提示執行
+  `python -m afterthread.migrate_tools_v5`；保有 target namespace 的模糊 shape 會
+  回報損壞、要求人工檢查，不會推薦一條 migration 必然拒絕的指令。
+- `PATCH /api/tools/{name}` — 切換某工具的 `enabled`；找不到回 404。寫的是套件的
+  `.afterthread.meta/state.json`（見下方「工具套件格式」），**完全不碰任何版本的
+  `tool.json`**——所以一次
+  切換不會移動 manifest 身分，不會讓進行中的修訂作廢、也不會讓一趟總結往返的
+  寫入被拒。**修訂或重新產生進行中也可以切換**：修訂只新增
+  `versions/<vid>` 並切換 `current`，套件層根本不會被換掉，因此不再需要
+  狀態搬運或 package-state 發布鎖，前端也不必把開關鎖起來。
+  `tool.json` 讀不到／過大／是 FIFO 都不再是拒絕理由（那些檢查守的是
+  已經不存在的 manifest 改寫），因此 manifest 壞掉但 `current` 可解析的套件仍可
+  切換；它照樣列成無效、照樣不會被端給模型。`current` 無法解析時則拒絕切換，
+  因為沒有一個版本可讓該列描述。**另一條 404 的理由**：`state.json` 是可讀但沒有
+  backend marker 的 foreign 檔案時，這條路由拒絕而不是覆蓋（見下方）。
+- `DELETE /api/tools/{name}` — 將整個工具套件從 registry 移除；找不到回 404。
+  只有非阻塞 exclusive tools lock 取得成功才會改名或刪除；AI request 或繼承 shared
+  descriptor 的工具子行程仍活著時，回獨立的 `409 ai_job_in_progress`，套件完全不動。
+  取得 lock 後先把套件改成隱藏的 `.stale-` 名稱，再盡力遞迴移除；這個 rename 是為了
+  讓 registry 消失與失敗後清理可重試，不再負責保護執行中的目錄。成功回 200
+  `{outcome: "removed", retained_path: null, retention_reason: null}`；若遞迴清理失敗，
+  回 `{outcome: "retained", retained_path: "<隱藏目錄的絕對路徑>",
+  retention_reason: "cleanup_failed"}`。兩種回應下工具都已不可見；後者表示設定與
+  金鑰檔仍在磁碟，修復權限／檔案系統問題後才手動清理。
+- `DELETE /api/tools/{name}/versions/{vid}` — 丟掉畫面所指的**精確目前版本**。後端先
+  取得全域工具名額，再比對 path 裡的 `vid`；不相符回
+  `409 version_mismatch`。`lineage=usable` 時把 `current` 原子切回
+  `origin.json.previous`，之後才盡力清掉原版本。和整包刪除一樣，未取得非阻塞
+  exclusive tools lock 時回 `409 ai_job_in_progress`，不發布 pointer、不移動檔案。
+  pointer 的目錄 fsync 已確認後，原版本先改名成 `<vid>.discarded` 再刪除；成功回
+  `{outcome: "removed", retained_path: null, retention_reason: null}`。清理失敗回
+  `retention_reason: "cleanup_failed"`，UI 提示檢查權限／檔案系統後處理；若
+  `current=P` 已換上但目錄 fsync 未確認，V 保留原位並回
+  `retention_reason: "durability_unconfirmed"`，UI 明確禁止手動刪除，要求先修復
+  儲存問題、重啟並確認 pointer 仍指 P。停止行程本身不能補上 durability invariant。
+  `lineage=sole` 在 UI 走既有的整包刪除確認；
+  前一版缺失、未提交或指回自己則回 `409 lineage_unavailable`，不動任何檔案。
 - `POST /api/tools/install` — 送出 KB 網頁安裝器工作（見下方「工具（KB 網頁
   安裝器）」）；202 + `job_id`，建置在背景執行。`TOOLS_DIR` 未設定回 `503
-  tools_not_configured`；已有安裝在跑時回 `409 install_in_progress`（同一時間
-  只允許一個安裝工作）。
-- `GET /api/tools/install/{job_id}` — 輪詢一個安裝工作的狀態
+  tools_not_configured`；名額被佔用時回 `409 install_in_progress`。**那個名額
+  不是安裝專屬的**：安裝、AI 修訂與同步的「重新產生總結」共用同一個 single-flight
+  （見下方三條路由與「依意見修訂既有工具」），所以這個 409 最常見的來源其實是
+  別的分頁正在修訂。代碼與訊息字串維持既有的 `install_in_progress`／
+  「已有安裝正在進行中，請等待其完成」（前端有 pin 住的分支，不動），但前端**刻意
+  覆寫**成中性文案「已有工具任務正在進行中（安裝、AI 修訂或重新產生總結），請等待
+  完成後再安裝」——指名一個使用者從沒送出的「安裝」只會讓他去找一個不存在的東西。
+- `GET /api/tools/jobs/{job_id}` — 輪詢一個工具工作（安裝**或**修訂）的狀態
   （`queued`／`running`／`succeeded`／`failed` + 完成後的 `tool_name`／
-  `summary`／`llm_log_id`）；工作已完成的清單被裁剪掉、或後端重啟過（工作只存在
-  記憶體）則回 404。
+  `summary`／`llm_log_id`／`llm_log_process`）；工作已完成的清單被裁剪掉、或後端
+  重啟過（工作只存在記憶體）則回 404。`llm_log_process` 與側檔那一個是同一個
+  token、同一條「沒有 id 就沒有 token」規則，只是**由這個路由在回應當下蓋章**：
+  工作表是行程內記憶體，與 id 空間同生共死，所以還答得出來的工作，它的
+  `llm_log_id` 必然是本行程鑄的（側檔要存下來是因為**檔案**活得比行程久）。工作
+  本身不會跨重啟，但**瀏覽器分頁會**：前端在工作終局後就停止輪詢並一直沿用快取，
+  所以那張卡片與它的「查看 AI 日誌」連結可能在重啟後還留在畫面上——token 跟著
+  連結走，AI 日誌頁才拒絕得掉。安裝與修訂共用同一張工作表、同一個輪詢端點，回應形狀完全
+  相同（前身是 `GET /api/tools/install/{job_id}`，改名後舊路徑**直接移除**、不留
+  相容別名——前後端同一個 wheel 出貨，不會有版本偏斜）。
+- `GET /api/tools/{name}/summary` — 該工具的 AI 總結（`summary`／
+  `updated_at`／`llm_log_id`／`current_vid`，見下方「安裝後的 AI 總結」）；尚無總結時
+  前三個欄位皆為 `null`、`current_vid` 仍存在的 200（不是錯誤），工具不存在（含 `TOOLS_DIR` 未設定）
+  才回 404。`current_vid` 是這次實際讀到的版本；請求按名稱定址，所以它可能在
+  pointer 變動後讀到另一版，client 必須丟棄與自己那列不符的回應，不能讓 P 的總結
+  污染 V 的快取。`llm_log_id` 另外在**後端重啟過**（側檔記的是前一個行程的 id）時
+  一律回 `null`，理由見下方同一節。
+- `POST /api/tools/{name}/summary/regenerate` — **同步**重新產生總結（不是背景
+  工作），body 必須帶 `{expected_vid}`，成功回新的總結與實際版本。工具不存在回
+  404；有工具工作正在進行時回 `409 job_busy`——而且它
+  **自己也會佔住那個名額**（整趟 LLM 往返期間，install／revise 送出一律 409），
+  否則窗內被放行的修訂會發布一個新版本並把 `current` 移過去，這趟已經付過錢的總結
+  就落在一個不再生效的版本上，畫面上永遠不會出現；LLM 未
+  設定／上游失敗與捕捉、補齊等同步 AI 動作共用同一組錯誤（`503
+  llm_not_configured`／`502 llm_upstream_error`），失敗時不會覆蓋既有總結；
+  取得名額後若目前版本不是 `expected_vid`，回 `409 version_mismatch`，不花 LLM。
+- `POST /api/tools/{name}/revise` — body
+  `{feedback: 1..20000, expected_vid}`，依使用者意見
+  送出一次 **AI 修訂**工作（見下方「依意見修訂既有工具」）；202 + `job_id`，
+  用上面的 `GET /api/tools/jobs/{job_id}` 輪詢。工具不存在回 404；已有工具工作
+  在跑回 `409 job_busy`；取得名額後版本不符回 `409 version_mismatch`，兩者都不
+  建立工作。**不宣告** `502`／`503`：修訂是背景工作，LLM 沒
+  設定或上游失敗都封在工作狀態裡（失敗的 job + 友善訊息 + AI 日誌連結），與
+  安裝送出同一套契約。
+  這三條路由都**不宣告** `503 tools_not_configured`：`TOOLS_DIR` 未設定時
+  任何名稱都解析不到工具，404 已經是誠實答案。
 
 ## 工具（KB 網頁安裝器）
 
-- **工具套件格式**：`<TOOLS_DIR>/<name>/`，內含 `tool.json`（`name`／
-  `description`／`parameters`(JSON Schema)／`entry`(argv)／可選 `enabled`）、
-  `entry` 會執行的實作檔，以及可選的 `.env`（該工具自己的秘密，例如某個 KB 的
-  API key，啟動子行程時注入）。`name` 必須等於目錄名，且符合
-  `^[a-z0-9][a-z0-9_-]{0,63}$`。執行契約（`services/tools.py` 的
-  `_run_tool_subprocess`）：`cwd` = 工具目錄，參數 JSON 寫進子行程 STDIN，
-  STDOUT 當作結果（超過 `LLM_TOOL_OUTPUT_MAX_CHARS` 截斷）、非 0 結束碼視為
-  失敗，逾時（`LLM_TOOL_TIMEOUT_SECONDS`）整個 process group 被砍。子行程環境
-  是**從零打造**的（只透傳 `PATH`/`HOME`/`LANG`/`LC_ALL`/`TMPDIR` + 工具自己的
-  `.env`）——絕不整包繼承父行程環境，因為父行程環境帶著 `OPENAI_API_KEY`；這
-  防的是「不小心」外洩，不是對抗惡意子行程的沙箱（同 UID 的子行程理論上仍讀得
-  到 `/proc/<ppid>/environ`）。
-- **安裝器**（`services/tool_builder.py`，`/tools` 頁「安裝新工具」分頁的後端；
-  設計依據見 `docs/web-v2-decisions.md` D21/D27）：`POST /api/tools/install`
-  在背景跑一次帶有四個 meta-tool（`write_file`／`read_file`／`list_dir`／
-  `run_shell`）的 `generate_structured` 工具迴圈，讓「工具建造者」LLM 讀
-  OpenAPI 文件、在一個暫存目錄（`<TOOLS_DIR>/.staging/<uuid>`，隱藏目錄，
-  registry 掃描略過）裡寫檔、用 `run_shell` 實際呼叫目標 API 測試，反覆直到
-  判定完成或放棄；完成後以安裝套件的**同一套**驗證規則
-  （`tools.validate_package`）檢查暫存內容，通過才搬進 `<TOOLS_DIR>/<name>`。
-  全程互動記錄進 AI 日誌（`workflow="tool_install"`），失敗時這是主要除錯
-  入口。
+- **磁碟版面與所有權**：
+
+  ```text
+  <TOOLS_DIR>/
+      .afterthread-tools.lck         # 永久保留的 shared/exclusive lock inode
+      <name>/
+          .afterthread.meta/
+              state.json
+              current
+              migration-owner.json  # 只存在於一次性 web-v5 遷移產物
+          versions/
+              <vid>/
+                  .afterthread.meta/
+                      origin.json
+                      summary.json       # 可缺
+                  tool.json
+                  run.py ...
+              <vid>.discarded/           # cleanup 失敗的隱藏重試名
+          .env
+  ```
+
+  套件層只有後端狀態與操作者的 `.env`；工具內容全部在版本層。
+  `tool.json` 的 `name` 必須等於套件名並符合
+  `^[a-z0-9][a-z0-9_-]{0,63}$`，另含非空 `description`、
+  `parameters` JSON Schema 與 `entry` argv。版本 id 符合
+  `^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$`。
+- **五個型別是防錯邊界，不是命名慣例**：`PackageLayoutRoot` 表示可能仍在 staging
+  或已退休的 package-shaped layout，`PackageRoot` 是其只表示已安裝套件的子型別，
+  `VersionRoot` 只表示一個已安裝版本，`BuildRoot` 只表示尚未安裝的 builder
+  內容，`Resolution` 則只能是帶有合法 package/version/vid 的 `Resolved`
+  或帶原因的 `Unresolved`。餵錯層級通常不會立刻炸掉，而會從錯的位置讀到「缺席」，
+  所以用型別讓 package state、version manifest 與 staging 驗證無法混用。
+  一次性 migration 需要辨識 shell／`.at-migrated` 的 package-shaped layout，
+  因此改用 `resolve_layout_current(PackageLayoutRoot)` 與
+  `PackageLayoutResolved`／`PackageLayoutUnresolved`；只有 live installed package
+  才能呼叫 `resolve_current(PackageRoot)`，migration 不會替 staging 或 retired
+  layout 鑄造 `PackageRoot`。
+  `validate_tool_content(BuildRoot, expected_name)` 與
+  `scan_installed(PackageRoot)` 共用 `_scan_tool_content` 的 manifest／entry／內容
+  規則；前者不碰 `current` 或開關，後者先解析一次 `current`，再從同一個
+  `Resolved` 讀 manifest、lineage 與總結。這保證安裝前後的內容規則不會分叉。
+- **`current` 是唯一生效指標**：讀取最多 64 bytes，只接受一個可選尾端換行後的
+  合法 vid；目標必須是 `versions/<vid>` 的真目錄，且有合法
+  `.afterthread.meta/origin.json`。`origin.json` 同時是不可變 provenance 與
+  **已提交標記**；缺或壞的版本不可被指向。任何錯誤都得到 `Unresolved`，不猜最新
+  版本、不 fallback。寫入使用原子且持久的同目錄發布；discard 另讀到「名稱已換上」
+  與「目錄 fsync 已確認」兩個事實，因為前者足以回報 pointer 切換成功，後者才足以
+  安全刪除舊目標。
+- **啟用開關**：live state 只在 `<name>/.afterthread.meta/state.json`，內容為
+  `{"afterthread":"tool-state","enabled":bool}`。檔案缺席或 foreign 都是
+  **disabled**，完全不再讀 `tool.json.enabled`；這是 fail-closed 的必要條件，
+  否則套件層沒有 manifest 的半發布套件會被舊預設 `true` 自己打開。foreign 檔案
+  可讀但沒有 marker，後端不讀、不覆寫、不刪除，列表會帶 notice，PATCH 回 404；
+  unreadable／非一般檔／marker 正確但值壞掉則列為 invalid + disabled。一般檔內容
+  壞掉可由 API PATCH 原子覆寫修復，非一般檔只能由操作者先移除；單純刪掉檔案只會
+  回到 disabled，不會重新開啟。
+- **安裝器與提交順序**：每場工作用
+  `<TOOLS_DIR>/.staging/<uuid>/{build,shell}`；`finally` 永遠清完整 session root。
+  builder 在 `build` 工作，後端先擷取並剝除 builder 寫的根層 `.env`，再剝除
+  版本根層的 `.afterthread.meta/`，然後驗證 `BuildRoot`。legacy
+  `.ai_meta.json` 與 `.afterthread-state.json` 在版本層是一般工具內容；同名的舊
+  package-root 檔案才屬於 legacy 後端命名空間。新安裝在 `shell`
+  組出完整 package：版本內容、`origin.json(previous=null)`、初始 enabled state、
+  `current`，以及表單秘密注入的 package `.env`；所有內容持久化後，以一次
+  `os.rename(shell, <name>)` 上線。durability walker 只 fsync 這棵樹內的真目錄：
+  內容中的 directory symlink 會保留但不跟隨、不 fsync 外部目標；任何真實樹內目錄
+  若所屬 filesystem 拒絕 directory fsync，durability 仍未成立，整次 build 失敗。
+  目標只要已存在任何內容就拒絕，不覆蓋。
+  完整互動記在 `workflow="tool_install"`。
+- **builder 不出貨 `.env`**：非秘密預設值應放在該版程式碼，以
+  `os.environ.get(KEY, default)`（或其他語言等價寫法）讀取；切換 `current` 時預設
+  自然跟版本一起切。builder 無論在 install 或 revise 寫出根層 `.env`，後端都先
+  只擷取 KEY 名、再刪檔；值不進結果。job response 的 `env_keys` 只列名稱，供
+  操作者判斷哪些值要自行放進 `<name>/.env`，或哪些非秘密預設應移回程式碼。安裝表單提供的
+  `secret_name`／`secret_value` 是另一條後端受控路徑：值注入 `run_shell`、全程
+  遮蔽，最後才由後端寫進 package `.env`，從未交給 builder。
+- **修訂只新增版本，不再換整包**：`run_revise` 從目前的 `VersionRoot` 複製工具
+  內容到 `build`；只排除該版後端自己的根層 `.afterthread.meta/` 與 package
+  `.env`。版本中的 legacy `.ai_meta.json`、FOREIGN
+  `.afterthread-state.json`（包含 migration 帶入者）及其巢狀同名檔都是工具內容，
+  會進工作區並隨新版本保留。package `.env` 不被複製或改寫，只把解析後的值注入
+  `run_shell` 供實測與遮蔽；builder 寫出的 `.env` 同樣被剝除。通過驗證後，
+  `shell` 被組成一個版本目錄並先寫
+  `origin.json(previous=<舊 vid>, feedback=<本次意見>)`；版本持久化、rename 到
+  `versions/<新 vid>` 後才原子發布 `current`。因此舊版本永久保留、套件 state 與
+  `.env` 原地不動，`current` 是修訂唯一 commit point。六位 hex 可能碰撞，建立時
+  會避開 `versions/` 下所有以候選 vid 開頭的項目，包括 `.discarded`。
+- **執行綁定廣告時的版本**：registry 廣告工具時把 `PackageRoot`、
+  `VersionRoot`、entry 與 manifest identity 一起封進 handler；模型稍後真的呼叫時
+  直接以那個 `VersionRoot` 當 cwd。package `.env` 與開關則在呼叫當下讀。
+  **`current` 在呼叫當下仍會解析一次，但只用來確認「這個套件還有可用的版本」，
+  不用來決定跑哪一版**——否則廣告綁定就沒有意義了。少了這道確認，列表會把
+  `current` 壞掉的套件判成 invalid＋停用，而已廣告的 handler 照樣跑得起來，
+  同一個問題兩條路徑兩個答案（overall review r2-4）。這避免 pointer 改變後用舊
+  schema 執行新程式。**「廣告與呼叫之間被 discard」已經不可能發生**：請求在送出 tools
+  array 之前就取得 shared lock 並持有到結束，而 discard 需要 exclusive lock，所以那段期間
+  按下 discard 會直接得到 `409 ai_job_in_progress`，`current` 與該版都不會被動到。（先前
+  這裡寫的是「discard 會成功、呼叫再得到拒絕」——那是互斥鎖出現以前的行為，已作廢。）
+- **request／子行程與破壞操作互斥**：capture、enrich、assist-update 在掃描並把
+  tools array 交給模型**之前**取得 `.afterthread-tools.lck` 的 shared `flock`，在整個
+  請求（所有模型 round、工具呼叫與錯誤清理）結束後才關閉 descriptor；shared lock
+  彼此相容，所以兩場一般對話不會被序列化。工具使用
+  `Popen(pass_fds=(fd,), start_new_session=True)` 繼承同一個 open-file reference：
+  backend 即使被 `kill -9`，只要 child 還活著，exclusive 仍取不到。整包 delete、
+  discard 與 `.stale-`／`.discarded` 背景清掃都只嘗試非阻塞 exclusive lock；前兩者
+  真正的 contention 回 `409 ai_job_in_progress`，清掃則略過、等下次工作再試。若 lock
+  path 無法開啟或鎖定，delete／discard 改回非 retryable 的
+  `500 tools_lock_unavailable`，訊息會列出完整路徑與原地修復 ownership／owner
+  read-write 權限的方式，不會假稱有 AI job。後端擁有的既存 `0400`／`0000` inode
+  會先在原地補回 owner `rw` 再開啟；不同 owner、非 regular file 或修復失敗則明確
+  中止，migration 也會收到同一個具名錯誤。安裝／修訂結尾的 best-effort 清掃若遇到
+  此錯誤，不會把已成功發佈的工具回報成失敗；完整路徑與同一套原地修復方式會寫入
+  backend 的 `afterthread.tool_builder` WARNING console log，之後的工具工作仍會重試清掃。
+  lock 檔**不得手動刪除或重建**：新 inode 不會和舊 holder 衝突，保護會無聲失效。
+  `flock` 只協調有檢查它的程式碼，這裡的 checker 都由 afterthread 控制，並不是防止
+  操作者或工具直接改檔的 sandbox。最後，這個 orphan 保護唯一依賴的工具行為是 child
+  不自行關閉繼承的 descriptor。
+- **版本保留、lineage 與 discard**：`origin.json.previous` 是前一版的唯一來源，
+  不是目錄排序；沒有自動回收。`lineage=sole` 表示 previous 為 null，
+  `usable` 表示 previous 是另一個合法已提交版本，`broken` 表示 pointer 壞掉或
+  指回自己。discard 的順序固定為：確認 expected vid → sole 則整包刪除 → 驗前一版
+  → 發布 `current=P` → 只有 pointer 的目錄 fsync 已確認才盡力移除 V。V 還在執行
+  時 exclusive lock 根本不會取得，discard 回 409 而不動任何檔案；無法確認持久化時
+  保留 V 但仍回成功，因為多一個未指向版本比「斷電後 current 指到已刪版本」安全。
+  掃描捕捉一個可解析版本時，就在
+  process-local registry 取得或建立該 `VersionRoot` 的 advertisement generation；
+  同一輪稍後建立的每個 handler 都持有這個物件。discard 成功發布 `current=P` 時，
+  會在與掃描捕捉共用的 lock 內把 V 當下的 generation 標成 retired 並移出
+  registry；因此即使持久化未確認或停放 rename 失敗、使 V 留在原廣告路徑，舊
+  handler 仍明確拒絕。retired generation 由既有 handler 持有到該對話／handler
+  釋放為止；之後從備份恢復並重新掃描同一 vid 會取得新 generation。退役完全不讀
+  目錄的 device、inode 或其他可由 rename／刪除／重建影響的磁碟屬性，避免磁碟
+  身分重用或搬回原位使舊廣告復活。這個 generation 只回答「舊 handler 是否已被
+  明確 discard」，不是執行中目錄的 mapping；後者的 package-inode registry、
+  `running/unknown/locally-proven-idle` 判斷、本地建立 provenance 與
+  park-because-running cleanup 資格都已刪除，由跨 restart 的 flock 排他性取代。
+  `.stale-`／`.discarded` 只代表清理失敗，後續 sweep 也必須先取得 exclusive lock。
+- **AI 總結拆成兩份 sidecar**：每版不可變的
+  `.afterthread.meta/origin.json` 保存來源、安裝指示、修訂意見與 previous；
+  可重新產生的 `.afterthread.meta/summary.json` 保存 summary、updated time 與
+  AI log identity。兩者都經 typed／bounded／secret-redacted／fail-closed／atomic
+  publisher；來源 URL 在捕捉時先收斂成不帶 userinfo/path/query/fragment 的
+  provenance。summary 缺席或損壞是「尚無可用總結」，不會使版本失效；安裝／修訂
+  上線後的自動產生是 best-effort，失敗不能翻轉已完成的提交。
+- **全域 single-flight**：安裝與修訂共用背景 job 表；同步 regenerate 與 discard
+  也透過同一個 admission lock 取得名額。它們的 API 形狀不同，但比對
+  `expected_vid` 都排在取得名額之後、實際寫入／花 LLM 之前，避免另開一條
+  check-then-write race。背景 job 是 process-local，重啟後舊 id 404。
+- **安全立場（v1）**：builder 的 `run_shell` 是服務權限下的真實 bash，不是沙箱；
+  只有 `write_file`／`read_file`／`list_dir` 被限制在 build root。信任邊界仍是
+  「只安裝可信的 OpenAPI 文件與指示」。工具子行程的環境從零建立，只透傳
+  `PATH`／`HOME`／`LANG`／`LC_ALL`／`TMPDIR`，再加 package `.env` 與正規化的
+  TLS 設定，避免不小心把父行程 `OPENAI_API_KEY` 一起交出去；同 UID 行程仍可能
+  讀 `/proc`，所以這不是對抗惡意程式的隔離。
+- **一次性 web-v5 遷移**：先停掉 afterthread；migration 會先以非阻塞方式取得同一個
+  exclusive tools lock 並持有到整體完成，取不到即拒絕開始。取得 lock **只證明當下
+  沒有 cooperating request 或 inherited tool child 持有它**；idle backend 與已停止
+  backend 無法區分，舊版 backend 也根本不知道這個 lock，因此不能用成功取得 lock
+  取代「先停服務」的操作前提。為使 migrated version 精確反映開始時的內容，仍建議
+  關閉編輯器並暫停手動／同步寫入。即使遷移期間發生 autosave，舊套件
+  現在也不會被刪除：那次編輯會留在 retained quarantine，**不保證進入 migrated
+  version**，操作者可事後比對與取回。確認 `TOOLS_DIR` 指向舊扁平套件，再於
+  `backend/` 執行：
+
+  ```bash
+  uv run python -m afterthread.migrate_tools_v5 --dry-run
+  uv run python -m afterthread.migrate_tools_v5
+  # 已人工審過同一份計畫的非互動執行：
+  uv run python -m afterthread.migrate_tools_v5 --yes
+  ```
+
+  `--dry-run` 除了建立（若尚不存在）並鎖住永久的 `.afterthread-tools.lck` inode，
+  只做唯讀預檢並列出整體計畫；一般執行會逐套件報告 legacy state／
+  `.ai_meta.json` 分類、enabled 與 `.env` **key 名**（永不列值），然後在第一次
+  寫入前最後一次詢問。只有明確 `y`／`yes` 才繼續；拒絕、關閉或無法詢問的 stdin
+  都視為 no，tree 保持 byte-identical。`--yes` 只適合計畫已審過的自動化執行。
+  確認後先在 `TOOLS_DIR` 的兄弟位置做完整備份，再建立
+  `.afterthread-migration.json` write-ahead journal。預檢一次收集所有問題；任何
+  legacy 套件不可遷移就完全不開始。程式會在寫入新 package `state.json` 的最後一刻
+  重讀 legacy enabled；若值與預檢不同，代表停在確認畫面時來源仍被修改，整趟會清楚
+  拒絕並 rollback，而不採用未審閱的新值或覆蓋它。每包把工具內容搬進單一初始版本、移除
+  manifest legacy `enabled`、把 owned state 搬成 package `state.json`、FOREIGN
+  legacy state 原封不動當工具內容、把 `.ai_meta.json` 拆成 origin/summary，並將
+  `.env` 位元與 mode 保留在 package 層。所有套件啟用後才持久寫下
+  `committed`；commit 前錯誤回復所有名稱，commit 後只重試清理、不再 rollback。
+  為縮短第一次複製後仍可能收到編輯器 autosave 的窗口，程式會先把舊套件停放到
+  `.at-premigrate`，再從該停放來源重抄一次 `.env`，成功才啟用新套件；重抄失敗會
+  走 commit 前 rollback。其他內容只在組 shell 時複製一次；之後對 `run.py`、
+  `tool.json` 或任何工具內容的編輯可能只出現在舊套件。commit 後程式會把整棵舊套件
+  從 `.at-premigrate` 改名成隨機、隱藏的 quarantine 並永久保留，因此這些 late edits
+  可復原，但不會被偷偷合併到 migrated version。
+  journal 另持久記錄 shell／舊套件目錄 identity，並在目錄內寫入綁定 package +
+  vid + role 的 marker。對 migration 自己建立且**從未完成 activation** 的 partial
+  新 shell，identity + marker（完整 target-layout 亦可用精確 VID）仍是清理證明；
+  新 shell 在空目錄時先記
+  identity，再以目前 journal 的 atomic hard link 暫時充當 bootstrap marker，正式
+  JSON marker 完整落盤後才移除 bootstrap。一個 shell 只要曾完成 activation（或
+  journal 停在 activation 可能已落地的 pending 狀態），就已可能以 live package
+  身分接受操作者寫入；rollback 不再 `rmtree`，而會改名成 role=`shell` 的隨機 hidden
+  quarantine 並列入報告。這套 destructive ownership proof 不再用於已 activation 的
+  新 shell 或 committed 舊套件：舊套件只產生 256-bit 隨機 quarantine 名稱、rename
+  過去並把
+  retained 階段持久寫進 tree 外的 journal，之後**沒有 `rmtree`**。舊套件 marker
+  留在 quarantine 內作為 fresh preflight 的持久分類標記；沒有 marker 的同形 sibling
+  仍視為 operator-owned 並拒絕。隨機 hidden quarantine 不會被 package scanner、
+  `.env` redaction scan 或 by-name API 當成 phantom package，且 `.at-premigrate`
+  不會成為 terminal 名稱。
+  成功報告會逐一列出 retained quarantine 的完整路徑，提醒其中可能有遷移期間才寫入
+  的內容，並明說檢查後是否移除由操作者決定。第二次 fresh run 也會辨識、列出並忽略
+  這些 quarantine，成為乾淨 no-op。舊的「quarantine 已刪但 journal 尚未記錄」空窗
+  已不存在，所以 restore 出來的 `.at-premigrate` 不可能再被該空窗藏在成功結果後面。
+  中斷後以同一指令重跑，journal 會按其狀態續做／回復／清理；不要手動猜測或刪除
+  `.at-*` 兄弟目錄。既有 journal 已代表先前確認過的 migration authority，所以
+  真實重跑會直接對帳，不再詢問；此時 `--dry-run` 只報 journal status，不做對帳。
+  唯一需要 operator 決定的是 v1 journal 搭配非空、markerless 且未完成的 shell：
+  v1 沒留下可驗 ownership，程式會保持所有內容不變，列出確切路徑，並要求先檢查後
+  將可丟棄的 v1 partial shell 刪除，或把要保留的資料移出 reserved 名稱，再重跑。
 - **安全立場（v1）**：這是單人本機工具，shell 能力是明確需求（比照 Claude
   Code 建 skill 的能力/風險模型）——`run_shell` 是以**本服務自身權限**執行的
   真實 bash，只是預設從暫存目錄開始（工作慣例，不是圍籬），v1 刻意不做容器
@@ -184,18 +463,31 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   symlink 逃逸都會被擋下）。信任邊界因此是「只安裝你信任的 OpenAPI 文件與
   指示」，不是程式碼在幫你圍出一個對抗式安全沙箱。安裝指示文字（作為提示）與
   工具呼叫參數的摘要／預覽（約前 200 字元）都會進 AI 日誌（見上方
-  `LLM_LOG_FILE`，兩者同樣受 `LLM_LOG_BODY_MAX_CHARS` 逐則截斷）——貼給 AI 的
-  任何第三方秘密都要當作「會被記錄」處理。
+  `LLM_LOG_FILE`，兩者同樣受 `LLM_LOG_BODY_MAX_CHARS` 逐則截斷），而指示文字
+  還會被存進該版本自己的 `versions/<vid>/.afterthread.meta/origin.json` 供之後的
+  修訂 session 使用——**打進 `instructions`
+  的東西一律當成「模型看得到、日誌留得住」處理**。憑證因此走
+  `secret_name`／`secret_value` 這對欄位（下一條），不是寫進指示：貼在指示裡的
+  值在它還不是「已知秘密」的那一刻就落地了，遮蔽器事後補登記救不回既有紀錄。
+- **安裝表單的秘密欄位**（`secret_name`／`secret_value`，D36；兩者要嘛都給、
+  要嘛都不給，名稱須為合法環境變數名，值至少 6 字元且不含換行，否則 422）：值
+  以該名字注入 `run_shell` 的環境（AI 因此能實測真的 API）、整個建置期間登記成
+  已知秘密（AI 日誌落地前就遮蔽）、驗證通過後由後端寫進該工具自己的 `.env`
+  （`_inject_secret_into_env`，在 `validate_tool_content` 之後、搬移之前）。值不進任何
+  提示，模型只拿得到**名字**。
 - **`.staging` 殘留**：清理是 best-effort（所有清理例外都被抑制），正常結束
   時通常會清掉暫存目錄；但後端在建置途中被中斷（當掉、被砍、主機重開機），
   **或清理本身失敗**（例如 `run_shell` 改了目錄權限）時，會留下
   `<TOOLS_DIR>/.staging/<uuid>`。這個目錄名稱以 `.` 開頭，registry 掃描
   （`tools._scan_all`）會直接跳過隱藏目錄，不會被列成無效工具，可以安全地手動
   刪除。
-- **同一時間只允許一個安裝工作**：`start_install_job` 在同一把鎖底下檢查「是否
-  已有 queued/running 的工作」並建立新工作；已有工作在跑時，第二個 submit 回
-  `409 install_in_progress`。工作狀態是 in-memory、不持久化，後端重啟後所有
-  工作（含仍在跑的）都會消失，FE 對舊 `job_id` 的輪詢會收到 404。
+- **同一時間只允許一個工具任務**：`start_install_job` 在同一把鎖底下檢查「名額是否
+  被佔用」並建立新工作；被佔用時，第二個 submit 回 `409 install_in_progress`。
+  **名額由四種動作共用**：安裝工作、AI 修訂工作（同一張 `_JOBS` 表），以及同步的
+  「重新產生總結」與 discard（兩者都用 `_SYNC_OPS` token，在同一把鎖底下
+  「檢查即取得」）——所以擋下這次送出的，未必是另一個安裝。工作狀態是 in-memory、
+  不持久化，後端重啟後所有工作（含仍在跑的）都會消失，FE 對舊 `job_id` 的輪詢會
+  收到 404。
 
 ## 設計筆記
 

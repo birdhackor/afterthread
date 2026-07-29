@@ -52,11 +52,20 @@ done
 
 echo "    OK: version $PACKAGE_VERSION; previous wheel/sdist archives removed"
 
+# `cd` rather than `pnpm --dir`: pnpm decides whether to self-switch to the
+# version pinned in `packageManager` by reading the CWD's package.json, not the
+# one under --dir. From the repo root -- which has no package.json at all -- it
+# never learns it should switch, corepack then invokes whatever pnpm is on PATH,
+# and a version drift makes corepack REFUSE outright ("pnpm does not switch
+# versions when running under corepack"). Measured: `pnpm --dir frontend
+# --version` fails that way while `cd frontend && pnpm --version` reports the
+# pinned 11.15.1. e2e/smoke.sh already uses the cd form, which is why it kept
+# passing while this script -- the release build -- could not run at all.
 echo "==> [2/6] Installing frontend dependencies (frozen lockfile)"
-pnpm --dir "$FRONTEND_DIR" install --frozen-lockfile
+(cd "$FRONTEND_DIR" && pnpm install --frozen-lockfile)
 
 echo "==> [3/6] Building frontend production bundle"
-pnpm --dir "$FRONTEND_DIR" build
+(cd "$FRONTEND_DIR" && pnpm build)
 
 echo "==> [4/6] Refreshing backend/afterthread/static/ from frontend/dist"
 rm -rf "$STATIC_DIR"

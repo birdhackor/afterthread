@@ -10,6 +10,7 @@ cross-thread session reads.
 
 import json
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -17,6 +18,7 @@ from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
 
 from afterthread.config import Settings
+from afterthread.services import tools
 from afterthread.services.llm import LLMUpstreamError
 from afterthread.services.memory_ai import _coerce_str
 
@@ -171,6 +173,37 @@ def test_capture_upstream_error_returns_502_and_no_rows(
     assert response.status_code == 502
     assert response.json()["detail"]["code"] == "llm_upstream_error"
     assert _total(client) == 0
+
+
+def test_capture_holds_shared_tools_lock_through_error_and_releases_it(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The HTTP request owns the lock, and its error path closes that reference."""
+
+    root = tmp_path / "tools"
+    root.mkdir()
+    settings = Settings(tools_dir=str(root))
+    monkeypatch.setattr("afterthread.services.tools.get_settings", lambda: settings)
+    observed: dict[str, bool] = {}
+
+    async def fail_while_observing_lock(
+        system: str, user: str, model_cls: type[BaseModel], **_kwargs: object
+    ) -> BaseModel:
+        with tools.exclusive_tools_lock(root) as acquired:
+            observed["exclusive_during_request"] = acquired
+        raise LLMUpstreamError("injected")
+
+    monkeypatch.setattr(
+        "afterthread.services.memory_ai.generate_structured",
+        fail_while_observing_lock,
+    )
+
+    response = client.post("/api/capture", json={"raw_text": "raw"})
+
+    assert response.status_code == 502
+    assert observed == {"exclusive_during_request": False}
+    with tools.exclusive_tools_lock(root) as acquired_after_error:
+        assert acquired_after_error is True
 
 
 def test_capture_invalid_draft_returns_502_and_no_rows(

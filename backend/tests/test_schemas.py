@@ -97,6 +97,19 @@ def test_progress_entry_create_declares_note_length_bound() -> None:
     assert prop["maxLength"] == 20000
 
 
+def test_tool_openapi_describes_the_versioned_metadata_paths() -> None:
+    """Published operator documentation must name the files runtime actually reads."""
+
+    schema = TestClient(app).get("/openapi.json").json()
+    toggle_description = schema["paths"]["/api/tools/{name}"]["patch"]["description"]
+    summary_description = schema["components"]["schemas"]["ToolSummaryDetail"]["description"]
+
+    assert ".afterthread.meta/state.json" in toggle_description
+    assert ".afterthread-state.json" not in toggle_description
+    assert "versions/<vid>/.afterthread.meta/summary.json" in summary_description
+    assert ".ai_meta.json" not in summary_description
+
+
 # --- ToolInstallRequest install-form secret pair (D36) ----------------------
 
 
@@ -176,11 +189,19 @@ def test_only_by_id_routes_declare_404() -> None:
     (GET/PATCH/DELETE /api/items/{item_id} and POST /api/items/{item_id}/progress),
     the two by-id AI routes (POST /api/items/{item_id}/enrich and /assist-update),
     the by-id LLM log route (GET /api/llm/logs/{log_id}, which 404s for an
-    unknown/evicted id), and the three by-name/by-id tool routes (PATCH/DELETE
-    /api/tools/{name} for a missing package, GET /api/tools/install/{job_id}
-    for an unknown/evicted/post-restart job). The collection, review, health,
+    unknown/evicted id), and the six by-name/by-id tool routes (PATCH/DELETE
+    /api/tools/{name} for a missing package, GET /api/tools/jobs/{job_id}
+    for an unknown/evicted/post-restart job, the two AI-summary routes
+    under /api/tools/{name}/summary -- D40 -- which 404 when the named tool does
+    not exist, TOOLS_DIR being unset included, and POST /api/tools/{name}/revise,
+    plus the version-addressed discard, which 404 on the same gate). The collection, review, health,
     status, capture, log-list, tool-list and install-submit routes cannot 404
     and must not declare it.
+
+    The job poll is `/api/tools/jobs/{job_id}` since D40 renamed it from
+    `/api/tools/install/{job_id}` (one endpoint now serves install AND revise
+    jobs); the old path is gone, not aliased, so a stale entry here would be a
+    route nothing serves.
     """
     client = TestClient(app)
     schema = client.get("/openapi.json").json()
@@ -200,5 +221,9 @@ def test_only_by_id_routes_declare_404() -> None:
         ("/api/llm/logs/{log_id}", "get"),
         ("/api/tools/{name}", "patch"),
         ("/api/tools/{name}", "delete"),
-        ("/api/tools/install/{job_id}", "get"),
+        ("/api/tools/{name}/versions/{vid}", "delete"),
+        ("/api/tools/jobs/{job_id}", "get"),
+        ("/api/tools/{name}/summary", "get"),
+        ("/api/tools/{name}/summary/regenerate", "post"),
+        ("/api/tools/{name}/revise", "post"),
     }

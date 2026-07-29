@@ -15,6 +15,8 @@ the HTTP contract:
   generated clients and docs never overstate or understate what can happen.
 """
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Any
 
@@ -42,7 +44,7 @@ from afterthread.schemas import (
     LLMTokenRatio,
     MemoryItemRead,
 )
-from afterthread.services import llm_log, token_budget
+from afterthread.services import llm_log, token_budget, tools
 from afterthread.services.llm import (
     _UPSTREAM_REASON,
     LLMNotConfiguredError,
@@ -181,6 +183,26 @@ def _conflict() -> HTTPException:
     )
 
 
+@asynccontextmanager
+async def _advertised_tools_lock() -> AsyncIterator[None]:
+    """Hold the shared tools lock across one complete tool-advertising request.
+
+    Acquisition runs off-loop because a destroyer that won the race may hold the
+    exclusive side briefly. The synchronous binding lets ``enabled_llm_tools``
+    capture this exact descriptor into every handler. The ``finally`` covers
+    normal output, LLM/config errors, validation errors, and request
+    cancellation; a subprocess has its own inherited reference if it outlives
+    the backend-side close.
+    """
+
+    fd = await run_in_threadpool(tools.acquire_shared_tools_lock)
+    try:
+        with tools.bind_request_tools_lock(fd):
+            yield
+    finally:
+        await run_in_threadpool(tools.release_tools_lock, fd)
+
+
 def _conditional_update(
     session: Session, item_id: int, snapshot_updated: datetime, values: dict[str, Any]
 ) -> int:
@@ -232,9 +254,15 @@ def llm_status() -> LLMStatus:
 
 # The read-only LLM interaction log (D09). Both endpoints stay in the /llm
 # namespace and deliberately declare NO 502/503: they never call the LLM, they
-# only read the in-memory ring, so the "exactly three AI operations declare
-# 502/503" contract (test_ai_contract) is untouched. The detail endpoint can
-# 404, declared below so generated clients know it.
+# only read the in-memory ring, so both stay OUT of the two exact sets
+# test_ai_contract pins -- which is the claim this comment makes, and the only
+# one it is entitled to. Those sets are no longer "exactly three AI operations":
+# D40's synchronous tool-summary regenerate is a FOURTH request-time LLM call
+# and joins BOTH (it raises the shared llm_not_configured / llm_upstream_error
+# defined here), and the installer's submit joins the 503 set alone under its own
+# tools_not_configured code. Adjusting either endpoint below to restore a
+# three-operation contract would strip declarations those operations genuinely
+# need. The detail endpoint can 404, declared below so generated clients know it.
 _LLM_LOG_NOT_FOUND = "LLM log not found"
 
 _LLM_LOG_NOT_FOUND_RESPONSE: dict[int | str, dict[str, Any]] = {
@@ -255,8 +283,16 @@ def llm_logs(limit: Annotated[int, Query(ge=1, le=500)] = 50) -> LlmLogListRespo
     [1, 500] at the query layer so an oversized page cannot be requested. The
     ring is process-wide and dies with the process, so an empty list is the
     normal state right after a restart.
+
+    That restart is also why the page needs ``process_token`` (see
+    ``LlmLogListResponse``): the ids here are a per-process counter, and a client
+    holding an OLDER one -- a ``?log=<id>`` deep link built from a cached job
+    response -- must be able to find out that its id was re-issued rather than
+    have this page open whatever now answers to the number.
     """
-    return LlmLogListResponse.model_validate({"logs": llm_log.list_summaries(limit)})
+    return LlmLogListResponse.model_validate(
+        {"logs": llm_log.list_summaries(limit), "process_token": llm_log.process_token()}
+    )
 
 
 @router.get(
@@ -311,12 +347,13 @@ async def capture(payload: CaptureRequest, session: SessionDep) -> CaptureRespon
     -- no partial rows -- because no write has happened yet. The blocking write
     itself runs in a threadpool (see _capture_persist), off the event loop.
     """
-    try:
-        draft = await capture_draft(payload.raw_text)
-    except LLMNotConfiguredError as exc:
-        raise _service_unavailable() from exc
-    except LLMUpstreamError as exc:
-        raise _bad_gateway(exc) from exc
+    async with _advertised_tools_lock():
+        try:
+            draft = await capture_draft(payload.raw_text)
+        except LLMNotConfiguredError as exc:
+            raise _service_unavailable() from exc
+        except LLMUpstreamError as exc:
+            raise _bad_gateway(exc) from exc
 
     # Building the ORM object is pure in-memory work (no SQL until flush), so it
     # stays on the loop; only the flush/commit segment is handed to the threadpool.
@@ -491,12 +528,13 @@ async def enrich(item_id: ItemId, payload: EnrichRequest, session: SessionDep) -
     """
     item_fields, original_updated = await run_in_threadpool(_snapshot_item_for_ai, session, item_id)
 
-    try:
-        result = await enrich_item(item_fields, payload.additional_context)
-    except LLMNotConfiguredError as exc:
-        raise _service_unavailable() from exc
-    except LLMUpstreamError as exc:
-        raise _bad_gateway(exc) from exc
+    async with _advertised_tools_lock():
+        try:
+            result = await enrich_item(item_fields, payload.additional_context)
+        except LLMNotConfiguredError as exc:
+            raise _service_unavailable() from exc
+        except LLMUpstreamError as exc:
+            raise _bad_gateway(exc) from exc
 
     result_read = await run_in_threadpool(
         _enrich_persist, session, item_id, original_updated, result
@@ -574,12 +612,13 @@ async def assist_update_item(
     """
     item_fields, original_updated = await run_in_threadpool(_snapshot_item_for_ai, session, item_id)
 
-    try:
-        result = await assist_update(item_fields, payload.note)
-    except LLMNotConfiguredError as exc:
-        raise _service_unavailable() from exc
-    except LLMUpstreamError as exc:
-        raise _bad_gateway(exc) from exc
+    async with _advertised_tools_lock():
+        try:
+            result = await assist_update(item_fields, payload.note)
+        except LLMNotConfiguredError as exc:
+            raise _service_unavailable() from exc
+        except LLMUpstreamError as exc:
+            raise _bad_gateway(exc) from exc
 
     result_read = await run_in_threadpool(
         _assist_persist, session, item_id, original_updated, result

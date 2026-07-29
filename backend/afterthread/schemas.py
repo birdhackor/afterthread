@@ -2,7 +2,7 @@
 
 import re
 from datetime import UTC, datetime, timedelta
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import (
     BaseModel,
@@ -421,9 +421,27 @@ class LlmLogSummary(LlmLogBase):
 
 
 class LlmLogListResponse(BaseModel):
-    """Newest-first page of LLM interaction summaries."""
+    """Newest-first page of LLM interaction summaries.
+
+    ``process_token`` is the ANSWERING process's opaque identity for the id space
+    every ``id`` on this page belongs to (``llm_log.process_token()``). Log ids
+    are a per-process counter over a ring that dies with the process, so an id a
+    client is HOLDING -- a ``?log=<id>`` deep link built from a job response the
+    browser cached before a restart -- may name a completely different
+    interaction here. Only the minting process's token can tell those apart, and
+    this is the reading the AI 日誌 page compares a link's claim against.
+
+    It rides on the ENVELOPE rather than on the rows: it is a property of the
+    process that answered, not of any record, so ``LlmLogBase`` (shared by the
+    row and the detail, one entry per RECORD) would be both the wrong shape and
+    50 copies of one string. The list is also the response that arrives BEFORE
+    the page decides what a deep link points at, while the detail is fetched
+    lazily per record -- an in-list link would have had to open the row first to
+    learn whether it should have.
+    """
 
     logs: list[LlmLogSummary]
+    process_token: str
 
 
 class LlmLogMessage(BaseModel):
@@ -444,8 +462,16 @@ class LlmLogAttempt(BaseModel):
     response ever landed on this attempt), never 0 for that case. ``usage`` is
     THIS attempt's own reading, distinct from ``LlmLogBase.usage``'s
     interaction-level aggregate (see the module comment above). ``truncated``
-    is true the moment ANY body on this attempt -- a request message or the
-    response -- was cut for size; the FE shows a small badge for it.
+    is true the moment ANY stored text on this attempt -- a request message, the
+    response, or an advertised tool name -- was cut for size; the FE shows a
+    small badge for it.
+    ``tools_advertised`` is the NAMES of the tools this attempt offered the
+    model, or null when it sent no ``tools`` parameter at all (see
+    ``LlmAttempt`` in services/llm_log.py) -- declaring it here is what keeps it
+    on the wire, since pydantic's default ``extra="ignore"`` would otherwise
+    drop the key silently at the router's ``model_validate``. Like every other
+    stored text here it has been through the log's redaction choke point, since
+    a tool NAME can itself equal a registered secret value.
     """
 
     request_messages: list[LlmLogMessage]
@@ -455,6 +481,7 @@ class LlmLogAttempt(BaseModel):
     error: str | None
     usage: LlmLogUsage | None
     truncated: bool
+    tools_advertised: list[str] | None = None
 
 
 class LlmLogDetail(LlmLogBase):
@@ -478,13 +505,18 @@ class ToolSummary(BaseModel):
     ``valid=False`` rows carry the safe ``error`` reason from the registry scan
     (bad manifest, name mismatch, missing entry file); such a package is listed
     so it can be deleted, but is never advertised to the model or executable.
+
+    The summary text itself is fetched per tool on demand
+    (``ToolSummaryDetail``), since it is far too long for a list row.
     """
 
     name: str
-    description: str
+    description: str | None
     enabled: bool
     valid: bool
     error: str | None
+    current_vid: str | None
+    lineage: Literal["sole", "usable", "broken"]
 
 
 class ToolListResponse(BaseModel):
@@ -493,10 +525,67 @@ class ToolListResponse(BaseModel):
     tools: list[ToolSummary]
 
 
+class ToolDeleteResponse(BaseModel):
+    """Whether DELETE removed the files or retained a hidden parked tree.
+
+    ``retained_path`` is the exact operator-facing path when ``outcome`` is
+    ``retained``; it is null after physical removal.
+    """
+
+    outcome: Literal["removed", "retained"]
+    retained_path: str | None
+    retention_reason: Literal["durability_unconfirmed", "cleanup_failed"] | None
+
+
+class ToolDiscardResponse(BaseModel):
+    """Whether discard removed the former version or retained its files."""
+
+    outcome: Literal["removed", "retained"]
+    retained_path: str | None
+    retention_reason: Literal["durability_unconfirmed", "cleanup_failed"] | None
+
+
+class ToolSummaryDetail(BaseModel):
+    """One tool's version summary
+    (``versions/<vid>/.afterthread.meta/summary.json``), as the 工具 page reads it.
+
+    The three sidecar fields are nullable and all three are null together for the
+    common, non-exceptional case of a tool with no sidecar: a hand-made package,
+    or one whose summary generation has not run (or failed) yet. That is a 200,
+    not a 404 -- the TOOL exists, it just has no summary -- so the page renders
+    尚無總結 plus a 重新產生 action rather than an error. ``current_vid`` is
+    always present and identifies the version that was actually read, so a
+    response that crossed a pointer change cannot poison another version's cache.
+
+    ``llm_log_id`` links to the summary session's AI 日誌 record (the
+    ``tool_summary`` workflow, distinct from the builder's ``tool_install``), so
+    a wrong or missing summary is debuggable from the UI. It is null whenever the
+    id on disk was minted by a PREVIOUS process: log ids are a per-process counter
+    over a ring that is wiped on restart, so a persisted id only means something
+    while that process lives (see ``routers.tools._summary_detail``, which nulls
+    it rather than adding a fifth field -- a null here already means "no record to
+    link", and the FE already renders exactly that).
+    """
+
+    summary: str | None
+    updated_at: str | None
+    llm_log_id: int | None
+    current_vid: str
+
+
 class ToolUpdateRequest(BaseModel):
     """PATCH payload for a tool: only the enabled toggle is mutable."""
 
     enabled: bool
+
+
+_TOOL_VID_PATTERN = r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$"
+
+
+class ToolExpectedVersionRequest(BaseModel):
+    """Required optimistic identity for a version-specific synchronous write."""
+
+    expected_vid: str = Field(pattern=_TOOL_VID_PATTERN)
 
 
 # An install-form secret NAME must be a valid environment-variable name: it
@@ -589,14 +678,33 @@ class ToolInstallRequest(BaseModel):
         return self
 
 
+class ToolReviseRequest(BaseModel):
+    """Payload for an AI revise job (D40): what the user wants changed.
+
+    ``feedback`` carries the SAME bound every other AI free-text input has
+    (20000 chars, stripped-non-empty) and becomes the builder session's user
+    turn. ``expected_vid`` is the required optimistic identity checked only
+    after global single-flight admission. Which tool is being revised remains
+    the PATH's job: the shared path regex validates its name.
+    """
+
+    feedback: str = Field(min_length=1, max_length=_MAX_AI_INPUT_CHARS)
+    expected_vid: str = Field(pattern=_TOOL_VID_PATTERN)
+
+    @field_validator("feedback")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        return _stripped_non_empty(value, "feedback")
+
+
 class ToolInstallAccepted(BaseModel):
-    """202 body for a queued install: the id to poll."""
+    """202 body for a queued install or revise: the id to poll."""
 
     job_id: str
 
 
-class ToolInstallJobStatus(BaseModel):
-    """One install job's visible state, as polled by the 工具 page.
+class ToolJobStatus(BaseModel):
+    """One install/revise job's visible state, as polled by the 工具 page.
 
     ``state`` walks queued -> running -> succeeded | failed. ``error`` is the
     friendly zh-TW failure text (failed only); ``tool_name``/``summary`` are
@@ -604,6 +712,24 @@ class ToolInstallJobStatus(BaseModel):
     AI 日誌 record whenever a session actually ran, so both success and failure
     are debuggable from the UI. Jobs are process-local and unpersisted: after a
     backend restart every previous job id is a 404.
+
+    ``llm_log_process`` names the process whose id space that ``llm_log_id``
+    belongs to -- the same both-or-neither pairing the sidecar keeps on disk
+    (``tools.store_summary_meta``), for the same reason: log ids restart from
+    zero in every process, so an id that OUTLIVES its process resolves to
+    whatever now occupies the number. A job never outlives its process (the 404
+    above), but a browser TAB does: the 工具 page stops polling a terminal job
+    and keeps its response cached, so the outcome card -- and the ``查看 AI 日誌``
+    link on it -- can still be on screen after a restart. The token travels with
+    the link so the AI 日誌 page can refuse to resolve it (R9-1); the backend
+    cannot catch this one alone, because it never SERVES a stale id.
+
+    One model for BOTH job kinds (D40 renamed it from ``ToolInstallJobStatus``
+    without touching a field): an install writes a package into the tools
+    directory and a revise adds a version to one and moves ``current``, and both
+    report through one job table and one poll endpoint. ``env_keys`` names
+    assignments from a builder-written ``.env`` that the backend stripped;
+    values never enter the result.
     """
 
     job_id: str
@@ -614,3 +740,5 @@ class ToolInstallJobStatus(BaseModel):
     tool_name: str | None
     summary: str | None
     llm_log_id: int | None
+    llm_log_process: str | None
+    env_keys: list[str]

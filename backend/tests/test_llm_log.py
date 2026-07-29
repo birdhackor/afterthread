@@ -33,7 +33,7 @@ from fastapi.testclient import TestClient
 from pydantic import BaseModel, ConfigDict
 
 from afterthread.config import Settings
-from afterthread.services import llm_log
+from afterthread.services import llm_log, tool_builder
 from afterthread.services.llm import (
     LLMNotConfiguredError,
     LLMUpstreamError,
@@ -76,10 +76,20 @@ def _record(
     response: str | None = "out",
     outcome: str = "ok",
     error: str | None = None,
+    tools_advertised: list[str] | None = None,
 ) -> llm_log.LlmInteractionRecorder:
-    """Build, populate and finalize one record straight through the recorder."""
+    """Build, populate and finalize one record straight through the recorder.
+
+    ``tools_advertised`` None means the kwarg is NOT passed to ``begin_attempt``
+    at all (exercising the default every pre-existing caller relies on), rather
+    than passed explicitly as None.
+    """
     recorder = llm_log.LlmInteractionRecorder(workflow=workflow, model=model)
-    recorder.begin_attempt(messages or [{"role": "user", "content": "hi"}])
+    attempt_messages = messages or [{"role": "user", "content": "hi"}]
+    if tools_advertised is None:
+        recorder.begin_attempt(attempt_messages)
+    else:
+        recorder.begin_attempt(attempt_messages, tools_advertised=tools_advertised)
     if response is not None:
         recorder.record_response(response)
     recorder.finish(outcome=outcome, error=error)
@@ -135,6 +145,38 @@ def test_get_record_unknown_id_returns_none() -> None:
     assert llm_log.get_record(999999) is None
 
 
+def test_attempt_without_tools_kwarg_records_none() -> None:
+    """An attempt begun the way every tool-less caller begins one -- no
+    ``tools_advertised`` kwarg at all -- carries None end to end, not [], so
+    "this round advertised nothing" stays distinguishable in the detail
+    payload."""
+    _record()
+    log_id = llm_log.list_summaries(1)[0]["id"]
+    record = llm_log.get_record(log_id)
+    assert record is not None
+    assert record["attempts"][0]["tools_advertised"] is None
+
+
+def test_attempt_tools_advertised_is_recorded_as_a_copy() -> None:
+    """The advertised names reach the detail payload, and the recorder holds a
+    COPY: the caller derives one list per interaction and reuses it across every
+    round, so mutating it afterwards must not rewrite an already-recorded
+    attempt."""
+    names = ["alpha", "beta"]
+    recorder = llm_log.LlmInteractionRecorder(workflow="capture", model="m")
+    recorder.begin_attempt([{"role": "user", "content": "hi"}], tools_advertised=names)
+    recorder.record_response("out")
+    recorder.finish(outcome="ok", error=None)
+
+    names.append("gamma")
+    names[0] = "MUTATED"
+
+    log_id = llm_log.list_summaries(1)[0]["id"]
+    record = llm_log.get_record(log_id)
+    assert record is not None
+    assert record["attempts"][0]["tools_advertised"] == ["alpha", "beta"]
+
+
 # --- stored-body size cap (_stored_body) ------------------------------------
 
 
@@ -143,7 +185,7 @@ def test_stored_body_at_or_under_cap_is_unchanged(monkeypatch: pytest.MonkeyPatc
     untruncated -- the cap must never touch a body that already fits."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_body_max_chars=1000))
     text = "x" * 1000
-    stored, truncated = llm_log._stored_body(text)
+    stored, truncated = llm_log._stored_body(text, [])
     assert stored == text
     assert truncated is False
 
@@ -153,7 +195,7 @@ def test_stored_body_over_cap_is_hard_cut_with_marker(monkeypatch: pytest.Monkey
     marker appended in place of the last characters (not merely a bare
     slice), and reports truncated=True."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_body_max_chars=1000))
-    stored, truncated = llm_log._stored_body("y" * 5000)
+    stored, truncated = llm_log._stored_body("y" * 5000, [])
     assert truncated is True
     assert len(stored) == 1000
     assert stored.endswith(llm_log._BODY_TRUNCATION_MARKER)
@@ -172,7 +214,7 @@ def test_stored_body_cap_smaller_than_marker_hard_cuts_without_it(
     Confirms the marker is DROPPED (not partially appended) and the result is
     a bare hard cut to exactly ``cap`` chars."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: SimpleNamespace(llm_log_body_max_chars=5))
-    stored, truncated = llm_log._stored_body("z" * 100)
+    stored, truncated = llm_log._stored_body("z" * 100, [])
     assert truncated is True
     assert stored == "zzzzz"
 
@@ -339,6 +381,221 @@ def test_redaction_masks_known_secret_in_request_and_response(
     file_text = log_file.read_text(encoding="utf-8")
     assert secret not in file_text
     assert llm_log._REDACTION_MARKER in file_text
+
+
+def test_advertised_tool_names_go_through_the_same_redaction(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A tool NAME that equals a registered secret value is masked in the record
+    and in the detail payload, exactly like a body.
+
+    The names used to be copied straight into the attempt, so they were the one
+    stored field that bypassed the redaction choke point -- and a name CAN
+    legitimately be a registered value (a hand-edited ``.env`` holding
+    ``TOKEN=kbsearch`` while ``kbsearch`` is an installed tool). Ordinary names
+    are untouched, and both sinks see the same masked record."""
+    secret = "kbsearch-tool"  # also the name of an installed tool
+    log_file = tmp_path / "llm.jsonl"
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_file=str(log_file), llm_log_max_entries=50),
+    )
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {secret})
+    llm_log._reset_for_tests()
+
+    _record(workflow="capture", tools_advertised=[secret, "notes"])
+
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    names = record["attempts"][0]["tools_advertised"]
+    assert names == [llm_log._REDACTION_MARKER, "notes"]
+    # The JSONL sink wrote the SAME masked record -- the value never on disk.
+    file_text = log_file.read_text(encoding="utf-8")
+    assert secret not in file_text
+
+
+def test_advertised_tool_names_keep_none_and_empty_apart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Routing the names through ``_stored_body`` must not blur the two answers
+    that mean different things: None (no ``tools`` parameter rode on this attempt
+    at all) stays None, and [] (a tools parameter rode, but nothing in it carried
+    a readable name) stays []."""
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {"kb-live-key-abcdef"})
+    llm_log._reset_for_tests()
+
+    _record(workflow="capture", tools_advertised=[])
+    _record(workflow="enrich")  # the kwarg is not passed at all
+
+    summaries = llm_log.list_summaries(2)
+    without_kwarg = llm_log.get_record(summaries[0]["id"])
+    empty_list = llm_log.get_record(summaries[1]["id"])
+    assert without_kwarg is not None and empty_list is not None
+    assert without_kwarg["attempts"][0]["tools_advertised"] is None
+    assert empty_list["attempts"][0]["tools_advertised"] == []
+
+
+def test_one_secret_sweep_per_attempt_however_many_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The known-secret provider is asked ONCE per recorded step, not once per
+    string.
+
+    The provider is ``tools.known_secret_values``: an ``iterdir`` plus a ``stat``
+    per installed package, plus a ``.env`` read on every cache miss -- and this
+    runs on the EVENT LOOP, before the request goes out. One sweep per name made
+    an attempt advertising N tools do N sweeps over N packages, quadratic
+    filesystem work to mask a handful of short names. Counted rather than timed,
+    because the count is the property; the masking itself is asserted in the same
+    breath so the cheaper shape cannot be mistaken for a weaker one."""
+    calls: list[int] = []
+    secret = "kbsearch-tool"  # also the name of an installed tool
+
+    def counting_provider() -> set[str]:
+        calls.append(1)
+        return {secret}
+
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    monkeypatch.setattr(llm_log, "_secret_provider", counting_provider)
+    llm_log._reset_for_tests()
+
+    recorder = llm_log.LlmInteractionRecorder(workflow="capture", model="m")
+    recorder.begin_attempt(
+        [{"role": "system", "content": "SYS"}, {"role": "user", "content": "USR"}],
+        tools_advertised=[secret, *[f"tool{index}" for index in range(20)]],
+    )
+    assert calls == [1]  # 2 messages + 21 names, ONE sweep
+
+    recorder.record_response("out")
+    assert len(calls) == 2  # the response is a separate step, a whole round trip later
+    recorder.finish(outcome="ok", error=None)
+
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    names = record["attempts"][0]["tools_advertised"]
+    assert names[0] == llm_log._REDACTION_MARKER  # still masked off the shared snapshot
+    assert names[1] == "tool0"
+
+
+def test_advertised_names_are_bounded_and_the_record_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one field of a record that used to bypass every size discipline.
+
+    Nothing caps how many packages a tools directory holds, so the array could be
+    arbitrarily long in the ring AND the JSONL sink while every body beside it was
+    capped twice. Both ceilings are pinned -- the COUNT (a name may store zero
+    characters, which no character budget can bound) and the aggregate CHARACTER
+    budget (``llm_log_body_max_chars``, the same knob ``_apply_total_budget``
+    re-uses for the message bodies) -- and so is the thing that makes a cut
+    honest: a trailing marker naming how many were dropped, plus the attempt's own
+    ``truncated`` flag. Silently short lists are how a reader concludes the model
+    was offered three tools when it was offered three hundred."""
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    llm_log._reset_for_tests()
+
+    def _last_attempt() -> dict[str, Any]:
+        record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+        assert record is not None
+        return record["attempts"][0]
+
+    over_count = [f"tool{index}" for index in range(llm_log._MAX_TOOLS_ADVERTISED + 7)]
+    _record(workflow="capture", tools_advertised=over_count)
+    attempt = _last_attempt()
+    names = attempt["tools_advertised"]
+    assert names[: llm_log._MAX_TOOLS_ADVERTISED] == over_count[: llm_log._MAX_TOOLS_ADVERTISED]
+    assert names[-1] == llm_log._names_elision_marker(7)  # kept in advertisement order
+    assert len(names) == llm_log._MAX_TOOLS_ADVERTISED + 1
+    assert attempt["truncated"] is True
+
+    # The character half, at a name length production can actually produce
+    # (``tools._NAME_RE`` admits at most 64 characters). 20 of these exhaust the
+    # budget EXACTLY, which is the case that used to publish an over-budget
+    # record: the marker was appended after the last character was already spent,
+    # so the stored total came to budget + len(marker). The bound is asserted on
+    # the SUM of what was stored, marker included -- the number the ring and the
+    # JSONL sink actually pay -- rather than on the shape of the list.
+    budget = 1000
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_body_max_chars=budget, llm_log_max_entries=50),
+    )
+    llm_log._reset_for_tests()
+
+    real_names = [f"kb-search-{index:02d}-{'a' * 37}" for index in range(25)]
+    assert {len(name) for name in real_names} == {50}
+    _record(workflow="capture", tools_advertised=real_names)
+    attempt = _last_attempt()
+    names = attempt["tools_advertised"]
+    assert sum(len(name) for name in names) <= budget
+    assert names[:-1] == real_names[:19]  # one name given back to make room
+    assert names[-1] == llm_log._names_elision_marker(6)  # ... and the count says so
+    assert attempt["truncated"] is True
+
+    # A single name longer than the whole budget still gets stored (``_stored_body``
+    # capped it at the budget itself, so the first entry always fits) -- a length no
+    # package name can have, kept only because that invariant is real code.
+    llm_log._reset_for_tests()
+    _record(workflow="capture", tools_advertised=["a" * 900, "b" * 900, "c" * 900])
+    attempt = _last_attempt()
+    assert attempt["tools_advertised"] == ["a" * 900, llm_log._names_elision_marker(2)]
+    assert sum(len(name) for name in attempt["tools_advertised"]) <= budget
+    assert attempt["truncated"] is True
+
+    # An ordinary list is stored EXACTLY as before -- no marker, no flag.
+    _record(workflow="capture", tools_advertised=["alpha", "beta"])
+    attempt = _last_attempt()
+    assert attempt["tools_advertised"] == ["alpha", "beta"]
+    assert attempt["truncated"] is False
+
+
+def test_advertised_tool_name_cut_for_size_sets_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A name cut by the size stage folds into the attempt's own ``truncated``
+    flag rather than being dropped silently.
+
+    Unreachable in production -- ``tools._NAME_RE`` bounds a name to 64 chars and
+    the cap's own floor is 1000 -- which is exactly why it is pinned here: a
+    signal discarded because it "cannot fire" is one that later fires unnoticed.
+    Driven by lowering the cap, the same way the body-truncation tests do."""
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_body_max_chars=1000, llm_log_max_entries=50),
+    )
+    llm_log._reset_for_tests()
+
+    _record(workflow="capture", tools_advertised=["short"])
+    unflagged = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert unflagged is not None
+    assert unflagged["attempts"][0]["truncated"] is False
+
+    _record(workflow="capture", tools_advertised=["n" * 2000])
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    attempt = record["attempts"][0]
+    assert attempt["truncated"] is True
+    assert attempt["tools_advertised"][0].endswith(llm_log._BODY_TRUNCATION_MARKER)
+
+
+def test_process_token_is_stable_and_re_minted_on_a_simulated_restart() -> None:
+    """The token names THIS process's id space, so it must be the same string on
+    every read within a process and a DIFFERENT one once that id space restarts.
+
+    ``_reset_for_tests`` is what a restart looks like to this module (the ring is
+    dropped and ids go back to 0), so re-minting there is a correctness property,
+    not a testing convenience: a token that survived the reset would vouch for
+    ids it no longer describes."""
+    before = llm_log.process_token()
+    assert llm_log.process_token() == before
+    assert before  # opaque, but never empty
+
+    llm_log._reset_for_tests()
+    assert llm_log.process_token() != before
 
 
 def test_redaction_skips_values_shorter_than_min(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1057,6 +1314,67 @@ def test_no_secret_leak_in_logs_or_api_payloads(
 # --- router endpoints ------------------------------------------------------
 
 
+def test_router_list_carries_this_process_id_space_token(client: TestClient) -> None:
+    """R9-1: the list says WHOSE id space its rows' ids belong to.
+
+    A client can be holding an id from a previous backend run -- a `?log=` deep
+    link built from a tool job the browser cached and stops refetching once the
+    job is terminal -- and every one of those ids resolves here, to an unrelated
+    interaction that merely reuses the number. The token is what lets the page
+    tell that apart, and it rides on the ENVELOPE (one property of the answering
+    process) rather than on each row.
+
+    The restart is produced the way ``_reset_for_tests`` produces one, the same
+    way O2-2's sidecar tests do it, rather than by mocking the route."""
+    _record(workflow="capture")
+    body = client.get("/api/llm/logs").json()
+    assert body["process_token"] == llm_log.process_token()
+    assert body["process_token"]  # opaque, but never empty
+
+    llm_log._reset_for_tests()
+    after_restart = client.get("/api/llm/logs").json()
+    assert after_restart["process_token"] != body["process_token"]
+
+
+def test_router_job_status_names_the_process_that_minted_its_log_id(client: TestClient) -> None:
+    """The job's half of the same pairing: an id and the token of its id space.
+
+    Stamped when the job is SERVED rather than stored on it, which holds
+    structurally: the job table is in-process memory that dies with the ring and
+    its counter, so any id a job can still be served with was minted here. The
+    both-or-neither rule the sidecar keeps is kept here too -- no id, no token --
+    so the pair can never disagree about whether there is a link to vouch for."""
+    linked = tool_builder.InstallJob(
+        job_id="job-linked",
+        state="succeeded",
+        created_at="2026-07-27T00:00:00+00:00",
+        finished_at="2026-07-27T00:01:00+00:00",
+        tool_name="kb",
+        summary="done",
+        llm_log_id=7,
+    )
+    unlinked = tool_builder.InstallJob(
+        job_id="job-unlinked",
+        state="failed",
+        created_at="2026-07-27T00:00:00+00:00",
+        finished_at="2026-07-27T00:01:00+00:00",
+        error="安裝失敗",
+    )
+    with tool_builder._JOBS_LOCK:
+        tool_builder._JOBS[linked.job_id] = linked
+        tool_builder._JOBS[unlinked.job_id] = unlinked
+    try:
+        with_link = client.get("/api/tools/jobs/job-linked").json()
+        without_link = client.get("/api/tools/jobs/job-unlinked").json()
+    finally:
+        tool_builder._reset_jobs_for_tests()
+
+    assert with_link["llm_log_id"] == 7
+    assert with_link["llm_log_process"] == llm_log.process_token()
+    assert without_link["llm_log_id"] is None
+    assert without_link["llm_log_process"] is None
+
+
 def test_router_lists_summaries_newest_first(client: TestClient) -> None:
     _record(workflow="capture", response="body-one")
     _record(workflow="enrich", response="body-two")
@@ -1094,6 +1412,30 @@ def test_router_detail_returns_full_record(client: TestClient) -> None:
     assert body["id"] == log_id
     assert body["attempts"][0]["response_content"] == "the full body"
     assert body["attempts"][0]["request_messages"][0] == {"role": "system", "content": "SYS"}
+
+
+def test_router_detail_exposes_tools_advertised(client: TestClient) -> None:
+    """The per-attempt tool names survive the router's response model.
+
+    This is the guard on schemas.LlmLogAttempt: the detail route builds its
+    response with ``LlmLogDetail.model_validate(record)``, and pydantic's default
+    ``extra="ignore"`` would drop an undeclared key SILENTLY -- the store would
+    keep recording the names while the API quietly stopped serving them. Both
+    shapes are pinned: null for a round that advertised nothing, and the exact
+    list for one that did."""
+    _record(workflow="capture")
+    _record(workflow="enrich", tools_advertised=["alpha", "beta"])
+    logs = client.get("/api/llm/logs").json()["logs"]
+
+    with_tools = client.get(f"/api/llm/logs/{logs[0]['id']}")
+    assert with_tools.status_code == 200
+    assert with_tools.json()["attempts"][0]["tools_advertised"] == ["alpha", "beta"]
+
+    without_tools = client.get(f"/api/llm/logs/{logs[1]['id']}")
+    assert without_tools.status_code == 200
+    attempt = without_tools.json()["attempts"][0]
+    assert "tools_advertised" in attempt  # present as an explicit null, not omitted
+    assert attempt["tools_advertised"] is None
 
 
 def test_router_detail_unknown_id_404(client: TestClient) -> None:

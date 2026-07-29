@@ -21,6 +21,8 @@ This repo is a personal afterthread system for preventing architectural knowledg
 
 - **launcher 行程就是 turn 驅動器**:`adversarial-review --background` 的 node(codex-companion.mjs)行程一死,server 端 job 不會自己跑完——job log 直接凍結成孤兒(實例:一次凍在 starting、一次凍在 verifying 中的 pytest)。「--background」不代表 launcher 可以死。
 - **啟動方式**:Claude Code 的背景任務會被系統中止(同 session 內兩度殺掉 launcher),所以 review 一律用 `setsid nohup node <codex-companion.mjs> adversarial-review --background … > log 2>&1 < /dev/null &` 完全脫離行程樹啟動。
+- **cwd 必須是 repo,而且要寫在啟動指令裡**:companion 沒有 `-C` 參數,它靠當下工作目錄找 repo。曾經在同一個 Bash 呼叫裡先 `cd` 去暫存目錄寫 prompt、再原地發動,結果 log 只留一行 `This command must run inside a Git repository.`,job 根本沒建立——而 `status --all` 只會顯示上一輪的舊 job,看起來像「還在跑」。所以 `bash -c` 內要自己 `cd <repo>` 再 `node`,別依賴外層 cwd。
+- **等待要認新 job id**:偵測完成時若用寬鬆樣式(如 `grep "^- review-"`)會配到上一輪那個 completed 的 job,立刻誤報完成。先記下已知的舊 id 並排除掉,或直接比對啟動後新出現的 id。反向的坑也踩過:偵測條件太嚴會讓 monitor 一直看不到 job 出現而空轉到逾時(一輪只跑 7 分鐘卻等了一小時)。啟動後先確認 log 沒有錯誤、且 `status` 真的多了一個新 job,再進等待迴圈。
 - **等待方式**:不要用 `--wait` 串流(中繼不可靠,舊教訓)。輪詢 `status --all` 等 job 離開 running,並搭配 stall 偵測:job log(`plugins/data/codex-openai-codex/state/<repo>/jobs/*.log`)mtime 超過 240 秒仍 running 就是凍死,別再等。Claude Code 內用 Monitor 工具跑這個迴圈(前景 sleep 會被擋、背景 bash 會被殺)。
 - **取結果**:`result` 只對 finished job 有效;job 還在跑時會回「No job found」——那不是 job 不見了,是還沒完成。
 - **孤兒清理**:凍結的 job 用 `cancel <job-id>` 清;被取消的 job 可能留下 bwrap sandbox 行程(pytest 等卡在裡面),每輪結束後 `pgrep -af codex-linux-sandbox` 檢查、照 PID kill。

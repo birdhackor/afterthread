@@ -55,6 +55,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 from afterthread.config import get_settings
 
@@ -108,10 +109,37 @@ class LlmAttempt:
     detail (the response body it was judged against is already recorded above
     it).
 
-    ``truncated`` is True the moment ANY body on this attempt -- a request
-    message or the response -- was cut by ``_stored_body``, so a reader can
-    tell "this record is honest but incomplete" apart from "this is
-    everything" without diffing lengths against the configured cap by hand.
+    ``truncated`` is True the moment ANY stored text on this attempt -- a
+    request message, the response, or an advertised tool name -- was cut by
+    ``_stored_body``, older messages were elided for the aggregate budget, or the
+    advertised-name list was bounded, so a reader can tell "this record is honest
+    but incomplete" apart from "this is everything" without diffing lengths
+    against the configured cap by hand.
+
+    ``tools_advertised`` is the list of tool NAMES this attempt actually
+    offered the model, or None when the attempt sent NO ``tools`` parameter at
+    all (a tool-less workflow, the tools-free finalize round after the round or
+    conversation-size budget is spent, the corrective retry). It exists because
+    tool specs ride as a SEPARATE ``chat.completions.create`` parameter and
+    never appear in ``request_messages``, so nothing else in a record can
+    answer "what could the model see on THIS round". NAMES only, never the
+    specs: one tool's parameters schema can run to 16KiB and would be
+    re-recorded verbatim on every attempt of every round, while the name alone
+    already answers that question -- the full spec is on disk in the tool's
+    tool.json. Each name is STORED through ``_stored_body`` like every other
+    caller-derived text in this record -- a tool name can equal a registered
+    secret value, so it does not get to skip the redaction choke point -- and the
+    LIST is bounded like every other stored text is, by a count and by an
+    aggregate character budget, with anything dropped replaced by one trailing
+    ``…[另 N 項工具已省略…]`` marker (see ``_bounded_tool_names`` and
+    ``LlmInteractionRecorder.begin_attempt``). In practice a reader sees only
+    None or a non-empty list: an
+    EMPTY tool set is normalized to "no tools parameter at all" upstream (see
+    ``_run_structured``), so ``tools=[]`` records None rather than []. A
+    literal [] stays possible for one degenerate reason, and means something
+    DIFFERENT from None -- a tools parameter WAS sent, but not one of its
+    entries carried a readable ``function.name`` (the same defensive read the
+    dispatcher makes, so none of them would have been callable either).
     """
 
     request_messages: list[dict[str, str]]
@@ -121,6 +149,7 @@ class LlmAttempt:
     error: str | None = None
     usage: dict[str, int | None] | None = None
     truncated: bool = False
+    tools_advertised: list[str] | None = None
 
 
 @dataclass(slots=True)
@@ -163,6 +192,25 @@ _LOCK = threading.Lock()
 _ring: deque[LlmInteractionRecord] | None = None
 _last_id = 0
 
+# This process's opaque identity for the id space above, minted once at import.
+#
+# ``id`` is a per-process counter starting at 0 and the ring dies with the
+# process -- so an id is only meaningful ALONGSIDE the identity of the process
+# that minted it. Anything that PERSISTS an id outlives that: the tool summary
+# sidecar (``tools.write_tool_meta``'s ``llm_log_id``) keeps the integer on disk
+# forever, and after a restart that integer resolves to whatever interaction now
+# holds it -- a DIFFERENT tool's summary session, possibly a different workflow
+# entirely. Nothing downstream can notice: ``get_record`` finds a real record and
+# the detail agrees with itself, because the row WAS selected by that id.
+#
+# So a persisted id is stored next to this token and the reader compares first
+# (see ``routers.tools._summary_detail``). Opaque and random rather than pid +
+# start time: a pid is reused, and this only ever has to answer "same process or
+# not", never "which process". A token that is merely ABSENT (every sidecar
+# written before this existed) reads as "not this process", which is the
+# conservative answer -- see that reader.
+_PROCESS_TOKEN = uuid4().hex
+
 
 def _get_ring() -> deque[LlmInteractionRecord]:
     """Return the process-wide ring, building it once from current settings.
@@ -186,17 +234,36 @@ def _allocate_id() -> int:
         return _last_id
 
 
+def process_token() -> str:
+    """This process's opaque identity for the log-id space (``_PROCESS_TOKEN``).
+
+    An accessor rather than the constant itself so every caller reads it at the
+    moment it acts -- which is what lets ``_reset_for_tests`` model a RESTART, and
+    what keeps a module-level ``from ... import`` from freezing a stale copy of a
+    value whose whole job is to differ between processes.
+    """
+    return _PROCESS_TOKEN
+
+
 def _reset_for_tests() -> None:
     """Drop the ring and id counter so a test starts from an empty log.
 
     Not used at runtime. Lets a test pick a fresh ``llm_log_max_entries`` (via a
     settings override) and have the next ``_get_ring()`` build a ring of that
     size, and keeps the monotonic id space from leaking assertions across tests.
+
+    The process token is re-minted here for a CORRECTNESS reason, not for tidiness:
+    it exists to vouch for THIS id space, and this function restarts that id space
+    at 0. Leaving the old token in place would have it vouch for ids it no longer
+    describes -- exactly the confusion it was added to prevent. It also makes a
+    restart something a test can produce honestly (reset, and every previously
+    persisted id is correctly foreign) instead of mocking the reader.
     """
-    global _ring, _last_id
+    global _ring, _last_id, _PROCESS_TOKEN
     with _LOCK:
         _ring = None
         _last_id = 0
+        _PROCESS_TOKEN = uuid4().hex
 
 
 # --- defensive usage extraction -------------------------------------------
@@ -436,12 +503,19 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     return "".join(out)
 
 
-def _redact(text: str) -> str:
-    """Replace every known secret value in ``text`` with the redaction marker.
+def _secret_snapshot() -> list[str]:
+    """The redactable known-secret values, materialized ONCE. [] when there are
+    none, when no provider is wired, or when asking failed.
 
-    The FIRST stage of `_stored_body` (before `_utf8_safe`, before the size cut):
-    a secret must be scrubbed BEFORE truncation could split it, or half of a key
-    straddling the cap edge would survive in the record.
+    Taken ONE per recorded step (an attempt's whole message list and its advertised
+    names together, a response on its own) and handed down to every ``_stored_body``
+    that step performs, rather than being re-derived per string. That is a real
+    cost, not tidiness: the provider is ``tools.known_secret_values``, which walks
+    every installed package -- an ``iterdir`` plus a ``stat`` per package, plus a
+    ``.env`` read on every cache miss -- and it runs on the EVENT LOOP, before the
+    upstream request goes out. One sweep per string made an attempt that advertises
+    N tools do N sweeps over N packages: quadratic filesystem work, synchronously,
+    to mask a handful of short names.
 
     The provider is called INSIDE a broad `except Exception` because of the
     no-observer-failure invariant: the recorder is a pure observer of the LLM
@@ -455,27 +529,53 @@ def _redact(text: str) -> str:
     floor also drops the empty string (``str.replace("", m)`` would splice the marker
     between every character) and a 1-5 char value (see that constant).
 
+    Snapshotting also makes one step's masking SELF-CONSISTENT: every string in an
+    attempt is now judged against the same secret set, instead of message 1 seeing
+    a set that message 5 no longer does. The set genuinely changes at runtime (an
+    install registers a value, a call holds the ``.env`` it was handed), so a
+    snapshot is a point-in-time answer either way -- taking it once just makes WHICH
+    point obvious.
+    """
+    provider = _secret_provider
+    if provider is None:
+        return []
+    try:
+        return [
+            value
+            for value in provider()
+            if isinstance(value, str) and len(value) >= _MIN_SECRET_LEN
+        ]
+    except Exception:
+        return []
+
+
+def _redact(text: str, secrets: list[str]) -> str:
+    """Replace every known secret value in ``text`` with the redaction marker.
+
+    The FIRST stage of `_stored_body` (before `_utf8_safe`, before the size cut):
+    a secret must be scrubbed BEFORE truncation could split it, or half of a key
+    straddling the cap edge would survive in the record.
+
+    ``secrets`` is a ``_secret_snapshot`` the CALLER took (see there for why the
+    snapshot is per step rather than per string); an empty list means "nothing to
+    mask", which is the byte-identical no-known-secrets behaviour every path had
+    before D36.
+
     The masking itself -- the shared ``_mask_known_secrets`` (byte-identical to
-    ``tools``' copy, see that helper) -- now runs INSIDE the SAME guard too (D36
+    ``tools``' copy, see that helper) -- runs inside this function's OWN guard (D36
     round-5): it computes every mask range on the PRISTINE text and merges them,
     which is what keeps a secret straddling an upstream boundary from surviving (H1)
     and mirrors the live redactor exactly, but it is still ordinary code that CAN
-    raise, and letting a failure there escape past the try below would violate the
-    exact no-observer-failure invariant this function exists to uphold.
+    raise, and letting a failure escape would violate the exact
+    no-observer-failure invariant this function exists to uphold. Splitting the
+    snapshot out did not narrow that: the two halves are guarded separately and
+    both degrade to "record unredacted".
     ``tools.redact_known_secrets`` is the mirror-image case: it deliberately leaves
     its OWN call to this same helper bare, because the LIVE path must fail CLOSED
     (propagate) rather than risk leaking an unmasked secret -- see that function's
     docstring.
     """
-    provider = _secret_provider
-    if provider is None:
-        return text
     try:
-        secrets = [
-            value
-            for value in provider()
-            if isinstance(value, str) and len(value) >= _MIN_SECRET_LEN
-        ]
         return _mask_known_secrets(text, secrets)
     except Exception:
         return text
@@ -524,14 +624,22 @@ def _utf8_safe(text: str) -> str:
 _BODY_TRUNCATION_MARKER = "…[紀錄過長已截斷]"
 
 
-def _stored_body(text: str) -> tuple[str, bool]:
+def _stored_body(text: str, secrets: list[str]) -> tuple[str, bool]:
     """Make ``text`` safe AND small enough to store; return (stored, truncated).
 
     The single choke point every request-message/response body passes through
     before it is written into an attempt, in a THREE-stage order that each
     guards a distinct hazard: ``_redact`` FIRST, then ``_utf8_safe``, then the
     hard cut to ``settings.llm_log_body_max_chars`` (with
-    ``_BODY_TRUNCATION_MARKER`` appended when a cut happens).
+    ``_BODY_TRUNCATION_MARKER`` appended when a cut happens). "Body" is its
+    origin, not its scope: an attempt's advertised tool NAMES run through it too
+    (see ``LlmInteractionRecorder.begin_attempt``), so that every stored string a
+    record holds that could carry operator/LLM/filesystem text reaches its sinks
+    through here. The one string that does not is a message's ``role``, and that
+    is deliberate: it is a closed vocabulary this codebase writes itself
+    ("system"/"user"/"assistant"/"tool", plus the synthetic elision entry below),
+    never operator text, and masking it would break rendering-by-role for a value
+    that cannot carry a secret.
 
     Redaction MUST run first -- before both the UTF-8 pass and the size cut. The
     size cut is the load-bearing reason: a secret value straddling the
@@ -561,8 +669,14 @@ def _stored_body(text: str) -> tuple[str, bool]:
     ``llm_log_body_max_chars``'s own ``ge=1_000`` floor makes that
     unreachable in practice, but the guard keeps this function correct
     independent of that floor rather than relying on it.
+
+    ``secrets`` is passed IN rather than fetched here, and has no default: this is
+    called once per string, while the sweep behind that list is per-package
+    filesystem work on the event loop (see ``_secret_snapshot``). A default would
+    make "forgot to hoist it" the quiet, working spelling -- which is exactly the
+    shape the advertised names were written in.
     """
-    safe = _utf8_safe(_redact(text))
+    safe = _utf8_safe(_redact(text, secrets))
     cap = get_settings().llm_log_body_max_chars
     if len(safe) <= cap:
         return safe, False
@@ -572,7 +686,7 @@ def _stored_body(text: str) -> tuple[str, bool]:
     return safe[: cap - marker_len] + _BODY_TRUNCATION_MARKER, True
 
 
-def _message_text(content: Any) -> tuple[str, bool]:
+def _message_text(content: Any, secrets: list[str]) -> tuple[str, bool]:
     """Coerce a message ``content`` to its STORED (safe, size-capped) text.
 
     Every message this codebase sends carries a plain string content, so the
@@ -584,10 +698,11 @@ def _message_text(content: Any) -> tuple[str, bool]:
     possibly oversized) previous reply back as an "assistant" message -- not
     just our own prompts. Returns ``(stored_text, truncated)`` so the caller
     (``LlmInteractionRecorder.begin_attempt``) can fold the per-message flag
-    into the attempt's own single ``truncated`` bit.
+    into the attempt's own single ``truncated`` bit. ``secrets`` is that same
+    caller's one snapshot for the whole attempt (see ``_secret_snapshot``).
     """
     text = content if isinstance(content, str) else str(content)
-    return _stored_body(text)
+    return _stored_body(text, secrets)
 
 
 def _elision_marker(count: int) -> str:
@@ -600,6 +715,107 @@ def _elision_marker(count: int) -> str:
     messages.
     """
     return f"…[較早 {count} 則訊息已省略以控制紀錄大小]"
+
+
+# Ceiling on how many advertised tool NAMES one attempt keeps verbatim. It is the
+# COUNT half of the bound (``_bounded_tool_names`` applies the char half), and it
+# is needed because the char budget alone cannot bound the list: a stored name may
+# be as short as the empty string, and nothing in this codebase limits how many
+# packages a tools directory holds -- one directory each, no registry-wide cap.
+# Set far above any plausible installation on purpose: this exists to keep a
+# pathological record finite, never to trim an ordinary one, so it must not fire
+# on a machine with a genuinely large tool set.
+_MAX_TOOLS_ADVERTISED = 100
+
+
+def _names_elision_marker(count: int) -> str:
+    """The synthetic trailing entry when advertised names are dropped for size.
+
+    Same construction as ``_elision_marker`` and readable next to it ("另 N 項工具"
+    -- another N tools -- vs "較早 N 則訊息"), so a reader who has met one
+    recognizes the other and can still tell which list was cut.
+    """
+    return f"…[另 {count} 項工具已省略以控制紀錄大小]"
+
+
+def _bounded_tool_names(names: list[str], secrets: list[str]) -> tuple[list[str], bool]:
+    """Store one attempt's advertised tool names, BOUNDED. Returns (stored, cut).
+
+    Each name goes through ``_stored_body`` -- the same choke point every message
+    and response passes, for the reasons ``LlmInteractionRecorder.begin_attempt``
+    gives -- against the caller's ONE ``_secret_snapshot`` for this attempt rather
+    than one provider sweep per name.
+
+    Then the bound the rest of a record has and this list did not. Two ceilings,
+    each closing what the other cannot:
+
+    * an AGGREGATE character budget, ``llm_log_body_max_chars`` applied a second
+      time exactly as ``_apply_total_budget`` applies it to the message bodies --
+      the same knob, the same "this is what the ring actually costs" reason, and no
+      new setting for an operator to reason about. Deliberately its OWN ceiling
+      rather than a share of the messages' one: a large tool set must never push
+      the CONVERSATION out of a record, which is the thing an attempt is mostly
+      read for;
+    * ``_MAX_TOOLS_ADVERTISED`` on the count, because the budget cannot bound a
+      list whose entries may store zero characters.
+
+    Kept in ADVERTISEMENT ORDER, oldest-first, which is where this list differs
+    from ``_apply_total_budget`` (which keeps the NEWEST messages): the field
+    answers "what could the model see on THIS round", and that set has no
+    recency -- but it does have the order the caller built it in, and a stable
+    prefix is one a reader can compare across attempts.
+
+    A cut is VISIBLE, never silent: the dropped entries become one trailing
+    ``_names_elision_marker`` naming how many there were, and the flag comes back
+    for the attempt's own ``truncated`` bit. That preserves the part of the answer
+    that survives truncation best -- how large the tool set was -- and a marker is
+    unmistakable for a name (``tools._NAME_RE`` admits no CJK, no brackets).
+
+    The marker is STORED, so it is CHARGED to the budget like everything else
+    (R6-5): it used to be appended unconditionally after the loop had already
+    spent the whole budget on names, which put the stored total OVER the ceiling
+    by the marker's length -- a bound that admits an exception is not one. Kept
+    names are given back from the END until it fits (so the stored list stays a
+    PREFIX of the advertisement order, which is the property above), and the
+    marker is rebuilt each time because the count it names grows with every one
+    returned. That always terminates with room: ``llm_log_body_max_chars`` is floored at 1000
+    (config.py) and this marker is ~20 characters plus the digits of a count, so
+    the marker alone fits inside the smallest budget an operator can configure --
+    it can never be the entry that has to be dropped.
+
+    None never reaches here (the caller short-circuits it) and ``[]`` returns
+    ``([], False)``, so the two answers stay as far apart as ``LlmAttempt``
+    documents.
+    """
+    budget = get_settings().llm_log_body_max_chars
+    stored: list[str] = []
+    truncated = False
+    used = 0
+    for name in names[:_MAX_TOOLS_ADVERTISED]:
+        stored_name, was_truncated = _stored_body(name, secrets)
+        # Never on the first name: ``_stored_body`` already capped it at this same
+        # budget, so ``used == 0`` cannot overflow -- the same "at least one is
+        # always kept" property ``_apply_total_budget`` relies on.
+        if used + len(stored_name) > budget:
+            break
+        stored.append(stored_name)
+        used += len(stored_name)
+        truncated = truncated or was_truncated
+    dropped = len(names) - len(stored)
+    if dropped:
+        marker = _names_elision_marker(dropped)
+        # The marker comes out of the SAME budget the names did (see docstring):
+        # give kept names back from the END until it fits, so what survives is
+        # still a PREFIX of the advertisement order. Each one returned makes the
+        # count -- and possibly the marker -- one longer, so it is rebuilt rather
+        # than measured once.
+        while stored and used + len(marker) > budget:
+            used -= len(stored.pop())
+            dropped += 1
+            marker = _names_elision_marker(dropped)
+        stored.append(marker)
+        truncated = True
+    return stored, truncated
 
 
 def _apply_total_budget(
@@ -694,7 +910,9 @@ class LlmInteractionRecorder:
         self._attempts: list[LlmAttempt] = []
         self._finished = False
 
-    def begin_attempt(self, messages: list[Any]) -> None:
+    def begin_attempt(
+        self, messages: list[Any], *, tools_advertised: list[str] | None = None
+    ) -> None:
         """Snapshot the messages ACTUALLY sent for a new attempt.
 
         Copied field-by-field (not aliased) because the caller rebuilds its
@@ -709,13 +927,65 @@ class LlmInteractionRecorder:
         the originals -- and ``truncated`` is set the moment ANY message was cut
         for size OR older messages were elided for the aggregate budget;
         ``record_response`` below may OR a response-side cut into the same flag.
+
+        ``tools_advertised`` is the NAMES of the tools this attempt offers the
+        model (see ``LlmAttempt``); keyword-only with a default so every caller
+        that advertises none -- and every pre-existing one -- keeps recording
+        None without changing a line. Each name goes through ``_stored_body``,
+        the SAME choke point every message and response passes, which is also why
+        the result is a new list rather than an alias of the caller's (that list
+        is derived once per interaction and reused across every round, so an alias
+        would let a later mutation rewrite an attempt already recorded here).
+
+        Putting the names through that choke point closes the one field of a
+        record that used to bypass it. A tool name can legitimately EQUAL a
+        registered secret VALUE -- a hand-edited ``.env`` holding
+        ``TOKEN=kbsearch`` while ``kbsearch`` is an installed tool -- and these
+        names were copied straight into the record, out to the detail API and into
+        the JSONL sink. It is the same class the revise prompt's name
+        interpolation already handles by redacting the interpolated name.
+
+        The FULL pipeline, not just its ``_redact`` stage, and that is a decision
+        rather than reflex: a name lands in the same two sinks and the same strict
+        UTF-8 serialization as a body, so ``_utf8_safe`` earns its place on
+        exactly the grounds it earns it there, while the ONE stage that might look
+        like dead weight -- the size cut -- is structurally unreachable for a name
+        (``tools._NAME_RE`` bounds one to 64 chars; ``llm_log_body_max_chars``
+        cannot go below 1000, and redaction can at most inflate 64 chars to ~120).
+        Unreachable is not the same as impossible, so its truncation flag is OR'd
+        into the attempt's own rather than dropped: silently discarding a signal
+        because it "cannot fire" is how it later fires unnoticed. Spelling out two
+        thirds of ``_stored_body`` instead would be a second, partial copy of the
+        choke point for no gain.
+
+        The names are also BOUNDED (``_bounded_tool_names``), which they were not
+        when they first went through the choke point: nothing in this codebase caps
+        how many packages a tools directory holds, so an arbitrarily long array
+        could enter the ring and the JSONL sink beside bodies that are capped twice
+        over. A cut shows up as a trailing marker and in ``truncated``, the way
+        every other cut in a record does.
+
+        None-vs-``[]`` survives exactly: None short-circuits (no tools parameter
+        was sent at all), and an empty list maps to an empty list (see
+        ``LlmAttempt`` for why those mean different things).
+
+        ONE ``_secret_snapshot`` covers this whole call -- every message and every
+        name -- instead of one provider sweep per string. The provider walks the
+        tools directory, and this method runs on the event loop before the request
+        goes out, so the old shape made an attempt advertising N tools do N sweeps
+        over N packages. See ``_secret_snapshot``.
         """
+        secrets = _secret_snapshot()
         stored: list[dict[str, str]] = []
         truncated = False
         for msg in messages:
-            content, was_truncated = _message_text(msg.get("content"))
+            content, was_truncated = _message_text(msg.get("content"), secrets)
             stored.append({"role": str(msg.get("role", "")), "content": content})
             truncated = truncated or was_truncated
+        stored_names: list[str] | None = None
+        if tools_advertised is not None:
+            stored_names, names_truncated = _bounded_tool_names(tools_advertised, secrets)
+            truncated = truncated or names_truncated
         request_messages, _elided, budget_truncated = _apply_total_budget(stored)
         request_chars = sum(len(message["content"]) for message in request_messages)
         self._attempts.append(
@@ -723,6 +993,7 @@ class LlmInteractionRecorder:
                 request_messages=request_messages,
                 request_chars=request_chars,
                 truncated=truncated or budget_truncated,
+                tools_advertised=stored_names,
             )
         )
 
@@ -754,10 +1025,15 @@ class LlmInteractionRecorder:
         shape) -- and a cut here is OR'd into the attempt's ``truncated`` flag
         rather than overwriting it, so a request-side cut already recorded by
         ``begin_attempt`` is never lost.
+
+        Its own ``_secret_snapshot``, and one is all this step needs: a response is
+        a single body, recorded a whole upstream round trip after the request was
+        snapshotted, so reusing that older set would mask against a view of the
+        secrets that is provably out of date.
         """
         if self._attempts:
             attempt = self._attempts[-1]
-            stored, was_truncated = _stored_body(content)
+            stored, was_truncated = _stored_body(content, _secret_snapshot())
             attempt.response_content = stored
             attempt.response_chars = len(stored)
             attempt.truncated = attempt.truncated or was_truncated
@@ -857,6 +1133,7 @@ def _record_detail(record: LlmInteractionRecord) -> dict[str, Any]:
                 "error": attempt.error,
                 "usage": attempt.usage,
                 "truncated": attempt.truncated,
+                "tools_advertised": attempt.tools_advertised,
             }
             for attempt in record.attempts
         ],
