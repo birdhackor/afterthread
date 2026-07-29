@@ -14,6 +14,13 @@ import { afterEach } from "vitest";
 
 afterEach(cleanup);
 
+// These measured shims match the installed Mantine 9.4.1 ESM. ResizeObserver,
+// IntersectionObserver, scrollIntoView, and getComputedStyle are deliberately
+// omitted: no component test has crossed those boundaries. Adding speculative
+// no-ops would let an inaccurate browser model silently age behind green tests.
+// scripts/check-mantine-api-surface.mjs separately flags upstream reference
+// changes; a reference there is only a prompt to inspect a real test failure.
+//
 // jsdom exposes no media-query evaluator, while MantineProvider reads
 // matchMedia during mount even when the test does not exercise color schemes.
 if (typeof window.matchMedia !== "function") {

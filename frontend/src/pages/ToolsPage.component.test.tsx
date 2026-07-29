@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 
 import { act, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ApiSuccessResponse } from "../api/client.js";
 import { apiGet } from "../api/client.js";
 import { renderWithAppProviders } from "../test/render.js";
@@ -15,6 +16,10 @@ vi.mock("../api/client.js", () => ({
 }));
 
 type ToolListResponse = ApiSuccessResponse<"/api/tools", "get">;
+type ToolSummaryResponse = ApiSuccessResponse<
+	"/api/tools/{name}/summary",
+	"get"
+>;
 
 const toolListResponse = {
 	tools: [
@@ -38,7 +43,11 @@ function deferred<T>() {
 	return { promise, resolve };
 }
 
-describe("ToolsPage component smoke", () => {
+describe("ToolsPage component", () => {
+	beforeEach(() => {
+		vi.mocked(apiGet).mockReset();
+	});
+
 	it("transitions from loading to the mocked tools response", async () => {
 		const request = deferred<ToolListResponse>();
 		vi.mocked(apiGet).mockImplementation(() => request.promise);
@@ -60,5 +69,86 @@ describe("ToolsPage component smoke", () => {
 		await waitFor(() => {
 			expect(screen.getByRole("button", { name: "重新整理" })).toBeEnabled();
 		});
+	});
+
+	it("drops revision feedback when the current version changes without visible row changes", async () => {
+		const user = userEvent.setup();
+		const versionV = {
+			tools: [
+				{
+					...toolListResponse.tools[0],
+					current_vid: "v-weather-revision",
+					lineage: "usable",
+				},
+			],
+		} satisfies ToolListResponse;
+		const versionP = {
+			tools: [
+				{
+					...versionV.tools[0],
+					current_vid: "v-weather-parent",
+				},
+			],
+		} satisfies ToolListResponse;
+		const summaryV = {
+			current_vid: versionV.tools[0].current_vid,
+			summary: "版本 V 的工具總結",
+			updated_at: null,
+			llm_log_id: null,
+		} satisfies ToolSummaryResponse;
+		const summaryP = {
+			...summaryV,
+			current_vid: versionP.tools[0].current_vid,
+			summary: "版本 P 的工具總結",
+		} satisfies ToolSummaryResponse;
+		let currentList = versionV;
+		let currentSummary = summaryV;
+
+		vi.mocked(apiGet).mockImplementation((path) => {
+			if (path === "/api/tools") {
+				return Promise.resolve(currentList);
+			}
+			if (path === "/api/tools/weather-search/summary") {
+				return Promise.resolve(currentSummary);
+			}
+			throw new Error(`Unexpected GET ${path}`);
+		});
+
+		renderWithAppProviders(<ToolsPage />);
+
+		expect(await screen.findByText("weather-search")).toBeInTheDocument();
+		await waitFor(() => {
+			expect(screen.getByRole("button", { name: "重新整理" })).toBeEnabled();
+		});
+		await user.click(screen.getByRole("button", { name: "AI 總結" }));
+		expect(await screen.findByText(summaryV.summary)).toBeInTheDocument();
+
+		const feedback = screen.getByRole("textbox", { name: "修訂意見" });
+		await user.type(feedback, "只適用於版本 V 的修訂方向");
+		expect(feedback).toHaveValue("只適用於版本 V 的修訂方向");
+
+		currentList = versionP;
+		currentSummary = summaryP;
+		await user.click(screen.getByRole("button", { name: "重新整理" }));
+		await waitFor(() => {
+			const listRequests = vi
+				.mocked(apiGet)
+				.mock.calls.filter(([path]) => path === "/api/tools");
+			expect(listRequests).toHaveLength(2);
+			expect(screen.getByRole("button", { name: "重新整理" })).toBeEnabled();
+		});
+
+		// A correctly keyed row remounts collapsed. The deliberately broken key
+		// used by the mutation proof leaves it expanded, so only open it when the
+		// remount actually happened; both paths then expose the same final field.
+		const collapsedSummaryButton = screen.queryByRole("button", {
+			name: "AI 總結",
+		});
+		if (collapsedSummaryButton) {
+			await user.click(collapsedSummaryButton);
+		}
+
+		expect(await screen.findByText(summaryP.summary)).toBeInTheDocument();
+		expect(screen.getByRole("textbox", { name: "修訂意見" })).toHaveValue("");
 	});
 });

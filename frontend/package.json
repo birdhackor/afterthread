@@ -12,6 +12,7 @@
 		"format": "biome check --write .",
 		"test": "vitest run",
 		"typecheck": "tsc --noEmit",
+		"check:mantine-api-surface": "node scripts/check-mantine-api-surface.mjs",
 		"generate:api-types": "../scripts/generate-api-types.sh",
 		"check:api-types": "../scripts/generate-api-types.sh --check"
 	},

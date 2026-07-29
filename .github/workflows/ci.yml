@@ -81,6 +81,9 @@ jobs:
       - name: Install locked dependencies
         run: pnpm --dir frontend install --frozen-lockfile
 
+      - name: Check Mantine browser API surface
+        run: pnpm --dir frontend check:mantine-api-surface
+
       - name: Lint
         run: pnpm --dir frontend lint
 
