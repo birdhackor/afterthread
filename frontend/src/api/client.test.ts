@@ -64,6 +64,36 @@ function expectTransportCall(
 	expect(headers.get("Content-Type")).toBe("application/json");
 }
 
+async function expectCallerHeaders(
+	headers: HeadersInit,
+	expected: {
+		marker: string;
+		accept: string;
+		contentType: string;
+	},
+): Promise<void> {
+	const fetchSpy = stubFetch(async () => ({
+		ok: true,
+		status: 200,
+		text: async () => JSON.stringify({ status: "ok" }),
+	}));
+
+	await expect(
+		apiFetch("/api/health", {
+			method: "GET",
+			headers,
+			reportConnectivity: false,
+		}),
+	).resolves.toEqual({ status: "ok" });
+
+	expect(fetchSpy).toHaveBeenCalledTimes(1);
+	const [, options] = fetchSpy.mock.calls[0] ?? [];
+	const sentHeaders = new Headers(options?.headers);
+	expect(sentHeaders.get("X-Transport-Contract")).toBe(expected.marker);
+	expect(sentHeaders.get("Accept")).toBe(expected.accept);
+	expect(sentHeaders.get("Content-Type")).toBe(expected.contentType);
+}
+
 // Await a promise that MUST reject and hand back its rejection reason. A
 // plain try/catch around `await` would let a wrongly-resolving call slip
 // through with no assertion executed; here an unexpected resolution fails
@@ -99,6 +129,19 @@ afterEach(() => {
 describe("transport contracts", () => {
 	it("apiFetch sends one expanded GET with fetch options and no body", async () => {
 		const controller = new AbortController();
+		const requestInit = {
+			cache: "no-store",
+			credentials: "include",
+			integrity: "sha256-transport-contract",
+			keepalive: true,
+			mode: "cors",
+			priority: "high",
+			redirect: "manual",
+			referrer: "",
+			referrerPolicy: "no-referrer",
+			signal: controller.signal,
+			window: null,
+		} satisfies Omit<RequestInit, "body" | "headers" | "method">;
 		const fetchSpy = stubFetch(async () => ({
 			ok: true,
 			status: 200,
@@ -110,7 +153,7 @@ describe("transport contracts", () => {
 				method: "GET",
 				query: { status: "active", q: "", limit: 20, offset: 0 },
 				headers: { "X-Transport-Contract": "apiFetch" },
-				signal: controller.signal,
+				...requestInit,
 				reportConnectivity: false,
 			}),
 		).resolves.toEqual({ items: [], total: 0 });
@@ -120,11 +163,54 @@ describe("transport contracts", () => {
 			method: "GET",
 		});
 		const [, options] = fetchSpy.mock.calls[0] ?? [];
-		expect(options?.signal).toBe(controller.signal);
+		expect(options).toMatchObject(requestInit);
 		expect(new Headers(options?.headers).get("X-Transport-Contract")).toBe(
 			"apiFetch",
 		);
 		expect(options).not.toHaveProperty("reportConnectivity");
+	});
+
+	it("apiFetch preserves a plain-object HeadersInit and caller media types", async () => {
+		await expectCallerHeaders(
+			{
+				Accept: "application/vnd.afterthread.object+json",
+				"Content-Type": "application/problem+json; form=object",
+				"X-Transport-Contract": "plain-object",
+			},
+			{
+				marker: "plain-object",
+				accept: "application/vnd.afterthread.object+json",
+				contentType: "application/problem+json; form=object",
+			},
+		);
+	});
+
+	it("apiFetch preserves a Headers instance and caller media types", async () => {
+		await expectCallerHeaders(
+			new Headers({
+				Accept: "application/vnd.afterthread.headers+json",
+				"Content-Type": "application/problem+json; form=headers",
+				"X-Transport-Contract": "headers-instance",
+			}),
+			{
+				marker: "headers-instance",
+				accept: "application/vnd.afterthread.headers+json",
+				contentType: "application/problem+json; form=headers",
+			},
+		);
+	});
+
+	it("apiFetch preserves a tuple-array HeadersInit and caller media types", async () => {
+		const headers: HeadersInit = [
+			["Accept", "application/vnd.afterthread.tuples+json"],
+			["Content-Type", "application/problem+json; form=tuples"],
+			["X-Transport-Contract", "tuple-array"],
+		];
+		await expectCallerHeaders(headers, {
+			marker: "tuple-array",
+			accept: "application/vnd.afterthread.tuples+json",
+			contentType: "application/problem+json; form=tuples",
+		});
 	});
 
 	it("apiGet sends one expanded GET with no body", async () => {

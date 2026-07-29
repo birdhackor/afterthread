@@ -345,21 +345,24 @@ async function rawApiFetch(
 	const { reportConnectivity = true, ...fetchOptions } = options;
 	let response: Response;
 	try {
+		// HeadersInit also accepts Headers and tuple arrays: object spread drops
+		// the former and turns the latter's indexes into bogus header names.
+		const headers = new Headers(fetchOptions.headers);
+		if (!headers.has("Accept")) {
+			headers.set("Accept", "application/json");
+		}
+		if (!headers.has("Content-Type")) {
+			headers.set("Content-Type", "application/json");
+		}
 		response = await fetch(path, {
 			...fetchOptions,
-			headers: {
-				// Accept matters beyond content negotiation here: in packaged
-				// mode the backend's SPA fallback (app.frontend) treats fetch's
-				// own default `Accept: */*` as a browser navigation, so a call
-				// to a route the backend doesn't serve would come back as
-				// 200 text/html (index.html) instead of a 404 -- and the HTML
-				// string would sail through as a "successful" body. Declaring
-				// JSON keeps unknown API routes answering 404 JSON, which
-				// normalizeError turns into a clean ApiError.
-				Accept: "application/json",
-				"Content-Type": "application/json",
-				...(fetchOptions.headers ?? {}),
-			},
+			// Accept matters beyond content negotiation here: in packaged mode
+			// the backend's SPA fallback (app.frontend) treats fetch's own
+			// default `Accept: */*` as a browser navigation, so a call to a route
+			// the backend doesn't serve would come back as 200 text/html
+			// (index.html) instead of a 404. Declaring JSON keeps unknown API
+			// routes answering 404 JSON, which becomes a clean ApiError.
+			headers,
 		});
 	} catch (_cause) {
 		if (reportConnectivity) {
