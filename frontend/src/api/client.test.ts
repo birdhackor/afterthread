@@ -112,6 +112,25 @@ function rejectionOf(promise: Promise<unknown>): Promise<ApiError> {
 	);
 }
 
+function expectNetworkError(error: ApiError): void {
+	expect(error).toMatchObject({
+		name: "ApiError",
+		status: 0,
+		code: "network_error",
+		message: "無法連線伺服器，請確認網路後再試",
+		fieldErrors: null,
+	});
+}
+
+async function rejectNonJson502(body: string): Promise<ApiError> {
+	stubFetch(async () => ({
+		ok: false,
+		status: 502,
+		text: async () => body,
+	}));
+	return rejectionOf(apiGet("/api/health"));
+}
+
 beforeEach(() => {
 	// Reset the shared default-store state so one test's report can neither
 	// satisfy nor break the next test's assertion.
@@ -457,9 +476,38 @@ describe("apiFetch passive connectivity reporting", () => {
 		// Start from known-up to prove the rejection itself flips it down.
 		store.set(statusAtom, { reachable: true });
 		const error = await rejectionOf(apiGet("/api/health"));
-		expect(error).toBeInstanceOf(ApiError);
-		expect(error.status).toBe(0);
-		expect(error.code).toBe("network_error");
+		expectNetworkError(error);
+		expect(store.get(statusAtom)).toEqual({ reachable: false });
+	});
+
+	it("normalizes an AbortSignal rejection exactly like a network failure and reports down", async () => {
+		const controller = new AbortController();
+		const fetchSpy = stubFetch(
+			(_path, options) =>
+				new Promise((_resolve, reject) => {
+					const signal = options?.signal;
+					if (!(signal instanceof AbortSignal)) {
+						reject(new Error("expected apiFetch to forward its AbortSignal"));
+						return;
+					}
+					signal.addEventListener("abort", () => reject(signal.reason), {
+						once: true,
+					});
+				}),
+		);
+		store.set(statusAtom, { reachable: true });
+
+		const request = apiFetch("/api/health", {
+			method: "GET",
+			signal: controller.signal,
+		});
+		controller.abort(
+			new DOMException("operator abandoned request", "AbortError"),
+		);
+
+		const error = await rejectionOf(request);
+		expectNetworkError(error);
+		expect(fetchSpy.mock.calls[0]?.[1]?.signal).toBe(controller.signal);
 		expect(store.get(statusAtom)).toEqual({ reachable: false });
 	});
 
@@ -483,11 +531,50 @@ describe("apiFetch passive connectivity reporting", () => {
 		});
 		const error = await rejectionOf(apiGet("/api/health"));
 		unsubscribe();
-		expect(error).toBeInstanceOf(ApiError);
-		expect(error.status).toBe(0);
-		expect(error.code).toBe("network_error");
+		expectNetworkError(error);
 		expect(seen).not.toContain(true);
 		expect(store.get(statusAtom)).toEqual({ reachable: false });
+	});
+
+	it("turns an HTML 502 proxy page into a caller-facing ApiError", async () => {
+		const error = await rejectNonJson502(
+			"<!doctype html><title>Bad Gateway</title>",
+		);
+
+		expect(error).toMatchObject({
+			name: "ApiError",
+			status: 502,
+			code: null,
+			message: "AI 服務暫時無法使用，請稍後再試",
+			fieldErrors: null,
+		});
+		expect(store.get(statusAtom)).toEqual({ reachable: null });
+	});
+
+	it("turns an empty 502 body into a caller-facing ApiError", async () => {
+		const error = await rejectNonJson502("");
+
+		expect(error).toMatchObject({
+			name: "ApiError",
+			status: 502,
+			code: null,
+			message: "AI 服務暫時無法使用，請稍後再試",
+			fieldErrors: null,
+		});
+		expect(store.get(statusAtom)).toEqual({ reachable: null });
+	});
+
+	it("turns truncated JSON from a 502 into a caller-facing ApiError", async () => {
+		const error = await rejectNonJson502('{"detail":{"code":"upstream_error"');
+
+		expect(error).toMatchObject({
+			name: "ApiError",
+			status: 502,
+			code: null,
+			message: "AI 服務暫時無法使用，請稍後再試",
+			fieldErrors: null,
+		});
+		expect(store.get(statusAtom)).toEqual({ reachable: null });
 	});
 
 	it("returns null and reports up on a 204 -- a bodiless response is already fully delivered", async () => {
@@ -529,8 +616,7 @@ describe("apiFetch passive connectivity reporting", () => {
 		const error = await rejectionOf(
 			apiFetch("/api/health", { method: "GET", reportConnectivity: false }),
 		);
-		expect(error).toBeInstanceOf(ApiError);
-		expect(error.status).toBe(0);
+		expectNetworkError(error);
 		expect(store.get(statusAtom)).toEqual({ reachable: true });
 	});
 });

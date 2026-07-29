@@ -24,10 +24,15 @@ vi.mock("../api/client.js", () => ({
 
 type ItemListResponse = ApiSuccessResponse<"/api/items", "get">;
 type Item = ItemListResponse["items"][number];
-type ReadStep = {
-	call: readonly unknown[];
-	response: ItemListResponse;
-};
+type ReadStep =
+	| {
+			call: readonly unknown[];
+			response: ItemListResponse;
+	  }
+	| {
+			call: readonly unknown[];
+			error: Error;
+	  };
 
 const mockedApiGet = vi.mocked(apiGet) as unknown as Mock<
 	(path: string, options?: unknown) => Promise<unknown>
@@ -108,7 +113,9 @@ function mockReadSequence(...steps: ReadStep[]) {
 				`Unexpected GET #${index + 1} ${JSON.stringify(call)}; expected ${JSON.stringify(step?.call ?? "no additional read")}`,
 			);
 		}
-		return Promise.resolve(step.response);
+		return "error" in step
+			? Promise.reject(step.error)
+			: Promise.resolve(step.response);
 	});
 }
 
@@ -133,6 +140,56 @@ afterEach(() => {
 });
 
 describe("ItemsListPage display correctness", () => {
+	it("shows a network read failure instead of claiming there are no items", async () => {
+		const message = "無法連線伺服器，請確認網路後再試";
+		mockReadSequence({
+			call: itemRead(),
+			error: Object.assign(new Error(message), {
+				status: 0,
+				code: "network_error",
+			}),
+		});
+
+		renderWithAppProviders(<ItemsListPage />, {
+			initialEntries: ["/items"],
+		});
+
+		expect((await screen.findAllByText(message)).length).toBeGreaterThan(0);
+		expect(screen.getByRole("button", { name: "重試" })).toBeInTheDocument();
+		expect(screen.queryByText("尚無記憶項目")).not.toBeInTheDocument();
+		expect(screen.queryByText("找不到符合條件的項目")).not.toBeInTheDocument();
+	});
+
+	it("labels retained rows as stale when a filtered read fails", async () => {
+		const user = userEvent.setup();
+		const query = "新篩選Z";
+		const message = "無法連線伺服器，請確認網路後再試";
+		mockReadSequence(
+			{
+				call: itemRead(),
+				response: { items: [item(1, "上次成功資料")], total: 1 },
+			},
+			{
+				call: itemRead({ q: query }),
+				error: Object.assign(new Error(message), {
+					status: 0,
+					code: "network_error",
+				}),
+			},
+		);
+		renderWithAppProviders(<ItemsListPage />, {
+			initialEntries: ["/items"],
+		});
+
+		expect(await findDisplayedText("上次成功資料")).toBeInTheDocument();
+		await user.type(screen.getByRole("textbox", { name: "搜尋" }), query);
+
+		expect(await screen.findByText("重新載入失敗")).toBeInTheDocument();
+		expect(screen.getByText("上次成功資料")).toBeInTheDocument();
+		expect(screen.getByText("共 1 筆（顯示先前結果）")).toBeInTheDocument();
+		expect(screen.queryByText("找不到符合條件的項目")).not.toBeInTheDocument();
+	});
+
 	// Two Mantine Select interactions plus two real 300 ms debounce windows can
 	// approach Vitest's 5 s default when jsdom files run in parallel.
 	it("sends every selected filter and the debounced final keystroke", async () => {

@@ -85,6 +85,37 @@ afterEach(() => {
 });
 
 describe("HomePage operator guidance", () => {
+	it("shows a network read failure instead of an empty review", async () => {
+		const message = "無法連線伺服器，請確認網路後再試";
+		mockedApiGet.mockRejectedValue(
+			Object.assign(new Error(message), {
+				status: 0,
+				code: "network_error",
+			}),
+		);
+		store.set(homeBackendStatusAtom, { reachable: true });
+		store.set(homeLlmStatusAtom, {
+			loaded: true,
+			loading: false,
+			configured: true,
+			model: "fixture-model",
+			error: null,
+		});
+
+		renderWithAppProviders(<HomePage />);
+
+		expect(await screen.findByText(message)).toBeInTheDocument();
+		expect(screen.getByText("載入失敗")).toBeInTheDocument();
+		for (const emptyText of [
+			"沒有待補齊的項目",
+			"沒有進行中的項目",
+			"沒有等待中的項目",
+			"沒有擱置的項目",
+		]) {
+			expect(screen.queryByText(emptyText)).not.toBeInTheDocument();
+		}
+	});
+
 	it("uses 重試 for failures and 重新檢查 only for a plain unconfigured result", async () => {
 		renderWithAppProviders(<HomePage />);
 
