@@ -802,7 +802,7 @@ def test_install_summary_stays_on_the_typed_published_version_when_current_moves
         captured["target"] = target
         alternate = target.package_root.path / tools._VERSIONS_DIRNAME / alternate_vid
         shutil.copytree(target.version_root.path, alternate)
-        assert tools.publish_current(target.package_root, alternate_vid)
+        assert _publish_current(target.package_root, alternate_vid)
         await real_hook(target, origin=origin, builder_summary=builder_summary)
 
     monkeypatch.setattr(tool_meta, "generate_and_store_summary", move_current_before_summary)
@@ -3062,7 +3062,7 @@ def test_router_delete_and_discard_return_distinct_ai_job_conflict(
     first = _seed_package(monkeypatch, tmp_path, "busy")
     current_vid = "20260728T020304Z-fedcba"
     _copy_committed_version(first, current_vid)
-    assert tools.publish_current(_package_root(first), current_vid)
+    assert _publish_current(_package_root(first), current_vid)
     shared_fd = tools.acquire_shared_tools_lock()
     assert shared_fd is not None
     try:
@@ -3089,7 +3089,7 @@ def test_router_delete_and_discard_report_unusable_lock_as_operator_error(
     first = _seed_package(monkeypatch, tmp_path, "locked")
     current_vid = "20260728T020304Z-fedcba"
     _copy_committed_version(first, current_vid)
-    assert tools.publish_current(_package_root(first), current_vid)
+    assert _publish_current(_package_root(first), current_vid)
     lock_path = tmp_path / "tools" / tools._TOOLS_LOCK_FILENAME
     lock_path.touch()
     lock_path.chmod(0o000)
@@ -3117,12 +3117,12 @@ def test_router_discard_response_distinguishes_removed_from_retained(
     removed_first = _seed_package(monkeypatch, tmp_path, "discard-idle")
     removed_vid = "20260728T020304Z-fedcba"
     _copy_committed_version(removed_first, removed_vid)
-    assert tools.publish_current(_package_root(removed_first), removed_vid)
+    assert _publish_current(_package_root(removed_first), removed_vid)
 
     retained_first = _seed_package(monkeypatch, tmp_path, "discard-unknown")
     retained_vid = "20260728T030405Z-acdeff"
     retained_current = _copy_committed_version(retained_first, retained_vid)
-    assert tools.publish_current(_package_root(retained_first), retained_vid)
+    assert _publish_current(_package_root(retained_first), retained_vid)
     real_rmtree = tools.shutil.rmtree
 
     def retain_unknown(path: Path, *args: Any, **kwargs: Any) -> None:
@@ -3168,14 +3168,14 @@ def test_router_discard_rechecks_expected_vid_after_exclusive_lock(
     replacement_vid = "20260728T030405Z-acdeff"
     discarded = _copy_committed_version(first, discarded_vid)
     replacement = _copy_committed_version(first, replacement_vid)
-    assert tools.publish_current(package_root, discarded_vid)
+    assert _publish_current(package_root, discarded_vid)
     real_lock = tools.exclusive_tools_lock
     after_edit: dict[str, bytes] = {}
 
     @contextlib.contextmanager
     def move_current_before_lock(base: Path | None = None) -> Generator[bool]:
         assert base == package.parent
-        assert tools.publish_current(package_root, replacement_vid)
+        assert _publish_current(package_root, replacement_vid)
         after_edit.update(_file_bytes(package))
         with real_lock(base) as acquired:
             yield acquired
@@ -3205,7 +3205,7 @@ def test_router_discard_uses_lineage_resolved_after_exclusive_lock(
     replacement_vid = "20260728T030405Z-acdeff"
     discarded = _copy_committed_version(first, discarded_vid)
     replacement = _copy_committed_version(first, replacement_vid)
-    assert tools.publish_current(package_root, discarded_vid)
+    assert _publish_current(package_root, discarded_vid)
     origin_path = discarded / tools._META_DIRNAME / tools._ORIGIN_FILENAME
     real_lock = tools.exclusive_tools_lock
 
@@ -3242,12 +3242,12 @@ def test_router_discard_marks_unconfirmed_durability_as_unsafe_cleanup(
     first = _seed_package(monkeypatch, tmp_path, "nondurable")
     current_vid = "20260728T020304Z-fedcba"
     current = _copy_committed_version(first, current_vid)
-    assert tools.publish_current(_package_root(first), current_vid)
+    assert _publish_current(_package_root(first), current_vid)
 
     monkeypatch.setattr(
         tools,
         "publish_current",
-        lambda package_root, vid: tools.CurrentPublication(published=True, durable=False),
+        lambda package_root, vid, expected: tools.CurrentPublication(published=True, durable=False),
     )
 
     response = client.delete(f"/api/tools/nondurable/versions/{current_vid}")
@@ -3560,6 +3560,12 @@ def _resolved_version(package: Path) -> Path:
     return package / tools._VERSIONS_DIRNAME / vid
 
 
+def _publish_current(package_root: tools.PackageRoot, vid: str) -> tools.CurrentPublication:
+    expected = tools.resolve_current(package_root)
+    assert isinstance(expected, tools.Resolved)
+    return tools.publish_current(package_root, vid, expected)
+
+
 def _current_version(version: Path) -> Path:
     return _resolved_version(_package_path(version))
 
@@ -3803,7 +3809,7 @@ def test_regenerate_refuses_if_current_moves_between_request_and_work(
     ) -> dict[str, Any] | None:
         assert resolution is not None
         assert resolution.vid == _TEST_VID
-        assert tools.publish_current(package_root, second_vid)
+        assert _publish_current(package_root, second_vid)
         return await real_regenerate(name, resolution)
 
     async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
@@ -4207,7 +4213,7 @@ def test_revise_refuses_if_current_moves_between_request_and_background_work(
     assert response.status_code == 202
     assert set(response.json()) == {"job_id"}
 
-    assert tools.publish_current(package_root, second_vid)
+    assert _publish_current(package_root, second_vid)
     outcome = asyncio.run(captured["run"]())
 
     assert outcome.ok is False
@@ -4265,6 +4271,7 @@ def test_invariant_k_stale_vid_starts_no_revise_regenerate_or_discard_work(
         package_root: tools.PackageRoot,
         previous_vid: str,
         discarded: tools.VersionRoot,
+        expected_current: tools.Resolved,
     ) -> tools.CurrentPublication:
         raise AssertionError("stale discard must not publish current")
 
@@ -4339,7 +4346,7 @@ def test_version_delete_cannot_remove_package_when_previous_becomes_null(
     package.joinpath(".env").write_text("API_KEY=sole-credential-copy\n", encoding="utf-8")
     second_vid = "20260728T020304Z-fedcba"
     second = _copy_committed_version(first, second_vid)
-    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    assert _publish_current(tools.PackageRoot(package), second_vid)
 
     row = client.get("/api/tools").json()["tools"][0]
     assert (row["current_vid"], row["lineage"]) == (second_vid, "usable")
@@ -4484,6 +4491,18 @@ def _file_bytes(root: Path) -> dict[str, bytes]:
             if path.is_file() and not path.is_symlink():
                 contents[str(path.relative_to(root))] = path.read_bytes()
     return contents
+
+
+def _stable_package_bytes(package: Path) -> dict[str, bytes]:
+    """Snapshot package files while excluding an atomic writer's private temp."""
+
+    contents = _file_bytes(package)
+    temp_prefix = f"{tools._META_DIRNAME}/{tools._CURRENT_FILENAME}."
+    return {
+        path: data
+        for path, data in contents.items()
+        if not (path.startswith(temp_prefix) and path.endswith(".tmp"))
+    }
 
 
 def _staging_dir(root: Path) -> Path:
@@ -5010,7 +5029,7 @@ def test_running_discard_returns_busy_then_succeeds_after_the_child_exits(
     origin = json.loads(origin_path.read_text(encoding="utf-8"))
     origin["previous"] = _TEST_VID
     origin_path.write_text(json.dumps(origin), encoding="utf-8")
-    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    assert _publish_current(tools.PackageRoot(package), second_vid)
     resolution = tools.resolve_current(tools.PackageRoot(package))
     assert isinstance(resolution, tools.Resolved)
     _install_settings(monkeypatch, tools_dir=str(base))
@@ -5243,7 +5262,7 @@ def test_revise_rechecks_current_after_version_fsync_immediately_before_publish(
         result = real_fsync_directory(path)
         if path == versions and not moved:
             moved = True
-            assert tools.publish_current(package_root, other_vid)
+            assert _publish_current(package_root, other_vid)
         return result
 
     monkeypatch.setattr(tool_builder, "_fsync_directory", move_current_after_versions_fsync)
@@ -5255,6 +5274,76 @@ def test_revise_rechecks_current_after_version_fsync_immediately_before_publish(
     assert outcome.ok is False
     assert outcome.error == tool_builder._ERROR_REVISE_TARGET_REPLACED
     assert _resolved_version(package) == other
+
+
+@pytest.mark.parametrize("edit", ["current", "origin.previous"])
+def test_revise_rechecks_current_and_lineage_after_current_temp_fsync(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, edit: str
+) -> None:
+    """Revise preserves an edit inside publish_current's own I/O window.
+
+    The real temp-file fsync completes before the mutation. The edit therefore
+    lands later than the caller-side final resolution but earlier than the
+    atomic writer's pre-replace guard; moving it anywhere earlier would let the
+    round-21 caller test cover it and would not pin this regression.
+    """
+
+    first = _seed_package(monkeypatch, tmp_path)
+    package = _package_path(first)
+    package_root = tools.PackageRoot(package)
+    replacement_vid = "20260728T020304Z-fedcba"
+    replacement = _copy_committed_version(first, replacement_vid)
+    current_path = package / tools._META_DIRNAME / tools._CURRENT_FILENAME
+    first_origin = first / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    versions = package / tools._VERSIONS_DIRNAME
+    real_fsync = os.fsync
+    injected = False
+    after_edit: dict[str, bytes] = {}
+    versions_after_edit: set[str] = set()
+
+    def fsync_then_edit(fd: int) -> None:
+        nonlocal injected
+        real_fsync(fd)
+        try:
+            open_path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        except OSError:
+            return
+        if (
+            not injected
+            and open_path.parent == current_path.parent
+            and open_path.name.startswith(f"{tools._CURRENT_FILENAME}.")
+            and open_path.name.endswith(".tmp")
+        ):
+            injected = True
+            if edit == "current":
+                current_path.write_text(f"{replacement_vid}\n", encoding="ascii")
+            else:
+                origin = json.loads(first_origin.read_text(encoding="utf-8"))
+                origin["previous"] = replacement_vid
+                first_origin.write_text(json.dumps(origin), encoding="utf-8")
+            after_edit.update(_stable_package_bytes(package))
+            versions_after_edit.update(path.name for path in versions.iterdir())
+
+    monkeypatch.setattr(tools.os, "fsync", fsync_then_edit)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert injected is True
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_CURRENT_WRITE
+    assert first.is_dir()
+    assert replacement.is_dir()
+    assert {path.name for path in versions.iterdir()} == versions_after_edit
+    assert len(versions_after_edit) == 3
+    assert _stable_package_bytes(package) == after_edit
+    resolution = tools.resolve_current(package_root)
+    assert isinstance(resolution, tools.Resolved)
+    if edit == "current":
+        assert resolution.version_root.path == replacement
+    else:
+        assert resolution.version_root.path == first
+        assert resolution.previous == tools.PreviousValue(replacement_vid)
 
 
 def test_vid_collision_checks_every_entry_with_the_candidate_prefix(
@@ -6552,7 +6641,7 @@ def test_revise_summary_stays_on_the_typed_published_version_when_current_moves(
         assert target.vid != _TEST_VID
         assert _resolved_version(package) == target.version_root.path
         captured["target"] = target
-        assert tools.publish_current(package_root, _TEST_VID)
+        assert _publish_current(package_root, _TEST_VID)
         await real_hook(target, origin=origin, builder_summary=builder_summary)
 
     monkeypatch.setattr(tool_meta, "generate_and_store_summary", move_current_before_summary)

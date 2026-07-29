@@ -1524,16 +1524,18 @@ def _write_package_file_atomic(
     *,
     default_mode: int = _OWNER_RW,
     identity_root: VersionRoot | None = None,
+    expected_current: Resolved | None = None,
     durability_out: list[bool] | None = None,
 ) -> bool:
     """Atomically publish one backend-owned file and preserve its safe mode.
 
     The publisher refuses non-regular existing targets, writes and fsyncs a temp
-    file in the destination directory, checks an optional version identity at the
-    last instant, replaces the target, and fsyncs the directory. Its bool contract
-    is shared by state, current, origin, and summary callers and reports whether
-    publication happened; the optional one-item out parameter exists solely so
-    ``publish_current`` can expose confirmed directory durability to discard.
+    file in the destination directory, checks an optional version identity and/or
+    installed-current expectation at the last instant, replaces the target, and
+    fsyncs the directory. Its bool contract is shared by state, current, origin,
+    and summary callers and reports whether publication happened; the optional
+    one-item out parameter exists solely so ``publish_current`` can expose
+    confirmed directory durability to discard.
     """
     path = directory / filename
     # The mode to publish under. There is ALWAYS one now (R11): a fresh file
@@ -1582,11 +1584,12 @@ def _write_package_file_atomic(
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        # The LAST instant: one lstat, then the publish. Nothing but the compare
-        # separates them, so what a swap can still reach is the syscall PAIR this
-        # module accepts by name elsewhere -- and even that lands harmlessly, since
-        # the temp file was minted inside the directory that moved and the rename
-        # below would then fail with ENOENT (measured; False, nothing published).
+        # The LAST instant: the applicable identity/current re-resolution, then
+        # the publish. Nothing but these compares separates them, so what a swap
+        # can still reach is the syscall PAIR this module accepts by name elsewhere
+        # -- and even a directory swap lands harmlessly, since the temp file was
+        # minted inside the directory that moved and the rename below would then
+        # fail with ENOENT (measured; False, nothing published).
         # None is skipped rather than refused, because at THIS layer it means "the
         # caller asserted nothing" -- the callers that have an identity to assert
         # refuse their own None long before they get here.
@@ -1595,6 +1598,20 @@ def _write_package_file_atomic(
             or not _still_the_expected_package(identity_root, expected_identity)
         ):
             raise _PackageReplaced
+        # A caller-side resolve on the line above publish_current is NOT
+        # sufficient: mkstemp + write + flush + this file fsync have real wall
+        # time inside the publisher. An autosave in that interval must be observed
+        # here, after the temp is durable and immediately before os.replace, or
+        # discard can destroy the newly selected lineage and revise can overwrite
+        # the operator's current answer.
+        if expected_current is not None:
+            current = resolve_current(expected_current.package_root)
+            if (
+                isinstance(current, Unresolved)
+                or current.vid != expected_current.vid
+                or current.previous != expected_current.previous
+            ):
+                raise _PackageReplaced
         os.replace(tmp_path, path)
     except OSError, _PackageReplaced:
         if fd_owned:
@@ -1854,8 +1871,8 @@ class CurrentPublication:
         return self.published
 
 
-def publish_current(package_root: PackageLayoutRoot, vid: str) -> CurrentPublication:
-    """Publish one syntactically valid vid into a package-shaped layout."""
+def publish_staging_current(package_root: PackageLayoutRoot, vid: str) -> CurrentPublication:
+    """Publish the first ``current`` inside a not-yet-installed package layout."""
 
     if not _VID_RE.fullmatch(vid):
         return CurrentPublication(published=False, durable=False)
@@ -1868,6 +1885,31 @@ def publish_current(package_root: PackageLayoutRoot, vid: str) -> CurrentPublica
         _CURRENT_FILENAME,
         f"{vid}\n".encode("ascii"),
         None,
+        durability_out=durability,
+    )
+    return CurrentPublication(
+        published=published,
+        durable=published and bool(durability) and durability[0],
+    )
+
+
+def publish_current(
+    package_root: PackageRoot, vid: str, expected_current: Resolved
+) -> CurrentPublication:
+    """Publish ``vid`` only while an installed current and its lineage stay expected."""
+
+    if expected_current.package_root != package_root or not _VID_RE.fullmatch(vid):
+        return CurrentPublication(published=False, durable=False)
+    meta_root = package_root.path / _META_DIRNAME
+    if not meta_root.is_dir():
+        return CurrentPublication(published=False, durable=False)
+    durability: list[bool] = []
+    published = _write_package_file_atomic(
+        meta_root,
+        _CURRENT_FILENAME,
+        f"{vid}\n".encode("ascii"),
+        None,
+        expected_current=expected_current,
         durability_out=durability,
     )
     return CurrentPublication(
@@ -2967,11 +3009,12 @@ def _publish_discard_and_retire(
     package_root: PackageRoot,
     previous_vid: str,
     discarded: VersionRoot,
+    expected_current: Resolved,
 ) -> CurrentPublication:
     """Commit one discard and retire every scan that captured its old current."""
 
     with _ADVERTISEMENT_LOCK:
-        publication = publish_current(package_root, previous_vid)
+        publication = publish_current(package_root, previous_vid, expected_current)
         if publication:
             generation = _ADVERTISEMENT_GENERATIONS.pop(discarded, None)
             if generation is not None:
@@ -3276,15 +3319,17 @@ def _discard_version_locked(package_root: PackageRoot, expected_vid: str) -> Dis
     assert isinstance(previous_vid, str)
 
     # This is not redundant with the first resolution: the flock excludes other
-    # backend operations, not an operator's supported hand edit.  Resolving after
-    # predecessor validation closes that late editor/autosave window; the compare
-    # is the last statement before publication so no new service work can stale it.
+    # backend operations, not an operator's supported hand edit. Resolving after
+    # predecessor validation closes that service-work window, but this caller-side
+    # guard is NOT sufficient for publication: publish_current still has
+    # mkstemp/write/flush/fsync work ahead. Passing this exact resolution makes the
+    # atomic writer repeat both current and lineage after its temp file is durable.
     final_resolution = resolve_current(package_root)
     if isinstance(final_resolution, Unresolved) or final_resolution.vid != resolution.vid:
         return "version_mismatch"
     if final_resolution.previous != previous:
         return "lineage_unavailable"
-    publication = _publish_discard_and_retire(package_root, previous_vid, current)
+    publication = _publish_discard_and_retire(package_root, previous_vid, current, final_resolution)
     if not publication:
         return "not_found"
 

@@ -722,6 +722,28 @@ def _resolved_version(package: Path) -> Path:
     return package / tools._VERSIONS_DIRNAME / vid
 
 
+def _stable_package_bytes(package: Path) -> dict[str, bytes]:
+    """Snapshot package files while excluding an atomic writer's private temp."""
+
+    meta_root = package / tools._META_DIRNAME
+    return {
+        str(path.relative_to(package)): path.read_bytes()
+        for path in package.rglob("*")
+        if path.is_file()
+        and not (
+            path.parent == meta_root
+            and path.name.startswith(f"{tools._CURRENT_FILENAME}.")
+            and path.name.endswith(".tmp")
+        )
+    }
+
+
+def _publish_current(package_root: tools.PackageRoot, vid: str) -> tools.CurrentPublication:
+    expected = tools.resolve_current(package_root)
+    assert isinstance(expected, tools.Resolved)
+    return tools.publish_current(package_root, vid, expected)
+
+
 def _state_document(enabled: bool) -> dict[str, Any]:
     """The document ``tools.write_package_state`` publishes -- ownership marker included.
 
@@ -832,7 +854,7 @@ def test_advertisement_binds_the_vid_while_requiring_some_usable_current(
     _install_tools(monkeypatch, root)
 
     handler = enabled_llm_tools()[0].handler
-    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    assert _publish_current(tools.PackageRoot(package), second_vid)
 
     assert asyncio.run(handler({})) == "FIRST"
     assert _resolved_version(package).name == second_vid
@@ -875,6 +897,7 @@ def test_invariant_g_list_resolves_current_once_and_keeps_one_version_per_row(
         },
     )
     package = _package_path(first)
+    current_path = package / tools._META_DIRNAME / tools._CURRENT_FILENAME
     second_vid = "20260728T020304Z-fedcba"
     _add_committed_version(package, second_vid, description="second description", output="SECOND")
     _install_tools(monkeypatch, root)
@@ -885,7 +908,8 @@ def test_invariant_g_list_resolves_current_once_and_keeps_one_version_per_row(
         nonlocal calls
         calls += 1
         resolution = real_resolve(package_root)
-        assert tools.publish_current(package_root, second_vid)
+        assert isinstance(resolution, tools.Resolved)
+        current_path.write_text(f"{second_vid}\n", encoding="ascii")
         return resolution
 
     monkeypatch.setattr(tools, "resolve_current", resolve_then_switch)
@@ -932,7 +956,7 @@ def test_list_reports_all_three_lineage_states_including_a_self_loop(
     document["previous"] = None
     first_origin.write_text(json.dumps(document), encoding="utf-8")
 
-    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    assert _publish_current(tools.PackageRoot(package), second_vid)
     usable = list_tools()[0]
     assert (usable["current_vid"], usable["lineage"]) == (second_vid, "usable")
     usable_resolution = tools.resolve_current(tools.PackageRoot(package))
@@ -1004,7 +1028,7 @@ def test_discard_rechecks_current_after_predecessor_resolution(
     replacement = _add_committed_version(
         package, replacement_vid, description="replacement", output="REPLACEMENT"
     )
-    assert tools.publish_current(package_root, discarded_vid)
+    assert _publish_current(package_root, discarded_vid)
     real_resolve_target = tools._resolve_version_target
     after_edit: dict[str, bytes] = {}
 
@@ -1053,7 +1077,7 @@ def test_discard_rechecks_previous_after_predecessor_resolution(
     replacement = _add_committed_version(
         package, replacement_vid, description="replacement", output="REPLACEMENT"
     )
-    assert tools.publish_current(package_root, discarded_vid)
+    assert _publish_current(package_root, discarded_vid)
     discarded_origin = discarded / tools._META_DIRNAME / tools._ORIGIN_FILENAME
     real_resolve_target = tools._resolve_version_target
     after_edit: dict[str, bytes] = {}
@@ -1088,6 +1112,76 @@ def test_discard_rechecks_previous_after_predecessor_resolution(
     } == after_edit
 
 
+@pytest.mark.parametrize("edit", ["current", "origin.previous"])
+def test_discard_rechecks_current_and_lineage_after_current_temp_fsync(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, edit: str
+) -> None:
+    """The installed-state guard runs inside the writer's fsync/replace window.
+
+    Patching ``os.fsync`` is deliberate: the real fsync completes first while
+    the fd still names publish_current's private temp, then the supported hand
+    edit lands before control returns to the writer. An injection before
+    publish_current would also pass without the inner guard and prove nothing.
+    """
+
+    first = _make_tool(tmp_path / "tools", "echo", "import sys\n")
+    package = _package_path(first)
+    package_root = tools.PackageRoot(package)
+    discarded_vid = "20260728T020304Z-fedcba"
+    replacement_vid = "20260728T030405Z-acdeff"
+    discarded = _add_committed_version(
+        package, discarded_vid, description="discarded", output="DISCARDED"
+    )
+    replacement = _add_committed_version(
+        package, replacement_vid, description="replacement", output="REPLACEMENT"
+    )
+    assert _publish_current(package_root, discarded_vid)
+
+    current_path = package / tools._META_DIRNAME / tools._CURRENT_FILENAME
+    discarded_origin = discarded / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    real_fsync = os.fsync
+    injected = False
+    after_edit: dict[str, bytes] = {}
+
+    def fsync_then_edit(fd: int) -> None:
+        nonlocal injected
+        real_fsync(fd)
+        try:
+            open_path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        except OSError:
+            return
+        if (
+            not injected
+            and open_path.parent == current_path.parent
+            and open_path.name.startswith(f"{tools._CURRENT_FILENAME}.")
+            and open_path.name.endswith(".tmp")
+        ):
+            injected = True
+            if edit == "current":
+                current_path.write_text(f"{replacement_vid}\n", encoding="ascii")
+            else:
+                origin = json.loads(discarded_origin.read_text(encoding="utf-8"))
+                origin["previous"] = replacement_vid
+                discarded_origin.write_text(json.dumps(origin), encoding="utf-8")
+            after_edit.update(_stable_package_bytes(package))
+
+    monkeypatch.setattr(tools.os, "fsync", fsync_then_edit)
+
+    outcome = tools.discard_version(package_root, discarded_vid)
+
+    assert injected is True
+    assert outcome == "not_found"
+    assert all(path.is_dir() for path in (first, discarded, replacement))
+    assert _stable_package_bytes(package) == after_edit
+    resolution = tools.resolve_current(package_root)
+    assert isinstance(resolution, tools.Resolved)
+    if edit == "current":
+        assert resolution.version_root.path == replacement
+    else:
+        assert resolution.version_root.path == discarded
+        assert resolution.previous == tools.PreviousValue(replacement_vid)
+
+
 def test_invariant_e_discard_succeeds_when_old_version_removal_fails(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1096,7 +1190,7 @@ def test_invariant_e_discard_succeeds_when_old_version_removal_fails(
     package = _package_path(first)
     second_vid = "20260728T020304Z-fedcba"
     second = _add_committed_version(package, second_vid, description="second", output="SECOND")
-    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    assert _publish_current(tools.PackageRoot(package), second_vid)
     resolution = tools.resolve_current(tools.PackageRoot(package))
     assert isinstance(resolution, tools.Resolved)
 
@@ -1133,7 +1227,7 @@ def test_discard_parks_then_removes_under_the_exclusive_lock(
     package = _package_path(first)
     second_vid = "20260728T020304Z-fedcba"
     second = _add_committed_version(package, second_vid, description="second", output="SECOND")
-    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    assert _publish_current(tools.PackageRoot(package), second_vid)
     resolution = tools.resolve_current(tools.PackageRoot(package))
     assert isinstance(resolution, tools.Resolved)
     parked = second.with_name(f"{second_vid}.discarded")
@@ -1170,7 +1264,7 @@ def test_discard_removes_version_when_exclusive_lock_is_available(tmp_path: Path
     package = _package_path(first)
     second_vid = "20260728T020304Z-fedcba"
     second = _add_committed_version(package, second_vid, description="second", output="SECOND")
-    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    assert _publish_current(tools.PackageRoot(package), second_vid)
     resolution = tools.resolve_current(tools.PackageRoot(package))
     assert isinstance(resolution, tools.Resolved)
 
@@ -1191,7 +1285,7 @@ def test_discard_rename_failure_is_success_and_leaves_the_version_in_place(
     package = _package_path(first)
     second_vid = "20260728T020304Z-fedcba"
     second = _add_committed_version(package, second_vid, description="second", output="SECOND")
-    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    assert _publish_current(tools.PackageRoot(package), second_vid)
     resolution = tools.resolve_current(tools.PackageRoot(package))
     assert isinstance(resolution, tools.Resolved)
 
@@ -1216,7 +1310,7 @@ def test_invariant_e_unconfirmed_current_durability_leaves_old_version_intact(
     package = _package_path(first)
     second_vid = "20260728T020304Z-fedcba"
     second = _add_committed_version(package, second_vid, description="second", output="SECOND")
-    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    assert _publish_current(tools.PackageRoot(package), second_vid)
     resolution = tools.resolve_current(tools.PackageRoot(package))
     assert isinstance(resolution, tools.Resolved)
 
@@ -1271,7 +1365,7 @@ def test_retired_advertised_version_cannot_run_when_discard_cannot_park_it(
         f"import sys\nopen({str(sentinel)!r}, 'w').write('x')\nsys.stdout.write('SECOND')\n",
         encoding="utf-8",
     )
-    assert tools.publish_current(package_root, second_vid)
+    assert _publish_current(package_root, second_vid)
     _install_tools(monkeypatch, root)
     handler = enabled_llm_tools()[0].handler
     resolution = tools.resolve_current(package_root)
@@ -1287,9 +1381,9 @@ def test_retired_advertised_version_cannot_run_when_discard_cannot_park_it(
         real_publish = tools.publish_current
 
         def publish_without_confirmed_durability(
-            root: tools.PackageRoot, vid: str
+            root: tools.PackageRoot, vid: str, expected: tools.Resolved
         ) -> tools.CurrentPublication:
-            publication = real_publish(root, vid)
+            publication = real_publish(root, vid, expected)
             assert publication.published
             return tools.CurrentPublication(published=True, durable=False)
 
@@ -1335,7 +1429,7 @@ def test_canonical_tools_base_makes_discard_retire_the_advertised_generation(
         f"import sys\nopen({str(sentinel)!r}, 'w').write('x')\nsys.stdout.write('SECOND')\n",
         encoding="utf-8",
     )
-    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    assert _publish_current(tools.PackageRoot(package), second_vid)
     settings = Settings(tools_dir=configured)
     monkeypatch.setattr(tools, "get_settings", lambda: settings)
 
@@ -1379,7 +1473,7 @@ def test_discard_between_scan_capture_and_handler_build_retires_handler(
         f"import sys\nopen({str(sentinel)!r}, 'w').write('x')\nsys.stdout.write('SECOND')\n",
         encoding="utf-8",
     )
-    assert tools.publish_current(package_root, second_vid)
+    assert _publish_current(package_root, second_vid)
     _make_tool(root, "zzz", "import sys\nsys.stdout.write('Z')\n")
     _install_tools(monkeypatch, root)
 
@@ -1433,7 +1527,7 @@ def test_restored_backup_of_retired_vid_executes_in_the_same_process(
     package_root = tools.PackageRoot(package)
     second_vid = "20260728T020304Z-fedcba"
     second = _add_committed_version(package, second_vid, description="second", output="SECOND")
-    assert tools.publish_current(package_root, second_vid)
+    assert _publish_current(package_root, second_vid)
     backup = tmp_path / "second-backup"
     shutil.copytree(second, backup)
     retired_info = os.stat(second)
@@ -1449,9 +1543,9 @@ def test_restored_backup_of_retired_vid_executes_in_the_same_process(
     real_publish = tools.publish_current
 
     def publish_without_confirmed_durability(
-        target_root: tools.PackageRoot, vid: str
+        target_root: tools.PackageRoot, vid: str, expected: tools.Resolved
     ) -> tools.CurrentPublication:
-        publication = real_publish(target_root, vid)
+        publication = real_publish(target_root, vid, expected)
         assert publication.published
         return tools.CurrentPublication(published=True, durable=False)
 
@@ -1466,7 +1560,9 @@ def test_restored_backup_of_retired_vid_executes_in_the_same_process(
     restored_identity = restored_info.st_dev, restored_info.st_ino
     assert restored_identity == backup_identity
     assert restored_identity != retired_identity
-    assert real_publish(package_root, second_vid)
+    restored_current = tools.resolve_current(package_root)
+    assert isinstance(restored_current, tools.Resolved)
+    assert real_publish(package_root, second_vid, restored_current)
 
     fresh_handler = enabled_llm_tools()[0].handler
     assert asyncio.run(fresh_handler({})) == "SECOND"
@@ -1499,7 +1595,7 @@ def test_retired_advertisement_survives_rename_aside_and_back(
     first_origin_document = json.loads(first_origin.read_text(encoding="utf-8"))
     first_origin_document["previous"] = third_vid
     first_origin.write_text(json.dumps(first_origin_document), encoding="utf-8")
-    assert tools.publish_current(package_root, second_vid)
+    assert _publish_current(package_root, second_vid)
 
     _install_tools(monkeypatch, root)
     stale_handler = enabled_llm_tools()[0].handler
@@ -1538,7 +1634,7 @@ def test_retired_advertisement_survives_rename_aside_and_back(
     restored_second_info = os.stat(second)
     assert (restored_second_info.st_dev, restored_second_info.st_ino) == second_identity
     assert tools.package_identity(tools.VersionRoot(second)) == second_manifest_identity
-    assert tools.publish_current(package_root, second_vid)
+    assert _publish_current(package_root, second_vid)
 
     fresh_handler = enabled_llm_tools()[0].handler
     assert asyncio.run(stale_handler({})) == tools._TOOL_REPLACED_RESULT
@@ -3894,7 +3990,7 @@ def test_destructive_production_paths_preserve_the_persistent_lock_inode(
     if action == "discard":
         second_vid = "20260728T020304Z-fedcba"
         _add_committed_version(package, second_vid, description="second", output="SECOND")
-        assert tools.publish_current(tools.PackageRoot(package), second_vid)
+        assert _publish_current(tools.PackageRoot(package), second_vid)
     _install_tools(monkeypatch, root)
 
     lock_fd = tools._open_tools_lock(root)

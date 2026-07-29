@@ -1604,7 +1604,7 @@ def _promote_staging(
     package_layout = tools.PackageLayoutRoot(shell_root)
     if not tools.write_package_state(package_layout, True):
         return None, _ERROR_INSTALL_STATE_WRITE
-    if not tools.publish_current(package_layout, vid):
+    if not tools.publish_staging_current(package_layout, vid):
         return None, _ERROR_CURRENT_WRITE
     if secret_name and secret_value:
         inject_error = _inject_secret_into_env(shell_root / ".env", secret_name, secret_value)
@@ -1729,13 +1729,19 @@ def _publish_revised_version(
         # version entry but left that rename+fsync gap free for a D21 hand edit
         # that publication would overwrite. Check the manifest fact first, then
         # resolve ``current`` LAST so no other filesystem read sits between the
-        # pointer answer and publish_current.
+        # pointer answer and publish_current. This caller-side guard is not the
+        # final guard: publish_current repeats both current and lineage after its
+        # temp file fsync, immediately before replacing the pointer.
         if tools.package_identity(previous.version_root) != expected_identity:
             return None, _ERROR_REVISE_TARGET_REPLACED
         current = tools.resolve_current(package_root)
-        if isinstance(current, tools.Unresolved) or current.vid != previous.vid:
+        if (
+            isinstance(current, tools.Unresolved)
+            or current.vid != previous.vid
+            or current.previous != previous.previous
+        ):
             return None, _ERROR_REVISE_TARGET_REPLACED
-        if not tools.publish_current(package_root, vid):
+        if not tools.publish_current(package_root, vid, previous):
             return None, _ERROR_CURRENT_WRITE
         # Construct the typed target from the exact directory just renamed and
         # vid just published. Re-resolving by package name here or in the summary
