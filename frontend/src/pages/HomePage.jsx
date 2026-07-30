@@ -222,9 +222,12 @@ export function HomePage() {
 	// an error, so `data === undefined && isFetching` -- rather than isPending --
 	// is what re-shows the Loader on retry, matching the old phase machine.
 	// A failed background refetch that still has prior data (data !== undefined)
-	// falls through to the buckets instead of blanking to the error Alert.
+	// falls through to the buckets instead of blanking to the error Alert. As
+	// on ToolsPage, that retained-data state gets its own orange warning so the
+	// previous snapshot cannot look freshly verified.
 	const loading = data === undefined && isFetching;
 	const showError = isError && data === undefined && !isFetching;
+	const staleReview = isError && data !== undefined;
 
 	const staleCount = data
 		? REVIEW_GROUPS.reduce(
@@ -265,6 +268,15 @@ export function HomePage() {
 							重試
 						</Button>
 					</Stack>
+				</Alert>
+			) : null}
+
+			{staleReview ? (
+				<Alert color="orange" title="無法更新回顧">
+					<Text size="sm">
+						{error?.message ?? "請稍後再試"}
+						。以下內容是先前讀到的結果，可能已過期。
+					</Text>
 				</Alert>
 			) : null}
 

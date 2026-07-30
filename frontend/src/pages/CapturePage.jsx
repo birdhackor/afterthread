@@ -105,7 +105,8 @@ export function CapturePage() {
 	// captureMutation.isPending (RHF's own isSubmitting would flip false the
 	// instant mutate() fires, since the submit handler no longer awaits).
 	const captureMutation = useMutation({
-		mutationFn: (value) => apiPost("/api/capture", { raw_text: value }),
+		mutationFn: (value) =>
+			apiPost("/api/capture", { body: { raw_text: value } }),
 		onSuccess: (data) => {
 			setResult(data);
 			// Clear the box only on success; a failure keeps the text for retry.

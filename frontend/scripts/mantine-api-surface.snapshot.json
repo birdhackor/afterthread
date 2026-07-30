@@ -1,0 +1,47 @@
+{
+	"matchMedia": [
+		"@mantine/core/esm/core/MantineProvider/ColorSchemeScript/ColorSchemeScript.mjs",
+		"@mantine/core/esm/core/MantineProvider/use-mantine-color-scheme/use-provider-color-scheme.mjs",
+		"@mantine/hooks/esm/use-media-query/use-media-query.mjs"
+	],
+	"ResizeObserver": [
+		"@mantine/core/esm/components/FloatingIndicator/use-floating-indicator.mjs",
+		"@mantine/core/esm/components/OverflowList/use-dimensions.mjs",
+		"@mantine/core/esm/components/ScrollArea/ScrollArea.mjs",
+		"@mantine/core/esm/components/ScrollArea/ScrollAreaCorner/ScrollAreaCorner.mjs",
+		"@mantine/core/esm/components/ScrollArea/ScrollAreaScrollbar/ScrollAreaScrollbarAuto.mjs",
+		"@mantine/core/esm/components/ScrollArea/ScrollAreaScrollbar/Scrollbar.mjs",
+		"@mantine/core/esm/components/ScrollArea/use-resize-observer.mjs",
+		"@mantine/core/esm/components/Textarea/Autosize.mjs",
+		"@mantine/hooks/esm/index.mjs",
+		"@mantine/hooks/esm/use-floating-window/use-floating-window.mjs",
+		"@mantine/hooks/esm/use-resize-observer/use-resize-observer.mjs",
+		"@mantine/hooks/esm/use-scroller/use-scroller.mjs",
+		"@mantine/hooks/esm/use-splitter/use-splitter.mjs"
+	],
+	"IntersectionObserver": [
+		"@mantine/core/esm/components/HoverCard/use-hover-card.mjs",
+		"@mantine/hooks/esm/use-in-viewport/use-in-viewport.mjs",
+		"@mantine/hooks/esm/use-intersection/use-intersection.mjs"
+	],
+	"document.fonts": ["@mantine/core/esm/components/Textarea/Autosize.mjs"],
+	"scrollIntoView": [
+		"@mantine/core/esm/components/Combobox/use-combobox-target-props/use-combobox-target-props.mjs",
+		"@mantine/core/esm/components/Combobox/use-combobox/use-combobox.mjs",
+		"@mantine/core/esm/components/Menu/MenuSearch/MenuSearch.mjs",
+		"@mantine/core/esm/components/Select/Select.mjs",
+		"@mantine/core/esm/components/TreeSelect/TreeSelect.mjs",
+		"@mantine/hooks/esm/use-scroll-into-view/use-scroll-into-view.mjs"
+	],
+	"getComputedStyle": [
+		"@mantine/core/esm/components/Combobox/use-pills-reorder/use-pills-reorder.mjs",
+		"@mantine/core/esm/components/FloatingIndicator/use-floating-indicator.mjs",
+		"@mantine/core/esm/components/OverflowList/OverflowList.mjs",
+		"@mantine/core/esm/components/ScrollArea/ScrollAreaScrollbar/ScrollbarX.mjs",
+		"@mantine/core/esm/components/ScrollArea/ScrollAreaScrollbar/ScrollbarY.mjs",
+		"@mantine/core/esm/components/Textarea/Autosize.mjs",
+		"@mantine/hooks/esm/use-floating-window/use-floating-window.mjs",
+		"@mantine/hooks/esm/use-scroller/use-scroller.mjs",
+		"@mantine/hooks/esm/use-splitter/use-splitter.mjs"
+	]
+}

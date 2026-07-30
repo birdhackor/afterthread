@@ -76,10 +76,9 @@ export const loadLlmStatusAtom = atom(null, async (get, set, options = {}) => {
 		// status endpoint that accepts the connection and then hangs would leak
 		// one pending request per recovery transition, without bound. The
 		// timeout caps every request's lifetime at one bound, turning that
-		// accumulation into a small, self-draining overlap. A timeout rejects
-		// through the ordinary network-error path below -- for a trivial
-		// no-DB/no-LLM endpoint, "can't answer within the bound" honestly reads
-		// as a failed check.
+		// accumulation into a small, self-draining overlap. The client reports
+		// a timeout as backend-down evidence but preserves its TimeoutError
+		// reason; this catch records that same failure on the LLM status atom.
 		const data = await apiFetch("/api/llm/status", {
 			method: "GET",
 			signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),

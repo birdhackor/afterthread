@@ -25,7 +25,8 @@ pnpm build         # production build 到 dist/
 pnpm preview       # 本機預覽 production build（見下方「已知限制」）
 pnpm lint          # biome check .
 pnpm format        # biome check --write .（自動修正）
-pnpm test          # vitest run（單元測試，node 環境、無 jsdom）
+pnpm test          # vitest run（純函式測試用 node；元件測試逐檔使用 jsdom）
+pnpm typecheck     # 僅檢查已撰寫的 .ts；既有 .js/.jsx 暫不做語意型別檢查
 ```
 
 以上指令皆已在本機實際執行過並確認通過：`pnpm install`、`pnpm lint`（無錯誤，
@@ -40,6 +41,91 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
 即因此在 preview 階段只驗證 SPA 外殼有被正確提供，不透過 preview 打任何 API；細節
 見 `e2e/README.md`）。開發時請用 `pnpm dev`，其代理設定與 `pnpm preview` 相同但通
 常搭配本機真的跑在 8000 埠的後端。
+
+## 元件測試
+
+元件測試使用 jsdom、React Testing Library 與
+`src/test/render.tsx` 的 `renderWithAppProviders`。測試檔使用
+`.test.tsx`，並在第一行加上：
+
+```tsx
+// @vitest-environment jsdom
+```
+
+Vitest 的全域預設仍明確設為 `node`；只有帶上述 pragma 的檔案才建立 DOM，既有純函式
+測試不會載入 jsdom。測試從 `@testing-library/react` 使用 `screen`／`waitFor`，
+互動則用 `@testing-library/user-event` 的 `userEvent.setup()`，不要直接呼叫 DOM
+元素的 `.click()`。
+
+`renderWithAppProviders` 依 `src/main.jsx` 的實際組裝提供
+`MantineProvider`、`Notifications`、每次 render 獨立的
+`QueryClientProvider`，以及使用 memory history 的 `RouterProvider`。測試 helper
+刻意不加 `StrictMode`，避免每個 smoke／行為規格都被開發期 double mount 混淆；也
+不加 jotai `Provider`，因為正式 app 明確使用 jotai default store。helper
+另補 jsdom 本身沒有、但 Mantine mount 時會讀取的 `matchMedia` 與
+`document.fonts`；兩者只提供事件介面的 no-op，不模擬 layout 或字型載入結果。
+API 一律 mock `src/api/client.ts`，mock response 則以產生的 schema 型別檢查，例如：
+
+```tsx
+import type { ApiSuccessResponse } from "../api/client.js";
+
+type ToolListResponse = ApiSuccessResponse<"/api/tools", "get">;
+const response = {
+	tools: [],
+} satisfies ToolListResponse;
+```
+
+## 測試要能失敗（十六輪 review 的產物）
+
+這套測試經過十六輪對抗式 review，找到 **11 個「不管程式對不對都會通過」的測試**。
+以下是從那些實例歸納出來的工作方式，寫測試前請先讀完。
+
+**每一個新測試都要附 mutation 證明。** 把它宣稱在檢查的東西改壞，某個**具名**測試必須
+轉紅。沒做過這件事的測試，等於沒有證據證明它有能力分辨對錯。改壞前先 `cp` 備份，改完
+用備份 `cp` 回去再 `cmp` 驗證——不要用 `git checkout`／`restore`／`stash`。
+
+**修守衛時先問兩個問題**，這兩問沒做完就交件會製造下一輪 review：
+
+1. **同樣形狀還存在於幾個地方？** 兩個探針、兩個分支、兩個消費者——修一個留一個是這裡
+   最常見的失敗。r15 給了 health probe 行為式的期限測試卻沒給 LLM probe；兩個 probe
+   各有成功／失敗兩道 generation guard，而兩個測試檔剛好各釘住對方缺的那半。
+2. **這個修正自己有沒有帶可證偽性？** 新加的守衛也是守衛，同樣要能被 mutation 打紅。
+
+**兩個具體的反樣式：**
+
+- **只驗正向的 oracle**：只斷言「警告有出現」，不斷言「健康時它不存在」「下一次成功後它
+  消失」。這種測試在「警告永遠出現」時仍然全綠。已知在四個地方犯過。
+- **用型別代替行為的斷言**：`signal: expect.any(AbortSignal)` 只證明「有傳一個 signal
+  物件」，一個永遠不會觸發的 signal 也能通過。契約是行為就要驅動行為——攔截
+  `AbortSignal.timeout`、換成自己控制的 signal、手動觸發，不要用假時鐘。
+
+**已釘住的守衛清單**（34 條，含各自的 pinning test 與實測 mutation）與**明確接受、不釘
+住的 residual**（四類）記在根目錄 `裁決紀錄.md` 的 #16。動到那些守衛時先讀它。
+
+**這台開發機只有一個 CPU core。** 不要並行跑多個測試套件——那會把機器餓到比任何真實
+runner 都嚴苛，已經製造過一次必須丟棄的假失敗。循序跑兩輪完整套件是穩定性的標準。
+
+## API schema 型別
+
+`src/api/openapi.gen.json`、`src/api/schema.gen.ts` 與
+`src/api/request-body-required.gen.ts` 是從後端 FastAPI/Pydantic 的真實 OpenAPI
+schema 產生並提交的 API contract；瀏覽器 build 只讀後兩個 TypeScript 檔，不需要
+Python，也不會啟動後端。required-key map 讓 request body 依 OpenAPI 的
+`required` 陣列判斷必填欄位；一般 generated types 仍保留 defaulted response
+欄位必定存在的嚴格契約。後端的 request／response schema 有任何異動後，請在 repo
+已安裝 `uv` 與 `pnpm` 依賴的環境執行：
+
+```bash
+pnpm generate:api-types
+pnpm typecheck
+```
+
+產生器位於 repo 共用的 `scripts/generate-api-types.sh`，會直接 import FastAPI
+`app`、呼叫 `app.openapi()` 寫入暫存 JSON，再由 `openapi-typescript` 更新已提交的
+一般型別，並從同一份 JSON 產生 request required-key map；它不會啟動 server 或
+curl `/openapi.json`。CI 的 full-stack job 另執行
+`pnpm --dir frontend check:api-types`，以同一路徑重產並在任一 committed output
+有任何 diff 時失敗。
 
 ## 頁面總覽
 
@@ -77,7 +163,7 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
 - **zh-TW 文案**：所有面向使用者的文字（標籤、按鈕、通知、錯誤訊息）一律使用正體
   中文，狀態／階段的顯示文字集中在 `constants/labels.js`（`STATUS_META` /
   `STAGE_META`）避免各處重覆定義；API 錯誤訊息的 zh-TW 映射集中在
-  `api/client.js` 的 `messageFor`。
+  `api/client.ts` 的 `messageFor`。
 - **Code-point 長度計數**：任何鏡射後端長度上限的前端驗證，一律用
   `utils/text.js` 的 `codePointLength`，而不是 JS 原生的 `.length` /
   `maxLength`。原生 `.length` 數的是 UTF-16 code unit，多數 emoji 與部分 CJK
@@ -121,8 +207,8 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   展開（`@mantine/core` 的 `Collapse` + `useDisclosure`，零新依賴，比照 D38
   選用 Mantine 內建元件的理由；每列獨立展開，不像 `LlmLogsPage` 的 Accordion
   同時間只開一項；展開 prop 是 `Collapse` 自己的 `expanded`，**不是** React
-  Transition Group 的 `in`——寫錯只會被靜默吞進 `...others`，見下面「沒有 jsdom」
-  那條），總結內容以 `enabled: expanded` 延遲讀取（比照
+  Transition Group 的 `in`——寫錯只會被靜默吞進 `...others`，見下面「jsdom
+  元件測試」那條），總結內容以 `enabled: expanded` 延遲讀取（比照
   `LlmLogsPage.LogDetailPanel`，收合的列從不打 API）。
 - **`ToolsPage` 的 per-row 閘：啟用開關 ⇄ 進行中的修訂／重新產生——web-v5 P1
   之後已經拆掉**。這一條留著是因為它同時記著「當初為什麼需要」與「現在為什麼不
@@ -230,8 +316,8 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   列的 `toolInstanceKey`、面板自己的忙碌旗標 `ownSummaryBusy`、詳情的「只在已存在
   時寫」updater `writeSummaryDetailIfPresent`、失敗要不要重讀的判準
   `summaryErrorRevalidates`），因為那與「安裝」無關，硬塞
-  進前者的檔名只會誤導之後的讀者——這個專案的 vitest 在 node 環境跑、沒有
-  jsdom，元件本身測不到，抽出的純函式是唯一能自動化驗證的介面，所以新邏輯一律
+  進前者的檔名只會誤導之後的讀者。這些純邏輯仍留在 node 環境的快速單元測試；
+  需要驗證元件組裝與互動時，另以逐檔 jsdom 測試搭配共用 render helper。新邏輯一律
   先問「這算安裝，還是總結」再決定放哪個檔案。**唯一的例外寫在
   `toolSummary.js` 的最後一節**：AI 日誌深連結的**兩半**（`工具` 頁產生連結的
   `logLinkSearch`、`AI 日誌` 頁解讀連結的 `deepLinkTarget`）刻意放在同一個檔案，
@@ -248,12 +334,11 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   token 的連結維持原本行為**（`工具` 頁總結面板的連結就是這種：後端在**回應當下**
   就把非本行程的 `llm_log_id` 改成 `null`，所以它不需要也無從提出主張；使用者自己
   存下來的網址同理——「說不出來」不可以被講成「我確定它過期了」）。
-- **沒有 jsdom ⇒ 寫錯的 prop 名稱沒有任何閘門擋得住**：`pnpm lint`（Biome）不做
-  型別檢查、`pnpm build`（Vite）只轉譯不檢型別、`pnpm test`（vitest）在 node 環境
-  下完全不 render 元件。一個拼錯的 Mantine prop 是合法 JS／合法 JSX，會被靜默
-  spread 進 `...others`，三個閘門依然全綠而功能是零（P4 的
-  `<Collapse in={…}>` 就是這樣讓整個 AI 總結面板從未打開過）。改動 Mantine 元件的
-  props 時，唯一可靠的驗證是**對照安裝版原始碼**——
+- **jsdom 元件測試補上渲染行為閘門**：`pnpm lint`（Biome）不做
+  型別檢查、`pnpm build`（Vite）只轉譯不檢型別；一個拼錯的 Mantine prop 仍是合法
+  JS／合法 JSX，會被靜默 spread 進 `...others`（P4 的
+  `<Collapse in={…}>` 就是這樣讓整個 AI 總結面板從未打開過）。現在可用逐檔 jsdom
+  元件測試斷言實際展開／互動結果；改動 Mantine 元件 props 時仍要先**對照安裝版原始碼**——
   `node_modules/@mantine/core/lib/components/<Name>/<Name>.d.ts` 的介面宣告，或
   `esm/.../<Name>.mjs` 的解構，style props 則見
   `lib/core/Box/style-props/style-props.types.d.ts`。憑記憶或憑線上文件都不算。

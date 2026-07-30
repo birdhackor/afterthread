@@ -8,8 +8,8 @@ import { atom } from "jotai";
 // Items per page for the list view (backend accepts limit 1..200).
 export const DEFAULT_LIMIT = 20;
 
-// "" means "no filter" (all values). buildQuery() drops empty strings, so an
-// empty atom is simply omitted from the request.
+// "" means "no filter" (all values). The API client's typed query serializer
+// drops empty strings, so an empty atom is simply omitted from the request.
 export const statusFilterAtom = atom("");
 export const stageFilterAtom = atom("");
 export const tagFilterAtom = atom("");

@@ -81,8 +81,14 @@ jobs:
       - name: Install locked dependencies
         run: pnpm --dir frontend install --frozen-lockfile
 
+      - name: Check Mantine browser API surface
+        run: pnpm --dir frontend check:mantine-api-surface
+
       - name: Lint
         run: pnpm --dir frontend lint
+
+      - name: Type-check authored TypeScript
+        run: pnpm --dir frontend typecheck
 
       - name: Test
         run: pnpm --dir frontend test
@@ -121,6 +127,17 @@ jobs:
           node-version: "24"
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
+
+      # This cross-surface gate needs both Python/FastAPI and the frontend
+      # generator dependency, so it belongs here instead of making the
+      # frontend-only job boot a Python environment.
+      - name: Install locked dependencies for API type drift check
+        run: |
+          uv sync --project backend --frozen
+          pnpm --dir frontend install --frozen-lockfile
+
+      - name: Check generated API types for drift
+        run: pnpm --dir frontend check:api-types
 
       - name: Dev-mode end-to-end smoke test
         run: bash e2e/smoke.sh

@@ -2,7 +2,14 @@
 	"$schema": "https://biomejs.dev/schemas/2.5.3/schema.json",
 	"files": {
 		"ignoreUnknown": false,
-		"includes": ["**", "!dist", "!node_modules", "!public"]
+		"includes": [
+			"**",
+			"!dist",
+			"!node_modules",
+			"!public",
+			"!src/api/openapi.gen.json",
+			"!src/api/schema.gen.ts"
+		]
 	},
 	"formatter": {
 		"enabled": true,

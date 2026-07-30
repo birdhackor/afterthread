@@ -275,7 +275,8 @@ function AttemptCard({ attempt, index }) {
 function LogDetailPanel({ log, expanded }) {
 	const { data, error, isError, isFetching, refetch } = useQuery({
 		queryKey: ["llm-log", log.id, log.started_at],
-		queryFn: () => apiGet(`/api/llm/logs/${log.id}`),
+		queryFn: () =>
+			apiGet("/api/llm/logs/{log_id}", { path: { log_id: log.id } }),
 		enabled: expanded,
 	});
 
@@ -388,7 +389,8 @@ function OffListRecord({ logId }) {
 		// know before the fetch, so a shared key could hand one query the other's
 		// cached record.
 		queryKey: ["llm-log", logId, "deep-link"],
-		queryFn: () => apiGet(`/api/llm/logs/${logId}`),
+		queryFn: () =>
+			apiGet("/api/llm/logs/{log_id}", { path: { log_id: logId } }),
 	});
 
 	if (data === undefined && isFetching) {
@@ -491,15 +493,18 @@ export function LlmLogsPage() {
 
 	const { data, error, isError, isFetching, refetch } = useQuery({
 		queryKey: ["llm-logs"],
-		queryFn: () => apiGet(`/api/llm/logs?limit=${LIST_LIMIT}`),
+		queryFn: () => apiGet("/api/llm/logs", { query: { limit: LIST_LIMIT } }),
 	});
 
 	// Same first-load / retry discipline as HomePage: react-query keeps status
 	// 'error' (not 'pending') while refetching after a failure, so
 	// `data === undefined && isFetching` re-shows the Loader on 重新整理, and a
 	// failed background refetch that still has prior rows falls through to them.
+	// Match ToolsPage's orange retained-data warning so those rows cannot look
+	// like the result of a successful refresh.
 	const loading = data === undefined && isFetching;
 	const showError = isError && data === undefined && !isFetching;
+	const staleLogs = isError && data !== undefined;
 	const logs = data?.logs ?? [];
 	// The token comes from THIS response, so it and the rows it is compared for
 	// are one reading of one process (backend schemas.LlmLogListResponse).
@@ -546,6 +551,15 @@ export function LlmLogsPage() {
 							重試
 						</Button>
 					</Stack>
+				</Alert>
+			) : null}
+
+			{staleLogs ? (
+				<Alert color="orange" title="無法更新 AI 日誌">
+					<Text size="sm">
+						{error?.message ?? "請稍後再試"}
+						。以下內容是先前讀到的結果，可能已過期。
+					</Text>
 				</Alert>
 			) : null}
 

@@ -6,7 +6,6 @@ import {
 	isToolJobActive,
 	secretNameError,
 	secretValueError,
-	TOOL_JOB_POLL_MS,
 	toolJobQueryEnabled,
 	toolJobRefetchInterval,
 } from "./toolInstall.js";
@@ -40,18 +39,22 @@ describe("isTerminalToolJobState", () => {
 });
 
 describe("toolJobRefetchInterval", () => {
+	// Keep the cadence expectation literal: importing TOOL_JOB_POLL_MS here
+	// would let an accidental production change move both sides together.
+	const expectedPollMs = 2000;
+
 	it("keeps polling while the job is queued or running", () => {
 		expect(toolJobRefetchInterval(queryWithState("queued"))).toBe(
-			TOOL_JOB_POLL_MS,
+			expectedPollMs,
 		);
 		expect(toolJobRefetchInterval(queryWithState("running"))).toBe(
-			TOOL_JOB_POLL_MS,
+			expectedPollMs,
 		);
 	});
 
 	it("keeps polling before the first response lands (no data yet)", () => {
-		expect(toolJobRefetchInterval(queryWithState(null))).toBe(TOOL_JOB_POLL_MS);
-		expect(toolJobRefetchInterval(undefined)).toBe(TOOL_JOB_POLL_MS);
+		expect(toolJobRefetchInterval(queryWithState(null))).toBe(expectedPollMs);
+		expect(toolJobRefetchInterval(undefined)).toBe(expectedPollMs);
 	});
 
 	it("stops polling once the job is terminal", () => {
@@ -64,9 +67,9 @@ describe("toolJobRefetchInterval", () => {
 	});
 
 	it("keeps polling on other errors (transient) and before any data", () => {
-		expect(toolJobRefetchInterval(queryWithError(500))).toBe(TOOL_JOB_POLL_MS);
-		expect(toolJobRefetchInterval(queryWithError(0))).toBe(TOOL_JOB_POLL_MS);
-		expect(toolJobRefetchInterval(queryWithState(null))).toBe(TOOL_JOB_POLL_MS);
+		expect(toolJobRefetchInterval(queryWithError(500))).toBe(expectedPollMs);
+		expect(toolJobRefetchInterval(queryWithError(0))).toBe(expectedPollMs);
+		expect(toolJobRefetchInterval(queryWithState(null))).toBe(expectedPollMs);
 	});
 });
 

@@ -1,5 +1,5 @@
 // Authoritative /api/health interpretation, fired by the connectivity
-// monitor (hooks/useConnectivityMonitor.js). The passive layer in client.js
+// monitor (hooks/useConnectivityMonitor.js). The passive layer in client.ts
 // only reports UNAMBIGUOUS evidence from real traffic (transport failure =
 // down, fully delivered sub-5xx response = up) and abstains on 5xx, because
 // a 5xx can be an intermediary answering on behalf of a dead upstream: in
@@ -21,20 +21,21 @@ import {
 } from "../atoms/connectivity.js";
 import { apiFetch, PROBE_TIMEOUT_MS } from "./client.js";
 
-// Same default-store rationale as client.js: the app renders without a
+// Same default-store rationale as client.ts: the app renders without a
 // jotai <Provider>, so writes from this non-React module land in the exact
 // store the components read.
 const store = getDefaultStore();
 
 // Probes carry their own deadline (PROBE_TIMEOUT_MS, shared with the LLM
-// status probe -- see client.js): a hung server (accepts the TCP connection
+// status probe -- see client.ts): a hung server (accepts the TCP connection
 // but never sends headers, or stalls mid-body) would otherwise leave every
 // probe pending forever -- stacking one unresolved request per poll tick
-// while never reporting anything. The abort surfaces as a fetch rejection,
-// which apiFetch's existing catch normalizes into the networkError ApiError
-// (no dedicated branch needed), so a timed-out probe lands in the rejection
-// handler below and honestly reads as down: a backend that cannot answer
-// its trivial health endpoint within this budget is not usable.
+// while never reporting anything. The abort surfaces as `signal.reason`, which
+// the client now rethrows UNCHANGED rather than normalizing -- so a timed-out
+// probe arrives here as a DOMException named TimeoutError, not as an ApiError.
+// The rejection handler below deliberately inspects nothing, so it reads as
+// down either way: a backend that cannot answer its trivial health endpoint
+// within this budget is not usable.
 
 // Module-level generation counter, same pattern as atoms/llm.js: the
 // monitor's interval tick and its focus/online/visibility pings can put two
@@ -48,7 +49,7 @@ let generation = 0;
 // Fire-and-forget: never throws and returns nothing, so trigger sites (the
 // monitor's interval and event listeners) stay one-liners. Interpretation
 // AND reporting both live here so every trigger gets identical judgment.
-export function probeBackendHealth() {
+export function probeBackendHealth(): void {
 	const myGeneration = ++generation;
 	// reportConnectivity: false -- probe traffic bypasses the passive layer
 	// entirely, making the semantic verdict below STRUCTURALLY the only
@@ -78,7 +79,12 @@ export function probeBackendHealth() {
 			if (myGeneration !== generation) {
 				return;
 			}
-			// Any ApiError counts as down here -- INCLUDING the 5xx the
+			// EVERY rejection counts as down here, and this handler takes no
+			// argument on purpose: an ApiError, and equally the DOMException a
+			// probe timeout now produces, both mean the backend did not answer.
+			// Narrowing this to `instanceof ApiError` would silently stop timeouts
+			// from turning the badge red -- there is a test pinning exactly that.
+			// The ApiError case INCLUDES the 5xx the
 			// passive layer abstains on: for this endpoint a 5xx is never a
 			// legitimate application answer, only a middleman covering for a
 			// dead upstream or a backend too broken to use, and both mean

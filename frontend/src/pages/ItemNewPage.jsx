@@ -36,7 +36,7 @@ export function ItemNewPage() {
 	// The new item shows up in the list and review buckets, so invalidate both;
 	// navigation to the detail page then loads it via its own ['item', id] query.
 	const createMutation = useMutation({
-		mutationFn: (payload) => apiPost("/api/items", payload),
+		mutationFn: (payload) => apiPost("/api/items", { body: payload }),
 		onSuccess: (created) => {
 			notifications.show({
 				color: "green",
