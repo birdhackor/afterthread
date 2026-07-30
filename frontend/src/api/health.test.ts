@@ -1,5 +1,13 @@
 import { getDefaultStore, type PrimitiveAtom } from "jotai";
-import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	type Mock,
+	vi,
+} from "vitest";
 import { backendStatusAtom } from "../atoms/connectivity.js";
 import { ApiError, type ApiSuccessResponse, apiFetch } from "./client.js";
 import { probeBackendHealth } from "./health.js";
@@ -54,22 +62,37 @@ beforeEach(() => {
 	mockedApiFetch.mockReset();
 });
 
+afterEach(() => {
+	vi.restoreAllMocks();
+});
+
 describe("probeBackendHealth", () => {
 	it("reports up when the health body says ok", async () => {
+		const timeoutController = new AbortController();
+		const timeoutSpy = vi
+			.spyOn(AbortSignal, "timeout")
+			.mockReturnValue(timeoutController.signal);
 		mockedApiFetch.mockResolvedValueOnce({ status: "ok" });
 		probeBackendHealth();
 		await flush();
 		// The probe must exempt itself from the passive layer (so its
-		// generation-guarded verdict is the only connectivity writer for
-		// probe traffic) and carry its own timeout signal (so a hung server
-		// cannot stack pending probes forever). The timeout VALUE is a
-		// tuning knob, not part of the contract.
+		// generation-guarded verdict is the only connectivity writer for probe
+		// traffic). Its deadline comes from AbortSignal.timeout with a finite,
+		// positive budget so a hung server cannot stack pending probes forever;
+		// the exact budget remains a tuning knob, not part of the contract.
+		expect(timeoutSpy).toHaveBeenCalledOnce();
+		const [timeoutMs] = timeoutSpy.mock.calls[0] ?? [];
+		expect(
+			typeof timeoutMs === "number" &&
+				Number.isFinite(timeoutMs) &&
+				timeoutMs > 0,
+		).toBe(true);
 		expect(apiFetch).toHaveBeenCalledWith(
 			"/api/health",
 			expect.objectContaining({
 				method: "GET",
 				reportConnectivity: false,
-				signal: expect.any(AbortSignal),
+				signal: timeoutController.signal,
 			}),
 		);
 		expect(store.get(statusAtom)).toEqual({ reachable: true });
@@ -106,18 +129,24 @@ describe("probeBackendHealth", () => {
 	});
 
 	it("reports down when the probe's own timeout fires", async () => {
-		// The probe passes `AbortSignal.timeout()`, and since the client began
-		// rethrowing `signal.reason` unchanged an abort no longer arrives as an
-		// ApiError -- it arrives as this DOMException. Every other rejection
-		// fixture here is an ApiError, so without this case a handler narrowed to
-		// `instanceof ApiError` would keep the whole file green while a backend
-		// that accepts the connection and then never answers left the badge
-		// showing green indefinitely.
-		mockedApiFetch.mockRejectedValueOnce(
-			new DOMException("signal timed out", "TimeoutError"),
-		);
+		const timeoutController = new AbortController();
+		vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeoutController.signal);
+		// Observe the signal exactly as apiFetch does: the request rejects only
+		// because the probe-created deadline aborts. A pre-rejected fixture would
+		// prove the rejection handler but not that the deadline can reach it.
+		mockedApiFetch.mockImplementationOnce((_path, options) => {
+			return new Promise((_resolve, reject) => {
+				const signal = options.signal;
+				signal?.addEventListener("abort", () => reject(signal.reason), {
+					once: true,
+				});
+			});
+		});
 		store.set(statusAtom, { reachable: true });
 		probeBackendHealth();
+		timeoutController.abort(
+			new DOMException("health probe timed out", "TimeoutError"),
+		);
 		await flush();
 		expect(store.get(statusAtom)).toEqual({ reachable: false });
 	});
