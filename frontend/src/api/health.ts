@@ -30,11 +30,12 @@ const store = getDefaultStore();
 // status probe -- see client.ts): a hung server (accepts the TCP connection
 // but never sends headers, or stalls mid-body) would otherwise leave every
 // probe pending forever -- stacking one unresolved request per poll tick
-// while never reporting anything. The abort surfaces as a fetch rejection,
-// which apiFetch's existing catch normalizes into the networkError ApiError
-// (no dedicated branch needed), so a timed-out probe lands in the rejection
-// handler below and honestly reads as down: a backend that cannot answer
-// its trivial health endpoint within this budget is not usable.
+// while never reporting anything. The abort surfaces as `signal.reason`, which
+// the client now rethrows UNCHANGED rather than normalizing -- so a timed-out
+// probe arrives here as a DOMException named TimeoutError, not as an ApiError.
+// The rejection handler below deliberately inspects nothing, so it reads as
+// down either way: a backend that cannot answer its trivial health endpoint
+// within this budget is not usable.
 
 // Module-level generation counter, same pattern as atoms/llm.js: the
 // monitor's interval tick and its focus/online/visibility pings can put two
@@ -78,7 +79,12 @@ export function probeBackendHealth(): void {
 			if (myGeneration !== generation) {
 				return;
 			}
-			// Any ApiError counts as down here -- INCLUDING the 5xx the
+			// EVERY rejection counts as down here, and this handler takes no
+			// argument on purpose: an ApiError, and equally the DOMException a
+			// probe timeout now produces, both mean the backend did not answer.
+			// Narrowing this to `instanceof ApiError` would silently stop timeouts
+			// from turning the badge red -- there is a test pinning exactly that.
+			// The ApiError case INCLUDES the 5xx the
 			// passive layer abstains on: for this endpoint a 5xx is never a
 			// legitimate application answer, only a middleman covering for a
 			// dead upstream or a backend too broken to use, and both mean

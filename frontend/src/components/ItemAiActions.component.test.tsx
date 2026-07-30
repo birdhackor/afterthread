@@ -100,10 +100,11 @@ describe("ItemAiActions money-spending requests", () => {
 	it("posts enrichment context for the item supplied by props", async () => {
 		const user = userEvent.setup();
 		const context = `第 ${propItemId} 號項目的補充背景`;
-		mockedApiPost.mockResolvedValue({
-			gaps: [],
-			item,
-		} satisfies EnrichResponse);
+		// This request-only case keeps success-side invalidation and notifications
+		// out of scope so they cannot commit after the test has already finished.
+		mockedApiPost.mockImplementation(
+			() => new Promise<EnrichResponse>(() => {}),
+		);
 		renderActions();
 
 		await user.type(
@@ -126,9 +127,11 @@ describe("ItemAiActions money-spending requests", () => {
 	it("posts an assisted update for the item supplied by props", async () => {
 		const user = userEvent.setup();
 		const note = `第 ${propItemId} 號項目的進度說明`;
-		mockedApiPost.mockResolvedValue({
-			item,
-		} satisfies AssistUpdateResponse);
+		// This request-only case keeps success-side invalidation and notifications
+		// out of scope so they cannot commit after the test has already finished.
+		mockedApiPost.mockImplementation(
+			() => new Promise<AssistUpdateResponse>(() => {}),
+		);
 		renderActions();
 
 		await user.type(

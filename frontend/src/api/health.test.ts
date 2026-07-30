@@ -90,14 +90,31 @@ describe("probeBackendHealth", () => {
 	});
 
 	it("reports down on a transport failure (status 0 network_error)", async () => {
-		// Fetch rejections AND the probe's own AbortSignal timeout both land
-		// here: apiFetch's catch normalizes either into this ApiError shape.
+		// A fetch rejection normalizes into this ApiError shape. The probe's own
+		// timeout does NOT -- see the TimeoutError case below.
 		mockedApiFetch.mockRejectedValueOnce(
 			new ApiError({
 				status: 0,
 				code: "network_error",
 				message: "無法連線伺服器，請確認網路後再試",
 			}),
+		);
+		store.set(statusAtom, { reachable: true });
+		probeBackendHealth();
+		await flush();
+		expect(store.get(statusAtom)).toEqual({ reachable: false });
+	});
+
+	it("reports down when the probe's own timeout fires", async () => {
+		// The probe passes `AbortSignal.timeout()`, and since the client began
+		// rethrowing `signal.reason` unchanged an abort no longer arrives as an
+		// ApiError -- it arrives as this DOMException. Every other rejection
+		// fixture here is an ApiError, so without this case a handler narrowed to
+		// `instanceof ApiError` would keep the whole file green while a backend
+		// that accepts the connection and then never answers left the badge
+		// showing green indefinitely.
+		mockedApiFetch.mockRejectedValueOnce(
+			new DOMException("signal timed out", "TimeoutError"),
 		);
 		store.set(statusAtom, { reachable: true });
 		probeBackendHealth();

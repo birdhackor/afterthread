@@ -576,15 +576,18 @@ describe("ToolsPage component", () => {
 		await openDiscardConfirmation(user);
 		await user.click(screen.getByRole("button", { name: "丟掉並退回" }));
 
-		expectOnlyWriteCall(writeApiMocks, mockedApiDelete, [
-			"/api/tools/{name}/versions/{vid}",
-			{
-				path: {
-					name: list.tools[0].name,
-					vid: list.tools[0].current_vid,
+		// The confirmation action starts the mutation asynchronously.
+		await waitFor(() => {
+			expectOnlyWriteCall(writeApiMocks, mockedApiDelete, [
+				"/api/tools/{name}/versions/{vid}",
+				{
+					path: {
+						name: list.tools[0].name,
+						vid: list.tools[0].current_vid,
+					},
 				},
-			},
-		]);
+			]);
+		});
 		expect(
 			await screen.findByText(
 				"已丟掉「weather-search」的目前版本並退回前一版；原版本檔案已移除",
@@ -1249,11 +1252,12 @@ describe("ToolsPage component", () => {
 		await user.click(screen.getByRole("button", { name: "刪除" }));
 		const dialog = await screen.findByRole("dialog", { name: "刪除工具" });
 		await user.click(within(dialog).getByRole("button", { name: "刪除" }));
-		expectOnlyWriteCall(writeApiMocks, mockedApiDelete, [
-			"/api/tools/{name}",
-			{ path: { name: list.tools[0].name } },
-		]);
+		// The confirmation action starts the mutation asynchronously.
 		await waitFor(() => {
+			expectOnlyWriteCall(writeApiMocks, mockedApiDelete, [
+				"/api/tools/{name}",
+				{ path: { name: list.tools[0].name } },
+			]);
 			expect(toolListRequestCount()).toBe(2);
 		});
 	});

@@ -33,40 +33,6 @@ const writeApiMocks = [
 type CaptureResponse = ApiSuccessResponse<"/api/capture", "post">;
 
 const capturedItemId = 37;
-const captureResponse = {
-	item: {
-		alternatives: "",
-		assumptions: "",
-		confidence: "mixed",
-		consequences: "",
-		constraints: "",
-		created: "2026-07-29T10:00:00Z",
-		decisions: "",
-		evidence: "",
-		id: capturedItemId,
-		inferred: "",
-		is_stale: false,
-		known: "",
-		next_actions: "",
-		open_questions: "",
-		rationale: "",
-		recovery_files: "",
-		recovery_keywords: "",
-		recovery_people: "",
-		resume_trigger: "",
-		risks: "",
-		snapshot: "Capture request assertion fixture",
-		source: "llm-capture",
-		stage: "quick",
-		status: "capture-quick",
-		tags: ["request-assertion"],
-		title: `第 ${capturedItemId} 號捕捉結果`,
-		unknown: "",
-		updated: "2026-07-29T10:00:00Z",
-		why_matters: "",
-	},
-	questions: [],
-} satisfies CaptureResponse;
 
 describe("CapturePage money-spending request", () => {
 	beforeEach(() => {
@@ -85,7 +51,11 @@ describe("CapturePage money-spending request", () => {
 	it("posts the trimmed discussion to the capture schema path", async () => {
 		const user = userEvent.setup();
 		const rawText = `第 ${capturedItemId} 次架構討論的原始內容`;
-		mockedApiPost.mockResolvedValue(captureResponse);
+		// This request-only case keeps success-side rendering and invalidation out
+		// of scope so they cannot commit after the test has already finished.
+		mockedApiPost.mockImplementation(
+			() => new Promise<CaptureResponse>(() => {}),
+		);
 		renderWithAppProviders(<CapturePage />, {
 			initialEntries: ["/capture"],
 		});

@@ -178,6 +178,7 @@ describe("ItemDetailPage destructive and rewriting requests", () => {
 		expect(await screen.findByRole("combobox", { name: "狀態" })).toHaveValue(
 			"進行中",
 		);
+		// The refetched value can commit before the mutation clears its final gate.
 		await waitFor(() => {
 			expect(screen.getByRole("combobox", { name: "狀態" })).toBeEnabled();
 		});
@@ -212,6 +213,7 @@ describe("ItemDetailPage destructive and rewriting requests", () => {
 			]);
 		});
 		expect(await screen.findByText(note)).toBeInTheDocument();
+		// The refetched note can commit before the mutation clears its final gate.
 		await waitFor(() => {
 			expect(screen.getByRole("button", { name: "新增進度" })).toBeEnabled();
 		});
