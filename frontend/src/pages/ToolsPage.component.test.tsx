@@ -534,6 +534,7 @@ describe("ToolsPage component", () => {
 		renderWithAppProviders(<ToolsPage />);
 		await waitForTool();
 
+		expect(screen.queryByText("無法退回前一版")).not.toBeInTheDocument();
 		expect(
 			screen.getByText("可丟掉目前版本，回到前一版。"),
 		).toBeInTheDocument();
@@ -651,13 +652,14 @@ describe("ToolsPage component", () => {
 		await openDiscardConfirmation(user);
 		await user.click(screen.getByRole("button", { name: "重新整理" }));
 
+		// The request starts before React commits the shared refetch gate.
 		await waitFor(() => {
 			expect(toolListRequestCount()).toBe(2);
+			expect(screen.getByRole("button", { name: "重新產生" })).toBeDisabled();
+			expect(screen.getByRole("textbox", { name: "修訂意見" })).toBeDisabled();
+			expect(screen.getByRole("button", { name: "送出修訂" })).toBeDisabled();
+			expect(screen.getByRole("button", { name: "丟掉並退回" })).toBeDisabled();
 		});
-		expect(screen.getByRole("button", { name: "重新產生" })).toBeDisabled();
-		expect(screen.getByRole("textbox", { name: "修訂意見" })).toBeDisabled();
-		expect(screen.getByRole("button", { name: "送出修訂" })).toBeDisabled();
-		expect(screen.getByRole("button", { name: "丟掉並退回" })).toBeDisabled();
 		await user.click(screen.getByRole("button", { name: "重新產生" }));
 		await user.click(screen.getByRole("button", { name: "丟掉並退回" }));
 		const reviseForm = screen
@@ -683,10 +685,10 @@ describe("ToolsPage component", () => {
 			expectedRead(
 				toolsListRead,
 				(callNumber) =>
-					callNumber === 1
-						? Promise.resolve(list)
-						: Promise.reject(new Error("工具清單重讀失敗")),
-				2,
+					callNumber === 2
+						? Promise.reject(new Error("工具清單重讀失敗"))
+						: Promise.resolve(list),
+				3,
 			),
 			expectedRead(
 				toolSummaryRead("weather-search"),
@@ -695,12 +697,14 @@ describe("ToolsPage component", () => {
 			),
 		);
 
-		renderWithAppProviders(<ToolsPage />);
+		const { queryClient } = renderWithAppProviders(<ToolsPage />);
 		await waitForTool();
 		await user.click(screen.getByRole("button", { name: "AI 總結" }));
 		expect(
 			await screen.findByText("weather-search 的工具總結"),
 		).toBeInTheDocument();
+		expect(screen.queryByText("無法更新工具清單")).not.toBeInTheDocument();
+		expect(screen.queryByText("載入失敗")).not.toBeInTheDocument();
 		await openDiscardConfirmation(user);
 		await user.click(screen.getByRole("button", { name: "重新整理" }));
 
@@ -712,6 +716,16 @@ describe("ToolsPage component", () => {
 		await user.click(screen.getByRole("button", { name: "丟掉並退回" }));
 		expect(apiPost).not.toHaveBeenCalled();
 		expect(apiDelete).not.toHaveBeenCalled();
+
+		await act(async () => {
+			await queryClient.refetchQueries({
+				queryKey: ["tools"],
+				exact: true,
+			});
+		});
+		await waitFor(() => {
+			expect(screen.queryByText("無法更新工具清單")).not.toBeInTheDocument();
+		});
 	});
 
 	it("blocks revision authoring while its displayed summary is refreshing or stale", async () => {
@@ -723,10 +737,10 @@ describe("ToolsPage component", () => {
 			expectedRead(
 				toolSummaryRead("weather-search"),
 				(callNumber) =>
-					callNumber === 1
+					callNumber === 1 || callNumber === 3
 						? Promise.resolve(summaryFor(list.tools[0]))
 						: summaryRefresh.promise,
-				2,
+				3,
 			),
 		);
 
@@ -736,6 +750,7 @@ describe("ToolsPage component", () => {
 		expect(
 			await screen.findByText("weather-search 的工具總結"),
 		).toBeInTheDocument();
+		expect(screen.queryByText("無法更新總結")).not.toBeInTheDocument();
 		await user.type(
 			screen.getByRole("textbox", { name: "修訂意見" }),
 			"總結重讀期間不可送出",
@@ -744,16 +759,17 @@ describe("ToolsPage component", () => {
 		const invalidation = queryClient.invalidateQueries({
 			queryKey: ["tool-summary", "weather-search"],
 		});
+		// The queryFn call precedes the render that exposes its refresh gate.
 		await waitFor(() => {
 			expect(
 				mockedApiGet.mock.calls.filter(
 					([path]) => path === "/api/tools/{name}/summary",
 				),
 			).toHaveLength(2);
+			expect(screen.getByRole("textbox", { name: "修訂意見" })).toBeDisabled();
+			expect(screen.getByRole("button", { name: "送出修訂" })).toBeDisabled();
+			expect(screen.getByRole("button", { name: "重新產生" })).toBeEnabled();
 		});
-		expect(screen.getByRole("textbox", { name: "修訂意見" })).toBeDisabled();
-		expect(screen.getByRole("button", { name: "送出修訂" })).toBeDisabled();
-		expect(screen.getByRole("button", { name: "重新產生" })).toBeEnabled();
 		const reviseForm = screen
 			.getByRole("textbox", { name: "修訂意見" })
 			.closest("form");
@@ -772,6 +788,15 @@ describe("ToolsPage component", () => {
 		expect(screen.getByRole("button", { name: "送出修訂" })).toBeDisabled();
 		expect(screen.getByRole("button", { name: "重新產生" })).toBeEnabled();
 		expect(apiPost).not.toHaveBeenCalled();
+
+		await act(async () => {
+			await queryClient.refetchQueries({
+				queryKey: ["tool-summary", "weather-search"],
+			});
+		});
+		await waitFor(() => {
+			expect(screen.queryByText("無法更新總結")).not.toBeInTheDocument();
+		});
 	});
 
 	it("sends the exact regenerate request and gates other tools while pending", async () => {
@@ -820,6 +845,7 @@ describe("ToolsPage component", () => {
 		);
 		await user.click(screen.getByRole("tab", { name: "已安裝工具" }));
 		await user.click(screen.getAllByRole("button", { name: "重新產生" })[0]);
+		// The POST begins before the mutation-pending gate is committed.
 		await waitFor(() => {
 			expectOnlyWriteCall(writeApiMocks, mockedApiPost, [
 				"/api/tools/{name}/summary/regenerate",
@@ -828,11 +854,11 @@ describe("ToolsPage component", () => {
 					body: { expected_vid: list.tools[0].current_vid },
 				},
 			]);
+			expect(
+				screen.getAllByRole("button", { name: "重新產生" })[1],
+			).toBeDisabled();
 		});
 
-		expect(
-			screen.getAllByRole("button", { name: "重新產生" })[1],
-		).toBeDisabled();
 		expect(
 			screen.getAllByRole("textbox", { name: "修訂意見" })[1],
 		).toBeDisabled();
@@ -887,6 +913,7 @@ describe("ToolsPage component", () => {
 			"建立測試工具",
 		);
 		await user.click(screen.getByRole("button", { name: "開始安裝" }));
+		// The POST begins before the mutation-pending gate is committed.
 		await waitFor(() => {
 			expectOnlyWriteCall(writeApiMocks, mockedApiPost, [
 				"/api/tools/install",
@@ -897,14 +924,14 @@ describe("ToolsPage component", () => {
 					},
 				},
 			]);
+			expect(
+				screen.getByRole("textbox", { name: "OpenAPI JSON 網址" }),
+			).toBeDisabled();
+			expect(
+				screen.getByRole("textbox", { name: "給 AI 的指示" }),
+			).toBeDisabled();
+			expect(screen.getByRole("button", { name: "開始安裝" })).toBeDisabled();
 		});
-		expect(
-			screen.getByRole("textbox", { name: "OpenAPI JSON 網址" }),
-		).toBeDisabled();
-		expect(
-			screen.getByRole("textbox", { name: "給 AI 的指示" }),
-		).toBeDisabled();
-		expect(screen.getByRole("button", { name: "開始安裝" })).toBeDisabled();
 		const installForm = screen
 			.getByRole("textbox", { name: "OpenAPI JSON 網址" })
 			.closest("form");
@@ -978,6 +1005,7 @@ describe("ToolsPage component", () => {
 		expect(
 			await screen.findByText("AI 正在安裝工具，可能需要數分鐘……"),
 		).toBeInTheDocument();
+		expect(screen.queryByText("安裝完成")).not.toBeInTheDocument();
 		const installUrl = screen.getByRole("textbox", {
 			name: "OpenAPI JSON 網址",
 		});
@@ -1106,6 +1134,7 @@ describe("ToolsPage component", () => {
 			).toBeEnabled();
 		});
 		await user.click(screen.getAllByRole("button", { name: "送出修訂" })[0]);
+		// The POST begins before the cross-tool pending gate is committed.
 		await waitFor(() => {
 			expectOnlyWriteCall(writeApiMocks, mockedApiPost, [
 				"/api/tools/{name}/revise",
@@ -1117,10 +1146,10 @@ describe("ToolsPage component", () => {
 					},
 				},
 			]);
+			expect(
+				screen.getAllByRole("button", { name: "重新產生" })[1],
+			).toBeDisabled();
 		});
-		expect(
-			screen.getAllByRole("button", { name: "重新產生" })[1],
-		).toBeDisabled();
 
 		await act(async () => {
 			revise.resolve({ job_id: "job-revise-1" });
@@ -1129,6 +1158,7 @@ describe("ToolsPage component", () => {
 		expect(
 			await screen.findByText("AI 正在修訂工具，可能需要數分鐘……"),
 		).toBeInTheDocument();
+		expect(screen.queryByText("修訂完成")).not.toBeInTheDocument();
 		expect(
 			screen.getAllByRole("button", { name: "重新產生" })[1],
 		).toBeDisabled();

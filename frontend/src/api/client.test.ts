@@ -691,11 +691,16 @@ describe("apiFetch passive connectivity reporting", () => {
 		expect(store.get(statusAtom)).toEqual({ reachable: true });
 	});
 
-	it("rejects a primitive body-bearing 2xx as an ApiError", async () => {
+	it.each([
+		["string", "a string"],
+		["number", 1],
+		["true boolean", true],
+		["false boolean", false],
+	])("rejects a %s body-bearing 2xx as an ApiError", async (_label, value) => {
 		stubFetch(async () => ({
 			ok: true,
 			status: 200,
-			text: async () => JSON.stringify("a string"),
+			text: async () => JSON.stringify(value),
 		}));
 
 		const error = await rejectionOf(apiGet("/api/health"));

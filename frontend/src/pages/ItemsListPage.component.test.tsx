@@ -3,6 +3,7 @@
 import { act, cleanup, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { getDefaultStore } from "jotai";
+import { Profiler } from "react";
 import {
 	afterEach,
 	beforeEach,
@@ -106,11 +107,13 @@ function itemRead(
 }
 
 function deferred<T>() {
+	let resolve!: (value: T) => void;
 	let reject!: (reason?: unknown) => void;
-	const promise = new Promise<T>((_resolve, fail) => {
+	const promise = new Promise<T>((succeed, fail) => {
+		resolve = succeed;
 		reject = fail;
 	});
-	return { promise, reject };
+	return { promise, resolve, reject };
 }
 
 function mockReadSequence(...steps: ReadStep[]) {
@@ -209,18 +212,32 @@ describe("ItemsListPage display correctness", () => {
 					code: "network_error",
 				}),
 			},
+			{
+				call: itemRead({ q: query }),
+				response: { items: [item(2, "更新成功資料")], total: 1 },
+			},
 		);
 		renderWithAppProviders(<ItemsListPage />, {
 			initialEntries: ["/items"],
 		});
 
 		expect(await findDisplayedText("上次成功資料")).toBeInTheDocument();
+		expect(screen.queryByText("重新載入失敗")).not.toBeInTheDocument();
+		expect(
+			screen.queryByRole("button", { name: "重試" }),
+		).not.toBeInTheDocument();
 		await user.type(screen.getByRole("textbox", { name: "搜尋" }), query);
 
 		expect(await screen.findByText("重新載入失敗")).toBeInTheDocument();
 		expect(screen.getByText("上次成功資料")).toBeInTheDocument();
 		expect(screen.getByText("共 1 筆（顯示先前結果）")).toBeInTheDocument();
 		expect(screen.queryByText("找不到符合條件的項目")).not.toBeInTheDocument();
+
+		await user.click(screen.getByRole("button", { name: "重試" }));
+		expect(await findDisplayedText("更新成功資料")).toBeInTheDocument();
+		await waitFor(() => {
+			expect(screen.queryByText("重新載入失敗")).not.toBeInTheDocument();
+		});
 	});
 
 	// Two Mantine Select interactions plus two real 300 ms debounce windows can
@@ -333,28 +350,71 @@ describe("ItemsListPage display correctness", () => {
 
 	it("clamps an emptied last page and displays the new last page", async () => {
 		store.set(pageAtom, 3);
+		const overshoot = deferred<ItemListResponse>();
+		const corrected = deferred<ItemListResponse>();
+		let markOvershootStarted!: () => void;
+		const overshootStarted = new Promise<void>((resolve) => {
+			markOvershootStarted = resolve;
+		});
+		let markCorrectedStarted!: () => void;
+		const correctedStarted = new Promise<void>((resolve) => {
+			markCorrectedStarted = resolve;
+		});
+		let markCorrectedCommitted!: () => void;
+		const correctedCommitted = new Promise<void>((resolve) => {
+			markCorrectedCommitted = resolve;
+		});
 		mockReadSequence(
 			{
 				call: itemRead({ offset: DEFAULT_LIMIT * 2 }),
-				response: { items: [], total: 21 },
+				promise: overshoot.promise,
+				onStart: markOvershootStarted,
 			},
 			{
 				call: itemRead({ offset: DEFAULT_LIMIT }),
-				response: { items: [item(21, "校正後最後一頁")], total: 21 },
+				promise: corrected.promise,
+				onStart: markCorrectedStarted,
 			},
 		);
-		renderWithAppProviders(<ItemsListPage />, {
-			initialEntries: ["/items"],
+		renderWithAppProviders(
+			<Profiler
+				id="page-clamp"
+				onRender={() => {
+					if (screen.queryByText("校正後最後一頁")) {
+						markCorrectedCommitted();
+					}
+				}}
+			>
+				<ItemsListPage />
+			</Profiler>,
+			{ initialEntries: ["/items"] },
+		);
+
+		// Wait for the async router mount before delivering the response that
+		// drives the clamp effect, then flush that effect through React's commit.
+		await overshootStarted;
+		await act(async () => {
+			overshoot.resolve({ items: [], total: 21 });
+			await overshoot.promise;
+		});
+		await correctedStarted;
+		await act(async () => {
+			corrected.resolve({
+				items: [item(21, "校正後最後一頁")],
+				total: 21,
+			});
+			await corrected.promise;
+			// React Query schedules observer delivery separately from its request;
+			// wait for the corrected render's actual commit inside this act.
+			await correctedCommitted;
 		});
 
-		expect(await findDisplayedText("校正後最後一頁")).toBeInTheDocument();
+		expect(screen.getByText("校正後最後一頁")).toBeInTheDocument();
 		expect(screen.getByText("共 21 筆")).toBeInTheDocument();
 		expect(screen.getByRole("button", { name: "2" })).toHaveAttribute(
 			"data-active",
 			"true",
 		);
-		await waitFor(() => {
-			expect(mockedApiGet).toHaveBeenCalledTimes(2);
-		});
+		expect(mockedApiGet).toHaveBeenCalledTimes(2);
 	});
 });

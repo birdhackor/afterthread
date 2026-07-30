@@ -83,12 +83,16 @@ const expectedItemReadCall = [
 	{ path: { item_id: routeItemId } },
 ] as const;
 
-function mockExpectedItemRead() {
+function mockItemReadResponses(...responses: ItemDetailResponse[]) {
 	mockedApiGet.mockImplementation((...call) => {
 		// A permissive fixture hides a wrong route target by rendering plausible
 		// content for it, even while the later write still targets this route.
 		expect(call).toEqual(expectedItemReadCall);
-		return Promise.resolve(item);
+		const response = responses[mockedApiGet.mock.calls.length - 1];
+		if (response === undefined) {
+			throw new Error("Unexpected additional item read");
+		}
+		return Promise.resolve(response);
 	});
 }
 
@@ -120,7 +124,7 @@ describe("ItemDetailPage destructive and rewriting requests", () => {
 			model: null,
 			error: null,
 		});
-		mockExpectedItemRead();
+		mockItemReadResponses(item);
 	});
 
 	it("deletes the item identified by the route and names that item in the success notification", async () => {
@@ -150,6 +154,7 @@ describe("ItemDetailPage destructive and rewriting requests", () => {
 
 	it("patches status on the item identified by the route", async () => {
 		const user = userEvent.setup();
+		mockItemReadResponses(item, { ...item, status: "active" });
 		mockedApiPatch.mockResolvedValue({ ...item, status: "active" });
 		renderDetailPage();
 
@@ -170,18 +175,26 @@ describe("ItemDetailPage destructive and rewriting requests", () => {
 				},
 			]);
 		});
+		expect(await screen.findByRole("combobox", { name: "狀態" })).toHaveValue(
+			"進行中",
+		);
+		await waitFor(() => {
+			expect(screen.getByRole("combobox", { name: "狀態" })).toBeEnabled();
+		});
 		expectItemReads(2);
 	});
 
 	it("posts a progress rewrite to the route item with the submitted note", async () => {
 		const user = userEvent.setup();
 		const note = `第 ${routeItemId} 號項目的新進度`;
-		mockedApiPost.mockResolvedValue({
+		const progress = {
 			date: "2026-07-29T08:30:00Z",
 			id: 501,
 			item_id: item.id,
 			note,
-		} satisfies ProgressResponse);
+		} satisfies ProgressResponse;
+		mockItemReadResponses(item, { ...item, progress: [progress] });
+		mockedApiPost.mockResolvedValue(progress);
 		renderDetailPage();
 
 		await waitFor(() => expectItemReads());
@@ -197,6 +210,10 @@ describe("ItemDetailPage destructive and rewriting requests", () => {
 					body: { note },
 				},
 			]);
+		});
+		expect(await screen.findByText(note)).toBeInTheDocument();
+		await waitFor(() => {
+			expect(screen.getByRole("button", { name: "新增進度" })).toBeEnabled();
 		});
 		expectItemReads(2);
 	});

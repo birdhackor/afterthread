@@ -101,21 +101,43 @@ type ParameterGroup<
 	? Exclude<OperationParameters<Path, Method>[Group], undefined>
 	: never;
 
+type RequiredKeys<Value> = Value extends object
+	? {
+			[Key in keyof Value]-?: object extends Pick<Value, Key> ? never : Key;
+		}[keyof Value]
+	: never;
+
+// Kept generic over the two OpenAPI groups so the required-query behaviour can
+// be compile-tested before the backend adds the first endpoint that exercises it.
+export type ApiRequestParametersFor<PathParameters, QueryParameters> = ([
+	PathParameters,
+] extends [never]
+	? { path?: never }
+	: { path: PathParameters }) &
+	([QueryParameters] extends [never]
+		? { query?: never }
+		: [RequiredKeys<QueryParameters>] extends [never]
+			? { query?: QueryParameters }
+			: { query: QueryParameters });
+
 export type ApiRequestParameters<
 	Path extends SchemaPath,
 	Method extends ApiMethod,
-> = ([ParameterGroup<Path, Method, "path">] extends [never]
-	? { path?: never }
-	: { path: ParameterGroup<Path, Method, "path"> }) &
-	([ParameterGroup<Path, Method, "query">] extends [never]
-		? { query?: never }
-		: { query?: ParameterGroup<Path, Method, "query"> });
-
-type ApiParameterArgs<Path extends SchemaPath, Method extends ApiMethod> = [
+> = ApiRequestParametersFor<
 	ParameterGroup<Path, Method, "path">,
+	ParameterGroup<Path, Method, "query">
+>;
+
+export type ApiParameterArgsFor<Parameters extends object> = [
+	RequiredKeys<Parameters>,
 ] extends [never]
-	? [parameters?: ApiRequestParameters<Path, Method>]
-	: [parameters: ApiRequestParameters<Path, Method>];
+	? [parameters?: Parameters]
+	: [parameters: Parameters];
+
+type ApiParameterArgs<
+	Path extends SchemaPath,
+	Method extends ApiMethod,
+> = ApiParameterArgsFor<ApiRequestParameters<Path, Method>>;
 
 export type ApiJsonRequestOptions<
 	Path extends SchemaPath,

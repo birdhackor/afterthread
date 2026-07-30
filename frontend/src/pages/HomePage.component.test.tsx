@@ -45,6 +45,42 @@ const reviewResponse = {
 	waiting: [],
 	parked: [],
 } satisfies ReviewResponse;
+const recoveredReviewResponse = {
+	...reviewResponse,
+	needs_enrichment: [
+		{
+			alternatives: "",
+			assumptions: "",
+			confidence: "mixed",
+			consequences: "",
+			constraints: "",
+			created: "2026-07-30T00:00:00Z",
+			decisions: "",
+			evidence: "",
+			id: 37,
+			inferred: "",
+			is_stale: false,
+			known: "",
+			next_actions: "",
+			open_questions: "",
+			rationale: "",
+			recovery_files: "",
+			recovery_keywords: "",
+			recovery_people: "",
+			resume_trigger: "",
+			risks: "",
+			snapshot: "恢復後的非空回顧",
+			source: "manual",
+			stage: "quick",
+			status: "capture-quick",
+			tags: [],
+			title: "恢復後待補齊項目",
+			unknown: "",
+			updated: "2026-07-30T00:00:00Z",
+			why_matters: "",
+		},
+	],
+} satisfies ReviewResponse;
 const expectedReviewRead = ["/api/review"] as const;
 let expectedReviewReadCount = 1;
 
@@ -165,10 +201,11 @@ describe("HomePage operator guidance", () => {
 		mockedApiGet
 			.mockResolvedValueOnce(reviewResponse)
 			.mockRejectedValueOnce(new Error(message))
-			.mockResolvedValueOnce(reviewResponse);
+			.mockResolvedValueOnce(recoveredReviewResponse);
 		const { queryClient } = renderWithAppProviders(<HomePage />);
 
 		expect(await screen.findByText("沒有待補齊的項目")).toBeInTheDocument();
+		expect(screen.queryByText("載入失敗")).not.toBeInTheDocument();
 		expect(screen.queryByText("無法更新回顧")).not.toBeInTheDocument();
 		await act(async () => {
 			await queryClient.refetchQueries({
@@ -191,6 +228,8 @@ describe("HomePage operator guidance", () => {
 		});
 		await waitFor(() => {
 			expect(screen.queryByText("無法更新回顧")).not.toBeInTheDocument();
+			expect(screen.queryByText("沒有待補齊的項目")).not.toBeInTheDocument();
+			expect(screen.getByText("恢復後待補齊項目")).toBeInTheDocument();
 		});
 	});
 });
