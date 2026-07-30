@@ -779,30 +779,174 @@ describe("apiFetch passive connectivity reporting", () => {
 		expect(store.get(statusAtom)).toEqual({ reachable: true });
 	});
 
-	it("skips every passive report when reportConnectivity is false", async () => {
-		// Success path: a fully delivered ok response must NOT report up --
-		// probe traffic (api/health.ts) opts out so its generation-guarded
-		// semantic verdict stays the only connectivity writer for probes.
-		stubFetch(async () => ({
-			ok: true,
-			status: 200,
-			text: async () => JSON.stringify({ status: "ok" }),
-		}));
-		await expect(
-			apiFetch("/api/health", { method: "GET", reportConnectivity: false }),
-		).resolves.toEqual({ status: "ok" });
-		expect(store.get(statusAtom)).toEqual({ reachable: null });
+	const passiveOptOutCases = [
+		{
+			name: "fetch TimeoutError keeps up",
+			initialReachable: true,
+			exercise: async () => {
+				const controller = new AbortController();
+				const timeoutReason = new DOMException(
+					"request timed out",
+					"TimeoutError",
+				);
+				stubFetch(
+					(_path, options) =>
+						new Promise((_resolve, reject) => {
+							const signal = options?.signal;
+							if (!(signal instanceof AbortSignal)) {
+								reject(
+									new Error("expected apiFetch to forward its AbortSignal"),
+								);
+								return;
+							}
+							signal.addEventListener("abort", () => reject(signal.reason), {
+								once: true,
+							});
+						}),
+				);
 
-		// Failure path: a transport failure must not report down either --
-		// opting out silences BOTH directions, not just the up-report.
-		stubFetch(async () => {
-			throw new TypeError("Failed to fetch");
+				const request = apiFetch("/api/health", {
+					method: "GET",
+					signal: controller.signal,
+					reportConnectivity: false,
+				});
+				controller.abort(timeoutReason);
+
+				await expect(request).rejects.toBe(timeoutReason);
+			},
+		},
+		{
+			name: "body TimeoutError keeps up",
+			initialReachable: true,
+			exercise: async () => {
+				const controller = new AbortController();
+				let markBodyReadStarted: (() => void) | undefined;
+				const bodyReadStarted = new Promise<void>((resolve) => {
+					markBodyReadStarted = resolve;
+				});
+				stubFetch(async () => ({
+					ok: true,
+					status: 200,
+					text: () => {
+						markBodyReadStarted?.();
+						return new Promise<string>((_resolve, reject) => {
+							controller.signal.addEventListener(
+								"abort",
+								() => reject(controller.signal.reason),
+								{ once: true },
+							);
+						});
+					},
+				}));
+
+				const request = apiFetch("/api/health", {
+					method: "GET",
+					signal: controller.signal,
+					reportConnectivity: false,
+				});
+				await bodyReadStarted;
+				const timeoutReason = new DOMException(
+					"response body timed out",
+					"TimeoutError",
+				);
+				controller.abort(timeoutReason);
+
+				await expect(request).rejects.toBe(timeoutReason);
+			},
+		},
+		{
+			name: "fetch failure keeps up",
+			initialReachable: true,
+			exercise: async () => {
+				stubFetch(async () => {
+					throw new TypeError("Failed to fetch");
+				});
+
+				const error = await rejectionOf(
+					apiFetch("/api/health", {
+						method: "GET",
+						reportConnectivity: false,
+					}),
+				);
+				expectNetworkError(error);
+			},
+		},
+		{
+			name: "body failure keeps up",
+			initialReachable: true,
+			exercise: async () => {
+				stubFetch(async () => ({
+					ok: true,
+					status: 200,
+					text: async () => {
+						throw new TypeError("body stream aborted");
+					},
+				}));
+
+				const error = await rejectionOf(
+					apiFetch("/api/health", {
+						method: "GET",
+						reportConnectivity: false,
+					}),
+				);
+				expectNetworkError(error);
+			},
+		},
+		{
+			name: "204 keeps down",
+			initialReachable: false,
+			exercise: async () => {
+				stubFetch(async () => ({
+					ok: true,
+					status: 204,
+					text: async () => {
+						throw new Error("a 204 body must not be read");
+					},
+				}));
+
+				await expect(
+					apiFetch("/api/health", {
+						method: "GET",
+						reportConnectivity: false,
+					}),
+				).resolves.toBeNull();
+			},
+		},
+		{
+			name: "complete sub-5xx keeps down",
+			initialReachable: false,
+			exercise: async () => {
+				stubFetch(async () => ({
+					ok: true,
+					status: 200,
+					text: async () => JSON.stringify({ status: "ok" }),
+				}));
+
+				await expect(
+					apiFetch("/api/health", {
+						method: "GET",
+						reportConnectivity: false,
+					}),
+				).resolves.toEqual({ status: "ok" });
+			},
+		},
+	] satisfies ReadonlyArray<{
+		name: string;
+		initialReachable: boolean;
+		exercise: () => Promise<void>;
+	}>;
+
+	it.each(passiveOptOutCases)("opts out at $name", async ({
+		initialReachable,
+		exercise,
+	}) => {
+		// Every potential down-report starts known-up and every potential
+		// up-report starts known-down, so an accidental write must flip the
+		// value instead of being hidden by null or an already-matching state.
+		store.set(statusAtom, { reachable: initialReachable });
+		await exercise();
+		expect(store.get(statusAtom)).toEqual({
+			reachable: initialReachable,
 		});
-		store.set(statusAtom, { reachable: true });
-		const error = await rejectionOf(
-			apiFetch("/api/health", { method: "GET", reportConnectivity: false }),
-		);
-		expectNetworkError(error);
-		expect(store.get(statusAtom)).toEqual({ reachable: true });
 	});
 });
