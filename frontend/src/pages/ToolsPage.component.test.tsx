@@ -419,7 +419,7 @@ describe("ToolsPage component", () => {
 		});
 	});
 
-	it("closes discard confirmation when the displayed version changes", async () => {
+	it("clears discard confirmation when the displayed version changes", async () => {
 		const user = userEvent.setup();
 		const versionV = toolListWith({
 			current_vid: "v-weather-revision",
@@ -432,8 +432,8 @@ describe("ToolsPage component", () => {
 		mockStrictReads(
 			expectedRead(
 				toolsListRead,
-				(callNumber) => Promise.resolve(callNumber === 1 ? versionV : versionP),
-				2,
+				(callNumber) => Promise.resolve(callNumber === 2 ? versionP : versionV),
+				3,
 			),
 		);
 
@@ -454,6 +454,18 @@ describe("ToolsPage component", () => {
 
 		await removal;
 		expect(toolListRequestCount()).toBe(2);
+		// Returning to the original vid must not resurrect the old confirmation:
+		// its target was cleared, not merely hidden while the identities differed.
+		await act(async () => {
+			await queryClient.invalidateQueries({
+				queryKey: ["tools"],
+				exact: true,
+			});
+		});
+		expect(toolListRequestCount()).toBe(3);
+		expect(
+			screen.queryByRole("dialog", { name: "退回前一版" }),
+		).not.toBeInTheDocument();
 		expect(apiDelete).not.toHaveBeenCalled();
 	});
 

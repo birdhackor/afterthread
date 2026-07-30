@@ -1,7 +1,11 @@
 import { getDefaultStore } from "jotai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { backendStatusAtom } from "./connectivity.js";
-import { llmStatusAtom, loadLlmStatusAtom } from "./llm.js";
+import {
+	llmStatusAtom,
+	loadLlmStatusAtom,
+	markLlmUnconfiguredAtom,
+} from "./llm.js";
 
 // llm.js's action atoms run in whatever store invokes them; like the app
 // itself (no <Provider>), these tests go through the default store. They stub
@@ -60,7 +64,7 @@ afterEach(() => {
 });
 
 describe("loadLlmStatusAtom", () => {
-	it("force during an in-flight load starts a second request and the stale response is discarded", async () => {
+	it("force during an in-flight load starts a second request and the stale rejection is discarded", async () => {
 		const oldProbe = deferred();
 		const forced = deferred();
 		const fetchSpy = vi
@@ -108,6 +112,67 @@ describe("loadLlmStatusAtom", () => {
 		});
 	});
 
+	it("discards a stale success after a newer forced load already ruled", async () => {
+		const oldProbe = deferred();
+		const forced = deferred();
+		globalThis.fetch = vi
+			.fn()
+			.mockReturnValueOnce(oldProbe.promise)
+			.mockReturnValueOnce(forced.promise);
+
+		store.set(loadLlmStatusAtom);
+		store.set(loadLlmStatusAtom, { force: true });
+
+		// The recovery-triggered probe reports the current backend reading
+		// first. A slower startup response must not later re-enable AI controls
+		// with a configured reading that was already superseded.
+		forced.resolve(jsonResponse({ configured: false, model: null }));
+		await flush();
+		expect(store.get(llmStatusAtom)).toEqual({
+			loaded: true,
+			loading: false,
+			configured: false,
+			model: null,
+			error: null,
+		});
+		oldProbe.resolve(jsonResponse({ configured: true, model: "stale-model" }));
+		await flush();
+		expect(store.get(llmStatusAtom)).toEqual({
+			loaded: true,
+			loading: false,
+			configured: false,
+			model: null,
+			error: null,
+		});
+	});
+
+	it("an authoritative downgrade invalidates an in-flight status success", async () => {
+		const oldProbe = deferred();
+		globalThis.fetch = vi.fn().mockReturnValueOnce(oldProbe.promise);
+
+		store.set(loadLlmStatusAtom);
+		store.set(markLlmUnconfiguredAtom);
+		expect(store.get(llmStatusAtom)).toEqual({
+			loaded: true,
+			loading: false,
+			configured: false,
+			model: null,
+			error: null,
+		});
+
+		// A real AI call's 503 owns this downgrade. The older optimistic status
+		// response must be stale even though no newer status probe was started.
+		oldProbe.resolve(jsonResponse({ configured: true, model: "stale-model" }));
+		await flush();
+		expect(store.get(llmStatusAtom)).toEqual({
+			loaded: true,
+			loading: false,
+			configured: false,
+			model: null,
+			error: null,
+		});
+	});
+
 	it("a non-forced call during an in-flight load still no-ops", async () => {
 		const probe = deferred();
 		const fetchSpy = vi.fn().mockReturnValueOnce(probe.promise);
@@ -137,9 +202,11 @@ describe("loadLlmStatusAtom", () => {
 		});
 	});
 
-	it("a current-generation TimeoutError updates both LLM failure and backend connectivity states", async () => {
+	it("uses one positive finite deadline whose TimeoutError updates LLM and connectivity states", async () => {
 		const timeoutController = new AbortController();
-		vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeoutController.signal);
+		const timeoutSpy = vi
+			.spyOn(AbortSignal, "timeout")
+			.mockReturnValue(timeoutController.signal);
 		const fetchSpy = vi.fn((_path, options) => {
 			return new Promise((_resolve, reject) => {
 				options.signal.addEventListener(
@@ -153,6 +220,13 @@ describe("loadLlmStatusAtom", () => {
 		store.set(backendStatusAtom, { reachable: true });
 
 		store.set(loadLlmStatusAtom);
+		expect(timeoutSpy).toHaveBeenCalledOnce();
+		const [timeoutMs] = timeoutSpy.mock.calls[0] ?? [];
+		expect(
+			typeof timeoutMs === "number" &&
+				Number.isFinite(timeoutMs) &&
+				timeoutMs > 0,
+		).toBe(true);
 		const timeoutReason = new DOMException(
 			"LLM status probe timed out",
 			"TimeoutError",

@@ -43,16 +43,19 @@ function flush(): Promise<void> {
 	});
 }
 
-// A promise plus its out-of-band settle handle, for the ordering test.
+// A promise plus its out-of-band settle handles, for the ordering tests.
 function deferred<Value>(): {
 	promise: Promise<Value>;
 	resolve: (value: Value | PromiseLike<Value>) => void;
+	reject: (reason?: unknown) => void;
 } {
 	let resolve!: (value: Value | PromiseLike<Value>) => void;
-	const promise = new Promise<Value>((res) => {
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<Value>((res, rej) => {
 		resolve = res;
+		reject = rej;
 	});
-	return { promise, resolve };
+	return { promise, resolve, reject };
 }
 
 beforeEach(() => {
@@ -179,5 +182,21 @@ describe("probeBackendHealth", () => {
 		slow.resolve({ status: "ok" });
 		await flush();
 		expect(store.get(statusAtom)).toEqual({ reachable: false });
+	});
+
+	it("discards a stale rejection after a newer probe already reported up", async () => {
+		// Probe A hangs, then a focus-triggered probe B succeeds and paints the
+		// backend green. A's later timeout must not repaint that newer verdict
+		// red; the rejection branch needs the same generation guard as success.
+		const slow = deferred<HealthResponse>();
+		mockedApiFetch.mockReturnValueOnce(slow.promise); // probe A
+		mockedApiFetch.mockResolvedValueOnce({ status: "ok" }); // probe B
+		probeBackendHealth();
+		probeBackendHealth();
+		await flush();
+		expect(store.get(statusAtom)).toEqual({ reachable: true });
+		slow.reject(new DOMException("health probe timed out", "TimeoutError"));
+		await flush();
+		expect(store.get(statusAtom)).toEqual({ reachable: true });
 	});
 });
