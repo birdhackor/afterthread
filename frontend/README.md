@@ -77,10 +77,13 @@ const response = {
 
 ## API schema 型別
 
-`src/api/schema.gen.ts` 是從後端 FastAPI/Pydantic 的真實 OpenAPI schema 產生並
-提交的 API contract；瀏覽器 build 只讀這個 TypeScript 檔，不需要 Python，也不會
-啟動後端。後端的 request／response schema 有任何異動後，請在 repo 已安裝
-`uv` 與 `pnpm` 依賴的環境執行：
+`src/api/openapi.gen.json`、`src/api/schema.gen.ts` 與
+`src/api/request-body-required.gen.ts` 是從後端 FastAPI/Pydantic 的真實 OpenAPI
+schema 產生並提交的 API contract；瀏覽器 build 只讀後兩個 TypeScript 檔，不需要
+Python，也不會啟動後端。required-key map 讓 request body 依 OpenAPI 的
+`required` 陣列判斷必填欄位；一般 generated types 仍保留 defaulted response
+欄位必定存在的嚴格契約。後端的 request／response schema 有任何異動後，請在 repo
+已安裝 `uv` 與 `pnpm` 依賴的環境執行：
 
 ```bash
 pnpm generate:api-types
@@ -89,9 +92,10 @@ pnpm typecheck
 
 產生器位於 repo 共用的 `scripts/generate-api-types.sh`，會直接 import FastAPI
 `app`、呼叫 `app.openapi()` 寫入暫存 JSON，再由 `openapi-typescript` 更新已提交的
-型別；它不會啟動 server 或 curl `/openapi.json`。CI 的 full-stack job 另執行
-`pnpm --dir frontend check:api-types`，以同一路徑重產並在 committed output 有任何
-diff 時失敗。
+一般型別，並從同一份 JSON 產生 request required-key map；它不會啟動 server 或
+curl `/openapi.json`。CI 的 full-stack job 另執行
+`pnpm --dir frontend check:api-types`，以同一路徑重產並在任一 committed output
+有任何 diff 時失敗。
 
 ## 頁面總覽
 

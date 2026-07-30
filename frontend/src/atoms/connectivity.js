@@ -1,11 +1,11 @@
 // App-wide backend reachability, shared by every page. Fed from two sides:
 //   - passively by api/client.js, which reports only UNAMBIGUOUS request
-//     outcomes: transport failure = down, sub-5xx response = up, 5xx = no
-//     report at all (a 5xx can be an intermediary answering for a dead
-//     upstream -- dev's vite proxy 500s by itself when the backend is down
-//     -- so it proves nothing either way). A user action that hits a dead
-//     backend thus flips the badge instantly, without a middlebox response
-//     ever painting a dead backend green;
+//     outcomes: transport failure or request deadline = down, sub-5xx
+//     response = up, 5xx = no report at all (a 5xx can be an intermediary
+//     answering for a dead upstream -- dev's vite proxy 500s by itself when
+//     the backend is down -- so it proves nothing either way). A user action
+//     that hits a dead backend thus flips the badge instantly, without a
+//     middlebox response ever painting a dead backend green;
 //   - actively and AUTHORITATIVELY by api/health.js's probeBackendHealth
 //     (triggered by hooks/useConnectivityMonitor.js: 30s poll plus
 //     focus/online/visibility pings), which judges /api/health response

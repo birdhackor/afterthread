@@ -549,6 +549,43 @@ describe("apiFetch passive connectivity reporting", () => {
 		expect(store.get(statusAtom)).toEqual({ reachable: true });
 	});
 
+	it("preserves a TimeoutError during body reading and reports the backend down", async () => {
+		const controller = new AbortController();
+		let markBodyReadStarted: (() => void) | undefined;
+		const bodyReadStarted = new Promise<void>((resolve) => {
+			markBodyReadStarted = resolve;
+		});
+		stubFetch(async () => ({
+			ok: true,
+			status: 200,
+			text: () => {
+				markBodyReadStarted?.();
+				return new Promise<string>((_resolve, reject) => {
+					controller.signal.addEventListener(
+						"abort",
+						() => reject(controller.signal.reason),
+						{ once: true },
+					);
+				});
+			},
+		}));
+		store.set(statusAtom, { reachable: true });
+
+		const request = apiFetch("/api/health", {
+			method: "GET",
+			signal: controller.signal,
+		});
+		await bodyReadStarted;
+		const timeoutReason = new DOMException(
+			"response body timed out",
+			"TimeoutError",
+		);
+		controller.abort(timeoutReason);
+
+		await expect(request).rejects.toBe(timeoutReason);
+		expect(store.get(statusAtom)).toEqual({ reachable: false });
+	});
+
 	it("emits ONLY a down signal when the connection drops mid-body (no transient up)", async () => {
 		stubFetch(async () => ({
 			ok: true,

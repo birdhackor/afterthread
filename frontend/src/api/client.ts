@@ -3,15 +3,16 @@
 //   - error normalization into a single ApiError shape {status, code,
 //     message, fieldErrors} following the shared UX rules, so callers get one
 //     already-localized (zh-TW) error type for server/transport failures;
-//     caller-owned aborts are the deliberate exception and keep their original
-//     signal reason so superseded work can be ignored;
+//     AbortError cancellations and TimeoutError deadlines are the deliberate
+//     exceptions and keep their original signal reason so callers can tell
+//     cancellation from timeout;
 //   - a query-string helper that skips empty filter values;
 //   - passive connectivity reporting: unambiguous call outcomes feed the
 //     shared backendStatusAtom (fully delivered sub-5xx response =
-//     reachable, transport failure = unreachable; a 5xx reports NOTHING
-//     either way -- see the rationale inside apiFetch; opt a call out
-//     entirely with `reportConnectivity: false`), so the badge tracks real
-//     traffic for free.
+//     reachable, transport failure or deadline timeout = unreachable; a 5xx
+//     reports NOTHING either way -- see the rationale inside apiFetch; opt a
+//     call out entirely with `reportConnectivity: false`), so the badge tracks
+//     real traffic for free.
 // Every page/atom must go through this module rather than calling fetch
 // directly.
 
@@ -20,6 +21,7 @@ import {
 	reportBackendDownAtom,
 	reportBackendUpAtom,
 } from "../atoms/connectivity.js";
+import type { ApiRequestBodyRequiredKeys } from "./request-body-required.gen.js";
 import type { components, paths } from "./schema.gen.js";
 
 type SchemaPath = keyof paths & string;
@@ -42,7 +44,7 @@ type OperationFor<
 	Method extends ApiMethod,
 > = Method extends keyof paths[Path] ? NonNullable<paths[Path][Method]> : never;
 
-type JsonRequestBody<Operation> = Operation extends {
+type SchemaJsonRequestBody<Operation> = Operation extends {
 	requestBody: {
 		content: {
 			"application/json": infer Body;
@@ -51,6 +53,22 @@ type JsonRequestBody<Operation> = Operation extends {
 }
 	? Body
 	: never;
+
+type RequestBodyRequiredKeys<
+	Path extends SchemaPath,
+	Method extends ApiMethod,
+> = Path extends keyof ApiRequestBodyRequiredKeys
+	? Method extends keyof ApiRequestBodyRequiredKeys[Path]
+		? ApiRequestBodyRequiredKeys[Path][Method]
+		: never
+	: never;
+
+type RequestBodyWithRequiredKeys<Body, Keys> = Body extends object
+	? [Keys] extends [keyof Body]
+		? Pick<Body, Extract<Keys, keyof Body>> &
+				Partial<Omit<Body, Extract<Keys, keyof Body>>>
+		: never
+	: Body;
 
 type ResponsesFor<Operation> = Operation extends {
 	responses: infer Responses;
@@ -75,7 +93,10 @@ type JsonResponseBody<Response> = Response extends {
 export type ApiRequestBody<
 	Path extends SchemaPath,
 	Method extends ApiMethod,
-> = JsonRequestBody<OperationFor<Path, Method>>;
+> = RequestBodyWithRequiredKeys<
+	SchemaJsonRequestBody<OperationFor<Path, Method>>,
+	RequestBodyRequiredKeys<Path, Method>
+>;
 
 export type ApiSuccessResponse<
 	Path extends SchemaPath,
@@ -183,11 +204,12 @@ interface ApiErrorOptions {
 const store = getDefaultStore();
 
 // Normalized error thrown by every helper below for server/transport failures.
-// A caller-owned AbortSignal keeps its original reason instead. `status` is
-// the HTTP status (0 for a network/transport failure), `code` is the machine
-// code from the backend detail object when present, `message` is a user-facing
-// zh-TW string, and `fieldErrors` maps a field name to its message for 422
-// responses.
+// An AbortSignal keeps its original reason instead: AbortError means the caller
+// cancelled its own work and reports no outage, while TimeoutError means the
+// server missed the request budget and reports down. `status` is the HTTP
+// status (0 for a network/transport failure), `code` is the machine code from
+// the backend detail object when present, `message` is a user-facing zh-TW
+// string, and `fieldErrors` maps a field name to its message for 422 responses.
 export class ApiError extends Error {
 	status: number;
 	code: string | null;
@@ -219,6 +241,29 @@ function networkError(): ApiError {
 	});
 }
 
+// AbortSignal uses the same fetch rejection channel for two different events.
+// Preserve either reason for the caller, but only a deadline is connectivity
+// evidence: explicit AbortError cancellation belongs to the caller, whereas a
+// current-platform AbortSignal.timeout() reason is a DOMException TimeoutError
+// saying the server failed to answer in budget.
+function rethrowSignalReason(
+	signal: AbortSignal | null | undefined,
+	reportConnectivity: boolean,
+): void {
+	if (!signal?.aborted) {
+		return;
+	}
+	const reason = signal.reason;
+	if (
+		reportConnectivity &&
+		reason instanceof DOMException &&
+		reason.name === "TimeoutError"
+	) {
+		store.set(reportBackendDownAtom);
+	}
+	throw reason;
+}
+
 function invalidResponseError(status: number): ApiError {
 	return new ApiError({
 		status,
@@ -236,9 +281,10 @@ function invalidResponseError(status: number): ApiError {
 // deadline a server that accepts connections but never responds would let
 // pending requests accumulate without limit (superseded requests are dropped
 // via generation counters but never cancelled; the timeout is what puts a
-// hard ceiling on how long any of them can hold a connection). An abort keeps
-// the signal's original reason rather than pretending the backend went down;
-// both probes opt out of passive connectivity and interpret their own result.
+// hard ceiling on how long any of them can hold a connection). Both keep the
+// TimeoutError reason. The health probe opts out of passive reporting and
+// makes its own generation-guarded verdict; the LLM status probe deliberately
+// leaves reporting on, so its timeout is immediate down-evidence.
 export const PROBE_TIMEOUT_MS = 10000;
 
 // Build a `?a=1&b=2` query string from a plain object. null / undefined /
@@ -350,8 +396,8 @@ function normalizeError(status: number, body: unknown): ApiError {
 
 // Core request helper. Resolves to the parsed JSON body (or null for 204),
 // and throws an ApiError for transport failures, malformed body-bearing
-// successes, and non-OK responses. Caller-owned aborts preserve their signal
-// reason so cancellation is distinguishable from an outage.
+// successes, and non-OK responses. Signal aborts preserve their exact reason:
+// AbortError is caller cancellation; TimeoutError is a reported outage.
 // Options pass through to fetch(), except `reportConnectivity` (default
 // true): false keeps this call's outcome out of the passive connectivity
 // reports entirely, in both directions -- api/health.ts sets it for probe
@@ -402,12 +448,7 @@ async function rawApiFetch(
 			headers,
 		});
 	} catch (_cause) {
-		// Cancellation belongs to the caller, not the network. Preserve the exact
-		// reason (normally DOMException/AbortError) so a superseding navigation can
-		// ignore its own request without painting the backend offline.
-		if (fetchOptions.signal?.aborted) {
-			throw fetchOptions.signal.reason;
-		}
+		rethrowSignalReason(fetchOptions.signal, reportConnectivity);
 		if (reportConnectivity) {
 			store.set(reportBackendDownAtom);
 		}
@@ -428,12 +469,9 @@ async function rawApiFetch(
 	try {
 		text = await response.text();
 	} catch (_cause) {
-		// An abort can arrive after headers while response.text() is still
-		// consuming the stream. It has the same caller-owned semantics as an
-		// abort rejected directly by fetch(), including no connectivity report.
-		if (fetchOptions.signal?.aborted) {
-			throw fetchOptions.signal.reason;
-		}
+		// The same abort/timeout split applies while response.text() is consuming
+		// the stream; no up-report has fired before the complete body arrives.
+		rethrowSignalReason(fetchOptions.signal, reportConnectivity);
 		// Headers arrived (response.ok / response.status are already known),
 		// but the connection dropped before the body finished streaming --
 		// still a transport failure from the caller's point of view, so it

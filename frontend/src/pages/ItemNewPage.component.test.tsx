@@ -20,14 +20,9 @@ vi.mock("../api/client.js", () => ({
 }));
 
 type ItemCreateOptions = ApiJsonRequestOptions<"/api/items", "post">;
-type MockApiOptions = Omit<ItemCreateOptions, "body"> & {
-	// OpenAPI marks fields with backend defaults as required, while this form
-	// intentionally lets the backend supply source/confidence.
-	body: Partial<ItemCreateOptions["body"]>;
-};
 
 const mockedApiPost = vi.mocked(apiPost) as unknown as Mock<
-	(path: string, options: MockApiOptions) => Promise<unknown>
+	(path: string, options: ItemCreateOptions) => Promise<unknown>
 >;
 const writeApiMocks = [
 	vi.mocked(apiDelete),
@@ -101,7 +96,7 @@ describe("ItemNewPage create request", () => {
 				recovery_files: "",
 				resume_trigger: "",
 			},
-		} satisfies MockApiOptions;
+		} satisfies ItemCreateOptions;
 		mockedApiPost.mockImplementation(() => new Promise(() => {}));
 		renderWithAppProviders(<ItemNewPage />, {
 			initialEntries: ["/items/new"],
