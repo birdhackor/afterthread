@@ -16,7 +16,12 @@ from pydantic import (
 )
 
 from afterthread.config import get_settings
-from afterthread.models import STALE_ELIGIBLE_STATUSES, MemoryStage, MemoryStatus
+from afterthread.models import (
+    SQLITE_MAX_INT,
+    STALE_ELIGIBLE_STATUSES,
+    MemoryStage,
+    MemoryStatus,
+)
 
 
 def _ensure_aware(value: datetime) -> datetime:
@@ -725,12 +730,17 @@ class ToolReviseRequest(BaseModel):
     to fix (web-v6 §8). With records attached the feedback may be omitted: the
     one-click fix sends none, and the prompt then says the operator asks only for
     those failures to be fixed. With neither there is nothing to do: 422. A
-    blank feedback counts as none; repeated ids count once.
+    blank feedback counts as none. The cap of three is on the list as sent (a
+    bound on the request itself); within it a repeated id is attached once. Each
+    id is bounded like every request int bound into SQLite
+    (``models.SQLITE_MAX_INT``): past it, the lookup would raise, not miss.
     """
 
     feedback: str | None = Field(default=None, max_length=_MAX_AI_INPUT_CHARS)
     expected_vid: str = Field(pattern=_TOOL_VID_PATTERN)
-    run_ids: list[int] = Field(default_factory=list, max_length=_REVISE_RUN_IDS_MAX)
+    run_ids: list[Annotated[int, Field(ge=1, le=SQLITE_MAX_INT)]] = Field(
+        default_factory=list, max_length=_REVISE_RUN_IDS_MAX
+    )
 
     @field_validator("feedback")
     @classmethod
@@ -741,9 +751,7 @@ class ToolReviseRequest(BaseModel):
 
     @field_validator("run_ids")
     @classmethod
-    def _unique_positive(cls, value: list[int]) -> list[int]:
-        if any(run_id < 1 for run_id in value):
-            raise ValueError("run_ids must be positive")
+    def _each_once(cls, value: list[int]) -> list[int]:
         return list(dict.fromkeys(value))
 
     @model_validator(mode="after")
@@ -923,7 +931,7 @@ class ToolRunPurgeRequest(BaseModel):
     before: datetime | None = None
     orphans_only: bool = False
     dry_run: bool = True
-    max_id: int | None = Field(default=None, ge=0)
+    max_id: int | None = Field(default=None, ge=0, le=SQLITE_MAX_INT)
 
     @model_validator(mode="after")
     def _confirm_needs_its_preview(self) -> ToolRunPurgeRequest:

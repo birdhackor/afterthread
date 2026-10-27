@@ -46,6 +46,7 @@ from sqlalchemy import Engine
 from sqlmodel import Session
 
 from afterthread.config import Settings
+from afterthread.models import SQLITE_MAX_INT
 from afterthread.services import llm_log, tool_builder, tool_meta, tool_runs, tools
 from afterthread.services.llm import LLMNotConfiguredError, LLMUpstreamError
 from afterthread.services.tool_builder import (
@@ -7191,9 +7192,20 @@ def test_router_revise_accepts_run_ids_without_feedback(
         {"feedback": "   ", "run_ids": [], "expected_vid": _TEST_VID},
         {"run_ids": [1, 2, 3, 4], "expected_vid": _TEST_VID},
         {"run_ids": [0], "expected_vid": _TEST_VID},
+        {"run_ids": [SQLITE_MAX_INT + 1], "expected_vid": _TEST_VID},
+        {"run_ids": [1, 1, 1, 1], "expected_vid": _TEST_VID},
         {"run_ids": [1]},
     ],
-    ids=["nothing", "blank-feedback", "blank-and-empty", "four-runs", "zero-id", "no-vid"],
+    ids=[
+        "nothing",
+        "blank-feedback",
+        "blank-and-empty",
+        "four-runs",
+        "zero-id",
+        "past-sqlite-int",
+        "four-as-sent",
+        "no-vid",
+    ],
 )
 def test_router_revise_needs_feedback_or_runs(
     client: TestClient,
@@ -7314,13 +7326,99 @@ def test_revise_prompt_carries_the_failing_runs_and_the_procedure(
     assert "Failing runs attached by the operator" in prompt
     assert "Run #7 at 2026-10-27 01:02:03 UTC, called from the capture workflow." in prompt
     assert "It ran the version that is in your workspace." in prompt
-    assert "It ran an OLDER version (20260101T000000Z-000000)" in prompt
+    assert "It ran a DIFFERENT version (20260101T000000Z-000000)" in prompt
     assert "KILLED because its stderr passed the output cap" in prompt
     assert '{"query": "zzzz-no-hit"}' in prompt
     assert "live-secret-value" not in prompt
     assert tools._REDACTION_MARKER in prompt
     assert "1. Reproduce first." in prompt
     assert "examples.json" in prompt
+
+
+def test_revise_prompt_keeps_its_own_no_feedback_words_whole(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P3-r1 G2: the backend's sentence is not operator text, so not redacted.
+
+    A registered value equal to one of its words would otherwise shred it.
+    """
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({"attached"}))
+
+    prompt = tool_builder._revise_user_prompt(
+        None, None, runs=(_attached(),), workspace_vid=_TEST_VID
+    )
+
+    assert tool_builder._NO_FEEDBACK in prompt
+    # The operator's own words still go through the redactor.
+    worded = tool_builder._revise_user_prompt("it attached nothing", None)
+    assert "it attached nothing" not in worded
+    assert tools._REDACTION_MARKER in worded
+
+
+def test_revise_prompt_keeps_the_end_of_a_long_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """P3-r1 G3: at a small budget stderr loses its START, never the failing line.
+
+    The stored copy is a tail and the header says stderr keeps its END; the
+    prompt cut agrees with both. stdout keeps its start.
+    """
+    budget = 4000  # the settings floor for llm_prompt_budget_tokens (cold ratio 1.0)
+    _install_settings(monkeypatch, llm_prompt_budget_tokens=budget)
+    stderr = "".join(f"  frame {i}\n" for i in range(1500)) + "KeyError: 'hits'"
+    stdout = "first line of output\n" + "x" * 6000
+
+    prompt = tool_builder._revise_user_prompt(
+        None,
+        None,
+        runs=(_attached(stderr=stderr, stdout=stdout),),
+        workspace_vid=_TEST_VID,
+    )
+
+    stderr_block = prompt.split("stderr:\n", 1)[1].split("\nstdout:\n", 1)[0]
+    assert len(stderr_block) == budget
+    assert stderr_block.startswith(tool_builder._TAIL_TRUNCATION_MARKER)
+    assert stderr_block.endswith("KeyError: 'hits'")
+    assert "  frame 0\n" not in stderr_block
+    stdout_block = prompt.split("\nstdout:\n", 1)[1].split("\n\n", 1)[0]
+    assert stdout_block.startswith("first line of output")
+
+
+def test_truncate_tail_to_bounds() -> None:
+    """The tail cut never exceeds its cap, marker included, and keeps short text."""
+    marker = tool_builder._TAIL_TRUNCATION_MARKER
+    assert tool_builder._truncate_tail_to("short", 10) == "short"
+    cut = tool_builder._truncate_tail_to("a" * 50 + "END", 30)
+    assert len(cut) == 30
+    assert cut.startswith(marker)
+    assert cut.endswith("END")
+    assert tool_builder._truncate_tail_to("abcdefghijklmnop", 3) == "nop"
+
+
+def test_failing_run_text_names_another_version_without_guessing_its_age() -> None:
+    """P3-r1 G4: a run of another vid may be newer (discarded) or unrelated."""
+    newer = tool_builder._failing_run_text(
+        _attached(vid="20270101T000000Z-ffffff"), _TEST_VID, 10_000
+    )
+
+    assert "It ran a DIFFERENT version (20270101T000000Z-ffffff)" in newer
+    assert "OLDER" not in newer
+
+
+def test_failing_run_text_explains_a_backend_error() -> None:
+    """P3-r1 G4: every outcome §6.1 lists has prose, ``error`` included."""
+    text = tool_builder._failing_run_text(
+        _attached(outcome=tools.RUN_ERROR, exit_code=None), _TEST_VID, 10_000
+    )
+
+    assert "Outcome: the BACKEND failed around this call" in text
+    assert {
+        tools.RUN_OK,
+        tools.RUN_FAILED,
+        tools.RUN_OUTPUT_OVERFLOW,
+        tools.RUN_TIMEOUT,
+        tools.RUN_START_FAILED,
+        tools.RUN_REFUSED,
+        tools.RUN_ERROR,
+    } <= set(tool_builder._RUN_OUTCOME_PROSE)
 
 
 def test_revise_provenance_names_the_runs_but_not_their_contents(

@@ -295,7 +295,8 @@ UTC 再比）、stats 的 SQL、孤兒判斷與別名、P2a-r1 的 `error` 路�
 
 - `ToolReviseRequest`：`feedback` 改為選填，`run_ids` 最多 3 筆；兩者至少要有一樣（422）。空白
   意見視同沒有（舊行為是 422，現在只有在也沒附紀錄時才 422，原本的四個 422 測試照樣成立）。
-  重複的 id 只算一次、非正數 422。
+  上限 3 是對送出的清單算（請求本身的上限），其中重複的 id 只附一次；非正數或超出 SQLite 整數
+  範圍（`models.SQLITE_MAX_INT`）的 id 422。
 - 紀錄在**路由**檢查與複製（`tool_runs.attach_for_revise`），因為那裡有資料庫 session；順序是
   紀錄 → `.env` 閘 → 名額 → 版本比對。不存在的 id 回 `404 run_not_found`、別的工具的回
   `422 run_not_for_tool`，結構化的 `{code, message}`。前端的 404 一律被 `messageFor` 換成「找不到
@@ -322,8 +323,8 @@ UTC 再比）、stats 的 SQL、孤兒判斷與別名、P2a-r1 的 `error` 路�
 - 一鍵修正就是一次 `reviseMutation`：同一個寫入閘（`versionWritesBlocked`）、同一個 job 追蹤與
   卡片。列表列上的按鈕只在 `last_run.fixable` 而且這一列有可用版本時出現；「最近執行」每筆
   `fixable` 的紀錄有「請 AI 修正」與「加上說明…」（對話框，說明選填、上限同其他 AI 輸入）。
-- 原本修訂卡片只在「AI 總結」展開時看得到；一鍵修正是從收合的列發起的，所以 AI 總結收合時，
-  卡片改顯示在那一列上（同一個條件的兩半，卡片只出現一次）。
+- 原本修訂卡片只在「AI 總結」展開時看得到；一鍵修正是從收合的列發起的，所以卡片改顯示在
+  那一列上（r1 起一律在列上，見附錄 G6）。
 - 修訂成功的卡片文字從「已依意見更新工具」改成「已發布工具的新版本」：一鍵修正沒有意見。
 - **`/tools?job=<id>` 移到 P4**：它只服務其他頁面（擷取、補齊、協助更新）發起的修正，與它的
   使用者一起做、一起測。
@@ -342,3 +343,20 @@ UTC 再比）、stats 的 SQL、孤兒判斷與別名、P2a-r1 的 `error` 路�
 `output_overflow` 的說明、秘密在提示裡被遮）與 `test_builder_prompts_ask_for_examples_and_their_rerun`。
 前端的請求內容與拒絕提示在 `toolSummary.js`，有 vitest；另用實際的瀏覽器跑過：列上的按鈕送出
 `{run_ids, expected_vid}`、「加上說明…」多帶 `feedback`，卡片顯示在列上，LLM 未設定時清楚失敗。
+
+### D45 附錄（P3 review r1，Fable）
+
+| # | 問題 | 處理 |
+|---|---|---|
+| G1 | `run_ids` 沒有上限，超過 SQLite 整數範圍的 id 在查詢時丟 `OverflowError`，變成 500 | **採納**，並一起補上同類的兩處：`GET/DELETE /api/tool-runs/{run_id}` 與 purge 的 `max_id`。`SQLITE_MAX_INT` 從 `routers/items.py` 移到 `models.py`，三處與 items 共用。文件說「重複的 id 只算一次」與實作（先檢查上限 3 再去重）不符：**改文件**——上限是對送出的清單算（請求本身的上限），重複的 id 只附一次。UI 只送一個 id |
+| G2 | 沒有意見時的固定句子 `_NO_FEEDBACK` 也經過遮蔽器；`.env` 有一個值剛好等於句中某個字時，句子被打碎 | **採納**：只有操作者／檔案來的文字要遮蔽（`_revise_system_prompt` 的既有規則），固定句子原樣放入 |
+| G3 | 提示裡每段都是保留開頭的截斷，但 stderr 存的是結尾、標頭也說 stderr 保留結尾；預算小時最後幾行（真正的錯誤）被丟掉 | **採納**：stderr 改用保留結尾的 `_truncate_tail_to`（標記放在前面），其他三段照舊保留開頭 |
+| G4 | 版本不同的紀錄一律說「OLDER version」，但可能是已丟棄的較新版本或同名的另一個套件；`error` 結果沒有說明文字 | **採納**：改說「a DIFFERENT version」；`_RUN_OUTCOME_PROSE` 補上 `error`（後端在這次呼叫周圍失敗，不是工具自己的結束代碼） |
+| G5 | 「最近執行」的修正按鈕只看頁面的寫入閘；重新展開的列先顯示快取清單，`fixable` 可能已過期，重新讀取失敗時更會一直過期 | **採納**：按鈕（含「加上說明…」對話框）在清單 `isFetching`／`isError` 時停用；讀取失敗時顯示橘色「可能已過期」提示。與 AI 總結的 `displayedMayBeStale` 同一條規則 |
+| G6 | 「卡片只出現一次」不成立：AI 總結展開但總結讀不到（例如修正剛發布、新版本的總結還沒對上）時面板提早返回，卡片哪裡都看不到 | **採納**：修訂卡片一律顯示在列上，從 AI 總結面板移除 |
+
+測試：`test_router_revise_needs_feedback_or_runs` 加上超出範圍與「送出四個相同 id」兩例；
+`test_revise_prompt_keeps_its_own_no_feedback_words_whole`、`test_revise_prompt_keeps_the_end_of_a_long_stderr`、
+`test_truncate_tail_to_bounds`、`test_failing_run_text_names_another_version_without_guessing_its_age`、
+`test_failing_run_text_explains_a_backend_error`；`test_tool_runs.py` 的單筆路由與 purge 驗證各加上超出範圍的
+422。

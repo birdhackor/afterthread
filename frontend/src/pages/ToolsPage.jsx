@@ -305,8 +305,6 @@ function ToolSummaryPanel({
 	onRegenerate,
 	reviseMutation,
 	isSubmittingRevise,
-	reviseJobId,
-	reviseJobQuery,
 }) {
 	const { data, error, isError, isFetching } = useQuery({
 		queryKey: summaryQueryKey,
@@ -530,12 +528,6 @@ function ToolSummaryPanel({
 					</Group>
 				</Stack>
 			</form>
-
-			<ToolJobProgress
-				kind="revise"
-				jobId={reviseJobId}
-				jobQuery={reviseJobQuery}
-			/>
 		</Stack>
 	);
 }
@@ -695,10 +687,13 @@ function ToolRow({
 					</Group>
 				</Group>
 
-				{/* A fix started from this row (or a revise from a panel since
-				    collapsed) must stay visible: the AI 總結 panel shows the card
-				    when it is open, the row shows it otherwise -- once either way. */}
-				{reviseJobId !== null && !expanded ? (
+				{/* The revise card lives on the row, whatever started the job (the
+				    AI 總結 form, a fix from 最近執行) and whether or not the panel is
+				    open: the panel returns early -- a Loader, 無法載入總結 -- whenever
+				    its summary query has no data, which is exactly the case right
+				    after a fix publishes a new version, so a card inside it could
+				    vanish mid-job. */}
+				{reviseJobId !== null ? (
 					<ToolJobProgress
 						kind="revise"
 						jobId={reviseJobId}
@@ -779,8 +774,6 @@ function ToolRow({
 								onRegenerate={onRegenerate}
 								reviseMutation={reviseMutation}
 								isSubmittingRevise={isSubmittingRevise}
-								reviseJobId={reviseJobId}
-								reviseJobQuery={reviseJobQuery}
 							/>
 						</Collapse>
 					</div>

@@ -11,6 +11,19 @@ from enum import StrEnum
 from sqlalchemy import JSON
 from sqlmodel import Column, Field, Relationship, SQLModel
 
+# SQLite's INTEGER storage class is a signed 64-bit two's-complement integer
+# (https://www.sqlite.org/datatype3.html#the_integer_datatypes): 2**63 - 1 is
+# the largest value it can hold. FastAPI's and pydantic's `int` accept any
+# Python int, which is unbounded, so a value beyond this -- e.g.
+# `item_id=9223372036854775808` (2**63) -- parses fine at the routing layer
+# but raises OverflowError from the pysqlite driver the moment it is bound
+# into a query, which FastAPI does not catch: it propagates as an unhandled
+# 500 instead of a client error. Every request `int` -- path, query or body --
+# that is bound into a SQLite query must be capped at this constant so
+# out-of-range values are instead rejected with 422 during validation, before
+# ever reaching the database.
+SQLITE_MAX_INT = 9223372036854775807  # 2**63 - 1
+
 
 class MemoryStatus(StrEnum):
     """Lifecycle status of a memory item (see docs/methodology.md)."""

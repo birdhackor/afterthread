@@ -29,7 +29,7 @@ from sqlmodel import Session, SQLModel, col, select
 from afterthread.config import Settings
 from afterthread.db import get_session
 from afterthread.main import app
-from afterthread.models import ToolRun
+from afterthread.models import SQLITE_MAX_INT, ToolRun
 from afterthread.services import llm, llm_log, tool_runs, tools
 from afterthread.services.tools import enabled_llm_tools, set_enabled
 
@@ -739,6 +739,11 @@ def test_run_detail_has_the_bodies_and_delete_removes_it(
     assert client.get(f"/api/tool-runs/{run_id}").status_code == 404
     assert client.delete(f"/api/tool-runs/{run_id}").status_code == 404
     assert client.get("/api/tool-runs/0").status_code == 422
+    # P3-r1: past SQLite's integer range the lookup would raise (a 500); it is
+    # refused at validation instead, like the items routes.
+    assert client.get(f"/api/tool-runs/{SQLITE_MAX_INT}").status_code == 404
+    assert client.get(f"/api/tool-runs/{SQLITE_MAX_INT + 1}").status_code == 422
+    assert client.delete(f"/api/tool-runs/{SQLITE_MAX_INT + 1}").status_code == 422
 
 
 def test_a_record_whose_package_is_gone_still_reads_as_gone(
@@ -921,6 +926,9 @@ def test_a_purge_that_deletes_needs_its_preview(client: TestClient) -> None:
     assert response.status_code == 422
     assert client.post("/api/tool-runs/purge", json={"tool": "../x"}).status_code == 422
     assert client.post("/api/tool-runs/purge", json={"outcome": "maybe"}).status_code == 422
+    # P3-r1: a max_id past SQLite's integer range is refused, not a 500.
+    too_big = {"dry_run": False, "max_id": SQLITE_MAX_INT + 1}
+    assert client.post("/api/tool-runs/purge", json=too_big).status_code == 422
 
 
 def test_without_a_tools_directory_no_record_is_called_an_orphan(

@@ -54,6 +54,8 @@ const BODY_STYLE = {
 // space, which splits a Chinese sentence.
 const RETENTION_NOTE =
 	"失敗的執行會連同輸入參數與錯誤輸出（已遮蔽秘密）一起保存；成功的只記時間與結果。";
+const STALE_LIST_NOTE =
+	"。以下是先前讀到的內容，可能已過期；重新讀取成功前不能從這裡請 AI 修正。";
 
 // The 最近執行 section of one tool row (web-v6 §6, §9): the newest run records,
 // newest first, fetched lazily (enabled: expanded) like the 設定 section and
@@ -64,7 +66,12 @@ const RETENTION_NOTE =
 //
 // `onFix(runIds, feedback?)` is the one-click fix (web-v6 §8): null when the tool
 // has no version a revise could start from, `fixBlocked` the page's gate for
-// every AI write. Only a record the backend marked `fixable` offers it.
+// every AI write. Only a record the backend marked `fixable` offers it -- and
+// `fixable` is the backend's judgement AT FETCH TIME, so the buttons also wait
+// while this list is refetching or after a refetch failed: the copy on screen
+// may predate a fix that already published (a re-expanded row renders its
+// cached list first), and a click would pay for a builder session on a record
+// the backend no longer offers. The same rule as 送出修訂's displayedMayBeStale.
 export function ToolRunsSection({
 	name,
 	expanded,
@@ -101,8 +108,16 @@ export function ToolRunsSection({
 			</Text>
 		);
 	}
+	const blocked = fixBlocked || isFetching || isError;
 	return (
 		<Stack gap="xs" pt="xs">
+			{/* Reached with data in hand: a BACKGROUND refetch failed and left the
+			    previous list rendered. Labelled, like the AI 總結 panel's. */}
+			{isError ? (
+				<Alert color="orange" title="無法更新執行紀錄">
+					<Text size="sm">{`${error?.message ?? "請稍後再試"}${STALE_LIST_NOTE}`}</Text>
+				</Alert>
+			) : null}
 			<Group justify="space-between" align="flex-start" wrap="nowrap" gap="sm">
 				<Text size="xs" c="dimmed">
 					{`共 ${data.total} 筆，顯示最近 ${data.runs.length} 筆。`}
@@ -140,7 +155,7 @@ export function ToolRunsSection({
 					fix={
 						run.fixable && onFix
 							? {
-									blocked: fixBlocked,
+									blocked,
 									submitting: isSubmittingFix,
 									now: () => onFix([run.id]),
 									withNote: () => setNoteRun(run),
@@ -151,7 +166,7 @@ export function ToolRunsSection({
 			))}
 			<FixNoteModal
 				run={noteRun}
-				blocked={fixBlocked}
+				blocked={blocked}
 				onClose={() => setNoteRun(null)}
 				onSubmit={(feedback) => {
 					onFix?.([noteRun.id], feedback);

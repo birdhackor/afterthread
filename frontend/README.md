@@ -240,8 +240,9 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   （`lastRunHint`、`runOutcomeMeta`、`vidStateMeta`、`runDetailSections`），元件是
   `components/ToolRunsSection.jsx`；**一鍵修正能不能給，只看後端算好的 `fixable`**，
   這裡不重算。一鍵修正就是一次附上 `run_ids` 的修訂：同一個 `reviseMutation`、同一個寫入閘與
-  工作卡片（`buildReviseRequest` 帶 `runIds`、空白意見不送）；AI 總結收合時，卡片改顯示在那一列
-  上。purge 的請求內容與措辭在 `utils/toolRunsPurge.js`，元件是 `ToolRunsPurgeDialog`／
+  工作卡片（`buildReviseRequest` 帶 `runIds`、空白意見不送）；修訂卡片一律顯示在那一列上，不放在
+  AI 總結裡（總結讀不到時整個面板會提早返回，卡片會跟著消失）。「最近執行」的修正按鈕在清單
+  重新讀取中或讀取失敗時停用：`fixable` 是讀取當下的判斷。purge 的請求內容與措辭在 `utils/toolRunsPurge.js`，元件是 `ToolRunsPurgeDialog`／
   `ToolRunStatsBar`。工作流的中文名稱 `WORKFLOW_LABELS` 在 `constants/labels.js`，時間與耗時的
   格式在 `utils/format.js`，`AI 日誌` 頁與執行紀錄共用。修訂工作的終局呈現 `toolJobOutcomeView` 在 `toolInstall.js`（job 輪詢那一組），
   送出被 `env_policy` 擋下時的通知 `reviseRefusalNotification` 在 `toolSummary.js`

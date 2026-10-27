@@ -18,6 +18,7 @@ from fastapi import Path as PathParam
 from sqlmodel import Session
 
 from afterthread.db import get_session
+from afterthread.models import SQLITE_MAX_INT
 from afterthread.schemas import (
     ToolRunDetail,
     ToolRunPurgeRequest,
@@ -30,7 +31,8 @@ from afterthread.services import tools as tools_service
 router = APIRouter(prefix="/tool-runs", tags=["tools"])
 
 SessionDep = Annotated[Session, Depends(get_session)]
-RunId = Annotated[int, PathParam(ge=1)]
+# Capped like every request int bound into SQLite (models.SQLITE_MAX_INT).
+RunId = Annotated[int, PathParam(ge=1, le=SQLITE_MAX_INT)]
 
 _RUN_NOT_FOUND = "Tool run not found"
 

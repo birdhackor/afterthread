@@ -1301,6 +1301,10 @@ _RUN_OUTCOME_PROSE = {
     "timeout": "the tool ran past its time limit and was killed",
     "start_failed": "the tool could not be started (interpreter or entry file)",
     "refused": "the call was refused before the tool ran",
+    "error": (
+        "the BACKEND failed around this call (an internal error, not the tool's "
+        "own exit), whether or not the tool had started"
+    ),
 }
 
 _FAILING_RUNS_HEADER = (
@@ -1308,6 +1312,27 @@ _FAILING_RUNS_HEADER = (
     "made; the texts are what the backend recorded (secrets masked, long outputs "
     "cut: stderr keeps its END, stdout its START)."
 )
+
+# Marks the front of a text cut to its END (``_truncate_tail_to``); the head
+# cut's ``_TRUNCATION_MARKER`` turned around.
+_TAIL_TRUNCATION_MARKER = "[內容過長已截斷]…"
+
+
+def _truncate_tail_to(value: str, cap: int) -> str:
+    """``value`` cut to its LAST ``cap`` chars, marked in front when it was cut.
+
+    stderr's counterpart of ``_truncate_to``: a traceback names its failure at
+    the end, the stored copy already keeps that end (``tool_runs._tail``), and
+    the header above tells the builder so -- a head cut here would drop exactly
+    the lines that matter whenever the prompt budget is smaller than the record.
+    """
+    if len(value) <= cap:
+        return value
+    marker_len = len(_TAIL_TRUNCATION_MARKER)
+    if cap <= marker_len:
+        return value[len(value) - cap :]
+    return _TAIL_TRUNCATION_MARKER + value[len(value) - cap + marker_len :]
+
 
 # The fixed procedure that follows the attached runs (web-v6 §8.4).
 _DEBUG_PROCEDURE = """How to work on these failures:
@@ -1330,28 +1355,34 @@ which examples you added."""
 
 
 def _failing_run_text(run: AttachedRun, workspace_vid: str | None, budget: int) -> str:
-    """One attached run as the builder reads it. Each text is redacted, then cut."""
+    """One attached run as the builder reads it. Each text is redacted, then cut.
+
+    A run of another version is called DIFFERENT, not older: an attached record
+    (the API takes any of the tool's runs, D45) may have run a version since
+    discarded, newer than the workspace's, or one of an earlier package that had
+    the same name.
+    """
     lines = [
         f"Run #{run.id} at {run.started_at:%Y-%m-%d %H:%M:%S} UTC, "
         f"called from the {run.workflow} workflow.",
         (
             "It ran the version that is in your workspace."
             if run.vid == workspace_vid
-            else f"It ran an OLDER version ({run.vid}), not the one in your workspace: "
-            "check whether it still fails before changing anything."
+            else f"It ran a DIFFERENT version ({run.vid}) than the one in your "
+            "workspace: check whether it still fails before changing anything."
         ),
         "Outcome: "
         + _RUN_OUTCOME_PROSE.get(run.outcome, run.outcome)
         + (f" (exit code {run.exit_code})." if run.exit_code is not None else "."),
     ]
-    for label, text in (
-        ("What the AI assistant was told", run.message),
-        ("stdin arguments (JSON)", run.args),
-        ("stderr", run.stderr),
-        ("stdout", run.stdout),
+    for label, text, cut in (
+        ("What the AI assistant was told", run.message, _truncate_to),
+        ("stdin arguments (JSON)", run.args, _truncate_to),
+        ("stderr", run.stderr, _truncate_tail_to),
+        ("stdout", run.stdout, _truncate_to),
     ):
         if text:
-            lines += [f"{label}:", _truncate_to(tools.redact_known_secrets(text), budget)]
+            lines += [f"{label}:", cut(tools.redact_known_secrets(text), budget)]
     return "\n".join(lines)
 
 
@@ -1404,15 +1435,19 @@ def _revise_user_prompt(
     stdin arguments and output, followed by the fixed debugging procedure.
     Their texts were masked when the job was submitted and go through the
     redactor again here, like every operator-derived text in this prompt. A
-    revise with runs and no feedback says so in the feedback slot.
+    revise with runs and no feedback says so in the feedback slot -- in the
+    backend's own words, which go in as they are: only operator- or
+    filesystem-derived text is redacted (see ``_revise_system_prompt``), and a
+    registered value that happens to equal one of those words would mangle it.
     """
     budget = token_budget.char_allowance(get_settings().llm_prompt_budget_tokens)
     parts = [
         "Revise the existing tool package as described below.",
         "User feedback:",
-        _truncate_to(
-            tools.redact_known_secrets(feedback if feedback is not None else _NO_FEEDBACK),
-            budget,
+        (
+            _truncate_to(tools.redact_known_secrets(feedback), budget)
+            if feedback is not None
+            else _NO_FEEDBACK
         ),
     ]
     if manifest_text is not None:
