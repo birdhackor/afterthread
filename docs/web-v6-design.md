@@ -405,8 +405,10 @@ exit 0 但結果不對：沒有失敗紀錄可附。這種情況照舊用修訂�
   可修時顯示「最近一次執行失敗」與「請 AI 修正」；不可修時只顯示文字。
 - **工具詳情**：
   - 「設定」（資料來自新的 `GET /api/tools/{name}/settings`）：`.env` 的 key 名（不顯示值）、
-    `config.env` 的內容（值仍經過 `redact_known_secrets`，萬一秘密放錯檔也不會從這裡外流）、兩邊
-    衝突的 key、第 4 節的兩種提醒。`.env` 的 key 旁邊說明「`.env` 的每個值都會被當成秘密遮蔽，
+    `config.env` 的內容（值**逐字包含**某個已登記秘密時，整個值只以遮蔽標記回傳，萬一秘密放錯檔
+    也不會從這裡外流；其餘原樣。**不要**改用 `redact_known_secrets`：它的結尾片段守衛會把只是
+    結尾剛好等於秘密前 6 字的完整值也遮掉、標成秘密，見 D42 附錄 C1）、兩邊衝突的 key、第 4 節
+    的兩種提醒。`.env` 的 key 旁邊說明「`.env` 的每個值都會被當成秘密遮蔽，
     不是秘密的請移到 config.env」。**遷移來的工具**（任一版本 `origin.json` 的 `source` 是
     `legacy-ai-meta` 或 `pre-existing/unknown`）另外顯示提醒：「這個工具建於 0.4.0 以前，`.env`
     可能混著設定」並列出 key。先做唯讀，編輯照舊手改檔案。
@@ -474,7 +476,7 @@ exit 0 但結果不對：沒有失敗紀錄可附。這種情況照舊用修訂�
 
 | # | 不變量 | 必須有的測試 | 階段 |
 |---|---|---|---|
-| A | `config.env` 的值不進遮蔽集合 | 套件的 `config.env` 有 `REGION=taipei` → `redact_known_secrets("taipei")` 不變；同一個值也出現在 `.env` 時則被遮；設定 API 回傳的 `config.env` 值經過遮蔽 | P1 |
+| A | `config.env` 的值不進遮蔽集合 | 套件的 `config.env` 有 `REGION=taipei` → `redact_known_secrets("taipei")` 不變；同一個值也出現在 `.env` 時則被遮；設定 API 對逐字含有已登記秘密的值只回遮蔽標記，只是結尾等於秘密前綴的值原樣回傳、不標示 | P1 |
 | B | `.env` 的政策不變 | 現有 `.env` 閘與遮蔽測試全部原樣通過（訊息字串除外） | P1 |
 | C | 閘的訊息列 key 名、絕不含值；送出時就擋 | 短值與錯誤拼法各一例：訊息含 key、不含值；超過 5 個 key 時只列 5 個；送出時擋下回 `409 env_policy`，沒有 job id、沒有 LLM 呼叫 | P1 |
 | D | 載入順序：`config.env` 蓋過透傳與 `TLS_NO_VERIFY`，`.env` 蓋過 `config.env` | 同一 key 在三處各有值，子行程拿到 `.env` 的值；修訂的 `run_shell` 環境相同 | P1 |
