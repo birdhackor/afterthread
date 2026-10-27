@@ -177,7 +177,15 @@ function VerificationRows({ rows }) {
 // A finished check's title, rows and actions: 請 AI 修正 attaches the failed
 // examples' records (at most three); 丟掉這一版 is offered only by a caller that
 // can address the version, and only after a failed post-fix verification.
-function VerificationSummary({ view, onFixRuns, onDiscardVersion }) {
+// `fixBlocked` is the page's write gate (versionWritesBlocked): the fix itself
+// re-checks it and does nothing while it holds, so the button says so instead
+// of ignoring the click (P5 review r1, J7).
+function VerificationSummary({
+	view,
+	onFixRuns,
+	onDiscardVersion,
+	fixBlocked = false,
+}) {
 	return (
 		<Stack gap={4} align="flex-start">
 			<Text size="sm" fw={600}>
@@ -196,6 +204,7 @@ function VerificationSummary({ view, onFixRuns, onDiscardVersion }) {
 							size="compact-xs"
 							color="red"
 							variant="light"
+							disabled={fixBlocked}
 							onClick={() => onFixRuns(view.failedRunIds)}
 						>
 							請 AI 修正
@@ -219,7 +228,7 @@ function VerificationSummary({ view, onFixRuns, onDiscardVersion }) {
 
 // 跑一次範例 (web-v6 §10): progress while the examples run, then the result per
 // example. The job is a health check, not a build, so it has its own card.
-function HealthCheckProgress({ jobQuery, job, onFixRuns }) {
+function HealthCheckProgress({ jobQuery, job, onFixRuns, fixBlocked }) {
 	if (jobQuery.isError) {
 		return (
 			<Alert color="orange" title="無法確認範例的結果">
@@ -266,6 +275,7 @@ function HealthCheckProgress({ jobQuery, job, onFixRuns }) {
 				view={view}
 				onFixRuns={onFixRuns}
 				onDiscardVersion={null}
+				fixBlocked={fixBlocked}
 			/>
 		</Alert>
 	);
@@ -284,6 +294,7 @@ function ToolJobProgress({
 	jobQuery,
 	onFixRuns = null,
 	onDiscardVersion = null,
+	fixBlocked = false,
 }) {
 	if (jobId === null) {
 		return null;
@@ -298,6 +309,7 @@ function ToolJobProgress({
 				jobQuery={jobQuery}
 				job={job}
 				onFixRuns={onFixRuns}
+				fixBlocked={fixBlocked}
 			/>
 		);
 	}
@@ -383,6 +395,7 @@ function ToolJobProgress({
 							view={verification}
 							onFixRuns={onFixRuns}
 							onDiscardVersion={verifyFailed ? onDiscardVersion : null}
+							fixBlocked={fixBlocked}
 						/>
 					) : null}
 					<LogLink
@@ -866,6 +879,7 @@ function ToolRow({
 						jobId={reviseJobId}
 						jobQuery={reviseJobQuery}
 						onFixRuns={lineageControls.showVersionControls ? onFix : null}
+						fixBlocked={writesBlocked}
 					/>
 				) : null}
 
@@ -1585,7 +1599,7 @@ function InstalledToolsPanel({
 			(candidate) => candidate.name === name && candidate.current_vid === vid,
 		);
 		if (!tool || vid == null) {
-			return { onFixRuns: null, onDiscardVersion: null };
+			return { onFixRuns: null, onDiscardVersion: null, fixBlocked: false };
 		}
 		const identity = toolIdentityConsumers(tool.name, tool.current_vid);
 		const controls = toolLineageControls(
@@ -1594,6 +1608,7 @@ function InstalledToolsPanel({
 		);
 		return {
 			onFixRuns: (runIds) => fixTool(tool, runIds),
+			fixBlocked: versionWritesBlocked,
 			onDiscardVersion:
 				controls.discardAction === "discard-version"
 					? () =>

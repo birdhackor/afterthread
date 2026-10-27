@@ -124,7 +124,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     that ``TLS_NO_VERIFY`` -- a deliberate, security-relevant opt-in (see
     config.py) -- is active for this run.
 
-    The tool run recorder (web-v6 §6.3) is wired HERE, after ``init_db``, not
+    The tool run and check recorders (web-v6 §6.3, §10) are wired HERE, after ``init_db``, not
     at import time with the redactors: it writes to the database, and only the
     lifespan knows the table exists. A process that never runs the lifespan --
     the test client, which does not enter it -- therefore records nothing unless
@@ -132,6 +132,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     """
     init_db()
     tools_service.set_run_recorder(tool_runs_service.record)
+    tools_service.set_check_recorder(tool_runs_service.record_check)
     if get_settings().tls_no_verify:
         _logger.warning(
             "TLS_NO_VERIFY is set: outbound TLS certificate verification is "
@@ -142,6 +143,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
         yield
     finally:
         tools_service.set_run_recorder(None)
+        tools_service.set_check_recorder(None)
 
 
 app = FastAPI(title="afterthread API", lifespan=lifespan)

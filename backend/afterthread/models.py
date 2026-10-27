@@ -225,3 +225,43 @@ class ToolRun(SQLModel, table=True):
     args: str | None = None
     stdout: str | None = None
     stderr: str | None = None
+
+
+class ToolCheck(SQLModel, table=True):
+    """The verdict of one run of a version's examples (web-v6 §9, §10).
+
+    Written once, when a health check or the verification after a fix has RUN
+    the examples, under the same shared tools lock as their run records. The
+    verification line of 最近執行 reads the newest one of the current version.
+    Kept apart from the records it sums up (P5 review r1, J1): those are evidence
+    the operator purges by outcome and age, and a verdict re-derived from whatever
+    a purge left behind reports what never happened -- purging the successes of a
+    clean pass made an older batch's failure the "newest".
+
+    ``tool_name`` is the package name, as on ToolRun: deleting a tool deletes its
+    verdicts. A discarded version's verdicts are never read again (only the
+    current version's count) and are a few integers each, so they are kept.
+    """
+
+    __tablename__ = "tool_check"
+    __table_args__ = {"sqlite_autoincrement": True}
+
+    id: int | None = Field(default=None, primary_key=True)
+    # The job id; the run records of the same check carry it as their check_id.
+    check_id: str
+    tool_name: str = Field(index=True)
+    vid: str
+    # health_check | verify
+    workflow: str
+    finished_at: datetime = Field(default_factory=utcnow)
+    # The examples the version's file listed when the check ran.
+    total: int
+    # Exit 0 within the tool's own timeout.
+    passed: int
+    # failed | output_overflow | timeout | start_failed: the tool's own failure.
+    failed: int
+    # Why the run ended short of the list, when it did: ``budget`` (the check's
+    # time budget ran out) or ``interrupted`` (the tool was switched off or
+    # replaced mid-run, so the rest were refused). A timeout is a failure and
+    # skips the rest by itself.
+    stopped: str | None = None

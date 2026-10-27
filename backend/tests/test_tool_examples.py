@@ -24,7 +24,7 @@ from sqlalchemy import Engine
 from sqlmodel import Session, col, select
 
 from afterthread.config import Settings
-from afterthread.models import ToolRun
+from afterthread.models import ToolCheck, ToolRun
 from afterthread.services import llm_log, tool_builder, tool_runs, tools
 
 _VID = "20260728T010203Z-abcdef"
@@ -35,9 +35,11 @@ def _reset_state() -> Generator[None]:
     llm_log._reset_for_tests()
     tools._ADVERTISEMENT_GENERATIONS.clear()
     tools.set_run_recorder(None)
+    tools.set_check_recorder(None)
     tool_builder._reset_jobs_for_tests()
     yield
     tools.set_run_recorder(None)
+    tools.set_check_recorder(None)
     tools._ADVERTISEMENT_GENERATIONS.clear()
     tool_builder._reset_jobs_for_tests()
     llm_log._reset_for_tests()
@@ -106,9 +108,11 @@ def _examples(*names: str) -> dict[str, Any]:
 
 @pytest.fixture
 def stored(session: Session) -> Callable[[], list[ToolRun]]:
+    """The real run and check recorders, writing into the test database."""
     engine = session.get_bind()
     assert isinstance(engine, Engine)
     tools.set_run_recorder(partial(tool_runs.record, engine=engine))
+    tools.set_check_recorder(partial(tool_runs.record_check, engine=engine))
 
     def _rows() -> list[ToolRun]:
         session.expire_all()
@@ -440,6 +444,196 @@ def test_verification_state_follows_the_newest_batch_of_the_current_version(
     (package / "versions" / _VID / "examples.json").write_text(
         json.dumps(_examples("a", "b", "c", "d")), encoding="utf-8"
     )
-    assert state()["state"] == "incomplete"  # the newest batch ran 3 of 4
+    grown = state()  # the newest check ran 3, the file now lists 4
+    assert (grown["state"], grown["reason"]) == ("incomplete", "examples_changed")
+    (package / "versions" / _VID / "examples.json").write_text(
+        json.dumps(_examples("a", "b")), encoding="utf-8"
+    )
+    shrunk = state()  # P5 review r1 J6: never "passed 3/2"
+    assert (shrunk["state"], shrunk["reason"]) == ("incomplete", "examples_changed")
     os.remove(package / "versions" / _VID / "examples.json")
     assert state()["state"] == "no_examples"
+
+
+# --- P5 review r1 ------------------------------------------------------------------
+
+
+_FLAGGED_RUN_PY = (
+    "import sys, json, pathlib\n"
+    "failing = pathlib.Path(__file__).with_name('FAIL').exists()\n"
+    "sys.exit(1 if failing and json.load(sys.stdin)['q'] == 'b' else 0)\n"
+)
+
+
+def test_purging_the_records_leaves_the_verdict_alone(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stored: Callable[[], list[ToolRun]],
+) -> None:
+    """J1: the verdict is its own row, so purging its evidence does not rewrite it.
+
+    Before, the state was re-derived from whatever records a purge left: purging
+    the successes of a clean pass made an older check's failure the newest.
+    """
+    root = tmp_path / "tools"
+    package = _make_tool(root, "kb", _FLAGGED_RUN_PY, examples=_examples("a", "b", "c"))
+    _settings(monkeypatch, root)
+    flag = package / "versions" / _VID / "FAIL"
+    flag.write_text("", encoding="utf-8")
+    _check("kb", check_id="old-failure")
+    flag.unlink()
+    _check("kb", check_id="clean-pass")
+
+    def state() -> dict[str, Any]:
+        return client.get("/api/tools/kb/runs").json()["verification"]
+
+    assert (state()["state"], state()["passed"]) == ("passed", 3)
+    for outcome in ("ok", "all"):
+        preview = client.post("/api/tool-runs/purge", json={"outcome": outcome}).json()
+        confirm = {"outcome": outcome, "dry_run": False, "max_id": preview["max_id"]}
+        assert client.post("/api/tool-runs/purge", json=confirm).status_code == 200
+        after = state()
+        assert (after["state"], after["passed"], after["total"]) == ("passed", 3, 3)
+    assert stored() == []
+
+
+def test_deleting_a_tool_deletes_its_verdicts(
+    client: TestClient,
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stored: Callable[[], list[ToolRun]],
+) -> None:
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n", examples=_examples("a"))
+    _make_tool(root, "other", "print('x')\n", examples=_examples("a"))
+    _settings(monkeypatch, root)
+    _check("kb", check_id="kb-check")
+    _check("other", check_id="other-check")
+
+    assert client.delete("/api/tools/kb").status_code == 200
+
+    session.expire_all()
+    assert [row.check_id for row in session.exec(select(ToolCheck))] == ["other-check"]
+
+
+def test_a_tool_switched_off_mid_check_stops_the_rest_and_is_not_a_failure(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stored: Callable[[], list[ToolRun]],
+) -> None:
+    """J3: a refusal is not the tool failing; the rest would only be refused too."""
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n", examples=_examples("a", "b", "c"))
+    _settings(monkeypatch, root)
+
+    def _switch_off(partial_result: tools.CheckResult) -> None:
+        if len(partial_result.results) == 1:
+            assert tools.set_enabled("kb", False)
+
+    result = _check("kb", on_progress=_switch_off)
+
+    assert [example.outcome for example in result.results] == ["ok", "refused", "stopped"]
+    assert (result.passed, result.failed, result.stopped) == (1, 0, "interrupted")
+    assert tools.set_enabled("kb", True)
+    state = client.get("/api/tools/kb/runs").json()["verification"]
+    assert (state["state"], state["reason"], state["ran"]) == ("incomplete", "interrupted", 1)
+
+
+def test_a_budget_cut_reads_as_incomplete_for_lack_of_budget(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stored: Callable[[], list[ToolRun]],
+) -> None:
+    """J8: 最近執行 can say the budget ran out -- the verdict keeps why it stopped."""
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "import time\ntime.sleep(0.5)\n", examples=_examples("a", "b", "c"))
+    _settings(monkeypatch, root)
+
+    _check("kb", budget_seconds=0.8)
+
+    state = client.get("/api/tools/kb/runs").json()["verification"]
+    assert (state["state"], state["reason"], state["ran"], state["total"]) == (
+        "incomplete",
+        "budget",
+        2,
+        3,
+    )
+
+
+def test_a_health_check_that_cannot_run_after_admission_says_why(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """J2: the version moved, or the tool went, between the submit and the run."""
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n", examples=_examples("a"))
+    _settings(monkeypatch, root)
+
+    async def _run(name: str, expected_vid: str) -> dict[str, Any]:
+        job = tool_builder._admit_job(kind="health_check", tool_name=name)
+        assert job is not None
+        await tool_builder._run_check_job(job.job_id, name, expected_vid)
+        finished = tool_builder.get_job(job.job_id)
+        assert finished is not None
+        return finished
+
+    moved = asyncio.run(_run("kb", "20260101T000000Z-000000"))
+    gone = asyncio.run(_run("missing", _VID))
+
+    assert moved["verification"]["status"] == "version_changed"
+    assert moved["error"] == tool_builder._CHECK_REFUSALS["version_changed"]
+    assert gone["verification"]["status"] == "not_found"
+    assert gone["error"] == tool_builder._CHECK_REFUSALS["not_found"]
+
+
+def test_an_example_name_is_masked_before_it_is_cut(tmp_path: Path) -> None:
+    """J4: a secret straddling the 200-char cut leaves no fragment behind."""
+    secret = "SECRETVALUE123"
+    name = "x" * 195 + secret
+
+    shown = tools.example_display_name(name, [secret])
+
+    assert len(shown) <= 200
+    assert "SECRE" not in shown
+    assert shown.startswith("x" * 195)
+    package = tmp_path / "v"
+    package.mkdir()
+    (package / "examples.json").write_text(
+        json.dumps({"examples": [{"name": name, "args": {}}]}), encoding="utf-8"
+    )
+    loaded = tools.load_examples(tools.VersionRoot(package))
+    assert [example.name for example in loaded.examples] == [name]  # kept whole
+
+
+def test_the_secret_scan_for_example_names_stays_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stored: Callable[[], list[ToolRun]]
+) -> None:
+    """J5: the scan walks every package's .env; it runs on a worker, never the loop."""
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n", examples=_examples("a", "b"))
+    _settings(monkeypatch, root)
+    real_scan = tools._redaction_secrets
+    on_loop: list[bool] = []
+
+    def _watched_scan() -> list[str]:
+        on_loop.append(threading.current_thread() is threading.main_thread())
+        return real_scan()
+
+    monkeypatch.setattr(tools, "_redaction_secrets", _watched_scan)
+
+    async def _run() -> dict[str, Any]:
+        job = tool_builder._admit_job(kind="health_check", tool_name="kb")
+        assert job is not None
+        await tool_builder._run_check_job(job.job_id, "kb", _VID)
+        finished = tool_builder.get_job(job.job_id)
+        assert finished is not None
+        return finished
+
+    finished = asyncio.run(_run())
+
+    assert finished["verification"]["completed"] == 2
+    assert on_loop
+    assert not any(on_loop)

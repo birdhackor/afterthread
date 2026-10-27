@@ -205,7 +205,7 @@ migration。
 | `outcome` | `ok`（stdout 超過上限而被截斷時另記 `truncated`）／`failed`（非零 exit）／`output_overflow`（stderr 超過上限，整組行程被終止）／`timeout`／`start_failed`／`refused`（停用、版本已換、身分不符：工具沒有執行）／`error`（後端這一側失敗，例如已知秘密掃描或 tools lock；P2a review 補上） |
 | `exit_code` | `failed` 才有 |
 | `workflow` | 呼叫來源：`capture`、`enrich`、`assist_update`……；後端自己執行的是 `health_check`（跑一次範例）與 `verify`（修正後自動驗證），見第 10 節 |
-| `check_id` | `health_check`／`verify` 那一批的 job id，用來推導驗證狀態（第 9 節）；其他為 null |
+| `check_id` | `health_check`／`verify` 那一批的 job id，連到那次檢查的結論（`tool_check`，第 9 節；P5 review r1 起結論另存，不再由紀錄推導）；其他為 null |
 | `llm_log_id`、`llm_log_process` | 連回 AI 日誌那一筆；用既有的 process token 判斷後端是否重啟過。`health_check`／`verify` 沒有這個連結，前端不顯示空連結；ring 只有 50 筆，連結失效是常態 |
 | `args`、`stderr`、`stdout` | **只有非 `ok` 才存**，已遮蔽、有上限（第 6.2 節） |
 
@@ -412,9 +412,10 @@ exit 0 但結果不對：沒有失敗紀錄可附。這種情況照舊用修訂�
     不是秘密的請移到 config.env」。**遷移來的工具**（任一版本 `origin.json` 的 `source` 是
     `legacy-ai-meta` 或 `pre-existing/unknown`）另外顯示提醒：「這個工具建於 0.4.0 以前，`.env`
     可能混著設定」並列出 key。先做唯讀，編輯照舊手改檔案。
-  - **驗證狀態**：由目前版本的 `verify`／`health_check` 紀錄（依 `check_id` 分批）推導——「沒有
-    範例」、「尚未驗證」、「驗證通過（3/3，時間）」、「驗證失敗（2/3）」、「驗證未完成（預算
-    用完）」。後端重啟、驗證中斷之後的復原路徑，就是按「跑一次範例」。
+  - **驗證狀態**：取目前版本最新一次檢查的結論（`tool_check`，每次跑完範例寫一筆；P5 review r1
+    起不再由可被清除的執行紀錄推導）——「沒有範例」、「尚未驗證」、「驗證通過（3/3，時間）」、
+    「驗證失敗（2/3）」、「驗證未完成（預算用完）」。後端重啟、驗證中斷之後的復原路徑，就是按
+    「跑一次範例」。
   - 「最近執行」：時間、版本、來源、結果、耗時。失敗的那一筆可以展開看參數與 stderr，可修的有
     「請 AI 修正」與「加上說明…」。
   - 「跑一次範例」與它的結果（第 10 節）。

@@ -33,12 +33,26 @@ export function verificationStateText(state) {
 				color: "red",
 			};
 		case "incomplete":
-			return {
-				text: `驗證未完成（跑了 ${state.ran}/${state.total} 個）`,
-				color: "orange",
-			};
+			return { text: incompleteText(state), color: "orange" };
 		default:
 			return null;
+	}
+}
+
+// Why the newest check of the current version did not cover every example
+// (ToolVerificationState.reason): the budget, the tool switched off or replaced
+// mid-run, or an examples.json that changed since.
+function incompleteText(state) {
+	const counted = `跑了 ${state.ran}/${state.total} 個`;
+	switch (state.reason) {
+		case "budget":
+			return `驗證未完成：預算用完（${counted}）`;
+		case "interrupted":
+			return `驗證未完成：工具在驗證途中被停用或更換（${counted}）`;
+		case "examples_changed":
+			return "範例在上次驗證後有變動，請再跑一次範例";
+		default:
+			return `驗證未完成（${counted}）`;
 	}
 }
 
@@ -55,6 +69,9 @@ export function exampleOutcomeMeta(outcome) {
 	}
 	if (outcome === "not_run") {
 		return { label: "未執行（預算用完）", color: "gray" };
+	}
+	if (outcome === "stopped") {
+		return { label: "未執行（工具被停用或更換）", color: "gray" };
 	}
 	return runOutcomeMeta(outcome);
 }
@@ -99,17 +116,15 @@ export function verificationView(verification) {
 			failedRunIds: [],
 		};
 	}
-	const passed = (verification.runs ?? []).filter(
-		(run) => run.outcome === "ok",
-	).length;
+	const runs = verification.runs ?? [];
+	const passed = runs.filter((run) => run.outcome === "ok").length;
+	const failed = runs.filter((run) => FAILED.has(run.outcome)).length;
 	const total = verification.total;
-	const anyFailed = (verification.runs ?? []).some(
-		(run) =>
-			run.outcome !== "ok" &&
-			run.outcome !== "skipped" &&
-			run.outcome !== "not_run",
-	);
-	if (anyFailed) {
+	// Only the tool's own failures fail a check. A refusal (the tool switched
+	// off or replaced mid-run) or the backend failing a call leaves an example
+	// unverified, not failed: there is nothing for a fix to attach (P5 review
+	// r1, J3), the same rule as the backend's verdict.
+	if (failed > 0) {
 		return {
 			tone: "failed",
 			title: `範例驗證失敗（${passed}/${total} 通過）`,
@@ -117,12 +132,18 @@ export function verificationView(verification) {
 			failedRunIds,
 		};
 	}
-	if (verification.completed < total) {
+	if (passed < total) {
 		return {
 			tone: "incomplete",
-			title: verification.budget_exhausted
-				? `驗證未完成：預算用完（跑了 ${verification.completed}/${total} 個）`
-				: `驗證未完成（跑了 ${verification.completed}/${total} 個）`,
+			title: incompleteText({
+				ran: passed,
+				total,
+				reason: verification.budget_exhausted
+					? "budget"
+					: runs.some((run) => run.outcome === "stopped")
+						? "interrupted"
+						: null,
+			}),
 			rows,
 			failedRunIds,
 		};

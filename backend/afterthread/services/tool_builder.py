@@ -3081,26 +3081,37 @@ _WORKFLOW_VERIFY = "verify"
 _WORKFLOW_HEALTH_CHECK = "health_check"
 
 
-def _verification_dict(result: tools.CheckResult, *, finished: bool) -> dict[str, Any]:
+async def _name_secrets() -> list[str] | None:
+    """The secrets example names are masked against, or None when the scan fails.
+
+    Scanned on a worker (P5 review r1, J5): the scan walks every package's
+    ``.env``, and nothing that touches the filesystem runs on the event loop.
+    """
+    try:
+        return await run_in_threadpool(tools._redaction_secrets)
+    except Exception:
+        return None
+
+
+def _verification_dict(
+    result: tools.CheckResult, *, finished: bool, secrets: list[str] | None
+) -> dict[str, Any]:
     """A check's result as the job reports it: per example, plus the totals.
 
     Example names are builder-written version content shown to the operator, so
-    they pass the redactor like every other such text. A failing secret scan
-    must not lose the result, so it costs the names instead.
+    they pass the redactor like every other such text -- masked, then cut
+    (``tools.example_display_name``). ``secrets`` comes from ``_name_secrets``;
+    a failed scan (None) must not lose the result, so it costs the names instead.
     """
-    try:
-        secrets = tools._redaction_secrets()
-    except Exception:
-        secrets = None
     runs = []
     for index, example in enumerate(result.results, start=1):
         name = (
-            tools._mask_known_secrets(example.name, secrets)
+            tools.example_display_name(example.name, secrets)
             if secrets is not None
             else f"範例 {index}"
         )
         runs.append({"name": name, "outcome": example.outcome, "run_id": example.run_id})
-    not_started = {tools.EXAMPLE_SKIPPED, tools.EXAMPLE_NOT_RUN}
+    not_started = {tools.EXAMPLE_SKIPPED, tools.EXAMPLE_NOT_RUN, tools.EXAMPLE_STOPPED}
     return {
         "status": result.status,
         "message": result.message,
@@ -3123,10 +3134,16 @@ async def _verify_published(name: str, vid: str) -> dict[str, Any]:
     reported on the job as each example finishes.
     """
     job_id = _CURRENT_JOB_ID.get()
+    # Progress is reported from the loop as each example ends, so its names are
+    # masked against one scan taken up front; the final report scans again.
+    progress_secrets = await _name_secrets()
 
     def _progress(partial: tools.CheckResult) -> None:
         if job_id is not None:
-            _update_job(job_id, verification=_verification_dict(partial, finished=False))
+            _update_job(
+                job_id,
+                verification=_verification_dict(partial, finished=False, secrets=progress_secrets),
+            )
 
     try:
         result = await tools.run_examples(
@@ -3142,7 +3159,7 @@ async def _verify_published(name: str, vid: str) -> dict[str, Any]:
         # not turn that into a failure. It says what happened instead.
         _logger.warning("Verification of %s not run: %s", name, type(exc).__name__)
         result = tools.CheckResult(status="error", vid=vid)
-    return _verification_dict(result, finished=True)
+    return _verification_dict(result, finished=True, secrets=await _name_secrets())
 
 
 # Why a health check cannot start, by the reason ``tools.checkable_tool`` or the
@@ -3152,6 +3169,10 @@ _CHECK_REFUSALS = {
     "no_examples": "這個版本沒有 examples.json，沒有範例可以跑。修訂時 AI 會建立它。",  # noqa: RUF001
     "disabled": "工具已停用：執行路徑不會執行停用的工具。啟用後再跑。",  # noqa: RUF001
     "invalid": "工具目前的版本不是可執行的工具包。",
+    # The two a check can only meet AFTER admission (P5 review r1, J2): the
+    # version moved between the submit and the run, or the package went away.
+    "version_changed": "送出之後工具換了版本，這次沒有跑範例。請重新整理後再跑。",  # noqa: RUF001
+    "not_found": "找不到這個工具（可能已被刪除），沒有跑範例。",  # noqa: RUF001
 }
 
 
@@ -3213,9 +3234,13 @@ async def start_health_check_job(name: str, expected_vid: str) -> CheckJobStart:
 async def _run_check_job(job_id: str, name: str, expected_vid: str) -> None:
     """The health check's task body: run the examples, report as they finish."""
     _update_job(job_id, state="running", tool_name=name)
+    progress_secrets = await _name_secrets()
 
     def _progress(partial: tools.CheckResult) -> None:
-        _update_job(job_id, verification=_verification_dict(partial, finished=False))
+        _update_job(
+            job_id,
+            verification=_verification_dict(partial, finished=False, secrets=progress_secrets),
+        )
 
     try:
         result = await tools.run_examples(
@@ -3239,9 +3264,11 @@ async def _run_check_job(job_id: str, name: str, expected_vid: str) -> None:
     _update_job(
         job_id,
         state="succeeded" if ran else "failed",
-        error=None if ran else (result.message or _CHECK_REFUSALS.get(result.status)),
+        error=None
+        if ran
+        else (result.message or _CHECK_REFUSALS.get(result.status, "沒有跑範例。")),
         outcome=None if ran else _OUTCOME_FAILED,
-        verification=_verification_dict(result, finished=True),
+        verification=_verification_dict(result, finished=True, secrets=await _name_secrets()),
         finished_at=_now_iso(),
     )
 

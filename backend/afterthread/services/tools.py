@@ -3064,10 +3064,10 @@ class CheckContext:
     """A run of a tool's examples (web-v6 §10) that the calls in it belong to.
 
     Set by ``run_examples`` around its calls: their records carry ``workflow``
-    (``health_check`` or ``verify``) and ``check_id`` -- the batch the tools page
-    derives the verification state from -- and ``runs`` collects each call's
-    ``(run_id, outcome)`` in order, which is how the runner learns an outcome the
-    handler's string does not carry.
+    (``health_check`` or ``verify``) and ``check_id`` -- the check whose verdict
+    (``tool_check``) they are the evidence of -- and ``runs`` collects each
+    call's ``(run_id, outcome)`` in order, which is how the runner learns an
+    outcome the handler's string does not carry.
     """
 
     check_id: str
@@ -3111,6 +3111,32 @@ def set_run_recorder(recorder: Callable[[ToolRunRecord], int | None] | None) -> 
     """Install (or, with None, remove) the callable that persists run records."""
     global _run_recorder
     _run_recorder = recorder
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCheckRecord:
+    """The verdict of one run of a version's examples, as ``tool_check`` keeps it."""
+
+    check_id: str
+    tool_name: str
+    vid: str
+    workflow: str
+    finished_at: datetime
+    total: int
+    passed: int
+    failed: int
+    stopped: str | None
+
+
+# The verdict recorder, injected by main (``tool_runs.record_check``) the way the
+# run recorder is, for the same reasons; None records nothing.
+_check_recorder: Callable[[ToolCheckRecord], int | None] | None = None
+
+
+def set_check_recorder(recorder: Callable[[ToolCheckRecord], int | None] | None) -> None:
+    """Install (or, with None, remove) the callable that persists check verdicts."""
+    global _check_recorder
+    _check_recorder = recorder
 
 
 def _record_bodies(
@@ -3631,16 +3657,29 @@ def load_examples(version_root: VersionRoot) -> ExamplesFile:
         # type checker as well.
         examples.append(
             ToolExample(
-                name=_utf8_safe(name.strip())[:_EXAMPLE_NAME_MAX_CHARS],
+                name=_utf8_safe(name.strip()),
                 args={str(key): value for key, value in args.items()},
             )
         )
     return ExamplesFile(examples=tuple(examples))
 
 
+def example_display_name(name: str, secrets: list[str]) -> str:
+    """An example's name as the operator is shown it: masked, THEN cut.
+
+    The name is builder-written version content. Redact before the cut, the
+    order every other slice here keeps (P5 review r1, J4): a cut first can leave
+    a registered value's head too short for the trailing-fragment guard.
+    """
+    return _mask_known_secrets(name, secrets)[:_EXAMPLE_NAME_MAX_CHARS]
+
+
 @dataclass(frozen=True, slots=True)
 class ExampleResult:
-    """How one example went: a run outcome, or ``skipped``/``not_run`` (never started)."""
+    """How one example went: a run outcome, or how it was never started.
+
+    ``skipped``, ``not_run`` or ``stopped`` -- see ``EXAMPLE_SKIPPED``.
+    """
 
     name: str
     outcome: str
@@ -3648,9 +3687,12 @@ class ExampleResult:
 
 
 # An example not started because an earlier one timed out (the API is most
-# likely down for all of them), or because the budget ran out.
+# likely down for all of them), because the budget ran out, or because an
+# earlier one was refused -- the tool was switched off or replaced mid-run, so
+# every call after it would be refused too (P5 review r1, J3).
 EXAMPLE_SKIPPED = "skipped"
 EXAMPLE_NOT_RUN = "not_run"
+EXAMPLE_STOPPED = "stopped"
 
 
 @dataclass(frozen=True, slots=True)
@@ -3670,6 +3712,24 @@ class CheckResult:
     total: int = 0
     budget_exhausted: bool = False
     message: str | None = None
+
+    @property
+    def passed(self) -> int:
+        return sum(1 for result in self.results if result.outcome == RUN_OK)
+
+    @property
+    def failed(self) -> int:
+        """Examples the TOOL failed; a refusal or a backend error is not one."""
+        return sum(1 for result in self.results if result.outcome in RUN_FAILURE_OUTCOMES)
+
+    @property
+    def stopped(self) -> str | None:
+        """Why the run ended short of the list, if not by a failure: see ToolCheck."""
+        if self.budget_exhausted:
+            return "budget"
+        if any(result.outcome == EXAMPLE_STOPPED for result in self.results):
+            return "interrupted"
+        return None
 
 
 def checkable_tool(name: str) -> tuple[Resolved, LlmTool] | str:
@@ -3729,7 +3789,7 @@ async def run_examples(
                 )
             if not loaded.examples:
                 return CheckResult(status="no_examples", vid=resolution.vid)
-            return await _run_loaded_examples(
+            result = await _run_loaded_examples(
                 tool,
                 resolution.vid,
                 loaded.examples,
@@ -3737,8 +3797,34 @@ async def run_examples(
                 budget_seconds,
                 on_progress,
             )
+            # Under the same lock as the run records: a delete, which clears
+            # the tool's verdicts with them, cannot land in between.
+            await _write_check(name, check_id, workflow, result)
+            return result
     finally:
         await run_in_threadpool(release_tools_lock, fd)
+
+
+async def _write_check(name: str, check_id: str, workflow: str, result: CheckResult) -> None:
+    """Hand a check's verdict to the recorder; never raise (like ``_write_record``)."""
+    recorder = _check_recorder
+    if recorder is None or result.vid is None:
+        return
+    record = ToolCheckRecord(
+        check_id=check_id,
+        tool_name=name,
+        vid=result.vid,
+        workflow=workflow,
+        finished_at=datetime.now(UTC),
+        total=result.total,
+        passed=result.passed,
+        failed=result.failed,
+        stopped=result.stopped,
+    )
+    try:
+        await run_in_threadpool(recorder, record)
+    except Exception as exc:
+        _logger.warning("Tool check verdict not written: %s", type(exc).__name__)
 
 
 async def _run_loaded_examples(
@@ -3781,6 +3867,8 @@ async def _run_loaded_examples(
             results.append(ExampleResult(example.name, outcome, run_id))
             if outcome == RUN_TIMEOUT:
                 stop_reason = EXAMPLE_SKIPPED
+            elif outcome == RUN_REFUSED:
+                stop_reason = EXAMPLE_STOPPED
             if on_progress is not None:
                 on_progress(_snapshot())
     finally:

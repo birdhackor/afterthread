@@ -27,7 +27,7 @@ from sqlmodel import Session, col, create_engine, select
 
 from afterthread.config import get_settings
 from afterthread.db import enable_sqlite_foreign_keys
-from afterthread.models import ToolRun
+from afterthread.models import ToolCheck, ToolRun
 from afterthread.services import llm_log, tools
 
 _logger = logging.getLogger("afterthread.tool_runs")
@@ -142,6 +142,31 @@ def record(run: tools.ToolRunRecord, *, engine: Engine | None = None) -> int | N
         return run_id
     except Exception as exc:
         _logger.warning("Tool run record not written: %s", type(exc).__name__)
+        return None
+
+
+def record_check(check: tools.ToolCheckRecord, *, engine: Engine | None = None) -> int | None:
+    """Write one check's verdict (web-v6 §10); its id, or None. Never raises, like ``record``."""
+    try:
+        row = ToolCheck(
+            check_id=check.check_id,
+            tool_name=check.tool_name,
+            vid=check.vid,
+            workflow=check.workflow,
+            finished_at=check.finished_at,
+            total=check.total,
+            passed=check.passed,
+            failed=check.failed,
+            stopped=check.stopped,
+        )
+        with Session(engine if engine is not None else _recorder_engine()) as session:
+            session.add(row)
+            session.flush()
+            check_row_id = row.id
+            session.commit()
+        return check_row_id
+    except Exception as exc:
+        _logger.warning("Tool check verdict not written: %s", type(exc).__name__)
         return None
 
 
@@ -314,6 +339,12 @@ def delete_for_tool(session: Session, tool_name: str) -> bool:
             .where(col(ToolRun.tool_name) == tool_name)
             .execution_options(synchronize_session=False)
         )
+        # The verdicts go with the records: a same-name reinstall is another tool.
+        session.exec(
+            sql_delete(ToolCheck)
+            .where(col(ToolCheck.tool_name) == tool_name)
+            .execution_options(synchronize_session=False)
+        )
         session.commit()
     except Exception as exc:
         session.rollback()
@@ -447,16 +478,22 @@ def stats(session: Session) -> dict[str, Any]:
 def verification_state(
     session: Session, tool_name: str, current: tools.Resolved | None
 ) -> dict[str, Any]:
-    """How the current version did on its examples, from its newest check batch.
+    """How the current version did on its examples, from its newest verdict.
 
-    A batch is the records of one health check or post-fix verification
-    (``check_id``). Only the CURRENT version's batches count: a pass of the
-    version before the fix says nothing about this one. Totals come from the
-    version's examples.json as it is now, so a batch that ran fewer examples than
-    the file lists (the budget ran out, the rest were skipped) reads as
-    incomplete. States: ``no_version``, ``examples_invalid``, ``no_examples``,
-    ``never`` (has examples, never checked), ``passed``, ``failed``,
-    ``incomplete``.
+    A verdict (``tool_check``) is written when a health check or the
+    verification after a fix has run the examples. Only the CURRENT version's
+    verdicts count: a pass of the version before the fix says nothing about
+    this one. Run records are not consulted (P5 review r1, J1): the operator
+    purges them by outcome and age, and the verdict must not change with what
+    a purge happened to leave.
+
+    States: ``no_version``, ``examples_invalid``, ``no_examples``, ``never`` (has
+    examples, never checked), ``failed`` (the tool failed at least one), ``passed``
+    (every example the file lists now passed), ``incomplete`` -- with ``reason``
+    ``budget`` (the time budget ran out), ``interrupted`` (the tool was switched
+    off or replaced mid-run), ``examples_changed`` (the file lists a different
+    number of examples than the check ran against: versions are immutable, so
+    only a hand edit does that), or none (an example the backend itself failed).
     """
     if current is None:
         return {"state": "no_version"}
@@ -467,39 +504,31 @@ def verification_state(
     if total == 0:
         return {"state": "no_examples", "total": 0}
     newest = session.exec(
-        select(ToolRun.check_id, func.max(ToolRun.id))
-        .where(
-            col(ToolRun.tool_name) == tool_name,
-            col(ToolRun.vid) == current.vid,
-            col(ToolRun.check_id).is_not(None),
-        )
-        .group_by(ToolRun.check_id)
-        .order_by(func.max(ToolRun.id).desc())
+        select(ToolCheck)
+        .where(col(ToolCheck.tool_name) == tool_name, col(ToolCheck.vid) == current.vid)
+        .order_by(col(ToolCheck.id).desc())
         .limit(1)
     ).first()
     if newest is None:
         return {"state": "never", "total": total}
-    rows = list(
-        session.exec(
-            select(ToolRun).where(
-                col(ToolRun.tool_name) == tool_name, col(ToolRun.check_id) == newest[0]
-            )
-        )
-    )
-    passed = sum(1 for row in rows if row.outcome == tools.RUN_OK)
-    if passed < len(rows):
+    reason: str | None = None
+    if newest.failed > 0:
         state = "failed"
-    elif len(rows) < total:
-        state = "incomplete"
-    else:
+    elif newest.total != total:
+        state, reason = "incomplete", "examples_changed"
+    elif newest.passed == total:
         state = "passed"
+    else:
+        state, reason = "incomplete", newest.stopped
     return {
         "state": state,
-        "passed": passed,
-        "ran": len(rows),
+        "reason": reason,
+        "passed": newest.passed,
+        "failed": newest.failed,
+        "ran": newest.passed + newest.failed,
         "total": total,
-        "checked_at": max(row.started_at for row in rows),
-        "workflow": rows[0].workflow,
+        "checked_at": newest.finished_at,
+        "workflow": newest.workflow,
     }
 
 

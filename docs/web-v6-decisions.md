@@ -454,7 +454,7 @@ UTC 再比）、stats 的 SQL、孤兒判斷與別名、P2a-r1 的 `error` 路�
 
 - 由目前版本最新一批（`check_id`）`verify`／`health_check` 紀錄推導，總數用 `examples.json` 目前的
   範例數；這一批跑的比總數少（預算用完、被略過、或之後加了範例）就是 `incomplete`。舊版本的通過
-  不算數。
+  不算數。（r1 改為讀另存的結論 `tool_check`，見附錄 J1。）
 - 放在 `GET /api/tools/{name}/runs` 的回應裡（「最近執行」展開時才讀），不放在工具列表：列表要為
   每個工具讀一次 `examples.json`，而狀態只在詳情裡看。
 
@@ -481,3 +481,23 @@ UTC 再比）、stats 的 SQL、孤兒判斷與別名、P2a-r1 的 `error` 路�
 健康檢查 job 與路由的拒絕、驗證狀態的推導（`test_verification_state_follows_the_newest_batch_of_the_current_version`）。
 前端的措辭與判斷在 `toolChecks.js`，有 vitest；另用實際的瀏覽器跑過：「最近執行」顯示「有 2 個範例，
 尚未驗證」，按「跑一次範例」後卡片列出逐個結果與「請 AI 修正」，驗證狀態與頁首筆數隨之更新。
+
+### D47 附錄（P5 review r1，Fable）
+
+| # | 問題 | 處理 |
+|---|---|---|
+| J1（P2） | 驗證狀態由「目前版本最新一批 `check_id` 紀錄」推導，而 purge 是逐筆的：清掉「只清成功的」之後，一次 3/3 的通過被清空，較舊那一批的失敗變成「最新」，畫面從「驗證通過」變成「驗證失敗（0/3）」 | **採納，改資料模型**：新增 `tool_check` 表，每次跑完範例（`status == "ran"`）在同一把共享鎖下寫一筆結論：`check_id`、版本、`workflow`、時間、`total`、`passed`、`failed`、`stopped`。驗證狀態只讀它；執行紀錄只是佐證，清除不影響結論。刪除工具時一起刪除（同名重新安裝是另一個工具）；丟棄的版本只留幾個整數，不再被讀到。寫入失敗與紀錄一樣只記一行警告 |
+| J2 | 送出後才發現無法執行（版本換了、套件不見）的健康檢查 `error` 為 null，卡片顯示「未知錯誤」 | **採納**：`_CHECK_REFUSALS` 補上 `version_changed` 與 `not_found`，未知狀態也有預設文字 |
+| J3 | 檢查途中工具被停用，其餘範例逐一被拒（`refused`）並算成未通過 → 「驗證失敗」，卻沒有可修的紀錄 | **採納**：第一個 `refused` 之後其餘標為 `stopped`、不再呼叫；只有工具自己的四種失敗算失敗，被拒與後端錯誤只讓檢查「未完成」（`reason: interrupted`）。前端 `verificationView` 用同一條規則 |
+| J4 | 範例名稱先截到 200 字才遮蔽，秘密跨在截斷處時留下 5 個字的前段 | **採納**：`load_examples` 保留完整名稱，顯示時 `example_display_name` 先遮蔽再截 |
+| J5 | `_verification_dict` 在事件迴圈上掃描所有套件的 `.env` | **採納**：`_name_secrets()` 在 worker 上掃描；進度用開始前掃一次的結果，最終結果再掃一次 |
+| J6 | 範例數變少後，舊的 3 筆結果顯示成「驗證通過（3/2）」 | **採納**：結論記下當時的 `total`，與現在的範例數不同就是 `incomplete`（`reason: examples_changed`）。版本不可變，只有手改才會發生 |
+| J7 | 驗證卡片上的「請 AI 修正」不看寫入閘：被擋時按了沒有反應 | **採納**：`ToolJobProgress` → `VerificationSummary` 帶 `fixBlocked`（列上用 `writesBlocked`，面板層級用 `versionWritesBlocked`），被擋時按鈕停用 |
+| J8 | 設計 §9 寫「驗證未完成（預算用完）」，但狀態裡沒有原因 | **採納**：結論的 `stopped` 經 `reason` 傳到前端，「最近執行」寫出預算用完、途中被停用或更換、範例有變動 |
+
+測試（`tests/test_tool_examples.py`）：`test_purging_the_records_leaves_the_verdict_alone`（先失敗再通過，清掉成功的
+與全部紀錄後仍是通過 3/3）、`test_deleting_a_tool_deletes_its_verdicts`、`test_a_tool_switched_off_mid_check_stops_the_rest_and_is_not_a_failure`、
+`test_a_budget_cut_reads_as_incomplete_for_lack_of_budget`、`test_a_health_check_that_cannot_run_after_admission_says_why`、
+`test_an_example_name_is_masked_before_it_is_cut`、`test_the_secret_scan_for_example_names_stays_off_the_event_loop`，
+`test_verification_state_follows_the_newest_batch_of_the_current_version` 加上範例變多與變少。前端 `toolChecks.test.js`
+加上未完成的原因、`stopped` 與「被拒不算失敗」。

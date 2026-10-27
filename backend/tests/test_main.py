@@ -20,7 +20,7 @@ from sqlmodel import Session, select
 from afterthread.config import Settings
 from afterthread.db import get_engine
 from afterthread.main import app, lifespan
-from afterthread.models import ToolRun
+from afterthread.models import ToolCheck, ToolRun
 from afterthread.services import tool_runs, tools
 
 
@@ -88,7 +88,7 @@ def test_lifespan_tls_no_verify_false_emits_no_warning(
     assert [r for r in caplog.records if r.name == "afterthread.main"] == []
 
 
-def test_lifespan_wires_the_tool_run_recorder_and_unwires_it_on_exit(
+def test_lifespan_wires_the_tool_run_recorders_and_unwires_them_on_exit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """web-v6 §6.3: the recorder is wired after ``init_db`` built the table, and a
@@ -118,25 +118,42 @@ def test_lifespan_wires_the_tool_run_recorder_and_unwires_it_on_exit(
         stdout=None,
         stderr=None,
     )
+    check = tools.ToolCheckRecord(
+        check_id="job-1",
+        tool_name="kb",
+        vid="20260728T010203Z-abcdef",
+        workflow="health_check",
+        finished_at=datetime(2026, 10, 27, tzinfo=UTC),
+        total=2,
+        passed=2,
+        failed=0,
+        stopped=None,
+    )
     try:
 
         async def _enter_and_exit() -> None:
             async with lifespan(app):
                 wired.append(tools._run_recorder)
+                wired.append(tools._check_recorder)
                 recorder = tools._run_recorder
                 assert recorder is not None
                 written.append(recorder(run))
+                check_recorder = tools._check_recorder
+                assert check_recorder is not None
+                written.append(check_recorder(check))
 
         asyncio.run(_enter_and_exit())
         with Session(get_engine()) as session:
             rows = list(session.exec(select(ToolRun)))
+            checks = list(session.exec(select(ToolCheck)))
     finally:
         tool_runs._recorder_engine().dispose()
         tool_runs._recorder_engine.cache_clear()
         get_engine().dispose()
         get_engine.cache_clear()
 
-    assert wired == [tool_runs.record]
-    assert tools._run_recorder is None
-    assert written == [rows[0].id]
+    assert wired == [tool_runs.record, tool_runs.record_check]
+    assert (tools._run_recorder, tools._check_recorder) == (None, None)
+    assert written == [rows[0].id, checks[0].id]
     assert [(row.tool_name, row.outcome) for row in rows] == [("kb", "ok")]
+    assert [(row.check_id, row.passed, row.total) for row in checks] == [("job-1", 2, 2)]

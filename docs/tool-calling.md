@@ -222,7 +222,9 @@ LLM。這道檢查在**送出時**先跑一次（不過就回 `409 env_policy`�
 tools lock、`bind_request_tools_lock`，用 `checkable_tool` 以 `enabled_llm_tools` 同一組函式建出
 那個工具的 handler 直接呼叫——身分檢查、遮蔽、執行紀錄全部照舊，停用的工具不會被執行。每個範例
 就是一次 handler 呼叫，紀錄帶 `check_id`（那一批的 job id）；通過條件只有 exit 0、沒有逾時，不比對
-輸出。總預算是 `TOOL_CHECK_BUDGET_SECONDS`：第一個逾時之後其餘略過，預算用完就不再跑。
+輸出。總預算是 `TOOL_CHECK_BUDGET_SECONDS`：第一個逾時之後其餘略過，預算用完就不再跑；某個範例
+被拒（工具在途中被停用或更換）時其餘標為 `stopped`。跑完之後，仍持有同一把共享鎖時把結論寫進
+`tool_check`（通過與失敗的個數、為什麼沒跑完），工具頁的驗證狀態讀的是這筆結論，不是紀錄本身。
 `examples.json` 讀不到、不是合法 JSON、形狀不對或超過 10 個時，整份不跑並回報原因。
 
 ### 啟用狀態

@@ -52,6 +52,15 @@ describe("verificationStateText", () => {
 		).toBe("驗證未完成（跑了 2/3 個）");
 	});
 
+	it("says why a check stopped short", () => {
+		const incomplete = (reason) =>
+			verificationStateText({ state: "incomplete", reason, ran: 2, total: 3 })
+				.text;
+		expect(incomplete("budget")).toBe("驗證未完成：預算用完（跑了 2/3 個）");
+		expect(incomplete("interrupted")).toContain("被停用或更換");
+		expect(incomplete("examples_changed")).toContain("請再跑一次範例");
+	});
+
 	it("is null with no current version", () => {
 		expect(verificationStateText({ state: "no_version" })).toBeNull();
 	});
@@ -71,6 +80,7 @@ describe("exampleOutcomeMeta", () => {
 	it("names the two ways an example is never started", () => {
 		expect(exampleOutcomeMeta("skipped").label).toContain("略過");
 		expect(exampleOutcomeMeta("not_run").label).toContain("預算");
+		expect(exampleOutcomeMeta("stopped").label).toContain("停用");
 		expect(exampleOutcomeMeta("timeout").label).toBe("逾時");
 	});
 });
@@ -124,6 +134,29 @@ describe("verificationView", () => {
 		);
 		expect(view.tone).toBe("incomplete");
 		expect(view.title).toContain("預算用完");
+	});
+
+	it("does not call a refused or backend-failed example a failure", () => {
+		const view = verificationView(
+			ran([
+				{ name: "a", outcome: "ok", run_id: 1 },
+				{ name: "b", outcome: "refused", run_id: 2 },
+				{ name: "c", outcome: "stopped", run_id: null },
+			]),
+		);
+		expect(view.tone).toBe("incomplete");
+		expect(view.title).toBe(
+			"驗證未完成：工具在驗證途中被停用或更換（跑了 1/3 個）",
+		);
+		expect(view.failedRunIds).toEqual([]);
+		const errored = verificationView(
+			ran([
+				{ name: "a", outcome: "ok", run_id: 1 },
+				{ name: "b", outcome: "error", run_id: 2 },
+			]),
+		);
+		expect(errored.tone).toBe("incomplete");
+		expect(errored.title).toBe("驗證未完成（跑了 1/2 個）");
 	});
 
 	it("says why nothing ran", () => {

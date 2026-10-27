@@ -280,8 +280,9 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   時兩者都回 `null`（紀錄活得比日誌環久，理由同 `summary` 的 `llm_log_id`）。
   另帶 `current_vid`、總筆數 `total`，以及目前版本的驗證狀態 `verification`（web-v6 §9）：
   `state` 是 `no_version`／`examples_invalid`／`no_examples`／`never`／`passed`／`failed`／
-  `incomplete`，由目前版本最新一批 `verify`／`health_check` 紀錄（依 `check_id` 分批）與
-  `examples.json` 目前的範例數推導。只要求套件存在（同 `settings`），宣告在 `/jobs/{job_id}` 之前。
+  `incomplete`（另帶 `reason`：`budget`／`interrupted`／`examples_changed`），取目前版本最新一次
+  檢查的結論（`tool_check` 表，每次跑完範例寫一筆）與 `examples.json` 目前的範例數比對；
+  不由執行紀錄推導，所以清除紀錄不會改變它。只要求套件存在（同 `settings`），宣告在 `/jobs/{job_id}` 之前。
   這五條路由都**不宣告** `503 tools_not_configured`：`TOOLS_DIR` 未設定時
   任何名稱都解析不到工具，404 已經是誠實答案。
 

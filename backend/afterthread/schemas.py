@@ -798,7 +798,7 @@ class ToolInstallAccepted(BaseModel):
 
 
 class ToolVerificationRun(BaseModel):
-    """One example of a check: its run outcome, or ``skipped``/``not_run``."""
+    """One example of a check: its run outcome, or ``skipped``/``not_run``/``stopped``."""
 
     name: str
     outcome: str
@@ -812,9 +812,10 @@ class ToolVerification(BaseModel):
     ``no_examples``, ``examples_invalid`` (``message`` says how), ``disabled``
     (not verified: the execution path refuses a disabled tool), ``invalid``,
     ``not_found``, ``version_changed``, or ``error``. ``completed`` of ``total``
-    examples were started; after the first timeout the rest are ``skipped``, and
-    past the budget ``not_run`` with ``budget_exhausted``. ``finished`` is false
-    while the run is still going -- a poll shows progress.
+    examples were started; after the first timeout the rest are ``skipped``,
+    after the first refusal (the tool switched off or replaced mid-run)
+    ``stopped``, and past the budget ``not_run`` with ``budget_exhausted``.
+    ``finished`` is false while the run is still going -- a poll shows progress.
     """
 
     status: str
@@ -967,20 +968,25 @@ class ToolRunDetail(ToolRunSummary):
 
 
 class ToolVerificationState(BaseModel):
-    """How the current version did on its examples.json, from its newest check (web-v6 §9).
+    """How the current version did on its examples.json, from its newest verdict (web-v6 §9).
 
     ``state``: ``no_version``, ``examples_invalid`` (``message`` says how),
-    ``no_examples``, ``never``, ``passed``, ``failed`` or ``incomplete`` (fewer
-    examples ran than the file lists). ``passed``/``ran``/``total`` count
-    examples; ``workflow`` says whether the batch was a health check or the
-    verification after a fix.
+    ``no_examples``, ``never``, ``passed``, ``failed`` (the tool failed at least
+    one example) or ``incomplete``, whose ``reason`` is ``budget``,
+    ``interrupted`` (the tool was switched off or replaced mid-run),
+    ``examples_changed`` or none. ``passed``/``failed``/``ran``/``total`` count
+    examples (``ran`` = passed + failed, ``total`` as the file lists them now);
+    ``workflow`` says whether the check was a health check or the verification
+    after a fix.
     """
 
     state: Literal[
         "no_version", "examples_invalid", "no_examples", "never", "passed", "failed", "incomplete"
     ]
+    reason: Literal["budget", "interrupted", "examples_changed"] | None = None
     message: str | None = None
     passed: int | None = None
+    failed: int | None = None
     ran: int | None = None
     total: int | None = None
     checked_at: datetime | None = None
