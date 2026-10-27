@@ -197,8 +197,9 @@ package `.env` 與 `state.json` 原地不動，舊 versions 永久保留。候�
 
 修訂開始前會驗 package `.env` 可讀、至多 64 KiB、值至少六字元，且決定每個值的最後
 assignment line 能被遮蔽器逐字對回，`config.env` 也必須讀得到；無法安全遮蔽就不花
-LLM。這道檢查在**送出時**先跑一次（不過就回 `409 env_policy`，訊息列出 key 名、
-永不列值），job 開跑時再跑一次（web-v6 §5.2）。builder shell 仍有服務
+LLM。這道檢查在**送出時**先跑一次（不過就回 `409 env_policy`；值太短或寫法無法
+對應時訊息列出 key 名、永不列值，檔案讀不到或過大時只說明狀況），job 開跑時再跑
+一次（web-v6 §5.2）。builder shell 仍有服務
 權限，因此修訂期間不要手改 `.env`：已寫入的 AI 日誌不能事後補遮。
 
 ### 啟用狀態

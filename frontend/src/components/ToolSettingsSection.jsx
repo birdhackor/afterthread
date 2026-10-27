@@ -13,6 +13,7 @@ import { useQuery } from "@tanstack/react-query";
 import { apiGet } from "../api/client.js";
 import {
 	configEntryFlags,
+	occurrenceKeys,
 	settingsNotices,
 	toolSettingsQueryKey,
 } from "../utils/toolSettings.js";
@@ -26,6 +27,9 @@ import {
 // Read-only on purpose. Editing stays a hand edit of the files, the supported
 // way to change them (D21); a web editor would first need the write-side rules
 // (atomic replace, mode bits) that `afterthread init-env` already had to learn.
+//
+// Row keys come from occurrenceKeys: the names arrive already redacted, and two
+// keys that both equal a secret come back as the same marker.
 export function ToolSettingsSection({ name, expanded }) {
 	const { data, error, isError, isFetching } = useQuery({
 		queryKey: toolSettingsQueryKey(name),
@@ -49,6 +53,8 @@ export function ToolSettingsSection({ name, expanded }) {
 	}
 
 	const notices = settingsNotices(data);
+	const configRowKeys = occurrenceKeys(data.config.map((entry) => entry.key));
+	const envKeyKeys = occurrenceKeys(data.env_keys);
 	return (
 		<Stack gap="sm" pt="xs">
 			{notices.map((notice) => (
@@ -68,8 +74,8 @@ export function ToolSettingsSection({ name, expanded }) {
 				) : (
 					<Table withTableBorder={false} verticalSpacing={4}>
 						<Table.Tbody>
-							{data.config.map((entry) => (
-								<Table.Tr key={entry.key}>
+							{data.config.map((entry, index) => (
+								<Table.Tr key={configRowKeys[index]}>
 									<Table.Td>
 										<Code>{entry.key}</Code>
 									</Table.Td>
@@ -112,8 +118,8 @@ export function ToolSettingsSection({ name, expanded }) {
 					</Text>
 				) : (
 					<Group gap={4}>
-						{data.env_keys.map((key) => (
-							<Code key={key}>{key}</Code>
+						{data.env_keys.map((key, index) => (
+							<Code key={envKeyKeys[index]}>{key}</Code>
 						))}
 					</Group>
 				)}

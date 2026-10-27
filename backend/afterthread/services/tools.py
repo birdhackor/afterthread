@@ -2575,29 +2575,39 @@ def package_settings(package_root: PackageRoot) -> dict[str, Any]:
 
     Blocking. ``.env`` contributes KEY NAMES only; its values are read solely to
     flag conflicts and never leave this function. ``config.env`` contributes its
-    pairs, each value still run through ``redact_known_secrets`` -- the file holds
-    settings by the operator's choice, but a secret pasted into it by mistake is
-    exactly what must not be served back, and a value the redactor changes is
-    flagged ``contains_secret`` (the zero-guess check: it equals or contains a
-    value some ``.env`` registers). Key names go through the redactor too, the
-    rule every operator-derived text in this subsystem follows.
+    pairs, but a value that CONTAINS a known secret -- an exact substring of some
+    registered value at the redactor's floor -- is flagged ``contains_secret`` and
+    served as the marker alone: the file holds settings by the operator's choice,
+    and a secret pasted into it by mistake is exactly what must not be served back.
+
+    Exact containment, deliberately NOT ``redact_known_secrets``' own answer (P1
+    review C1): that redactor also masks a text that merely ENDS with the first six
+    characters of a secret -- a guard for text cut mid-secret by a cap, which a
+    whole config value never is. Asking it here flagged an innocent
+    ``https://host/myproj`` red because some token began ``myproj-``, sending the
+    operator to hunt for a secret that is not there, the very confusion this view
+    exists to remove. Key names still go through the full mask, the rule every
+    operator-derived text in this subsystem follows; over-masking a name costs
+    nothing. The known-secret set is computed ONCE here (review C2): the redactor
+    recomputes it, a whole tools-directory scan, on every call.
     """
+    secrets = [value for value in known_secret_values() if len(value) >= _MIN_SECRET_LEN]
     env_values, env_readable = _dotenv_file_state(package_root.path / ".env")
     config_values, config_readable = _dotenv_file_state(package_root.path / _CONFIG_FILENAME)
     config: list[dict[str, Any]] = []
     for key, value in config_values.items():
-        shown = redact_known_secrets(value)
+        contains_secret = any(secret in value for secret in secrets)
         config.append(
             {
-                "key": redact_known_secrets(key),
-                "value": shown,
+                "key": _mask_known_secrets(key, secrets),
+                "value": _REDACTION_MARKER if contains_secret else value,
                 "overridden_by_env": key in env_values,
                 "secret_like_name": any(part in key.upper() for part in _SECRET_LIKE_KEY_PARTS),
-                "contains_secret": shown != value,
+                "contains_secret": contains_secret,
             }
         )
     return {
-        "env_keys": [redact_known_secrets(key) for key in env_values],
+        "env_keys": [_mask_known_secrets(key, secrets) for key in env_values],
         "env_readable": env_readable,
         "config": config,
         "config_readable": config_readable,

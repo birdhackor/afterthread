@@ -2767,6 +2767,80 @@ def test_package_settings_tells_missing_from_unreadable(
     assert tools.package_settings(_package_root(pkg))["config_readable"] is False
 
 
+def test_package_settings_flags_exact_containment_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``contains_secret`` means the value really contains a registered secret
+    (P1 review C1). A value that merely ENDS with a secret's first six characters
+    is not flagged and is served as written: the redactor's trailing-fragment guard
+    is for text cut mid-secret by a cap, and a whole config value never is. A value
+    that does contain a secret is served as the marker alone."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(
+        root,
+        "kb",
+        "import sys\nsys.stdout.write('ok')\n",
+        dotenv="TOKEN=myproj-super-secret-token\n",
+    )
+    (_package_path(pkg) / tools._CONFIG_FILENAME).write_text(
+        "BASE_URL=https://api.example.com/myproj\n"
+        "LEAKY_URL=https://api.example.com/?t=myproj-super-secret-token\n",
+        encoding="utf-8",
+    )
+    _install_tools(monkeypatch, root)
+
+    by_key = {e["key"]: e for e in tools.package_settings(_package_root(pkg))["config"]}
+
+    assert by_key["BASE_URL"]["value"] == "https://api.example.com/myproj"
+    assert by_key["BASE_URL"]["contains_secret"] is False
+    assert by_key["LEAKY_URL"]["value"] == tools._REDACTION_MARKER
+    assert by_key["LEAKY_URL"]["contains_secret"] is True
+
+
+def test_package_settings_reports_an_unreadable_dotenv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``env_readable`` is the ``.env`` half of the missing-vs-unreadable split
+    (P1 review C5): a symlinked ``.env`` is refused by the bounded reader, and
+    the view says so instead of showing an empty key list."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "kb", "import sys\nsys.stdout.write('ok')\n")
+    target = tmp_path / "elsewhere.env"
+    target.write_text("API_KEY=abcdefgh\n", encoding="utf-8")
+    (_package_path(pkg) / ".env").symlink_to(target)
+    _install_tools(monkeypatch, root)
+
+    settings = tools.package_settings(_package_root(pkg))
+
+    assert settings["env_readable"] is False
+    assert settings["env_keys"] == []
+
+
+def test_built_before_v5_skips_entries_that_are_not_committed_versions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``versions/`` can hold things that are not committed versions -- a stray
+    file, a ``.discarded`` leftover, a symlink, a version with a corrupt
+    ``origin.json`` -- and none of them may count as "migrated" or break the view
+    (P1 review C5)."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "kb", "import sys\nsys.stdout.write('ok')\n")
+    versions = _package_path(pkg) / tools._VERSIONS_DIRNAME
+    (versions / "README.txt").write_text("legacy-ai-meta", encoding="utf-8")
+    discarded = versions / "20250101T000000Z-aaaaaa.discarded" / tools._META_DIRNAME
+    discarded.mkdir(parents=True)
+    (discarded / tools._ORIGIN_FILENAME).write_text(
+        json.dumps({"source": "legacy-ai-meta"}), encoding="utf-8"
+    )
+    corrupt = versions / "20250101T000000Z-bbbbbb" / tools._META_DIRNAME
+    corrupt.mkdir(parents=True)
+    (corrupt / tools._ORIGIN_FILENAME).write_text("{not json", encoding="utf-8")
+    (versions / "20250101T000000Z-cccccc").symlink_to(discarded.parent)
+    _install_tools(monkeypatch, root)
+
+    assert tools.package_settings(_package_root(pkg))["built_before_v5"] is False
+
+
 @pytest.mark.parametrize(
     ("source", "expected"),
     [("legacy-ai-meta", True), ("pre-existing/unknown", True), ("builder-install", False)],

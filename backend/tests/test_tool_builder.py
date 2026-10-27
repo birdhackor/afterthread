@@ -6907,7 +6907,7 @@ def test_run_revise_gives_config_env_to_the_shell_and_the_prompt(
     prompt = captured["prompt"]
     assert "# 快取秒數\nCACHE_TTL=3600\nSHARED=public-value" in prompt
     assert "These keys are also set in the package's .env, whose value wins: SHARED" in prompt
-    assert "(values hidden; never print them): API_KEY, SHARED" in prompt
+    assert "(secrets; values hidden; never print them): API_KEY, SHARED" in prompt
     assert "live-secret-value-123456" not in prompt
     assert "secret-wins-123456" not in prompt
 
@@ -7010,3 +7010,62 @@ def test_router_settings_serves_a_tool_named_jobs_and_404s_the_unknown(
     missing = client.get("/api/tools/ghost/settings")
     assert missing.status_code == 404
     assert missing.json() == {"detail": "Tool not found"}
+
+
+def test_spelling_gate_names_each_failing_line_once_in_order() -> None:
+    """Invariant C for the spelling gate (P1 review C5): two different keys are
+    both named, the deciding-line failures before the shadowed-line ones, and a
+    key failing both checks is named once."""
+    text = (
+        'A_KEY="abcd\\"efgh"\n'  # shadowed; reversible spelling
+        "A_KEY='abcd\"efgh'\n"  # the deciding line, plain
+        "B_KEY=two words here\n"  # deciding line; bare value the serializer would quote
+        'C_KEY="ijkl\\"mnop"\n'  # deciding line AND shadowed check both fail
+    )
+    values = {
+        key: value
+        for key, value in tools._parse_dotenv_text(text).items()
+        if value  # what run_revise registers
+    }
+
+    message = tool_builder._unmaskable_env_error(text, values)
+
+    assert message is not None
+    assert message == _unmatchable("B_KEY", "C_KEY", "A_KEY")
+    for value in values.values():
+        assert value not in message
+
+
+def test_spelling_gate_names_a_comment_line_as_a_comment() -> None:
+    """A comment holding an ``=`` is judged like any line ``_env_line_key``
+    recognizes (R8-1, unchanged); the message only says it is a comment line
+    rather than calling ``# Usage: KEY`` a key (P1 review C3)."""
+    text = 'TOKEN=abcdefgh\n# Usage: KEY="x\\"y" # comment\n'
+
+    message = tool_builder._unmaskable_env_error(text, {"TOKEN": "abcdefgh"})
+
+    assert message == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE.replace(
+        "{keys}", "註解行「# Usage: KEY」"
+    )
+
+
+def test_router_revise_refuses_an_oversized_config_env(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The size cap ``.env`` has applies to ``config.env`` at submit too (P1
+    review C5), with its own category-only message."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / tools._CONFIG_FILENAME).write_text(
+        "X=" + "a" * tools._ENV_FILE_MAX_BYTES + "\n", encoding="utf-8"
+    )
+
+    response = client.post(
+        "/api/tools/kbsearch/revise",
+        json={"feedback": "修好錯誤", "expected_vid": _TEST_VID},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "env_policy",
+        "message": tool_builder._ERROR_REVISE_CONFIG_TOO_LARGE,
+    }

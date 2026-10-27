@@ -266,7 +266,8 @@ LangChain），見 [docs/tool-calling.md](docs/tool-calling.md)。
 - 工具頁每個工具的「設定」會列出 `.env` 有哪些 key（看不到值）與 `config.env` 的內容，並提醒
   名稱像秘密、或值和 `.env` 某個秘密相同的項目。0.4.0 以前建的工具，當時的 AI 可能把設定也寫
   進了 `.env`，「設定」會特別提示，請把不是秘密的那幾行搬到 `config.env`。
-- AI 修訂進行中不要編輯這兩個檔案：修訂期間的讀取無法事後補遮（見 `docs/tool-calling.md`）。
+- AI 修訂進行中不要編輯這兩個檔案：AI 開工時讀到的是當時的內容，中途改了，它測試用的環境
+  就和之後實際執行的不同；`.env` 的新值也不會在那一場修訂裡被遮蔽（見 `docs/tool-calling.md`）。
 
 ### `.staging` 殘留清理
 

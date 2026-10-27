@@ -232,7 +232,13 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   `summaryErrorRevalidates`），因為那與「安裝」無關，硬塞
   進前者的檔名只會誤導之後的讀者——這個專案的 vitest 在 node 環境跑、沒有
   jsdom，元件本身測不到，抽出的純函式是唯一能自動化驗證的介面，所以新邏輯一律
-  先問「這算安裝，還是總結」再決定放哪個檔案。**唯一的例外寫在
+  先問「這算安裝、總結，還是套件設定」再決定放哪個檔案。第三個檔案是 web-v6 的
+  `utils/toolSettings.js`：套件層 `.env`／`config.env` 唯讀「設定」區的措辭與旗標
+  （`configEntryFlags`、`settingsNotices`、`occurrenceKeys`），它的元件是
+  `components/ToolSettingsSection.jsx`——那份資料屬於套件、跨版本存在，不屬於某一版的
+  總結。修訂工作的終局呈現 `toolJobOutcomeView` 在 `toolInstall.js`（job 輪詢那一組），
+  送出被 `env_policy` 擋下時的通知 `reviseRefusalNotification` 在 `toolSummary.js`
+  （修訂請求那一組）。**唯一的例外寫在
   `toolSummary.js` 的最後一節**：AI 日誌深連結的**兩半**（`工具` 頁產生連結的
   `logLinkSearch`、`AI 日誌` 頁解讀連結的 `deepLinkTarget`）刻意放在同一個檔案，
   因為它們是同一份約定；拆開的話，發出主張的那一頁和依主張行動的那一頁會各自漂移，

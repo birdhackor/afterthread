@@ -57,8 +57,9 @@
 
 - 只要求套件存在，不要求 `current` 可解析：兩個檔案都在套件層，`current` 壞掉的套件正是需要看
   設定的時候。內部別名一樣回 404。
-- `contains_secret` 的判斷是「遮蔽器有沒有改動這個值」。這是零猜測的判斷，涵蓋所有套件的 `.env`
-  與進行中登記的秘密；回傳的值本身也是遮蔽後的。
+- `contains_secret` 的判斷是「這個值是否**逐字包含**某個已登記的秘密」（長度達遮蔽下限者），
+  涵蓋所有套件的 `.env` 與進行中登記的秘密；含有秘密的值整個以遮蔽標記回傳。最初的寫法是
+  「遮蔽器有沒有改動這個值」，review C1 指出那會誤報，見下方附錄。
 - `built_before_v5` 看**任一**已提交版本的 `origin.json` 的 `source` 是否來自遷移
   （`legacy-ai-meta`、`pre-existing/unknown`）。不看遷移專用的 `migration-owner.json`：那是遷移
   內部的所有權證明，不是產品語意。
@@ -91,3 +92,27 @@
 前端的判斷邏輯在 `toolSettings.js`、`toolInstall.js` 的 `toolJobOutcomeView`、`toolSummary.js` 的
 `reviseRefusalNotification`，各有 vitest。另外用實際的瀏覽器跑過一次：遷移來的套件顯示提醒、
 貼錯檔的秘密被遮蔽並標示、送出修訂被 `CACHE_TTL` 擋下時出現列出 key 的橘色通知。
+
+### D42 附錄（P1 review r1，Fable，8 條）
+
+| # | 嚴重度 | finding | 處置 |
+|---|---|---|---|
+| C1 | P2 | `contains_secret = redact(value) != value` 會誤報：遮蔽器的「結尾是秘密前 6 字就遮」守衛是給被截斷的文字用的，完整的設定值也被套上了。實例：token 以 `myproj-` 開頭，`BASE_URL=https://api.example.com/myproj` 被標成紅色秘密 | **採納**。改成逐字包含判斷；含有秘密的值整個以標記回傳。測試 `test_package_settings_flags_exact_containment_only` 在舊寫法下會失敗 |
+| C2 | P3 | `package_settings` 對每個值與 key 都呼叫 `redact_known_secrets`，每次都重掃整個 tools 目錄；500 行的 `config.env` 掃 1,002 次 | **採納**，與 C1 一起：已知秘密集合只算一次，key 名用同一份集合遮 |
+| C3 | P3 | 拼法閘把含 `=` 的註解行當 key 點名，訊息出現「「# Usage: KEY」的寫法」 | **採納（只改措辭）**：以 `#` 開頭的列為「註解行「…」」。閘的語意不變（R8-1 本來就檢查註解行，`cat` 會印出註解） |
+| C4 | P3 | 送出路徑的閘現在會呼叫 `redact_known_secrets`，而它在已知秘密掃描失敗時會拋例外 → 500 | **接受並記錄**：拋出時還沒有名額、工作或秘密登記，也沒有文字外流；把它映成 `env_policy` 反而會告訴操作者「你的檔案有問題」，其實壞的是掃描。寫進 `_revise_env_gate` 的 docstring |
+| C5 | P3 | 測試缺口：拼法閘多個 key、`config.env` 超過上限、`.env` 不可讀的 `env_readable`、`versions/` 裡的怪項目 | **採納**：補 `test_spelling_gate_names_each_failing_line_once_in_order`、`test_router_revise_refuses_an_oversized_config_env`、`test_package_settings_reports_an_unreadable_dotenv`、`test_built_before_v5_skips_entries_that_are_not_committed_versions` |
+| C6 | P3 | 設定區用遮蔽後的 key 名當 React key，兩個 key 都等於秘密時會重複 | **採納**：改用 `occurrenceKeys`（`TagList` 的「名稱-出現次數」做法；Biome 禁止用陣列索引） |
+| C7 | P3 | 文件不一致：`frontend/README.md` 的檔案分工規則沒提第三個檔；兩份文件說 `env_policy` 一律列出 key（讀不到／過大其實只說明狀況）；根 README 對 `config.env` 給了錯的理由 | **採納**：三處都改 |
+| C8 | P3 | 行為變更應記錄；修訂提示把空值的 `.env` key 也叫「credentials」 | **採納**：記錄如下；提示改稱「the package's .env sets in your run_shell environment (secrets; values hidden…)」 |
+
+C8 記錄的兩個行為變更：
+
+- **送出時的拒絕順序**：`.env`／`config.env` 的閘只要套件目錄存在就跑，所以 `current` 壞掉、同時
+  `.env` 不合格的套件，現在回 `409 env_policy`，以前是 `404`；`job_busy` 也排在 `env_policy` 之後。
+  前端不會對沒有可用版本的列提供修訂，所以目前沒有可見影響；P3 的一鍵修正會走同一條路徑，屆時
+  沿用這個順序。
+- **空值的 `.env` key 也會列進修訂提示**：它們確實會蓋過 `config.env` 的同名值（與執行時一致），
+  所以提示不排除它們，只把措辭從「credentials」改成「.env 設定的變數」。
+
+覆蓋判定：不變量 A、B、C、D、E、O、W 全部有測試覆蓋（review 的逐條判定相同）。

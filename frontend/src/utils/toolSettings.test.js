@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	configEntryFlags,
+	occurrenceKeys,
 	settingsNotices,
 	toolSettingsQueryKey,
 } from "./toolSettings.js";
@@ -67,5 +68,17 @@ describe("settingsNotices", () => {
 		);
 		expect(notice.color).toBe("orange");
 		expect(notice.text).toContain("config.env");
+	});
+});
+
+describe("occurrenceKeys", () => {
+	it("keeps keys unique when redacted names collide", () => {
+		const marker = "•••[秘密已遮蔽]•••";
+		expect(occurrenceKeys(["A", marker, marker, "B"])).toEqual([
+			"A-0",
+			`${marker}-0`,
+			`${marker}-1`,
+			"B-0",
+		]);
 	});
 });

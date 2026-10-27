@@ -6,18 +6,32 @@
 // in node without jsdom, so a pure function is the only testable surface.
 //
 // The backend (GET /api/tools/{name}/settings) already did the security work:
-// .env arrives as KEY NAMES only, and every config.env value has been through
-// the redactor. Nothing here can make that weaker; it only decides wording.
+// .env arrives as KEY NAMES only, and a config.env value that contains a known
+// secret arrives as the redaction marker. Nothing here can make that weaker; it
+// only decides wording.
 
 export function toolSettingsQueryKey(name) {
 	return ["tool-settings", name];
 }
 
+// React keys for a list of names that may repeat: the names arrive already
+// redacted, so two keys that both equal a secret come back as the same marker.
+// `${name}-${occurrence}` is TagList's scheme -- stable per distinct value, and
+// no raw array index (Biome's noArrayIndexKey).
+export function occurrenceKeys(names) {
+	const seen = new Map();
+	return names.map((name) => {
+		const occurrence = seen.get(name) ?? 0;
+		seen.set(name, occurrence + 1);
+		return `${name}-${occurrence}`;
+	});
+}
+
 // Badges beside one config.env pair, most serious first. Each one is a fact the
 // backend computed, not a guess made here:
-// * contains_secret -- the redactor changed the value, i.e. it equals or
-//   contains a value some .env registers: very likely a secret in the wrong
-//   file, and config.env values are NOT masked anywhere else;
+// * contains_secret -- the value equals or contains (exactly) a value some
+//   .env registers: very likely a secret in the wrong file, and config.env
+//   values are NOT masked anywhere else;
 // * secret_like_name -- the KEY reads like a credential (KEY/TOKEN/SECRET/
 //   PASSWORD); a reminder only, since a value can never prove it is a setting;
 // * overridden_by_env -- .env sets the same key, and its value is the one that

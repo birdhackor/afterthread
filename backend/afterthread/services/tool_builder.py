@@ -1334,8 +1334,8 @@ def _revise_user_prompt(
             )
     if env_keys:
         parts.append(
-            "Credentials available as environment variables in run_shell "
-            "(values hidden; never print them): "
+            "Variables the package's .env sets in your run_shell environment "
+            "(secrets; values hidden; never print them): "
             + _truncate_to(tools.redact_known_secrets(", ".join(env_keys)), budget)
         )
     return "\n\n".join(parts)
@@ -2290,6 +2290,14 @@ def _revise_env_gate(directory: Path) -> tuple[_ReviseEnv | None, str | None]:
     Only the non-empty ``.env`` values are judged: a ``KEY=`` line contributes no
     secret to anything (``tools._cached_env_values``' own rule), so it can never
     make a package permanently unrevisable.
+
+    It can also RAISE, and that is accepted rather than caught (P1 review C4): a
+    refusal names keys through ``redact_known_secrets``, which fails closed when
+    the known-secret scan itself fails (an unreadable tools directory). On the
+    submit path that surfaces as a plain 500 before any slot, job or secret
+    registration exists; inside the job it is ``_run_job``'s category-only
+    backstop. Neither leaks text, and mapping it onto ``env_policy`` would tell the
+    operator their files are wrong when the scan is what broke.
     """
     _env_existed, env_values, env_text, env_error = _read_env_for_values(directory)
     if env_error is not None:
@@ -2617,6 +2625,13 @@ def _env_policy_message(template: str, keys: list[str]) -> str:
     follows: key names are operator-chosen, so in principle one could equal a
     registered value, and cutting first could leave a fragment no redactor
     matches.
+
+    A "key" that starts with ``#`` is a COMMENT line holding an ``=``: the
+    shadowed-line check (R8-1) judges every line ``_env_line_key`` recognizes,
+    comments included, and that is deliberate -- a ``cat`` prints a comment as
+    readily as an assignment. Only the wording follows from it (P1 review C3): the
+    line is named as a comment line, so the operator is not told a key called
+    ``# Usage: KEY`` exists.
     """
     unique = list(dict.fromkeys(keys))
     shown = []
@@ -2624,7 +2639,8 @@ def _env_policy_message(template: str, keys: list[str]) -> str:
         redacted = tools.redact_known_secrets(key)
         if len(redacted) > _ENV_KEY_SHOWN_MAX:
             redacted = redacted[:_ENV_KEY_SHOWN_MAX] + "…"
-        shown.append(f"「{redacted}」")
+        label = f"「{redacted}」"
+        shown.append(f"註解行{label}" if key.startswith("#") else label)
     named = "、".join(shown)
     if len(unique) > _ENV_KEYS_SHOWN_MAX:
         named += f"等 {len(unique)} 個"

@@ -753,9 +753,9 @@ class ToolJobStatus(BaseModel):
 class ToolSettingsEntry(BaseModel):
     """One ``config.env`` pair as the 工具 page shows it (web-v6 §9).
 
-    ``value`` has been through the redactor; ``contains_secret`` says the redactor
-    changed it (it equals or contains a value some ``.env`` registers -- likely a
-    secret in the wrong file). ``overridden_by_env`` marks a key ``.env`` also
+    ``contains_secret`` says the value equals or contains (as an exact substring) a
+    value some ``.env`` registers -- likely a secret in the wrong file -- and such a
+    value is served as the redaction marker alone. ``overridden_by_env`` marks a key ``.env`` also
     sets, whose value is the one that runs. ``secret_like_name`` is a name-only
     reminder (KEY/TOKEN/SECRET/PASSWORD).
     """

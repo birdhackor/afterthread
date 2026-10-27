@@ -232,8 +232,8 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `{feedback: 1..20000, expected_vid}`，依使用者意見
   送出一次 **AI 修訂**工作（見下方「依意見修訂既有工具」）；202 + `job_id`，
   用上面的 `GET /api/tools/jobs/{job_id}` 輪詢。**先**檢查套件的 `.env`／`config.env`
-  政策（web-v6 §5.2）：不過就回 `409 env_policy`，`message` 是會列出 key 名（永不列值）
-  的那段說明；工作開跑時會再檢查一次。工具不存在回 404；已有工具工作
+  政策（web-v6 §5.2）：不過就回 `409 env_policy`。值太短或寫法無法對應時，`message`
+  會列出 key 名（永不列值）；檔案讀不到或超過上限時只說明狀況。工作開跑時會再檢查一次。工具不存在回 404；已有工具工作
   在跑回 `409 job_busy`；取得名額後版本不符回 `409 version_mismatch`，這些都不
   建立工作。**不宣告** `502`／`503`：修訂是背景工作，LLM 沒
   設定或上游失敗都封在工作狀態裡（失敗的 job + 友善訊息 + AI 日誌連結），與
@@ -336,8 +336,8 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   會進工作區並隨新版本保留。package `.env` 不被複製或改寫，只把解析後的值注入
   `run_shell` 供實測與遮蔽；`config.env` 的值墊在它底下一起注入，文字與 `.env`
   的 key 名則放進修訂提示。開工前（送出時與 job 開跑時各一次）`.env` 的每個值
-  必須至少 6 字元、寫法能被遮蔽器逐字對回，`config.env` 必須讀得到；不過的訊息會
-  列出 key 名。builder 寫出的 `.env` 同樣被剝除。通過驗證後，
+  必須至少 6 字元、寫法能被遮蔽器逐字對回，`config.env` 必須讀得到；前兩項不過的
+  訊息會列出 key 名。builder 寫出的 `.env` 同樣被剝除。通過驗證後，
   `shell` 被組成一個版本目錄並先寫
   `origin.json(previous=<舊 vid>, feedback=<本次意見>)`；版本持久化、rename 到
   `versions/<新 vid>` 後才原子發布 `current`。因此舊版本永久保留、套件 state 與
