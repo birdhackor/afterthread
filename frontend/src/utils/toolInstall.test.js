@@ -7,6 +7,7 @@ import {
 	secretNameError,
 	secretValueError,
 	TOOL_JOB_POLL_MS,
+	toolJobOutcomeView,
 	toolJobQueryEnabled,
 	toolJobRefetchInterval,
 } from "./toolInstall.js";
@@ -257,5 +258,47 @@ describe("secretNameError / secretValueError (both-or-neither pair)", () => {
 		// field stays clean even for a short value, mirroring the backend's
 		// pair-incomplete-before-length precedence.
 		expect(secretValueError("", "abc")).toBeNull();
+	});
+});
+
+describe("toolJobOutcomeView", () => {
+	it("keeps success green", () => {
+		expect(toolJobOutcomeView({ state: "succeeded" }, "revise")).toMatchObject({
+			tone: "success",
+			color: "green",
+			title: "修訂完成",
+		});
+	});
+
+	it("shows the builder's own ready=false as not published, never as a failure", () => {
+		const view = toolJobOutcomeView(
+			{ state: "failed", outcome: "not_published" },
+			"revise",
+		);
+		expect(view).toMatchObject({
+			tone: "not_published",
+			color: "orange",
+			title: "AI 未發布新版本",
+		});
+		expect(view.note).toContain("沒有任何變更");
+		expect(
+			toolJobOutcomeView(
+				{ state: "failed", outcome: "not_published" },
+				"install",
+			).title,
+		).toBe("AI 未安裝工具");
+	});
+
+	it("keeps every other failure red, including a poll with no outcome field", () => {
+		for (const job of [
+			{ state: "failed", outcome: "failed" },
+			{ state: "failed" },
+		]) {
+			expect(toolJobOutcomeView(job, "revise")).toMatchObject({
+				tone: "failed",
+				color: "red",
+				title: "修訂失敗",
+			});
+		}
 	});
 });

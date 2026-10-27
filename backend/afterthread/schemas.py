@@ -730,6 +730,11 @@ class ToolJobStatus(BaseModel):
     report through one job table and one poll endpoint. ``env_keys`` names
     assignments from a builder-written ``.env`` that the backend stripped;
     values never enter the result.
+
+    ``outcome`` (web-v6 §8.3) is how a TERMINAL job ended, finer than ``state``:
+    ``published``, ``not_published`` (the builder itself declined to publish --
+    possibly an outside cause, possibly a fix it could not make; the card says
+    neither), or ``failed``. Null while queued/running.
     """
 
     job_id: str
@@ -742,3 +747,39 @@ class ToolJobStatus(BaseModel):
     llm_log_id: int | None
     llm_log_process: str | None
     env_keys: list[str]
+    outcome: Literal["published", "not_published", "failed"] | None
+
+
+class ToolSettingsEntry(BaseModel):
+    """One ``config.env`` pair as the 工具 page shows it (web-v6 §9).
+
+    ``value`` has been through the redactor; ``contains_secret`` says the redactor
+    changed it (it equals or contains a value some ``.env`` registers -- likely a
+    secret in the wrong file). ``overridden_by_env`` marks a key ``.env`` also
+    sets, whose value is the one that runs. ``secret_like_name`` is a name-only
+    reminder (KEY/TOKEN/SECRET/PASSWORD).
+    """
+
+    key: str
+    value: str
+    overridden_by_env: bool
+    secret_like_name: bool
+    contains_secret: bool
+
+
+class ToolSettings(BaseModel):
+    """A package's operator-owned settings, read-only (web-v6 §4, §9).
+
+    ``.env`` is KEY NAMES only -- its values are secrets and never leave the
+    backend. ``config.env`` is shown in full (redacted). The two ``*_readable``
+    flags separate "no such file" (true, empty) from "a file that cannot be read
+    the bounded way" (false). ``built_before_v5`` marks a package migrated from
+    the pre-0.4.0 layout, whose ``.env`` may still hold settings an older builder
+    wrote there.
+    """
+
+    env_keys: list[str]
+    env_readable: bool
+    config: list[ToolSettingsEntry]
+    config_readable: bool
+    built_before_v5: bool

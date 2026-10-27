@@ -226,4 +226,5 @@ def test_only_by_id_routes_declare_404() -> None:
         ("/api/tools/{name}/summary", "get"),
         ("/api/tools/{name}/summary/regenerate", "post"),
         ("/api/tools/{name}/revise", "post"),
+        ("/api/tools/{name}/settings", "get"),
     }

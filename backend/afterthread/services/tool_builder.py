@@ -175,12 +175,20 @@ _ERROR_REVISE_NOT_FOUND = "找不到要修訂的工具（可能已被刪除）�
 _ERROR_REVISE_ENV_UNREADABLE = "無法讀取既有工具包的 .env，修訂已取消。"  # noqa: RUF001
 _ERROR_REVISE_ENV_TOO_LARGE = "既有工具包的 .env 超過大小上限，修訂已取消。"  # noqa: RUF001
 # A hand-edited ``.env`` holding a value BELOW the redactor's floor (R1-1). Names
-# the CONDITION and the two remedies, never the key and never the value -- the
-# whole point is that this value cannot be masked, so it must not be echoed by the
-# very message that refuses to expose it. See ``run_revise``'s own gate for why
-# refusing beats running.
+# the CONDITION, the KEYS (web-v6 §5: the operator ruled key names may be shown;
+# they already surface in ``env_keys`` and the migration report) and the two
+# remedies -- never the value: the whole point is that this value cannot be
+# masked, so it must not be echoed by the very message that refuses to expose it.
+# It also says WHY a non-secret trips it, because the operator who first met the
+# keyless version read "cannot be masked" as "you have a secret here" and could
+# not find one: every ``.env`` value is a secret to the redactor, and a setting
+# such as a TTL belongs in ``config.env``. ``{keys}`` is filled by
+# ``_env_policy_message``. See ``run_revise``'s own gate for why refusing beats
+# running.
 _ERROR_REVISE_ENV_UNMASKABLE = (
-    "既有工具包的 .env 內有值過短、無法遮蔽，修訂已取消：請加長該值，或將它從 .env 移除。"  # noqa: RUF001
+    f"既有工具包 .env 的{{keys}}值短於 {tools._MIN_SECRET_LEN} 字元，修訂已取消："  # noqa: RUF001
+    ".env 的每個值都會被當成秘密遮蔽，而太短的值遮不掉。"  # noqa: RUF001
+    "如果它是秘密，請加長；如果只是設定（例如 TTL），請把那一行移到同目錄的 config.env。"  # noqa: RUF001
 )
 # A hand-edited ``.env`` whose assignment line does not spell a value the way this
 # system itself would (R5-1, narrowed to that LINE by R6-1 and to EXACT equality by
@@ -195,14 +203,22 @@ _ERROR_REVISE_ENV_UNMASKABLE = (
 # rather than only its quoting, because R7-1's equality rule also refuses shapes with
 # nothing wrong with their quotes -- a trailing comment, an unquoted value with
 # spaces -- and a remedy that sent the operator hunting for escapes they do not have
-# would be worse than the refusal. Category-only like the rest: the condition and the
-# remedy, never the key and never the value -- printing the value in the message that
-# refuses to expose it would BE the leak.
+# would be worse than the refusal. The condition, the KEYS (web-v6 §5, as above) and
+# the remedy, never the value -- printing the value in the message that refuses to
+# expose it would BE the leak. A setting that merely happens to be written this way
+# has the same second way out as a short one, so the message offers it too.
 _ERROR_REVISE_ENV_UNMATCHABLE = (
-    "既有工具包的 .env 內有值的寫法無法對應到實際值、無法遮蔽，修訂已取消："  # noqa: RUF001
+    "既有工具包 .env 中{keys}的寫法無法對應到實際值、無法遮蔽，修訂已取消："  # noqa: RUF001
     "請把該行的值寫成最單純的形式（原值直接寫，或整段用引號包住），"  # noqa: RUF001
-    "並移除行尾註解與多餘的跳脫。"
+    "並移除行尾註解與多餘的跳脫；如果它只是設定，也可以把那一行移到同目錄的 config.env。"  # noqa: RUF001
 )
+# Revise reads the package's ``config.env`` (web-v6 §4) for the same reason it
+# reads ``.env``: its values go into run_shell's environment and its text into
+# the prompt, and a builder testing against a different environment than the
+# runtime's would be verifying the wrong thing. Category-only, like the two
+# ``.env`` read failures above.
+_ERROR_REVISE_CONFIG_UNREADABLE = "無法讀取既有工具包的 config.env，修訂已取消。"  # noqa: RUF001
+_ERROR_REVISE_CONFIG_TOO_LARGE = "既有工具包的 config.env 超過大小上限，修訂已取消。"  # noqa: RUF001
 # A fresh install publishes its package toggle before the final shell rename.
 _ERROR_INSTALL_STATE_WRITE = "無法寫入工具的啟用狀態，安裝已取消。"  # noqa: RUF001
 # Revise refuses a package that vanished, became an alias, or no longer matches
@@ -361,7 +377,9 @@ prints to STDOUT is the result shown to the AI assistant; a non-zero exit \
 code means failure (STDERR is shown as the error).
 - Put non-secret configuration defaults in the tool's own code, using \
 `os.environ.get("KEY", "default")` (or the equivalent in another language), so \
-the defaults remain part of this version. Do NOT write a `.env` file. If the \
+the defaults remain part of this version. The operator can override them for \
+this package in a `config.env` kept outside your workspace; never create one \
+yourself. Do NOT write a `.env` file. If the \
 tool needs a credential, name the required environment variable clearly in \
 tool.json's description; the operator supplies its value outside this build.
 - The workspace-root `.afterthread.meta/` directory belongs to the backend and \
@@ -472,14 +490,17 @@ address the user's feedback below, and leave everything the feedback does not \
 ask you to change exactly as you found it.
 
 Three facts about this workspace that differ from a fresh build:
-- The package's operator-owned `.env` remains outside this version workspace. \
-Do not write one, do not invent placeholder values, and do not make your changes \
-depend on rewriting it -- any `.env` you write is stripped before publication. \
-Its values are \
-already exported into your run_shell environment under their own names, so you \
+- The package's operator-owned `.env` (secrets) and `config.env` (setting \
+overrides) remain outside this version workspace. Do not write either one, do \
+not invent placeholder values, and do not make your changes depend on rewriting \
+them -- any `.env` you write is stripped before publication, and a `config.env` \
+in the workspace is never loaded. Their values are \
+already exported into your run_shell environment under their own names \
+(`config.env` first, `.env` on top), so you \
 can still live-test the real API (e.g. `echo '{"query":"test"}' | python3 \
-run.py`) without ever seeing them. If the user's feedback asks to CHANGE a \
-secret value, say so in your summary -- that is done by hand, not here.
+run.py`) without ever seeing the secrets. If the user's feedback asks to CHANGE \
+a secret value or an overridden setting, say so in your summary -- that is done \
+by hand, not here.
 - Never write a secret value into any file. A package that embeds a known \
 secret is REFUSED, and that refusal discards your whole revision.
 - The backend-owned root `.afterthread.meta/` directory is missing from this \
@@ -602,6 +623,13 @@ class InstallOutcome:
     # Names extracted from a builder-written .env before that file was stripped.
     # Values are intentionally not representable in the outcome or job schema.
     env_keys: tuple[str, ...] = ()
+    # True only for the builder's own ``ready=false`` close (web-v6 §8.3): the
+    # session ran and the model chose not to publish. Kept apart from every other
+    # failure because it is not one in the same sense -- the model may have found
+    # an external cause (an expired credential) or simply given up, and the job
+    # card must say "not published" rather than show the red "failed" both share
+    # today, without claiming to know which of the two it was.
+    not_ready: bool = False
 
 
 # --- staging containment + meta-tools ---------------------------------------
@@ -758,8 +786,10 @@ def _build_meta_tools(staging: Path, secret_env: dict[str, str] | None = None) -
     ``secret_env`` is the env addition injected into run_shell's environment so
     the builder can live-test the real API -- the install form's single
     ``{<NAME>: <value>}`` (D36), or a revise's whole preserved package ``.env``
-    (D40) -- passed straight to ``_run_shell_subprocess``. It touches ONLY
-    run_shell (the file meta-tools never see it) and never any prompt.
+    (D40) layered over its ``config.env`` (web-v6 §4) -- passed straight to
+    ``_run_shell_subprocess``. It touches ONLY run_shell (the file meta-tools
+    never see it) and never any prompt; the ``config.env`` TEXT reaches the
+    prompt separately, through ``_revise_user_prompt``.
     """
 
     async def write_file(args: dict[str, Any]) -> str:
@@ -1236,7 +1266,13 @@ def _builder_user_prompt(instructions: str, openapi_text: str) -> str:
     )
 
 
-def _revise_user_prompt(feedback: str, manifest_text: str | None) -> str:
+def _revise_user_prompt(
+    feedback: str,
+    manifest_text: str | None,
+    config_text: str = "",
+    env_keys: tuple[str, ...] = (),
+    conflicts: tuple[str, ...] = (),
+) -> str:
     """The revise session's user turn: the feedback + the package's manifest.
 
     Deliberately NOT a re-fetch of the OpenAPI document (D40): the revision is
@@ -1258,6 +1294,17 @@ def _revise_user_prompt(feedback: str, manifest_text: str | None) -> str:
     Each part carries the same per-part budget ``_builder_user_prompt`` gives the
     document; both are separately request/manifest-bounded already, so the cut is
     a backstop rather than the usual case.
+
+    Two package-layer facts follow when present (web-v6 §4), because the model
+    cannot see either file from its workspace. ``config.env`` is quoted WHOLE --
+    its comments are part of what the operator meant, and its values are settings
+    by the operator's own choice of file -- yet still through the redactor like
+    every operator-derived text here, so a secret pasted into the wrong file is
+    masked as long as ``.env`` holds it too. Without it the model changes a code
+    default that an override silently shadows and reports success (v5 §3). The
+    ``.env`` part is KEY NAMES only, which tells the model what credentials it
+    has without telling it any of them; ``conflicts`` are the keys both files
+    set, where the ``.env`` value is the one that runs.
     """
     budget = token_budget.char_allowance(get_settings().llm_prompt_budget_tokens)
     parts = [
@@ -1270,6 +1317,27 @@ def _revise_user_prompt(feedback: str, manifest_text: str | None) -> str:
             "The package's current tool.json:",
             _truncate_to(tools.redact_known_secrets(manifest_text), budget),
         ]
+    if config_text.strip():
+        parts += [
+            "The operator's setting overrides for this package (its config.env, "
+            "outside your workspace). These values override the defaults in the "
+            "tool's code at runtime and are already in your run_shell environment. "
+            "If the feedback asks to change one of these settings, changing the code "
+            "default has NO effect while the override stays: say in your summary "
+            "that the operator must edit config.env.",
+            _truncate_to(tools.redact_known_secrets(config_text), budget),
+        ]
+        if conflicts:
+            parts.append(
+                "These keys are also set in the package's .env, whose value wins: "
+                + _truncate_to(tools.redact_known_secrets(", ".join(conflicts)), budget)
+            )
+    if env_keys:
+        parts.append(
+            "Credentials available as environment variables in run_shell "
+            "(values hidden; never print them): "
+            + _truncate_to(tools.redact_known_secrets(", ".join(env_keys)), budget)
+        )
     return "\n\n".join(parts)
 
 
@@ -1988,6 +2056,7 @@ async def run_install(
                 error=f"AI 判定工具尚未完成：{reason}",  # noqa: RUF001
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
+                not_ready=True,
             )
 
         published, promote_error = await run_in_threadpool(
@@ -2172,6 +2241,69 @@ def _read_env_for_values(directory: Path) -> tuple[bool, dict[str, str], str, st
     return True, tools._parse_dotenv_text(text), text, None
 
 
+def _read_config_for_values(directory: Path) -> tuple[dict[str, str], str, str | None]:
+    """Read package ``config.env`` (web-v6 §4) for the builder shell and the prompt.
+
+    The same bounded, non-following read as ``_read_env_for_values`` and the same
+    "missing is fine, unreadable refuses" split, for the reason the error
+    constants give. Returns ``(values, text, error)``; the text is what the prompt
+    quotes, since its comments are part of what the operator meant.
+    """
+    config_file = directory / tools._CONFIG_FILENAME
+    try:
+        config_stat = config_file.lstat()
+    except FileNotFoundError:
+        return {}, "", None
+    except OSError:
+        return {}, "", _ERROR_REVISE_CONFIG_UNREADABLE
+    if config_stat.st_size > tools._ENV_FILE_MAX_BYTES:
+        return {}, "", _ERROR_REVISE_CONFIG_TOO_LARGE
+    text = tools._read_regular_file_capped(config_file, tools._ENV_FILE_MAX_BYTES)
+    if text is None:
+        return {}, "", _ERROR_REVISE_CONFIG_UNREADABLE
+    if len(text) > tools._ENV_FILE_MAX_BYTES:
+        return {}, "", _ERROR_REVISE_CONFIG_TOO_LARGE
+    return tools._parse_dotenv_text(text), text, None
+
+
+@dataclass(frozen=True, slots=True)
+class _ReviseEnv:
+    """What one read of a package's two env files gave the revise gate."""
+
+    env_values: dict[str, str]
+    config_values: dict[str, str]
+    config_text: str
+
+
+def _revise_env_gate(directory: Path) -> tuple[_ReviseEnv | None, str | None]:
+    """Read ``.env`` and ``config.env`` and apply the whole revise env policy.
+
+    Blocking, ONE worker hop for all of it (R1-3/R4-3): the ``.env`` read and
+    parse, the masking policy over its values, and the ``config.env`` read. Called
+    twice per revise, deliberately (web-v6 §5.2): once on the SUBMIT path, before
+    the global slot is taken, so a refusal reaches the operator as the response
+    to the click that caused it instead of as a job card they may never open; and
+    again inside ``run_revise``, on whatever the files say by then, because a
+    queued job can start minutes after its submit.
+
+    Returns ``(env, None)`` on success and ``(None, error)`` on any refusal.
+    Only the non-empty ``.env`` values are judged: a ``KEY=`` line contributes no
+    secret to anything (``tools._cached_env_values``' own rule), so it can never
+    make a package permanently unrevisable.
+    """
+    _env_existed, env_values, env_text, env_error = _read_env_for_values(directory)
+    if env_error is not None:
+        return None, env_error
+    registered_by_key = {key: value for key, value in env_values.items() if value}
+    mask_error = _unmaskable_env_error(env_text, registered_by_key)
+    if mask_error is not None:
+        return None, mask_error
+    config_values, config_text, config_error = _read_config_for_values(directory)
+    if config_error is not None:
+        return None, config_error
+    return _ReviseEnv(env_values, config_values, config_text), None
+
+
 def _env_assignment_rhs(text: str) -> dict[str, str]:
     """Each key in a ``.env`` text mapped to the RAW RHS that DETERMINES its value.
 
@@ -2207,8 +2339,11 @@ def _env_assignment_rhs(text: str) -> dict[str, str]:
     return spelled
 
 
-def _env_assignment_rhs_all(text: str) -> list[str]:
-    """EVERY assignment line's raw RHS, shadowed ones included (R8-1).
+def _env_assignment_rhs_all(text: str) -> list[tuple[str, str]]:
+    """EVERY assignment line's ``(key, raw RHS)``, shadowed ones included (R8-1).
+
+    The key rides along only so a refusal can NAME the line (web-v6 §5); the RHS
+    is still what is judged.
 
     Pure, and deliberately the counterpart of ``_env_assignment_rhs`` rather than
     a variant of it: that one answers "which spelling DECIDED this key's value"
@@ -2222,9 +2357,9 @@ def _env_assignment_rhs_all(text: str) -> list[str]:
     form the winning line avoided, and a ``cat`` of the file shows them all.
     """
     return [
-        line.split("=", 1)[1].strip()
+        (key, line.split("=", 1)[1].strip())
         for line in text.split("\n")
-        if _env_line_key(line) is not None
+        if (key := _env_line_key(line)) is not None
     ]
 
 
@@ -2438,25 +2573,62 @@ def _unmaskable_env_error(text: str, values: dict[str, str]) -> str | None:
     in front of the redactor.
 
     Refusing is the only honest option (the same "do not run beats leak" the floor
-    check already chose), and the messages name the CONDITION and the REMEDY only
-    -- never the key, never the value.
+    check already chose), and the messages name the CONDITION, the REMEDY and
+    every offending KEY (web-v6 §5) -- never the value. Each gate therefore
+    collects all of its keys before answering instead of stopping at the first,
+    so one refusal names everything the operator has to move; the passing case
+    already walked every key and every line, so this costs nothing new.
     """
-    if any(len(value) < tools._MIN_SECRET_LEN for value in values.values()):
-        return _ERROR_REVISE_ENV_UNMASKABLE
+    short = [key for key, value in values.items() if len(value) < tools._MIN_SECRET_LEN]
+    if short:
+        return _env_policy_message(_ERROR_REVISE_ENV_UNMASKABLE, short)
     spelled = _env_assignment_rhs(text)
-    for key, value in values.items():
-        rhs = spelled.get(key)
-        if rhs is None or rhs not in _dotenv_safe_spellings(value):
-            return _ERROR_REVISE_ENV_UNMATCHABLE
+    unmatched = [
+        key
+        for key, value in values.items()
+        if (rhs := spelled.get(key)) is None or rhs not in _dotenv_safe_spellings(value)
+    ]
     # ... and every OTHER assignment line, shadowed ones included (R8-1), for its
     # SHAPE alone: `_plainly_spelled` asks whether a line holds its own text
     # literally, which is answerable without knowing which value it was meant to
     # spell -- and it is exactly what a shadowed line needs to be innocent.
     # `spelled` cannot serve here: it keeps only the WINNER per key, which is the
     # one line this check does not need.
-    if any(not _plainly_spelled(rhs) for rhs in _env_assignment_rhs_all(text)):
-        return _ERROR_REVISE_ENV_UNMATCHABLE
+    unmatched += [key for key, rhs in _env_assignment_rhs_all(text) if not _plainly_spelled(rhs)]
+    if unmatched:
+        return _env_policy_message(_ERROR_REVISE_ENV_UNMATCHABLE, unmatched)
     return None
+
+
+# At most this many keys are named in one ``.env`` policy message, each cut to
+# ``_ENV_KEY_SHOWN_MAX`` characters: a hand-edited file can hold thousands of
+# lines, and the message is a job error and a 409 body, not a report. The count of
+# the rest is still given, so the operator knows the list is not complete.
+_ENV_KEYS_SHOWN_MAX = 5
+_ENV_KEY_SHOWN_MAX = 64
+
+
+def _env_policy_message(template: str, keys: list[str]) -> str:
+    """Fill a ``.env`` policy message's ``{keys}`` with the offending key names.
+
+    Blocking (it redacts). Duplicates collapse in first-seen order, since one key
+    can fail both the deciding-line and the shadowed-line check. Each name is
+    redacted BEFORE it is cut, the redact->cap order every text in this module
+    follows: key names are operator-chosen, so in principle one could equal a
+    registered value, and cutting first could leave a fragment no redactor
+    matches.
+    """
+    unique = list(dict.fromkeys(keys))
+    shown = []
+    for key in unique[:_ENV_KEYS_SHOWN_MAX]:
+        redacted = tools.redact_known_secrets(key)
+        if len(redacted) > _ENV_KEY_SHOWN_MAX:
+            redacted = redacted[:_ENV_KEY_SHOWN_MAX] + "…"
+        shown.append(f"「{redacted}」")
+    named = "、".join(shown)
+    if len(unique) > _ENV_KEYS_SHOWN_MAX:
+        named += f"等 {len(unique)} 個"
+    return template.replace("{keys}", named)
 
 
 def _current_manifest_text(directory: Path) -> str | None:
@@ -2514,26 +2686,23 @@ async def run_revise(
         # check would have to either wave stale work through -- exactly the loss R10-1
         # closed -- or refuse after burning the whole build.
         return InstallOutcome(ok=False, error=_ERROR_REVISE_IDENTITY_UNKNOWN)
-    _env_existed, env_values, env_text, env_error = await run_in_threadpool(
-        _read_env_for_values, package_root.path
-    )
-    if env_error is not None:
-        return InstallOutcome(ok=False, error=env_error)
-    registered_by_key = {key: value for key, value in env_values.items() if value}
-    registered = list(registered_by_key.values())
     # BEFORE the LLM call, and before anything is registered: a value we would be
     # required to ignore, or one whose own assignment line spells it so that no
     # redactor can match what a ``cat`` of the file prints, cannot be protected by
     # registering it (see the docstring and ``_unmaskable_env_error``). The KEYS go
     # in too, because the spelling that has to vouch for a value is the one on the
     # line that DETERMINES it, never some other line or a comment that merely
-    # repeats it (R6-1). Only the non-empty values are passed, so a ``KEY=`` line --
-    # which contributes no secret to anything -- can never trip either half. On a
-    # worker like every other scan in this function (R1-3): a 64 KiB ``.env`` is a
-    # full walk plus thousands of substring searches.
-    mask_error = await run_in_threadpool(_unmaskable_env_error, env_text, registered_by_key)
-    if mask_error is not None:
-        return InstallOutcome(ok=False, error=mask_error)
+    # repeats it (R6-1). ONE worker hop for the read, the parse and the policy
+    # (R1-3/R4-3): a 64 KiB ``.env`` is a full walk plus thousands of substring
+    # searches. The submit path already ran this same gate (web-v6 §5.2); it runs
+    # again here because a queued job can start minutes after its submit, and
+    # what counts is the files as they are when the session actually begins.
+    revise_env, env_error = await run_in_threadpool(_revise_env_gate, package_root.path)
+    if env_error is not None:
+        return InstallOutcome(ok=False, error=env_error)
+    assert revise_env is not None  # exactly one of the pair is set
+    env_values = revise_env.env_values
+    registered = [value for value in env_values.values() if value]
     for value in registered:
         tools.register_inflight_secret(value)
 
@@ -2562,7 +2731,19 @@ async def run_revise(
         # backstop. The SYSTEM prompt joined them when its interpolated package name
         # became redactable (R2-4) -- it was a pure join until then.
         system_prompt = await run_in_threadpool(_revise_system_prompt, name)
-        user_prompt = await run_in_threadpool(_revise_user_prompt, feedback, manifest_text)
+        config_values = revise_env.config_values
+        user_prompt = await run_in_threadpool(
+            _revise_user_prompt,
+            feedback,
+            manifest_text,
+            revise_env.config_text,
+            tuple(sorted(env_values)),
+            tuple(sorted(set(config_values) & set(env_values))),
+        )
+        # The run_shell environment is layered exactly as ``tools._build_tool_env``
+        # layers the runtime one -- config.env first, .env on top (web-v6 §4) -- so
+        # the builder tests what the tool will actually run with.
+        shell_env = {**config_values, **env_values}
         result: InstallResult | None = None
         llm_error: str | None = None
         try:
@@ -2574,7 +2755,8 @@ async def run_revise(
                 # The whole existing .env goes into run_shell's environment (never
                 # into a prompt), so the model can live-test the real API against
                 # the tool's own credentials without the file being in staging.
-                tools=_build_meta_tools(build_root.path, secret_env=env_values or None),
+                # config.env rides along under it; its TEXT is in the prompt above.
+                tools=_build_meta_tools(build_root.path, secret_env=shell_env or None),
                 max_tool_rounds=settings.tool_install_max_rounds,
                 timeout_seconds=settings.tool_install_timeout_seconds,
             )
@@ -2627,6 +2809,7 @@ async def run_revise(
                 error=f"AI 判定修訂尚未完成：{reason}",  # noqa: RUF001
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
+                not_ready=True,
             )
         if result.tool_name != name:
             # D40: ``InstallResult._ready_requires_valid_name`` only checks the
@@ -2754,6 +2937,17 @@ class InstallJob:
     summary: str | None = None
     llm_log_id: int | None = None
     env_keys: tuple[str, ...] = ()
+    # How a TERMINAL job ended, finer than ``state`` (web-v6 §8.3):
+    # ``published`` | ``not_published`` (the model's own ready=false) | ``failed``.
+    # None while queued/running. ``state`` keeps its two terminal values so an
+    # older reader of the poll is not broken; this field only splits its failure.
+    outcome: str | None = None
+
+
+# The three terminal ``InstallJob.outcome`` values.
+_OUTCOME_PUBLISHED = "published"
+_OUTCOME_NOT_PUBLISHED = "not_published"
+_OUTCOME_FAILED = "failed"
 
 
 def _now_iso() -> str:
@@ -2771,6 +2965,7 @@ def _job_dict(job: InstallJob) -> dict[str, Any]:
         "summary": job.summary,
         "llm_log_id": job.llm_log_id,
         "env_keys": list(job.env_keys),
+        "outcome": job.outcome,
     }
 
 
@@ -2818,9 +3013,16 @@ async def _run_job(
             job_id,
             state="failed",
             error=f"{action}過程發生未預期錯誤（{type(exc).__name__}）。",  # noqa: RUF001
+            outcome=_OUTCOME_FAILED,
             finished_at=_now_iso(),
         )
         return
+    if outcome.ok:
+        terminal = _OUTCOME_PUBLISHED
+    elif outcome.not_ready:
+        terminal = _OUTCOME_NOT_PUBLISHED
+    else:
+        terminal = _OUTCOME_FAILED
     _update_job(
         job_id,
         state="succeeded" if outcome.ok else "failed",
@@ -2829,6 +3031,7 @@ async def _run_job(
         summary=outcome.summary,
         llm_log_id=outcome.llm_log_id,
         env_keys=outcome.env_keys,
+        outcome=terminal,
         finished_at=_now_iso(),
     )
 
@@ -2932,19 +3135,41 @@ def start_install_job(
 
 @dataclass(frozen=True, slots=True)
 class ReviseJobStart:
-    """A revise submit result with machine-distinct pre-job refusals."""
+    """A revise submit result with machine-distinct pre-job refusals.
+
+    ``message`` is set only for ``env_policy``: the gate's own zh-TW text, which
+    names the offending keys and is the one refusal whose wording the operator
+    needs in order to act.
+    """
 
     job_id: str | None = None
     refusal: str | None = None
+    message: str | None = None
 
 
 async def start_revise_job(name: str, feedback: str, expected_vid: str) -> ReviseJobStart:
-    """Take the global slot, compare ``expected_vid``, then enqueue a revise.
+    """Check the env policy, take the global slot, compare ``expected_vid``, enqueue.
 
     The stale path never creates an ``InstallJob`` and never launches a task.
     The reservation is converted into a queued job atomically only after the
     comparison passes, so no other current writer can race that check.
+
+    The ``.env``/``config.env`` gate runs FIRST, before the slot is even taken
+    (web-v6 §5.2). Inside the job alone, its refusal arrived seconds later as a
+    failed job card -- and a revise submitted from anywhere but the 工具 page may
+    never have that card on screen, so the one message that says which key to
+    move was effectively silent. Here it is the response to the click. It is a
+    read and a policy check, with no version in it, so running it outside the
+    slot cannot weaken invariant K: the ``expected_vid`` comparison stays after
+    the reservation, exactly where it was. ``run_revise`` repeats the gate on
+    whatever the files say when the job really starts.
     """
+
+    package_root = await run_in_threadpool(tools._resolve_package_dir_no_alias, name)
+    if package_root is not None:
+        _env, env_error = await run_in_threadpool(_revise_env_gate, package_root.path)
+        if env_error is not None:
+            return ReviseJobStart(refusal="env_policy", message=env_error)
 
     reservation = reserve_sync_operation()
     if reservation is None:

@@ -106,6 +106,17 @@ _PARAMETERS_SCHEMA_MAX_BYTES = 16 * 1024
 # (a handful of KEY=VALUE lines).
 _ENV_FILE_MAX_BYTES = 64 * 1024
 
+# The package-layer SETTINGS file (web-v6 §4): operator-owned overrides of the
+# defaults a version's code carries, beside the package's ``.env``. The split is
+# the whole point. Every ``.env`` value is a SECRET to the redaction pipeline,
+# so a setting parked there is either too short to mask (and blocks every revise)
+# or long enough to be masked out of every tool result and AI log. Values here are
+# deliberately NOT secrets: they never enter ``known_secret_values``, are shown to
+# the builder in full, and carry no length floor. Read exactly like ``.env``
+# (same bounded reader, same 64 KiB cap, same ``interpolate=False`` parse), and
+# layered UNDER it so a secret can never be shadowed by a public value.
+_CONFIG_FILENAME = "config.env"
+
 # Legacy flat-layout name retained for the offline migration reader and for
 # stripping builder-authored forgeries. New summaries live at
 # ``versions/<vid>/.afterthread.meta/summary.json``.
@@ -2501,7 +2512,101 @@ def _load_tool_dotenv(package_root: PackageRoot) -> dict[str, str]:
     off the value is kept as the literal string ``${OPENAI_API_KEY}``, so a
     generated tool can never exfiltrate a parent secret through its own manifest.
     """
-    env_file = package_root.path / ".env"
+    return _load_package_dotenv(package_root.path / ".env")
+
+
+def _load_tool_config(package_root: PackageRoot) -> dict[str, str]:
+    """Parse the package's optional ``config.env`` (web-v6 §4) into a plain dict.
+
+    The same read and the same parse as ``.env``, for the same reasons -- a FIFO,
+    a symlink or a runaway file degrades to {} -- because the two files feed the
+    same child environment and must not differ in how a line is understood. What
+    differs is only what the CALLER does with the values: ``_build_tool_env``
+    never hands these to the redactor.
+    """
+    return _load_package_dotenv(package_root.path / _CONFIG_FILENAME)
+
+
+# Substrings that make a ``config.env`` KEY NAME look like a credential (web-v6
+# §4). A reminder only, shown beside the key: it reads names, never values,
+# because no rule can tell a secret from a setting by its value (``PIN=1234``).
+_SECRET_LIKE_KEY_PARTS: tuple[str, ...] = ("KEY", "TOKEN", "SECRET", "PASSWORD")
+
+# The migration sources (``migrate_tools_v5``) that mark a package as built
+# before 0.4.0, when the builder was told to put secrets -- and in practice its
+# settings too -- into ``.env`` (web-v6 §1 A5).
+_PRE_V5_ORIGIN_SOURCES = frozenset({"legacy-ai-meta", "pre-existing/unknown"})
+
+
+def _dotenv_file_state(env_file: Path) -> tuple[dict[str, str], bool]:
+    """``(values, readable)`` for a package env file, for DISPLAY only.
+
+    Missing is readable-and-empty (an absent file is a normal state); a file that
+    exists but cannot be read the bounded way is ``readable=False``, so the page
+    can say so instead of showing an empty list that looks like "no settings".
+    """
+    try:
+        os.lstat(env_file)
+    except FileNotFoundError:
+        return {}, True
+    except OSError:
+        return {}, False
+    text = _read_regular_file_capped(env_file, _ENV_FILE_MAX_BYTES)
+    if text is None or len(text) > _ENV_FILE_MAX_BYTES:
+        return {}, False
+    return _parse_dotenv_text(text), True
+
+
+def _built_before_v5(package_root: PackageRoot) -> bool:
+    """True when any committed version's ``origin.json`` came from the v5 migration."""
+    try:
+        names = os.listdir(package_root.path / _VERSIONS_DIRNAME)
+    except OSError:
+        return False
+    for name in names:
+        resolved = _resolve_version_target(package_root, name)
+        if resolved is not None and resolved[1].get("source") in _PRE_V5_ORIGIN_SOURCES:
+            return True
+    return False
+
+
+def package_settings(package_root: PackageRoot) -> dict[str, Any]:
+    """The package-layer settings view the 工具 page shows (web-v6 §9).
+
+    Blocking. ``.env`` contributes KEY NAMES only; its values are read solely to
+    flag conflicts and never leave this function. ``config.env`` contributes its
+    pairs, each value still run through ``redact_known_secrets`` -- the file holds
+    settings by the operator's choice, but a secret pasted into it by mistake is
+    exactly what must not be served back, and a value the redactor changes is
+    flagged ``contains_secret`` (the zero-guess check: it equals or contains a
+    value some ``.env`` registers). Key names go through the redactor too, the
+    rule every operator-derived text in this subsystem follows.
+    """
+    env_values, env_readable = _dotenv_file_state(package_root.path / ".env")
+    config_values, config_readable = _dotenv_file_state(package_root.path / _CONFIG_FILENAME)
+    config: list[dict[str, Any]] = []
+    for key, value in config_values.items():
+        shown = redact_known_secrets(value)
+        config.append(
+            {
+                "key": redact_known_secrets(key),
+                "value": shown,
+                "overridden_by_env": key in env_values,
+                "secret_like_name": any(part in key.upper() for part in _SECRET_LIKE_KEY_PARTS),
+                "contains_secret": shown != value,
+            }
+        )
+    return {
+        "env_keys": [redact_known_secrets(key) for key in env_values],
+        "env_readable": env_readable,
+        "config": config,
+        "config_readable": config_readable,
+        "built_before_v5": _built_before_v5(package_root),
+    }
+
+
+def _load_package_dotenv(env_file: Path) -> dict[str, str]:
+    """The bounded read + interpolate=False parse both package env files share."""
     # Read through the ONE bounded-regular-file helper (F3a): its O_NONBLOCK+S_ISREG
     # gate refuses a FIFO an operator (or a post-install mutation) could `mkfifo` in
     # place of .env -- which dotenv_values(path) would reopen and BLOCK on forever --
@@ -2537,17 +2642,24 @@ def _build_tool_env(package_root: PackageRoot) -> tuple[dict[str, str], frozense
     outbound connections do (see config.py), without that trust decision being
     silently forced on every tool regardless of the operator's setting.
 
+    The package's ``config.env`` (web-v6 §4) sits between ``TLS_NO_VERIFY`` and
+    ``.env``: it may override the injected flag exactly as ``.env`` always could,
+    and ``.env`` overrides IT, so a key present in both resolves to the secret.
+
     Returns the env AND the (non-empty) ``.env`` VALUES that went into it, from
     the SAME read -- which is the whole point of handing them back rather than
     letting the caller re-read the file: a second read could see a rotated
     ``.env`` and register values the child never got, leaving the ones it DID get
     unmaskable. The passthrough names are deliberately NOT in that set: PATH and
     HOME are not secrets, and masking them would shred every result that mentions
-    a path. The values are handed to ``_inflight_secrets`` by ``_make_handler``.
+    a path. Neither are the ``config.env`` values, for the reason that file
+    exists at all. The values are handed to ``_inflight_secrets`` by
+    ``_make_handler``.
     """
     env = {name: os.environ[name] for name in _PASSTHROUGH_ENV if name in os.environ}
     if get_settings().tls_no_verify:
         env["TLS_NO_VERIFY"] = "1"
+    env.update(_load_tool_config(package_root))
     dotenv = _load_tool_dotenv(package_root)
     env.update(dotenv)
     # Empty values are dropped for the SAME reason ``_cached_env_values`` drops

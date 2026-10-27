@@ -101,6 +101,24 @@ export function buildDiscardRequest({ name, currentVid }) {
 	};
 }
 
+// The revise submit's one refusal whose MESSAGE is the instruction (web-v6
+// §5.2): `env_policy` comes back before any job exists, and its text names the
+// .env/config.env keys the operator has to move. So it gets its own title and
+// stays on screen until dismissed -- the next step is editing a file, and a toast
+// that closes after a few seconds takes the key names with it. Every other
+// error keeps the generic red notification (null here).
+export function reviseRefusalNotification(error) {
+	if (error?.status !== 409 || error?.code !== "env_policy") {
+		return null;
+	}
+	return {
+		color: "orange",
+		title: "修訂未送出：工具設定需要調整",
+		message: error.message,
+		autoClose: false,
+	};
+}
+
 // Structured 409s are instructions, not interchangeable conflicts. Keeping the
 // dispatch pure makes it impossible for UI code to branch on translated message
 // text, and gives the no-refetch cases an explicit default.

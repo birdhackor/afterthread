@@ -52,6 +52,7 @@ from afterthread.schemas import (
     ToolJobStatus,
     ToolListResponse,
     ToolReviseRequest,
+    ToolSettings,
     ToolSummary,
     ToolSummaryDetail,
     ToolUpdateRequest,
@@ -145,6 +146,12 @@ _LINEAGE_UNAVAILABLE_MESSAGE = "前一版已不存在或版本關係已損壞，
 _AI_JOB_IN_PROGRESS_CODE = "ai_job_in_progress"
 _AI_JOB_IN_PROGRESS_MESSAGE = "AI 任務進行中，請稍後再試"  # noqa: RUF001
 _TOOLS_LOCK_UNAVAILABLE_CODE = "tools_lock_unavailable"
+# The revise submit's env-policy refusal (web-v6 §5.2): the package's .env or
+# config.env fails the gate before any job exists. Unlike every code above, its
+# MESSAGE is the payload -- the gate's own text names the keys to move -- so the
+# OpenAPI example is one real instance of that text rather than a fixed constant.
+_ENV_POLICY_CODE = "env_policy"
+_ENV_POLICY_EXAMPLE = tool_builder._ERROR_REVISE_ENV_UNMASKABLE.replace("{keys}", "「CACHE_TTL」")
 
 
 def _tools_lock_unavailable(exc: tools_service.ToolsLockUnavailableError) -> HTTPException:
@@ -182,6 +189,15 @@ def _conflict_response(
 _AI_ITERATION_CONFLICT_RESPONSE = _conflict_response(
     (_VERSION_MISMATCH_CODE, _VERSION_MISMATCH_MESSAGE, "The requested version is stale"),
     (_JOB_BUSY_CODE, _JOB_BUSY_MESSAGE, "Another tool operation holds the global slot"),
+)
+_REVISE_CONFLICT_RESPONSE = _conflict_response(
+    (_VERSION_MISMATCH_CODE, _VERSION_MISMATCH_MESSAGE, "The requested version is stale"),
+    (_JOB_BUSY_CODE, _JOB_BUSY_MESSAGE, "Another tool operation holds the global slot"),
+    (
+        _ENV_POLICY_CODE,
+        _ENV_POLICY_EXAMPLE,
+        "The package's .env or config.env fails the revise env policy",
+    ),
 )
 _DISCARD_CONFLICT_RESPONSE = _conflict_response(
     (_VERSION_MISMATCH_CODE, _VERSION_MISMATCH_MESSAGE, "The requested version is stale"),
@@ -633,7 +649,7 @@ async def regenerate_tool_summary(
     "/{name}/revise",
     response_model=ToolInstallAccepted,
     status_code=202,
-    responses={**_TOOL_NOT_FOUND_RESPONSE, **_AI_ITERATION_CONFLICT_RESPONSE},
+    responses={**_TOOL_NOT_FOUND_RESPONSE, **_REVISE_CONFLICT_RESPONSE},
 )
 async def revise_tool(name: ToolName, payload: ToolReviseRequest) -> ToolInstallAccepted:
     """Queue an AI revise job for one installed tool; poll it via `/jobs/{id}`.
@@ -648,13 +664,20 @@ async def revise_tool(name: ToolName, payload: ToolReviseRequest) -> ToolInstall
     That 503 has no counterpart here: with TOOLS_DIR unset no name resolves, so
     this route's existence gate already answers 404.
 
-    ``start_revise_job`` first reserves the global slot, then resolves the package
-    and compares the required ``expected_vid``.  Missing/aliased packages return
-    404, a stale version returns ``version_mismatch``, and an occupied slot returns
-    ``job_busy``.  Only a matching version is converted into a queued job, so a
-    stale submit has neither an LLM charge nor even a pollable job id.
+    ``start_revise_job`` first applies the package's env policy (web-v6 §5.2),
+    then reserves the global slot, then resolves the package and compares the
+    required ``expected_vid``.  An env-policy refusal returns ``env_policy`` with
+    the gate's own message (it names the keys to move), missing/aliased packages
+    return 404, a stale version returns ``version_mismatch``, and an occupied slot
+    returns ``job_busy``.  Only a matching version is converted into a queued job,
+    so a refused submit has neither an LLM charge nor even a pollable job id.
     """
     started = await tool_builder.start_revise_job(name, payload.feedback, payload.expected_vid)
+    if started.refusal == "env_policy":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": _ENV_POLICY_CODE, "message": started.message},
+        )
     if started.refusal == "not_found":
         raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
     if started.refusal == "version_mismatch":
@@ -669,6 +692,36 @@ async def revise_tool(name: ToolName, payload: ToolReviseRequest) -> ToolInstall
         )
     assert started.job_id is not None
     return ToolInstallAccepted(job_id=started.job_id)
+
+
+@router.get(
+    "/{name}/settings",
+    response_model=ToolSettings,
+    responses=_TOOL_NOT_FOUND_RESPONSE,
+)
+async def get_tool_settings(name: ToolName) -> ToolSettings:
+    """One tool's package-layer settings, read-only (web-v6 §4, §9).
+
+    ``.env`` key names (never values), the redacted ``config.env`` pairs and the
+    flags beside them. The gate is package EXISTENCE only, not a resolvable
+    ``current``: both files live at the package layer and outlive any version, and
+    a package whose pointer is broken is exactly one whose settings an operator
+    may need to inspect. Like the summary routes, an internal alias is a 404.
+
+    Declared BEFORE the job poll, which must stay last (see the comment there): a
+    tool may be named ``jobs``.
+    """
+
+    def _read() -> dict[str, Any] | None:
+        package_root = tools_service._resolve_package_dir_no_alias(name)
+        if package_root is None:
+            return None
+        return tools_service.package_settings(package_root)
+
+    settings = await run_in_threadpool(_read)
+    if settings is None:
+        raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
+    return ToolSettings.model_validate(settings)
 
 
 # --- tool job poll -----------------------------------------------------------

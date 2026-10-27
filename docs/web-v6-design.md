@@ -168,10 +168,13 @@ GET •••[秘密已遮蔽]•••/search failed (region •••[秘密�
 `_unmaskable_env_error`（`tool_builder.py:2312`）改成回報**是哪些 key**。訊息仍然只講條件、key 名
 與補救，絕不含值：
 
-- 過短：「既有工具包 .env 的 `CACHE_TTL`、`TIMEOUT` 值短於 6 字元、無法遮蔽，修訂已取消：如果是
-  秘密請加長；如果只是設定，請移到同目錄的 config.env。」
-- 拼法：「既有工具包 .env 的 `TOKEN` 那一行寫法無法對應到實際值……」。被後面同名行蓋掉的舊行，也用
-  `_env_line_key` 取得它的 key。
+- 過短：「既有工具包 .env 的「CACHE_TTL」、「TIMEOUT」值短於 6 字元，修訂已取消：.env 的每個值都會
+  被當成秘密遮蔽，而太短的值遮不掉。如果它是秘密，請加長；如果只是設定（例如 TTL），請把那一行
+  移到同目錄的 config.env。」
+- 拼法：「既有工具包 .env 中「TOKEN」的寫法無法對應到實際值、無法遮蔽……」。被後面同名行蓋掉的
+  舊行，也用 `_env_line_key` 取得它的 key。
+
+（實際文字以 `tool_builder.py` 的常數為準；P1 的實作細節見 `docs/web-v6-decisions.md` D42。）
 
 key 名最多列 5 個（其餘寫「等 N 個」），每個截到 64 字元，並先過 `redact_known_secrets`。
 

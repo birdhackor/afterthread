@@ -2609,6 +2609,185 @@ def test_build_tool_env_tool_dotenv_can_override_tls_no_verify(
     assert env["TLS_NO_VERIFY"] == "0"  # the tool's own .env wins
 
 
+# --- package config.env (web-v6 §4) -------------------------------------------
+
+
+def test_config_env_layers_between_tls_no_verify_and_dotenv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Invariant D: ``config.env`` overrides the passthrough and the injected
+    ``TLS_NO_VERIFY`` (as ``.env`` always could), and ``.env`` overrides IT, so a
+    key set in both runs with the secret. Only the ``.env`` values come back as
+    the values to hold redactable -- a setting is never one."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(
+        root,
+        "envtool",
+        "import sys\nsys.stdout.write('ok')\n",
+        dotenv="SHARED=secret-wins-123456\nAPI_KEY=live-secret-abcdef\n",
+    )
+    (_package_path(pkg) / tools._CONFIG_FILENAME).write_text(
+        "TLS_NO_VERIFY=0\nSHARED=public-value\nCACHE_TTL=3600\n", encoding="utf-8"
+    )
+    _install_tools(monkeypatch, root, tls_no_verify=True)
+
+    env, secrets = tools._build_tool_env(_package_root(pkg))
+
+    assert env["TLS_NO_VERIFY"] == "0"  # config.env over the injection
+    assert env["SHARED"] == "secret-wins-123456"  # .env over config.env
+    assert env["CACHE_TTL"] == "3600"
+    assert secrets == frozenset({"secret-wins-123456", "live-secret-abcdef"})
+
+
+def test_config_env_values_are_never_registered_as_secrets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Invariant A: a ``config.env`` value is a setting, so it is neither in the
+    global masking set nor masked out of a tool's own result -- which is the whole
+    reason the file exists (web-v6 §1 A3: ``REGION=taipei`` in ``.env`` used to
+    mask the word out of every AI log). The same value DOES get masked once a
+    ``.env`` also holds it: the redactor works by value, and the file a value came
+    from cannot launder a secret the other file registers."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(
+        root,
+        "regional",
+        "import os, sys\nsys.stdout.write('region=' + os.environ['REGION'])\n",
+    )
+    (_package_path(pkg) / tools._CONFIG_FILENAME).write_text("REGION=taipei\n", encoding="utf-8")
+    _install_tools(monkeypatch, root)
+
+    assert "taipei" not in tools.known_secret_values()
+    assert tools.redact_known_secrets("a trip to taipei") == "a trip to taipei"
+    assert asyncio.run(enabled_llm_tools()[0].handler({})) == "region=taipei"
+
+    (_package_path(pkg) / ".env").write_text("OTHER=taipei\n", encoding="utf-8")
+    assert tools.redact_known_secrets("a trip to taipei") == (
+        f"a trip to {tools._REDACTION_MARKER}"
+    )
+
+
+def test_config_env_is_not_interpolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Invariant E: the same ``interpolate=False`` parse as ``.env``, so a
+    ``${OPENAI_API_KEY}`` reference stays a literal string instead of resolving
+    to the backend's own key from the parent environment."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "envtool", "import sys\nsys.stdout.write('ok')\n")
+    (_package_path(pkg) / tools._CONFIG_FILENAME).write_text(
+        "LEAK=${OPENAI_API_KEY}\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret-should-not-leak")
+    _install_tools(monkeypatch, root)
+
+    env, _ = tools._build_tool_env(_package_root(pkg))
+    assert env["LEAK"] == "${OPENAI_API_KEY}"
+    assert "sk-secret-should-not-leak" not in env.values()
+
+
+def test_config_env_that_is_not_a_regular_file_degrades_to_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The bounded reader refuses a symlinked ``config.env`` exactly as it does a
+    symlinked ``.env`` (O_NOFOLLOW), and the runtime degrades to "no extra env"
+    rather than failing the call."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "envtool", "import sys\nsys.stdout.write('ok')\n")
+    target = tmp_path / "elsewhere.env"
+    target.write_text("SMUGGLED=yes\n", encoding="utf-8")
+    (_package_path(pkg) / tools._CONFIG_FILENAME).symlink_to(target)
+    _install_tools(monkeypatch, root)
+
+    env, _ = tools._build_tool_env(_package_root(pkg))
+    assert "SMUGGLED" not in env
+
+
+def test_package_settings_shows_key_names_and_redacted_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The settings view (web-v6 §9): ``.env`` contributes KEY NAMES only, and no
+    ``.env`` value appears anywhere in the result; ``config.env`` pairs come back
+    redacted, each with its three flags. A secret pasted into ``config.env`` is
+    served masked and flagged -- the one case where a value there must not be
+    shown as written."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(
+        root,
+        "kb",
+        "import sys\nsys.stdout.write('ok')\n",
+        dotenv="API_KEY=sk-live-abcdef123456\nSHARED=secret-wins-123456\n",
+    )
+    (_package_path(pkg) / tools._CONFIG_FILENAME).write_text(
+        "# seconds\nCACHE_TTL=3600\nSHARED=public\nPASTED=sk-live-abcdef123456\nMY_TOKEN=abc\n",
+        encoding="utf-8",
+    )
+    _install_tools(monkeypatch, root)
+
+    settings = tools.package_settings(_package_root(pkg))
+
+    assert settings["env_keys"] == ["API_KEY", "SHARED"]
+    assert settings["env_readable"] is True
+    assert settings["config_readable"] is True
+    by_key = {entry["key"]: entry for entry in settings["config"]}
+    assert set(by_key) == {"CACHE_TTL", "SHARED", "PASTED", "MY_TOKEN"}
+    assert by_key["CACHE_TTL"] == {
+        "key": "CACHE_TTL",
+        "value": "3600",
+        "overridden_by_env": False,
+        "secret_like_name": False,
+        "contains_secret": False,
+    }
+    assert by_key["SHARED"]["overridden_by_env"] is True
+    assert by_key["SHARED"]["value"] == "public"
+    assert by_key["PASTED"]["value"] == tools._REDACTION_MARKER
+    assert by_key["PASTED"]["contains_secret"] is True
+    assert by_key["MY_TOKEN"]["secret_like_name"] is True
+    serialized = json.dumps(settings, ensure_ascii=False)
+    assert "sk-live-abcdef123456" not in serialized
+    assert "secret-wins-123456" not in serialized
+    assert settings["built_before_v5"] is False
+
+
+def test_package_settings_tells_missing_from_unreadable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A missing file is the normal empty state; a file that exists but cannot be
+    read the bounded way is reported as unreadable, so the page does not show an
+    empty list that looks like "no settings"."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "kb", "import sys\nsys.stdout.write('ok')\n")
+    _install_tools(monkeypatch, root)
+
+    empty = tools.package_settings(_package_root(pkg))
+    assert empty["env_keys"] == [] and empty["config"] == []
+    assert empty["env_readable"] is True and empty["config_readable"] is True
+
+    target = tmp_path / "elsewhere.env"
+    target.write_text("X=1\n", encoding="utf-8")
+    (_package_path(pkg) / tools._CONFIG_FILENAME).symlink_to(target)
+    assert tools.package_settings(_package_root(pkg))["config_readable"] is False
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [("legacy-ai-meta", True), ("pre-existing/unknown", True), ("builder-install", False)],
+)
+def test_package_settings_marks_packages_built_before_v5(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str, expected: bool
+) -> None:
+    """A package whose committed version came from the v5 migration was built when
+    the builder still wrote settings into ``.env`` (web-v6 §1 A5), so the page
+    reminds the operator to look; anything installed since is not flagged."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "kb", "import sys\nsys.stdout.write('ok')\n")
+    origin_path = pkg / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    origin = json.loads(origin_path.read_text(encoding="utf-8"))
+    origin["source"] = source
+    origin_path.write_text(json.dumps(origin), encoding="utf-8")
+    _install_tools(monkeypatch, root)
+
+    assert tools.package_settings(_package_root(pkg))["built_before_v5"] is expected
+
+
 def test_runtime_background_descendant_reaped_no_thread_leak(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -50,7 +50,8 @@ identity。模型可能幾分鐘後才真的呼叫；若那時 `current` 已從 
 3. 重驗該版 `tool.json` identity；操作者若在廣告後手改 manifest，這次呼叫保守拒絕。
 4. 讀 package-level `.afterthread.meta/state.json`。缺席、foreign、unreadable 都
    fail closed；沒有 `tool.json.enabled` fallback。
-5. 從短允許清單建立乾淨環境，再加入 package `.env` 與正規化 TLS 設定。
+5. 從短允許清單建立乾淨環境，依序加入正規化 TLS 設定、package `config.env`
+   與 package `.env`（同一個 key 以 `.env` 為準）。
 6. 以廣告時的 `VersionRoot` 為 cwd 啟動 entry；arguments JSON 經 stdin，stdout
    是工具結果。
 7. 套用單工具 timeout、process-group 終止與輸出截斷；成功、非零 exit、timeout
@@ -73,7 +74,8 @@ identity。模型可能幾分鐘後才真的呼叫；若那時 `current` 已從 
   防止意外繼承後端 secret，但同 UID 程式仍可能從 `/proc` 或其他可讀路徑取資料。
   真正信任邊界是只安裝可信的 OpenAPI 文件與指示。
 - **子行程環境從零建立**：只透傳 `PATH`、`HOME`、`LANG`、`LC_ALL`、`TMPDIR`，
-  再加入 package `.env`；父行程 `OPENAI_API_KEY` 不會結構性地落入 child env。
+  再加入 package `config.env` 與 `.env`；父行程 `OPENAI_API_KEY` 不會結構性地落入
+  child env。兩個檔案都以 `interpolate=False` 解析，`${OPENAI_API_KEY}` 保持字面。
 - **單工具限制**：`LLM_TOOL_TIMEOUT_SECONDS` 控制 timeout，
   `LLM_TOOL_OUTPUT_MAX_CHARS` 控制送回模型的 stdout 長度；逾時會終止整個 process
   group，避免只殺 shell 留下孫行程。
@@ -90,7 +92,9 @@ identity。模型可能幾分鐘後才真的呼叫；若那時 `current` 已從 
   deadline 加一個既有工具 timeout，而不是再加整輪工具。
 - **已知秘密遮蔽**：後端 API key、所有 package `.env` 值、install/revise/tool-call
   期間登記的值，都在工具輸出進模型前 fail closed 遮蔽。短於六字元的值不遮，避免
-  普通文字被洗掉，因此安裝表單也拒絕短 secret。AI 日誌是觀測者，遮蔽失敗時刻意
+  普通文字被洗掉，因此安裝表單也拒絕短 secret。package `config.env` 的值**不是**
+  秘密，不進遮蔽集合（web-v6 §4）：設定放 `.env` 會被當成秘密全域遮蔽，放錯檔的
+  秘密則不會被遮。AI 日誌是觀測者，遮蔽失敗時刻意
   fail open，不讓記錄功能打斷真正操作；所以日誌遮蔽是常態防線，不是安全隔離。
 - **builder 檔案工具有 jail，shell 沒有**：`write_file`／`read_file`／`list_dir`
   拒絕 absolute path、`..` 與 symlink escape；`run_shell` 仍是真 bash。
@@ -113,9 +117,11 @@ identity。模型可能幾分鐘後才真的呼叫；若那時 `current` 已從 
             run.py ...
         <vid>.discarded/
     .env
+    config.env
 ```
 
-package layer 由後端管理「現在」的狀態，`.env` 是操作者跨版本持有的秘密；工具內容
+package layer 由後端管理「現在」的狀態，`.env` 是操作者跨版本持有的秘密，
+`config.env` 是操作者跨版本持有的一般設定（蓋過該版程式內的預設值）；工具內容
 只在 version layer。版本 id 為 `YYYYMMDDTHHMMSSZ-ffffff`。
 
 ### 為什麼需要四個型別
@@ -177,7 +183,8 @@ session root。
 修訂只新增版本，不再整包換裝：
 
 1. 從目前 `VersionRoot` 複製工具內容到 `build/`；package `.env` 不進工作區，值只注入
-   `run_shell` 並暫時登記遮蔽。
+   `run_shell` 並暫時登記遮蔽。package `config.env` 的值墊在 `.env` 底下一起注入，
+   全文（經遮蔽器）與 `.env` 的 key 名放進修訂提示，讓 builder 知道哪些設定被覆寫。
 2. builder 修改後，同樣剝除 builder `.env` 與 backend 保留 sidecar，再驗證內容。
 3. `shell/` 寫入工具內容與
    `origin.json(previous=<目前 vid>, feedback=<本次意見>)`。
@@ -189,7 +196,9 @@ package `.env` 與 `state.json` 原地不動，舊 versions 永久保留。候�
 `versions/` 下所有同前綴項目，包括 `.discarded`。
 
 修訂開始前會驗 package `.env` 可讀、至多 64 KiB、值至少六字元，且決定每個值的最後
-assignment line 能被遮蔽器逐字對回；無法安全遮蔽就不花 LLM。builder shell 仍有服務
+assignment line 能被遮蔽器逐字對回，`config.env` 也必須讀得到；無法安全遮蔽就不花
+LLM。這道檢查在**送出時**先跑一次（不過就回 `409 env_policy`，訊息列出 key 名、
+永不列值），job 開跑時再跑一次（web-v6 §5.2）。builder shell 仍有服務
 權限，因此修訂期間不要手改 `.env`：已寫入的 AI 日誌不能事後補遮。
 
 ### 啟用狀態

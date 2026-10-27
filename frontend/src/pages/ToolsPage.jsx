@@ -28,6 +28,7 @@ import { apiDelete, apiGet, apiPatch, apiPost } from "../api/client.js";
 import { CharCounter } from "../components/CharCounter.jsx";
 import { formatDate } from "../components/DateText.jsx";
 import { EmptyState } from "../components/EmptyState.jsx";
+import { ToolSettingsSection } from "../components/ToolSettingsSection.jsx";
 import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { usePageTitle } from "../hooks/usePageTitle.js";
 import { codePointLength } from "../utils/text.js";
@@ -44,9 +45,11 @@ import {
 	isToolJobActive,
 	secretNameError,
 	secretValueError,
+	toolJobOutcomeView,
 	toolJobQueryEnabled,
 	toolJobRefetchInterval,
 } from "../utils/toolInstall.js";
+import { toolSettingsQueryKey } from "../utils/toolSettings.js";
 import {
 	acceptSummaryForVersion,
 	buildDiscardRequest,
@@ -56,6 +59,7 @@ import {
 	logLinkSearch,
 	markLineageUnavailable,
 	ownSummaryBusy,
+	reviseRefusalNotification,
 	summaryErrorRevalidates,
 	toolIdentityConsumers,
 	toolLineageControls,
@@ -200,9 +204,11 @@ function ToolJobProgress({ kind, jobId, jobQuery }) {
 		);
 	}
 
-	if (job.state === "succeeded") {
+	const view = toolJobOutcomeView(job, kind);
+
+	if (view.tone === "success") {
 		return (
-			<Alert color="green" title={`${verb}完成`}>
+			<Alert color={view.color} title={view.title}>
 				<Stack gap="xs" align="flex-start">
 					<Text size="sm">
 						{kind === "revise"
@@ -219,8 +225,30 @@ function ToolJobProgress({ kind, jobId, jobQuery }) {
 		);
 	}
 
+	if (view.tone === "not_published") {
+		// The builder's own ready=false (web-v6 §8.3): its words are the body,
+		// because they are the only account of WHY -- an outside cause it found or
+		// a fix it could not make. The card does not claim which.
+		return (
+			<Alert color={view.color} title={view.title}>
+				<Stack gap="xs" align="flex-start">
+					<Text size="sm" style={{ whiteSpace: "pre-wrap" }}>
+						{job.summary ?? job.error ?? "AI 未說明原因"}
+					</Text>
+					<Text size="xs" c="dimmed">
+						{view.note}
+					</Text>
+					<LogLink
+						llmLogId={job.llm_log_id}
+						llmLogProcess={job.llm_log_process}
+					/>
+				</Stack>
+			</Alert>
+		);
+	}
+
 	return (
-		<Alert color="red" title={`${verb}失敗`}>
+		<Alert color={view.color} title={view.title}>
 			<Stack gap="xs" align="flex-start">
 				<Text size="sm">{job.error ?? "未知錯誤"}</Text>
 				{job.summary ? (
@@ -535,6 +563,11 @@ function ToolRow({
 	// force one closed, and expand/collapse is a pure UI state that is never
 	// itself gated.
 	const [expanded, { toggle: toggleExpanded }] = useDisclosure(false);
+	// The 設定 section (web-v6 §9) has its own toggle and is offered for EVERY
+	// package, broken ones included: config.env and .env live at the package
+	// layer and outlive any version, so they stay readable exactly when the
+	// summary panel (which needs a resolvable `current`) is not offered.
+	const [settingsExpanded, { toggle: toggleSettings }] = useDisclosure(false);
 	const lineageControls = toolLineageControls(tool, lineageUnavailable);
 
 	return (
@@ -709,6 +742,16 @@ function ToolRow({
 						</Collapse>
 					</div>
 				) : null}
+
+				<div>
+					<Button variant="subtle" size="xs" px={0} onClick={toggleSettings}>
+						{settingsExpanded ? "收合設定" : "設定"}
+					</Button>
+					{/* `expanded`, not `in` -- see the AI 總結 Collapse above. */}
+					<Collapse expanded={settingsExpanded}>
+						<ToolSettingsSection name={tool.name} expanded={settingsExpanded} />
+					</Collapse>
+				</div>
 			</Stack>
 		</Card>
 	);
@@ -781,6 +824,9 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 			// and it still cannot reach another tool, because the
 			// name is the second element of the prefix.
 			queryClient.removeQueries({ queryKey: toolSummaryKeyPrefix(name) });
+			// The same reasoning holds for the package-layer 設定 view: a same-name
+			// reinstall has its own .env and config.env.
+			queryClient.removeQueries({ queryKey: toolSettingsQueryKey(name) });
 			await queryClient.invalidateQueries({ queryKey: ["tools"] });
 		},
 		onError: (mutationError) => {
@@ -940,6 +986,13 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 			setActiveJob({ name, jobAttributionKey, jobId: result.job_id });
 		},
 		onError: (mutationError, variables) => {
+			// env_policy (web-v6 §5.2) is refused before any job exists and its text
+			// names the keys to move: not a version conflict, nothing to refetch.
+			const refusal = reviseRefusalNotification(mutationError);
+			if (refusal !== null) {
+				notifications.show(refusal);
+				return;
+			}
 			const reaction = reactToVersionWriteConflict(
 				mutationError,
 				variables.jobAttributionKey,

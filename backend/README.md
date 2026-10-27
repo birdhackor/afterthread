@@ -199,7 +199,10 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   完成後再安裝」——指名一個使用者從沒送出的「安裝」只會讓他去找一個不存在的東西。
 - `GET /api/tools/jobs/{job_id}` — 輪詢一個工具工作（安裝**或**修訂）的狀態
   （`queued`／`running`／`succeeded`／`failed` + 完成後的 `tool_name`／
-  `summary`／`llm_log_id`／`llm_log_process`）；工作已完成的清單被裁剪掉、或後端
+  `summary`／`llm_log_id`／`llm_log_process`／`outcome`）；`outcome` 是終局的細分
+  （`published`／`not_published`／`failed`，進行中為 `null`），`not_published` 指
+  builder 自己回 `ready=false`、沒有發布任何東西——前端以橘色而非紅色呈現，且不宣稱
+  原因是外部還是修不好（web-v6 §8.3）。工作已完成的清單被裁剪掉、或後端
   重啟過（工作只存在記憶體）則回 404。`llm_log_process` 與側檔那一個是同一個
   token、同一條「沒有 id 就沒有 token」規則，只是**由這個路由在回應當下蓋章**：
   工作表是行程內記憶體，與 id 空間同生共死，所以還答得出來的工作，它的
@@ -228,12 +231,20 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 - `POST /api/tools/{name}/revise` — body
   `{feedback: 1..20000, expected_vid}`，依使用者意見
   送出一次 **AI 修訂**工作（見下方「依意見修訂既有工具」）；202 + `job_id`，
-  用上面的 `GET /api/tools/jobs/{job_id}` 輪詢。工具不存在回 404；已有工具工作
-  在跑回 `409 job_busy`；取得名額後版本不符回 `409 version_mismatch`，兩者都不
+  用上面的 `GET /api/tools/jobs/{job_id}` 輪詢。**先**檢查套件的 `.env`／`config.env`
+  政策（web-v6 §5.2）：不過就回 `409 env_policy`，`message` 是會列出 key 名（永不列值）
+  的那段說明；工作開跑時會再檢查一次。工具不存在回 404；已有工具工作
+  在跑回 `409 job_busy`；取得名額後版本不符回 `409 version_mismatch`，這些都不
   建立工作。**不宣告** `502`／`503`：修訂是背景工作，LLM 沒
   設定或上游失敗都封在工作狀態裡（失敗的 job + 友善訊息 + AI 日誌連結），與
   安裝送出同一套契約。
-  這三條路由都**不宣告** `503 tools_not_configured`：`TOOLS_DIR` 未設定時
+- `GET /api/tools/{name}/settings` — 工具的套件層設定，唯讀（web-v6 §4、§9）：
+  `.env` 的 **key 名**（值永不離開後端）、`config.env` 的每一組（值仍經過遮蔽器，
+  並標示 `overridden_by_env`／`secret_like_name`／`contains_secret`）、兩個檔案
+  各自是否讀得到，以及是否為 0.4.0 以前建、遷移來的工具（`built_before_v5`）。
+  只要求套件存在、不要求 `current` 可解析——`current` 壞掉的套件正是需要看設定的
+  時候。宣告在 `/jobs/{job_id}` 之前（工具可以叫 `jobs`）。
+  這四條路由都**不宣告** `503 tools_not_configured`：`TOOLS_DIR` 未設定時
   任何名稱都解析不到工具，404 已經是誠實答案。
 
 ## 工具（KB 網頁安裝器）
@@ -256,10 +267,14 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
                   tool.json
                   run.py ...
               <vid>.discarded/           # cleanup 失敗的隱藏重試名
-          .env
+          .env                           # 操作者的秘密
+          config.env                     # 操作者的一般設定（web-v6，可缺）
   ```
 
-  套件層只有後端狀態與操作者的 `.env`；工具內容全部在版本層。
+  套件層只有後端狀態與操作者的 `.env`、`config.env`；工具內容全部在版本層。
+  `.env` 的每個值都是遮蔽器的秘密；`config.env` 的值不是秘密、不進遮蔽集合、
+  沒有長度下限，修訂時整份交給 builder。執行環境的順序是透傳 → `TLS_NO_VERIFY`
+  → `config.env` → `.env`，同一個 key 以 `.env` 為準。
   `tool.json` 的 `name` 必須等於套件名並符合
   `^[a-z0-9][a-z0-9_-]{0,63}$`，另含非空 `description`、
   `parameters` JSON Schema 與 `entry` argv。版本 id 符合
@@ -319,7 +334,10 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `.env`。版本中的 legacy `.ai_meta.json`、FOREIGN
   `.afterthread-state.json`（包含 migration 帶入者）及其巢狀同名檔都是工具內容，
   會進工作區並隨新版本保留。package `.env` 不被複製或改寫，只把解析後的值注入
-  `run_shell` 供實測與遮蔽；builder 寫出的 `.env` 同樣被剝除。通過驗證後，
+  `run_shell` 供實測與遮蔽；`config.env` 的值墊在它底下一起注入，文字與 `.env`
+  的 key 名則放進修訂提示。開工前（送出時與 job 開跑時各一次）`.env` 的每個值
+  必須至少 6 字元、寫法能被遮蔽器逐字對回，`config.env` 必須讀得到；不過的訊息會
+  列出 key 名。builder 寫出的 `.env` 同樣被剝除。通過驗證後，
   `shell` 被組成一個版本目錄並先寫
   `origin.json(previous=<舊 vid>, feedback=<本次意見>)`；版本持久化、rename 到
   `versions/<新 vid>` 後才原子發布 `current`。因此舊版本永久保留、套件 state 與
@@ -389,8 +407,8 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 - **安全立場（v1）**：builder 的 `run_shell` 是服務權限下的真實 bash，不是沙箱；
   只有 `write_file`／`read_file`／`list_dir` 被限制在 build root。信任邊界仍是
   「只安裝可信的 OpenAPI 文件與指示」。工具子行程的環境從零建立，只透傳
-  `PATH`／`HOME`／`LANG`／`LC_ALL`／`TMPDIR`，再加 package `.env` 與正規化的
-  TLS 設定，避免不小心把父行程 `OPENAI_API_KEY` 一起交出去；同 UID 行程仍可能
+  `PATH`／`HOME`／`LANG`／`LC_ALL`／`TMPDIR`，再加正規化的 TLS 設定、package
+  `config.env` 與 `.env`，避免不小心把父行程 `OPENAI_API_KEY` 一起交出去；同 UID 行程仍可能
   讀 `/proc`，所以這不是對抗惡意程式的隔離。
 - **一次性 web-v5 遷移**：先停掉 afterthread；migration 會先以非阻塞方式取得同一個
   exclusive tools lock 並持有到整體完成，取不到即拒絕開始。取得 lock **只證明當下

@@ -10,6 +10,7 @@ import {
 	logLinkSearch,
 	markLineageUnavailable,
 	ownSummaryBusy,
+	reviseRefusalNotification,
 	summaryErrorRevalidates,
 	toolIdentityConsumers,
 	toolInstanceKey,
@@ -515,5 +516,27 @@ describe("deepLinkTarget", () => {
 				processToken: token,
 			}),
 		).toEqual({ mode: "off-list", value: "3" });
+	});
+});
+
+describe("reviseRefusalNotification", () => {
+	it("keeps an env_policy refusal on screen with the gate's own message", () => {
+		const message = "既有工具包 .env 的「CACHE_TTL」值短於 6 字元";
+		expect(
+			reviseRefusalNotification({ status: 409, code: "env_policy", message }),
+		).toEqual({
+			color: "orange",
+			title: "修訂未送出：工具設定需要調整",
+			message,
+			autoClose: false,
+		});
+	});
+
+	it("leaves every other error to the generic notification", () => {
+		expect(
+			reviseRefusalNotification({ status: 409, code: "version_mismatch" }),
+		).toBeNull();
+		expect(reviseRefusalNotification({ status: 404 })).toBeNull();
+		expect(reviseRefusalNotification(undefined)).toBeNull();
 	});
 });

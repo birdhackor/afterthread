@@ -27,6 +27,33 @@ export function isTerminalToolJobState(state) {
 	return TERMINAL_STATES.has(state);
 }
 
+// How a TERMINAL job is shown (web-v6 §8.3). `state` still has only its two
+// terminal values; the backend's `outcome` splits the failure, and the one that
+// matters here is `not_published`: the builder itself declined to publish. That
+// is not a red failure -- it may be an outside cause the AI found (an expired
+// credential) or a fix it could not make, and the card says neither: orange,
+// with the AI's own words as the body and a note that nothing changed. Any other
+// non-success (including a job from an older backend with no `outcome`) keeps
+// the red card it always had.
+export function toolJobOutcomeView(job, kind) {
+	const verb = kind === "revise" ? "修訂" : "安裝";
+	if (job?.state === "succeeded") {
+		return { tone: "success", color: "green", title: `${verb}完成` };
+	}
+	if (job?.outcome === "not_published") {
+		return {
+			tone: "not_published",
+			color: "orange",
+			title: kind === "revise" ? "AI 未發布新版本" : "AI 未安裝工具",
+			note:
+				kind === "revise"
+					? "工具維持原本的版本，沒有任何變更。"
+					: "沒有安裝任何東西。",
+		};
+	}
+	return { tone: "failed", color: "red", title: `${verb}失敗` };
+}
+
 // THE stop rule, stated exactly ONCE. Everything below is an adapter that
 // feeds it a different input shape; nothing below re-decides it, so the poll
 // cadence, the query's `enabled`, and the form/panel locks are the SAME
