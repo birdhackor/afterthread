@@ -35,6 +35,7 @@ import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { usePageTitle } from "../hooks/usePageTitle.js";
 import { formatTimestamp } from "../utils/format.js";
 import { codePointLength } from "../utils/text.js";
+import { verificationView } from "../utils/toolChecks.js";
 import {
 	keepDeleteConfirmationOpen,
 	toolDeleteConfirmation,
@@ -154,6 +155,122 @@ function LogLink({ llmLogId, llmLogProcess }) {
 	);
 }
 
+// The examples of a check, one row each: its badge and its name.
+function VerificationRows({ rows }) {
+	if (rows.length === 0) {
+		return null;
+	}
+	return (
+		<Stack gap={2}>
+			{rows.map((row) => (
+				<Group key={row.key} gap="xs" wrap="nowrap">
+					<Badge size="sm" variant="light" color={row.color} tt="none">
+						{row.label}
+					</Badge>
+					<Text size="sm">{row.name}</Text>
+				</Group>
+			))}
+		</Stack>
+	);
+}
+
+// A finished check's title, rows and actions: 請 AI 修正 attaches the failed
+// examples' records (at most three); 丟掉這一版 is offered only by a caller that
+// can address the version, and only after a failed post-fix verification.
+function VerificationSummary({ view, onFixRuns, onDiscardVersion }) {
+	return (
+		<Stack gap={4} align="flex-start">
+			<Text size="sm" fw={600}>
+				{view.title}
+			</Text>
+			{view.note ? (
+				<Text size="xs" c="dimmed">
+					{view.note}
+				</Text>
+			) : null}
+			<VerificationRows rows={view.rows} />
+			{(onFixRuns && view.failedRunIds.length > 0) || onDiscardVersion ? (
+				<Group gap="xs">
+					{onFixRuns && view.failedRunIds.length > 0 ? (
+						<Button
+							size="compact-xs"
+							color="red"
+							variant="light"
+							onClick={() => onFixRuns(view.failedRunIds)}
+						>
+							請 AI 修正
+						</Button>
+					) : null}
+					{onDiscardVersion ? (
+						<Button
+							size="compact-xs"
+							color="orange"
+							variant="light"
+							onClick={onDiscardVersion}
+						>
+							丟掉這一版
+						</Button>
+					) : null}
+				</Group>
+			) : null}
+		</Stack>
+	);
+}
+
+// 跑一次範例 (web-v6 §10): progress while the examples run, then the result per
+// example. The job is a health check, not a build, so it has its own card.
+function HealthCheckProgress({ jobQuery, job, onFixRuns }) {
+	if (jobQuery.isError) {
+		return (
+			<Alert color="orange" title="無法確認範例的結果">
+				<Text size="sm">
+					{jobQuery.error?.status === 404
+						? "找不到這個跑範例的工作，後端可能已重新啟動。結果仍在「最近執行」的紀錄裡。"
+						: (jobQuery.error?.message ?? "請稍後再試")}
+				</Text>
+			</Alert>
+		);
+	}
+	const view = verificationView(job?.verification);
+	if (!job || !isTerminalToolJobState(job.state)) {
+		return (
+			<Card withBorder padding="md" radius="md">
+				<Stack gap="xs">
+					<Group gap="sm" wrap="nowrap">
+						<Loader size="sm" />
+						<Text size="sm">
+							{view ? `${view.title}……` : "正在準備跑範例……"}
+						</Text>
+					</Group>
+					{view ? <VerificationRows rows={view.rows} /> : null}
+				</Stack>
+			</Card>
+		);
+	}
+	if (job.state === "failed" || !view) {
+		return (
+			<Alert color="red" title="範例沒有跑完">
+				<Text size="sm">{job.error ?? "未知錯誤"}</Text>
+			</Alert>
+		);
+	}
+	const color = {
+		passed: "green",
+		failed: "red",
+		incomplete: "orange",
+		not_run: "gray",
+	}[view.tone];
+	return (
+		<Alert color={color} title={`工具「${job.tool_name}」的範例`}>
+			<VerificationSummary
+				view={view}
+				onFixRuns={onFixRuns}
+				onDiscardVersion={null}
+			/>
+		</Alert>
+	);
+}
+
 // The tool-job progress card: spinner while the job runs (2s poll, stopping
 // on a terminal state -- see toolJobRefetchInterval), then the green/red
 // outcome with a link into the AI 日誌 trace. Shared by BOTH job kinds this
@@ -161,12 +278,30 @@ function LogLink({ llmLogId, llmLogProcess }) {
 // the job WAS ("安裝"/"修訂") -- the queued/running/failed shell is otherwise
 // identical, so this is one component (renamed from the original
 // install-only InstallProgress) rather than a second copy for revise.
-function ToolJobProgress({ kind, jobId, jobQuery }) {
+function ToolJobProgress({
+	kind,
+	jobId,
+	jobQuery,
+	onFixRuns = null,
+	onDiscardVersion = null,
+}) {
 	if (jobId === null) {
 		return null;
 	}
 	const job = jobQuery.data;
-	const verb = kind === "revise" ? "修訂" : "安裝";
+	// The job says what it is (web-v6 §10 added the health check); the caller's
+	// `kind` covers the moment before the first poll lands.
+	const jobKind = job?.kind ?? kind;
+	if (jobKind === "health_check") {
+		return (
+			<HealthCheckProgress
+				jobQuery={jobQuery}
+				job={job}
+				onFixRuns={onFixRuns}
+			/>
+		);
+	}
+	const verb = jobKind === "revise" ? "修訂" : "安裝";
 
 	if (jobQuery.isError) {
 		// A 404 means the job RECORD is gone (jobs are process-local), NOT that the
@@ -196,15 +331,23 @@ function ToolJobProgress({ kind, jobId, jobQuery }) {
 	}
 
 	if (!job || !isTerminalToolJobState(job.state)) {
+		// A revise that has published is checking the new version's examples
+		// (web-v6 §8.3): say so, with the count so far.
+		const checking = verificationView(job?.verification);
 		return (
 			<Card withBorder padding="md" radius="md">
-				<Group gap="sm" wrap="nowrap">
-					<Loader size="sm" />
-					<Text size="sm">
-						AI 正在{verb}工具，可能需要數分鐘……
-						{job?.state === "queued" ? "（排隊中）" : ""}
-					</Text>
-				</Group>
+				<Stack gap="xs">
+					<Group gap="sm" wrap="nowrap">
+						<Loader size="sm" />
+						<Text size="sm">
+							{checking
+								? `已發布新版本，${checking.title}……`
+								: `AI 正在${verb}工具，可能需要數分鐘……`}
+							{job?.state === "queued" ? "（排隊中）" : ""}
+						</Text>
+					</Group>
+					{checking ? <VerificationRows rows={checking.rows} /> : null}
+				</Stack>
 			</Card>
 		);
 	}
@@ -212,15 +355,36 @@ function ToolJobProgress({ kind, jobId, jobQuery }) {
 	const view = toolJobOutcomeView(job, kind);
 
 	if (view.tone === "success") {
+		// The verification of the published version, when there was one. A
+		// failure turns the card red and offers the two ways out: fix again, or
+		// discard this version (web-v6 §8.3) -- never automatically, since the
+		// version is the result of a paid build.
+		const verification = verificationView(job.verification);
+		const verifyFailed = verification?.tone === "failed";
+		const color = verifyFailed
+			? "red"
+			: verification?.tone === "incomplete"
+				? "orange"
+				: view.color;
 		return (
-			<Alert color={view.color} title={view.title}>
+			<Alert
+				color={color}
+				title={verifyFailed ? `${view.title}，但範例驗證失敗` : view.title}
+			>
 				<Stack gap="xs" align="flex-start">
 					<Text size="sm">
-						{kind === "revise"
+						{jobKind === "revise"
 							? `已發布工具「${job.tool_name}」的新版本。`
 							: `已安裝工具「${job.tool_name}」。`}
 					</Text>
 					{job.summary ? <Text size="sm">{job.summary}</Text> : null}
+					{verification ? (
+						<VerificationSummary
+							view={verification}
+							onFixRuns={onFixRuns}
+							onDiscardVersion={verifyFailed ? onDiscardVersion : null}
+						/>
+					) : null}
 					<LogLink
 						llmLogId={job.llm_log_id}
 						llmLogProcess={job.llm_log_process}
@@ -555,6 +719,8 @@ function ToolRow({
 	reviseJobId,
 	reviseJobQuery,
 	onFix,
+	onCheck,
+	isSubmittingCheck,
 }) {
 	// Local, independent per row (unlike LlmLogsPage's single-open Accordion):
 	// there is no reason comparing two tools' summaries side by side should
@@ -687,17 +853,19 @@ function ToolRow({
 					</Group>
 				</Group>
 
-				{/* The revise card lives on the row, whatever started the job (the
-				    AI 總結 form, a fix from 最近執行) and whether or not the panel is
-				    open: the panel returns early -- a Loader, 無法載入總結 -- whenever
-				    its summary query has no data, which is exactly the case right
-				    after a fix publishes a new version, so a card inside it could
-				    vanish mid-job. */}
+				{/* The job card lives on the row, whatever started the job (the AI
+				    總結 form, a fix or 跑一次範例 from 最近執行; the card follows the
+				    job's own kind) and whether or not the panel is open: the panel
+				    returns early -- a Loader, 無法載入總結 -- whenever its summary
+				    query has no data, which is exactly the case right after a fix
+				    publishes a new version, so a card inside it could vanish
+				    mid-job. */}
 				{reviseJobId !== null ? (
 					<ToolJobProgress
 						kind="revise"
 						jobId={reviseJobId}
 						jobQuery={reviseJobQuery}
+						onFixRuns={lineageControls.showVersionControls ? onFix : null}
 					/>
 				) : null}
 
@@ -801,6 +969,8 @@ function ToolRow({
 							onFix={lineageControls.showVersionControls ? onFix : null}
 							fixBlocked={writesBlocked}
 							isSubmittingFix={isSubmittingRevise}
+							onCheck={lineageControls.showVersionControls ? onCheck : null}
+							isSubmittingCheck={isSubmittingCheck}
 						/>
 					</Collapse>
 				</div>
@@ -981,8 +1151,10 @@ function InstalledToolsPanel({
 				queryClient.invalidateQueries({ queryKey: toolSummaryKeyPrefix(name) }),
 				queryClient.invalidateQueries({ queryKey: ["tools"] }),
 				// A published revision moves current_vid, which every record's
-				// vid_state and fixable were judged against.
+				// vid_state and fixable were judged against -- and a revise's
+				// verification or a health check has just written records.
 				queryClient.invalidateQueries({ queryKey: toolRunsQueryKey(name) }),
+				queryClient.invalidateQueries({ queryKey: toolRunStatsQueryKey }),
 			]),
 		[queryClient],
 	);
@@ -1173,6 +1345,47 @@ function InstalledToolsPanel({
 		errorStatus: jobQuery.error?.status,
 	});
 
+	// 跑一次範例 (web-v6 §10): a job in the same single flight, tracked as the
+	// panel's active job exactly like a revise, so it shows in its row and holds
+	// the same gate. A refusal that says why nothing can run (no usable
+	// examples, a switched-off tool) is the operator's to act on.
+	const checkMutation = useMutation({
+		mutationFn: ({ name, currentVid }) =>
+			apiPost(`/api/tools/${name}/check`, { expected_vid: currentVid }),
+		onSuccess: (result, { name, jobAttributionKey }) => {
+			setActiveJob({ name, jobAttributionKey, jobId: result.job_id });
+		},
+		onError: (mutationError, variables) => {
+			if (
+				mutationError?.status === 409 &&
+				mutationError?.code === "check_unavailable"
+			) {
+				notifications.show({
+					color: "orange",
+					title: "沒有可以跑的範例",
+					message: mutationError.message,
+				});
+				return;
+			}
+			const reaction = reactToVersionWriteConflict(
+				mutationError,
+				variables.jobAttributionKey,
+			);
+			notifications.show({
+				color: "red",
+				title: "無法跑範例",
+				message: toolErrorMessage(
+					mutationError,
+					"無法跑範例",
+					VERSION_WRITE_CODE_COPY,
+				),
+			});
+			if (reaction === null) {
+				revalidateAfterSummaryError(mutationError, variables.name);
+			}
+		},
+	});
+
 	// A job started ELSEWHERE and linked here as /tools?job=<id> (web-v6 §8.2,
 	// §9): a fix requested beside a capture / enrich / assist-update result. It
 	// gets its own card, holds the same busy gate as a local job while it is
@@ -1259,7 +1472,7 @@ function InstalledToolsPanel({
 	// before any job id anywhere existed.
 	const ownBusy = ownSummaryBusy({
 		regeneratePending: regenerateMutation.isPending,
-		revisePending: reviseMutation.isPending,
+		revisePending: reviseMutation.isPending || checkMutation.isPending,
 		reviseJobActive: reviseJobActive || linkedJobActive,
 	});
 	const summaryBusy = ownBusy || externalBusy;
@@ -1326,6 +1539,72 @@ function InstalledToolsPanel({
 				toolIdentityConsumers(tool.name, tool.current_vid).jobAttributionKey ===
 				activeJobKey,
 		);
+	// The one-click fix (web-v6 §8): a revise that attaches failing run records
+	// -- the same mutation, single-flight gate and job card as 送出修訂, with the
+	// gate re-checked here like the other AI writes. `feedback` is set only by
+	// 加上說明….
+	const fixTool = (tool, runIds, feedback = "") => {
+		if (versionWritesBlocked) {
+			return;
+		}
+		reviseMutation.mutate(
+			{
+				name: tool.name,
+				currentVid: tool.current_vid,
+				jobAttributionKey: toolIdentityConsumers(tool.name, tool.current_vid)
+					.jobAttributionKey,
+				feedback,
+				runIds,
+			},
+			{
+				onSuccess: () =>
+					notifications.show({
+						color: "blue",
+						message: `已請 AI 修正「${tool.name}」，進度顯示在這個工具下方`,
+					}),
+			},
+		);
+	};
+	const checkTool = (tool) => {
+		if (versionWritesBlocked) {
+			return;
+		}
+		checkMutation.mutate({
+			name: tool.name,
+			currentVid: tool.current_vid,
+			jobAttributionKey: toolIdentityConsumers(tool.name, tool.current_vid)
+				.jobAttributionKey,
+		});
+	};
+	// The actions a free-standing job card (a published fix whose row has
+	// remounted on the new version, or a job linked from another page) may offer
+	// for the version its verification ran: only while that version is still the
+	// tool's current one, and 丟掉這一版 only where the row itself would offer it.
+	const versionActions = (name, vid) => {
+		const tool = tools.find(
+			(candidate) => candidate.name === name && candidate.current_vid === vid,
+		);
+		if (!tool || vid == null) {
+			return { onFixRuns: null, onDiscardVersion: null };
+		}
+		const identity = toolIdentityConsumers(tool.name, tool.current_vid);
+		const controls = toolLineageControls(
+			tool,
+			lineageUnavailableKeys.has(identity.rowKey),
+		);
+		return {
+			onFixRuns: (runIds) => fixTool(tool, runIds),
+			onDiscardVersion:
+				controls.discardAction === "discard-version"
+					? () =>
+							setDiscardTarget({
+								name: tool.name,
+								currentVid: tool.current_vid,
+								jobAttributionKey: identity.jobAttributionKey,
+							})
+					: null,
+		};
+	};
 	const discardTargetIsCurrent =
 		discardTarget === null ||
 		tools.some(
@@ -1376,6 +1655,10 @@ function InstalledToolsPanel({
 						kind="revise"
 						jobId={followedJobId}
 						jobQuery={linkedJobQuery}
+						{...versionActions(
+							linkedJob?.tool_name,
+							linkedJob?.verification?.vid,
+						)}
 					/>
 				</Stack>
 			) : null}
@@ -1453,6 +1736,7 @@ function InstalledToolsPanel({
 						kind="revise"
 						jobId={activeJob.jobId}
 						jobQuery={jobQuery}
+						{...versionActions(activeJob.name, job?.verification?.vid)}
 					/>
 				</Stack>
 			) : null}
@@ -1532,31 +1816,12 @@ function InstalledToolsPanel({
 						// rendered exactly once, never twice and never nowhere.
 						reviseJobId={rowKey === activeJobKey ? activeJob.jobId : null}
 						reviseJobQuery={jobQuery}
-						// The one-click fix (web-v6 §8): a revise that attaches failing
-						// run records -- the same mutation, single-flight gate and job
-						// card as 送出修訂, with the gate re-checked here like the other
-						// AI writes. `feedback` is set only by 加上說明….
-						onFix={(runIds, feedback = "") => {
-							if (versionWritesBlocked) {
-								return;
-							}
-							reviseMutation.mutate(
-								{
-									name: tool.name,
-									currentVid: tool.current_vid,
-									jobAttributionKey: identity.jobAttributionKey,
-									feedback,
-									runIds,
-								},
-								{
-									onSuccess: () =>
-										notifications.show({
-											color: "blue",
-											message: `已請 AI 修正「${tool.name}」，進度顯示在這個工具下方`,
-										}),
-								},
-							);
-						}}
+						onFix={(runIds, feedback = "") => fixTool(tool, runIds, feedback)}
+						onCheck={() => checkTool(tool)}
+						isSubmittingCheck={
+							checkMutation.isPending &&
+							checkMutation.variables?.name === tool.name
+						}
 					/>
 				);
 			})}

@@ -764,6 +764,58 @@ async def revise_tool(
     return ToolInstallAccepted(job_id=started.job_id)
 
 
+_CHECK_UNAVAILABLE_CODE = "check_unavailable"
+
+
+@router.post(
+    "/{name}/check",
+    response_model=ToolInstallAccepted,
+    status_code=202,
+    responses={
+        **_TOOL_NOT_FOUND_RESPONSE,
+        **_conflict_response(
+            (_VERSION_MISMATCH_CODE, _VERSION_MISMATCH_MESSAGE, "The requested version is stale"),
+            (_JOB_BUSY_CODE, _JOB_BUSY_MESSAGE, "Another tool operation holds the global slot"),
+            (
+                _CHECK_UNAVAILABLE_CODE,
+                tool_builder._CHECK_REFUSALS["no_examples"],
+                "Nothing to run: no usable examples.json, or the tool is off",
+            ),
+        ),
+    },
+)
+async def check_tool(name: ToolName, payload: ToolExpectedVersionRequest) -> ToolInstallAccepted:
+    """跑一次範例: run the current version's examples.json as a job (web-v6 §10).
+
+    202 + job id, polled like an install or revise; the job holds the global
+    slot and, while the examples run, the shared tools lock. Refusals, none of
+    which creates a job: 404 for a tool that does not exist, ``job_busy``,
+    ``version_mismatch`` (compared after the slot is taken), and
+    ``check_unavailable`` -- no examples, an examples.json that cannot be used,
+    or a tool that is switched off -- whose message says which.
+    """
+    started = await tool_builder.start_health_check_job(name, payload.expected_vid)
+    if started.refusal == "not_found":
+        raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
+    if started.refusal == "version_mismatch":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": _VERSION_MISMATCH_CODE, "message": _VERSION_MISMATCH_MESSAGE},
+        )
+    if started.refusal == "job_busy":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": _JOB_BUSY_CODE, "message": _JOB_BUSY_MESSAGE},
+        )
+    if started.refusal == "check_unavailable":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": _CHECK_UNAVAILABLE_CODE, "message": started.message},
+        )
+    assert started.job_id is not None
+    return ToolInstallAccepted(job_id=started.job_id)
+
+
 @router.get(
     "/{name}/settings",
     response_model=ToolSettings,
@@ -828,6 +880,7 @@ async def list_tool_runs(
             "current_vid": versions.current_vid,
             "total": tool_runs.count_for_tool(session, name),
             "runs": [tool_runs.view(row, versions, secrets, bodies=False) for row in rows],
+            "verification": tool_runs.verification_state(session, name, versions.current),
         }
 
     data = await run_in_threadpool(_read)

@@ -166,9 +166,15 @@ def is_fixable(outcome: str, vid: str, current_vid: str | None) -> bool:
 class PackageVersions:
     """Where a run's version stands in its package today; each vid asked once."""
 
-    def __init__(self, package_root: tools.PackageRoot | None, current_vid: str | None) -> None:
+    def __init__(
+        self,
+        package_root: tools.PackageRoot | None,
+        current_vid: str | None,
+        current: tools.Resolved | None = None,
+    ) -> None:
         self.package_root = package_root
         self.current_vid = current_vid
+        self.current = current
         self._exists: dict[str, bool] = {}
 
     @classmethod
@@ -178,8 +184,9 @@ class PackageVersions:
         if package_root is None:
             return cls(None, None)
         resolution = tools.resolve_current(package_root)
-        current_vid = resolution.vid if isinstance(resolution, tools.Resolved) else None
-        return cls(package_root, current_vid)
+        if not isinstance(resolution, tools.Resolved):
+            return cls(package_root, None)
+        return cls(package_root, resolution.vid, resolution)
 
     def state(self, vid: str) -> str:
         if self.current_vid is not None and vid == self.current_vid:
@@ -431,6 +438,68 @@ def stats(session: Session) -> dict[str, Any]:
         "not_ok": sum(entry["not_ok"] for entry in per_tool),
         "orphans": sum(entry["total"] for entry in per_tool if entry["tool_name"] in orphans),
         "tools": per_tool,
+    }
+
+
+# --- verification state (web-v6 §9) ----------------------------------------------
+
+
+def verification_state(
+    session: Session, tool_name: str, current: tools.Resolved | None
+) -> dict[str, Any]:
+    """How the current version did on its examples, from its newest check batch.
+
+    A batch is the records of one health check or post-fix verification
+    (``check_id``). Only the CURRENT version's batches count: a pass of the
+    version before the fix says nothing about this one. Totals come from the
+    version's examples.json as it is now, so a batch that ran fewer examples than
+    the file lists (the budget ran out, the rest were skipped) reads as
+    incomplete. States: ``no_version``, ``examples_invalid``, ``no_examples``,
+    ``never`` (has examples, never checked), ``passed``, ``failed``,
+    ``incomplete``.
+    """
+    if current is None:
+        return {"state": "no_version"}
+    loaded = tools.load_examples(current.version_root)
+    if loaded.error is not None:
+        return {"state": "examples_invalid", "message": loaded.error}
+    total = len(loaded.examples)
+    if total == 0:
+        return {"state": "no_examples", "total": 0}
+    newest = session.exec(
+        select(ToolRun.check_id, func.max(ToolRun.id))
+        .where(
+            col(ToolRun.tool_name) == tool_name,
+            col(ToolRun.vid) == current.vid,
+            col(ToolRun.check_id).is_not(None),
+        )
+        .group_by(ToolRun.check_id)
+        .order_by(func.max(ToolRun.id).desc())
+        .limit(1)
+    ).first()
+    if newest is None:
+        return {"state": "never", "total": total}
+    rows = list(
+        session.exec(
+            select(ToolRun).where(
+                col(ToolRun.tool_name) == tool_name, col(ToolRun.check_id) == newest[0]
+            )
+        )
+    )
+    passed = sum(1 for row in rows if row.outcome == tools.RUN_OK)
+    if passed < len(rows):
+        state = "failed"
+    elif len(rows) < total:
+        state = "incomplete"
+    else:
+        state = "passed"
+    return {
+        "state": state,
+        "passed": passed,
+        "ran": len(rows),
+        "total": total,
+        "checked_at": max(row.started_at for row in rows),
+        "workflow": rows[0].workflow,
     }
 
 

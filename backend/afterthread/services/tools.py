@@ -30,7 +30,7 @@ import time
 import weakref
 from collections.abc import Awaitable, Callable, Iterator
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any, Literal
@@ -61,6 +61,12 @@ _CURRENT_FILENAME = "current"
 _PACKAGE_STATE_FILENAME = "state.json"
 _ORIGIN_FILENAME = "origin.json"
 _SUMMARY_FILENAME = "summary.json"
+# A version's regression inputs (web-v6 §10): tool content the builder writes,
+# read by the backend only to run them.
+_EXAMPLES_FILENAME = "examples.json"
+_EXAMPLES_MAX_BYTES = 64 * 1024
+EXAMPLES_MAX = 10
+_EXAMPLE_NAME_MAX_CHARS = 200
 _CURRENT_MAX_BYTES = 64
 _TOOLS_LOCK_FILENAME = ".afterthread-tools.lck"
 
@@ -3052,6 +3058,25 @@ class ToolFailure:
     outcome: str
 
 
+@dataclass(slots=True)
+class CheckContext:
+    """A run of a tool's examples (web-v6 §10) that the calls in it belong to.
+
+    Set by ``run_examples`` around its calls: their records carry ``workflow``
+    (``health_check`` or ``verify``) and ``check_id`` -- the batch the tools page
+    derives the verification state from -- and ``runs`` collects each call's
+    ``(run_id, outcome)`` in order, which is how the runner learns an outcome the
+    handler's string does not carry.
+    """
+
+    check_id: str
+    workflow: str
+    runs: list[tuple[int | None, str]] = field(default_factory=list)
+
+
+_CHECK_CONTEXT: ContextVar[CheckContext | None] = ContextVar("_CHECK_CONTEXT", default=None)
+
+
 # The failures of the AI request running in this context, collected for its
 # response (``collect_tool_failures``). None outside such a request: a direct
 # service caller collects nothing. A ContextVar rather than a parameter for the
@@ -3351,6 +3376,9 @@ async def _record_run(
     there is one -- whether or not its record was written (web-v6 §8.2).
     """
     run_id = await _write_record(advertised, result, started_at=started_at, duration_ms=duration_ms)
+    check = _CHECK_CONTEXT.get()
+    if check is not None:
+        check.runs.append((run_id, result.outcome))
     failures = _REQUEST_TOOL_FAILURES.get()
     if failures is not None and result.outcome in RUN_FAILURE_OUTCOMES:
         failures.append(
@@ -3371,6 +3399,13 @@ async def _write_record(
     if recorder is None:
         return None
     interaction = current_interaction()
+    check = _CHECK_CONTEXT.get()
+    if check is not None:
+        workflow = check.workflow
+    elif interaction is not None:
+        workflow = interaction.workflow
+    else:
+        workflow = "unknown"
     record = ToolRunRecord(
         tool_name=advertised.package_root.path.name,
         vid=advertised.vid,
@@ -3379,8 +3414,8 @@ async def _write_record(
         outcome=result.outcome,
         exit_code=result.exit_code,
         truncated=result.truncated,
-        workflow=interaction.workflow if interaction is not None else "unknown",
-        check_id=None,
+        workflow=workflow,
+        check_id=check.check_id if check is not None else None,
         llm_log_id=interaction.record_id if interaction is not None else None,
         llm_log_process=interaction.process if interaction is not None else None,
         message=None if result.outcome == RUN_OK else result.text,
@@ -3493,6 +3528,225 @@ def _make_handler(
                 await run_in_threadpool(release_tools_lock, owned_lock_fd)
 
     return _handler
+
+
+# --- examples.json: a version's regression inputs (web-v6 §10) ---------------
+
+
+@dataclass(frozen=True, slots=True)
+class ToolExample:
+    """One input the tool must keep handling: a label and the JSON it is given."""
+
+    name: str
+    args: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ExamplesFile:
+    """A version's examples, or why they cannot be run (``error``, zh-TW).
+
+    No file is no examples and no error. A file that is there but unusable is
+    an error and runs NOTHING: a half-understood list would report a partial
+    check as a clean one.
+    """
+
+    examples: tuple[ToolExample, ...] = ()
+    error: str | None = None
+
+
+def load_examples(version_root: VersionRoot) -> ExamplesFile:
+    """Read and validate one version's ``examples.json``.
+
+    Read through the bounded, FIFO/symlink-hardened reader every other package
+    file goes through. The shape is ``{"examples": [{"name": str, "args": {...}},
+    ...]}`` with at most ``EXAMPLES_MAX`` entries; each ``args`` is a JSON object,
+    because that is what a tool is called with.
+    """
+    path = version_root.path / _EXAMPLES_FILENAME
+    if not os.path.lexists(path):
+        return ExamplesFile()
+    text = _read_regular_file_capped(path, _EXAMPLES_MAX_BYTES)
+    if text is None:
+        return ExamplesFile(error="examples.json 無法讀取（不是一般檔案，或沒有權限）。")  # noqa: RUF001
+    if len(text) > _EXAMPLES_MAX_BYTES:
+        return ExamplesFile(error="examples.json 超過 64 KiB。")
+    try:
+        data = json.loads(text)
+    except ValueError, RecursionError:
+        return ExamplesFile(error="examples.json 不是合法的 JSON。")
+    entries = data.get("examples") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return ExamplesFile(error="examples.json 需要一個 examples 陣列。")
+    if len(entries) > EXAMPLES_MAX:
+        too_many = f"examples.json 最多 {EXAMPLES_MAX} 個範例，目前有 {len(entries)} 個。"  # noqa: RUF001
+        return ExamplesFile(error=too_many)
+    examples = []
+    for index, entry in enumerate(entries, start=1):
+        name = entry.get("name") if isinstance(entry, dict) else None
+        args = entry.get("args") if isinstance(entry, dict) else None
+        if not isinstance(name, str) or not name.strip() or not isinstance(args, dict):
+            return ExamplesFile(
+                error=f"examples.json 的第 {index} 個範例需要非空的 name 與一個 args 物件。"
+            )
+        # JSON object keys are always strings; the comprehension says so to the
+        # type checker as well.
+        examples.append(
+            ToolExample(
+                name=_utf8_safe(name.strip())[:_EXAMPLE_NAME_MAX_CHARS],
+                args={str(key): value for key, value in args.items()},
+            )
+        )
+    return ExamplesFile(examples=tuple(examples))
+
+
+@dataclass(frozen=True, slots=True)
+class ExampleResult:
+    """How one example went: a run outcome, or ``skipped``/``not_run`` (never started)."""
+
+    name: str
+    outcome: str
+    run_id: int | None
+
+
+# An example not started because an earlier one timed out (the API is most
+# likely down for all of them), or because the budget ran out.
+EXAMPLE_SKIPPED = "skipped"
+EXAMPLE_NOT_RUN = "not_run"
+
+
+@dataclass(frozen=True, slots=True)
+class CheckResult:
+    """One run of a tool's examples.
+
+    ``status`` is ``ran`` when the examples were run (however they went), else
+    why nothing ran: ``no_examples``, ``examples_invalid`` (``message`` says
+    how), ``disabled`` (the execution path refuses a disabled tool, so it is not
+    verified), ``invalid`` (the package does not validate), ``not_found``, or
+    ``version_changed`` (``current`` moved off the version to check).
+    """
+
+    status: str
+    vid: str | None = None
+    results: tuple[ExampleResult, ...] = ()
+    total: int = 0
+    budget_exhausted: bool = False
+    message: str | None = None
+
+
+def checkable_tool(name: str) -> tuple[Resolved, LlmTool] | str:
+    """The tool ``name`` exactly as an AI request would be handed it, or why not.
+
+    One package scanned and built by the same functions ``enabled_llm_tools``
+    uses -- so a check runs through the same identity checks, redaction and
+    records as a conversation's call (invariant P). Call it with the request
+    tools lock bound: the handler captures it.
+    """
+    package_root = _resolve_package_dir_no_alias(name)
+    if package_root is None:
+        return "not_found"
+    scan = scan_installed(package_root)
+    if not scan.valid or not isinstance(scan.resolution, Resolved):
+        return "invalid"
+    if not scan.enabled:
+        return "disabled"
+    return scan.resolution, _build_llm_tool(scan)
+
+
+async def run_examples(
+    name: str,
+    *,
+    check_id: str,
+    workflow: str,
+    budget_seconds: float,
+    expected_vid: str | None = None,
+    on_progress: Callable[[CheckResult], None] | None = None,
+) -> CheckResult:
+    """Run the current version's examples through the normal tool path (web-v6 §10).
+
+    Takes the shared tools lock for the whole run, as an AI request does: a
+    delete or discard meanwhile is refused (invariant T), and the budget is the
+    bound on that wait. Each example is one handler call -- identity recheck,
+    redaction, a run record carrying ``workflow`` and ``check_id``. Passing is
+    exit 0 within the tool's own timeout; output is not compared, the API is
+    real. After the first timeout the rest are skipped (one API down is usually
+    all of them down), and once ``budget_seconds`` is spent the rest are not run
+    (invariant S). ``on_progress`` sees the result after every example.
+    """
+    fd = await run_in_threadpool(acquire_shared_tools_lock)
+    if fd is None:
+        return CheckResult(status="not_found")
+    try:
+        with bind_request_tools_lock(fd):
+            found = checkable_tool(name)
+            if isinstance(found, str):
+                return CheckResult(status=found)
+            resolution, tool = found
+            if expected_vid is not None and resolution.vid != expected_vid:
+                return CheckResult(status="version_changed", vid=resolution.vid)
+            loaded = await run_in_threadpool(load_examples, resolution.version_root)
+            if loaded.error is not None:
+                return CheckResult(
+                    status="examples_invalid", vid=resolution.vid, message=loaded.error
+                )
+            if not loaded.examples:
+                return CheckResult(status="no_examples", vid=resolution.vid)
+            return await _run_loaded_examples(
+                tool,
+                resolution.vid,
+                loaded.examples,
+                CheckContext(check_id=check_id, workflow=workflow),
+                budget_seconds,
+                on_progress,
+            )
+    finally:
+        await run_in_threadpool(release_tools_lock, fd)
+
+
+async def _run_loaded_examples(
+    tool: LlmTool,
+    vid: str,
+    examples: tuple[ToolExample, ...],
+    context: CheckContext,
+    budget_seconds: float,
+    on_progress: Callable[[CheckResult], None] | None,
+) -> CheckResult:
+    started = time.monotonic()
+    results: list[ExampleResult] = []
+    stop_reason: str | None = None
+    budget_exhausted = False
+
+    def _snapshot() -> CheckResult:
+        return CheckResult(
+            status="ran",
+            vid=vid,
+            results=tuple(results),
+            total=len(examples),
+            budget_exhausted=budget_exhausted,
+        )
+
+    token = _CHECK_CONTEXT.set(context)
+    try:
+        for example in examples:
+            if stop_reason is None and time.monotonic() - started >= budget_seconds:
+                stop_reason = EXAMPLE_NOT_RUN
+                budget_exhausted = True
+            if stop_reason is not None:
+                results.append(ExampleResult(example.name, stop_reason, None))
+                continue
+            before = len(context.runs)
+            # The handler records even a call the backend fails (``error``), then
+            # raises; the check reports that outcome and moves on.
+            with contextlib.suppress(Exception):
+                await tool.handler(example.args)
+            run_id, outcome = context.runs[-1] if len(context.runs) > before else (None, RUN_ERROR)
+            results.append(ExampleResult(example.name, outcome, run_id))
+            if outcome == RUN_TIMEOUT:
+                stop_reason = EXAMPLE_SKIPPED
+            if on_progress is not None:
+                on_progress(_snapshot())
+    finally:
+        _CHECK_CONTEXT.reset(token)
+    return _snapshot()
 
 
 # --- mutation (name-validated + containment-checked) -----------------------

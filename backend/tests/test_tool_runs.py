@@ -840,7 +840,8 @@ def test_a_tool_named_jobs_has_its_runs_read_not_a_job_poll(
     response = client.get("/api/tools/jobs/runs")
 
     assert response.status_code == 200
-    assert response.json() == {"current_vid": _TEST_VID, "total": 0, "runs": []}
+    body = response.json()
+    assert (body["current_vid"], body["total"], body["runs"]) == (_TEST_VID, 0, [])
 
 
 # --- P2b: purge, stats, deleting a tool (web-v6 §7, §6.4) ------------------------

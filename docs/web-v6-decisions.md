@@ -398,3 +398,70 @@ UTC 再比）、stats 的 SQL、孤兒判斷與別名、P2a-r1 的 `error` 路�
 跑過整條路：e2e 的 mock LLM（`#variant:tool_roundtrip`）讓快速捕捉呼叫一個會失敗的工具，結果旁
 出現提醒，按「請 AI 修正」送出修訂，「到工具頁看進度」開啟 `/tools?job=<id>`，卡片接上那個工作
 並顯示結局。
+
+## D47（P5）：跑一次範例與修正後自動驗證
+
+範圍是設計 §10 的後端執行、§8.3 的自動驗證、§9 的驗證狀態。（D46 是 P4。）下面是實作時才定下的細節。
+
+### 執行
+
+- `tools.run_examples` 是兩者共用的執行函式：取得共享 tools lock 並 `bind_request_tools_lock`，
+  再用 `checkable_tool(name)` 建出那個工具的 handler——它只掃描那一個套件，但用的是
+  `enabled_llm_tools` 同一組函式（`scan_installed`、`_build_llm_tool`），所以身分檢查、遮蔽與執行
+  紀錄完全相同（不變量 P）。停用或無效的工具回報原因，不執行。
+- 每次呼叫的 outcome 從新的 `CheckContext`（ContextVar）取得：handler 回給模型的只有字串，
+  outcome 在 `_record_run` 裡才知道；同一個 context 也讓紀錄帶上 `workflow` 與 `check_id`。紀錄器
+  沒接上時 outcome 照樣收得到（`run_id` 為 None）。
+- 一個範例在後端出錯（`error`）時 handler 會拋出；執行函式記下那個 outcome 後繼續下一個。
+- **預算**：每個範例開始前檢查已用時間，超過 `TOOL_CHECK_BUDGET_SECONDS` 就把其餘標為 `not_run`、
+  `budget_exhausted`；第一個 `timeout` 之後其餘標為 `skipped`（不變量 S）。單一範例仍受
+  `LLM_TOOL_TIMEOUT_SECONDS` 限制，所以實際上限是預算加一個範例的逾時。
+- `examples.json` 讀不到、不是 JSON、形狀不對、超過 10 個或單一範例缺 name／args 時，整份不跑
+  並回報原因：只跑看得懂的一部分，會把一次不完整的驗證說成通過。範例名稱截到 200 字。
+
+### job
+
+- `InstallJob` 多了 `kind`（`install`／`revise`／`health_check`）與 `verification`。原本刻意不放 kind，
+  因為兩種 job 的卡片相同；健康檢查不建置任何東西，卡片不同，輪詢的人必須知道手上是哪一種。
+- 健康檢查的送出順序：取得名額 → 版本比對（不變量 K 的順序）→ 工具能不能跑、有沒有可用的範例；
+  不能跑就回 `409 check_unavailable`（附原因），不建立 job。job 期間持有名額，執行範例期間持有共享
+  鎖，所以刪除回 `ai_job_in_progress`、丟棄回 `job_busy`，都不動任何東西（不變量 T）。
+- 自動驗證在修訂 job 裡、發布與總結**之後**執行，`check_id` 是那個修訂 job 的 id（由 `_run_job`
+  設定的 `_CURRENT_JOB_ID`），`expected_vid` 是剛發布的版本；`current` 在這之間被移走就回報
+  `version_changed`，不去驗證別的版本。驗證本身出錯不會讓已發布的修訂變成失敗。
+- 進度：每跑完一個範例就更新 job 的 `verification`（`finished: false`），卡片顯示「已發布新版本，
+  正在跑範例（2/5）」。
+- 範例名稱是 builder 寫的版本內容，放進 job 時經過遮蔽器；已知秘密的掃描失敗時改用「範例 N」，
+  不讓結果因此遺失。
+
+### 驗證狀態
+
+- 由目前版本最新一批（`check_id`）`verify`／`health_check` 紀錄推導，總數用 `examples.json` 目前的
+  範例數；這一批跑的比總數少（預算用完、被略過、或之後加了範例）就是 `incomplete`。舊版本的通過
+  不算數。
+- 放在 `GET /api/tools/{name}/runs` 的回應裡（「最近執行」展開時才讀），不放在工具列表：列表要為
+  每個工具讀一次 `examples.json`，而狀態只在詳情裡看。
+
+### 前端
+
+- 「跑一次範例」是 `checkMutation`，成功後設成面板的 `activeJob`，與修訂共用卡片位置、寫入閘與結束
+  後的重新讀取（現在也重讀頁首的筆數）。只有目前版本有範例時才提供按鈕。
+- `ToolJobProgress` 以 job 自己的 `kind` 決定卡片：健康檢查有自己的卡片（逐個範例的結果、失敗的
+  可以一鍵修正）；修訂成功的卡片附上驗證結果，失敗時轉紅並提供「請 AI 修正」（附上失敗範例的紀錄，
+  最多 3 筆）與「丟掉這一版」。修訂發布後那一列會以新版本重新掛載，卡片因此出現在面板層級；面板
+  只在那個版本仍是工具的目前版本時提供這兩個按鈕，「丟掉這一版」走既有的確認框，而且只在那一列
+  本來就會提供時才出現。
+- `WORKFLOW_LABELS` 加上 `health_check`（跑一次範例）與 `verify`（修正後驗證）。
+
+### 驗收
+
+| 不變量 | 測試 |
+|---|---|
+| P | `test_a_check_runs_each_example_through_the_tool_path_and_records_the_batch`、`test_a_disabled_tool_is_not_run_and_says_so`、`test_a_published_fix_is_verified_against_its_examples_only`（附上的原始輸入沒有被後端執行）、`test_a_published_fix_of_a_disabled_tool_is_reported_unverified` |
+| S | `test_after_the_first_timeout_the_rest_are_skipped`、`test_past_the_budget_the_remaining_examples_are_not_run` |
+| T | `test_delete_and_discard_are_refused_while_a_check_runs`、`test_a_running_health_check_holds_the_slot_against_a_discard` |
+
+另有 `examples.json` 的解析（`test_an_unusable_examples_file_is_an_error_not_a_partial_list` 等）、
+健康檢查 job 與路由的拒絕、驗證狀態的推導（`test_verification_state_follows_the_newest_batch_of_the_current_version`）。
+前端的措辭與判斷在 `toolChecks.js`，有 vitest；另用實際的瀏覽器跑過：「最近執行」顯示「有 2 個範例，
+尚未驗證」，按「跑一次範例」後卡片列出逐個結果與「請 AI 修正」，驗證狀態與頁首筆數隨之更新。

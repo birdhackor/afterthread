@@ -77,6 +77,7 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 | `TOOL_INSTALL_MAX_ROUNDS` | `24` | KB 網頁安裝器（見下方「工具（KB 網頁安裝器）」）單一安裝工作階段的工具輪數上限，邊界 `[4, 64]`。 |
 | `TOOL_INSTALL_TIMEOUT_SECONDS` | `900` | KB 網頁安裝器單一安裝工作階段的整體逾時秒數，邊界 `(0, 3600]`。 |
 | `TOOL_INSTALL_SHELL_TIMEOUT_SECONDS` | `120` | 安裝器內單一 `run_shell` 指令的逾時秒數，邊界 `(0, 600]`。 |
+| `TOOL_CHECK_BUDGET_SECONDS` | `300` | 跑一次 `examples.json`（「跑一次範例」與 AI 修正發布後的自動驗證）的總預算秒數；超過就不再跑剩下的範例、標示未完成。執行期間持有共享 tools lock，所以這也是刪除／丟棄最久會被擋住的時間。邊界 `(0, 3600]`。 |
 | `DATABASE_URL` | `sqlite:///./afterthread.db` | SQLAlchemy URL。**只支援 SQLite**，且必須是檔案型（不可為 in-memory）——見下方設計筆記。 |
 | `STALE_AFTER_DAYS` | `14` | 非終態項目（`STALE_ELIGIBLE_STATUSES`：除 `done`／`superseded` 外的五種狀態）的 `updated` 超過這個天數，API 回應的 `is_stale` 會是 `true`。邊界 `[0, 36500]`。 |
 
@@ -208,7 +209,9 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   完成後再安裝」——指名一個使用者從沒送出的「安裝」只會讓他去找一個不存在的東西。
 - `GET /api/tools/jobs/{job_id}` — 輪詢一個工具工作（安裝**或**修訂）的狀態
   （`queued`／`running`／`succeeded`／`failed` + 完成後的 `tool_name`／
-  `summary`／`llm_log_id`／`llm_log_process`／`outcome`）；`outcome` 是終局的細分
+  `summary`／`llm_log_id`／`llm_log_process`／`outcome`／`kind`／`verification`）；`kind` 是
+  `install`／`revise`／`health_check`，`verification` 是範例的執行結果（健康檢查的全部結果，或修訂
+  發布之後的自動驗證），執行中就會逐個更新；`outcome` 是終局的細分
   （`published`／`not_published`／`failed`，進行中為 `null`），`not_published` 指
   builder 自己回 `ready=false`、沒有發布任何東西——前端以橘色而非紅色呈現，且不宣稱
   原因是外部還是修不好（web-v6 §8.3）。工作已完成的清單被裁剪掉、或後端
@@ -252,6 +255,12 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   建立工作。**不宣告** `502`／`503`：修訂是背景工作，LLM 沒
   設定或上游失敗都封在工作狀態裡（失敗的 job + 友善訊息 + AI 日誌連結），與
   安裝送出同一套契約。
+- `POST /api/tools/{name}/check` — body `{expected_vid}`，「跑一次範例」（web-v6 §10）：把目前版本的
+  `examples.json` 當成一個 job 跑一次；202 + `job_id`，用 `GET /api/tools/jobs/{job_id}` 輪詢
+  （`kind: "health_check"`，結果在 `verification`）。占用全域名額，執行範例期間持有共享 tools
+  lock，所以刪除與丟棄會被擋（不變量 T）。工具不存在回 404；名額被占回 `409 job_busy`；取得名額
+  後版本不符回 `409 version_mismatch`；沒有範例、`examples.json` 無法使用、或工具已停用回
+  `409 check_unavailable`，`message` 說明是哪一種——這些都不建立工作。
 - `GET /api/tools/{name}/settings` — 工具的套件層設定，唯讀（web-v6 §4、§9）：
   `.env` 的 **key 名**（值永不離開後端）、`config.env` 的每一組（值**逐字包含**某個
   已登記秘密時整個以遮蔽標記回傳，其餘原樣；並標示 `overridden_by_env`／
@@ -267,8 +276,10 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   以及後端算好的 `fixable`（失敗、而且失敗的就是目前版本；前端不自己判斷）。
   `llm_log_id`／`llm_log_process` 連回造成這次呼叫的 AI 日誌；id 是前一個行程鑄的
   時兩者都回 `null`（紀錄活得比日誌環久，理由同 `summary` 的 `llm_log_id`）。
-  另帶 `current_vid` 與總筆數 `total`。只要求套件存在（同 `settings`），宣告在
-  `/jobs/{job_id}` 之前。
+  另帶 `current_vid`、總筆數 `total`，以及目前版本的驗證狀態 `verification`（web-v6 §9）：
+  `state` 是 `no_version`／`examples_invalid`／`no_examples`／`never`／`passed`／`failed`／
+  `incomplete`，由目前版本最新一批 `verify`／`health_check` 紀錄（依 `check_id` 分批）與
+  `examples.json` 目前的範例數推導。只要求套件存在（同 `settings`），宣告在 `/jobs/{job_id}` 之前。
   這五條路由都**不宣告** `503 tools_not_configured`：`TOOLS_DIR` 未設定時
   任何名稱都解析不到工具，404 已經是誠實答案。
 

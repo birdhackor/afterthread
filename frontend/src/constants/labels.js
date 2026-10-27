@@ -63,5 +63,9 @@ export const WORKFLOW_LABELS = {
 	assist_update: "AI 進度更新",
 	tool_install: "工具建置",
 	tool_summary: "工具總結",
+	// Not LLM workflows: the two ways the backend itself runs a tool's
+	// examples.json (web-v6 §10), recorded as such on the tool's run records.
+	health_check: "跑一次範例",
+	verify: "修正後驗證",
 	unknown: "其他",
 };

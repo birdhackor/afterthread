@@ -23,6 +23,7 @@ import { apiDelete, apiGet } from "../api/client.js";
 import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { formatDuration, formatTimestamp } from "../utils/format.js";
 import { codePointLength } from "../utils/text.js";
+import { canRunExamples, verificationStateText } from "../utils/toolChecks.js";
 import {
 	runDetailSections,
 	runHasDetails,
@@ -72,12 +73,17 @@ const STALE_LIST_NOTE =
 // may predate a fix that already published (a re-expanded row renders its
 // cached list first), and a click would pay for a builder session on a record
 // the backend no longer offers. The same rule as 送出修訂's displayedMayBeStale.
+//
+// The section also says how the current version did on its examples.json
+// (web-v6 §9) and offers 跑一次範例 (`onCheck`, a job in the same gate).
 export function ToolRunsSection({
 	name,
 	expanded,
 	onFix = null,
 	fixBlocked = false,
 	isSubmittingFix = false,
+	onCheck = null,
+	isSubmittingCheck = false,
 }) {
 	const [purgeTarget, setPurgeTarget] = useState(null);
 	const [noteRun, setNoteRun] = useState(null);
@@ -101,11 +107,36 @@ export function ToolRunsSection({
 			</Alert>
 		) : null;
 	}
+	const verification = verificationStateText(data.verification);
+	const checkLine =
+		verification || (onCheck && canRunExamples(data.verification)) ? (
+			<Group gap="xs" wrap="wrap">
+				{verification ? (
+					<Text size="sm" c={verification.color}>
+						{verification.text}
+					</Text>
+				) : null}
+				{onCheck && canRunExamples(data.verification) ? (
+					<Button
+						size="compact-xs"
+						variant="light"
+						disabled={fixBlocked}
+						loading={isSubmittingCheck}
+						onClick={onCheck}
+					>
+						跑一次範例
+					</Button>
+				) : null}
+			</Group>
+		) : null;
 	if (data.runs.length === 0) {
 		return (
-			<Text size="sm" c="dimmed" pt="xs">
-				還沒有執行紀錄。AI 呼叫這個工具時，每一次都會記在這裡。
-			</Text>
+			<Stack gap="xs" pt="xs">
+				{checkLine}
+				<Text size="sm" c="dimmed">
+					還沒有執行紀錄。AI 呼叫這個工具時，每一次都會記在這裡。
+				</Text>
+			</Stack>
 		);
 	}
 	const blocked = fixBlocked || isFetching || isError;
@@ -118,6 +149,7 @@ export function ToolRunsSection({
 					<Text size="sm">{`${error?.message ?? "請稍後再試"}${STALE_LIST_NOTE}`}</Text>
 				</Alert>
 			) : null}
+			{checkLine}
 			<Group justify="space-between" align="flex-start" wrap="nowrap" gap="sm">
 				<Text size="xs" c="dimmed">
 					{`共 ${data.total} 筆，顯示最近 ${data.runs.length} 筆。`}

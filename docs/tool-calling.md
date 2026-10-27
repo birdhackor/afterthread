@@ -217,6 +217,14 @@ LLM。這道檢查在**送出時**先跑一次（不過就回 `409 env_policy`�
 `examples.json` 是版本內容（工具的回歸輸入清單）：builder 安裝時把測過的輸入寫進去，修訂時
 必須把每個範例都重跑一次、全部成功才回 `ready=true`。只放唯讀的輸入。
 
+後端自己也會跑範例（web-v6 §10）：修訂發布之後的**自動驗證**（`workflow=verify`），與工具頁的
+「跑一次範例」（`workflow=health_check`，一種 job）。兩者走 AI 請求的同一條執行路徑：取得共享
+tools lock、`bind_request_tools_lock`，用 `checkable_tool` 以 `enabled_llm_tools` 同一組函式建出
+那個工具的 handler 直接呼叫——身分檢查、遮蔽、執行紀錄全部照舊，停用的工具不會被執行。每個範例
+就是一次 handler 呼叫，紀錄帶 `check_id`（那一批的 job id）；通過條件只有 exit 0、沒有逾時，不比對
+輸出。總預算是 `TOOL_CHECK_BUDGET_SECONDS`：第一個逾時之後其餘略過，預算用完就不再跑。
+`examples.json` 讀不到、不是合法 JSON、形狀不對或超過 10 個時，整份不跑並回報原因。
+
 ### 啟用狀態
 
 live toggle 只在 `<name>/.afterthread.meta/state.json`：

@@ -797,6 +797,36 @@ class ToolInstallAccepted(BaseModel):
     job_id: str
 
 
+class ToolVerificationRun(BaseModel):
+    """One example of a check: its run outcome, or ``skipped``/``not_run``."""
+
+    name: str
+    outcome: str
+    run_id: int | None
+
+
+class ToolVerification(BaseModel):
+    """One run of a version's examples.json (web-v6 §8.3, §10).
+
+    ``status`` is ``ran`` when the examples were run, else why not:
+    ``no_examples``, ``examples_invalid`` (``message`` says how), ``disabled``
+    (not verified: the execution path refuses a disabled tool), ``invalid``,
+    ``not_found``, ``version_changed``, or ``error``. ``completed`` of ``total``
+    examples were started; after the first timeout the rest are ``skipped``, and
+    past the budget ``not_run`` with ``budget_exhausted``. ``finished`` is false
+    while the run is still going -- a poll shows progress.
+    """
+
+    status: str
+    message: str | None
+    vid: str | None
+    runs: list[ToolVerificationRun]
+    completed: int
+    total: int
+    budget_exhausted: bool
+    finished: bool
+
+
 class ToolJobStatus(BaseModel):
     """One install/revise job's visible state, as polled by the 工具 page.
 
@@ -825,6 +855,11 @@ class ToolJobStatus(BaseModel):
     assignments from a builder-written ``.env`` that the backend stripped;
     values never enter the result.
 
+    ``kind`` says which job it is: ``install``, ``revise``, or ``health_check``
+    (跑一次範例, web-v6 §10). ``verification`` is the run of the version's
+    examples -- a health check's whole result, or the check that follows a
+    published revise -- and is filled in while the job runs.
+
     ``outcome`` (web-v6 §8.3) is how a TERMINAL job ended, finer than ``state``:
     ``published``, ``not_published`` (the builder itself declined to publish --
     possibly an outside cause, possibly a fix it could not make; the card says
@@ -842,6 +877,8 @@ class ToolJobStatus(BaseModel):
     llm_log_process: str | None
     env_keys: list[str]
     outcome: Literal["published", "not_published", "failed"] | None
+    kind: Literal["install", "revise", "health_check"] = "install"
+    verification: ToolVerification | None = None
 
 
 class ToolSettingsEntry(BaseModel):
@@ -929,12 +966,42 @@ class ToolRunDetail(ToolRunSummary):
     stderr: str | None
 
 
+class ToolVerificationState(BaseModel):
+    """How the current version did on its examples.json, from its newest check (web-v6 §9).
+
+    ``state``: ``no_version``, ``examples_invalid`` (``message`` says how),
+    ``no_examples``, ``never``, ``passed``, ``failed`` or ``incomplete`` (fewer
+    examples ran than the file lists). ``passed``/``ran``/``total`` count
+    examples; ``workflow`` says whether the batch was a health check or the
+    verification after a fix.
+    """
+
+    state: Literal[
+        "no_version", "examples_invalid", "no_examples", "never", "passed", "failed", "incomplete"
+    ]
+    message: str | None = None
+    passed: int | None = None
+    ran: int | None = None
+    total: int | None = None
+    checked_at: datetime | None = None
+    workflow: str | None = None
+
+    @field_validator("checked_at")
+    @classmethod
+    def _aware_checked_at(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else _ensure_aware(value)
+
+
 class ToolRunList(BaseModel):
-    """One tool's newest run records, newest first, with the total it has."""
+    """One tool's newest run records, newest first, with the total it has.
+
+    ``verification`` is the current version's verification state (web-v6 §9).
+    """
 
     current_vid: str | None
     total: int
     runs: list[ToolRunSummary]
+    verification: ToolVerificationState
 
 
 class ToolRunPurgeRequest(BaseModel):

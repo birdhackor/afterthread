@@ -245,7 +245,9 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   重新讀取中或讀取失敗時停用：`fixable` 是讀取當下的判斷。purge 的請求內容與措辭在 `utils/toolRunsPurge.js`，元件是 `ToolRunsPurgeDialog`／
   `ToolRunStatsBar`。AI 結果旁的工具失敗提醒（擷取、補齊、協助更新）在
   `components/ToolFailureNotice.jsx`，分組與「能不能送出」的判斷在 `utils/toolFailures.js`；
-  `/tools?job=<id>` 的驗證（`toolsJobSearch`）也在那裡，工具頁以 `useSearch` 讀取。工作流的中文名稱 `WORKFLOW_LABELS` 在 `constants/labels.js`，時間與耗時的
+  `/tools?job=<id>` 的驗證（`toolsJobSearch`）也在那裡，工具頁以 `useSearch` 讀取。範例的驗證
+  （「最近執行」的驗證狀態、工作卡片上的逐個結果、可以附上的失敗紀錄）在 `utils/toolChecks.js`；
+  「跑一次範例」是一種 job，沿用修訂的工作追蹤與寫入閘。工作流的中文名稱 `WORKFLOW_LABELS` 在 `constants/labels.js`，時間與耗時的
   格式在 `utils/format.js`，`AI 日誌` 頁與執行紀錄共用。修訂工作的終局呈現 `toolJobOutcomeView` 在 `toolInstall.js`（job 輪詢那一組），
   送出被 `env_policy` 擋下時的通知 `reviseRefusalNotification` 在 `toolSummary.js`
   （修訂請求那一組）。**唯一的例外寫在

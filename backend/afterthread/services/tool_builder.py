@@ -65,6 +65,7 @@ import stat
 import subprocess
 import threading
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
@@ -647,6 +648,9 @@ class InstallOutcome:
     # card must say "not published" rather than show the red "failed" both share
     # today, without claiming to know which of the two it was.
     not_ready: bool = False
+    # How the published version did on its own examples.json (web-v6 §8.3): set
+    # by a revise that published, None otherwise. A ``_verification_dict``.
+    verification: dict[str, Any] | None = None
 
 
 # --- staging containment + meta-tools ---------------------------------------
@@ -3053,12 +3057,14 @@ async def run_revise(
             origin=published.origin,
             builder_summary=summary,
         )
+        verification = await _verify_published(name, published.resolution.vid)
         return InstallOutcome(
             ok=True,
             tool_name=name,
             summary=summary,
             llm_log_id=llm_log_id,
             env_keys=env_keys,
+            verification=verification,
         )
     finally:
         # The package .env was untouched, so its live scan keeps covering these
@@ -3067,6 +3073,177 @@ async def run_revise(
         for value in registered:
             tools.discard_inflight_secret(value)
         await run_in_threadpool(_cleanup_staging, session_root, base)
+
+
+# --- examples: verification and the health check (web-v6 §8.3, §10) --------
+
+_WORKFLOW_VERIFY = "verify"
+_WORKFLOW_HEALTH_CHECK = "health_check"
+
+
+def _verification_dict(result: tools.CheckResult, *, finished: bool) -> dict[str, Any]:
+    """A check's result as the job reports it: per example, plus the totals.
+
+    Example names are builder-written version content shown to the operator, so
+    they pass the redactor like every other such text. A failing secret scan
+    must not lose the result, so it costs the names instead.
+    """
+    try:
+        secrets = tools._redaction_secrets()
+    except Exception:
+        secrets = None
+    runs = []
+    for index, example in enumerate(result.results, start=1):
+        name = (
+            tools._mask_known_secrets(example.name, secrets)
+            if secrets is not None
+            else f"範例 {index}"
+        )
+        runs.append({"name": name, "outcome": example.outcome, "run_id": example.run_id})
+    not_started = {tools.EXAMPLE_SKIPPED, tools.EXAMPLE_NOT_RUN}
+    return {
+        "status": result.status,
+        "message": result.message,
+        "vid": result.vid,
+        "runs": runs,
+        "completed": sum(1 for example in result.results if example.outcome not in not_started),
+        "total": result.total,
+        "budget_exhausted": result.budget_exhausted,
+        "finished": finished,
+    }
+
+
+async def _verify_published(name: str, vid: str) -> dict[str, Any]:
+    """Run the just-published version's examples, the fix's own verification.
+
+    Only the version's examples.json is run -- never the inputs attached to the
+    fix, which the builder alone replays inside its session (web-v6 §8.5). A
+    tool switched off is not run: the execution path refuses it, so the result
+    says it was not verified. Labelled with this job's id as ``check_id`` and
+    reported on the job as each example finishes.
+    """
+    job_id = _CURRENT_JOB_ID.get()
+
+    def _progress(partial: tools.CheckResult) -> None:
+        if job_id is not None:
+            _update_job(job_id, verification=_verification_dict(partial, finished=False))
+
+    try:
+        result = await tools.run_examples(
+            name,
+            check_id=job_id or uuid4().hex,
+            workflow=_WORKFLOW_VERIFY,
+            budget_seconds=get_settings().tool_check_budget_seconds,
+            expected_vid=vid,
+            on_progress=_progress,
+        )
+    except Exception as exc:
+        # The fix is published; a verification that could not even run must
+        # not turn that into a failure. It says what happened instead.
+        _logger.warning("Verification of %s not run: %s", name, type(exc).__name__)
+        result = tools.CheckResult(status="error", vid=vid)
+    return _verification_dict(result, finished=True)
+
+
+# Why a health check cannot start, by the reason ``tools.checkable_tool`` or the
+# examples file gives. The operator reads these on the submit, so they say what
+# to do.
+_CHECK_REFUSALS = {
+    "no_examples": "這個版本沒有 examples.json，沒有範例可以跑。修訂時 AI 會建立它。",  # noqa: RUF001
+    "disabled": "工具已停用：執行路徑不會執行停用的工具。啟用後再跑。",  # noqa: RUF001
+    "invalid": "工具目前的版本不是可執行的工具包。",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class CheckJobStart:
+    """A health-check submit: the job id, or a refusal (and its message)."""
+
+    job_id: str | None = None
+    refusal: str | None = None
+    message: str | None = None
+
+
+async def start_health_check_job(name: str, expected_vid: str) -> CheckJobStart:
+    """Take the global slot, check the version and its examples, queue the run.
+
+    A health check is a job like an install or a revise (web-v6 §10): it holds
+    the single flight -- so every version write is refused meanwhile -- and the
+    shared tools lock while it runs. ``expected_vid`` is compared after the slot
+    is taken, the order every version-specific write keeps (invariant K). A
+    version with no usable examples, or a tool that is off, is refused here, so a
+    job never exists that could only report that nothing ran.
+    """
+    reservation = reserve_sync_operation()
+    if reservation is None:
+        return CheckJobStart(refusal="job_busy")
+    try:
+        package_root = await run_in_threadpool(tools._resolve_package_dir_no_alias, name)
+        if package_root is None:
+            return CheckJobStart(refusal="not_found")
+        resolution = await run_in_threadpool(tools.resolve_current, package_root)
+        if isinstance(resolution, tools.Unresolved):
+            return CheckJobStart(refusal="not_found")
+        if resolution.vid != expected_vid:
+            return CheckJobStart(refusal="version_mismatch")
+        found = await run_in_threadpool(tools.checkable_tool, name)
+        if isinstance(found, str):
+            refusal = "not_found" if found == "not_found" else "check_unavailable"
+            return CheckJobStart(refusal=refusal, message=_CHECK_REFUSALS.get(found))
+        loaded = await run_in_threadpool(tools.load_examples, resolution.version_root)
+        if loaded.error is not None:
+            return CheckJobStart(refusal="check_unavailable", message=loaded.error)
+        if not loaded.examples:
+            return CheckJobStart(
+                refusal="check_unavailable", message=_CHECK_REFUSALS["no_examples"]
+            )
+        job = _admit_job(reservation_token=reservation, kind="health_check")
+        if job is None:
+            return CheckJobStart(refusal="job_busy")
+        reservation = ""
+        task = asyncio.create_task(_run_check_job(job.job_id, name, expected_vid))
+        _TASKS.add(task)
+        task.add_done_callback(_TASKS.discard)
+        return CheckJobStart(job_id=job.job_id)
+    finally:
+        if reservation:
+            release_sync_operation(reservation)
+
+
+async def _run_check_job(job_id: str, name: str, expected_vid: str) -> None:
+    """The health check's task body: run the examples, report as they finish."""
+    _update_job(job_id, state="running", tool_name=name)
+
+    def _progress(partial: tools.CheckResult) -> None:
+        _update_job(job_id, verification=_verification_dict(partial, finished=False))
+
+    try:
+        result = await tools.run_examples(
+            name,
+            check_id=job_id,
+            workflow=_WORKFLOW_HEALTH_CHECK,
+            budget_seconds=get_settings().tool_check_budget_seconds,
+            expected_vid=expected_vid,
+            on_progress=_progress,
+        )
+    except Exception as exc:
+        _update_job(
+            job_id,
+            state="failed",
+            error=f"跑範例時發生未預期錯誤（{type(exc).__name__}）。",  # noqa: RUF001
+            outcome=_OUTCOME_FAILED,
+            finished_at=_now_iso(),
+        )
+        return
+    ran = result.status == "ran"
+    _update_job(
+        job_id,
+        state="succeeded" if ran else "failed",
+        error=None if ran else (result.message or _CHECK_REFUSALS.get(result.status)),
+        outcome=None if ran else _OUTCOME_FAILED,
+        verification=_verification_dict(result, finished=True),
+        finished_at=_now_iso(),
+    )
 
 
 # --- background jobs ---------------------------------------------------------
@@ -3081,6 +3258,9 @@ async def run_revise(
 # submits.
 _MAX_JOBS = 20
 _JOBS: dict[str, InstallJob] = {}
+# The job whose run is executing in this context, set by ``_run_job``: a revise
+# reads it to label and report the verification it runs after publishing.
+_CURRENT_JOB_ID: ContextVar[str | None] = ContextVar("_CURRENT_JOB_ID", default=None)
 _JOBS_LOCK = threading.Lock()
 _TASKS: set[asyncio.Task[None]] = set()
 
@@ -3115,6 +3295,10 @@ class InstallJob:
     job_id: str
     state: str  # queued | running | succeeded | failed
     created_at: str
+    # install | revise | health_check (web-v6 §10). The first two share every
+    # field; a health check runs a tool's examples and builds nothing, so its
+    # card reads differently, and the poller needs to know which it holds.
+    kind: str = "install"
     finished_at: str | None = None
     error: str | None = None
     tool_name: str | None = None
@@ -3126,6 +3310,10 @@ class InstallJob:
     # None while queued/running. ``state`` keeps its two terminal values so an
     # older reader of the poll is not broken; this field only splits its failure.
     outcome: str | None = None
+    # A run of the tool's examples (web-v6 §8.3, §10): the health check's whole
+    # result, or the verification that follows a published revise. Updated as
+    # each example finishes, so a poll shows progress.
+    verification: dict[str, Any] | None = None
 
 
 # The three terminal ``InstallJob.outcome`` values.
@@ -3150,6 +3338,8 @@ def _job_dict(job: InstallJob) -> dict[str, Any]:
         "llm_log_id": job.llm_log_id,
         "env_keys": list(job.env_keys),
         "outcome": job.outcome,
+        "kind": job.kind,
+        "verification": job.verification,
     }
 
 
@@ -3190,6 +3380,7 @@ async def _run_job(
     this is category-only).
     """
     _update_job(job_id, state="running")
+    job_token = _CURRENT_JOB_ID.set(job_id)
     try:
         outcome = await run()
     except Exception as exc:
@@ -3201,6 +3392,8 @@ async def _run_job(
             finished_at=_now_iso(),
         )
         return
+    finally:
+        _CURRENT_JOB_ID.reset(job_token)
     if outcome.ok:
         terminal = _OUTCOME_PUBLISHED
     elif outcome.not_ready:
@@ -3216,6 +3409,7 @@ async def _run_job(
         llm_log_id=outcome.llm_log_id,
         env_keys=outcome.env_keys,
         outcome=terminal,
+        verification=outcome.verification,
         finished_at=_now_iso(),
     )
 
@@ -3236,7 +3430,7 @@ def _single_flight_held() -> bool:
     return bool(_SYNC_OPS) or any(job.state in ("queued", "running") for job in _JOBS.values())
 
 
-def _admit_job(*, reservation_token: str | None = None) -> InstallJob | None:
+def _admit_job(*, reservation_token: str | None = None, kind: str = "install") -> InstallJob | None:
     """Register one queued job, or None when another is already active (M7/D40).
 
     The single-flight admission, written ONCE for both kinds: the active-check
@@ -3254,7 +3448,7 @@ def _admit_job(*, reservation_token: str | None = None) -> InstallJob | None:
     deterministic tiebreak for identical timestamps); a TERMINAL (succeeded/
     failed) job stays pollable until evicted and never blocks a new submit.
     """
-    job = InstallJob(job_id=uuid4().hex, state="queued", created_at=_now_iso())
+    job = InstallJob(job_id=uuid4().hex, state="queued", created_at=_now_iso(), kind=kind)
     with _JOBS_LOCK:
         if reservation_token is None:
             if _single_flight_held():
@@ -3378,7 +3572,7 @@ async def start_revise_job(
             return ReviseJobStart(refusal="not_found")
         if resolution.vid != expected_vid:
             return ReviseJobStart(refusal="version_mismatch")
-        job = _admit_job(reservation_token=reservation)
+        job = _admit_job(reservation_token=reservation, kind="revise")
         if job is None:
             return ReviseJobStart(refusal="job_busy")
         reservation = ""

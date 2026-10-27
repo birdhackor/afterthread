@@ -286,6 +286,14 @@ class Settings(BaseSettings):
     # llm_tool_timeout_seconds's convention.
     tool_install_shell_timeout_seconds: float = Field(default=120, gt=0, le=600)
 
+    # Wall-clock budget (seconds) for ONE run of a tool's examples.json -- the
+    # 跑一次範例 health check and the verification after a fix is published
+    # (web-v6 §10). The run holds the shared tools lock, so this is also the
+    # longest a delete or discard can be refused by it. Each example still has
+    # llm_tool_timeout_seconds of its own; past the budget the rest are not run
+    # and the check reports itself incomplete. Bounded to (0, 3600].
+    tool_check_budget_seconds: float = Field(default=300, gt=0, le=3600)
+
     database_url: str = "sqlite:///./afterthread.db"
 
     # An item in any stale-eligible status (models.STALE_ELIGIBLE_STATUSES --

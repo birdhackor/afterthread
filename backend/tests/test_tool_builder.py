@@ -3460,6 +3460,8 @@ def test_router_job_status_and_404(client: TestClient) -> None:
         "llm_log_process": llm_log.process_token(),
         "env_keys": ["KB_API_KEY"],
         "outcome": "published",
+        "kind": "install",
+        "verification": None,
     }
 
     missing = client.get("/api/tools/jobs/ghost")
@@ -7459,3 +7461,128 @@ def test_builder_prompts_ask_for_examples_and_their_rerun() -> None:
     assert "examples.json" in install
     assert "READ-ONLY" in install
     assert "run EVERY example" in revise
+
+
+# --- web-v6 P5: the published fix is verified against its examples ------------------
+
+_ECHO_RUN_PY = "import sys, json\nprint(json.load(sys.stdin))\n"
+
+
+def _record_into(monkeypatch: pytest.MonkeyPatch) -> list[tools.ToolRunRecord]:
+    kept: list[tools.ToolRunRecord] = []
+
+    def _record(run: tools.ToolRunRecord) -> int:
+        kept.append(run)
+        return len(kept)
+
+    tools.set_run_recorder(_record)
+    monkeypatch.setattr(tools, "_run_recorder", _record)
+    return kept
+
+
+def _current_resolution(name: str = "kbsearch") -> tools.Resolved:
+    package_root = tools._resolve_package_dir_no_alias(name)
+    assert package_root is not None
+    resolution = tools.resolve_current(package_root)
+    assert isinstance(resolution, tools.Resolved)
+    return resolution
+
+
+def test_a_published_fix_is_verified_against_its_examples_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """P: the backend runs the new version's examples, never the attached inputs."""
+    _seed_package(monkeypatch, tmp_path)
+    records = _record_into(monkeypatch)
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={
+            "run.py": _ECHO_RUN_PY,
+            "examples.json": json.dumps(
+                {"examples": [{"name": "查無結果", "args": {"q": "zzzz-no-hit"}}]}
+            ),
+        },
+    )
+    _fake_summary_generate(monkeypatch, summary="修好了")
+    attached = _attached(args='{"query": "my private note"}')
+
+    try:
+        outcome = asyncio.run(
+            tool_builder.run_revise("kbsearch", None, _current_resolution(), runs=(attached,))
+        )
+    finally:
+        tools.set_run_recorder(None)
+
+    assert outcome.ok is True
+    verification = outcome.verification
+    assert verification is not None
+    assert (verification["status"], verification["finished"]) == ("ran", True)
+    assert [(run["name"], run["outcome"]) for run in verification["runs"]] == [("查無結果", "ok")]
+    assert verification["vid"] == _current_resolution().vid != _TEST_VID
+    assert [(record.workflow, record.args) for record in records] == [("verify", None)]
+    assert [record.vid for record in records] == [verification["vid"]]
+
+
+def test_a_published_fix_of_a_disabled_tool_is_reported_unverified(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pkg = _seed_package(monkeypatch, tmp_path)
+    assert tools.set_enabled("kbsearch", False) is True
+    records = _record_into(monkeypatch)
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={
+            "run.py": _ECHO_RUN_PY,
+            "examples.json": json.dumps({"examples": [{"name": "a", "args": {}}]}),
+        },
+    )
+    _fake_summary_generate(monkeypatch, summary="修好了")
+
+    try:
+        outcome = asyncio.run(_run_revise("kbsearch", "改一下"))
+    finally:
+        tools.set_run_recorder(None)
+
+    assert outcome.ok is True
+    assert outcome.verification is not None
+    assert outcome.verification["status"] == "disabled"
+    assert records == []
+    assert _current_version(pkg).name != _TEST_VID  # the fix itself is published
+
+
+def test_the_revise_job_carries_the_verification(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _seed_package(monkeypatch, tmp_path)
+
+    async def fake_run_revise(
+        name: str,
+        feedback: str | None,
+        _resolution: tools.Resolved | None,
+        *,
+        runs: tuple[Any, ...] = (),
+    ) -> InstallOutcome:
+        return InstallOutcome(
+            ok=True,
+            tool_name=name,
+            verification={"status": "no_examples", "runs": [], "finished": True},
+        )
+
+    monkeypatch.setattr(tool_builder, "run_revise", fake_run_revise)
+
+    async def scenario() -> dict[str, Any]:
+        started = await tool_builder.start_revise_job("kbsearch", "x", _TEST_VID)
+        assert started.job_id is not None
+        for _ in range(200):
+            job = tool_builder.get_job(started.job_id)
+            assert job is not None
+            if job["state"] not in ("queued", "running"):
+                return job
+            await asyncio.sleep(0.01)
+        raise AssertionError("job did not finish")
+
+    job = asyncio.run(scenario())
+    assert job["kind"] == "revise"
+    assert job["verification"] == {"status": "no_examples", "runs": [], "finished": True}
