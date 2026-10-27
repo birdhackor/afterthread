@@ -274,10 +274,12 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 - `DELETE /api/tool-runs/{run_id}` — 刪除一筆；204，找不到回 404。
 - `GET /api/tool-runs/stats` — `{total, not_ok, orphans, tools: [{tool_name, total, not_ok}]}`：
   `not_ok` 是成功以外的全部（被拒也算），`orphans` 是套件已不存在的紀錄數（`TOOLS_DIR`
-  未設定時一律 0，因為那時沒有任何名稱判斷得出來）。宣告在 `/{run_id}` 之前。
+  未設定、或設定了但目錄不在時一律 0，因為那時沒有任何名稱判斷得出來）。宣告在 `/{run_id}`
+  之前。
 - `POST /api/tool-runs/purge` — body `{tool?, outcome?: all|ok|not_ok, before?, orphans_only?,
   dry_run = true, max_id?}`，回 `{matched, deleted, max_id}`（web-v6 §7）。條件只會縮小範圍；
-  `before` 是絕對時間（前端在開啟對話框時算一次），預覽與確認因此判斷同一批紀錄。
+  `before` 是絕對時間（前端在開啟對話框時算一次；沒有時區的值視為 UTC），預覽與確認因此
+  判斷同一批紀錄。不認得的 key 回 422，不會被默默略過——少一個條件等於刪除範圍變大。
   `dry_run` 只計數並回傳符合者的最大 id；`dry_run: false` 必須帶那個 `max_id`（缺了回 422），
   只刪 `id <= max_id` 的——預覽之後才寫進來的紀錄不會被一起刪掉（id 只增不減，
   AUTOINCREMENT）。不會自動刪除任何紀錄。

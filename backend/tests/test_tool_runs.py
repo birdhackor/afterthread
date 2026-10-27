@@ -934,6 +934,62 @@ def test_without_a_tools_directory_no_record_is_called_an_orphan(
     assert client.get("/api/tool-runs/stats").json()["orphans"] == 0
 
 
+def test_a_missing_tools_directory_makes_no_record_an_orphan(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TOOLS_DIR set but not there (unmounted, renamed) is the feature off, too."""
+    _install_tools(monkeypatch, tmp_path / "not-there")
+    _seed_rows(session, _record(), _record(tool_name="other"))
+
+    assert _purge(client, orphans_only=True)["matched"] == 0
+    assert client.get("/api/tool-runs/stats").json()["orphans"] == 0
+
+
+def test_a_purge_with_an_unknown_condition_is_refused_not_widened(client: TestClient) -> None:
+    """A dropped key would silently widen what a confirmation deletes."""
+    response = client.post("/api/tool-runs/purge", json={"older_than_days": 30})
+    assert response.status_code == 422
+
+
+def test_a_naive_before_is_read_as_utc(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n")
+    _install_tools(monkeypatch, root)
+    _seed_rows(session, _record(started_at=datetime(2026, 10, 27, 1, 0, tzinfo=UTC)))
+
+    assert _purge(client, before="2026-10-27T01:30:00")["matched"] == 1
+    assert _purge(client, before="2026-10-27T09:30:00+08:00")["matched"] == 1
+    assert _purge(client, before="2026-10-27T00:30:00")["matched"] == 0
+
+
+def test_a_purge_through_a_session_holding_run_objects_still_deletes(
+    session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The DELETE does not re-evaluate its WHERE over objects the session holds.
+
+    A run built in Python carries an AWARE ``started_at``; SQLAlchemy's default
+    synchronization compared it with the naive cutoff and raised.
+    """
+    _install_tools(monkeypatch, tmp_path / "tools")
+    row = ToolRun(
+        tool_name="kb",
+        vid=_TEST_VID,
+        started_at=datetime(2026, 1, 1, tzinfo=UTC),
+        outcome=tools.RUN_FAILED,
+    )
+    session.add(row)
+    session.flush()
+    scope = tool_runs.PurgeScope(before=datetime(2026, 6, 1, tzinfo=UTC))
+
+    preview = tool_runs.purge(session, scope, dry_run=True)
+    result = tool_runs.purge(session, scope, dry_run=False, max_id=preview["max_id"])
+
+    assert result["deleted"] == 1
+    assert tool_runs.delete_for_tool(session, "kb") is True
+
+
 def test_stats_counts_per_tool_and_orphans_and_is_not_an_id(
     client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

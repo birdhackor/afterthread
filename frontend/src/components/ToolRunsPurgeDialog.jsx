@@ -12,7 +12,7 @@ import {
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { apiPost } from "../api/client.js";
 import {
 	PURGE_AGE_OPTIONS,
@@ -34,12 +34,19 @@ import {
 // operator read the count -- another tab's tool call failing meanwhile -- is
 // never removed with it.
 export function ToolRunsPurgeDialog({ target, onClose }) {
+	// Lifted from PurgeBody so the Modal can refuse to close mid-delete, the
+	// way the page's other delete dialogs do: dismissed then, a re-opened
+	// dialog would preview rows the delete in flight is still removing.
+	const [deleting, setDeleting] = useState(false);
 	return (
 		<Modal
 			opened={target !== null}
 			onClose={onClose}
 			title="清除執行紀錄"
 			centered
+			closeOnEscape={!deleting}
+			closeOnClickOutside={!deleting}
+			withCloseButton={!deleting}
 		>
 			{target !== null ? (
 				// Keyed by the opening instant: every open starts from its own scope
@@ -48,13 +55,14 @@ export function ToolRunsPurgeDialog({ target, onClose }) {
 					key={target.now.getTime()}
 					target={target}
 					onClose={onClose}
+					onDeletingChange={setDeleting}
 				/>
 			) : null}
 		</Modal>
 	);
 }
 
-function PurgeBody({ target, onClose }) {
+function PurgeBody({ target, onClose, onDeletingChange }) {
 	const queryClient = useQueryClient();
 	const [scope, setScope] = useState(target.scope);
 	const body = purgeRequestBody(scope, target.now);
@@ -95,6 +103,11 @@ function PurgeBody({ target, onClose }) {
 			});
 		},
 	});
+
+	useEffect(() => {
+		onDeletingChange(purge.isPending);
+		return () => onDeletingChange(false);
+	}, [purge.isPending, onDeletingChange]);
 
 	const matched = preview.data?.matched ?? 0;
 	return (

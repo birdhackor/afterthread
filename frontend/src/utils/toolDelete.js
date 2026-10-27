@@ -33,7 +33,7 @@ function withRunRecordsNote(notification, result) {
 	return {
 		...notification,
 		color: notification.color === "green" ? "orange" : notification.color,
-		message: `${notification.message}。它的執行紀錄沒有一起刪掉，可以在工具頁上方的「清除紀錄…」選「只清已刪除的工具留下的」清掉。`,
+		message: `${notification.message.replace(/。$/, "")}。它的執行紀錄沒有一起刪掉，可以在工具頁上方的「清除紀錄…」選「只清已刪除的工具留下的」清掉。`,
 	};
 }
 

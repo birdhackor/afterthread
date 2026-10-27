@@ -14,26 +14,33 @@ import { ToolRunsPurgeDialog } from "./ToolRunsPurgeDialog.jsx";
 // operator's cue that it is time to clear some.
 export function ToolRunStatsBar() {
 	const [target, setTarget] = useState(null);
-	const { data } = useQuery({
+	const { data, isError } = useQuery({
 		queryKey: toolRunStatsQueryKey,
 		queryFn: () => apiGet("/api/tool-runs/stats"),
 	});
-	if (data === undefined) {
+	if (data === undefined && !isError) {
 		return null;
 	}
+	// Without counts (the request failed) the line says so and the purge stays
+	// offered: its own preview counts what it would delete.
 	return (
 		<Group gap="sm" justify="space-between" wrap="wrap">
-			<Text size="sm" c="dimmed">
-				{statsSummaryText(data)}
+			<Text size="sm" c={data === undefined ? "red" : "dimmed"}>
+				{data === undefined
+					? "無法讀取工具執行紀錄的筆數"
+					: statsSummaryText(data)}
 			</Text>
 			<Button
 				size="xs"
 				variant="subtle"
 				color="red"
-				disabled={data.total === 0}
+				disabled={data !== undefined && data.total === 0}
 				onClick={() =>
 					setTarget({
-						scope: { outcome: "all", orphansOnly: data.orphans > 0 },
+						scope: {
+							outcome: "all",
+							orphansOnly: (data?.orphans ?? 0) > 0,
+						},
 						now: new Date(),
 						editable: true,
 					})

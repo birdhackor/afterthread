@@ -303,7 +303,11 @@ def delete_for_tool(session: Session, tool_name: str) -> bool:
     purge's orphan scope.
     """
     try:
-        session.exec(sql_delete(ToolRun).where(col(ToolRun.tool_name) == tool_name))
+        session.exec(
+            sql_delete(ToolRun)
+            .where(col(ToolRun.tool_name) == tool_name)
+            .execution_options(synchronize_session=False)
+        )
         session.commit()
     except Exception as exc:
         session.rollback()
@@ -336,11 +340,14 @@ class PurgeScope:
 def orphan_names(session: Session) -> list[str]:
     """The record names whose package no longer exists, sorted.
 
-    Empty when the tools directory is not configured: then NO name resolves, and
-    calling every record an orphan would hand a purge the whole table for a
-    setting the operator may only have switched off for a while.
+    Empty when the tools directory is not configured OR not there (an unmounted
+    volume, a renamed directory): then NO name resolves, and calling every
+    record an orphan would hand a purge the whole table for a condition the
+    operator may fix in a minute. The same "missing root is the feature off"
+    reading ``tools._scan_all`` and the tools lock apply.
     """
-    if tools.tools_dir() is None:
+    base = tools.tools_dir()
+    if base is None or not base.is_dir():
         return []
     names = session.exec(select(ToolRun.tool_name).distinct()).all()
     return sorted(name for name in names if tools._resolve_package_dir_no_alias(name) is None)
@@ -393,7 +400,15 @@ def purge(
         return {"matched": int(matched), "deleted": 0, "max_id": highest}
     if max_id is None:
         raise ValueError("a purge that deletes needs the max_id of its preview")
-    result = session.exec(sql_delete(ToolRun).where(*conditions, col(ToolRun.id) <= max_id))
+    # synchronize_session=False: the session is the request's, and the default
+    # ("evaluate") would re-run this WHERE in Python over every ToolRun it holds
+    # -- comparing their aware ``started_at`` with the naive cutoff raises.
+    # Nothing in these sessions needs syncing, and ``rowcount`` is unaffected.
+    result = session.exec(
+        sql_delete(ToolRun)
+        .where(*conditions, col(ToolRun.id) <= max_id)
+        .execution_options(synchronize_session=False)
+    )
     session.commit()
     deleted = int(result.rowcount or 0)
     return {"matched": deleted, "deleted": deleted, "max_id": max_id}

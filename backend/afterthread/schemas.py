@@ -884,7 +884,13 @@ class ToolRunPurgeRequest(BaseModel):
 
     ``dry_run`` (the default) only counts. A real run must carry the ``max_id``
     its preview returned and deletes nothing newer than it.
+
+    Unknown keys are refused, not ignored: a dropped condition (say the
+    ``older_than_days`` an early design used) would silently WIDEN the scope of
+    a delete. A ``before`` without an offset is read as UTC.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     tool: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
     outcome: Literal["all", "ok", "not_ok"] = "all"

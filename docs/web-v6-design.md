@@ -266,7 +266,7 @@ migration。
 | 條件 | 選項 |
 |---|---|
 | 工具 | 某一個工具／全部 |
-| 結果 | 全部／只清成功／只清失敗 |
+| 結果 | 全部／只清成功／只清失敗（P2b 實作為 `not_ok`：成功以外的全部，含被拒，見 D44） |
 | 時間 | 全部／N 天前的 |
 | 孤兒 | 只清已不存在的工具留下的紀錄 |
 | 單筆 | 指定一筆（例如內容不想留） |
@@ -281,7 +281,7 @@ migration。
 - **API**：全域操作放在獨立前綴 `/api/tool-runs`。`routers/tools.py:676` 的註解記載過，
   `/api/tools/` 底下任何字面的第一段都可能是合法套件名，獨立前綴讓全域操作避開這個問題。
   - `GET /api/tool-runs/stats`：每個工具的筆數、失敗數，以及孤兒數
-  - `POST /api/tool-runs/purge`：`{tool?, outcome?, older_than_days?, orphans_only?, dry_run, max_id?}`
+  - `POST /api/tool-runs/purge`：`{tool?, outcome?, older_than_days?, orphans_only?, dry_run, max_id?}`（P2b 實作改用絕對時間 `before` 取代 `older_than_days`，未知的 key 回 422，見 D44）
     → `{matched, deleted, max_id}`
   - `GET /api/tool-runs/{id}`、`DELETE /api/tool-runs/{id}`
   - 單一工具的列表：`GET /api/tools/{name}/runs`

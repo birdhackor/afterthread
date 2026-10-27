@@ -137,6 +137,17 @@ describe("toolDeleteNotification and run records", () => {
 		).toBe("已刪除「kbsearch」的工具目錄");
 	});
 
+	it("joins the note with one sentence break after a message that already ends one", () => {
+		const notice = toolDeleteNotification("kbsearch", {
+			outcome: "retained",
+			retained_path: "/srv/tools/.kbsearch.stale-0123",
+			retention_reason: "cleanup_failed",
+			runs_deleted: false,
+		});
+		expect(notice.message).not.toContain("。。");
+		expect(notice.message).toContain("執行紀錄沒有一起刪掉");
+	});
+
 	it("points to the orphan purge when the records stayed behind", () => {
 		const notice = toolDeleteNotification("kbsearch", {
 			outcome: "removed",

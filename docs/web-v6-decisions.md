@@ -238,7 +238,7 @@ lifespan 接線與實際寫入檔案（`test_lifespan_wires_the_tool_run_recorde
 - 確認（`dry_run: false`）一定要帶預覽的 `max_id`，缺了回 422；預覽沒有任何符合的紀錄時
   `max_id` 為 `null`，前端因此停用「刪除」。
 - **孤兒**是名稱已解析不到套件的紀錄（`_resolve_package_dir_no_alias` 為 None）。`TOOLS_DIR`
-  未設定時一律**沒有**孤兒：那時任何名稱都解析不到，把整張表當孤兒等於讓一個暫時關掉的設定
+  未設定、或設定了但目錄不在時一律**沒有**孤兒（後者是 review r1 F1 補上的）：那時任何名稱都解析不到，把整張表當孤兒等於讓一個暫時關掉的設定
   交出全部紀錄。孤兒在確認時重新判斷，所以預覽與確認之間有人手動刪掉某個工具目錄，那個工具的
   紀錄會多出來；`max_id` 仍然擋住預覽之後寫進來的紀錄。這個時間窗是操作者自己的手動操作，接受。
 - `/stats` 宣告在 `/{run_id}` 之前；`/purge` 是 POST，不會與 GET `/{run_id}` 衝突。
@@ -270,3 +270,18 @@ lifespan 接線與實際寫入檔案（`test_lifespan_wires_the_tool_run_recorde
 | W | `test_stats_counts_per_tool_and_orphans_and_is_not_an_id` |
 
 前端的請求內容、範圍說明與筆數文字在 `toolRunsPurge.js`，刪除通知在 `toolDelete.js`，各有 vitest。
+
+### D44 附錄（P2b review r1，Fable）
+
+判定**未收斂**：一條 P2、五條 P3，全部處理。逐條比對過且無誤的：不變量 J（預覽不刪、`max_id` 界線、
+預覽後的新紀錄留下）、K（404／409 不動、紀錄刪除失敗時回報）、W、時間比較（aware／naive 都換成
+UTC 再比）、stats 的 SQL、孤兒判斷與別名、P2a-r1 的 `error` 路徑。
+
+| # | 嚴重度 | finding | 處置 |
+|---|---|---|---|
+| F1 | P2 | `TOOLS_DIR` 有設定但目錄不在（卷沒掛上、改了名）時，每個名稱都解析不到，整張表都成了孤兒：頁首寫「已刪除的工具留下 N 筆」，「清除紀錄…」預設勾選孤兒、將刪除全部 | **採納**。比照 `_scan_all` 與 tools lock，目錄不在也視為功能關閉、沒有孤兒。測試 `test_a_missing_tools_directory_makes_no_record_an_orphan` |
+| F2 | P3 | 請求模型沿用 pydantic 預設的忽略多餘 key，而設計 §7 還寫著舊的 `older_than_days`：照設計送出時那個條件被丟掉，範圍默默變大，確認時刪掉全部 | **採納**。`ToolRunPurgeRequest` 改為 `extra="forbid"`（422），§7 兩處註明 P2b 的實作；沒有時區的 `before` 視為 UTC，寫進後端 README。測試 `test_a_purge_with_an_unknown_condition_is_refused_not_widened`、`test_a_naive_before_is_read_as_utc` |
+| F3 | P3 | 兩個 DELETE 用 SQLAlchemy 預設的 `synchronize_session`，會在 Python 裡對 session 持有的 ToolRun 物件重跑 WHERE；物件的 `started_at` 有時區、條件沒有，比較時拋 `TypeError`。目前的路由碰不到，但 session 是和路由共用的 | **採納**。兩個 DELETE 都加 `synchronize_session=False`。測試 `test_a_purge_through_a_session_holding_run_objects_still_deletes`（沒有修正時重現 `TypeError`） |
+| F4 | P3 | 刪除工具的通知在 `retained` 等本來就以「。」結尾的訊息後面再接「。它的執行紀錄…」，出現「。。」 | **採納**：接上之前去掉結尾的「。」，補測試 |
+| F5 | P3 | 清除對話框只停用「取消」，Esc／點外面／右上角仍能在刪除進行中關掉；重開後預覽會算到正在被刪的紀錄 | **採納**：刪除進行中對話框不能關（與頁面上其他刪除對話框相同） |
+| F6 | P3 | 筆數讀取失敗時整列（含頁面層級的「清除紀錄…」）默默消失 | **採納**：改成紅字「無法讀取工具執行紀錄的筆數」，「清除紀錄…」照樣可用（它自己的預覽會計數） |
