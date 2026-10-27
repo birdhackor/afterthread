@@ -708,23 +708,49 @@ class ToolInstallRequest(BaseModel):
         return self
 
 
+# How many failing run records one revise may attach (web-v6 §8.1).
+_REVISE_RUN_IDS_MAX = 3
+
+
 class ToolReviseRequest(BaseModel):
     """Payload for an AI revise job (D40): what the user wants changed.
 
     ``feedback`` carries the SAME bound every other AI free-text input has
-    (20000 chars, stripped-non-empty) and becomes the builder session's user
-    turn. ``expected_vid`` is the required optimistic identity checked only
-    after global single-flight admission. Which tool is being revised remains
-    the PATH's job: the shared path regex validates its name.
+    (20000 chars) and becomes the builder session's user turn. ``expected_vid``
+    is the required optimistic identity checked only after global single-flight
+    admission. Which tool is being revised remains the PATH's job: the shared
+    path regex validates its name.
+
+    ``run_ids`` attaches up to three of this tool's run records -- the failures
+    to fix (web-v6 §8). With records attached the feedback may be omitted: the
+    one-click fix sends none, and the prompt then says the operator asks only for
+    those failures to be fixed. With neither there is nothing to do: 422. A
+    blank feedback counts as none; repeated ids count once.
     """
 
-    feedback: str = Field(min_length=1, max_length=_MAX_AI_INPUT_CHARS)
+    feedback: str | None = Field(default=None, max_length=_MAX_AI_INPUT_CHARS)
     expected_vid: str = Field(pattern=_TOOL_VID_PATTERN)
+    run_ids: list[int] = Field(default_factory=list, max_length=_REVISE_RUN_IDS_MAX)
 
     @field_validator("feedback")
     @classmethod
-    def _not_blank(cls, value: str) -> str:
-        return _stripped_non_empty(value, "feedback")
+    def _blank_is_none(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
+
+    @field_validator("run_ids")
+    @classmethod
+    def _unique_positive(cls, value: list[int]) -> list[int]:
+        if any(run_id < 1 for run_id in value):
+            raise ValueError("run_ids must be positive")
+        return list(dict.fromkeys(value))
+
+    @model_validator(mode="after")
+    def _something_to_do(self) -> ToolReviseRequest:
+        if self.feedback is None and not self.run_ids:
+            raise ValueError("feedback or run_ids is required")
+        return self
 
 
 class ToolInstallAccepted(BaseModel):

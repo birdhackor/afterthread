@@ -9,8 +9,10 @@ import {
 	Group,
 	Loader,
 	Menu,
+	Modal,
 	Stack,
 	Text,
+	Textarea,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
@@ -18,7 +20,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useState } from "react";
 import { apiDelete, apiGet } from "../api/client.js";
+import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { formatDuration, formatTimestamp } from "../utils/format.js";
+import { codePointLength } from "../utils/text.js";
 import {
 	runDetailSections,
 	runHasDetails,
@@ -34,6 +38,7 @@ import {
 	toolRunStatsQueryKey,
 } from "../utils/toolRunsPurge.js";
 import { logLinkSearch } from "../utils/toolSummary.js";
+import { CharCounter } from "./CharCounter.jsx";
 import { ToolRunsPurgeDialog } from "./ToolRunsPurgeDialog.jsx";
 
 // Bounded, whitespace-preserving box for a body (up to 16,000 chars of stderr):
@@ -56,8 +61,19 @@ const RETENTION_NOTE =
 // history worth reading. Read-only apart from deleting: one record (for a run
 // whose contents the operator does not want kept) from its detail, or many
 // from the 清除紀錄 menu, which previews before it deletes (web-v6 §7).
-export function ToolRunsSection({ name, expanded }) {
+//
+// `onFix(runIds, feedback?)` is the one-click fix (web-v6 §8): null when the tool
+// has no version a revise could start from, `fixBlocked` the page's gate for
+// every AI write. Only a record the backend marked `fixable` offers it.
+export function ToolRunsSection({
+	name,
+	expanded,
+	onFix = null,
+	fixBlocked = false,
+	isSubmittingFix = false,
+}) {
 	const [purgeTarget, setPurgeTarget] = useState(null);
+	const [noteRun, setNoteRun] = useState(null);
 	const { data, error, isError, isFetching } = useQuery({
 		queryKey: toolRunsQueryKey(name),
 		queryFn: () => apiGet(`/api/tools/${name}/runs?limit=${TOOL_RUNS_LIMIT}`),
@@ -117,8 +133,31 @@ export function ToolRunsSection({ name, expanded }) {
 				</Menu>
 			</Group>
 			{data.runs.map((run) => (
-				<ToolRunRow key={run.id} name={name} run={run} />
+				<ToolRunRow
+					key={run.id}
+					name={name}
+					run={run}
+					fix={
+						run.fixable && onFix
+							? {
+									blocked: fixBlocked,
+									submitting: isSubmittingFix,
+									now: () => onFix([run.id]),
+									withNote: () => setNoteRun(run),
+								}
+							: null
+					}
+				/>
 			))}
+			<FixNoteModal
+				run={noteRun}
+				blocked={fixBlocked}
+				onClose={() => setNoteRun(null)}
+				onSubmit={(feedback) => {
+					onFix?.([noteRun.id], feedback);
+					setNoteRun(null);
+				}}
+			/>
 			<ToolRunsPurgeDialog
 				target={purgeTarget}
 				onClose={() => setPurgeTarget(null)}
@@ -127,7 +166,7 @@ export function ToolRunsSection({ name, expanded }) {
 	);
 }
 
-function ToolRunRow({ name, run }) {
+function ToolRunRow({ name, run, fix }) {
 	const [open, { toggle }] = useDisclosure(false);
 	const outcome = runOutcomeMeta(run.outcome);
 	const version = vidStateMeta(run.vid_state);
@@ -154,6 +193,28 @@ function ToolRunRow({ name, run }) {
 					<Button variant="subtle" size="compact-xs" onClick={toggle}>
 						{open ? "收合" : "詳情"}
 					</Button>
+				) : null}
+				{fix ? (
+					<>
+						<Button
+							size="compact-xs"
+							variant="light"
+							color="red"
+							disabled={fix.blocked}
+							loading={fix.submitting}
+							onClick={fix.now}
+						>
+							請 AI 修正
+						</Button>
+						<Button
+							size="compact-xs"
+							variant="subtle"
+							disabled={fix.blocked}
+							onClick={fix.withNote}
+						>
+							加上說明…
+						</Button>
+					</>
 				) : null}
 			</Group>
 			{/* `expanded`, not `in` -- see the AI 總結 Collapse in ToolsPage. */}
@@ -277,5 +338,60 @@ function ToolRunDetail({ name, run, expanded }) {
 				)}
 			</Group>
 		</Stack>
+	);
+}
+
+// 加上說明… (web-v6 §8.1): the same fix, with words. The record rides along; the
+// note is optional, and bounded like every other AI input.
+function FixNoteModal({ run, blocked, onClose, onSubmit }) {
+	const [note, setNote] = useState("");
+	const tooLong = codePointLength(note.trim()) > SECTION_MAX_LENGTH;
+	// Every way out clears the draft, so the next record never opens with a note
+	// written about another one.
+	const close = () => {
+		setNote("");
+		onClose();
+	};
+	return (
+		<Modal
+			opened={run !== null}
+			onClose={close}
+			title="請 AI 修正這次失敗"
+			centered
+		>
+			<Stack gap="sm">
+				<Text size="sm">
+					這次失敗的參數與錯誤輸出會一起交給 AI。想補充背景（例如這個 API
+					最近改了什麼）就寫在下面，可以留空。
+				</Text>
+				<div>
+					<Textarea
+						label="補充說明（選填）"
+						autosize
+						minRows={3}
+						value={note}
+						onChange={(event) => setNote(event.currentTarget.value)}
+						error={tooLong ? `不可超過 ${SECTION_MAX_LENGTH} 字` : null}
+					/>
+					<CharCounter value={note} max={SECTION_MAX_LENGTH} />
+				</div>
+				<Group justify="flex-end" gap="sm">
+					<Button variant="default" onClick={close}>
+						取消
+					</Button>
+					<Button
+						color="red"
+						disabled={blocked || tooLong}
+						onClick={() => {
+							const feedback = note.trim();
+							setNote("");
+							onSubmit(feedback);
+						}}
+					>
+						送出修正
+					</Button>
+				</Group>
+			</Stack>
+		</Modal>
 	);
 }

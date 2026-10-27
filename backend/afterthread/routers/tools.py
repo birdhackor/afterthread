@@ -155,6 +155,12 @@ _TOOLS_LOCK_UNAVAILABLE_CODE = "tools_lock_unavailable"
 # MESSAGE is the payload -- the gate's own text names the keys to move -- so the
 # OpenAPI example is one real instance of that text rather than a fixed constant.
 _ENV_POLICY_CODE = "env_policy"
+# A revise attaching run records (web-v6 §8.3) that cannot be used: refused
+# before the job, so the message is all the operator gets.
+_RUN_NOT_FOUND_CODE = "run_not_found"
+_RUN_NOT_FOUND_MESSAGE = "找不到附上的執行紀錄（可能已被清除），請重新整理後再試"  # noqa: RUF001
+_RUN_NOT_FOR_TOOL_CODE = "run_not_for_tool"
+_RUN_NOT_FOR_TOOL_MESSAGE = "附上的執行紀錄不屬於這個工具"
 _ENV_POLICY_EXAMPLE = tool_builder._ERROR_REVISE_ENV_UNMASKABLE.replace("{keys}", "「CACHE_TTL」")
 
 
@@ -689,7 +695,9 @@ async def regenerate_tool_summary(
     status_code=202,
     responses={**_TOOL_NOT_FOUND_RESPONSE, **_REVISE_CONFLICT_RESPONSE},
 )
-async def revise_tool(name: ToolName, payload: ToolReviseRequest) -> ToolInstallAccepted:
+async def revise_tool(
+    name: ToolName, payload: ToolReviseRequest, session: SessionDep
+) -> ToolInstallAccepted:
     """Queue an AI revise job for one installed tool; poll it via `/jobs/{id}`.
 
     202 + job id, exactly like the installer's submit and for the same reason: a
@@ -709,8 +717,32 @@ async def revise_tool(name: ToolName, payload: ToolReviseRequest) -> ToolInstall
     return 404, a stale version returns ``version_mismatch``, and an occupied slot
     returns ``job_busy``.  Only a matching version is converted into a queued job,
     so a refused submit has neither an LLM charge nor even a pollable job id.
+
+    Attached ``run_ids`` (web-v6 §8.3) are checked and copied FIRST, before any
+    of that: an id that does not exist (or was purged) is a 404
+    ``run_not_found``, one that belongs to another tool a 422 ``run_not_for_tool``
+    -- no job, no slot, no LLM call (invariant M). The copy rides with the job,
+    so a purge after the submit does not change what the builder is shown.
     """
-    started = await tool_builder.start_revise_job(name, payload.feedback, payload.expected_vid)
+    runs: tuple[tool_runs.AttachedRun, ...] = ()
+    if payload.run_ids:
+        attached = await run_in_threadpool(
+            tool_runs.attach_for_revise, session, name, payload.run_ids
+        )
+        if attached.refusal == "run_not_found":
+            raise HTTPException(
+                status_code=404,
+                detail={"code": _RUN_NOT_FOUND_CODE, "message": _RUN_NOT_FOUND_MESSAGE},
+            )
+        if attached.refusal == "run_not_for_tool":
+            raise HTTPException(
+                status_code=422,
+                detail={"code": _RUN_NOT_FOR_TOOL_CODE, "message": _RUN_NOT_FOR_TOOL_MESSAGE},
+            )
+        runs = attached.runs
+    started = await tool_builder.start_revise_job(
+        name, payload.feedback, payload.expected_vid, runs=runs
+    )
     if started.refusal == "env_policy":
         raise HTTPException(
             status_code=409,

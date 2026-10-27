@@ -433,3 +433,72 @@ def stats(session: Session) -> dict[str, Any]:
         "orphans": sum(entry["total"] for entry in per_tool if entry["tool_name"] in orphans),
         "tools": per_tool,
     }
+
+
+# --- attaching records to a revise (web-v6 §8.3) ---------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class AttachedRun:
+    """One run record as a revise job carries it: copied, and masked, at submit.
+
+    The copy is the point (invariant L): it is taken before the job exists, so a
+    purge of the record while the revise is queued or running changes nothing
+    about what the builder is shown. The texts are masked against the secrets
+    known at that moment, the same second mask a read applies.
+    """
+
+    id: int
+    started_at: datetime
+    workflow: str
+    vid: str
+    outcome: str
+    exit_code: int | None
+    message: str | None
+    args: str | None
+    stdout: str | None
+    stderr: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class AttachedRuns:
+    """The records to attach, in the order asked for, or why they cannot be."""
+
+    runs: tuple[AttachedRun, ...] = ()
+    # ``run_not_found`` (no such id, or purged) | ``run_not_for_tool``
+    refusal: str | None = None
+
+
+def attach_for_revise(session: Session, tool_name: str, run_ids: list[int]) -> AttachedRuns:
+    """Load and copy the records a revise of ``tool_name`` attaches.
+
+    Every id must exist and belong to this package name; otherwise nothing is
+    attached and the caller refuses the submit before any job, slot or LLM call
+    exists (invariant M). Fail-closed on the secret scan like every read.
+    """
+    rows = {
+        row.id: row for row in session.exec(select(ToolRun).where(col(ToolRun.id).in_(run_ids)))
+    }
+    if any(run_id not in rows for run_id in run_ids):
+        return AttachedRuns(refusal="run_not_found")
+    if any(rows[run_id].tool_name != tool_name for run_id in run_ids):
+        return AttachedRuns(refusal="run_not_for_tool")
+    secrets = tools._redaction_secrets()
+    attached = []
+    for run_id in run_ids:
+        row = rows[run_id]
+        attached.append(
+            AttachedRun(
+                id=run_id,
+                started_at=_naive_utc(row.started_at).replace(tzinfo=UTC),
+                workflow=row.workflow,
+                vid=row.vid,
+                outcome=row.outcome,
+                exit_code=row.exit_code,
+                message=_masked(row.message, secrets),
+                args=_masked(row.args, secrets),
+                stdout=_masked(row.stdout, secrets),
+                stderr=_masked(row.stderr, secrets),
+            )
+        )
+    return AttachedRuns(runs=tuple(attached))

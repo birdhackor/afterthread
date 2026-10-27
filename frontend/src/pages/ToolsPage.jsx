@@ -217,7 +217,7 @@ function ToolJobProgress({ kind, jobId, jobQuery }) {
 				<Stack gap="xs" align="flex-start">
 					<Text size="sm">
 						{kind === "revise"
-							? `已依意見更新工具「${job.tool_name}」。`
+							? `已發布工具「${job.tool_name}」的新版本。`
 							: `已安裝工具「${job.tool_name}」。`}
 					</Text>
 					{job.summary ? <Text size="sm">{job.summary}</Text> : null}
@@ -562,6 +562,7 @@ function ToolRow({
 	isSubmittingRevise,
 	reviseJobId,
 	reviseJobQuery,
+	onFix,
 }) {
 	// Local, independent per row (unlike LlmLogsPage's single-open Accordion):
 	// there is no reason comparing two tools' summaries side by side should
@@ -615,9 +616,27 @@ function ToolRow({
 							</>
 						)}
 						{runHint ? (
-							<Text size="xs" c={runHint.color}>
-								{runHint.text} ・ {formatTimestamp(tool.last_run.started_at)}
-							</Text>
+							<Group gap="xs" wrap="wrap">
+								<Text size="xs" c={runHint.color}>
+									{runHint.text} ・ {formatTimestamp(tool.last_run.started_at)}
+								</Text>
+								{/* The one-click fix (web-v6 §8.2) for the newest run, offered on
+								    the backend's `fixable` alone: a failure of the version that
+								    is current. Gated like 送出修訂, because it IS a revise. */}
+								{tool.last_run.fixable &&
+								lineageControls.showVersionControls ? (
+									<Button
+										size="compact-xs"
+										variant="light"
+										color="red"
+										disabled={writesBlocked}
+										loading={isSubmittingRevise}
+										onClick={() => onFix([tool.last_run.id])}
+									>
+										請 AI 修正
+									</Button>
+								) : null}
+							</Group>
 						) : null}
 					</Stack>
 					<Group gap="sm" wrap="nowrap">
@@ -675,6 +694,17 @@ function ToolRow({
 						</Button>
 					</Group>
 				</Group>
+
+				{/* A fix started from this row (or a revise from a panel since
+				    collapsed) must stay visible: the AI 總結 panel shows the card
+				    when it is open, the row shows it otherwise -- once either way. */}
+				{reviseJobId !== null && !expanded ? (
+					<ToolJobProgress
+						kind="revise"
+						jobId={reviseJobId}
+						jobQuery={reviseJobQuery}
+					/>
+				) : null}
 
 				{lineageControls.discardAction === "delete-tool" ? (
 					<Group gap="sm" align="center">
@@ -772,7 +802,13 @@ function ToolRow({
 					</Button>
 					{/* `expanded`, not `in` -- see the AI 總結 Collapse above. */}
 					<Collapse expanded={runsExpanded}>
-						<ToolRunsSection name={tool.name} expanded={runsExpanded} />
+						<ToolRunsSection
+							name={tool.name}
+							expanded={runsExpanded}
+							onFix={lineageControls.showVersionControls ? onFix : null}
+							fixBlocked={writesBlocked}
+							isSubmittingFix={isSubmittingRevise}
+						/>
 					</Collapse>
 				</div>
 			</Stack>
@@ -1010,8 +1046,13 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	});
 
 	const reviseMutation = useMutation({
-		mutationFn: ({ name, currentVid, feedback }) => {
-			const request = buildReviseRequest({ name, currentVid, feedback });
+		mutationFn: ({ name, currentVid, feedback, runIds }) => {
+			const request = buildReviseRequest({
+				name,
+				currentVid,
+				feedback,
+				runIds,
+			});
 			return apiPost(request.path, request.body);
 		},
 		onSuccess: (result, { name, jobAttributionKey }) => {
@@ -1425,6 +1466,31 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 						// rendered exactly once, never twice and never nowhere.
 						reviseJobId={rowKey === activeJobKey ? activeJob.jobId : null}
 						reviseJobQuery={jobQuery}
+						// The one-click fix (web-v6 §8): a revise that attaches failing
+						// run records -- the same mutation, single-flight gate and job
+						// card as 送出修訂, with the gate re-checked here like the other
+						// AI writes. `feedback` is set only by 加上說明….
+						onFix={(runIds, feedback = "") => {
+							if (versionWritesBlocked) {
+								return;
+							}
+							reviseMutation.mutate(
+								{
+									name: tool.name,
+									currentVid: tool.current_vid,
+									jobAttributionKey: identity.jobAttributionKey,
+									feedback,
+									runIds,
+								},
+								{
+									onSuccess: () =>
+										notifications.show({
+											color: "blue",
+											message: `已請 AI 修正「${tool.name}」，進度顯示在這個工具下方`,
+										}),
+								},
+							);
+						}}
 					/>
 				);
 			})}

@@ -165,6 +165,28 @@ describe("Invariant K — every version-specific write carries the vid", () => {
 		});
 	});
 
+	it("sends a one-click fix as run_ids and expected_vid, with no feedback", () => {
+		expect(buildReviseRequest({ name, currentVid, runIds: [7] })).toEqual({
+			path: "/api/tools/kb_search/revise",
+			body: { run_ids: [7], expected_vid: currentVid },
+		});
+		expect(
+			buildReviseRequest({ name, currentVid, feedback: "", runIds: [7] }).body,
+		).toEqual({ run_ids: [7], expected_vid: currentVid });
+		expect(
+			buildReviseRequest({
+				name,
+				currentVid,
+				feedback: "請加上說明",
+				runIds: [7],
+			}).body,
+		).toEqual({
+			feedback: "請加上說明",
+			run_ids: [7],
+			expected_vid: currentVid,
+		});
+	});
+
 	it("puts expected_vid in the regenerate body", () => {
 		expect(buildRegenerateRequest({ name, currentVid })).toEqual({
 			path: "/api/tools/kb_search/summary/regenerate",
@@ -538,5 +560,30 @@ describe("reviseRefusalNotification", () => {
 		).toBeNull();
 		expect(reviseRefusalNotification({ status: 404 })).toBeNull();
 		expect(reviseRefusalNotification(undefined)).toBeNull();
+	});
+});
+
+describe("reviseRefusalNotification for attached runs", () => {
+	it("explains a purged record in its own words", () => {
+		const notice = reviseRefusalNotification({
+			status: 404,
+			code: "run_not_found",
+			message: "找不到項目",
+		});
+		expect(notice.message).toContain("已不存在");
+	});
+
+	it("passes the backend's words for a record of another tool", () => {
+		expect(
+			reviseRefusalNotification({
+				status: 422,
+				code: "run_not_for_tool",
+				message: "附上的執行紀錄不屬於這個工具",
+			}).message,
+		).toBe("附上的執行紀錄不屬於這個工具");
+	});
+
+	it("leaves other errors to the generic handling", () => {
+		expect(reviseRefusalNotification({ status: 404, code: null })).toBeNull();
 	});
 });

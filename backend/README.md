@@ -232,8 +232,12 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   llm_not_configured`／`502 llm_upstream_error`），失敗時不會覆蓋既有總結；
   取得名額後若目前版本不是 `expected_vid`，回 `409 version_mismatch`，不花 LLM。
 - `POST /api/tools/{name}/revise` — body
-  `{feedback: 1..20000, expected_vid}`，依使用者意見
-  送出一次 **AI 修訂**工作（見下方「依意見修訂既有工具」）；202 + `job_id`，
+  `{feedback?: ≤20000, run_ids?: [id ×≤3], expected_vid}`，依使用者意見及／或附上的失敗
+  執行紀錄送出一次 **AI 修訂**工作（見下方「依意見修訂既有工具」）；意見與紀錄至少要有一樣，
+  空白的意見視同沒有，重複的 id 只算一次（web-v6 §8）。**附上的紀錄最先檢查並複製**：不存在
+  （或已被清除）回 `404 run_not_found`，屬於別的工具回 `422 run_not_for_tool`，兩者都在名額
+  與任何 LLM 呼叫之前；複製下來的內容（已遮蔽）隨工作帶走，送出後再清除那幾筆也不影響這次
+  修訂。202 + `job_id`，
   用上面的 `GET /api/tools/jobs/{job_id}` 輪詢。**先**檢查套件的 `.env`／`config.env`
   政策（web-v6 §5.2）：不過就回 `409 env_policy`。值太短或寫法無法對應時，`message`
   會列出 key 名（永不列值）；檔案讀不到或超過上限時只說明狀況。工作開跑時會再檢查一次。工具不存在回 404；已有工具工作

@@ -285,3 +285,60 @@ UTC 再比）、stats 的 SQL、孤兒判斷與別名、P2a-r1 的 `error` 路�
 | F4 | P3 | 刪除工具的通知在 `retained` 等本來就以「。」結尾的訊息後面再接「。它的執行紀錄…」，出現「。。」 | **採納**：接上之前去掉結尾的「。」，補測試 |
 | F5 | P3 | 清除對話框只停用「取消」，Esc／點外面／右上角仍能在刪除進行中關掉；重開後預覽會算到正在被刪的紀錄 | **採納**：刪除進行中對話框不能關（與頁面上其他刪除對話框相同） |
 | F6 | P3 | 筆數讀取失敗時整列（含頁面層級的「清除紀錄…」）默默消失 | **採納**：改成紅字「無法讀取工具執行紀錄的筆數」，「清除紀錄…」照樣可用（它自己的預覽會計數） |
+
+## D45（P3）：一鍵請 AI 修正（工具頁）
+
+範圍是設計 §8 的工具列表與「最近執行」兩個入口、§8.4 的除錯程序、§8.5 的防呆、§10 的提示規則。
+下面是實作時才定下的細節。
+
+### 請求
+
+- `ToolReviseRequest`：`feedback` 改為選填，`run_ids` 最多 3 筆；兩者至少要有一樣（422）。空白
+  意見視同沒有（舊行為是 422，現在只有在也沒附紀錄時才 422，原本的四個 422 測試照樣成立）。
+  重複的 id 只算一次、非正數 422。
+- 紀錄在**路由**檢查與複製（`tool_runs.attach_for_revise`），因為那裡有資料庫 session；順序是
+  紀錄 → `.env` 閘 → 名額 → 版本比對。不存在的 id 回 `404 run_not_found`、別的工具的回
+  `422 run_not_for_tool`，結構化的 `{code, message}`。前端的 404 一律被 `messageFor` 換成「找不到
+  項目」，所以 `run_not_found` 的提示文字由前端自己寫。
+- 後端不要求附上的紀錄必須「可修」：舊版本的失敗也可以附（提示會寫明它跑的不是工作區這一版），
+  按鈕只出現在 `fixable` 的紀錄上。重複付費的防線是 `expected_vid`：修好並發布後，同一個頁面再按
+  會得到 `409 version_mismatch`。
+- 複製在送出時完成，內容以當下的已知秘密再遮一次（同讀取），之後在提示裡再經過一次遮蔽器。
+
+### 提示
+
+- 失敗紀錄與除錯程序放在**使用者提示**（只有附了紀錄才出現），系統提示只加 `examples.json` 的
+  規則：安裝時把測過的輸入寫進去、只放唯讀輸入、最多 10 個；修訂時每個範例都重跑。
+- 沒有意見時，意見欄寫 `(none) The operator attached the failing runs below and asks only that you fix them.`
+- 每筆紀錄的每段文字都先遮蔽再依提示預算截斷，與修訂提示其他部分相同。
+
+### provenance
+
+`origin.feedback` = 操作者的意見（若有）+ 空行 + 「附上的失敗紀錄：#id（時間 UTC，結果，exit N）、…」。
+只有編號、時間、結果與 exit code（不變量 V）。
+
+### 前端
+
+- 一鍵修正就是一次 `reviseMutation`：同一個寫入閘（`versionWritesBlocked`）、同一個 job 追蹤與
+  卡片。列表列上的按鈕只在 `last_run.fixable` 而且這一列有可用版本時出現；「最近執行」每筆
+  `fixable` 的紀錄有「請 AI 修正」與「加上說明…」（對話框，說明選填、上限同其他 AI 輸入）。
+- 原本修訂卡片只在「AI 總結」展開時看得到；一鍵修正是從收合的列發起的，所以 AI 總結收合時，
+  卡片改顯示在那一列上（同一個條件的兩半，卡片只出現一次）。
+- 修訂成功的卡片文字從「已依意見更新工具」改成「已發布工具的新版本」：一鍵修正沒有意見。
+- **`/tools?job=<id>` 移到 P4**：它只服務其他頁面（擷取、補齊、協助更新）發起的修正，與它的
+  使用者一起做、一起測。
+
+### 驗收
+
+| 不變量 | 測試（`tests/test_tool_builder.py`） |
+|---|---|
+| L | `test_router_revise_keeps_its_copy_when_the_records_are_purged`（送出後刪除紀錄，再執行工作：收到的仍是當時的內容） |
+| M | `test_router_revise_refuses_unusable_run_ids_before_any_job`（沒有 job、沒有名額、沒有 LLM 呼叫） |
+| N | `test_router_revise_accepts_run_ids_without_feedback`、`test_router_revise_needs_feedback_or_runs` |
+| R | P2a 的 `test_fixable_is_a_failure_of_the_current_version`（含已丟棄版本＝`gone`） |
+| V | `test_revise_provenance_names_the_runs_but_not_their_contents` |
+
+另有 `test_revise_prompt_carries_the_failing_runs_and_the_procedure`（工作區版本與舊版本的措辭、
+`output_overflow` 的說明、秘密在提示裡被遮）與 `test_builder_prompts_ask_for_examples_and_their_rerun`。
+前端的請求內容與拒絕提示在 `toolSummary.js`，有 vitest；另用實際的瀏覽器跑過：列上的按鈕送出
+`{run_ids, expected_vid}`、「加上說明…」多帶 `feedback`，卡片顯示在列上，LLM 未設定時清楚失敗。

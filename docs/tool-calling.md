@@ -204,6 +204,19 @@ LLM。這道檢查在**送出時**先跑一次（不過就回 `409 env_policy`�
 一次（web-v6 §5.2）。builder shell 仍有服務
 權限，因此修訂期間不要手改 `.env`：已寫入的 AI 日誌不能事後補遮。
 
+**附上失敗紀錄的修訂（一鍵修正，web-v6 §8）**：送出時可以帶最多三筆這個工具的執行紀錄
+（`run_ids`）。它們在取得名額之前就被檢查並**複製**下來（已遮蔽），之後清除那幾筆不影響這次
+修訂。修訂提示多一段 `Failing runs attached by the operator`：每筆的時間、呼叫的 workflow、
+執行的是不是工作區這一版、結果（`output_overflow` 寫成「輸出超過上限被終止」而不是 exit -9）、
+模型收到的字串、stdin 參數與 stderr／stdout，接著是固定的除錯程序：先用同樣的參數重現、修根因、
+把附上的輸入與 `examples.json` 的每個範例都重跑、問題不在程式就回 `ready=false` 並說明、把修好的
+輸入改寫成不含個人內容的等價範例加進 `examples.json`、summary 寫出根因與驗證方式。沒有意見時，
+意見欄寫明操作者只要求修正附上的失敗。新版本的 `origin.json` 的 `feedback` 會附一行
+「附上的失敗紀錄：#編號（時間，結果，exit code）」，不含 stderr 與參數。
+
+`examples.json` 是版本內容（工具的回歸輸入清單）：builder 安裝時把測過的輸入寫進去，修訂時
+必須把每個範例都重跑一次、全部成功才回 `ready=true`。只放唯讀的輸入。
+
 ### 啟用狀態
 
 live toggle 只在 `<name>/.afterthread.meta/state.json`：

@@ -55,6 +55,7 @@ the user re-runs the install). Bounded to the most recent ``_MAX_JOBS``.
 import asyncio
 import concurrent.futures
 import contextlib
+import functools
 import logging
 import os
 import queue
@@ -84,6 +85,7 @@ from afterthread.services.llm import (
     generate_structured,
 )
 from afterthread.services.memory_ai import _coerce_bool, _coerce_str, _truncate_to
+from afterthread.services.tool_runs import AttachedRun
 from afterthread.services.tools import _NAME_RE
 
 _logger = logging.getLogger("afterthread.tool_builder")
@@ -390,6 +392,14 @@ inside this version workspace.
 so the tool runs anywhere without installing dependencies. If the environment \
 variable TLS_NO_VERIFY is set to a truthy value, skip TLS certificate \
 verification (for urllib.request: pass context=ssl._create_unverified_context()).
+- `examples.json` at the workspace root is the tool's regression list: the \
+inputs it must keep handling. A JSON object \
+{"examples": [{"name": "<what this input checks>", "args": {<the JSON object \
+piped to the tool>}}, ...]} with at most 10 entries. Record in it the inputs \
+you tested with. Only READ-ONLY inputs (searches, lookups): the backend runs \
+every example against the real API to verify the tool, so an input that \
+creates, changes or deletes data would do so again on every check. Never put a \
+secret or personal content in it.
 
 Your meta-tools (the file tools below take paths RELATIVE to the workspace and \
 cannot reach outside it):
@@ -413,7 +423,8 @@ that serve the user's goal.
 command; verify the output is genuinely useful to an AI assistant (compact, \
 relevant, plain text or small JSON).
 4. Fix and re-test until it works. Do not stop at "should work" -- prove it.
-5. Only then finish with ready=true.
+5. Write the inputs you tested into examples.json.
+6. Only then finish with ready=true.
 
 Finish by returning the final JSON object described in the system \
 instructions: "tool_name" MUST equal the "name" in tool.json; "summary" is a \
@@ -489,7 +500,7 @@ IN YOUR WORKSPACE. You are not building a new tool: revise THIS package to \
 address the user's feedback below, and leave everything the feedback does not \
 ask you to change exactly as you found it.
 
-Three facts about this workspace that differ from a fresh build:
+What differs in this workspace from a fresh build:
 - The package's operator-owned `.env` (secrets) and `config.env` (setting \
 overrides) remain outside this version workspace. Do not write either one, do \
 not invent placeholder values, and do not make your changes depend on rewriting \
@@ -507,6 +518,12 @@ secret is REFUSED, and that refusal discards your whole revision.
 workspace and is rebuilt after you finish; do not create or edit it. Any legacy \
 flat `.ai_meta.json` or `.afterthread-state.json` file you find here is this \
 version's tool content: leave it alone unless the feedback asks you to change it.
+- If the workspace has an `examples.json`, run EVERY example in it (pipe its \
+"args" into the entry command) after your change, and finish with ready=true \
+only if all of them still succeed (exit code 0, no timeout): a change that \
+fixes one input and breaks another is not done. Keep the file and its \
+examples; add to it rather than replace it. If there is none yet, create one \
+as described above.
 
 Finish exactly as described above, with one added rule: "tool_name" MUST be \
 exactly {name}, because it names the installed package this revision updates \
@@ -1266,12 +1283,87 @@ def _builder_user_prompt(instructions: str, openapi_text: str) -> str:
     )
 
 
+# The feedback line of a revise that only attaches failing runs (web-v6 §8.1):
+# the one-click fix sends no words, and the builder is told what that means.
+_NO_FEEDBACK = (
+    "(none) The operator attached the failing runs below and asks only that you fix them."
+)
+
+# How each outcome reads to the builder. ``output_overflow`` is spelled out
+# because the assistant was told "exit -9", which reads as a crash.
+_RUN_OUTCOME_PROSE = {
+    "ok": "the tool succeeded",
+    "failed": "the tool exited with a non-zero code",
+    "output_overflow": (
+        "the tool was KILLED because its stderr passed the output cap (the "
+        "assistant was told exit -9; it did not crash on its own)"
+    ),
+    "timeout": "the tool ran past its time limit and was killed",
+    "start_failed": "the tool could not be started (interpreter or entry file)",
+    "refused": "the call was refused before the tool ran",
+}
+
+_FAILING_RUNS_HEADER = (
+    "Failing runs attached by the operator. They are real calls the AI assistant "
+    "made; the texts are what the backend recorded (secrets masked, long outputs "
+    "cut: stderr keeps its END, stdout its START)."
+)
+
+# The fixed procedure that follows the attached runs (web-v6 §8.4).
+_DEBUG_PROCEDURE = """How to work on these failures:
+1. Reproduce first. Pipe the exact attached arguments into the entry command \
+(for example: echo '<the stdin arguments>' | python3 run.py) and confirm you see \
+the same error. If you cannot reproduce it, say so and find out why (the API \
+changed, credentials, data-dependent behaviour) instead of changing code on a \
+guess.
+2. Fix the root cause.
+3. Re-run every attached input and every example in examples.json. Finish with \
+ready=true only if all of them succeed (exit code 0, no timeout).
+4. If the cause is outside the code (expired credentials, the API is down), \
+finish with ready=false and explain the cause and what the operator should do.
+5. For each failure you fixed, add an example to examples.json: an equivalent \
+input that takes the same code path WITHOUT any personal content the original \
+may carry (for example another query that also returns no hits). Read-only \
+inputs only.
+6. In your summary: the root cause, what you changed, how you verified it, and \
+which examples you added."""
+
+
+def _failing_run_text(run: AttachedRun, workspace_vid: str | None, budget: int) -> str:
+    """One attached run as the builder reads it. Each text is redacted, then cut."""
+    lines = [
+        f"Run #{run.id} at {run.started_at:%Y-%m-%d %H:%M:%S} UTC, "
+        f"called from the {run.workflow} workflow.",
+        (
+            "It ran the version that is in your workspace."
+            if run.vid == workspace_vid
+            else f"It ran an OLDER version ({run.vid}), not the one in your workspace: "
+            "check whether it still fails before changing anything."
+        ),
+        "Outcome: "
+        + _RUN_OUTCOME_PROSE.get(run.outcome, run.outcome)
+        + (f" (exit code {run.exit_code})." if run.exit_code is not None else "."),
+    ]
+    for label, text in (
+        ("What the AI assistant was told", run.message),
+        ("stdin arguments (JSON)", run.args),
+        ("stderr", run.stderr),
+        ("stdout", run.stdout),
+    ):
+        if text:
+            lines += [f"{label}:", _truncate_to(tools.redact_known_secrets(text), budget)]
+    return "\n".join(lines)
+
+
 def _revise_user_prompt(
-    feedback: str,
+    feedback: str | None,
     manifest_text: str | None,
     config_text: str = "",
     env_keys: tuple[str, ...] = (),
     conflicts: tuple[str, ...] = (),
+    *,
+    runs: tuple[AttachedRun, ...] = (),
+    workspace_vid: str | None = None,
 ) -> str:
     """The revise session's user turn: the feedback + the package's manifest.
 
@@ -1305,12 +1397,23 @@ def _revise_user_prompt(
     ``.env`` part is KEY NAMES only, which tells the model what credentials it
     has without telling it any of them; ``conflicts`` are the keys both files
     set, where the ``.env`` value is the one that runs.
+
+    ``runs`` are the failing run records the operator attached (web-v6 §8.4):
+    each one's time, workflow, whether it ran the workspace's version
+    (``workspace_vid``), outcome, the string the assistant got, and the masked
+    stdin arguments and output, followed by the fixed debugging procedure.
+    Their texts were masked when the job was submitted and go through the
+    redactor again here, like every operator-derived text in this prompt. A
+    revise with runs and no feedback says so in the feedback slot.
     """
     budget = token_budget.char_allowance(get_settings().llm_prompt_budget_tokens)
     parts = [
         "Revise the existing tool package as described below.",
         "User feedback:",
-        _truncate_to(tools.redact_known_secrets(feedback), budget),
+        _truncate_to(
+            tools.redact_known_secrets(feedback if feedback is not None else _NO_FEEDBACK),
+            budget,
+        ),
     ]
     if manifest_text is not None:
         parts += [
@@ -1338,7 +1441,31 @@ def _revise_user_prompt(
             "(secrets; values hidden; never print them): "
             + _truncate_to(tools.redact_known_secrets(", ".join(env_keys)), budget)
         )
+    if runs:
+        parts.append(_FAILING_RUNS_HEADER)
+        parts += [_failing_run_text(run, workspace_vid, budget) for run in runs]
+        parts.append(_DEBUG_PROCEDURE)
     return "\n\n".join(parts)
+
+
+def _provenance_feedback(feedback: str | None, runs: tuple[AttachedRun, ...]) -> str:
+    """The ``origin.feedback`` a revise writes: the operator's words, then the runs.
+
+    A version records WHY it exists (web-v6 §8.1): for a fix, which failures it
+    was made for -- id, time, outcome and exit code, never the stderr or the
+    arguments (invariant V): the origin is kept as long as the version is, and
+    the record's bodies are the operator's to purge.
+    """
+    if not runs:
+        return feedback or ""
+    entries = []
+    for run in runs:
+        detail = f"{run.started_at:%Y-%m-%d %H:%M:%S} UTC，{run.outcome}"  # noqa: RUF001
+        if run.exit_code is not None:
+            detail += f"，exit {run.exit_code}"  # noqa: RUF001
+        entries.append(f"#{run.id}（{detail}）")  # noqa: RUF001
+    line = "附上的失敗紀錄：" + "、".join(entries)  # noqa: RUF001
+    return f"{feedback}\n\n{line}" if feedback else line
 
 
 # --- staging promotion + cleanup ---------------------------------------------
@@ -2659,8 +2786,10 @@ def _current_manifest_text(directory: Path) -> str | None:
 
 async def run_revise(
     name: str,
-    feedback: str,
+    feedback: str | None,
     resolution: tools.Resolved | None,
+    *,
+    runs: tuple[AttachedRun, ...] = (),
 ) -> InstallOutcome:
     """Build and commit one new version, then publish ``current``.
 
@@ -2749,12 +2878,16 @@ async def run_revise(
         system_prompt = await run_in_threadpool(_revise_system_prompt, name)
         config_values = revise_env.config_values
         user_prompt = await run_in_threadpool(
-            _revise_user_prompt,
-            feedback,
-            manifest_text,
-            revise_env.config_text,
-            tuple(sorted(env_values)),
-            tuple(sorted(set(config_values) & set(env_values))),
+            functools.partial(
+                _revise_user_prompt,
+                feedback,
+                manifest_text,
+                revise_env.config_text,
+                tuple(sorted(env_values)),
+                tuple(sorted(set(config_values) & set(env_values))),
+                runs=runs,
+                workspace_vid=resolution.vid,
+            )
         )
         # The run_shell environment is layered exactly as ``tools._build_tool_env``
         # layers the runtime one -- config.env first, .env on top (web-v6 §4) -- so
@@ -2860,7 +2993,7 @@ async def run_revise(
             package_root,
             resolution,
             package_identity,
-            feedback,
+            _provenance_feedback(feedback, runs),
         )
         if promote_error is not None:
             return InstallOutcome(
@@ -3163,7 +3296,13 @@ class ReviseJobStart:
     message: str | None = None
 
 
-async def start_revise_job(name: str, feedback: str, expected_vid: str) -> ReviseJobStart:
+async def start_revise_job(
+    name: str,
+    feedback: str | None,
+    expected_vid: str,
+    *,
+    runs: tuple[AttachedRun, ...] = (),
+) -> ReviseJobStart:
     """Check the env policy, take the global slot, compare ``expected_vid``, enqueue.
 
     The stale path never creates an ``InstallJob`` and never launches a task.
@@ -3179,6 +3318,11 @@ async def start_revise_job(name: str, feedback: str, expected_vid: str) -> Revis
     slot cannot weaken invariant K: the ``expected_vid`` comparison stays after
     the reservation, exactly where it was. ``run_revise`` repeats the gate on
     whatever the files say when the job really starts.
+
+    ``runs`` are the failing run records the route attached and COPIED before
+    calling this (web-v6 §8.3): a database read with no version in it, so it
+    precedes the slot like the env gate, and the copy is what the job keeps --
+    a purge after this point changes nothing about the revise (invariant L).
     """
 
     package_root = await run_in_threadpool(tools._resolve_package_dir_no_alias, name)
@@ -3206,7 +3350,7 @@ async def start_revise_job(name: str, feedback: str, expected_vid: str) -> Revis
         return ReviseJobStart(
             job_id=_launch_job(
                 job,
-                lambda: run_revise(name, feedback, resolution),
+                lambda: run_revise(name, feedback, resolution, runs=runs),
                 _ACTION_REVISE,
             )
         )
