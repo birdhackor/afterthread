@@ -28,6 +28,7 @@ import { apiDelete, apiGet, apiPatch, apiPost } from "../api/client.js";
 import { CharCounter } from "../components/CharCounter.jsx";
 import { formatDate } from "../components/DateText.jsx";
 import { EmptyState } from "../components/EmptyState.jsx";
+import { ToolRunStatsBar } from "../components/ToolRunStatsBar.jsx";
 import { ToolRunsSection } from "../components/ToolRunsSection.jsx";
 import { ToolSettingsSection } from "../components/ToolSettingsSection.jsx";
 import { SECTION_MAX_LENGTH } from "../constants/sections.js";
@@ -52,6 +53,7 @@ import {
 	toolJobRefetchInterval,
 } from "../utils/toolInstall.js";
 import { lastRunHint, toolRunsQueryKey } from "../utils/toolRuns.js";
+import { toolRunStatsQueryKey } from "../utils/toolRunsPurge.js";
 import { toolSettingsQueryKey } from "../utils/toolSettings.js";
 import {
 	acceptSummaryForVersion,
@@ -850,6 +852,8 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 			// records were the deleted tool's.
 			queryClient.removeQueries({ queryKey: toolSettingsQueryKey(name) });
 			queryClient.removeQueries({ queryKey: toolRunsQueryKey(name) });
+			// The tool's records went with it (or became orphans): recount.
+			queryClient.invalidateQueries({ queryKey: toolRunStatsQueryKey });
 			await queryClient.invalidateQueries({ queryKey: ["tools"] });
 		},
 		onError: (mutationError) => {
@@ -1248,17 +1252,21 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 
 	return (
 		<Stack gap="md">
-			<Group justify="flex-end">
+			<Group justify="space-between" align="center" wrap="wrap">
+				<ToolRunStatsBar />
 				<Button
 					variant="light"
 					loading={isFetching}
 					onClick={() => {
 						// Refresh means refresh EVERYTHING on screen, not just the list
 						// (R5-3). The current_vid key prevents cross-version reuse, while
-						// the name prefix still reaches every expanded version entry.
+						// the name prefix still reaches every expanded version entry --
+						// and the run records and their counts are on screen too.
 						setLineageUnavailableKeys(new Set());
 						refetch();
 						queryClient.invalidateQueries({ queryKey: ["tool-summary"] });
+						queryClient.invalidateQueries({ queryKey: ["tool-runs"] });
+						queryClient.invalidateQueries({ queryKey: toolRunStatsQueryKey });
 					}}
 				>
 					重新整理

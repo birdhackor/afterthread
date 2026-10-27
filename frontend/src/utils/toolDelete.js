@@ -20,6 +20,24 @@ export function keepDeleteConfirmationOpen(error) {
 // removing a row from the registry is not the same as removing config or key
 // files from disk, and the operator needs that path to finish cleanup safely.
 export function toolDeleteNotification(name, result) {
+	return withRunRecordsNote(toolRemovalNotification(name, result), result);
+}
+
+// The tool's run records go with it (web-v6 §6.4). When they could not be
+// deleted the tool is still gone, so this only adds what is left behind and
+// where to clear it: they are now records of a tool that no longer exists.
+function withRunRecordsNote(notification, result) {
+	if (result?.runs_deleted !== false) {
+		return notification;
+	}
+	return {
+		...notification,
+		color: notification.color === "green" ? "orange" : notification.color,
+		message: `${notification.message}。它的執行紀錄沒有一起刪掉，可以在工具頁上方的「清除紀錄…」選「只清已刪除的工具留下的」清掉。`,
+	};
+}
+
+function toolRemovalNotification(name, result) {
 	if (result?.outcome === "removed") {
 		return {
 			color: "green",

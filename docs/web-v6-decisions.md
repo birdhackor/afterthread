@@ -223,3 +223,50 @@ lifespan 接線與實際寫入檔案（`test_lifespan_wires_the_tool_run_recorde
 | E3 | 什麼都沒印的失敗，詳情畫出空白的程式碼框 | **採納**。資料庫照存空字串（「沒有輸出」也是事實），畫面改寫「（沒有輸出）」 |
 | E4 | README 說事後才搬進 `.env` 的值「也看不到」，但設計 §6.2 已接受被截斷切開的片段；後端 README 說寫入都在共享鎖內，兩種早退的拒絕其實沒有鎖 | **採納**：兩處都改成精確的說法 |
 | E5 | 耗時從取得鎖之前算起，等破壞性操作放鎖的時間算進了工具耗時 | **採納**：改成取得鎖之後才開始計時 |
+
+## D44（P2b）：手動 purge、筆數、刪除工具時清紀錄
+
+範圍是設計 §7、§6.4。下面是實作時才定下的細節。
+
+### API
+
+- **時間條件用絕對時間 `before`，不用 `older_than_days`**。設計寫的是天數；但天數要在預覽與確認
+  各算一次，兩次之間剛好跨過界線的紀錄會在確認時被刪掉、卻沒算進預覽的筆數，不變量 J 就破了。
+  前端在開啟對話框時取一次「現在」，換算成 `before`，預覽與確認都送同一個值。
+- **結果條件是 `all`／`ok`／`not_ok`**。`not_ok` 是成功以外的全部，包括 `refused`：被拒的呼叫
+  也不是成功，沒有人會為了它本身留著它。筆數的 `not_ok` 用同一個定義，畫面寫「失敗與被拒」。
+- 確認（`dry_run: false`）一定要帶預覽的 `max_id`，缺了回 422；預覽沒有任何符合的紀錄時
+  `max_id` 為 `null`，前端因此停用「刪除」。
+- **孤兒**是名稱已解析不到套件的紀錄（`_resolve_package_dir_no_alias` 為 None）。`TOOLS_DIR`
+  未設定時一律**沒有**孤兒：那時任何名稱都解析不到，把整張表當孤兒等於讓一個暫時關掉的設定
+  交出全部紀錄。孤兒在確認時重新判斷，所以預覽與確認之間有人手動刪掉某個工具目錄，那個工具的
+  紀錄會多出來；`max_id` 仍然擋住預覽之後寫進來的紀錄。這個時間窗是操作者自己的手動操作，接受。
+- `/stats` 宣告在 `/{run_id}` 之前；`/purge` 是 POST，不會與 GET `/{run_id}` 衝突。
+
+### 刪除工具
+
+- 在路由層、`delete_tool` 回 `removed` 或 `retained` 之後才刪紀錄；404 與 409 什麼都不動。紀錄
+  刪除失敗只回報 `runs_deleted: false`（`delete_for_tool` 吞下例外、記一行只含型別的 WARNING），
+  工具的刪除照樣成立。
+- 這一步在排他鎖釋放之後。P2a 讓紀錄在共享鎖釋放之前寫入，而刪除需要排他鎖，所以刪除開始時
+  不會有尚未寫入的紀錄；刪除之後，這個工具也不可能再被廣告。
+
+### 前端
+
+- 確認框：每個工具「最近執行」的「清除紀錄」選單（全部／只清成功的／30 天前的）開的是固定
+  範圍的框，只列出範圍；工具頁上方的「清除紀錄…」開的是可以調整的框（結果、時間、只清已刪除
+  的工具留下的），有孤兒時預設勾選孤兒。兩者都先顯示「將刪除 N 筆」再讓你按「刪除」。
+- 預覽的查詢 `staleTime: Infinity`、不在視窗取得焦點時重抓：畫面上的筆數就是確認時的筆數，
+  不讓背景重抓在操作者考慮時換掉它與它的 `max_id`。
+- 刪除工具的通知在 `runs_deleted: false` 時轉為橘色，並指出用「只清已刪除的工具留下的」清掉。
+- 工具頁的「重新整理」也重抓執行紀錄與筆數。
+
+### 驗收
+
+| 不變量 | 測試（`tests/test_tool_runs.py`） |
+|---|---|
+| J | `test_purge_deletes_exactly_what_its_preview_counted`、`test_purge_scopes_narrow_and_combine`、`test_purge_with_nothing_to_match_has_no_bound`、`test_a_purge_that_deletes_needs_its_preview`、`test_without_a_tools_directory_no_record_is_called_an_orphan` |
+| K | `test_deleting_a_tool_deletes_its_runs_and_only_its_runs`、`test_a_refused_delete_keeps_the_runs`、`test_records_that_could_not_be_deleted_are_reported_and_stay_purgeable` |
+| W | `test_stats_counts_per_tool_and_orphans_and_is_not_an_id` |
+
+前端的請求內容、範圍說明與筆數文字在 `toolRunsPurge.js`，刪除通知在 `toolDelete.js`，各有 vitest。

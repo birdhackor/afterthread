@@ -1,4 +1,4 @@
-"""Tool run records by id (web-v6 §6, §7): read one with its bodies, delete one.
+"""Tool run records (web-v6 §6, §7): counts, purge, and one record by id.
 
 A prefix of its own rather than routes under ``/api/tools``: every literal first
 segment under ``/api/tools/`` is a name a package could have (the reason the
@@ -18,7 +18,12 @@ from fastapi import Path as PathParam
 from sqlmodel import Session
 
 from afterthread.db import get_session
-from afterthread.schemas import ToolRunDetail
+from afterthread.schemas import (
+    ToolRunDetail,
+    ToolRunPurgeRequest,
+    ToolRunPurgeResult,
+    ToolRunStats,
+)
 from afterthread.services import tool_runs
 from afterthread.services import tools as tools_service
 
@@ -36,9 +41,34 @@ _RUN_NOT_FOUND_RESPONSE: dict[int | str, dict[str, Any]] = {
     }
 }
 
-# Any literal GET added under this prefix (the purge's ``/stats``) must be
-# declared ABOVE ``/{run_id}``: FastAPI matches in declaration order, and an id
-# route declared first answers ``/stats`` with a 422 for a non-integer id.
+# Every literal GET under this prefix (``/stats``) is declared ABOVE
+# ``/{run_id}``: FastAPI matches in declaration order, and an id route declared
+# first answers ``/stats`` with a 422 for a non-integer id.
+
+
+@router.get("/stats", response_model=ToolRunStats)
+def tool_run_stats(session: SessionDep) -> ToolRunStats:
+    """Record counts for the 工具 page header: total, not-ok, orphans, per tool."""
+    return ToolRunStats.model_validate(tool_runs.stats(session))
+
+
+@router.post("/purge", response_model=ToolRunPurgeResult)
+def purge_tool_runs(payload: ToolRunPurgeRequest, session: SessionDep) -> ToolRunPurgeResult:
+    """Preview (``dry_run``, the default) or delete the records a scope matches.
+
+    The deleting call carries the preview's ``max_id`` and removes nothing newer
+    (web-v6 §7, invariant J). Nothing is ever deleted automatically: this route,
+    the single-record DELETE and deleting a tool are the only ways records go.
+    """
+    scope = tool_runs.PurgeScope(
+        tool=payload.tool,
+        outcome=payload.outcome,
+        before=payload.before,
+        orphans_only=payload.orphans_only,
+    )
+    return ToolRunPurgeResult.model_validate(
+        tool_runs.purge(session, scope, dry_run=payload.dry_run, max_id=payload.max_id)
+    )
 
 
 @router.get("/{run_id}", response_model=ToolRunDetail, responses=_RUN_NOT_FOUND_RESPONSE)

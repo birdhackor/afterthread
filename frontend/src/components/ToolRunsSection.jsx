@@ -8,6 +8,7 @@ import {
 	Collapse,
 	Group,
 	Loader,
+	Menu,
 	Stack,
 	Text,
 } from "@mantine/core";
@@ -28,7 +29,12 @@ import {
 	toolRunsQueryKey,
 	vidStateMeta,
 } from "../utils/toolRuns.js";
+import {
+	TOOL_PURGE_PRESETS,
+	toolRunStatsQueryKey,
+} from "../utils/toolRunsPurge.js";
 import { logLinkSearch } from "../utils/toolSummary.js";
+import { ToolRunsPurgeDialog } from "./ToolRunsPurgeDialog.jsx";
 
 // Bounded, whitespace-preserving box for a body (up to 16,000 chars of stderr):
 // the same shape the AI 日誌 page uses for its prompt/response bodies.
@@ -47,10 +53,11 @@ const RETENTION_NOTE =
 // The 最近執行 section of one tool row (web-v6 §6, §9): the newest run records,
 // newest first, fetched lazily (enabled: expanded) like the 設定 section and
 // offered for every package -- a package whose pointer broke still has a
-// history worth reading. Read-only apart from deleting one record, for a run
-// whose contents the operator does not want kept. Purging many is the job of
-// the 清除紀錄 controls.
+// history worth reading. Read-only apart from deleting: one record (for a run
+// whose contents the operator does not want kept) from its detail, or many
+// from the 清除紀錄 menu, which previews before it deletes (web-v6 §7).
 export function ToolRunsSection({ name, expanded }) {
+	const [purgeTarget, setPurgeTarget] = useState(null);
 	const { data, error, isError, isFetching } = useQuery({
 		queryKey: toolRunsQueryKey(name),
 		queryFn: () => apiGet(`/api/tools/${name}/runs?limit=${TOOL_RUNS_LIMIT}`),
@@ -80,13 +87,42 @@ export function ToolRunsSection({ name, expanded }) {
 	}
 	return (
 		<Stack gap="xs" pt="xs">
-			<Text size="xs" c="dimmed">
-				{`共 ${data.total} 筆，顯示最近 ${data.runs.length} 筆。`}
-				{RETENTION_NOTE}
-			</Text>
+			<Group justify="space-between" align="flex-start" wrap="nowrap" gap="sm">
+				<Text size="xs" c="dimmed">
+					{`共 ${data.total} 筆，顯示最近 ${data.runs.length} 筆。`}
+					{RETENTION_NOTE}
+				</Text>
+				<Menu position="bottom-end" withinPortal>
+					<Menu.Target>
+						<Button size="compact-xs" variant="subtle" color="red">
+							清除紀錄
+						</Button>
+					</Menu.Target>
+					<Menu.Dropdown>
+						{TOOL_PURGE_PRESETS.map((preset) => (
+							<Menu.Item
+								key={preset.key}
+								onClick={() =>
+									setPurgeTarget({
+										scope: { tool: name, ...preset.scope },
+										now: new Date(),
+										editable: false,
+									})
+								}
+							>
+								{preset.label}
+							</Menu.Item>
+						))}
+					</Menu.Dropdown>
+				</Menu>
+			</Group>
 			{data.runs.map((run) => (
 				<ToolRunRow key={run.id} name={name} run={run} />
 			))}
+			<ToolRunsPurgeDialog
+				target={purgeTarget}
+				onClose={() => setPurgeTarget(null)}
+			/>
 		</Stack>
 	);
 }
@@ -149,6 +185,7 @@ function ToolRunDetail({ name, run, expanded }) {
 			await Promise.all([
 				queryClient.invalidateQueries({ queryKey: toolRunsQueryKey(name) }),
 				queryClient.invalidateQueries({ queryKey: ["tools"] }),
+				queryClient.invalidateQueries({ queryKey: toolRunStatsQueryKey }),
 			]);
 		},
 		onError: (mutationError) => {

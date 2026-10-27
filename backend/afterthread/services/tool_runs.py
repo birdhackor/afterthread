@@ -16,10 +16,13 @@ added to a ``.env`` after the run was written is hidden too (invariant I).
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any
 
-from sqlalchemy import Engine, func
+from sqlalchemy import ColumnElement, Engine, case, func
+from sqlalchemy import delete as sql_delete
 from sqlmodel import Session, col, create_engine, select
 
 from afterthread.config import get_settings
@@ -289,3 +292,129 @@ def last_runs_by_name(session: Session, names: list[str]) -> dict[str, ToolRun]:
     )
     statement = select(ToolRun).where(col(ToolRun.id).in_(newest))
     return {row.tool_name: row for row in session.exec(statement)}
+
+
+def delete_for_tool(session: Session, tool_name: str) -> bool:
+    """Delete every record of one package name; False when that failed (web-v6 §6.4).
+
+    Called after the package itself was deleted. A failure here must not turn a
+    finished deletion into an error, so it is reported, not raised: the route
+    answers ``runs_deleted: false`` and the records stay reachable through the
+    purge's orphan scope.
+    """
+    try:
+        session.exec(sql_delete(ToolRun).where(col(ToolRun.tool_name) == tool_name))
+        session.commit()
+    except Exception as exc:
+        session.rollback()
+        _logger.warning("Tool run records not deleted: %s", type(exc).__name__)
+        return False
+    return True
+
+
+# --- purge (web-v6 §7) ---------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class PurgeScope:
+    """Which records a purge addresses; every condition narrows, none widens.
+
+    ``outcome`` is ``all``, ``ok`` (successes) or ``not_ok`` (everything else: a
+    refused call is not a success either, and nobody keeps one for its own
+    sake). ``before`` is an absolute instant rather than an age, so the preview
+    and the confirmation judge the same records: an age measured twice moves
+    with the clock, and a record crossing the line between the two calls would
+    be deleted without having been counted.
+    """
+
+    tool: str | None = None
+    outcome: str = "all"
+    before: datetime | None = None
+    orphans_only: bool = False
+
+
+def orphan_names(session: Session) -> list[str]:
+    """The record names whose package no longer exists, sorted.
+
+    Empty when the tools directory is not configured: then NO name resolves, and
+    calling every record an orphan would hand a purge the whole table for a
+    setting the operator may only have switched off for a while.
+    """
+    if tools.tools_dir() is None:
+        return []
+    names = session.exec(select(ToolRun.tool_name).distinct()).all()
+    return sorted(name for name in names if tools._resolve_package_dir_no_alias(name) is None)
+
+
+def _conditions(session: Session, scope: PurgeScope) -> list[ColumnElement[bool]] | None:
+    """The WHERE terms of a scope, or None when it can match nothing at all."""
+    conditions: list[ColumnElement[bool]] = []
+    if scope.tool is not None:
+        conditions.append(col(ToolRun.tool_name) == scope.tool)
+    if scope.outcome == "ok":
+        conditions.append(col(ToolRun.outcome) == tools.RUN_OK)
+    elif scope.outcome == "not_ok":
+        conditions.append(col(ToolRun.outcome) != tools.RUN_OK)
+    if scope.before is not None:
+        conditions.append(col(ToolRun.started_at) < _naive_utc(scope.before))
+    if scope.orphans_only:
+        orphans = orphan_names(session)
+        if not orphans:
+            return None
+        conditions.append(col(ToolRun.tool_name).in_(orphans))
+    return conditions
+
+
+def _naive_utc(value: datetime) -> datetime:
+    # The column holds naive UTC (SQLite keeps no offset); compare like with like.
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
+def purge(
+    session: Session, scope: PurgeScope, *, dry_run: bool, max_id: int | None = None
+) -> dict[str, Any]:
+    """Count, or delete, the records a scope matches (web-v6 §7).
+
+    A dry run answers ``matched`` and the highest matching id. The real run
+    deletes only up to the ``max_id`` that preview returned, so a record written
+    after the operator saw the count -- another tab's tool call failing in
+    between -- is never swept along with it (invariant J). Ids only grow
+    (AUTOINCREMENT), which is what makes the bound exact.
+    """
+    conditions = _conditions(session, scope)
+    if conditions is None:
+        return {"matched": 0, "deleted": 0, "max_id": None}
+    if dry_run:
+        matched, highest = session.exec(
+            select(func.count(), func.max(ToolRun.id)).where(*conditions)
+        ).one()
+        return {"matched": int(matched), "deleted": 0, "max_id": highest}
+    if max_id is None:
+        raise ValueError("a purge that deletes needs the max_id of its preview")
+    result = session.exec(sql_delete(ToolRun).where(*conditions, col(ToolRun.id) <= max_id))
+    session.commit()
+    deleted = int(result.rowcount or 0)
+    return {"matched": deleted, "deleted": deleted, "max_id": max_id}
+
+
+def stats(session: Session) -> dict[str, Any]:
+    """How many records there are, per package name, and how many are orphans."""
+    not_ok = func.sum(case((col(ToolRun.outcome) != tools.RUN_OK, 1), else_=0))
+    rows = session.exec(
+        select(ToolRun.tool_name, func.count(), not_ok)
+        .group_by(ToolRun.tool_name)
+        .order_by(ToolRun.tool_name)
+    ).all()
+    per_tool = [
+        {"tool_name": name, "total": int(total), "not_ok": int(failed or 0)}
+        for name, total, failed in rows
+    ]
+    orphans = set(orphan_names(session))
+    return {
+        "total": sum(entry["total"] for entry in per_tool),
+        "not_ok": sum(entry["not_ok"] for entry in per_tool),
+        "orphans": sum(entry["total"] for entry in per_tool if entry["tool_name"] in orphans),
+        "tools": per_tool,
+    }

@@ -169,6 +169,9 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 - `DELETE /api/tools/{name}` — 將整個工具套件從 registry 移除；找不到回 404。
   只有非阻塞 exclusive tools lock 取得成功才會改名或刪除；AI request 或繼承 shared
   descriptor 的工具子行程仍活著時，回獨立的 `409 ai_job_in_progress`，套件完全不動。
+  工具從清單消失（`removed` 或 `retained`）之後，它的執行紀錄一併刪除，回應的
+  `runs_deleted` 說明有沒有刪成（`false` 時工具照樣已刪除，紀錄改由 purge 的孤兒範圍清掉）；
+  404／409 時紀錄不動。
   取得 lock 後先把套件改成隱藏的 `.stale-` 名稱，再盡力遞迴移除；這個 rename 是為了
   讓 registry 消失與失敗後清理可重試，不再負責保護執行中的目錄。成功回 200
   `{outcome: "removed", retained_path: null, retention_reason: null}`；若遞迴清理失敗，
@@ -269,6 +272,15 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   已知秘密遮一次**；已知秘密的掃描失敗時這條路由回 500，不回未經檢查的文字。套件已
   不存在的紀錄照樣回應（`vid_state: gone`、`fixable: false`）。找不到回 404。
 - `DELETE /api/tool-runs/{run_id}` — 刪除一筆；204，找不到回 404。
+- `GET /api/tool-runs/stats` — `{total, not_ok, orphans, tools: [{tool_name, total, not_ok}]}`：
+  `not_ok` 是成功以外的全部（被拒也算），`orphans` 是套件已不存在的紀錄數（`TOOLS_DIR`
+  未設定時一律 0，因為那時沒有任何名稱判斷得出來）。宣告在 `/{run_id}` 之前。
+- `POST /api/tool-runs/purge` — body `{tool?, outcome?: all|ok|not_ok, before?, orphans_only?,
+  dry_run = true, max_id?}`，回 `{matched, deleted, max_id}`（web-v6 §7）。條件只會縮小範圍；
+  `before` 是絕對時間（前端在開啟對話框時算一次），預覽與確認因此判斷同一批紀錄。
+  `dry_run` 只計數並回傳符合者的最大 id；`dry_run: false` 必須帶那個 `max_id`（缺了回 422），
+  只刪 `id <= max_id` 的——預覽之後才寫進來的紀錄不會被一起刪掉（id 只增不減，
+  AUTOINCREMENT）。不會自動刪除任何紀錄。
 
 ## 工具（KB 網頁安裝器）
 

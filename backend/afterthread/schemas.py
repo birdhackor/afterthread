@@ -556,12 +556,15 @@ class ToolDeleteResponse(BaseModel):
     """Whether DELETE removed the files or retained a hidden parked tree.
 
     ``retained_path`` is the exact operator-facing path when ``outcome`` is
-    ``retained``; it is null after physical removal.
+    ``retained``; it is null after physical removal. ``runs_deleted`` says whether
+    the tool's run records went with it (web-v6 §6.4); false leaves them to the
+    purge's orphan scope.
     """
 
     outcome: Literal["removed", "retained"]
     retained_path: str | None
     retention_reason: Literal["durability_unconfirmed", "cleanup_failed"] | None
+    runs_deleted: bool
 
 
 class ToolDiscardResponse(BaseModel):
@@ -868,3 +871,57 @@ class ToolRunList(BaseModel):
     current_vid: str | None
     total: int
     runs: list[ToolRunSummary]
+
+
+class ToolRunPurgeRequest(BaseModel):
+    """A purge of run records (web-v6 §7): a scope, then preview or confirm.
+
+    Every condition narrows: ``tool`` (one package name), ``outcome`` (``ok`` or
+    ``not_ok`` -- anything but a success, refusals included), ``before`` (records
+    that started before this instant), ``orphans_only`` (records whose package no
+    longer exists). ``before`` is absolute so that the preview and the
+    confirmation count the same records; the page computes it once.
+
+    ``dry_run`` (the default) only counts. A real run must carry the ``max_id``
+    its preview returned and deletes nothing newer than it.
+    """
+
+    tool: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    outcome: Literal["all", "ok", "not_ok"] = "all"
+    before: datetime | None = None
+    orphans_only: bool = False
+    dry_run: bool = True
+    max_id: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _confirm_needs_its_preview(self) -> ToolRunPurgeRequest:
+        if not self.dry_run and self.max_id is None:
+            raise ValueError("max_id is required when dry_run is false")
+        return self
+
+
+class ToolRunPurgeResult(BaseModel):
+    """What a purge matched and deleted; ``max_id`` bounds the confirmation."""
+
+    matched: int
+    deleted: int
+    max_id: int | None
+
+
+class ToolRunStatsEntry(BaseModel):
+    tool_name: str
+    total: int
+    not_ok: int
+
+
+class ToolRunStats(BaseModel):
+    """Run-record counts for the 工具 page header (web-v6 §7).
+
+    ``orphans`` counts records whose package no longer exists (zero while
+    TOOLS_DIR is unset, when no name can be judged).
+    """
+
+    total: int
+    not_ok: int
+    orphans: int
+    tools: list[ToolRunStatsEntry]

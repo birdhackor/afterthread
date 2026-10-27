@@ -835,3 +835,196 @@ def test_a_tool_named_jobs_has_its_runs_read_not_a_job_poll(
 
     assert response.status_code == 200
     assert response.json() == {"current_vid": _TEST_VID, "total": 0, "runs": []}
+
+
+# --- P2b: purge, stats, deleting a tool (web-v6 §7, §6.4) ------------------------
+
+
+def _purge(client: TestClient, **body: Any) -> dict[str, Any]:
+    response = client.post("/api/tool-runs/purge", json=body)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _ids(session: Session) -> list[int | None]:
+    session.expire_all()
+    return [row.id for row in session.exec(select(ToolRun).order_by(col(ToolRun.id)))]
+
+
+def test_purge_deletes_exactly_what_its_preview_counted(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """J: a record written after the preview survives the confirmation."""
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n")
+    _install_tools(monkeypatch, root)
+    failed_a, ok_run, failed_b = _seed_rows(
+        session,
+        _record(),
+        _record(outcome=tools.RUN_OK, exit_code=None, args=None, stdout=None, stderr=None),
+        _record(outcome=tools.RUN_TIMEOUT),
+    )
+
+    preview = _purge(client, tool="kb", outcome="not_ok")
+    assert preview == {"matched": 2, "deleted": 0, "max_id": failed_b}
+    assert _ids(session) == [failed_a, ok_run, failed_b]  # a preview deletes nothing
+
+    [late] = _seed_rows(session, _record())  # matches the scope, written after the count
+    confirm = _purge(client, tool="kb", outcome="not_ok", dry_run=False, max_id=preview["max_id"])
+
+    assert confirm == {"matched": 2, "deleted": 2, "max_id": failed_b}
+    assert _ids(session) == [ok_run, late]
+
+
+def test_purge_scopes_narrow_and_combine(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n")
+    _make_tool(root, "web", "print('x')\n")
+    _install_tools(monkeypatch, root)
+    old = datetime(2026, 1, 1, tzinfo=UTC)
+    new = datetime(2026, 10, 1, tzinfo=UTC)
+    _seed_rows(
+        session,
+        _record(tool_name="kb", started_at=old),
+        _record(tool_name="kb", started_at=new, outcome=tools.RUN_OK),
+        _record(tool_name="web", started_at=old, outcome=tools.RUN_REFUSED),
+        _record(tool_name="gone", started_at=new),
+    )
+    cutoff = "2026-06-01T00:00:00Z"
+
+    assert _purge(client)["matched"] == 4
+    assert _purge(client, tool="kb")["matched"] == 2
+    assert _purge(client, outcome="ok")["matched"] == 1
+    assert _purge(client, outcome="not_ok")["matched"] == 3  # a refusal is not a success
+    assert _purge(client, before=cutoff)["matched"] == 2
+    assert _purge(client, before=cutoff, outcome="not_ok", tool="web")["matched"] == 1
+    assert _purge(client, orphans_only=True)["matched"] == 1
+    assert _purge(client, orphans_only=True, tool="kb")["matched"] == 0
+
+
+def test_purge_with_nothing_to_match_has_no_bound(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n")
+    _install_tools(monkeypatch, root)
+    _seed_rows(session, _record())
+
+    assert _purge(client, orphans_only=True) == {"matched": 0, "deleted": 0, "max_id": None}
+    assert _purge(client, tool="other") == {"matched": 0, "deleted": 0, "max_id": None}
+
+
+def test_a_purge_that_deletes_needs_its_preview(client: TestClient) -> None:
+    response = client.post("/api/tool-runs/purge", json={"dry_run": False})
+    assert response.status_code == 422
+    assert client.post("/api/tool-runs/purge", json={"tool": "../x"}).status_code == 422
+    assert client.post("/api/tool-runs/purge", json={"outcome": "maybe"}).status_code == 422
+
+
+def test_without_a_tools_directory_no_record_is_called_an_orphan(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Switching the feature off must not make the whole table purgeable as orphans."""
+    monkeypatch.setattr("afterthread.services.tools.get_settings", lambda: Settings(tools_dir=""))
+    _seed_rows(session, _record())
+
+    assert _purge(client, orphans_only=True)["matched"] == 0
+    assert client.get("/api/tool-runs/stats").json()["orphans"] == 0
+
+
+def test_stats_counts_per_tool_and_orphans_and_is_not_an_id(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """W: the literal /stats is declared above /{run_id}."""
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n")
+    _install_tools(monkeypatch, root)
+    _seed_rows(
+        session,
+        _record(),
+        _record(outcome=tools.RUN_OK),
+        _record(tool_name="gone"),
+    )
+
+    response = client.get("/api/tool-runs/stats")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "total": 3,
+        "not_ok": 2,
+        "orphans": 1,
+        "tools": [
+            {"tool_name": "gone", "total": 1, "not_ok": 1},
+            {"tool_name": "kb", "total": 2, "not_ok": 1},
+        ],
+    }
+
+
+def test_deleting_a_tool_deletes_its_runs_and_only_its_runs(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """K: a same-name reinstall must not inherit the deleted tool's history."""
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n")
+    _make_tool(root, "web", "print('x')\n")
+    _install_tools(monkeypatch, root)
+    _kb, web = _seed_rows(session, _record(tool_name="kb"), _record(tool_name="web"))
+
+    response = client.delete("/api/tools/kb")
+
+    assert response.status_code == 200
+    assert response.json()["runs_deleted"] is True
+    assert _ids(session) == [web]
+
+
+def test_a_refused_delete_keeps_the_runs(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """K: 409 ai_job_in_progress touches nothing, records included."""
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n")
+    _install_tools(monkeypatch, root)
+    [run_id] = _seed_rows(session, _record())
+    shared_fd = tools.acquire_shared_tools_lock()
+    assert shared_fd is not None
+    try:
+        response = client.delete("/api/tools/kb")
+    finally:
+        tools.release_tools_lock(shared_fd)
+
+    assert response.status_code == 409
+    assert _ids(session) == [run_id]
+    assert client.delete("/api/tools/missing").status_code == 404
+    assert _ids(session) == [run_id]
+
+
+def test_records_that_could_not_be_deleted_are_reported_and_stay_purgeable(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """K: the tool's deletion stands; its records become orphans for the purge."""
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n")
+    _install_tools(monkeypatch, root)
+    [run_id] = _seed_rows(session, _record())
+    real_exec = session.exec
+
+    def _failing_exec(statement: Any, *args: Any, **kwargs: Any) -> Any:
+        if "DELETE" in str(statement).upper():
+            raise RuntimeError("database is locked")
+        return real_exec(statement, *args, **kwargs)
+
+    monkeypatch.setattr(session, "exec", _failing_exec)
+    response = client.delete("/api/tools/kb")
+    monkeypatch.setattr(session, "exec", real_exec)
+
+    assert response.status_code == 200
+    assert response.json()["runs_deleted"] is False
+    assert not (root / "kb").exists()
+    assert _ids(session) == [run_id]
+    preview = _purge(client, orphans_only=True)
+    assert preview["matched"] == 1
+    assert (
+        _purge(client, orphans_only=True, dry_run=False, max_id=preview["max_id"])["deleted"] == 1
+    )

@@ -326,7 +326,7 @@ async def update_tool(
         **_TOOLS_LOCK_UNAVAILABLE_RESPONSE,
     },
 )
-async def delete_installed_tool(name: ToolName) -> ToolDeleteResponse:
+async def delete_installed_tool(name: ToolName, session: SessionDep) -> ToolDeleteResponse:
     """Delete a tool package (its whole directory).
 
     The registry's ``delete_tool`` re-validates the name AND resolved-path
@@ -338,6 +338,13 @@ async def delete_installed_tool(name: ToolName) -> ToolDeleteResponse:
     distinct retryable ``ai_job_in_progress`` 409 without renaming or deleting
     anything. Otherwise the 200 response says ``removed`` after physical
     deletion or ``retained`` with the exact cleanup-failure path.
+
+    The tool's run records go once the package is gone -- ``removed`` and
+    ``retained`` alike, since either way the tool has left the registry -- and
+    never on a 404 or 409 (web-v6 §6.4). A name is not an identity: a same-name
+    reinstall is a different tool, and must not inherit this one's history.
+    ``runs_deleted: false`` reports records that could not be deleted; the
+    deletion of the tool itself still stands.
     """
     try:
         result = await run_in_threadpool(tools_service.delete_tool, name)
@@ -353,10 +360,12 @@ async def delete_installed_tool(name: ToolName) -> ToolDeleteResponse:
                 "message": _AI_JOB_IN_PROGRESS_MESSAGE,
             },
         )
+    runs_deleted = await run_in_threadpool(tool_runs.delete_for_tool, session, name)
     return ToolDeleteResponse(
         outcome=result.outcome,
         retained_path=str(result.retained_path) if result.retained_path is not None else None,
         retention_reason=result.retention_reason,
+        runs_deleted=runs_deleted,
     )
 
 

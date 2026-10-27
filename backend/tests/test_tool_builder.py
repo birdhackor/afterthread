@@ -3041,10 +3041,12 @@ def test_router_delete_tool_response_distinguishes_removed_from_retained(
         "outcome": "removed",
         "retained_path": None,
         "retention_reason": None,
+        "runs_deleted": True,
     }
     assert retained.status_code == 200
     retained_body = retained.json()
     assert retained_body["outcome"] == "retained"
+    assert retained_body["runs_deleted"] is True
     assert retained_body["retention_reason"] == "cleanup_failed"
     retained_path = Path(retained_body["retained_path"])
     assert retained_path.parent == tmp_path / "tools"
