@@ -33,10 +33,12 @@ response status.
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi import Path as PathParam
+from sqlmodel import Session
 from starlette.concurrency import run_in_threadpool
 
+from afterthread.db import get_session
 from afterthread.routers.ai import (
     _LLM_UNCONFIGURED_RESPONSE,
     _LLM_UPSTREAM_RESPONSE,
@@ -52,12 +54,13 @@ from afterthread.schemas import (
     ToolJobStatus,
     ToolListResponse,
     ToolReviseRequest,
+    ToolRunList,
     ToolSettings,
     ToolSummary,
     ToolSummaryDetail,
     ToolUpdateRequest,
 )
-from afterthread.services import llm_log, tool_builder, tool_meta
+from afterthread.services import llm_log, tool_builder, tool_meta, tool_runs
 from afterthread.services import tools as tools_service
 from afterthread.services.llm import LLMNotConfiguredError, LLMUpstreamError
 from afterthread.services.tools import _NAME_RE
@@ -70,6 +73,7 @@ router = APIRouter(prefix="/tools", tags=["tools"])
 # the two layers can never drift apart.
 ToolName = Annotated[str, PathParam(pattern=_NAME_RE.pattern)]
 ToolVersionId = Annotated[str, PathParam(pattern=tools_service._VID_RE.pattern)]
+SessionDep = Annotated[Session, Depends(get_session)]
 
 # Fixed, config-free error details, following items.py's `_NOT_FOUND` pattern
 # (the OpenAPI examples derive from the same constants the handlers raise).
@@ -242,8 +246,29 @@ _TOOLS_LOCK_UNAVAILABLE_RESPONSE: dict[int | str, dict[str, Any]] = {
 }
 
 
+def _with_last_runs(session: Session, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The registry rows, each with its newest run record (web-v6 §9) or None.
+
+    ``fixable`` is judged against the row's own ``current_vid`` -- the version
+    the same scan just resolved -- so the button and the version it would revise
+    come from one reading.
+    """
+    newest = tool_runs.last_runs_by_name(session, [row["name"] for row in rows])
+    return [
+        {
+            **row,
+            "last_run": (
+                tool_runs.last_run_view(newest[row["name"]], row["current_vid"])
+                if row["name"] in newest
+                else None
+            ),
+        }
+        for row in rows
+    ]
+
+
 @router.get("", response_model=ToolListResponse)
-async def list_installed_tools() -> ToolListResponse:
+async def list_installed_tools(session: SessionDep) -> ToolListResponse:
     """List every installed tool package (valid or broken), in name order.
 
     With the feature off (TOOLS_DIR unset) or nothing installed this is an
@@ -251,11 +276,14 @@ async def list_installed_tools() -> ToolListResponse:
     install endpoint's 503, while an empty listing is a normal state.
     """
     listed = await run_in_threadpool(tools_service.list_tools)
-    return ToolListResponse.model_validate({"tools": listed})
+    rows = await run_in_threadpool(_with_last_runs, session, listed)
+    return ToolListResponse.model_validate({"tools": rows})
 
 
 @router.patch("/{name}", response_model=ToolSummary, responses=_TOOL_NOT_FOUND_RESPONSE)
-async def update_tool(name: ToolName, payload: ToolUpdateRequest) -> ToolSummary:
+async def update_tool(
+    name: ToolName, payload: ToolUpdateRequest, session: SessionDep
+) -> ToolSummary:
     """Toggle a tool's ``enabled`` flag; returns the updated row.
 
     ``set_enabled`` returning False collapses every did-not-happen case into one
@@ -282,7 +310,8 @@ async def update_tool(name: ToolName, payload: ToolUpdateRequest) -> ToolSummary
         raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
     for row in await run_in_threadpool(tools_service.list_tools):
         if row["name"] == name:
-            return ToolSummary.model_validate(row)
+            [with_run] = await run_in_threadpool(_with_last_runs, session, [row])
+            return ToolSummary.model_validate(with_run)
     # The write landed but the package vanished before the re-scan (a racing
     # delete). The resource is gone, so the honest answer is the same 404.
     raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
@@ -722,6 +751,48 @@ async def get_tool_settings(name: ToolName) -> ToolSettings:
     if settings is None:
         raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
     return ToolSettings.model_validate(settings)
+
+
+@router.get(
+    "/{name}/runs",
+    response_model=ToolRunList,
+    responses=_TOOL_NOT_FOUND_RESPONSE,
+)
+async def list_tool_runs(
+    name: ToolName,
+    session: SessionDep,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> ToolRunList:
+    """One tool's newest run records, newest first, without bodies (web-v6 §6, §9).
+
+    The gate is package existence, as for the settings: a package whose pointer
+    is broken still has a history worth reading (``current_vid`` is then null and
+    nothing is fixable). Records of a package that no longer exists are reached
+    through the purge's orphan scope, not here. The bodies of one record are
+    ``GET /api/tool-runs/{run_id}``.
+
+    Declared BEFORE the job poll, which must stay last (see the comment there): a
+    tool may be named ``jobs``.
+    """
+
+    def _read() -> dict[str, Any] | None:
+        versions = tool_runs.PackageVersions.of(name)
+        if versions.package_root is None:
+            return None
+        # One scan of the tools directory serves every row's second mask, and
+        # fails the request -- rather than serve unchecked text -- if it raises.
+        secrets = tools_service._redaction_secrets()
+        rows = tool_runs.list_for_tool(session, name, limit=limit)
+        return {
+            "current_vid": versions.current_vid,
+            "total": tool_runs.count_for_tool(session, name),
+            "runs": [tool_runs.view(row, versions, secrets, bodies=False) for row in rows],
+        }
+
+    data = await run_in_threadpool(_read)
+    if data is None:
+        raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
+    return ToolRunList.model_validate(data)
 
 
 # --- tool job poll -----------------------------------------------------------

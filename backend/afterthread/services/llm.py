@@ -33,6 +33,7 @@ Two hard rules shape this file:
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, cast
@@ -163,6 +164,37 @@ def set_tool_args_redactor(redactor: Callable[[str], str]) -> None:
     """
     global _tool_args_redactor
     _tool_args_redactor = redactor
+
+
+@dataclass(frozen=True, slots=True)
+class LlmInteraction:
+    """The AI log record an interaction is writing, as a tool handler sees it.
+
+    ``record_id`` and ``process`` together name the record (the id is a
+    per-process counter, see ``llm_log.process_token``); ``workflow`` is the
+    caller's label. A tool run record (web-v6 §6) copies all three so the tools
+    page can link a failure back to the conversation that caused it.
+    """
+
+    record_id: int
+    process: str
+    workflow: str
+
+
+# Set by ``generate_structured`` for the span of one interaction and read by the
+# tool handlers that interaction awaits. A ContextVar rather than a parameter
+# because the handler signature is fixed (``LlmTool.handler`` takes only the
+# arguments) and the handlers are awaited in this same task, so the value they
+# read is the one this interaction set; a concurrent request runs in its own
+# task, with its own copy.
+_CURRENT_INTERACTION: ContextVar[LlmInteraction | None] = ContextVar(
+    "_CURRENT_INTERACTION", default=None
+)
+
+
+def current_interaction() -> LlmInteraction | None:
+    """The interaction whose tool loop is running in this context, if any."""
+    return _CURRENT_INTERACTION.get()
 
 
 # Hard cap on how many tool calls from ONE assistant reply are actually EXECUTED.
@@ -1361,23 +1393,34 @@ async def generate_structured[ModelT: BaseModel](
     resolved_timeout = (
         settings.openai_timeout_seconds if timeout_seconds is None else timeout_seconds
     )
-    try:
-        result = await _run_structured(
-            recorder,
-            settings,
-            system_prompt,
-            user_prompt,
-            model_cls,
-            tools=tools,
-            max_tool_rounds=resolved_rounds,
-            timeout_seconds=resolved_timeout,
+    # The tool handlers this interaction awaits read it to link their run records
+    # to this log record (web-v6 §6.3). Reset in the outer finally, so it never
+    # outlives the interaction whichever way that ends.
+    interaction_token = _CURRENT_INTERACTION.set(
+        LlmInteraction(
+            record_id=recorder.record_id, process=llm_log.process_token(), workflow=workflow
         )
-    except LLMNotConfiguredError as exc:
-        recorder.finish(outcome="not_configured", error=str(exc))
-        raise
-    except LLMUpstreamError as exc:
-        recorder.finish(outcome=_classify_upstream_outcome(exc), error=str(exc))
-        raise
-    else:
-        recorder.finish(outcome="ok", error=None)
-        return result
+    )
+    try:
+        try:
+            result = await _run_structured(
+                recorder,
+                settings,
+                system_prompt,
+                user_prompt,
+                model_cls,
+                tools=tools,
+                max_tool_rounds=resolved_rounds,
+                timeout_seconds=resolved_timeout,
+            )
+        except LLMNotConfiguredError as exc:
+            recorder.finish(outcome="not_configured", error=str(exc))
+            raise
+        except LLMUpstreamError as exc:
+            recorder.finish(outcome=_classify_upstream_outcome(exc), error=str(exc))
+            raise
+        else:
+            recorder.finish(outcome="ok", error=None)
+            return result
+    finally:
+        _CURRENT_INTERACTION.reset(interaction_token)

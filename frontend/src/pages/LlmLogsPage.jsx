@@ -19,7 +19,9 @@ import { useState } from "react";
 import { apiGet } from "../api/client.js";
 import { EmptyState } from "../components/EmptyState.jsx";
 import { TagList } from "../components/TagList.jsx";
+import { WORKFLOW_LABELS } from "../constants/labels.js";
 import { usePageTitle } from "../hooks/usePageTitle.js";
+import { formatDuration, formatTimestamp } from "../utils/format.js";
 // The resolving half of the `?log=` contract, kept next to the 工具 page's
 // emitting half (and covered by that file's tests -- this page's own logic is
 // components, which node-env vitest cannot render).
@@ -28,24 +30,6 @@ import { deepLinkTarget } from "../utils/toolSummary.js";
 // The list page reads at most this many recent interactions; the backend caps
 // the ring itself (llm_log_max_entries) and validates the limit to [1, 500].
 const LIST_LIMIT = 50;
-
-// Workflow -> zh-TW label. Mirrors every workflow name generate_structured is
-// called with: the three memory ones (afterthread/services/memory_ai.py), the
-// builder session shared by an install and an AI 修訂 (tool_builder._WORKFLOW),
-// and the summary session that follows one or a 重新產生 (tool_meta.
-// _SUMMARY_WORKFLOW). The last two are SEPARATE names by decision (D40) --
-// two sessions of one job, split so their log links cannot collide -- so
-// labelling only the memory three left every tool session reading 其他, which
-// is exactly the distinction the split was made to preserve. An unrecognized
-// value still falls back to 其他 rather than showing a raw English token.
-const WORKFLOW_LABELS = {
-	capture: "快速捕捉",
-	enrich: "AI 補齊",
-	assist_update: "AI 進度更新",
-	tool_install: "工具建置",
-	tool_summary: "工具總結",
-	unknown: "其他",
-};
 
 // Outcome -> badge label + color, matching the service's outcome vocabulary
 // (afterthread/services/llm.py). ok is the only success; timeout and
@@ -91,33 +75,6 @@ const CODE_SCROLL_STYLE = {
 	whiteSpace: "pre-wrap",
 	wordBreak: "break-word",
 };
-
-// Local date+time formatter: DateText renders only YYYY-MM-DD, but log rows
-// within one day need the time to be distinguishable. started_at is an ISO
-// UTC string; this renders it in the viewer's local zone. Returns "—" for a
-// missing/invalid value so a malformed record never blanks the cell.
-function formatTimestamp(value) {
-	if (!value) {
-		return "—";
-	}
-	const date = new Date(value);
-	if (Number.isNaN(date.getTime())) {
-		return "—";
-	}
-	const pad = (part) => String(part).padStart(2, "0");
-	const ymd = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
-	const hms = `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
-	return `${ymd} ${hms}`;
-}
-
-// Milliseconds -> a compact human string; seconds once past 1s so a long
-// generation reads as "12.3 s" rather than "12345 ms".
-function formatDuration(ms) {
-	if (typeof ms !== "number") {
-		return "—";
-	}
-	return ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms} ms`;
-}
 
 function OutcomeBadge({ outcome }) {
 	const meta = OUTCOME_META[outcome] ?? {

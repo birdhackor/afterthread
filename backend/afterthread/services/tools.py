@@ -17,6 +17,7 @@ import contextlib
 import fcntl
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -40,7 +41,12 @@ from starlette.concurrency import run_in_threadpool
 
 from afterthread.config import get_settings
 from afterthread.services import llm_log
-from afterthread.services.llm import LlmTool
+from afterthread.services.llm import LlmTool, current_interaction
+
+# Under the "afterthread" namespace main attaches its console handler to. The one
+# line this module logs is a run record that could not be written -- its type
+# only, never a body (see ``_record_run``).
+_logger = logging.getLogger("afterthread.tools")
 
 # A package (and directory) name: lowercase alnum start, then up to 63 more of
 # alnum/underscore/hyphen. Admits no ".", "/", or whitespace, so a traversal
@@ -995,6 +1001,16 @@ def _resolve_version_target(
     return version_root, origin
 
 
+def version_exists(package_root: PackageRoot, vid: str) -> bool:
+    """Whether ``vid`` is still one of the package's committed versions.
+
+    A run record outlives a discarded version (web-v6 §6.4); this is how the
+    page learns the version it ran is gone. The rule is the one ``current`` and
+    discard accept a version by, so the three cannot disagree.
+    """
+    return _resolve_version_target(package_root, vid) is not None
+
+
 def _resolve_current_data(
     package_root: PackageLayoutRoot,
 ) -> tuple[VersionRoot, str, Previous] | str:
@@ -1267,7 +1283,7 @@ def _find_embedded_secret_file(build_root: BuildRoot) -> str | None:
     in a deterministic sorted order so the named offender is stable. Cost is one substring
     pass per known secret per file -- fine for the few small files a package holds.
     """
-    secrets = [value for value in known_secret_values() if len(value) >= _MIN_SECRET_LEN]
+    secrets = _redaction_secrets()
     if not secrets:
         return None
     base = build_root.path.resolve()
@@ -2440,6 +2456,15 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     return "".join(out)
 
 
+def _redaction_secrets() -> list[str]:
+    """``known_secret_values`` at the redactor's floor: the list every mask takes.
+
+    Unguarded, like the scan it wraps: a caller that must not fail on it says so
+    itself (``_record_bodies``); every other caller wants the failure to propagate.
+    """
+    return [value for value in known_secret_values() if len(value) >= _MIN_SECRET_LEN]
+
+
 def redact_known_secrets(text: str) -> str:
     """Replace every known secret VALUE in ``text`` with the redaction marker (D36).
 
@@ -2465,7 +2490,7 @@ def redact_known_secrets(text: str) -> str:
     and meta-tools' own ``except`` degrade it into a safe failed-tool-result string),
     never a silent leak.
     """
-    secrets = [value for value in known_secret_values() if len(value) >= _MIN_SECRET_LEN]
+    secrets = _redaction_secrets()
     # Bare call, deliberately unguarded (see the docstring above): a failure here must
     # PROPAGATE fail-closed, the opposite of llm_log._redact's guarded degrade-to-
     # unredacted direction (D36 round-5).
@@ -2591,7 +2616,7 @@ def package_settings(package_root: PackageRoot) -> dict[str, Any]:
     nothing. The known-secret set is computed ONCE here (review C2): the redactor
     recomputes it, a whole tools-directory scan, on every call.
     """
-    secrets = [value for value in known_secret_values() if len(value) >= _MIN_SECRET_LEN]
+    secrets = _redaction_secrets()
     env_values, env_readable = _dotenv_file_state(package_root.path / ".env")
     config_values, config_readable = _dotenv_file_state(package_root.path / _CONFIG_FILENAME)
     config: list[dict[str, Any]] = []
@@ -2948,6 +2973,97 @@ _TOOL_REPLACED_RESULT = "tool not run: this tool's package changed after it was 
 _TOOL_DISABLED_RESULT = "tool not run: this tool was disabled after it was offered"
 
 
+# --- run records (web-v6 §6) -------------------------------------------------
+
+# How one call ended, as its run record states it. ``refused`` is the tool never
+# running (disabled, replaced, identity changed); every other non-ok value is a
+# way a tool that DID start can fail. ``output_overflow`` is the one the model's
+# string cannot tell apart: stderr past the cap kills the process group, so the
+# model sees ``tool failed (exit -9)`` -- the record says what really happened.
+RUN_OK = "ok"
+RUN_FAILED = "failed"
+RUN_OUTPUT_OVERFLOW = "output_overflow"
+RUN_TIMEOUT = "timeout"
+RUN_START_FAILED = "start_failed"
+RUN_REFUSED = "refused"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRunResult:
+    """One call's outcome: the string the model gets, plus what its record keeps.
+
+    ``text`` is the agent-visible result, byte-identical to what this module
+    returned before run records existed (invariant F) -- the record is an
+    observer and must not change the conversation. ``args``/``stdout``/``stderr``
+    are set only for a run that started and failed, already REDACTED and not yet
+    CUT: the recorder applies its own caps afterwards, the redact->cap order.
+    """
+
+    text: str
+    outcome: str
+    exit_code: int | None = None
+    truncated: bool = False
+    args: str | None = None
+    stdout: str | None = None
+    stderr: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRunRecord:
+    """Everything one run record stores (web-v6 §6.1), as handed to the recorder."""
+
+    tool_name: str
+    vid: str
+    started_at: datetime
+    duration_ms: int
+    outcome: str
+    exit_code: int | None
+    truncated: bool
+    workflow: str
+    check_id: str | None
+    llm_log_id: int | None
+    llm_log_process: str | None
+    message: str | None
+    args: str | None
+    stdout: str | None
+    stderr: str | None
+
+
+# The run recorder, injected by main (``tool_runs.record``) exactly as llm_log's
+# secret provider is: this module stays free of the database, and a test can
+# swap the recorder for a list. None means "record nothing" -- the state of every
+# process that never wired one.
+_run_recorder: Callable[[ToolRunRecord], int | None] | None = None
+
+
+def set_run_recorder(recorder: Callable[[ToolRunRecord], int | None] | None) -> None:
+    """Install (or, with None, remove) the callable that persists run records."""
+    global _run_recorder
+    _run_recorder = recorder
+
+
+def _record_bodies(
+    args_json: str, stdout: str | None, stderr: str | None
+) -> tuple[str | None, str | None, str | None]:
+    """Redacted copies of a failed run's input and output, for its record ONLY.
+
+    Used on the paths whose model-facing string carries no output (a timeout, a
+    process that never started), so the redaction here is the record's alone and
+    must not be allowed to change the call: a failing secret scan yields no
+    bodies instead of an exception. The path whose string DOES carry output (a
+    non-zero exit) redacts fail-closed for the model and reuses that result.
+    """
+    try:
+        secrets = _redaction_secrets()
+        return (
+            _mask_known_secrets(args_json, secrets),
+            None if stdout is None else _mask_known_secrets(stdout, secrets),
+            None if stderr is None else _mask_known_secrets(stderr, secrets),
+        )
+    except Exception:
+        return None, None, None
+
+
 def _run_tool_subprocess(
     entry: list[str],
     advertised: Resolved,
@@ -2958,8 +3074,8 @@ def _run_tool_subprocess(
     args_json: str,
     timeout: float,
     output_cap: int,
-) -> str:
-    """Run the advertised version and return one agent-visible result string.
+) -> ToolRunResult:
+    """Run the advertised version; return the agent-visible result and its record.
 
     The final ordering is deliberate and compact: refuse a version retired by a
     completed discard, read the PackageRoot toggle, require that ``current`` still
@@ -2967,20 +3083,24 @@ def _run_tool_subprocess(
     then call ``Popen`` with nothing between that identity check and process
     creation.  Resolving ``current`` does not compare vids: a normal revise may
     move it while this call must remain bound to the schema it was shown.
+
+    ``ToolRunResult.text`` is exactly the string this function returned before
+    run records existed (web-v6 §6.3); everything else on the result is for the
+    record.
     """
     version_root = advertised.version_root
     if _advertisement_retired(advertisement_generation):
-        return _TOOL_REPLACED_RESULT
+        return ToolRunResult(_TOOL_REPLACED_RESULT, RUN_REFUSED)
     package_root = advertised.package_root
     if not package_enabled(package_root):
-        return _TOOL_DISABLED_RESULT
+        return ToolRunResult(_TOOL_DISABLED_RESULT, RUN_REFUSED)
     if isinstance(resolve_current(package_root), Unresolved):
-        return _TOOL_REPLACED_RESULT
+        return ToolRunResult(_TOOL_REPLACED_RESULT, RUN_REFUSED)
     # This identity check is deliberately LAST. No state read, lineage resolve,
     # retired-marker lookup, or other fallible operation may be inserted between
     # its answer and Popen's cwd resolution.
     if not _still_the_expected_package(version_root, expected_identity):
-        return _TOOL_REPLACED_RESULT
+        return ToolRunResult(_TOOL_REPLACED_RESULT, RUN_REFUSED)
     try:
         proc = subprocess.Popen(
             entry,
@@ -3003,11 +3123,23 @@ def _run_tool_subprocess(
     except OSError as exc:
         # FileNotFoundError (bad interpreter/script), PermissionError (no exec
         # bit), ... -- the tool never ran. Category only, no raw error string.
-        return f"tool failed to start: {type(exc).__name__}"
+        args, _stdout, _stderr = _record_bodies(args_json, None, None)
+        return ToolRunResult(
+            f"tool failed to start: {type(exc).__name__}", RUN_START_FAILED, args=args
+        )
 
     output = _communicate_bounded(proc, input_text=args_json, cap=output_cap, timeout=timeout)
     if output.timed_out:
-        return f"tool timed out after {timeout:g} seconds"
+        # The model is told only that time ran out; the record keeps what the
+        # tool had printed by then, which is usually where it was stuck.
+        args, stdout, stderr = _record_bodies(args_json, output.stdout, output.stderr)
+        return ToolRunResult(
+            f"tool timed out after {timeout:g} seconds",
+            RUN_TIMEOUT,
+            args=args,
+            stdout=stdout,
+            stderr=stderr,
+        )
     # F1/D36: mask any known secret VALUE the child wrote to stdout/stderr BEFORE the
     # size cap. Redact-before-truncate is load-bearing (the same order llm_log's stored
     # -body pipeline uses): a secret straddling the cap edge must be replaced while the
@@ -3021,11 +3153,24 @@ def _run_tool_subprocess(
     # behind: the tool produced its answer, we just stopped reading it. _cap_output
     # trims the retained cap+1 chars down to the cap behind the marker.
     if output.stdout_overflow:
-        return _cap_output(redact_known_secrets(output.stdout), output_cap)
+        return ToolRunResult(
+            _cap_output(redact_known_secrets(output.stdout), output_cap), RUN_OK, truncated=True
+        )
     if proc.returncode != 0:
-        stderr = _cap_output(redact_known_secrets(output.stderr).strip(), output_cap)
-        return f"tool failed (exit {proc.returncode}): {stderr}"
-    return _cap_output(redact_known_secrets(output.stdout), output_cap)
+        # One snapshot of the known secrets serves the model's string AND the
+        # record, so this branch still scans once. Fail-closed exactly as
+        # ``redact_known_secrets`` is: these are the same two calls it makes.
+        secrets = _redaction_secrets()
+        stderr = _mask_known_secrets(output.stderr, secrets)
+        return ToolRunResult(
+            f"tool failed (exit {proc.returncode}): {_cap_output(stderr.strip(), output_cap)}",
+            RUN_OUTPUT_OVERFLOW if output.stderr_overflow else RUN_FAILED,
+            exit_code=proc.returncode,
+            args=_mask_known_secrets(args_json, secrets),
+            stdout=_mask_known_secrets(output.stdout, secrets),
+            stderr=stderr,
+        )
+    return ToolRunResult(_cap_output(redact_known_secrets(output.stdout), output_cap), RUN_OK)
 
 
 @dataclass(slots=True, weakref_slot=True)
@@ -3142,6 +3287,45 @@ def _stale_backup_path(base: Path, name: str, token: str) -> Path:
     return base / f".{name}.stale-{token}"
 
 
+async def _record_run(
+    advertised: Resolved, result: ToolRunResult, *, started_at: datetime, duration_ms: int
+) -> int | None:
+    """Hand one finished call to the run recorder; never raise, never alter the call.
+
+    The no-observer-failure invariant (web-v6 §6.3, invariant F): whatever the
+    recorder does -- raise, find the database locked, not be wired at all -- the
+    tool's result goes back to the model unchanged. A failure leaves one WARNING
+    line naming only the exception's type: a database error's text carries the
+    statement and its parameters, which here are the run's bodies.
+    """
+    recorder = _run_recorder
+    if recorder is None:
+        return None
+    interaction = current_interaction()
+    record = ToolRunRecord(
+        tool_name=advertised.package_root.path.name,
+        vid=advertised.vid,
+        started_at=started_at,
+        duration_ms=duration_ms,
+        outcome=result.outcome,
+        exit_code=result.exit_code,
+        truncated=result.truncated,
+        workflow=interaction.workflow if interaction is not None else "unknown",
+        check_id=None,
+        llm_log_id=interaction.record_id if interaction is not None else None,
+        llm_log_process=interaction.process if interaction is not None else None,
+        message=None if result.outcome == RUN_OK else result.text,
+        args=result.args,
+        stdout=result.stdout,
+        stderr=result.stderr,
+    )
+    try:
+        return await run_in_threadpool(recorder, record)
+    except Exception as exc:
+        _logger.warning("Tool run record not written: %s", type(exc).__name__)
+        return None
+
+
 def _make_handler(
     advertised: Resolved,
     entry: list[str],
@@ -3159,51 +3343,65 @@ def _make_handler(
 
     request_lock_fd = _REQUEST_TOOLS_LOCK_FD.get()
 
-    async def _handler(arguments: dict[str, Any]) -> str:
+    async def _execute(arguments: dict[str, Any], tools_lock_fd: int) -> ToolRunResult:
         package_root = advertised.package_root
-        version_root = advertised.version_root
-        if identity is None:
-            return _TOOL_REPLACED_RESULT
+        # Recheck inside the hold, then once more immediately before Popen.
+        if not _still_the_expected_package(advertised.version_root, identity):
+            return ToolRunResult(_TOOL_REPLACED_RESULT, RUN_REFUSED)
+        # Toggle and .env are PackageRoot state, intentionally read at call
+        # time. Missing, foreign, or unreadable state all fail closed.
+        if not package_enabled(package_root):
+            return ToolRunResult(_TOOL_DISABLED_RESULT, RUN_REFUSED)
+        settings = get_settings()
+        env, env_secrets = _build_tool_env(package_root)
+        args_json = json.dumps(arguments, ensure_ascii=False)
+        # The ``.env`` VALUES this child is about to be handed, held so they
+        # stay redactable no matter what the file says by the time the child
+        # finishes. The scope has to reach past the subprocess: the masking of
+        # the child's output happens INSIDE ``_run_tool_subprocess`` (F1/D36),
+        # so releasing on the child's exit would still be too early. It ends
+        # where the awaited call returns, which is after that redaction -- and
+        # after the redaction of the run record's bodies, which happens there
+        # too -- and before the string is handed to the llm loop: everything
+        # downstream (the role:"tool" message, the log, the JSONL sink, the run
+        # record) sees the masked copy.
+        with _inflight_secrets(env_secrets):
+            return await run_in_threadpool(
+                _run_tool_subprocess,
+                list(entry),
+                advertised,
+                identity,
+                advertisement_generation,
+                tools_lock_fd,
+                env,
+                args_json,
+                settings.llm_tool_timeout_seconds,
+                settings.llm_tool_output_max_chars,
+            )
+
+    async def _handler(arguments: dict[str, Any]) -> str:
+        started_at = datetime.now(UTC)
+        started = time.monotonic()
         owned_lock_fd: int | None = None
-        tools_lock_fd = request_lock_fd
-        if tools_lock_fd is None:
-            owned_lock_fd = await run_in_threadpool(acquire_shared_tools_lock)
-            tools_lock_fd = owned_lock_fd
-        if tools_lock_fd is None:
-            return _TOOL_REPLACED_RESULT
         try:
-            # Recheck inside the hold, then once more immediately before Popen.
-            if not _still_the_expected_package(version_root, identity):
-                return _TOOL_REPLACED_RESULT
-            # Toggle and .env are PackageRoot state, intentionally read at call
-            # time. Missing, foreign, or unreadable state all fail closed.
-            if not package_enabled(package_root):
-                return _TOOL_DISABLED_RESULT
-            settings = get_settings()
-            env, env_secrets = _build_tool_env(package_root)
-            args_json = json.dumps(arguments, ensure_ascii=False)
-            # The ``.env`` VALUES this child is about to be handed, held so they
-            # stay redactable no matter what the file says by the time the child
-            # finishes. The scope has to reach past the subprocess: the masking of
-            # the child's output happens INSIDE ``_run_tool_subprocess`` (F1/D36),
-            # so releasing on the child's exit would still be too early. It ends
-            # where the awaited call returns, which is after that redaction and
-            # before the string is handed to the llm loop -- everything downstream
-            # (the role:"tool" message, the log, the JSONL sink) sees the masked
-            # copy.
-            with _inflight_secrets(env_secrets):
-                return await run_in_threadpool(
-                    _run_tool_subprocess,
-                    list(entry),
-                    advertised,
-                    identity,
-                    advertisement_generation,
-                    tools_lock_fd,
-                    env,
-                    args_json,
-                    settings.llm_tool_timeout_seconds,
-                    settings.llm_tool_output_max_chars,
-                )
+            tools_lock_fd = request_lock_fd
+            if identity is not None and tools_lock_fd is None:
+                owned_lock_fd = await run_in_threadpool(acquire_shared_tools_lock)
+                tools_lock_fd = owned_lock_fd
+            if identity is None or tools_lock_fd is None:
+                result = ToolRunResult(_TOOL_REPLACED_RESULT, RUN_REFUSED)
+            else:
+                result = await _execute(arguments, tools_lock_fd)
+            # Written while the shared lock is still held, so a delete (which
+            # needs it exclusively, and clears the tool's records) cannot land
+            # between this run and its record.
+            await _record_run(
+                advertised,
+                result,
+                started_at=started_at,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
+            return result.text
         finally:
             if owned_lock_fd is not None:
                 await run_in_threadpool(release_tools_lock, owned_lock_fd)

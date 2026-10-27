@@ -129,3 +129,84 @@ C8 記錄的兩個行為變更：
 本輪也確認了 C1 的取捨可接受：截斷的秘密（例如 token 的前 19 字）放在 `config.env` 時會原樣顯示、
 不標示。設定區只給操作者自己的瀏覽器看，而同一份 `config.env` 在修訂提示裡經過遮蔽器時同樣不會
 被遮（結尾守衛只作用在整段文字的最末端），所以設定區的暴露面嚴格小於那條已接受的路徑。
+
+## D43（P2a）：工具執行紀錄 `tool_run`
+
+範圍是設計 §6、§9 的「最近執行」（唯讀＋單筆刪除）與列表的 `last_run`。下面是實作時才定下的細節。
+
+### 執行路徑
+
+- `_run_tool_subprocess` 回傳 `ToolRunResult`；`text` 就是以前回傳的字串。**驗收方式**：用一支
+  探測程式對改動前的 commit 與改動後各跑一次八種情況（成功、stdout 超限、非零 exit、帶秘密的
+  stderr、stderr 超限、逾時、無法啟動、帶秘密的 stdout），輸出逐字相同。
+- `_make_handler` 拆成 `_execute`（照舊的重驗、開關、環境、執行）與 `_handler`（量時間、寫紀錄、
+  回傳 `text`）。identity 讀不到與共享鎖拿不到這兩個早退，也記成 `refused`。
+- **紀錄在共享鎖釋放之前寫**。直接呼叫服務、自己拿鎖的那條路徑也一樣；AI 請求本來就整場持有。
+  這讓 P2b 的「刪除工具後刪紀錄」不會漏掉一筆剛好寫在中間的紀錄。
+- **`refused` 不存內文**：工具沒有執行，參數沒有除錯價值，只有隱私成本。`message` 照存（拒絕的
+  理由）。
+- 非零 exit 的路徑用**同一份**已知秘密遮給模型的字串與紀錄的三段內文，fail-closed 與以前相同。
+  逾時與無法啟動的路徑，給模型的字串不含輸出，遮蔽只為紀錄而做：掃描失敗就不存內文
+  （`_record_bodies`），不讓紀錄改變呼叫的結果。
+- stderr 超限、但行程在被終止前自己以 exit 0 結束時，舊程式回傳 stdout（視為成功），紀錄因此
+  也是 `ok`——紀錄描述的是模型實際收到的東西。
+- `message` 是模型收到的整段字串，由寫入端截到 500 字；它的輸出部分本來就完整存在 `stderr`。
+
+### 寫入
+
+- 紀錄器在 `main` 的 **lifespan** 接上（`init_db` 之後），不在 import 時：只有 lifespan 知道表已經
+  存在。測試的 client 不進 lifespan，所以只有自己裝紀錄器的測試會寫紀錄。lifespan 結束時拆掉。
+- **短 busy timeout 用獨立的 engine**（`build_recorder_engine`，1.5 秒），不在共用連線池的連線上
+  改 `PRAGMA busy_timeout` 再改回來：改回失敗時那條連線會帶著短 timeout 回到池裡，影響之後的
+  一般請求。
+- WARNING 只寫例外的**型別**：SQLAlchemy 的錯誤文字會帶 SQL 參數，也就是內文。
+- 截斷標記算在上限之內：開頭截斷在尾端加 `\n…[已截斷]`，結尾截斷在前面加 `[前段已截斷]…\n`。
+- 寫入前的 `_utf8_safe` 沿用 `llm_log` 的標準作法：一個 lone surrogate 會變成三個 U+FFFD
+  （它的三個位元組各自無效），測試以函式本身為準，不寫死字元數。
+
+### 讀出
+
+- **第二次遮蔽 fail-closed**：讀取時對當下的已知秘密再遮一次；掃描失敗就回 500，不回沒檢查過的
+  文字。列表只遮 `message`，內文只在單筆詳情裡遮與回傳。
+- **AI 日誌連結**：`generate_structured` 在互動期間設定 ContextVar（`LlmInteraction`：紀錄 id、
+  process token、workflow），handler 讀它。紀錄活得比日誌環久，所以讀出時 token 不是本行程就把
+  id 與 token 一起改成 `null`（同 `_summary_detail`）；是本行程時兩者都回傳，連結帶著 token，
+  分頁跨過重啟時 AI 日誌頁照樣拒絕。
+- **`vid_state`**（`current`／`older`／`gone`）：設計 §6.4 要求標示「版本已丟棄」。`gone` 同時
+  涵蓋丟棄與手動刪除，畫面寫「版本已不存在」，不猜是哪一種。判斷沿用 `current` 與 discard 接受
+  一個版本的同一條規則（`version_exists` → `_resolve_version_target`），同一次讀取裡每個 vid 只查
+  一次。
+- `GET /api/tools/{name}/runs` 的閘是**套件存在**（同設定），不要求 `current` 可解析。
+- `PATCH /api/tools/{name}` 回傳的那一列也帶 `last_run`，與列表一致。
+
+### 前端
+
+- 「最近執行」是每一列獨立的開關（`ToolRunsSection`），所有套件都有。失敗的可以展開，詳情在
+  展開時才讀 `GET /api/tool-runs/{id}`。
+- **刪除一筆時不移除那筆詳情的快取**：元件仍掛著、仍在觀察它，移除會讓它立刻重抓、得到 404。
+  列表重抓後那一列卸載，id 不會重用（AUTOINCREMENT），留下的快取項目碰不到。這是瀏覽器實測時
+  看到的 404，改掉之後主控台乾淨。
+- 版本改變（丟掉這一版、修訂發布）時重新驗證這個工具的執行紀錄，因為 `vid_state` 與 `fixable`
+  都是對舊的 `current_vid` 算的；刪除工具時移除它的快取。
+- `WORKFLOW_LABELS` 搬到 `constants/labels.js`，`formatTimestamp`／`formatDuration` 搬到
+  `utils/format.js`，AI 日誌頁與執行紀錄共用，避免兩份標籤漂移。
+- JSX 裡斷行的中文會在斷行處多一個空格，所以說明句改成一個字串常數。
+
+### 驗收
+
+| 不變量 | 測試（`tests/test_tool_runs.py`，另有一則在 `tests/test_main.py`） |
+|---|---|
+| F | `test_ok_run_returns_the_same_string_and_records_metadata_only`、`test_ok_run_cut_at_the_output_cap_is_recorded_as_truncated`、`test_failed_run_returns_the_same_string_and_keeps_the_bodies`、`test_stderr_overflow_says_exit_minus_nine_but_records_output_overflow`、`test_timeout_returns_the_same_string_and_keeps_what_was_printed`、`test_start_failure_returns_the_same_string_and_keeps_the_args`、`test_refusals_return_the_same_strings_and_record_no_bodies`、`test_a_recorder_that_raises_changes_nothing_and_logs_no_body`；另加上面的新舊比對 |
+| G | `test_secrets_in_args_and_output_are_masked_in_the_stored_record`、`test_secrets_are_masked_on_the_timeout_path`、`test_secrets_are_masked_on_the_stderr_overflow_path` |
+| H | `test_ok_run_returns_the_same_string_and_records_metadata_only` |
+| I | `test_bodies_are_masked_again_on_read`、`test_a_failing_secret_scan_fails_the_read_instead_of_serving_unchecked_text` |
+| U | `test_a_lone_surrogate_in_the_args_is_stored_as_a_replacement_character`、`test_a_locked_database_costs_the_record_within_the_short_timeout` |
+| W | `test_a_tool_named_jobs_has_its_runs_read_not_a_job_poll`；`test_only_by_id_routes_declare_404` 加上三條新路由 |
+
+其他：AI 日誌連結（`test_a_run_inside_an_interaction_links_to_its_log_record`、
+`test_a_log_link_from_another_process_is_not_served`）、可修判斷與 `vid_state`
+（`test_fixable_is_a_failure_of_the_current_version`、`test_an_older_version_that_still_exists_is_older_not_gone`、
+`test_a_record_whose_package_is_gone_still_reads_as_gone`）、截斷（`test_record_cuts_each_body_to_its_cap_from_the_right_end`）、
+lifespan 接線與實際寫入檔案（`test_lifespan_wires_the_tool_run_recorder_and_unwires_it_on_exit`）。前端的判斷在
+`toolRuns.js`、`format.js`，各有 vitest；另用實際的瀏覽器跑過：列上的提示、展開詳情、寫入時沒遮到的
+秘密在讀出時被遮、單筆刪除後列表更新。

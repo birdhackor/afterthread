@@ -239,13 +239,36 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   設定或上游失敗都封在工作狀態裡（失敗的 job + 友善訊息 + AI 日誌連結），與
   安裝送出同一套契約。
 - `GET /api/tools/{name}/settings` — 工具的套件層設定，唯讀（web-v6 §4、§9）：
-  `.env` 的 **key 名**（值永不離開後端）、`config.env` 的每一組（值仍經過遮蔽器，
-  並標示 `overridden_by_env`／`secret_like_name`／`contains_secret`）、兩個檔案
+  `.env` 的 **key 名**（值永不離開後端）、`config.env` 的每一組（值**逐字包含**某個
+  已登記秘密時整個以遮蔽標記回傳，其餘原樣；並標示 `overridden_by_env`／
+  `secret_like_name`／`contains_secret`）、兩個檔案
   各自是否讀得到，以及是否為 0.4.0 以前建、遷移來的工具（`built_before_v5`）。
   只要求套件存在、不要求 `current` 可解析——`current` 壞掉的套件正是需要看設定的
   時候。宣告在 `/jobs/{job_id}` 之前（工具可以叫 `jobs`）。
-  這四條路由都**不宣告** `503 tools_not_configured`：`TOOLS_DIR` 未設定時
+- `GET /api/tools/{name}/runs?limit=1..100`（預設 20）— 這個工具最近的執行紀錄，新的
+  在前，**不含內文**（web-v6 §6）：每筆有時間、耗時、執行的 `vid` 與它現在的位置
+  `vid_state`（`current`／`older`／`gone`——丟掉的版本紀錄仍在）、呼叫的 `workflow`、
+  `outcome`（`ok`／`failed`／`output_overflow`／`timeout`／`start_failed`／`refused`）、
+  `exit_code`、`truncated`、AI 收到的字串開頭 `message`（非 `ok` 才有）、`has_details`，
+  以及後端算好的 `fixable`（失敗、而且失敗的就是目前版本；前端不自己判斷）。
+  `llm_log_id`／`llm_log_process` 連回造成這次呼叫的 AI 日誌；id 是前一個行程鑄的
+  時兩者都回 `null`（紀錄活得比日誌環久，理由同 `summary` 的 `llm_log_id`）。
+  另帶 `current_vid` 與總筆數 `total`。只要求套件存在（同 `settings`），宣告在
+  `/jobs/{job_id}` 之前。
+  這五條路由都**不宣告** `503 tools_not_configured`：`TOOLS_DIR` 未設定時
   任何名稱都解析不到工具，404 已經是誠實答案。
+
+`GET /api/tools` 的每一列另有 `last_run`：該工具最新一筆執行紀錄的
+`{id, outcome, started_at, vid, fixable}`，沒有紀錄時為 `null`。
+
+**Tool runs**（`afterthread/routers/tool_runs.py`，前綴 `/api/tool-runs`）——不在
+`/api/tools/` 底下，因為那裡任何字面的第一段都可能是套件名：
+- `GET /api/tool-runs/{run_id}` — 一筆執行紀錄**含內文**：`args`（工具從 stdin 收到的
+  JSON，保留開頭 8,000 字）、`stderr`（保留**結尾** 16,000 字）、`stdout`（保留開頭
+  4,000 字）；成功或被拒的執行三者皆為 `null`。內文寫入前已遮蔽，**讀出時再對當下的
+  已知秘密遮一次**；已知秘密的掃描失敗時這條路由回 500，不回未經檢查的文字。套件已
+  不存在的紀錄照樣回應（`vid_state: gone`、`fixable: false`）。找不到回 404。
+- `DELETE /api/tool-runs/{run_id}` — 刪除一筆；204，找不到回 404。
 
 ## 工具（KB 網頁安裝器）
 
@@ -354,6 +377,19 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   array 之前就取得 shared lock 並持有到結束，而 discard 需要 exclusive lock，所以那段期間
   按下 discard 會直接得到 `409 ai_job_in_progress`，`current` 與該版都不會被動到。（先前
   這裡寫的是「discard 會成功、呼叫再得到拒絕」——那是互斥鎖出現以前的行為，已作廢。）
+- **執行紀錄是觀察者（web-v6 §6）**：經由已廣告 handler 的每一次呼叫（`_make_handler`
+  這條路；builder 的 meta-tool 不算）都寫一筆 `tool_run`。`_run_tool_subprocess` 回傳
+  `ToolRunResult`：給模型的字串 `text` **與加入紀錄之前逐字相同**（不變量 F，六種 outcome
+  都對舊程式比對過），其餘是紀錄要的 outcome、exit code 與已遮蔽的內文。handler 把字串交回、
+  把其餘交給注入的紀錄器（`tools.set_run_recorder`，由 `main` 的 lifespan 在 `init_db` 之後
+  接上 `tool_runs.record`；測試的 client 不進 lifespan，所以不寫紀錄）。紀錄器有自己的
+  engine 與 1.5 秒的 busy timeout，在自己的短 transaction 裡寫；任何失敗只留一行只含例外
+  **型別**的 WARNING（資料庫錯誤的文字會帶 SQL 參數，也就是內文），工具結果照常回給模型。
+  寫入在共享鎖釋放之前完成，所以刪除工具（需要 exclusive）不會插在一次執行與它的紀錄之間。
+  內文只在**啟動過而且失敗**的執行才有：先在整段文字上遮蔽（非零 exit 時與給模型的那份共用
+  同一刻的已知秘密、同樣 fail-closed），再 `_utf8_safe`、再截斷；逾時與無法啟動兩條路徑的遮蔽
+  只為紀錄而做，掃描失敗就不存內文，不影響呼叫。`workflow` 與 AI 日誌連結來自
+  `llm.generate_structured` 在互動期間設定的 ContextVar。
 - **request／子行程與破壞操作互斥**：capture、enrich、assist-update 在掃描並把
   tools array 交給模型**之前**取得 `.afterthread-tools.lck` 的 shared `flock`，在整個
   請求（所有模型 round、工具呼叫與錯誤清理）結束後才關閉 descriptor；shared lock

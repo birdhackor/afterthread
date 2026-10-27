@@ -2970,6 +2970,7 @@ def test_router_list_tools(
                 "error": None,
                 "current_vid": _TEST_VID,
                 "lineage": "sole",
+                "last_run": None,
             }
         ]
     }

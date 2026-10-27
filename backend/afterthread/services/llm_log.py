@@ -910,6 +910,16 @@ class LlmInteractionRecorder:
         self._attempts: list[LlmAttempt] = []
         self._finished = False
 
+    @property
+    def record_id(self) -> int:
+        """The id this interaction's record will carry, allocated at construction.
+
+        Read by ``llm.generate_structured`` to tell the tool handlers which record
+        they run under (web-v6 §6.3); the id is final from the moment the recorder
+        exists, before any attempt is made.
+        """
+        return self._id
+
     def begin_attempt(
         self, messages: list[Any], *, tools_advertised: list[str] | None = None
     ) -> None:

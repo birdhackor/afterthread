@@ -53,7 +53,7 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
 | `/items/new` | `ItemNewPage` | 手動新增項目的表單頁（沿用 `ItemForm` 元件）。 |
 | `/items/$itemId` | `ItemDetailPage` | 單筆項目詳情：完整欄位、progress 歷史（可追加一筆）、狀態/階段快速修改、`ItemAiActions` 提供的「AI 補齊」（enrich）／「AI 進度更新」（assist-update）兩個操作、刪除。 |
 | `/items/$itemId/edit` | `ItemEditPage` | 手動編輯項目的表單頁（沿用 `ItemForm` 元件）。 |
-| `/tools` | `ToolsPage` | 「已安裝工具」（清單／啟停／刪除，每列可展開讀取／重新產生 AI 總結，並可提意見送出 AI 修訂）與「安裝新工具」（貼 OpenAPI JSON 網址 + 指示，AI 背景建置、輪詢進度）兩個分頁；細節見根目錄 README「KB 工具安裝指南」。 |
+| `/tools` | `ToolsPage` | 「已安裝工具」（清單／啟停／刪除，每列可展開讀取／重新產生 AI 總結、提意見送出 AI 修訂、唯讀的「設定」與「最近執行」；列上顯示最近一次執行的結果）與「安裝新工具」（貼 OpenAPI JSON 網址 + 指示，AI 背景建置、輪詢進度）兩個分頁；細節見根目錄 README「KB 工具安裝指南」。 |
 | `/llm-logs` | `LlmLogsPage` | AI 日誌：呼叫 `GET /api/llm/logs` 列出最近的 LLM 互動，每筆可展開讀取 `GET /api/llm/logs/{id}` 取得的請求/回應內容（每則受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；支援 `?log=<id>` 深連結（`工具` 頁的安裝／修訂結果會連過來）：在清單裡就自動展開該列，不在清單裡（比最近 50 筆更舊）就直接向詳情端點取那一筆、單獨顯示在清單上方，真的被擠出保留區才說明它已經不在；連結若標明自己來自**另一個**後端行程（`?logProcess=`，見下方慣例）則一律不展開，只說明編號已被重新配發。 |
 | （其他） | `NotFoundPage` | 404 fallback（router 的 `defaultNotFoundComponent`）。 |
 
@@ -236,7 +236,11 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   `utils/toolSettings.js`：套件層 `.env`／`config.env` 唯讀「設定」區的措辭與旗標
   （`configEntryFlags`、`settingsNotices`、`occurrenceKeys`），它的元件是
   `components/ToolSettingsSection.jsx`——那份資料屬於套件、跨版本存在，不屬於某一版的
-  總結。修訂工作的終局呈現 `toolJobOutcomeView` 在 `toolInstall.js`（job 輪詢那一組），
+  總結。第四個是 `utils/toolRuns.js`：執行紀錄（web-v6 §6）的措辭與列上的提示
+  （`lastRunHint`、`runOutcomeMeta`、`vidStateMeta`、`runDetailSections`），元件是
+  `components/ToolRunsSection.jsx`；**一鍵修正能不能給，只看後端算好的 `fixable`**，
+  這裡不重算。工作流的中文名稱 `WORKFLOW_LABELS` 在 `constants/labels.js`，時間與耗時的
+  格式在 `utils/format.js`，`AI 日誌` 頁與執行紀錄共用。修訂工作的終局呈現 `toolJobOutcomeView` 在 `toolInstall.js`（job 輪詢那一組），
   送出被 `env_policy` 擋下時的通知 `reviseRefusalNotification` 在 `toolSummary.js`
   （修訂請求那一組）。**唯一的例外寫在
   `toolSummary.js` 的最後一節**：AI 日誌深連結的**兩半**（`工具` 頁產生連結的

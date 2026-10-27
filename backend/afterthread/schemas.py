@@ -499,6 +499,29 @@ class LlmLogDetail(LlmLogBase):
 # either service's output in the first place.
 
 
+ToolRunOutcome = Literal["ok", "failed", "output_overflow", "timeout", "start_failed", "refused"]
+
+
+class ToolLastRun(BaseModel):
+    """A list row's newest run record (web-v6 §9), or null when it has none.
+
+    ``fixable`` is computed by the backend and is the ONLY input the page uses to
+    offer a one-click fix (web-v6 §8.5): a failure that ran the package's current
+    version. The page must not re-derive it.
+    """
+
+    id: int
+    outcome: ToolRunOutcome
+    started_at: datetime
+    vid: str
+    fixable: bool
+
+    @field_validator("started_at")
+    @classmethod
+    def _aware_started_at(cls, value: datetime) -> datetime:
+        return _ensure_aware(value)
+
+
 class ToolSummary(BaseModel):
     """One installed tool package as the 工具 page lists it.
 
@@ -508,6 +531,7 @@ class ToolSummary(BaseModel):
 
     The summary text itself is fetched per tool on demand
     (``ToolSummaryDetail``), since it is far too long for a list row.
+    ``last_run`` is the tool's newest run record, null when it has none.
     """
 
     name: str
@@ -517,6 +541,7 @@ class ToolSummary(BaseModel):
     error: str | None
     current_vid: str | None
     lineage: Literal["sole", "usable", "broken"]
+    last_run: ToolLastRun | None = None
 
 
 class ToolListResponse(BaseModel):
@@ -783,3 +808,61 @@ class ToolSettings(BaseModel):
     config: list[ToolSettingsEntry]
     config_readable: bool
     built_before_v5: bool
+
+
+class ToolRunSummary(BaseModel):
+    """One run record without its bodies, for the 最近執行 list (web-v6 §6, §9).
+
+    ``vid_state`` places the version the run executed against the package as it is
+    now: ``current``, ``older`` (still a version of the package), or ``gone``
+    (discarded or removed; the record outlives it, §6.4). ``message`` is the head of
+    the string the model got, for a run that did not succeed. ``has_details`` says
+    whether the record kept bodies (a failed run that started) for the detail view.
+
+    ``llm_log_id`` links to the AI 日誌 record of the conversation that made the
+    call. Both it and ``llm_log_process`` are null when the id was minted by a
+    previous backend process -- the record outlives the log ring and its id
+    counter, the reason ``ToolSummaryDetail`` nulls a stale id too.
+    """
+
+    id: int
+    tool_name: str
+    vid: str
+    vid_state: Literal["current", "older", "gone"]
+    started_at: datetime
+    duration_ms: int
+    outcome: ToolRunOutcome
+    exit_code: int | None
+    truncated: bool
+    workflow: str
+    llm_log_id: int | None
+    llm_log_process: str | None
+    message: str | None
+    has_details: bool
+    fixable: bool
+
+    @field_validator("started_at")
+    @classmethod
+    def _aware_started_at(cls, value: datetime) -> datetime:
+        return _ensure_aware(value)
+
+
+class ToolRunDetail(ToolRunSummary):
+    """One run record with its bodies: redacted, capped, and masked again on read.
+
+    ``args`` is the JSON the tool got on stdin (head), ``stdout`` the head of what
+    it printed, ``stderr`` the TAIL of its error output. All three are null for a
+    successful or refused run, which keeps metadata only (web-v6 §6.2).
+    """
+
+    args: str | None
+    stdout: str | None
+    stderr: str | None
+
+
+class ToolRunList(BaseModel):
+    """One tool's newest run records, newest first, with the total it has."""
+
+    current_vid: str | None
+    total: int
+    runs: list[ToolRunSummary]

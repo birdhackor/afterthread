@@ -2919,7 +2919,7 @@ def test_runtime_background_descendant_reaped_no_thread_leak(
         )
         elapsed = time.monotonic() - started
 
-        assert "STARTED" in result  # the leader's own output survived the escalation
+        assert "STARTED" in result.text  # the leader's own output survived the escalation
         # Bounded by the reap join + escalation, NOT waited out for the 60s sleep.
         assert elapsed < 20
         # No reader/writer thread leak: the group-kill unblocked the pipe-held
@@ -2998,7 +2998,7 @@ def test_runtime_detached_child_closing_pipes_is_killed(
         )
         elapsed = time.monotonic() - started
 
-        assert "LEADER_DONE" in result  # the leader's own output survived
+        assert "LEADER_DONE" in result.text  # the leader's own output survived
         assert elapsed < 20  # returned on the leader's prompt exit, not the 60s sleep
         # The detached child shared the leader's process group; the unconditional
         # pre-reap group kill SIGKILLed it. Round-3 would have left it sleeping.

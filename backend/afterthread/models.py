@@ -167,3 +167,48 @@ class ProgressEntry(SQLModel, table=True):
     note: str
 
     item: MemoryItem | None = Relationship(back_populates="entries")
+
+
+class ToolRun(SQLModel, table=True):
+    """One execution of an installed tool (web-v6 §6): what ran and how it ended.
+
+    Metadata for every call; the redacted INPUT and OUTPUT only for a run that
+    failed -- the operator ruled the store may hold failure bodies (a deliberate
+    exception to D09's "bodies stay off disk", whose privacy reason holds just as
+    well for successful runs, so those keep metadata only). Bodies are capped and
+    surrogate-scrubbed by ``services.tool_runs`` before they reach this table.
+
+    ``tool_name`` is the package NAME, not an identity: a same-name reinstall is a
+    different tool, which is why deleting a tool deletes its runs and why "can this
+    failure be fixed" also requires ``vid`` to be the package's current version.
+    Nothing here is ever deleted automatically; purging is the operator's call.
+    """
+
+    __tablename__ = "tool_run"
+    # Ids are handed to the browser and come back as ``run_ids`` on a revise; a
+    # purge followed by id REUSE would let a stale reference attach someone
+    # else's failure. AUTOINCREMENT is SQLite's guarantee against that, the same
+    # one ProgressEntry takes.
+    __table_args__ = {"sqlite_autoincrement": True}
+
+    id: int | None = Field(default=None, primary_key=True)
+    tool_name: str = Field(index=True)
+    vid: str
+    started_at: datetime = Field(default_factory=utcnow)
+    duration_ms: int = 0
+    # ok | failed | output_overflow | timeout | start_failed | refused
+    outcome: str
+    exit_code: int | None = None
+    # stdout ran past the cap and the (successful) result was cut.
+    truncated: bool = False
+    # Which workflow called it (capture, enrich, assist_update, ...).
+    workflow: str = "unknown"
+    # The health-check / verification batch a run belongs to (web-v6 §10).
+    check_id: str | None = Field(default=None, index=True)
+    llm_log_id: int | None = None
+    llm_log_process: str | None = None
+    # The string the model received (head only), for a non-ok run.
+    message: str | None = None
+    args: str | None = None
+    stdout: str | None = None
+    stderr: str | None = None

@@ -28,9 +28,11 @@ import { apiDelete, apiGet, apiPatch, apiPost } from "../api/client.js";
 import { CharCounter } from "../components/CharCounter.jsx";
 import { formatDate } from "../components/DateText.jsx";
 import { EmptyState } from "../components/EmptyState.jsx";
+import { ToolRunsSection } from "../components/ToolRunsSection.jsx";
 import { ToolSettingsSection } from "../components/ToolSettingsSection.jsx";
 import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { usePageTitle } from "../hooks/usePageTitle.js";
+import { formatTimestamp } from "../utils/format.js";
 import { codePointLength } from "../utils/text.js";
 import {
 	keepDeleteConfirmationOpen,
@@ -49,6 +51,7 @@ import {
 	toolJobQueryEnabled,
 	toolJobRefetchInterval,
 } from "../utils/toolInstall.js";
+import { lastRunHint, toolRunsQueryKey } from "../utils/toolRuns.js";
 import { toolSettingsQueryKey } from "../utils/toolSettings.js";
 import {
 	acceptSummaryForVersion,
@@ -568,7 +571,10 @@ function ToolRow({
 	// layer and outlive any version, so they stay readable exactly when the
 	// summary panel (which needs a resolvable `current`) is not offered.
 	const [settingsExpanded, { toggle: toggleSettings }] = useDisclosure(false);
+	// 最近執行 (web-v6 §9), offered for every package for the same reason.
+	const [runsExpanded, { toggle: toggleRuns }] = useDisclosure(false);
 	const lineageControls = toolLineageControls(tool, lineageUnavailable);
+	const runHint = lastRunHint(tool.last_run, tool.current_vid);
 
 	return (
 		<Card withBorder padding="md" radius="md">
@@ -606,6 +612,11 @@ function ToolRow({
 								) : null}
 							</>
 						)}
+						{runHint ? (
+							<Text size="xs" c={runHint.color}>
+								{runHint.text} ・ {formatTimestamp(tool.last_run.started_at)}
+							</Text>
+						) : null}
 					</Stack>
 					<Group gap="sm" wrap="nowrap">
 						{lineageControls.showVersionControls ? (
@@ -752,6 +763,16 @@ function ToolRow({
 						<ToolSettingsSection name={tool.name} expanded={settingsExpanded} />
 					</Collapse>
 				</div>
+
+				<div>
+					<Button variant="subtle" size="xs" px={0} onClick={toggleRuns}>
+						{runsExpanded ? "收合最近執行" : "最近執行"}
+					</Button>
+					{/* `expanded`, not `in` -- see the AI 總結 Collapse above. */}
+					<Collapse expanded={runsExpanded}>
+						<ToolRunsSection name={tool.name} expanded={runsExpanded} />
+					</Collapse>
+				</div>
 			</Stack>
 		</Card>
 	);
@@ -825,8 +846,10 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 			// name is the second element of the prefix.
 			queryClient.removeQueries({ queryKey: toolSummaryKeyPrefix(name) });
 			// The same reasoning holds for the package-layer 設定 view: a same-name
-			// reinstall has its own .env and config.env.
+			// reinstall has its own .env and config.env -- and for 最近執行, whose
+			// records were the deleted tool's.
 			queryClient.removeQueries({ queryKey: toolSettingsQueryKey(name) });
+			queryClient.removeQueries({ queryKey: toolRunsQueryKey(name) });
 			await queryClient.invalidateQueries({ queryKey: ["tools"] });
 		},
 		onError: (mutationError) => {
@@ -875,6 +898,10 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 			queryClient.removeQueries({
 				queryKey: toolSummaryKeyPrefix(variables.name),
 			});
+			// Every record's vid_state and fixable were judged against V.
+			queryClient.invalidateQueries({
+				queryKey: toolRunsQueryKey(variables.name),
+			});
 			await queryClient.invalidateQueries({
 				queryKey: ["tools"],
 				exact: true,
@@ -916,6 +943,9 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 			Promise.all([
 				queryClient.invalidateQueries({ queryKey: toolSummaryKeyPrefix(name) }),
 				queryClient.invalidateQueries({ queryKey: ["tools"] }),
+				// A published revision moves current_vid, which every record's
+				// vid_state and fixable were judged against.
+				queryClient.invalidateQueries({ queryKey: toolRunsQueryKey(name) }),
 			]),
 		[queryClient],
 	);

@@ -11,13 +11,17 @@ convention).
 
 import asyncio
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from sqlmodel import Session, select
 
 from afterthread.config import Settings
 from afterthread.db import get_engine
 from afterthread.main import app, lifespan
+from afterthread.models import ToolRun
+from afterthread.services import tool_runs, tools
 
 
 def _run_lifespan_startup(
@@ -82,3 +86,57 @@ def test_lifespan_tls_no_verify_false_emits_no_warning(
         _run_lifespan_startup(monkeypatch, tmp_path, tls_no_verify=False)
 
     assert [r for r in caplog.records if r.name == "afterthread.main"] == []
+
+
+def test_lifespan_wires_the_tool_run_recorder_and_unwires_it_on_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """web-v6 §6.3: the recorder is wired after ``init_db`` built the table, and a
+    record written through the production engine lands in the configured file."""
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'lifespan.db'}")
+    monkeypatch.setattr("afterthread.main.get_settings", lambda: settings)
+    monkeypatch.setattr("afterthread.db.get_settings", lambda: settings)
+    monkeypatch.setattr("afterthread.services.tool_runs.get_settings", lambda: settings)
+    get_engine.cache_clear()
+    tool_runs._recorder_engine.cache_clear()
+    wired: list[object] = []
+    written: list[int | None] = []
+    run = tools.ToolRunRecord(
+        tool_name="kb",
+        vid="20260728T010203Z-abcdef",
+        started_at=datetime(2026, 10, 27, tzinfo=UTC),
+        duration_ms=1,
+        outcome=tools.RUN_OK,
+        exit_code=None,
+        truncated=False,
+        workflow="capture",
+        check_id=None,
+        llm_log_id=None,
+        llm_log_process=None,
+        message=None,
+        args=None,
+        stdout=None,
+        stderr=None,
+    )
+    try:
+
+        async def _enter_and_exit() -> None:
+            async with lifespan(app):
+                wired.append(tools._run_recorder)
+                recorder = tools._run_recorder
+                assert recorder is not None
+                written.append(recorder(run))
+
+        asyncio.run(_enter_and_exit())
+        with Session(get_engine()) as session:
+            rows = list(session.exec(select(ToolRun)))
+    finally:
+        tool_runs._recorder_engine().dispose()
+        tool_runs._recorder_engine.cache_clear()
+        get_engine().dispose()
+        get_engine.cache_clear()
+
+    assert wired == [tool_runs.record]
+    assert tools._run_recorder is None
+    assert written == [rows[0].id]
+    assert [(row.tool_name, row.outcome) for row in rows] == [("kb", "ok")]

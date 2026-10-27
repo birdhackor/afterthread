@@ -45,3 +45,23 @@ export const STAGE_OPTIONS = Object.entries(STAGE_META).map(
 // install's settings live in `<data-dir>/.env`, not backend/.env.
 export const LLM_NOT_CONFIGURED_NOTICE =
 	"AI 功能尚未設定：請在後端設定 OPENAI_BASE_URL 與 OPENAI_MODEL 後重啟服務（設定位置見 README）";
+
+// Workflow -> zh-TW label, shared by the AI 日誌 page and the 工具 page's
+// 最近執行 (a tool run records the workflow that called it). Mirrors every
+// workflow name generate_structured is called with: the three memory ones
+// (afterthread/services/memory_ai.py), the builder session shared by an install
+// and an AI 修訂 (tool_builder._WORKFLOW), and the summary session that follows
+// one or a 重新產生 (tool_meta._SUMMARY_WORKFLOW). The last two are SEPARATE
+// names by decision (D40) -- two sessions of one job, split so their log links
+// cannot collide -- so labelling only the memory three left every tool session
+// reading 其他, which is exactly the distinction the split was made to
+// preserve. An unrecognized value still falls back to 其他 rather than showing
+// a raw English token.
+export const WORKFLOW_LABELS = {
+	capture: "快速捕捉",
+	enrich: "AI 補齊",
+	assist_update: "AI 進度更新",
+	tool_install: "工具建置",
+	tool_summary: "工具總結",
+	unknown: "其他",
+};

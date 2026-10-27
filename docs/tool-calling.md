@@ -56,6 +56,8 @@ identity。模型可能幾分鐘後才真的呼叫；若那時 `current` 已從 
    是工具結果。
 7. 套用單工具 timeout、process-group 終止與輸出截斷；成功、非零 exit、timeout
    都收斂成模型可讀的結果字串。
+8. 寫一筆執行紀錄（見第 6 節）。它是觀察者：給模型的字串不因此改變，紀錄寫不進去
+   也只留一行警告。
 
 操作者在請求進行中按下 discard 或刪除，會得到 `409 ai_job_in_progress`，**套件與指標
 完全沒有被動到**，可以原地重試。互斥鎖取代了先前那套「登記誰在執行、刪除前去查」的機制
@@ -318,6 +320,21 @@ AI 日誌記錄 capture、enrich、assist-update、tool_install 與 tool_summary
 - install／revise job 提供 builder session 的 log id；summary sidecar 的 log id 另帶
   process token。id 是 process-local counter，後端重啟會重用數字；token 不符時前端
   拒絕把舊 deep link 指到新行程的無關紀錄。
+
+**工具執行紀錄**（web-v6 §6）補上 AI 日誌看不到的那一段：工具自己那一側發生了什麼。
+AI 日誌只在記憶體、只有 50 筆，而且工具的參數只留前 200 字；工具失敗時真正要看的 stderr，
+在日誌裡只是 `role="tool"` 訊息的一部分，還受 `llm_tool_output_max_chars` 截斷。
+
+- 每一次已安裝工具的呼叫都寫進 SQLite 的 `tool_run`：時間、耗時、執行的版本、呼叫的
+  workflow、結果與 exit code，以及連回那一筆 AI 日誌的 id 與 process token。
+- 結果比模型看到的更精確：stderr 超過上限時整組行程被終止，模型只看到
+  `tool failed (exit -9)`，紀錄則寫 `output_overflow`；`refused` 是工具根本沒執行
+  （停用、版本已換、身分不符）。
+- **只有失敗的執行存內文**：參數（前 8,000 字）、stderr（最後 16,000 字，traceback
+  的關鍵在最後）、stdout（前 4,000 字）。先在整段上遮蔽再截斷；讀出時再對當下的已知
+  秘密遮一次。成功的執行只有中繼資料（AI 日誌不落地的理由對它們一樣成立）。
+- 工具頁的「最近執行」看得到這些紀錄；`GET /api/tools/{name}/runs` 與
+  `GET /api/tool-runs/{id}` 是它們的 API（見 `backend/README.md`）。
 
 ## 7. 為什麼不用 LangChain
 
