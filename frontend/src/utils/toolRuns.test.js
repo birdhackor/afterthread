@@ -64,6 +64,15 @@ describe("lastRunHint", () => {
 		expect(lastRunHint(null, CURRENT)).toBeNull();
 	});
 
+	it("names a backend error as the backend's, not the tool's", () => {
+		expect(
+			lastRunHint(lastRun({ outcome: "error", fixable: false }), CURRENT),
+		).toEqual({
+			text: "最近一次呼叫在後端出錯",
+			color: "orange",
+		});
+	});
+
 	it("is quiet for a success and a refusal", () => {
 		expect(lastRunHint(lastRun({ outcome: "ok" }), CURRENT).color).toBe(
 			"dimmed",
@@ -118,5 +127,20 @@ describe("runHasDetails and runDetailSections", () => {
 			"stderr",
 		]);
 		expect(sections[2].label).toContain("結尾");
+	});
+
+	it("keeps an output that printed nothing, marked empty", () => {
+		const sections = runDetailSections({
+			message: "tool failed (exit 2): ",
+			args: "{}",
+			stderr: "",
+			stdout: "",
+		});
+		expect(sections.map((section) => [section.key, section.empty])).toEqual([
+			["message", false],
+			["args", false],
+			["stderr", true],
+			["stdout", true],
+		]);
 	});
 });

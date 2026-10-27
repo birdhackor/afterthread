@@ -25,6 +25,8 @@ export function toolRunQueryKey(runId) {
 // RUN_*). output_overflow is spelled out: the model was told "exit -9", which
 // reads like a crash, while the record knows the tool was stopped for printing
 // too much. refused is gray because the tool never ran -- nothing failed.
+// error is the backend failing the call (its secret scan, its tools lock), not
+// the tool: orange, and never offered as a fix.
 const OUTCOME_META = {
 	ok: { label: "成功", color: "green" },
 	failed: { label: "失敗", color: "red" },
@@ -32,6 +34,7 @@ const OUTCOME_META = {
 	timeout: { label: "逾時", color: "red" },
 	start_failed: { label: "無法啟動", color: "red" },
 	refused: { label: "被拒，未執行", color: "gray" },
+	error: { label: "後端錯誤", color: "orange" },
 };
 
 export function runOutcomeMeta(outcome) {
@@ -78,6 +81,9 @@ export function lastRunHint(lastRun, currentVid) {
 	if (lastRun.outcome === "refused") {
 		return { text: "最近一次呼叫被拒，工具沒有執行", color: "dimmed" };
 	}
+	if (lastRun.outcome === "error") {
+		return { text: "最近一次呼叫在後端出錯", color: "orange" };
+	}
 	const label = runOutcomeMeta(lastRun.outcome).label;
 	if (
 		FAILED_OUTCOMES.has(lastRun.outcome) &&
@@ -101,35 +107,25 @@ export function runHasDetails(run) {
 // The detail view's text blocks, in reading order, skipping what the record did
 // not keep. stderr is its TAIL and stdout its HEAD (web-v6 §6.2), and the
 // labels say so, because a cut that is not named reads as the whole output.
+//
+// A kept but EMPTY output is a fact ("it printed nothing"), so it stays, with
+// `empty` set for the view to say so instead of drawing a blank box.
 export function runDetailSections(detail) {
-	const sections = [];
-	if (detail.message) {
-		sections.push({
-			key: "message",
-			label: "AI 收到的結果",
-			text: detail.message,
-		});
-	}
-	if (detail.args != null) {
-		sections.push({
-			key: "args",
-			label: "輸入參數（stdin）",
-			text: detail.args,
-		});
-	}
-	if (detail.stderr != null) {
-		sections.push({
+	const candidates = [
+		{ key: "message", label: "AI 收到的結果", text: detail.message || null },
+		{ key: "args", label: "輸入參數（stdin）", text: detail.args },
+		{
 			key: "stderr",
 			label: "錯誤輸出（stderr，保留結尾）",
 			text: detail.stderr,
-		});
-	}
-	if (detail.stdout != null) {
-		sections.push({
+		},
+		{
 			key: "stdout",
 			label: "標準輸出（stdout，保留開頭）",
 			text: detail.stdout,
-		});
-	}
-	return sections;
+		},
+	];
+	return candidates
+		.filter((section) => section.text != null)
+		.map((section) => ({ ...section, empty: section.text === "" }));
 }

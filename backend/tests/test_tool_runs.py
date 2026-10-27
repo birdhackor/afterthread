@@ -322,6 +322,58 @@ def test_no_recorder_means_no_record_and_the_same_result(
     assert _call() == "ok"
 
 
+def test_a_call_the_backend_fails_is_recorded_as_error_and_still_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, records: list[tools.ToolRunRecord]
+) -> None:
+    """Every call is recorded -- also one that dies in the backend after the tool ran.
+
+    The fail-closed redaction is the realistic case: the tool exited non-zero and
+    the secret scan masking its stderr raised. The exception still reaches the
+    llm loop, which tells the model what it always did; the record stores the
+    same words and keeps no bodies.
+    """
+    root = tmp_path / "tools"
+    _make_tool(root, "boom", "import sys\nsys.stderr.write('bad')\nsys.exit(1)\n")
+    _install_tools(monkeypatch, root)
+    [tool] = enabled_llm_tools()
+
+    def _broken_scan() -> frozenset[str]:
+        raise OSError("tools directory unreadable")
+
+    monkeypatch.setattr(tools, "known_secret_values", _broken_scan)
+
+    with pytest.raises(OSError):
+        asyncio.run(tool.handler({"q": "x"}))
+    model_text = asyncio.run(llm._invoke_tool_handler(tool, '{"q": "x"}'))
+
+    assert model_text == "tool execution failed: OSError"
+    assert [run.outcome for run in records] == [tools.RUN_ERROR, tools.RUN_ERROR]
+    assert records[0].message == model_text
+    assert (records[0].args, records[0].stdout, records[0].stderr) == (None, None, None)
+
+
+def test_stderr_overflow_that_exits_on_its_own_is_a_plain_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, records: list[tools.ToolRunRecord]
+) -> None:
+    """``output_overflow`` claims the kill; a tool that exited with its own code first
+    failed with that code, and the model was told so."""
+    root = tmp_path / "tools"
+    _make_tool(root, "noisy", "import sys\nsys.stderr.write('e' * 10)\nsys.exit(3)\n")
+    _install_tools(monkeypatch, root)
+    real = tools._communicate_bounded
+
+    def _overflowed(*args: Any, **kwargs: Any) -> Any:
+        output = real(*args, **kwargs)
+        output.stderr_overflow = True  # past the cap, but the exit beat the kill
+        return output
+
+    monkeypatch.setattr(tools, "_communicate_bounded", _overflowed)
+
+    assert _call() == "tool failed (exit 3): eeeeeeeeee"
+    [run] = records
+    assert (run.outcome, run.exit_code) == (tools.RUN_FAILED, 3)
+
+
 # --- the AI log link -----------------------------------------------------------
 
 

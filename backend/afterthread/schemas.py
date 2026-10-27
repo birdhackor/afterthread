@@ -499,7 +499,9 @@ class LlmLogDetail(LlmLogBase):
 # either service's output in the first place.
 
 
-ToolRunOutcome = Literal["ok", "failed", "output_overflow", "timeout", "start_failed", "refused"]
+ToolRunOutcome = Literal[
+    "ok", "failed", "output_overflow", "timeout", "start_failed", "refused", "error"
+]
 
 
 class ToolLastRun(BaseModel):

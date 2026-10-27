@@ -328,8 +328,10 @@ AI 日誌只在記憶體、只有 50 筆，而且工具的參數只留前 200 �
 - 每一次已安裝工具的呼叫都寫進 SQLite 的 `tool_run`：時間、耗時、執行的版本、呼叫的
   workflow、結果與 exit code，以及連回那一筆 AI 日誌的 id 與 process token。
 - 結果比模型看到的更精確：stderr 超過上限時整組行程被終止，模型只看到
-  `tool failed (exit -9)`，紀錄則寫 `output_overflow`；`refused` 是工具根本沒執行
-  （停用、版本已換、身分不符）。
+  `tool failed (exit -9)`，紀錄則寫 `output_overflow`（工具在被終止前就以自己的 exit code
+  結束的，照實記成 `failed`）；`refused` 是工具根本沒執行（停用、版本已換、身分不符）；
+  `error` 是後端這一側失敗（已知秘密掃描、tools lock），模型收到的是
+  `tool execution failed: <型別>`。
 - **只有失敗的執行存內文**：參數（前 8,000 字）、stderr（最後 16,000 字，traceback
   的關鍵在最後）、stdout（前 4,000 字）。先在整段上遮蔽再截斷；讀出時再對當下的已知
   秘密遮一次。成功的執行只有中繼資料（AI 日誌不落地的理由對它們一樣成立）。

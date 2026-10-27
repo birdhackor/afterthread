@@ -41,7 +41,7 @@ from starlette.concurrency import run_in_threadpool
 
 from afterthread.config import get_settings
 from afterthread.services import llm_log
-from afterthread.services.llm import LlmTool, current_interaction
+from afterthread.services.llm import LlmTool, current_interaction, tool_exception_text
 
 # Under the "afterthread" namespace main attaches its console handler to. The one
 # line this module logs is a run record that could not be written -- its type
@@ -2976,16 +2976,20 @@ _TOOL_DISABLED_RESULT = "tool not run: this tool was disabled after it was offer
 # --- run records (web-v6 §6) -------------------------------------------------
 
 # How one call ended, as its run record states it. ``refused`` is the tool never
-# running (disabled, replaced, identity changed); every other non-ok value is a
-# way a tool that DID start can fail. ``output_overflow`` is the one the model's
-# string cannot tell apart: stderr past the cap kills the process group, so the
-# model sees ``tool failed (exit -9)`` -- the record says what really happened.
+# running (disabled, replaced, identity changed); ``error`` is the BACKEND failing
+# the call -- the secret scan behind the redaction, the tools lock -- whether or
+# not the tool had run, which the model reads as ``tool execution failed: <type>``.
+# Every other non-ok value is a way a tool that DID start can fail.
+# ``output_overflow`` is the one the model's string cannot tell apart: stderr past
+# the cap kills the process group, so the model sees ``tool failed (exit -9)`` --
+# the record says what really happened.
 RUN_OK = "ok"
 RUN_FAILED = "failed"
 RUN_OUTPUT_OVERFLOW = "output_overflow"
 RUN_TIMEOUT = "timeout"
 RUN_START_FAILED = "start_failed"
 RUN_REFUSED = "refused"
+RUN_ERROR = "error"
 
 
 @dataclass(frozen=True, slots=True)
@@ -3162,9 +3166,13 @@ def _run_tool_subprocess(
         # ``redact_known_secrets`` is: these are the same two calls it makes.
         secrets = _redaction_secrets()
         stderr = _mask_known_secrets(output.stderr, secrets)
+        # ``output_overflow`` only when the overflow KILL ended it: a tool that
+        # wrote past the cap and exited with its own code first is a plain failure
+        # (its code is what the model was told). Exit 0 never reaches here.
+        killed_for_output = output.stderr_overflow and proc.returncode == -signal.SIGKILL
         return ToolRunResult(
             f"tool failed (exit {proc.returncode}): {_cap_output(stderr.strip(), output_cap)}",
-            RUN_OUTPUT_OVERFLOW if output.stderr_overflow else RUN_FAILED,
+            RUN_OUTPUT_OVERFLOW if killed_for_output else RUN_FAILED,
             exit_code=proc.returncode,
             args=_mask_known_secrets(args_json, secrets),
             stdout=_mask_known_secrets(output.stdout, secrets),
@@ -3384,17 +3392,34 @@ def _make_handler(
         started = time.monotonic()
         owned_lock_fd: int | None = None
         try:
-            tools_lock_fd = request_lock_fd
-            if identity is not None and tools_lock_fd is None:
-                owned_lock_fd = await run_in_threadpool(acquire_shared_tools_lock)
-                tools_lock_fd = owned_lock_fd
-            if identity is None or tools_lock_fd is None:
-                result = ToolRunResult(_TOOL_REPLACED_RESULT, RUN_REFUSED)
-            else:
-                result = await _execute(arguments, tools_lock_fd)
+            try:
+                tools_lock_fd = request_lock_fd
+                if identity is not None and tools_lock_fd is None:
+                    owned_lock_fd = await run_in_threadpool(acquire_shared_tools_lock)
+                    tools_lock_fd = owned_lock_fd
+                # Timed from here: a direct caller may have waited for a destroyer
+                # to let go of the lock, and that wait is not the tool's duration.
+                started_at = datetime.now(UTC)
+                started = time.monotonic()
+                if identity is None or tools_lock_fd is None:
+                    result = ToolRunResult(_TOOL_REPLACED_RESULT, RUN_REFUSED)
+                else:
+                    result = await _execute(arguments, tools_lock_fd)
+            except Exception as exc:
+                # The call fails here and the llm loop turns the exception into
+                # ``tool_exception_text`` for the model; the record stores those
+                # same words, then the exception goes on unchanged (invariant F).
+                await _record_run(
+                    advertised,
+                    ToolRunResult(tool_exception_text(exc), RUN_ERROR),
+                    started_at=started_at,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                )
+                raise
             # Written while the shared lock is still held, so a delete (which
             # needs it exclusively, and clears the tool's records) cannot land
-            # between this run and its record.
+            # between this run and its record. The two refusals above hold no
+            # lock to write under -- and ran nothing.
             await _record_run(
                 advertised,
                 result,

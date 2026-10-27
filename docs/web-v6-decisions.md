@@ -210,3 +210,16 @@ C8 記錄的兩個行為變更：
 lifespan 接線與實際寫入檔案（`test_lifespan_wires_the_tool_run_recorder_and_unwires_it_on_exit`）。前端的判斷在
 `toolRuns.js`、`format.js`，各有 vitest；另用實際的瀏覽器跑過：列上的提示、展開詳情、寫入時沒遮到的
 秘密在讀出時被遮、單筆刪除後列表更新。
+
+### D43 附錄（P2a review r1，Fable）
+
+判定**已收斂**，沒有 P1／P2。逐條比對過的：F（13 種情境對改動前的程式逐字相同）、G、H、I、U、W、
+鎖與執行緒、ContextVar、前後端欄位、快取失效。五條 P3 全部處理：
+
+| # | finding | 處置 |
+|---|---|---|
+| E1 | `_execute` 拋例外時（非零 exit 後遮蔽用的秘密掃描失敗、tools lock 無法使用）不寫紀錄，與「每一次都記」不符 | **採納**。新增 outcome `error`：記下模型收到的同一句 `tool execution failed: <型別>`（抽成 `llm.tool_exception_text`，兩處共用一個拼法），不存內文，再把例外原樣拋出，交給模型的字串不變。不可一鍵修正（那是後端的問題，不是工具的）。測試 `test_a_call_the_backend_fails_is_recorded_as_error_and_still_raises` |
+| E2 | stderr 超過上限、但工具在被終止前以自己的 exit code 結束時，仍記成 `output_overflow`，畫面寫「被終止」 | **採納**。只有 exit code 是 `-SIGKILL` 才算 `output_overflow`，否則是 `failed`。測試 `test_stderr_overflow_that_exits_on_its_own_is_a_plain_failure` |
+| E3 | 什麼都沒印的失敗，詳情畫出空白的程式碼框 | **採納**。資料庫照存空字串（「沒有輸出」也是事實），畫面改寫「（沒有輸出）」 |
+| E4 | README 說事後才搬進 `.env` 的值「也看不到」，但設計 §6.2 已接受被截斷切開的片段；後端 README 說寫入都在共享鎖內，兩種早退的拒絕其實沒有鎖 | **採納**：兩處都改成精確的說法 |
+| E5 | 耗時從取得鎖之前算起，等破壞性操作放鎖的時間算進了工具耗時 | **採納**：改成取得鎖之後才開始計時 |

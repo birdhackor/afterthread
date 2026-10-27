@@ -248,7 +248,7 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 - `GET /api/tools/{name}/runs?limit=1..100`（預設 20）— 這個工具最近的執行紀錄，新的
   在前，**不含內文**（web-v6 §6）：每筆有時間、耗時、執行的 `vid` 與它現在的位置
   `vid_state`（`current`／`older`／`gone`——丟掉的版本紀錄仍在）、呼叫的 `workflow`、
-  `outcome`（`ok`／`failed`／`output_overflow`／`timeout`／`start_failed`／`refused`）、
+  `outcome`（`ok`／`failed`／`output_overflow`／`timeout`／`start_failed`／`refused`／`error`）、
   `exit_code`、`truncated`、AI 收到的字串開頭 `message`（非 `ok` 才有）、`has_details`，
   以及後端算好的 `fixable`（失敗、而且失敗的就是目前版本；前端不自己判斷）。
   `llm_log_id`／`llm_log_process` 連回造成這次呼叫的 AI 日誌；id 是前一個行程鑄的
@@ -385,7 +385,10 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   接上 `tool_runs.record`；測試的 client 不進 lifespan，所以不寫紀錄）。紀錄器有自己的
   engine 與 1.5 秒的 busy timeout，在自己的短 transaction 裡寫；任何失敗只留一行只含例外
   **型別**的 WARNING（資料庫錯誤的文字會帶 SQL 參數，也就是內文），工具結果照常回給模型。
-  寫入在共享鎖釋放之前完成，所以刪除工具（需要 exclusive）不會插在一次執行與它的紀錄之間。
+  寫入在共享鎖釋放之前完成，所以刪除工具（需要 exclusive）不會插在一次執行與它的紀錄之間
+  （兩種在取得鎖之前就拒絕的呼叫沒有鎖可持有，但它們什麼也沒執行）。呼叫在後端這一側拋出例外
+  （例如遮蔽用的已知秘密掃描失敗、tools lock 無法使用）也會記一筆 `error`，內容只有模型收到的
+  `tool execution failed: <型別>`，例外照樣往上拋。
   內文只在**啟動過而且失敗**的執行才有：先在整段文字上遮蔽（非零 exit 時與給模型的那份共用
   同一刻的已知秘密、同樣 fail-closed），再 `_utf8_safe`、再截斷；逾時與無法啟動兩條路徑的遮蔽
   只為紀錄而做，掃描失敗就不存內文，不影響呼叫。`workflow` 與 AI 日誌連結來自

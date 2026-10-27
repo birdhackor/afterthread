@@ -186,9 +186,15 @@ function ToolRunDetail({ name, run, expanded }) {
 					<Text size="xs" fw={600}>
 						{section.label}
 					</Text>
-					<Code block style={BODY_STYLE}>
-						{section.text}
-					</Code>
+					{section.empty ? (
+						<Text size="xs" c="dimmed">
+							（沒有輸出）
+						</Text>
+					) : (
+						<Code block style={BODY_STYLE}>
+							{section.text}
+						</Code>
+					)}
 				</Stack>
 			))}
 			<Group gap="sm">

@@ -196,7 +196,7 @@ class ToolRun(SQLModel, table=True):
     vid: str
     started_at: datetime = Field(default_factory=utcnow)
     duration_ms: int = 0
-    # ok | failed | output_overflow | timeout | start_failed | refused
+    # ok | failed | output_overflow | timeout | start_failed | refused | error
     outcome: str
     exit_code: int | None = None
     # stdout ran past the cap and the (successful) result was cut.

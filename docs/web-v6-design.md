@@ -202,7 +202,7 @@ migration。
 | `tool_name` | 套件名（索引） |
 | `vid` | **實際執行的版本**，也就是廣告時綁定的那一版 |
 | `started_at`、`duration_ms` | |
-| `outcome` | `ok`（stdout 超過上限而被截斷時另記 `truncated`）／`failed`（非零 exit）／`output_overflow`（stderr 超過上限，整組行程被終止）／`timeout`／`start_failed`／`refused`（停用、版本已換、身分不符：工具沒有執行） |
+| `outcome` | `ok`（stdout 超過上限而被截斷時另記 `truncated`）／`failed`（非零 exit）／`output_overflow`（stderr 超過上限，整組行程被終止）／`timeout`／`start_failed`／`refused`（停用、版本已換、身分不符：工具沒有執行）／`error`（後端這一側失敗，例如已知秘密掃描或 tools lock；P2a review 補上） |
 | `exit_code` | `failed` 才有 |
 | `workflow` | 呼叫來源：`capture`、`enrich`、`assist_update`……；後端自己執行的是 `health_check`（跑一次範例）與 `verify`（修正後自動驗證），見第 10 節 |
 | `check_id` | `health_check`／`verify` 那一批的 job id，用來推導驗證狀態（第 9 節）；其他為 null |

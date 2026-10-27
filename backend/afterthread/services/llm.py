@@ -704,6 +704,16 @@ def _assistant_tool_call_message(
     return cast(ChatCompletionMessageParam, message)
 
 
+def tool_exception_text(exc: BaseException) -> str:
+    """The tool result a handler's exception becomes: its category, never its text.
+
+    One spelling for the two places that need it: ``_invoke_tool_handler`` below,
+    which hands it to the model, and the tool run recorder, which stores the same
+    words for a call that raised (``tools._handler``).
+    """
+    return f"tool execution failed: {type(exc).__name__}"
+
+
 async def _invoke_tool_handler(tool: LlmTool, arguments_json: str) -> str:
     """Parse the model's arguments and run one tool handler, never raising.
 
@@ -729,7 +739,7 @@ async def _invoke_tool_handler(tool: LlmTool, arguments_json: str) -> str:
     try:
         result = await tool.handler(parsed)
     except Exception as exc:
-        return f"tool execution failed: {type(exc).__name__}"
+        return tool_exception_text(exc)
     return result if isinstance(result, str) else str(result)
 
 
