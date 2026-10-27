@@ -27,6 +27,7 @@ import { BulletList } from "../components/BulletList.jsx";
 import { CharCounter } from "../components/CharCounter.jsx";
 import { StaleBadge } from "../components/StaleBadge.jsx";
 import { StatusBadge } from "../components/StatusBadge.jsx";
+import { ToolFailureNotice } from "../components/ToolFailureNotice.jsx";
 import { LLM_NOT_CONFIGURED_NOTICE } from "../constants/labels.js";
 import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { usePageTitle } from "../hooks/usePageTitle.js";
@@ -39,7 +40,7 @@ const CAPTURE_MAX = SECTION_MAX_LENGTH;
 // questions render as a non-interactive bullet list the user should answer
 // soon; the primary button carries them into the detail page's AI 補齊 card.
 function CaptureResult({ result }) {
-	const { item, questions } = result;
+	const { item, questions, tool_failures: toolFailures } = result;
 	const detailTo = `/items/${item.id}`;
 	return (
 		<Card withBorder padding="md" radius="md">
@@ -51,6 +52,7 @@ function CaptureResult({ result }) {
 					<StatusBadge status={item.status} />
 					<StaleBadge stale={item.is_stale} />
 				</Group>
+				<ToolFailureNotice failures={toolFailures} />
 				<Divider />
 				{questions.length > 0 ? (
 					<Stack gap="xs" align="flex-start">

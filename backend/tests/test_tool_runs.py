@@ -31,6 +31,7 @@ from afterthread.db import get_session
 from afterthread.main import app
 from afterthread.models import SQLITE_MAX_INT, ToolRun
 from afterthread.services import llm, llm_log, tool_runs, tools
+from afterthread.services.llm import LLMUpstreamError
 from afterthread.services.tools import enabled_llm_tools, set_enabled
 
 _TEST_VID = "20260728T010203Z-abcdef"
@@ -1092,3 +1093,165 @@ def test_records_that_could_not_be_deleted_are_reported_and_stay_purgeable(
     assert (
         _purge(client, orphans_only=True, dry_run=False, max_id=preview["max_id"])["deleted"] == 1
     )
+
+
+# --- P4: failures beside the AI result (web-v6 §8.2, invariant Q) ------------------
+
+_CAPTURE_DRAFT: dict[str, Any] = {
+    "title": "t",
+    "snapshot": "s",
+    "why_matters": "w",
+    "known": "",
+    "inferred": "",
+    "unknown": "",
+    "next_actions": "",
+    "recovery_keywords": "",
+    "recovery_people": "",
+    "recovery_files": "",
+    "resume_trigger": "",
+    "tags": [],
+    "suggested_status": "needs-enrichment",
+    "questions": [],
+}
+
+
+def _model_calls_every_tool(
+    monkeypatch: pytest.MonkeyPatch, *, then_raise: Exception | None = None
+) -> None:
+    """A capture model that calls each advertised tool once, then answers (or fails)."""
+
+    async def _fake(system: str, user: str, model_cls: type[BaseModel], **kwargs: Any) -> Any:
+        for tool in kwargs.get("tools") or []:
+            await tool.handler({"q": "x"})
+        if then_raise is not None:
+            raise then_raise
+        return model_cls.model_validate(_CAPTURE_DRAFT)
+
+    monkeypatch.setattr("afterthread.services.memory_ai.generate_structured", _fake)
+
+
+def _two_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    root = tmp_path / "tools"
+    _make_tool(root, "boom", "import sys\nsys.stderr.write('bad')\nsys.exit(1)\n")
+    _make_tool(root, "fine", "print('ok')\n")
+    _install_tools(monkeypatch, root)
+    return root
+
+
+def test_capture_reports_the_tool_that_failed_beside_its_result(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stored: Callable[[], list[ToolRun]],
+) -> None:
+    _two_tools(monkeypatch, tmp_path)
+    _model_calls_every_tool(monkeypatch)
+
+    response = client.post("/api/capture", json={"raw_text": "raw"})
+
+    assert response.status_code == 201
+    failed = [row for row in stored() if row.outcome == tools.RUN_FAILED]
+    assert response.json()["tool_failures"] == [
+        {
+            "run_id": failed[0].id,
+            "tool_name": "boom",
+            "vid": _TEST_VID,
+            "outcome": "failed",
+            "recorded": True,
+        }
+    ]
+
+
+def test_a_failure_whose_record_was_not_written_is_still_reported(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Q: ``recorded: false`` -- the page then offers only a link."""
+    _two_tools(monkeypatch, tmp_path)
+    _model_calls_every_tool(monkeypatch)
+
+    def _broken(_run: tools.ToolRunRecord) -> int:
+        raise RuntimeError("database is locked")
+
+    tools.set_run_recorder(_broken)
+    body = client.post("/api/capture", json={"raw_text": "raw"}).json()
+
+    assert body["tool_failures"] == [
+        {
+            "run_id": None,
+            "tool_name": "boom",
+            "vid": _TEST_VID,
+            "outcome": "failed",
+            "recorded": False,
+        }
+    ]
+
+
+def test_a_request_that_ends_in_502_still_records_its_tool_failure(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stored: Callable[[], list[ToolRun]],
+) -> None:
+    """Q: no response to carry it, but the 工具 page will show it."""
+    _two_tools(monkeypatch, tmp_path)
+    _model_calls_every_tool(monkeypatch, then_raise=LLMUpstreamError("Timeout: upstream"))
+
+    response = client.post("/api/capture", json={"raw_text": "raw"})
+
+    assert response.status_code == 502
+    assert [row.outcome for row in stored() if row.tool_name == "boom"] == [tools.RUN_FAILED]
+
+
+def test_concurrent_requests_each_collect_only_their_own_failures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, records: list[tools.ToolRunRecord]
+) -> None:
+    """Q: the collector is per request task, never shared."""
+    root = tmp_path / "tools"
+    _make_tool(root, "boom-a", "import sys\nsys.exit(2)\n")
+    _make_tool(root, "boom-b", "import sys\nsys.exit(3)\n")
+    _install_tools(monkeypatch, root)
+    by_name = {tool.spec["function"]["name"]: tool for tool in enabled_llm_tools()}
+
+    async def _request(name: str) -> list[tools.ToolFailure]:
+        with tools.collect_tool_failures() as failures:
+            for _ in range(3):
+                await by_name[name].handler({})
+                await asyncio.sleep(0.01)  # let the other request interleave
+            return list(failures)
+
+    async def _both() -> tuple[list[tools.ToolFailure], list[tools.ToolFailure]]:
+        first, second = await asyncio.gather(_request("boom-a"), _request("boom-b"))
+        return first, second
+
+    first, second = asyncio.run(_both())
+
+    assert {failure.tool_name for failure in first} == {"boom-a"}
+    assert {failure.tool_name for failure in second} == {"boom-b"}
+    assert len(first) == len(second) == 3
+    assert tools._REQUEST_TOOL_FAILURES.get() is None
+
+
+def test_successes_refusals_and_backend_errors_are_not_reported_as_tool_failures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, records: list[tools.ToolRunRecord]
+) -> None:
+    root = tmp_path / "tools"
+    _make_tool(root, "fine", "print('ok')\n")
+    _install_tools(monkeypatch, root)
+    [tool] = enabled_llm_tools()
+
+    def _broken_scan() -> frozenset[str]:
+        raise OSError("tools directory unreadable")
+
+    async def _request() -> list[tools.ToolFailure]:
+        with tools.collect_tool_failures() as failures:
+            await tool.handler({})
+            set_enabled("fine", False)
+            await tool.handler({})
+            set_enabled("fine", True)
+            monkeypatch.setattr(tools, "known_secret_values", _broken_scan)
+            with pytest.raises(OSError):
+                await tool.handler({})
+            return list(failures)
+
+    assert asyncio.run(_request()) == []
+    assert [run.outcome for run in records] == [tools.RUN_OK, tools.RUN_REFUSED, tools.RUN_ERROR]

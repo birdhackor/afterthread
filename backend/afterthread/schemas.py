@@ -333,11 +333,33 @@ class CaptureRequest(BaseModel):
         return _stripped_non_empty(value, "raw_text")
 
 
+class ToolFailureEntry(BaseModel):
+    """One installed tool that failed during this AI request (web-v6 §8.2).
+
+    Reported beside the result so the failure is seen where it happened.
+    ``recorded`` is false when its run record could not be written -- then
+    ``run_id`` is null and only a link to the 工具 page can be offered. ``vid``
+    is the version that ran; the page compares it with the tool's current one
+    before offering a fix, since it does not know that version itself.
+    """
+
+    run_id: int | None
+    tool_name: str
+    vid: str
+    outcome: Literal["failed", "output_overflow", "timeout", "start_failed"]
+    recorded: bool
+
+
 class CaptureResponse(BaseModel):
-    """AI quick-capture result: the created item plus follow-up questions."""
+    """AI quick-capture result: the created item plus follow-up questions.
+
+    ``tool_failures`` lists the installed tools that failed during this request
+    (web-v6 §8.2); empty when none did.
+    """
 
     item: MemoryItemRead
     questions: list[str]
+    tool_failures: list[ToolFailureEntry] = Field(default_factory=list)
 
 
 class EnrichRequest(BaseModel):
@@ -352,10 +374,14 @@ class EnrichRequest(BaseModel):
 
 
 class EnrichResponse(BaseModel):
-    """AI enrichment result: the updated item plus remaining checklist gaps."""
+    """AI enrichment result: the updated item plus remaining checklist gaps.
+
+    ``tool_failures`` as on ``CaptureResponse``.
+    """
 
     item: MemoryItemRead
     gaps: list[str]
+    tool_failures: list[ToolFailureEntry] = Field(default_factory=list)
 
 
 class AssistUpdateRequest(BaseModel):
@@ -370,9 +396,13 @@ class AssistUpdateRequest(BaseModel):
 
 
 class AssistUpdateResponse(BaseModel):
-    """AI assisted-update result: the updated item."""
+    """AI assisted-update result: the updated item.
+
+    ``tool_failures`` as on ``CaptureResponse``.
+    """
 
     item: MemoryItemRead
+    tool_failures: list[ToolFailureEntry] = Field(default_factory=list)
 
 
 # --- LLM interaction log (see afterthread.services.llm_log) --------------

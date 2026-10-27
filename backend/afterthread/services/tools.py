@@ -2991,6 +2991,11 @@ RUN_START_FAILED = "start_failed"
 RUN_REFUSED = "refused"
 RUN_ERROR = "error"
 
+# The outcomes a fix of the tool's code can address: it started and failed. The
+# one-click fix is offered for these alone (web-v6 §8.5), and they are what an
+# AI request reports beside its result (§8.2).
+RUN_FAILURE_OUTCOMES = frozenset({RUN_FAILED, RUN_OUTPUT_OVERFLOW, RUN_TIMEOUT, RUN_START_FAILED})
+
 
 @dataclass(frozen=True, slots=True)
 class ToolRunResult:
@@ -3031,6 +3036,42 @@ class ToolRunRecord:
     args: str | None
     stdout: str | None
     stderr: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolFailure:
+    """One failed call of an installed tool during the current AI request (web-v6 §8.2).
+
+    ``run_id`` is its run record, or None when the record was not written --
+    the failure is reported either way, and the page then offers only a link.
+    """
+
+    run_id: int | None
+    tool_name: str
+    vid: str
+    outcome: str
+
+
+# The failures of the AI request running in this context, collected for its
+# response (``collect_tool_failures``). None outside such a request: a direct
+# service caller collects nothing. A ContextVar rather than a parameter for the
+# reason ``llm._CURRENT_INTERACTION`` is one: the handler signature is fixed, and
+# the handlers run in the request's own task, so two concurrent requests each
+# see only their own list (invariant Q).
+_REQUEST_TOOL_FAILURES: ContextVar[list[ToolFailure] | None] = ContextVar(
+    "_REQUEST_TOOL_FAILURES", default=None
+)
+
+
+@contextlib.contextmanager
+def collect_tool_failures() -> Iterator[list[ToolFailure]]:
+    """Collect this context's tool failures into the yielded list."""
+    failures: list[ToolFailure] = []
+    token = _REQUEST_TOOL_FAILURES.set(failures)
+    try:
+        yield failures
+    finally:
+        _REQUEST_TOOL_FAILURES.reset(token)
 
 
 # The run recorder, injected by main (``tool_runs.record``) exactly as llm_log's
@@ -3305,7 +3346,27 @@ async def _record_run(
     tool's result goes back to the model unchanged. A failure leaves one WARNING
     line naming only the exception's type: a database error's text carries the
     statement and its parameters, which here are the run's bodies.
+
+    A failure of the tool also goes to the current request's collector, if
+    there is one -- whether or not its record was written (web-v6 §8.2).
     """
+    run_id = await _write_record(advertised, result, started_at=started_at, duration_ms=duration_ms)
+    failures = _REQUEST_TOOL_FAILURES.get()
+    if failures is not None and result.outcome in RUN_FAILURE_OUTCOMES:
+        failures.append(
+            ToolFailure(
+                run_id=run_id,
+                tool_name=advertised.package_root.path.name,
+                vid=advertised.vid,
+                outcome=result.outcome,
+            )
+        )
+    return run_id
+
+
+async def _write_record(
+    advertised: Resolved, result: ToolRunResult, *, started_at: datetime, duration_ms: int
+) -> int | None:
     recorder = _run_recorder
     if recorder is None:
         return None

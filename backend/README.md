@@ -138,6 +138,12 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
   工具名單）；記錄已被環狀緩衝擠出（見 `LLM_LOG_MAX_ENTRIES`）或程序重啟過則
   404。
 
+`capture`／`enrich`／`assist-update` 的成功回應都另帶 `tool_failures`（web-v6 §8.2）：這次請求
+裡失敗的已安裝工具呼叫（`failed`／`output_overflow`／`timeout`／`start_failed`；被拒與後端錯誤不算），
+每筆 `{run_id, tool_name, vid, outcome, recorded}`。收集器放在每個廣告工具的請求都會經過的
+`_advertised_tools_lock` 裡（ContextVar，每個請求各自一份）；紀錄沒寫成的失敗照樣列出，
+`recorded: false`、`run_id: null`。LLM 失敗回 502 時沒有回應可放，但紀錄照樣寫進資料庫。
+
 AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 `502 llm_upstream_error`（上游呼叫失敗或輸出無法解析，即使重試一次後仍失敗）、
 `409 conflict`（enrich／assist-update 於 LLM 呼叫期間，項目被別的請求改動——樂觀

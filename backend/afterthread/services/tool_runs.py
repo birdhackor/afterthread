@@ -148,10 +148,9 @@ def record(run: tools.ToolRunRecord, *, engine: Engine | None = None) -> int | N
 # --- reads ----------------------------------------------------------------
 
 # The outcomes a one-click fix is offered for (web-v6 §8.5): the tool started and
-# failed. ``refused`` never ran, so there is nothing for the builder to fix.
-FIXABLE_OUTCOMES = frozenset(
-    {tools.RUN_FAILED, tools.RUN_OUTPUT_OVERFLOW, tools.RUN_TIMEOUT, tools.RUN_START_FAILED}
-)
+# failed. ``refused`` never ran and ``error`` is the backend's own failure, so
+# neither leaves anything for the builder to fix.
+FIXABLE_OUTCOMES = tools.RUN_FAILURE_OUTCOMES
 
 
 def is_fixable(outcome: str, vid: str, current_vid: str | None) -> bool:

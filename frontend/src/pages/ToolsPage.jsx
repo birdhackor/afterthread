@@ -21,7 +21,7 @@ import {
 import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link } from "@tanstack/react-router";
+import { Link, useSearch } from "@tanstack/react-router";
 import { useCallback, useEffect, useState } from "react";
 import { Controller, useForm } from "react-hook-form";
 import { apiDelete, apiGet, apiPatch, apiPost } from "../api/client.js";
@@ -811,7 +811,11 @@ function ToolRow({
 
 // The 已安裝工具 tab: list + enable toggle + delete (confirm modal) + each
 // row's AI-summary panel (D40: regenerate / revise).
-function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
+function InstalledToolsPanel({
+	externalBusy = false,
+	onBusyChange,
+	linkedJobId = null,
+}) {
 	const queryClient = useQueryClient();
 	const [deleteTarget, setDeleteTarget] = useState(null);
 	const [discardTarget, setDiscardTarget] = useState(null);
@@ -1169,6 +1173,56 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 		errorStatus: jobQuery.error?.status,
 	});
 
+	// A job started ELSEWHERE and linked here as /tools?job=<id> (web-v6 §8.2,
+	// §9): a fix requested beside a capture / enrich / assist-update result. It
+	// gets its own card, holds the same busy gate as a local job while it is
+	// live, and once it ends re-reads that tool by NAME (revalidateSummaryAndList)
+	// -- it never writes a vid-keyed cache entry, so the v5 version-identity
+	// rules (invariants H, J) are untouched. A job this panel already tracks as
+	// its own is not followed twice.
+	const followedJobId =
+		linkedJobId !== null && linkedJobId !== activeJob?.jobId
+			? linkedJobId
+			: null;
+	const linkedJobQuery = useQuery({
+		queryKey: ["tool-job", followedJobId],
+		queryFn: () => apiGet(`/api/tools/jobs/${followedJobId}`),
+		enabled: toolJobQueryEnabled(followedJobId),
+		refetchInterval: toolJobRefetchInterval,
+	});
+	const linkedJob = linkedJobQuery.data;
+	const linkedJobActive = isToolJobActive({
+		jobId: followedJobId,
+		state: linkedJob?.state,
+		errorStatus: linkedJobQuery.error?.status,
+	});
+	const linkedJobEnded =
+		followedJobId !== null &&
+		(isTerminalToolJobState(linkedJob?.state) ||
+			linkedJobQuery.error?.status === 404);
+	// Derived like settlingJobEnd above, for the same two reasons (R9-1/R9-2).
+	const [settledLinkedJobId, setSettledLinkedJobId] = useState(null);
+	const settlingLinkedJobEnd =
+		linkedJobEnded && settledLinkedJobId !== followedJobId;
+	useEffect(() => {
+		if (!linkedJobEnded || settledLinkedJobId === followedJobId) {
+			return;
+		}
+		const endedJobId = followedJobId;
+		const name = linkedJob?.tool_name;
+		(name
+			? revalidateSummaryAndList(name)
+			: queryClient.invalidateQueries({ queryKey: ["tools"] })
+		).finally(() => setSettledLinkedJobId(endedJobId));
+	}, [
+		linkedJobEnded,
+		settledLinkedJobId,
+		followedJobId,
+		linkedJob?.tool_name,
+		revalidateSummaryAndList,
+		queryClient,
+	]);
+
 	// Any control that would race the backend's single global tool-job slot
 	// (D40: install, revise, and a synchronous regenerate all contend for the
 	// SAME `_JOBS`/`_SYNC_OPS` admission -- see the R7-3 addendum in
@@ -1206,7 +1260,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	const ownBusy = ownSummaryBusy({
 		regeneratePending: regenerateMutation.isPending,
 		revisePending: reviseMutation.isPending,
-		reviseJobActive,
+		reviseJobActive: reviseJobActive || linkedJobActive,
 	});
 	const summaryBusy = ownBusy || externalBusy;
 
@@ -1252,7 +1306,11 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	// reversible or confirmed, and neither carries content authored against one
 	// specific instance the way a revise draft does.
 	const versionWritesBlocked =
-		summaryBusy || staleList || isFetching || settlingJobEnd;
+		summaryBusy ||
+		staleList ||
+		isFetching ||
+		settlingJobEnd ||
+		settlingLinkedJobEnd;
 
 	// The INSTANCE the tracked revise job was submitted against -- the same
 	// identity string the rows are keyed by, captured from the same
@@ -1306,6 +1364,21 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 					重新整理
 				</Button>
 			</Group>
+
+			{followedJobId !== null ? (
+				<Stack gap={4}>
+					<Text size="sm" fw={600}>
+						{linkedJob?.tool_name
+							? `從其他頁面請 AI 修正的工具「${linkedJob.tool_name}」`
+							: "從其他頁面發起的 AI 修正"}
+					</Text>
+					<ToolJobProgress
+						kind="revise"
+						jobId={followedJobId}
+						jobQuery={linkedJobQuery}
+					/>
+				</Stack>
+			) : null}
 
 			{externalBusy ? (
 				<Alert color="orange" title="請稍候">
@@ -1892,6 +1965,8 @@ function InstallPanel({ externalBusy = false, onBusyChange }) {
 // is showing.
 export function ToolsPage() {
 	usePageTitle("工具");
+	// /tools?job=<id> (validated by the route's toolsJobSearch).
+	const { job: linkedJobId = null } = useSearch({ from: "/tools" });
 
 	// D40's backend job table (`_JOBS`/`_SYNC_OPS`) is ONE global single-flight
 	// shared by an install job, a revise job, AND a synchronous regenerate --
@@ -1950,6 +2025,7 @@ export function ToolsPage() {
 					<InstalledToolsPanel
 						externalBusy={installBusy}
 						onBusyChange={setSummaryBusy}
+						linkedJobId={linkedJobId}
 					/>
 				</Tabs.Panel>
 				<Tabs.Panel value="install" pt="md">

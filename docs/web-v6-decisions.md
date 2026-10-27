@@ -360,3 +360,41 @@ UTC 再比）、stats 的 SQL、孤兒判斷與別名、P2a-r1 的 `error` 路�
 `test_truncate_tail_to_bounds`、`test_failing_run_text_names_another_version_without_guessing_its_age`、
 `test_failing_run_text_explains_a_backend_error`；`test_tool_runs.py` 的單筆路由與 purge 驗證各加上超出範圍的
 422。
+
+## D46（P4）：AI 結果旁的修正入口
+
+範圍是設計 §8.2 的第三個入口，以及從 P3 移過來的 `/tools?job=<id>`。下面是實作時才定下的細節。
+
+### 後端
+
+- 收集器是 `tools.collect_tool_failures()`（ContextVar），由 `routers/ai.py` 的
+  `_advertised_tools_lock` 一起開：每個會廣告工具的請求都經過它，沒有路由能呼叫工具卻不收集。
+  `_record_run` 在寫完紀錄之後把失敗加進目前的收集器；不在 AI 請求裡（直接呼叫服務、P5 的驗證）
+  就沒有收集器，什麼都不加。
+- 只收**可修的四種**（`tools.RUN_FAILURE_OUTCOMES`，也就是 P2a 的 `FIXABLE_OUTCOMES` 的出處，
+  現在兩邊共用一個集合）。`refused` 沒有執行、`error` 是後端的問題，放在 AI 結果旁只會讓人去修
+  一個沒壞的工具；它們照樣在工具頁的執行紀錄裡。
+- 紀錄沒寫成的失敗照樣列出（`recorded: false`），前端只給連結。
+
+### 前端
+
+- 提醒以**工具**為單位：一次請求可能呼叫好幾個工具，而一次修訂只能修一個工具。每組附上那個工具
+  這次已寫成紀錄的失敗，最多最新 3 筆。
+- 按下時用 `fetchQuery`（`staleTime: 0`）重讀工具清單再判斷：版本相同才送出；不同、工具不見了、
+  或沒有紀錄時不送，只說明原因。`409 version_mismatch` 重讀一次再判斷，第二次就照實說；
+  `job_busy`、`env_policy`、`run_not_found` 各有說明。
+- `/tools?job=<id>`：路由的 `validateSearch` 只接受 32 位小寫十六進位，其他值丟掉。工具頁的
+  「已安裝工具」上方顯示那個工作的卡片；進行中時加入寫入閘（與本頁發起的工作相同），結束後
+  以工具**名稱**重新讀取清單、總結與執行紀錄，不寫任何以 vid 為 key 的快取。本頁自己追蹤的工作
+  不重複顯示。工作被逐出或後端重啟時沿用既有的「找不到這個修訂工作」文案。
+
+### 驗收
+
+| 不變量 | 測試（`tests/test_tool_runs.py`） |
+|---|---|
+| Q | `test_capture_reports_the_tool_that_failed_beside_its_result`、`test_a_failure_whose_record_was_not_written_is_still_reported`、`test_a_request_that_ends_in_502_still_records_its_tool_failure`、`test_concurrent_requests_each_collect_only_their_own_failures`、`test_successes_refusals_and_backend_errors_are_not_reported_as_tool_failures` |
+
+前端的分組、判斷與文字在 `toolFailures.js`（含 `/tools?job=` 的驗證），有 vitest。另用實際的瀏覽器
+跑過整條路：e2e 的 mock LLM（`#variant:tool_roundtrip`）讓快速捕捉呼叫一個會失敗的工具，結果旁
+出現提醒，按「請 AI 修正」送出修訂，「到工具頁看進度」開啟 `/tools?job=<id>`，卡片接上那個工作
+並顯示結局。
