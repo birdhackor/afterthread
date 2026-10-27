@@ -140,7 +140,9 @@ export function verificationView(verification) {
 				total,
 				reason: verification.budget_exhausted
 					? "budget"
-					: runs.some((run) => run.outcome === "stopped")
+					: runs.some(
+								(run) => run.outcome === "stopped" || run.outcome === "refused",
+							)
 						? "interrupted"
 						: null,
 			}),

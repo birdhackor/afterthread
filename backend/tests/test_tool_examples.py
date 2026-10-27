@@ -10,6 +10,7 @@ while a check runs, delete and discard are refused and touch nothing.
 import asyncio
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -436,6 +437,9 @@ def test_verification_state_follows_the_newest_batch_of_the_current_version(
     (package / "versions" / _VID / "examples.json").write_text(
         json.dumps(_examples("a", "b", "c")), encoding="utf-8"
     )
+    # Final review K2: the old failure was against 2 examples, not these 3.
+    changed = state()
+    assert (changed["state"], changed["reason"]) == ("incomplete", "examples_changed")
     _check("kb", check_id="second", budget_seconds=60.0)
     passed = state()
     assert (passed["state"], passed["passed"], passed["ran"]) == ("passed", 3, 3)
@@ -540,6 +544,59 @@ def test_a_tool_switched_off_mid_check_stops_the_rest_and_is_not_a_failure(
     assert tools.set_enabled("kb", True)
     state = client.get("/api/tools/kb/runs").json()["verification"]
     assert (state["state"], state["reason"], state["ran"]) == ("incomplete", "interrupted", 1)
+
+
+def test_a_refusal_of_the_last_example_still_reads_as_interrupted(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stored: Callable[[], list[ToolRun]],
+) -> None:
+    """Final review K1: no ``stopped`` row follows the last example, yet it was cut."""
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n", examples=_examples("a", "b"))
+    _settings(monkeypatch, root)
+
+    def _switch_off(partial_result: tools.CheckResult) -> None:
+        if len(partial_result.results) == 1:
+            assert tools.set_enabled("kb", False)
+
+    result = _check("kb", on_progress=_switch_off)
+
+    assert [example.outcome for example in result.results] == ["ok", "refused"]
+    assert result.stopped == "interrupted"
+    assert tools.set_enabled("kb", True)
+    state = client.get("/api/tools/kb/runs").json()["verification"]
+    assert (state["state"], state["reason"]) == ("incomplete", "interrupted")
+
+
+def test_the_orphan_purge_also_drops_the_verdicts_of_tools_that_are_gone(
+    client: TestClient,
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stored: Callable[[], list[ToolRun]],
+) -> None:
+    """Final review K3: where a failed tool delete sends the operator, verdicts too.
+
+    Only the orphan scope, and only gone tools: a live tool's verdict is never
+    touched by a purge (J1).
+    """
+    root = tmp_path / "tools"
+    gone = _make_tool(root, "gone", "print('x')\n", examples=_examples("a"))
+    _make_tool(root, "kept", "print('x')\n", examples=_examples("a"))
+    _settings(monkeypatch, root)
+    _check("gone", check_id="gone-check")
+    _check("kept", check_id="kept-check")
+    shutil.rmtree(gone)  # removed outside the app: its records are orphans
+
+    preview = client.post("/api/tool-runs/purge", json={"orphans_only": True}).json()
+    assert preview["matched"] == 1
+    confirm = {"orphans_only": True, "dry_run": False, "max_id": preview["max_id"]}
+    assert client.post("/api/tool-runs/purge", json=confirm).json()["deleted"] == 1
+
+    session.expire_all()
+    assert [row.check_id for row in session.exec(select(ToolCheck))] == ["kept-check"]
 
 
 def test_a_budget_cut_reads_as_incomplete_for_lack_of_budget(

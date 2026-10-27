@@ -3582,7 +3582,18 @@ def _make_handler(
                 await run_in_threadpool(release_tools_lock, owned_lock_fd)
 
     async def _handler(arguments: dict[str, Any]) -> str:
-        call_lock_fd = os.dup(request_lock_fd) if request_lock_fd is not None else None
+        try:
+            call_lock_fd = os.dup(request_lock_fd) if request_lock_fd is not None else None
+        except OSError as exc:
+            # The backend failing the call before it began (EMFILE): recorded
+            # like every other backend failure, then raised for the llm loop.
+            await _record_run(
+                advertised,
+                ToolRunResult(tool_exception_text(exc), RUN_ERROR),
+                started_at=datetime.now(UTC),
+                duration_ms=0,
+            )
+            raise
         try:
             task = asyncio.ensure_future(_call(arguments, call_lock_fd))
         except BaseException:
@@ -3724,10 +3735,14 @@ class CheckResult:
 
     @property
     def stopped(self) -> str | None:
-        """Why the run ended short of the list, if not by a failure: see ToolCheck."""
+        """Why the run ended short of the list, if not by a failure: see ToolCheck.
+
+        Interrupted by a refusal wherever it fell -- the last example refused
+        leaves no ``stopped`` row behind it, yet the check was cut all the same.
+        """
         if self.budget_exhausted:
             return "budget"
-        if any(result.outcome == EXAMPLE_STOPPED for result in self.results):
+        if any(result.outcome in (RUN_REFUSED, EXAMPLE_STOPPED) for result in self.results):
             return "interrupted"
         return None
 

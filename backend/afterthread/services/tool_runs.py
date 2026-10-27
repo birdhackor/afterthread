@@ -426,29 +426,58 @@ def purge(
     after the operator saw the count -- another tab's tool call failing in
     between -- is never swept along with it (invariant J). Ids only grow
     (AUTOINCREMENT), which is what makes the bound exact.
+
+    The orphan scope also drops the verdicts (``tool_check``) of tools that no
+    longer exist: a tool's delete normally removes them with its records, and
+    when that failed this scope is where the operator is sent (``delete_for_tool``).
+    They are not counted -- they are not records, and nothing shows them once
+    their tool is gone.
     """
     conditions = _conditions(session, scope)
-    if conditions is None:
-        return {"matched": 0, "deleted": 0, "max_id": None}
     if dry_run:
+        if conditions is None:
+            return {"matched": 0, "deleted": 0, "max_id": None}
         matched, highest = session.exec(
             select(func.count(), func.max(ToolRun.id)).where(*conditions)
         ).one()
         return {"matched": int(matched), "deleted": 0, "max_id": highest}
-    if max_id is None:
-        raise ValueError("a purge that deletes needs the max_id of its preview")
-    # synchronize_session=False: the session is the request's, and the default
-    # ("evaluate") would re-run this WHERE in Python over every ToolRun it holds
-    # -- comparing their aware ``started_at`` with the naive cutoff raises.
-    # Nothing in these sessions needs syncing, and ``rowcount`` is unaffected.
-    result = session.exec(
-        sql_delete(ToolRun)
-        .where(*conditions, col(ToolRun.id) <= max_id)
-        .execution_options(synchronize_session=False)
-    )
+    deleted = 0
+    if conditions is not None:
+        if max_id is None:
+            raise ValueError("a purge that deletes needs the max_id of its preview")
+        # synchronize_session=False: the session is the request's, and the default
+        # ("evaluate") would re-run this WHERE in Python over every ToolRun it holds
+        # -- comparing their aware ``started_at`` with the naive cutoff raises.
+        # Nothing in these sessions needs syncing, and ``rowcount`` is unaffected.
+        result = session.exec(
+            sql_delete(ToolRun)
+            .where(*conditions, col(ToolRun.id) <= max_id)
+            .execution_options(synchronize_session=False)
+        )
+        deleted = int(result.rowcount or 0)
+    if scope.orphans_only:
+        _delete_gone_verdicts(session)
     session.commit()
-    deleted = int(result.rowcount or 0)
     return {"matched": deleted, "deleted": deleted, "max_id": max_id}
+
+
+def _delete_gone_verdicts(session: Session) -> None:
+    """Delete the verdicts of every tool whose package no longer exists.
+
+    The same reading of "gone" as ``orphan_names``, over the verdicts' own
+    names: nothing at all while the tools directory is unset or missing.
+    """
+    base = tools.tools_dir()
+    if base is None or not base.is_dir():
+        return
+    names = session.exec(select(ToolCheck.tool_name).distinct()).all()
+    gone = [name for name in names if tools._resolve_package_dir_no_alias(name) is None]
+    if gone:
+        session.exec(
+            sql_delete(ToolCheck)
+            .where(col(ToolCheck.tool_name).in_(gone))
+            .execution_options(synchronize_session=False)
+        )
 
 
 def stats(session: Session) -> dict[str, Any]:
@@ -490,10 +519,11 @@ def verification_state(
     States: ``no_version``, ``examples_invalid``, ``no_examples``, ``never`` (has
     examples, never checked), ``failed`` (the tool failed at least one), ``passed``
     (every example the file lists now passed), ``incomplete`` -- with ``reason``
-    ``budget`` (the time budget ran out), ``interrupted`` (the tool was switched
-    off or replaced mid-run), ``examples_changed`` (the file lists a different
-    number of examples than the check ran against: versions are immutable, so
-    only a hand edit does that), or none (an example the backend itself failed).
+    ``examples_changed`` (the file lists a different number of examples than the
+    check ran against, which outranks its result: versions are immutable, so
+    only a hand edit does that), ``budget`` (the time budget ran out),
+    ``interrupted`` (the tool was switched off or replaced mid-run), or none (an
+    example the backend itself failed).
     """
     if current is None:
         return {"state": "no_version"}
@@ -512,10 +542,12 @@ def verification_state(
     if newest is None:
         return {"state": "never", "total": total}
     reason: str | None = None
-    if newest.failed > 0:
-        state = "failed"
-    elif newest.total != total:
+    # A check of another example list says nothing about this one -- not even
+    # a failure, whose counts would be read against the wrong total.
+    if newest.total != total:
         state, reason = "incomplete", "examples_changed"
+    elif newest.failed > 0:
+        state = "failed"
     elif newest.passed == total:
         state = "passed"
     else:

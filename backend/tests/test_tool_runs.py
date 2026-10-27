@@ -397,6 +397,36 @@ def test_a_call_cut_off_by_the_interaction_deadline_still_ends_and_is_recorded(
         assert free is True
 
 
+def test_a_call_that_cannot_take_its_lock_reference_is_recorded_as_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, records: list[tools.ToolRunRecord]
+) -> None:
+    """Final review K4: the backend failing a call before it began is recorded too."""
+    root = tmp_path / "tools"
+    _make_tool(root, "fine", "print('ok')\n")
+    _install_tools(monkeypatch, root)
+
+    def _no_descriptors(_fd: int) -> int:
+        raise OSError(24, "Too many open files")
+
+    async def _request() -> None:
+        fd = tools.acquire_shared_tools_lock()
+        try:
+            with tools.bind_request_tools_lock(fd):
+                [tool] = enabled_llm_tools()
+            # Patched only around the call: ``tools.os`` is the os module itself.
+            with monkeypatch.context() as patched, pytest.raises(OSError):
+                patched.setattr(tools.os, "dup", _no_descriptors)
+                await tool.handler({})
+        finally:
+            tools.release_tools_lock(fd)
+
+    asyncio.run(_request())
+
+    [run] = records
+    assert (run.tool_name, run.outcome) == ("fine", tools.RUN_ERROR)
+    assert run.message == "tool execution failed: OSError"
+
+
 def test_stderr_overflow_that_exits_on_its_own_is_a_plain_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, records: list[tools.ToolRunRecord]
 ) -> None:

@@ -45,8 +45,9 @@ identity。模型可能幾分鐘後才真的呼叫；若那時 `current` 已從 
 
 1. 把 arguments JSON 解析成物件；失敗就回固定錯誤文字，不啟動工具。
 2. （**沒有執行登記**。工具目錄的共享鎖在送出工具清單之前就已取得、並由這次請求持有到
-   結束，而子行程會**繼承**它，所以刪除與 discard 在鎖被釋放之前根本進不來——不需要登記
-   誰正在執行。）
+   結束；每次呼叫另外持有一份自己的參照（`os.dup`），子行程也會**繼承**它，所以刪除與
+   discard 在所有參照都關掉之前根本進不來——不需要登記誰正在執行。請求在期限結束時，
+   還在跑的那次呼叫照樣跑完、寫紀錄，才關掉自己的參照。）
 3. 重驗該版 `tool.json` identity；操作者若在廣告後手改 manifest，這次呼叫保守拒絕。
 4. 讀 package-level `.afterthread.meta/state.json`。缺席、foreign、unreadable 都
    fail closed；沒有 `tool.json.enabled` fallback。
@@ -89,9 +90,10 @@ identity。模型可能幾分鐘後才真的呼叫；若那時 `current` 已從 
   arguments 與同則文字的總量上限 256 KiB，擋的是「數量合法但單一參數巨大」。
 - **對話總量**：`LLM_TOOL_CONVERSATION_BUDGET_TOKENS` 以模型回報的
   `prompt_tokens` 動態估算字元／token 比，控制多輪工具結果累積。
-- **deadline 不啟動新工作**：剩餘時間不超過一秒就不再啟動工具。threadpool 裡已經
-  跑的 subprocess 不能由 asyncio timeout 強制打斷；這條規則把最壞延遲限制成
-  deadline 加一個既有工具 timeout，而不是再加整輪工具。
+- **deadline 不啟動新工作**：剩餘時間不超過一秒就不再啟動工具。請求本身在 deadline
+  準時結束（502），但 threadpool 裡已經跑的 subprocess 不能由 asyncio timeout 打斷：那次
+  呼叫在背景跑完（最晚到它自己的 `LLM_TOOL_TIMEOUT_SECONDS`），期間持有共享鎖、結束時寫
+  紀錄。這條規則讓請求結束後最多只有一個工具還在跑，而不是整輪工具接著跑。
 - **已知秘密遮蔽**：後端 API key、所有 package `.env` 值、install/revise/tool-call
   期間登記的值，都在工具輸出進模型前 fail closed 遮蔽。短於六字元的值不遮，避免
   普通文字被洗掉，因此安裝表單也拒絕短 secret。package `config.env` 的值**不是**

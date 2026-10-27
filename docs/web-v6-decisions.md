@@ -501,3 +501,22 @@ UTC 再比）、stats 的 SQL、孤兒判斷與別名、P2a-r1 的 `error` 路�
 `test_an_example_name_is_masked_before_it_is_cut`、`test_the_secret_scan_for_example_names_stays_off_the_event_loop`，
 `test_verification_state_follows_the_newest_batch_of_the_current_version` 加上範例變多與變少。前端 `toolChecks.test.js`
 加上未完成的原因、`stopped` 與「被拒不算失敗」。
+
+## 最終審查（v6 整體，5e8bcec..523fa7c，Fable）
+
+結論：可以發布（沒有 P1／P2）。下列一併處理：
+
+| # | 問題 | 處理 |
+|---|---|---|
+| K1 | 「途中被停用」只從後面跟著的 `stopped` 判斷；被拒的剛好是最後一個（或唯一一個）範例時沒有原因，顯示成一般的「驗證未完成」 | **採納**：`CheckResult.stopped` 與前端 `verificationView` 都把任何 `refused` 也算成 `interrupted` |
+| K2 | 範例數變了之後，舊的失敗仍以「驗證失敗（1/5 通過）」顯示——舊的計數配新的總數，與 J6 的裁決不符 | **採納**：`examples_changed` 優先於結論本身：別份範例清單的結果（包括失敗）都不拿來說這一份 |
+| K3 | 刪除工具時若刪紀錄失敗，README 說用「只清已刪除的工具留下的紀錄」清掉，但 purge 只碰 `tool_run`，那個工具的結論永遠留著 | **採納**：確認刪除的孤兒範圍 purge 一併刪掉已不存在的工具的結論（不計入筆數：它們不是紀錄，工具不在了也不會再被顯示）；工具目錄未設定或不存在時一樣不動 |
+| K4 | `os.dup` 在 `_call` 的 try 之外：取得自己的鎖參照失敗（EMFILE）時沒有 `error` 紀錄 | **採納**：失敗時照其他後端錯誤記一筆 `error`，再拋給 llm 迴圈 |
+| K5 | `docs/tool-calling.md` 兩處仍是舊的鎖與期限模型；`TOOL_CHECK_BUDGET_SECONDS` 的說明說它是刪除被擋的最長時間（實際是預算加一個範例的逾時）；README 說執行紀錄只來自三個 AI 流程 | **採納**：改寫成實際行為 |
+| K6 | 文件網站（`website/content/`）完全沒有 v6：設定參考缺 `TOOL_CHECK_BUDGET_SECONDS`、網頁導覽的工具頁、KB 工具指南沒有 `config.env`、執行紀錄、清除、一鍵修正、`examples.json` 與「跑一次範例」 | **採納**：補上這些段落；工具呼叫頁的期限說明改成新的行為。站台以 `zensical build` 確認可建置 |
+
+另：版本號仍是 0.4.0、CHANGELOG 只有 [Unreleased]——這是發版那一步的事（`uv version` 與 CHANGELOG 的版本段落），等確認後再做。
+
+測試：`test_a_refusal_of_the_last_example_still_reads_as_interrupted`、`test_the_orphan_purge_also_drops_the_verdicts_of_tools_that_are_gone`、
+`test_a_call_that_cannot_take_its_lock_reference_is_recorded_as_error`；`test_verification_state_follows_the_newest_batch_of_the_current_version`
+加上「範例變了之後舊的失敗不算數」；前端 `toolChecks.test.js` 加上最後一個被拒的情況。

@@ -77,7 +77,7 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 | `TOOL_INSTALL_MAX_ROUNDS` | `24` | KB 網頁安裝器（見下方「工具（KB 網頁安裝器）」）單一安裝工作階段的工具輪數上限，邊界 `[4, 64]`。 |
 | `TOOL_INSTALL_TIMEOUT_SECONDS` | `900` | KB 網頁安裝器單一安裝工作階段的整體逾時秒數，邊界 `(0, 3600]`。 |
 | `TOOL_INSTALL_SHELL_TIMEOUT_SECONDS` | `120` | 安裝器內單一 `run_shell` 指令的逾時秒數，邊界 `(0, 600]`。 |
-| `TOOL_CHECK_BUDGET_SECONDS` | `300` | 跑一次 `examples.json`（「跑一次範例」與 AI 修正發布後的自動驗證）的總預算秒數；超過就不再跑剩下的範例、標示未完成。執行期間持有共享 tools lock，所以這也是刪除／丟棄最久會被擋住的時間。邊界 `(0, 3600]`。 |
+| `TOOL_CHECK_BUDGET_SECONDS` | `300` | 跑一次 `examples.json`（「跑一次範例」與 AI 修正發布後的自動驗證）的總預算秒數；超過就不再跑剩下的範例、標示未完成。執行期間持有共享 tools lock：預算是在每個範例開始前檢查的，已經開始的那一個會跑到它自己的 `LLM_TOOL_TIMEOUT_SECONDS`，所以刪除／丟棄最久會被擋住預算加一個範例的逾時。邊界 `(0, 3600]`。 |
 | `DATABASE_URL` | `sqlite:///./afterthread.db` | SQLAlchemy URL。**只支援 SQLite**，且必須是檔案型（不可為 in-memory）——見下方設計筆記。 |
 | `STALE_AFTER_DAYS` | `14` | 非終態項目（`STALE_ELIGIBLE_STATUSES`：除 `done`／`superseded` 外的五種狀態）的 `updated` 超過這個天數，API 回應的 `is_stale` 會是 `true`。邊界 `[0, 36500]`。 |
 

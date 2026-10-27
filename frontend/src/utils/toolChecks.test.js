@@ -149,6 +149,14 @@ describe("verificationView", () => {
 			"驗證未完成：工具在驗證途中被停用或更換（跑了 1/3 個）",
 		);
 		expect(view.failedRunIds).toEqual([]);
+		// Refused on the last example: no "stopped" row follows, still interrupted.
+		const lastRefused = verificationView(
+			ran([
+				{ name: "a", outcome: "ok", run_id: 1 },
+				{ name: "b", outcome: "refused", run_id: 2 },
+			]),
+		);
+		expect(lastRefused.title).toContain("被停用或更換");
 		const errored = verificationView(
 			ran([
 				{ name: "a", outcome: "ok", run_id: 1 },
