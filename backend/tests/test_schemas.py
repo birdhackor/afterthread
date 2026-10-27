@@ -194,7 +194,10 @@ def test_only_by_id_routes_declare_404() -> None:
     for an unknown/evicted/post-restart job, the two AI-summary routes
     under /api/tools/{name}/summary -- D40 -- which 404 when the named tool does
     not exist, TOOLS_DIR being unset included, and POST /api/tools/{name}/revise,
-    plus the version-addressed discard, which 404 on the same gate). The collection, review, health,
+    plus the version-addressed discard, which 404 on the same gate), the settings and
+    run-list reads under /api/tools/{name}, and the by-id run record read and delete
+    (/api/tool-runs/{run_id}, web-v6 §6), and the 跑一次範例 submit
+    (POST /api/tools/{name}/check, web-v6 §10). The collection, review, health,
     status, capture, log-list, tool-list and install-submit routes cannot 404
     and must not declare it.
 
@@ -226,4 +229,9 @@ def test_only_by_id_routes_declare_404() -> None:
         ("/api/tools/{name}/summary", "get"),
         ("/api/tools/{name}/summary/regenerate", "post"),
         ("/api/tools/{name}/revise", "post"),
+        ("/api/tools/{name}/settings", "get"),
+        ("/api/tools/{name}/runs", "get"),
+        ("/api/tool-runs/{run_id}", "get"),
+        ("/api/tool-runs/{run_id}", "delete"),
+        ("/api/tools/{name}/check", "post"),
     }

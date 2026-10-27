@@ -33,10 +33,12 @@ response status.
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi import Path as PathParam
+from sqlmodel import Session
 from starlette.concurrency import run_in_threadpool
 
+from afterthread.db import get_session
 from afterthread.routers.ai import (
     _LLM_UNCONFIGURED_RESPONSE,
     _LLM_UPSTREAM_RESPONSE,
@@ -52,11 +54,13 @@ from afterthread.schemas import (
     ToolJobStatus,
     ToolListResponse,
     ToolReviseRequest,
+    ToolRunList,
+    ToolSettings,
     ToolSummary,
     ToolSummaryDetail,
     ToolUpdateRequest,
 )
-from afterthread.services import llm_log, tool_builder, tool_meta
+from afterthread.services import llm_log, tool_builder, tool_meta, tool_runs
 from afterthread.services import tools as tools_service
 from afterthread.services.llm import LLMNotConfiguredError, LLMUpstreamError
 from afterthread.services.tools import _NAME_RE
@@ -69,6 +73,7 @@ router = APIRouter(prefix="/tools", tags=["tools"])
 # the two layers can never drift apart.
 ToolName = Annotated[str, PathParam(pattern=_NAME_RE.pattern)]
 ToolVersionId = Annotated[str, PathParam(pattern=tools_service._VID_RE.pattern)]
+SessionDep = Annotated[Session, Depends(get_session)]
 
 # Fixed, config-free error details, following items.py's `_NOT_FOUND` pattern
 # (the OpenAPI examples derive from the same constants the handlers raise).
@@ -145,6 +150,18 @@ _LINEAGE_UNAVAILABLE_MESSAGE = "前一版已不存在或版本關係已損壞，
 _AI_JOB_IN_PROGRESS_CODE = "ai_job_in_progress"
 _AI_JOB_IN_PROGRESS_MESSAGE = "AI 任務進行中，請稍後再試"  # noqa: RUF001
 _TOOLS_LOCK_UNAVAILABLE_CODE = "tools_lock_unavailable"
+# The revise submit's env-policy refusal (web-v6 §5.2): the package's .env or
+# config.env fails the gate before any job exists. Unlike every code above, its
+# MESSAGE is the payload -- the gate's own text names the keys to move -- so the
+# OpenAPI example is one real instance of that text rather than a fixed constant.
+_ENV_POLICY_CODE = "env_policy"
+# A revise attaching run records (web-v6 §8.3) that cannot be used: refused
+# before the job, so the message is all the operator gets.
+_RUN_NOT_FOUND_CODE = "run_not_found"
+_RUN_NOT_FOUND_MESSAGE = "找不到附上的執行紀錄（可能已被清除），請重新整理後再試"  # noqa: RUF001
+_RUN_NOT_FOR_TOOL_CODE = "run_not_for_tool"
+_RUN_NOT_FOR_TOOL_MESSAGE = "附上的執行紀錄不屬於這個工具"
+_ENV_POLICY_EXAMPLE = tool_builder._ERROR_REVISE_ENV_UNMASKABLE.replace("{keys}", "「CACHE_TTL」")
 
 
 def _tools_lock_unavailable(exc: tools_service.ToolsLockUnavailableError) -> HTTPException:
@@ -182,6 +199,15 @@ def _conflict_response(
 _AI_ITERATION_CONFLICT_RESPONSE = _conflict_response(
     (_VERSION_MISMATCH_CODE, _VERSION_MISMATCH_MESSAGE, "The requested version is stale"),
     (_JOB_BUSY_CODE, _JOB_BUSY_MESSAGE, "Another tool operation holds the global slot"),
+)
+_REVISE_CONFLICT_RESPONSE = _conflict_response(
+    (_VERSION_MISMATCH_CODE, _VERSION_MISMATCH_MESSAGE, "The requested version is stale"),
+    (_JOB_BUSY_CODE, _JOB_BUSY_MESSAGE, "Another tool operation holds the global slot"),
+    (
+        _ENV_POLICY_CODE,
+        _ENV_POLICY_EXAMPLE,
+        "The package's .env or config.env fails the revise env policy",
+    ),
 )
 _DISCARD_CONFLICT_RESPONSE = _conflict_response(
     (_VERSION_MISMATCH_CODE, _VERSION_MISMATCH_MESSAGE, "The requested version is stale"),
@@ -226,8 +252,29 @@ _TOOLS_LOCK_UNAVAILABLE_RESPONSE: dict[int | str, dict[str, Any]] = {
 }
 
 
+def _with_last_runs(session: Session, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The registry rows, each with its newest run record (web-v6 §9) or None.
+
+    ``fixable`` is judged against the row's own ``current_vid`` -- the version
+    the same scan just resolved -- so the button and the version it would revise
+    come from one reading.
+    """
+    newest = tool_runs.last_runs_by_name(session, [row["name"] for row in rows])
+    return [
+        {
+            **row,
+            "last_run": (
+                tool_runs.last_run_view(newest[row["name"]], row["current_vid"])
+                if row["name"] in newest
+                else None
+            ),
+        }
+        for row in rows
+    ]
+
+
 @router.get("", response_model=ToolListResponse)
-async def list_installed_tools() -> ToolListResponse:
+async def list_installed_tools(session: SessionDep) -> ToolListResponse:
     """List every installed tool package (valid or broken), in name order.
 
     With the feature off (TOOLS_DIR unset) or nothing installed this is an
@@ -235,11 +282,14 @@ async def list_installed_tools() -> ToolListResponse:
     install endpoint's 503, while an empty listing is a normal state.
     """
     listed = await run_in_threadpool(tools_service.list_tools)
-    return ToolListResponse.model_validate({"tools": listed})
+    rows = await run_in_threadpool(_with_last_runs, session, listed)
+    return ToolListResponse.model_validate({"tools": rows})
 
 
 @router.patch("/{name}", response_model=ToolSummary, responses=_TOOL_NOT_FOUND_RESPONSE)
-async def update_tool(name: ToolName, payload: ToolUpdateRequest) -> ToolSummary:
+async def update_tool(
+    name: ToolName, payload: ToolUpdateRequest, session: SessionDep
+) -> ToolSummary:
     """Toggle a tool's ``enabled`` flag; returns the updated row.
 
     ``set_enabled`` returning False collapses every did-not-happen case into one
@@ -266,7 +316,8 @@ async def update_tool(name: ToolName, payload: ToolUpdateRequest) -> ToolSummary
         raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
     for row in await run_in_threadpool(tools_service.list_tools):
         if row["name"] == name:
-            return ToolSummary.model_validate(row)
+            [with_run] = await run_in_threadpool(_with_last_runs, session, [row])
+            return ToolSummary.model_validate(with_run)
     # The write landed but the package vanished before the re-scan (a racing
     # delete). The resource is gone, so the honest answer is the same 404.
     raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
@@ -281,7 +332,7 @@ async def update_tool(name: ToolName, payload: ToolUpdateRequest) -> ToolSummary
         **_TOOLS_LOCK_UNAVAILABLE_RESPONSE,
     },
 )
-async def delete_installed_tool(name: ToolName) -> ToolDeleteResponse:
+async def delete_installed_tool(name: ToolName, session: SessionDep) -> ToolDeleteResponse:
     """Delete a tool package (its whole directory).
 
     The registry's ``delete_tool`` re-validates the name AND resolved-path
@@ -293,6 +344,13 @@ async def delete_installed_tool(name: ToolName) -> ToolDeleteResponse:
     distinct retryable ``ai_job_in_progress`` 409 without renaming or deleting
     anything. Otherwise the 200 response says ``removed`` after physical
     deletion or ``retained`` with the exact cleanup-failure path.
+
+    The tool's run records go once the package is gone -- ``removed`` and
+    ``retained`` alike, since either way the tool has left the registry -- and
+    never on a 404 or 409 (web-v6 §6.4). A name is not an identity: a same-name
+    reinstall is a different tool, and must not inherit this one's history.
+    ``runs_deleted: false`` reports records that could not be deleted; the
+    deletion of the tool itself still stands.
     """
     try:
         result = await run_in_threadpool(tools_service.delete_tool, name)
@@ -308,10 +366,12 @@ async def delete_installed_tool(name: ToolName) -> ToolDeleteResponse:
                 "message": _AI_JOB_IN_PROGRESS_MESSAGE,
             },
         )
+    runs_deleted = await run_in_threadpool(tool_runs.delete_for_tool, session, name)
     return ToolDeleteResponse(
         outcome=result.outcome,
         retained_path=str(result.retained_path) if result.retained_path is not None else None,
         retention_reason=result.retention_reason,
+        runs_deleted=runs_deleted,
     )
 
 
@@ -633,9 +693,11 @@ async def regenerate_tool_summary(
     "/{name}/revise",
     response_model=ToolInstallAccepted,
     status_code=202,
-    responses={**_TOOL_NOT_FOUND_RESPONSE, **_AI_ITERATION_CONFLICT_RESPONSE},
+    responses={**_TOOL_NOT_FOUND_RESPONSE, **_REVISE_CONFLICT_RESPONSE},
 )
-async def revise_tool(name: ToolName, payload: ToolReviseRequest) -> ToolInstallAccepted:
+async def revise_tool(
+    name: ToolName, payload: ToolReviseRequest, session: SessionDep
+) -> ToolInstallAccepted:
     """Queue an AI revise job for one installed tool; poll it via `/jobs/{id}`.
 
     202 + job id, exactly like the installer's submit and for the same reason: a
@@ -648,13 +710,44 @@ async def revise_tool(name: ToolName, payload: ToolReviseRequest) -> ToolInstall
     That 503 has no counterpart here: with TOOLS_DIR unset no name resolves, so
     this route's existence gate already answers 404.
 
-    ``start_revise_job`` first reserves the global slot, then resolves the package
-    and compares the required ``expected_vid``.  Missing/aliased packages return
-    404, a stale version returns ``version_mismatch``, and an occupied slot returns
-    ``job_busy``.  Only a matching version is converted into a queued job, so a
-    stale submit has neither an LLM charge nor even a pollable job id.
+    ``start_revise_job`` first applies the package's env policy (web-v6 §5.2),
+    then reserves the global slot, then resolves the package and compares the
+    required ``expected_vid``.  An env-policy refusal returns ``env_policy`` with
+    the gate's own message (it names the keys to move), missing/aliased packages
+    return 404, a stale version returns ``version_mismatch``, and an occupied slot
+    returns ``job_busy``.  Only a matching version is converted into a queued job,
+    so a refused submit has neither an LLM charge nor even a pollable job id.
+
+    Attached ``run_ids`` (web-v6 §8.3) are checked and copied FIRST, before any
+    of that: an id that does not exist (or was purged) is a 404
+    ``run_not_found``, one that belongs to another tool a 422 ``run_not_for_tool``
+    -- no job, no slot, no LLM call (invariant M). The copy rides with the job,
+    so a purge after the submit does not change what the builder is shown.
     """
-    started = await tool_builder.start_revise_job(name, payload.feedback, payload.expected_vid)
+    runs: tuple[tool_runs.AttachedRun, ...] = ()
+    if payload.run_ids:
+        attached = await run_in_threadpool(
+            tool_runs.attach_for_revise, session, name, payload.run_ids
+        )
+        if attached.refusal == "run_not_found":
+            raise HTTPException(
+                status_code=404,
+                detail={"code": _RUN_NOT_FOUND_CODE, "message": _RUN_NOT_FOUND_MESSAGE},
+            )
+        if attached.refusal == "run_not_for_tool":
+            raise HTTPException(
+                status_code=422,
+                detail={"code": _RUN_NOT_FOR_TOOL_CODE, "message": _RUN_NOT_FOR_TOOL_MESSAGE},
+            )
+        runs = attached.runs
+    started = await tool_builder.start_revise_job(
+        name, payload.feedback, payload.expected_vid, runs=runs
+    )
+    if started.refusal == "env_policy":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": _ENV_POLICY_CODE, "message": started.message},
+        )
     if started.refusal == "not_found":
         raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
     if started.refusal == "version_mismatch":
@@ -669,6 +762,131 @@ async def revise_tool(name: ToolName, payload: ToolReviseRequest) -> ToolInstall
         )
     assert started.job_id is not None
     return ToolInstallAccepted(job_id=started.job_id)
+
+
+_CHECK_UNAVAILABLE_CODE = "check_unavailable"
+
+
+@router.post(
+    "/{name}/check",
+    response_model=ToolInstallAccepted,
+    status_code=202,
+    responses={
+        **_TOOL_NOT_FOUND_RESPONSE,
+        **_conflict_response(
+            (_VERSION_MISMATCH_CODE, _VERSION_MISMATCH_MESSAGE, "The requested version is stale"),
+            (_JOB_BUSY_CODE, _JOB_BUSY_MESSAGE, "Another tool operation holds the global slot"),
+            (
+                _CHECK_UNAVAILABLE_CODE,
+                tool_builder._CHECK_REFUSALS["no_examples"],
+                "Nothing to run: no usable examples.json, or the tool is off",
+            ),
+        ),
+    },
+)
+async def check_tool(name: ToolName, payload: ToolExpectedVersionRequest) -> ToolInstallAccepted:
+    """跑一次範例: run the current version's examples.json as a job (web-v6 §10).
+
+    202 + job id, polled like an install or revise; the job holds the global
+    slot and, while the examples run, the shared tools lock. Refusals, none of
+    which creates a job: 404 for a tool that does not exist, ``job_busy``,
+    ``version_mismatch`` (compared after the slot is taken), and
+    ``check_unavailable`` -- no examples, an examples.json that cannot be used,
+    or a tool that is switched off -- whose message says which.
+    """
+    started = await tool_builder.start_health_check_job(name, payload.expected_vid)
+    if started.refusal == "not_found":
+        raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
+    if started.refusal == "version_mismatch":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": _VERSION_MISMATCH_CODE, "message": _VERSION_MISMATCH_MESSAGE},
+        )
+    if started.refusal == "job_busy":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": _JOB_BUSY_CODE, "message": _JOB_BUSY_MESSAGE},
+        )
+    if started.refusal == "check_unavailable":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": _CHECK_UNAVAILABLE_CODE, "message": started.message},
+        )
+    assert started.job_id is not None
+    return ToolInstallAccepted(job_id=started.job_id)
+
+
+@router.get(
+    "/{name}/settings",
+    response_model=ToolSettings,
+    responses=_TOOL_NOT_FOUND_RESPONSE,
+)
+async def get_tool_settings(name: ToolName) -> ToolSettings:
+    """One tool's package-layer settings, read-only (web-v6 §4, §9).
+
+    ``.env`` key names (never values), the redacted ``config.env`` pairs and the
+    flags beside them. The gate is package EXISTENCE only, not a resolvable
+    ``current``: both files live at the package layer and outlive any version, and
+    a package whose pointer is broken is exactly one whose settings an operator
+    may need to inspect. Like the summary routes, an internal alias is a 404.
+
+    Declared BEFORE the job poll, which must stay last (see the comment there): a
+    tool may be named ``jobs``.
+    """
+
+    def _read() -> dict[str, Any] | None:
+        package_root = tools_service._resolve_package_dir_no_alias(name)
+        if package_root is None:
+            return None
+        return tools_service.package_settings(package_root)
+
+    settings = await run_in_threadpool(_read)
+    if settings is None:
+        raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
+    return ToolSettings.model_validate(settings)
+
+
+@router.get(
+    "/{name}/runs",
+    response_model=ToolRunList,
+    responses=_TOOL_NOT_FOUND_RESPONSE,
+)
+async def list_tool_runs(
+    name: ToolName,
+    session: SessionDep,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> ToolRunList:
+    """One tool's newest run records, newest first, without bodies (web-v6 §6, §9).
+
+    The gate is package existence, as for the settings: a package whose pointer
+    is broken still has a history worth reading (``current_vid`` is then null and
+    nothing is fixable). Records of a package that no longer exists are reached
+    through the purge's orphan scope, not here. The bodies of one record are
+    ``GET /api/tool-runs/{run_id}``.
+
+    Declared BEFORE the job poll, which must stay last (see the comment there): a
+    tool may be named ``jobs``.
+    """
+
+    def _read() -> dict[str, Any] | None:
+        versions = tool_runs.PackageVersions.of(name)
+        if versions.package_root is None:
+            return None
+        # One scan of the tools directory serves every row's second mask, and
+        # fails the request -- rather than serve unchecked text -- if it raises.
+        secrets = tools_service._redaction_secrets()
+        rows = tool_runs.list_for_tool(session, name, limit=limit)
+        return {
+            "current_vid": versions.current_vid,
+            "total": tool_runs.count_for_tool(session, name),
+            "runs": [tool_runs.view(row, versions, secrets, bodies=False) for row in rows],
+            "verification": tool_runs.verification_state(session, name, versions.current),
+        }
+
+    data = await run_in_threadpool(_read)
+    if data is None:
+        raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
+    return ToolRunList.model_validate(data)
 
 
 # --- tool job poll -----------------------------------------------------------

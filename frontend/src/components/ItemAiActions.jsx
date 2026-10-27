@@ -25,6 +25,7 @@ import { LLM_NOT_CONFIGURED_NOTICE } from "../constants/labels.js";
 import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { codePointLength } from "../utils/text.js";
 import { BulletList } from "./BulletList.jsx";
+import { ToolFailureNotice } from "./ToolFailureNotice.jsx";
 
 // One AI action card: a textarea + submit button whose submit fires the
 // `mutation` passed in from ItemAiActions. Handles the long-request loading
@@ -188,6 +189,14 @@ function AiActionCard({
 // of completion. Reading stage live (instead of a snapshot taken when gaps
 // was set) means a stage change from the quick Select after this pass still
 // shows copy that matches the page, not what stage was at enrich time.
+// One action's last-reported tool failures, numbered by result (see
+// ItemAiActions' enrichFailures).
+const NO_FAILURES = { seq: 0, failures: [] };
+
+function nextFailures(previous, result) {
+	return { seq: previous.seq + 1, failures: result?.tool_failures ?? [] };
+}
+
 function GapsChecklist({ gaps, stage }) {
 	if (gaps.length > 0) {
 		return (
@@ -252,6 +261,14 @@ export function ItemAiActions({ item, pending, onPendingChange, queryItemId }) {
 	// the live `item.stage` prop at render (see its doc comment), so this
 	// never goes stale relative to a later quick-Select stage change.
 	const [gaps, setGaps] = useState(null);
+	// The tool failures each AI action's last result reported (web-v6 §8.2),
+	// shown inside that action's card until its next success replaces them.
+	// `seq` counts the results and keys the notice: each reminder keeps what its
+	// 請 AI 修正 did (started a job, or why not) in its own state, and a new
+	// result for the same tool must start from scratch, not inherit the old
+	// one's "已請 AI 修正" (P4 review r1, H2).
+	const [enrichFailures, setEnrichFailures] = useState(NO_FAILURES);
+	const [assistFailures, setAssistFailures] = useState(NO_FAILURES);
 	// Conflict-banner refresh in flight (shared by both cards; only the
 	// conflicted one renders a banner). Feeds aiBusy below so the page's own
 	// controls stay disabled for its duration too.
@@ -318,6 +335,7 @@ export function ItemAiActions({ item, pending, onPendingChange, queryItemId }) {
 			// from the quick Select can't leave this checklist's copy contradicting
 			// the page.
 			setGaps(result?.gaps ?? []);
+			setEnrichFailures((previous) => nextFailures(previous, result));
 			await invalidateAll();
 			notifications.show({ color: "green", message: "AI 已補齊內容" });
 		},
@@ -328,11 +346,12 @@ export function ItemAiActions({ item, pending, onPendingChange, queryItemId }) {
 	const assistMutation = useMutation({
 		mutationFn: (value) =>
 			apiPost(`/api/items/${itemId}/assist-update`, { note: value }),
-		onSuccess: async () => {
+		onSuccess: async (result) => {
 			// An assist-update can resolve (or otherwise make stale) the gaps the
 			// last AI 補齊 flagged, so clear that checklist rather than leave a
 			// superseded one on screen -- the next AI 補齊 recomputes it.
 			setGaps(null);
+			setAssistFailures((previous) => nextFailures(previous, result));
 			await invalidateAll();
 			notifications.show({ color: "green", message: "AI 已更新進度" });
 		},
@@ -404,6 +423,10 @@ export function ItemAiActions({ item, pending, onPendingChange, queryItemId }) {
 				onRefreshConflict={() => refreshConflict(enrichMutation)}
 				onPendingChange={onPendingChange}
 			>
+				<ToolFailureNotice
+					key={enrichFailures.seq}
+					failures={enrichFailures.failures}
+				/>
 				{gaps ? <GapsChecklist gaps={gaps} stage={item.stage} /> : null}
 			</AiActionCard>
 
@@ -421,7 +444,12 @@ export function ItemAiActions({ item, pending, onPendingChange, queryItemId }) {
 				refreshing={refreshing}
 				onRefreshConflict={() => refreshConflict(assistMutation)}
 				onPendingChange={onPendingChange}
-			/>
+			>
+				<ToolFailureNotice
+					key={assistFailures.seq}
+					failures={assistFailures.failures}
+				/>
+			</AiActionCard>
 		</Stack>
 	);
 }

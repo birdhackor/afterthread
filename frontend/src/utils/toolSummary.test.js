@@ -10,6 +10,7 @@ import {
 	logLinkSearch,
 	markLineageUnavailable,
 	ownSummaryBusy,
+	reviseRefusalNotification,
 	summaryErrorRevalidates,
 	toolIdentityConsumers,
 	toolInstanceKey,
@@ -161,6 +162,28 @@ describe("Invariant K — every version-specific write carries the vid", () => {
 				feedback: "限制為五筆",
 				expected_vid: currentVid,
 			},
+		});
+	});
+
+	it("sends a one-click fix as run_ids and expected_vid, with no feedback", () => {
+		expect(buildReviseRequest({ name, currentVid, runIds: [7] })).toEqual({
+			path: "/api/tools/kb_search/revise",
+			body: { run_ids: [7], expected_vid: currentVid },
+		});
+		expect(
+			buildReviseRequest({ name, currentVid, feedback: "", runIds: [7] }).body,
+		).toEqual({ run_ids: [7], expected_vid: currentVid });
+		expect(
+			buildReviseRequest({
+				name,
+				currentVid,
+				feedback: "請加上說明",
+				runIds: [7],
+			}).body,
+		).toEqual({
+			feedback: "請加上說明",
+			run_ids: [7],
+			expected_vid: currentVid,
 		});
 	});
 
@@ -515,5 +538,52 @@ describe("deepLinkTarget", () => {
 				processToken: token,
 			}),
 		).toEqual({ mode: "off-list", value: "3" });
+	});
+});
+
+describe("reviseRefusalNotification", () => {
+	it("keeps an env_policy refusal on screen with the gate's own message", () => {
+		const message = "既有工具包 .env 的「CACHE_TTL」值短於 6 字元";
+		expect(
+			reviseRefusalNotification({ status: 409, code: "env_policy", message }),
+		).toEqual({
+			color: "orange",
+			title: "修訂未送出：工具設定需要調整",
+			message,
+			autoClose: false,
+		});
+	});
+
+	it("leaves every other error to the generic notification", () => {
+		expect(
+			reviseRefusalNotification({ status: 409, code: "version_mismatch" }),
+		).toBeNull();
+		expect(reviseRefusalNotification({ status: 404 })).toBeNull();
+		expect(reviseRefusalNotification(undefined)).toBeNull();
+	});
+});
+
+describe("reviseRefusalNotification for attached runs", () => {
+	it("explains a purged record in its own words", () => {
+		const notice = reviseRefusalNotification({
+			status: 404,
+			code: "run_not_found",
+			message: "找不到項目",
+		});
+		expect(notice.message).toContain("已不存在");
+	});
+
+	it("passes the backend's words for a record of another tool", () => {
+		expect(
+			reviseRefusalNotification({
+				status: 422,
+				code: "run_not_for_tool",
+				message: "附上的執行紀錄不屬於這個工具",
+			}).message,
+		).toBe("附上的執行紀錄不屬於這個工具");
+	});
+
+	it("leaves other errors to the generic handling", () => {
+		expect(reviseRefusalNotification({ status: 404, code: null })).toBeNull();
 	});
 });

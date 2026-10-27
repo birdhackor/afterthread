@@ -21,16 +21,21 @@ import {
 import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link } from "@tanstack/react-router";
+import { Link, useSearch } from "@tanstack/react-router";
 import { useCallback, useEffect, useState } from "react";
 import { Controller, useForm } from "react-hook-form";
 import { apiDelete, apiGet, apiPatch, apiPost } from "../api/client.js";
 import { CharCounter } from "../components/CharCounter.jsx";
 import { formatDate } from "../components/DateText.jsx";
 import { EmptyState } from "../components/EmptyState.jsx";
+import { ToolRunStatsBar } from "../components/ToolRunStatsBar.jsx";
+import { ToolRunsSection } from "../components/ToolRunsSection.jsx";
+import { ToolSettingsSection } from "../components/ToolSettingsSection.jsx";
 import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { usePageTitle } from "../hooks/usePageTitle.js";
+import { formatTimestamp } from "../utils/format.js";
 import { codePointLength } from "../utils/text.js";
+import { verificationView } from "../utils/toolChecks.js";
 import {
 	keepDeleteConfirmationOpen,
 	toolDeleteConfirmation,
@@ -44,9 +49,13 @@ import {
 	isToolJobActive,
 	secretNameError,
 	secretValueError,
+	toolJobOutcomeView,
 	toolJobQueryEnabled,
 	toolJobRefetchInterval,
 } from "../utils/toolInstall.js";
+import { lastRunHint, toolRunsQueryKey } from "../utils/toolRuns.js";
+import { toolRunStatsQueryKey } from "../utils/toolRunsPurge.js";
+import { toolSettingsQueryKey } from "../utils/toolSettings.js";
 import {
 	acceptSummaryForVersion,
 	buildDiscardRequest,
@@ -56,6 +65,7 @@ import {
 	logLinkSearch,
 	markLineageUnavailable,
 	ownSummaryBusy,
+	reviseRefusalNotification,
 	summaryErrorRevalidates,
 	toolIdentityConsumers,
 	toolLineageControls,
@@ -145,6 +155,132 @@ function LogLink({ llmLogId, llmLogProcess }) {
 	);
 }
 
+// The examples of a check, one row each: its badge and its name.
+function VerificationRows({ rows }) {
+	if (rows.length === 0) {
+		return null;
+	}
+	return (
+		<Stack gap={2}>
+			{rows.map((row) => (
+				<Group key={row.key} gap="xs" wrap="nowrap">
+					<Badge size="sm" variant="light" color={row.color} tt="none">
+						{row.label}
+					</Badge>
+					<Text size="sm">{row.name}</Text>
+				</Group>
+			))}
+		</Stack>
+	);
+}
+
+// A finished check's title, rows and actions: 請 AI 修正 attaches the failed
+// examples' records (at most three); 丟掉這一版 is offered only by a caller that
+// can address the version, and only after a failed post-fix verification.
+// `fixBlocked` is the page's write gate (versionWritesBlocked): the fix itself
+// re-checks it and does nothing while it holds, so the button says so instead
+// of ignoring the click (P5 review r1, J7).
+function VerificationSummary({
+	view,
+	onFixRuns,
+	onDiscardVersion,
+	fixBlocked = false,
+}) {
+	return (
+		<Stack gap={4} align="flex-start">
+			<Text size="sm" fw={600}>
+				{view.title}
+			</Text>
+			{view.note ? (
+				<Text size="xs" c="dimmed">
+					{view.note}
+				</Text>
+			) : null}
+			<VerificationRows rows={view.rows} />
+			{(onFixRuns && view.failedRunIds.length > 0) || onDiscardVersion ? (
+				<Group gap="xs">
+					{onFixRuns && view.failedRunIds.length > 0 ? (
+						<Button
+							size="compact-xs"
+							color="red"
+							variant="light"
+							disabled={fixBlocked}
+							onClick={() => onFixRuns(view.failedRunIds)}
+						>
+							請 AI 修正
+						</Button>
+					) : null}
+					{onDiscardVersion ? (
+						<Button
+							size="compact-xs"
+							color="orange"
+							variant="light"
+							onClick={onDiscardVersion}
+						>
+							丟掉這一版
+						</Button>
+					) : null}
+				</Group>
+			) : null}
+		</Stack>
+	);
+}
+
+// 跑一次範例 (web-v6 §10): progress while the examples run, then the result per
+// example. The job is a health check, not a build, so it has its own card.
+function HealthCheckProgress({ jobQuery, job, onFixRuns, fixBlocked }) {
+	if (jobQuery.isError) {
+		return (
+			<Alert color="orange" title="無法確認範例的結果">
+				<Text size="sm">
+					{jobQuery.error?.status === 404
+						? "找不到這個跑範例的工作，後端可能已重新啟動。結果仍在「最近執行」的紀錄裡。"
+						: (jobQuery.error?.message ?? "請稍後再試")}
+				</Text>
+			</Alert>
+		);
+	}
+	const view = verificationView(job?.verification);
+	if (!job || !isTerminalToolJobState(job.state)) {
+		return (
+			<Card withBorder padding="md" radius="md">
+				<Stack gap="xs">
+					<Group gap="sm" wrap="nowrap">
+						<Loader size="sm" />
+						<Text size="sm">
+							{view ? `${view.title}……` : "正在準備跑範例……"}
+						</Text>
+					</Group>
+					{view ? <VerificationRows rows={view.rows} /> : null}
+				</Stack>
+			</Card>
+		);
+	}
+	if (job.state === "failed" || !view) {
+		return (
+			<Alert color="red" title="範例沒有跑完">
+				<Text size="sm">{job.error ?? "未知錯誤"}</Text>
+			</Alert>
+		);
+	}
+	const color = {
+		passed: "green",
+		failed: "red",
+		incomplete: "orange",
+		not_run: "gray",
+	}[view.tone];
+	return (
+		<Alert color={color} title={`工具「${job.tool_name}」的範例`}>
+			<VerificationSummary
+				view={view}
+				onFixRuns={onFixRuns}
+				onDiscardVersion={null}
+				fixBlocked={fixBlocked}
+			/>
+		</Alert>
+	);
+}
+
 // The tool-job progress card: spinner while the job runs (2s poll, stopping
 // on a terminal state -- see toolJobRefetchInterval), then the green/red
 // outcome with a link into the AI 日誌 trace. Shared by BOTH job kinds this
@@ -152,12 +288,32 @@ function LogLink({ llmLogId, llmLogProcess }) {
 // the job WAS ("安裝"/"修訂") -- the queued/running/failed shell is otherwise
 // identical, so this is one component (renamed from the original
 // install-only InstallProgress) rather than a second copy for revise.
-function ToolJobProgress({ kind, jobId, jobQuery }) {
+function ToolJobProgress({
+	kind,
+	jobId,
+	jobQuery,
+	onFixRuns = null,
+	onDiscardVersion = null,
+	fixBlocked = false,
+}) {
 	if (jobId === null) {
 		return null;
 	}
 	const job = jobQuery.data;
-	const verb = kind === "revise" ? "修訂" : "安裝";
+	// The job says what it is (web-v6 §10 added the health check); the caller's
+	// `kind` covers the moment before the first poll lands.
+	const jobKind = job?.kind ?? kind;
+	if (jobKind === "health_check") {
+		return (
+			<HealthCheckProgress
+				jobQuery={jobQuery}
+				job={job}
+				onFixRuns={onFixRuns}
+				fixBlocked={fixBlocked}
+			/>
+		);
+	}
+	const verb = jobKind === "revise" ? "修訂" : "安裝";
 
 	if (jobQuery.isError) {
 		// A 404 means the job RECORD is gone (jobs are process-local), NOT that the
@@ -187,29 +343,83 @@ function ToolJobProgress({ kind, jobId, jobQuery }) {
 	}
 
 	if (!job || !isTerminalToolJobState(job.state)) {
+		// A revise that has published is checking the new version's examples
+		// (web-v6 §8.3): say so, with the count so far.
+		const checking = verificationView(job?.verification);
 		return (
 			<Card withBorder padding="md" radius="md">
-				<Group gap="sm" wrap="nowrap">
-					<Loader size="sm" />
-					<Text size="sm">
-						AI 正在{verb}工具，可能需要數分鐘……
-						{job?.state === "queued" ? "（排隊中）" : ""}
-					</Text>
-				</Group>
+				<Stack gap="xs">
+					<Group gap="sm" wrap="nowrap">
+						<Loader size="sm" />
+						<Text size="sm">
+							{checking
+								? `已發布新版本，${checking.title}……`
+								: `AI 正在${verb}工具，可能需要數分鐘……`}
+							{job?.state === "queued" ? "（排隊中）" : ""}
+						</Text>
+					</Group>
+					{checking ? <VerificationRows rows={checking.rows} /> : null}
+				</Stack>
 			</Card>
 		);
 	}
 
-	if (job.state === "succeeded") {
+	const view = toolJobOutcomeView(job, kind);
+
+	if (view.tone === "success") {
+		// The verification of the published version, when there was one. A
+		// failure turns the card red and offers the two ways out: fix again, or
+		// discard this version (web-v6 §8.3) -- never automatically, since the
+		// version is the result of a paid build.
+		const verification = verificationView(job.verification);
+		const verifyFailed = verification?.tone === "failed";
+		const color = verifyFailed
+			? "red"
+			: verification?.tone === "incomplete"
+				? "orange"
+				: view.color;
 		return (
-			<Alert color="green" title={`${verb}完成`}>
+			<Alert
+				color={color}
+				title={verifyFailed ? `${view.title}，但範例驗證失敗` : view.title}
+			>
 				<Stack gap="xs" align="flex-start">
 					<Text size="sm">
-						{kind === "revise"
-							? `已依意見更新工具「${job.tool_name}」。`
+						{jobKind === "revise"
+							? `已發布工具「${job.tool_name}」的新版本。`
 							: `已安裝工具「${job.tool_name}」。`}
 					</Text>
 					{job.summary ? <Text size="sm">{job.summary}</Text> : null}
+					{verification ? (
+						<VerificationSummary
+							view={verification}
+							onFixRuns={onFixRuns}
+							onDiscardVersion={verifyFailed ? onDiscardVersion : null}
+							fixBlocked={fixBlocked}
+						/>
+					) : null}
+					<LogLink
+						llmLogId={job.llm_log_id}
+						llmLogProcess={job.llm_log_process}
+					/>
+				</Stack>
+			</Alert>
+		);
+	}
+
+	if (view.tone === "not_published") {
+		// The builder's own ready=false (web-v6 §8.3): its words are the body,
+		// because they are the only account of WHY -- an outside cause it found or
+		// a fix it could not make. The card does not claim which.
+		return (
+			<Alert color={view.color} title={view.title}>
+				<Stack gap="xs" align="flex-start">
+					<Text size="sm" style={{ whiteSpace: "pre-wrap" }}>
+						{job.summary ?? job.error ?? "AI 未說明原因"}
+					</Text>
+					<Text size="xs" c="dimmed">
+						{view.note}
+					</Text>
 					<LogLink
 						llmLogId={job.llm_log_id}
 						llmLogProcess={job.llm_log_process}
@@ -220,7 +430,7 @@ function ToolJobProgress({ kind, jobId, jobQuery }) {
 	}
 
 	return (
-		<Alert color="red" title={`${verb}失敗`}>
+		<Alert color={view.color} title={view.title}>
 			<Stack gap="xs" align="flex-start">
 				<Text size="sm">{job.error ?? "未知錯誤"}</Text>
 				{job.summary ? (
@@ -272,8 +482,6 @@ function ToolSummaryPanel({
 	onRegenerate,
 	reviseMutation,
 	isSubmittingRevise,
-	reviseJobId,
-	reviseJobQuery,
 }) {
 	const { data, error, isError, isFetching } = useQuery({
 		queryKey: summaryQueryKey,
@@ -497,12 +705,6 @@ function ToolSummaryPanel({
 					</Group>
 				</Stack>
 			</form>
-
-			<ToolJobProgress
-				kind="revise"
-				jobId={reviseJobId}
-				jobQuery={reviseJobQuery}
-			/>
 		</Stack>
 	);
 }
@@ -529,13 +731,24 @@ function ToolRow({
 	isSubmittingRevise,
 	reviseJobId,
 	reviseJobQuery,
+	onFix,
+	onCheck,
+	isSubmittingCheck,
 }) {
 	// Local, independent per row (unlike LlmLogsPage's single-open Accordion):
 	// there is no reason comparing two tools' summaries side by side should
 	// force one closed, and expand/collapse is a pure UI state that is never
 	// itself gated.
 	const [expanded, { toggle: toggleExpanded }] = useDisclosure(false);
+	// The 設定 section (web-v6 §9) has its own toggle and is offered for EVERY
+	// package, broken ones included: config.env and .env live at the package
+	// layer and outlive any version, so they stay readable exactly when the
+	// summary panel (which needs a resolvable `current`) is not offered.
+	const [settingsExpanded, { toggle: toggleSettings }] = useDisclosure(false);
+	// 最近執行 (web-v6 §9), offered for every package for the same reason.
+	const [runsExpanded, { toggle: toggleRuns }] = useDisclosure(false);
 	const lineageControls = toolLineageControls(tool, lineageUnavailable);
+	const runHint = lastRunHint(tool.last_run, tool.current_vid);
 
 	return (
 		<Card withBorder padding="md" radius="md">
@@ -573,6 +786,29 @@ function ToolRow({
 								) : null}
 							</>
 						)}
+						{runHint ? (
+							<Group gap="xs" wrap="wrap">
+								<Text size="xs" c={runHint.color}>
+									{runHint.text} ・ {formatTimestamp(tool.last_run.started_at)}
+								</Text>
+								{/* The one-click fix (web-v6 §8.2) for the newest run, offered on
+								    the backend's `fixable` alone: a failure of the version that
+								    is current. Gated like 送出修訂, because it IS a revise. */}
+								{tool.last_run.fixable &&
+								lineageControls.showVersionControls ? (
+									<Button
+										size="compact-xs"
+										variant="light"
+										color="red"
+										disabled={writesBlocked}
+										loading={isSubmittingRevise}
+										onClick={() => onFix([tool.last_run.id])}
+									>
+										請 AI 修正
+									</Button>
+								) : null}
+							</Group>
+						) : null}
 					</Stack>
 					<Group gap="sm" wrap="nowrap">
 						{lineageControls.showVersionControls ? (
@@ -629,6 +865,23 @@ function ToolRow({
 						</Button>
 					</Group>
 				</Group>
+
+				{/* The job card lives on the row, whatever started the job (the AI
+				    總結 form, a fix or 跑一次範例 from 最近執行; the card follows the
+				    job's own kind) and whether or not the panel is open: the panel
+				    returns early -- a Loader, 無法載入總結 -- whenever its summary
+				    query has no data, which is exactly the case right after a fix
+				    publishes a new version, so a card inside it could vanish
+				    mid-job. */}
+				{reviseJobId !== null ? (
+					<ToolJobProgress
+						kind="revise"
+						jobId={reviseJobId}
+						jobQuery={reviseJobQuery}
+						onFixRuns={lineageControls.showVersionControls ? onFix : null}
+						fixBlocked={writesBlocked}
+					/>
+				) : null}
 
 				{lineageControls.discardAction === "delete-tool" ? (
 					<Group gap="sm" align="center">
@@ -703,12 +956,38 @@ function ToolRow({
 								onRegenerate={onRegenerate}
 								reviseMutation={reviseMutation}
 								isSubmittingRevise={isSubmittingRevise}
-								reviseJobId={reviseJobId}
-								reviseJobQuery={reviseJobQuery}
 							/>
 						</Collapse>
 					</div>
 				) : null}
+
+				<div>
+					<Button variant="subtle" size="xs" px={0} onClick={toggleSettings}>
+						{settingsExpanded ? "收合設定" : "設定"}
+					</Button>
+					{/* `expanded`, not `in` -- see the AI 總結 Collapse above. */}
+					<Collapse expanded={settingsExpanded}>
+						<ToolSettingsSection name={tool.name} expanded={settingsExpanded} />
+					</Collapse>
+				</div>
+
+				<div>
+					<Button variant="subtle" size="xs" px={0} onClick={toggleRuns}>
+						{runsExpanded ? "收合最近執行" : "最近執行"}
+					</Button>
+					{/* `expanded`, not `in` -- see the AI 總結 Collapse above. */}
+					<Collapse expanded={runsExpanded}>
+						<ToolRunsSection
+							name={tool.name}
+							expanded={runsExpanded}
+							onFix={lineageControls.showVersionControls ? onFix : null}
+							fixBlocked={writesBlocked}
+							isSubmittingFix={isSubmittingRevise}
+							onCheck={lineageControls.showVersionControls ? onCheck : null}
+							isSubmittingCheck={isSubmittingCheck}
+						/>
+					</Collapse>
+				</div>
 			</Stack>
 		</Card>
 	);
@@ -716,7 +995,11 @@ function ToolRow({
 
 // The 已安裝工具 tab: list + enable toggle + delete (confirm modal) + each
 // row's AI-summary panel (D40: regenerate / revise).
-function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
+function InstalledToolsPanel({
+	externalBusy = false,
+	onBusyChange,
+	linkedJobId = null,
+}) {
 	const queryClient = useQueryClient();
 	const [deleteTarget, setDeleteTarget] = useState(null);
 	const [discardTarget, setDiscardTarget] = useState(null);
@@ -781,6 +1064,13 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 			// and it still cannot reach another tool, because the
 			// name is the second element of the prefix.
 			queryClient.removeQueries({ queryKey: toolSummaryKeyPrefix(name) });
+			// The same reasoning holds for the package-layer 設定 view: a same-name
+			// reinstall has its own .env and config.env -- and for 最近執行, whose
+			// records were the deleted tool's.
+			queryClient.removeQueries({ queryKey: toolSettingsQueryKey(name) });
+			queryClient.removeQueries({ queryKey: toolRunsQueryKey(name) });
+			// The tool's records went with it (or became orphans): recount.
+			queryClient.invalidateQueries({ queryKey: toolRunStatsQueryKey });
 			await queryClient.invalidateQueries({ queryKey: ["tools"] });
 		},
 		onError: (mutationError) => {
@@ -829,6 +1119,10 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 			queryClient.removeQueries({
 				queryKey: toolSummaryKeyPrefix(variables.name),
 			});
+			// Every record's vid_state and fixable were judged against V.
+			queryClient.invalidateQueries({
+				queryKey: toolRunsQueryKey(variables.name),
+			});
 			await queryClient.invalidateQueries({
 				queryKey: ["tools"],
 				exact: true,
@@ -870,6 +1164,11 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 			Promise.all([
 				queryClient.invalidateQueries({ queryKey: toolSummaryKeyPrefix(name) }),
 				queryClient.invalidateQueries({ queryKey: ["tools"] }),
+				// A published revision moves current_vid, which every record's
+				// vid_state and fixable were judged against -- and a revise's
+				// verification or a health check has just written records.
+				queryClient.invalidateQueries({ queryKey: toolRunsQueryKey(name) }),
+				queryClient.invalidateQueries({ queryKey: toolRunStatsQueryKey }),
 			]),
 		[queryClient],
 	);
@@ -930,8 +1229,13 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	});
 
 	const reviseMutation = useMutation({
-		mutationFn: ({ name, currentVid, feedback }) => {
-			const request = buildReviseRequest({ name, currentVid, feedback });
+		mutationFn: ({ name, currentVid, feedback, runIds }) => {
+			const request = buildReviseRequest({
+				name,
+				currentVid,
+				feedback,
+				runIds,
+			});
 			return apiPost(request.path, request.body);
 		},
 		onSuccess: (result, { name, jobAttributionKey }) => {
@@ -940,6 +1244,13 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 			setActiveJob({ name, jobAttributionKey, jobId: result.job_id });
 		},
 		onError: (mutationError, variables) => {
+			// env_policy (web-v6 §5.2) is refused before any job exists and its text
+			// names the keys to move: not a version conflict, nothing to refetch.
+			const refusal = reviseRefusalNotification(mutationError);
+			if (refusal !== null) {
+				notifications.show(refusal);
+				return;
+			}
 			const reaction = reactToVersionWriteConflict(
 				mutationError,
 				variables.jobAttributionKey,
@@ -1048,6 +1359,97 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 		errorStatus: jobQuery.error?.status,
 	});
 
+	// 跑一次範例 (web-v6 §10): a job in the same single flight, tracked as the
+	// panel's active job exactly like a revise, so it shows in its row and holds
+	// the same gate. A refusal that says why nothing can run (no usable
+	// examples, a switched-off tool) is the operator's to act on.
+	const checkMutation = useMutation({
+		mutationFn: ({ name, currentVid }) =>
+			apiPost(`/api/tools/${name}/check`, { expected_vid: currentVid }),
+		onSuccess: (result, { name, jobAttributionKey }) => {
+			setActiveJob({ name, jobAttributionKey, jobId: result.job_id });
+		},
+		onError: (mutationError, variables) => {
+			if (
+				mutationError?.status === 409 &&
+				mutationError?.code === "check_unavailable"
+			) {
+				notifications.show({
+					color: "orange",
+					title: "沒有可以跑的範例",
+					message: mutationError.message,
+				});
+				return;
+			}
+			const reaction = reactToVersionWriteConflict(
+				mutationError,
+				variables.jobAttributionKey,
+			);
+			notifications.show({
+				color: "red",
+				title: "無法跑範例",
+				message: toolErrorMessage(
+					mutationError,
+					"無法跑範例",
+					VERSION_WRITE_CODE_COPY,
+				),
+			});
+			if (reaction === null) {
+				revalidateAfterSummaryError(mutationError, variables.name);
+			}
+		},
+	});
+
+	// A job started ELSEWHERE and linked here as /tools?job=<id> (web-v6 §8.2,
+	// §9): a fix requested beside a capture / enrich / assist-update result. It
+	// gets its own card, holds the same busy gate as a local job while it is
+	// live, and once it ends re-reads that tool by NAME (revalidateSummaryAndList)
+	// -- it never writes a vid-keyed cache entry, so the v5 version-identity
+	// rules (invariants H, J) are untouched. A job this panel already tracks as
+	// its own is not followed twice.
+	const followedJobId =
+		linkedJobId !== null && linkedJobId !== activeJob?.jobId
+			? linkedJobId
+			: null;
+	const linkedJobQuery = useQuery({
+		queryKey: ["tool-job", followedJobId],
+		queryFn: () => apiGet(`/api/tools/jobs/${followedJobId}`),
+		enabled: toolJobQueryEnabled(followedJobId),
+		refetchInterval: toolJobRefetchInterval,
+	});
+	const linkedJob = linkedJobQuery.data;
+	const linkedJobActive = isToolJobActive({
+		jobId: followedJobId,
+		state: linkedJob?.state,
+		errorStatus: linkedJobQuery.error?.status,
+	});
+	const linkedJobEnded =
+		followedJobId !== null &&
+		(isTerminalToolJobState(linkedJob?.state) ||
+			linkedJobQuery.error?.status === 404);
+	// Derived like settlingJobEnd above, for the same two reasons (R9-1/R9-2).
+	const [settledLinkedJobId, setSettledLinkedJobId] = useState(null);
+	const settlingLinkedJobEnd =
+		linkedJobEnded && settledLinkedJobId !== followedJobId;
+	useEffect(() => {
+		if (!linkedJobEnded || settledLinkedJobId === followedJobId) {
+			return;
+		}
+		const endedJobId = followedJobId;
+		const name = linkedJob?.tool_name;
+		(name
+			? revalidateSummaryAndList(name)
+			: queryClient.invalidateQueries({ queryKey: ["tools"] })
+		).finally(() => setSettledLinkedJobId(endedJobId));
+	}, [
+		linkedJobEnded,
+		settledLinkedJobId,
+		followedJobId,
+		linkedJob?.tool_name,
+		revalidateSummaryAndList,
+		queryClient,
+	]);
+
 	// Any control that would race the backend's single global tool-job slot
 	// (D40: install, revise, and a synchronous regenerate all contend for the
 	// SAME `_JOBS`/`_SYNC_OPS` admission -- see the R7-3 addendum in
@@ -1084,8 +1486,8 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	// before any job id anywhere existed.
 	const ownBusy = ownSummaryBusy({
 		regeneratePending: regenerateMutation.isPending,
-		revisePending: reviseMutation.isPending,
-		reviseJobActive,
+		revisePending: reviseMutation.isPending || checkMutation.isPending,
+		reviseJobActive: reviseJobActive || linkedJobActive,
 	});
 	const summaryBusy = ownBusy || externalBusy;
 
@@ -1131,7 +1533,11 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 	// reversible or confirmed, and neither carries content authored against one
 	// specific instance the way a revise draft does.
 	const versionWritesBlocked =
-		summaryBusy || staleList || isFetching || settlingJobEnd;
+		summaryBusy ||
+		staleList ||
+		isFetching ||
+		settlingJobEnd ||
+		settlingLinkedJobEnd;
 
 	// The INSTANCE the tracked revise job was submitted against -- the same
 	// identity string the rows are keyed by, captured from the same
@@ -1147,6 +1553,73 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 				toolIdentityConsumers(tool.name, tool.current_vid).jobAttributionKey ===
 				activeJobKey,
 		);
+	// The one-click fix (web-v6 §8): a revise that attaches failing run records
+	// -- the same mutation, single-flight gate and job card as 送出修訂, with the
+	// gate re-checked here like the other AI writes. `feedback` is set only by
+	// 加上說明….
+	const fixTool = (tool, runIds, feedback = "") => {
+		if (versionWritesBlocked) {
+			return;
+		}
+		reviseMutation.mutate(
+			{
+				name: tool.name,
+				currentVid: tool.current_vid,
+				jobAttributionKey: toolIdentityConsumers(tool.name, tool.current_vid)
+					.jobAttributionKey,
+				feedback,
+				runIds,
+			},
+			{
+				onSuccess: () =>
+					notifications.show({
+						color: "blue",
+						message: `已請 AI 修正「${tool.name}」，進度顯示在這個工具下方`,
+					}),
+			},
+		);
+	};
+	const checkTool = (tool) => {
+		if (versionWritesBlocked) {
+			return;
+		}
+		checkMutation.mutate({
+			name: tool.name,
+			currentVid: tool.current_vid,
+			jobAttributionKey: toolIdentityConsumers(tool.name, tool.current_vid)
+				.jobAttributionKey,
+		});
+	};
+	// The actions a free-standing job card (a published fix whose row has
+	// remounted on the new version, or a job linked from another page) may offer
+	// for the version its verification ran: only while that version is still the
+	// tool's current one, and 丟掉這一版 only where the row itself would offer it.
+	const versionActions = (name, vid) => {
+		const tool = tools.find(
+			(candidate) => candidate.name === name && candidate.current_vid === vid,
+		);
+		if (!tool || vid == null) {
+			return { onFixRuns: null, onDiscardVersion: null, fixBlocked: false };
+		}
+		const identity = toolIdentityConsumers(tool.name, tool.current_vid);
+		const controls = toolLineageControls(
+			tool,
+			lineageUnavailableKeys.has(identity.rowKey),
+		);
+		return {
+			onFixRuns: (runIds) => fixTool(tool, runIds),
+			fixBlocked: versionWritesBlocked,
+			onDiscardVersion:
+				controls.discardAction === "discard-version"
+					? () =>
+							setDiscardTarget({
+								name: tool.name,
+								currentVid: tool.current_vid,
+								jobAttributionKey: identity.jobAttributionKey,
+							})
+					: null,
+		};
+	};
 	const discardTargetIsCurrent =
 		discardTarget === null ||
 		tools.some(
@@ -1165,22 +1638,45 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 
 	return (
 		<Stack gap="md">
-			<Group justify="flex-end">
+			<Group justify="space-between" align="center" wrap="wrap">
+				<ToolRunStatsBar />
 				<Button
 					variant="light"
 					loading={isFetching}
 					onClick={() => {
 						// Refresh means refresh EVERYTHING on screen, not just the list
 						// (R5-3). The current_vid key prevents cross-version reuse, while
-						// the name prefix still reaches every expanded version entry.
+						// the name prefix still reaches every expanded version entry --
+						// and the run records and their counts are on screen too.
 						setLineageUnavailableKeys(new Set());
 						refetch();
 						queryClient.invalidateQueries({ queryKey: ["tool-summary"] });
+						queryClient.invalidateQueries({ queryKey: ["tool-runs"] });
+						queryClient.invalidateQueries({ queryKey: toolRunStatsQueryKey });
 					}}
 				>
 					重新整理
 				</Button>
 			</Group>
+
+			{followedJobId !== null ? (
+				<Stack gap={4}>
+					<Text size="sm" fw={600}>
+						{linkedJob?.tool_name
+							? `從其他頁面請 AI 修正的工具「${linkedJob.tool_name}」`
+							: "從其他頁面發起的 AI 修正"}
+					</Text>
+					<ToolJobProgress
+						kind="revise"
+						jobId={followedJobId}
+						jobQuery={linkedJobQuery}
+						{...versionActions(
+							linkedJob?.tool_name,
+							linkedJob?.verification?.vid,
+						)}
+					/>
+				</Stack>
+			) : null}
 
 			{externalBusy ? (
 				<Alert color="orange" title="請稍候">
@@ -1255,6 +1751,7 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 						kind="revise"
 						jobId={activeJob.jobId}
 						jobQuery={jobQuery}
+						{...versionActions(activeJob.name, job?.verification?.vid)}
 					/>
 				</Stack>
 			) : null}
@@ -1334,6 +1831,12 @@ function InstalledToolsPanel({ externalBusy = false, onBusyChange }) {
 						// rendered exactly once, never twice and never nowhere.
 						reviseJobId={rowKey === activeJobKey ? activeJob.jobId : null}
 						reviseJobQuery={jobQuery}
+						onFix={(runIds, feedback = "") => fixTool(tool, runIds, feedback)}
+						onCheck={() => checkTool(tool)}
+						isSubmittingCheck={
+							checkMutation.isPending &&
+							checkMutation.variables?.name === tool.name
+						}
 					/>
 				);
 			})}
@@ -1742,6 +2245,8 @@ function InstallPanel({ externalBusy = false, onBusyChange }) {
 // is showing.
 export function ToolsPage() {
 	usePageTitle("工具");
+	// /tools?job=<id> (validated by the route's toolsJobSearch).
+	const { job: linkedJobId = null } = useSearch({ from: "/tools" });
 
 	// D40's backend job table (`_JOBS`/`_SYNC_OPS`) is ONE global single-flight
 	// shared by an install job, a revise job, AND a synchronous regenerate --
@@ -1800,6 +2305,7 @@ export function ToolsPage() {
 					<InstalledToolsPanel
 						externalBusy={installBusy}
 						onBusyChange={setSummaryBusy}
+						linkedJobId={linkedJobId}
 					/>
 				</Tabs.Panel>
 				<Tabs.Panel value="install" pt="md">

@@ -11,6 +11,19 @@ from enum import StrEnum
 from sqlalchemy import JSON
 from sqlmodel import Column, Field, Relationship, SQLModel
 
+# SQLite's INTEGER storage class is a signed 64-bit two's-complement integer
+# (https://www.sqlite.org/datatype3.html#the_integer_datatypes): 2**63 - 1 is
+# the largest value it can hold. FastAPI's and pydantic's `int` accept any
+# Python int, which is unbounded, so a value beyond this -- e.g.
+# `item_id=9223372036854775808` (2**63) -- parses fine at the routing layer
+# but raises OverflowError from the pysqlite driver the moment it is bound
+# into a query, which FastAPI does not catch: it propagates as an unhandled
+# 500 instead of a client error. Every request `int` -- path, query or body --
+# that is bound into a SQLite query must be capped at this constant so
+# out-of-range values are instead rejected with 422 during validation, before
+# ever reaching the database.
+SQLITE_MAX_INT = 9223372036854775807  # 2**63 - 1
+
 
 class MemoryStatus(StrEnum):
     """Lifecycle status of a memory item (see docs/methodology.md)."""
@@ -167,3 +180,88 @@ class ProgressEntry(SQLModel, table=True):
     note: str
 
     item: MemoryItem | None = Relationship(back_populates="entries")
+
+
+class ToolRun(SQLModel, table=True):
+    """One execution of an installed tool (web-v6 §6): what ran and how it ended.
+
+    Metadata for every call; the redacted INPUT and OUTPUT only for a run that
+    failed -- the operator ruled the store may hold failure bodies (a deliberate
+    exception to D09's "bodies stay off disk", whose privacy reason holds just as
+    well for successful runs, so those keep metadata only). Bodies are capped and
+    surrogate-scrubbed by ``services.tool_runs`` before they reach this table.
+
+    ``tool_name`` is the package NAME, not an identity: a same-name reinstall is a
+    different tool, which is why deleting a tool deletes its runs and why "can this
+    failure be fixed" also requires ``vid`` to be the package's current version.
+    Nothing here is ever deleted automatically; purging is the operator's call.
+    """
+
+    __tablename__ = "tool_run"
+    # Ids are handed to the browser and come back as ``run_ids`` on a revise; a
+    # purge followed by id REUSE would let a stale reference attach someone
+    # else's failure. AUTOINCREMENT is SQLite's guarantee against that, the same
+    # one ProgressEntry takes.
+    __table_args__ = {"sqlite_autoincrement": True}
+
+    id: int | None = Field(default=None, primary_key=True)
+    tool_name: str = Field(index=True)
+    vid: str
+    started_at: datetime = Field(default_factory=utcnow)
+    duration_ms: int = 0
+    # ok | failed | output_overflow | timeout | start_failed | refused | error
+    outcome: str
+    exit_code: int | None = None
+    # stdout ran past the cap and the (successful) result was cut.
+    truncated: bool = False
+    # Which workflow called it (capture, enrich, assist_update, ...).
+    workflow: str = "unknown"
+    # The health-check / verification batch a run belongs to (web-v6 §10).
+    check_id: str | None = Field(default=None, index=True)
+    llm_log_id: int | None = None
+    llm_log_process: str | None = None
+    # The string the model received (head only), for a non-ok run.
+    message: str | None = None
+    args: str | None = None
+    stdout: str | None = None
+    stderr: str | None = None
+
+
+class ToolCheck(SQLModel, table=True):
+    """The verdict of one run of a version's examples (web-v6 §9, §10).
+
+    Written once, when a health check or the verification after a fix has RUN
+    the examples, under the same shared tools lock as their run records. The
+    verification line of 最近執行 reads the newest one of the current version.
+    Kept apart from the records it sums up (P5 review r1, J1): those are evidence
+    the operator purges by outcome and age, and a verdict re-derived from whatever
+    a purge left behind reports what never happened -- purging the successes of a
+    clean pass made an older batch's failure the "newest".
+
+    ``tool_name`` is the package name, as on ToolRun: deleting a tool deletes its
+    verdicts. A discarded version's verdicts are never read again (only the
+    current version's count) and are a few integers each, so they are kept.
+    """
+
+    __tablename__ = "tool_check"
+    __table_args__ = {"sqlite_autoincrement": True}
+
+    id: int | None = Field(default=None, primary_key=True)
+    # The job id; the run records of the same check carry it as their check_id.
+    check_id: str
+    tool_name: str = Field(index=True)
+    vid: str
+    # health_check | verify
+    workflow: str
+    finished_at: datetime = Field(default_factory=utcnow)
+    # The examples the version's file listed when the check ran.
+    total: int
+    # Exit 0 within the tool's own timeout.
+    passed: int
+    # failed | output_overflow | timeout | start_failed: the tool's own failure.
+    failed: int
+    # Why the run ended short of the list, when it did: ``budget`` (the check's
+    # time budget ran out) or ``interrupted`` (the tool was switched off or
+    # replaced mid-run, so the rest were refused). A timeout is a failure and
+    # skips the rest by itself.
+    stopped: str | None = None

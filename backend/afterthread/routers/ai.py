@@ -43,6 +43,7 @@ from afterthread.schemas import (
     LLMStatus,
     LLMTokenRatio,
     MemoryItemRead,
+    ToolFailureEntry,
 )
 from afterthread.services import llm_log, token_budget, tools
 from afterthread.services.llm import (
@@ -184,7 +185,7 @@ def _conflict() -> HTTPException:
 
 
 @asynccontextmanager
-async def _advertised_tools_lock() -> AsyncIterator[None]:
+async def _advertised_tools_lock() -> AsyncIterator[list[tools.ToolFailure]]:
     """Hold the shared tools lock across one complete tool-advertising request.
 
     Acquisition runs off-loop because a destroyer that won the race may hold the
@@ -193,14 +194,35 @@ async def _advertised_tools_lock() -> AsyncIterator[None]:
     normal output, LLM/config errors, validation errors, and request
     cancellation; a subprocess has its own inherited reference if it outlives
     the backend-side close.
+
+    It also collects the request's tool failures (web-v6 §8.2) into the yielded
+    list, which the route puts in its response as ``tool_failures``. The scope
+    is the one that already wraps every tool-advertising request, so no route
+    can call a tool without its failures being collected.
     """
 
     fd = await run_in_threadpool(tools.acquire_shared_tools_lock)
     try:
-        with tools.bind_request_tools_lock(fd):
-            yield
+        with tools.bind_request_tools_lock(fd), tools.collect_tool_failures() as failures:
+            yield failures
     finally:
         await run_in_threadpool(tools.release_tools_lock, fd)
+
+
+def _failure_entries(failures: list[tools.ToolFailure]) -> list[ToolFailureEntry]:
+    """The collected failures as the response's ``tool_failures``."""
+    return [
+        ToolFailureEntry.model_validate(
+            {
+                "run_id": failure.run_id,
+                "tool_name": failure.tool_name,
+                "vid": failure.vid,
+                "outcome": failure.outcome,
+                "recorded": failure.run_id is not None,
+            }
+        )
+        for failure in failures
+    ]
 
 
 def _conditional_update(
@@ -347,7 +369,7 @@ async def capture(payload: CaptureRequest, session: SessionDep) -> CaptureRespon
     -- no partial rows -- because no write has happened yet. The blocking write
     itself runs in a threadpool (see _capture_persist), off the event loop.
     """
-    async with _advertised_tools_lock():
+    async with _advertised_tools_lock() as tool_failures:
         try:
             draft = await capture_draft(payload.raw_text)
         except LLMNotConfiguredError as exc:
@@ -396,7 +418,9 @@ async def capture(payload: CaptureRequest, session: SessionDep) -> CaptureRespon
     )
     item.entries.append(ProgressEntry(note=_CAPTURE_NOTE))  # ty: ignore[missing-argument]
     result = await run_in_threadpool(_capture_persist, session, item)
-    return CaptureResponse(item=result, questions=draft.questions)
+    return CaptureResponse(
+        item=result, questions=draft.questions, tool_failures=_failure_entries(tool_failures)
+    )
 
 
 # The two by-id AI routes can 404 (unknown item, or an item deleted during the
@@ -528,7 +552,7 @@ async def enrich(item_id: ItemId, payload: EnrichRequest, session: SessionDep) -
     """
     item_fields, original_updated = await run_in_threadpool(_snapshot_item_for_ai, session, item_id)
 
-    async with _advertised_tools_lock():
+    async with _advertised_tools_lock() as tool_failures:
         try:
             result = await enrich_item(item_fields, payload.additional_context)
         except LLMNotConfiguredError as exc:
@@ -539,7 +563,11 @@ async def enrich(item_id: ItemId, payload: EnrichRequest, session: SessionDep) -
     result_read = await run_in_threadpool(
         _enrich_persist, session, item_id, original_updated, result
     )
-    return EnrichResponse(item=result_read, gaps=result.remaining_gaps)
+    return EnrichResponse(
+        item=result_read,
+        gaps=result.remaining_gaps,
+        tool_failures=_failure_entries(tool_failures),
+    )
 
 
 def _assist_persist(
@@ -612,7 +640,7 @@ async def assist_update_item(
     """
     item_fields, original_updated = await run_in_threadpool(_snapshot_item_for_ai, session, item_id)
 
-    async with _advertised_tools_lock():
+    async with _advertised_tools_lock() as tool_failures:
         try:
             result = await assist_update(item_fields, payload.note)
         except LLMNotConfiguredError as exc:
@@ -623,4 +651,4 @@ async def assist_update_item(
     result_read = await run_in_threadpool(
         _assist_persist, session, item_id, original_updated, result
     )
-    return AssistUpdateResponse(item=result_read)
+    return AssistUpdateResponse(item=result_read, tool_failures=_failure_entries(tool_failures))

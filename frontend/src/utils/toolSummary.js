@@ -81,11 +81,19 @@ export function acceptSummaryForVersion(currentVid, detail) {
 // component consumes these objects directly, so revise/regenerate cannot drift
 // back to an empty body and discard cannot accidentally fall back to the
 // name-only DELETE route.
-export function buildReviseRequest({ name, currentVid, feedback }) {
-	return {
-		path: `/api/tools/${name}/revise`,
-		body: { feedback, expected_vid: currentVid },
-	};
+//
+// A revise may attach failing run records (web-v6 §8.1): `runIds`. The one-click
+// fix sends ONLY those and the expected version -- no words, no form -- so an
+// empty feedback is left out of the body rather than sent blank.
+export function buildReviseRequest({ name, currentVid, feedback, runIds }) {
+	const body = { expected_vid: currentVid };
+	if (feedback) {
+		body.feedback = feedback;
+	}
+	if (runIds?.length) {
+		body.run_ids = runIds;
+	}
+	return { path: `/api/tools/${name}/revise`, body };
 }
 
 export function buildRegenerateRequest({ name, currentVid }) {
@@ -98,6 +106,39 @@ export function buildRegenerateRequest({ name, currentVid }) {
 export function buildDiscardRequest({ name, currentVid }) {
 	return {
 		path: `/api/tools/${name}/versions/${currentVid}`,
+	};
+}
+
+// The revise submit's one refusal whose MESSAGE is the instruction (web-v6
+// §5.2): `env_policy` comes back before any job exists, and its text names the
+// .env/config.env keys the operator has to move. So it gets its own title and
+// stays on screen until dismissed -- the next step is editing a file, and a toast
+// that closes after a few seconds takes the key names with it. Every other
+// error keeps the generic red notification (null here).
+//
+// The attached run records (web-v6 §8.3) are the other refusal made before any
+// job: a record purged meanwhile (404 -- whose ApiError message is the generic
+// 找不到項目, so the copy is ours) or one of another tool (422, the backend's
+// own words).
+export function reviseRefusalNotification(error) {
+	if (error?.status === 404 && error?.code === "run_not_found") {
+		return {
+			color: "orange",
+			title: "修正未送出",
+			message: "附上的執行紀錄已不存在（可能已被清除），請重新整理後再試。",
+		};
+	}
+	if (error?.status === 422 && error?.code === "run_not_for_tool") {
+		return { color: "orange", title: "修正未送出", message: error.message };
+	}
+	if (error?.status !== 409 || error?.code !== "env_policy") {
+		return null;
+	}
+	return {
+		color: "orange",
+		title: "修訂未送出：工具設定需要調整",
+		message: error.message,
+		autoClose: false,
 	};
 }
 

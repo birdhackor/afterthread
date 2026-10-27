@@ -32,7 +32,8 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Awaitable, Callable, Generator
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -41,9 +42,12 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
+from sqlalchemy import Engine
+from sqlmodel import Session
 
 from afterthread.config import Settings
-from afterthread.services import llm_log, tool_builder, tool_meta, tools
+from afterthread.models import SQLITE_MAX_INT
+from afterthread.services import llm_log, tool_builder, tool_meta, tool_runs, tools
 from afterthread.services.llm import LLMNotConfiguredError, LLMUpstreamError
 from afterthread.services.tool_builder import (
     _ERROR_NAME_TAKEN,
@@ -57,6 +61,7 @@ from afterthread.services.tool_builder import (
     _resolve_in_staging,
     run_install,
 )
+from afterthread.services.tool_runs import AttachedRun
 
 _TEST_VID = "20260728T010203Z-abcdef"
 
@@ -2970,6 +2975,7 @@ def test_router_list_tools(
                 "error": None,
                 "current_vid": _TEST_VID,
                 "lineage": "sole",
+                "last_run": None,
             }
         ]
     }
@@ -3040,10 +3046,12 @@ def test_router_delete_tool_response_distinguishes_removed_from_retained(
         "outcome": "removed",
         "retained_path": None,
         "retention_reason": None,
+        "runs_deleted": True,
     }
     assert retained.status_code == 200
     retained_body = retained.json()
     assert retained_body["outcome"] == "retained"
+    assert retained_body["runs_deleted"] is True
     assert retained_body["retention_reason"] == "cleanup_failed"
     retained_path = Path(retained_body["retained_path"])
     assert retained_path.parent == tmp_path / "tools"
@@ -3431,6 +3439,7 @@ def test_router_job_status_and_404(client: TestClient) -> None:
         summary="done",
         llm_log_id=3,
         env_keys=("KB_API_KEY",),
+        outcome="published",
     )
     with tool_builder._JOBS_LOCK:
         tool_builder._JOBS[job.job_id] = job
@@ -3450,6 +3459,9 @@ def test_router_job_status_and_404(client: TestClient) -> None:
         # outlive it (R9-1; see the token's own tests in test_llm_log).
         "llm_log_process": llm_log.process_token(),
         "env_keys": ["KB_API_KEY"],
+        "outcome": "published",
+        "kind": "install",
+        "verification": None,
     }
 
     missing = client.get("/api/tools/jobs/ghost")
@@ -4147,14 +4159,15 @@ def test_router_revise_202_queues_job(
     session, so it cannot live inside a request. The feedback arrives stripped by
     the request layer."""
     _seed_package(monkeypatch, tmp_path)
-    seen: dict[str, str] = {}
+    seen: dict[str, Any] = {}
 
     async def fake_start(
-        name: str, feedback: str, expected_vid: str
+        name: str, feedback: str, expected_vid: str, *, runs: tuple[Any, ...] = ()
     ) -> tool_builder.ReviseJobStart:
         seen["name"] = name
         seen["feedback"] = feedback
         seen["expected_vid"] = expected_vid
+        seen["runs"] = runs
         return tool_builder.ReviseJobStart(job_id="job-rev")
 
     monkeypatch.setattr("afterthread.services.tool_builder.start_revise_job", fake_start)
@@ -4169,6 +4182,7 @@ def test_router_revise_202_queues_job(
         "name": "kbsearch",
         "feedback": "加上分頁參數",
         "expected_vid": _TEST_VID,
+        "runs": (),
     }
 
 
@@ -4429,7 +4443,11 @@ def test_router_job_poll_serves_install_and_revise_jobs(
             return InstallOutcome(ok=True, tool_name="kb", summary="裝好了", llm_log_id=1)
 
         async def fake_run_revise(
-            name: str, feedback: str, _resolution: tools.Resolved | None
+            name: str,
+            feedback: str,
+            _resolution: tools.Resolved | None,
+            *,
+            runs: tuple[Any, ...] = (),
         ) -> InstallOutcome:
             return InstallOutcome(ok=True, tool_name=name, summary="改好了", llm_log_id=2)
 
@@ -5447,6 +5465,13 @@ def test_run_revise_refuses_a_stat_failure_on_the_env(
         assert not tools._INFLIGHT_SECRETS  # nothing was registered either
 
 
+def _unmatchable(*keys: str) -> str:
+    """The spelling gate's message as it names ``keys`` (web-v6 §5)."""
+    return tool_builder._ERROR_REVISE_ENV_UNMATCHABLE.replace(
+        "{keys}", "、".join(f"「{key}」" for key in keys)
+    )
+
+
 def test_run_revise_refuses_an_env_value_too_short_to_mask(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -5462,9 +5487,10 @@ def test_run_revise_refuses_an_env_value_too_short_to_mask(
     short secret for this exact reason; this is the same rule at the other entry
     point.
 
-    The message names the CONDITION and the remedy and nothing else: naming the
-    key or the value in the very error that refuses to expose it would be the leak
-    it exists to prevent."""
+    The message names the CONDITION, the remedy and the KEY (web-v6 §5: the
+    operator ruled key names may be shown -- they already surface in ``env_keys``
+    and the migration report), and never the VALUE: echoing the value in the very
+    error that refuses to expose it would be the leak it exists to prevent."""
     pkg = _seed_package(monkeypatch, tmp_path)
     (_package_path(pkg) / ".env").write_text("PIN=1234\n", encoding="utf-8")
     before = _file_bytes(pkg)
@@ -5475,9 +5501,9 @@ def test_run_revise_refuses_an_env_value_too_short_to_mask(
     outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
-    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMASKABLE
-    assert "PIN" not in (outcome.error or "")  # never the key
+    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMASKABLE.replace("{keys}", "「PIN」")
     assert "1234" not in (outcome.error or "")  # never the value
+    assert "config.env" in (outcome.error or "")  # the way out for a setting
     assert captured == {}  # the builder session never started
     assert outcome.llm_log_id is None
     assert _file_bytes(pkg) == before  # the package is untouched
@@ -5563,8 +5589,7 @@ def test_run_revise_refuses_an_env_value_the_file_spells_reversibly(
     outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
-    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
-    assert "KEY" not in (outcome.error or "")  # never the key
+    assert outcome.error == _unmatchable("KEY")
     assert parsed not in (outcome.error or "")  # never the value
     assert captured == {}  # the builder session never started
     assert outcome.llm_log_id is None
@@ -5606,7 +5631,7 @@ def test_run_revise_refuses_a_shadowed_line_that_spells_the_value_reversibly(
     outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
-    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
+    assert outcome.error == _unmatchable("KEY")
     assert parsed not in (outcome.error or "")  # never the value
     assert captured == {}  # the builder session never started
     assert _file_bytes(pkg) == before
@@ -5639,7 +5664,7 @@ def test_run_revise_refuses_a_backslash_escape_inside_single_quotes(
     outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
-    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
+    assert outcome.error == _unmatchable("TOKEN")
     assert parsed not in (outcome.error or "")
     assert captured == {}  # refused before the session
     assert _file_bytes(pkg) == before
@@ -5813,8 +5838,7 @@ def test_run_revise_refuses_a_value_only_an_unrelated_line_spells_literally(
     outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
-    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
-    assert "TOKEN" not in (outcome.error or "")  # never the key
+    assert outcome.error == _unmatchable("TOKEN")
     assert parsed not in (outcome.error or "")  # never the value
     assert captured == {}  # the builder session never started
     assert outcome.llm_log_id is None
@@ -5857,8 +5881,7 @@ def test_run_revise_refuses_a_value_a_comment_on_its_own_line_vouches_for(
     outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
-    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
-    assert "TOKEN" not in (outcome.error or "")  # never the key
+    assert outcome.error == _unmatchable("TOKEN")
     assert parsed not in (outcome.error or "")  # never the value
     assert captured == {}  # the builder session never started
     assert outcome.llm_log_id is None
@@ -5902,7 +5925,7 @@ def test_run_revise_refuses_a_plain_value_carrying_a_trailing_comment(
     outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
-    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
+    assert outcome.error == _unmatchable("KEY")
     assert captured == {}  # refused before the session, like every other .env gate
     assert _file_bytes(pkg) == before
     with tools._INFLIGHT_LOCK:
@@ -5938,7 +5961,7 @@ def test_run_revise_refuses_a_value_its_assignment_line_cannot_vouch_for(
     outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.ok is False
-    assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
+    assert outcome.error == _unmatchable("SPAN")
     assert captured == {}  # the builder session never started
     assert _file_bytes(pkg) == before
     with tools._INFLIGHT_LOCK:
@@ -5993,7 +6016,7 @@ def test_run_revise_checks_the_last_assignment_of_a_duplicated_env_key(
 
     if refused:
         assert outcome.ok is False
-        assert outcome.error == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE
+        assert outcome.error == _unmatchable("KEY")
         assert captured == {}  # the builder session never started
     else:
         assert outcome.ok is True
@@ -6621,7 +6644,11 @@ def test_revise_job_records_its_outcome_and_backstops_bugs(
 
     async def scenario() -> None:
         async def fake_run_revise(
-            name: str, feedback: str, _resolution: tools.Resolved | None
+            name: str,
+            feedback: str,
+            _resolution: tools.Resolved | None,
+            *,
+            runs: tuple[Any, ...] = (),
         ) -> InstallOutcome:
             return InstallOutcome(
                 ok=True,
@@ -6635,6 +6662,10 @@ def test_revise_job_records_its_outcome_and_backstops_bugs(
         started = await tool_builder.start_revise_job("kbsearch", "加上分頁", _TEST_VID)
         assert started.job_id is not None
         job_id = started.job_id
+        # P4 review r1 H3: named from the first poll, before the builder reports.
+        queued = tool_builder.get_job(job_id)
+        assert queued is not None
+        assert (queued["state"], queued["tool_name"]) == ("queued", "kbsearch")
         for _ in range(200):
             job = tool_builder.get_job(job_id)
             assert job is not None
@@ -6649,7 +6680,11 @@ def test_revise_job_records_its_outcome_and_backstops_bugs(
         assert job["finished_at"] is not None
 
         async def exploding(
-            name: str, feedback: str, _resolution: tools.Resolved | None
+            name: str,
+            feedback: str,
+            _resolution: tools.Resolved | None,
+            *,
+            runs: tuple[Any, ...] = (),
         ) -> InstallOutcome:
             raise RuntimeError("bug with secrets in str()")
 
@@ -6667,6 +6702,7 @@ def test_revise_job_records_its_outcome_and_backstops_bugs(
         assert "修訂過程發生未預期錯誤" in (job["error"] or "")
         assert "RuntimeError" in (job["error"] or "")
         assert "secrets" not in (job["error"] or "")
+        assert job["tool_name"] == "kbsearch"  # the backstop keeps the name (H3)
         await asyncio.gather(*list(tool_builder._TASKS), return_exceptions=True)
 
     asyncio.run(scenario())
@@ -6696,7 +6732,11 @@ def test_install_and_revise_share_one_single_flight_slot(
             return InstallOutcome(ok=True, tool_name="kb")
 
         async def blocking_revise(
-            name: str, feedback: str, _resolution: tools.Resolved | None
+            name: str,
+            feedback: str,
+            _resolution: tools.Resolved | None,
+            *,
+            runs: tuple[Any, ...] = (),
         ) -> InstallOutcome:
             await release.wait()
             return InstallOutcome(ok=True, tool_name=name)
@@ -6755,3 +6795,799 @@ def test_resolve_in_staging_direct_cases(tmp_path: Path) -> None:
     assert _resolve_in_staging(staging, "/abs") is None
     assert _resolve_in_staging(staging, 123) is None
     assert _resolve_in_staging(staging, "") is None
+
+
+# --- web-v6 P1: config.env, key-named gate messages, not_published -----------
+
+
+def test_unmaskable_env_error_names_every_short_key_and_never_a_value() -> None:
+    """Invariant C: one refusal names everything the operator has to move -- not
+    just the first offender -- capped at five names plus a count, and no value
+    appears in it. Each value is unique so a leak of any one would be caught."""
+    values = {
+        "A_TTL": "1",
+        "B_TTL": "22",
+        "C_TTL": "333",
+        "D_TTL": "4444",
+        "E_TTL": "55555",
+        "F_TTL": "q",
+        "LONG_ENOUGH": "abcdefgh",
+    }
+    text = "".join(f"{key}={value}\n" for key, value in values.items())
+
+    message = tool_builder._unmaskable_env_error(text, values)
+
+    assert message is not None
+    named = "、".join(f"「{key}」" for key in ("A_TTL", "B_TTL", "C_TTL", "D_TTL", "E_TTL"))
+    assert message == tool_builder._ERROR_REVISE_ENV_UNMASKABLE.replace("{keys}", named + "等 6 個")
+    assert "F_TTL" not in message and "LONG_ENOUGH" not in message
+    for value in ("22", "333", "4444", "55555", "abcdefgh"):
+        assert value not in message
+
+
+def test_env_policy_message_redacts_a_key_before_cutting_it() -> None:
+    """A key name is operator-chosen text, so it goes through the redactor like
+    every other operator-derived interpolation, and only THEN is it cut -- the
+    redact->cap order, which leaves no partial secret behind."""
+    tools.register_inflight_secret("SECRET_NAMED_KEY")
+    long_key = "K" * 100
+
+    message = tool_builder._env_policy_message("{keys}", ["SECRET_NAMED_KEY", long_key])
+
+    assert "SECRET_NAMED_KEY" not in message
+    assert tools._REDACTION_MARKER in message
+    assert f"「{'K' * tool_builder._ENV_KEY_SHOWN_MAX}…」" in message
+
+
+def test_router_revise_refuses_an_env_policy_failure_before_any_job(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Invariant C, submit time (web-v6 §5.2): the gate answers the click itself --
+    a 409 whose message names the key -- instead of a job card the operator may
+    never open. Nothing is created: no job, no reservation left behind, no LLM
+    call."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / ".env").write_text("CACHE_TTL=3600\n", encoding="utf-8")
+
+    async def must_not_generate(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("an env-policy refusal must not reach the LLM")
+
+    monkeypatch.setattr(tool_builder, "generate_structured", must_not_generate)
+
+    response = client.post(
+        "/api/tools/kbsearch/revise",
+        json={"feedback": "修好錯誤", "expected_vid": _TEST_VID},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "env_policy",
+            "message": tool_builder._ERROR_REVISE_ENV_UNMASKABLE.replace("{keys}", "「CACHE_TTL」"),
+        }
+    }
+    assert "3600" not in response.text
+    with tool_builder._JOBS_LOCK:
+        assert tool_builder._JOBS == {}
+        assert not tool_builder._SYNC_OPS
+
+
+def test_router_revise_refuses_an_unreadable_config_env(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A ``config.env`` the bounded reader refuses stops the revise at submit, for
+    the reason ``.env`` does: the builder must test against the environment the
+    runtime will actually build."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    target = tmp_path / "elsewhere.env"
+    target.write_text("X=1\n", encoding="utf-8")
+    (_package_path(pkg) / tools._CONFIG_FILENAME).symlink_to(target)
+
+    response = client.post(
+        "/api/tools/kbsearch/revise",
+        json={"feedback": "修好錯誤", "expected_vid": _TEST_VID},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "env_policy",
+        "message": tool_builder._ERROR_REVISE_CONFIG_UNREADABLE,
+    }
+
+
+def test_run_revise_gives_config_env_to_the_shell_and_the_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Invariant D for the builder (web-v6 §4): run_shell gets ``config.env`` with
+    ``.env`` on top, exactly as the runtime layers them; the prompt quotes the
+    ``config.env`` TEXT (comments included), names the ``.env`` KEYS and the
+    keys both files set -- and carries no ``.env`` value."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / ".env").write_text(
+        "API_KEY=live-secret-value-123456\nSHARED=secret-wins-123456\n", encoding="utf-8"
+    )
+    (_package_path(pkg) / tools._CONFIG_FILENAME).write_text(
+        "# 快取秒數\nCACHE_TTL=3600\nSHARED=public-value\n", encoding="utf-8"
+    )
+    captured: dict[str, Any] = {}
+
+    async def fake(
+        system_prompt: str,
+        user_prompt: str,
+        model_cls: type[BaseModel],
+        *,
+        workflow: str = "unknown",
+        tools: Any = None,
+        max_tool_rounds: int | None = None,
+        timeout_seconds: float | None = None,
+    ) -> BaseModel:
+        by_name = {t.spec["function"]["name"]: t for t in tools or []}
+        captured["prompt"] = user_prompt
+        captured["shell"] = await by_name["run_shell"].handler(
+            {"command": 'echo "ttl=$CACHE_TTL shared=$SHARED"'}
+        )
+        return model_cls.model_validate(_revise_result())
+
+    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", fake)
+    _fake_summary_generate(monkeypatch)
+
+    outcome = asyncio.run(_run_revise("kbsearch", "把快取改短"))
+
+    assert outcome.ok is True
+    assert "ttl=3600" in captured["shell"]
+    assert "secret-wins-123456" not in captured["shell"]  # .env won, then got masked
+    assert f"shared={tools._REDACTION_MARKER}" in captured["shell"]
+    prompt = captured["prompt"]
+    assert "# 快取秒數\nCACHE_TTL=3600\nSHARED=public-value" in prompt
+    assert "These keys are also set in the package's .env, whose value wins: SHARED" in prompt
+    assert "(secrets; values hidden; never print them): API_KEY, SHARED" in prompt
+    assert "live-secret-value-123456" not in prompt
+    assert "secret-wins-123456" not in prompt
+
+
+_NOT_READY_SUMMARY = "API 回 401，金鑰可能過期"  # noqa: RUF001
+
+
+def test_run_revise_not_ready_publishes_nothing_and_says_so(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Invariant O: the builder's own ``ready=false`` is ``not_ready`` on the
+    outcome -- distinct from every other failure -- and nothing is published:
+    ``current`` stays put and no version directory appears."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    package = _package_path(pkg)
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": _NOT_READY_SUMMARY, "ready": False},
+        files={"run.py": _REVISED_RUN_PY},
+    )
+
+    outcome = asyncio.run(_run_revise("kbsearch", "修好錯誤"))
+
+    assert outcome.ok is False
+    assert outcome.not_ready is True
+    assert outcome.summary == _NOT_READY_SUMMARY
+    assert _resolved_version(package) == pkg
+    assert sorted(p.name for p in (package / tools._VERSIONS_DIRNAME).iterdir()) == [_TEST_VID]
+
+
+@pytest.mark.parametrize(
+    ("make_outcome", "expected_state", "expected_outcome"),
+    [
+        (lambda: InstallOutcome(ok=True, tool_name="kb"), "succeeded", "published"),
+        (
+            lambda: InstallOutcome(ok=False, error="not ready", not_ready=True),
+            "failed",
+            "not_published",
+        ),
+        (lambda: InstallOutcome(ok=False, error="LLM 尚未設定"), "failed", "failed"),
+    ],
+)
+def test_job_outcome_separates_not_published_from_failed(
+    make_outcome: Callable[[], InstallOutcome], expected_state: str, expected_outcome: str
+) -> None:
+    """Invariant O at the job layer: ``state`` keeps its two terminal values, and
+    ``outcome`` splits the failure so the card can show "not published" in its
+    own colour without claiming why."""
+    job = tool_builder._admit_job()
+    assert job is not None
+
+    async def run() -> InstallOutcome:
+        return make_outcome()
+
+    asyncio.run(tool_builder._run_job(job.job_id, run, tool_builder._ACTION_REVISE))
+
+    polled = tool_builder.get_job(job.job_id)
+    assert polled is not None
+    assert polled["state"] == expected_state
+    assert polled["outcome"] == expected_outcome
+
+
+def test_job_outcome_of_an_unexpected_exception_is_failed() -> None:
+    """The backstop for a genuine bug ends in ``failed`` too, never a null that
+    would leave the card without a terminal shape."""
+    job = tool_builder._admit_job()
+    assert job is not None
+
+    async def run() -> InstallOutcome:
+        raise RuntimeError("bug")
+
+    asyncio.run(tool_builder._run_job(job.job_id, run, tool_builder._ACTION_REVISE))
+
+    polled = tool_builder.get_job(job.job_id)
+    assert polled is not None
+    assert (polled["state"], polled["outcome"]) == ("failed", "failed")
+
+
+def test_router_settings_serves_a_tool_named_jobs_and_404s_the_unknown(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Invariant W: ``/{name}/settings`` is declared before the job poll, which
+    must stay last -- so a tool named ``jobs`` still gets its settings rather than
+    a "Tool job not found". An unknown tool is the ordinary 404."""
+    pkg = _seed_package(monkeypatch, tmp_path, name="jobs")
+    (_package_path(pkg) / tools._CONFIG_FILENAME).write_text("CACHE_TTL=3600\n", encoding="utf-8")
+
+    response = client.get("/api/tools/jobs/settings")
+    assert response.status_code == 200
+    assert response.json()["config"] == [
+        {
+            "key": "CACHE_TTL",
+            "value": "3600",
+            "overridden_by_env": False,
+            "secret_like_name": False,
+            "contains_secret": False,
+        }
+    ]
+
+    missing = client.get("/api/tools/ghost/settings")
+    assert missing.status_code == 404
+    assert missing.json() == {"detail": "Tool not found"}
+
+
+def test_spelling_gate_names_each_failing_line_once_in_order() -> None:
+    """Invariant C for the spelling gate (P1 review C5): two different keys are
+    both named, the deciding-line failures before the shadowed-line ones, and a
+    key failing both checks is named once."""
+    text = (
+        'A_KEY="abcd\\"efgh"\n'  # shadowed; reversible spelling
+        "A_KEY='abcd\"efgh'\n"  # the deciding line, plain
+        "B_KEY=two words here\n"  # deciding line; bare value the serializer would quote
+        'C_KEY="ijkl\\"mnop"\n'  # deciding line AND shadowed check both fail
+    )
+    values = {
+        key: value
+        for key, value in tools._parse_dotenv_text(text).items()
+        if value  # what run_revise registers
+    }
+
+    message = tool_builder._unmaskable_env_error(text, values)
+
+    assert message is not None
+    assert message == _unmatchable("B_KEY", "C_KEY", "A_KEY")
+    for value in values.values():
+        assert value not in message
+
+
+def test_spelling_gate_names_a_comment_line_as_a_comment() -> None:
+    """A comment holding an ``=`` is judged like any line ``_env_line_key``
+    recognizes (R8-1, unchanged); the message only says it is a comment line
+    rather than calling ``# Usage: KEY`` a key (P1 review C3)."""
+    text = 'TOKEN=abcdefgh\n# Usage: KEY="x\\"y" # comment\n'
+
+    message = tool_builder._unmaskable_env_error(text, {"TOKEN": "abcdefgh"})
+
+    assert message == tool_builder._ERROR_REVISE_ENV_UNMATCHABLE.replace(
+        "{keys}", "註解行「# Usage: KEY」"
+    )
+
+
+def test_router_revise_refuses_an_oversized_config_env(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The size cap ``.env`` has applies to ``config.env`` at submit too (P1
+    review C5), with its own category-only message."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / tools._CONFIG_FILENAME).write_text(
+        "X=" + "a" * tools._ENV_FILE_MAX_BYTES + "\n", encoding="utf-8"
+    )
+
+    response = client.post(
+        "/api/tools/kbsearch/revise",
+        json={"feedback": "修好錯誤", "expected_vid": _TEST_VID},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "env_policy",
+        "message": tool_builder._ERROR_REVISE_CONFIG_TOO_LARGE,
+    }
+
+
+# --- web-v6 P3: one-click fix (run_ids on a revise) ------------------------------
+
+_RUN_TIME = datetime(2026, 10, 27, 1, 2, 3, tzinfo=UTC)
+
+
+def _seed_run(session: Session, tool_name: str = "kbsearch", **overrides: Any) -> int:
+    """One run record in the test database; its id."""
+    fields: dict[str, Any] = {
+        "tool_name": tool_name,
+        "vid": _TEST_VID,
+        "started_at": _RUN_TIME,
+        "duration_ms": 10,
+        "outcome": tools.RUN_FAILED,
+        "exit_code": 1,
+        "truncated": False,
+        "workflow": "capture",
+        "check_id": None,
+        "llm_log_id": None,
+        "llm_log_process": None,
+        "message": "tool failed (exit 1): KeyError: 'hits'",
+        "args": '{"query": "zzzz-no-hit"}',
+        "stdout": "searching",
+        "stderr": "Traceback ...\nKeyError: 'hits'",
+    }
+    fields.update(overrides)
+    engine = session.get_bind()
+    assert isinstance(engine, Engine)
+    run_id = tool_runs.record(tools.ToolRunRecord(**fields), engine=engine)
+    assert run_id is not None
+    return run_id
+
+
+def _attached(**overrides: Any) -> AttachedRun:
+    fields: dict[str, Any] = {
+        "id": 7,
+        "started_at": _RUN_TIME,
+        "workflow": "capture",
+        "vid": _TEST_VID,
+        "outcome": tools.RUN_FAILED,
+        "exit_code": 1,
+        "message": "tool failed (exit 1): KeyError: 'hits'",
+        "args": '{"query": "zzzz-no-hit"}',
+        "stdout": "searching",
+        "stderr": "Traceback ...\nKeyError: 'hits'",
+    }
+    fields.update(overrides)
+    return AttachedRun(**fields)
+
+
+def _capture_start(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+
+    async def fake_start(
+        name: str, feedback: str | None, expected_vid: str, *, runs: tuple[Any, ...] = ()
+    ) -> tool_builder.ReviseJobStart:
+        calls.append(
+            {"name": name, "feedback": feedback, "expected_vid": expected_vid, "runs": runs}
+        )
+        return tool_builder.ReviseJobStart(job_id="job-fix")
+
+    monkeypatch.setattr("afterthread.services.tool_builder.start_revise_job", fake_start)
+    return calls
+
+
+def test_router_revise_accepts_run_ids_without_feedback(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """N: the one-click fix sends only run_ids and expected_vid."""
+    _seed_package(monkeypatch, tmp_path)
+    run_id = _seed_run(session)
+    calls = _capture_start(monkeypatch)
+
+    response = client.post(
+        "/api/tools/kbsearch/revise",
+        json={"run_ids": [run_id, run_id], "expected_vid": _TEST_VID},
+    )
+
+    assert response.status_code == 202
+    [call] = calls
+    assert call["feedback"] is None
+    [attached] = call["runs"]  # repeated ids count once
+    assert isinstance(attached, AttachedRun)
+    assert (attached.id, attached.outcome, attached.exit_code) == (run_id, "failed", 1)
+    assert attached.stderr == "Traceback ...\nKeyError: 'hits'"
+    assert attached.started_at == _RUN_TIME
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"expected_vid": _TEST_VID},
+        {"feedback": "   ", "expected_vid": _TEST_VID},
+        {"feedback": "   ", "run_ids": [], "expected_vid": _TEST_VID},
+        {"run_ids": [1, 2, 3, 4], "expected_vid": _TEST_VID},
+        {"run_ids": [0], "expected_vid": _TEST_VID},
+        {"run_ids": [SQLITE_MAX_INT + 1], "expected_vid": _TEST_VID},
+        {"run_ids": [1, 1, 1, 1], "expected_vid": _TEST_VID},
+        {"run_ids": [1]},
+    ],
+    ids=[
+        "nothing",
+        "blank-feedback",
+        "blank-and-empty",
+        "four-runs",
+        "zero-id",
+        "past-sqlite-int",
+        "four-as-sent",
+        "no-vid",
+    ],
+)
+def test_router_revise_needs_feedback_or_runs(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    payload: dict[str, Any],
+) -> None:
+    """N: with neither words nor records there is nothing to do."""
+    _seed_package(monkeypatch, tmp_path)
+    calls = _capture_start(monkeypatch)
+
+    assert client.post("/api/tools/kbsearch/revise", json=payload).status_code == 422
+    assert calls == []
+
+
+def test_router_revise_refuses_unusable_run_ids_before_any_job(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """M: a missing or foreign record stops the submit before the slot or the LLM."""
+    _seed_package(monkeypatch, tmp_path)
+    ours = _seed_run(session)
+    foreign = _seed_run(session, tool_name="web")
+    llm_calls: list[Any] = []
+
+    async def no_llm(*args: Any, **kwargs: Any) -> Any:
+        llm_calls.append(args)
+        raise AssertionError("no LLM call may happen")
+
+    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", no_llm)
+
+    missing = client.post(
+        "/api/tools/kbsearch/revise",
+        json={"run_ids": [ours, 999], "expected_vid": _TEST_VID},
+    )
+    other = client.post(
+        "/api/tools/kbsearch/revise",
+        json={"run_ids": [ours, foreign], "expected_vid": _TEST_VID},
+    )
+
+    assert missing.status_code == 404
+    assert missing.json()["detail"]["code"] == "run_not_found"
+    assert other.status_code == 422
+    assert other.json()["detail"]["code"] == "run_not_for_tool"
+    assert tool_builder._JOBS == {}
+    assert not tool_builder._SYNC_OPS
+    assert llm_calls == []
+
+
+def test_router_revise_keeps_its_copy_when_the_records_are_purged(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """L: the job carries what was attached at submit; a purge afterwards changes nothing."""
+    _seed_package(monkeypatch, tmp_path)
+    run_id = _seed_run(session)
+    launched: list[Callable[[], Awaitable[InstallOutcome]]] = []
+    received: list[tuple[AttachedRun, ...]] = []
+
+    def hold_the_job(job: Any, run: Callable[[], Awaitable[InstallOutcome]], action: str) -> str:
+        launched.append(run)
+        return job.job_id
+
+    async def fake_run_revise(
+        name: str,
+        feedback: str | None,
+        resolution: tools.Resolved | None,
+        *,
+        runs: tuple[AttachedRun, ...] = (),
+    ) -> InstallOutcome:
+        received.append(runs)
+        return InstallOutcome(ok=True, tool_name=name)
+
+    monkeypatch.setattr(tool_builder, "_launch_job", hold_the_job)
+    monkeypatch.setattr(tool_builder, "run_revise", fake_run_revise)
+
+    response = client.post(
+        "/api/tools/kbsearch/revise",
+        json={"run_ids": [run_id], "expected_vid": _TEST_VID},
+    )
+    assert response.status_code == 202
+    assert client.delete(f"/api/tool-runs/{run_id}").status_code == 204
+    [run] = launched
+    asyncio.run(run())
+
+    [[attached]] = received
+    assert attached.id == run_id
+    assert attached.stderr == "Traceback ...\nKeyError: 'hits'"
+    assert attached.args == '{"query": "zzzz-no-hit"}'
+
+
+def test_revise_prompt_carries_the_failing_runs_and_the_procedure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """§8.4: each run, whether it ran the workspace's version, and the fixed steps."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / ".env").write_text("KB_API_KEY=live-secret-value\n", encoding="utf-8")
+    captured = _fake_generate(
+        monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY}
+    )
+    runs = (
+        _attached(stderr="401 for token live-secret-value"),
+        _attached(
+            id=8,
+            vid="20260101T000000Z-000000",
+            outcome=tools.RUN_OUTPUT_OVERFLOW,
+            exit_code=-9,
+        ),
+    )
+
+    package_root = tools._resolve_package_dir_no_alias("kbsearch")
+    assert package_root is not None
+    resolution = tools.resolve_current(package_root)
+    assert isinstance(resolution, tools.Resolved)
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", None, resolution, runs=runs))
+
+    assert outcome.ok is True
+    prompt = captured["user_prompt"]
+    assert "asks only that you fix them" in prompt  # no feedback was given
+    assert "Failing runs attached by the operator" in prompt
+    assert "Run #7 at 2026-10-27 01:02:03 UTC, called from the capture workflow." in prompt
+    assert "It ran the version that is in your workspace." in prompt
+    assert "It ran a DIFFERENT version (20260101T000000Z-000000)" in prompt
+    assert "KILLED because its stderr passed the output cap" in prompt
+    assert '{"query": "zzzz-no-hit"}' in prompt
+    assert "live-secret-value" not in prompt
+    assert tools._REDACTION_MARKER in prompt
+    assert "1. Reproduce first." in prompt
+    assert "examples.json" in prompt
+
+
+def test_revise_prompt_keeps_its_own_no_feedback_words_whole(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P3-r1 G2: the backend's sentence is not operator text, so not redacted.
+
+    A registered value equal to one of its words would otherwise shred it.
+    """
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({"attached"}))
+
+    prompt = tool_builder._revise_user_prompt(
+        None, None, runs=(_attached(),), workspace_vid=_TEST_VID
+    )
+
+    assert tool_builder._NO_FEEDBACK in prompt
+    # The operator's own words still go through the redactor.
+    worded = tool_builder._revise_user_prompt("it attached nothing", None)
+    assert "it attached nothing" not in worded
+    assert tools._REDACTION_MARKER in worded
+
+
+def test_revise_prompt_keeps_the_end_of_a_long_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """P3-r1 G3: at a small budget stderr loses its START, never the failing line.
+
+    The stored copy is a tail and the header says stderr keeps its END; the
+    prompt cut agrees with both. stdout keeps its start.
+    """
+    budget = 4000  # the settings floor for llm_prompt_budget_tokens (cold ratio 1.0)
+    _install_settings(monkeypatch, llm_prompt_budget_tokens=budget)
+    stderr = "".join(f"  frame {i}\n" for i in range(1500)) + "KeyError: 'hits'"
+    stdout = "first line of output\n" + "x" * 6000
+
+    prompt = tool_builder._revise_user_prompt(
+        None,
+        None,
+        runs=(_attached(stderr=stderr, stdout=stdout),),
+        workspace_vid=_TEST_VID,
+    )
+
+    stderr_block = prompt.split("stderr:\n", 1)[1].split("\nstdout:\n", 1)[0]
+    assert len(stderr_block) == budget
+    assert stderr_block.startswith(tool_builder._TAIL_TRUNCATION_MARKER)
+    assert stderr_block.endswith("KeyError: 'hits'")
+    assert "  frame 0\n" not in stderr_block
+    stdout_block = prompt.split("\nstdout:\n", 1)[1].split("\n\n", 1)[0]
+    assert stdout_block.startswith("first line of output")
+
+
+def test_truncate_tail_to_bounds() -> None:
+    """The tail cut never exceeds its cap, marker included, and keeps short text."""
+    marker = tool_builder._TAIL_TRUNCATION_MARKER
+    assert tool_builder._truncate_tail_to("short", 10) == "short"
+    cut = tool_builder._truncate_tail_to("a" * 50 + "END", 30)
+    assert len(cut) == 30
+    assert cut.startswith(marker)
+    assert cut.endswith("END")
+    assert tool_builder._truncate_tail_to("abcdefghijklmnop", 3) == "nop"
+
+
+def test_failing_run_text_names_another_version_without_guessing_its_age() -> None:
+    """P3-r1 G4: a run of another vid may be newer (discarded) or unrelated."""
+    newer = tool_builder._failing_run_text(
+        _attached(vid="20270101T000000Z-ffffff"), _TEST_VID, 10_000
+    )
+
+    assert "It ran a DIFFERENT version (20270101T000000Z-ffffff)" in newer
+    assert "OLDER" not in newer
+
+
+def test_failing_run_text_explains_a_backend_error() -> None:
+    """P3-r1 G4: every outcome §6.1 lists has prose, ``error`` included."""
+    text = tool_builder._failing_run_text(
+        _attached(outcome=tools.RUN_ERROR, exit_code=None), _TEST_VID, 10_000
+    )
+
+    assert "Outcome: the BACKEND failed around this call" in text
+    assert {
+        tools.RUN_OK,
+        tools.RUN_FAILED,
+        tools.RUN_OUTPUT_OVERFLOW,
+        tools.RUN_TIMEOUT,
+        tools.RUN_START_FAILED,
+        tools.RUN_REFUSED,
+        tools.RUN_ERROR,
+    } <= set(tool_builder._RUN_OUTCOME_PROSE)
+
+
+def test_revise_provenance_names_the_runs_but_not_their_contents(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """V: origin.feedback says which failures the version was made for, no stderr."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _write_meta(pkg, summary="舊的說明", origin={"openapi_url": None, "instructions": "i"})
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+    _fake_summary_generate(monkeypatch, summary="新的說明")
+    package_root = tools._resolve_package_dir_no_alias("kbsearch")
+    assert package_root is not None
+    resolution = tools.resolve_current(package_root)
+    assert isinstance(resolution, tools.Resolved)
+
+    outcome = asyncio.run(
+        tool_builder.run_revise(
+            "kbsearch",
+            "也請順便加上分頁",
+            resolution,
+            runs=(_attached(), _attached(id=9, outcome=tools.RUN_TIMEOUT, exit_code=None)),
+        )
+    )
+
+    assert outcome.ok is True
+    feedback = _meta(_current_version(pkg))["origin"]["feedback"]
+    assert feedback.startswith("也請順便加上分頁")
+    assert "#7（2026-10-27 01:02:03 UTC，failed，exit 1）" in feedback  # noqa: RUF001
+    assert "#9（2026-10-27 01:02:03 UTC，timeout）" in feedback  # noqa: RUF001
+    assert "KeyError" not in feedback
+    assert "zzzz-no-hit" not in feedback
+
+
+def test_builder_prompts_ask_for_examples_and_their_rerun() -> None:
+    """§10: install records tested inputs; revise re-runs them all."""
+    install = tool_builder._builder_system_prompt(None)
+    revise = tool_builder._revise_system_prompt("kbsearch")
+    assert "examples.json" in install
+    assert "READ-ONLY" in install
+    assert "run EVERY example" in revise
+
+
+# --- web-v6 P5: the published fix is verified against its examples ------------------
+
+_ECHO_RUN_PY = "import sys, json\nprint(json.load(sys.stdin))\n"
+
+
+def _record_into(monkeypatch: pytest.MonkeyPatch) -> list[tools.ToolRunRecord]:
+    kept: list[tools.ToolRunRecord] = []
+
+    def _record(run: tools.ToolRunRecord) -> int:
+        kept.append(run)
+        return len(kept)
+
+    tools.set_run_recorder(_record)
+    monkeypatch.setattr(tools, "_run_recorder", _record)
+    return kept
+
+
+def _current_resolution(name: str = "kbsearch") -> tools.Resolved:
+    package_root = tools._resolve_package_dir_no_alias(name)
+    assert package_root is not None
+    resolution = tools.resolve_current(package_root)
+    assert isinstance(resolution, tools.Resolved)
+    return resolution
+
+
+def test_a_published_fix_is_verified_against_its_examples_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """P: the backend runs the new version's examples, never the attached inputs."""
+    _seed_package(monkeypatch, tmp_path)
+    records = _record_into(monkeypatch)
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={
+            "run.py": _ECHO_RUN_PY,
+            "examples.json": json.dumps(
+                {"examples": [{"name": "查無結果", "args": {"q": "zzzz-no-hit"}}]}
+            ),
+        },
+    )
+    _fake_summary_generate(monkeypatch, summary="修好了")
+    attached = _attached(args='{"query": "my private note"}')
+
+    try:
+        outcome = asyncio.run(
+            tool_builder.run_revise("kbsearch", None, _current_resolution(), runs=(attached,))
+        )
+    finally:
+        tools.set_run_recorder(None)
+
+    assert outcome.ok is True
+    verification = outcome.verification
+    assert verification is not None
+    assert (verification["status"], verification["finished"]) == ("ran", True)
+    assert [(run["name"], run["outcome"]) for run in verification["runs"]] == [("查無結果", "ok")]
+    assert verification["vid"] == _current_resolution().vid != _TEST_VID
+    assert [(record.workflow, record.args) for record in records] == [("verify", None)]
+    assert [record.vid for record in records] == [verification["vid"]]
+
+
+def test_a_published_fix_of_a_disabled_tool_is_reported_unverified(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pkg = _seed_package(monkeypatch, tmp_path)
+    assert tools.set_enabled("kbsearch", False) is True
+    records = _record_into(monkeypatch)
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={
+            "run.py": _ECHO_RUN_PY,
+            "examples.json": json.dumps({"examples": [{"name": "a", "args": {}}]}),
+        },
+    )
+    _fake_summary_generate(monkeypatch, summary="修好了")
+
+    try:
+        outcome = asyncio.run(_run_revise("kbsearch", "改一下"))
+    finally:
+        tools.set_run_recorder(None)
+
+    assert outcome.ok is True
+    assert outcome.verification is not None
+    assert outcome.verification["status"] == "disabled"
+    assert records == []
+    assert _current_version(pkg).name != _TEST_VID  # the fix itself is published
+
+
+def test_the_revise_job_carries_the_verification(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _seed_package(monkeypatch, tmp_path)
+
+    async def fake_run_revise(
+        name: str,
+        feedback: str | None,
+        _resolution: tools.Resolved | None,
+        *,
+        runs: tuple[Any, ...] = (),
+    ) -> InstallOutcome:
+        return InstallOutcome(
+            ok=True,
+            tool_name=name,
+            verification={"status": "no_examples", "runs": [], "finished": True},
+        )
+
+    monkeypatch.setattr(tool_builder, "run_revise", fake_run_revise)
+
+    async def scenario() -> dict[str, Any]:
+        started = await tool_builder.start_revise_job("kbsearch", "x", _TEST_VID)
+        assert started.job_id is not None
+        for _ in range(200):
+            job = tool_builder.get_job(started.job_id)
+            assert job is not None
+            if job["state"] not in ("queued", "running"):
+                return job
+            await asyncio.sleep(0.01)
+        raise AssertionError("job did not finish")
+
+    job = asyncio.run(scenario())
+    assert job["kind"] == "revise"
+    assert job["verification"] == {"status": "no_examples", "runs": [], "finished": True}

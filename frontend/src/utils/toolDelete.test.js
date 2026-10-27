@@ -125,3 +125,37 @@ describe("toolDiscardNotification", () => {
 		expect(notice.message).toContain("請勿手動刪除");
 	});
 });
+
+describe("toolDeleteNotification and run records", () => {
+	it("says nothing extra when the records went with the tool", () => {
+		expect(
+			toolDeleteNotification("kbsearch", {
+				outcome: "removed",
+				retained_path: null,
+				runs_deleted: true,
+			}).message,
+		).toBe("已刪除「kbsearch」的工具目錄");
+	});
+
+	it("joins the note with one sentence break after a message that already ends one", () => {
+		const notice = toolDeleteNotification("kbsearch", {
+			outcome: "retained",
+			retained_path: "/srv/tools/.kbsearch.stale-0123",
+			retention_reason: "cleanup_failed",
+			runs_deleted: false,
+		});
+		expect(notice.message).not.toContain("。。");
+		expect(notice.message).toContain("執行紀錄沒有一起刪掉");
+	});
+
+	it("points to the orphan purge when the records stayed behind", () => {
+		const notice = toolDeleteNotification("kbsearch", {
+			outcome: "removed",
+			retained_path: null,
+			runs_deleted: false,
+		});
+		expect(notice.color).toBe("orange");
+		expect(notice.message).toContain("執行紀錄沒有一起刪掉");
+		expect(notice.message).toContain("只清已刪除的工具留下的");
+	});
+});

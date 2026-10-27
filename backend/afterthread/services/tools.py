@@ -13,10 +13,12 @@ version identity; a call runs that exact version with its directory as cwd.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import fcntl
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -29,7 +31,7 @@ import time
 import weakref
 from collections.abc import Awaitable, Callable, Iterator
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any, Literal
@@ -40,7 +42,12 @@ from starlette.concurrency import run_in_threadpool
 
 from afterthread.config import get_settings
 from afterthread.services import llm_log
-from afterthread.services.llm import LlmTool
+from afterthread.services.llm import LlmTool, current_interaction, tool_exception_text
+
+# Under the "afterthread" namespace main attaches its console handler to. The one
+# line this module logs is a run record that could not be written -- its type
+# only, never a body (see ``_record_run``).
+_logger = logging.getLogger("afterthread.tools")
 
 # A package (and directory) name: lowercase alnum start, then up to 63 more of
 # alnum/underscore/hyphen. Admits no ".", "/", or whitespace, so a traversal
@@ -55,6 +62,12 @@ _CURRENT_FILENAME = "current"
 _PACKAGE_STATE_FILENAME = "state.json"
 _ORIGIN_FILENAME = "origin.json"
 _SUMMARY_FILENAME = "summary.json"
+# A version's regression inputs (web-v6 §10): tool content the builder writes,
+# read by the backend only to run them.
+_EXAMPLES_FILENAME = "examples.json"
+_EXAMPLES_MAX_BYTES = 64 * 1024
+EXAMPLES_MAX = 10
+_EXAMPLE_NAME_MAX_CHARS = 200
 _CURRENT_MAX_BYTES = 64
 _TOOLS_LOCK_FILENAME = ".afterthread-tools.lck"
 
@@ -105,6 +118,17 @@ _PARAMETERS_SCHEMA_MAX_BYTES = 16 * 1024
 # the package outright (``validate_tool_content``). 64 KiB dwarfs any real secrets file
 # (a handful of KEY=VALUE lines).
 _ENV_FILE_MAX_BYTES = 64 * 1024
+
+# The package-layer SETTINGS file (web-v6 §4): operator-owned overrides of the
+# defaults a version's code carries, beside the package's ``.env``. The split is
+# the whole point. Every ``.env`` value is a SECRET to the redaction pipeline,
+# so a setting parked there is either too short to mask (and blocks every revise)
+# or long enough to be masked out of every tool result and AI log. Values here are
+# deliberately NOT secrets: they never enter ``known_secret_values``, are shown to
+# the builder in full, and carry no length floor. Read exactly like ``.env``
+# (same bounded reader, same 64 KiB cap, same ``interpolate=False`` parse), and
+# layered UNDER it so a secret can never be shadowed by a public value.
+_CONFIG_FILENAME = "config.env"
 
 # Legacy flat-layout name retained for the offline migration reader and for
 # stripping builder-authored forgeries. New summaries live at
@@ -984,6 +1008,16 @@ def _resolve_version_target(
     return version_root, origin
 
 
+def version_exists(package_root: PackageRoot, vid: str) -> bool:
+    """Whether ``vid`` is still one of the package's committed versions.
+
+    A run record outlives a discarded version (web-v6 §6.4); this is how the
+    page learns the version it ran is gone. The rule is the one ``current`` and
+    discard accept a version by, so the three cannot disagree.
+    """
+    return _resolve_version_target(package_root, vid) is not None
+
+
 def _resolve_current_data(
     package_root: PackageLayoutRoot,
 ) -> tuple[VersionRoot, str, Previous] | str:
@@ -1256,7 +1290,7 @@ def _find_embedded_secret_file(build_root: BuildRoot) -> str | None:
     in a deterministic sorted order so the named offender is stable. Cost is one substring
     pass per known secret per file -- fine for the few small files a package holds.
     """
-    secrets = [value for value in known_secret_values() if len(value) >= _MIN_SECRET_LEN]
+    secrets = _redaction_secrets()
     if not secrets:
         return None
     base = build_root.path.resolve()
@@ -2429,6 +2463,15 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     return "".join(out)
 
 
+def _redaction_secrets() -> list[str]:
+    """``known_secret_values`` at the redactor's floor: the list every mask takes.
+
+    Unguarded, like the scan it wraps: a caller that must not fail on it says so
+    itself (``_record_bodies``); every other caller wants the failure to propagate.
+    """
+    return [value for value in known_secret_values() if len(value) >= _MIN_SECRET_LEN]
+
+
 def redact_known_secrets(text: str) -> str:
     """Replace every known secret VALUE in ``text`` with the redaction marker (D36).
 
@@ -2454,7 +2497,7 @@ def redact_known_secrets(text: str) -> str:
     and meta-tools' own ``except`` degrade it into a safe failed-tool-result string),
     never a silent leak.
     """
-    secrets = [value for value in known_secret_values() if len(value) >= _MIN_SECRET_LEN]
+    secrets = _redaction_secrets()
     # Bare call, deliberately unguarded (see the docstring above): a failure here must
     # PROPAGATE fail-closed, the opposite of llm_log._redact's guarded degrade-to-
     # unredacted direction (D36 round-5).
@@ -2501,7 +2544,111 @@ def _load_tool_dotenv(package_root: PackageRoot) -> dict[str, str]:
     off the value is kept as the literal string ``${OPENAI_API_KEY}``, so a
     generated tool can never exfiltrate a parent secret through its own manifest.
     """
-    env_file = package_root.path / ".env"
+    return _load_package_dotenv(package_root.path / ".env")
+
+
+def _load_tool_config(package_root: PackageRoot) -> dict[str, str]:
+    """Parse the package's optional ``config.env`` (web-v6 §4) into a plain dict.
+
+    The same read and the same parse as ``.env``, for the same reasons -- a FIFO,
+    a symlink or a runaway file degrades to {} -- because the two files feed the
+    same child environment and must not differ in how a line is understood. What
+    differs is only what the CALLER does with the values: ``_build_tool_env``
+    never hands these to the redactor.
+    """
+    return _load_package_dotenv(package_root.path / _CONFIG_FILENAME)
+
+
+# Substrings that make a ``config.env`` KEY NAME look like a credential (web-v6
+# §4). A reminder only, shown beside the key: it reads names, never values,
+# because no rule can tell a secret from a setting by its value (``PIN=1234``).
+_SECRET_LIKE_KEY_PARTS: tuple[str, ...] = ("KEY", "TOKEN", "SECRET", "PASSWORD")
+
+# The migration sources (``migrate_tools_v5``) that mark a package as built
+# before 0.4.0, when the builder was told to put secrets -- and in practice its
+# settings too -- into ``.env`` (web-v6 §1 A5).
+_PRE_V5_ORIGIN_SOURCES = frozenset({"legacy-ai-meta", "pre-existing/unknown"})
+
+
+def _dotenv_file_state(env_file: Path) -> tuple[dict[str, str], bool]:
+    """``(values, readable)`` for a package env file, for DISPLAY only.
+
+    Missing is readable-and-empty (an absent file is a normal state); a file that
+    exists but cannot be read the bounded way is ``readable=False``, so the page
+    can say so instead of showing an empty list that looks like "no settings".
+    """
+    try:
+        os.lstat(env_file)
+    except FileNotFoundError:
+        return {}, True
+    except OSError:
+        return {}, False
+    text = _read_regular_file_capped(env_file, _ENV_FILE_MAX_BYTES)
+    if text is None or len(text) > _ENV_FILE_MAX_BYTES:
+        return {}, False
+    return _parse_dotenv_text(text), True
+
+
+def _built_before_v5(package_root: PackageRoot) -> bool:
+    """True when any committed version's ``origin.json`` came from the v5 migration."""
+    try:
+        names = os.listdir(package_root.path / _VERSIONS_DIRNAME)
+    except OSError:
+        return False
+    for name in names:
+        resolved = _resolve_version_target(package_root, name)
+        if resolved is not None and resolved[1].get("source") in _PRE_V5_ORIGIN_SOURCES:
+            return True
+    return False
+
+
+def package_settings(package_root: PackageRoot) -> dict[str, Any]:
+    """The package-layer settings view the 工具 page shows (web-v6 §9).
+
+    Blocking. ``.env`` contributes KEY NAMES only; its values are read solely to
+    flag conflicts and never leave this function. ``config.env`` contributes its
+    pairs, but a value that CONTAINS a known secret -- an exact substring of some
+    registered value at the redactor's floor -- is flagged ``contains_secret`` and
+    served as the marker alone: the file holds settings by the operator's choice,
+    and a secret pasted into it by mistake is exactly what must not be served back.
+
+    Exact containment, deliberately NOT ``redact_known_secrets``' own answer (P1
+    review C1): that redactor also masks a text that merely ENDS with the first six
+    characters of a secret -- a guard for text cut mid-secret by a cap, which a
+    whole config value never is. Asking it here flagged an innocent
+    ``https://host/myproj`` red because some token began ``myproj-``, sending the
+    operator to hunt for a secret that is not there, the very confusion this view
+    exists to remove. Key names still go through the full mask, the rule every
+    operator-derived text in this subsystem follows; over-masking a name costs
+    nothing. The known-secret set is computed ONCE here (review C2): the redactor
+    recomputes it, a whole tools-directory scan, on every call.
+    """
+    secrets = _redaction_secrets()
+    env_values, env_readable = _dotenv_file_state(package_root.path / ".env")
+    config_values, config_readable = _dotenv_file_state(package_root.path / _CONFIG_FILENAME)
+    config: list[dict[str, Any]] = []
+    for key, value in config_values.items():
+        contains_secret = any(secret in value for secret in secrets)
+        config.append(
+            {
+                "key": _mask_known_secrets(key, secrets),
+                "value": _REDACTION_MARKER if contains_secret else value,
+                "overridden_by_env": key in env_values,
+                "secret_like_name": any(part in key.upper() for part in _SECRET_LIKE_KEY_PARTS),
+                "contains_secret": contains_secret,
+            }
+        )
+    return {
+        "env_keys": [_mask_known_secrets(key, secrets) for key in env_values],
+        "env_readable": env_readable,
+        "config": config,
+        "config_readable": config_readable,
+        "built_before_v5": _built_before_v5(package_root),
+    }
+
+
+def _load_package_dotenv(env_file: Path) -> dict[str, str]:
+    """The bounded read + interpolate=False parse both package env files share."""
     # Read through the ONE bounded-regular-file helper (F3a): its O_NONBLOCK+S_ISREG
     # gate refuses a FIFO an operator (or a post-install mutation) could `mkfifo` in
     # place of .env -- which dotenv_values(path) would reopen and BLOCK on forever --
@@ -2537,17 +2684,24 @@ def _build_tool_env(package_root: PackageRoot) -> tuple[dict[str, str], frozense
     outbound connections do (see config.py), without that trust decision being
     silently forced on every tool regardless of the operator's setting.
 
+    The package's ``config.env`` (web-v6 §4) sits between ``TLS_NO_VERIFY`` and
+    ``.env``: it may override the injected flag exactly as ``.env`` always could,
+    and ``.env`` overrides IT, so a key present in both resolves to the secret.
+
     Returns the env AND the (non-empty) ``.env`` VALUES that went into it, from
     the SAME read -- which is the whole point of handing them back rather than
     letting the caller re-read the file: a second read could see a rotated
     ``.env`` and register values the child never got, leaving the ones it DID get
     unmaskable. The passthrough names are deliberately NOT in that set: PATH and
     HOME are not secrets, and masking them would shred every result that mentions
-    a path. The values are handed to ``_inflight_secrets`` by ``_make_handler``.
+    a path. Neither are the ``config.env`` values, for the reason that file
+    exists at all. The values are handed to ``_inflight_secrets`` by
+    ``_make_handler``.
     """
     env = {name: os.environ[name] for name in _PASSTHROUGH_ENV if name in os.environ}
     if get_settings().tls_no_verify:
         env["TLS_NO_VERIFY"] = "1"
+    env.update(_load_tool_config(package_root))
     dotenv = _load_tool_dotenv(package_root)
     env.update(dotenv)
     # Empty values are dropped for the SAME reason ``_cached_env_values`` drops
@@ -2826,6 +2980,187 @@ _TOOL_REPLACED_RESULT = "tool not run: this tool's package changed after it was 
 _TOOL_DISABLED_RESULT = "tool not run: this tool was disabled after it was offered"
 
 
+# --- run records (web-v6 §6) -------------------------------------------------
+
+# How one call ended, as its run record states it. ``refused`` is the tool never
+# running (disabled, replaced, identity changed); ``error`` is the BACKEND failing
+# the call -- the secret scan behind the redaction, the tools lock -- whether or
+# not the tool had run, which the model reads as ``tool execution failed: <type>``.
+# Every other non-ok value is a way a tool that DID start can fail.
+# ``output_overflow`` is the one the model's string cannot tell apart: stderr past
+# the cap kills the process group, so the model sees ``tool failed (exit -9)`` --
+# the record says what really happened.
+RUN_OK = "ok"
+RUN_FAILED = "failed"
+RUN_OUTPUT_OVERFLOW = "output_overflow"
+RUN_TIMEOUT = "timeout"
+RUN_START_FAILED = "start_failed"
+RUN_REFUSED = "refused"
+RUN_ERROR = "error"
+
+# The outcomes a fix of the tool's code can address: it started and failed. The
+# one-click fix is offered for these alone (web-v6 §8.5), and they are what an
+# AI request reports beside its result (§8.2).
+RUN_FAILURE_OUTCOMES = frozenset({RUN_FAILED, RUN_OUTPUT_OVERFLOW, RUN_TIMEOUT, RUN_START_FAILED})
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRunResult:
+    """One call's outcome: the string the model gets, plus what its record keeps.
+
+    ``text`` is the agent-visible result, byte-identical to what this module
+    returned before run records existed (invariant F) -- the record is an
+    observer and must not change the conversation. ``args``/``stdout``/``stderr``
+    are set only for a run that started and failed, already REDACTED and not yet
+    CUT: the recorder applies its own caps afterwards, the redact->cap order.
+    """
+
+    text: str
+    outcome: str
+    exit_code: int | None = None
+    truncated: bool = False
+    args: str | None = None
+    stdout: str | None = None
+    stderr: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRunRecord:
+    """Everything one run record stores (web-v6 §6.1), as handed to the recorder."""
+
+    tool_name: str
+    vid: str
+    started_at: datetime
+    duration_ms: int
+    outcome: str
+    exit_code: int | None
+    truncated: bool
+    workflow: str
+    check_id: str | None
+    llm_log_id: int | None
+    llm_log_process: str | None
+    message: str | None
+    args: str | None
+    stdout: str | None
+    stderr: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolFailure:
+    """One failed call of an installed tool during the current AI request (web-v6 §8.2).
+
+    ``run_id`` is its run record, or None when the record was not written --
+    the failure is reported either way, and the page then offers only a link.
+    """
+
+    run_id: int | None
+    tool_name: str
+    vid: str
+    outcome: str
+
+
+@dataclass(slots=True)
+class CheckContext:
+    """A run of a tool's examples (web-v6 §10) that the calls in it belong to.
+
+    Set by ``run_examples`` around its calls: their records carry ``workflow``
+    (``health_check`` or ``verify``) and ``check_id`` -- the check whose verdict
+    (``tool_check``) they are the evidence of -- and ``runs`` collects each
+    call's ``(run_id, outcome)`` in order, which is how the runner learns an
+    outcome the handler's string does not carry.
+    """
+
+    check_id: str
+    workflow: str
+    runs: list[tuple[int | None, str]] = field(default_factory=list)
+
+
+_CHECK_CONTEXT: ContextVar[CheckContext | None] = ContextVar("_CHECK_CONTEXT", default=None)
+
+
+# The failures of the AI request running in this context, collected for its
+# response (``collect_tool_failures``). None outside such a request: a direct
+# service caller collects nothing. A ContextVar rather than a parameter for the
+# reason ``llm._CURRENT_INTERACTION`` is one: the handler signature is fixed, and
+# the handlers run in the request's own task, so two concurrent requests each
+# see only their own list (invariant Q).
+_REQUEST_TOOL_FAILURES: ContextVar[list[ToolFailure] | None] = ContextVar(
+    "_REQUEST_TOOL_FAILURES", default=None
+)
+
+
+@contextlib.contextmanager
+def collect_tool_failures() -> Iterator[list[ToolFailure]]:
+    """Collect this context's tool failures into the yielded list."""
+    failures: list[ToolFailure] = []
+    token = _REQUEST_TOOL_FAILURES.set(failures)
+    try:
+        yield failures
+    finally:
+        _REQUEST_TOOL_FAILURES.reset(token)
+
+
+# The run recorder, injected by main (``tool_runs.record``) exactly as llm_log's
+# secret provider is: this module stays free of the database, and a test can
+# swap the recorder for a list. None means "record nothing" -- the state of every
+# process that never wired one.
+_run_recorder: Callable[[ToolRunRecord], int | None] | None = None
+
+
+def set_run_recorder(recorder: Callable[[ToolRunRecord], int | None] | None) -> None:
+    """Install (or, with None, remove) the callable that persists run records."""
+    global _run_recorder
+    _run_recorder = recorder
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCheckRecord:
+    """The verdict of one run of a version's examples, as ``tool_check`` keeps it."""
+
+    check_id: str
+    tool_name: str
+    vid: str
+    workflow: str
+    finished_at: datetime
+    total: int
+    passed: int
+    failed: int
+    stopped: str | None
+
+
+# The verdict recorder, injected by main (``tool_runs.record_check``) the way the
+# run recorder is, for the same reasons; None records nothing.
+_check_recorder: Callable[[ToolCheckRecord], int | None] | None = None
+
+
+def set_check_recorder(recorder: Callable[[ToolCheckRecord], int | None] | None) -> None:
+    """Install (or, with None, remove) the callable that persists check verdicts."""
+    global _check_recorder
+    _check_recorder = recorder
+
+
+def _record_bodies(
+    args_json: str, stdout: str | None, stderr: str | None
+) -> tuple[str | None, str | None, str | None]:
+    """Redacted copies of a failed run's input and output, for its record ONLY.
+
+    Used on the paths whose model-facing string carries no output (a timeout, a
+    process that never started), so the redaction here is the record's alone and
+    must not be allowed to change the call: a failing secret scan yields no
+    bodies instead of an exception. The path whose string DOES carry output (a
+    non-zero exit) redacts fail-closed for the model and reuses that result.
+    """
+    try:
+        secrets = _redaction_secrets()
+        return (
+            _mask_known_secrets(args_json, secrets),
+            None if stdout is None else _mask_known_secrets(stdout, secrets),
+            None if stderr is None else _mask_known_secrets(stderr, secrets),
+        )
+    except Exception:
+        return None, None, None
+
+
 def _run_tool_subprocess(
     entry: list[str],
     advertised: Resolved,
@@ -2836,8 +3171,8 @@ def _run_tool_subprocess(
     args_json: str,
     timeout: float,
     output_cap: int,
-) -> str:
-    """Run the advertised version and return one agent-visible result string.
+) -> ToolRunResult:
+    """Run the advertised version; return the agent-visible result and its record.
 
     The final ordering is deliberate and compact: refuse a version retired by a
     completed discard, read the PackageRoot toggle, require that ``current`` still
@@ -2845,20 +3180,24 @@ def _run_tool_subprocess(
     then call ``Popen`` with nothing between that identity check and process
     creation.  Resolving ``current`` does not compare vids: a normal revise may
     move it while this call must remain bound to the schema it was shown.
+
+    ``ToolRunResult.text`` is exactly the string this function returned before
+    run records existed (web-v6 §6.3); everything else on the result is for the
+    record.
     """
     version_root = advertised.version_root
     if _advertisement_retired(advertisement_generation):
-        return _TOOL_REPLACED_RESULT
+        return ToolRunResult(_TOOL_REPLACED_RESULT, RUN_REFUSED)
     package_root = advertised.package_root
     if not package_enabled(package_root):
-        return _TOOL_DISABLED_RESULT
+        return ToolRunResult(_TOOL_DISABLED_RESULT, RUN_REFUSED)
     if isinstance(resolve_current(package_root), Unresolved):
-        return _TOOL_REPLACED_RESULT
+        return ToolRunResult(_TOOL_REPLACED_RESULT, RUN_REFUSED)
     # This identity check is deliberately LAST. No state read, lineage resolve,
     # retired-marker lookup, or other fallible operation may be inserted between
     # its answer and Popen's cwd resolution.
     if not _still_the_expected_package(version_root, expected_identity):
-        return _TOOL_REPLACED_RESULT
+        return ToolRunResult(_TOOL_REPLACED_RESULT, RUN_REFUSED)
     try:
         proc = subprocess.Popen(
             entry,
@@ -2881,11 +3220,23 @@ def _run_tool_subprocess(
     except OSError as exc:
         # FileNotFoundError (bad interpreter/script), PermissionError (no exec
         # bit), ... -- the tool never ran. Category only, no raw error string.
-        return f"tool failed to start: {type(exc).__name__}"
+        args, _stdout, _stderr = _record_bodies(args_json, None, None)
+        return ToolRunResult(
+            f"tool failed to start: {type(exc).__name__}", RUN_START_FAILED, args=args
+        )
 
     output = _communicate_bounded(proc, input_text=args_json, cap=output_cap, timeout=timeout)
     if output.timed_out:
-        return f"tool timed out after {timeout:g} seconds"
+        # The model is told only that time ran out; the record keeps what the
+        # tool had printed by then, which is usually where it was stuck.
+        args, stdout, stderr = _record_bodies(args_json, output.stdout, output.stderr)
+        return ToolRunResult(
+            f"tool timed out after {timeout:g} seconds",
+            RUN_TIMEOUT,
+            args=args,
+            stdout=stdout,
+            stderr=stderr,
+        )
     # F1/D36: mask any known secret VALUE the child wrote to stdout/stderr BEFORE the
     # size cap. Redact-before-truncate is load-bearing (the same order llm_log's stored
     # -body pipeline uses): a secret straddling the cap edge must be replaced while the
@@ -2899,11 +3250,28 @@ def _run_tool_subprocess(
     # behind: the tool produced its answer, we just stopped reading it. _cap_output
     # trims the retained cap+1 chars down to the cap behind the marker.
     if output.stdout_overflow:
-        return _cap_output(redact_known_secrets(output.stdout), output_cap)
+        return ToolRunResult(
+            _cap_output(redact_known_secrets(output.stdout), output_cap), RUN_OK, truncated=True
+        )
     if proc.returncode != 0:
-        stderr = _cap_output(redact_known_secrets(output.stderr).strip(), output_cap)
-        return f"tool failed (exit {proc.returncode}): {stderr}"
-    return _cap_output(redact_known_secrets(output.stdout), output_cap)
+        # One snapshot of the known secrets serves the model's string AND the
+        # record, so this branch still scans once. Fail-closed exactly as
+        # ``redact_known_secrets`` is: these are the same two calls it makes.
+        secrets = _redaction_secrets()
+        stderr = _mask_known_secrets(output.stderr, secrets)
+        # ``output_overflow`` only when the overflow KILL ended it: a tool that
+        # wrote past the cap and exited with its own code first is a plain failure
+        # (its code is what the model was told). Exit 0 never reaches here.
+        killed_for_output = output.stderr_overflow and proc.returncode == -signal.SIGKILL
+        return ToolRunResult(
+            f"tool failed (exit {proc.returncode}): {_cap_output(stderr.strip(), output_cap)}",
+            RUN_OUTPUT_OVERFLOW if killed_for_output else RUN_FAILED,
+            exit_code=proc.returncode,
+            args=_mask_known_secrets(args_json, secrets),
+            stdout=_mask_known_secrets(output.stdout, secrets),
+            stderr=stderr,
+        )
+    return ToolRunResult(_cap_output(redact_known_secrets(output.stdout), output_cap), RUN_OK)
 
 
 @dataclass(slots=True, weakref_slot=True)
@@ -3020,6 +3388,89 @@ def _stale_backup_path(base: Path, name: str, token: str) -> Path:
     return base / f".{name}.stale-{token}"
 
 
+async def _record_run(
+    advertised: Resolved, result: ToolRunResult, *, started_at: datetime, duration_ms: int
+) -> int | None:
+    """Hand one finished call to the run recorder; never raise, never alter the call.
+
+    The no-observer-failure invariant (web-v6 §6.3, invariant F): whatever the
+    recorder does -- raise, find the database locked, not be wired at all -- the
+    tool's result goes back to the model unchanged. A failure leaves one WARNING
+    line naming only the exception's type: a database error's text carries the
+    statement and its parameters, which here are the run's bodies.
+
+    A failure of the tool also goes to the current request's collector, if
+    there is one -- whether or not its record was written (web-v6 §8.2).
+    """
+    run_id = await _write_record(advertised, result, started_at=started_at, duration_ms=duration_ms)
+    check = _CHECK_CONTEXT.get()
+    if check is not None:
+        check.runs.append((run_id, result.outcome))
+    failures = _REQUEST_TOOL_FAILURES.get()
+    if failures is not None and result.outcome in RUN_FAILURE_OUTCOMES:
+        failures.append(
+            ToolFailure(
+                run_id=run_id,
+                tool_name=advertised.package_root.path.name,
+                vid=advertised.vid,
+                outcome=result.outcome,
+            )
+        )
+    return run_id
+
+
+async def _write_record(
+    advertised: Resolved, result: ToolRunResult, *, started_at: datetime, duration_ms: int
+) -> int | None:
+    recorder = _run_recorder
+    if recorder is None:
+        return None
+    interaction = current_interaction()
+    check = _CHECK_CONTEXT.get()
+    if check is not None:
+        workflow = check.workflow
+    elif interaction is not None:
+        workflow = interaction.workflow
+    else:
+        workflow = "unknown"
+    record = ToolRunRecord(
+        tool_name=advertised.package_root.path.name,
+        vid=advertised.vid,
+        started_at=started_at,
+        duration_ms=duration_ms,
+        outcome=result.outcome,
+        exit_code=result.exit_code,
+        truncated=result.truncated,
+        workflow=workflow,
+        check_id=check.check_id if check is not None else None,
+        llm_log_id=interaction.record_id if interaction is not None else None,
+        llm_log_process=interaction.process if interaction is not None else None,
+        message=None if result.outcome == RUN_OK else result.text,
+        args=result.args,
+        stdout=result.stdout,
+        stderr=result.stderr,
+    )
+    try:
+        return await run_in_threadpool(recorder, record)
+    except Exception as exc:
+        _logger.warning("Tool run record not written: %s", type(exc).__name__)
+        return None
+
+
+# Tool calls whose request may already be gone (``_make_handler``): strong
+# references, so a call still running is never garbage-collected mid-flight.
+_CALL_TASKS: set[asyncio.Task[ToolRunResult]] = set()
+
+
+def _forget_call_task(task: asyncio.Task[ToolRunResult]) -> None:
+    _CALL_TASKS.discard(task)
+    # Retrieved so a call that failed after its request had gone is not logged
+    # as "Task exception was never retrieved": the failure already has its
+    # record (``error``), which is everything that can be done with it.
+    if not task.cancelled():
+        task.exception()
+
+
 def _make_handler(
     advertised: Resolved,
     entry: list[str],
@@ -3033,60 +3484,411 @@ def _make_handler(
     scope takes a shared lock for this handler invocation as a fail-safe; normal
     capture/enrich/assist-update requests already hold one across scan, every
     model round, every tool call, and error cleanup.
+
+    Each call runs as a task of its own, shielded from the caller (P4 review r1,
+    H1). The interaction's deadline (``llm.generate_structured``) cancels the
+    request with a tool in flight, and asyncio cancellation cannot stop the
+    worker thread that runs the tool: before this, the request then went on
+    without the call -- no record, and the call's ``.env`` values released
+    while its output still had to be masked. Shielded, the call ends the way
+    every call does: masked while its values are held, recorded, its lock
+    reference closed. That reference is the call's OWN (a ``dup`` of the
+    request's, taken while the request's is certainly open), so the request
+    closing its descriptor neither drops the lock under a running tool nor
+    leaves the call a descriptor number the process may already have reused.
     """
 
     request_lock_fd = _REQUEST_TOOLS_LOCK_FD.get()
 
-    async def _handler(arguments: dict[str, Any]) -> str:
+    async def _execute(arguments: dict[str, Any], tools_lock_fd: int) -> ToolRunResult:
         package_root = advertised.package_root
-        version_root = advertised.version_root
-        if identity is None:
-            return _TOOL_REPLACED_RESULT
-        owned_lock_fd: int | None = None
-        tools_lock_fd = request_lock_fd
-        if tools_lock_fd is None:
-            owned_lock_fd = await run_in_threadpool(acquire_shared_tools_lock)
-            tools_lock_fd = owned_lock_fd
-        if tools_lock_fd is None:
-            return _TOOL_REPLACED_RESULT
+        # Recheck inside the hold, then once more immediately before Popen.
+        if not _still_the_expected_package(advertised.version_root, identity):
+            return ToolRunResult(_TOOL_REPLACED_RESULT, RUN_REFUSED)
+        # Toggle and .env are PackageRoot state, intentionally read at call
+        # time. Missing, foreign, or unreadable state all fail closed.
+        if not package_enabled(package_root):
+            return ToolRunResult(_TOOL_DISABLED_RESULT, RUN_REFUSED)
+        settings = get_settings()
+        env, env_secrets = _build_tool_env(package_root)
+        args_json = json.dumps(arguments, ensure_ascii=False)
+        # The ``.env`` VALUES this child is about to be handed, held so they
+        # stay redactable no matter what the file says by the time the child
+        # finishes. The scope has to reach past the subprocess: the masking of
+        # the child's output happens INSIDE ``_run_tool_subprocess`` (F1/D36),
+        # so releasing on the child's exit would still be too early. It ends
+        # where the awaited call returns, which is after that redaction -- and
+        # after the redaction of the run record's bodies, which happens there
+        # too -- and before the string is handed to the llm loop: everything
+        # downstream (the role:"tool" message, the log, the JSONL sink, the run
+        # record) sees the masked copy.
+        with _inflight_secrets(env_secrets):
+            return await run_in_threadpool(
+                _run_tool_subprocess,
+                list(entry),
+                advertised,
+                identity,
+                advertisement_generation,
+                tools_lock_fd,
+                env,
+                args_json,
+                settings.llm_tool_timeout_seconds,
+                settings.llm_tool_output_max_chars,
+            )
+
+    async def _call(arguments: dict[str, Any], call_lock_fd: int | None) -> ToolRunResult:
+        """One call and its record, start to finish; closes ``call_lock_fd``."""
+        started_at = datetime.now(UTC)
+        started = time.monotonic()
+        owned_lock_fd = call_lock_fd
         try:
-            # Recheck inside the hold, then once more immediately before Popen.
-            if not _still_the_expected_package(version_root, identity):
-                return _TOOL_REPLACED_RESULT
-            # Toggle and .env are PackageRoot state, intentionally read at call
-            # time. Missing, foreign, or unreadable state all fail closed.
-            if not package_enabled(package_root):
-                return _TOOL_DISABLED_RESULT
-            settings = get_settings()
-            env, env_secrets = _build_tool_env(package_root)
-            args_json = json.dumps(arguments, ensure_ascii=False)
-            # The ``.env`` VALUES this child is about to be handed, held so they
-            # stay redactable no matter what the file says by the time the child
-            # finishes. The scope has to reach past the subprocess: the masking of
-            # the child's output happens INSIDE ``_run_tool_subprocess`` (F1/D36),
-            # so releasing on the child's exit would still be too early. It ends
-            # where the awaited call returns, which is after that redaction and
-            # before the string is handed to the llm loop -- everything downstream
-            # (the role:"tool" message, the log, the JSONL sink) sees the masked
-            # copy.
-            with _inflight_secrets(env_secrets):
-                return await run_in_threadpool(
-                    _run_tool_subprocess,
-                    list(entry),
+            try:
+                tools_lock_fd = owned_lock_fd
+                if identity is not None and tools_lock_fd is None:
+                    owned_lock_fd = await run_in_threadpool(acquire_shared_tools_lock)
+                    tools_lock_fd = owned_lock_fd
+                # Timed from here: a direct caller may have waited for a destroyer
+                # to let go of the lock, and that wait is not the tool's duration.
+                started_at = datetime.now(UTC)
+                started = time.monotonic()
+                if identity is None or tools_lock_fd is None:
+                    result = ToolRunResult(_TOOL_REPLACED_RESULT, RUN_REFUSED)
+                else:
+                    result = await _execute(arguments, tools_lock_fd)
+            except Exception as exc:
+                # The call fails here and the llm loop turns the exception into
+                # ``tool_exception_text`` for the model; the record stores those
+                # same words, then the exception goes on unchanged (invariant F).
+                await _record_run(
                     advertised,
-                    identity,
-                    advertisement_generation,
-                    tools_lock_fd,
-                    env,
-                    args_json,
-                    settings.llm_tool_timeout_seconds,
-                    settings.llm_tool_output_max_chars,
+                    ToolRunResult(tool_exception_text(exc), RUN_ERROR),
+                    started_at=started_at,
+                    duration_ms=int((time.monotonic() - started) * 1000),
                 )
+                raise
+            # Written while the shared lock is still held, so a delete (which
+            # needs it exclusively, and clears the tool's records) cannot land
+            # between this run and its record. A refusal above may hold no lock
+            # to write under -- and ran nothing.
+            await _record_run(
+                advertised,
+                result,
+                started_at=started_at,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
+            return result
         finally:
             if owned_lock_fd is not None:
                 await run_in_threadpool(release_tools_lock, owned_lock_fd)
 
+    async def _handler(arguments: dict[str, Any]) -> str:
+        try:
+            call_lock_fd = os.dup(request_lock_fd) if request_lock_fd is not None else None
+        except OSError as exc:
+            # The backend failing the call before it began (EMFILE): recorded
+            # like every other backend failure, then raised for the llm loop.
+            await _record_run(
+                advertised,
+                ToolRunResult(tool_exception_text(exc), RUN_ERROR),
+                started_at=datetime.now(UTC),
+                duration_ms=0,
+            )
+            raise
+        try:
+            task = asyncio.ensure_future(_call(arguments, call_lock_fd))
+        except BaseException:
+            release_tools_lock(call_lock_fd)
+            raise
+        _CALL_TASKS.add(task)
+        task.add_done_callback(_forget_call_task)
+        return (await asyncio.shield(task)).text
+
     return _handler
+
+
+# --- examples.json: a version's regression inputs (web-v6 §10) ---------------
+
+
+@dataclass(frozen=True, slots=True)
+class ToolExample:
+    """One input the tool must keep handling: a label and the JSON it is given."""
+
+    name: str
+    args: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ExamplesFile:
+    """A version's examples, or why they cannot be run (``error``, zh-TW).
+
+    No file is no examples and no error. A file that is there but unusable is
+    an error and runs NOTHING: a half-understood list would report a partial
+    check as a clean one.
+    """
+
+    examples: tuple[ToolExample, ...] = ()
+    error: str | None = None
+
+
+def load_examples(version_root: VersionRoot) -> ExamplesFile:
+    """Read and validate one version's ``examples.json``.
+
+    Read through the bounded, FIFO/symlink-hardened reader every other package
+    file goes through. The shape is ``{"examples": [{"name": str, "args": {...}},
+    ...]}`` with at most ``EXAMPLES_MAX`` entries; each ``args`` is a JSON object,
+    because that is what a tool is called with.
+    """
+    path = version_root.path / _EXAMPLES_FILENAME
+    if not os.path.lexists(path):
+        return ExamplesFile()
+    text = _read_regular_file_capped(path, _EXAMPLES_MAX_BYTES)
+    if text is None:
+        return ExamplesFile(error="examples.json 無法讀取（不是一般檔案，或沒有權限）。")  # noqa: RUF001
+    if len(text) > _EXAMPLES_MAX_BYTES:
+        return ExamplesFile(error="examples.json 超過 64 KiB。")
+    try:
+        data = json.loads(text)
+    except ValueError, RecursionError:
+        return ExamplesFile(error="examples.json 不是合法的 JSON。")
+    entries = data.get("examples") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return ExamplesFile(error="examples.json 需要一個 examples 陣列。")
+    if len(entries) > EXAMPLES_MAX:
+        too_many = f"examples.json 最多 {EXAMPLES_MAX} 個範例，目前有 {len(entries)} 個。"  # noqa: RUF001
+        return ExamplesFile(error=too_many)
+    examples = []
+    for index, entry in enumerate(entries, start=1):
+        name = entry.get("name") if isinstance(entry, dict) else None
+        args = entry.get("args") if isinstance(entry, dict) else None
+        if not isinstance(name, str) or not name.strip() or not isinstance(args, dict):
+            return ExamplesFile(
+                error=f"examples.json 的第 {index} 個範例需要非空的 name 與一個 args 物件。"
+            )
+        # JSON object keys are always strings; the comprehension says so to the
+        # type checker as well.
+        examples.append(
+            ToolExample(
+                name=_utf8_safe(name.strip()),
+                args={str(key): value for key, value in args.items()},
+            )
+        )
+    return ExamplesFile(examples=tuple(examples))
+
+
+def example_display_name(name: str, secrets: list[str]) -> str:
+    """An example's name as the operator is shown it: masked, THEN cut.
+
+    The name is builder-written version content. Redact before the cut, the
+    order every other slice here keeps (P5 review r1, J4): a cut first can leave
+    a registered value's head too short for the trailing-fragment guard.
+    """
+    return _mask_known_secrets(name, secrets)[:_EXAMPLE_NAME_MAX_CHARS]
+
+
+@dataclass(frozen=True, slots=True)
+class ExampleResult:
+    """How one example went: a run outcome, or how it was never started.
+
+    ``skipped``, ``not_run`` or ``stopped`` -- see ``EXAMPLE_SKIPPED``.
+    """
+
+    name: str
+    outcome: str
+    run_id: int | None
+
+
+# An example not started because an earlier one timed out (the API is most
+# likely down for all of them), because the budget ran out, or because an
+# earlier one was refused -- the tool was switched off or replaced mid-run, so
+# every call after it would be refused too (P5 review r1, J3).
+EXAMPLE_SKIPPED = "skipped"
+EXAMPLE_NOT_RUN = "not_run"
+EXAMPLE_STOPPED = "stopped"
+
+
+@dataclass(frozen=True, slots=True)
+class CheckResult:
+    """One run of a tool's examples.
+
+    ``status`` is ``ran`` when the examples were run (however they went), else
+    why nothing ran: ``no_examples``, ``examples_invalid`` (``message`` says
+    how), ``disabled`` (the execution path refuses a disabled tool, so it is not
+    verified), ``invalid`` (the package does not validate), ``not_found``, or
+    ``version_changed`` (``current`` moved off the version to check).
+    """
+
+    status: str
+    vid: str | None = None
+    results: tuple[ExampleResult, ...] = ()
+    total: int = 0
+    budget_exhausted: bool = False
+    message: str | None = None
+
+    @property
+    def passed(self) -> int:
+        return sum(1 for result in self.results if result.outcome == RUN_OK)
+
+    @property
+    def failed(self) -> int:
+        """Examples the TOOL failed; a refusal or a backend error is not one."""
+        return sum(1 for result in self.results if result.outcome in RUN_FAILURE_OUTCOMES)
+
+    @property
+    def stopped(self) -> str | None:
+        """Why the run ended short of the list, if not by a failure: see ToolCheck.
+
+        Interrupted by a refusal wherever it fell -- the last example refused
+        leaves no ``stopped`` row behind it, yet the check was cut all the same.
+        """
+        if self.budget_exhausted:
+            return "budget"
+        if any(result.outcome in (RUN_REFUSED, EXAMPLE_STOPPED) for result in self.results):
+            return "interrupted"
+        return None
+
+
+def checkable_tool(name: str) -> tuple[Resolved, LlmTool] | str:
+    """The tool ``name`` exactly as an AI request would be handed it, or why not.
+
+    One package scanned and built by the same functions ``enabled_llm_tools``
+    uses -- so a check runs through the same identity checks, redaction and
+    records as a conversation's call (invariant P). Call it with the request
+    tools lock bound: the handler captures it.
+    """
+    package_root = _resolve_package_dir_no_alias(name)
+    if package_root is None:
+        return "not_found"
+    scan = scan_installed(package_root)
+    if not scan.valid or not isinstance(scan.resolution, Resolved):
+        return "invalid"
+    if not scan.enabled:
+        return "disabled"
+    return scan.resolution, _build_llm_tool(scan)
+
+
+async def run_examples(
+    name: str,
+    *,
+    check_id: str,
+    workflow: str,
+    budget_seconds: float,
+    expected_vid: str | None = None,
+    on_progress: Callable[[CheckResult], None] | None = None,
+) -> CheckResult:
+    """Run the current version's examples through the normal tool path (web-v6 §10).
+
+    Takes the shared tools lock for the whole run, as an AI request does: a
+    delete or discard meanwhile is refused (invariant T), and the budget is the
+    bound on that wait. Each example is one handler call -- identity recheck,
+    redaction, a run record carrying ``workflow`` and ``check_id``. Passing is
+    exit 0 within the tool's own timeout; output is not compared, the API is
+    real. After the first timeout the rest are skipped (one API down is usually
+    all of them down), and once ``budget_seconds`` is spent the rest are not run
+    (invariant S). ``on_progress`` sees the result after every example.
+    """
+    fd = await run_in_threadpool(acquire_shared_tools_lock)
+    if fd is None:
+        return CheckResult(status="not_found")
+    try:
+        with bind_request_tools_lock(fd):
+            found = checkable_tool(name)
+            if isinstance(found, str):
+                return CheckResult(status=found)
+            resolution, tool = found
+            if expected_vid is not None and resolution.vid != expected_vid:
+                return CheckResult(status="version_changed", vid=resolution.vid)
+            loaded = await run_in_threadpool(load_examples, resolution.version_root)
+            if loaded.error is not None:
+                return CheckResult(
+                    status="examples_invalid", vid=resolution.vid, message=loaded.error
+                )
+            if not loaded.examples:
+                return CheckResult(status="no_examples", vid=resolution.vid)
+            result = await _run_loaded_examples(
+                tool,
+                resolution.vid,
+                loaded.examples,
+                CheckContext(check_id=check_id, workflow=workflow),
+                budget_seconds,
+                on_progress,
+            )
+            # Under the same lock as the run records: a delete, which clears
+            # the tool's verdicts with them, cannot land in between.
+            await _write_check(name, check_id, workflow, result)
+            return result
+    finally:
+        await run_in_threadpool(release_tools_lock, fd)
+
+
+async def _write_check(name: str, check_id: str, workflow: str, result: CheckResult) -> None:
+    """Hand a check's verdict to the recorder; never raise (like ``_write_record``)."""
+    recorder = _check_recorder
+    if recorder is None or result.vid is None:
+        return
+    record = ToolCheckRecord(
+        check_id=check_id,
+        tool_name=name,
+        vid=result.vid,
+        workflow=workflow,
+        finished_at=datetime.now(UTC),
+        total=result.total,
+        passed=result.passed,
+        failed=result.failed,
+        stopped=result.stopped,
+    )
+    try:
+        await run_in_threadpool(recorder, record)
+    except Exception as exc:
+        _logger.warning("Tool check verdict not written: %s", type(exc).__name__)
+
+
+async def _run_loaded_examples(
+    tool: LlmTool,
+    vid: str,
+    examples: tuple[ToolExample, ...],
+    context: CheckContext,
+    budget_seconds: float,
+    on_progress: Callable[[CheckResult], None] | None,
+) -> CheckResult:
+    started = time.monotonic()
+    results: list[ExampleResult] = []
+    stop_reason: str | None = None
+    budget_exhausted = False
+
+    def _snapshot() -> CheckResult:
+        return CheckResult(
+            status="ran",
+            vid=vid,
+            results=tuple(results),
+            total=len(examples),
+            budget_exhausted=budget_exhausted,
+        )
+
+    token = _CHECK_CONTEXT.set(context)
+    try:
+        for example in examples:
+            if stop_reason is None and time.monotonic() - started >= budget_seconds:
+                stop_reason = EXAMPLE_NOT_RUN
+                budget_exhausted = True
+            if stop_reason is not None:
+                results.append(ExampleResult(example.name, stop_reason, None))
+                continue
+            before = len(context.runs)
+            # The handler records even a call the backend fails (``error``), then
+            # raises; the check reports that outcome and moves on.
+            with contextlib.suppress(Exception):
+                await tool.handler(example.args)
+            run_id, outcome = context.runs[-1] if len(context.runs) > before else (None, RUN_ERROR)
+            results.append(ExampleResult(example.name, outcome, run_id))
+            if outcome == RUN_TIMEOUT:
+                stop_reason = EXAMPLE_SKIPPED
+            elif outcome == RUN_REFUSED:
+                stop_reason = EXAMPLE_STOPPED
+            if on_progress is not None:
+                on_progress(_snapshot())
+    finally:
+        _CHECK_CONTEXT.reset(token)
+    return _snapshot()
 
 
 # --- mutation (name-validated + containment-checked) -----------------------

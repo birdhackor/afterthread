@@ -15,8 +15,9 @@ from fastapi.responses import JSONResponse
 
 from afterthread.config import get_settings
 from afterthread.db import init_db
-from afterthread.routers import ai, items, review, tools
+from afterthread.routers import ai, items, review, tool_runs, tools
 from afterthread.services import llm, llm_log
+from afterthread.services import tool_runs as tool_runs_service
 from afterthread.services import tools as tools_service
 
 # The child logger for THIS module's own startup diagnostics, under the
@@ -122,15 +123,27 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     once per app startup), so an operator scanning startup logs cannot miss
     that ``TLS_NO_VERIFY`` -- a deliberate, security-relevant opt-in (see
     config.py) -- is active for this run.
+
+    The tool run and check recorders (web-v6 §6.3, §10) are wired HERE, after ``init_db``, not
+    at import time with the redactors: it writes to the database, and only the
+    lifespan knows the table exists. A process that never runs the lifespan --
+    the test client, which does not enter it -- therefore records nothing unless
+    a test installs a recorder of its own.
     """
     init_db()
+    tools_service.set_run_recorder(tool_runs_service.record)
+    tools_service.set_check_recorder(tool_runs_service.record_check)
     if get_settings().tls_no_verify:
         _logger.warning(
             "TLS_NO_VERIFY is set: outbound TLS certificate verification is "
             "DISABLED for the OpenAPI-document fetch, the LLM endpoint, and "
             "(where a tool honors it) installed tool subprocesses."
         )
-    yield
+    try:
+        yield
+    finally:
+        tools_service.set_run_recorder(None)
+        tools_service.set_check_recorder(None)
 
 
 app = FastAPI(title="afterthread API", lifespan=lifespan)
@@ -189,6 +202,7 @@ app.include_router(items.router, prefix="/api")
 app.include_router(review.router, prefix="/api")
 app.include_router(ai.router, prefix="/api")
 app.include_router(tools.router, prefix="/api")
+app.include_router(tool_runs.router, prefix="/api")
 
 # Packaged mode only. `scripts/build-wheel.sh` copies the built frontend into
 # `afterthread/static/` before `uv build` runs, and that directory's

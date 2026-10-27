@@ -11,7 +11,14 @@ from sqlalchemy.sql.elements import ColumnElement
 from sqlmodel import Session, col, select
 
 from afterthread.db import get_session
-from afterthread.models import MemoryItem, MemoryStage, MemoryStatus, ProgressEntry, utcnow
+from afterthread.models import (
+    SQLITE_MAX_INT,
+    MemoryItem,
+    MemoryStage,
+    MemoryStatus,
+    ProgressEntry,
+    utcnow,
+)
 from afterthread.schemas import (
     ItemListResponse,
     MemoryItemCreate,
@@ -42,25 +49,12 @@ _NOT_FOUND_RESPONSE: dict[int | str, dict[str, Any]] = {
     }
 }
 
-# SQLite's INTEGER storage class is a signed 64-bit two's-complement integer
-# (https://www.sqlite.org/datatype3.html#the_integer_datatypes): 2**63 - 1 is
-# the largest value it can hold. FastAPI's `int` path/query converters accept
-# any Python int, which is unbounded, so a value beyond this -- e.g.
-# `item_id=9223372036854775808` (2**63) -- parses fine at the routing layer
-# but raises OverflowError from the pysqlite driver the moment it is bound
-# into a query, which FastAPI does not catch: it propagates as an unhandled
-# 500 instead of a client error. Every `int` path/query parameter that is
-# bound into a SQLite query below must be capped at this constant so
-# out-of-range values are instead rejected with 422 during FastAPI's own
-# validation, before ever reaching the database.
-SQLITE_MAX_INT = 9223372036854775807  # 2**63 - 1
-
 # Shared path type for `item_id`: applied to every route below that looks up
 # a MemoryItem by id (GET/PATCH/DELETE /{item_id} and POST
 # /{item_id}/progress) so all four enforce the same bounds. Lower-bounded at
 # 1 since SQLite's `INTEGER PRIMARY KEY` rowids -- MemoryItem.id here -- are
 # always positive; upper-bounded at SQLITE_MAX_INT for the OverflowError
-# reason above.
+# reason given at its definition (models.py).
 ItemId = Annotated[int, Path(ge=1, le=SQLITE_MAX_INT)]
 
 # Escape character for user-built LIKE/ILIKE patterns. It must be escaped

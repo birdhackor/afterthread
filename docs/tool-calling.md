@@ -45,16 +45,20 @@ identity。模型可能幾分鐘後才真的呼叫；若那時 `current` 已從 
 
 1. 把 arguments JSON 解析成物件；失敗就回固定錯誤文字，不啟動工具。
 2. （**沒有執行登記**。工具目錄的共享鎖在送出工具清單之前就已取得、並由這次請求持有到
-   結束，而子行程會**繼承**它，所以刪除與 discard 在鎖被釋放之前根本進不來——不需要登記
-   誰正在執行。）
+   結束；每次呼叫另外持有一份自己的參照（`os.dup`），子行程也會**繼承**它，所以刪除與
+   discard 在所有參照都關掉之前根本進不來——不需要登記誰正在執行。請求在期限結束時，
+   還在跑的那次呼叫照樣跑完、寫紀錄，才關掉自己的參照。）
 3. 重驗該版 `tool.json` identity；操作者若在廣告後手改 manifest，這次呼叫保守拒絕。
 4. 讀 package-level `.afterthread.meta/state.json`。缺席、foreign、unreadable 都
    fail closed；沒有 `tool.json.enabled` fallback。
-5. 從短允許清單建立乾淨環境，再加入 package `.env` 與正規化 TLS 設定。
+5. 從短允許清單建立乾淨環境，依序加入正規化 TLS 設定、package `config.env`
+   與 package `.env`（同一個 key 以 `.env` 為準）。
 6. 以廣告時的 `VersionRoot` 為 cwd 啟動 entry；arguments JSON 經 stdin，stdout
    是工具結果。
 7. 套用單工具 timeout、process-group 終止與輸出截斷；成功、非零 exit、timeout
    都收斂成模型可讀的結果字串。
+8. 寫一筆執行紀錄（見第 6 節）。它是觀察者：給模型的字串不因此改變，紀錄寫不進去
+   也只留一行警告。
 
 操作者在請求進行中按下 discard 或刪除，會得到 `409 ai_job_in_progress`，**套件與指標
 完全沒有被動到**，可以原地重試。互斥鎖取代了先前那套「登記誰在執行、刪除前去查」的機制
@@ -73,7 +77,8 @@ identity。模型可能幾分鐘後才真的呼叫；若那時 `current` 已從 
   防止意外繼承後端 secret，但同 UID 程式仍可能從 `/proc` 或其他可讀路徑取資料。
   真正信任邊界是只安裝可信的 OpenAPI 文件與指示。
 - **子行程環境從零建立**：只透傳 `PATH`、`HOME`、`LANG`、`LC_ALL`、`TMPDIR`，
-  再加入 package `.env`；父行程 `OPENAI_API_KEY` 不會結構性地落入 child env。
+  再加入 package `config.env` 與 `.env`；父行程 `OPENAI_API_KEY` 不會結構性地落入
+  child env。兩個檔案都以 `interpolate=False` 解析，`${OPENAI_API_KEY}` 保持字面。
 - **單工具限制**：`LLM_TOOL_TIMEOUT_SECONDS` 控制 timeout，
   `LLM_TOOL_OUTPUT_MAX_CHARS` 控制送回模型的 stdout 長度；逾時會終止整個 process
   group，避免只殺 shell 留下孫行程。
@@ -85,12 +90,15 @@ identity。模型可能幾分鐘後才真的呼叫；若那時 `current` 已從 
   arguments 與同則文字的總量上限 256 KiB，擋的是「數量合法但單一參數巨大」。
 - **對話總量**：`LLM_TOOL_CONVERSATION_BUDGET_TOKENS` 以模型回報的
   `prompt_tokens` 動態估算字元／token 比，控制多輪工具結果累積。
-- **deadline 不啟動新工作**：剩餘時間不超過一秒就不再啟動工具。threadpool 裡已經
-  跑的 subprocess 不能由 asyncio timeout 強制打斷；這條規則把最壞延遲限制成
-  deadline 加一個既有工具 timeout，而不是再加整輪工具。
+- **deadline 不啟動新工作**：剩餘時間不超過一秒就不再啟動工具。請求本身在 deadline
+  準時結束（502），但 threadpool 裡已經跑的 subprocess 不能由 asyncio timeout 打斷：那次
+  呼叫在背景跑完（最晚到它自己的 `LLM_TOOL_TIMEOUT_SECONDS`），期間持有共享鎖、結束時寫
+  紀錄。這條規則讓請求結束後最多只有一個工具還在跑，而不是整輪工具接著跑。
 - **已知秘密遮蔽**：後端 API key、所有 package `.env` 值、install/revise/tool-call
   期間登記的值，都在工具輸出進模型前 fail closed 遮蔽。短於六字元的值不遮，避免
-  普通文字被洗掉，因此安裝表單也拒絕短 secret。AI 日誌是觀測者，遮蔽失敗時刻意
+  普通文字被洗掉，因此安裝表單也拒絕短 secret。package `config.env` 的值**不是**
+  秘密，不進遮蔽集合（web-v6 §4）：設定放 `.env` 會被當成秘密全域遮蔽，放錯檔的
+  秘密則不會被遮。AI 日誌是觀測者，遮蔽失敗時刻意
   fail open，不讓記錄功能打斷真正操作；所以日誌遮蔽是常態防線，不是安全隔離。
 - **builder 檔案工具有 jail，shell 沒有**：`write_file`／`read_file`／`list_dir`
   拒絕 absolute path、`..` 與 symlink escape；`run_shell` 仍是真 bash。
@@ -113,9 +121,11 @@ identity。模型可能幾分鐘後才真的呼叫；若那時 `current` 已從 
             run.py ...
         <vid>.discarded/
     .env
+    config.env
 ```
 
-package layer 由後端管理「現在」的狀態，`.env` 是操作者跨版本持有的秘密；工具內容
+package layer 由後端管理「現在」的狀態，`.env` 是操作者跨版本持有的秘密，
+`config.env` 是操作者跨版本持有的一般設定（蓋過該版程式內的預設值）；工具內容
 只在 version layer。版本 id 為 `YYYYMMDDTHHMMSSZ-ffffff`。
 
 ### 為什麼需要四個型別
@@ -177,7 +187,8 @@ session root。
 修訂只新增版本，不再整包換裝：
 
 1. 從目前 `VersionRoot` 複製工具內容到 `build/`；package `.env` 不進工作區，值只注入
-   `run_shell` 並暫時登記遮蔽。
+   `run_shell` 並暫時登記遮蔽。package `config.env` 的值墊在 `.env` 底下一起注入，
+   全文（經遮蔽器）與 `.env` 的 key 名放進修訂提示，讓 builder 知道哪些設定被覆寫。
 2. builder 修改後，同樣剝除 builder `.env` 與 backend 保留 sidecar，再驗證內容。
 3. `shell/` 寫入工具內容與
    `origin.json(previous=<目前 vid>, feedback=<本次意見>)`。
@@ -189,8 +200,34 @@ package `.env` 與 `state.json` 原地不動，舊 versions 永久保留。候�
 `versions/` 下所有同前綴項目，包括 `.discarded`。
 
 修訂開始前會驗 package `.env` 可讀、至多 64 KiB、值至少六字元，且決定每個值的最後
-assignment line 能被遮蔽器逐字對回；無法安全遮蔽就不花 LLM。builder shell 仍有服務
+assignment line 能被遮蔽器逐字對回，`config.env` 也必須讀得到；無法安全遮蔽就不花
+LLM。這道檢查在**送出時**先跑一次（不過就回 `409 env_policy`；值太短或寫法無法
+對應時訊息列出 key 名、永不列值，檔案讀不到或過大時只說明狀況），job 開跑時再跑
+一次（web-v6 §5.2）。builder shell 仍有服務
 權限，因此修訂期間不要手改 `.env`：已寫入的 AI 日誌不能事後補遮。
+
+**附上失敗紀錄的修訂（一鍵修正，web-v6 §8）**：送出時可以帶最多三筆這個工具的執行紀錄
+（`run_ids`）。它們在取得名額之前就被檢查並**複製**下來（已遮蔽），之後清除那幾筆不影響這次
+修訂。修訂提示多一段 `Failing runs attached by the operator`：每筆的時間、呼叫的 workflow、
+執行的是不是工作區這一版、結果（`output_overflow` 寫成「輸出超過上限被終止」而不是 exit -9）、
+模型收到的字串、stdin 參數與 stderr／stdout，接著是固定的除錯程序：先用同樣的參數重現、修根因、
+把附上的輸入與 `examples.json` 的每個範例都重跑、問題不在程式就回 `ready=false` 並說明、把修好的
+輸入改寫成不含個人內容的等價範例加進 `examples.json`、summary 寫出根因與驗證方式。沒有意見時，
+意見欄寫明操作者只要求修正附上的失敗。新版本的 `origin.json` 的 `feedback` 會附一行
+「附上的失敗紀錄：#編號（時間，結果，exit code）」，不含 stderr 與參數。
+
+`examples.json` 是版本內容（工具的回歸輸入清單）：builder 安裝時把測過的輸入寫進去，修訂時
+必須把每個範例都重跑一次、全部成功才回 `ready=true`。只放唯讀的輸入。
+
+後端自己也會跑範例（web-v6 §10）：修訂發布之後的**自動驗證**（`workflow=verify`），與工具頁的
+「跑一次範例」（`workflow=health_check`，一種 job）。兩者走 AI 請求的同一條執行路徑：取得共享
+tools lock、`bind_request_tools_lock`，用 `checkable_tool` 以 `enabled_llm_tools` 同一組函式建出
+那個工具的 handler 直接呼叫——身分檢查、遮蔽、執行紀錄全部照舊，停用的工具不會被執行。每個範例
+就是一次 handler 呼叫，紀錄帶 `check_id`（那一批的 job id）；通過條件只有 exit 0、沒有逾時，不比對
+輸出。總預算是 `TOOL_CHECK_BUDGET_SECONDS`：第一個逾時之後其餘略過，預算用完就不再跑；某個範例
+被拒（工具在途中被停用或更換）時其餘標為 `stopped`。跑完之後，仍持有同一把共享鎖時把結論寫進
+`tool_check`（通過與失敗的個數、為什麼沒跑完），工具頁的驗證狀態讀的是這筆結論，不是紀錄本身。
+`examples.json` 讀不到、不是合法 JSON、形狀不對或超過 10 個時，整份不跑並回報原因。
 
 ### 啟用狀態
 
@@ -308,6 +345,23 @@ AI 日誌記錄 capture、enrich、assist-update、tool_install 與 tool_summary
 - install／revise job 提供 builder session 的 log id；summary sidecar 的 log id 另帶
   process token。id 是 process-local counter，後端重啟會重用數字；token 不符時前端
   拒絕把舊 deep link 指到新行程的無關紀錄。
+
+**工具執行紀錄**（web-v6 §6）補上 AI 日誌看不到的那一段：工具自己那一側發生了什麼。
+AI 日誌只在記憶體、只有 50 筆，而且工具的參數只留前 200 字；工具失敗時真正要看的 stderr，
+在日誌裡只是 `role="tool"` 訊息的一部分，還受 `llm_tool_output_max_chars` 截斷。
+
+- 每一次已安裝工具的呼叫都寫進 SQLite 的 `tool_run`：時間、耗時、執行的版本、呼叫的
+  workflow、結果與 exit code，以及連回那一筆 AI 日誌的 id 與 process token。
+- 結果比模型看到的更精確：stderr 超過上限時整組行程被終止，模型只看到
+  `tool failed (exit -9)`，紀錄則寫 `output_overflow`（工具在被終止前就以自己的 exit code
+  結束的，照實記成 `failed`）；`refused` 是工具根本沒執行（停用、版本已換、身分不符）；
+  `error` 是後端這一側失敗（已知秘密掃描、tools lock），模型收到的是
+  `tool execution failed: <型別>`。
+- **只有失敗的執行存內文**：參數（前 8,000 字）、stderr（最後 16,000 字，traceback
+  的關鍵在最後）、stdout（前 4,000 字）。先在整段上遮蔽再截斷；讀出時再對當下的已知
+  秘密遮一次。成功的執行只有中繼資料（AI 日誌不落地的理由對它們一樣成立）。
+- 工具頁的「最近執行」看得到這些紀錄；`GET /api/tools/{name}/runs` 與
+  `GET /api/tool-runs/{id}` 是它們的 API（見 `backend/README.md`）。
 
 ## 7. 為什麼不用 LangChain
 

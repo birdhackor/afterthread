@@ -55,6 +55,7 @@ the user re-runs the install). Bounded to the most recent ``_MAX_JOBS``.
 import asyncio
 import concurrent.futures
 import contextlib
+import functools
 import logging
 import os
 import queue
@@ -64,6 +65,7 @@ import stat
 import subprocess
 import threading
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
@@ -84,6 +86,7 @@ from afterthread.services.llm import (
     generate_structured,
 )
 from afterthread.services.memory_ai import _coerce_bool, _coerce_str, _truncate_to
+from afterthread.services.tool_runs import AttachedRun
 from afterthread.services.tools import _NAME_RE
 
 _logger = logging.getLogger("afterthread.tool_builder")
@@ -175,12 +178,20 @@ _ERROR_REVISE_NOT_FOUND = "找不到要修訂的工具（可能已被刪除）�
 _ERROR_REVISE_ENV_UNREADABLE = "無法讀取既有工具包的 .env，修訂已取消。"  # noqa: RUF001
 _ERROR_REVISE_ENV_TOO_LARGE = "既有工具包的 .env 超過大小上限，修訂已取消。"  # noqa: RUF001
 # A hand-edited ``.env`` holding a value BELOW the redactor's floor (R1-1). Names
-# the CONDITION and the two remedies, never the key and never the value -- the
-# whole point is that this value cannot be masked, so it must not be echoed by the
-# very message that refuses to expose it. See ``run_revise``'s own gate for why
-# refusing beats running.
+# the CONDITION, the KEYS (web-v6 §5: the operator ruled key names may be shown;
+# they already surface in ``env_keys`` and the migration report) and the two
+# remedies -- never the value: the whole point is that this value cannot be
+# masked, so it must not be echoed by the very message that refuses to expose it.
+# It also says WHY a non-secret trips it, because the operator who first met the
+# keyless version read "cannot be masked" as "you have a secret here" and could
+# not find one: every ``.env`` value is a secret to the redactor, and a setting
+# such as a TTL belongs in ``config.env``. ``{keys}`` is filled by
+# ``_env_policy_message``. See ``run_revise``'s own gate for why refusing beats
+# running.
 _ERROR_REVISE_ENV_UNMASKABLE = (
-    "既有工具包的 .env 內有值過短、無法遮蔽，修訂已取消：請加長該值，或將它從 .env 移除。"  # noqa: RUF001
+    f"既有工具包 .env 的{{keys}}值短於 {tools._MIN_SECRET_LEN} 字元，修訂已取消："  # noqa: RUF001
+    ".env 的每個值都會被當成秘密遮蔽，而太短的值遮不掉。"  # noqa: RUF001
+    "如果它是秘密，請加長；如果只是設定（例如 TTL），請把那一行移到同目錄的 config.env。"  # noqa: RUF001
 )
 # A hand-edited ``.env`` whose assignment line does not spell a value the way this
 # system itself would (R5-1, narrowed to that LINE by R6-1 and to EXACT equality by
@@ -195,14 +206,22 @@ _ERROR_REVISE_ENV_UNMASKABLE = (
 # rather than only its quoting, because R7-1's equality rule also refuses shapes with
 # nothing wrong with their quotes -- a trailing comment, an unquoted value with
 # spaces -- and a remedy that sent the operator hunting for escapes they do not have
-# would be worse than the refusal. Category-only like the rest: the condition and the
-# remedy, never the key and never the value -- printing the value in the message that
-# refuses to expose it would BE the leak.
+# would be worse than the refusal. The condition, the KEYS (web-v6 §5, as above) and
+# the remedy, never the value -- printing the value in the message that refuses to
+# expose it would BE the leak. A setting that merely happens to be written this way
+# has the same second way out as a short one, so the message offers it too.
 _ERROR_REVISE_ENV_UNMATCHABLE = (
-    "既有工具包的 .env 內有值的寫法無法對應到實際值、無法遮蔽，修訂已取消："  # noqa: RUF001
+    "既有工具包 .env 中{keys}的寫法無法對應到實際值、無法遮蔽，修訂已取消："  # noqa: RUF001
     "請把該行的值寫成最單純的形式（原值直接寫，或整段用引號包住），"  # noqa: RUF001
-    "並移除行尾註解與多餘的跳脫。"
+    "並移除行尾註解與多餘的跳脫；如果它只是設定，也可以把那一行移到同目錄的 config.env。"  # noqa: RUF001
 )
+# Revise reads the package's ``config.env`` (web-v6 §4) for the same reason it
+# reads ``.env``: its values go into run_shell's environment and its text into
+# the prompt, and a builder testing against a different environment than the
+# runtime's would be verifying the wrong thing. Category-only, like the two
+# ``.env`` read failures above.
+_ERROR_REVISE_CONFIG_UNREADABLE = "無法讀取既有工具包的 config.env，修訂已取消。"  # noqa: RUF001
+_ERROR_REVISE_CONFIG_TOO_LARGE = "既有工具包的 config.env 超過大小上限，修訂已取消。"  # noqa: RUF001
 # A fresh install publishes its package toggle before the final shell rename.
 _ERROR_INSTALL_STATE_WRITE = "無法寫入工具的啟用狀態，安裝已取消。"  # noqa: RUF001
 # Revise refuses a package that vanished, became an alias, or no longer matches
@@ -361,7 +380,9 @@ prints to STDOUT is the result shown to the AI assistant; a non-zero exit \
 code means failure (STDERR is shown as the error).
 - Put non-secret configuration defaults in the tool's own code, using \
 `os.environ.get("KEY", "default")` (or the equivalent in another language), so \
-the defaults remain part of this version. Do NOT write a `.env` file. If the \
+the defaults remain part of this version. The operator can override them for \
+this package in a `config.env` kept outside your workspace; never create one \
+yourself. Do NOT write a `.env` file. If the \
 tool needs a credential, name the required environment variable clearly in \
 tool.json's description; the operator supplies its value outside this build.
 - The workspace-root `.afterthread.meta/` directory belongs to the backend and \
@@ -372,6 +393,14 @@ inside this version workspace.
 so the tool runs anywhere without installing dependencies. If the environment \
 variable TLS_NO_VERIFY is set to a truthy value, skip TLS certificate \
 verification (for urllib.request: pass context=ssl._create_unverified_context()).
+- `examples.json` at the workspace root is the tool's regression list: the \
+inputs it must keep handling. A JSON object \
+{"examples": [{"name": "<what this input checks>", "args": {<the JSON object \
+piped to the tool>}}, ...]} with at most 10 entries. Record in it the inputs \
+you tested with. Only READ-ONLY inputs (searches, lookups): the backend runs \
+every example against the real API to verify the tool, so an input that \
+creates, changes or deletes data would do so again on every check. Never put a \
+secret or personal content in it.
 
 Your meta-tools (the file tools below take paths RELATIVE to the workspace and \
 cannot reach outside it):
@@ -395,7 +424,8 @@ that serve the user's goal.
 command; verify the output is genuinely useful to an AI assistant (compact, \
 relevant, plain text or small JSON).
 4. Fix and re-test until it works. Do not stop at "should work" -- prove it.
-5. Only then finish with ready=true.
+5. Write the inputs you tested into examples.json.
+6. Only then finish with ready=true.
 
 Finish by returning the final JSON object described in the system \
 instructions: "tool_name" MUST equal the "name" in tool.json; "summary" is a \
@@ -471,21 +501,30 @@ IN YOUR WORKSPACE. You are not building a new tool: revise THIS package to \
 address the user's feedback below, and leave everything the feedback does not \
 ask you to change exactly as you found it.
 
-Three facts about this workspace that differ from a fresh build:
-- The package's operator-owned `.env` remains outside this version workspace. \
-Do not write one, do not invent placeholder values, and do not make your changes \
-depend on rewriting it -- any `.env` you write is stripped before publication. \
-Its values are \
-already exported into your run_shell environment under their own names, so you \
+What differs in this workspace from a fresh build:
+- The package's operator-owned `.env` (secrets) and `config.env` (setting \
+overrides) remain outside this version workspace. Do not write either one, do \
+not invent placeholder values, and do not make your changes depend on rewriting \
+them -- any `.env` you write is stripped before publication, and a `config.env` \
+in the workspace is never loaded. Their values are \
+already exported into your run_shell environment under their own names \
+(`config.env` first, `.env` on top), so you \
 can still live-test the real API (e.g. `echo '{"query":"test"}' | python3 \
-run.py`) without ever seeing them. If the user's feedback asks to CHANGE a \
-secret value, say so in your summary -- that is done by hand, not here.
+run.py`) without ever seeing the secrets. If the user's feedback asks to CHANGE \
+a secret value or an overridden setting, say so in your summary -- that is done \
+by hand, not here.
 - Never write a secret value into any file. A package that embeds a known \
 secret is REFUSED, and that refusal discards your whole revision.
 - The backend-owned root `.afterthread.meta/` directory is missing from this \
 workspace and is rebuilt after you finish; do not create or edit it. Any legacy \
 flat `.ai_meta.json` or `.afterthread-state.json` file you find here is this \
 version's tool content: leave it alone unless the feedback asks you to change it.
+- If the workspace has an `examples.json`, run EVERY example in it (pipe its \
+"args" into the entry command) after your change, and finish with ready=true \
+only if all of them still succeed (exit code 0, no timeout): a change that \
+fixes one input and breaks another is not done. Keep the file and its \
+examples; add to it rather than replace it. If there is none yet, create one \
+as described above.
 
 Finish exactly as described above, with one added rule: "tool_name" MUST be \
 exactly {name}, because it names the installed package this revision updates \
@@ -602,6 +641,16 @@ class InstallOutcome:
     # Names extracted from a builder-written .env before that file was stripped.
     # Values are intentionally not representable in the outcome or job schema.
     env_keys: tuple[str, ...] = ()
+    # True only for the builder's own ``ready=false`` close (web-v6 §8.3): the
+    # session ran and the model chose not to publish. Kept apart from every other
+    # failure because it is not one in the same sense -- the model may have found
+    # an external cause (an expired credential) or simply given up, and the job
+    # card must say "not published" rather than show the red "failed" both share
+    # today, without claiming to know which of the two it was.
+    not_ready: bool = False
+    # How the published version did on its own examples.json (web-v6 §8.3): set
+    # by a revise that published, None otherwise. A ``_verification_dict``.
+    verification: dict[str, Any] | None = None
 
 
 # --- staging containment + meta-tools ---------------------------------------
@@ -758,8 +807,10 @@ def _build_meta_tools(staging: Path, secret_env: dict[str, str] | None = None) -
     ``secret_env`` is the env addition injected into run_shell's environment so
     the builder can live-test the real API -- the install form's single
     ``{<NAME>: <value>}`` (D36), or a revise's whole preserved package ``.env``
-    (D40) -- passed straight to ``_run_shell_subprocess``. It touches ONLY
-    run_shell (the file meta-tools never see it) and never any prompt.
+    (D40) layered over its ``config.env`` (web-v6 §4) -- passed straight to
+    ``_run_shell_subprocess``. It touches ONLY run_shell (the file meta-tools
+    never see it) and never any prompt; the ``config.env`` TEXT reaches the
+    prompt separately, through ``_revise_user_prompt``.
     """
 
     async def write_file(args: dict[str, Any]) -> str:
@@ -1236,7 +1287,119 @@ def _builder_user_prompt(instructions: str, openapi_text: str) -> str:
     )
 
 
-def _revise_user_prompt(feedback: str, manifest_text: str | None) -> str:
+# The feedback line of a revise that only attaches failing runs (web-v6 §8.1):
+# the one-click fix sends no words, and the builder is told what that means.
+_NO_FEEDBACK = (
+    "(none) The operator attached the failing runs below and asks only that you fix them."
+)
+
+# How each outcome reads to the builder. ``output_overflow`` is spelled out
+# because the assistant was told "exit -9", which reads as a crash.
+_RUN_OUTCOME_PROSE = {
+    "ok": "the tool succeeded",
+    "failed": "the tool exited with a non-zero code",
+    "output_overflow": (
+        "the tool was KILLED because its stderr passed the output cap (the "
+        "assistant was told exit -9; it did not crash on its own)"
+    ),
+    "timeout": "the tool ran past its time limit and was killed",
+    "start_failed": "the tool could not be started (interpreter or entry file)",
+    "refused": "the call was refused before the tool ran",
+    "error": (
+        "the BACKEND failed around this call (an internal error, not the tool's "
+        "own exit), whether or not the tool had started"
+    ),
+}
+
+_FAILING_RUNS_HEADER = (
+    "Failing runs attached by the operator. They are real calls the AI assistant "
+    "made; the texts are what the backend recorded (secrets masked, long outputs "
+    "cut: stderr keeps its END, stdout its START)."
+)
+
+# Marks the front of a text cut to its END (``_truncate_tail_to``); the head
+# cut's ``_TRUNCATION_MARKER`` turned around.
+_TAIL_TRUNCATION_MARKER = "[內容過長已截斷]…"
+
+
+def _truncate_tail_to(value: str, cap: int) -> str:
+    """``value`` cut to its LAST ``cap`` chars, marked in front when it was cut.
+
+    stderr's counterpart of ``_truncate_to``: a traceback names its failure at
+    the end, the stored copy already keeps that end (``tool_runs._tail``), and
+    the header above tells the builder so -- a head cut here would drop exactly
+    the lines that matter whenever the prompt budget is smaller than the record.
+    """
+    if len(value) <= cap:
+        return value
+    marker_len = len(_TAIL_TRUNCATION_MARKER)
+    if cap <= marker_len:
+        return value[len(value) - cap :]
+    return _TAIL_TRUNCATION_MARKER + value[len(value) - cap + marker_len :]
+
+
+# The fixed procedure that follows the attached runs (web-v6 §8.4).
+_DEBUG_PROCEDURE = """How to work on these failures:
+1. Reproduce first. Pipe the exact attached arguments into the entry command \
+(for example: echo '<the stdin arguments>' | python3 run.py) and confirm you see \
+the same error. If you cannot reproduce it, say so and find out why (the API \
+changed, credentials, data-dependent behaviour) instead of changing code on a \
+guess.
+2. Fix the root cause.
+3. Re-run every attached input and every example in examples.json. Finish with \
+ready=true only if all of them succeed (exit code 0, no timeout).
+4. If the cause is outside the code (expired credentials, the API is down), \
+finish with ready=false and explain the cause and what the operator should do.
+5. For each failure you fixed, add an example to examples.json: an equivalent \
+input that takes the same code path WITHOUT any personal content the original \
+may carry (for example another query that also returns no hits). Read-only \
+inputs only.
+6. In your summary: the root cause, what you changed, how you verified it, and \
+which examples you added."""
+
+
+def _failing_run_text(run: AttachedRun, workspace_vid: str | None, budget: int) -> str:
+    """One attached run as the builder reads it. Each text is redacted, then cut.
+
+    A run of another version is called DIFFERENT, not older: an attached record
+    (the API takes any of the tool's runs, D45) may have run a version since
+    discarded, newer than the workspace's, or one of an earlier package that had
+    the same name.
+    """
+    lines = [
+        f"Run #{run.id} at {run.started_at:%Y-%m-%d %H:%M:%S} UTC, "
+        f"called from the {run.workflow} workflow.",
+        (
+            "It ran the version that is in your workspace."
+            if run.vid == workspace_vid
+            else f"It ran a DIFFERENT version ({run.vid}) than the one in your "
+            "workspace: check whether it still fails before changing anything."
+        ),
+        "Outcome: "
+        + _RUN_OUTCOME_PROSE.get(run.outcome, run.outcome)
+        + (f" (exit code {run.exit_code})." if run.exit_code is not None else "."),
+    ]
+    for label, text, cut in (
+        ("What the AI assistant was told", run.message, _truncate_to),
+        ("stdin arguments (JSON)", run.args, _truncate_to),
+        ("stderr", run.stderr, _truncate_tail_to),
+        ("stdout", run.stdout, _truncate_to),
+    ):
+        if text:
+            lines += [f"{label}:", cut(tools.redact_known_secrets(text), budget)]
+    return "\n".join(lines)
+
+
+def _revise_user_prompt(
+    feedback: str | None,
+    manifest_text: str | None,
+    config_text: str = "",
+    env_keys: tuple[str, ...] = (),
+    conflicts: tuple[str, ...] = (),
+    *,
+    runs: tuple[AttachedRun, ...] = (),
+    workspace_vid: str | None = None,
+) -> str:
     """The revise session's user turn: the feedback + the package's manifest.
 
     Deliberately NOT a re-fetch of the OpenAPI document (D40): the revision is
@@ -1258,19 +1421,90 @@ def _revise_user_prompt(feedback: str, manifest_text: str | None) -> str:
     Each part carries the same per-part budget ``_builder_user_prompt`` gives the
     document; both are separately request/manifest-bounded already, so the cut is
     a backstop rather than the usual case.
+
+    Two package-layer facts follow when present (web-v6 §4), because the model
+    cannot see either file from its workspace. ``config.env`` is quoted WHOLE --
+    its comments are part of what the operator meant, and its values are settings
+    by the operator's own choice of file -- yet still through the redactor like
+    every operator-derived text here, so a secret pasted into the wrong file is
+    masked as long as ``.env`` holds it too. Without it the model changes a code
+    default that an override silently shadows and reports success (v5 §3). The
+    ``.env`` part is KEY NAMES only, which tells the model what credentials it
+    has without telling it any of them; ``conflicts`` are the keys both files
+    set, where the ``.env`` value is the one that runs.
+
+    ``runs`` are the failing run records the operator attached (web-v6 §8.4):
+    each one's time, workflow, whether it ran the workspace's version
+    (``workspace_vid``), outcome, the string the assistant got, and the masked
+    stdin arguments and output, followed by the fixed debugging procedure.
+    Their texts were masked when the job was submitted and go through the
+    redactor again here, like every operator-derived text in this prompt. A
+    revise with runs and no feedback says so in the feedback slot -- in the
+    backend's own words, which go in as they are: only operator- or
+    filesystem-derived text is redacted (see ``_revise_system_prompt``), and a
+    registered value that happens to equal one of those words would mangle it.
     """
     budget = token_budget.char_allowance(get_settings().llm_prompt_budget_tokens)
     parts = [
         "Revise the existing tool package as described below.",
         "User feedback:",
-        _truncate_to(tools.redact_known_secrets(feedback), budget),
+        (
+            _truncate_to(tools.redact_known_secrets(feedback), budget)
+            if feedback is not None
+            else _NO_FEEDBACK
+        ),
     ]
     if manifest_text is not None:
         parts += [
             "The package's current tool.json:",
             _truncate_to(tools.redact_known_secrets(manifest_text), budget),
         ]
+    if config_text.strip():
+        parts += [
+            "The operator's setting overrides for this package (its config.env, "
+            "outside your workspace). These values override the defaults in the "
+            "tool's code at runtime and are already in your run_shell environment. "
+            "If the feedback asks to change one of these settings, changing the code "
+            "default has NO effect while the override stays: say in your summary "
+            "that the operator must edit config.env.",
+            _truncate_to(tools.redact_known_secrets(config_text), budget),
+        ]
+        if conflicts:
+            parts.append(
+                "These keys are also set in the package's .env, whose value wins: "
+                + _truncate_to(tools.redact_known_secrets(", ".join(conflicts)), budget)
+            )
+    if env_keys:
+        parts.append(
+            "Variables the package's .env sets in your run_shell environment "
+            "(secrets; values hidden; never print them): "
+            + _truncate_to(tools.redact_known_secrets(", ".join(env_keys)), budget)
+        )
+    if runs:
+        parts.append(_FAILING_RUNS_HEADER)
+        parts += [_failing_run_text(run, workspace_vid, budget) for run in runs]
+        parts.append(_DEBUG_PROCEDURE)
     return "\n\n".join(parts)
+
+
+def _provenance_feedback(feedback: str | None, runs: tuple[AttachedRun, ...]) -> str:
+    """The ``origin.feedback`` a revise writes: the operator's words, then the runs.
+
+    A version records WHY it exists (web-v6 §8.1): for a fix, which failures it
+    was made for -- id, time, outcome and exit code, never the stderr or the
+    arguments (invariant V): the origin is kept as long as the version is, and
+    the record's bodies are the operator's to purge.
+    """
+    if not runs:
+        return feedback or ""
+    entries = []
+    for run in runs:
+        detail = f"{run.started_at:%Y-%m-%d %H:%M:%S} UTC，{run.outcome}"  # noqa: RUF001
+        if run.exit_code is not None:
+            detail += f"，exit {run.exit_code}"  # noqa: RUF001
+        entries.append(f"#{run.id}（{detail}）")  # noqa: RUF001
+    line = "附上的失敗紀錄：" + "、".join(entries)  # noqa: RUF001
+    return f"{feedback}\n\n{line}" if feedback else line
 
 
 # --- staging promotion + cleanup ---------------------------------------------
@@ -1988,6 +2222,7 @@ async def run_install(
                 error=f"AI 判定工具尚未完成：{reason}",  # noqa: RUF001
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
+                not_ready=True,
             )
 
         published, promote_error = await run_in_threadpool(
@@ -2172,6 +2407,77 @@ def _read_env_for_values(directory: Path) -> tuple[bool, dict[str, str], str, st
     return True, tools._parse_dotenv_text(text), text, None
 
 
+def _read_config_for_values(directory: Path) -> tuple[dict[str, str], str, str | None]:
+    """Read package ``config.env`` (web-v6 §4) for the builder shell and the prompt.
+
+    The same bounded, non-following read as ``_read_env_for_values`` and the same
+    "missing is fine, unreadable refuses" split, for the reason the error
+    constants give. Returns ``(values, text, error)``; the text is what the prompt
+    quotes, since its comments are part of what the operator meant.
+    """
+    config_file = directory / tools._CONFIG_FILENAME
+    try:
+        config_stat = config_file.lstat()
+    except FileNotFoundError:
+        return {}, "", None
+    except OSError:
+        return {}, "", _ERROR_REVISE_CONFIG_UNREADABLE
+    if config_stat.st_size > tools._ENV_FILE_MAX_BYTES:
+        return {}, "", _ERROR_REVISE_CONFIG_TOO_LARGE
+    text = tools._read_regular_file_capped(config_file, tools._ENV_FILE_MAX_BYTES)
+    if text is None:
+        return {}, "", _ERROR_REVISE_CONFIG_UNREADABLE
+    if len(text) > tools._ENV_FILE_MAX_BYTES:
+        return {}, "", _ERROR_REVISE_CONFIG_TOO_LARGE
+    return tools._parse_dotenv_text(text), text, None
+
+
+@dataclass(frozen=True, slots=True)
+class _ReviseEnv:
+    """What one read of a package's two env files gave the revise gate."""
+
+    env_values: dict[str, str]
+    config_values: dict[str, str]
+    config_text: str
+
+
+def _revise_env_gate(directory: Path) -> tuple[_ReviseEnv | None, str | None]:
+    """Read ``.env`` and ``config.env`` and apply the whole revise env policy.
+
+    Blocking, ONE worker hop for all of it (R1-3/R4-3): the ``.env`` read and
+    parse, the masking policy over its values, and the ``config.env`` read. Called
+    twice per revise, deliberately (web-v6 §5.2): once on the SUBMIT path, before
+    the global slot is taken, so a refusal reaches the operator as the response
+    to the click that caused it instead of as a job card they may never open; and
+    again inside ``run_revise``, on whatever the files say by then, because a
+    queued job can start minutes after its submit.
+
+    Returns ``(env, None)`` on success and ``(None, error)`` on any refusal.
+    Only the non-empty ``.env`` values are judged: a ``KEY=`` line contributes no
+    secret to anything (``tools._cached_env_values``' own rule), so it can never
+    make a package permanently unrevisable.
+
+    It can also RAISE, and that is accepted rather than caught (P1 review C4): a
+    refusal names keys through ``redact_known_secrets``, which fails closed when
+    the known-secret scan itself fails (an unreadable tools directory). On the
+    submit path that surfaces as a plain 500 before any slot, job or secret
+    registration exists; inside the job it is ``_run_job``'s category-only
+    backstop. Neither leaks text, and mapping it onto ``env_policy`` would tell the
+    operator their files are wrong when the scan is what broke.
+    """
+    _env_existed, env_values, env_text, env_error = _read_env_for_values(directory)
+    if env_error is not None:
+        return None, env_error
+    registered_by_key = {key: value for key, value in env_values.items() if value}
+    mask_error = _unmaskable_env_error(env_text, registered_by_key)
+    if mask_error is not None:
+        return None, mask_error
+    config_values, config_text, config_error = _read_config_for_values(directory)
+    if config_error is not None:
+        return None, config_error
+    return _ReviseEnv(env_values, config_values, config_text), None
+
+
 def _env_assignment_rhs(text: str) -> dict[str, str]:
     """Each key in a ``.env`` text mapped to the RAW RHS that DETERMINES its value.
 
@@ -2207,8 +2513,11 @@ def _env_assignment_rhs(text: str) -> dict[str, str]:
     return spelled
 
 
-def _env_assignment_rhs_all(text: str) -> list[str]:
-    """EVERY assignment line's raw RHS, shadowed ones included (R8-1).
+def _env_assignment_rhs_all(text: str) -> list[tuple[str, str]]:
+    """EVERY assignment line's ``(key, raw RHS)``, shadowed ones included (R8-1).
+
+    The key rides along only so a refusal can NAME the line (web-v6 §5); the RHS
+    is still what is judged.
 
     Pure, and deliberately the counterpart of ``_env_assignment_rhs`` rather than
     a variant of it: that one answers "which spelling DECIDED this key's value"
@@ -2222,9 +2531,9 @@ def _env_assignment_rhs_all(text: str) -> list[str]:
     form the winning line avoided, and a ``cat`` of the file shows them all.
     """
     return [
-        line.split("=", 1)[1].strip()
+        (key, line.split("=", 1)[1].strip())
         for line in text.split("\n")
-        if _env_line_key(line) is not None
+        if (key := _env_line_key(line)) is not None
     ]
 
 
@@ -2438,25 +2747,70 @@ def _unmaskable_env_error(text: str, values: dict[str, str]) -> str | None:
     in front of the redactor.
 
     Refusing is the only honest option (the same "do not run beats leak" the floor
-    check already chose), and the messages name the CONDITION and the REMEDY only
-    -- never the key, never the value.
+    check already chose), and the messages name the CONDITION, the REMEDY and
+    every offending KEY (web-v6 §5) -- never the value. Each gate therefore
+    collects all of its keys before answering instead of stopping at the first,
+    so one refusal names everything the operator has to move; the passing case
+    already walked every key and every line, so this costs nothing new.
     """
-    if any(len(value) < tools._MIN_SECRET_LEN for value in values.values()):
-        return _ERROR_REVISE_ENV_UNMASKABLE
+    short = [key for key, value in values.items() if len(value) < tools._MIN_SECRET_LEN]
+    if short:
+        return _env_policy_message(_ERROR_REVISE_ENV_UNMASKABLE, short)
     spelled = _env_assignment_rhs(text)
-    for key, value in values.items():
-        rhs = spelled.get(key)
-        if rhs is None or rhs not in _dotenv_safe_spellings(value):
-            return _ERROR_REVISE_ENV_UNMATCHABLE
+    unmatched = [
+        key
+        for key, value in values.items()
+        if (rhs := spelled.get(key)) is None or rhs not in _dotenv_safe_spellings(value)
+    ]
     # ... and every OTHER assignment line, shadowed ones included (R8-1), for its
     # SHAPE alone: `_plainly_spelled` asks whether a line holds its own text
     # literally, which is answerable without knowing which value it was meant to
     # spell -- and it is exactly what a shadowed line needs to be innocent.
     # `spelled` cannot serve here: it keeps only the WINNER per key, which is the
     # one line this check does not need.
-    if any(not _plainly_spelled(rhs) for rhs in _env_assignment_rhs_all(text)):
-        return _ERROR_REVISE_ENV_UNMATCHABLE
+    unmatched += [key for key, rhs in _env_assignment_rhs_all(text) if not _plainly_spelled(rhs)]
+    if unmatched:
+        return _env_policy_message(_ERROR_REVISE_ENV_UNMATCHABLE, unmatched)
     return None
+
+
+# At most this many keys are named in one ``.env`` policy message, each cut to
+# ``_ENV_KEY_SHOWN_MAX`` characters: a hand-edited file can hold thousands of
+# lines, and the message is a job error and a 409 body, not a report. The count of
+# the rest is still given, so the operator knows the list is not complete.
+_ENV_KEYS_SHOWN_MAX = 5
+_ENV_KEY_SHOWN_MAX = 64
+
+
+def _env_policy_message(template: str, keys: list[str]) -> str:
+    """Fill a ``.env`` policy message's ``{keys}`` with the offending key names.
+
+    Blocking (it redacts). Duplicates collapse in first-seen order, since one key
+    can fail both the deciding-line and the shadowed-line check. Each name is
+    redacted BEFORE it is cut, the redact->cap order every text in this module
+    follows: key names are operator-chosen, so in principle one could equal a
+    registered value, and cutting first could leave a fragment no redactor
+    matches.
+
+    A "key" that starts with ``#`` is a COMMENT line holding an ``=``: the
+    shadowed-line check (R8-1) judges every line ``_env_line_key`` recognizes,
+    comments included, and that is deliberate -- a ``cat`` prints a comment as
+    readily as an assignment. Only the wording follows from it (P1 review C3): the
+    line is named as a comment line, so the operator is not told a key called
+    ``# Usage: KEY`` exists.
+    """
+    unique = list(dict.fromkeys(keys))
+    shown = []
+    for key in unique[:_ENV_KEYS_SHOWN_MAX]:
+        redacted = tools.redact_known_secrets(key)
+        if len(redacted) > _ENV_KEY_SHOWN_MAX:
+            redacted = redacted[:_ENV_KEY_SHOWN_MAX] + "…"
+        label = f"「{redacted}」"
+        shown.append(f"註解行{label}" if key.startswith("#") else label)
+    named = "、".join(shown)
+    if len(unique) > _ENV_KEYS_SHOWN_MAX:
+        named += f"等 {len(unique)} 個"
+    return template.replace("{keys}", named)
 
 
 def _current_manifest_text(directory: Path) -> str | None:
@@ -2471,8 +2825,10 @@ def _current_manifest_text(directory: Path) -> str | None:
 
 async def run_revise(
     name: str,
-    feedback: str,
+    feedback: str | None,
     resolution: tools.Resolved | None,
+    *,
+    runs: tuple[AttachedRun, ...] = (),
 ) -> InstallOutcome:
     """Build and commit one new version, then publish ``current``.
 
@@ -2514,26 +2870,23 @@ async def run_revise(
         # check would have to either wave stale work through -- exactly the loss R10-1
         # closed -- or refuse after burning the whole build.
         return InstallOutcome(ok=False, error=_ERROR_REVISE_IDENTITY_UNKNOWN)
-    _env_existed, env_values, env_text, env_error = await run_in_threadpool(
-        _read_env_for_values, package_root.path
-    )
-    if env_error is not None:
-        return InstallOutcome(ok=False, error=env_error)
-    registered_by_key = {key: value for key, value in env_values.items() if value}
-    registered = list(registered_by_key.values())
     # BEFORE the LLM call, and before anything is registered: a value we would be
     # required to ignore, or one whose own assignment line spells it so that no
     # redactor can match what a ``cat`` of the file prints, cannot be protected by
     # registering it (see the docstring and ``_unmaskable_env_error``). The KEYS go
     # in too, because the spelling that has to vouch for a value is the one on the
     # line that DETERMINES it, never some other line or a comment that merely
-    # repeats it (R6-1). Only the non-empty values are passed, so a ``KEY=`` line --
-    # which contributes no secret to anything -- can never trip either half. On a
-    # worker like every other scan in this function (R1-3): a 64 KiB ``.env`` is a
-    # full walk plus thousands of substring searches.
-    mask_error = await run_in_threadpool(_unmaskable_env_error, env_text, registered_by_key)
-    if mask_error is not None:
-        return InstallOutcome(ok=False, error=mask_error)
+    # repeats it (R6-1). ONE worker hop for the read, the parse and the policy
+    # (R1-3/R4-3): a 64 KiB ``.env`` is a full walk plus thousands of substring
+    # searches. The submit path already ran this same gate (web-v6 §5.2); it runs
+    # again here because a queued job can start minutes after its submit, and
+    # what counts is the files as they are when the session actually begins.
+    revise_env, env_error = await run_in_threadpool(_revise_env_gate, package_root.path)
+    if env_error is not None:
+        return InstallOutcome(ok=False, error=env_error)
+    assert revise_env is not None  # exactly one of the pair is set
+    env_values = revise_env.env_values
+    registered = [value for value in env_values.values() if value]
     for value in registered:
         tools.register_inflight_secret(value)
 
@@ -2562,7 +2915,23 @@ async def run_revise(
         # backstop. The SYSTEM prompt joined them when its interpolated package name
         # became redactable (R2-4) -- it was a pure join until then.
         system_prompt = await run_in_threadpool(_revise_system_prompt, name)
-        user_prompt = await run_in_threadpool(_revise_user_prompt, feedback, manifest_text)
+        config_values = revise_env.config_values
+        user_prompt = await run_in_threadpool(
+            functools.partial(
+                _revise_user_prompt,
+                feedback,
+                manifest_text,
+                revise_env.config_text,
+                tuple(sorted(env_values)),
+                tuple(sorted(set(config_values) & set(env_values))),
+                runs=runs,
+                workspace_vid=resolution.vid,
+            )
+        )
+        # The run_shell environment is layered exactly as ``tools._build_tool_env``
+        # layers the runtime one -- config.env first, .env on top (web-v6 §4) -- so
+        # the builder tests what the tool will actually run with.
+        shell_env = {**config_values, **env_values}
         result: InstallResult | None = None
         llm_error: str | None = None
         try:
@@ -2574,7 +2943,8 @@ async def run_revise(
                 # The whole existing .env goes into run_shell's environment (never
                 # into a prompt), so the model can live-test the real API against
                 # the tool's own credentials without the file being in staging.
-                tools=_build_meta_tools(build_root.path, secret_env=env_values or None),
+                # config.env rides along under it; its TEXT is in the prompt above.
+                tools=_build_meta_tools(build_root.path, secret_env=shell_env or None),
                 max_tool_rounds=settings.tool_install_max_rounds,
                 timeout_seconds=settings.tool_install_timeout_seconds,
             )
@@ -2627,6 +2997,7 @@ async def run_revise(
                 error=f"AI 判定修訂尚未完成：{reason}",  # noqa: RUF001
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
+                not_ready=True,
             )
         if result.tool_name != name:
             # D40: ``InstallResult._ready_requires_valid_name`` only checks the
@@ -2661,7 +3032,7 @@ async def run_revise(
             package_root,
             resolution,
             package_identity,
-            feedback,
+            _provenance_feedback(feedback, runs),
         )
         if promote_error is not None:
             return InstallOutcome(
@@ -2686,12 +3057,14 @@ async def run_revise(
             origin=published.origin,
             builder_summary=summary,
         )
+        verification = await _verify_published(name, published.resolution.vid)
         return InstallOutcome(
             ok=True,
             tool_name=name,
             summary=summary,
             llm_log_id=llm_log_id,
             env_keys=env_keys,
+            verification=verification,
         )
     finally:
         # The package .env was untouched, so its live scan keeps covering these
@@ -2700,6 +3073,204 @@ async def run_revise(
         for value in registered:
             tools.discard_inflight_secret(value)
         await run_in_threadpool(_cleanup_staging, session_root, base)
+
+
+# --- examples: verification and the health check (web-v6 §8.3, §10) --------
+
+_WORKFLOW_VERIFY = "verify"
+_WORKFLOW_HEALTH_CHECK = "health_check"
+
+
+async def _name_secrets() -> list[str] | None:
+    """The secrets example names are masked against, or None when the scan fails.
+
+    Scanned on a worker (P5 review r1, J5): the scan walks every package's
+    ``.env``, and nothing that touches the filesystem runs on the event loop.
+    """
+    try:
+        return await run_in_threadpool(tools._redaction_secrets)
+    except Exception:
+        return None
+
+
+def _verification_dict(
+    result: tools.CheckResult, *, finished: bool, secrets: list[str] | None
+) -> dict[str, Any]:
+    """A check's result as the job reports it: per example, plus the totals.
+
+    Example names are builder-written version content shown to the operator, so
+    they pass the redactor like every other such text -- masked, then cut
+    (``tools.example_display_name``). ``secrets`` comes from ``_name_secrets``;
+    a failed scan (None) must not lose the result, so it costs the names instead.
+    """
+    runs = []
+    for index, example in enumerate(result.results, start=1):
+        name = (
+            tools.example_display_name(example.name, secrets)
+            if secrets is not None
+            else f"範例 {index}"
+        )
+        runs.append({"name": name, "outcome": example.outcome, "run_id": example.run_id})
+    not_started = {tools.EXAMPLE_SKIPPED, tools.EXAMPLE_NOT_RUN, tools.EXAMPLE_STOPPED}
+    return {
+        "status": result.status,
+        "message": result.message,
+        "vid": result.vid,
+        "runs": runs,
+        "completed": sum(1 for example in result.results if example.outcome not in not_started),
+        "total": result.total,
+        "budget_exhausted": result.budget_exhausted,
+        "finished": finished,
+    }
+
+
+async def _verify_published(name: str, vid: str) -> dict[str, Any]:
+    """Run the just-published version's examples, the fix's own verification.
+
+    Only the version's examples.json is run -- never the inputs attached to the
+    fix, which the builder alone replays inside its session (web-v6 §8.5). A
+    tool switched off is not run: the execution path refuses it, so the result
+    says it was not verified. Labelled with this job's id as ``check_id`` and
+    reported on the job as each example finishes.
+    """
+    job_id = _CURRENT_JOB_ID.get()
+    # Progress is reported from the loop as each example ends, so its names are
+    # masked against one scan taken up front; the final report scans again.
+    progress_secrets = await _name_secrets()
+
+    def _progress(partial: tools.CheckResult) -> None:
+        if job_id is not None:
+            _update_job(
+                job_id,
+                verification=_verification_dict(partial, finished=False, secrets=progress_secrets),
+            )
+
+    try:
+        result = await tools.run_examples(
+            name,
+            check_id=job_id or uuid4().hex,
+            workflow=_WORKFLOW_VERIFY,
+            budget_seconds=get_settings().tool_check_budget_seconds,
+            expected_vid=vid,
+            on_progress=_progress,
+        )
+    except Exception as exc:
+        # The fix is published; a verification that could not even run must
+        # not turn that into a failure. It says what happened instead.
+        _logger.warning("Verification of %s not run: %s", name, type(exc).__name__)
+        result = tools.CheckResult(status="error", vid=vid)
+    return _verification_dict(result, finished=True, secrets=await _name_secrets())
+
+
+# Why a health check cannot start, by the reason ``tools.checkable_tool`` or the
+# examples file gives. The operator reads these on the submit, so they say what
+# to do.
+_CHECK_REFUSALS = {
+    "no_examples": "這個版本沒有 examples.json，沒有範例可以跑。修訂時 AI 會建立它。",  # noqa: RUF001
+    "disabled": "工具已停用：執行路徑不會執行停用的工具。啟用後再跑。",  # noqa: RUF001
+    "invalid": "工具目前的版本不是可執行的工具包。",
+    # The two a check can only meet AFTER admission (P5 review r1, J2): the
+    # version moved between the submit and the run, or the package went away.
+    "version_changed": "送出之後工具換了版本，這次沒有跑範例。請重新整理後再跑。",  # noqa: RUF001
+    "not_found": "找不到這個工具（可能已被刪除），沒有跑範例。",  # noqa: RUF001
+}
+
+
+@dataclass(frozen=True, slots=True)
+class CheckJobStart:
+    """A health-check submit: the job id, or a refusal (and its message)."""
+
+    job_id: str | None = None
+    refusal: str | None = None
+    message: str | None = None
+
+
+async def start_health_check_job(name: str, expected_vid: str) -> CheckJobStart:
+    """Take the global slot, check the version and its examples, queue the run.
+
+    A health check is a job like an install or a revise (web-v6 §10): it holds
+    the single flight -- so every version write is refused meanwhile -- and the
+    shared tools lock while it runs. ``expected_vid`` is compared after the slot
+    is taken, the order every version-specific write keeps (invariant K). A
+    version with no usable examples, or a tool that is off, is refused here, so a
+    job never exists that could only report that nothing ran.
+    """
+    reservation = reserve_sync_operation()
+    if reservation is None:
+        return CheckJobStart(refusal="job_busy")
+    try:
+        package_root = await run_in_threadpool(tools._resolve_package_dir_no_alias, name)
+        if package_root is None:
+            return CheckJobStart(refusal="not_found")
+        resolution = await run_in_threadpool(tools.resolve_current, package_root)
+        if isinstance(resolution, tools.Unresolved):
+            return CheckJobStart(refusal="not_found")
+        if resolution.vid != expected_vid:
+            return CheckJobStart(refusal="version_mismatch")
+        found = await run_in_threadpool(tools.checkable_tool, name)
+        if isinstance(found, str):
+            refusal = "not_found" if found == "not_found" else "check_unavailable"
+            return CheckJobStart(refusal=refusal, message=_CHECK_REFUSALS.get(found))
+        loaded = await run_in_threadpool(tools.load_examples, resolution.version_root)
+        if loaded.error is not None:
+            return CheckJobStart(refusal="check_unavailable", message=loaded.error)
+        if not loaded.examples:
+            return CheckJobStart(
+                refusal="check_unavailable", message=_CHECK_REFUSALS["no_examples"]
+            )
+        job = _admit_job(reservation_token=reservation, kind="health_check", tool_name=name)
+        if job is None:
+            return CheckJobStart(refusal="job_busy")
+        reservation = ""
+        task = asyncio.create_task(_run_check_job(job.job_id, name, expected_vid))
+        _TASKS.add(task)
+        task.add_done_callback(_TASKS.discard)
+        return CheckJobStart(job_id=job.job_id)
+    finally:
+        if reservation:
+            release_sync_operation(reservation)
+
+
+async def _run_check_job(job_id: str, name: str, expected_vid: str) -> None:
+    """The health check's task body: run the examples, report as they finish."""
+    _update_job(job_id, state="running", tool_name=name)
+    progress_secrets = await _name_secrets()
+
+    def _progress(partial: tools.CheckResult) -> None:
+        _update_job(
+            job_id,
+            verification=_verification_dict(partial, finished=False, secrets=progress_secrets),
+        )
+
+    try:
+        result = await tools.run_examples(
+            name,
+            check_id=job_id,
+            workflow=_WORKFLOW_HEALTH_CHECK,
+            budget_seconds=get_settings().tool_check_budget_seconds,
+            expected_vid=expected_vid,
+            on_progress=_progress,
+        )
+    except Exception as exc:
+        _update_job(
+            job_id,
+            state="failed",
+            error=f"跑範例時發生未預期錯誤（{type(exc).__name__}）。",  # noqa: RUF001
+            outcome=_OUTCOME_FAILED,
+            finished_at=_now_iso(),
+        )
+        return
+    ran = result.status == "ran"
+    _update_job(
+        job_id,
+        state="succeeded" if ran else "failed",
+        error=None
+        if ran
+        else (result.message or _CHECK_REFUSALS.get(result.status, "沒有跑範例。")),
+        outcome=None if ran else _OUTCOME_FAILED,
+        verification=_verification_dict(result, finished=True, secrets=await _name_secrets()),
+        finished_at=_now_iso(),
+    )
 
 
 # --- background jobs ---------------------------------------------------------
@@ -2714,6 +3285,9 @@ async def run_revise(
 # submits.
 _MAX_JOBS = 20
 _JOBS: dict[str, InstallJob] = {}
+# The job whose run is executing in this context, set by ``_run_job``: a revise
+# reads it to label and report the verification it runs after publishing.
+_CURRENT_JOB_ID: ContextVar[str | None] = ContextVar("_CURRENT_JOB_ID", default=None)
 _JOBS_LOCK = threading.Lock()
 _TASKS: set[asyncio.Task[None]] = set()
 
@@ -2748,12 +3322,31 @@ class InstallJob:
     job_id: str
     state: str  # queued | running | succeeded | failed
     created_at: str
+    # install | revise | health_check (web-v6 §10). The first two share every
+    # field; a health check runs a tool's examples and builds nothing, so its
+    # card reads differently, and the poller needs to know which it holds.
+    kind: str = "install"
     finished_at: str | None = None
     error: str | None = None
     tool_name: str | None = None
     summary: str | None = None
     llm_log_id: int | None = None
     env_keys: tuple[str, ...] = ()
+    # How a TERMINAL job ended, finer than ``state`` (web-v6 §8.3):
+    # ``published`` | ``not_published`` (the model's own ready=false) | ``failed``.
+    # None while queued/running. ``state`` keeps its two terminal values so an
+    # older reader of the poll is not broken; this field only splits its failure.
+    outcome: str | None = None
+    # A run of the tool's examples (web-v6 §8.3, §10): the health check's whole
+    # result, or the verification that follows a published revise. Updated as
+    # each example finishes, so a poll shows progress.
+    verification: dict[str, Any] | None = None
+
+
+# The three terminal ``InstallJob.outcome`` values.
+_OUTCOME_PUBLISHED = "published"
+_OUTCOME_NOT_PUBLISHED = "not_published"
+_OUTCOME_FAILED = "failed"
 
 
 def _now_iso() -> str:
@@ -2771,6 +3364,9 @@ def _job_dict(job: InstallJob) -> dict[str, Any]:
         "summary": job.summary,
         "llm_log_id": job.llm_log_id,
         "env_keys": list(job.env_keys),
+        "outcome": job.outcome,
+        "kind": job.kind,
+        "verification": job.verification,
     }
 
 
@@ -2811,6 +3407,7 @@ async def _run_job(
     this is category-only).
     """
     _update_job(job_id, state="running")
+    job_token = _CURRENT_JOB_ID.set(job_id)
     try:
         outcome = await run()
     except Exception as exc:
@@ -2818,18 +3415,32 @@ async def _run_job(
             job_id,
             state="failed",
             error=f"{action}過程發生未預期錯誤（{type(exc).__name__}）。",  # noqa: RUF001
+            outcome=_OUTCOME_FAILED,
             finished_at=_now_iso(),
         )
         return
+    finally:
+        _CURRENT_JOB_ID.reset(job_token)
+    if outcome.ok:
+        terminal = _OUTCOME_PUBLISHED
+    elif outcome.not_ready:
+        terminal = _OUTCOME_NOT_PUBLISHED
+    else:
+        terminal = _OUTCOME_FAILED
+    # A revise's name was set at admission; an outcome that does not repeat it
+    # (a failure before the builder reported anything) must not erase it.
+    named = {"tool_name": outcome.tool_name} if outcome.tool_name is not None else {}
     _update_job(
         job_id,
         state="succeeded" if outcome.ok else "failed",
         error=outcome.error,
-        tool_name=outcome.tool_name,
         summary=outcome.summary,
         llm_log_id=outcome.llm_log_id,
         env_keys=outcome.env_keys,
+        outcome=terminal,
+        verification=outcome.verification,
         finished_at=_now_iso(),
+        **named,
     )
 
 
@@ -2849,7 +3460,9 @@ def _single_flight_held() -> bool:
     return bool(_SYNC_OPS) or any(job.state in ("queued", "running") for job in _JOBS.values())
 
 
-def _admit_job(*, reservation_token: str | None = None) -> InstallJob | None:
+def _admit_job(
+    *, reservation_token: str | None = None, kind: str = "install", tool_name: str | None = None
+) -> InstallJob | None:
     """Register one queued job, or None when another is already active (M7/D40).
 
     The single-flight admission, written ONCE for both kinds: the active-check
@@ -2866,8 +3479,20 @@ def _admit_job(*, reservation_token: str | None = None) -> InstallJob | None:
     Eviction keeps the newest ``_MAX_JOBS`` by creation time (job_id as a
     deterministic tiebreak for identical timestamps); a TERMINAL (succeeded/
     failed) job stays pollable until evicted and never blocks a new submit.
+
+    ``tool_name`` is known from the start for a revise and a health check (the
+    path names the tool) and set here, so a poll -- the 工具 page following a
+    job started elsewhere (``/tools?job=``) -- can say which tool from the
+    first response, and a job that ends in the backstop still names it (P4
+    review r1, H3). An install learns its name from the builder at the end.
     """
-    job = InstallJob(job_id=uuid4().hex, state="queued", created_at=_now_iso())
+    job = InstallJob(
+        job_id=uuid4().hex,
+        state="queued",
+        created_at=_now_iso(),
+        kind=kind,
+        tool_name=tool_name,
+    )
     with _JOBS_LOCK:
         if reservation_token is None:
             if _single_flight_held():
@@ -2932,19 +3557,52 @@ def start_install_job(
 
 @dataclass(frozen=True, slots=True)
 class ReviseJobStart:
-    """A revise submit result with machine-distinct pre-job refusals."""
+    """A revise submit result with machine-distinct pre-job refusals.
+
+    ``message`` is set only for ``env_policy``: the gate's own zh-TW text, which
+    names the offending keys and is the one refusal whose wording the operator
+    needs in order to act.
+    """
 
     job_id: str | None = None
     refusal: str | None = None
+    message: str | None = None
 
 
-async def start_revise_job(name: str, feedback: str, expected_vid: str) -> ReviseJobStart:
-    """Take the global slot, compare ``expected_vid``, then enqueue a revise.
+async def start_revise_job(
+    name: str,
+    feedback: str | None,
+    expected_vid: str,
+    *,
+    runs: tuple[AttachedRun, ...] = (),
+) -> ReviseJobStart:
+    """Check the env policy, take the global slot, compare ``expected_vid``, enqueue.
 
     The stale path never creates an ``InstallJob`` and never launches a task.
     The reservation is converted into a queued job atomically only after the
     comparison passes, so no other current writer can race that check.
+
+    The ``.env``/``config.env`` gate runs FIRST, before the slot is even taken
+    (web-v6 §5.2). Inside the job alone, its refusal arrived seconds later as a
+    failed job card -- and a revise submitted from anywhere but the 工具 page may
+    never have that card on screen, so the one message that says which key to
+    move was effectively silent. Here it is the response to the click. It is a
+    read and a policy check, with no version in it, so running it outside the
+    slot cannot weaken invariant K: the ``expected_vid`` comparison stays after
+    the reservation, exactly where it was. ``run_revise`` repeats the gate on
+    whatever the files say when the job really starts.
+
+    ``runs`` are the failing run records the route attached and COPIED before
+    calling this (web-v6 §8.3): a database read with no version in it, so it
+    precedes the slot like the env gate, and the copy is what the job keeps --
+    a purge after this point changes nothing about the revise (invariant L).
     """
+
+    package_root = await run_in_threadpool(tools._resolve_package_dir_no_alias, name)
+    if package_root is not None:
+        _env, env_error = await run_in_threadpool(_revise_env_gate, package_root.path)
+        if env_error is not None:
+            return ReviseJobStart(refusal="env_policy", message=env_error)
 
     reservation = reserve_sync_operation()
     if reservation is None:
@@ -2958,14 +3616,14 @@ async def start_revise_job(name: str, feedback: str, expected_vid: str) -> Revis
             return ReviseJobStart(refusal="not_found")
         if resolution.vid != expected_vid:
             return ReviseJobStart(refusal="version_mismatch")
-        job = _admit_job(reservation_token=reservation)
+        job = _admit_job(reservation_token=reservation, kind="revise", tool_name=name)
         if job is None:
             return ReviseJobStart(refusal="job_busy")
         reservation = ""
         return ReviseJobStart(
             job_id=_launch_job(
                 job,
-                lambda: run_revise(name, feedback, resolution),
+                lambda: run_revise(name, feedback, resolution, runs=runs),
                 _ACTION_REVISE,
             )
         )

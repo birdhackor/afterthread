@@ -16,7 +16,12 @@ from pydantic import (
 )
 
 from afterthread.config import get_settings
-from afterthread.models import STALE_ELIGIBLE_STATUSES, MemoryStage, MemoryStatus
+from afterthread.models import (
+    SQLITE_MAX_INT,
+    STALE_ELIGIBLE_STATUSES,
+    MemoryStage,
+    MemoryStatus,
+)
 
 
 def _ensure_aware(value: datetime) -> datetime:
@@ -328,11 +333,33 @@ class CaptureRequest(BaseModel):
         return _stripped_non_empty(value, "raw_text")
 
 
+class ToolFailureEntry(BaseModel):
+    """One installed tool that failed during this AI request (web-v6 §8.2).
+
+    Reported beside the result so the failure is seen where it happened.
+    ``recorded`` is false when its run record could not be written -- then
+    ``run_id`` is null and only a link to the 工具 page can be offered. ``vid``
+    is the version that ran; the page compares it with the tool's current one
+    before offering a fix, since it does not know that version itself.
+    """
+
+    run_id: int | None
+    tool_name: str
+    vid: str
+    outcome: Literal["failed", "output_overflow", "timeout", "start_failed"]
+    recorded: bool
+
+
 class CaptureResponse(BaseModel):
-    """AI quick-capture result: the created item plus follow-up questions."""
+    """AI quick-capture result: the created item plus follow-up questions.
+
+    ``tool_failures`` lists the installed tools that failed during this request
+    (web-v6 §8.2); empty when none did.
+    """
 
     item: MemoryItemRead
     questions: list[str]
+    tool_failures: list[ToolFailureEntry] = Field(default_factory=list)
 
 
 class EnrichRequest(BaseModel):
@@ -347,10 +374,14 @@ class EnrichRequest(BaseModel):
 
 
 class EnrichResponse(BaseModel):
-    """AI enrichment result: the updated item plus remaining checklist gaps."""
+    """AI enrichment result: the updated item plus remaining checklist gaps.
+
+    ``tool_failures`` as on ``CaptureResponse``.
+    """
 
     item: MemoryItemRead
     gaps: list[str]
+    tool_failures: list[ToolFailureEntry] = Field(default_factory=list)
 
 
 class AssistUpdateRequest(BaseModel):
@@ -365,9 +396,13 @@ class AssistUpdateRequest(BaseModel):
 
 
 class AssistUpdateResponse(BaseModel):
-    """AI assisted-update result: the updated item."""
+    """AI assisted-update result: the updated item.
+
+    ``tool_failures`` as on ``CaptureResponse``.
+    """
 
     item: MemoryItemRead
+    tool_failures: list[ToolFailureEntry] = Field(default_factory=list)
 
 
 # --- LLM interaction log (see afterthread.services.llm_log) --------------
@@ -499,6 +534,31 @@ class LlmLogDetail(LlmLogBase):
 # either service's output in the first place.
 
 
+ToolRunOutcome = Literal[
+    "ok", "failed", "output_overflow", "timeout", "start_failed", "refused", "error"
+]
+
+
+class ToolLastRun(BaseModel):
+    """A list row's newest run record (web-v6 §9), or null when it has none.
+
+    ``fixable`` is computed by the backend and is the ONLY input the page uses to
+    offer a one-click fix (web-v6 §8.5): a failure that ran the package's current
+    version. The page must not re-derive it.
+    """
+
+    id: int
+    outcome: ToolRunOutcome
+    started_at: datetime
+    vid: str
+    fixable: bool
+
+    @field_validator("started_at")
+    @classmethod
+    def _aware_started_at(cls, value: datetime) -> datetime:
+        return _ensure_aware(value)
+
+
 class ToolSummary(BaseModel):
     """One installed tool package as the 工具 page lists it.
 
@@ -508,6 +568,7 @@ class ToolSummary(BaseModel):
 
     The summary text itself is fetched per tool on demand
     (``ToolSummaryDetail``), since it is far too long for a list row.
+    ``last_run`` is the tool's newest run record, null when it has none.
     """
 
     name: str
@@ -517,6 +578,7 @@ class ToolSummary(BaseModel):
     error: str | None
     current_vid: str | None
     lineage: Literal["sole", "usable", "broken"]
+    last_run: ToolLastRun | None = None
 
 
 class ToolListResponse(BaseModel):
@@ -529,12 +591,15 @@ class ToolDeleteResponse(BaseModel):
     """Whether DELETE removed the files or retained a hidden parked tree.
 
     ``retained_path`` is the exact operator-facing path when ``outcome`` is
-    ``retained``; it is null after physical removal.
+    ``retained``; it is null after physical removal. ``runs_deleted`` says whether
+    the tool's run records went with it (web-v6 §6.4); false leaves them to the
+    purge's orphan scope.
     """
 
     outcome: Literal["removed", "retained"]
     retained_path: str | None
     retention_reason: Literal["durability_unconfirmed", "cleanup_failed"] | None
+    runs_deleted: bool
 
 
 class ToolDiscardResponse(BaseModel):
@@ -678,29 +743,89 @@ class ToolInstallRequest(BaseModel):
         return self
 
 
+# How many failing run records one revise may attach (web-v6 §8.1).
+_REVISE_RUN_IDS_MAX = 3
+
+
 class ToolReviseRequest(BaseModel):
     """Payload for an AI revise job (D40): what the user wants changed.
 
     ``feedback`` carries the SAME bound every other AI free-text input has
-    (20000 chars, stripped-non-empty) and becomes the builder session's user
-    turn. ``expected_vid`` is the required optimistic identity checked only
-    after global single-flight admission. Which tool is being revised remains
-    the PATH's job: the shared path regex validates its name.
+    (20000 chars) and becomes the builder session's user turn. ``expected_vid``
+    is the required optimistic identity checked only after global single-flight
+    admission. Which tool is being revised remains the PATH's job: the shared
+    path regex validates its name.
+
+    ``run_ids`` attaches up to three of this tool's run records -- the failures
+    to fix (web-v6 §8). With records attached the feedback may be omitted: the
+    one-click fix sends none, and the prompt then says the operator asks only for
+    those failures to be fixed. With neither there is nothing to do: 422. A
+    blank feedback counts as none. The cap of three is on the list as sent (a
+    bound on the request itself); within it a repeated id is attached once. Each
+    id is bounded like every request int bound into SQLite
+    (``models.SQLITE_MAX_INT``): past it, the lookup would raise, not miss.
     """
 
-    feedback: str = Field(min_length=1, max_length=_MAX_AI_INPUT_CHARS)
+    feedback: str | None = Field(default=None, max_length=_MAX_AI_INPUT_CHARS)
     expected_vid: str = Field(pattern=_TOOL_VID_PATTERN)
+    run_ids: list[Annotated[int, Field(ge=1, le=SQLITE_MAX_INT)]] = Field(
+        default_factory=list, max_length=_REVISE_RUN_IDS_MAX
+    )
 
     @field_validator("feedback")
     @classmethod
-    def _not_blank(cls, value: str) -> str:
-        return _stripped_non_empty(value, "feedback")
+    def _blank_is_none(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
+
+    @field_validator("run_ids")
+    @classmethod
+    def _each_once(cls, value: list[int]) -> list[int]:
+        return list(dict.fromkeys(value))
+
+    @model_validator(mode="after")
+    def _something_to_do(self) -> ToolReviseRequest:
+        if self.feedback is None and not self.run_ids:
+            raise ValueError("feedback or run_ids is required")
+        return self
 
 
 class ToolInstallAccepted(BaseModel):
     """202 body for a queued install or revise: the id to poll."""
 
     job_id: str
+
+
+class ToolVerificationRun(BaseModel):
+    """One example of a check: its run outcome, or ``skipped``/``not_run``/``stopped``."""
+
+    name: str
+    outcome: str
+    run_id: int | None
+
+
+class ToolVerification(BaseModel):
+    """One run of a version's examples.json (web-v6 §8.3, §10).
+
+    ``status`` is ``ran`` when the examples were run, else why not:
+    ``no_examples``, ``examples_invalid`` (``message`` says how), ``disabled``
+    (not verified: the execution path refuses a disabled tool), ``invalid``,
+    ``not_found``, ``version_changed``, or ``error``. ``completed`` of ``total``
+    examples were started; after the first timeout the rest are ``skipped``,
+    after the first refusal (the tool switched off or replaced mid-run)
+    ``stopped``, and past the budget ``not_run`` with ``budget_exhausted``.
+    ``finished`` is false while the run is still going -- a poll shows progress.
+    """
+
+    status: str
+    message: str | None
+    vid: str | None
+    runs: list[ToolVerificationRun]
+    completed: int
+    total: int
+    budget_exhausted: bool
+    finished: bool
 
 
 class ToolJobStatus(BaseModel):
@@ -730,6 +855,16 @@ class ToolJobStatus(BaseModel):
     report through one job table and one poll endpoint. ``env_keys`` names
     assignments from a builder-written ``.env`` that the backend stripped;
     values never enter the result.
+
+    ``kind`` says which job it is: ``install``, ``revise``, or ``health_check``
+    (跑一次範例, web-v6 §10). ``verification`` is the run of the version's
+    examples -- a health check's whole result, or the check that follows a
+    published revise -- and is filled in while the job runs.
+
+    ``outcome`` (web-v6 §8.3) is how a TERMINAL job ended, finer than ``state``:
+    ``published``, ``not_published`` (the builder itself declined to publish --
+    possibly an outside cause, possibly a fix it could not make; the card says
+    neither), or ``failed``. Null while queued/running.
     """
 
     job_id: str
@@ -742,3 +877,194 @@ class ToolJobStatus(BaseModel):
     llm_log_id: int | None
     llm_log_process: str | None
     env_keys: list[str]
+    outcome: Literal["published", "not_published", "failed"] | None
+    kind: Literal["install", "revise", "health_check"] = "install"
+    verification: ToolVerification | None = None
+
+
+class ToolSettingsEntry(BaseModel):
+    """One ``config.env`` pair as the 工具 page shows it (web-v6 §9).
+
+    ``contains_secret`` says the value equals or contains (as an exact substring) a
+    value some ``.env`` registers -- likely a secret in the wrong file -- and such a
+    value is served as the redaction marker alone. ``overridden_by_env`` marks a key ``.env`` also
+    sets, whose value is the one that runs. ``secret_like_name`` is a name-only
+    reminder (KEY/TOKEN/SECRET/PASSWORD).
+    """
+
+    key: str
+    value: str
+    overridden_by_env: bool
+    secret_like_name: bool
+    contains_secret: bool
+
+
+class ToolSettings(BaseModel):
+    """A package's operator-owned settings, read-only (web-v6 §4, §9).
+
+    ``.env`` is KEY NAMES only -- its values are secrets and never leave the
+    backend. ``config.env`` is shown in full (redacted). The two ``*_readable``
+    flags separate "no such file" (true, empty) from "a file that cannot be read
+    the bounded way" (false). ``built_before_v5`` marks a package migrated from
+    the pre-0.4.0 layout, whose ``.env`` may still hold settings an older builder
+    wrote there.
+    """
+
+    env_keys: list[str]
+    env_readable: bool
+    config: list[ToolSettingsEntry]
+    config_readable: bool
+    built_before_v5: bool
+
+
+class ToolRunSummary(BaseModel):
+    """One run record without its bodies, for the 最近執行 list (web-v6 §6, §9).
+
+    ``vid_state`` places the version the run executed against the package as it is
+    now: ``current``, ``older`` (still a version of the package), or ``gone``
+    (discarded or removed; the record outlives it, §6.4). ``message`` is the head of
+    the string the model got, for a run that did not succeed. ``has_details`` says
+    whether the record kept bodies (a failed run that started) for the detail view.
+
+    ``llm_log_id`` links to the AI 日誌 record of the conversation that made the
+    call. Both it and ``llm_log_process`` are null when the id was minted by a
+    previous backend process -- the record outlives the log ring and its id
+    counter, the reason ``ToolSummaryDetail`` nulls a stale id too.
+    """
+
+    id: int
+    tool_name: str
+    vid: str
+    vid_state: Literal["current", "older", "gone"]
+    started_at: datetime
+    duration_ms: int
+    outcome: ToolRunOutcome
+    exit_code: int | None
+    truncated: bool
+    workflow: str
+    llm_log_id: int | None
+    llm_log_process: str | None
+    message: str | None
+    has_details: bool
+    fixable: bool
+
+    @field_validator("started_at")
+    @classmethod
+    def _aware_started_at(cls, value: datetime) -> datetime:
+        return _ensure_aware(value)
+
+
+class ToolRunDetail(ToolRunSummary):
+    """One run record with its bodies: redacted, capped, and masked again on read.
+
+    ``args`` is the JSON the tool got on stdin (head), ``stdout`` the head of what
+    it printed, ``stderr`` the TAIL of its error output. All three are null for a
+    successful or refused run, which keeps metadata only (web-v6 §6.2).
+    """
+
+    args: str | None
+    stdout: str | None
+    stderr: str | None
+
+
+class ToolVerificationState(BaseModel):
+    """How the current version did on its examples.json, from its newest verdict (web-v6 §9).
+
+    ``state``: ``no_version``, ``examples_invalid`` (``message`` says how),
+    ``no_examples``, ``never``, ``passed``, ``failed`` (the tool failed at least
+    one example) or ``incomplete``, whose ``reason`` is ``budget``,
+    ``interrupted`` (the tool was switched off or replaced mid-run),
+    ``examples_changed`` or none. ``passed``/``failed``/``ran``/``total`` count
+    examples (``ran`` = passed + failed, ``total`` as the file lists them now);
+    ``workflow`` says whether the check was a health check or the verification
+    after a fix.
+    """
+
+    state: Literal[
+        "no_version", "examples_invalid", "no_examples", "never", "passed", "failed", "incomplete"
+    ]
+    reason: Literal["budget", "interrupted", "examples_changed"] | None = None
+    message: str | None = None
+    passed: int | None = None
+    failed: int | None = None
+    ran: int | None = None
+    total: int | None = None
+    checked_at: datetime | None = None
+    workflow: str | None = None
+
+    @field_validator("checked_at")
+    @classmethod
+    def _aware_checked_at(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else _ensure_aware(value)
+
+
+class ToolRunList(BaseModel):
+    """One tool's newest run records, newest first, with the total it has.
+
+    ``verification`` is the current version's verification state (web-v6 §9).
+    """
+
+    current_vid: str | None
+    total: int
+    runs: list[ToolRunSummary]
+    verification: ToolVerificationState
+
+
+class ToolRunPurgeRequest(BaseModel):
+    """A purge of run records (web-v6 §7): a scope, then preview or confirm.
+
+    Every condition narrows: ``tool`` (one package name), ``outcome`` (``ok`` or
+    ``not_ok`` -- anything but a success, refusals included), ``before`` (records
+    that started before this instant), ``orphans_only`` (records whose package no
+    longer exists). ``before`` is absolute so that the preview and the
+    confirmation count the same records; the page computes it once.
+
+    ``dry_run`` (the default) only counts. A real run must carry the ``max_id``
+    its preview returned and deletes nothing newer than it.
+
+    Unknown keys are refused, not ignored: a dropped condition (say the
+    ``older_than_days`` an early design used) would silently WIDEN the scope of
+    a delete. A ``before`` without an offset is read as UTC.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    outcome: Literal["all", "ok", "not_ok"] = "all"
+    before: datetime | None = None
+    orphans_only: bool = False
+    dry_run: bool = True
+    max_id: int | None = Field(default=None, ge=0, le=SQLITE_MAX_INT)
+
+    @model_validator(mode="after")
+    def _confirm_needs_its_preview(self) -> ToolRunPurgeRequest:
+        if not self.dry_run and self.max_id is None:
+            raise ValueError("max_id is required when dry_run is false")
+        return self
+
+
+class ToolRunPurgeResult(BaseModel):
+    """What a purge matched and deleted; ``max_id`` bounds the confirmation."""
+
+    matched: int
+    deleted: int
+    max_id: int | None
+
+
+class ToolRunStatsEntry(BaseModel):
+    tool_name: str
+    total: int
+    not_ok: int
+
+
+class ToolRunStats(BaseModel):
+    """Run-record counts for the 工具 page header (web-v6 §7).
+
+    ``orphans`` counts records whose package no longer exists (zero while
+    TOOLS_DIR is unset, when no name can be judged).
+    """
+
+    total: int
+    not_ok: int
+    orphans: int
+    tools: list[ToolRunStatsEntry]

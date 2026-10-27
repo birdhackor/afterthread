@@ -30,6 +30,7 @@ import { ItemsListPage } from "./pages/ItemsListPage.jsx";
 import { LlmLogsPage } from "./pages/LlmLogsPage.jsx";
 import { NotFoundPage } from "./pages/NotFoundPage.jsx";
 import { ToolsPage } from "./pages/ToolsPage.jsx";
+import { toolsJobSearch } from "./utils/toolFailures.js";
 
 // Navbar entry rendered as a TanStack Link. Active highlighting is driven by
 // `activeProps` (data-active), which Mantine's NavLink styles via its
@@ -179,6 +180,10 @@ const toolsRoute = createRoute({
 	getParentRoute: () => rootRoute,
 	path: "/tools",
 	component: ToolsPage,
+	// Optional: /tools?job=<id> follows a tool job started elsewhere -- a fix
+	// requested beside a capture / enrich / assist-update result (web-v6 §8.2).
+	// Anything that is not a job id is dropped, never thrown on.
+	validateSearch: toolsJobSearch,
 });
 
 // Remount-per-id contract: TanStack Router reuses the matched route's

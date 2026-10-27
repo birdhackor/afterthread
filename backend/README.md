@@ -77,6 +77,7 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 | `TOOL_INSTALL_MAX_ROUNDS` | `24` | KB 網頁安裝器（見下方「工具（KB 網頁安裝器）」）單一安裝工作階段的工具輪數上限，邊界 `[4, 64]`。 |
 | `TOOL_INSTALL_TIMEOUT_SECONDS` | `900` | KB 網頁安裝器單一安裝工作階段的整體逾時秒數，邊界 `(0, 3600]`。 |
 | `TOOL_INSTALL_SHELL_TIMEOUT_SECONDS` | `120` | 安裝器內單一 `run_shell` 指令的逾時秒數，邊界 `(0, 600]`。 |
+| `TOOL_CHECK_BUDGET_SECONDS` | `300` | 跑一次 `examples.json`（「跑一次範例」與 AI 修正發布後的自動驗證）的總預算秒數；超過就不再跑剩下的範例、標示未完成。執行期間持有共享 tools lock：預算是在每個範例開始前檢查的，已經開始的那一個會跑到它自己的 `LLM_TOOL_TIMEOUT_SECONDS`，所以刪除／丟棄最久會被擋住預算加一個範例的逾時。邊界 `(0, 3600]`。 |
 | `DATABASE_URL` | `sqlite:///./afterthread.db` | SQLAlchemy URL。**只支援 SQLite**，且必須是檔案型（不可為 in-memory）——見下方設計筆記。 |
 | `STALE_AFTER_DAYS` | `14` | 非終態項目（`STALE_ELIGIBLE_STATUSES`：除 `done`／`superseded` 外的五種狀態）的 `updated` 超過這個天數，API 回應的 `is_stale` 會是 `true`。邊界 `[0, 36500]`。 |
 
@@ -138,6 +139,14 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
   工具名單）；記錄已被環狀緩衝擠出（見 `LLM_LOG_MAX_ENTRIES`）或程序重啟過則
   404。
 
+`capture`／`enrich`／`assist-update` 的成功回應都另帶 `tool_failures`（web-v6 §8.2）：這次請求
+裡失敗的已安裝工具呼叫（`failed`／`output_overflow`／`timeout`／`start_failed`；被拒與後端錯誤不算），
+每筆 `{run_id, tool_name, vid, outcome, recorded}`。收集器放在每個廣告工具的請求都會經過的
+`_advertised_tools_lock` 裡（ContextVar，每個請求各自一份）；紀錄沒寫成的失敗照樣列出，
+`recorded: false`、`run_id: null`。LLM 失敗回 502 時沒有回應可放，但紀錄照樣寫進資料庫；
+互動期限到了、工具還在跑時也一樣：請求在期限回 502，那次呼叫在背景跑完（最晚到它自己的
+`LLM_TOOL_TIMEOUT_SECONDS`）才寫紀錄，期間仍持有共享鎖，刪除與丟棄照常回「AI 工作進行中」。
+
 AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 `502 llm_upstream_error`（上游呼叫失敗或輸出無法解析，即使重試一次後仍失敗）、
 `409 conflict`（enrich／assist-update 於 LLM 呼叫期間，項目被別的請求改動——樂觀
@@ -169,6 +178,9 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 - `DELETE /api/tools/{name}` — 將整個工具套件從 registry 移除；找不到回 404。
   只有非阻塞 exclusive tools lock 取得成功才會改名或刪除；AI request 或繼承 shared
   descriptor 的工具子行程仍活著時，回獨立的 `409 ai_job_in_progress`，套件完全不動。
+  工具從清單消失（`removed` 或 `retained`）之後，它的執行紀錄一併刪除，回應的
+  `runs_deleted` 說明有沒有刪成（`false` 時工具照樣已刪除，紀錄改由 purge 的孤兒範圍清掉）；
+  404／409 時紀錄不動。
   取得 lock 後先把套件改成隱藏的 `.stale-` 名稱，再盡力遞迴移除；這個 rename 是為了
   讓 registry 消失與失敗後清理可重試，不再負責保護執行中的目錄。成功回 200
   `{outcome: "removed", retained_path: null, retention_reason: null}`；若遞迴清理失敗，
@@ -199,7 +211,12 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   完成後再安裝」——指名一個使用者從沒送出的「安裝」只會讓他去找一個不存在的東西。
 - `GET /api/tools/jobs/{job_id}` — 輪詢一個工具工作（安裝**或**修訂）的狀態
   （`queued`／`running`／`succeeded`／`failed` + 完成後的 `tool_name`／
-  `summary`／`llm_log_id`／`llm_log_process`）；工作已完成的清單被裁剪掉、或後端
+  `summary`／`llm_log_id`／`llm_log_process`／`outcome`／`kind`／`verification`）；`kind` 是
+  `install`／`revise`／`health_check`，`verification` 是範例的執行結果（健康檢查的全部結果，或修訂
+  發布之後的自動驗證），執行中就會逐個更新；`outcome` 是終局的細分
+  （`published`／`not_published`／`failed`，進行中為 `null`），`not_published` 指
+  builder 自己回 `ready=false`、沒有發布任何東西——前端以橘色而非紅色呈現，且不宣稱
+  原因是外部還是修不好（web-v6 §8.3）。工作已完成的清單被裁剪掉、或後端
   重啟過（工作只存在記憶體）則回 404。`llm_log_process` 與側檔那一個是同一個
   token、同一條「沒有 id 就沒有 token」規則，只是**由這個路由在回應當下蓋章**：
   工作表是行程內記憶體，與 id 空間同生共死，所以還答得出來的工作，它的
@@ -226,15 +243,71 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   llm_not_configured`／`502 llm_upstream_error`），失敗時不會覆蓋既有總結；
   取得名額後若目前版本不是 `expected_vid`，回 `409 version_mismatch`，不花 LLM。
 - `POST /api/tools/{name}/revise` — body
-  `{feedback: 1..20000, expected_vid}`，依使用者意見
-  送出一次 **AI 修訂**工作（見下方「依意見修訂既有工具」）；202 + `job_id`，
-  用上面的 `GET /api/tools/jobs/{job_id}` 輪詢。工具不存在回 404；已有工具工作
-  在跑回 `409 job_busy`；取得名額後版本不符回 `409 version_mismatch`，兩者都不
+  `{feedback?: ≤20000, run_ids?: [id ×≤3], expected_vid}`，依使用者意見及／或附上的失敗
+  執行紀錄送出一次 **AI 修訂**工作（見下方「依意見修訂既有工具」）；意見與紀錄至少要有一樣，
+  空白的意見視同沒有；上限 3 是對送出的清單算，其中重複的 id 只附一次，超出 SQLite
+  整數範圍的 id 回 422（web-v6 §8）。**附上的紀錄最先檢查並複製**：不存在
+  （或已被清除）回 `404 run_not_found`，屬於別的工具回 `422 run_not_for_tool`，兩者都在名額
+  與任何 LLM 呼叫之前；複製下來的內容（已遮蔽）隨工作帶走，送出後再清除那幾筆也不影響這次
+  修訂。202 + `job_id`，
+  用上面的 `GET /api/tools/jobs/{job_id}` 輪詢。**先**檢查套件的 `.env`／`config.env`
+  政策（web-v6 §5.2）：不過就回 `409 env_policy`。值太短或寫法無法對應時，`message`
+  會列出 key 名（永不列值）；檔案讀不到或超過上限時只說明狀況。工作開跑時會再檢查一次。工具不存在回 404；已有工具工作
+  在跑回 `409 job_busy`；取得名額後版本不符回 `409 version_mismatch`，這些都不
   建立工作。**不宣告** `502`／`503`：修訂是背景工作，LLM 沒
   設定或上游失敗都封在工作狀態裡（失敗的 job + 友善訊息 + AI 日誌連結），與
   安裝送出同一套契約。
-  這三條路由都**不宣告** `503 tools_not_configured`：`TOOLS_DIR` 未設定時
+- `POST /api/tools/{name}/check` — body `{expected_vid}`，「跑一次範例」（web-v6 §10）：把目前版本的
+  `examples.json` 當成一個 job 跑一次；202 + `job_id`，用 `GET /api/tools/jobs/{job_id}` 輪詢
+  （`kind: "health_check"`，結果在 `verification`）。占用全域名額，執行範例期間持有共享 tools
+  lock，所以刪除與丟棄會被擋（不變量 T）。工具不存在回 404；名額被占回 `409 job_busy`；取得名額
+  後版本不符回 `409 version_mismatch`；沒有範例、`examples.json` 無法使用、或工具已停用回
+  `409 check_unavailable`，`message` 說明是哪一種——這些都不建立工作。
+- `GET /api/tools/{name}/settings` — 工具的套件層設定，唯讀（web-v6 §4、§9）：
+  `.env` 的 **key 名**（值永不離開後端）、`config.env` 的每一組（值**逐字包含**某個
+  已登記秘密時整個以遮蔽標記回傳，其餘原樣；並標示 `overridden_by_env`／
+  `secret_like_name`／`contains_secret`）、兩個檔案
+  各自是否讀得到，以及是否為 0.4.0 以前建、遷移來的工具（`built_before_v5`）。
+  只要求套件存在、不要求 `current` 可解析——`current` 壞掉的套件正是需要看設定的
+  時候。宣告在 `/jobs/{job_id}` 之前（工具可以叫 `jobs`）。
+- `GET /api/tools/{name}/runs?limit=1..100`（預設 20）— 這個工具最近的執行紀錄，新的
+  在前，**不含內文**（web-v6 §6）：每筆有時間、耗時、執行的 `vid` 與它現在的位置
+  `vid_state`（`current`／`older`／`gone`——丟掉的版本紀錄仍在）、呼叫的 `workflow`、
+  `outcome`（`ok`／`failed`／`output_overflow`／`timeout`／`start_failed`／`refused`／`error`）、
+  `exit_code`、`truncated`、AI 收到的字串開頭 `message`（非 `ok` 才有）、`has_details`，
+  以及後端算好的 `fixable`（失敗、而且失敗的就是目前版本；前端不自己判斷）。
+  `llm_log_id`／`llm_log_process` 連回造成這次呼叫的 AI 日誌；id 是前一個行程鑄的
+  時兩者都回 `null`（紀錄活得比日誌環久，理由同 `summary` 的 `llm_log_id`）。
+  另帶 `current_vid`、總筆數 `total`，以及目前版本的驗證狀態 `verification`（web-v6 §9）：
+  `state` 是 `no_version`／`examples_invalid`／`no_examples`／`never`／`passed`／`failed`／
+  `incomplete`（另帶 `reason`：`budget`／`interrupted`／`examples_changed`），取目前版本最新一次
+  檢查的結論（`tool_check` 表，每次跑完範例寫一筆）與 `examples.json` 目前的範例數比對；
+  不由執行紀錄推導，所以清除紀錄不會改變它。只要求套件存在（同 `settings`），宣告在 `/jobs/{job_id}` 之前。
+  這五條路由都**不宣告** `503 tools_not_configured`：`TOOLS_DIR` 未設定時
   任何名稱都解析不到工具，404 已經是誠實答案。
+
+`GET /api/tools` 的每一列另有 `last_run`：該工具最新一筆執行紀錄的
+`{id, outcome, started_at, vid, fixable}`，沒有紀錄時為 `null`。
+
+**Tool runs**（`afterthread/routers/tool_runs.py`，前綴 `/api/tool-runs`）——不在
+`/api/tools/` 底下，因為那裡任何字面的第一段都可能是套件名：
+- `GET /api/tool-runs/{run_id}` — 一筆執行紀錄**含內文**：`args`（工具從 stdin 收到的
+  JSON，保留開頭 8,000 字）、`stderr`（保留**結尾** 16,000 字）、`stdout`（保留開頭
+  4,000 字）；成功或被拒的執行三者皆為 `null`。內文寫入前已遮蔽，**讀出時再對當下的
+  已知秘密遮一次**；已知秘密的掃描失敗時這條路由回 500，不回未經檢查的文字。套件已
+  不存在的紀錄照樣回應（`vid_state: gone`、`fixable: false`）。找不到回 404。
+- `DELETE /api/tool-runs/{run_id}` — 刪除一筆；204，找不到回 404。
+- `GET /api/tool-runs/stats` — `{total, not_ok, orphans, tools: [{tool_name, total, not_ok}]}`：
+  `not_ok` 是成功以外的全部（被拒也算），`orphans` 是套件已不存在的紀錄數（`TOOLS_DIR`
+  未設定、或設定了但目錄不在時一律 0，因為那時沒有任何名稱判斷得出來）。宣告在 `/{run_id}`
+  之前。
+- `POST /api/tool-runs/purge` — body `{tool?, outcome?: all|ok|not_ok, before?, orphans_only?,
+  dry_run = true, max_id?}`，回 `{matched, deleted, max_id}`（web-v6 §7）。條件只會縮小範圍；
+  `before` 是絕對時間（前端在開啟對話框時算一次；沒有時區的值視為 UTC），預覽與確認因此
+  判斷同一批紀錄。不認得的 key 回 422，不會被默默略過——少一個條件等於刪除範圍變大。
+  `dry_run` 只計數並回傳符合者的最大 id；`dry_run: false` 必須帶那個 `max_id`（缺了回 422），
+  只刪 `id <= max_id` 的——預覽之後才寫進來的紀錄不會被一起刪掉（id 只增不減，
+  AUTOINCREMENT）。不會自動刪除任何紀錄。
 
 ## 工具（KB 網頁安裝器）
 
@@ -256,10 +329,14 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
                   tool.json
                   run.py ...
               <vid>.discarded/           # cleanup 失敗的隱藏重試名
-          .env
+          .env                           # 操作者的秘密
+          config.env                     # 操作者的一般設定（web-v6，可缺）
   ```
 
-  套件層只有後端狀態與操作者的 `.env`；工具內容全部在版本層。
+  套件層只有後端狀態與操作者的 `.env`、`config.env`；工具內容全部在版本層。
+  `.env` 的每個值都是遮蔽器的秘密；`config.env` 的值不是秘密、不進遮蔽集合、
+  沒有長度下限，修訂時整份交給 builder。執行環境的順序是透傳 → `TLS_NO_VERIFY`
+  → `config.env` → `.env`，同一個 key 以 `.env` 為準。
   `tool.json` 的 `name` 必須等於套件名並符合
   `^[a-z0-9][a-z0-9_-]{0,63}$`，另含非空 `description`、
   `parameters` JSON Schema 與 `entry` argv。版本 id 符合
@@ -319,7 +396,10 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `.env`。版本中的 legacy `.ai_meta.json`、FOREIGN
   `.afterthread-state.json`（包含 migration 帶入者）及其巢狀同名檔都是工具內容，
   會進工作區並隨新版本保留。package `.env` 不被複製或改寫，只把解析後的值注入
-  `run_shell` 供實測與遮蔽；builder 寫出的 `.env` 同樣被剝除。通過驗證後，
+  `run_shell` 供實測與遮蔽；`config.env` 的值墊在它底下一起注入，文字與 `.env`
+  的 key 名則放進修訂提示。開工前（送出時與 job 開跑時各一次）`.env` 的每個值
+  必須至少 6 字元、寫法能被遮蔽器逐字對回，`config.env` 必須讀得到；前兩項不過的
+  訊息會列出 key 名。builder 寫出的 `.env` 同樣被剝除。通過驗證後，
   `shell` 被組成一個版本目錄並先寫
   `origin.json(previous=<舊 vid>, feedback=<本次意見>)`；版本持久化、rename 到
   `versions/<新 vid>` 後才原子發布 `current`。因此舊版本永久保留、套件 state 與
@@ -336,6 +416,22 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   array 之前就取得 shared lock 並持有到結束，而 discard 需要 exclusive lock，所以那段期間
   按下 discard 會直接得到 `409 ai_job_in_progress`，`current` 與該版都不會被動到。（先前
   這裡寫的是「discard 會成功、呼叫再得到拒絕」——那是互斥鎖出現以前的行為，已作廢。）
+- **執行紀錄是觀察者（web-v6 §6）**：經由已廣告 handler 的每一次呼叫（`_make_handler`
+  這條路；builder 的 meta-tool 不算）都寫一筆 `tool_run`。`_run_tool_subprocess` 回傳
+  `ToolRunResult`：給模型的字串 `text` **與加入紀錄之前逐字相同**（不變量 F，六種 outcome
+  都對舊程式比對過），其餘是紀錄要的 outcome、exit code 與已遮蔽的內文。handler 把字串交回、
+  把其餘交給注入的紀錄器（`tools.set_run_recorder`，由 `main` 的 lifespan 在 `init_db` 之後
+  接上 `tool_runs.record`；測試的 client 不進 lifespan，所以不寫紀錄）。紀錄器有自己的
+  engine 與 1.5 秒的 busy timeout，在自己的短 transaction 裡寫；任何失敗只留一行只含例外
+  **型別**的 WARNING（資料庫錯誤的文字會帶 SQL 參數，也就是內文），工具結果照常回給模型。
+  寫入在共享鎖釋放之前完成，所以刪除工具（需要 exclusive）不會插在一次執行與它的紀錄之間
+  （兩種在取得鎖之前就拒絕的呼叫沒有鎖可持有，但它們什麼也沒執行）。呼叫在後端這一側拋出例外
+  （例如遮蔽用的已知秘密掃描失敗、tools lock 無法使用）也會記一筆 `error`，內容只有模型收到的
+  `tool execution failed: <型別>`，例外照樣往上拋。
+  內文只在**啟動過而且失敗**的執行才有：先在整段文字上遮蔽（非零 exit 時與給模型的那份共用
+  同一刻的已知秘密、同樣 fail-closed），再 `_utf8_safe`、再截斷；逾時與無法啟動兩條路徑的遮蔽
+  只為紀錄而做，掃描失敗就不存內文，不影響呼叫。`workflow` 與 AI 日誌連結來自
+  `llm.generate_structured` 在互動期間設定的 ContextVar。
 - **request／子行程與破壞操作互斥**：capture、enrich、assist-update 在掃描並把
   tools array 交給模型**之前**取得 `.afterthread-tools.lck` 的 shared `flock`，在整個
   請求（所有模型 round、工具呼叫與錯誤清理）結束後才關閉 descriptor；shared lock
@@ -389,8 +485,8 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 - **安全立場（v1）**：builder 的 `run_shell` 是服務權限下的真實 bash，不是沙箱；
   只有 `write_file`／`read_file`／`list_dir` 被限制在 build root。信任邊界仍是
   「只安裝可信的 OpenAPI 文件與指示」。工具子行程的環境從零建立，只透傳
-  `PATH`／`HOME`／`LANG`／`LC_ALL`／`TMPDIR`，再加 package `.env` 與正規化的
-  TLS 設定，避免不小心把父行程 `OPENAI_API_KEY` 一起交出去；同 UID 行程仍可能
+  `PATH`／`HOME`／`LANG`／`LC_ALL`／`TMPDIR`，再加正規化的 TLS 設定、package
+  `config.env` 與 `.env`，避免不小心把父行程 `OPENAI_API_KEY` 一起交出去；同 UID 行程仍可能
   讀 `/proc`，所以這不是對抗惡意程式的隔離。
 - **一次性 web-v5 遷移**：先停掉 afterthread；migration 會先以非阻塞方式取得同一個
   exclusive tools lock 並持有到整體完成，取不到即拒絕開始。取得 lock **只證明當下
