@@ -6662,6 +6662,10 @@ def test_revise_job_records_its_outcome_and_backstops_bugs(
         started = await tool_builder.start_revise_job("kbsearch", "加上分頁", _TEST_VID)
         assert started.job_id is not None
         job_id = started.job_id
+        # P4 review r1 H3: named from the first poll, before the builder reports.
+        queued = tool_builder.get_job(job_id)
+        assert queued is not None
+        assert (queued["state"], queued["tool_name"]) == ("queued", "kbsearch")
         for _ in range(200):
             job = tool_builder.get_job(job_id)
             assert job is not None
@@ -6698,6 +6702,7 @@ def test_revise_job_records_its_outcome_and_backstops_bugs(
         assert "修訂過程發生未預期錯誤" in (job["error"] or "")
         assert "RuntimeError" in (job["error"] or "")
         assert "secrets" not in (job["error"] or "")
+        assert job["tool_name"] == "kbsearch"  # the backstop keeps the name (H3)
         await asyncio.gather(*list(tool_builder._TASKS), return_exceptions=True)
 
     asyncio.run(scenario())

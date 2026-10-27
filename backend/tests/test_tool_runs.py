@@ -353,6 +353,50 @@ def test_a_call_the_backend_fails_is_recorded_as_error_and_still_raises(
     assert (records[0].args, records[0].stdout, records[0].stderr) == (None, None, None)
 
 
+def test_a_call_cut_off_by_the_interaction_deadline_still_ends_and_is_recorded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, records: list[tools.ToolRunRecord]
+) -> None:
+    """P4 review r1 H1: the deadline cancels the caller, never the call.
+
+    The request gives up at its deadline (a 502 in the routes) with the tool still
+    running -- cancellation cannot stop the worker thread it runs in. The call
+    holds its OWN reference to the shared lock past the request's, runs to its
+    end, and is recorded with its real outcome; only then is the lock free.
+    """
+    root = tmp_path / "tools"
+    _make_tool(
+        root,
+        "slow",
+        "import sys, time\ntime.sleep(0.6)\nsys.stderr.write('late')\nsys.exit(1)\n",
+    )
+    _install_tools(monkeypatch, root)
+    seen: dict[str, Any] = {}
+
+    async def _request_then_wait() -> None:
+        fd = tools.acquire_shared_tools_lock()
+        try:
+            with tools.bind_request_tools_lock(fd):
+                [tool] = enabled_llm_tools()
+            with pytest.raises(TimeoutError):
+                async with asyncio.timeout(0.2):
+                    await tool.handler({})
+        finally:
+            tools.release_tools_lock(fd)
+        seen["records_when_request_ended"] = len(records)
+        with tools.exclusive_tools_lock(root) as free:
+            seen["lock_free_while_tool_runs"] = free
+        await asyncio.gather(*list(tools._CALL_TASKS))
+
+    asyncio.run(_request_then_wait())
+
+    assert seen == {"records_when_request_ended": 0, "lock_free_while_tool_runs": False}
+    [run] = records
+    assert (run.tool_name, run.outcome, run.exit_code) == ("slow", tools.RUN_FAILED, 1)
+    assert run.stderr == "late"
+    with tools.exclusive_tools_lock(root) as free:
+        assert free is True
+
+
 def test_stderr_overflow_that_exits_on_its_own_is_a_plain_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, records: list[tools.ToolRunRecord]
 ) -> None:

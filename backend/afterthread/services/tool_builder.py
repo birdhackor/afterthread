@@ -3197,7 +3197,7 @@ async def start_health_check_job(name: str, expected_vid: str) -> CheckJobStart:
             return CheckJobStart(
                 refusal="check_unavailable", message=_CHECK_REFUSALS["no_examples"]
             )
-        job = _admit_job(reservation_token=reservation, kind="health_check")
+        job = _admit_job(reservation_token=reservation, kind="health_check", tool_name=name)
         if job is None:
             return CheckJobStart(refusal="job_busy")
         reservation = ""
@@ -3400,17 +3400,20 @@ async def _run_job(
         terminal = _OUTCOME_NOT_PUBLISHED
     else:
         terminal = _OUTCOME_FAILED
+    # A revise's name was set at admission; an outcome that does not repeat it
+    # (a failure before the builder reported anything) must not erase it.
+    named = {"tool_name": outcome.tool_name} if outcome.tool_name is not None else {}
     _update_job(
         job_id,
         state="succeeded" if outcome.ok else "failed",
         error=outcome.error,
-        tool_name=outcome.tool_name,
         summary=outcome.summary,
         llm_log_id=outcome.llm_log_id,
         env_keys=outcome.env_keys,
         outcome=terminal,
         verification=outcome.verification,
         finished_at=_now_iso(),
+        **named,
     )
 
 
@@ -3430,7 +3433,9 @@ def _single_flight_held() -> bool:
     return bool(_SYNC_OPS) or any(job.state in ("queued", "running") for job in _JOBS.values())
 
 
-def _admit_job(*, reservation_token: str | None = None, kind: str = "install") -> InstallJob | None:
+def _admit_job(
+    *, reservation_token: str | None = None, kind: str = "install", tool_name: str | None = None
+) -> InstallJob | None:
     """Register one queued job, or None when another is already active (M7/D40).
 
     The single-flight admission, written ONCE for both kinds: the active-check
@@ -3447,8 +3452,20 @@ def _admit_job(*, reservation_token: str | None = None, kind: str = "install") -
     Eviction keeps the newest ``_MAX_JOBS`` by creation time (job_id as a
     deterministic tiebreak for identical timestamps); a TERMINAL (succeeded/
     failed) job stays pollable until evicted and never blocks a new submit.
+
+    ``tool_name`` is known from the start for a revise and a health check (the
+    path names the tool) and set here, so a poll -- the 工具 page following a
+    job started elsewhere (``/tools?job=``) -- can say which tool from the
+    first response, and a job that ends in the backstop still names it (P4
+    review r1, H3). An install learns its name from the builder at the end.
     """
-    job = InstallJob(job_id=uuid4().hex, state="queued", created_at=_now_iso(), kind=kind)
+    job = InstallJob(
+        job_id=uuid4().hex,
+        state="queued",
+        created_at=_now_iso(),
+        kind=kind,
+        tool_name=tool_name,
+    )
     with _JOBS_LOCK:
         if reservation_token is None:
             if _single_flight_held():
@@ -3572,7 +3589,7 @@ async def start_revise_job(
             return ReviseJobStart(refusal="not_found")
         if resolution.vid != expected_vid:
             return ReviseJobStart(refusal="version_mismatch")
-        job = _admit_job(reservation_token=reservation, kind="revise")
+        job = _admit_job(reservation_token=reservation, kind="revise", tool_name=name)
         if job is None:
             return ReviseJobStart(refusal="job_busy")
         reservation = ""

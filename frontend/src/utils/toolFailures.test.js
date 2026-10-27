@@ -102,6 +102,14 @@ describe("fixRefusalMessage", () => {
 			"已被清除",
 		);
 	});
+
+	it("names a tool deleted between the list read and the submit", () => {
+		const gone = { status: 404, code: null, message: "找不到項目" };
+		expect(fixRefusalMessage(gone, "kb")).toBe("工具「kb」已不存在。");
+		expect(fixRefusalMessage({ status: 500, message: "boom" }, "kb")).toBe(
+			"boom",
+		);
+	});
 });
 
 describe("toolsJobSearch", () => {

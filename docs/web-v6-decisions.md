@@ -399,6 +399,22 @@ UTC 再比）、stats 的 SQL、孤兒判斷與別名、P2a-r1 的 `error` 路�
 出現提醒，按「請 AI 修正」送出修訂，「到工具頁看進度」開啟 `/tools?job=<id>`，卡片接上那個工作
 並顯示結局。
 
+### D46 附錄（P4 review r1，Fable）
+
+審查結論為收斂（沒有 P1／P2），下列一併處理：
+
+| # | 問題 | 處理 |
+|---|---|---|
+| H1 | 互動期限（`asyncio.timeout`）在工具執行中觸發時，取消直接送到 handler 的 await；`CancelledError` 不是 `Exception`，所以那次呼叫既沒有紀錄也沒進收集器，工具卻在被丟下的 worker 執行緒裡繼續跑。設計 §11 的 Q 與 README 說「502 時紀錄仍寫入」只對上游錯誤成立；`llm.py` 的 F2 註解說期限「無法搶先中止進行中的工具」也不對——中止的是請求，不是工具 | **採納，修程式**：每次呼叫（含紀錄）在 `_make_handler` 裡以獨立 task 執行、用 `asyncio.shield` 等它；請求被取消時呼叫照樣跑完、遮蔽、寫紀錄。呼叫持有**自己的**共享鎖參照（handler 被呼叫時對請求的 fd 做 `os.dup`），所以請求關掉自己的 fd 不會在工具還在跑時放掉鎖，也不會留給呼叫一個可能已被重新配發的 fd 號碼；鎖在紀錄寫完後才放。順帶修好兩個既有的邊角：直接呼叫者自己取的鎖在取消時不會漏掉、`.env` 值在輸出遮蔽完之前不會被釋放。`llm.py` 的三處 F2 註解改寫成實際行為：請求準時結束，最多一個呼叫在背景多跑一個工具逾時 |
+| H2 | 補齊／協助更新的提醒以工具名稱為 key、狀態存在元件裡；同一個工具在下一次結果又失敗時 React 沿用舊狀態，仍顯示「已請 AI 修正」與舊工作連結，不提供新的修正 | **採納**：`ItemAiActions` 為每個動作的結果編號，提醒以編號為 key，新結果一定從頭開始 |
+| H3 | 修訂工作的 `tool_name` 只在結束時寫入：`/tools?job=` 進行中的標題沒有工具名稱；走 backstop 結束的工作 `tool_name` 為 null，只重讀工具清單 | **採納**：修訂與健康檢查在 `_admit_job` 就帶上名稱；結束時結果沒有名稱就不覆蓋 |
+| H4 | 讀完清單到送出之間工具被刪掉時，`Tool not found`（沒有 code 的 404）被 API client 換成「找不到項目」 | **採納**：`fixRefusalMessage(error, toolName)` 對沒有 code 的 404 說「工具「名稱」已不存在。」 |
+| H5 | 手打的 `/tools?job=<32 位數字>` 會被路由的預設 `parseSearch` 當成 JSON 數字解析而丟掉 | **不處理**：頁面產生的連結會加引號、可以往返；32 個字元全是數字的 uuid4 hex 機率約 (10/16)^32 |
+
+測試：`test_a_call_cut_off_by_the_interaction_deadline_still_ends_and_is_recorded`（請求在期限結束時還沒有
+紀錄、鎖仍被持有；呼叫結束後紀錄是真正的結果，鎖才釋放）；`test_revise_job_records_its_outcome_and_backstops_bugs`
+加上排隊時與 backstop 後的 `tool_name`；`toolFailures.test.js` 加上被刪除工具的說明。
+
 ## D47（P5）：跑一次範例與修正後自動驗證
 
 範圍是設計 §10 的後端執行、§8.3 的自動驗證、§9 的驗證狀態。（D46 是 P4。）下面是實作時才定下的細節。

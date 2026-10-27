@@ -13,6 +13,7 @@ version identity; a call runs that exact version with its directory as cwd.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import fcntl
 import io
@@ -3430,6 +3431,20 @@ async def _write_record(
         return None
 
 
+# Tool calls whose request may already be gone (``_make_handler``): strong
+# references, so a call still running is never garbage-collected mid-flight.
+_CALL_TASKS: set[asyncio.Task[ToolRunResult]] = set()
+
+
+def _forget_call_task(task: asyncio.Task[ToolRunResult]) -> None:
+    _CALL_TASKS.discard(task)
+    # Retrieved so a call that failed after its request had gone is not logged
+    # as "Task exception was never retrieved": the failure already has its
+    # record (``error``), which is everything that can be done with it.
+    if not task.cancelled():
+        task.exception()
+
+
 def _make_handler(
     advertised: Resolved,
     entry: list[str],
@@ -3443,6 +3458,18 @@ def _make_handler(
     scope takes a shared lock for this handler invocation as a fail-safe; normal
     capture/enrich/assist-update requests already hold one across scan, every
     model round, every tool call, and error cleanup.
+
+    Each call runs as a task of its own, shielded from the caller (P4 review r1,
+    H1). The interaction's deadline (``llm.generate_structured``) cancels the
+    request with a tool in flight, and asyncio cancellation cannot stop the
+    worker thread that runs the tool: before this, the request then went on
+    without the call -- no record, and the call's ``.env`` values released
+    while its output still had to be masked. Shielded, the call ends the way
+    every call does: masked while its values are held, recorded, its lock
+    reference closed. That reference is the call's OWN (a ``dup`` of the
+    request's, taken while the request's is certainly open), so the request
+    closing its descriptor neither drops the lock under a running tool nor
+    leaves the call a descriptor number the process may already have reused.
     """
 
     request_lock_fd = _REQUEST_TOOLS_LOCK_FD.get()
@@ -3483,13 +3510,14 @@ def _make_handler(
                 settings.llm_tool_output_max_chars,
             )
 
-    async def _handler(arguments: dict[str, Any]) -> str:
+    async def _call(arguments: dict[str, Any], call_lock_fd: int | None) -> ToolRunResult:
+        """One call and its record, start to finish; closes ``call_lock_fd``."""
         started_at = datetime.now(UTC)
         started = time.monotonic()
-        owned_lock_fd: int | None = None
+        owned_lock_fd = call_lock_fd
         try:
             try:
-                tools_lock_fd = request_lock_fd
+                tools_lock_fd = owned_lock_fd
                 if identity is not None and tools_lock_fd is None:
                     owned_lock_fd = await run_in_threadpool(acquire_shared_tools_lock)
                     tools_lock_fd = owned_lock_fd
@@ -3514,18 +3542,29 @@ def _make_handler(
                 raise
             # Written while the shared lock is still held, so a delete (which
             # needs it exclusively, and clears the tool's records) cannot land
-            # between this run and its record. The two refusals above hold no
-            # lock to write under -- and ran nothing.
+            # between this run and its record. A refusal above may hold no lock
+            # to write under -- and ran nothing.
             await _record_run(
                 advertised,
                 result,
                 started_at=started_at,
                 duration_ms=int((time.monotonic() - started) * 1000),
             )
-            return result.text
+            return result
         finally:
             if owned_lock_fd is not None:
                 await run_in_threadpool(release_tools_lock, owned_lock_fd)
+
+    async def _handler(arguments: dict[str, Any]) -> str:
+        call_lock_fd = os.dup(request_lock_fd) if request_lock_fd is not None else None
+        try:
+            task = asyncio.ensure_future(_call(arguments, call_lock_fd))
+        except BaseException:
+            release_tools_lock(call_lock_fd)
+            raise
+        _CALL_TASKS.add(task)
+        task.add_done_callback(_forget_call_task)
+        return (await asyncio.shield(task)).text
 
     return _handler
 

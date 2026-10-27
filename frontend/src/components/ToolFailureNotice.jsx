@@ -51,7 +51,10 @@ function FailureGroup({ group }) {
 					})
 				).tools;
 			} catch (error) {
-				setState({ kind: "refused", message: fixRefusalMessage(error) });
+				setState({
+					kind: "refused",
+					message: fixRefusalMessage(error, group.toolName),
+				});
 				return;
 			}
 			const decision = fixDecision(group, tools);
@@ -72,7 +75,10 @@ function FailureGroup({ group }) {
 					error?.status === 409 &&
 					error?.code === "version_mismatch";
 				if (!retry) {
-					setState({ kind: "refused", message: fixRefusalMessage(error) });
+					setState({
+						kind: "refused",
+						message: fixRefusalMessage(error, group.toolName),
+					});
 					return;
 				}
 			}

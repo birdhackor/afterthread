@@ -75,8 +75,10 @@ export function fixDecision(group, tools) {
 }
 
 // A refused submit, in words. version_mismatch reaches here only after the one
-// re-read the caller already spent on it.
-export function fixRefusalMessage(error) {
+// re-read the caller already spent on it. A 404 without a code is the revise
+// route's own "Tool not found" -- the tool was deleted after the fresh list
+// read -- which the API client would otherwise word as an item's 「找不到項目」.
+export function fixRefusalMessage(error, toolName) {
 	if (error?.status === 409 && error?.code === "job_busy") {
 		return "目前有其他 AI 工作進行中，請稍後再試。";
 	}
@@ -88,6 +90,9 @@ export function fixRefusalMessage(error) {
 	}
 	if (error?.status === 404 && error?.code === "run_not_found") {
 		return "這次失敗的執行紀錄已被清除，請到工具頁查看。";
+	}
+	if (error?.status === 404 && error?.code == null && toolName) {
+		return `工具「${toolName}」已不存在。`;
 	}
 	return error?.message ?? "無法送出修正，請稍後再試。";
 }

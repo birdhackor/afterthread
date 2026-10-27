@@ -143,7 +143,9 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 裡失敗的已安裝工具呼叫（`failed`／`output_overflow`／`timeout`／`start_failed`；被拒與後端錯誤不算），
 每筆 `{run_id, tool_name, vid, outcome, recorded}`。收集器放在每個廣告工具的請求都會經過的
 `_advertised_tools_lock` 裡（ContextVar，每個請求各自一份）；紀錄沒寫成的失敗照樣列出，
-`recorded: false`、`run_id: null`。LLM 失敗回 502 時沒有回應可放，但紀錄照樣寫進資料庫。
+`recorded: false`、`run_id: null`。LLM 失敗回 502 時沒有回應可放，但紀錄照樣寫進資料庫；
+互動期限到了、工具還在跑時也一樣：請求在期限回 502，那次呼叫在背景跑完（最晚到它自己的
+`LLM_TOOL_TIMEOUT_SECONDS`）才寫紀錄，期間仍持有共享鎖，刪除與丟棄照常回「AI 工作進行中」。
 
 AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 `502 llm_upstream_error`（上游呼叫失敗或輸出無法解析，即使重試一次後仍失敗）、

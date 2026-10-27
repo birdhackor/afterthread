@@ -189,6 +189,14 @@ function AiActionCard({
 // of completion. Reading stage live (instead of a snapshot taken when gaps
 // was set) means a stage change from the quick Select after this pass still
 // shows copy that matches the page, not what stage was at enrich time.
+// One action's last-reported tool failures, numbered by result (see
+// ItemAiActions' enrichFailures).
+const NO_FAILURES = { seq: 0, failures: [] };
+
+function nextFailures(previous, result) {
+	return { seq: previous.seq + 1, failures: result?.tool_failures ?? [] };
+}
+
 function GapsChecklist({ gaps, stage }) {
 	if (gaps.length > 0) {
 		return (
@@ -255,8 +263,12 @@ export function ItemAiActions({ item, pending, onPendingChange, queryItemId }) {
 	const [gaps, setGaps] = useState(null);
 	// The tool failures each AI action's last result reported (web-v6 §8.2),
 	// shown inside that action's card until its next success replaces them.
-	const [enrichFailures, setEnrichFailures] = useState([]);
-	const [assistFailures, setAssistFailures] = useState([]);
+	// `seq` counts the results and keys the notice: each reminder keeps what its
+	// 請 AI 修正 did (started a job, or why not) in its own state, and a new
+	// result for the same tool must start from scratch, not inherit the old
+	// one's "已請 AI 修正" (P4 review r1, H2).
+	const [enrichFailures, setEnrichFailures] = useState(NO_FAILURES);
+	const [assistFailures, setAssistFailures] = useState(NO_FAILURES);
 	// Conflict-banner refresh in flight (shared by both cards; only the
 	// conflicted one renders a banner). Feeds aiBusy below so the page's own
 	// controls stay disabled for its duration too.
@@ -323,7 +335,7 @@ export function ItemAiActions({ item, pending, onPendingChange, queryItemId }) {
 			// from the quick Select can't leave this checklist's copy contradicting
 			// the page.
 			setGaps(result?.gaps ?? []);
-			setEnrichFailures(result?.tool_failures ?? []);
+			setEnrichFailures((previous) => nextFailures(previous, result));
 			await invalidateAll();
 			notifications.show({ color: "green", message: "AI 已補齊內容" });
 		},
@@ -339,7 +351,7 @@ export function ItemAiActions({ item, pending, onPendingChange, queryItemId }) {
 			// last AI 補齊 flagged, so clear that checklist rather than leave a
 			// superseded one on screen -- the next AI 補齊 recomputes it.
 			setGaps(null);
-			setAssistFailures(result?.tool_failures ?? []);
+			setAssistFailures((previous) => nextFailures(previous, result));
 			await invalidateAll();
 			notifications.show({ color: "green", message: "AI 已更新進度" });
 		},
@@ -411,7 +423,10 @@ export function ItemAiActions({ item, pending, onPendingChange, queryItemId }) {
 				onRefreshConflict={() => refreshConflict(enrichMutation)}
 				onPendingChange={onPendingChange}
 			>
-				<ToolFailureNotice failures={enrichFailures} />
+				<ToolFailureNotice
+					key={enrichFailures.seq}
+					failures={enrichFailures.failures}
+				/>
 				{gaps ? <GapsChecklist gaps={gaps} stage={item.stage} /> : null}
 			</AiActionCard>
 
@@ -430,7 +445,10 @@ export function ItemAiActions({ item, pending, onPendingChange, queryItemId }) {
 				onRefreshConflict={() => refreshConflict(assistMutation)}
 				onPendingChange={onPendingChange}
 			>
-				<ToolFailureNotice failures={assistFailures} />
+				<ToolFailureNotice
+					key={assistFailures.seq}
+					failures={assistFailures.failures}
+				/>
 			</AiActionCard>
 		</Stack>
 	);

@@ -257,14 +257,15 @@ _TOOL_CALLS_OVERSIZED_PREFIX = "tool_calls oversized"
 # F2 -- the role:"tool" result content for a call NOT STARTED because the
 # interaction's wall-clock deadline is essentially spent (see the per-call check in
 # _run_structured's tool-execution loop). The outer asyncio.timeout is a genuine
-# end-to-end deadline for everything the loop AWAITS, but a tool handler runs its
-# subprocess in a Starlette run_in_threadpool worker whose AnyIO thread ignores
-# host cancellation until it finishes -- so asyncio.timeout cannot PREEMPT a tool
-# already in flight. Rather than let each new tool in a round start a fresh
-# subprocess that would then run PAST the deadline to its own
-# llm_tool_timeout_seconds (up to _MAX_TOOL_CALLS_PER_REPLY of them, sequentially --
-# a 16x overrun the deadline cannot stop), the loop STOPS STARTING tools once too
-# little time remains and hands back this fixed reason keyed to the call's id,
+# end-to-end deadline for everything the loop AWAITS, tool calls included, but it
+# cannot STOP a tool already in flight: the subprocess runs in a Starlette
+# run_in_threadpool worker that cancellation does not reach, and the call is
+# shielded so it still ends properly (tools._make_handler) -- it runs on to its
+# own llm_tool_timeout_seconds after the interaction is gone. Rather than let
+# each new tool in a round start a fresh subprocess bound to outlive the
+# deadline that way (up to _MAX_TOOL_CALLS_PER_REPLY of them), the loop STOPS
+# STARTING tools once too little time remains and hands back this fixed reason
+# keyed to the call's id,
 # exactly like the too-many-calls rejection. Fed back so the model learns the call
 # did not run, and so the echoed assistant turn's tool_calls entry still has its
 # matching result. Carries no config value.
@@ -273,7 +274,7 @@ _TOOL_DEADLINE_REACHED = "tool call skipped: interaction deadline reached"
 # The minimum seconds that must remain on the interaction deadline for the loop to
 # START another tool call (F2). Below this, starting a tool would almost certainly
 # let a threadpool worker run to its own subprocess timeout well PAST the deadline
-# (which asyncio.timeout cannot stop mid-flight), so the call is skipped with
+# (asyncio.timeout ends the interaction, not the tool), so the call is skipped with
 # _TOOL_DEADLINE_REACHED instead. A small positive floor rather than 0 because a
 # tool that starts with only a sliver of budget left is guaranteed to overrun; 1s
 # is comfortably below any real per-call tool timeout (llm_tool_timeout_seconds
@@ -1017,17 +1018,18 @@ async def _run_structured[ModelT: BaseModel](
         # ``timeout_seconds``; the installer uses a much larger one) bounds the
         # entire agentic interaction end to end, not each create() separately.
         # Unlike the client-level timeout (see _build_client), which only bounds
-        # per-phase inactivity, this is a genuine deadline on total duration --
-        # with ONE honest caveat (F2): a tool handler's subprocess runs in a
-        # Starlette run_in_threadpool worker whose AnyIO thread ignores host
-        # cancellation until it returns, so asyncio.timeout cannot PREEMPT a tool
-        # already in flight; that one tool runs to its own llm_tool_timeout_seconds
-        # (self-terminating via its process-group SIGKILL, see tools.py). New tool
-        # calls are NOT STARTED once the deadline is essentially spent (the
-        # per-call _TOOL_DEADLINE_FLOOR_SECONDS check below), so the worst-case
-        # wall-clock is approximately this deadline PLUS a single
-        # llm_tool_timeout_seconds -- not the deadline plus _MAX_TOOL_CALLS_PER_REPLY
-        # of them running back to back.
+        # per-phase inactivity, this is a genuine deadline on total duration,
+        # tool calls included (F2, corrected in web-v6 P4 review r1 H1): the
+        # cancellation reaches the handler's await at once, so the interaction
+        # ends on time even with a tool in flight. What it cannot stop is the
+        # tool itself -- a subprocess in a Starlette run_in_threadpool worker --
+        # so each call runs shielded (tools._make_handler) and finishes on its
+        # own, at the latest at its llm_tool_timeout_seconds (self-terminating
+        # via its process-group SIGKILL, see tools.py), writing its run record
+        # and closing its lock reference then. New tool calls are NOT STARTED
+        # once the deadline is essentially spent (the per-call
+        # _TOOL_DEADLINE_FLOOR_SECONDS check below), so at most one call
+        # outlives the interaction, by at most one llm_tool_timeout_seconds.
         async with asyncio.timeout(timeout_seconds):
             # Monotonic deadline on the SAME clock asyncio.timeout uses
             # (loop.time()), so the per-call remaining-budget check in the
@@ -1235,16 +1237,16 @@ async def _run_structured[ModelT: BaseModel](
                             if index < _MAX_TOOL_CALLS_PER_REPLY:
                                 # F2: before STARTING a handler, check the deadline.
                                 # A handler's subprocess runs in a threadpool worker
-                                # the outer asyncio.timeout cannot preempt (see the
+                                # the outer asyncio.timeout cannot stop (see the
                                 # async-with note above), so a tool started with too
                                 # little budget left would run PAST the deadline to
                                 # its own llm_tool_timeout_seconds. Once at most
                                 # _TOOL_DEADLINE_FLOOR_SECONDS remains, DON'T start
                                 # it -- reject with _TOOL_DEADLINE_REACHED instead
-                                # (id pairing preserved). This bounds the residual
-                                # overrun to at most ONE already-in-flight tool
-                                # rather than _MAX_TOOL_CALLS_PER_REPLY of them back
-                                # to back. Composes with the F1 size gate above: F1
+                                # (id pairing preserved). This bounds what outlives
+                                # the interaction to at most ONE already-in-flight
+                                # tool rather than _MAX_TOOL_CALLS_PER_REPLY of them
+                                # back to back. Composes with the F1 size gate above: F1
                                 # stops advertising tools per ROUND, F2 stops
                                 # starting them per CALL within a round already in
                                 # progress.
