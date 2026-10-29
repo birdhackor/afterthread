@@ -40,6 +40,7 @@ import {
 } from "../utils/toolRunsPurge.js";
 import { logLinkSearch } from "../utils/toolSummary.js";
 import { CharCounter } from "./CharCounter.jsx";
+import { ReviseBlockedNote } from "./ReviseBlockedNote.jsx";
 import { ToolRunsPurgeDialog } from "./ToolRunsPurgeDialog.jsx";
 
 // Bounded, whitespace-preserving box for a body (up to 16,000 chars of stderr):
@@ -76,11 +77,20 @@ const STALE_LIST_NOTE =
 //
 // The section also says how the current version did on its examples.json
 // (web-v6 §9) and offers 跑一次範例 (`onCheck`, a job in the same gate).
+//
+// `blockedByDraft` is the sentence (reviseBlockedByDraft) saying the tool's draft
+// keeps any revise from being sent, or null: it turns off every control here that
+// sends or prepares one -- 請 AI 修正, 加上說明… and the modal's 送出修正 -- and is
+// said under each record that has them, since a list of records is as long as the
+// operator's failures and one sentence above it would soon be a screen away from
+// the control it explains. 跑一次範例 is not a revise and answers to `fixBlocked`
+// alone.
 export function ToolRunsSection({
 	name,
 	expanded,
 	onFix = null,
 	fixBlocked = false,
+	blockedByDraft = null,
 	isSubmittingFix = false,
 	onCheck = null,
 	isSubmittingCheck = false,
@@ -139,7 +149,8 @@ export function ToolRunsSection({
 			</Stack>
 		);
 	}
-	const blocked = fixBlocked || isFetching || isError;
+	const blocked =
+		fixBlocked || isFetching || isError || blockedByDraft !== null;
 	return (
 		<Stack gap="xs" pt="xs">
 			{/* Reached with data in hand: a BACKGROUND refetch failed and left the
@@ -188,6 +199,7 @@ export function ToolRunsSection({
 						run.fixable && onFix
 							? {
 									blocked,
+									blockedByDraft,
 									submitting: isSubmittingFix,
 									now: () => onFix([run.id]),
 									withNote: () => setNoteRun(run),
@@ -199,6 +211,7 @@ export function ToolRunsSection({
 			<FixNoteModal
 				run={noteRun}
 				blocked={blocked}
+				blockedByDraft={blockedByDraft}
 				onClose={() => setNoteRun(null)}
 				onSubmit={(feedback) => {
 					onFix?.([noteRun.id], feedback);
@@ -261,6 +274,7 @@ function ToolRunRow({ name, run, fix }) {
 						>
 							加上說明…
 						</Button>
+						<ReviseBlockedNote reason={fix.blockedByDraft} />
 					</>
 				) : null}
 			</Group>
@@ -389,8 +403,10 @@ function ToolRunDetail({ name, run, expanded }) {
 }
 
 // 加上說明… (web-v6 §8.1): the same fix, with words. The record rides along; the
-// note is optional, and bounded like every other AI input.
-function FixNoteModal({ run, blocked, onClose, onSubmit }) {
+// note is optional, and bounded like every other AI input. The modal can be open
+// when the tool's draft appears (a list read again behind it), so it answers to
+// `blocked` as the rows do and says the draft's sentence beside 送出修正.
+function FixNoteModal({ run, blocked, blockedByDraft, onClose, onSubmit }) {
 	const [note, setNote] = useState("");
 	const tooLong = codePointLength(note.trim()) > SECTION_MAX_LENGTH;
 	// Every way out clears the draft, so the next record never opens with a note
@@ -422,6 +438,7 @@ function FixNoteModal({ run, blocked, onClose, onSubmit }) {
 					/>
 					<CharCounter value={note} max={SECTION_MAX_LENGTH} />
 				</div>
+				<ReviseBlockedNote reason={blockedByDraft} />
 				<Group justify="flex-end" gap="sm">
 					<Button variant="default" onClick={close}>
 						取消

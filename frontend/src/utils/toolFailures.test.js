@@ -103,6 +103,25 @@ describe("fixRefusalMessage", () => {
 		);
 	});
 
+	it("sends a draft_pending refusal to the 工具 page in this page's own words", () => {
+		const backend =
+			"這個工具有一份未完成的修正（草稿）。需要裡面的檔案就先到草稿路徑取回，然後在工具列放棄它，才能送出新的修正。";
+		const message = fixRefusalMessage(
+			{ status: 409, code: "draft_pending", message: backend },
+			"kb",
+		);
+		expect(message).toContain("工具「kb」");
+		expect(message).toContain("工具頁");
+		expect(message).not.toBe(backend);
+		expect(
+			fixRefusalMessage({
+				status: 409,
+				code: "draft_pending",
+				message: backend,
+			}),
+		).toContain("這個工具");
+	});
+
 	it("names a tool deleted between the list read and the submit", () => {
 		const gone = { status: 404, code: null, message: "找不到項目" };
 		expect(fixRefusalMessage(gone, "kb")).toBe("工具「kb」已不存在。");

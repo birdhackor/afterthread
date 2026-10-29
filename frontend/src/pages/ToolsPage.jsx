@@ -27,7 +27,10 @@ import { Controller, useForm } from "react-hook-form";
 import { apiDelete, apiGet, apiPatch, apiPost } from "../api/client.js";
 import { CharCounter } from "../components/CharCounter.jsx";
 import { formatDate } from "../components/DateText.jsx";
+import { DraftNotice } from "../components/DraftNotice.jsx";
 import { EmptyState } from "../components/EmptyState.jsx";
+import { ReviseBlockedNote } from "../components/ReviseBlockedNote.jsx";
+import { ReviseDraftResult } from "../components/ReviseDraftResult.jsx";
 import { ReviseStopNotice } from "../components/ReviseStopNotice.jsx";
 import { ToolRunStatsBar } from "../components/ToolRunStatsBar.jsx";
 import { ToolRunsSection } from "../components/ToolRunsSection.jsx";
@@ -44,6 +47,12 @@ import {
 	toolDiscardConfirmation,
 	toolDiscardNotification,
 } from "../utils/toolDelete.js";
+import {
+	buildDraftDiscardRequest,
+	draftDiscardFailure,
+	draftDiscardNotification,
+	reviseBlockedByDraft,
+} from "../utils/toolDraft.js";
 import {
 	isHttpUrl,
 	isTerminalToolJobState,
@@ -180,13 +189,17 @@ function VerificationRows({ rows }) {
 // can address the version, and only after a failed post-fix verification.
 // `fixBlocked` is the page's write gate (versionWritesBlocked): the fix itself
 // re-checks it and does nothing while it holds, so the button says so instead
-// of ignoring the click (P5 review r1, J7).
+// of ignoring the click. `blockedByDraft` is the tool's draft
+// keeping any revise from being sent (reviseBlockedByDraft, null when none): the
+// fix is off, and the sentence says why. 丟掉這一版 is not a revise and stays.
 function VerificationSummary({
 	view,
 	onFixRuns,
 	onDiscardVersion,
 	fixBlocked = false,
+	blockedByDraft = null,
 }) {
+	const offersFix = onFixRuns != null && view.failedRunIds.length > 0;
 	return (
 		<Stack gap={4} align="flex-start">
 			<Text size="sm" fw={600}>
@@ -198,14 +211,14 @@ function VerificationSummary({
 				</Text>
 			) : null}
 			<VerificationRows rows={view.rows} />
-			{(onFixRuns && view.failedRunIds.length > 0) || onDiscardVersion ? (
+			{offersFix || onDiscardVersion ? (
 				<Group gap="xs">
-					{onFixRuns && view.failedRunIds.length > 0 ? (
+					{offersFix ? (
 						<Button
 							size="compact-xs"
 							color="red"
 							variant="light"
-							disabled={fixBlocked}
+							disabled={fixBlocked || blockedByDraft !== null}
 							onClick={() => onFixRuns(view.failedRunIds)}
 						>
 							請 AI 修正
@@ -223,13 +236,20 @@ function VerificationSummary({
 					) : null}
 				</Group>
 			) : null}
+			{offersFix ? <ReviseBlockedNote reason={blockedByDraft} /> : null}
 		</Stack>
 	);
 }
 
 // 跑一次範例 (web-v6 §10): progress while the examples run, then the result per
 // example. The job is a health check, not a build, so it has its own card.
-function HealthCheckProgress({ jobQuery, job, onFixRuns, fixBlocked }) {
+function HealthCheckProgress({
+	jobQuery,
+	job,
+	onFixRuns,
+	fixBlocked,
+	blockedByDraft,
+}) {
 	if (jobQuery.isError) {
 		return (
 			<Alert color="orange" title="無法確認範例的結果">
@@ -277,6 +297,7 @@ function HealthCheckProgress({ jobQuery, job, onFixRuns, fixBlocked }) {
 				onFixRuns={onFixRuns}
 				onDiscardVersion={null}
 				fixBlocked={fixBlocked}
+				blockedByDraft={blockedByDraft}
 			/>
 		</Alert>
 	);
@@ -296,6 +317,7 @@ function ToolJobProgress({
 	onFixRuns = null,
 	onDiscardVersion = null,
 	fixBlocked = false,
+	blockedByDraft = null,
 }) {
 	if (jobId === null) {
 		return null;
@@ -311,6 +333,7 @@ function ToolJobProgress({
 				job={job}
 				onFixRuns={onFixRuns}
 				fixBlocked={fixBlocked}
+				blockedByDraft={blockedByDraft}
 			/>
 		);
 	}
@@ -397,8 +420,10 @@ function ToolJobProgress({
 							onFixRuns={onFixRuns}
 							onDiscardVersion={verifyFailed ? onDiscardVersion : null}
 							fixBlocked={fixBlocked}
+							blockedByDraft={blockedByDraft}
 						/>
 					) : null}
+					<ReviseDraftResult job={job} kind={jobKind} />
 					<ReviseStopNotice job={job} kind={jobKind} />
 					<LogLink
 						llmLogId={job.llm_log_id}
@@ -422,6 +447,7 @@ function ToolJobProgress({
 					<Text size="xs" c="dimmed">
 						{view.note}
 					</Text>
+					<ReviseDraftResult job={job} kind={jobKind} />
 					<ReviseStopNotice job={job} kind={jobKind} />
 					<LogLink
 						llmLogId={job.llm_log_id}
@@ -441,6 +467,7 @@ function ToolJobProgress({
 						AI 回報：{job.summary}
 					</Text>
 				) : null}
+				<ReviseDraftResult job={job} kind={jobKind} />
 				<ReviseStopNotice job={job} kind={jobKind} />
 				<LogLink
 					llmLogId={job.llm_log_id}
@@ -466,7 +493,12 @@ function ToolJobProgress({
 // job whose re-read has not landed (see InstalledToolsPanel's
 // versionWritesBlocked for all three).
 // 送出修訂 additionally answers to `displayedMayBeStale`, which is what this
-// panel knows first-hand about its OWN summary query.
+// panel knows first-hand about its OWN summary query, and to `blockedByDraft`:
+// the sentence (reviseBlockedByDraft) saying the tool's draft keeps any revise
+// from being sent, or null. 重新產生 does not answer to it; it leaves the draft
+// alone. `blockedByDraft` has no default on purpose: the form is the one sender
+// that has no handler of the page between it and the mutation, so a caller that
+// forgets to pass it gets a form that is off, not one that is open.
 //
 // What is deliberately NO LONGER here: an in-flight 啟用 toggle
 // (`isTogglingThisTool`, R7-2) used to gate both writes as well. It was the
@@ -486,6 +518,7 @@ function ToolSummaryPanel({
 	onRegenerate,
 	reviseMutation,
 	isSubmittingRevise,
+	blockedByDraft,
 }) {
 	const { data, error, isError, isFetching } = useQuery({
 		queryKey: summaryQueryKey,
@@ -547,7 +580,7 @@ function ToolSummaryPanel({
 	const displayedMayBeStale = settlingJobEnd || isFetching || isError;
 
 	const submitRevise = handleSubmit((values) => {
-		if (writesBlocked || displayedMayBeStale) {
+		if (writesBlocked || displayedMayBeStale || blockedByDraft !== null) {
 			return;
 		}
 		const feedback = values.feedback.trim();
@@ -670,7 +703,8 @@ function ToolSummaryPanel({
 							</div>
 						)}
 					/>
-					<Group justify="flex-end">
+					<Group justify="flex-end" align="center">
+						<ReviseBlockedNote reason={blockedByDraft} />
 						<Button
 							type="submit"
 							size="xs"
@@ -702,7 +736,14 @@ function ToolSummaryPanel({
 							// issuing it while that text is known to be superseded hands a
 							// builder session instructions for an implementation that no
 							// longer exists. See `displayedMayBeStale` for the rule.
-							disabled={writesBlocked || displayedMayBeStale}
+							//
+							// `blockedByDraft` is the other kind of reason: nothing on screen
+							// is stale, the backend would simply refuse (draft_pending). The
+							// feedback field stays open, because what is typed here is still
+							// good once the draft is gone and the row is the same one.
+							disabled={
+								writesBlocked || displayedMayBeStale || blockedByDraft !== null
+							}
 						>
 							送出修訂
 						</Button>
@@ -738,6 +779,9 @@ function ToolRow({
 	onFix,
 	onCheck,
 	isSubmittingCheck,
+	onDiscardDraft,
+	draftBlocked,
+	isDiscardingDraft,
 }) {
 	// Local, independent per row (unlike LlmLogsPage's single-open Accordion):
 	// there is no reason comparing two tools' summaries side by side should
@@ -753,6 +797,18 @@ function ToolRow({
 	const [runsExpanded, { toggle: toggleRuns }] = useDisclosure(false);
 	const lineageControls = toolLineageControls(tool, lineageUnavailable);
 	const runHint = lastRunHint(tool.last_run, tool.current_vid);
+	// The sentence saying this tool's draft keeps a revise from being sent, or
+	// null. Every control of the row that sends a revise follows it, and the fix
+	// handler of the page asks again when one is pressed. 跑一次範例, 重新產生,
+	// 丟掉這一版, 刪除 and 放棄 are not revises and do not.
+	const blockedByDraft = reviseBlockedByDraft(tool.draft);
+	// Whether the header offers the one-click fix for the newest run: the backend's
+	// `fixable` (a failure of the version that is current), on a row whose current
+	// version can be revised.
+	const offersLastRunFix =
+		runHint !== null &&
+		tool.last_run.fixable &&
+		lineageControls.showVersionControls;
 
 	return (
 		<Card withBorder padding="md" radius="md">
@@ -798,13 +854,12 @@ function ToolRow({
 								{/* The one-click fix (web-v6 §8.2) for the newest run, offered on
 								    the backend's `fixable` alone: a failure of the version that
 								    is current. Gated like 送出修訂, because it IS a revise. */}
-								{tool.last_run.fixable &&
-								lineageControls.showVersionControls ? (
+								{offersLastRunFix ? (
 									<Button
 										size="compact-xs"
 										variant="light"
 										color="red"
-										disabled={writesBlocked}
+										disabled={writesBlocked || blockedByDraft !== null}
 										loading={isSubmittingRevise}
 										onClick={() => onFix([tool.last_run.id])}
 									>
@@ -870,6 +925,14 @@ function ToolRow({
 					</Group>
 				</Group>
 
+				{/* Why the header's 請 AI 修正 is off, said under the header and not in
+				    its left column: that column shares a row with the 啟用 switch,
+				    and a sentence this long there squeezes the switch's label onto
+				    two lines. */}
+				{offersLastRunFix ? (
+					<ReviseBlockedNote reason={blockedByDraft} />
+				) : null}
+
 				{/* The job card lives on the row, whatever started the job (the AI
 				    總結 form, a fix or 跑一次範例 from 最近執行; the card follows the
 				    job's own kind) and whether or not the panel is open: the panel
@@ -884,6 +947,23 @@ function ToolRow({
 						jobQuery={reviseJobQuery}
 						onFixRuns={lineageControls.showVersionControls ? onFix : null}
 						fixBlocked={writesBlocked}
+						blockedByDraft={blockedByDraft}
+					/>
+				) : null}
+
+				{/* The tool's draft, whatever its state and whether or not the
+				    package still resolves a current version: it is files on disk the
+				    operator may need to fetch, so it is shown for every package that
+				    has one. 放棄 shares the page's slot gate (`draftBlocked`) with
+				    the other writes that take the backend's one slot. */}
+				{tool.draft ? (
+					<DraftNotice
+						toolName={tool.name}
+						draft={tool.draft}
+						currentVid={tool.current_vid}
+						blocked={draftBlocked}
+						discarding={isDiscardingDraft}
+						onDiscard={onDiscardDraft}
 					/>
 				) : null}
 
@@ -960,6 +1040,7 @@ function ToolRow({
 								onRegenerate={onRegenerate}
 								reviseMutation={reviseMutation}
 								isSubmittingRevise={isSubmittingRevise}
+								blockedByDraft={blockedByDraft}
 							/>
 						</Collapse>
 					</div>
@@ -986,6 +1067,7 @@ function ToolRow({
 							expanded={runsExpanded}
 							onFix={lineageControls.showVersionControls ? onFix : null}
 							fixBlocked={writesBlocked}
+							blockedByDraft={blockedByDraft}
 							isSubmittingFix={isSubmittingRevise}
 							onCheck={lineageControls.showVersionControls ? onCheck : null}
 							isSubmittingCheck={isSubmittingCheck}
@@ -1232,6 +1314,39 @@ function InstalledToolsPanel({
 		},
 	});
 
+	// 放棄 on a tool's draft: the draft the operator confirmed on, discarded whole.
+	// The request names it by id and generation (or by token, for an unusable one),
+	// so a draft that changed since is refused rather than discarded unseen.
+	// Which refusal re-reads the list, and what to tell the operator, is decided
+	// by draftDiscardFailure; every other error is an ordinary failed tool write.
+	const discardDraftMutation = useMutation({
+		mutationFn: ({ name, draft }) =>
+			apiDelete(buildDraftDiscardRequest({ name, draft }).path),
+		onSuccess: async (result, variables) => {
+			notifications.show(draftDiscardNotification(variables.name, result));
+			await queryClient.invalidateQueries({ queryKey: ["tools"], exact: true });
+		},
+		onError: (mutationError, variables) => {
+			const failure = draftDiscardFailure(mutationError);
+			if (failure === null) {
+				notifications.show({
+					color: "red",
+					title: "無法放棄草稿",
+					message: toolErrorMessage(mutationError, "無法放棄草稿"),
+				});
+				revalidateAfterSummaryError(mutationError, variables.name);
+				return;
+			}
+			if (failure.refresh) {
+				queryClient.invalidateQueries({ queryKey: ["tools"], exact: true });
+			}
+			notifications.show(failure.notification);
+		},
+	});
+
+	// Called from two places: submitRevise (the summary form) and fixTool. Each turns
+	// a tool that has a draft away before it gets here (reviseBlockedByDraft); a new
+	// caller has to do the same, since the backend refuses the request otherwise.
 	const reviseMutation = useMutation({
 		mutationFn: ({ name, currentVid, feedback, runIds }) => {
 			const request = buildReviseRequest({
@@ -1249,10 +1364,14 @@ function InstalledToolsPanel({
 		},
 		onError: (mutationError, variables) => {
 			// env_policy (web-v6 §5.2) is refused before any job exists and its text
-			// names the keys to move: not a version conflict, nothing to refetch.
+			// names the keys to move: not a version conflict, nothing to refetch. A
+			// draft_pending refusal is shown the same way, and its reaction (read the
+			// list again, so the row shows the draft the message talks about) is
+			// taken too.
 			const refusal = reviseRefusalNotification(mutationError);
 			if (refusal !== null) {
 				notifications.show(refusal);
+				reactToVersionWriteConflict(mutationError, variables.jobAttributionKey);
 				return;
 			}
 			const reaction = reactToVersionWriteConflict(
@@ -1490,7 +1609,12 @@ function InstalledToolsPanel({
 	// before any job id anywhere existed.
 	const ownBusy = ownSummaryBusy({
 		regeneratePending: regenerateMutation.isPending,
-		revisePending: reviseMutation.isPending || checkMutation.isPending,
+		// A discard of a draft holds the same backend slot for the length of its
+		// request, so it gates the other writes like a submit does.
+		revisePending:
+			reviseMutation.isPending ||
+			checkMutation.isPending ||
+			discardDraftMutation.isPending,
 		reviseJobActive: reviseJobActive || linkedJobActive,
 	});
 	const summaryBusy = ownBusy || externalBusy;
@@ -1561,8 +1685,12 @@ function InstalledToolsPanel({
 	// -- the same mutation, single-flight gate and job card as 送出修訂, with the
 	// gate re-checked here like the other AI writes. `feedback` is set only by
 	// 加上說明….
+	//
+	// The backend refuses a revise of a tool that has a draft. The controls that
+	// call this are off for such a tool, and it asks again here -- on the row it
+	// was given, the list as of this render -- because a rendering is not a gate.
 	const fixTool = (tool, runIds, feedback = "") => {
-		if (versionWritesBlocked) {
+		if (versionWritesBlocked || reviseBlockedByDraft(tool.draft) !== null) {
 			return;
 		}
 		reviseMutation.mutate(
@@ -1603,7 +1731,12 @@ function InstalledToolsPanel({
 			(candidate) => candidate.name === name && candidate.current_vid === vid,
 		);
 		if (!tool || vid == null) {
-			return { onFixRuns: null, onDiscardVersion: null, fixBlocked: false };
+			return {
+				onFixRuns: null,
+				onDiscardVersion: null,
+				fixBlocked: false,
+				blockedByDraft: null,
+			};
 		}
 		const identity = toolIdentityConsumers(tool.name, tool.current_vid);
 		const controls = toolLineageControls(
@@ -1613,6 +1746,7 @@ function InstalledToolsPanel({
 		return {
 			onFixRuns: (runIds) => fixTool(tool, runIds),
 			fixBlocked: versionWritesBlocked,
+			blockedByDraft: reviseBlockedByDraft(tool.draft),
 			onDiscardVersion:
 				controls.discardAction === "discard-version"
 					? () =>
@@ -1840,6 +1974,20 @@ function InstalledToolsPanel({
 						isSubmittingCheck={
 							checkMutation.isPending &&
 							checkMutation.variables?.name === tool.name
+						}
+						// Re-checked here as well as on the button's `disabled`, like
+						// the other writes that take the slot: a rendering is not a
+						// gate.
+						onDiscardDraft={(draft) => {
+							if (summaryBusy) {
+								return;
+							}
+							discardDraftMutation.mutate({ name: tool.name, draft });
+						}}
+						draftBlocked={summaryBusy}
+						isDiscardingDraft={
+							discardDraftMutation.isPending &&
+							discardDraftMutation.variables?.name === tool.name
 						}
 					/>
 				);

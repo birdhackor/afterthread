@@ -109,11 +109,13 @@ export function buildDiscardRequest({ name, currentVid }) {
 	};
 }
 
-// The revise submit's one refusal whose MESSAGE is the instruction (web-v6
-// §5.2): `env_policy` comes back before any job exists, and its text names the
-// .env/config.env keys the operator has to move. So it gets its own title and
-// stays on screen until dismissed -- the next step is editing a file, and a toast
-// that closes after a few seconds takes the key names with it. Every other
+// The revise submit's refusals whose MESSAGE is the instruction: `env_policy`
+// comes back before any job exists, and its text names the .env/config.env keys the
+// operator has to move; `draft_pending` comes back when the tool has a draft, and
+// its text says to fetch the files from the draft's path and discard the draft on
+// the tool's row. So each gets its own title and stays on screen until dismissed --
+// the next step is editing a file or discarding a draft, and a toast that closes
+// after a few seconds takes the key names, or the instruction, with it. Every other
 // error keeps the generic red notification (null here).
 //
 // The attached run records (web-v6 §8.3) are the other refusal made before any
@@ -121,6 +123,14 @@ export function buildDiscardRequest({ name, currentVid }) {
 // 找不到項目, so the copy is ours) or one of another tool (422, the backend's
 // own words).
 export function reviseRefusalNotification(error) {
+	if (error?.status === 409 && error?.code === "draft_pending") {
+		return {
+			color: "orange",
+			title: "修訂未送出：這個工具有未完成的修正",
+			message: error.message,
+			autoClose: false,
+		};
+	}
 	if (error?.status === 404 && error?.code === "run_not_found") {
 		return {
 			color: "orange",
@@ -150,6 +160,12 @@ export function versionWriteConflictReaction({ status, code } = {}) {
 		return null;
 	}
 	if (code === "version_mismatch") {
+		return "refresh";
+	}
+	// The tool has a draft the list on screen may not show (made by a job this page
+	// did not see end, or from another tab): the list is read again so the row
+	// shows what the refusal talks about.
+	if (code === "draft_pending") {
 		return "refresh";
 	}
 	if (code === "job_busy" || code === "ai_job_in_progress") {

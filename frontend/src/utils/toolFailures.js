@@ -88,6 +88,12 @@ export function fixRefusalMessage(error, toolName) {
 	if (error?.status === 409 && error?.code === "version_mismatch") {
 		return "工具版本剛剛又變了，請到工具頁確認後再試。";
 	}
+	// The backend's own sentence points at "the tool's row", which only the 工具
+	// page has; this page's reader is sent there instead.
+	if (error?.status === 409 && error?.code === "draft_pending") {
+		const tool = toolName ? `工具「${toolName}」` : "這個工具";
+		return `${tool}有一份未完成的修正（草稿），要先處理才能再請 AI 修正。請到工具頁，取回草稿裡需要的檔案，再把草稿放棄。`;
+	}
 	if (error?.status === 404 && error?.code === "run_not_found") {
 		return "這次失敗的執行紀錄已被清除，請到工具頁查看。";
 	}

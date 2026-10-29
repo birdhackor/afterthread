@@ -53,7 +53,7 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
 | `/items/new` | `ItemNewPage` | 手動新增項目的表單頁（沿用 `ItemForm` 元件）。 |
 | `/items/$itemId` | `ItemDetailPage` | 單筆項目詳情：完整欄位、progress 歷史（可追加一筆）、狀態/階段快速修改、`ItemAiActions` 提供的「AI 補齊」（enrich）／「AI 進度更新」（assist-update）兩個操作、刪除。 |
 | `/items/$itemId/edit` | `ItemEditPage` | 手動編輯項目的表單頁（沿用 `ItemForm` 元件）。 |
-| `/tools` | `ToolsPage` | 「已安裝工具」（清單／啟停／刪除，每列可展開讀取／重新產生 AI 總結、提意見送出 AI 修訂、唯讀的「設定」與「最近執行」；列上顯示最近一次執行的結果，可修的失敗有「請 AI 修正」；`?job=<id>` 接上其他頁面發起的修正工作）與「安裝新工具」（貼 OpenAPI JSON 網址 + 指示，AI 背景建置、輪詢進度）兩個分頁；細節見根目錄 README「KB 工具安裝指南」。 |
+| `/tools` | `ToolsPage` | 「已安裝工具」（清單／啟停／刪除，每列可展開讀取／重新產生 AI 總結、提意見送出 AI 修訂、唯讀的「設定」與「最近執行」；列上顯示最近一次執行的結果，可修的失敗有「請 AI 修正」；`?job=<id>` 接上其他頁面發起的修正工作；修訂沒有發布時，這一輪的成果會存成草稿，該列顯示草稿提示（狀態、輪數、上一輪怎麼結束、需要你動手的事、檔案路徑）並可「放棄」，修訂工作卡片也說明成果存到哪裡）與「安裝新工具」（貼 OpenAPI JSON 網址 + 指示，AI 背景建置、輪詢進度）兩個分頁；細節見根目錄 README「KB 工具安裝指南」。 |
 | `/llm-logs` | `LlmLogsPage` | AI 日誌：呼叫 `GET /api/llm/logs` 列出最近的 LLM 互動，每筆可展開讀取 `GET /api/llm/logs/{id}` 取得的請求/回應內容（每則受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；支援 `?log=<id>` 深連結（`工具` 頁的安裝／修訂結果會連過來）：在清單裡就自動展開該列，不在清單裡（比最近 50 筆更舊）就直接向詳情端點取那一筆、單獨顯示在清單上方，真的被擠出保留區才說明它已經不在；連結若標明自己來自**另一個**後端行程（`?logProcess=`，見下方慣例）則一律不展開，只說明編號已被重新配發。 |
 | （其他） | `NotFoundPage` | 404 fallback（router 的 `defaultNotFoundComponent`）。 |
 
@@ -266,6 +266,46 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   token 的連結維持原本行為**（`工具` 頁總結面板的連結就是這種：後端在**回應當下**
   就把非本行程的 `llm_log_id` 改成 `null`，所以它不需要也無從提出主張；使用者自己
   存下來的網址同理——「說不出來」不可以被講成「我確定它過期了」）。
+- **工具的草稿（沒發布的修訂）**：修訂沒有發布時，後端把這一輪的成果存成一份草稿
+  （格式與狀態見 `docs/web-v7-design.md`），`GET /api/tools` 的每一列帶 `draft`。前端
+  的判斷全在純函式 `utils/toolDraft.js`，元件只照它畫：
+  - `draftView(draft, { currentVid })` 把草稿轉成畫面：標題、說明句、`buttons`、輪數、
+    上一輪怎麼結束、模型寫的「需要你動手」與總結摘錄、路徑。元件是
+    `components/DraftNotice.jsx`，掛在該列的修訂工作卡片之下。**`buttons` 只會是
+    `["discard"]` 或 `[]`**：處理中（`running`）與發布中（`publishing`）不給按鈕，其餘
+    狀態（可接續、已過期、無法使用、已發布、結果未知）只能放棄。現在沒有接續或發布
+    草稿的 API，所以任何文案都不能叫人按那兩個動作。後端 `ToolDraft.state` 的每個值
+    都要有文案：`toolDraft.test.js` 手抄一份後端的狀態清單，斷言 `KNOWN_DRAFT_STATES`
+    與它相同；後端新增狀態時，要先補這份清單，測試才會要求補文案。
+  - **「無法使用」有兩種形狀**：說明檔讀不出來時，`draft_id`、`generation`、
+    `attempts`、`base_vid`、`last` 都是 null；說明檔讀得出來、檔案目錄卻不見時，這些
+    欄位有值。兩種的 `path` 都是草稿目錄，`draftView` 兩種都讀得了。
+  - **放棄的請求**（`buildDraftDiscardRequest`）：可讀的草稿帶 `draft_id` 與
+    `generation`，無法使用的（兩種形狀都算）帶 `discard_token`，只送其中一種，後端對
+    兩種都帶或都沒帶回 422。確認框記住使用者按下「放棄」當下看到的那一份草稿，確認時
+    送的就是那一份；其間若換成別份，後端回 `draft_changed`（`draftDiscardFailure`：
+    重讀清單並說明），不會刪到沒看過的草稿。`draft_not_found` 重讀清單，`job_busy`
+    請稍後再試；放棄成功而有殘留（`residual_path`）時，通知會說殘留在哪
+    （`draftDiscardNotification`）。放棄的請求佔用後端的全域名額，所以它的 pending
+    併入 `ownSummaryBusy`，和其他寫入一起停用。
+  - **工作卡片**：`components/ReviseDraftResult.jsx` 依 `jobDraftView` 說這一輪的
+    成果去了哪——「進度已保存（第 N 輪）」、「未能保存（原因）」、發布前保存失敗而發布
+    也失敗時的「成果留在 <路徑>，未能存成草稿」，以及已發布的修訂沒能刪掉草稿的說明
+    （已發布的修訂不說「進度已保存」）。它和 `ReviseStopNotice`（說這一輪為何停止）
+    各管一件事，分開。
+  - 上一輪的停止原因沿用 `utils/toolJobStop.js` 的詞彙（`toolJobStopReason`）；草稿
+    沒有保存工具回合數，所以句子不帶「用了 N／M 次」。
+  - **`draft_pending`**（有草稿的工具送出修訂）：工具頁用 `reviseRefusalNotification`
+    的通知（訊息本身就是指示，不自動關閉），並依 `versionWriteConflictReaction` 重讀
+    清單，讓該列顯示出訊息說的草稿；其他頁面（`ToolFailureNotice`）用
+    `fixRefusalMessage` 說明並請使用者到工具頁。
+  - **有草稿時，送出修訂的控制項停用並在旁邊說明原因**：該列的 `draft` 不是 null 就
+    停用（不分狀態，`draft_id` 是 null 的「無法使用」也算），判準與原因句只在
+    `utils/toolDraft.js` 的 `reviseBlockedByDraft(draft)`，元件
+    （`components/ReviseBlockedNote.jsx`）只畫它的回答，送出的 handler 在按下時也再查
+    一次；跑一次範例、重新產生、丟掉這一版、刪除與「放棄」不是修訂，不停用。
+  - 路徑旁的「複製路徑」靠瀏覽器的剪貼簿，只有 https 或 localhost 才開放；開不了時
+    會說明，路徑區塊點一下就全選，仍可手動複製。
 - **沒有 jsdom ⇒ 寫錯的 prop 名稱沒有任何閘門擋得住**：`pnpm lint`（Biome）不做
   型別檢查、`pnpm build`（Vite）只轉譯不檢型別、`pnpm test`（vitest）在 node 環境
   下完全不 render 元件。一個拼錯的 Mantine prop 是合法 JS／合法 JSX，會被靜默

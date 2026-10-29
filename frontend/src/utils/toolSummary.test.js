@@ -207,6 +207,7 @@ describe("versionWriteConflictReaction", () => {
 		["job_busy", "retry"],
 		["ai_job_in_progress", "retry"],
 		["lineage_unavailable", "delete-tool"],
+		["draft_pending", "refresh"],
 	])("maps %s to its distinct reaction", (code, reaction) => {
 		expect(versionWriteConflictReaction({ status: 409, code })).toBe(reaction);
 	});
@@ -560,6 +561,32 @@ describe("reviseRefusalNotification", () => {
 		).toBeNull();
 		expect(reviseRefusalNotification({ status: 404 })).toBeNull();
 		expect(reviseRefusalNotification(undefined)).toBeNull();
+	});
+
+	it("keeps a draft_pending refusal on screen with the backend's instruction", () => {
+		const message =
+			"這個工具有一份未完成的修正（草稿）。需要裡面的檔案就先到草稿路徑取回，然後在工具列放棄它，才能送出新的修正。";
+		expect(
+			reviseRefusalNotification({
+				status: 409,
+				code: "draft_pending",
+				message,
+			}),
+		).toEqual({
+			color: "orange",
+			title: "修訂未送出：這個工具有未完成的修正",
+			message,
+			autoClose: false,
+		});
+	});
+
+	it("takes a draft_pending refusal by its code, not by its status alone", () => {
+		expect(
+			reviseRefusalNotification({ status: 409, code: "job_busy" }),
+		).toBeNull();
+		expect(
+			reviseRefusalNotification({ status: 400, code: "draft_pending" }),
+		).toBeNull();
 	});
 });
 
