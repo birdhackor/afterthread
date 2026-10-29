@@ -10212,6 +10212,173 @@ def test_a_publish_that_fails_after_its_save_failed_keeps_the_work_where_it_is(
     assert _resolved_version(_package_path(pkg)) == pkg
 
 
+def test_a_publish_whose_origin_text_cannot_be_masked_fails_and_names_the_kept_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The known secrets cannot be read from the save before the publish on: the
+    save keeps nothing, and the text the new version's origin would carry cannot
+    be masked. That is a publish that failed like any other -- nothing published,
+    the staging workspace left where it is, and the job naming it."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    real_save = tool_builder._save_round_draft
+
+    def unreadable() -> frozenset[str]:
+        raise OSError("the tools directory cannot be read")
+
+    def save_then_lose_the_secrets(
+        context: Any, outcome: tool_drafts.RoundOutcome | None, error: str | None
+    ) -> tool_drafts.SaveResult:
+        if outcome is None:  # the save a publish follows
+            monkeypatch.setattr(tools, "known_secret_values", unreadable)
+        return real_save(context, outcome, error)
+
+    monkeypatch.setattr(tool_builder, "_save_round_draft", save_then_lose_the_secrets)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+        outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.not_ready is False
+    assert outcome.error == tool_builder._ERROR_ORIGIN_MASK.format(kind="OSError")
+    [session] = _session_roots(tmp_path)
+    assert outcome.draft == {
+        "saved": False,
+        "draft_id": None,
+        "generation": None,
+        "attempts": None,
+        "reason": tool_drafts.REASON_SCAN_FAILED.format(reason="OSError"),
+        "retained_path": str(session / "build"),
+    }
+    assert (session / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert any(str(session) in record.getMessage() for record in caplog.records)
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    assert _resolved_version(_package_path(pkg)) == pkg
+
+
+def _publish_raises(*args: Any) -> Any:
+    raise RuntimeError("an unforeseen failure inside the publish")
+
+
+def test_an_exception_in_the_publish_keeps_the_workspace_no_draft_holds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The save before the publish kept nothing, and the publish ends in an
+    exception no outcome describes: the staging workspace is then the only copy of
+    the work, so it stays where it is and the backend log names it."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _install_settings(monkeypatch, tools_dir=str(_package_path(pkg).parent), tool_draft_max_files=1)
+    monkeypatch.setattr(tool_builder, "_publish_revised_version", _publish_raises)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    with (
+        caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"),
+        pytest.raises(RuntimeError),
+    ):
+        asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    [session] = _session_roots(tmp_path)
+    assert (session / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert any(str(session) in record.getMessage() for record in caplog.records)
+    assert not tool_drafts.has_draft(_package_root(pkg))
+
+
+def test_an_exception_in_the_publish_after_its_draft_was_saved_removes_the_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The save before the publish kept the work, so an exception in the publish
+    loses nothing by the cleanup: the draft holds the round's files, and the
+    staging workspace is removed as after any other end of a revise."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    monkeypatch.setattr(tool_builder, "_publish_revised_version", _publish_raises)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert (_draft_files(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert _session_roots(tmp_path) == []
+
+
+def _revise_cancelled_while_held(monkeypatch: pytest.MonkeyPatch, step: str) -> None:
+    """Run one revise and cancel it while ``step`` -- ``"save"``, the save before
+    its publish, or ``"publish"`` -- is held on its worker, then let that worker
+    return. The held step changes nothing on disk and hands back a failure."""
+    entered = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+
+    def held(result: Any) -> Any:
+        entered.set()
+        release.wait(10)
+        returned.set()
+        return result
+
+    real_save = tool_builder._save_round_draft
+
+    def save(
+        context: Any, outcome: tool_drafts.RoundOutcome | None, error: str | None
+    ) -> tool_drafts.SaveResult:
+        if outcome is None and step == "save":
+            return held(tool_drafts.SaveResult(worth_saving=True, reason="held"))
+        return real_save(context, outcome, error)
+
+    def publish(build_root: tools.BuildRoot, *args: Any) -> Any:
+        return held((None, "held", build_root.path))
+
+    monkeypatch.setattr(tool_builder, "_save_round_draft", save)
+    if step == "publish":
+        monkeypatch.setattr(tool_builder, "_publish_revised_version", publish)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    async def scenario() -> None:
+        task = asyncio.create_task(_run_revise("kbsearch", "加上分頁"))
+        for _ in range(1000):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert entered.is_set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        assert await asyncio.to_thread(returned.wait, 10)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("during", ["save", "publish"])
+def test_a_revise_cancelled_before_its_publish_is_handled_keeps_the_workspace_no_draft_holds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, during: str
+) -> None:
+    """Cancelled while the save before the publish, or the publish itself, runs
+    on its worker: the worker goes on, and no draft is known to hold the work, so
+    the staging workspace stays where it is."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _install_settings(monkeypatch, tools_dir=str(_package_path(pkg).parent), tool_draft_max_files=1)
+
+    _revise_cancelled_while_held(monkeypatch, during)
+
+    [session] = _session_roots(tmp_path)
+    assert (session / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert not tool_drafts.has_draft(_package_root(pkg))
+
+
+def test_a_publish_still_running_when_its_revise_is_cancelled_keeps_the_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The draft holds the work, and the revise is cancelled while its publish
+    runs on a worker. That worker goes on -- it may be moving the staging into
+    ``versions/`` -- so the staging is not removed beside it."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+
+    _revise_cancelled_while_held(monkeypatch, "publish")
+
+    assert (_draft_files(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    [session] = _session_roots(tmp_path)
+    assert (session / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+
+
 def test_deleting_the_tool_while_its_draft_is_saved_is_refused(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -10438,6 +10605,70 @@ def test_router_discards_only_the_draft_the_caller_names(
     assert again.json()["detail"]["code"] == "draft_not_found"
     [row] = client.get("/api/tools").json()["tools"]
     assert row["draft"] is None
+
+
+def test_router_shows_and_discards_no_draft_through_another_tool_s_metadata_directory(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One tool's ``.afterthread.meta`` is a link to another tool's, which has a
+    draft. The linked tool has no draft of its own: its row shows none, and a
+    discard addressed to it with the token the other tool's row gives is 404
+    ``draft_not_found``, the other tool's draft left exactly as it was."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _save_an_unfinished_round(monkeypatch, pkg)
+    other = _package_path(_seed_package(monkeypatch, tmp_path, name="kbother"))
+    shutil.rmtree(other / tools._META_DIRNAME)
+    os.symlink(_package_path(pkg) / tools._META_DIRNAME, other / tools._META_DIRNAME)
+    before = tool_drafts.tree_digest(_draft_dir(pkg))
+
+    rows = {row["name"]: row for row in client.get("/api/tools").json()["tools"]}
+    refused = client.delete(
+        "/api/tools/kbother/draft",
+        params={"discard_token": rows["kbsearch"]["draft"]["discard_token"]},
+    )
+
+    assert rows["kbother"]["draft"] is None
+    assert rows["kbsearch"]["draft"]["state"] == "open"
+    assert refused.status_code == 404
+    assert refused.json()["detail"]["code"] == "draft_not_found"
+    assert tool_drafts.same_tree(before, tool_drafts.tree_digest(_draft_dir(pkg)))
+
+
+def test_router_answers_a_discard_that_cannot_see_the_draft_gone_as_not_done(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``draft/`` cannot be looked at or renamed: the list shows it unusable, and
+    a discard by the token it gives cannot see the draft gone. The answer is not a
+    discard that went through -- 500 ``draft_not_removed``, naming ``draft/`` --
+    and the draft is still there."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _save_an_unfinished_round(monkeypatch, pkg)
+    draft = _draft_dir(pkg)
+    real_lstat, real_rename = os.lstat, os.rename
+
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if os.fspath(path) == os.fspath(draft):
+            raise PermissionError(errno.EACCES, "Permission denied", os.fspath(path))
+        return real_lstat(path, *args, **kwargs)
+
+    def rename(source: Any, destination: Any, *args: Any, **kwargs: Any) -> None:
+        if os.fspath(source) == os.fspath(draft):
+            raise PermissionError(errno.EACCES, "Permission denied", os.fspath(source))
+        real_rename(source, destination, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "lstat", lstat)
+        patch.setattr(os, "rename", rename)
+        [row] = client.get("/api/tools").json()["tools"]
+        refused = client.delete(
+            "/api/tools/kbsearch/draft", params={"discard_token": row["draft"]["discard_token"]}
+        )
+
+    assert row["draft"]["state"] == "unusable"
+    assert refused.status_code == 500
+    assert refused.json()["detail"]["code"] == "draft_not_removed"
+    assert str(draft) in refused.json()["detail"]["message"]
+    assert tool_drafts.has_draft(_package_root(pkg))
 
 
 def test_router_discards_an_unusable_draft_by_the_token_the_list_gave(

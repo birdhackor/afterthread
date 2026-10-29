@@ -251,6 +251,9 @@ _ERROR_REVISE_TARGET_REPLACED = "原工具在修訂期間被改動或重新安�
 _ERROR_REVISE_IDENTITY_UNKNOWN = "無法確認原工具的內容（`tool.json` 讀取失敗），修訂已取消。"  # noqa: RUF001
 _ERROR_VERSION_ID_WRITE = "無法為工具建立不重複的版本編號，操作已取消。"  # noqa: RUF001
 _ERROR_ORIGIN_WRITE = "無法寫入工具版本的來源資料，操作已取消。"  # noqa: RUF001
+# A revise's origin text (``_provenance_feedback``) is masked with the known
+# secrets, and that query fails closed; ``{kind}`` is the exception's type name.
+_ERROR_ORIGIN_MASK = "無法遮蔽工具版本來源資料裡的秘密值（{kind}），操作已取消。"  # noqa: RUF001
 _ERROR_CURRENT_WRITE = "無法發布工具的新版本，操作已取消。"  # noqa: RUF001
 _ERROR_DURABILITY = "無法確認工具資料已安全寫入磁碟，操作已取消。"  # noqa: RUF001
 
@@ -3546,6 +3549,28 @@ def _log_result_kept(session_root: Path) -> None:
         )
 
 
+def _log_unsaved_work_kept(session_root: Path) -> None:
+    """Say in the backend log where a revise that stopped before its publish was
+    handled left work no draft is known to hold."""
+    with contextlib.suppress(Exception):
+        _logger.warning(
+            "Builder workspace kept at %s: the revise stopped before the result of "
+            "its publish was handled, and no draft is known to hold its work.",
+            session_root,
+        )
+
+
+def _log_publish_running_kept(session_root: Path) -> None:
+    """Say in the backend log where a revise that stopped while its publish still
+    ran left its staging, which that publish may still be writing."""
+    with contextlib.suppress(Exception):
+        _logger.warning(
+            "Builder workspace kept at %s: the revise stopped while its publish was "
+            "still running, and that publish may still be writing it.",
+            session_root,
+        )
+
+
 async def run_revise(
     name: str,
     feedback: str | None,
@@ -3569,6 +3594,10 @@ async def run_revise(
     outcome; only when the save before a publish failed and the publish failed
     too is the work left where the publish left it, and named on the job: this
     session's staging, which then stays, or a version ``current`` does not name.
+    An exception or a cancellation that ends the revise from the start of that
+    save until the publish's result is handled leaves the staging in place as
+    well, named in the backend log only, while no draft is known to hold work
+    worth keeping or while the publish's worker may still be writing the staging.
     """
     base = tools.tools_dir()
     if base is None:
@@ -3637,6 +3666,29 @@ async def run_revise(
     # Set when a publish failed with its work still in this session's staging and
     # no draft holding it: the workspace then stays where it is.
     keep_workspace = False
+    # Two flags keep the staging in place (``finally``) when an exception or a
+    # cancellation ends the revise between the save before a publish and the
+    # handling of the publish's result:
+    # * ``unsaved_work_pending`` is up from the start of that save until the result
+    #   is handled, unless the save kept the work or found nothing worth keeping:
+    #   the staging may hold the only copy of the work;
+    # * ``publish_running`` is up while the publish's worker may still be writing
+    #   the staging. The await ending with the worker's result or with an
+    #   ``Exception`` lowers it -- the worker has returned, or never began -- and a
+    #   cancellation does not, since the worker goes on without it.
+    # Verified (tests/test_tool_builder.py):
+    # test_an_exception_in_the_publish_keeps_the_workspace_no_draft_holds,
+    # test_a_revise_cancelled_before_its_publish_is_handled_keeps_the_workspace_no_draft_holds,
+    # test_a_publish_still_running_when_its_revise_is_cancelled_keeps_the_workspace,
+    # and, that both are down once a draft holds the work and the worker returned,
+    # test_an_exception_in_the_publish_after_its_draft_was_saved_removes_the_workspace.
+    # Not covered: the path goes to the backend log only, never to the job, which
+    # an exception ends in ``_run_job``'s backstop; work already moved into
+    # ``versions/<vid>`` is only that version, which the log does not name; and
+    # before that save, a cancellation still removes the staging beside whatever
+    # worker of the session is running then.
+    unsaved_work_pending = False
+    publish_running = False
     try:
         copy_error = await run_in_threadpool(
             _copy_package_into_staging, resolution.version_root, build_root
@@ -3877,7 +3929,9 @@ async def run_revise(
         # manifest then marks as being published from. A mark that cannot be
         # written does not stop the publish; it only leaves a crash right after
         # the publish to be read as a stale draft rather than a published one.
+        unsaved_work_pending = True
         kept = await run_in_threadpool(_save_round_draft, round_draft, None, None)
+        unsaved_work_pending = kept.worth_saving and not kept.saved
         drafted: tuple[str, int] | None = None
         draft_line: str | None = None
         if kept.saved and kept.draft_id is not None and kept.generation is not None:
@@ -3890,18 +3944,37 @@ async def run_revise(
             )
             drafted = (kept.draft_id, kept.generation if marked is None else marked)
             draft_line = tool_drafts.provenance_line(kept.draft_id, kept.attempts or 1)
-        origin_feedback = await run_in_threadpool(_provenance_feedback, feedback, runs, draft_line)
-        # The publisher reads immutable provenance from the version whose identity
-        # was captured before the builder session.
-        published, promote_error, content = await run_in_threadpool(
-            _publish_revised_version,
-            build_root,
-            shell_root,
-            package_root,
-            resolution,
-            package_identity,
-            origin_feedback,
-        )
+        published: _PublishedRevision | None = None
+        promote_error: str | None
+        content: Path = build_root.path
+        try:
+            origin_feedback = await run_in_threadpool(
+                _provenance_feedback, feedback, runs, draft_line
+            )
+        except Exception as exc:
+            # The masking fails closed (``tools.redact_known_secrets``): a publish
+            # that failed before it began, the work where the round left it.
+            promote_error = _ERROR_ORIGIN_MASK.format(kind=type(exc).__name__)
+        else:
+            # The publisher reads immutable provenance from the version whose
+            # identity was captured before the builder session.
+            publish_running = True
+            try:
+                published, promote_error, content = await run_in_threadpool(
+                    _publish_revised_version,
+                    build_root,
+                    shell_root,
+                    package_root,
+                    resolution,
+                    package_identity,
+                    origin_feedback,
+                )
+            except Exception:
+                # The worker's own exception, or one before it began: either way
+                # nothing of it writes into the staging any more.
+                publish_running = False
+                raise
+            publish_running = False
         if promote_error is not None:
             failed_draft: dict[str, Any] | None = None
             if drafted is not None:
@@ -3922,6 +3995,7 @@ async def run_revise(
                 # is, and keep it there if that is this session's staging.
                 keep_workspace = tools._is_within(session_root, content)
                 failed_draft = kept.report(retained_path=str(content))
+            unsaved_work_pending = False
             return InstallOutcome(
                 ok=False,
                 tool_name=name,
@@ -3934,6 +4008,7 @@ async def run_revise(
                 **notes,
             )
         assert published is not None
+        unsaved_work_pending = False
         published_draft: dict[str, Any] | None = None
         if drafted is not None:
             removal = await run_in_threadpool(
@@ -3974,15 +4049,22 @@ async def run_revise(
         # values after the temporary registrations are dropped. Cleanup targets
         # the complete session root, including any unused shell -- unless the
         # session's commands could not be confirmed stopped, which keeps it all,
-        # or a failed publish left in it work that no draft holds, which keeps it
+        # or a failed publish left in it work that no draft holds, or the revise
+        # stopped before its publish was handled with no draft known to hold the
+        # work or with the publish's worker still running, any of which keeps it
         # too while the sweep still runs (it never looks inside ``.staging``).
         for value in registered:
             tools.discard_inflight_secret(value)
         if not shells_ended:
             # Kept in place: a command not confirmed stopped may still be using it.
             _log_workspace_kept(session_root)
-        elif keep_workspace:
-            _log_result_kept(session_root)
+        elif keep_workspace or unsaved_work_pending or publish_running:
+            if keep_workspace:
+                _log_result_kept(session_root)
+            elif publish_running:
+                _log_publish_running_kept(session_root)
+            else:
+                _log_unsaved_work_kept(session_root)
             await run_in_threadpool(_sweep_logged, base)
         else:
             await run_in_threadpool(_cleanup_staging, session_root, base)

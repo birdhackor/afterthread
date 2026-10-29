@@ -174,6 +174,12 @@ _DRAFT_CHANGED_CODE = "draft_changed"
 _DRAFT_CHANGED_MESSAGE = "草稿已經變更，請重新整理後再確認要不要放棄"  # noqa: RUF001
 _DRAFT_NOT_FOUND_CODE = "draft_not_found"
 _DRAFT_NOT_FOUND_MESSAGE = "這個工具沒有未完成的修正"
+# A discard after which ``draft/`` is not seen gone: the draft may still be there,
+# so this is not an answer that it was discarded. ``{path}`` is ``draft/``.
+_DRAFT_NOT_REMOVED_CODE = "draft_not_removed"
+_DRAFT_NOT_REMOVED_MESSAGE = (
+    "沒能確認草稿已刪除，它可能仍在：{path}。請檢查權限與檔案系統狀態後再放棄一次，或自行刪除。"  # noqa: RUF001
+)
 
 
 def _tools_lock_unavailable(exc: tools_service.ToolsLockUnavailableError) -> HTTPException:
@@ -270,6 +276,40 @@ _TOOLS_LOCK_UNAVAILABLE_RESPONSE: dict[int | str, dict[str, Any]] = {
                             "recreate it."
                         ),
                     }
+                }
+            }
+        },
+    }
+}
+
+
+# The discard route's 500: the lock above, or a draft not seen gone after it.
+_DRAFT_DISCARD_ERROR_RESPONSE: dict[int | str, dict[str, Any]] = {
+    500: {
+        "description": (
+            "The persistent tools lock path cannot be opened or locked, or the draft "
+            "is not seen gone after the discard"
+        ),
+        "content": {
+            "application/json": {
+                "examples": {
+                    _TOOLS_LOCK_UNAVAILABLE_CODE: {
+                        "summary": "The persistent tools lock path cannot be opened or locked",
+                        "value": _TOOLS_LOCK_UNAVAILABLE_RESPONSE[500]["content"][
+                            "application/json"
+                        ]["example"],
+                    },
+                    _DRAFT_NOT_REMOVED_CODE: {
+                        "summary": "The draft is not seen gone after the discard",
+                        "value": {
+                            "detail": {
+                                "code": _DRAFT_NOT_REMOVED_CODE,
+                                "message": _DRAFT_NOT_REMOVED_MESSAGE.format(
+                                    path="/path/to/tools/<name>/.afterthread.meta/draft"
+                                ),
+                            }
+                        },
+                    },
                 }
             }
         },
@@ -528,7 +568,7 @@ async def discard_tool_version(name: ToolName, vid: ToolVersionId) -> ToolDiscar
             },
         },
         **_DRAFT_DISCARD_CONFLICT_RESPONSE,
-        **_TOOLS_LOCK_UNAVAILABLE_RESPONSE,
+        **_DRAFT_DISCARD_ERROR_RESPONSE,
     },
 )
 async def discard_tool_draft(
@@ -549,7 +589,11 @@ async def discard_tool_draft(
     It takes the global slot first (409 ``job_busy``), which keeps every job, and
     so every save and the sweep, away while it runs. The draft is renamed aside,
     then removed; ``residual_path`` names what could not be removed, which the
-    sweep at the end of a later install or revise retries.
+    sweep at the end of a later install or revise retries. A ``draft/`` that is
+    not seen gone afterwards -- the rename refused and the removal in place
+    incomplete, or ``draft/`` that cannot be looked at -- is a 500
+    ``draft_not_removed`` naming it: the draft may still be there, so the answer
+    is not that it was discarded.
 
     Declared BEFORE the job poll, which must stay last (see the comment there):
     a tool may be named ``jobs``.
@@ -594,6 +638,15 @@ async def discard_tool_draft(
         raise HTTPException(
             status_code=409,
             detail={"code": _DRAFT_CHANGED_CODE, "message": _DRAFT_CHANGED_MESSAGE},
+        )
+    if not outcome.removed:
+        left = tools_service._utf8_safe(str(outcome.residual_path))
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": _DRAFT_NOT_REMOVED_CODE,
+                "message": _DRAFT_NOT_REMOVED_MESSAGE.format(path=left),
+            },
         )
     residual = outcome.residual_path
     return ToolDraftDiscardResponse(
