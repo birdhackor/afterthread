@@ -8037,6 +8037,61 @@ def test_run_revise_masks_the_notes_off_the_event_loop(
         assert loop_thread not in threads, note
 
 
+def test_run_revise_env_strip_refusal_still_carries_what_the_model_said_masked_on_a_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The session returned an answer, then the builder ``.env`` could not be
+    stripped: the outcome reports that refusal AND carries the model's summary and
+    both notes, each masked again by ``run_revise`` on a worker -- the model's raw
+    text reaches it here, and the secret it repeats is the package's own key."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / ".env").write_text(f"KB_API_KEY={_NOTE_SECRET}\n", encoding="utf-8")
+    loop_thread = threading.current_thread()
+    masked_on: dict[str, list[threading.Thread]] = {}
+    real_redact = tools.redact_known_secrets
+
+    def redact_spy(text: str) -> str:
+        masked_on.setdefault(text, []).append(threading.current_thread())
+        return real_redact(text)
+
+    monkeypatch.setattr(tools, "redact_known_secrets", redact_spy)
+    monkeypatch.setattr(
+        tool_builder,
+        "_strip_builder_env",
+        lambda build_root, base: ((), tool_builder._ERROR_BUILDER_ENV_STRIP),
+    )
+    said = {
+        "summary": f"分頁改好了，用 {_NOTE_SECRET} 測過",  # noqa: RUF001
+        "handoff": f"run.py 的 page 參數已加上，用 {_NOTE_SECRET} 測過第一頁",  # noqa: RUF001
+        "operator_action": f"在 config.env 加上 PAGE_SIZE=50（金鑰 {_NOTE_SECRET} 不要改）",  # noqa: RUF001
+    }
+    _fake_revise_session(
+        monkeypatch,
+        measure=lambda stats: None,
+        result=tool_builder.ReviseResult.model_construct(
+            tool_name="kbsearch",
+            ready=True,
+            summary=said["summary"],
+            handoff=said["handoff"],
+            operator_action=said["operator_action"],
+        ),
+    )
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_BUILDER_ENV_STRIP
+    carried = {
+        "summary": outcome.summary,
+        "handoff": outcome.handoff,
+        "operator_action": outcome.operator_action,
+    }
+    for field_name, raw in said.items():
+        assert carried[field_name] == raw.replace(_NOTE_SECRET, tools._REDACTION_MARKER), field_name
+        assert masked_on.get(raw), field_name
+        assert loop_thread not in masked_on[raw], field_name
+
+
 def test_the_revise_job_reports_the_measured_stop_and_the_notes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, client: TestClient
 ) -> None:

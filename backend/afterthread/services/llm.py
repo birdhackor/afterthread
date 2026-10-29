@@ -359,8 +359,12 @@ class StructuredRunStats:
     * ``deadline`` -- the interaction's own wall-clock deadline fired;
     * ``not_configured`` -- no usable endpoint.
 
-    ``completions`` counts the requests that returned a completion, so a call
-    whose first request failed reports 0. Pass a fresh instance per call.
+    ``tool_rounds_used`` counts the tool replies the loop accepted -- past its
+    count and size checks -- the round still in progress when the call ended
+    included: a deadline that fires while the first round's tools run reports 1,
+    and a reply those checks refuse is no round at all. ``completions`` counts
+    the requests that returned a completion, so a call whose first request failed
+    reports 0. Pass a fresh instance per call.
     Measuring never steers the call: with or without one, the same replies
     produce the same requests, the same handler calls, and the same result or
     exception.
@@ -1326,6 +1330,11 @@ async def _run_structured[ModelT: BaseModel](
                         # attempt. Aliasing is therefore safe, and the next round's
                         # begin_attempt copies the grown list afresh.
                         messages.append(_assistant_tool_call_message(content, tool_calls))
+                        # The reply is accepted, so its round counts as used from
+                        # here on: a deadline that fires while its tools run still
+                        # reports it. A measurement only -- ``tool_rounds_used``
+                        # itself moves once the round's tools are done, below.
+                        stats.tool_rounds_used = tool_rounds_used + 1
                         for index, tool_call in enumerate(tool_calls):
                             # Execute only the first _MAX_TOOL_CALLS_PER_REPLY calls;
                             # the rest are rejected WITHOUT execution but still get a
@@ -1374,7 +1383,6 @@ async def _run_structured[ModelT: BaseModel](
                             # the round responsive to the deadline regardless.
                             await asyncio.sleep(0)
                         tool_rounds_used += 1
-                        stats.tool_rounds_used = tool_rounds_used
                         # If that spent the last permitted round, append the
                         # finalize nudge NOW so the next (tools-free) create() is
                         # explicitly told to stop calling tools and answer.

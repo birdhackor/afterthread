@@ -226,7 +226,9 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `OPENAI_TIMEOUT_SECONDS` 擲出的 `APITimeoutError`，或請求本身在整場期限觸發前擲出的
   builtin `TimeoutError`）、`deadline`（整場時間 `TOOL_INSTALL_TIMEOUT_SECONDS` 用完）、
   `not_configured`，正常回答為 `null`。兩者可以同時成立，例如回合用完迫使收尾、
-  收尾那次又回了空內容。`rounds_used`／`max_rounds` 是用掉與給定的工具回合數。
+  收尾那次又回了空內容。`rounds_used` 是用掉的工具回合數：通過數量與大小檢查、被接受的工具回覆
+  才算一回合，session 結束時正在跑的那一回合也算（例如期限在第一回合的工具執行中觸發，記 1）；
+  `max_rounds` 是給定的回合數。
   `handoff`（至多 4000 字，給接手者的交接筆記）與 `operator_action`（至多 1000 字，需要
   操作者在工作區外動手的事）是模型自己寫的，先遮蔽再截斷，只供顯示與交接，後端不據以做
   任何判斷。這六個欄位在安裝、跑範例、session 開始前就結束的修訂，以及因未預期錯誤

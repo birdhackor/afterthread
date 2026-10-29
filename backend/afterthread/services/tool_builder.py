@@ -3156,15 +3156,50 @@ async def run_revise(
             "rounds_used": stats.tool_rounds_used,
             "max_rounds": settings.tool_install_max_rounds,
         }
+        # What the model handed back -- its summary and the two notes -- masked
+        # BEFORE the first return below, so every outcome returned after a session
+        # that produced an answer carries the model's own words, the .env strip
+        # refusal's included. The LLM-failure outcome has no answer to carry.
+        #
+        # The SAME single choke point run_install uses, and for the same reason:
+        # the finally below discards the in-flight secrets before this function
+        # returns, so redacting at job-update time would be a no-op that leaks. On a
+        # worker, for the same reason the prompt builds above are: this is the
+        # identical tools-directory scan, just after the LLM call instead of before
+        # it. Every ``redact_known_secrets`` call this function makes is off the
+        # loop, the one in the rename refusal below included. The notes ride along
+        # for display only -- nothing below branches on them.
+        summary: str | None = None
+        notes: dict[str, Any] = {}
+        if result is not None:
+            summary = (
+                await run_in_threadpool(tools.redact_known_secrets, result.summary)
+                if result.summary
+                else None
+            )
+            notes = {
+                "handoff": (
+                    await run_in_threadpool(tools.redact_known_secrets, result.handoff)
+                    if result.handoff
+                    else None
+                ),
+                "operator_action": (
+                    await run_in_threadpool(tools.redact_known_secrets, result.operator_action)
+                    if result.operator_action
+                    else None
+                ),
+            }
         env_keys, env_strip_error = await run_in_threadpool(_strip_builder_env, build_root, base)
         if env_strip_error is not None:
             return InstallOutcome(
                 ok=False,
                 tool_name=name,
+                summary=summary,
                 error=env_strip_error,
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
                 **facts,
+                **notes,
             )
         if llm_error is not None:
             return InstallOutcome(
@@ -3177,33 +3212,6 @@ async def run_revise(
             )
         assert result is not None  # exactly one of result/llm_error is set above
 
-        # The SAME single choke point run_install uses, and for the same reason:
-        # the finally below discards the in-flight secrets before this function
-        # returns, so redacting at job-update time would be a no-op that leaks.
-        # On a WORKER for the same reason the prompt build above is (R1-3) -- this
-        # is the identical tools-directory scan, just after the LLM call instead of
-        # before it. Every ``redact_known_secrets`` call this function makes is off
-        # the loop, the one in the rename refusal below included.
-        summary = (
-            await run_in_threadpool(tools.redact_known_secrets, result.summary)
-            if result.summary
-            else None
-        )
-        # The two notes take the summary's path for the summary's reason: masked
-        # again here, on a worker, before the in-flight secrets are dropped. They
-        # ride along for display only -- nothing below branches on them.
-        notes: dict[str, Any] = {
-            "handoff": (
-                await run_in_threadpool(tools.redact_known_secrets, result.handoff)
-                if result.handoff
-                else None
-            ),
-            "operator_action": (
-                await run_in_threadpool(tools.redact_known_secrets, result.operator_action)
-                if result.operator_action
-                else None
-            ),
-        }
         # ``tool_name`` on these outcomes is the package the user addressed, never
         # the model's answer: the job's tool_name is what the FE links to.
         if not result.ready:

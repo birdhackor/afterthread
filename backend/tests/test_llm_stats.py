@@ -26,6 +26,7 @@ from afterthread.schemas import ToolJobStatus
 from afterthread.services import llm, llm_log, token_budget
 from afterthread.services.llm import (
     _MAX_TOOL_CALLS_ACCEPTED,
+    _MAX_TOOL_CALLS_TOTAL_BYTES,
     _TOOL_BUDGET_EXHAUSTED,
     _UPSTREAM_REASON,
     LLMNotConfiguredError,
@@ -67,6 +68,20 @@ def _tool_round(calls: int = 1) -> SimpleNamespace:
     return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
 
+def _oversized_tool_round() -> SimpleNamespace:
+    """A reply of ONE ``echo`` call -- well under the count bound -- whose arguments
+    alone pass the size bound."""
+    tool_call = SimpleNamespace(
+        id="call_0",
+        type="function",
+        function=SimpleNamespace(
+            name="echo", arguments=json.dumps({"pad": "x" * _MAX_TOOL_CALLS_TOTAL_BYTES})
+        ),
+    )
+    message = SimpleNamespace(content=None, tool_calls=[tool_call])
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
 def _answer(content: str | None) -> SimpleNamespace:
     message = SimpleNamespace(content=content, tool_calls=None)
     return SimpleNamespace(choices=[SimpleNamespace(message=message)])
@@ -96,15 +111,20 @@ class _ScriptedCompletions:
 
 @dataclass
 class _Scenario:
-    """One scripted call: the replies, plus whatever settings or arguments make
-    the path under test reachable. ``steps`` is a factory, so every run gets fresh
-    reply and exception objects."""
+    """One scripted call: the replies, plus whatever settings, arguments or timings
+    make the path under test reachable. ``steps`` is a factory, so every run gets
+    fresh reply and exception objects. ``delay`` holds every request,
+    ``tool_delay`` every run of the tool; ``deadline_floor`` replaces the time
+    that must be left for the loop to start a tool at all, so a short deadline can
+    still fire while a tool runs."""
 
     steps: Callable[[], list[Any]]
     settings: dict[str, Any] = field(default_factory=dict)
     kwargs: dict[str, Any] = field(default_factory=dict)
     delay: float = 0.0
     tool_output: str = "ok"
+    tool_delay: float = 0.0
+    deadline_floor: float | None = None
 
 
 def _request(method: str = "POST") -> httpx.Request:
@@ -131,7 +151,14 @@ _SCENARIOS: dict[str, _Scenario] = {
     "sdk-request-timeout": _Scenario(lambda: [openai.APITimeoutError(request=_request())]),
     "request-timeout": _Scenario(lambda: [TimeoutError("the request timed out")]),
     "deadline": _Scenario(lambda: [_answer(_ANSWER)], kwargs={"timeout_seconds": 0.05}, delay=1.0),
+    "deadline-inside-a-tool-round": _Scenario(
+        lambda: [_tool_round(), _answer(_ANSWER)],
+        kwargs={"timeout_seconds": 0.1},
+        tool_delay=1.0,
+        deadline_floor=0.0,
+    ),
     "flood": _Scenario(lambda: [_tool_round(_MAX_TOOL_CALLS_ACCEPTED + 1)]),
+    "oversized": _Scenario(lambda: [_oversized_tool_round()]),
     "not-configured": _Scenario(lambda: [_answer(_ANSWER)], settings={"openai_base_url": ""}),
 }
 
@@ -163,10 +190,14 @@ def _observe(
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
     monkeypatch.setattr("afterthread.services.llm.get_settings", lambda: settings)
     monkeypatch.setattr("afterthread.services.llm._get_client", lambda: client)
+    if scenario.deadline_floor is not None:
+        monkeypatch.setattr(llm, "_TOOL_DEADLINE_FLOOR_SECONDS", scenario.deadline_floor)
     handler_calls: list[dict[str, Any]] = []
 
     async def echo(args: dict[str, Any]) -> str:
         handler_calls.append(args)
+        if scenario.tool_delay:
+            await asyncio.sleep(scenario.tool_delay)
         return scenario.tool_output
 
     tool = LlmTool(
@@ -215,7 +246,7 @@ def test_stats_never_changes_what_the_call_does(monkeypatch: pytest.MonkeyPatch,
     """The same replies, with and without a stats object: the same requests (the
     exact messages and tools sent each time), the same tool-handler calls, the same
     result or exception (type, message, severed cause), and the same AI log
-    record. Every scenario the classification tests below rely on is here."""
+    record."""
     scenario = _SCENARIOS[name]
     plain = _observe(monkeypatch, scenario, stats=None)
     measured = _observe(monkeypatch, scenario, stats=StructuredRunStats())
@@ -360,6 +391,39 @@ def test_stats_only_the_sdk_timeout_is_a_request_timeout_not_its_parent_connecti
         f"APIConnectionError: {_UPSTREAM_REASON}",
     )
     assert refused.failure == "upstream"
+
+
+def test_stats_a_tool_reply_refused_at_entry_is_no_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool reply the loop refuses on arrival -- too many calls, or too many
+    bytes -- was received but never accepted: it is a completion, not a round, and
+    no tool ran."""
+    for name, prefix in (("flood", "tool_calls flood"), ("oversized", "tool_calls oversized")):
+        stats, observed = _run(monkeypatch, name)
+
+        assert observed.outcome[1] == "LLMUpstreamError", name
+        assert observed.outcome[2].startswith(prefix), name
+        assert observed.handler_calls == [], name
+        assert stats == StructuredRunStats(
+            tool_rounds_used=0, completions=1, finalized_by=None, failure="upstream"
+        ), name
+
+
+def test_stats_deadline_inside_a_tool_round_counts_that_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deadline fires while the first round's tool is still running: that
+    round was accepted, so it is counted. The tool started and the next request
+    was never sent, so the deadline did fire inside the round."""
+    stats, observed = _run(monkeypatch, "deadline-inside-a-tool-round")
+
+    assert observed.outcome[1:3] == ("LLMUpstreamError", f"Timeout: {_UPSTREAM_REASON}")
+    assert observed.handler_calls == [{"n": 0}]
+    assert len(observed.requests) == 1
+    assert stats == StructuredRunStats(
+        tool_rounds_used=1, completions=1, finalized_by=None, failure="deadline"
+    )
 
 
 def test_stats_first_request_failing_counts_no_completion(
