@@ -48,12 +48,25 @@ openai SDK（2.45.0）對單一請求的逾時擲 `openai.APITimeoutError`。它
 `stop_and_wait` 先設訊號，再等每個指令的 worker 回報停止證據。`_communicate_bounded` 在輪詢時看到訊號，
 就用它既有、在鎖下的拆除流程殺掉並回收；訊號設下之後才要啟動的指令不啟動。
 
-「已停止」只有一個定義：指令的 process group 已殺、leader 已回收（`_communicate_bounded` 的拆除完成），
-或它根本沒有啟動子行程。證據由 `_communicate_bounded` 的拆除在完成的當下記下（`on_reaped`），不論函式
-之後正常返回還是擲出例外。「已殺」的判定是 `killpg(SIGKILL)` 成功；若被拒，就等 leader 回收之後，用
-signal 0 確認 group 已不存在。macOS 對只剩已退出、未回收 leader 的 group 會回 EPERM，所以需要這一步。
-不涵蓋同時有可殺與殺不了成員的 group：`killpg` 只要有一個成員收到就回成功。
-以下三種替代訊號都試過，也都被推翻：
+「已停止」只有一個定義：指令的 leader 已回收，而且回收之後觀察到它的 process group 已不存在
+（signal 0 得到 `ProcessLookupError`）；或它根本沒有啟動子行程。證據由 `_communicate_bounded` 的拆除在觀察到的當下
+記下（`on_reaped`），不論函式之後正常返回還是擲出例外。送訊的結果都不是證據：`killpg(SIGKILL)` 成功只代表送到了
+送訊當下的成員，送到不等於已退出；macOS 還會先收集成員再逐一送，送訊途中 fork 出來的成員根本收不到，審查時實測過
+這種成員在證據記下之後仍在寫檔。EPERM 也不是：在 macOS 它代表沒有活的成員可送（只剩殭屍，leader 或非 leader 都算），
+在兩個平台它也可能代表活的成員都是這個程序殺不了的。被 SIGKILL 的成員要等它的回收者（init、launchd）收走，
+group 才會消失，所以確認要輪詢：第一次緊接在回收之後、不先等待，之後持續到拆除的時限為止。回收本身
+若已用掉時限，仍會確認那一次；那時看到的消失仍是真的，只是可能晚於等待的一方放棄。
+
+拆除只有一個時限：開始時以 `_REAP_TIMEOUT_SECONDS` 起算，回收前補送、回收後輪詢與 reader 的 join 共用它。
+group 一消失，就沒有成員還拿著管線的寫端，join 立刻完成，所以等待上限不必逐段加總。回收前補送只在 macOS 做：
+leader 未回收時 PGID 被它釘住，補送 SIGKILL 直到確認沒有活的成員可送（EPERM）或 group 已不存在（ESRCH），
+或時限到；補送的退出不是證據，回收後的 ESRCH 才是。Linux 不需要也不能這樣做：它的群組訊號連進行中的 fork
+都送得到，而殭屍 leader 未回收時 signal 0 一直回成功，迴圈會燒滿時限。回收之後不再送任何 kill，因為 PGID
+已不再被 leader 釘住。
+只有拆除會回收 leader：輸出超量時的 kill 也直接對 `proc.pid` 送 `killpg`，不經 `getpgid`（macOS 對已退出的
+leader 回 ESRCH），也不回落到 `proc.kill()`（它先 `poll()`，會回收已退出的 leader）。
+
+除了上面的送訊結果，以下三種替代訊號也都試過、也都被推翻：
 - asyncio task 的狀態：uvicorn 關閉時 `asyncio.run` 會取消所有 task，被取消的 command task 看起來已完成，
   它等待的 threadpool worker 卻還在跑；
 - worker 返回：它可能在啟動子行程之後、拆除完成之前就被例外打斷；
@@ -61,7 +74,9 @@ signal 0 確認 group 已不存在。macOS 對只剩已退出、未回收 leader
 
 等待上限是 `tool_install_shell_timeout_seconds` 加上 `_REAP_TIMEOUT_SECONDS`。超過時不剝除、不發布，
 也不清理這一場的暫存目錄：它原地保留，job 失敗並在訊息裡附上路徑；名額照放，理由見下一段。
-等不到證據的情況例如：kernel 回收不了的 leader、回收失敗、SIGKILL 被拒而回收後 group 仍有成員、
+等不到證據的情況例如：kernel 回收不了的 leader、回收失敗、group 在時限內沒有消失（送訊途中 fork 出來
+而沒收到的成員、殺不了的成員、卡在不可中斷 kernel 等待的成員、沒有回收者收走的殭屍，例如服務在
+Linux 上是 PID 1 而沒有 init）、
 拆除完成之前被例外打斷、被卡住的執行緒（例如已啟動子行程、卻在第一次輪詢前停住）。
 這個出口不得再等待可能被卡住的資源，例如卡住的 worker 佔著的共用 threadpool。至於沒有被排程、根本
 沒進入 worker 的指令，它之後看到訊號就不會啟動，算作沒有啟動子行程（`entered` 握手；這個推導依賴

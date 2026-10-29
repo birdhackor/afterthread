@@ -25,6 +25,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -254,11 +255,34 @@ _TOOL_SUMMARY_CAP = 8000
 # apart from a truncated item section or a truncated log body.
 _OUTPUT_TRUNCATION_MARKER = "…[工具輸出過長已截斷]"
 
-# How long the bounded reader is given to drain pipes and reap AFTER the process
-# group has already been SIGKILLed on timeout. The group is dead, so this
-# returns effectively immediately; it exists only so a wedged pipe can never
-# turn cleanup itself into a hang.
+# The one time limit of the teardown in ``_communicate_bounded``, counted from the
+# moment it starts. With ``on_reaped``, everything that teardown waits for shares
+# it: the re-sent group kill, the watch for the group to be gone, and the join of
+# the reader/writer threads. One limit is enough because once the group is gone no
+# member holds a write end of the pipes, so the readers hit EOF and the join
+# completes at once -- the waits need no adding up. Without ``on_reaped`` there is
+# only the join, and each thread is given the whole limit, purely so a wedged pipe
+# can never turn cleanup itself into a hang.
 _REAP_TIMEOUT_SECONDS = 5.0
+
+# Whether one SIGKILL to a process group can miss a member forked while it is
+# being sent. XNU's ``killpg`` first collects the group's members and then
+# signals them one by one, so a child that a member forks meanwhile is on no list
+# and is never signalled. Linux misses none: ``copy_process`` holds a group signal
+# that arrives during a fork for the new child as well. Where a miss is possible,
+# the teardown in ``_communicate_bounded`` sends the kill again
+# (``_resend_group_kill``).
+_GROUP_KILL_CAN_MISS_A_FORK = sys.platform == "darwin"
+
+# The pause between those re-sent kills. A send reaches every member alive when it
+# is sent, so another is needed only for those forked while the one before it was
+# being delivered -- a count the pause does little to change. What the pause sets
+# is how long the sends take, and what a loop that runs to the time limit costs --
+# a member stuck in an uninterruptible wait in the kernel keeps answering signal 0
+# however often it is sent SIGKILL. At one millisecond the first is a few
+# milliseconds, and the second one round of two cheap system calls for each
+# millisecond of the limit.
+_GROUP_KILL_RESEND_SECONDS = 0.001
 
 # Poll interval for the NON-reaping wait that watches the tool leader for exit
 # (see _communicate_bounded). We cannot block in ``proc.wait`` there: reaping the
@@ -266,7 +290,8 @@ _REAP_TIMEOUT_SECONDS = 5.0
 # instead poll ``os.waitid`` with WNOWAIT (detect exit WITHOUT reaping) under our
 # own deadline. The only cost of polling over blocking is up to ONE interval of
 # added latency detecting a natural exit; 25 ms is imperceptible for a local tool
-# call yet keeps the poll loop's CPU wake-ups negligible.
+# call yet keeps the poll loop's CPU wake-ups negligible. The teardown's watch for
+# the group to be gone (``_group_seen_gone_by``) polls at the same pace.
 _WAIT_POLL_SECONDS = 0.025
 
 # Chunk size for the bounded incremental pipe reads (see _communicate_bounded).
@@ -1507,7 +1532,11 @@ def validate_tool_content(build_root: BuildRoot, expected_name: str) -> str | No
     # offending relative path, never the value. The path is masked before it lands in
     # the message, because a builder can write a file whose very NAME is an expanded
     # ``$SECRET``. One snapshot of the known secrets serves the scan and the mask, so
-    # the value a hit was found by is the one masked out of its path.
+    # the value a hit was found by is the one masked out of its path. Only then are
+    # the path's lone surrogates replaced (``_utf8_safe``): a name that is not UTF-8
+    # is read back with them, and the message must encode to be shown. Not before the
+    # mask: a known value can hold one too, and replacing it in the path's copy of the
+    # value would hide that copy from the mask.
     try:
         secrets = _redaction_secrets()
     except Exception as exc:
@@ -1516,16 +1545,17 @@ def validate_tool_content(build_root: BuildRoot, expected_name: str) -> str | No
     if isinstance(scan, SecretScanFailed):
         return _secret_scan_failed_error(scan.reason)
     if scan.hits:
-        offender = _mask_known_secrets(scan.hits[0].path, secrets)
+        offender = _utf8_safe(_mask_known_secrets(scan.hits[0].path, secrets))
         return f"{offender} 不得包含秘密值（請改由環境變數讀取）"  # noqa: RUF001
     # An entry the scan could not read is content nobody checked: refused like a
     # failed scan, naming the first one -- whatever it holds would be published
     # unseen, and nothing after this reads it again. A FIFO, socket or device
     # (``not_regular``) is not refused: it has no stored content to hold a value,
-    # and its name was checked like every other entry's.
+    # and its name was checked like every other entry's. Its path is masked, then
+    # made encodable, the same way.
     unread = [skip.path for skip in scan.skipped if skip.reason == "unreadable"]
     if unread:
-        unchecked = _mask_known_secrets(unread[0], secrets)
+        unchecked = _utf8_safe(_mask_known_secrets(unread[0], secrets))
         return f"{unchecked} 無法讀取，無法確認裡面沒有已知的秘密值。"  # noqa: RUF001
     return None
 
@@ -2905,18 +2935,20 @@ def _cap_output(text: str, cap: int) -> str:
 def _kill_process_group(proc: subprocess.Popen[str]) -> None:
     """SIGKILL the child's whole process group (it is a group leader).
 
-    ``start_new_session=True`` made the child a session/group leader, so
-    ``os.getpgid(pid) == pid`` and one ``killpg`` takes down the child AND any
-    grandchildren it spawned -- a tool that forked a runaway helper cannot
-    survive the timeout. Falls back to killing just the child if the group
-    signal cannot be delivered (already reaped, or a platform edge), and never
-    raises.
+    Every child drained by ``_communicate_bounded`` is started with
+    ``start_new_session=True``, which made it a session/group leader: its group
+    id is its pid, and one ``killpg`` takes down the child AND any grandchildren
+    it spawned -- a tool that forked a runaway helper cannot survive the timeout.
+    ESRCH and EPERM, the answers of a group with nothing left this process may
+    signal, are ignored.
+
+    Sent to ``proc.pid`` as it is: no ``getpgid``, which macOS answers ESRCH for
+    an exited leader, and no ``proc.kill()``, whose ``poll()`` would reap that
+    leader -- the teardown alone reaps it, and the group id stays pinned until
+    then.
     """
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except ProcessLookupError, PermissionError, OSError:
-        with contextlib.suppress(Exception):
-            proc.kill()
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGKILL)
 
 
 @dataclass(slots=True)
@@ -3007,6 +3039,52 @@ def _process_group_is_gone(pgid: int) -> bool:
     return False
 
 
+def _resend_group_kill(pgid: int, deadline: float) -> None:
+    """Send SIGKILL to group ``pgid`` again until nothing in it is left to kill.
+
+    For a platform whose group kill can miss a fork (``_GROUP_KILL_CAN_MISS_A_FORK``):
+    ``_communicate_bounded``'s teardown calls it after its first SIGKILL and before
+    it reaps the leader, with the leader unreaped (``proc.returncode`` is None) --
+    the unreaped leader pins the group id, so every send here reaches this group
+    and no other. Each round asks with signal 0 first and stops once that raises
+    -- EPERM, macOS's answer when no live member is left to signal (exited ones
+    waiting for their reaper count as none), or ESRCH -- or once ``deadline`` has
+    passed. Whether the leader itself has exited is no reason to stop: a command
+    that ended on its own can leave members running, forking as they go.
+
+    Its end is not evidence of anything. EPERM is also the answer when every live
+    member left is one this process may not signal, and stopping early then is
+    right: such a member keeps the group in existence, which the check after the
+    reap sees, and no further send could reach it.
+    """
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except OSError:
+            return
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(_GROUP_KILL_RESEND_SECONDS)
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, signal.SIGKILL)
+
+
+def _group_seen_gone_by(pgid: int, deadline: float) -> bool:
+    """Whether group ``pgid`` is seen gone (``_process_group_is_gone``) by ``deadline``.
+
+    Asked at once, then every ``_WAIT_POLL_SECONDS``: a member sent SIGKILL leaves
+    the group only once its reaper (init, launchd) has collected it, so the first
+    answer may come too early. Only signal 0 is ever sent, so asking after the
+    leader's reap reaches no other process.
+    """
+    while not _process_group_is_gone(pgid):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_WAIT_POLL_SECONDS, remaining))
+    return True
+
+
 def _communicate_bounded(
     proc: subprocess.Popen[str],
     *,
@@ -3032,21 +3110,40 @@ def _communicate_bounded(
     blocks, so the reads and the ``wait`` genuinely proceed in parallel.
 
     ``abort`` is an optional stop signal set from another thread. Once it is set
-    while the leader still runs, the wait ends at the next poll and the group is
-    killed and reaped by the same teardown the deadline uses, under the same lock
-    -- so a stop never needs a kill from outside, which could reach a pid already
-    reaped and reused. The result then has ``aborted`` set. Without ``abort``,
-    the wait is the deadline-only one it always was.
+    while the leader still runs, the wait ends at the next poll, and the group is
+    sent SIGKILL and its leader reaped by the same teardown the deadline uses,
+    under the same lock -- so a stop never needs a kill from outside, which could
+    reach a pid already reaped and reused. The result then has ``aborted`` set.
+    Without ``abort``, the wait is the deadline-only one it always was.
 
     Every way out passes through that teardown -- a return, and an exception
     too (a reader thread that cannot start, say) -- so no exit skips the kill and
     the reap. ``on_reaped``, when given, is called from the teardown itself, at
-    the one point where it is known to have worked: the group is down -- sent
-    SIGKILL, or found gone -- and ``proc.wait()`` has left a return code. It is
-    called the same way whether the function then returns or raises, and not at
-    all when either half failed; a caller that must know the process is gone
-    relies on it, never on the return. It runs under the teardown lock and must
-    not raise. Without it, nothing here changes.
+    the one point where it is known to have worked: ``proc.wait()`` has left a
+    return code, and after that the group is seen gone -- signal 0 to it raises
+    ESRCH. The group is asked at once after the reap, then again until the
+    teardown's time limit (``_REAP_TIMEOUT_SECONDS``, counted from the teardown's
+    start, so a slow reap leaves less of it). What a send answers is never that
+    point: a SIGKILL delivered is not a member exited, macOS's group kill can miss
+    a member forked while it is sent, and EPERM may mean only that the live
+    members left are ones this process may not signal.
+    Where the kill can miss a fork, it is sent again before the reap
+    (``_resend_group_kill``); never after it, when the group id is no longer
+    pinned. ``on_reaped`` is called the same way whether the function then
+    returns or raises, and not at all when the reap failed or the group was still
+    there at the limit; a caller that must know the process is gone relies on it,
+    never on the return. It must not raise. Without it, the teardown sends one
+    SIGKILL, watches nothing, and gives each thread's join the whole limit.
+
+    There is no ``on_reaped`` to be had -- the process stays possibly running for
+    the caller -- when, among others:
+
+    * a member SIGKILL cannot end within the limit: one stuck in an
+      uninterruptible wait in the kernel, or one this process may not signal (a
+      setuid program) -- either keeps the group in existence;
+    * the service runs as PID 1 on Linux with no init: an orphaned member is
+      reaped by nobody, and its zombie keeps the group in existence, so a process
+      that leaves any member besides its leader is never confirmed.
     """
     threads: list[threading.Thread] = []
     # `teardown_lock` + `reaped` make the overflow-kill callback below and the
@@ -3058,12 +3155,12 @@ def _communicate_bounded(
     def kill() -> None:
         # Called by a _CappedReader the instant its stream passes the cap. Guarded
         # so it can NEVER run once the teardown below has begun reaping: after
-        # proc.wait() frees the leader's pid, os.getpgid(proc.pid) here could read a
-        # REUSED pid's group and _kill_process_group would signal the wrong group. The
-        # lock makes "kill" and "reap" mutually exclusive; the `reaped` flag makes a
-        # kill attempt after teardown a no-op. While NOT reaped (teardown not begun),
-        # the leader is un-reaped so proc.pid still names THIS group and the early
-        # overflow kill is valid.
+        # proc.wait() frees the leader's pid, _kill_process_group's killpg(proc.pid)
+        # here could reach a group that has REUSED that id. The lock makes "kill"
+        # and "reap" mutually exclusive; the `reaped` flag makes a kill attempt
+        # after teardown a no-op. While NOT reaped (teardown not begun), the leader
+        # is un-reaped -- the teardown is the only thing that reaps it -- so
+        # proc.pid still names THIS group and the early overflow kill is valid.
         with teardown_lock:
             if reaped:
                 return
@@ -3125,8 +3222,8 @@ def _communicate_bounded(
             try:
                 info = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
             except ChildProcessError:
-                # Already reaped somehow (we are the only waiter, so this is defensive):
-                # stop polling and fall through to the kill, which no-ops on a gone group.
+                # Already reaped. Nothing here reaps the leader before the teardown
+                # does, so this is defensive: stop polling and fall through to it.
                 break
             if info is not None:
                 break  # leader exited; the zombie is retained, pinning the PGID
@@ -3140,66 +3237,78 @@ def _communicate_bounded(
     finally:
         # Tear the WHOLE group down and reap, atomically w.r.t. the overflow-kill
         # callback above (teardown_lock): setting `reaped` before releasing the lock
-        # guarantees no _CappedReader can call getpgid/killpg on the pid we are about
-        # to free below. Within the lock, the kill+reap still run UNCONDITIONALLY --
+        # guarantees no _CappedReader can send a kill to the pid we are about to free
+        # below. Within the lock, the kill+reap still run UNCONDITIONALLY --
         # whether the leader exited on its own, we timed out, or the caller's stop
         # signal ended the wait. This is the fix for two holes the old "escalate only
         # if a reader thread is still alive" teardown carried:
         #  (a) a descendant that CLOSED its inherited stdout/stderr but kept running
         #      left the readers at EOF and their threads dead, so no escalation ever
-        #      fired and the detached daemon LEAKED. An unconditional kill reaps it;
+        #      fired and the detached daemon LEAKED. An unconditional kill reaches it;
         #  (b) killing AFTER ``proc.wait`` reaped the leader targeted a pid the kernel
-        #      had already freed -- a REUSED-pgid hazard. Here the leader is still
-        #      un-reaped (a zombie on natural exit, or alive on timeout or stop), so
-        #      ``proc.pid`` provably still names THIS group (``start_new_session=True``
+        #      had already freed -- a REUSED-pgid hazard. Here the kill comes before
+        #      the reap: the leader is a zombie on natural exit, or alive on timeout
+        #      or stop, so ``proc.pid`` still names THIS group (``start_new_session=True``
         #      made the leader its own group leader, so the group id EQUALS its pid).
-        # A leader that exited NATURALLY is already a dead zombie, so this SIGKILL is a
-        # no-op for it and cannot disturb its recorded exit status -- ``proc.wait`` below
-        # still returns the tool's REAL exit code. A descendant that double-fork/setsid'd
+        # A leader that exited NATURALLY is already a zombie, so this SIGKILL cannot
+        # disturb its recorded exit status -- ``proc.wait`` below still returns the
+        # tool's REAL exit code. Whether the send succeeds says nothing about whether
+        # the group is gone (see the docstring); with ``on_reaped`` that is asked of
+        # the group itself, after the reap. A descendant that double-fork/setsid'd
         # OUT of the group escapes even this and is beyond v1's non-container stance
         # (D21); the daemon flag on every reader/writer thread is the honest backstop.
+        #
+        # One limit, counted from here, bounds everything below that waits
+        # (``_REAP_TIMEOUT_SECONDS``).
+        deadline = time.monotonic() + _REAP_TIMEOUT_SECONDS
         with teardown_lock:
             if not reaped:
-                group_down = True
-                try:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass  # no group left to signal
-                except PermissionError:
-                    # Nothing in the group could be signalled: what macOS answers
-                    # for a group that holds only its exited, unreaped leader --
-                    # and what any system answers when every live member is one
-                    # this process may not kill. Only ``on_reaped`` needs the two
-                    # told apart.
-                    group_down = False
+                # A defence, not a path anything here takes: a leader reaped by
+                # anything before the teardown no longer pins the group id, so
+                # nothing is sent to that id again.
+                if (
+                    on_reaped is not None
+                    and _GROUP_KILL_CAN_MISS_A_FORK
+                    and proc.returncode is None
+                ):
+                    _resend_group_kill(proc.pid, deadline)
 
-                # Reap the leader now that its group is SIGKILLed: this frees the zombie
-                # (releasing the pinned pid) and, on a natural exit, returns the tool's
-                # REAL returncode -- preserving exit-code semantics for ordinary tools. No
-                # timeout is needed: the group is dead, so a natural-exit zombie is
-                # collected at once and a timed-out leader was just killed (SIGKILL is
-                # uncatchable, so it dies promptly).
+                # Reap the leader: this frees the zombie (releasing the pinned pid)
+                # and, on a natural exit, returns the tool's REAL returncode --
+                # preserving exit-code semantics for ordinary tools. No timeout: a
+                # natural-exit zombie is collected at once, and a leader just sent
+                # SIGKILL dies promptly (SIGKILL is uncatchable).
                 with contextlib.suppress(Exception):
                     proc.wait()
                 reaped = True
-                if on_reaped is not None and proc.returncode is not None:
-                    if not group_down:
-                        # With the leader reaped, a group that held nothing else is
-                        # gone, while one with a member it could not kill is not.
-                        group_down = _process_group_is_gone(proc.pid)
-                    if group_down:
-                        on_reaped()
 
-        # The group is dead, so every inherited pipe write end is now closed and the
-        # (daemon) reader/writer threads hit EOF and finish. Join them under the short
-        # reap bound purely so a pathologically wedged pipe can never turn cleanup
-        # itself into a hang; with the group gone this join is guaranteed to complete.
+        # The evidence ``on_reaped`` stands for, asked of the group itself now that its
+        # leader is reaped: gone at once, or within what is left of the limit. Only
+        # signal 0 is sent from here on, so it is asked OUTSIDE teardown_lock.
+        if (
+            on_reaped is not None
+            and proc.returncode is not None
+            and _group_seen_gone_by(proc.pid, deadline)
+        ):
+            on_reaped()
+
+        # Once the group is gone no member holds a write end of the pipes, so the
+        # (daemon) reader/writer threads hit EOF and the join completes at once. With
+        # ``on_reaped`` the join gets what is left of the one limit: a group still
+        # there at the limit has left the caller without evidence anyway. Without it
+        # each thread gets the whole limit, purely so a pathologically wedged pipe can
+        # never turn cleanup itself into a hang.
         # OUTSIDE teardown_lock (released above): a reader thread still inside `kill`,
         # blocked waiting on the lock, must be free to acquire it and no-op before this
         # join can observe that thread finished -- joining while still holding the lock
         # could deadlock against it.
         for thread in threads:
-            thread.join(timeout=_REAP_TIMEOUT_SECONDS)
+            if on_reaped is None:
+                thread.join(timeout=_REAP_TIMEOUT_SECONDS)
+            else:
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
     return _BoundedOutput(
         stdout=stdout_reader.text if stdout_reader is not None else "",

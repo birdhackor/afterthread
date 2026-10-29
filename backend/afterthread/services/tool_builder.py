@@ -919,13 +919,13 @@ class _ShellEvidence:
 
     def confirm(self) -> None:
         """Record that the command left no process: its spawn failed, or -- as the
-        drain's ``on_reaped`` -- its group is down and its leader reaped."""
+        drain's ``on_reaped`` -- its leader was reaped and its group then seen gone."""
         self.confirmed = True
 
     def stopped(self) -> bool:
-        """Whether the command is known to have no process left: the teardown of
-        its process group completed, its spawn failed, or it never got as far as
-        spawning."""
+        """Whether the command is known to have no process left: its leader was
+        reaped and its process group then seen gone, its spawn failed, or it never
+        got as far as spawning."""
         return self.confirmed or not self.spawning
 
 
@@ -984,13 +984,14 @@ def _run_shell_subprocess(
     ``evidence`` records the only points at which the command is known to be
     stopped. ``spawning`` is set the instant before ``Popen``. ``confirmed`` is
     set by the teardown in ``_communicate_bounded``, through ``on_reaped``, once
-    the group is down and the leader reaped -- whether the drain then returns or
-    raises -- or when ``Popen`` raises ``OSError``. CPython raises that before
-    forking, or after reaping a child whose exec failed; the one case read wrongly
-    is an ``OSError`` from closing or reading the pipes CPython has just made,
-    after a fork that succeeded. Whatever happens after ``confirmed`` is set stays
-    confirmed (a redaction that fails closed, say); an exception that leaves the
-    drain before its teardown worked leaves the command unconfirmed.
+    the leader is reaped and its group is then seen gone -- asked at once, and
+    again until the teardown's time limit -- whether the drain then returns or
+    raises; or when ``Popen`` raises ``OSError``. CPython raises that before
+    forking, or after reaping a child whose exec failed; the one case read
+    wrongly is an ``OSError`` from closing or reading the pipes CPython has just
+    made, after a fork that succeeded. Whatever happens after ``confirmed`` is
+    set stays confirmed (a redaction that fails closed, say); an exception that
+    leaves the drain before its teardown worked leaves the command unconfirmed.
     """
     if abort is not None and abort.is_set():
         return _SHELL_NOT_STARTED
@@ -1078,12 +1079,14 @@ def _shell_stop_seconds() -> float:
     """How long a builder session waits for its run_shell commands once stopped.
 
     The bounded part of what a command already running could still take without
-    the stop signal: the rest of its own timeout, then the allowance
-    ``_communicate_bounded`` gives its one output reader once the group is killed.
-    The signal normally ends the wait within one poll and the reap; the bound only
-    matters for a worker that entered and cannot report in time (a leader SIGKILL
-    cannot reap, a thread stuck before its first poll, a redaction scan that
-    hangs -- a worker reports only as it returns).
+    the stop signal: the rest of its own timeout, then the teardown in
+    ``_communicate_bounded``, whose three waits -- the re-sent group kill, the
+    watch for the group to be gone, the join of its one output reader -- share
+    the single limit ``_REAP_TIMEOUT_SECONDS``. The signal normally ends the wait
+    within one poll and the teardown; the bound only matters for a worker that
+    entered and cannot report in time (a leader SIGKILL cannot reap, a thread
+    stuck before its first poll, a redaction scan that hangs -- a worker reports
+    only as it returns).
     """
     return get_settings().tool_install_shell_timeout_seconds + tools._REAP_TIMEOUT_SECONDS
 
@@ -1102,14 +1105,16 @@ class _BuilderShells:
     to their end.
 
     A command counts as stopped on evidence from the worker running it only
-    (``_ShellEvidence``): the teardown of its process group completed (or its
-    spawn failed), or it never started a subprocess. The worker reports which, from
-    a ``finally`` around ``_run_shell_subprocess``, through
-    ``loop.call_soon_threadsafe``. Nothing else counts. Not the command's task: a
-    cancelled task is done too, and the event loop cancels every task as it shuts
-    down while the worker runs on. Not the worker returning: it can return
-    through an exception after the spawn and before the teardown. Not the clock:
-    running out of time says only that no word came.
+    (``_ShellEvidence``): its leader was reaped and its process group then seen
+    gone (or its spawn failed), or it never started a subprocess. The worker
+    reports which, from a ``finally`` around ``_run_shell_subprocess``, through
+    ``loop.call_soon_threadsafe``. Nothing else counts. Not what the group kill
+    answered: a SIGKILL delivered is not a member exited (``_communicate_bounded``
+    says more). Not the command's task: a cancelled task is done too, and the
+    event loop cancels every task as it shuts down while the worker runs on. Not
+    the worker returning: it can return through an exception after the spawn and
+    before the teardown. Not the clock: running out of time says only that no
+    word came.
 
     While the loop shuts down it runs the gather of every task it cancelled, the
     session waiting here among them, so it is still running to take a worker's
@@ -1126,23 +1131,23 @@ class _BuilderShells:
     its pool runs it later or never.
 
     What it guarantees: once ``stop_and_wait`` returns True, no command this
-    session ran has a process left: its group was killed and its leader reaped,
-    its spawn failed, or it never started one. ``stop_and_wait`` sets the stop
-    signal before it waits: a command still running is killed at
-    ``_communicate_bounded``'s next poll, by that function's own teardown under
-    its own lock, and a command not spawned yet is never started -- or, spawned in
-    the instant after that check, is killed at its first poll. Nothing here kills
-    a process group from outside, so the guard opens no way to signal a pid that
-    has been reaped and reused.
+    session ran has a process left: its leader was reaped and its process group
+    was then seen gone, its spawn failed, or it never started one.
+    ``stop_and_wait`` sets the stop signal before it waits: a command still
+    running is killed at ``_communicate_bounded``'s next poll, by that function's
+    own teardown under its own lock, and a command not spawned yet is never
+    started -- or, spawned in the instant after that check, is killed at its
+    first poll. Nothing here kills a process group from outside, so the guard
+    opens no way to signal a pid that has been reaped and reused.
 
     What it does not cover:
 
-    * a descendant that leaves the process group (``setsid``, a double fork), or
-      one the service may not signal (a setuid program) in a group where it can
-      signal another member -- the group SIGKILL then succeeds, and the teardown
-      counts as done while that member lives on: run_shell is a real shell with
-      the service's own rights, not a sandbox, and the group kill is all a stop
-      can do -- as it is all a timeout can do;
+    * a descendant that leaves the process group (``setsid``, a double fork): the
+      group can be gone while it lives on. run_shell is a real shell with the
+      service's own rights, not a sandbox, and the group kill is all a stop can do
+      -- as it is all a timeout can do. A member the service may not signal (a
+      setuid program) is not such a case: it keeps the group in existence, so the
+      command counts as unconfirmed;
     * a command that cannot be confirmed stopped: its worker reported it
       unconfirmed, or it entered and sent no report within
       ``_shell_stop_seconds`` (a leader SIGKILL cannot reap, a thread that is
@@ -3962,8 +3967,48 @@ def _job_dict(job: InstallJob) -> dict[str, Any]:
     }
 
 
+# How many containers deep ``_job_text_safe`` follows. The deepest text a job
+# holds is an example's name in its verification, three containers down (the
+# verification, its ``runs`` list, one run); the fourth level is a margin, and
+# the bound itself keeps the walk from following whatever a caller nests.
+_JOB_TEXT_DEPTH = 4
+
+
+def _job_text_safe(value: Any, depth: int = 0) -> Any:
+    """``value`` with ``tools._utf8_safe`` applied to every string in it.
+
+    Walks dicts (keys too), lists and tuples, building new ones, down to
+    ``_JOB_TEXT_DEPTH`` containers; anything deeper, and every value that is not
+    text, is kept as it is.
+    """
+    if isinstance(value, str):
+        return tools._utf8_safe(value)
+    if depth >= _JOB_TEXT_DEPTH:
+        return value
+    if isinstance(value, dict):
+        return {
+            _job_text_safe(key, depth + 1): _job_text_safe(item, depth + 1)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_job_text_safe(item, depth + 1) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_job_text_safe(item, depth + 1) for item in value)
+    return value
+
+
 def _update_job(job_id: str, **changes: Any) -> None:
     """Apply field changes to a job, if it is still tracked.
+
+    The one writer of a job's fields once it is admitted, and so the one place
+    their text is made encodable: every string written, inside the containers a
+    job holds as well (``verification``, ``env_keys``), has its lone surrogates
+    replaced (``_job_text_safe``). A poll encodes the job as UTF-8 JSON, and one
+    such character fails the whole response; model text arrives with them
+    (``json.loads`` accepts ``"\\ud800"``), and so can a path or a message built
+    from what the backend read. This covers the job API's way out and nothing
+    else: text that leaves by another way -- stored in a note, sent in a prompt --
+    is that way's to make safe.
 
     A job evicted past ``_MAX_JOBS`` while its task was still running simply
     stops being visible; the task's later updates land here as no-ops. That is
@@ -3974,7 +4019,7 @@ def _update_job(job_id: str, **changes: Any) -> None:
         if job is None:
             return
         for key, value in changes.items():
-            setattr(job, key, value)
+            setattr(job, key, _job_text_safe(value))
 
 
 async def _run_job(

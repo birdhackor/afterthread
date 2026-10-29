@@ -392,9 +392,10 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `<TOOLS_DIR>/.staging/<uuid>/{build,shell}`；`finally` 清完整 session root。
   session 結束時（含逾時與被取消），後端先對這一場的每個 `run_shell` 指令發出中止
   訊號，等每個指令都有已停止的證據，才剝除、驗證、發布或清理。證據只有兩種：
-  process group 已殺、leader 已回收（由 `_communicate_bounded` 的拆除在完成的當下
-  記下，不論它之後正常返回還是擲出例外），或根本沒有啟動子行程（含啟動失敗）；
-  worker 返回、例外、時間到都不算。拿不到證據就是無法確認停止：
+  leader 已回收，而且回收之後觀察到它的 process group 已不存在（回收後立刻看一次，
+  之後持續看到回收時限為止；由 `_communicate_bounded` 的拆除在觀察到的當下記下，
+  不論它之後正常返回還是擲出例外），或根本沒有啟動子行程（含啟動失敗）；SIGKILL
+  送出成功、worker 返回、例外、時間到都不算。拿不到證據就是無法確認停止：
   worker 回報未確認（例如在拆除完成前被例外打斷）、已開始的 worker 等了
   `TOOL_INSTALL_SHELL_TIMEOUT_SECONDS` 加上回收時限仍沒有回報，或等待被再次取消
   打斷。這時這一場的剝除、發布、清理永久放棄，session root 原地保留，路徑寫進

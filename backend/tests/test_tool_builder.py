@@ -23,6 +23,8 @@ an autouse fixture resets both around every test.
 
 import asyncio
 import contextlib
+import dataclasses
+import errno
 import hashlib
 import json
 import logging
@@ -35,6 +37,8 @@ import subprocess
 import sys
 import threading
 import time
+import types
+import typing
 from collections.abc import Awaitable, Callable, Generator
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -53,6 +57,7 @@ from sqlmodel import Session
 
 from afterthread.config import Settings
 from afterthread.models import SQLITE_MAX_INT
+from afterthread.schemas import ToolJobStatus
 from afterthread.services import llm, llm_log, memory_ai, tool_builder, tool_meta, tool_runs, tools
 from afterthread.services.llm import LLMNotConfiguredError, LLMUpstreamError, StructuredRunStats
 from afterthread.services.tool_builder import (
@@ -3537,6 +3542,92 @@ def test_router_job_status_and_404(client: TestClient) -> None:
     # wheel, so there is no version skew for an alias to protect): it matches no
     # route at all now, hence Starlette's own 404 rather than the handler's.
     assert client.get("/api/tools/install/job-1").status_code == 404
+
+
+def _without_none(hint: Any) -> Any:
+    """``hint`` without its ``| None``."""
+    if typing.get_origin(hint) in (types.UnionType, typing.Union):
+        (inner,) = [arg for arg in typing.get_args(hint) if arg is not type(None)]
+        return inner
+    return hint
+
+
+def _holds_free_text(hint: Any) -> bool:
+    """Whether a value typed ``hint`` can carry text of any content: ``str``, or a
+    container that can hold one. A ``Literal`` is a fixed set of values, not text."""
+    if hint is str:
+        return True
+    if typing.get_origin(hint) is typing.Literal:
+        return False
+    return any(_holds_free_text(arg) for arg in typing.get_args(hint))
+
+
+def _a_vocabulary(annotation: Any) -> bool:
+    """Whether the poll admits only a fixed set of values for a field typed
+    ``annotation``: a ``Literal``, optional or not."""
+    return typing.get_origin(_without_none(annotation)) is typing.Literal
+
+
+def _free_text_fields(job_type: type, poll: dict[str, Any]) -> list[str]:
+    """The fields of the dataclass ``job_type`` that can carry free text through a
+    poll whose fields are ``poll``: text by the dataclass's own types, less those
+    the poll admits only from a fixed vocabulary, and the id a job is addressed
+    by."""
+    hints = typing.get_type_hints(job_type)
+    return [
+        field.name
+        for field in dataclasses.fields(job_type)
+        if field.name != "job_id"
+        and _holds_free_text(hints[field.name])
+        and not _a_vocabulary(poll[field.name].annotation)
+    ]
+
+
+def _with_lone_surrogates(hint: Any) -> Any:
+    """A value of the type ``hint`` names whose every piece of text, nested ones
+    included, carries a lone surrogate."""
+    inner = _without_none(hint)
+    if typing.get_origin(inner) is tuple:
+        return ("KEY_\udc80",)
+    if typing.get_origin(inner) is dict:  # the one dict a job holds: its verification
+        result = tools.CheckResult(
+            status="ran\udc80",
+            vid="vid-\udc80",
+            results=(tools.ExampleResult("example \udc80", "ok\udc80", None),),
+            total=1,
+            message="message \udc80",
+        )
+        return tool_builder._verification_dict(result, finished=True, secrets=[])
+    return "text \udc80"
+
+
+def test_a_job_poll_answers_whatever_text_install_job_fields_hold(client: TestClient) -> None:
+    """Every ``InstallJob`` field that can carry free text -- as the dataclass
+    declares it, less those the poll admits only from a fixed vocabulary, and the
+    id the job is addressed by -- is given text holding a lone surrogate, nested
+    text in the verification (built the way a check builds it) and the env keys
+    too. Model text arrives like that through ``json.loads``. The real poll still
+    answers 200, each value with the surrogate replaced, because the job table's
+    one writer makes what it stores encodable."""
+    free_text = _free_text_fields(tool_builder.InstallJob, ToolJobStatus.model_fields)
+    assert free_text
+    # One field of each shape the filter must find, and one it must leave out:
+    # free text in the dataclass, a vocabulary in the poll.
+    assert {"summary", "env_keys", "verification"} <= set(free_text)
+    assert "kind" not in free_text
+    job = tool_builder._admit_job()
+    assert job is not None
+
+    hints = typing.get_type_hints(tool_builder.InstallJob)
+    tool_builder._update_job(
+        job.job_id, **{name: _with_lone_surrogates(hints[name]) for name in free_text}
+    )
+    response = client.get(f"/api/tools/jobs/{job.job_id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    for name in free_text:
+        assert "\ufffd" in json.dumps(body[name], ensure_ascii=False), name
 
 
 # --- router: AI summary (D40) --------------------------------------------------
@@ -9306,28 +9397,36 @@ def test_a_teardown_whose_reap_fails_gives_no_evidence(
 def test_a_group_the_teardown_could_not_signal_gives_no_evidence_while_a_member_lives(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """SIGKILL to the group is refused -- as for a member this process may not
-    kill -- while the leader exits on its own and a member it started lives on.
-    The leader is reaped, but the group is not gone, so there is no evidence:
-    the command counts as unconfirmed."""
+    """Every signal to the group is refused, signal 0 included -- what the kernel
+    answers when the live members left are ones this process may not signal, since
+    it checks permission for signal 0 too -- while the leader exits on its own and
+    a member it started lives on. The leader is reaped, but the group is never
+    seen gone, EPERM not being ESRCH, so there is no evidence: the command counts
+    as unconfirmed."""
     _install_settings(
         monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
     )
+    monkeypatch.setattr(tools, "_REAP_TIMEOUT_SECONDS", 0.5)  # the wait for a group that stays
     staging = tmp_path / "staging"
     staging.mkdir()
     spawned = _record_spawns(monkeypatch)
     real_killpg = os.killpg
 
-    def refusing_sigkill(pgid: int, sig: int) -> None:
-        if sig == signal.SIGKILL:
-            raise PermissionError("operation not permitted")
-        real_killpg(pgid, sig)
+    def refusing_every_signal(pgid: int, sig: int) -> None:
+        raise PermissionError(errno.EPERM, "Operation not permitted")
 
-    monkeypatch.setattr(tools.os, "killpg", refusing_sigkill)
+    def member_lives(pgid: int) -> bool:
+        try:
+            real_killpg(pgid, 0)  # past the stand-in, which refuses every signal
+        except OSError:
+            return False
+        return True
+
+    monkeypatch.setattr(tools.os, "killpg", refusing_every_signal)
     try:
         # The member lets go of the output pipe, so the drain is not left reading it.
         result, stopped = _shells_run_alone(staging, "sleep 30 >/dev/null 2>&1 & sleep 0.3", 20)
-        leftover = len(spawned) == 1 and _group_exists(spawned[0].pid)
+        leftover = len(spawned) == 1 and member_lives(spawned[0].pid)
     finally:
         for proc in spawned:  # the leader is reaped; its group lives on in the member
             with contextlib.suppress(ProcessLookupError):
@@ -9336,3 +9435,170 @@ def test_a_group_the_teardown_could_not_signal_gives_no_evidence_while_a_member_
     assert result == ""
     assert leftover  # the member outlived the teardown
     assert stopped is False
+
+
+def _live_members(pgid: int) -> list[int]:
+    """The members of group ``pgid`` that have not exited, as ``ps`` lists them:
+    zombies -- exited, waiting for their reaper -- are left out."""
+    listing = subprocess.run(
+        ["ps", "-A", "-o", "pid=,pgid=,stat="], capture_output=True, text=True, check=True
+    ).stdout
+    rows = [line.split() for line in listing.splitlines()]
+    return [
+        int(row[0])
+        for row in rows
+        if len(row) >= 3 and row[1] == str(pgid) and not row[2].startswith(("Z", "X"))
+    ]
+
+
+def _group_kill_that_misses_a_member(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Make the first SIGKILL sent to a group reach its leader alone, and report
+    success -- what macOS's group kill does when a member is forked while it is
+    sent -- and every later one the whole group. Signal 0 answers as macOS does,
+    on either platform: ESRCH once the group is gone, EPERM while it holds no
+    member left alive (exited ones waiting for their reaper count as none).
+    Returns the group ids SIGKILL was sent to, in order."""
+    real_killpg = os.killpg
+    kills: list[int] = []
+
+    def killpg(pgid: int, sig: int) -> None:
+        if sig == signal.SIGKILL:
+            kills.append(pgid)
+            if len(kills) == 1:
+                os.kill(pgid, signal.SIGKILL)
+                return
+        real_killpg(pgid, sig)
+        if sig == 0 and not _live_members(pgid):
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(tools.os, "killpg", killpg)
+    return kills
+
+
+def _kill_live_members(kills: list[int]) -> None:
+    """Kill whatever is still alive in the group the first kill was sent to: the
+    member a test left running. Picked by group from ``ps`` at that moment, not by
+    a pid recorded earlier."""
+    for pid in _live_members(kills[0]) if kills else []:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+
+
+def _stop_once_running(
+    staging: Path, command: str, running: Callable[[], bool]
+) -> tuple[str, bool]:
+    """Start one command through a fresh ``_BuilderShells``, stop the session once
+    ``running`` says the command is under way, and return the command's result
+    text and what ``stop_and_wait`` answered."""
+
+    async def scenario() -> tuple[str, bool]:
+        shells = tool_builder._BuilderShells()
+        command_task = asyncio.ensure_future(shells.run(staging, command, 20, 4096, None))
+        give_up = time.monotonic() + 15
+        while not running() and not command_task.done() and time.monotonic() < give_up:
+            await asyncio.sleep(0.01)
+        stopped = await shells.stop_and_wait()
+        return await command_task, stopped
+
+    return asyncio.run(scenario())
+
+
+# A leader that forks a member which lets go of the output pipe, then becomes the
+# second ``sleep`` itself; the member's pid is written to the named file.
+_LEADER_AND_MEMBER = 'sleep 30 >/dev/null 2>&1 & echo $! > "{member_file}"; exec sleep 30'
+
+
+def test_a_group_kill_that_reached_only_the_leader_gives_no_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The session is stopped, and the group kill succeeds but reaches only the
+    leader. Where the kill is not sent again, the member outlives the teardown:
+    the leader is reaped, but the group is never seen gone, so the command counts
+    as unconfirmed. A kill that succeeded is not evidence."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    monkeypatch.setattr(tools, "_REAP_TIMEOUT_SECONDS", 0.5)  # the wait for a group that stays
+    monkeypatch.setattr(tools, "_GROUP_KILL_CAN_MISS_A_FORK", False)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    member_file = tmp_path / "member.pid"
+    kills = _group_kill_that_misses_a_member(monkeypatch)
+    try:
+        result, stopped = _stop_once_running(
+            staging,
+            _LEADER_AND_MEMBER.format(member_file=member_file),
+            lambda: _pid_in(member_file) is not None,
+        )
+        member = _pid_in(member_file)
+        survived = len(kills) == 1 and member in _live_members(kills[0])
+    finally:
+        _kill_live_members(kills)
+
+    assert result == tool_builder._SHELL_STOPPED
+    assert survived  # sent once, and the member it missed lived on
+    assert stopped is False
+
+
+def test_a_group_kill_sent_again_reaches_the_member_the_first_one_missed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The same first kill, where the platform's group kill can miss a fork: the
+    teardown sends it again before the reap until no member is left alive. The
+    member the first one missed is killed, the group is then seen gone, and the
+    command counts as stopped."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    monkeypatch.setattr(tools, "_GROUP_KILL_CAN_MISS_A_FORK", True)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    member_file = tmp_path / "member.pid"
+    kills = _group_kill_that_misses_a_member(monkeypatch)
+    try:
+        result, stopped = _stop_once_running(
+            staging,
+            _LEADER_AND_MEMBER.format(member_file=member_file),
+            lambda: _pid_in(member_file) is not None,
+        )
+        member = _pid_in(member_file)
+    finally:
+        _kill_live_members(kills)
+
+    assert result == tool_builder._SHELL_STOPPED
+    assert len(kills) >= 2  # sent again after the first
+    assert member is not None
+    with pytest.raises(ProcessLookupError):
+        os.kill(member, 0)  # gone, reaped
+    assert stopped is True
+
+
+def test_a_group_kill_sent_again_reaches_a_member_left_by_a_leader_that_exited(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The command ends on its own and leaves a member running, and the first
+    kill misses that member. A leader already gone is no reason to stop sending:
+    the kill is sent again while a member is alive, so the member is killed, the
+    group is then seen gone, and the command counts as stopped."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    monkeypatch.setattr(tools, "_GROUP_KILL_CAN_MISS_A_FORK", True)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    member_file = tmp_path / "member.pid"
+    kills = _group_kill_that_misses_a_member(monkeypatch)
+    try:
+        result, stopped = _shells_run_alone(
+            staging, f'sleep 30 >/dev/null 2>&1 & echo $! > "{member_file}"', 20
+        )
+        member = _pid_in(member_file)
+    finally:
+        _kill_live_members(kills)
+
+    assert result == ""  # it ended by itself: neither stopped nor timed out
+    assert len(kills) >= 2  # sent again after the first
+    assert member is not None
+    with pytest.raises(ProcessLookupError):
+        os.kill(member, 0)  # gone, reaped
+    assert stopped is True

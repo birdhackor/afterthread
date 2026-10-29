@@ -1627,8 +1627,8 @@ def test_runtime_overflow_output_with_exiting_leader_stays_clean(
     test does not assert (or need) which one wins -- only that the result is
     invariant either way: `_communicate_bounded`'s teardown_lock makes the
     overflow callback a no-op once the main thread has started reaping,
-    instead of letting it call getpgid/killpg on a pid the reap may have just
-    freed (and the kernel could have reused)."""
+    instead of letting it send its kill to a pid the reap may have just freed
+    (and the kernel could have reused)."""
     root = tmp_path / "tools"
     _make_tool(root, "big", "import sys\nsys.stdout.write('a' * 5000)\n")
     _install_tools(monkeypatch, root, llm_tool_output_max_chars=1000)
@@ -1686,6 +1686,208 @@ def test_communicate_bounded_without_a_stop_signal_ends_as_before(
     assert (output, proc.returncode) == expected
     assert output.aborted is False
     assert elapsed < 5
+
+
+def _bash_in_its_own_group(command: str) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        ["bash", "-c", command],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+
+
+def test_communicate_bounded_asks_after_the_reap_until_the_group_is_seen_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With ``on_reaped``, the teardown asks about the group after the leader's
+    reap, and asks again while the limit lasts: the first answer can come before
+    the members' reaper has collected them. The evidence is given once, at the
+    first answer that the group is gone, and nothing is asked after it."""
+    monkeypatch.setattr(tools, "_GROUP_KILL_CAN_MISS_A_FORK", False)
+    answers = [False, False, True]
+    asked: list[int] = []
+
+    def gone_at_the_third_ask(pgid: int) -> bool:
+        asked.append(pgid)
+        return answers[len(asked) - 1]
+
+    monkeypatch.setattr(tools, "_process_group_is_gone", gone_at_the_third_ask)
+    proc = _bash_in_its_own_group("exit 0")
+    confirmations: list[int | None] = []
+
+    tools._communicate_bounded(
+        proc,
+        input_text=None,
+        cap=1000,
+        timeout=30,
+        on_reaped=lambda: confirmations.append(proc.returncode),
+    )
+
+    assert asked == [proc.pid] * 3
+    assert confirmations == [0]  # once, and only after the reap
+
+
+def test_communicate_bounded_bounds_its_whole_teardown_by_one_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The group is never seen gone, and a member the kill missed still holds the
+    output pipes, so the readers stay blocked. ``on_reaped`` is never called, and
+    the teardown ends at its one limit: the watch for the group and the join of
+    the readers share it rather than each taking a limit of its own."""
+    limit = 0.6
+    monkeypatch.setattr(tools, "_REAP_TIMEOUT_SECONDS", limit)
+    monkeypatch.setattr(tools, "_GROUP_KILL_CAN_MISS_A_FORK", False)
+    monkeypatch.setattr(tools, "_process_group_is_gone", lambda pgid: False)
+    real_killpg = os.killpg
+
+    def leader_only(pgid: int, sig: int) -> None:
+        if sig == signal.SIGKILL:
+            os.kill(pgid, signal.SIGKILL)  # the member is missed
+            return
+        real_killpg(pgid, sig)
+
+    member_file = tmp_path / "member.pid"
+    proc = _bash_in_its_own_group(f'sleep 30 & echo $! > "{member_file}"; exec sleep 30')
+    member: int | None = None
+    try:
+        for _ in range(500):
+            text = member_file.read_text(encoding="utf-8").strip() if member_file.exists() else ""
+            if text:
+                member = int(text)
+                break
+            time.sleep(0.01)
+        assert member is not None
+        monkeypatch.setattr(tools.os, "killpg", leader_only)
+        stop = threading.Event()
+        stop.set()
+        confirmations: list[None] = []
+
+        started = time.monotonic()
+        output = tools._communicate_bounded(
+            proc,
+            input_text=None,
+            cap=1000,
+            timeout=30,
+            abort=stop,
+            on_reaped=lambda: confirmations.append(None),
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        if member is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(member, signal.SIGKILL)  # releases the pipes the readers wait on
+
+    assert output.aborted is True
+    assert proc.returncode == -signal.SIGKILL  # the leader was reaped
+    assert confirmations == []
+    assert limit <= elapsed < 1.5 * limit
+
+
+def test_communicate_bounded_resends_the_kill_only_while_the_leader_pins_the_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Where the group kill can miss a fork, it is sent again before the reap --
+    but only while the unreaped leader holds the group id. Nothing in the drain
+    reaps the leader before its teardown, so the test reaps it first: the
+    teardown then sends its one SIGKILL, re-sends nothing, and only asks whether
+    the group is gone. (The SIGKILL is recorded, not sent: this leader no longer
+    pins its id.)"""
+    monkeypatch.setattr(tools, "_GROUP_KILL_CAN_MISS_A_FORK", True)
+    proc = _bash_in_its_own_group("exit 0")
+    proc.wait()
+    real_killpg = os.killpg
+    sent: list[int] = []
+
+    def recording(pgid: int, sig: int) -> None:
+        sent.append(sig)
+        if sig == signal.SIGKILL:
+            raise ProcessLookupError(errno.ESRCH, "No such process")
+        real_killpg(pgid, sig)
+
+    monkeypatch.setattr(tools.os, "killpg", recording)
+    confirmations: list[None] = []
+
+    tools._communicate_bounded(
+        proc, input_text=None, cap=1000, timeout=30, on_reaped=lambda: confirmations.append(None)
+    )
+
+    assert sent == [signal.SIGKILL, 0]  # the kill, then the one question after the reap
+    assert confirmations == [None]
+
+
+def test_the_overflow_kill_leaves_an_exited_leader_unreaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The overflow kill sends SIGKILL to the leader's group id as it is. Here the
+    leader has already exited and is a zombie, and ``getpgid`` is made to answer
+    ESRCH for it -- macOS's answer for a zombie -- so the test means the same on
+    either platform. The kill raises nothing and reaps nothing: the leader is
+    still there to wait for, so its group id stays pinned until the teardown
+    reaps it."""
+
+    def no_group_for_a_zombie(pid: int) -> int:
+        raise ProcessLookupError(errno.ESRCH, "No such process")
+
+    monkeypatch.setattr(tools.os, "getpgid", no_group_for_a_zombie)
+    proc = subprocess.Popen(
+        ["bash", "-c", "exit 3"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        start_new_session=True,
+    )
+    exited = os.WEXITED | os.WNOWAIT | os.WNOHANG
+    try:
+        for _ in range(500):
+            if os.waitid(os.P_PID, proc.pid, exited) is not None:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("the leader never exited")
+
+        tools._kill_process_group(proc)
+
+        assert proc.returncode is None  # not reaped by the kill
+        assert os.waitid(os.P_PID, proc.pid, exited) is not None  # still waitable
+    finally:
+        proc.wait()
+    assert proc.returncode == 3  # reaped only here, with its own exit code
+
+
+def test_runtime_tool_teardown_sends_one_kill_and_watches_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A runtime tool's drain is given no ``on_reaped``: its teardown sends one
+    SIGKILL to the group and asks nothing afterwards -- no kill sent again, even
+    where the platform's group kill can miss a fork, and no watch for the group to
+    be gone."""
+    root = tmp_path / "tools"
+    _make_tool(root, "quick", "import sys\nsys.stdout.write('ok')\n")
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler
+    monkeypatch.setattr(tools, "_GROUP_KILL_CAN_MISS_A_FORK", True)
+    real_killpg = os.killpg
+    sent: list[int] = []
+    asked: list[int] = []
+
+    def recording_killpg(pgid: int, sig: int) -> None:
+        sent.append(sig)
+        real_killpg(pgid, sig)
+
+    def recording_gone(pgid: int) -> bool:
+        asked.append(pgid)
+        return True
+
+    monkeypatch.setattr(tools.os, "killpg", recording_killpg)
+    monkeypatch.setattr(tools, "_process_group_is_gone", recording_gone)
+
+    assert asyncio.run(handler({})) == "ok"
+    assert sent == [signal.SIGKILL]
+    assert asked == []
 
 
 def test_runtime_refuses_a_package_replaced_after_it_was_advertised(
@@ -3815,6 +4017,39 @@ def test_validate_does_not_refuse_a_package_for_a_fifo_in_it(
     assert isinstance(scan, tools.SecretScanDone)
     assert scan.skipped == (tools.SecretScanSkip("pipe", "not_regular"),)
     assert tools.validate_tool_content(tools.BuildRoot(pkg), "staged") is None
+
+
+# A known value holding a lone surrogate, as one read from an environment that is
+# not UTF-8 does.
+_SURROGATE_SECRET = "planted-\udcff-secret-abcdef"
+
+
+@pytest.mark.parametrize("named_as", ["a hit", "unreadable"])
+def test_validate_names_a_path_with_lone_surrogates_masked_and_encodable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, named_as: str
+) -> None:
+    """A path read back from a name that is not UTF-8 carries lone surrogates --
+    here one beside the known value and one inside it. The scan's answer is
+    injected, since not every filesystem can hold such a name. Either way the gate
+    names the path, the message encodes as UTF-8, and the value is still masked
+    out of it: the mask comes first, and only then are the surrogates replaced."""
+    pkg = _staged_pkg(
+        tmp_path / "stage", tool_json=_kbsearch_manifest(), run_py="import sys\nprint('x')\n"
+    )
+    path = f"dir-\udc80/key-{_SURROGATE_SECRET}.txt"
+    if named_as == "a hit":
+        scan = tools.SecretScanDone(hits=(tools.SecretHit(path, "name"),), skipped=())
+    else:
+        scan = tools.SecretScanDone(hits=(), skipped=(tools.SecretScanSkip(path, "unreadable"),))
+    monkeypatch.setattr(tools, "_redaction_secrets", lambda: [_SURROGATE_SECRET])
+    monkeypatch.setattr(tools, "scan_embedded_secrets", lambda root, secrets=None: scan)
+
+    error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
+
+    assert error is not None
+    error.encode("utf-8")  # a lone surrogate left in it would raise here
+    assert error.startswith(tools._utf8_safe("dir-\udc80") + f"/key-{tools._REDACTION_MARKER}.txt ")
+    assert "planted-" not in error
 
 
 # --- known-secret redaction (F1 / F4, D36) ---------------------------------
