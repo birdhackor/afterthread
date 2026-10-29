@@ -918,15 +918,77 @@ class _ShellEvidence:
     confirmed: bool = False
 
     def confirm(self) -> None:
-        """Record that the command left no process: its spawn failed, or -- as the
-        drain's ``on_reaped`` -- its leader was reaped and its group then seen gone."""
+        """Record that the command left no process: its leader was reaped and its
+        group then seen gone -- by the drain's teardown, as its ``on_reaped``, or
+        by CPython after a failed exec -- or its start failed before the fork."""
         self.confirmed = True
 
     def stopped(self) -> bool:
-        """Whether the command is known to have no process left: its leader was
-        reaped and its process group then seen gone, its spawn failed, or it never
-        got as far as spawning."""
+        """Whether the command is known to have no process left. Stopped: its
+        leader was reaped -- by the drain's teardown, or by CPython after a failed
+        exec -- and its process group then seen gone. Never started: it did not
+        get as far as starting, or its start failed before the fork."""
         return self.confirmed or not self.spawning
+
+
+class _ShellPopen(subprocess.Popen[str]):
+    """The ``Popen`` a run_shell command is started with, kept when the start fails.
+
+    ``subprocess.Popen`` raises out of its constructor, and the object would go
+    with the exception -- and with it CPython's own record of the start: whether
+    it forked a child (``pid``) and whether it reaped that child again
+    (``returncode``). This subclass keeps the object: it catches the ``OSError``
+    its constructor raises and holds it as ``spawn_error``, so
+    ``_start_left_no_process`` can read that record. ``pid`` and ``returncode`` are
+    set to None before ``Popen`` runs, so a failure before ``Popen`` sets them
+    itself still reads as nothing forked, nothing reaped.
+
+    Only ``OSError`` is caught. Anything else -- one raised after the fork and
+    before ``Popen`` records the pid, a ``MemoryError`` in C, say -- would read as
+    nothing forked and be taken for evidence; it propagates instead, and the
+    command stays unconfirmed. The error is kept without its traceback, whose
+    frames hold this object: a still-running child's ``Popen`` then reaches
+    ``__del__`` as soon as it is dropped, not at some later garbage collection.
+    """
+
+    pid: int | None  # None until CPython has forked
+    spawn_error: OSError | None
+
+    def __init__(self, command: str, *, cwd: Path, env: dict[str, str]) -> None:
+        self.pid = None
+        self.returncode = None
+        self.spawn_error = None
+        try:
+            super().__init__(
+                ["bash", "-c", command],
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=env,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                start_new_session=True,
+            )
+        except OSError as exc:
+            self.spawn_error = exc.with_traceback(None)
+
+
+def _start_left_no_process(proc: _ShellPopen) -> bool:
+    """Whether a run_shell command whose start failed is known to have no process.
+
+    Read from CPython's own record on the kept ``Popen``. No pid: the start
+    failed before the fork, so nothing was started. A pid and a return code:
+    CPython reaped the child before raising -- it does that for a child that
+    reported a failed exec, one that never ran the command and so forked nothing
+    -- and the group is then seen gone; asked once, since nothing is left to
+    leave it. Anything else is a child forked and not reaped, which may be
+    running the command now.
+    """
+    if proc.pid is None:
+        return True
+    return proc.returncode is not None and tools._process_group_is_gone(proc.pid)
 
 
 def _run_shell_subprocess(
@@ -982,16 +1044,17 @@ def _run_shell_subprocess(
     its process group at its next poll. Omitted, nothing here changes.
 
     ``evidence`` records the only points at which the command is known to be
-    stopped. ``spawning`` is set the instant before ``Popen``. ``confirmed`` is
+    stopped. ``spawning`` is set the instant before the start. ``confirmed`` is
     set by the teardown in ``_communicate_bounded``, through ``on_reaped``, once
     the leader is reaped and its group is then seen gone -- asked at once, and
     again until the teardown's time limit -- whether the drain then returns or
-    raises; or when ``Popen`` raises ``OSError``. CPython raises that before
-    forking, or after reaping a child whose exec failed; the one case read
-    wrongly is an ``OSError`` from closing or reading the pipes CPython has just
-    made, after a fork that succeeded. Whatever happens after ``confirmed`` is
-    set stays confirmed (a redaction that fails closed, say); an exception that
-    leaves the drain before its teardown worked leaves the command unconfirmed.
+    raises. A start that fails with an ``OSError`` sets it only on CPython's own
+    record of that start (``_ShellPopen``, ``_start_left_no_process``): no pid --
+    it failed before the fork, so nothing was started -- or a pid CPython has
+    reaped again, its group then seen gone. A child forked and not reaped leaves
+    the command unconfirmed. Whatever happens after ``confirmed`` is set stays
+    confirmed (a redaction that fails closed, say); an exception that leaves the
+    drain before its teardown worked leaves the command unconfirmed.
     """
     if abort is not None and abort.is_set():
         return _SHELL_NOT_STARTED
@@ -1002,23 +1065,20 @@ def _run_shell_subprocess(
         env.update(extra_env)
     if evidence is not None:
         evidence.spawning = True
-    try:
-        proc = subprocess.Popen(
-            ["bash", "-c", command],
-            cwd=staging,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=env,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            start_new_session=True,
-        )
-    except OSError as exc:
+    proc = _ShellPopen(command, cwd=staging, env=env)
+    if proc.spawn_error is not None:
+        failed = f"command failed to start: {type(proc.spawn_error).__name__}"
+        if not _start_left_no_process(proc):
+            # Forked and not reaped: the child may be running the command, and the
+            # command stays unconfirmed. It is left alone on purpose. Not killed:
+            # the child may not have called setsid yet, so a killpg on its pid
+            # could miss it. Not waited for: ``proc.wait()`` has no bound. CPython's
+            # ``Popen.__del__`` keeps the object in ``subprocess._active``, and a
+            # later ``Popen`` reaps the child once it has exited.
+            return failed
         if evidence is not None:
             evidence.confirm()
-        return f"command failed to start: {type(exc).__name__}"
+        return failed
     # One output pipe (stderr is merged into stdout); no stdin (DEVNULL).
     output = tools._communicate_bounded(
         proc,
@@ -1080,13 +1140,13 @@ def _shell_stop_seconds() -> float:
 
     The bounded part of what a command already running could still take without
     the stop signal: the rest of its own timeout, then the teardown in
-    ``_communicate_bounded``, whose three waits -- the re-sent group kill, the
+    ``_communicate_bounded``, whose bounded waits -- the re-sent group kill, the
     watch for the group to be gone, the join of its one output reader -- share
-    the single limit ``_REAP_TIMEOUT_SECONDS``. The signal normally ends the wait
-    within one poll and the teardown; the bound only matters for a worker that
-    entered and cannot report in time (a leader SIGKILL cannot reap, a thread
-    stuck before its first poll, a redaction scan that hangs -- a worker reports
-    only as it returns).
+    the single limit ``_REAP_TIMEOUT_SECONDS``; its reap of the leader has no
+    bound. The signal normally ends the wait within one poll and the teardown;
+    the bound only matters for a worker that entered and cannot report in time
+    (a leader SIGKILL cannot reap, a thread stuck before its first poll, a
+    redaction scan that hangs -- a worker reports only as it returns).
     """
     return get_settings().tool_install_shell_timeout_seconds + tools._REAP_TIMEOUT_SECONDS
 
@@ -1105,16 +1165,18 @@ class _BuilderShells:
     to their end.
 
     A command counts as stopped on evidence from the worker running it only
-    (``_ShellEvidence``): its leader was reaped and its process group then seen
-    gone (or its spawn failed), or it never started a subprocess. The worker
-    reports which, from a ``finally`` around ``_run_shell_subprocess``, through
-    ``loop.call_soon_threadsafe``. Nothing else counts. Not what the group kill
-    answered: a SIGKILL delivered is not a member exited (``_communicate_bounded``
-    says more). Not the command's task: a cancelled task is done too, and the
-    event loop cancels every task as it shuts down while the worker runs on. Not
-    the worker returning: it can return through an exception after the spawn and
-    before the teardown. Not the clock: running out of time says only that no
-    word came.
+    (``_ShellEvidence``): its leader was reaped -- by the drain's teardown, or by
+    CPython after a failed exec -- and its process group then seen gone, or it
+    never started a subprocess (it did not get as far as starting, or its start
+    failed before the fork). The worker reports which, from a ``finally`` around
+    ``_run_shell_subprocess``, through ``loop.call_soon_threadsafe``. Nothing
+    else counts. Not a start that failed after the fork: its child is not reaped
+    and may run the command. Not what the group kill answered: a SIGKILL
+    delivered is not a member exited (``_communicate_bounded`` says more). Not the
+    command's task: a cancelled task is done too, and the event loop cancels every
+    task as it shuts down while the worker runs on. Not the worker returning: it
+    can return through an exception after the spawn and before the teardown. Not
+    the clock: running out of time says only that no word came.
 
     While the loop shuts down it runs the gather of every task it cancelled, the
     session waiting here among them, so it is still running to take a worker's
@@ -1132,13 +1194,14 @@ class _BuilderShells:
 
     What it guarantees: once ``stop_and_wait`` returns True, no command this
     session ran has a process left: its leader was reaped and its process group
-    was then seen gone, its spawn failed, or it never started one.
-    ``stop_and_wait`` sets the stop signal before it waits: a command still
-    running is killed at ``_communicate_bounded``'s next poll, by that function's
-    own teardown under its own lock, and a command not spawned yet is never
-    started -- or, spawned in the instant after that check, is killed at its
-    first poll. Nothing here kills a process group from outside, so the guard
-    opens no way to signal a pid that has been reaped and reused.
+    was then seen gone, or it never started one -- it did not get as far as
+    starting, or its start failed before the fork. ``stop_and_wait`` sets the
+    stop signal before it waits: a command still running is killed at
+    ``_communicate_bounded``'s next poll, by that function's own teardown under
+    its own lock, and a command not spawned yet is never started -- or, spawned
+    in the instant after that check, is killed at its first poll. Nothing here
+    kills a process group from outside, so the guard opens no way to signal a pid
+    that has been reaped and reused.
 
     What it does not cover:
 

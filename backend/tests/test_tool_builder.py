@@ -39,6 +39,7 @@ import threading
 import time
 import types
 import typing
+import warnings
 from collections.abc import Awaitable, Callable, Generator
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -8595,7 +8596,7 @@ def test_a_command_its_worker_reaches_after_the_session_stopped_never_outlives_i
     _endpoint_asking_for_one_command(monkeypatch, f'echo $$ > "{pid_file}"; sleep 30')
     _no_fetch(monkeypatch)
     real_run = tool_builder._run_shell_subprocess
-    real_popen = subprocess.Popen
+    real_shell_popen = tool_builder._ShellPopen
     stops: list[threading.Event | None] = []
     spawned: list[int] = []
 
@@ -8613,15 +8614,16 @@ def test_a_command_its_worker_reaches_after_the_session_stopped_never_outlives_i
             assert abort is not None and abort.wait(15)
         return real_run(staging, command, timeout, cap, extra_env, abort, evidence)
 
-    def spawn_late(*args: Any, **kwargs: Any) -> Any:
+    def spawn_late(command: str, *, cwd: Path, env: dict[str, str]) -> Any:
         if held_until_stop == "its-spawn":
             assert stops[0] is not None and stops[0].wait(15)
-        proc = real_popen(*args, **kwargs)
+        proc = real_shell_popen(command, cwd=cwd, env=env)
+        assert proc.pid is not None
         spawned.append(proc.pid)
         return proc
 
     monkeypatch.setattr(tool_builder, "_run_shell_subprocess", run_late)
-    monkeypatch.setattr(subprocess, "Popen", spawn_late)
+    monkeypatch.setattr(tool_builder, "_ShellPopen", spawn_late)
     seen = _watch_workspace_steps(
         monkeypatch, lambda: spawned[0] if spawned else None, worker_lag=0.0
     )
@@ -8714,8 +8716,11 @@ def _session_roots(tmp_path: Path) -> list[Path]:
 
 
 def _record_spawns(monkeypatch: pytest.MonkeyPatch) -> list[subprocess.Popen[str]]:
-    """Every process ``subprocess.Popen`` starts from here on, in order."""
+    """Every process started from here on, in order: each run_shell command that
+    started (``tool_builder._ShellPopen``), and anything ``subprocess.Popen``
+    starts directly."""
     real_popen = subprocess.Popen
+    real_shell_popen = tool_builder._ShellPopen
     spawned: list[subprocess.Popen[str]] = []
 
     def recording(*args: Any, **kwargs: Any) -> Any:
@@ -8723,7 +8728,14 @@ def _record_spawns(monkeypatch: pytest.MonkeyPatch) -> list[subprocess.Popen[str
         spawned.append(proc)
         return proc
 
+    def recording_shell(command: str, *, cwd: Path, env: dict[str, str]) -> Any:
+        proc = real_shell_popen(command, cwd=cwd, env=env)
+        if proc.spawn_error is None:
+            spawned.append(proc)
+        return proc
+
     monkeypatch.setattr(subprocess, "Popen", recording)
+    monkeypatch.setattr(tool_builder, "_ShellPopen", recording_shell)
     return spawned
 
 
@@ -9250,8 +9262,9 @@ def test_a_command_whose_spawn_fails_counts_as_stopped(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The child cannot enter its working directory, so ``Popen`` raises after
-    the fork -- and CPython reaps that child before it raises. That ``OSError``
-    is evidence: the command counts as stopped, nothing is left running."""
+    the fork -- and CPython reaps that child before it raises. That reap, read
+    from the record CPython left on the kept ``Popen``, and the group then gone
+    are the evidence: the command counts as stopped, nothing is left running."""
     _install_settings(
         monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
     )
@@ -9277,6 +9290,172 @@ def test_a_command_whose_spawn_fails_counts_as_stopped(
     with pytest.raises(ChildProcessError):  # already reaped: nothing left to wait for
         os.waitpid(spawned[0], os.WNOHANG)
     assert stopped is True
+
+
+def _fail_a_start_step(
+    monkeypatch: pytest.MonkeyPatch, name: str, error: OSError, *, after_the_fork: bool
+) -> list[int]:
+    """Make one ``os`` call that ``subprocess`` makes while starting a child fail
+    with ``error``: the first call of ``name`` after the fork, or the first one at
+    all. Only ``subprocess``'s own view of ``os`` changes (``subprocess.os``). A
+    ``close`` releases its descriptor before failing, as an interrupted close
+    does. Returns the pid of every child forked meanwhile, in order."""
+    real_fork_exec = subprocess._fork_exec  # ty: ignore[unresolved-attribute]
+    real_call = getattr(os, name)
+    forked: list[int] = []
+    armed = [not after_the_fork]
+
+    def recording_fork_exec(*args: Any) -> int:
+        pid = real_fork_exec(*args)
+        forked.append(pid)
+        if after_the_fork:
+            armed[0] = True
+        return pid
+
+    def failing_once(*args: Any) -> Any:
+        if not armed[0]:
+            return real_call(*args)
+        armed[0] = False
+        if name == "close":
+            real_call(*args)
+        raise error
+
+    class SubprocessOs:
+        def __getattr__(self, attr: str) -> Any:
+            return failing_once if attr == name else getattr(os, attr)
+
+    monkeypatch.setattr(subprocess, "_fork_exec", recording_fork_exec)
+    monkeypatch.setattr(subprocess, "os", SubprocessOs())
+    return forked
+
+
+def _leads_its_own_group(pid: int) -> bool:
+    """Whether ``pid`` comes to lead a process group of its own within a few
+    seconds: a child ``Popen`` forked with ``start_new_session`` calls ``setsid``
+    on its way to exec, which may not have happened yet."""
+    give_up = time.monotonic() + 5
+    while time.monotonic() < give_up:
+        with contextlib.suppress(ProcessLookupError):
+            if os.getpgid(pid) == pid:
+                return True
+        time.sleep(0.01)
+    return False
+
+
+def _kill_and_reap(pid: int) -> None:
+    """End a child that nothing else will reap: kill its group -- its own by now,
+    else the child alone -- and wait for it."""
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+    with contextlib.suppress(ChildProcessError):
+        os.waitpid(pid, 0)
+
+
+@pytest.mark.parametrize(
+    ("name", "error"),
+    [
+        pytest.param("close", InterruptedError(errno.EINTR, "Interrupted system call"), id="close"),
+        pytest.param("read", OSError(errno.EIO, "Input/output error"), id="exec-report-read"),
+    ],
+)
+def test_a_start_that_fails_after_the_fork_leaves_the_command_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str, error: OSError
+) -> None:
+    """``Popen`` raises ``OSError`` after the fork -- closing its own end of a pipe,
+    or reading the child's report of its exec -- while the child goes on to run
+    the command. CPython has not reaped that child, so nothing vouches that it is
+    gone: the command counts as unconfirmed, and its leader is still there, in a
+    group of its own."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    forked = _fail_a_start_step(monkeypatch, name, error, after_the_fork=True)
+    with warnings.catch_warnings():
+        # The kept Popen still names a running child when it is dropped, and
+        # CPython says so.
+        warnings.simplefilter("ignore", ResourceWarning)
+        try:
+            result, stopped = _shells_run_alone(staging, "sleep 30", 20)
+            assert len(forked) == 1
+            leader = forked[0]
+            still_there = os.waitid(os.P_PID, leader, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            own_group = _leads_its_own_group(leader) and _group_exists(leader)
+        finally:
+            for pid in forked:
+                _kill_and_reap(pid)
+
+    assert result == f"command failed to start: {type(error).__name__}"
+    assert still_there is None  # neither exited nor reaped
+    assert own_group
+    assert stopped is False
+
+
+def test_a_start_that_fails_before_the_fork_counts_as_never_started(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``Popen`` fails creating the command's output pipe, before any fork. The
+    kept ``Popen`` has no pid, and the record of every fork stays empty: that
+    nothing was started is read, not inferred. The command counts as stopped."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    forked = _fail_a_start_step(
+        monkeypatch, "pipe", OSError(errno.EMFILE, "Too many open files"), after_the_fork=False
+    )
+
+    result, stopped = _shells_run_alone(staging, "sleep 30", 20)
+
+    assert result == "command failed to start: OSError"
+    assert forked == []
+    assert stopped is True
+
+
+def test_a_start_that_fails_with_anything_but_oserror_leaves_the_command_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The fork happens, and then the start fails with something other than
+    ``OSError`` -- here a ``MemoryError`` before ``Popen`` has recorded the pid.
+    Read as a failed start, the missing pid would say nothing was forked; so it
+    is not read at all: the error propagates out of run_shell, and the command,
+    whose child is running, counts as unconfirmed."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    real_fork_exec = subprocess._fork_exec  # ty: ignore[unresolved-attribute]
+    forked: list[int] = []
+
+    def fork_then_fail(*args: Any) -> int:
+        forked.append(real_fork_exec(*args))
+        raise MemoryError
+
+    monkeypatch.setattr(subprocess, "_fork_exec", fork_then_fail)
+
+    async def scenario() -> bool:
+        shells = tool_builder._BuilderShells()
+        with pytest.raises(MemoryError):
+            await shells.run(staging, "sleep 30", 20, 4096, None)
+        return await shells.stop_and_wait()
+
+    try:
+        stopped = asyncio.run(scenario())
+        assert len(forked) == 1
+        still_there = os.waitid(os.P_PID, forked[0], os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    finally:
+        for pid in forked:
+            _leads_its_own_group(pid)
+            _kill_and_reap(pid)
+
+    assert still_there is None  # the child runs on
+    assert stopped is False
 
 
 def test_a_command_that_finds_the_stop_set_before_spawning_counts_as_stopped(
@@ -9367,11 +9546,11 @@ def test_a_teardown_whose_reap_fails_gives_no_evidence(
     )
     staging = tmp_path / "staging"
     staging.mkdir()
-    real_popen = subprocess.Popen
+    real_shell_popen = tool_builder._ShellPopen
     spawned: list[subprocess.Popen[str]] = []
 
-    def popen_whose_wait_fails(*args: Any, **kwargs: Any) -> Any:
-        proc = real_popen(*args, **kwargs)
+    def popen_whose_wait_fails(command: str, *, cwd: Path, env: dict[str, str]) -> Any:
+        proc = real_shell_popen(command, cwd=cwd, env=env)
         spawned.append(proc)
 
         def failing_wait(timeout: float | None = None) -> int:
@@ -9380,7 +9559,7 @@ def test_a_teardown_whose_reap_fails_gives_no_evidence(
         proc.wait = failing_wait  # ty: ignore[invalid-assignment]
         return proc
 
-    monkeypatch.setattr(subprocess, "Popen", popen_whose_wait_fails)
+    monkeypatch.setattr(tool_builder, "_ShellPopen", popen_whose_wait_fails)
     try:
         result, stopped = _shells_run_alone(staging, "sleep 30", 0.3)
         ends = [proc.returncode for proc in spawned]

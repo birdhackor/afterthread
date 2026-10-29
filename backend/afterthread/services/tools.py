@@ -256,11 +256,11 @@ _TOOL_SUMMARY_CAP = 8000
 _OUTPUT_TRUNCATION_MARKER = "…[工具輸出過長已截斷]"
 
 # The one time limit of the teardown in ``_communicate_bounded``, counted from the
-# moment it starts. With ``on_reaped``, everything that teardown waits for shares
-# it: the re-sent group kill, the watch for the group to be gone, and the join of
-# the reader/writer threads. One limit is enough because once the group is gone no
+# moment it starts. With ``on_reaped``, it bounds the re-sent group kill, the watch
+# for the group to be gone, and the join of the reader/writer threads; the reap of
+# the leader has no bound. One limit is enough because once the group is gone no
 # member holds a write end of the pipes, so the readers hit EOF and the join
-# completes at once -- the waits need no adding up. Without ``on_reaped`` there is
+# completes at once -- the waits need no adding up. Without ``on_reaped`` it bounds
 # only the join, and each thread is given the whole limit, purely so a wedged pipe
 # can never turn cleanup itself into a hang.
 _REAP_TIMEOUT_SECONDS = 5.0
@@ -3258,8 +3258,9 @@ def _communicate_bounded(
         # OUT of the group escapes even this and is beyond v1's non-container stance
         # (D21); the daemon flag on every reader/writer thread is the honest backstop.
         #
-        # One limit, counted from here, bounds everything below that waits
-        # (``_REAP_TIMEOUT_SECONDS``).
+        # One limit, counted from here (``_REAP_TIMEOUT_SECONDS``), bounds the
+        # re-sent kill, the watch after the reap, and the join. The reap itself
+        # has no bound.
         deadline = time.monotonic() + _REAP_TIMEOUT_SECONDS
         with teardown_lock:
             if not reaped:
