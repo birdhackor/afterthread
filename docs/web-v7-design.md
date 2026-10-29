@@ -112,9 +112,11 @@ session 執行期間不碰草稿目錄；草稿只在保存那一步換成新的
 固定：
 
 1. **等這一輪自己啟動的 `run_shell` 全部結束。** 只有逾時的路徑會有在飛的指令（正常路徑上，迴圈
-   每輪都等完所有工具結果才送下一次請求）。每個指令在受保護的 task 裡跑並登記它的 `Popen`；逾時時
-   用 `tools._kill_process_group` 殺掉它的 process group，再等 task 結束。現有的清理與發布也因此
-   不再與還在跑的指令競爭。
+   每輪都等完所有工具結果才送下一次請求）。每個指令在受保護的 task 裡跑；session 結束時設下這一場的
+   中止訊號，`_communicate_bounded` 在輪詢時看到它，就用自己在 `teardown_lock` 下的拆除流程殺掉
+   process group 並回收（不從外部 kill，免得打到已回收而被重用的 PID），再等 task 結束；訊號設下之後
+   才要啟動的指令不會啟動。等不到（超過單一指令逾時加回收餘裕）就不保存、不發布（D52）。現有的清理
+   與發布也因此不再與還在跑的指令競爭。
 2. **剝除** builder 寫的 `.env`（`_strip_builder_env`）與根目錄的 `.afterthread.meta/`
    （`_strip_builder_sidecars`）。剝除失敗就不保存檔案。
 3. **確認工作區**：`_verify_staging_root`，加上存在、是目錄、不是連結（現有函式對不存在的路徑放行）。

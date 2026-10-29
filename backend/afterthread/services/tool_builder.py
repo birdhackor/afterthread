@@ -252,6 +252,12 @@ _ERROR_VERSION_ID_WRITE = "無法為工具建立不重複的版本編號，操�
 _ERROR_ORIGIN_WRITE = "無法寫入工具版本的來源資料，操作已取消。"  # noqa: RUF001
 _ERROR_CURRENT_WRITE = "無法發布工具的新版本，操作已取消。"  # noqa: RUF001
 _ERROR_DURABILITY = "無法確認工具資料已安全寫入磁碟，操作已取消。"  # noqa: RUF001
+# A run_shell command of the session had not ended when ``_BuilderShells`` stopped
+# waiting for it, so nothing the session produced is taken as settled. Appended to
+# the session's own error when it has one (in practice its deadline).
+_ERROR_SHELL_NOT_STOPPED = (
+    "工作階段結束後，有 run_shell 指令沒能在時限內確認停止，這次的成果不會發布；詳情見後端記錄。"  # noqa: RUF001
+)
 
 _VID_RETRY_LIMIT = 16
 
@@ -895,12 +901,20 @@ def _tool_spec(name: str, description: str, properties: dict[str, Any]) -> dict[
     }
 
 
+# What run_shell hands back for a command its session had already stopped: never
+# started, or killed part-way. Model-facing English like every run_shell result,
+# though by then the session that would read it is over.
+_SHELL_NOT_STARTED = "command not run: the session has ended"
+_SHELL_STOPPED = "command stopped: the session has ended"
+
+
 def _run_shell_subprocess(
     staging: Path,
     command: str,
     timeout: float,
     cap: int,
     extra_env: dict[str, str] | None = None,
+    abort: threading.Event | None = None,
 ) -> str:
     """Run one builder shell command to completion (or timeout); returns text.
 
@@ -939,7 +953,14 @@ def _run_shell_subprocess(
     which caps the single merged pipe as it reads instead of slurping the whole
     stream first: a command that spews far past the cap is killed at the cap, so a
     runaway ``yes``/``cat`` can never OOM the service before the cap is applied.
+
+    ``abort`` is the session's stop signal (``_BuilderShells``). Already set when
+    this starts, the command is not started at all; set while it runs -- or
+    between this check and the spawn -- ``_communicate_bounded`` kills and reaps
+    its process group at its next poll. Omitted, nothing here changes.
     """
+    if abort is not None and abort.is_set():
+        return _SHELL_NOT_STARTED
     env = {name: os.environ[name] for name in tools._PASSTHROUGH_ENV if name in os.environ}
     if get_settings().tls_no_verify:
         env["TLS_NO_VERIFY"] = "1"
@@ -961,7 +982,11 @@ def _run_shell_subprocess(
     except OSError as exc:
         return f"command failed to start: {type(exc).__name__}"
     # One output pipe (stderr is merged into stdout); no stdin (DEVNULL).
-    output = tools._communicate_bounded(proc, input_text=None, cap=cap, timeout=timeout)
+    output = tools._communicate_bounded(
+        proc, input_text=None, cap=cap, timeout=timeout, abort=abort
+    )
+    if output.aborted:
+        return _SHELL_STOPPED
     if output.timed_out:
         return f"command timed out after {timeout:g} seconds"
     # F1/D36: mask any known secret VALUE in the builder shell's output BEFORE the
@@ -982,7 +1007,114 @@ def _run_shell_subprocess(
     return tools._cap_output(tools.redact_known_secrets(output.stdout), cap)
 
 
-def _build_meta_tools(staging: Path, secret_env: dict[str, str] | None = None) -> list[LlmTool]:
+def _shell_stop_seconds() -> float:
+    """How long a builder session waits for its run_shell commands once stopped.
+
+    The bounded part of what a command already running could still take without
+    the stop signal: the rest of its own timeout, then the allowance
+    ``_communicate_bounded`` gives its one output reader once the group is killed.
+    The signal normally ends the wait within one poll and the reap; the bound only
+    matters for a worker that does not get to run at all (a thread pool with no
+    free worker) or cannot finish (a leader SIGKILL cannot reap, a redaction scan
+    that hangs).
+    """
+    return get_settings().tool_install_shell_timeout_seconds + tools._REAP_TIMEOUT_SECONDS
+
+
+class _BuilderShells:
+    """The run_shell commands of ONE builder session, and the signal that stops them.
+
+    ``run_install``/``run_revise`` create one per session and hand it to
+    ``_build_meta_tools``; it is never module state, because other work (a health
+    check, an AI request's tool call) runs subprocesses of its own meanwhile.
+
+    Each command runs as a task of its own, kept here by a strong reference and
+    awaited through ``asyncio.shield`` -- the shape of ``tools._make_handler``. The
+    session's deadline, or a cancellation of the session, then cancels only the
+    handler's await: the command's task, and the worker thread it waits on, go on
+    to their end, which is what ``stop_and_wait`` waits for.
+
+    What it guarantees: once ``stop_and_wait`` returns True, every command this
+    session ran has returned from its worker, and every process group one of them
+    spawned has been killed and its leader reaped. ``stop_and_wait`` sets the stop
+    signal before it waits: a command still running is killed at
+    ``_communicate_bounded``'s next poll, by that function's own teardown under its
+    own lock, and a command not spawned yet is never started -- or, spawned in the
+    instant after that check, is killed at its first poll. Nothing here kills a
+    process group from outside, so the guard opens no way to signal a pid that has
+    been reaped and reused.
+
+    What it does not cover:
+
+    * a descendant that leaves the process group (``setsid``, a double fork):
+      run_shell is a real shell with the service's own rights, not a sandbox, and
+      the group kill is all a stop can do -- as it is all a timeout can do;
+    * the session cancelled a second time while ``stop_and_wait`` waits: that
+      cancellation ends the wait, and the cleanup that follows no longer waits;
+    * a command's task cancelled from elsewhere, as the event loop does to every
+      task when it shuts down: the task then ends before its worker does, and the
+      wait cannot tell the two apart.
+    """
+
+    __slots__ = ("_stop", "_tasks")
+
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._tasks: set[asyncio.Task[str]] = set()
+
+    async def run(
+        self,
+        staging: Path,
+        command: str,
+        timeout: float,
+        cap: int,
+        extra_env: dict[str, str] | None,
+    ) -> str:
+        """Run one command for the session; returns run_shell's result text."""
+        task = asyncio.ensure_future(
+            run_in_threadpool(
+                _run_shell_subprocess, staging, command, timeout, cap, extra_env, self._stop
+            )
+        )
+        self._tasks.add(task)
+        task.add_done_callback(self._forget)
+        return await asyncio.shield(task)
+
+    def _forget(self, task: asyncio.Task[str]) -> None:
+        self._tasks.discard(task)
+        # Retrieved, so a command that failed after its handler stopped waiting is
+        # not logged as "Task exception was never retrieved": nobody is left to
+        # read its result.
+        if not task.cancelled():
+            task.exception()
+
+    async def stop_and_wait(self) -> bool:
+        """Stop every command of this session and wait for each to end.
+
+        True once all have ended. False when some are still running after
+        ``_shell_stop_seconds``: the caller must then not take the workspace as
+        settled. That case is logged here with the bound, never a command.
+        """
+        self._stop.set()
+        pending = [task for task in self._tasks if not task.done()]
+        if not pending:
+            return True
+        bound = _shell_stop_seconds()
+        _done, still_running = await asyncio.wait(pending, timeout=bound)
+        if still_running:
+            with contextlib.suppress(Exception):
+                _logger.warning(
+                    "A builder run_shell command had not ended %g seconds after its "
+                    "session stopped it; nothing from that session is published.",
+                    bound,
+                )
+            return False
+        return True
+
+
+def _build_meta_tools(
+    staging: Path, secret_env: dict[str, str] | None = None, *, shells: _BuilderShells
+) -> list[LlmTool]:
     """The four meta-tools, every handler a closure over this session's staging.
 
     All handlers follow the LlmTool no-raise contract: filesystem/subprocess
@@ -997,6 +1129,9 @@ def _build_meta_tools(staging: Path, secret_env: dict[str, str] | None = None) -
     ``_run_shell_subprocess``. It touches ONLY run_shell (the file meta-tools
     never see it) and never any prompt; the ``config.env`` TEXT reaches the
     prompt separately, through ``_revise_user_prompt``.
+
+    ``shells`` is the session's ``_BuilderShells``: every run_shell command runs
+    through it, so the session can stop them all and wait for them to end.
     """
 
     async def write_file(args: dict[str, Any]) -> str:
@@ -1147,8 +1282,7 @@ def _build_meta_tools(staging: Path, secret_env: dict[str, str] | None = None) -
         if not isinstance(command, str) or not command.strip():
             return "run_shell rejected: command must be a non-empty string"
         settings = get_settings()
-        return await run_in_threadpool(
-            _run_shell_subprocess,
+        return await shells.run(
             staging,
             command,
             settings.tool_install_shell_timeout_seconds,
@@ -2361,13 +2495,14 @@ async def run_install(
         settings = get_settings()
         result: InstallResult | None = None
         llm_error: str | None = None
+        shells = _BuilderShells()
         try:
             result = await generate_structured(
                 _builder_system_prompt(secret_name),
                 _builder_user_prompt(instructions, openapi_text),
                 InstallResult,
                 workflow=_WORKFLOW,
-                tools=_build_meta_tools(build_root.path, secret_env=secret_env),
+                tools=_build_meta_tools(build_root.path, secret_env=secret_env, shells=shells),
                 max_tool_rounds=settings.tool_install_max_rounds,
                 timeout_seconds=settings.tool_install_timeout_seconds,
             )
@@ -2378,10 +2513,24 @@ async def run_install(
             # afterthread.services.llm); surfacing it names WHICH failure
             # (timeout vs invalid output vs upstream) without config leakage.
             llm_error = f"AI 建置工具失敗（{exc}）。"  # noqa: RUF001
+        finally:
+            # However the session ended -- an answer, an error, its deadline, or this
+            # coroutine cancelled -- stop the commands it started and wait for them
+            # (``_BuilderShells``) before anything below touches the workspace and
+            # before the job gives up its slot. If one has not ended within the
+            # bound, the workspace is neither stripped nor published: only the
+            # outer ``finally``'s cleanup still touches it.
+            shells_ended = await shells.stop_and_wait()
 
         # The builder session ran (even a not-configured exit records one), so
         # link its AI 日誌 record to the outcome NOW -- error paths included.
         llm_log_id = llm_log.last_record_id_for_workflow(_WORKFLOW)
+        if not shells_ended:
+            return InstallOutcome(
+                ok=False,
+                error=(llm_error or "") + _ERROR_SHELL_NOT_STOPPED,
+                llm_log_id=llm_log_id,
+            )
         env_keys, env_strip_error = await run_in_threadpool(_strip_builder_env, build_root, base)
 
         if env_strip_error is not None:
@@ -3136,6 +3285,7 @@ async def run_revise(
         stats = StructuredRunStats()
         result: ReviseResult | None = None
         llm_error: str | None = None
+        shells = _BuilderShells()
         try:
             result = await generate_structured(
                 system_prompt,
@@ -3146,7 +3296,9 @@ async def run_revise(
                 # into a prompt), so the model can live-test the real API against
                 # the tool's own credentials without the file being in staging.
                 # config.env rides along under it; its TEXT is in the prompt above.
-                tools=_build_meta_tools(build_root.path, secret_env=shell_env or None),
+                tools=_build_meta_tools(
+                    build_root.path, secret_env=shell_env or None, shells=shells
+                ),
                 max_tool_rounds=settings.tool_install_max_rounds,
                 timeout_seconds=settings.tool_install_timeout_seconds,
                 stats=stats,
@@ -3156,6 +3308,10 @@ async def run_revise(
         except LLMUpstreamError as exc:
             # str(exc) is category + fixed reason by construction (see llm.py).
             llm_error = f"AI 修訂工具失敗（{exc}）。"  # noqa: RUF001
+        finally:
+            # The same stop-and-wait as run_install's: before anything below touches
+            # the workspace and before the job gives up its slot.
+            shells_ended = await shells.stop_and_wait()
 
         llm_log_id = llm_log.last_record_id_for_workflow(_WORKFLOW)
         # How the session ended as the loop measured it, on EVERY outcome from here
@@ -3205,6 +3361,16 @@ async def run_revise(
                     else None
                 ),
             }
+        if not shells_ended:
+            return InstallOutcome(
+                ok=False,
+                tool_name=name,
+                summary=summary,
+                error=(llm_error or "") + _ERROR_SHELL_NOT_STOPPED,
+                llm_log_id=llm_log_id,
+                **facts,
+                **notes,
+            )
         env_keys, env_strip_error = await run_in_threadpool(_strip_builder_env, build_root, base)
         if env_strip_error is not None:
             return InstallOutcome(

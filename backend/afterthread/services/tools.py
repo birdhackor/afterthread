@@ -29,7 +29,7 @@ import tempfile
 import threading
 import time
 import weakref
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterable, Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -1267,45 +1267,201 @@ def _scan_all() -> list[_PackageScan]:
     ]
 
 
-def _find_embedded_secret_file(build_root: BuildRoot) -> str | None:
-    """Relative path of the first staged file that embeds a known secret VALUE, or None.
+# --- embedded-secret scan ------------------------------------------------------
 
-    The install-only H3 gate. A builder session has real shell capability (run_shell,
-    D21), so it could read another tool's ``.env`` -- or any file the service uid can --
-    and bake a live key into the package it is producing. The manifest is the
-    persistence-and-broadcast vector (served via /api/tools and re-sent in EVERY future
-    LLM tool spec), and every implementation file is a persisted plaintext copy, so
-    before promotion EVERY regular file is scanned for any known secret value (>=
-    _MIN_SECRET_LEN, the redactor floor). A hit REJECTS the install (the caller names the
-    offending relative path) rather than redacting: an embedded key is malformed by
-    design, and masking would silently alter the schema the model built. The in-flight
-    install secret is registered for the whole build (run_install), so it is covered here
-    too -- and validate runs BEFORE promote writes the secret into the package ``.env``,
-    so this never trips on the backend's own later injection.
+# How many characters of a file one read of the embedded-secret scan takes. Each
+# read is searched together with the end of the read before it, so this bounds
+# the memory a file costs the scan, not what the scan can find in it.
+_SECRET_SCAN_CHUNK_CHARS = 64 * 1024
 
-    Each file is read through the ONE bounded, FIFO/symlink-hardened helper (cap =
-    _MANIFEST_MAX_BYTES); a non-regular/unreadable file comes back None and is skipped.
-    ``os.walk`` does not follow directory symlinks and the read's O_NOFOLLOW refuses a
-    symlinked leaf, so the scan can never be walked out of the package. Files are visited
-    in a deterministic sorted order so the named offender is stable. Cost is one substring
-    pass per known secret per file -- fine for the few small files a package holds.
+# Where in a tree a known secret was found: a regular file's content, an entry's
+# relative path (its own name, or a directory above it), or a symlink's target
+# string. Hits on one path are listed in this order.
+type SecretHitKind = Literal["content", "name", "link_target"]
+_SECRET_HIT_KIND_ORDER: dict[str, int] = {"content": 0, "name": 1, "link_target": 2}
+
+# Why the scan did not search an entry's content (or a symlink's target):
+# ``not_regular`` -- neither a directory, a link nor a regular file, such as a FIFO,
+# socket or device, which is never read -- or ``unreadable``, when an ``OSError``
+# stopped the open or the read.
+type SecretScanSkipReason = Literal["not_regular", "unreadable"]
+
+
+@dataclass(frozen=True, slots=True)
+class SecretHit:
+    """One place a known secret value was found, by path relative to the root."""
+
+    path: str
+    kind: SecretHitKind
+
+
+@dataclass(frozen=True, slots=True)
+class SecretScanSkip:
+    """An entry whose content, or symlink target, the scan did not search."""
+
+    path: str
+    reason: SecretScanSkipReason
+
+
+@dataclass(frozen=True, slots=True)
+class SecretScanDone:
+    """A scan that went through the whole tree: every hit, and every skipped entry.
+
+    No hits means no searched place holds a known secret. ``skipped`` is what was
+    not searched; whether that is acceptable is the caller's call.
     """
-    secrets = _redaction_secrets()
-    if not secrets:
-        return None
-    base = build_root.path.resolve()
-    for dirpath, dirnames, filenames in os.walk(base):
-        dirnames.sort()
-        filenames.sort()
-        here = Path(dirpath)
-        for filename in filenames:
-            path = here / filename
-            text = _read_regular_file_capped(path, _MANIFEST_MAX_BYTES)
-            if text is None:
-                continue
-            if any(secret in text for secret in secrets):
-                return str(path.relative_to(base))
-    return None
+
+    hits: tuple[SecretHit, ...]
+    skipped: tuple[SecretScanSkip, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SecretScanFailed:
+    """A scan that could not finish, so nothing is known about the tree.
+
+    It deliberately has no ``hits``: a caller must tell it apart from
+    ``SecretScanDone`` before it can read any, so a failed scan cannot pass for a
+    clean one. ``reason`` is the exception's class name only, because an error's
+    text can carry a path and a path can embed a secret.
+    """
+
+    reason: str
+
+
+type SecretScan = SecretScanDone | SecretScanFailed
+
+
+def scan_embedded_secrets(
+    root: Path | BuildRoot, secrets: Iterable[str] | None = None
+) -> SecretScan:
+    """Which paths in the tree under ``root`` embed a known secret value.
+
+    A builder session has a real shell (run_shell), so it can read another tool's
+    ``.env`` -- or any file the service uid can -- and bake a live key into what it
+    produces: into a file, a file or directory name, or a symlink's target. This
+    finds every such place. ``secrets`` defaults to the values known now
+    (``_redaction_secrets``); a value shorter than ``_MIN_SECRET_LEN``, the
+    redactor's floor, is never looked for.
+
+    What it checks:
+
+    * every entry's relative path, which carries its own name and every directory
+      above it, so an entry under a directory named after a secret is a hit too;
+    * every symlink's target string, read with ``os.readlink``; the link is never
+      followed, opened or descended into;
+    * the whole content of every regular file. Each ``_SECRET_SCAN_CHUNK_CHARS``
+      read is searched together with the last "longest secret minus one"
+      characters before it, so a value split across two reads is still found
+      whole, while memory stays at one read plus that overlap however large the
+      file is. Files are opened like ``_read_regular_file_capped`` opens them
+      (``O_NOFOLLOW``, ``O_NONBLOCK``, ``S_ISREG`` on the descriptor), without
+      its cap. With no secret to look for, no file is opened.
+
+    What it returns: ``SecretScanDone`` with every hit, sorted by path and then
+    kind so callers and messages are stable, and every entry whose content went
+    unsearched -- ``not_regular`` for one that is neither a directory, a link nor
+    a regular file (a FIFO, socket or device, never read), ``unreadable`` when an
+    ``OSError`` stopped the open or read of a file or the read of a link. A
+    ``SecretScanFailed`` instead when the scan could not finish: the known-secret
+    lookup raised, or the walk did -- a directory that cannot be listed, an entry
+    that cannot be classified, a read failing with anything other than
+    ``OSError``.
+
+    What it does not cover: content is decoded as UTF-8 with replacement and
+    universal newlines, as ``_read_regular_file_capped`` decodes it, so a value
+    stored in another encoding, or one containing a carriage return, is not
+    found; the root itself is listed as given, link or not; and the tree can
+    change after the scan returns -- keeping writers away is the caller's job.
+    """
+    path = root.path if isinstance(root, BuildRoot) else root
+    try:
+        values = _redaction_secrets() if secrets is None else list(secrets)
+        looked_for = sorted({value for value in values if len(value) >= _MIN_SECRET_LEN})
+        return _scan_tree(path, looked_for)
+    except Exception as exc:
+        return SecretScanFailed(type(exc).__name__)
+
+
+def _scan_tree(root: Path, secrets: list[str]) -> SecretScanDone:
+    """The walk behind ``scan_embedded_secrets``. Raises whatever fails the scan.
+
+    A directory that cannot be listed raises out of ``os.scandir``; an ``OSError``
+    on one file or link is caught where it happens and recorded as a skip.
+    """
+    hits: list[SecretHit] = []
+    skipped: list[SecretScanSkip] = []
+    overlap = max((len(secret) for secret in secrets), default=1) - 1
+    pending: list[tuple[str, str]] = [(os.fspath(root), "")]
+    while pending:
+        directory, prefix = pending.pop()
+        with os.scandir(directory) as listing:
+            entries = sorted(listing, key=lambda entry: entry.name)
+        for entry in entries:
+            relative = prefix + entry.name
+            if any(secret in relative for secret in secrets):
+                hits.append(SecretHit(relative, "name"))
+            if entry.is_symlink():
+                if not secrets:
+                    continue
+                try:
+                    target = os.readlink(entry.path)
+                except OSError:
+                    skipped.append(SecretScanSkip(relative, "unreadable"))
+                    continue
+                if any(secret in target for secret in secrets):
+                    hits.append(SecretHit(relative, "link_target"))
+            elif entry.is_dir(follow_symlinks=False):
+                pending.append((entry.path, relative + "/"))
+            elif not entry.is_file(follow_symlinks=False):
+                skipped.append(SecretScanSkip(relative, "not_regular"))
+            elif secrets:
+                found = _search_file(entry.path, secrets, overlap)
+                if isinstance(found, bool):
+                    if found:
+                        hits.append(SecretHit(relative, "content"))
+                else:
+                    skipped.append(SecretScanSkip(relative, found))
+    hits.sort(key=lambda hit: (hit.path, _SECRET_HIT_KIND_ORDER[hit.kind]))
+    skipped.sort(key=lambda skip: skip.path)
+    return SecretScanDone(tuple(hits), tuple(skipped))
+
+
+def _search_file(path: str, secrets: list[str], overlap: int) -> bool | SecretScanSkipReason:
+    """Whether the regular file at ``path`` holds one of ``secrets``, read to the end.
+
+    Each read is searched with the last ``overlap`` characters of the previous one
+    in front of it. A file that turns out not to be regular once open, or an
+    ``OSError`` on the open or a read, comes back as the reason it was skipped;
+    any other exception propagates and fails the scan.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return "unreadable"
+    fd_owned = True  # until fdopen takes the descriptor over
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return "not_regular"
+        handle = os.fdopen(fd, encoding="utf-8", errors="replace")
+        fd_owned = False
+        with handle:
+            carried = ""
+            while chunk := handle.read(_SECRET_SCAN_CHUNK_CHARS):
+                window = carried + chunk
+                if any(secret in window for secret in secrets):
+                    return True
+                carried = window[max(len(window) - overlap, 0) :]
+        return False
+    except OSError:
+        return "unreadable"
+    finally:
+        if fd_owned:
+            os.close(fd)
+
+
+def _secret_scan_failed_error(reason: str) -> str:
+    """The publish refusal for a scan that could not finish; it never says "secret found"."""
+    return f"秘密掃描失敗（{reason}），無法確認工具包裡沒有已知的秘密值。"  # noqa: RUF001
 
 
 def validate_tool_content(build_root: BuildRoot, expected_name: str) -> str | None:
@@ -1326,7 +1482,10 @@ def validate_tool_content(build_root: BuildRoot, expected_name: str) -> str | No
 
     The embedded-secret gate (H3) is likewise install-only: it must BLOCK a package
     that baked a known key into any file, but is never re-run on installed packages
-    (whose ``.env`` legitimately holds the injected secret post-install).
+    (whose ``.env`` legitimately holds the injected secret post-install). It runs
+    ``scan_embedded_secrets``, so it reads every file whole and checks every path
+    and symlink target; a scan that could not finish refuses the package too,
+    with a message that says the scan failed rather than that a secret was found.
     """
     error = _scan_tool_content(build_root, expected_name).error
     if error is not None:
@@ -1342,14 +1501,22 @@ def validate_tool_content(build_root: BuildRoot, expected_name: str) -> str | No
         oversized = False
     if oversized:
         return "`.env` is too large"
-    # Install-only embedded-secret gate (H3): reject a package that baked a known secret
-    # value into any file, naming the offending relative path (never the value itself).
-    # The path is itself run through the redactor before it lands in the message, in case
-    # a builder wrote a file whose very NAME embeds an expanded ``$SECRET`` -- so the
-    # rejection can never echo the value even via the path.
-    offender = _find_embedded_secret_file(build_root)
-    if offender is not None:
-        return f"{redact_known_secrets(offender)} 不得包含秘密值（請改由環境變數讀取）"  # noqa: RUF001
+    # Install-only embedded-secret gate: reject a package that embeds a known secret
+    # value anywhere -- a file's content, a path, a symlink target -- naming the first
+    # offending relative path, never the value. The path is masked before it lands in
+    # the message, because a builder can write a file whose very NAME is an expanded
+    # ``$SECRET``. One snapshot of the known secrets serves the scan and the mask, so
+    # the value a hit was found by is the one masked out of its path.
+    try:
+        secrets = _redaction_secrets()
+    except Exception as exc:
+        return _secret_scan_failed_error(type(exc).__name__)
+    scan = scan_embedded_secrets(build_root, secrets)
+    if isinstance(scan, SecretScanFailed):
+        return _secret_scan_failed_error(scan.reason)
+    if scan.hits:
+        offender = _mask_known_secrets(scan.hits[0].path, secrets)
+        return f"{offender} 不得包含秘密值（請改由環境變數讀取）"  # noqa: RUF001
     return None
 
 
@@ -2750,7 +2917,9 @@ class _BoundedOutput:
     flags say a stream ran PAST the cap (and so the process was killed for it),
     which the callers use to decide between "here is the truncated output" and
     "the tool failed". ``timed_out`` is the wall-clock expiry, kept distinct so
-    a caller can render the timeout message instead of an output.
+    a caller can render the timeout message instead of an output. ``aborted``
+    says the caller's stop signal ended the wait first (only a caller that
+    passed one can see it set).
     """
 
     stdout: str
@@ -2758,6 +2927,7 @@ class _BoundedOutput:
     stdout_overflow: bool
     stderr_overflow: bool
     timed_out: bool
+    aborted: bool = False
 
 
 class _CappedReader:
@@ -2812,7 +2982,12 @@ class _CappedReader:
 
 
 def _communicate_bounded(
-    proc: subprocess.Popen[str], *, input_text: str | None, cap: int, timeout: float
+    proc: subprocess.Popen[str],
+    *,
+    input_text: str | None,
+    cap: int,
+    timeout: float,
+    abort: threading.Event | None = None,
 ) -> _BoundedOutput:
     """``communicate`` with a hard per-stream memory cap and a wall-clock timeout.
 
@@ -2828,6 +3003,13 @@ def _communicate_bounded(
     (see ``_CappedReader``). Threads are the mechanism, not asyncio: this runs in
     a ``run_in_threadpool`` worker, and ``file.read`` releases the GIL while it
     blocks, so the reads and the ``wait`` genuinely proceed in parallel.
+
+    ``abort`` is an optional stop signal set from another thread. Once it is set
+    while the leader still runs, the wait ends at the next poll and the group is
+    killed and reaped by the same teardown the deadline uses, under the same lock
+    -- so a stop never needs a kill from outside, which could reach a pid already
+    reaped and reused. The result then has ``aborted`` set. Without ``abort``,
+    the wait is the deadline-only one it always was.
     """
     threads: list[threading.Thread] = []
     # `teardown_lock` + `reaped` make the overflow-kill callback below and the
@@ -2893,6 +3075,7 @@ def _communicate_bounded(
     # which is the load-bearing invariant that makes the kill race-free. WNOHANG
     # makes each probe non-blocking so we poll under our own deadline.
     timed_out = False
+    aborted = False
     deadline = time.monotonic() + timeout
     while True:
         try:
@@ -2903,6 +3086,9 @@ def _communicate_bounded(
             break
         if info is not None:
             break  # leader exited; the zombie is retained, pinning the PGID
+        if abort is not None and abort.is_set():
+            aborted = True
+            break
         if time.monotonic() >= deadline:
             timed_out = True
             break
@@ -2912,17 +3098,17 @@ def _communicate_bounded(
     # callback above (teardown_lock): setting `reaped` before releasing the lock
     # guarantees no _CappedReader can call getpgid/killpg on the pid we are about
     # to free below. Within the lock, the kill+reap still run UNCONDITIONALLY --
-    # whether the leader exited on its own or we timed out. This is the fix for
-    # two holes the old "escalate only if a reader thread is still alive"
-    # teardown carried:
+    # whether the leader exited on its own, we timed out, or the caller's stop
+    # signal ended the wait. This is the fix for two holes the old "escalate only
+    # if a reader thread is still alive" teardown carried:
     #  (a) a descendant that CLOSED its inherited stdout/stderr but kept running
     #      left the readers at EOF and their threads dead, so no escalation ever
     #      fired and the detached daemon LEAKED. An unconditional kill reaps it;
     #  (b) killing AFTER ``proc.wait`` reaped the leader targeted a pid the kernel
     #      had already freed -- a REUSED-pgid hazard. Here the leader is still
-    #      un-reaped (a zombie on natural exit, or alive on timeout), so ``proc.pid``
-    #      provably still names THIS group (``start_new_session=True`` made the
-    #      leader its own group leader, so the group id EQUALS its pid).
+    #      un-reaped (a zombie on natural exit, or alive on timeout or stop), so
+    #      ``proc.pid`` provably still names THIS group (``start_new_session=True``
+    #      made the leader its own group leader, so the group id EQUALS its pid).
     # A leader that exited NATURALLY is already a dead zombie, so this SIGKILL is a
     # no-op for it and cannot disturb its recorded exit status -- ``proc.wait`` below
     # still returns the tool's REAL exit code. A descendant that double-fork/setsid'd
@@ -2959,6 +3145,7 @@ def _communicate_bounded(
         stdout_overflow=stdout_reader.overflow if stdout_reader is not None else False,
         stderr_overflow=stderr_reader.overflow if stderr_reader is not None else False,
         timed_out=timed_out,
+        aborted=aborted,
     )
 
 

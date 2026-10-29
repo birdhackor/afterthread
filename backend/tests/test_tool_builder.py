@@ -29,6 +29,7 @@ import logging
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -36,6 +37,7 @@ from collections.abc import Awaitable, Callable, Generator
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
@@ -108,7 +110,10 @@ def _install_settings(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> Sett
 
 
 def _meta_by_name(staging: Path) -> dict[str, Any]:
-    return {t.spec["function"]["name"]: t for t in _build_meta_tools(staging)}
+    return {
+        t.spec["function"]["name"]: t
+        for t in _build_meta_tools(staging, shells=tool_builder._BuilderShells())
+    }
 
 
 def _call(handler: Any, args: dict[str, Any]) -> str:
@@ -449,6 +454,45 @@ def test_run_shell_omits_tls_no_verify_when_off(
 
     result = _call(meta["run_shell"].handler, {"command": 'echo "T=${TLS_NO_VERIFY:-unset}"'})
     assert "T=unset" in result
+
+
+_FLOOD_RESULT = ("y\n" * 1000)[: 1000 - len(tools._OUTPUT_TRUNCATION_MARKER)] + (
+    tools._OUTPUT_TRUNCATION_MARKER
+)
+
+
+@pytest.mark.parametrize("abort", ["omitted", "never-set"])
+@pytest.mark.parametrize(
+    ("command", "timeout", "expected"),
+    [
+        ("printf out", 30.0, "out"),
+        ("printf bad; exit 3", 30.0, "command failed (exit 3): bad"),
+        ("sleep 30", 0.3, "command timed out after 0.3 seconds"),
+        ("yes", 30.0, _FLOOD_RESULT),
+    ],
+    ids=["exits", "fails", "times-out", "overflows"],
+)
+def test_run_shell_subprocess_without_a_stop_signal_answers_as_before(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command: str,
+    timeout: float,
+    expected: str,
+    abort: str,
+) -> None:
+    """With no stop signal -- none passed, or one that is never set -- a command
+    answers exactly as before the signal existed: its output, its failure, its
+    timeout, its output cut at the cap."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    stop = () if abort == "omitted" else (None, threading.Event())
+
+    started = time.monotonic()
+    result = tool_builder._run_shell_subprocess(staging, command, timeout, 1000, *stop)
+
+    assert result == expected
+    assert time.monotonic() - started < 5
 
 
 # --- InstallResult sanitizer ---------------------------------------------------
@@ -1709,7 +1753,11 @@ def test_run_shell_receives_injected_secret(
     staging.mkdir()
     meta = {
         t.spec["function"]["name"]: t
-        for t in _build_meta_tools(staging, secret_env={"KB_API_KEY": "shell-secret-123456"})
+        for t in _build_meta_tools(
+            staging,
+            secret_env={"KB_API_KEY": "shell-secret-123456"},
+            shells=tool_builder._BuilderShells(),
+        )
     }
 
     result = _call(meta["run_shell"].handler, {"command": 'echo "K=$KB_API_KEY"'})
@@ -8260,3 +8308,280 @@ def test_the_revise_job_reports_the_measured_stop_and_the_notes(
     polled = client.get(f"/api/tools/jobs/{job['job_id']}")
     assert polled.status_code == 200
     assert {key: polled.json()[key] for key in reported} == reported
+
+
+# --- run_shell commands end with their session ----------------------------------
+#
+# These drive the REAL generate_structured: a scripted endpoint answers the first
+# request with one run_shell call, so the command runs through the real tool loop,
+# the real meta-tool and a real process group, and the session's own deadline (or
+# a cancellation) is what ends it.
+
+
+def _session_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **overrides: Any
+) -> Settings:
+    """One settings object for the builder and the llm loop: a configured endpoint,
+    a one-second session, and a per-command timeout far longer than the session."""
+    values: dict[str, Any] = {
+        "tools_dir": str(tmp_path / "tools"),
+        "openai_base_url": "http://llm.internal.example/v1",
+        "openai_api_key": "sk-session-test-key",
+        "openai_model": "test-model",
+        "tool_install_timeout_seconds": 1.0,
+        "tool_install_shell_timeout_seconds": 20,
+        **overrides,
+    }
+    settings = _install_settings(monkeypatch, **values)
+    monkeypatch.setattr("afterthread.services.llm.get_settings", lambda: settings)
+    # The loop starts a tool call only while more than this is left of the
+    # session; lowered so a one-second session still starts its command.
+    monkeypatch.setattr(llm, "_TOOL_DEADLINE_FLOOR_SECONDS", 0.05)
+    return settings
+
+
+def _endpoint_asking_for_one_command(monkeypatch: pytest.MonkeyPatch, command: str) -> None:
+    """The first request is answered with ONE run_shell call. No later request
+    ever returns, so the session ends by its deadline or by a cancellation."""
+    call = SimpleNamespace(
+        id="call_0",
+        type="function",
+        function=SimpleNamespace(name="run_shell", arguments=json.dumps({"command": command})),
+    )
+    message = SimpleNamespace(content=None, tool_calls=[call])
+    replies = [SimpleNamespace(choices=[SimpleNamespace(message=message)])]
+
+    async def create(**_kwargs: Any) -> Any:
+        if replies:
+            return replies.pop(0)
+        await asyncio.sleep(3600)
+        raise AssertionError("the session should have ended before this")
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr("afterthread.services.llm._get_client", lambda: client)
+
+
+def _group_exists(pgid: int) -> bool:
+    """Whether the group id is still held. A killed leader not yet reaped holds it
+    too: macOS answers that case with EPERM, not ESRCH."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _pid_in(pid_file: Path) -> int | None:
+    text = pid_file.read_text(encoding="utf-8").strip() if pid_file.exists() else ""
+    return int(text) if text else None
+
+
+def _watch_workspace_steps(
+    monkeypatch: pytest.MonkeyPatch,
+    pgid: Callable[[], int | None],
+    *,
+    worker_lag: float | None = None,
+) -> list[tuple[str, bool]]:
+    """Record, in order, each ``_strip_builder_env`` and ``_cleanup_staging`` call
+    with whether the command's process group still existed at that moment.
+
+    With ``worker_lag``, the run_shell worker's return is recorded as well, that
+    many seconds after its command ended: a run that does not wait for the worker
+    reaches the workspace inside that window, and the order shows it."""
+    seen: list[tuple[str, bool]] = []
+    real_strip = tool_builder._strip_builder_env
+    real_cleanup = tool_builder._cleanup_staging
+
+    def group_alive() -> bool:
+        group = pgid()
+        return group is not None and _group_exists(group)
+
+    def strip(build_root: tools.BuildRoot, base: Path) -> Any:
+        seen.append(("strip", group_alive()))
+        return real_strip(build_root, base)
+
+    def cleanup(staging: Path, base: Path) -> None:
+        seen.append(("cleanup", group_alive()))
+        real_cleanup(staging, base)
+
+    monkeypatch.setattr(tool_builder, "_strip_builder_env", strip)
+    monkeypatch.setattr(tool_builder, "_cleanup_staging", cleanup)
+    if worker_lag is not None:
+        inner = tool_builder._run_shell_subprocess
+
+        def worker(*args: Any) -> str:
+            try:
+                return inner(*args)
+            finally:
+                time.sleep(worker_lag)
+                seen.append(("worker returned", group_alive()))
+
+        monkeypatch.setattr(tool_builder, "_run_shell_subprocess", worker)
+    return seen
+
+
+@pytest.mark.parametrize("kind", ["install", "revise"])
+def test_a_deadline_mid_command_kills_and_waits_for_it_before_the_workspace_is_touched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kind: str
+) -> None:
+    """The session's deadline fires while a run_shell command runs -- it recorded
+    its process group, then sleeps far past the session. By the time the workspace
+    is stripped and removed, that group is gone -- killed and reaped, not left to
+    run on to its own timeout -- and the worker that ran it has returned. The run
+    ends long before that timeout would."""
+    if kind == "revise":
+        _seed_package(monkeypatch, tmp_path)
+    settings = _session_settings(monkeypatch, tmp_path)
+    pid_file = tmp_path / "command.pid"
+    _endpoint_asking_for_one_command(monkeypatch, f'echo $$ > "{pid_file}"; sleep 30')
+    seen = _watch_workspace_steps(monkeypatch, lambda: _pid_in(pid_file), worker_lag=0.3)
+    _no_fetch(monkeypatch)
+
+    started = time.monotonic()
+    if kind == "install":
+        outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build it"))
+    else:
+        outcome = asyncio.run(_run_revise("kbsearch", "fix it"))
+    elapsed = time.monotonic() - started
+
+    assert _pid_in(pid_file) is not None  # the command was running at the deadline
+    assert seen == [("worker returned", False), ("strip", False), ("cleanup", False)]
+    assert elapsed < settings.tool_install_shell_timeout_seconds / 2
+    assert outcome.ok is False
+    assert outcome.error is not None and "Timeout" in outcome.error
+    if kind == "revise":
+        assert outcome.failure == "deadline"
+
+
+def test_cancelling_the_session_still_kills_and_waits_for_its_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The revise itself is cancelled while its command runs: the cleanup in its
+    ``finally`` still comes only after the command's process group is gone and
+    its worker has returned."""
+    _seed_package(monkeypatch, tmp_path)
+    _session_settings(monkeypatch, tmp_path, tool_install_timeout_seconds=60)
+    pid_file = tmp_path / "command.pid"
+    _endpoint_asking_for_one_command(monkeypatch, f'echo $$ > "{pid_file}"; sleep 30')
+    seen = _watch_workspace_steps(monkeypatch, lambda: _pid_in(pid_file), worker_lag=0.3)
+
+    async def cancel_once_running() -> None:
+        session = asyncio.ensure_future(_run_revise("kbsearch", "fix it"))
+        for _ in range(1000):
+            if _pid_in(pid_file) is not None:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("the command never started")
+        session.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await session
+
+    started = time.monotonic()
+    asyncio.run(cancel_once_running())
+
+    assert seen == [("worker returned", False), ("cleanup", False)]
+    assert time.monotonic() - started < 10
+
+
+@pytest.mark.parametrize("held_until_stop", ["its-check", "its-spawn"])
+def test_a_command_its_worker_reaches_after_the_session_stopped_never_outlives_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, held_until_stop: str
+) -> None:
+    """A command whose worker only gets going after the session has stopped --
+    held here until the stop signal is set. Reaching the start of
+    ``_run_shell_subprocess`` only then, it is never spawned at all; reaching the
+    spawn only then (past the check before it), it is killed at its first poll.
+    Either way nothing waits out the command's own timeout."""
+    _session_settings(monkeypatch, tmp_path)
+    pid_file = tmp_path / "command.pid"
+    _endpoint_asking_for_one_command(monkeypatch, f'echo $$ > "{pid_file}"; sleep 30')
+    _no_fetch(monkeypatch)
+    real_run = tool_builder._run_shell_subprocess
+    real_popen = subprocess.Popen
+    stops: list[threading.Event | None] = []
+    spawned: list[int] = []
+
+    def run_late(
+        staging: Path,
+        command: str,
+        timeout: float,
+        cap: int,
+        extra_env: dict[str, str] | None = None,
+        abort: threading.Event | None = None,
+    ) -> str:
+        stops.append(abort)
+        if held_until_stop == "its-check":
+            assert abort is not None and abort.wait(15)
+        return real_run(staging, command, timeout, cap, extra_env, abort)
+
+    def spawn_late(*args: Any, **kwargs: Any) -> Any:
+        if held_until_stop == "its-spawn":
+            assert stops[0] is not None and stops[0].wait(15)
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc.pid)
+        return proc
+
+    monkeypatch.setattr(tool_builder, "_run_shell_subprocess", run_late)
+    monkeypatch.setattr(subprocess, "Popen", spawn_late)
+    seen = _watch_workspace_steps(
+        monkeypatch, lambda: spawned[0] if spawned else None, worker_lag=0.0
+    )
+
+    started = time.monotonic()
+    outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build it"))
+    elapsed = time.monotonic() - started
+
+    # The command reached its worker, holding the session's stop signal.
+    assert len(stops) == 1 and isinstance(stops[0], threading.Event)
+    assert outcome.ok is False
+    assert seen == [("worker returned", False), ("strip", False), ("cleanup", False)]
+    assert elapsed < 10
+    if held_until_stop == "its-check":
+        assert spawned == []
+        assert not pid_file.exists()
+    else:
+        assert len(spawned) == 1
+
+
+def test_a_command_still_running_past_the_stop_bound_leaves_nothing_published(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A command still running ``_shell_stop_seconds`` after the stop -- a worker
+    the signal cannot reach, standing in for one a full thread pool never started
+    or a leader SIGKILL cannot reap. The run stops waiting rather than hang, and
+    takes nothing from that workspace: it neither strips nor publishes, says so
+    after the session's own error, keeps the measured stop, and still cleans up."""
+    version = _seed_package(monkeypatch, tmp_path)
+    _session_settings(monkeypatch, tmp_path)
+    _endpoint_asking_for_one_command(monkeypatch, "true")
+    release = threading.Event()
+
+    def unstoppable(*_args: Any) -> str:
+        release.wait(30)
+        return "ended late"
+
+    monkeypatch.setattr(tool_builder, "_run_shell_subprocess", unstoppable)
+    monkeypatch.setattr(tool_builder, "_shell_stop_seconds", lambda: 0.2)
+    seen = _watch_workspace_steps(monkeypatch, lambda: None)
+
+    started = time.monotonic()
+    try:
+        with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+            outcome = asyncio.run(_run_revise("kbsearch", "fix it"))
+    finally:
+        release.set()
+    elapsed = time.monotonic() - started
+
+    assert outcome.ok is False
+    assert outcome.error is not None
+    assert outcome.error.startswith("AI 修訂工具失敗（Timeout")  # noqa: RUF001
+    assert outcome.error.endswith(tool_builder._ERROR_SHELL_NOT_STOPPED)
+    assert outcome.failure == "deadline"
+    assert seen == [("cleanup", False)]  # never stripped; cleaned up as on every exit
+    assert elapsed < 10
+    current = tools.resolve_current(_package_root(version))
+    assert isinstance(current, tools.Resolved) and current.vid == _TEST_VID
+    assert any("had not ended 0.2 seconds" in record.getMessage() for record in caplog.records)

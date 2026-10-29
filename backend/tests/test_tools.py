@@ -23,11 +23,13 @@ ring is process-wide, so an autouse fixture resets it around every test.
 """
 
 import asyncio
+import errno
 import fcntl
 import inspect
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -1595,6 +1597,51 @@ def test_runtime_overflow_output_with_exiting_leader_stays_clean(
         assert len(result) == 1000
         assert result.endswith(marker)
     assert time.monotonic() - started < 10  # 20 clean teardowns, never a hang
+
+
+@pytest.mark.parametrize("abort", ["omitted", "never-set"])
+@pytest.mark.parametrize("scenario", ["exits", "times-out", "overflows"])
+def test_communicate_bounded_without_a_stop_signal_ends_as_before(
+    scenario: str, abort: str
+) -> None:
+    """With no stop signal -- none passed, or one that is never set -- a bounded
+    read ends exactly as it did before the signal existed: a natural exit keeps
+    its output and exit code, a timeout kills the group, an overflow kills it at
+    the cap, and none of them reads as stopped."""
+    command, timeout = {
+        "exits": ("printf out; exit 3", 30.0),
+        "times-out": ("printf out; sleep 30", 0.3),
+        "overflows": ("yes", 30.0),
+    }[scenario]
+    proc = subprocess.Popen(
+        ["bash", "-c", command],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    signal_kwargs = {} if abort == "omitted" else {"abort": threading.Event()}
+    cap = 1000
+
+    started = time.monotonic()
+    output = tools._communicate_bounded(
+        proc, input_text=None, cap=cap, timeout=timeout, **signal_kwargs
+    )
+    elapsed = time.monotonic() - started
+
+    expected = {
+        "exits": (tools._BoundedOutput("out", "", False, False, False), 3),
+        "times-out": (tools._BoundedOutput("out", "", False, False, True), -signal.SIGKILL),
+        # The reader keeps one character past the cap, to tell "over" from "at".
+        "overflows": (
+            tools._BoundedOutput(("y\n" * cap)[: cap + 1], "", True, False, False),
+            -signal.SIGKILL,
+        ),
+    }[scenario]
+    assert (output, proc.returncode) == expected
+    assert output.aborted is False
+    assert elapsed < 5
 
 
 def test_runtime_refuses_a_package_replaced_after_it_was_advertised(
@@ -3240,6 +3287,409 @@ def test_validate_package_rejection_never_echoes_secret_in_filename(
     assert "不得包含秘密值" in error
     assert secret not in error  # neither content nor filename echoes the value
     assert tools._REDACTION_MARKER in error  # the offending path is named, masked
+
+
+# --- the embedded-secret scan ------------------------------------------------
+
+_SCAN_SECRET = "planted-secret-value-abcdef"
+# A value holding a "/", as a base64 key can.
+_SLASHED_SECRET = "planted/secret-value-ghijkl"
+
+
+def _scan(root: Path) -> tools.SecretScanDone:
+    """Scan ``root`` for the two planted values; the scan must have finished."""
+    scan = tools.scan_embedded_secrets(root, [_SCAN_SECRET, _SLASHED_SECRET])
+    assert isinstance(scan, tools.SecretScanDone), scan
+    return scan
+
+
+def _hits(scan: tools.SecretScanDone) -> list[tuple[str, str]]:
+    return [(hit.path, hit.kind) for hit in scan.hits]
+
+
+def _plant_past_the_first_64_kib(root: Path) -> list[tuple[str, str]]:
+    (root / "data.txt").write_text("x" * (70 * 1024) + _SCAN_SECRET + "\n", encoding="utf-8")
+    return [("data.txt", "content")]
+
+
+def _plant_across_a_read_boundary(root: Path) -> list[tuple[str, str]]:
+    # Half of the value before the end of the scan's first read, half after it.
+    before = tools._SECRET_SCAN_CHUNK_CHARS - len(_SCAN_SECRET) // 2
+    (root / "data.txt").write_text("x" * before + _SCAN_SECRET + "x" * 10, encoding="utf-8")
+    return [("data.txt", "content")]
+
+
+def _plant_in_a_file_name(root: Path) -> list[tuple[str, str]]:
+    (root / f"key-{_SCAN_SECRET}.txt").write_text("clean\n", encoding="utf-8")
+    return [(f"key-{_SCAN_SECRET}.txt", "name")]
+
+
+def _plant_in_a_directory_name(root: Path) -> list[tuple[str, str]]:
+    # Two levels down, with clean names below it: every path under the directory
+    # carries the value too.
+    nested = root / "a" / f"d-{_SCAN_SECRET}" / "b"
+    nested.mkdir(parents=True)
+    (nested / "inner.txt").write_text("clean\n", encoding="utf-8")
+    named = f"a/d-{_SCAN_SECRET}"
+    return [(named, "name"), (f"{named}/b", "name"), (f"{named}/b/inner.txt", "name")]
+
+
+def _plant_across_path_components(root: Path) -> list[tuple[str, str]]:
+    # Written as a path, a value with a "/" becomes a directory and a file; no
+    # single name holds it, the relative path does.
+    head, tail = _SLASHED_SECRET.split("/")
+    (root / head).mkdir()
+    (root / head / tail).write_text("clean\n", encoding="utf-8")
+    return [(_SLASHED_SECRET, "name")]
+
+
+def _plant_in_a_hidden_file(root: Path) -> list[tuple[str, str]]:
+    # A dot-directory is walked like any other.
+    (root / ".cache").mkdir()
+    (root / ".cache" / "notes").write_text("token " + _SCAN_SECRET, encoding="utf-8")
+    return [(".cache/notes", "content")]
+
+
+def _plant_in_a_link_target(root: Path) -> list[tuple[str, str]]:
+    # A dangling link: only its target STRING carries the value, and it is never
+    # followed.
+    (root / "link").symlink_to(f"../{_SCAN_SECRET}/nowhere")
+    return [("link", "link_target")]
+
+
+def _plant_in_a_binary_file(root: Path) -> list[tuple[str, str]]:
+    noise = b"\xff\xfe\x00\x80" * 4096
+    (root / "blob.bin").write_bytes(noise + _SCAN_SECRET.encode() + b"\xc3")
+    return [("blob.bin", "content")]
+
+
+def _plant_in_several_files(root: Path) -> list[tuple[str, str]]:
+    (root / "b.txt").write_text(_SCAN_SECRET, encoding="utf-8")
+    (root / "sub").mkdir()
+    (root / "sub" / "a.txt").write_text("prefix " + _SCAN_SECRET, encoding="utf-8")
+    (root / "clean.txt").write_text("nothing here\n", encoding="utf-8")
+    return [("b.txt", "content"), ("sub/a.txt", "content")]
+
+
+# Every place the scan must find a value, each building its own tree and returning
+# the hits it expects, in the scan's order.
+_PLANTED: dict[str, Callable[[Path], list[tuple[str, str]]]] = {
+    "past-the-first-64-KiB": _plant_past_the_first_64_kib,
+    "across-a-read-boundary": _plant_across_a_read_boundary,
+    "file-name": _plant_in_a_file_name,
+    "directory-name": _plant_in_a_directory_name,
+    "across-path-components": _plant_across_path_components,
+    "hidden-file": _plant_in_a_hidden_file,
+    "link-target": _plant_in_a_link_target,
+    "binary-file": _plant_in_a_binary_file,
+    "several-files": _plant_in_several_files,
+}
+
+# The places the publish gate could not see before it read files whole and
+# checked paths and link targets.
+_NEWLY_REFUSED = (
+    "past-the-first-64-KiB",
+    "across-a-read-boundary",
+    "file-name",
+    "directory-name",
+    "across-path-components",
+    "link-target",
+)
+
+
+@pytest.mark.parametrize("case", list(_PLANTED))
+def test_scan_embedded_secrets_finds_every_planted_value(tmp_path: Path, case: str) -> None:
+    """Each place a builder can bake a known value into a tree is found, and every
+    hit is returned -- not only the first -- sorted by path."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    expected = _PLANTED[case](root)
+
+    scan = _scan(root)
+
+    assert _hits(scan) == expected
+    assert scan.skipped == ()
+
+
+@pytest.mark.parametrize("before", range(1, len(_SCAN_SECRET)))
+def test_scan_embedded_secrets_finds_a_value_cut_at_any_point_by_a_read_boundary(
+    tmp_path: Path, before: int
+) -> None:
+    """A read boundary can fall anywhere inside a value: ``before`` of its
+    characters end the first read and the rest open the next one. The value is
+    found at every cut, down to the worst -- all but its last character before the
+    boundary -- which needs the whole "longest value minus one" carried over."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    start = tools._SECRET_SCAN_CHUNK_CHARS - before
+    (root / "data.txt").write_text("x" * start + _SCAN_SECRET + "x" * 10, encoding="utf-8")
+
+    # The cut value is the only, and so the longest, value looked for.
+    scan = tools.scan_embedded_secrets(root, [_SCAN_SECRET])
+
+    assert scan == tools.SecretScanDone(hits=(tools.SecretHit("data.txt", "content"),), skipped=())
+
+
+def test_scan_embedded_secrets_passes_long_and_binary_files_without_the_value(
+    tmp_path: Path,
+) -> None:
+    """A file several reads long and one that is not text at all, neither holding
+    the value: no hit, nothing skipped."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    long_text = "x" * (3 * tools._SECRET_SCAN_CHUNK_CHARS + 17)
+    (root / "long.txt").write_text(long_text, encoding="utf-8")
+    (root / "blob.bin").write_bytes(bytes(range(256)) * 1024)
+
+    assert _scan(root) == tools.SecretScanDone(hits=(), skipped=())
+
+
+def test_scan_embedded_secrets_never_follows_a_link(tmp_path: Path) -> None:
+    """Links to a file and to a directory outside the tree, both holding the
+    value: the scan reads neither target, and their target strings are clean."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "holder.txt").write_text(_SCAN_SECRET, encoding="utf-8")
+    (root / "to-file").symlink_to(outside / "holder.txt")
+    (root / "to-dir").symlink_to(outside, target_is_directory=True)
+
+    assert _scan(root) == tools.SecretScanDone(hits=(), skipped=())
+
+
+def test_scan_embedded_secrets_skips_a_fifo_and_says_so(tmp_path: Path) -> None:
+    """A FIFO is never opened -- a read of one could block -- and the caller is
+    told its content went unsearched; the rest of the tree is still scanned."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    os.mkfifo(root / "pipe")
+    (root / "a.txt").write_text(_SCAN_SECRET, encoding="utf-8")
+
+    scan = _scan(root)
+
+    assert _hits(scan) == [("a.txt", "content")]
+    assert scan.skipped == (tools.SecretScanSkip("pipe", "not_regular"),)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read a mode-000 file")
+def test_scan_embedded_secrets_lists_an_unreadable_file_as_skipped(tmp_path: Path) -> None:
+    """An OSError reading one file does not fail the scan: the file is listed as
+    unreadable, so the caller knows its content went unsearched."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    locked = root / "locked.txt"
+    locked.write_text(_SCAN_SECRET, encoding="utf-8")
+    locked.chmod(0)
+    try:
+        scan = _scan(root)
+    finally:
+        locked.chmod(0o600)
+
+    assert scan == tools.SecretScanDone(
+        hits=(), skipped=(tools.SecretScanSkip("locked.txt", "unreadable"),)
+    )
+
+
+def test_scan_embedded_secrets_lists_a_file_whose_read_fails_as_skipped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An OSError after the open succeeded -- here the descriptor's stat -- counts
+    the same as one on the open: the file is listed as unreadable and the scan
+    still finishes."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.txt").write_text(_SCAN_SECRET, encoding="utf-8")
+
+    def failing_fstat(_fd: int) -> os.stat_result:
+        raise OSError(errno.EIO, "input/output error")
+
+    with monkeypatch.context() as patch:
+        # Only the scan runs while this is in place.
+        patch.setattr(tools.os, "fstat", failing_fstat)
+        scan = tools.scan_embedded_secrets(root, [_SCAN_SECRET])
+
+    assert scan == tools.SecretScanDone(
+        hits=(), skipped=(tools.SecretScanSkip("a.txt", "unreadable"),)
+    )
+
+
+def test_scan_embedded_secrets_fails_when_the_known_secrets_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no list given, the scan looks the known values up itself; if that
+    raises, the result is a failure -- one with no hits to misread as clean."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.txt").write_text("text\n", encoding="utf-8")
+
+    def unavailable() -> frozenset[str]:
+        raise RuntimeError("the secret store is unavailable")
+
+    monkeypatch.setattr(tools, "known_secret_values", unavailable)
+
+    scan = tools.scan_embedded_secrets(root)
+
+    assert scan == tools.SecretScanFailed("RuntimeError")
+    assert not hasattr(scan, "hits")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can list a mode-000 directory")
+def test_scan_embedded_secrets_fails_when_a_directory_cannot_be_listed(tmp_path: Path) -> None:
+    """A directory the scan cannot list may hold anything, so the scan fails
+    rather than report the rest of the tree as all there is."""
+    root = tmp_path / "tree"
+    sealed = root / "sealed"
+    sealed.mkdir(parents=True)
+    (sealed / "a.txt").write_text(_SCAN_SECRET, encoding="utf-8")
+    sealed.chmod(0)
+    try:
+        scan = tools.scan_embedded_secrets(root, [_SCAN_SECRET])
+    finally:
+        sealed.chmod(0o700)
+
+    assert scan == tools.SecretScanFailed("PermissionError")
+
+
+def test_scan_embedded_secrets_fails_on_a_read_error_other_than_oserror(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only an OSError makes a file "unreadable". Anything else a read raises --
+    here the TypeError a text read raises for a read size that is not an int --
+    fails the scan instead of passing the file as clean or merely skipped."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.txt").write_text(_SCAN_SECRET, encoding="utf-8")
+    monkeypatch.setattr(tools, "_SECRET_SCAN_CHUNK_CHARS", 1.5)
+
+    assert tools.scan_embedded_secrets(root, [_SCAN_SECRET]) == tools.SecretScanFailed("TypeError")
+
+
+def _package_with_other_tools_secret(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """A clean staged package, while another installed tool's ``.env`` makes the
+    two planted values known."""
+    root = tmp_path / "tools"
+    dotenv = f"OTHER_KEY={_SCAN_SECRET}\nSECOND_KEY={_SLASHED_SECRET}\n"
+    _make_tool(root, "other", "import sys\n", dotenv=dotenv)
+    _install_tools(monkeypatch, root)
+    return _staged_pkg(
+        tmp_path / "stage", tool_json=_kbsearch_manifest(), run_py="import sys\nprint('x')\n"
+    )
+
+
+@pytest.mark.parametrize("case", _NEWLY_REFUSED)
+def test_validate_refuses_a_value_planted_where_the_old_gate_could_not_see(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str
+) -> None:
+    """Past the first 64 KiB of a file, across a read boundary, in a file or
+    directory name, in a link target: publication is refused now, and the message
+    reads as it always has -- the first hit's path, with the value masked out."""
+    pkg = _package_with_other_tools_secret(monkeypatch, tmp_path)
+    first_path = _PLANTED[case](pkg)[0][0]
+
+    error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
+
+    marker = tools._REDACTION_MARKER
+    masked = first_path.replace(_SCAN_SECRET, marker).replace(_SLASHED_SECRET, marker)
+    assert error == f"{masked} 不得包含秘密值（請改由環境變數讀取）"  # noqa: RUF001
+    assert _SCAN_SECRET not in (error or "")
+    assert _SLASHED_SECRET not in (error or "")
+
+
+def _known_secrets_by_lookup(first: list[str], later: list[str]) -> Callable[[], list[str]]:
+    """A stand-in for ``tools._redaction_secrets`` whose answer changes after the
+    first lookup -- a value registered, or released, while the gate runs."""
+    lookups = 0
+
+    def lookup() -> list[str]:
+        nonlocal lookups
+        lookups += 1
+        return list(first if lookups == 1 else later)
+
+    return lookup
+
+
+def _package_with_a_file_named_after_the_value(tmp_path: Path) -> Path:
+    pkg = _staged_pkg(
+        tmp_path / "stage", tool_json=_kbsearch_manifest(), run_py="import sys\nprint('x')\n"
+    )
+    (pkg / f"key-{_SCAN_SECRET}.txt").write_text("clean\n", encoding="utf-8")
+    return pkg
+
+
+def test_validate_scans_and_masks_with_one_secrets_snapshot_a_value_known_only_later(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The gate scans and masks with the SAME snapshot of the known values. Here a
+    value becomes known only after the first lookup, and a file is named after
+    it. Whatever the gate answers, the value is not in it: a scan that looked the
+    values up again would hit that name, and the path would reach the message
+    masked by a list that does not hold the value."""
+    pkg = _package_with_a_file_named_after_the_value(tmp_path)
+    monkeypatch.setattr(tools, "_redaction_secrets", _known_secrets_by_lookup([], [_SCAN_SECRET]))
+
+    error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
+
+    assert _SCAN_SECRET not in (error or "")
+
+
+def test_validate_scans_and_masks_with_one_secrets_snapshot_a_value_known_only_first(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The other order: a value known at the first lookup and gone after it. The
+    package is refused for the file named after the value, and the path in the
+    message is masked -- a scan that looked again would find nothing to refuse,
+    and a mask that looked again would leave the value bare."""
+    pkg = _package_with_a_file_named_after_the_value(tmp_path)
+    monkeypatch.setattr(tools, "_redaction_secrets", _known_secrets_by_lookup([_SCAN_SECRET], []))
+
+    error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
+
+    masked = f"key-{tools._REDACTION_MARKER}.txt"
+    assert error == f"{masked} 不得包含秘密值（請改由環境變數讀取）"  # noqa: RUF001
+
+
+def test_validate_refuses_when_the_known_secrets_cannot_be_read_and_says_why(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The known values cannot be looked up: the package is refused as UNCHECKED,
+    and the message says the scan failed -- never that it holds a secret."""
+    pkg = _package_with_other_tools_secret(monkeypatch, tmp_path)
+
+    def unavailable() -> frozenset[str]:
+        raise RuntimeError("the secret store is unavailable")
+
+    monkeypatch.setattr(tools, "known_secret_values", unavailable)
+
+    error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
+
+    assert error is not None
+    assert "秘密掃描失敗" in error
+    assert "RuntimeError" in error  # the failure's category, never its text
+    assert "不得包含秘密值" not in error
+    assert "含秘密" not in error
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can list a mode-000 directory")
+def test_validate_refuses_a_package_whose_directory_the_scan_cannot_list(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A directory the builder made unlistable hides whatever is inside it, here
+    a known value: the package is refused as unchecked rather than published."""
+    pkg = _package_with_other_tools_secret(monkeypatch, tmp_path)
+    sealed = pkg / "sealed"
+    sealed.mkdir()
+    (sealed / "key.txt").write_text(_SCAN_SECRET, encoding="utf-8")
+    sealed.chmod(0)
+    try:
+        error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
+    finally:
+        sealed.chmod(0o700)
+
+    assert error is not None
+    assert "秘密掃描失敗" in error
+    assert "PermissionError" in error
+    assert "不得包含秘密值" not in error
 
 
 # --- known-secret redaction (F1 / F4, D36) ---------------------------------

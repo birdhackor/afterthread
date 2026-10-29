@@ -37,3 +37,18 @@ openai SDK（2.45.0）對單一請求的逾時擲 `openai.APITimeoutError`。它
 
 設定的上限只定義在 `config.py` 的 `Field(le=…)`，超過上限的值在載入設定時就被拒絕。前端手抄一份，後端改邊界時
 會無聲過時；卡片因此只點名設定名稱，不寫上限數字。
+
+## D52（P2）：以中止訊號停止 builder 指令，不從外部殺
+
+設計 §3.3 第 1 步原本寫「登記 `Popen`，逾時用 `tools._kill_process_group` 殺」。從外部
+`killpg(getpgid(pid))` 可能落在 worker 的 `proc.wait()` 回收之後，打到已被重用的 PID，正是
+`_communicate_bounded` 的 `teardown_lock`／`reaped` 要擋的情形。
+
+實作改為每場 session 一個 `_BuilderShells`：一個 `threading.Event` 加上強參照的 task 集合。
+`stop_and_wait` 先設訊號、再等 task。`_communicate_bounded` 在輪詢時看到訊號，就用它既有、在鎖下的
+拆除流程殺掉並回收；訊號設下之後才要啟動的指令不啟動。
+
+等待上限是 `tool_install_shell_timeout_seconds` 加上 `_REAP_TIMEOUT_SECONDS`。超過時不剝除、不發布，
+job 失敗並說明；清理照做、名額照放，因為到那時還沒返回的 worker 不會再啟動指令。
+
+不變量 DC 不變。設計 §3.3 第 1 步已照此更新。
