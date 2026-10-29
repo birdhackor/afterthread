@@ -2198,14 +2198,24 @@ def resolution_lineage(
     )
 
 
-def list_tools() -> list[dict[str, Any]]:
+def list_tools(
+    *, draft_view: Callable[[PackageRoot, Resolution], dict[str, Any] | None] | None = None
+) -> list[dict[str, Any]]:
     """List every installed package as a UI-facing summary.
 
     A broken package is included with ``valid=False`` and a safe error reason,
     but is never executable; a missing or unset tools directory yields [].
+
+    With ``draft_view`` each row also carries ``draft``: what it answers for the
+    package and the resolution this same scan made. The caller hands it in
+    (``tool_drafts.draft_view``, bound to the job table), because reading a draft
+    needs to know which jobs are running, and that is not this module's to know.
+    ``tool_drafts.draft_view`` answers a package without ``draft/`` with one
+    ``lstat`` and reads a manifest only where there is one.
     """
-    return [
-        {
+    rows = []
+    for scan in _scan_all():
+        row: dict[str, Any] = {
             "name": scan.name,
             "description": scan.description,
             "enabled": scan.enabled,
@@ -2218,8 +2228,10 @@ def list_tools() -> list[dict[str, Any]]:
                 else "broken"
             ),
         }
-        for scan in _scan_all()
-    ]
+        if draft_view is not None:
+            row["draft"] = draft_view(scan.package_root, scan.resolution)
+        rows.append(row)
+    return rows
 
 
 def package_identity(version_root: VersionRoot) -> tuple[int, int, int] | None:

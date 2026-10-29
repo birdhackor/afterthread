@@ -22,7 +22,7 @@ import pytest
 from pydantic import BaseModel, ConfigDict
 
 from afterthread.config import Settings
-from afterthread.schemas import ToolJobStatus
+from afterthread.schemas import ToolDraftLast, ToolJobStatus
 from afterthread.services import llm, llm_log, token_budget
 from afterthread.services.llm import (
     _MAX_TOOL_CALLS_ACCEPTED,
@@ -554,13 +554,14 @@ def _literal_values(annotation: Any) -> set[Any]:
     return set()
 
 
-def test_tool_job_status_admits_every_run_failure_and_finalize_trigger() -> None:
-    """``ToolJobStatus`` spells ``RunFailure`` and ``FinalizeTrigger`` out rather than
-    importing them; a value the loop can record but the schema rejects would fail
-    the job poll."""
+def test_tool_job_status_and_draft_last_admit_every_run_failure_and_finalize_trigger() -> None:
+    """``ToolJobStatus`` and ``ToolDraftLast`` spell ``RunFailure`` and
+    ``FinalizeTrigger`` out rather than importing them; a value the loop can
+    record but a schema rejects would fail the job poll or the tools list."""
     failures = set(get_args(llm.RunFailure))
     triggers = set(get_args(llm.FinalizeTrigger))
     assert failures and triggers
-    fields = ToolJobStatus.model_fields
-    assert _literal_values(fields["stopped_by"].annotation) == triggers
-    assert _literal_values(fields["failure"].annotation) == failures
+    for model in (ToolJobStatus, ToolDraftLast):
+        fields = model.model_fields
+        assert _literal_values(fields["stopped_by"].annotation) == triggers, model
+        assert _literal_values(fields["failure"].annotation) == failures, model

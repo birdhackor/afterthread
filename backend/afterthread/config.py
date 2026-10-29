@@ -295,6 +295,20 @@ class Settings(BaseSettings):
     # not run and the check reports itself incomplete. Bounded to (0, 3600].
     tool_check_budget_seconds: float = Field(default=300, gt=0, le=3600)
 
+    # The largest workspace a revise round keeps as its draft (an unfinished
+    # revision, see afterthread/services/tool_drafts.py): how many entries --
+    # files, directories and links alike -- and how many bytes of file content.
+    # Past either, the round keeps no files and says why. Every save copies the
+    # whole workspace and fsyncs the copy, so these bound what one save copies,
+    # how long its fsync takes, and the disk one draft holds. The file count is
+    # four times list_dir's 500-entry cap, which the builder's own listing deems
+    # enough for any sane package. The byte default is an estimate, not a
+    # measurement: a typical package is expected to be a few tens of KB, and one
+    # that vendors its dependencies a few MB, which 50 MB leaves room for. Bounded
+    # to [1, 100000] entries and [1 MB, 2 GB].
+    tool_draft_max_files: int = Field(default=2_000, ge=1, le=100_000)
+    tool_draft_max_bytes: int = Field(default=50_000_000, ge=1_000_000, le=2_000_000_000)
+
     database_url: str = "sqlite:///./afterthread.db"
 
     # An item in any stale-eligible status (models.STALE_ELIGIBLE_STATUSES --

@@ -111,6 +111,10 @@ P1 已經拆掉其中一個根因（開關就地改寫 manifest）。本設計�
     .afterthread.meta/              #   後端的：這個工具「現在」的狀態
         state.json                  #     { "afterthread": ..., "enabled": bool }
         current                     #     目前生效的 <vid>（契約見第 6 節）
+        draft/                      #     沒發布的修訂（草稿），可缺；格式見 docs/web-v7-design.md
+            manifest.json           #       每一輪怎麼結束、模型的筆記、沒存的檔案
+            files-<hex>/            #       那一輪工作區的複本
+        draft.discarded-<hex>/      #     放棄草稿時沒刪乾淨的殘留，等 sweep 收
     versions/                       #   後端的：由後端建立、命名、刪除
         <vid>/                      #     一個版本
             .afterthread.meta/      #       後端的：這一版的資料

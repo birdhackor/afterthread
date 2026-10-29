@@ -55,11 +55,22 @@ from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import Engine
 from sqlmodel import Session
+from starlette.routing import Match
 
 from afterthread.config import Settings
 from afterthread.models import SQLITE_MAX_INT
+from afterthread.routers import tools as tools_router
 from afterthread.schemas import ToolJobStatus
-from afterthread.services import llm, llm_log, memory_ai, tool_builder, tool_meta, tool_runs, tools
+from afterthread.services import (
+    llm,
+    llm_log,
+    memory_ai,
+    tool_builder,
+    tool_drafts,
+    tool_meta,
+    tool_runs,
+    tools,
+)
 from afterthread.services.llm import LLMNotConfiguredError, LLMUpstreamError, StructuredRunStats
 from afterthread.services.tool_builder import (
     _ERROR_NAME_TAKEN,
@@ -3040,6 +3051,7 @@ def test_router_list_tools(
                 "current_vid": _TEST_VID,
                 "lineage": "sole",
                 "last_run": None,
+                "draft": None,
             }
         ]
     }
@@ -3526,13 +3538,14 @@ def test_router_job_status_and_404(client: TestClient) -> None:
         "outcome": "published",
         "kind": "install",
         "verification": None,
-        # A revise's measured session and notes; an install carries none of them.
+        # A revise's measured session, notes and draft; an install carries none.
         "stopped_by": None,
         "failure": None,
         "rounds_used": None,
         "max_rounds": None,
         "handoff": None,
         "operator_action": None,
+        "draft": None,
     }
 
     missing = client.get("/api/tools/jobs/ghost")
@@ -3584,13 +3597,22 @@ def _free_text_fields(job_type: type, poll: dict[str, Any]) -> list[str]:
     ]
 
 
-def _with_lone_surrogates(hint: Any) -> Any:
-    """A value of the type ``hint`` names whose every piece of text, nested ones
-    included, carries a lone surrogate."""
+def _with_lone_surrogates(name: str, hint: Any) -> Any:
+    """A value for the field ``name``, of the type ``hint`` names, whose every piece
+    of text, nested ones included, carries a lone surrogate."""
     inner = _without_none(hint)
     if typing.get_origin(inner) is tuple:
         return ("KEY_\udc80",)
-    if typing.get_origin(inner) is dict:  # the one dict a job holds: its verification
+    if name == "draft":
+        return {
+            "saved": False,
+            "draft_id": None,
+            "generation": None,
+            "attempts": None,
+            "reason": "reason \udc80",
+            "retained_path": "/tools/.staging/\udc80/build",
+        }
+    if typing.get_origin(inner) is dict:  # the other dict a job holds: its verification
         result = tools.CheckResult(
             status="ran\udc80",
             vid="vid-\udc80",
@@ -3606,22 +3628,22 @@ def test_a_job_poll_answers_whatever_text_install_job_fields_hold(client: TestCl
     """Every ``InstallJob`` field that can carry free text -- as the dataclass
     declares it, less those the poll admits only from a fixed vocabulary, and the
     id the job is addressed by -- is given text holding a lone surrogate, nested
-    text in the verification (built the way a check builds it) and the env keys
-    too. Model text arrives like that through ``json.loads``. The real poll still
-    answers 200, each value with the surrogate replaced, because the job table's
-    one writer makes what it stores encodable."""
+    text in the verification (built the way a check builds it), the draft and the
+    env keys too. A path read from the filesystem arrives like that. The real poll
+    still answers 200, each value with the surrogate replaced, because the job
+    table's one writer makes what it stores encodable."""
     free_text = _free_text_fields(tool_builder.InstallJob, ToolJobStatus.model_fields)
     assert free_text
     # One field of each shape the filter must find, and one it must leave out:
     # free text in the dataclass, a vocabulary in the poll.
-    assert {"summary", "env_keys", "verification"} <= set(free_text)
+    assert {"summary", "env_keys", "verification", "draft"} <= set(free_text)
     assert "kind" not in free_text
     job = tool_builder._admit_job()
     assert job is not None
 
     hints = typing.get_type_hints(tool_builder.InstallJob)
     tool_builder._update_job(
-        job.job_id, **{name: _with_lone_surrogates(hints[name]) for name in free_text}
+        job.job_id, **{name: _with_lone_surrogates(name, hints[name]) for name in free_text}
     )
     response = client.get(f"/api/tools/jobs/{job.job_id}")
 
@@ -5493,7 +5515,9 @@ def test_run_revise_reports_the_target_package_being_deleted(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A delete landing during the build is answered honestly -- the revision is
-    NOT installed as a new tool because its predecessor package vanished."""
+    NOT installed as a new tool because its predecessor package vanished. No draft
+    can hold the work either (its package is gone), so the workspace stays where
+    it is and the job names it: the round's work is not lost with the tool."""
     pkg = _seed_package(monkeypatch, tmp_path)
     root = _package_path(pkg).parent
     _fake_generate(
@@ -5510,7 +5534,12 @@ def test_run_revise_reports_the_target_package_being_deleted(
     assert not _package_path(pkg).exists()
     assert tools.list_tools() == []
     assert _leftovers(root) == []
-    assert not (root / ".staging").exists()
+    assert outcome.draft is not None
+    assert outcome.draft["saved"] is False
+    assert outcome.draft["reason"] == tool_drafts.REASON_PACKAGE_GONE
+    [session] = list((root / ".staging").iterdir())
+    assert outcome.draft["retained_path"] == str(session / "build")
+    assert (session / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
 
 
 def test_run_revise_never_publishes_on_a_validation_failure(
@@ -8205,7 +8234,9 @@ def test_run_revise_env_strip_refusal_still_carries_what_the_model_said_masked_o
     """The session returned an answer, then the builder ``.env`` could not be
     stripped: the outcome reports that refusal AND carries the model's summary and
     both notes, each masked again by ``run_revise`` on a worker -- the model's raw
-    text reaches it here, and the secret it repeats is the package's own key."""
+    text reaches it here, and the secret it repeats is the package's own key. No
+    draft is made of a workspace that may still hold that ``.env``, although the
+    notes alone would be worth one, and the job says why."""
     pkg = _seed_package(monkeypatch, tmp_path)
     (_package_path(pkg) / ".env").write_text(f"KB_API_KEY={_NOTE_SECRET}\n", encoding="utf-8")
     loop_thread = threading.current_thread()
@@ -8243,6 +8274,12 @@ def test_run_revise_env_strip_refusal_still_carries_what_the_model_said_masked_o
 
     assert outcome.ok is False
     assert outcome.error == tool_builder._ERROR_BUILDER_ENV_STRIP
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    assert outcome.draft is not None
+    assert (outcome.draft["saved"], outcome.draft["reason"]) == (
+        False,
+        tool_drafts.REASON_STRIP_ENV,
+    )
     carried = {
         "summary": outcome.summary,
         "handoff": outcome.handoff,
@@ -9781,3 +9818,684 @@ def test_a_group_kill_sent_again_reaches_a_member_left_by_a_leader_that_exited(
     with pytest.raises(ProcessLookupError):
         os.kill(member, 0)  # gone, reaped
     assert stopped is True
+
+
+# --- drafts: what a revise round keeps with the tool (tool_drafts) -------------
+#
+# The store on its own is in tests/test_tool_drafts.py; here is the revise job's
+# use of it: which exits save, the publish around its save, the routes.
+
+
+def _draft_dir(version: Path) -> Path:
+    return tool_drafts.draft_path(_package_root(version))
+
+
+def _draft_manifest(version: Path) -> dict[str, Any]:
+    manifest = tool_drafts.read_manifest(_draft_dir(version))
+    assert manifest is not None
+    return manifest
+
+
+def _draft_files(version: Path) -> Path:
+    return _draft_dir(version) / _draft_manifest(version)["files_dir"]
+
+
+# A builder that stops short, with all three of its notes.
+_UNFINISHED: dict[str, Any] = {
+    "tool_name": "kbsearch",
+    "summary": "API 沒有分頁參數",
+    "ready": False,
+    "handoff": "run.py 的查詢已改，分頁還沒試",  # noqa: RUF001
+    "operator_action": "在 config.env 設定 PAGE_SIZE",
+}
+
+_DRAFT_SECRET = "kb-live-secret-0123456789"
+
+
+def _save_an_unfinished_round(monkeypatch: pytest.MonkeyPatch, pkg: Path) -> dict[str, Any]:
+    """Run one revise whose builder stops short; returns its draft's manifest."""
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+    assert outcome.draft is not None and outcome.draft["saved"] is True
+    return _draft_manifest(pkg)
+
+
+def test_a_revise_that_does_not_publish_keeps_its_work_as_the_tool_s_draft(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The builder's own ``ready=false``: nothing is published, and the round is
+    kept with the tool -- its files as the session left them, how it ended, the
+    model's notes -- while the staging session is removed as before."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.not_ready is True
+    manifest = _draft_manifest(pkg)
+    assert outcome.draft == {
+        "saved": True,
+        "draft_id": manifest["draft_id"],
+        "generation": 1,
+        "attempts": 1,
+        "reason": None,
+        "retained_path": None,
+    }
+    assert (manifest["base_vid"], manifest["feedback"]) == (_TEST_VID, "加上分頁")
+    [attempt] = manifest["attempts"]
+    assert (attempt["outcome"], attempt["error"]) == ("not_published", outcome.error)
+    assert (attempt["summary"], attempt["handoff"], attempt["operator_action"]) == (
+        _UNFINISHED["summary"],
+        _UNFINISHED["handoff"],
+        _UNFINISHED["operator_action"],
+    )
+    files = _draft_files(pkg)
+    assert (files / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert (files / "tool.json").read_bytes() == (pkg / "tool.json").read_bytes()
+    assert not (files / tools._META_DIRNAME).exists()
+    assert _resolved_version(_package_path(pkg)) == pkg
+    assert _session_roots(tmp_path) == []
+
+
+@pytest.mark.parametrize("wrote", [False, True], ids=["nothing-changed", "files-changed"])
+def test_a_revise_whose_session_fails_keeps_a_draft_only_of_work_it_did(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, wrote: bool
+) -> None:
+    """An upstream failure ends the session with no answer, so with no notes. A
+    workspace left as it was received keeps nothing -- no draft, nothing on the
+    job -- and one the session had changed is kept, its round recorded as failed
+    with the error."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+
+    async def failing(
+        system_prompt: str, user_prompt: str, model_cls: type[BaseModel], **kwargs: Any
+    ) -> BaseModel:
+        if wrote:
+            by_name = {t.spec["function"]["name"]: t for t in kwargs["tools"]}
+            await by_name["write_file"].handler({"path": "run.py", "content": _REVISED_RUN_PY})
+        raise LLMUpstreamError("APITimeoutError: the upstream LLM request failed")
+
+    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", failing)
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    if not wrote:
+        assert outcome.draft is None
+        assert not tool_drafts.has_draft(_package_root(pkg))
+        return
+    assert outcome.draft is not None and outcome.draft["saved"] is True
+    [attempt] = _draft_manifest(pkg)["attempts"]
+    assert (attempt["outcome"], attempt["error"]) == ("failed", outcome.error)
+    assert (_draft_files(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+
+
+def test_a_round_whose_commands_are_not_confirmed_stopped_saves_no_draft(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The exit for commands not confirmed stopped comes before every save: a
+    round worth a draft -- files changed, notes handed back -- leaves its
+    workspace where it is and writes nothing into the tool."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+
+    async def not_confirmed(self: tool_builder._BuilderShells) -> bool:
+        return False
+
+    monkeypatch.setattr(tool_builder._BuilderShells, "stop_and_wait", not_confirmed)
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.draft is None
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    [kept] = _session_roots(tmp_path)
+    assert (kept / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+
+
+def test_a_published_revise_takes_its_draft_away_and_its_origin_names_the_draft(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A round about to publish saves its work first and marks the draft as being
+    published from; once the publish went through, the draft is taken away, and
+    the new version's origin names it -- what the list goes by when a draft is
+    left behind."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    marked: list[tuple[str, int]] = []
+    real_mark = tool_drafts.mark_publishing
+
+    def mark(
+        package_root: tools.PackageRoot,
+        identity: tuple[int, int] | None,
+        expected: tuple[str, int],
+        job_id: str | None,
+    ) -> int | None:
+        marked.append(expected)
+        assert (_draft_files(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+        return real_mark(package_root, identity, expected, job_id)
+
+    monkeypatch.setattr(tool_drafts, "mark_publishing", mark)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert outcome.draft is None
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    assert not [
+        entry.name
+        for entry in (_package_path(pkg) / tools._META_DIRNAME).iterdir()
+        if entry.name.startswith(tool_drafts.DRAFT_DIRNAME)
+    ]
+    [(draft_id, _generation)] = marked
+    origin = tools.read_origin_meta(tools.VersionRoot(_current_version(pkg)))
+    assert origin is not None
+    assert origin["feedback"] == f"加上分頁\n\n草稿 {draft_id}，經過 1 輪"  # noqa: RUF001
+
+
+def test_the_origin_feedback_is_masked_then_cut_keeping_its_draft_line_whole(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The operator's words are masked first and the whole is cut to its cap after,
+    the draft line kept whole at the end: that line is what the list looks for.
+    Cut first, the markers -- longer than the value they hide -- would push the
+    text past the cap."""
+    _seed_package(monkeypatch, tmp_path)
+    tools.register_inflight_secret(_SHORT_SECRET)
+    line = tool_drafts.provenance_line("a" * 32, 2)
+
+    written = tool_builder._provenance_feedback(
+        _filled_with_secret(tool_builder._ORIGIN_FEEDBACK_CAP), (), line
+    )
+
+    assert _SHORT_SECRET not in written
+    assert len(written) == tool_builder._ORIGIN_FEEDBACK_CAP
+    assert written.endswith("\n\n" + line)
+
+
+def test_a_publish_goes_ahead_when_its_draft_cannot_be_marked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The mark only helps the list tell, after a crash, a publish that went
+    through: failing to write it is no reason to hold the publish back."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    monkeypatch.setattr(tool_drafts, "mark_publishing", lambda *args: None)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert (_current_version(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert not tool_drafts.has_draft(_package_root(pkg))
+
+
+def test_a_draft_a_publish_could_not_take_away_lists_as_published(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The publish went through but its draft stayed: the job says so, naming the
+    draft at the generation the publish marked, which a discard needs; and the
+    list, matching the draft against ``current``'s origin, shows it as published
+    rather than as work still to do."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        tool_drafts, "remove_after_publish", lambda *args: tool_drafts.Removal(False, None)
+    )
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    manifest = _draft_manifest(pkg)
+    assert outcome.draft == {
+        "saved": True,
+        "draft_id": manifest["draft_id"],
+        "generation": manifest["generation"],
+        "attempts": 1,
+        "reason": tool_builder._DRAFT_NOT_REMOVED,
+        "retained_path": None,
+    }
+    [row] = client.get("/api/tools").json()["tools"]
+    assert row["current_vid"] != _TEST_VID
+    assert row["draft"]["state"] == "published"
+
+
+_PUBLISH_FAULTS = [
+    "validation",
+    "embedded-secret",
+    "base-replaced-before-the-move",
+    "base-replaced-after-the-move",
+    "origin-write",
+    "version-fsync",
+    "current-write",
+]
+
+
+@pytest.mark.parametrize("fault", _PUBLISH_FAULTS)
+def test_a_publish_that_fails_leaves_the_round_s_work_in_the_draft(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fault: str
+) -> None:
+    """At every point a publish can fail, the save before it is what holds the
+    work: the draft stays, no longer marked as being published from, the failure
+    recorded on its round, and the job names the draft at the generation it is
+    now at. ``current`` is left as the fault left it, and the staging session is
+    removed: the draft has the work."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    package = _package_path(pkg)
+    (package / ".env").write_text(f"KB_API_KEY={_DRAFT_SECRET}\n", encoding="utf-8")
+    files = {"run.py": _REVISED_RUN_PY}
+    side_effect: Callable[[], None] | None = None
+    expected_current = _TEST_VID
+    expected_error: str
+    if fault == "validation":
+        files = {"tool.json": "{ not json at all"}
+        expected_error = "工具包驗證失敗"
+    elif fault == "embedded-secret":
+        files = {"run.py": f"KEY = '{_DRAFT_SECRET}'\n"}
+        expected_error = "工具包驗證失敗：run.py 不得包含秘密值"  # noqa: RUF001
+    elif fault == "base-replaced-before-the-move":
+
+        def reinstall() -> None:
+            shutil.rmtree(pkg)
+            pkg.mkdir()
+            (pkg / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")))
+            (pkg / "run.py").write_text("print('reinstalled')\n", encoding="utf-8")
+
+        side_effect = reinstall
+        expected_error = tool_builder._ERROR_REVISE_TARGET_REPLACED
+    elif fault == "base-replaced-after-the-move":
+        other_vid = "20260728T020304Z-fedcba"
+        _copy_committed_version(pkg, other_vid)
+        versions = package / tools._VERSIONS_DIRNAME
+        real_fsync_directory = tool_builder._fsync_directory
+
+        def move_current_after_the_move(path: Path) -> bool:
+            durable = real_fsync_directory(path)
+            if path == versions:
+                assert tools.publish_current(tools.PackageRoot(package), other_vid)
+            return durable
+
+        monkeypatch.setattr(tool_builder, "_fsync_directory", move_current_after_the_move)
+        expected_current = other_vid
+        expected_error = tool_builder._ERROR_REVISE_TARGET_REPLACED
+    elif fault == "origin-write":
+        monkeypatch.setattr(tools, "write_origin_meta", lambda root, origin: False)
+        expected_error = tool_builder._ERROR_ORIGIN_WRITE
+    elif fault == "version-fsync":
+        real_fsync_tree = tool_builder._fsync_tree
+        monkeypatch.setattr(
+            tool_builder,
+            "_fsync_tree",
+            lambda path: path.name != "shell" and real_fsync_tree(path),
+        )
+        expected_error = tool_builder._ERROR_DURABILITY
+    else:
+        monkeypatch.setattr(tools, "publish_current", lambda package_root, vid: False)
+        expected_error = tool_builder._ERROR_CURRENT_WRITE
+    _fake_generate(monkeypatch, result=_revise_result(), files=files, side_effect=side_effect)
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert (outcome.error or "").startswith(expected_error)
+    manifest = _draft_manifest(pkg)
+    assert manifest["publishing"] is None
+    [attempt] = manifest["attempts"]
+    assert (attempt["outcome"], attempt["error"]) == ("failed", outcome.error)
+    # Saved, marked as being published from, then the mark cleared.
+    assert manifest["generation"] == 3
+    assert outcome.draft == {
+        "saved": True,
+        "draft_id": manifest["draft_id"],
+        "generation": 3,
+        "attempts": 1,
+        "reason": None,
+        "retained_path": None,
+    }
+    kept = _draft_files(pkg)
+    if fault == "validation":
+        assert (kept / "tool.json").read_text(encoding="utf-8") == "{ not json at all"
+    elif fault == "embedded-secret":
+        # This round's run.py holds the secret: the draft keeps the base's instead.
+        assert (kept / "run.py").read_text(encoding="utf-8") == "print('x')\n"
+        assert attempt["omitted"] == [{"path": "run.py", "reason": "secret_content"}]
+    else:
+        assert (kept / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    for dirpath, _dirnames, filenames in os.walk(_draft_dir(pkg)):
+        for filename in filenames:
+            assert _DRAFT_SECRET.encode() not in (Path(dirpath) / filename).read_bytes()
+    current = package / tools._META_DIRNAME / tools._CURRENT_FILENAME
+    assert current.read_text(encoding="ascii") == f"{expected_current}\n"
+    assert _session_roots(tmp_path) == []
+
+
+@pytest.mark.parametrize("where", ["staging", "version"])
+def test_a_publish_that_fails_after_its_save_failed_keeps_the_work_where_it_is(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    where: str,
+) -> None:
+    """Nothing holds the work but the place the failed publish left it, and the
+    job names that place: the staging workspace, which then stays where it is,
+    or, once moved, the version directory ``current`` does not name."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _install_settings(monkeypatch, tools_dir=str(_package_path(pkg).parent), tool_draft_max_files=1)
+    if where == "staging":
+        files = {"tool.json": "{ not json at all"}
+    else:
+        files = {"run.py": _REVISED_RUN_PY}
+        monkeypatch.setattr(tools, "publish_current", lambda package_root, vid: False)
+    _fake_generate(monkeypatch, result=_revise_result(), files=files)
+
+    with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+        outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    assert outcome.draft is not None
+    assert (outcome.draft["saved"], outcome.draft["reason"]) == (
+        False,
+        tool_drafts.REASON_TOO_MANY_FILES,
+    )
+    retained = Path(outcome.draft["retained_path"])
+    if where == "staging":
+        [session] = _session_roots(tmp_path)
+        assert retained == session / "build"
+        assert (retained / "tool.json").read_text(encoding="utf-8") == "{ not json at all"
+        assert any(str(session) in record.getMessage() for record in caplog.records)
+    else:
+        assert retained.parent == _package_path(pkg) / tools._VERSIONS_DIRNAME
+        assert retained.name != _TEST_VID
+        assert (retained / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+        assert _session_roots(tmp_path) == []
+    assert _resolved_version(_package_path(pkg)) == pkg
+
+
+def test_deleting_the_tool_while_its_draft_is_saved_is_refused(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The save holds the shared tools lock from the copy to the manifest, so a
+    delete in that window is the retryable 409 and the package -- with the draft
+    just written into it -- is still there afterwards."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    answers: list[Any] = []
+    real_carry_out = tool_drafts._carry_out
+
+    def carry_out_then_delete(plan: Any, incoming: Path, known: list[str]) -> Any:
+        omitted = real_carry_out(plan, incoming, known)
+        answers.append(client.delete("/api/tools/kbsearch"))
+        return omitted
+
+    monkeypatch.setattr(tool_drafts, "_carry_out", carry_out_then_delete)
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    [answer] = answers
+    assert answer.status_code == 409
+    assert answer.json()["detail"]["code"] == "ai_job_in_progress"
+    assert outcome.draft is not None and outcome.draft["saved"] is True
+    assert (_draft_files(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+
+
+@pytest.mark.parametrize("draft", ["saved", "bare-directory"])
+def test_router_revise_refuses_a_tool_with_a_draft_and_says_what_to_do(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, draft: str
+) -> None:
+    """A tool with a draft, in whatever state, takes no new revise: 409
+    ``draft_pending`` with the message naming the ways out, and no job. A stale
+    ``expected_vid`` is answered first, as the version check precedes it."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    if draft == "saved":
+        _save_an_unfinished_round(monkeypatch, pkg)
+    else:
+        _draft_dir(pkg).mkdir()
+
+    refused = client.post(
+        "/api/tools/kbsearch/revise", json={"feedback": "再試一次", "expected_vid": _TEST_VID}
+    )
+    stale = client.post(
+        "/api/tools/kbsearch/revise",
+        json={"feedback": "再試一次", "expected_vid": "20260728T020304Z-fedcba"},
+    )
+
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == {
+        "code": "draft_pending",
+        "message": tool_builder._DRAFT_PENDING_MESSAGE,
+    }
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "version_mismatch"
+    assert tool_builder._JOBS == {}
+    assert tool_builder.any_job_active() is False
+
+
+def test_a_revise_sees_a_draft_made_before_it_took_the_slot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The draft is judged after the slot is taken: a draft that appears up to
+    that moment -- a job that held the slot made it -- refuses the revise. Judged
+    any earlier, it would slip through."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    real_reserve = tool_builder.reserve_sync_operation
+
+    def reserve_once_a_draft_exists() -> str | None:
+        _draft_dir(pkg).mkdir()
+        return real_reserve()
+
+    monkeypatch.setattr(tool_builder, "reserve_sync_operation", reserve_once_a_draft_exists)
+
+    started = asyncio.run(tool_builder.start_revise_job("kbsearch", "加上分頁", _TEST_VID))
+
+    assert (started.refusal, started.message) == (
+        "draft_pending",
+        tool_builder._DRAFT_PENDING_MESSAGE,
+    )
+    assert tool_builder._JOBS == {}
+    assert tool_builder.any_job_active() is False
+
+
+def test_the_job_poll_names_the_draft_its_round_saved(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The card's round count comes from the job's ``draft``: which draft, at
+    which generation, after how many rounds. The round recorded in the draft
+    knows the job it ran in."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
+
+    async def scenario() -> str:
+        started = await tool_builder.start_revise_job("kbsearch", "加上分頁", _TEST_VID)
+        await _job_when_done(started.job_id)
+        assert started.job_id is not None
+        return started.job_id
+
+    job_id = asyncio.run(scenario())
+    polled = client.get(f"/api/tools/jobs/{job_id}")
+
+    assert polled.status_code == 200
+    manifest = _draft_manifest(pkg)
+    assert polled.json()["outcome"] == "not_published"
+    assert polled.json()["draft"] == {
+        "saved": True,
+        "draft_id": manifest["draft_id"],
+        "generation": 1,
+        "attempts": 1,
+        "reason": None,
+        "retained_path": None,
+    }
+    assert manifest["attempts"][0]["job_id"] == job_id
+
+
+def test_router_list_shows_the_draft_masked_with_the_secrets_known_now(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The list row carries the draft as the operator needs it -- its state, where
+    its files are, the last round -- and the model's notes masked with the
+    secrets known at this read: a value registered after the save is not
+    served back."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    late = "registered-after-the-save"
+    _fake_generate(
+        monkeypatch,
+        result={**_UNFINISHED, "summary": f"用 {late} 測過", "operator_action": f"把 {late} 換掉"},
+        files={"run.py": _REVISED_RUN_PY},
+    )
+    asyncio.run(_run_revise("kbsearch", "加上分頁"))
+    tools.register_inflight_secret(late)
+
+    response = client.get("/api/tools")
+
+    assert response.status_code == 200
+    assert late not in response.text
+    manifest = _draft_manifest(pkg)
+    [row] = response.json()["tools"]
+    assert row["draft"] == {
+        "draft_id": manifest["draft_id"],
+        "generation": 1,
+        "attempts": 1,
+        "state": "open",
+        "interrupted": False,
+        "base_vid": _TEST_VID,
+        "path": str(_draft_files(pkg)),
+        "discard_token": tool_drafts.discard_token(_draft_dir(pkg)),
+        "last": {
+            "stopped_by": None,
+            "failure": None,
+            "outcome": "not_published",
+            "finished_at": manifest["attempts"][0]["finished_at"],
+            "operator_action": f"把 {tools._REDACTION_MARKER} 換掉",
+            "summary": f"用 {tools._REDACTION_MARKER} 測過",
+            "omitted": 0,
+        },
+    }
+
+
+def test_router_list_fails_rather_than_serve_draft_text_it_could_not_mask(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The secrets a draft's text is masked with cannot be scanned: the listing is
+    a 500, not a page of text no one checked. Without a draft nothing needs that
+    scan, and the same listing is served."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _save_an_unfinished_round(monkeypatch, pkg)
+
+    def unscannable() -> list[str]:
+        raise OSError("the tools directory cannot be read")
+
+    monkeypatch.setattr(tools, "_redaction_secrets", unscannable)
+    lenient = TestClient(client.app, raise_server_exceptions=False)
+
+    assert lenient.get("/api/tools").status_code == 500
+    shutil.rmtree(_draft_dir(pkg))
+    assert lenient.get("/api/tools").status_code == 200
+
+
+def test_router_discards_only_the_draft_the_caller_names(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``DELETE /api/tools/{name}/draft`` names the draft by its id and generation
+    (or a token, never both); takes the slot first; refuses a draft other than the
+    one named; and once it is gone answers that there is none."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _save_an_unfinished_round(monkeypatch, pkg)
+    [row] = client.get("/api/tools").json()["tools"]
+    draft = row["draft"]
+    named = {"draft_id": draft["draft_id"], "generation": draft["generation"]}
+    url = "/api/tools/kbsearch/draft"
+
+    for params in (
+        {},
+        {"draft_id": draft["draft_id"]},
+        {"generation": draft["generation"]},
+        {**named, "discard_token": draft["discard_token"]},
+        {"draft_id": "not-a-draft-id", "generation": 1},
+        {"discard_token": "abc"},
+    ):
+        assert client.delete(url, params=params).status_code == 422, params
+    missing = client.delete("/api/tools/ghost/draft", params=named)
+    assert (missing.status_code, missing.json()) == (404, {"detail": "Tool not found"})
+    changed = client.delete(url, params={**named, "generation": draft["generation"] + 1})
+    assert changed.status_code == 409
+    assert changed.json()["detail"]["code"] == "draft_changed"
+    with tool_builder._JOBS_LOCK:
+        tool_builder._JOBS["active"] = tool_builder.InstallJob(
+            job_id="active", state="running", created_at="2026-07-16T00:00:00+00:00"
+        )
+    busy = client.delete(url, params=named)
+    assert busy.status_code == 409
+    assert busy.json()["detail"]["code"] == "job_busy"
+    tool_builder._reset_jobs_for_tests()
+    assert tool_drafts.has_draft(_package_root(pkg))
+
+    done = client.delete(url, params=named)
+
+    assert (done.status_code, done.json()) == (200, {"residual_path": None})
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    again = client.delete(url, params=named)
+    assert again.status_code == 404
+    assert again.json()["detail"]["code"] == "draft_not_found"
+    [row] = client.get("/api/tools").json()["tools"]
+    assert row["draft"] is None
+
+
+def test_router_discards_an_unusable_draft_by_the_token_the_list_gave(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A draft whose manifest cannot be read has no id or generation to name, so
+    the list hands out a token for it. The token stands for the draft as listed:
+    once the manifest is rewritten it is refused, and a fresh one is honoured."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    manifest = _draft_dir(pkg) / tool_drafts.MANIFEST_FILENAME
+    _draft_dir(pkg).mkdir()
+    manifest.write_text("{broken", encoding="utf-8")
+    url = "/api/tools/kbsearch/draft"
+    [row] = client.get("/api/tools").json()["tools"]
+    assert (row["draft"]["state"], row["draft"]["draft_id"]) == ("unusable", None)
+    seen = row["draft"]["discard_token"]
+
+    manifest.write_text("{broken again", encoding="utf-8")
+    stale = client.delete(url, params={"discard_token": seen})
+    [row] = client.get("/api/tools").json()["tools"]
+    done = client.delete(url, params={"discard_token": row["draft"]["discard_token"]})
+
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "draft_changed"
+    assert (done.status_code, done.json()) == (200, {"residual_path": None})
+    assert not tool_drafts.has_draft(_package_root(pkg))
+
+
+def test_no_route_declared_before_the_draft_discard_takes_its_requests() -> None:
+    """A tool may be named ``jobs``, so ``DELETE /api/tools/jobs/draft`` must reach
+    the draft discard. Starlette serves the first route that matches path AND
+    method, so no route declared before the discard may match both; one that
+    matches the path alone (the job poll, a GET) is passed over."""
+    routes = tools_router.router.routes
+    [index] = [
+        position
+        for position, route in enumerate(routes)
+        if getattr(route, "endpoint", None) is tools_router.discard_tool_draft
+    ]
+    scope = {"type": "http", "path": "/tools/jobs/draft", "root_path": "", "method": "DELETE"}
+
+    assert routes[index].matches(scope)[0] is Match.FULL
+    for route in routes[:index]:
+        assert route.matches(scope)[0] is not Match.FULL, getattr(route, "path", route)
+
+
+def test_the_stale_backup_sweep_collects_what_a_discard_left_and_keeps_the_draft(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``_sweep_stale_backups``, which installs and revises end with, collects what
+    a discard could not remove -- and only that: the draft itself stays as it is."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _save_an_unfinished_round(monkeypatch, pkg)
+    leftover = _package_path(pkg) / tools._META_DIRNAME / ("draft.discarded-" + "1" * 32)
+    leftover.mkdir()
+    (leftover / "run.py").write_text("print('left')\n", encoding="utf-8")
+
+    tool_builder._sweep_stale_backups(_package_path(pkg).parent)
+
+    assert not leftover.exists()
+    assert (_draft_files(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY

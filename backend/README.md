@@ -78,6 +78,8 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 | `TOOL_INSTALL_TIMEOUT_SECONDS` | `900` | KB 網頁安裝器單一安裝工作階段的整體逾時秒數，邊界 `(0, 3600]`。 |
 | `TOOL_INSTALL_SHELL_TIMEOUT_SECONDS` | `120` | 安裝器內單一 `run_shell` 指令的逾時秒數，邊界 `(0, 600]`。 |
 | `TOOL_CHECK_BUDGET_SECONDS` | `300` | 跑一次 `examples.json`（「跑一次範例」與 AI 修正發布後的自動驗證）的總預算秒數；超過就不再跑剩下的範例、標示未完成。執行期間持有共享 tools lock：預算是在每個範例開始前檢查的，已經開始的那一個會跑到它自己的 `LLM_TOOL_TIMEOUT_SECONDS`，所以刪除／丟棄最久會被擋住預算加一個範例的逾時。邊界 `(0, 3600]`。 |
+| `TOOL_DRAFT_MAX_FILES` | `2000` | 一輪修訂保存成草稿（見下方「沒發布的修訂留成草稿」）時，工作區最多幾個項目（檔案、目錄、連結都算）；超過就不存檔案、記下原因。每次保存都複製整個工作區並 fsync 複本，這個上限與下一個限制的是一次保存複製的量、fsync 的時間與一份草稿佔的磁碟。預設是 `list_dir` 列出上限 500 的四倍。邊界 `[1, 100000]`。 |
+| `TOOL_DRAFT_MAX_BYTES` | `50000000` | 同上，工作區檔案內容的總位元組上限。預設是估計值、不是量測：一般套件預期是幾十 KB，連依賴一起放進來的也只有幾 MB。邊界 `[1000000, 2000000000]`。 |
 | `DATABASE_URL` | `sqlite:///./afterthread.db` | SQLAlchemy URL。**只支援 SQLite**，且必須是檔案型（不可為 in-memory）——見下方設計筆記。 |
 | `STALE_AFTER_DAYS` | `14` | 非終態項目（`STALE_ELIGIBLE_STATUSES`：除 `done`／`superseded` 外的五種狀態）的 `updated` 超過這個天數，API 回應的 `is_stale` 會是 `true`。邊界 `[0, 36500]`。 |
 
@@ -200,6 +202,15 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   儲存問題、重啟並確認 pointer 仍指 P。停止行程本身不能補上 durability invariant。
   `lineage=sole` 在 UI 走既有的整包刪除確認；
   前一版缺失、未提交或指回自己則回 `409 lineage_unavailable`，不動任何檔案。
+- `DELETE /api/tools/{name}/draft?draft_id=…&generation=…`（或 `?discard_token=…`）— 放棄工具的
+  草稿（見下方「沒發布的修訂留成草稿」），連檔案一起刪。以 `draft_id`＋`generation` 指名，說明檔
+  讀不出來的草稿改用清單給的 `discard_token`，兩種恰好給一種（否則 422）。先取得全域名額
+  （`409 job_busy`），所以期間沒有任何保存或 sweep；再持共享 tools lock，刪除工具因此回
+  `409 ai_job_in_progress`。草稿不是呼叫者指名的那一份（之後又被寫過，或放棄後又建了一份新的）回
+  `409 draft_changed`；工具不存在回 404（`TOOLS_DIR` 未設定也是），工具沒有草稿回
+  `404 draft_not_found`。任何狀態的草稿都能放棄。`draft/` 先改名成
+  `.afterthread.meta/draft.discarded-<hex>` 再刪；回應 `{residual_path}` 是刪不掉而留下的路徑（沒有就是
+  `null`），之後安裝或修訂工作收尾時的 sweep 會再收。宣告在 `/jobs/{job_id}` 之前（工具可以叫 `jobs`）。
 - `POST /api/tools/install` — 送出 KB 網頁安裝器工作（見下方「工具（KB 網頁
   安裝器）」）；202 + `job_id`，建置在背景執行。`TOOLS_DIR` 未設定回 `503
   tools_not_configured`；名額被佔用時回 `409 install_in_progress`。**那個名額
@@ -233,7 +244,13 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   操作者在工作區外動手的事）是模型自己寫的，先遮蔽再截斷，只供顯示與交接，後端不據以做
   任何判斷。這六個欄位在安裝、跑範例、session 開始前就結束的修訂，以及因未預期錯誤
   而中止的工作上都是 `null`；`run_shell` 指令無法確認停止的修訂只帶前四個，`summary`、
-  `handoff`、`operator_action` 都是 `null`（AI 日誌仍有整場紀錄）。工作已完成的清單被裁剪掉、或後端
+  `handoff`、`operator_action` 都是 `null`（AI 日誌仍有整場紀錄）。修訂另帶 `draft`：這一輪的草稿怎麼了
+  （`{saved, draft_id, generation, attempts, reason, retained_path}`）。`saved` 是草稿是否存了這一輪的
+  成果，`reason` 是沒存的原因（發布成功卻刪不掉草稿時，是請你放棄它的說明）；`attempts` 是這份草稿
+  累計的輪數；`retained_path` 只在發布前的保存失敗、接著發布也失敗時才有，指出成果現在在哪裡：
+  暫存目錄，或已搬進 `versions/` 但 `current` 沒有指到的那一版。沒有值得存的東西、發布成功且草稿已
+  刪除、指令無法確認停止（什麼都不存）時，以及上面六個欄位為 `null` 的情況，`draft` 都是 `null`。
+  工作已完成的清單被裁剪掉、或後端
   重啟過（工作只存在記憶體）則回 404。`llm_log_process` 與側檔那一個是同一個
   token、同一條「沒有 id 就沒有 token」規則，只是**由這個路由在回應當下蓋章**：
   工作表是行程內記憶體，與 id 空間同生共死，所以還答得出來的工作，它的
@@ -270,7 +287,8 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   用上面的 `GET /api/tools/jobs/{job_id}` 輪詢。**先**檢查套件的 `.env`／`config.env`
   政策（web-v6 §5.2）：不過就回 `409 env_policy`。值太短或寫法無法對應時，`message`
   會列出 key 名（永不列值）；檔案讀不到或超過上限時只說明狀況。工作開跑時會再檢查一次。工具不存在回 404；已有工具工作
-  在跑回 `409 job_busy`；取得名額後版本不符回 `409 version_mismatch`，這些都不
+  在跑回 `409 job_busy`；取得名額後版本不符回 `409 version_mismatch`；版本相符但工具有草稿（不論
+  狀態，`draft/` 存在就算）回 `409 draft_pending`，`message` 說明先取回需要的檔案、再放棄草稿。這些都不
   建立工作。**不宣告** `502`／`503`：修訂是背景工作，LLM 沒
   設定或上游失敗都封在工作狀態裡（失敗的 job + 友善訊息 + AI 日誌連結），與
   安裝送出同一套契約。
@@ -304,7 +322,15 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   任何名稱都解析不到工具，404 已經是誠實答案。
 
 `GET /api/tools` 的每一列另有 `last_run`：該工具最新一筆執行紀錄的
-`{id, outcome, started_at, vid, fixable}`，沒有紀錄時為 `null`。
+`{id, outcome, started_at, vid, fixable}`，沒有紀錄時為 `null`；以及 `draft`：工具的草稿，沒有時為
+`null`。`draft` 是 `{draft_id, generation, attempts, state, interrupted, base_vid, path, discard_token,
+last}`：`state` 依序判定為 `running`（本行程有一輪正在處理它）、`unusable`（說明檔讀不出、形狀不對，
+或檔案目錄不在；只能放棄，說明檔讀不出時 `draft_id` 等欄位為 `null`）、`publishing`／`published`／`unknown`（從它
+發布的那一次：還在進行、已生效——`current` 的 origin 記著這份草稿——、或無從得知）、`stale`
+（`current` 已不是 `base_vid`）、`open`。`path` 是檔案所在（無法使用時是 `draft/` 本身），
+`last` 是最後一輪的停止原因、結局、`operator_action`、摘要前 300 字與沒存的檔案數。文字在讀出時
+以當下的已知秘密再遮一次；已知秘密的掃描失敗時整個清單回 500，不回未經檢查的文字。沒有 `draft/`
+的工具只多一次 `lstat`。
 
 **Tool runs**（`afterthread/routers/tool_runs.py`，前綴 `/api/tool-runs`）——不在
 `/api/tools/` 底下，因為那裡任何字面的第一段都可能是套件名：
@@ -338,6 +364,10 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
               state.json
               current
               migration-owner.json  # 只存在於一次性 web-v5 遷移產物
+              draft/                # 沒發布的修訂（草稿），可缺
+                  manifest.json
+                  files-<hex>/      # 那一輪工作區的複本
+              draft.discarded-<hex>/  # 放棄時沒刪乾淨的殘留，sweep 收
           versions/
               <vid>/
                   .afterthread.meta/
@@ -435,6 +465,28 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `versions/<新 vid>` 後才原子發布 `current`。因此舊版本永久保留、套件 state 與
   `.env` 原地不動，`current` 是修訂唯一 commit point。六位 hex 可能碰撞，建立時
   會避開 `versions/` 下所有以候選 vid 開頭的項目，包括 `.discarded`。
+- **沒發布的修訂留成草稿**（`services/tool_drafts.py`）：一輪修訂沒有發布時——builder 自己回
+  `ready=false`、session 失敗、試圖改名——工作區存成工具的草稿，在
+  `<name>/.afterthread.meta/draft/`；準備發布的那一輪也先存一份，發布成功後刪除，發布失敗時清掉
+  「正在發布」的標記、把錯誤記在那一輪。每一次保存都排在「指令無法確認停止」那個出口之後、
+  builder 的 `.env` 與根層 `.afterthread.meta/` 剝除之後；剝除失敗就不存檔案。順序是固定的：
+  值不值得存（第一輪相對開工時複製進來的內容沒有變更、模型也沒交回任何筆記，就什麼都不建）、
+  大小上限（`TOOL_DRAFT_MAX_FILES`／`TOOL_DRAFT_MAX_BYTES`）、連結（以連結所在目錄為起點、純字串
+  解析後仍在工作區內才存，存成相對連結；路徑裡有 `..` 緊接在一個本身是連結的元件之後也不存，
+  那是字串與作業系統解析會不一致的唯一情形）、完整的內嵌秘密掃描（內容或連結目標含已知秘密的
+  路徑改存起點版本的那一份，起點也含就不存；檔名含秘密的不存；掃描失敗就不存檔案，內容永遠不改寫
+  成遮蔽標記）。接著持共享 tools lock，並確認 `<TOOLS_DIR>/<name>` 仍是開工時那個目錄（比對
+  `(st_dev, st_ino)`，不是比名稱）：複製（不是搬移、不是 hard link）到 `draft/.incoming-<hex>`、
+  fsync、改名成 `files-<hex>`、原子寫入 `manifest.json`。`draft/` 只用不遞迴的 `os.mkdir` 建在既有的
+  `.afterthread.meta/` 下，被刪掉的套件不會被重建。第一輪保存失敗會收回它建的東西，連空的
+  `draft/` 一起。說明檔的文字先遮蔽、再截斷、再處理孤立的 surrogate；識別碼、時間與詞彙值改為檢查
+  形狀。一個工具一份草稿：`draft/` 存在就拒絕新的修訂（`draft_pending`）。發布前的保存失敗、接著
+  發布也失敗時，成果所在的暫存目錄原地保留（sweep 照常執行，它不看 `.staging`），工作的
+  `draft.retained_path` 與後端記錄寫出它的路徑；成果已搬進 `versions/<vid>` 時回報那一版。安裝與
+  修訂工作收尾時的 sweep（排他鎖下；指令無法確認停止的那一場不跑）也收草稿的殘留：放棄留下的
+  `draft.discarded-<hex>`，以及說明檔讀得出、形狀正確、它指的檔案目錄在、而且說明檔與 `draft/`
+  都先 fsync 成功時，說明檔沒有指到也不在 `kept`（一輪進行中被手改過、因此留下的舊複本）的
+  `files-<hex>` 與 `.incoming-<hex>`；任何一項不成立，整個 `draft/` 都不碰。
 - **執行綁定廣告時的版本**：registry 廣告工具時把 `PackageRoot`、
   `VersionRoot`、entry 與 manifest identity 一起封進 handler；模型稍後真的呼叫時
   直接以那個 `VersionRoot` 當 cwd。package `.env` 與開關則在呼叫當下讀。

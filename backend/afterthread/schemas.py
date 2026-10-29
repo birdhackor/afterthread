@@ -538,6 +538,77 @@ ToolRunOutcome = Literal[
     "ok", "failed", "output_overflow", "timeout", "start_failed", "refused", "error"
 ]
 
+# How a revise session ended, as the loop measured it: the budget that ended its
+# tool phase, and how it failed. They mirror ``llm.FinalizeTrigger`` /
+# ``llm.RunFailure`` rather than importing them (this module stays free of the
+# service layer); tests/test_llm_stats.py pins them equal, since a value missing
+# here would fail the poll or the tools list.
+ToolStoppedBy = Literal["rounds", "conversation"]
+ToolRunFailure = Literal[
+    "empty_response",
+    "invalid_output",
+    "upstream",
+    "request_timeout",
+    "deadline",
+    "not_configured",
+]
+
+
+class ToolDraftLast(BaseModel):
+    """How the latest round of a draft ended (see ``ToolDraft``).
+
+    ``outcome`` is null for a round saved just before it published.
+    ``operator_action`` and ``summary`` are the model's own notes, masked with the
+    secrets known at the time of this read; ``summary`` is an excerpt. ``omitted``
+    counts the workspace paths that round did not keep.
+    """
+
+    stopped_by: ToolStoppedBy | None
+    failure: ToolRunFailure | None
+    outcome: Literal["published", "not_published", "failed"] | None
+    finished_at: str | None
+    operator_action: str | None
+    summary: str | None
+    omitted: int
+
+
+class ToolDraft(BaseModel):
+    """A tool's unfinished revision (its draft), as the tools list shows it.
+
+    ``state`` is read from the draft each time: ``running`` (a round of this
+    backend is working on it), ``unusable`` (its manifest cannot be read or is out
+    of shape, or its files are missing: it can only be discarded), ``publishing``
+    (a publish from it is in progress), ``published`` (that publish went through:
+    the version is the row's ``current_vid``), ``unknown`` (a publish from it was
+    started and whether it went through is not known), ``stale`` (``current`` is
+    no longer ``base_vid``) or ``open``. ``interrupted``: a round marked as running
+    is not running any more.
+
+    ``attempts`` is how many rounds the draft has been through. ``path`` is where
+    its files are, to be opened or copied as it is; for an unusable draft, the
+    draft directory itself. ``discard_token`` stands for the draft as it is now,
+    whatever its manifest holds, so an unusable draft can be discarded by it.
+    ``draft_id``, ``generation``, ``attempts``, ``base_vid`` and ``last`` are null
+    when the manifest cannot be read; an unusable draft whose files are missing
+    still has them.
+    """
+
+    draft_id: str | None
+    generation: int | None
+    attempts: int | None
+    state: Literal["running", "unusable", "publishing", "unknown", "published", "stale", "open"]
+    interrupted: bool
+    base_vid: str | None
+    path: str
+    discard_token: str
+    last: ToolDraftLast | None
+
+
+class ToolDraftDiscardResponse(BaseModel):
+    """The draft was discarded; ``residual_path`` is what could not be removed, or null."""
+
+    residual_path: str | None
+
 
 class ToolLastRun(BaseModel):
     """A list row's newest run record (web-v6 §9), or null when it has none.
@@ -569,6 +640,7 @@ class ToolSummary(BaseModel):
     The summary text itself is fetched per tool on demand
     (``ToolSummaryDetail``), since it is far too long for a list row.
     ``last_run`` is the tool's newest run record, null when it has none.
+    ``draft`` is the tool's unfinished revision, null when it has none.
     """
 
     name: str
@@ -579,6 +651,7 @@ class ToolSummary(BaseModel):
     current_vid: str | None
     lineage: Literal["sole", "usable", "broken"]
     last_run: ToolLastRun | None = None
+    draft: ToolDraft | None = None
 
 
 class ToolListResponse(BaseModel):
@@ -828,6 +901,25 @@ class ToolVerification(BaseModel):
     finished: bool
 
 
+class ToolJobDraft(BaseModel):
+    """What became of a revise round's draft (see ``ToolJobStatus.draft``).
+
+    ``saved``: the draft holds this round's work. ``reason`` says why it does not,
+    or, on a published revise, that the draft could not be taken away.
+    ``attempts`` is how many rounds the draft has been through, for the card's
+    "round N". ``retained_path`` is set only when the save before a publish failed
+    and the publish failed too: where the work is now, a staging directory or a
+    version directory ``current`` does not name.
+    """
+
+    saved: bool
+    draft_id: str | None
+    generation: int | None
+    attempts: int | None
+    reason: str | None
+    retained_path: str | None
+
+
 class ToolJobStatus(BaseModel):
     """One install/revise job's visible state, as polled by the 工具 page.
 
@@ -881,6 +973,12 @@ class ToolJobStatus(BaseModel):
     the operator must do by hand), already masked, for display only. All six are
     null for an install, a health check, a revise that failed before its session
     started, and a job that ended in an unexpected error.
+
+    ``draft`` is what became of the round's draft (``ToolJobDraft``): null when
+    the round had nothing to keep, when it published and its draft was taken
+    away, when its commands could not be confirmed stopped (nothing is saved then;
+    ``error`` names the workspace kept in place), and wherever the six above are
+    null.
     """
 
     job_id: str
@@ -896,27 +994,13 @@ class ToolJobStatus(BaseModel):
     outcome: Literal["published", "not_published", "failed"] | None
     kind: Literal["install", "revise", "health_check"] = "install"
     verification: ToolVerification | None = None
-    # The two vocabularies mirror ``llm.FinalizeTrigger`` / ``llm.RunFailure``
-    # rather than importing them (this module stays free of the service layer).
-    # ``test_tool_job_status_admits_every_run_failure_and_finalize_trigger``
-    # (tests/test_llm_stats.py) pins them equal, since a value missing here would
-    # fail the poll.
-    stopped_by: Literal["rounds", "conversation"] | None = None
-    failure: (
-        Literal[
-            "empty_response",
-            "invalid_output",
-            "upstream",
-            "request_timeout",
-            "deadline",
-            "not_configured",
-        ]
-        | None
-    ) = None
+    stopped_by: ToolStoppedBy | None = None
+    failure: ToolRunFailure | None = None
     rounds_used: int | None = None
     max_rounds: int | None = None
     handoff: str | None = None
     operator_action: str | None = None
+    draft: ToolJobDraft | None = None
 
 
 class ToolSettingsEntry(BaseModel):

@@ -31,6 +31,8 @@ not: it queues a background job, so its LLM failures are job state, not a
 response status.
 """
 
+import functools
+from collections.abc import Callable
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -48,6 +50,7 @@ from afterthread.routers.ai import (
 from afterthread.schemas import (
     ToolDeleteResponse,
     ToolDiscardResponse,
+    ToolDraftDiscardResponse,
     ToolExpectedVersionRequest,
     ToolInstallAccepted,
     ToolInstallRequest,
@@ -60,7 +63,7 @@ from afterthread.schemas import (
     ToolSummaryDetail,
     ToolUpdateRequest,
 )
-from afterthread.services import llm_log, tool_builder, tool_meta, tool_runs
+from afterthread.services import llm_log, tool_builder, tool_drafts, tool_meta, tool_runs
 from afterthread.services import tools as tools_service
 from afterthread.services.llm import LLMNotConfiguredError, LLMUpstreamError
 from afterthread.services.tools import _NAME_RE
@@ -162,6 +165,15 @@ _RUN_NOT_FOUND_MESSAGE = "找不到附上的執行紀錄（可能已被清除）
 _RUN_NOT_FOR_TOOL_CODE = "run_not_for_tool"
 _RUN_NOT_FOR_TOOL_MESSAGE = "附上的執行紀錄不屬於這個工具"
 _ENV_POLICY_EXAMPLE = tool_builder._ERROR_REVISE_ENV_UNMASKABLE.replace("{keys}", "「CACHE_TTL」")
+# A revise refused because the tool has an unfinished revision (its draft); the
+# message says what can be done about it.
+_DRAFT_PENDING_CODE = "draft_pending"
+# A discard aimed at a draft other than the one the caller saw: it was written to
+# since, or discarded and another one made.
+_DRAFT_CHANGED_CODE = "draft_changed"
+_DRAFT_CHANGED_MESSAGE = "草稿已經變更，請重新整理後再確認要不要放棄"  # noqa: RUF001
+_DRAFT_NOT_FOUND_CODE = "draft_not_found"
+_DRAFT_NOT_FOUND_MESSAGE = "這個工具沒有未完成的修正"
 
 
 def _tools_lock_unavailable(exc: tools_service.ToolsLockUnavailableError) -> HTTPException:
@@ -208,6 +220,19 @@ _REVISE_CONFLICT_RESPONSE = _conflict_response(
         _ENV_POLICY_EXAMPLE,
         "The package's .env or config.env fails the revise env policy",
     ),
+    (
+        _DRAFT_PENDING_CODE,
+        tool_builder._DRAFT_PENDING_MESSAGE,
+        "The tool has an unfinished revision (a draft) to deal with first",
+    ),
+)
+_DRAFT_DISCARD_CONFLICT_RESPONSE = _conflict_response(
+    (_JOB_BUSY_CODE, _JOB_BUSY_MESSAGE, "Another tool operation holds the global slot"),
+    (
+        _DRAFT_CHANGED_CODE,
+        _DRAFT_CHANGED_MESSAGE,
+        "The draft is not the one the caller saw",
+    ),
 )
 _DISCARD_CONFLICT_RESPONSE = _conflict_response(
     (_VERSION_MISMATCH_CODE, _VERSION_MISMATCH_MESSAGE, "The requested version is stale"),
@@ -252,6 +277,28 @@ _TOOLS_LOCK_UNAVAILABLE_RESPONSE: dict[int | str, dict[str, Any]] = {
 }
 
 
+def _draft_reader() -> Callable[
+    [tools_service.PackageRoot, tools_service.Resolution], dict[str, Any] | None
+]:
+    """What ``list_tools`` reads each package's draft with, for one listing.
+
+    Bound to this process's job table, which says whether a round marked on a
+    draft is still running here. The secrets the draft's text is masked with are
+    scanned once, on the first draft found, and a scan that fails fails the
+    listing: text that could not be masked is not served.
+    """
+    scanned: list[list[str]] = []
+
+    def known() -> list[str]:
+        if not scanned:
+            scanned.append(tools_service._redaction_secrets())
+        return scanned[0]
+
+    return functools.partial(
+        tool_drafts.draft_view, job_active=tool_builder.job_is_active, known=known
+    )
+
+
 def _with_last_runs(session: Session, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The registry rows, each with its newest run record (web-v6 §9) or None.
 
@@ -280,8 +327,14 @@ async def list_installed_tools(session: SessionDep) -> ToolListResponse:
     With the feature off (TOOLS_DIR unset) or nothing installed this is an
     empty list, NOT an error: the 工具 page distinguishes "feature off" via the
     install endpoint's 503, while an empty listing is a normal state.
+
+    Each row carries the tool's draft (``ToolDraft``), when it has one. Its text is
+    masked as it is read, so a listing whose secret scan fails is a 500 rather
+    than a page of text no one checked.
     """
-    listed = await run_in_threadpool(tools_service.list_tools)
+    listed = await run_in_threadpool(
+        functools.partial(tools_service.list_tools, draft_view=_draft_reader())
+    )
     rows = await run_in_threadpool(_with_last_runs, session, listed)
     return ToolListResponse.model_validate({"tools": rows})
 
@@ -314,7 +367,10 @@ async def update_tool(
     changed = await run_in_threadpool(tools_service.set_enabled, name, payload.enabled)
     if not changed:
         raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
-    for row in await run_in_threadpool(tools_service.list_tools):
+    listed = await run_in_threadpool(
+        functools.partial(tools_service.list_tools, draft_view=_draft_reader())
+    )
+    for row in listed:
         if row["name"] == name:
             [with_run] = await run_in_threadpool(_with_last_runs, session, [row])
             return ToolSummary.model_validate(with_run)
@@ -443,6 +499,106 @@ async def discard_tool_version(name: ToolName, vid: ToolVersionId) -> ToolDiscar
         )
     finally:
         tool_builder.release_sync_operation(reservation)
+
+
+@router.delete(
+    "/{name}/draft",
+    response_model=ToolDraftDiscardResponse,
+    responses={
+        404: {
+            "description": "No such tool, or the tool has no draft",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "tool": {
+                            "summary": "No such tool",
+                            "value": {"detail": _TOOL_NOT_FOUND},
+                        },
+                        _DRAFT_NOT_FOUND_CODE: {
+                            "summary": "The tool has no draft",
+                            "value": {
+                                "detail": {
+                                    "code": _DRAFT_NOT_FOUND_CODE,
+                                    "message": _DRAFT_NOT_FOUND_MESSAGE,
+                                }
+                            },
+                        },
+                    }
+                }
+            },
+        },
+        **_DRAFT_DISCARD_CONFLICT_RESPONSE,
+        **_TOOLS_LOCK_UNAVAILABLE_RESPONSE,
+    },
+)
+async def discard_tool_draft(
+    name: ToolName,
+    draft_id: Annotated[str | None, Query(pattern=tool_drafts.DRAFT_ID_PATTERN)] = None,
+    generation: Annotated[int | None, Query(ge=1)] = None,
+    discard_token: Annotated[str | None, Query(pattern=tool_drafts.DISCARD_TOKEN_PATTERN)] = None,
+) -> ToolDraftDiscardResponse:
+    """Discard the tool's unfinished revision (its draft), files and all.
+
+    Names the draft it means one of two ways: ``draft_id`` and ``generation``, or,
+    for a draft whose manifest cannot be read, the ``discard_token`` the tools
+    list gave for it; exactly one of the two (422 otherwise). A draft that is not
+    the one named -- written to since, or discarded and another one made -- is a
+    409 ``draft_changed``: the confirmation was about the draft the operator saw.
+    Any state can be discarded.
+
+    It takes the global slot first (409 ``job_busy``), which keeps every job, and
+    so every save and the sweep, away while it runs. The draft is renamed aside,
+    then removed; ``residual_path`` names what could not be removed, which the
+    sweep at the end of a later install or revise retries.
+
+    Declared BEFORE the job poll, which must stay last (see the comment there):
+    a tool may be named ``jobs``.
+    """
+    by_token = discard_token is not None
+    by_identity = draft_id is not None or generation is not None
+    if by_token == by_identity or (by_identity and (draft_id is None or generation is None)):
+        raise HTTPException(
+            status_code=422,
+            detail="give draft_id and generation, or discard_token",
+        )
+    reservation = tool_builder.reserve_sync_operation()
+    if reservation is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": _JOB_BUSY_CODE, "message": _JOB_BUSY_MESSAGE},
+        )
+    try:
+        package_root = await run_in_threadpool(tools_service._resolve_package_dir_no_alias, name)
+        if package_root is None:
+            raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
+        try:
+            outcome = await run_in_threadpool(
+                functools.partial(
+                    tool_drafts.discard,
+                    package_root,
+                    draft_id=draft_id,
+                    generation=generation,
+                    token=discard_token,
+                )
+            )
+        except tools_service.ToolsLockUnavailableError as exc:
+            raise _tools_lock_unavailable(exc) from exc
+    finally:
+        tool_builder.release_sync_operation(reservation)
+    if outcome == "not_found":
+        raise HTTPException(
+            status_code=404,
+            detail={"code": _DRAFT_NOT_FOUND_CODE, "message": _DRAFT_NOT_FOUND_MESSAGE},
+        )
+    if outcome == "changed":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": _DRAFT_CHANGED_CODE, "message": _DRAFT_CHANGED_MESSAGE},
+        )
+    residual = outcome.residual_path
+    return ToolDraftDiscardResponse(
+        residual_path=tools_service._utf8_safe(str(residual)) if residual is not None else None
+    )
 
 
 @router.post(
@@ -714,9 +870,10 @@ async def revise_tool(
     then reserves the global slot, then resolves the package and compares the
     required ``expected_vid``.  An env-policy refusal returns ``env_policy`` with
     the gate's own message (it names the keys to move), missing/aliased packages
-    return 404, a stale version returns ``version_mismatch``, and an occupied slot
-    returns ``job_busy``.  Only a matching version is converted into a queued job,
-    so a refused submit has neither an LLM charge nor even a pollable job id.
+    return 404, a stale version returns ``version_mismatch``, an occupied slot
+    returns ``job_busy``, and a tool with a draft returns ``draft_pending``.  Only
+    a matching version is converted into a queued job, so a refused submit has
+    neither an LLM charge nor even a pollable job id.
 
     Attached ``run_ids`` (web-v6 §8.3) are checked and copied FIRST, before any
     of that: an id that does not exist (or was purged) is a 404
@@ -747,6 +904,11 @@ async def revise_tool(
         raise HTTPException(
             status_code=409,
             detail={"code": _ENV_POLICY_CODE, "message": started.message},
+        )
+    if started.refusal == "draft_pending":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": _DRAFT_PENDING_CODE, "message": started.message},
         )
     if started.refusal == "not_found":
         raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)

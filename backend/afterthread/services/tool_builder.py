@@ -55,6 +55,7 @@ the user re-runs the install). Bounded to the most recent ``_MAX_JOBS``.
 import asyncio
 import concurrent.futures
 import contextlib
+import dataclasses
 import functools
 import logging
 import os
@@ -78,7 +79,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from starlette.concurrency import run_in_threadpool
 
 from afterthread.config import get_settings
-from afterthread.services import llm, llm_log, token_budget, tool_meta, tools
+from afterthread.services import llm, llm_log, token_budget, tool_drafts, tool_meta, tools
 from afterthread.services.llm import (
     FinalizeTrigger,
     LLMNotConfiguredError,
@@ -837,6 +838,11 @@ class InstallOutcome:
     # construction like ``summary``. Display and handover only.
     handoff: str | None = None
     operator_action: str | None = None
+    # What became of this round's draft (``tool_drafts.SaveResult.report``): kept,
+    # or why not, and where the work is when neither the draft nor a version has
+    # it. None when the round had nothing to keep, published and took its draft
+    # away, or never ran.
+    draft: dict[str, Any] | None = None
 
 
 # --- staging containment + meta-tools ---------------------------------------
@@ -2025,24 +2031,46 @@ def _revise_user_prompt(
     return "\n\n".join(parts)
 
 
-def _provenance_feedback(feedback: str | None, runs: tuple[AttachedRun, ...]) -> str:
-    """The ``origin.feedback`` a revise writes: the operator's words, then the runs.
+# The longest ``origin.feedback`` a revise writes, so ``origin.json`` stays far
+# below ``tools._AI_META_MAX_BYTES`` and is never refused after the version moved.
+_ORIGIN_FEEDBACK_CAP = 20_000
+
+
+def _provenance_feedback(
+    feedback: str | None, runs: tuple[AttachedRun, ...], draft_line: str | None = None
+) -> str:
+    """The ``origin.feedback`` a revise writes: the operator's words, the runs, the draft.
 
     A version records WHY it exists (web-v6 §8.1): for a fix, which failures it
     was made for -- id, time, outcome and exit code, never the stderr or the
     arguments (invariant V): the origin is kept as long as the version is, and
-    the record's bodies are the operator's to purge.
+    the record's bodies are the operator's to purge. ``draft_line`` names the
+    draft the round saved before publishing (``tool_drafts.provenance_line``):
+    the tools list finds that draft's id here to tell a publish that went through
+    from one that did not.
+
+    Each part is masked, then the whole is cut to ``_ORIGIN_FEEDBACK_CAP`` with the
+    draft line kept whole at its end, since it is what the list looks for. Blocking:
+    the mask scans the tools directory.
     """
-    if not runs:
-        return feedback or ""
-    entries = []
-    for run in runs:
-        detail = f"{run.started_at:%Y-%m-%d %H:%M:%S} UTC，{run.outcome}"  # noqa: RUF001
-        if run.exit_code is not None:
-            detail += f"，exit {run.exit_code}"  # noqa: RUF001
-        entries.append(f"#{run.id}（{detail}）")  # noqa: RUF001
-    line = "附上的失敗紀錄：" + "、".join(entries)  # noqa: RUF001
-    return f"{feedback}\n\n{line}" if feedback else line
+    parts = []
+    if feedback:
+        parts.append(tools.redact_known_secrets(feedback))
+    if runs:
+        entries = []
+        for run in runs:
+            detail = f"{run.started_at:%Y-%m-%d %H:%M:%S} UTC，{run.outcome}"  # noqa: RUF001
+            if run.exit_code is not None:
+                detail += f"，exit {run.exit_code}"  # noqa: RUF001
+            entries.append(f"#{run.id}（{detail}）")  # noqa: RUF001
+        parts.append(tools.redact_known_secrets("附上的失敗紀錄：" + "、".join(entries)))  # noqa: RUF001
+    head = "\n\n".join(parts)
+    if draft_line is None:
+        return head[:_ORIGIN_FEEDBACK_CAP]
+    tail = tools.redact_known_secrets(draft_line)
+    if head:
+        tail = "\n\n" + tail
+    return head[: max(_ORIGIN_FEEDBACK_CAP - len(tail), 0)] + tail
 
 
 # --- staging promotion + cleanup ---------------------------------------------
@@ -2423,31 +2451,39 @@ def _publish_revised_version(
     previous: tools.Resolved,
     expected_identity: tuple[int, int, int],
     feedback: str,
-) -> tuple[_PublishedRevision | None, str | None]:
-    """Install one durable version and only then publish it through ``current``."""
+) -> tuple[_PublishedRevision | None, str | None, Path]:
+    """Install one durable version and only then publish it through ``current``.
 
+    Also says where the built content is when it returns, publish or not: it
+    moves twice, ``build`` to the session's ``shell`` and then into
+    ``versions/<vid>``, so after a failure it may be in staging still or already a
+    version that ``current`` does not name. The caller reports that place when
+    nothing else holds the work.
+    """
+
+    content: Path = build_root.path
     base = package_root.path.parent
     root_error = _verify_staging_root(build_root.path, base)
     if root_error is not None:
-        return None, root_error
+        return None, root_error, content
     if _entry_exists(shell_root):
-        return None, _ERROR_STAGING_TAMPERED
+        return None, _ERROR_STAGING_TAMPERED, content
     strip_error = _strip_builder_sidecars(build_root.path)
     if strip_error is not None:
-        return None, strip_error
+        return None, strip_error, content
     error = tools.validate_tool_content(build_root, expected_name=package_root.path.name)
     if error is not None:
-        return None, f"工具包驗證失敗：{error}"  # noqa: RUF001
+        return None, f"工具包驗證失敗：{error}", content  # noqa: RUF001
 
     try:
         package_info = os.lstat(package_root.path)
         versions_info = os.lstat(package_root.path / tools._VERSIONS_DIRNAME)
     except FileNotFoundError:
-        return None, _ERROR_REVISE_TARGET_MISSING
+        return None, _ERROR_REVISE_TARGET_MISSING, content
     except OSError:
-        return None, _ERROR_REVISE_TARGET_ALIAS
+        return None, _ERROR_REVISE_TARGET_ALIAS, content
     if not stat.S_ISDIR(package_info.st_mode) or not stat.S_ISDIR(versions_info.st_mode):
-        return None, _ERROR_REVISE_TARGET_ALIAS
+        return None, _ERROR_REVISE_TARGET_ALIAS, content
     # Identity alone cannot answer whether the request's V is still current:
     # moving ``current`` to P leaves V's manifest tuple untouched. Re-resolve at
     # the publication stage, after the paid build but before assembling anything
@@ -2458,7 +2494,7 @@ def _publish_revised_version(
         or current.vid != previous.vid
         or tools.package_identity(previous.version_root) != expected_identity
     ):
-        return None, _ERROR_REVISE_TARGET_REPLACED
+        return None, _ERROR_REVISE_TARGET_REPLACED, content
 
     prior_origin = tools.read_origin_meta(previous.version_root) or {}
     origin = {
@@ -2470,19 +2506,23 @@ def _publish_revised_version(
     }
     try:
         os.rename(build_root.path, shell_root)
+    except OSError as exc:
+        return None, f"無法組裝工具版本（{type(exc).__name__}）。", content  # noqa: RUF001
+    content = shell_root
+    try:
         (shell_root / tools._META_DIRNAME).mkdir()
     except OSError as exc:
-        return None, f"無法組裝工具版本（{type(exc).__name__}）。"  # noqa: RUF001
+        return None, f"無法組裝工具版本（{type(exc).__name__}）。", content  # noqa: RUF001
     if not tools.write_origin_meta(tools.BuildRoot(shell_root), origin):
-        return None, _ERROR_ORIGIN_WRITE
+        return None, _ERROR_ORIGIN_WRITE, content
     if not _fsync_tree(shell_root):
-        return None, _ERROR_DURABILITY
+        return None, _ERROR_DURABILITY, content
 
     versions = package_root.path / tools._VERSIONS_DIRNAME
     for _ in range(_VID_RETRY_LIMIT):
         vid = _choose_unused_vid(versions)
         if vid is None:
-            return None, _ERROR_VERSION_ID_WRITE
+            return None, _ERROR_VERSION_ID_WRITE, content
         target = versions / vid
         if _entry_exists(target):
             continue
@@ -2491,10 +2531,11 @@ def _publish_revised_version(
         except FileExistsError:
             continue
         except OSError as exc:
-            return None, f"無法安裝工具版本（{type(exc).__name__}）。"  # noqa: RUF001
+            return None, f"無法安裝工具版本（{type(exc).__name__}）。", content  # noqa: RUF001
+        content = target
         published_version = tools.VersionRoot(target)
         if not _fsync_directory(versions):
-            return None, _ERROR_DURABILITY
+            return None, _ERROR_DURABILITY, content
 
         # Re-check AFTER the rename and its directory fsync, immediately before
         # publishing ``current``. The earlier placement guarded creation of the
@@ -2503,12 +2544,12 @@ def _publish_revised_version(
         # resolve ``current`` LAST so no other filesystem read sits between the
         # pointer answer and publish_current.
         if tools.package_identity(previous.version_root) != expected_identity:
-            return None, _ERROR_REVISE_TARGET_REPLACED
+            return None, _ERROR_REVISE_TARGET_REPLACED, content
         current = tools.resolve_current(package_root)
         if isinstance(current, tools.Unresolved) or current.vid != previous.vid:
-            return None, _ERROR_REVISE_TARGET_REPLACED
+            return None, _ERROR_REVISE_TARGET_REPLACED, content
         if not tools.publish_current(package_root, vid):
-            return None, _ERROR_CURRENT_WRITE
+            return None, _ERROR_CURRENT_WRITE, content
         # Construct the typed target from the exact directory just renamed and
         # vid just published. Re-resolving by package name here or in the summary
         # hook would let a later current edit redirect the new version's work.
@@ -2518,18 +2559,19 @@ def _publish_revised_version(
             vid,
             tools.PreviousValue(previous.vid),
         )
-        return _PublishedRevision(published, origin), None
-    return None, _ERROR_VERSION_ID_WRITE
+        return _PublishedRevision(published, origin), None, content
+    return None, _ERROR_VERSION_ID_WRITE, content
 
 
 def _sweep_stale_backups(base: Path) -> None:
-    """Best-effort collection of marked packages and discarded versions.
+    """Best-effort collection of marked packages, discarded versions and draft leftovers.
 
     One non-blocking exclusive lock replaces the old local-provenance and
     observed-running judgements. If any request or orphaned tool child still
     holds the shared side, the whole sweep is skipped and a later tool job
     retries. Hidden entries outside the marked namespace and symlinks are never
-    traversed.
+    traversed. A package's draft leftovers are ``tool_drafts.sweep_package``'s,
+    which runs under this same lock and takes none of its own.
     """
     with tools.exclusive_tools_lock(base) as acquired:
         if not acquired:
@@ -2553,6 +2595,7 @@ def _sweep_stale_backups(base: Path) -> None:
                     or not child.is_dir()
                 ):
                     continue
+                tool_drafts.sweep_package(child, fsync_directory=_fsync_directory)
                 versions = child / tools._VERSIONS_DIRNAME
                 try:
                     entries = sorted(versions.iterdir())
@@ -2629,25 +2672,35 @@ def _cleanup_staging(staging: Path, base: Path) -> None:
         with contextlib.suppress(OSError):
             staging.parent.rmdir()
     finally:
-        try:
-            _sweep_stale_backups(base)
-        except tools.ToolsLockUnavailableError as exc:
-            # This sweep is decoration after the job's real outcome is already
-            # decided. Preserve the actionable lock path/remedy in the backend
-            # console without turning an installed package into a failed job.
-            # Logging is itself an observer and therefore cannot break the
-            # cleanup contract even under a pathological custom handler.
-            with contextlib.suppress(Exception):
-                _logger.warning("Tool cleanup sweep skipped: %s", exc)
-        except Exception as exc:
-            # The sweep is best-effort for every failure class, not only lock
-            # setup. Category-only avoids feeding an arbitrary filesystem
-            # exception string into the operator log.
-            with contextlib.suppress(Exception):
-                _logger.warning(
-                    "Tool cleanup sweep failed (%s); a later tool job will retry.",
-                    type(exc).__name__,
-                )
+        _sweep_logged(base)
+
+
+def _sweep_logged(base: Path) -> None:
+    """``_sweep_stale_backups``, with every failure logged rather than raised.
+
+    Blocking (runs via ``run_in_threadpool``). The one way a job ends the sweep,
+    whether it removed its workspace first (``_cleanup_staging``) or kept it for
+    the operator; the sweep never looks inside ``.staging`` either way.
+    """
+    try:
+        _sweep_stale_backups(base)
+    except tools.ToolsLockUnavailableError as exc:
+        # This sweep is decoration after the job's real outcome is already
+        # decided. Preserve the actionable lock path/remedy in the backend
+        # console without turning an installed package into a failed job.
+        # Logging is itself an observer and therefore cannot break the
+        # cleanup contract even under a pathological custom handler.
+        with contextlib.suppress(Exception):
+            _logger.warning("Tool cleanup sweep skipped: %s", exc)
+    except Exception as exc:
+        # The sweep is best-effort for every failure class, not only lock
+        # setup. Category-only avoids feeding an arbitrary filesystem
+        # exception string into the operator log.
+        with contextlib.suppress(Exception):
+            _logger.warning(
+                "Tool cleanup sweep failed (%s); a later tool job will retry.",
+                type(exc).__name__,
+            )
 
 
 # --- the install run ---------------------------------------------------------
@@ -3392,6 +3445,107 @@ def _current_manifest_text(directory: Path) -> str | None:
     return tools._read_regular_file_capped(directory / "tool.json", tools._MANIFEST_MAX_BYTES)
 
 
+# The job's note on a published revise whose draft could not be taken away: the
+# list shows it as published, and only discarding it is left to do.
+_DRAFT_NOT_REMOVED = "已發布，但未能刪除這一輪的草稿，請在工具列放棄它。"  # noqa: RUF001
+
+
+@dataclass(frozen=True, slots=True)
+class _RoundDraft:
+    """Everything a revise round's draft save needs, gathered once the session ended.
+
+    The notes are the model's own words, already masked and capped; nothing reads
+    them to decide anything (``tool_drafts.DraftRound``).
+    """
+
+    base: Path
+    build_root: tools.BuildRoot
+    package_root: tools.PackageRoot
+    package_dir_identity: tuple[int, int] | None
+    base_version: tools.VersionRoot
+    copied_in: tool_drafts.TreeDigest | None
+    start: tool_drafts.DraftStart
+    job_id: str | None
+    started_at: str
+    facts: dict[str, Any]
+    summary: str | None
+    handoff: str | None
+    operator_action: str | None
+
+
+def _save_round_draft(
+    context: _RoundDraft, outcome: tool_drafts.RoundOutcome | None, error: str | None
+) -> tool_drafts.SaveResult:
+    """Save the round's workspace as the tool's draft; never raises.
+
+    Blocking (runs via ``run_in_threadpool``). The steps a save shares with the
+    publish are here: the caller has confirmed the round's commands stopped and
+    stripped the builder's ``.env``; this strips the root ``.afterthread.meta/``
+    and checks that the workspace is still the real, contained staging directory
+    it was given. ``tool_drafts.save_round`` does the rest, with this module's
+    fsync helpers. ``outcome`` is None for the save a publish is about to follow.
+    """
+    try:
+        workspace = context.build_root.path
+        if (
+            _verify_staging_root(workspace, context.base) is not None
+            or tool_drafts.directory_identity(workspace) is None
+        ):
+            return tool_drafts.SaveResult(worth_saving=True, reason=tool_drafts.REASON_WORKSPACE)
+        if _strip_builder_sidecars(workspace) is not None:
+            return tool_drafts.SaveResult(
+                worth_saving=True, reason=tool_drafts.REASON_STRIP_SIDECARS
+            )
+        settings = get_settings()
+        facts = context.facts
+        return tool_drafts.save_round(
+            package_root=context.package_root,
+            package_dir_identity=context.package_dir_identity,
+            workspace=workspace,
+            earlier_root=context.base_version.path,
+            copied_in=context.copied_in,
+            draft_round=tool_drafts.DraftRound(
+                finished_at=_now_iso(),
+                job_id=context.job_id,
+                started_at=context.started_at,
+                outcome=outcome,
+                stopped_by=facts.get("stopped_by"),
+                failure=facts.get("failure"),
+                rounds_used=facts.get("rounds_used"),
+                max_rounds=facts.get("max_rounds"),
+                error=error,
+                summary=context.summary,
+                handoff=context.handoff,
+                operator_action=context.operator_action,
+            ),
+            start=context.start,
+            previous=None,
+            max_files=settings.tool_draft_max_files,
+            max_bytes=settings.tool_draft_max_bytes,
+            durability=tool_drafts.Durability(tree=_fsync_tree, directory=_fsync_directory),
+        )
+    except Exception as exc:
+        return tool_drafts.SaveResult(
+            worth_saving=True,
+            reason=tool_drafts.REASON_UNEXPECTED.format(kind=type(exc).__name__),
+        )
+
+
+def _draft_report(saved: tool_drafts.SaveResult) -> dict[str, Any] | None:
+    """The job's ``draft`` for a round that did not publish: None if nothing was worth keeping."""
+    return saved.report() if saved.worth_saving else None
+
+
+def _log_result_kept(session_root: Path) -> None:
+    """Say in the backend log where a failed publish left work no draft holds."""
+    with contextlib.suppress(Exception):
+        _logger.warning(
+            "Builder workspace kept at %s: its publish failed and it could not be "
+            "saved as the tool's draft.",
+            session_root,
+        )
+
+
 async def run_revise(
     name: str,
     feedback: str | None,
@@ -3405,6 +3559,16 @@ async def run_revise(
     package name to resolve a second time after the background task starts. The
     initially resolved version supplies the build content and identity. The
     package toggle and ``.env`` remain package-layer state throughout.
+
+    A round that does not publish keeps its work as the tool's draft
+    (``tool_drafts``), and a round about to publish saves it first, so a publish
+    that fails cannot take the only copy of the work with it; a publish that goes
+    through takes the draft away again. Every save comes after the exit for
+    commands not confirmed stopped, which leaves the workspace untouched and
+    waits on no worker. A save that fails changes nothing about the round's
+    outcome; only when the save before a publish failed and the publish failed
+    too is the work left where the publish left it, and named on the job: this
+    session's staging, which then stays, or a version ``current`` does not name.
     """
     base = tools.tools_dir()
     if base is None:
@@ -3412,6 +3576,7 @@ async def run_revise(
 
     if resolution is None:
         return InstallOutcome(ok=False, error=_ERROR_REVISE_NOT_FOUND)
+    started_at = _now_iso()
     package_root = resolution.package_root
     current = await run_in_threadpool(tools.resolve_current, package_root)
     if isinstance(current, tools.Unresolved) or current.vid != resolution.vid:
@@ -3439,6 +3604,11 @@ async def run_revise(
         # check would have to either wave stale work through -- exactly the loss R10-1
         # closed -- or refuse after burning the whole build.
         return InstallOutcome(ok=False, error=_ERROR_REVISE_IDENTITY_UNKNOWN)
+    # The package directory as this round finds it: the round's draft is written
+    # into this directory and no other, never a same-name reinstall.
+    package_dir_identity = await run_in_threadpool(
+        tool_drafts.directory_identity, package_root.path
+    )
     # BEFORE the LLM call, and before anything is registered: a value we would be
     # required to ignore, or one whose own assignment line spells it so that no
     # redactor can match what a ``cat`` of the file prints, cannot be protected by
@@ -3464,6 +3634,9 @@ async def run_revise(
     shell_root = session_root / "shell"
     # True until the session starts: an exit before it has no command to wait for.
     shells_ended = True
+    # Set when a publish failed with its work still in this session's staging and
+    # no draft holding it: the workspace then stays where it is.
+    keep_workspace = False
     try:
         copy_error = await run_in_threadpool(
             _copy_package_into_staging, resolution.version_root, build_root
@@ -3472,6 +3645,16 @@ async def run_revise(
             return InstallOutcome(ok=False, error=copy_error)
 
         settings = get_settings()
+        # The workspace as the round receives it, which "the round changed
+        # something" is measured against when it ends.
+        copied_in = await run_in_threadpool(
+            functools.partial(
+                tool_drafts.tree_digest,
+                build_root.path,
+                max_entries=settings.tool_draft_max_files,
+                max_bytes=settings.tool_draft_max_bytes,
+            )
+        )
         manifest_text = await run_in_threadpool(
             _current_manifest_text, resolution.version_root.path
         )
@@ -3596,6 +3779,7 @@ async def run_revise(
             }
         env_keys, env_strip_error = await run_in_threadpool(_strip_builder_env, build_root, base)
         if env_strip_error is not None:
+            # A workspace that may still hold the builder's .env keeps no files.
             return InstallOutcome(
                 ok=False,
                 tool_name=name,
@@ -3603,16 +3787,39 @@ async def run_revise(
                 error=env_strip_error,
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
+                draft=tool_drafts.SaveResult(
+                    worth_saving=True, reason=tool_drafts.REASON_STRIP_ENV
+                ).report(),
                 **facts,
                 **notes,
             )
+        # Each exit below saves the round as the tool's draft, the one that
+        # publishes before it does: every one of them comes after the exit for
+        # commands not confirmed stopped, with the workspace stripped.
+        round_draft = _RoundDraft(
+            base=base,
+            build_root=build_root,
+            package_root=package_root,
+            package_dir_identity=package_dir_identity,
+            base_version=resolution.version_root,
+            copied_in=copied_in,
+            start=tool_drafts.DraftStart(base_vid=resolution.vid, feedback=feedback, runs=runs),
+            job_id=_CURRENT_JOB_ID.get(),
+            started_at=started_at,
+            facts=facts,
+            summary=summary,
+            handoff=notes.get("handoff"),
+            operator_action=notes.get("operator_action"),
+        )
         if llm_error is not None:
+            kept = await run_in_threadpool(_save_round_draft, round_draft, "failed", llm_error)
             return InstallOutcome(
                 ok=False,
                 tool_name=name,
                 error=llm_error,
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
+                draft=_draft_report(kept),
                 **facts,
             )
         assert result is not None  # exactly one of result/llm_error is set above
@@ -3621,14 +3828,19 @@ async def run_revise(
         # the model's answer: the job's tool_name is what the FE links to.
         if not result.ready:
             reason = summary or "（AI 未說明原因）"  # noqa: RUF001
+            not_ready_error = f"AI 判定修訂尚未完成：{reason}"  # noqa: RUF001
+            kept = await run_in_threadpool(
+                _save_round_draft, round_draft, "not_published", not_ready_error
+            )
             return InstallOutcome(
                 ok=False,
                 tool_name=name,
                 summary=summary,
-                error=f"AI 判定修訂尚未完成：{reason}",  # noqa: RUF001
+                error=not_ready_error,
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
                 not_ready=True,
+                draft=_draft_report(kept),
                 **facts,
                 **notes,
             )
@@ -3647,29 +3859,69 @@ async def run_revise(
             # like the others (R1-3): rare is not the same as free, and leaving
             # one instance of the class behind is how it grows back.
             attempted = await run_in_threadpool(tools.redact_known_secrets, result.tool_name)
+            rename_error = f"AI 試圖將工具改名為「{attempted}」，修訂已取消。"  # noqa: RUF001
+            kept = await run_in_threadpool(_save_round_draft, round_draft, "failed", rename_error)
             return InstallOutcome(
                 ok=False,
                 tool_name=name,
                 summary=summary,
-                error=f"AI 試圖將工具改名為「{attempted}」，修訂已取消。",  # noqa: RUF001
+                error=rename_error,
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
+                draft=_draft_report(kept),
                 **facts,
                 **notes,
             )
 
+        # About to publish: the work is saved as a draft first, which the
+        # manifest then marks as being published from. A mark that cannot be
+        # written does not stop the publish; it only leaves a crash right after
+        # the publish to be read as a stale draft rather than a published one.
+        kept = await run_in_threadpool(_save_round_draft, round_draft, None, None)
+        drafted: tuple[str, int] | None = None
+        draft_line: str | None = None
+        if kept.saved and kept.draft_id is not None and kept.generation is not None:
+            marked = await run_in_threadpool(
+                tool_drafts.mark_publishing,
+                package_root,
+                package_dir_identity,
+                (kept.draft_id, kept.generation),
+                round_draft.job_id,
+            )
+            drafted = (kept.draft_id, kept.generation if marked is None else marked)
+            draft_line = tool_drafts.provenance_line(kept.draft_id, kept.attempts or 1)
+        origin_feedback = await run_in_threadpool(_provenance_feedback, feedback, runs, draft_line)
         # The publisher reads immutable provenance from the version whose identity
         # was captured before the builder session.
-        published, promote_error = await run_in_threadpool(
+        published, promote_error, content = await run_in_threadpool(
             _publish_revised_version,
             build_root,
             shell_root,
             package_root,
             resolution,
             package_identity,
-            _provenance_feedback(feedback, runs),
+            origin_feedback,
         )
         if promote_error is not None:
+            failed_draft: dict[str, Any] | None = None
+            if drafted is not None:
+                # What was just saved is the work again: ``publishing`` cleared,
+                # the failure recorded on the round.
+                cleared = await run_in_threadpool(
+                    tool_drafts.clear_publishing,
+                    package_root,
+                    package_dir_identity,
+                    drafted,
+                    promote_error,
+                )
+                failed_draft = dataclasses.replace(
+                    kept, generation=drafted[1] if cleared is None else cleared
+                ).report()
+            elif kept.worth_saving:
+                # Neither a draft nor ``current`` holds the work now: say where it
+                # is, and keep it there if that is this session's staging.
+                keep_workspace = tools._is_within(session_root, content)
+                failed_draft = kept.report(retained_path=str(content))
             return InstallOutcome(
                 ok=False,
                 tool_name=name,
@@ -3677,10 +3929,21 @@ async def run_revise(
                 error=promote_error,
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
+                draft=failed_draft,
                 **facts,
                 **notes,
             )
         assert published is not None
+        published_draft: dict[str, Any] | None = None
+        if drafted is not None:
+            removal = await run_in_threadpool(
+                tool_drafts.remove_after_publish, package_root, package_dir_identity, drafted
+            )
+            if not removal.removed:
+                # The generation the publish marked, which is what a discard names.
+                published_draft = dataclasses.replace(kept, generation=drafted[1]).report(
+                    reason=_DRAFT_NOT_REMOVED
+                )
         # The revision is LIVE as of the line above; everything after it is
         # decoration and cannot fail the outcome (``generate_and_store_summary``
         # never raises -- see tool_meta). The sidecar was excluded from staging, so
@@ -3702,6 +3965,7 @@ async def run_revise(
             llm_log_id=llm_log_id,
             env_keys=env_keys,
             verification=verification,
+            draft=published_draft,
             **facts,
             **notes,
         )
@@ -3709,14 +3973,19 @@ async def run_revise(
         # The package .env was untouched, so its live scan keeps covering these
         # values after the temporary registrations are dropped. Cleanup targets
         # the complete session root, including any unused shell -- unless the
-        # session's commands could not be confirmed stopped, which keeps it all.
+        # session's commands could not be confirmed stopped, which keeps it all,
+        # or a failed publish left in it work that no draft holds, which keeps it
+        # too while the sweep still runs (it never looks inside ``.staging``).
         for value in registered:
             tools.discard_inflight_secret(value)
-        if shells_ended:
-            await run_in_threadpool(_cleanup_staging, session_root, base)
-        else:
+        if not shells_ended:
             # Kept in place: a command not confirmed stopped may still be using it.
             _log_workspace_kept(session_root)
+        elif keep_workspace:
+            _log_result_kept(session_root)
+            await run_in_threadpool(_sweep_logged, base)
+        else:
+            await run_in_threadpool(_cleanup_staging, session_root, base)
 
 
 # --- examples: verification and the health check (web-v6 §8.3, §10) --------
@@ -3995,6 +4264,8 @@ class InstallJob:
     max_rounds: int | None = None
     handoff: str | None = None
     operator_action: str | None = None
+    # Copied from the terminal ``InstallOutcome.draft``.
+    draft: dict[str, Any] | None = None
 
 
 # The three terminal ``InstallJob.outcome`` values.
@@ -4027,6 +4298,7 @@ def _job_dict(job: InstallJob) -> dict[str, Any]:
         "max_rounds": job.max_rounds,
         "handoff": job.handoff,
         "operator_action": job.operator_action,
+        "draft": job.draft,
     }
 
 
@@ -4065,13 +4337,16 @@ def _update_job(job_id: str, **changes: Any) -> None:
 
     The one writer of a job's fields once it is admitted, and so the one place
     their text is made encodable: every string written, inside the containers a
-    job holds as well (``verification``, ``env_keys``), has its lone surrogates
-    replaced (``_job_text_safe``). A poll encodes the job as UTF-8 JSON, and one
-    such character fails the whole response; model text arrives with them
-    (``json.loads`` accepts ``"\\ud800"``), and so can a path or a message built
-    from what the backend read. This covers the job API's way out and nothing
-    else: text that leaves by another way -- stored in a note, sent in a prompt --
-    is that way's to make safe.
+    job holds as well (``verification``, ``env_keys``, ``draft``), has its lone
+    surrogates replaced (``_job_text_safe``). A poll encodes the job as UTF-8
+    JSON, and one such character fails the whole response. The model's own text
+    does not bring them: every text field of a structured answer passes
+    ``memory_ai._coerce_str``, which refuses one, so that answer is retried. What
+    this guards is text built from what the backend read -- a path, a message
+    naming one, an example's name in a verification -- since a file name read on
+    Linux can carry them. This covers the job API's way out and nothing else:
+    text that leaves by another way -- stored in a draft, sent in a prompt -- is
+    that way's to make safe.
 
     A job evicted past ``_MAX_JOBS`` while its task was still running simply
     stops being visible; the task's later updates land here as no-ops. That is
@@ -4145,6 +4420,7 @@ async def _run_job(
         max_rounds=outcome.max_rounds,
         handoff=outcome.handoff,
         operator_action=outcome.operator_action,
+        draft=outcome.draft,
         finished_at=_now_iso(),
         **named,
     )
@@ -4261,13 +4537,22 @@ def start_install_job(
     )
 
 
+# Why a revise is refused while the tool has a draft. There is no way yet to
+# continue a draft, so the message offers the two things that do exist: taking
+# the files from the draft's path, and discarding it.
+_DRAFT_PENDING_MESSAGE = (
+    "這個工具有一份未完成的修正（草稿）。需要裡面的檔案就先到草稿路徑取回，"  # noqa: RUF001
+    "然後在工具列放棄它，才能送出新的修正。"  # noqa: RUF001
+)
+
+
 @dataclass(frozen=True, slots=True)
 class ReviseJobStart:
     """A revise submit result with machine-distinct pre-job refusals.
 
-    ``message`` is set only for ``env_policy``: the gate's own zh-TW text, which
-    names the offending keys and is the one refusal whose wording the operator
-    needs in order to act.
+    ``message`` is set for ``env_policy`` -- the gate's own zh-TW text, which
+    names the offending keys and is the refusal whose wording the operator needs
+    in order to act -- and for ``draft_pending``.
     """
 
     job_id: str | None = None
@@ -4302,6 +4587,10 @@ async def start_revise_job(
     calling this (web-v6 §8.3): a database read with no version in it, so it
     precedes the slot like the env gate, and the copy is what the job keeps --
     a purge after this point changes nothing about the revise (invariant L).
+
+    A tool that has a draft is refused (``draft_pending``), judged after the slot
+    and the version comparison like everything that names the package's state: a
+    draft made while the slot was held is one this answer sees.
     """
 
     package_root = await run_in_threadpool(tools._resolve_package_dir_no_alias, name)
@@ -4322,6 +4611,8 @@ async def start_revise_job(
             return ReviseJobStart(refusal="not_found")
         if resolution.vid != expected_vid:
             return ReviseJobStart(refusal="version_mismatch")
+        if await run_in_threadpool(tool_drafts.has_draft, package_root):
+            return ReviseJobStart(refusal="draft_pending", message=_DRAFT_PENDING_MESSAGE)
         job = _admit_job(reservation_token=reservation, kind="revise", tool_name=name)
         if job is None:
             return ReviseJobStart(refusal="job_busy")
@@ -4391,6 +4682,18 @@ def release_sync_operation(token: str) -> None:
     """Give back a reservation from ``reserve_sync_operation``; idempotent."""
     with _JOBS_LOCK:
         _SYNC_OPS.discard(token)
+
+
+def job_is_active(job_id: str) -> bool:
+    """Whether ``job_id`` names a queued or running job of this process.
+
+    What a draft's ``running`` and ``publishing`` marks are read against: a mark
+    whose job is not active here belongs to a round that ended, or to a process
+    that is gone.
+    """
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        return job is not None and job.state in ("queued", "running")
 
 
 def get_job(job_id: str) -> dict[str, Any] | None:
