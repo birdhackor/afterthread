@@ -581,7 +581,7 @@ def _redact(text: str, secrets: list[str]) -> str:
         return text
 
 
-# --- stored-body safety: redact, THEN UTF-8-safe, THEN size-capped ----------
+# --- stored-body safety: redact, UTF-8-safe, size-capped, checked as written ---
 
 
 def _utf8_safe(text: str) -> str:
@@ -628,10 +628,13 @@ def _stored_body(text: str, secrets: list[str]) -> tuple[str, bool]:
     """Make ``text`` safe AND small enough to store; return (stored, truncated).
 
     The single choke point every request-message/response body passes through
-    before it is written into an attempt, in a THREE-stage order that each
+    before it is written into an attempt, in a FOUR-stage order that each
     guards a distinct hazard: ``_redact`` FIRST, then ``_utf8_safe``, then the
     hard cut to ``settings.llm_log_body_max_chars`` (with
-    ``_BODY_TRUNCATION_MARKER`` appended when a cut happens). "Body" is its
+    ``_BODY_TRUNCATION_MARKER`` appended when a cut happens), and last the check
+    of what is stored in the form a JSON line writes it
+    (``_checked_as_written``): a body whose escapes, or whose replacement
+    characters, spell a known secret is stored as the marker. "Body" is its
     origin, not its scope: an attempt's advertised tool NAMES run through it too
     (see ``LlmInteractionRecorder.begin_attempt``), so that every stored string a
     record holds that could carry operator/LLM/filesystem text reaches its sinks
@@ -679,11 +682,42 @@ def _stored_body(text: str, secrets: list[str]) -> tuple[str, bool]:
     safe = _utf8_safe(_redact(text, secrets))
     cap = get_settings().llm_log_body_max_chars
     if len(safe) <= cap:
-        return safe, False
+        return _checked_as_written(safe, secrets), False
     marker_len = len(_BODY_TRUNCATION_MARKER)
     if cap <= marker_len:
-        return safe[:cap], True
-    return safe[: cap - marker_len] + _BODY_TRUNCATION_MARKER, True
+        return _checked_as_written(safe[:cap], secrets), True
+    return _checked_as_written(safe[: cap - marker_len] + _BODY_TRUNCATION_MARKER, secrets), True
+
+
+def _checked_as_written(stored: str, secrets: list[str]) -> str:
+    """``stored``, or the redaction marker when its form in a JSON line holds a known secret.
+
+    The last stage of ``_stored_body``. ``_redact`` works on the text, while the
+    JSONL sink writes it as a JSON string literal (``json.dumps(...,
+    ensure_ascii=False)``, as ``_write_file_sink`` does), and the two differ: a
+    line break is written as ``\\n``, a quote as ``\\"``, a backslash as ``\\\\``, a
+    control character as ``\\uXXXX``, and ``_utf8_safe`` leaves three U+FFFD for
+    one lone surrogate. A PEM registered from a single-quoted ``.env`` line keeps
+    its ``\\n`` as those two characters, so a body holding that key with real line
+    breaks would land on disk as exactly the secret's bytes. The literal is
+    checked with this module's own matcher (``_mask_known_secrets``, so a whole
+    value, a trailing prefix of one and the range cap all count), and a body it
+    would change is stored as the marker, whole: masking inside the literal would
+    mean cutting into escapes.
+
+    What it does not cover: a difference of representation an exact match cannot
+    see -- a secret registered with a real line break that a body spells as the
+    two characters ``\\n``, a value encoded another way (base64, say), a ``.env``
+    value whose undecodable bytes were replaced when it was read.
+
+    Like ``_redact``, it swallows its own failure and keeps ``stored`` as it is:
+    the recorder is a pure observer and must never raise into the call it records.
+    """
+    with contextlib.suppress(Exception):
+        literal = json.dumps(stored, ensure_ascii=False)[1:-1]
+        if _mask_known_secrets(literal, secrets) != literal:
+            return _REDACTION_MARKER
+    return stored
 
 
 def _message_text(content: Any, secrets: list[str]) -> tuple[str, bool]:

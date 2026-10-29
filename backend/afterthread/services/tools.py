@@ -175,6 +175,10 @@ _AI_META_FILENAME = ".ai_meta.json"
 # property (at the same ratio) every other capped read in this module has.
 _AI_META_MAX_BYTES = 256 * 1024
 
+# The shape ``datetime.now(UTC).isoformat()`` gives: the ``updated_at`` a summary
+# sidecar is written with (``store_summary_meta``).
+_UTC_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?\+00:00\Z")
+
 # Legacy flat-layout state name retained for migration and builder-content policy.
 # The live toggle now belongs to package-layer
 # ``.afterthread.meta/state.json`` and never falls back to ``tool.json``.
@@ -1691,35 +1695,130 @@ def _meta_str(value: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _redacted(value: str | None) -> str | None:
-    """One sidecar string VALUE, masked THEN surrogate-scrubbed; None stays None.
+def _written_literal(text: str) -> str:
+    """``text`` as a JSON file this backend writes holds it, without its quotes.
 
-    The whole redaction surface of the sidecar, now that ``write_tool_meta``
-    builds the file from a fixed schema instead of serializing a caller's dict:
-    exactly three string VALUES can carry operator/LLM text, and this is applied
-    to each of them by name.
-
-    Redact BEFORE the scrub, the same order ``llm_log._stored_body`` runs its two
-    passes in: the redactor must match the REGISTERED value against untouched
-    text, and the scrub must not be undone afterwards (it only ever replaces a
-    lone surrogate with U+FFFD, which carries nothing to mask).
-
-    The scrub is what keeps the write path's own encode from raising: an LLM
-    reply or a hand-edited field can carry a lone surrogate, which is a legal
-    ``str`` that ``.encode("utf-8")`` refuses. Scrubbing rather than REFUSING is
-    the adjudicated choice -- one bad code point is a display-level defect in a
-    summary that is otherwise a genuine, useful explanation, and refusing would
-    lose the whole generation over it (and, on the install hook's placeholder
-    path, leave the operator with no sidecar and no 重新產生 button at all).
-    U+FFFD is exactly what the reader would show anyway, so scrubbing makes the
-    file agree with the render. The read side scrubs INDEPENDENTLY regardless
-    (see ``_utf8_safe_meta``), because a hand-edited file never passes here.
-
-    Raises whatever ``redact_known_secrets`` raises: the LIVE redactor
-    deliberately propagates a provider failure rather than degrading to
-    unmasked, and ``write_tool_meta`` turns that into its fail-closed refusal.
+    The string literal ``json.dumps(..., ensure_ascii=False)`` makes, which is how
+    every such file is encoded; an ``indent`` changes only the whitespace between
+    tokens, never a literal, so this one form serves the indented manifest and the
+    flat sidecars alike.
     """
-    return None if value is None else _utf8_safe(redact_known_secrets(value))
+    return json.dumps(text, ensure_ascii=False)[1:-1]
+
+
+def _holds_a_secret(written: str, secrets: list[str]) -> bool:
+    """Whether ``_mask_known_secrets`` would change ``written``: the mask's own matcher.
+
+    So the same three things count as a hit: a whole known value, a trailing
+    prefix of one at least ``_MIN_SECRET_LEN`` long, and more matches than the
+    mask collects.
+    """
+    return _mask_known_secrets(written, secrets) != written
+
+
+def _spells_a_secret(text: str, secrets: list[str]) -> bool:
+    """Whether ``text``, written as a JSON string literal, holds a known secret."""
+    return _holds_a_secret(_written_literal(text), secrets)
+
+
+def _redacted(value: str | None, secrets: list[str], cap: int | None = None) -> str | None:
+    """One free-text VALUE of a JSON file, as it is written; None stays None.
+
+    The field check of every JSON file this module and ``tool_drafts`` write with
+    text in them (``summary.json``, ``origin.json``, a draft's manifest): masked
+    with ``secrets``, cut to ``cap`` when there is one, surrogate-scrubbed, and
+    then checked in the form the file holds it (``_spells_a_secret``), with the
+    mask's own matcher. The mask works on the text and the file holds it encoded,
+    and the two differ: the encoder writes a line break as ``\\n``, a quote as
+    ``\\"``, a backslash as ``\\\\``, a control character as ``\\uXXXX``, and the
+    scrub leaves three U+FFFD for one lone surrogate. A PEM registered from a
+    single-quoted ``.env`` line keeps its ``\\n`` as those two characters, so a
+    text holding that key with real line breaks is written as exactly the
+    secret's bytes. A value whose written form holds a secret is written as the
+    redaction marker, whole: masking it in place would mean cutting into escapes.
+
+    What it does not cover: a difference of representation an exact match cannot
+    see -- a secret registered with a real line break that a text spells as the
+    two characters ``\\n``, a value encoded another way (base64, say), a ``.env``
+    value whose undecodable bytes were replaced when it was read.
+
+    Masking comes before the scrub: the mask must match the REGISTERED value
+    against untouched text. The scrub is what keeps the write path's own encode
+    from raising: an LLM reply or a hand-edited field can carry a lone surrogate,
+    which is a legal ``str`` that ``.encode("utf-8")`` refuses. Scrubbing rather
+    than REFUSING is the adjudicated choice -- one bad code point is a
+    display-level defect in a summary that is otherwise a genuine, useful
+    explanation, and refusing would lose the whole generation over it (and, on
+    the install hook's placeholder path, leave the operator with no sidecar and no
+    重新產生 button at all). U+FFFD is exactly what the reader would show anyway,
+    so scrubbing makes the file agree with the render. The read side scrubs
+    INDEPENDENTLY regardless (see ``_utf8_safe_meta``), because a hand-edited file
+    never passes here.
+    """
+    if value is None:
+        return None
+    masked = _mask_known_secrets(value, secrets)
+    text = _utf8_safe(masked if cap is None else masked[:cap])
+    return _REDACTION_MARKER if _spells_a_secret(text, secrets) else text
+
+
+@dataclass(frozen=True, slots=True)
+class _Writing:
+    """How a builder hands over the values of one JSON file: for the file, or for its probe.
+
+    A builder of such a file (``write_tool_meta``'s, ``write_origin_meta``'s,
+    ``tool_drafts._document``) hands a value over through one of these methods by
+    what it is, so the probe ``_encode_checked`` looks at comes from the same code
+    as the file:
+
+    * ``fixed`` -- a value whose shape a check fixed (a vid, a timestamp, an id, a
+      number, a word of a closed vocabulary): as it is, and ``""`` in the probe.
+      Nothing such a check passes can carry text, and a mask could only corrupt it;
+    * ``record`` -- a mapping keyed by the builder's own literals: as it is, and its
+      values alone in the probe, since a key is fixed too;
+    * ``text`` -- free text: through ``_redacted``, or the redaction marker when
+      ``degraded``.
+
+    A value a builder writes without one of them -- as ``write_tool_meta`` writes
+    ``llm_log_process`` -- is in the probe as it is.
+    """
+
+    secrets: list[str]
+    probe: bool = False
+    degraded: bool = False
+
+    def fixed(self, value: Any) -> Any:
+        return "" if self.probe else value
+
+    def record(self, fields: dict[str, Any]) -> Any:
+        return list(fields.values()) if self.probe else fields
+
+    def text(self, value: str | None, cap: int | None = None) -> str | None:
+        if value is None:
+            return None
+        if self.degraded:
+            return _REDACTION_MARKER
+        return _redacted(value, self.secrets, cap)
+
+
+def _encode_checked(
+    build: Callable[[_Writing], Any], secrets: list[str], encode: Callable[[Any], str]
+) -> str | None:
+    """The file ``build`` makes, as ``encode`` writes it; None when it would hold a known secret.
+
+    The backstop behind the field check (``_redacted``): before anything is
+    written, the probe -- ``build`` once more, with what a shape check fixed left
+    out (``_Writing``) -- is encoded the same way and checked with the same
+    matcher (``_holds_a_secret``), so a text that reached the file without the
+    field check is seen too. When the probe holds a secret, every free text is
+    written as the marker and the probe is checked again; one that still holds a
+    secret holds it outside any free text, and nothing is written.
+    """
+    for degraded in (False, True):
+        probe = encode(build(_Writing(secrets, probe=True, degraded=degraded)))
+        if not _holds_a_secret(probe, secrets):
+            return encode(build(_Writing(secrets, degraded=degraded)))
+    return None
 
 
 def _still_the_expected_package(
@@ -1890,10 +1989,11 @@ def write_tool_meta(
       either"). Any OTHER type refuses the write: ``summary`` is a string by
       contract, the read path renders anything else as "no summary", and writing
       one would make the file lie about whether a summary exists;
-    * ``updated_at`` -- a ``str``, else the write is REFUSED. Every caller stamps
-      its own (``_now_iso`` / ``datetime.now``), so a missing or out-of-shape one
-      is a caller bug, and inventing a timestamp on their behalf would put a
-      fact in the file that nothing actually observed;
+    * ``updated_at`` -- a timestamp in the shape ``datetime.now(UTC).isoformat()``
+      gives (``_UTC_TIMESTAMP_RE``), else the write is REFUSED. Every caller stamps
+      its own, so a missing or out-of-shape one is a caller bug, and inventing a
+      timestamp on their behalf would put a fact in the file that nothing actually
+      observed;
     * ``llm_log_id`` -- an ``int`` (``bool`` excluded, since it is an ``int``
       subclass and a stray ``true`` would render as a link to log record 1), else
       None;
@@ -1939,14 +2039,14 @@ def write_tool_meta(
     reasonably relax the refusal below into "write it unmasked", and nothing
     downstream would catch anything.
 
-    So a redaction failure (``known_secret_values`` raising -- the LIVE path
-    deliberately propagates rather than degrading to unmasked, see
-    ``redact_known_secrets``) writes NOTHING and returns False. It is applied to
-    the three fields that can carry operator/LLM text and to nothing else,
-    because nothing else CAN: ``llm_log_id`` is an int,
-    ``llm_log_process`` is an opaque token this backend
-    generated for itself, and ``updated_at`` is a machine timestamp its caller
-    just produced (no on-disk one ever round-trips -- both callers overwrite it).
+    So a failure to read the known secrets (``known_secret_values`` raising -- the
+    LIVE path deliberately propagates rather than degrading to unmasked, see
+    ``redact_known_secrets``) writes NOTHING and returns False. The field check
+    (``_redacted``) is applied to ``summary``, the one field that carries
+    operator/LLM text; the backstop (``_encode_checked``) to the whole file but
+    its keys and ``updated_at`` and ``llm_log_id``, whose shapes are checked above.
+    ``llm_log_process`` is written as the caller gives it, so the backstop sees it
+    whole: a known secret in it writes nothing.
 
     The serialized payload is bounded by ``_AI_META_MAX_BYTES``, the SAME cap
     ``read_tool_meta`` refuses past, so this can never produce a file that reads
@@ -1956,15 +2056,14 @@ def write_tool_meta(
     metadata is best-effort by design.
 
     The serialize + encode + size check live INSIDE the fail-closed ``try``, and
-    that placement is load-bearing rather than tidy. They used to sit outside it,
-    so a lone surrogate reaching any string field raised ``UnicodeEncodeError``
-    straight out of this function -- turning a PATCH that should have answered
-    False (-> 404) into a 500. ``_redacted`` now scrubs the three text fields
-    before ``dumps`` sees them, so the surrogate case is HANDLED rather than
-    merely caught; the guard still covers ``updated_at``, the one caller-supplied
-    string this function passes through verbatim (every real caller stamps a
-    machine timestamp, so scrubbing it would only paper over a caller bug -- a
-    refusal is the honest answer there).
+    that placement is load-bearing rather than tidy: a lone surrogate reaching a
+    string field would otherwise raise ``UnicodeEncodeError`` straight out of this
+    function -- turning a PATCH that should have answered False (-> 404) into a
+    500. ``_redacted`` scrubs the summary before ``dumps`` sees it and
+    ``updated_at`` is refused unless it is a timestamp, so for those two the
+    surrogate case is HANDLED rather than merely caught; the guard still covers
+    ``llm_log_process``, the one caller-supplied string this function passes
+    through verbatim.
 
     The write itself is ATOMIC (``_write_package_file_atomic``): the previous sidecar
     survives every failure and the file is never observable half-written. See
@@ -2011,7 +2110,7 @@ def write_tool_meta(
     if not isinstance(summary, str):
         return False
     updated_at = meta.get("updated_at")
-    if not isinstance(updated_at, str):
+    if not isinstance(updated_at, str) or not _UTC_TIMESTAMP_RE.fullmatch(updated_at):
         return False
     log_id = meta.get("llm_log_id")
     if not isinstance(log_id, int) or isinstance(log_id, bool):
@@ -2019,21 +2118,32 @@ def write_tool_meta(
     log_process = meta.get("llm_log_process")
     if not isinstance(log_process, str):
         log_process = None
+
+    def build(writing: _Writing) -> Any:
+        return writing.record(
+            {
+                "summary": writing.text(summary),
+                "updated_at": writing.fixed(updated_at),
+                "llm_log_id": writing.fixed(log_id),
+                # Written as the caller gives it: the probe sees it whole.
+                "llm_log_process": log_process,
+            }
+        )
+
     try:
-        payload: dict[str, Any] = {
-            "summary": _redacted(summary),
-            "updated_at": updated_at,
-            "llm_log_id": log_id,
-            "llm_log_process": log_process,
-        }
         # ensure_ascii=False keeps CJK readable in the file (and is what the byte
         # cap below is measured against). Every value is a str/int/None we just
         # built, so dumps cannot fail on an unserializable type -- but the ENCODE
-        # can still raise on a surrogate-bearing ``updated_at``, which is why both
-        # steps sit inside this guard (see the docstring). The cap is checked on
-        # the ENCODED length, because that is the unit the writer's half of the
+        # can still raise on a surrogate-bearing ``llm_log_process``, which is why
+        # both steps sit inside this guard (see the docstring). The cap is checked
+        # on the ENCODED length, because that is the unit the writer's half of the
         # read/write symmetry is stated in (see _AI_META_MAX_BYTES).
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        text = _encode_checked(
+            build, _redaction_secrets(), lambda payload: json.dumps(payload, ensure_ascii=False)
+        )
+        if text is None:
+            return False
+        data = text.encode("utf-8")
     except Exception:
         return False
     if len(data) > _AI_META_MAX_BYTES:
@@ -2051,7 +2161,14 @@ def write_tool_meta(
 
 
 def write_origin_meta(build_root: BuildRoot, origin: dict[str, Any]) -> bool:
-    """Publish immutable, sanitized ``origin.json`` before a version is installed."""
+    """Publish immutable, sanitized ``origin.json`` before a version is installed.
+
+    Its four text fields go through the field check (``_redacted``) and the file
+    through the backstop (``_encode_checked``); the vid of the version before it
+    is the one field whose shape a check fixes. Every False writes nothing, among
+    them a failure to read the known secrets and a file that would hold one even
+    with every text written as the marker.
+    """
 
     source = origin.get("source")
     previous = origin.get("previous")
@@ -2059,15 +2176,27 @@ def write_origin_meta(build_root: BuildRoot, origin: dict[str, Any]) -> bool:
         return False
     if previous is not None and (not isinstance(previous, str) or not _VID_RE.fullmatch(previous)):
         return False
+
+    def build(writing: _Writing) -> Any:
+        return writing.record(
+            {
+                "source": writing.text(source),
+                "openapi_url": writing.text(_meta_str(origin.get("openapi_url"))),
+                "instructions": writing.text(_meta_str(origin.get("instructions"))),
+                "feedback": writing.text(_meta_str(origin.get("feedback"))),
+                "previous": writing.fixed(previous),
+            }
+        )
+
     try:
-        payload = {
-            "source": _redacted(source),
-            "openapi_url": _redacted(_meta_str(origin.get("openapi_url"))),
-            "instructions": _redacted(_meta_str(origin.get("instructions"))),
-            "feedback": _redacted(_meta_str(origin.get("feedback"))),
-            "previous": previous,
-        }
-        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        text = _encode_checked(
+            build,
+            _redaction_secrets(),
+            lambda payload: json.dumps(payload, ensure_ascii=False) + "\n",
+        )
+        if text is None:
+            return False
+        data = text.encode("utf-8")
     except Exception:
         return False
     if len(data) > _AI_META_MAX_BYTES:

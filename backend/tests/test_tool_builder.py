@@ -10014,6 +10014,59 @@ def test_the_origin_feedback_is_masked_then_cut_keeping_its_draft_line_whole(
     assert written.endswith("\n\n" + line)
 
 
+# (secret, text): the text does not hold the secret, but the JSON the text is
+# written as does -- an escape the encoder writes, or, for a lone surrogate, the
+# three replacement characters the scrub leaves.
+_SPELLED_AS_WRITTEN = {
+    "newline": ("kb-pem-head\\nkb-pem-body", "key kb-pem-head\nkb-pem-body here"),
+    "quote": ('kb-quote-left\\"kb-quote-right', 'say kb-quote-left"kb-quote-right ok'),
+    "backslash": ("kb-back-left\\\\kb-back-right", "at kb-back-left\\kb-back-right ok"),
+    "tab": ("kb-tab-left\\tkb-tab-right", "key kb-tab-left\tkb-tab-right ok"),
+    "control": ("kb-ctl-left\\u0001kb-ctl-right", "key kb-ctl-left\x01kb-ctl-right ok"),
+    "tail": ("abcde\\nxyz123", "it ends with abcde\n"),
+    "replacement": ("kb-���-key", "name kb-\udcff-key here"),
+}
+
+
+@pytest.mark.parametrize("case", list(_SPELLED_AS_WRITTEN))
+def test_origin_feedback_that_spells_a_secret_only_as_written_reaches_no_byte_of_origin_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str
+) -> None:
+    """The operator's words, as the feedback a revise writes when no draft line
+    follows them, into ``origin.json``: the version is written, its origin reads
+    back with the feedback as the marker and the instructions as they were -- the
+    field check did it, not the whole-file check -- and no byte of the file holds
+    the secret."""
+    secret, text = _SPELLED_AS_WRITTEN[case]
+    assert secret not in text
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+    version = tmp_path / "version"
+    (version / tools._META_DIRNAME).mkdir(parents=True)
+    feedback = tool_builder._provenance_feedback(text, ())
+
+    written = tools.write_origin_meta(
+        tools.BuildRoot(version),
+        {
+            "source": "builder-revise",
+            "openapi_url": None,
+            "instructions": "查 KB",
+            "feedback": feedback,
+            "previous": _TEST_VID,
+        },
+    )
+
+    assert written is True
+    data = (version / tools._META_DIRNAME / tools._ORIGIN_FILENAME).read_bytes()
+    encoded = secret.encode("utf-8", "surrogatepass")
+    assert encoded not in data
+    # Nor a prefix of it as long as the mask's trailing guard covers, ending a string.
+    for end in range(tools._MIN_SECRET_LEN, len(encoded)):
+        assert encoded[:end] + b'"' not in data
+    origin = tools.read_origin_meta(tools.VersionRoot(version))
+    assert origin is not None
+    assert (origin["feedback"], origin["instructions"]) == (tools._REDACTION_MARKER, "查 KB")
+
+
 def test_a_publish_goes_ahead_when_its_draft_cannot_be_marked(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

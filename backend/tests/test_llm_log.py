@@ -383,6 +383,34 @@ def test_redaction_masks_known_secret_in_request_and_response(
     assert llm_log._REDACTION_MARKER in file_text
 
 
+def test_a_body_that_spells_a_secret_only_as_written_reaches_no_byte_of_the_jsonl_file(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PEM registered from a single-quoted ``.env`` line keeps ``\\n`` as two
+    characters; the bodies hold the key with a real line break, which a JSON line
+    writes as exactly those two characters. Each such body is stored as the
+    marker, and no byte of the file holds the secret."""
+    secret = "kb-pem-head\\nkb-pem-body"
+    text = "it signs with kb-pem-head\nkb-pem-body"
+    log_file = tmp_path / "llm.jsonl"
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_file=str(log_file), llm_log_max_entries=50),
+    )
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {secret})
+    llm_log._reset_for_tests()
+
+    _record(messages=[{"role": "user", "content": text}], response=text)
+
+    assert secret.encode("utf-8") not in log_file.read_bytes()
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    attempt = record["attempts"][0]
+    assert attempt["request_messages"][0]["content"] == llm_log._REDACTION_MARKER
+    assert attempt["response_content"] == llm_log._REDACTION_MARKER
+
+
 def test_advertised_tool_names_go_through_the_same_redaction(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:

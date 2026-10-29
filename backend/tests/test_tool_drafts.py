@@ -387,6 +387,109 @@ def test_the_manifest_masks_its_text_and_keeps_identifiers_as_they_are() -> None
     assert json.loads(text)["draft_id"] == "a" * 32
 
 
+# (secret, text): the text does not hold the secret, but the JSON the text is
+# written as does -- an escape the encoder writes, or, for a lone surrogate, the
+# three replacement characters the scrub leaves.
+_SPELLED_AS_WRITTEN = {
+    "newline": ("kb-pem-head\\nkb-pem-body", "key kb-pem-head\nkb-pem-body here"),
+    "quote": ('kb-quote-left\\"kb-quote-right', 'say kb-quote-left"kb-quote-right ok'),
+    "backslash": ("kb-back-left\\\\kb-back-right", "at kb-back-left\\kb-back-right ok"),
+    "tab": ("kb-tab-left\\tkb-tab-right", "key kb-tab-left\tkb-tab-right ok"),
+    "control": ("kb-ctl-left\\u0001kb-ctl-right", "key kb-ctl-left\x01kb-ctl-right ok"),
+    "tail": ("abcde\\nxyz123", "it ends with abcde\n"),
+    "replacement": ("kb-���-key", "name kb-\udcff-key here"),
+}
+
+
+_PLAIN_NOTE = "a plain note"
+
+
+def _text_in_the_listed_fields(text: str) -> dict[str, Any]:
+    """A manifest in shape with ``text`` in each free-text field listed here, and
+    ``_PLAIN_NOTE`` in ``note``."""
+    return _document(
+        feedback=text,
+        runs=[
+            {
+                "id": 1,
+                "started_at": text,
+                "workflow": text,
+                "vid": text,
+                "outcome": text,
+                "exit_code": None,
+            }
+        ],
+        attempt_fields={
+            "error": text,
+            "summary": text,
+            "handoff": text,
+            "operator_action": text,
+            "note": _PLAIN_NOTE,
+            "reason": text,
+            "omitted": [{"path": text, "reason": "secret_name"}],
+            "omitted_count": 1,
+        },
+    )
+
+
+def _holds(secret: str, data: bytes) -> bool:
+    """Whether ``data`` holds ``secret``, or ends a JSON string with a prefix of it
+    as long as the mask's trailing guard covers."""
+    encoded = secret.encode("utf-8", "surrogatepass")
+    return encoded in data or any(
+        encoded[:end] + b'"' in data for end in range(tools._MIN_SECRET_LEN, len(encoded))
+    )
+
+
+def _reads_back(tmp_path: Path, data: bytes) -> dict[str, Any] | None:
+    draft = tmp_path / "draft"
+    draft.mkdir()
+    (draft / tool_drafts.MANIFEST_FILENAME).write_bytes(data)
+    return tool_drafts.read_manifest(draft)
+
+
+@pytest.mark.parametrize("case", list(_SPELLED_AS_WRITTEN))
+def test_text_spelling_a_secret_only_as_written_reaches_no_manifest_byte_from_the_listed_fields(
+    tmp_path: Path, case: str
+) -> None:
+    """Each field is checked as it is written: the ones that spell the secret are
+    the marker, and the note that does not is kept as it is -- the whole-file
+    check, which would mask the note too, never had to step in."""
+    secret, text = _SPELLED_AS_WRITTEN[case]
+    assert secret not in text
+
+    data = tool_drafts.manifest_bytes(_text_in_the_listed_fields(text), [secret])
+
+    assert data is not None
+    assert not _holds(secret, data)
+    read = _reads_back(tmp_path, data)
+    assert read is not None
+    last = read["attempts"][-1]
+    assert (last["summary"], last["note"]) == (tools._REDACTION_MARKER, _PLAIN_NOTE)
+
+
+def test_text_a_field_check_lets_through_is_caught_by_the_whole_file_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The field check passes every text as it is; the check of the whole file,
+    less what a shape check fixed, still sees the secret its JSON spells. Every
+    free text is then written as the marker -- the plain note too -- and the
+    manifest is written without the secret."""
+    secret, text = _SPELLED_AS_WRITTEN["newline"]
+    monkeypatch.setattr(tools, "_redacted", lambda value, *rest: value)
+
+    data = tool_drafts.manifest_bytes(
+        _document(attempt_fields={"summary": text, "handoff": "a plain note"}), [secret]
+    )
+
+    assert data is not None
+    assert secret.encode("utf-8") not in data
+    read = _reads_back(tmp_path, data)
+    assert read is not None
+    last = read["attempts"][-1]
+    assert (last["summary"], last["handoff"]) == (tools._REDACTION_MARKER,) * 2
+
+
 def test_the_manifest_makes_a_path_with_lone_surrogates_encodable() -> None:
     """A file name read on Linux can carry lone surrogates; the UTF-8 encode of the
     whole manifest would refuse it. It is written with replacement characters."""
@@ -719,6 +822,32 @@ def test_a_path_the_scan_of_the_copy_could_not_search_is_not_kept(
     assert _manifest(package_root)["attempts"][-1]["omitted"] == [
         {"path": "run.py", "reason": "unreadable"}
     ]
+
+
+def test_a_manifest_that_would_hold_a_secret_with_every_text_masked_is_not_saved_and_says_why(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A text written past the field check altogether -- as a value a builder
+    hands over without saying what it is -- still holds the secret once every
+    free text is the marker. Nothing is written: the first round keeps no draft,
+    and its reason says the manifest would hold a known secret."""
+    package_root = _package(monkeypatch, tmp_path)
+    workspace = _workspace(tmp_path, package_root)
+    copied_in = tool_drafts.tree_digest(workspace)
+    (workspace / "run.py").write_text("print('changed')\n", encoding="utf-8")
+    monkeypatch.setattr(tools._Writing, "text", lambda self, value, cap=None: value)
+
+    result = _save(
+        package_root,
+        workspace,
+        copied_in,
+        draft_round=tool_drafts.DraftRound(
+            finished_at=_now(), outcome="not_published", summary=f"used {_SECRET}"
+        ),
+    )
+
+    assert (result.saved, result.reason) == (False, tool_drafts.REASON_MANIFEST_SECRET)
+    assert not tool_drafts.has_draft(package_root)
 
 
 def test_a_scan_that_cannot_finish_keeps_no_files(

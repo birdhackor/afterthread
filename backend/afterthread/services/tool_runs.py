@@ -74,6 +74,13 @@ def _storable(text: str | None, cut: Any, cap: int) -> str | None:
     the piece of a secret a cut-then-redact order could leave behind. The scrub
     is what lets sqlite3 take the text at all -- a model's tool arguments can
     carry a lone surrogate, which it refuses to encode.
+
+    Not covered: the scrub comes after the redaction, and it writes a lone
+    surrogate as three U+FFFD, so a known value that itself holds three U+FFFD in
+    a row can be completed by it in the stored text. Only the arguments and the
+    message can carry a surrogate: the output is decoded with errors="replace"
+    before it is redacted. The reads that hand the bodies on (``view``,
+    ``attach_for_revise``) mask them again.
     """
     if text is None:
         return None

@@ -499,7 +499,13 @@ last}`：`state` 依序判定為 `running`（本行程有一輪正在處理它�
   或 `draft/` 的 `lstat` 是「不存在」以外的錯誤）讀取時當作有：清單列出、擋修訂；寫入（含放棄）時不動手：
   保存不寫、發布前後的標記與發布後的刪除都不做，放棄原樣不動並回 `500 draft_not_removed`。第一輪
   保存失敗會收回它建的東西，連空的 `draft/` 一起。說明檔的文字先遮蔽、再截斷、再處理孤立的
-  surrogate；識別碼、時間與詞彙值改為檢查形狀。一個工具一份草稿：`draft/` 存在就拒絕新的修訂
+  surrogate，最後以寫進檔案的樣子（JSON 字串字面）用同一個比對器再檢查一次（`tools._redacted`）：
+  跳脫字元（`\n`、`\"`、`\\`、`\uXXXX`）或替代字元拼出已知秘密的欄位，整欄寫成遮蔽標記；識別碼、
+  時間、數字與詞彙值改為檢查形狀。寫入前再對整份檔案做同樣的檢查當底線（`tools._encode_checked`），
+  檢查的是去掉形狀固定的值與鍵之後剩下的部分：命中就把所有文字欄位都寫成遮蔽標記再查一次，仍命中
+  就不寫，保存以「說明檔寫下去仍會含有已知的秘密值」失敗。精確比對看不到表示法的差異：以真換行登記、
+  文字卻寫成 `\n` 兩個字元的秘密，base64 等其他編碼，`.env` 讀入時壞位元組已被替換的值，都不在這個
+  保證內。一個工具一份草稿：`draft/` 存在就拒絕新的修訂
   （`draft_pending`）。新版本 `origin.feedback` 的文字遮蔽不了（已知秘密讀不到）時算發布失敗，什麼都
   不發布。發布前的保存失敗、接著發布也失敗時，成果所在的暫存目錄原地保留（sweep 照常執行，它不看
   `.staging`），工作的 `draft.retained_path` 與後端記錄寫出它的路徑；成果已搬進 `versions/<vid>` 時回報
@@ -580,7 +586,10 @@ last}`：`state` 依序判定為 `running`（本行程有一輪正在處理它�
   `.afterthread.meta/origin.json` 保存來源、安裝指示、修訂意見與 previous；
   可重新產生的 `.afterthread.meta/summary.json` 保存 summary、updated time 與
   AI log identity。兩者都經 typed／bounded／secret-redacted／fail-closed／atomic
-  publisher；來源 URL 在捕捉時先收斂成不帶 userinfo/path/query/fragment 的
+  publisher：文字欄位先遮蔽，再以寫進檔案的樣子檢查（拼出已知秘密就整欄寫成遮蔽標記，與草稿說明檔
+  同一套），整份檔案扣掉形狀固定的欄位（`previous`、`updated_at`、`llm_log_id`）與鍵之後再做一次底線
+  檢查，仍命中就不寫；`updated_at` 必須是 `datetime.now(UTC).isoformat()` 的形狀，否則拒寫。
+  `origin.json` 寫不出來就是發布失敗、成果保留。來源 URL 在捕捉時先收斂成不帶 userinfo/path/query/fragment 的
   provenance。summary 缺席或損壞是「尚無可用總結」，不會使版本失效；安裝／修訂
   上線後的自動產生是 best-effort，失敗不能翻轉已完成的提交。
 - **全域 single-flight**：安裝與修訂共用背景 job 表；同步 regenerate 與 discard

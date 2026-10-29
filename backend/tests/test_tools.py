@@ -37,6 +37,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Generator
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal
@@ -5777,6 +5778,101 @@ def test_write_tool_meta_keys_survive_a_secret_that_equals_one(
         assert stored["origin"]["openapi_url"] == "http://kb.example/o.json"
 
 
+# A PEM registered from a single-quoted ``.env`` line keeps ``\n`` as two
+# characters; the summary holds the key with a real line break, which the JSON of
+# the file writes as exactly those two characters.
+_PEM_SECRET = "kb-pem-head\\nkb-pem-body"
+_PEM_TEXT = "it signs with kb-pem-head\nkb-pem-body"
+
+
+def test_a_summary_that_spells_a_secret_only_as_written_reaches_no_byte_of_summary_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({_PEM_SECRET}))
+
+    assert _write_meta(pkg, summary=_PEM_TEXT) is True
+
+    assert _PEM_SECRET.encode("utf-8") not in _sidecar(pkg).read_bytes()
+    stored = tools.read_tool_meta(_version_root(pkg))
+    assert stored is not None
+    assert stored["summary"] == tools._REDACTION_MARKER
+
+
+def test_a_summary_that_spells_a_secret_only_as_written_is_the_marker_by_its_field_check_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With the whole-file check taken away, the field check on its own writes the
+    summary as the marker: the one text field cannot show which check did it."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({_PEM_SECRET}))
+    monkeypatch.setattr(
+        tools,
+        "_encode_checked",
+        lambda build, secrets, encode: encode(build(tools._Writing(secrets))),
+    )
+
+    assert _write_meta(pkg, summary=_PEM_TEXT) is True
+
+    assert _PEM_SECRET.encode("utf-8") not in _sidecar(pkg).read_bytes()
+    stored = tools.read_tool_meta(_version_root(pkg))
+    assert stored is not None
+    assert stored["summary"] == tools._REDACTION_MARKER
+
+
+def test_a_sidecar_text_the_field_check_lets_through_is_caught_by_the_whole_file_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The field check passes the summary as it is; the check of the whole file,
+    less what a shape check fixed, still sees the secret it spells, and the
+    summary is written as the marker."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({_PEM_SECRET}))
+    monkeypatch.setattr(tools, "_redacted", lambda value, *rest: value)
+
+    assert _write_meta(pkg, summary=_PEM_TEXT) is True
+
+    assert _PEM_SECRET.encode("utf-8") not in _sidecar(pkg).read_bytes()
+    stored = tools.read_tool_meta(_version_root(pkg))
+    assert stored is not None
+    assert stored["summary"] == tools._REDACTION_MARKER
+
+
+def test_write_tool_meta_writes_nothing_when_a_field_no_check_fixed_holds_a_secret(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``llm_log_process`` is written as the caller gives it, through no field
+    check and no shape check. A known secret in it is still in the file once the
+    summary is the marker, so nothing is written."""
+    secret = "process-borne-secret-abcdef"
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+
+    assert _write_meta(pkg, summary="沒有秘密的說明", llm_log_process=f"token-{secret}") is False
+
+    assert not _sidecar(pkg).exists()
+
+
+def test_write_tool_meta_requires_updated_at_in_the_shape_the_backend_stamps(
+    tmp_path: Path,
+) -> None:
+    """``updated_at`` is left out of the whole-file check because its shape is
+    fixed: ``datetime.now(UTC).isoformat()``, what ``store_summary_meta`` stamps.
+    A string of any other shape is refused rather than written unchecked."""
+    pkg = tmp_path / "pkg"
+    (pkg / tools._META_DIRNAME).mkdir(parents=True)
+    for stamp in ("yesterday", "2026-01-01", "2026-01-01T00:00:00Z"):
+        meta = {"summary": "s", "updated_at": stamp}
+        assert tools.write_tool_meta(_version_root(pkg), meta) is False
+    assert not _sidecar(pkg).exists()
+    stamped = {"summary": "s", "updated_at": datetime.now(UTC).isoformat()}
+    assert tools.write_tool_meta(_version_root(pkg), stamped) is True
+
+
 def test_write_tool_meta_drops_unknown_keys_and_containers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -6404,24 +6500,29 @@ def test_write_tool_meta_scrubs_a_surrogate_bearing_summary(tmp_path: Path) -> N
     assert _SURROGATE_FFFD in _sidecar(pkg).read_text(encoding="utf-8")
 
 
-def test_write_tool_meta_refuses_a_surrogate_bearing_updated_at(tmp_path: Path) -> None:
-    """``updated_at`` is the one caller string that rides through verbatim, so it
-    is the field the fail-closed guard still has to cover.
-
-    The serialize+encode used to sit OUTSIDE that try, so this raised
-    UnicodeEncodeError straight out of write_tool_meta -- a PATCH answering 500
-    where its contract says False (-> 404). Scrubbing it would only paper over a
-    caller bug (every real caller stamps a machine timestamp), so the refusal is
-    the honest answer -- and the previous sidecar survives it."""
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"updated_at": "2026\ud800"},
+        {"updated_at": "2026-01-01T00:00:00+00:00", "llm_log_process": "token\ud800"},
+    ],
+    ids=["updated_at", "llm_log_process"],
+)
+def test_write_tool_meta_refuses_a_surrogate_bearing_caller_string(
+    tmp_path: Path, fields: dict[str, str]
+) -> None:
+    """A caller string that would reach the file with a lone surrogate --
+    ``updated_at``, which its shape check refuses, or ``llm_log_process``, written
+    as given, whose encode the fail-closed guard catches -- answers False where a
+    PATCH's contract says False (-> 404), not a 500. Scrubbing either would only
+    paper over a caller bug, so the refusal is the honest answer -- and the
+    previous sidecar survives it."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     assert _write_meta(pkg, summary="好的說明") is True
     before = _sidecar(pkg).read_bytes()
 
-    assert (
-        tools.write_tool_meta(_version_root(pkg), {"summary": "s", "updated_at": "2026\ud800"})
-        is False
-    )
+    assert tools.write_tool_meta(_version_root(pkg), {"summary": "s", **fields}) is False
 
     assert _sidecar(pkg).read_bytes() == before
     assert not list(pkg.glob(f"{tools._AI_META_FILENAME}.*"))
@@ -6602,22 +6703,22 @@ def _swap_the_package_once(
     caller's last look and closes at ``os.replace``, and everything in it belongs
     to ``write_tool_meta`` -- a redactor sweep of the whole tools directory, a
     JSON encode, an mkstemp, a write, an fsync. So the swap is driven from one of
-    those steps (``_redacted``, the first) rather than from a thread race, which
-    makes it deterministic AND pins the window to exactly where the finding puts
-    it. Delete-then-reinstall-the-same-name is the swap that costs no job slot at
+    those steps (``_redacted``) rather than from a thread race, which makes it
+    deterministic AND pins the window to exactly where the finding puts it.
+    Delete-then-reinstall-the-same-name is the swap that costs no job slot at
     all (D40 r5 O5-3), so it is the one a summary can genuinely lose a race to.
 
-    Fires ONCE (the writer redacts three fields), and returns an accessor for the
-    replacement package."""
+    Fires ONCE (the writer calls ``_redacted`` more than once), and returns an
+    accessor for the replacement package."""
     root_pkg = root / name
     state: dict[str, Path] = {}
     real_redacted = tools._redacted
 
-    def swap_then_redact(value: str | None) -> str | None:
+    def swap_then_redact(value: str | None, *rest: Any) -> str | None:
         if "pkg" not in state:
             shutil.rmtree(root_pkg)
             state["pkg"] = _make_tool(root, name, replacement_run_py)
-        return real_redacted(value)
+        return real_redacted(value, *rest)
 
     monkeypatch.setattr(tools, "_redacted", swap_then_redact)
     return lambda: state["pkg"]

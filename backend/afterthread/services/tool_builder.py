@@ -2050,7 +2050,9 @@ def _provenance_feedback(
     the record's bodies are the operator's to purge. ``draft_line`` names the
     draft the round saved before publishing (``tool_drafts.provenance_line``):
     the tools list finds that draft's id here to tell a publish that went through
-    from one that did not.
+    from one that did not -- unless ``write_origin_meta`` writes the whole field
+    as the redaction marker (``tools._redacted``), when the list cannot tell and
+    says ``unknown``.
 
     Each part is masked, then the whole is cut to ``_ORIGIN_FEEDBACK_CAP`` with the
     draft line kept whole at its end, since it is what the list looks for. Blocking:

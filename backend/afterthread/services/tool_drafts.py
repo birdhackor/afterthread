@@ -45,15 +45,28 @@ What holds, and why:
   write: such a draft is listed and gates a revise, and a discard of it removes
   nothing and answers that it may still be there (``_seen_own_draft``).
 * TEXT. Every free-text string written into the manifest is masked against the
-  secrets known at that moment, then cut to its cap, then made encodable
-  (``tools._utf8_safe``): a file name read from disk can carry lone surrogates,
-  which the UTF-8 encode of the whole document would refuse. Identifiers,
-  timestamps and vocabulary values are backend-made and fixed in shape, so they
-  are checked against that shape instead of masked; a mask could only corrupt
-  them. The keys are this module's literals. Reading makes every string
-  encodable again, since a hand edit bypasses the writer, and what goes to the
-  API is masked once more: a secret registered after the write must not come
-  back unmasked.
+  secrets known at that moment, cut to its cap, made encodable
+  (``tools._utf8_safe``: a file name read from disk can carry lone surrogates,
+  which the UTF-8 encode of the whole document would refuse), and then checked
+  in the form the file holds it, a JSON string literal, with the mask's own
+  matcher (``tools._redacted``): an escape the encoder writes, or the replacement
+  characters the scrub leaves, can spell a known value the text did not, and
+  such a string is written as the redaction marker, whole. A value whose shape a
+  check here fixes -- an identifier, a timestamp this module wrote, a number, a
+  vocabulary word -- is checked against that shape instead of masked; a mask
+  could only corrupt it. What a run record hands over is free text. The keys
+  are this module's literals. Before anything is written, the whole file is
+  checked the same way, less what a shape check fixed and less the keys
+  (``tools._encode_checked``), so a text that reached it some other way is seen
+  too: when that check finds a secret, every free text is written as the
+  marker, and when it still finds one, nothing is written
+  (``REASON_MANIFEST_SECRET``). What it does not cover: a secret registered with
+  a real line break that a text spells as the two characters ``\\n``, a value
+  encoded another way (base64, say), a ``.env`` value whose undecodable bytes
+  were replaced when it was read -- the match is exact. Reading makes every
+  string encodable again, since a hand edit bypasses the writer, and what goes
+  to the API is masked once more: a secret registered after the write must not
+  come back unmasked.
 * SECRETS. The embedded-secret scanner (``tools.scan_embedded_secrets``) runs on
   two trees, with the secrets known when the save starts. On the workspace,
   before anything is copied, it decides what is copied: a path whose name holds
@@ -178,6 +191,7 @@ REASON_DRAFT_CHANGED = "草稿在這一輪進行中被改動過"
 REASON_COPY = "無法複製檔案到草稿（{kind}）"  # noqa: RUF001
 REASON_DURABILITY = "無法確認草稿已安全寫入磁碟"
 REASON_MANIFEST = "無法寫入草稿的說明檔"
+REASON_MANIFEST_SECRET = "草稿的說明檔寫下去仍會含有已知的秘密值，沒有寫入"  # noqa: RUF001
 REASON_UNEXPECTED = "保存時發生未預期錯誤（{kind}）"  # noqa: RUF001
 
 # A relative path -> the fingerprint ``tree_digest`` takes of that entry.
@@ -522,13 +536,11 @@ class _BadShape(Exception):
     """Raised inside the manifest checks; never leaves this module."""
 
 
-def _text(value: Any, cap: int, known: list[str]) -> str | None:
-    """A free-text value for the manifest: masked, then cut, then made encodable."""
-    if value is None:
-        return None
-    if not isinstance(value, str):
+def _free(value: Any, cap: int, writing: tools._Writing) -> str | None:
+    """A free-text value of the manifest, as ``writing`` writes it (``tools._redacted``)."""
+    if value is not None and not isinstance(value, str):
         raise _BadShape
-    return tools._utf8_safe(tools._mask_known_secrets(value, known)[:cap])
+    return writing.text(value, cap)
 
 
 def _matching(value: Any, pattern: re.Pattern[str]) -> str:
@@ -577,16 +589,19 @@ def _listing(value: Any, limit: int) -> list[Any]:
     return value
 
 
-def _run_entry(raw: Any, known: list[str]) -> dict[str, Any]:
+def _run_entry(raw: Any, writing: tools._Writing) -> Any:
     run = _mapping(raw)
-    return {
-        "id": _count(run.get("id"), minimum=1),
-        "started_at": _text(run.get("started_at"), _RUN_TEXT_CAP, known),
-        "workflow": _text(run.get("workflow"), _RUN_TEXT_CAP, known),
-        "vid": _text(run.get("vid"), _RUN_TEXT_CAP, known),
-        "outcome": _text(run.get("outcome"), _RUN_TEXT_CAP, known),
-        "exit_code": None if run.get("exit_code") is None else _signed(run.get("exit_code")),
-    }
+    exit_code = None if run.get("exit_code") is None else _signed(run.get("exit_code"))
+    return writing.record(
+        {
+            "id": writing.fixed(_count(run.get("id"), minimum=1)),
+            "started_at": _free(run.get("started_at"), _RUN_TEXT_CAP, writing),
+            "workflow": _free(run.get("workflow"), _RUN_TEXT_CAP, writing),
+            "vid": _free(run.get("vid"), _RUN_TEXT_CAP, writing),
+            "outcome": _free(run.get("outcome"), _RUN_TEXT_CAP, writing),
+            "exit_code": writing.fixed(exit_code),
+        }
+    )
 
 
 def _signed(value: Any) -> int:
@@ -595,18 +610,22 @@ def _signed(value: Any) -> int:
     return value
 
 
-def _omitted_entry(raw: Any, known: list[str]) -> dict[str, Any]:
+def _omitted_entry(raw: Any, writing: tools._Writing) -> Any:
     entry = _mapping(raw)
-    path = _text(entry.get("path"), _PATH_CAP, known)
-    if path is None:
+    if entry.get("path") is None:
         raise _BadShape
-    return {"path": path, "reason": _vocabulary(entry.get("reason"), _OMIT_REASONS)}
+    return writing.record(
+        {
+            "path": _free(entry.get("path"), _PATH_CAP, writing),
+            "reason": writing.fixed(_vocabulary(entry.get("reason"), _OMIT_REASONS)),
+        }
+    )
 
 
-def _attempt_entry(raw: Any, known: list[str]) -> dict[str, Any]:
+def _attempt_entry(raw: Any, writing: tools._Writing) -> Any:
     attempt = _mapping(raw)
     omitted = [
-        _omitted_entry(item, known) for item in _listing(attempt.get("omitted"), OMITTED_KEPT)
+        _omitted_entry(item, writing) for item in _listing(attempt.get("omitted"), OMITTED_KEPT)
     ]
     omitted_count = _count(attempt.get("omitted_count"))
     if omitted_count < len(omitted):
@@ -614,29 +633,33 @@ def _attempt_entry(raw: Any, known: list[str]) -> dict[str, Any]:
     finished_at = _optional_matching(attempt.get("finished_at"), _TIMESTAMP_RE)
     if finished_at is None:
         raise _BadShape
-    return {
-        "number": _count(attempt.get("number"), minimum=1),
-        "job_id": _optional_matching(attempt.get("job_id"), _ID_RE),
-        "started_at": _optional_matching(attempt.get("started_at"), _TIMESTAMP_RE),
-        "finished_at": finished_at,
-        "outcome": _vocabulary(attempt.get("outcome"), _OUTCOMES),
-        "stopped_by": _vocabulary(attempt.get("stopped_by"), _STOPPED_BY),
-        "failure": _vocabulary(attempt.get("failure"), _FAILURES),
-        "rounds_used": _optional_count(attempt.get("rounds_used")),
-        "max_rounds": _optional_count(attempt.get("max_rounds")),
-        "error": _text(attempt.get("error"), ERROR_CAP, known),
-        "summary": _text(attempt.get("summary"), SUMMARY_CAP, known),
-        "handoff": _text(attempt.get("handoff"), HANDOFF_CAP, known),
-        "operator_action": _text(attempt.get("operator_action"), OPERATOR_ACTION_CAP, known),
-        "note": _text(attempt.get("note"), NOTE_CAP, known),
-        "saved": _flag(attempt.get("saved")),
-        "reason": _text(attempt.get("reason"), ERROR_CAP, known),
-        "omitted": omitted,
-        "omitted_count": omitted_count,
-    }
+    return writing.record(
+        {
+            "number": writing.fixed(_count(attempt.get("number"), minimum=1)),
+            "job_id": writing.fixed(_optional_matching(attempt.get("job_id"), _ID_RE)),
+            "started_at": writing.fixed(
+                _optional_matching(attempt.get("started_at"), _TIMESTAMP_RE)
+            ),
+            "finished_at": writing.fixed(finished_at),
+            "outcome": writing.fixed(_vocabulary(attempt.get("outcome"), _OUTCOMES)),
+            "stopped_by": writing.fixed(_vocabulary(attempt.get("stopped_by"), _STOPPED_BY)),
+            "failure": writing.fixed(_vocabulary(attempt.get("failure"), _FAILURES)),
+            "rounds_used": writing.fixed(_optional_count(attempt.get("rounds_used"))),
+            "max_rounds": writing.fixed(_optional_count(attempt.get("max_rounds"))),
+            "error": _free(attempt.get("error"), ERROR_CAP, writing),
+            "summary": _free(attempt.get("summary"), SUMMARY_CAP, writing),
+            "handoff": _free(attempt.get("handoff"), HANDOFF_CAP, writing),
+            "operator_action": _free(attempt.get("operator_action"), OPERATOR_ACTION_CAP, writing),
+            "note": _free(attempt.get("note"), NOTE_CAP, writing),
+            "saved": writing.fixed(_flag(attempt.get("saved"))),
+            "reason": _free(attempt.get("reason"), ERROR_CAP, writing),
+            "omitted": omitted,
+            "omitted_count": writing.fixed(omitted_count),
+        }
+    )
 
 
-def _marker(raw: Any, time_key: str) -> dict[str, Any] | None:
+def _marker(raw: Any, time_key: str, writing: tools._Writing) -> Any:
     """``running`` or ``publishing``: which job, since when."""
     if raw is None:
         return None
@@ -644,28 +667,36 @@ def _marker(raw: Any, time_key: str) -> dict[str, Any] | None:
     stamp = _optional_matching(marker.get(time_key), _TIMESTAMP_RE)
     if stamp is None:
         raise _BadShape
-    return {"job_id": _optional_matching(marker.get("job_id"), _ID_RE), time_key: stamp}
+    return writing.record(
+        {
+            "job_id": writing.fixed(_optional_matching(marker.get("job_id"), _ID_RE)),
+            time_key: writing.fixed(stamp),
+        }
+    )
 
 
-def _document(raw: Any, known: list[str]) -> dict[str, Any]:
+def _document(raw: Any, writing: tools._Writing) -> Any:
     """The manifest built from ``raw`` field by field, every value checked.
 
-    The ONE description of the manifest's shape: the writer runs it over what it
-    is about to write (with the secrets known now, so every text is masked and
-    cut on the way in) and the reader over what it read back (with no secrets,
-    which still makes every text encodable and cut). Keys are this function's
-    literals, never the input's. Raises ``_BadShape`` on anything out of shape.
+    The ONE description of the manifest's shape, and every value goes to
+    ``writing`` (``tools._Writing``) as what it is: fixed by a shape check, or
+    free text. The writer runs it over what it is about to write -- for the
+    file, with the secrets known now, so every text is masked, cut and checked as
+    written, and for the probe its backstop looks at -- and the reader over what
+    it read back (with no secrets, which still makes every text encodable and
+    cut). Keys are this function's literals, never the input's. Raises
+    ``_BadShape`` on anything out of shape.
     """
     doc = _mapping(raw)
     files_dir = _matching(doc.get("files_dir"), _FILES_RE)
     kept = [_matching(name, _FILES_RE) for name in _listing(doc.get("kept"), _KEPT_MAX)]
     if files_dir in kept or len(set(kept)) != len(kept):
         raise _BadShape
-    attempts = [
-        _attempt_entry(item, known) for item in _listing(doc.get("attempts"), ATTEMPTS_KEPT)
-    ]
+    raw_attempts = _listing(doc.get("attempts"), ATTEMPTS_KEPT)
+    attempts = [_attempt_entry(item, writing) for item in raw_attempts]
+    # Taken from what was just checked: what ``writing`` gives back may be a probe.
+    numbers = [item["number"] for item in raw_attempts]
     attempt_count = _count(doc.get("attempt_count"), minimum=1)
-    numbers = [attempt["number"] for attempt in attempts]
     if (
         not attempts
         or numbers != sorted(set(numbers))
@@ -673,31 +704,50 @@ def _document(raw: Any, known: list[str]) -> dict[str, Any]:
         or attempt_count < len(attempts)
     ):
         raise _BadShape
-    return {
-        "draft_id": _matching(doc.get("draft_id"), _ID_RE),
-        "generation": _count(doc.get("generation"), minimum=1),
-        "files_dir": files_dir,
-        "kept": kept,
-        "base_vid": _matching(doc.get("base_vid"), tools._VID_RE),
-        "feedback": _text(doc.get("feedback"), FEEDBACK_CAP, known),
-        "runs": [_run_entry(item, known) for item in _listing(doc.get("runs"), _RUNS_KEPT)],
-        "attempt_count": attempt_count,
-        "attempts": attempts,
-        "running": _marker(doc.get("running"), "started_at"),
-        "publishing": _marker(doc.get("publishing"), "at"),
-    }
+    return writing.record(
+        {
+            "draft_id": writing.fixed(_matching(doc.get("draft_id"), _ID_RE)),
+            "generation": writing.fixed(_count(doc.get("generation"), minimum=1)),
+            "files_dir": writing.fixed(files_dir),
+            "kept": writing.fixed(kept),
+            "base_vid": writing.fixed(_matching(doc.get("base_vid"), tools._VID_RE)),
+            "feedback": _free(doc.get("feedback"), FEEDBACK_CAP, writing),
+            "runs": [_run_entry(item, writing) for item in _listing(doc.get("runs"), _RUNS_KEPT)],
+            "attempt_count": writing.fixed(attempt_count),
+            "attempts": attempts,
+            "running": _marker(doc.get("running"), "started_at", writing),
+            "publishing": _marker(doc.get("publishing"), "at", writing),
+        }
+    )
+
+
+def _manifest_text(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+
+
+def _manifest_data(doc: dict[str, Any], known: list[str]) -> bytes | str:
+    """The manifest file for ``doc``, or the reason there is none.
+
+    ``REASON_MANIFEST_SECRET`` when it would hold a known secret even with every
+    free text written as the marker (``tools._encode_checked``);
+    ``REASON_MANIFEST`` when it is out of shape or too large.
+    """
+    try:
+        text = tools._encode_checked(lambda writing: _document(doc, writing), known, _manifest_text)
+    except _BadShape, TypeError, ValueError:
+        return REASON_MANIFEST
+    if text is None:
+        return REASON_MANIFEST_SECRET
+    data = text.encode("utf-8")
+    if len(data) > _MANIFEST_MAX_BYTES:
+        return REASON_MANIFEST
+    return data
 
 
 def manifest_bytes(doc: dict[str, Any], known: list[str]) -> bytes | None:
-    """The manifest file for ``doc``, or None when it is out of shape or too large."""
-    try:
-        payload = _document(doc, known)
-        data = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    except _BadShape, TypeError, ValueError:
-        return None
-    if len(data) > _MANIFEST_MAX_BYTES:
-        return None
-    return data
+    """The manifest file for ``doc``; None when there is none to write (``_manifest_data``)."""
+    data = _manifest_data(doc, known)
+    return data if isinstance(data, bytes) else None
 
 
 def read_manifest(draft_dir: Path) -> dict[str, Any] | None:
@@ -716,21 +766,31 @@ def read_manifest(draft_dir: Path) -> dict[str, Any] | None:
     except ValueError, RecursionError:
         return None
     try:
-        return _document(raw, [])
+        document = _document(raw, tools._Writing([]))
     except _BadShape:
         return None
+    return document if isinstance(document, dict) else None
 
 
-def _write_manifest(draft_dir: Path, doc: dict[str, Any], known: list[str]) -> tuple[bool, bool]:
-    """Replace the manifest atomically: (replaced, confirmed durable)."""
-    data = manifest_bytes(doc, known)
-    if data is None:
-        return False, False
+@dataclass(frozen=True, slots=True)
+class _ManifestWrite:
+    """One replacement of the manifest: whether it happened, whether it is on disk, why not."""
+
+    replaced: bool
+    durable: bool = False
+    reason: str = REASON_MANIFEST
+
+
+def _write_manifest(draft_dir: Path, doc: dict[str, Any], known: list[str]) -> _ManifestWrite:
+    """Replace the manifest atomically."""
+    data = _manifest_data(doc, known)
+    if not isinstance(data, bytes):
+        return _ManifestWrite(replaced=False, reason=data)
     durable: list[bool] = []
     replaced = tools._write_package_file_atomic(
         draft_dir, MANIFEST_FILENAME, data, None, durability_out=durable
     )
-    return replaced, replaced and bool(durable) and durable[0]
+    return _ManifestWrite(replaced=replaced, durable=replaced and bool(durable) and durable[0])
 
 
 def _round_entry(
@@ -1573,9 +1633,9 @@ def _as_draft(result: SaveResult) -> dict[str, Any] | None:
 
 
 def _record(draft_dir: Path, doc: dict[str, Any], known: list[str], *, saved: bool) -> SaveResult:
-    replaced, _durable = _write_manifest(draft_dir, doc, known)
-    if not replaced:
-        return _not_saved(REASON_MANIFEST)
+    written = _write_manifest(draft_dir, doc, known)
+    if not written.replaced:
+        return _not_saved(written.reason)
     return SaveResult(
         worth_saving=True,
         saved=saved,
@@ -1675,10 +1735,10 @@ def _copy_and_commit(
             draft_round, current["attempt_count"] + 1, saved=True, reason=None, omitted=omitted
         )
         doc = {**_with_round(current, entry), "files_dir": files_name, "kept": kept}
-    replaced, durable = _write_manifest(draft_dir, doc, known)
-    if not replaced:
-        return files, REASON_MANIFEST
-    if current is not None and not keep_previous and durable:
+    written = _write_manifest(draft_dir, doc, known)
+    if not written.replaced:
+        return files, written.reason
+    if current is not None and not keep_previous and written.durable:
         # Only once the new manifest is known to be on disk; otherwise the sweep
         # takes it later, after its own fsync of the manifest.
         remove_entry(draft_dir / current["files_dir"])
@@ -1751,8 +1811,8 @@ def mark_publishing(
             "generation": current["generation"] + 1,
             "publishing": {"job_id": job_id, "at": _now_iso()},
         }
-        replaced, _durable = _write_manifest(draft_dir, doc, tools._redaction_secrets())
-        return doc["generation"] if replaced else None
+        written = _write_manifest(draft_dir, doc, tools._redaction_secrets())
+        return doc["generation"] if written.replaced else None
 
     try:
         return _locked_in_package(package_root, package_dir_identity, act)
@@ -1784,8 +1844,8 @@ def clear_publishing(
             "attempts": attempts,
             "publishing": None,
         }
-        replaced, _durable = _write_manifest(draft_dir, doc, tools._redaction_secrets())
-        return doc["generation"] if replaced else None
+        written = _write_manifest(draft_dir, doc, tools._redaction_secrets())
+        return doc["generation"] if written.replaced else None
 
     try:
         return _locked_in_package(package_root, package_dir_identity, act)
