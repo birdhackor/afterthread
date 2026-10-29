@@ -1,13 +1,23 @@
 """Tests for schema-level contracts in afterthread.schemas."""
 
-from typing import Any
+import json
+import typing
+from typing import Annotated, Any
 
 import pytest
 from fastapi.testclient import TestClient
-from pydantic import ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
+from afterthread import schemas
 from afterthread.main import app
-from afterthread.schemas import ToolInstallRequest
+from afterthread.schemas import (
+    ToolDeleteResponse,
+    ToolDiscardResponse,
+    ToolDraft,
+    ToolDraftDiscardResponse,
+    ToolInstallRequest,
+    ToolJobDraft,
+)
 from afterthread.services.memory_ai import SECTION_FIELD_ORDER
 
 
@@ -238,3 +248,121 @@ def test_only_by_id_routes_declare_404() -> None:
         ("/api/tool-runs/{run_id}", "delete"),
         ("/api/tools/{name}/check", "post"),
     }
+
+
+# --- backend paths in responses ----------------------------------------------
+
+# A directory name read on Linux decodes with a lone surrogate for each byte that
+# is not UTF-8 (here ``\xff``); made encodable, the surrogate becomes three
+# replacement characters.
+_NOT_UTF8_PATH = "/srv/tools-\udcff/kb/.afterthread.meta/draft"
+_MADE_ENCODABLE = "/srv/tools-���/kb/.afterthread.meta/draft"
+
+# The response fields that state a path on the backend's own filesystem, as
+# decided by hand, with what else each model needs to be valid.
+_BACKEND_PATH_FIELDS: dict[tuple[type[BaseModel], str], dict[str, Any]] = {
+    (ToolDraft, "path"): {
+        "draft_id": None,
+        "generation": None,
+        "attempts": None,
+        "state": "unusable",
+        "interrupted": False,
+        "base_vid": None,
+        "discard_token": "0" * 64,
+        "last": None,
+    },
+    (ToolDraftDiscardResponse, "residual_path"): {},
+    (ToolDeleteResponse, "retained_path"): {
+        "outcome": "retained",
+        "retention_reason": "cleanup_failed",
+        "runs_deleted": False,
+    },
+    (ToolDiscardResponse, "retained_path"): {
+        "outcome": "retained",
+        "retention_reason": "cleanup_failed",
+    },
+    (ToolJobDraft, "retained_path"): {
+        "saved": False,
+        "draft_id": None,
+        "generation": None,
+        "attempts": None,
+        "reason": "沒能存成草稿",
+    },
+}
+
+
+def _carries(annotation: Any, check: object) -> bool:
+    """Whether ``check`` is ``Annotated`` metadata anywhere inside ``annotation``."""
+    if typing.get_origin(annotation) is Annotated:
+        base, *metadata = typing.get_args(annotation)
+        return any(item == check for item in metadata) or _carries(base, check)
+    return any(_carries(arg, check) for arg in typing.get_args(annotation))
+
+
+def _fields_typed_backend_path() -> set[tuple[type[BaseModel], str]]:
+    """Every field of every model in ``afterthread.schemas`` whose type carries
+    ``BackendPath``'s check, however deep."""
+    check = typing.get_args(schemas.BackendPath)[1]
+    found: set[tuple[type[BaseModel], str]] = set()
+    for model in vars(schemas).values():
+        if not (
+            isinstance(model, type)
+            and issubclass(model, BaseModel)
+            and model.__module__ == schemas.__name__
+        ):
+            continue
+        for name, info in model.model_fields.items():
+            if any(item == check for item in info.metadata) or _carries(info.annotation, check):
+                found.add((model, name))
+    return found
+
+
+def test_backend_path_makes_a_path_encodable_and_leaves_an_encodable_one_as_it_is() -> None:
+    """A path whose name is not UTF-8 comes back with replacement characters, and
+    encodes; a path that encodes already, CJK included, comes back unchanged."""
+    adapter = TypeAdapter(schemas.BackendPath)
+
+    made = adapter.validate_python(_NOT_UTF8_PATH)
+
+    assert made == _MADE_ENCODABLE
+    made.encode("utf-8")
+    for path in ("/srv/tools/kb", "/srv/工具/kb/草稿"):
+        assert adapter.validate_python(path) == path
+
+
+def test_the_listed_backend_path_fields_are_exactly_the_fields_typed_backend_path() -> None:
+    """The fields listed as stating a backend path take the one type, and no other
+    field does: a listed field typed plain ``str`` drops out of what is found
+    here, and a field given the type without being listed is found. A new field
+    that states a path, typed plain ``str`` and not listed, is in neither."""
+    found = _fields_typed_backend_path()
+
+    assert found
+    assert found == set(_BACKEND_PATH_FIELDS)
+
+
+@pytest.mark.parametrize(
+    ("model", "field"),
+    list(_BACKEND_PATH_FIELDS),
+    ids=lambda value: getattr(value, "__name__", value),
+)
+def test_each_listed_backend_path_field_answers_a_path_that_is_not_utf8_made_encodable(
+    model: type[BaseModel], field: str
+) -> None:
+    """Built with a path that does not encode as UTF-8, the response holds it made
+    encodable and serializes: one such character would fail the encode of the
+    whole response."""
+    answer = model.model_validate({**_BACKEND_PATH_FIELDS[(model, field)], field: _NOT_UTF8_PATH})
+
+    assert getattr(answer, field) == _MADE_ENCODABLE
+    assert json.loads(answer.model_dump_json())[field] == _MADE_ENCODABLE
+
+
+def test_tools_and_the_schemas_make_text_encodable_with_one_definition() -> None:
+    """``tools._utf8_safe`` and ``BackendPath``'s check are one function, so a path
+    the services write and a path a response states are made encodable alike."""
+    from afterthread import utf8
+    from afterthread.services import tools
+
+    assert tools._utf8_safe is utf8.encodable
+    assert typing.get_args(schemas.BackendPath)[1].func is utf8.encodable

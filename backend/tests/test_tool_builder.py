@@ -10592,6 +10592,60 @@ def test_router_list_shows_the_draft_masked_with_the_secrets_known_now(
     }
 
 
+def test_router_list_serves_a_draft_path_that_is_not_utf8_made_encodable(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """On Linux a tools directory whose name is not UTF-8 reaches the draft's path
+    as lone surrogates. This filesystem cannot make such a name, so the draft
+    view's answer is given one here. The listing is served, with the path made
+    encodable and the rest of the draft as it was."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _save_an_unfinished_round(monkeypatch, pkg)
+    tools_root = str(tmp_path / "tools")
+    real_view = tool_drafts.draft_view
+
+    def view_under_a_name_that_is_not_utf8(*args: Any, **kwargs: Any) -> dict[str, Any] | None:
+        row = real_view(*args, **kwargs)
+        assert row is not None
+        return {**row, "path": row["path"].replace(tools_root, f"{tools_root}-\udcff", 1)}
+
+    monkeypatch.setattr(tool_drafts, "draft_view", view_under_a_name_that_is_not_utf8)
+
+    response = client.get("/api/tools")
+
+    assert response.status_code == 200
+    [row] = response.json()["tools"]
+    assert row["draft"]["path"] == str(_draft_files(pkg)).replace(
+        tools_root, f"{tools_root}-���", 1
+    )
+    assert (row["draft"]["state"], row["draft"]["attempts"]) == ("open", 1)
+
+
+def test_router_reports_an_unusable_lock_whose_path_is_not_utf8_made_encodable(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The lock error names the lock file, under the tools directory, whose name on
+    Linux can carry lone surrogates. The 500 is served with that path made
+    encodable and the operator's instructions as they were."""
+    _seed_package(monkeypatch, tmp_path, "locked")
+    error = tools.ToolsLockUnavailableError(
+        Path("/srv/tools-\udcff") / tools._TOOLS_LOCK_FILENAME, "cannot open it: Permission denied"
+    )
+
+    def unusable(name: str) -> None:
+        raise error
+
+    monkeypatch.setattr(tools, "delete_tool", unusable)
+
+    response = client.delete("/api/tools/locked")
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == {
+        "code": "tools_lock_unavailable",
+        "message": str(error).replace("\udcff", "���"),
+    }
+
+
 def test_router_list_fails_rather_than_serve_draft_text_it_could_not_mask(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

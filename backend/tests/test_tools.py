@@ -6392,12 +6392,10 @@ _SURROGATE_FFFD = "�" * 3
 def test_utf8_safe_matches_llm_log() -> None:
     """tools._utf8_safe and llm_log._utf8_safe MUST agree on every input.
 
-    Deliberately duplicated rather than imported (llm_log stays a leaf
-    observability module that must not import the tool runtime, and the reverse
-    edge would create exactly the coupling both docstrings forbid -- the same
-    duplication-with-rationale the redaction marker carries). Pinned equal on a
-    probe set, mirroring test_redaction_marker_matches_llm_log, so the two can
-    never silently drift into disagreeing about what a corrupt code point
+    ``tools._utf8_safe`` is the shared definition (``afterthread.utf8.encodable``,
+    which the API schemas use too); ``llm_log`` keeps a copy of its own. Pinned
+    equal on a probe set, mirroring test_redaction_marker_matches_llm_log, so the
+    two can never silently drift into disagreeing about what a corrupt code point
     becomes."""
     probes = [
         "",

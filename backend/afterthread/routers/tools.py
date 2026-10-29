@@ -40,6 +40,7 @@ from fastapi import Path as PathParam
 from sqlmodel import Session
 from starlette.concurrency import run_in_threadpool
 
+from afterthread import utf8
 from afterthread.db import get_session
 from afterthread.routers.ai import (
     _LLM_UNCONFIGURED_RESPONSE,
@@ -186,11 +187,16 @@ _DRAFT_NOT_REMOVED_MESSAGE = (
 
 
 def _tools_lock_unavailable(exc: tools_service.ToolsLockUnavailableError) -> HTTPException:
-    """Expose the operator-actionable lock path without calling it contention."""
+    """Expose the operator-actionable lock path without calling it contention.
+
+    The message names the lock file, under the tools directory, so it is made
+    encodable (``utf8.encodable``): a name there that is not UTF-8 would fail
+    the encode of the whole response.
+    """
 
     return HTTPException(
         status_code=500,
-        detail={"code": _TOOLS_LOCK_UNAVAILABLE_CODE, "message": str(exc)},
+        detail={"code": _TOOLS_LOCK_UNAVAILABLE_CODE, "message": utf8.encodable(str(exc))},
     )
 
 
@@ -442,7 +448,7 @@ async def delete_installed_tool(name: ToolName, session: SessionDep) -> ToolDele
     A request or inherited child holding the shared tools lock produces the
     distinct retryable ``ai_job_in_progress`` 409 without renaming or deleting
     anything. Otherwise the 200 response says ``removed`` after physical
-    deletion or ``retained`` with the exact cleanup-failure path.
+    deletion or ``retained`` with the cleanup-failure path (a ``BackendPath``).
 
     The tool's run records go once the package is gone -- ``removed`` and
     ``retained`` alike, since either way the tool has left the registry -- and
@@ -491,7 +497,7 @@ async def discard_tool_version(name: ToolName, vid: ToolVersionId) -> ToolDiscar
     lock. That second placement is what prevents a route-level answer for V from
     authorizing an old V -> P publication after ``current`` has moved to Q. The
     response reports whether the former version's files were removed or retained,
-    with the exact operator cleanup path in the latter case.
+    with the operator cleanup path in the latter case (a ``BackendPath``).
     """
 
     reservation = tool_builder.reserve_sync_operation()
@@ -645,7 +651,7 @@ async def discard_tool_draft(
             detail={"code": _DRAFT_CHANGED_CODE, "message": _DRAFT_CHANGED_MESSAGE},
         )
     if not outcome.removed:
-        left = tools_service._utf8_safe(str(outcome.residual_path))
+        left = utf8.encodable(str(outcome.residual_path))
         raise HTTPException(
             status_code=500,
             detail={
@@ -654,9 +660,7 @@ async def discard_tool_draft(
             },
         )
     residual = outcome.residual_path
-    return ToolDraftDiscardResponse(
-        residual_path=tools_service._utf8_safe(str(residual)) if residual is not None else None
-    )
+    return ToolDraftDiscardResponse(residual_path=str(residual) if residual is not None else None)
 
 
 @router.post(

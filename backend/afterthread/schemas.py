@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -15,6 +16,7 @@ from pydantic import (
     model_validator,
 )
 
+from afterthread import utf8
 from afterthread.config import get_settings
 from afterthread.models import (
     SQLITE_MAX_INT,
@@ -554,6 +556,22 @@ ToolRunFailure = Literal[
 ]
 
 
+BackendPath = Annotated[str, AfterValidator(utf8.encodable)]
+"""A path on the backend's own filesystem, as a response states it.
+
+Validated: the text is made encodable as UTF-8 (``afterthread.utf8.encodable``,
+the definition the services use too). A name on the path, read on Linux, decodes
+with a lone surrogate for each byte that is not UTF-8, and one such character
+fails the encode of the whole response. Not covered: such a path comes back
+with replacement characters where those bytes were, so it cannot be used as it
+is to open or copy anything -- that is as far as JSON text can carry it. This is
+not masking: backend paths are not masked, and only the characters that cannot
+be encoded are changed.
+
+A response field that states a backend path takes this type.
+"""
+
+
 class ToolDraftLast(BaseModel):
     """How the latest round of a draft ended (see ``ToolDraft``).
 
@@ -585,9 +603,10 @@ class ToolDraft(BaseModel):
     is not running any more.
 
     ``attempts`` is how many rounds the draft has been through. ``path`` is where
-    its files are, to be opened or copied as it is; for an unusable draft, the
-    draft directory itself. ``discard_token`` stands for the draft as it is now,
-    whatever its manifest holds, so an unusable draft can be discarded by it.
+    its files are, for the operator to open or copy (a ``BackendPath``); for an
+    unusable draft, the draft directory itself. ``discard_token`` stands for the
+    draft as it is now, whatever its manifest holds, so an unusable draft can be
+    discarded by it.
     ``draft_id``, ``generation``, ``attempts``, ``base_vid`` and ``last`` are null
     when the manifest cannot be read; an unusable draft whose files are missing
     still has them.
@@ -599,7 +618,7 @@ class ToolDraft(BaseModel):
     state: Literal["running", "unusable", "publishing", "unknown", "published", "stale", "open"]
     interrupted: bool
     base_vid: str | None
-    path: str
+    path: BackendPath
     discard_token: str
     last: ToolDraftLast | None
 
@@ -607,7 +626,7 @@ class ToolDraft(BaseModel):
 class ToolDraftDiscardResponse(BaseModel):
     """The draft was discarded; ``residual_path`` is what could not be removed, or null."""
 
-    residual_path: str | None
+    residual_path: BackendPath | None
 
 
 class ToolLastRun(BaseModel):
@@ -663,14 +682,14 @@ class ToolListResponse(BaseModel):
 class ToolDeleteResponse(BaseModel):
     """Whether DELETE removed the files or retained a hidden parked tree.
 
-    ``retained_path`` is the exact operator-facing path when ``outcome`` is
-    ``retained``; it is null after physical removal. ``runs_deleted`` says whether
+    ``retained_path`` is the operator-facing path (a ``BackendPath``) when ``outcome``
+    is ``retained``; it is null after physical removal. ``runs_deleted`` says whether
     the tool's run records went with it (web-v6 §6.4); false leaves them to the
     purge's orphan scope.
     """
 
     outcome: Literal["removed", "retained"]
-    retained_path: str | None
+    retained_path: BackendPath | None
     retention_reason: Literal["durability_unconfirmed", "cleanup_failed"] | None
     runs_deleted: bool
 
@@ -679,7 +698,7 @@ class ToolDiscardResponse(BaseModel):
     """Whether discard removed the former version or retained its files."""
 
     outcome: Literal["removed", "retained"]
-    retained_path: str | None
+    retained_path: BackendPath | None
     retention_reason: Literal["durability_unconfirmed", "cleanup_failed"] | None
 
 
@@ -917,7 +936,7 @@ class ToolJobDraft(BaseModel):
     generation: int | None
     attempts: int | None
     reason: str | None
-    retained_path: str | None
+    retained_path: BackendPath | None
 
 
 class ToolJobStatus(BaseModel):

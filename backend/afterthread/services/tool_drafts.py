@@ -78,20 +78,30 @@ What holds, and why:
   could not search, is removed and recorded as not kept. The second scan is
   what keeps known secrets out of the files the draft keeps, because the copy
   is not the workspace: an earlier version is put back without being scanned,
-  and an absolute link target inside the workspace is stored relative, with
-  ``.`` and ``..`` folded away, which can spell a secret the target as written
-  did not. A scan of either tree that cannot finish keeps no files. Content is
-  never rewritten with redaction markers, which could break the program.
+  and an absolute link target inside the workspace is stored relative, behind a
+  ``../`` for each directory the link is in: added text, which with what follows
+  it can spell a secret the target as written did not. A scan of either tree
+  that cannot finish keeps no files. Content is never rewritten with redaction
+  markers, which could break the program.
 * LINKS. A link is kept only when its target, resolved as a string from the
   link's own directory, stays inside the tree, and no ``..`` in it follows a
-  component that is itself a link: that is the one case where the string and the
-  operating system resolve differently. The rule is applied twice: on the
+  component that is itself a link (``stored_link_target`` says why). The rule is
+  applied twice: on the
   workspace, to plan the copy, and on the copy once every link is in it, before
   it is made durable, to every link of the copy. The copy differs from the
   workspace wherever an earlier version was put back, and the rule holds only on
   the tree it was applied to. Every link is judged before any is removed; what
-  fails is removed and recorded as not kept. An absolute target inside the
-  workspace is stored relative.
+  fails is removed and recorded as not kept. An absolute target is inside the
+  workspace only when it begins with the workspace's own path, as given or as
+  resolved, followed by a separator or by nothing; it is stored relative, as
+  what follows that path behind a ``..`` for each directory the link is in,
+  every component as written but the empty ones a link at the top would begin
+  with, and judged by the same walk as a relative target. Folding ``x/..`` away
+  first, as a path normalizer would, can hide the link ``x`` the ``..`` follows.
+  Not covered: a kept link whose way runs through an entry the copy does not
+  keep -- a link that failed, a FIFO -- dangles in the copy and is not recorded
+  on its own: dangling is safe, and what it runs through is recorded as not
+  kept, itself or a directory it is in.
 * DURABILITY. A new copy is written under a temporary name, made durable and
   renamed into place before the manifest names it, and the manifest is replaced
   atomically. A previous copy is removed only once the new manifest is confirmed
@@ -1059,23 +1069,32 @@ def stored_link_target(
     tree the rule was applied to, which is why the copy is judged again
     (``_links_failing_on``).
 
-    An absolute target inside ``root`` comes back relative to the link's
-    directory; a relative one comes back as it was.
+    A relative target comes back as it was. An absolute one is inside ``root``
+    only when it begins with root's own path, as given or as resolved, ending at
+    a separator or at the end of the target: that prefix is the one part read as
+    text, since through it the operating system reaches ``root`` however its
+    parents are reached. What follows the prefix comes back behind one ``..`` for
+    each directory the link is in, every component as written -- ``.``, ``..``
+    and empty ones too, since folding a ``..`` away before the walk would hide the
+    link it follows -- and is walked like a relative target; ``.`` when nothing is
+    left. The one change: for a link at the top of ``root``, the empty components
+    it would begin with are dropped, since written first they would make it
+    absolute. One that begins with neither path is ``link_outside``.
     """
     link_dir = list(parts[:-1])
     relative = target
     if os.path.isabs(target):
-        normalized = os.path.normpath(target)
         inside: list[str] | None = None
         for spelling in dict.fromkeys((os.fspath(root), os.path.realpath(root))):
-            if normalized == spelling:
-                inside = []
-                break
-            if normalized.startswith(spelling.rstrip(os.sep) + os.sep):
-                inside = normalized[len(spelling.rstrip(os.sep)) + 1 :].split(os.sep)
+            prefix = spelling.rstrip(os.sep)
+            if target == prefix or target.startswith(prefix + os.sep):
+                inside = target[len(prefix) :].split(os.sep)[1:]
                 break
         if inside is None:
             return None, "link_outside"
+        if not link_dir:
+            while inside and not inside[0]:
+                inside.pop(0)
         relative = "/".join([".."] * len(link_dir) + inside) or "."
     stack = list(link_dir)
     for component in relative.split("/"):

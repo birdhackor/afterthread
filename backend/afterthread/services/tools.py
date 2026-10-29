@@ -41,6 +41,7 @@ from uuid import uuid4
 from dotenv import dotenv_values
 from starlette.concurrency import run_in_threadpool
 
+from afterthread import utf8
 from afterthread.config import get_settings
 from afterthread.services import llm_log
 from afterthread.services.llm import LlmTool, current_interaction, tool_exception_text
@@ -1567,29 +1568,15 @@ def validate_tool_content(build_root: BuildRoot, expected_name: str) -> str | No
 # --- AI summary sidecar (D40) ------------------------------------------------
 
 
-def _utf8_safe(text: str) -> str:
-    """Replace any lone (unpaired) Unicode surrogate in ``text`` with U+FFFD.
-
-    A three-line duplicate of ``llm_log._utf8_safe``, which is the CANONICAL
-    twin -- read its docstring for why ``surrogatepass``-encode + ``replace``-
-    decode is the only pairing that actually yields U+FFFD. Duplicated rather
-    than imported for the SAME leaf/layering reason ``_REDACTION_MARKER`` is
-    (llm_log is a leaf observability module that must not import this capability
-    module, and the reverse edge would create exactly the coupling both modules'
-    docstrings forbid); ``tests/test_tools.py`` pins the two behaviorally equal
-    on a probe set so they cannot silently drift.
-
-    Why version metadata needs it at all: ``origin.json`` and ``summary.json``
-    are plain JSON files the operator is explicitly allowed to hand-edit, and
-    ``"\\ud800"`` is a JSON-LEGAL escape that ``json.loads`` accepts happily --
-    producing a ``str`` that is NOT UTF-8 encodable. Left alone it breaks both
-    boundaries: on the WRITE side ``json.dumps(...).encode("utf-8")`` raises
-    ``UnicodeEncodeError`` (a 500 out of a PATCH that should have answered False
-    -> 404), and on the READ side it sails into the summary response and blows
-    up in Starlette's strict ``JSONResponse.render`` encode -- a 500 on a GET
-    that exists to DEGRADE corrupt metadata, not to die on it.
-    """
-    return text.encode("utf-8", errors="surrogatepass").decode("utf-8", errors="replace")
+# Text made encodable as UTF-8: the definition the API schemas use too
+# (``afterthread.utf8.encodable``, also what ``BackendPath`` checks), so a path
+# written here and a path a response states come out alike. Version metadata
+# needs it because ``origin.json`` and ``summary.json`` are plain JSON the
+# operator may hand-edit, and ``"\\ud800"`` in one loads as a lone surrogate:
+# left alone it fails the UTF-8 encode of the next write (a 500 out of a PATCH
+# that should have answered False -> 404) and of the summary response that serves
+# it (a 500 on a GET that exists to degrade corrupt metadata).
+_utf8_safe = utf8.encodable
 
 
 def _utf8_safe_meta(meta: dict[str, Any]) -> dict[str, Any]:

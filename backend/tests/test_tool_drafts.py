@@ -686,68 +686,71 @@ def test_secrets_in_names_and_link_targets_reach_no_byte_under_the_draft(
     assert _manifest(package_root)["attempts"][-1]["omitted_count"] == 4
 
 
-# A secret a link target spells only once it is stored relative: ``./`` folded away.
-_SLASHED_SECRET = "abcdef/ghijkl"
+# A secret a link target spells only once it is stored relative: it begins in the
+# ``../`` added in front of the target for the directory the link is in.
+_UP_SECRET = "../kb-up-secret"
 
 
 def test_a_link_whose_target_spells_a_secret_only_as_stored_is_not_kept(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The round's link points at ``<workspace>/abcdef/./ghijkl``, which does not
-    hold the secret ``abcdef/ghijkl``; stored relative, its target is
-    ``abcdef/ghijkl``, which does. The link is not kept, it is recorded under its
-    link target, and no name, link target or file byte under ``draft/`` holds the
-    secret."""
+    """The round's link ``sub/shortcut`` points at ``<workspace>/kb-up-secret``,
+    which does not hold the secret ``../kb-up-secret``; stored relative, from
+    ``sub/``, its target is ``../kb-up-secret``, which does. The link is not kept,
+    it is recorded under its link target, and no name, link target or file byte
+    under ``draft/`` holds the secret."""
     package_root = _package(monkeypatch, tmp_path)
-    tools.register_inflight_secret(_SLASHED_SECRET)
+    tools.register_inflight_secret(_UP_SECRET)
     workspace = _workspace(tmp_path, package_root)
     copied_in = tool_drafts.tree_digest(workspace)
-    target = f"{workspace}/abcdef/./ghijkl"
-    os.symlink(target, workspace / "shortcut")
-    assert _SLASHED_SECRET not in target
-    assert tool_drafts.stored_link_target(workspace, ("shortcut",), target) == (
-        _SLASHED_SECRET,
+    (workspace / "sub").mkdir()
+    target = f"{workspace}/kb-up-secret"
+    os.symlink(target, workspace / "sub" / "shortcut")
+    assert _UP_SECRET not in target
+    assert tool_drafts.stored_link_target(workspace, ("sub", "shortcut"), target) == (
+        _UP_SECRET,
         None,
     )
 
     assert _save(package_root, workspace, copied_in).saved
 
-    assert not os.path.lexists(_files(package_root) / "shortcut")
+    assert not os.path.lexists(_files(package_root) / "sub" / "shortcut")
     assert _manifest(package_root)["attempts"][-1]["omitted"] == [
-        {"path": "shortcut", "reason": "secret_link_target"}
+        {"path": "sub/shortcut", "reason": "secret_link_target"}
     ]
     under = _all_bytes_under(_draft_dir(package_root))
-    assert not [piece for piece in under if _SLASHED_SECRET in piece]
+    assert not [piece for piece in under if _UP_SECRET in piece]
 
 
 def test_an_earlier_link_put_back_whose_target_spells_a_secret_only_as_stored_is_not_kept(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The round pointed ``x`` at a target holding the secret, so the base's ``x``
-    is put back in its place. That earlier link points at
-    ``<workspace>/abcdef/./ghijkl``: clean as written, ``abcdef/ghijkl`` -- the
-    secret -- once stored relative. Neither version of ``x`` is kept, ``x`` is
-    recorded once, and no name, link target or file byte under ``draft/`` holds
-    the secret."""
+    """The round pointed ``sub/x`` at a target holding the secret, so the base's
+    ``sub/x`` is put back in its place. That earlier link points at
+    ``<workspace>/kb-up-secret``: clean as written, ``../kb-up-secret`` -- the
+    secret -- once stored relative from ``sub/``. Neither version of ``sub/x`` is
+    kept, ``sub/x`` is recorded once, and no name, link target or file byte under
+    ``draft/`` holds the secret."""
     package_root = _package(monkeypatch, tmp_path)
-    tools.register_inflight_secret(_SLASHED_SECRET)
+    tools.register_inflight_secret(_UP_SECRET)
     workspace = tmp_path / "work" / "build"
-    earlier_target = f"{workspace}/abcdef/./ghijkl"
-    os.symlink(earlier_target, _version(package_root) / "x")
+    earlier_target = f"{workspace}/kb-up-secret"
+    (_version(package_root) / "sub").mkdir()
+    os.symlink(earlier_target, _version(package_root) / "sub" / "x")
     assert _workspace(tmp_path, package_root) == workspace
     copied_in = tool_drafts.tree_digest(workspace)
-    os.unlink(workspace / "x")
-    os.symlink(f"run-{_SLASHED_SECRET}.py", workspace / "x")
-    assert _SLASHED_SECRET not in earlier_target
+    os.unlink(workspace / "sub" / "x")
+    os.symlink(f"run-{_UP_SECRET}.py", workspace / "sub" / "x")
+    assert _UP_SECRET not in earlier_target
 
     assert _save(package_root, workspace, copied_in).saved
 
-    assert not os.path.lexists(_files(package_root) / "x")
+    assert not os.path.lexists(_files(package_root) / "sub" / "x")
     assert _manifest(package_root)["attempts"][-1]["omitted"] == [
-        {"path": "x", "reason": "secret_link_target"}
+        {"path": "sub/x", "reason": "secret_link_target"}
     ]
     under = _all_bytes_under(_draft_dir(package_root))
-    assert not [piece for piece in under if _SLASHED_SECRET in piece]
+    assert not [piece for piece in under if _UP_SECRET in piece]
 
 
 def _scan_of_the_copy(
@@ -1014,6 +1017,218 @@ def test_links_that_leave_the_workspace_are_not_kept(
         "rel_out": "link_outside",
         "through_link": "link_ambiguous",
     }
+
+
+@pytest.mark.parametrize(
+    ("x_target", "reached"),
+    [("d/sub", "d/data.txt"), (".", "../data.txt")],
+    ids=["x-into-a-subdirectory", "x-at-the-top"],
+)
+def test_an_absolute_target_going_up_from_a_link_is_not_kept_and_is_recorded_ambiguous(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, x_target: str, reached: str
+) -> None:
+    """``shortcut -> <workspace>/x/../data.txt``: the operating system follows ``x``
+    first and goes up from where it points -- to ``d/data.txt`` when
+    ``x -> d/sub``, out of the workspace when ``x -> .`` -- while the same path
+    with ``x/..`` folded away names the top's ``data.txt``, another file. Judged
+    like the same path written relative, it is not kept and is recorded as
+    ambiguous."""
+    package_root = _package(monkeypatch, tmp_path)
+    workspace = _workspace(tmp_path, package_root)
+    copied_in = tool_drafts.tree_digest(workspace)
+    (workspace / "d" / "sub").mkdir(parents=True)
+    (workspace / "d" / "data.txt").write_text("in d\n", encoding="utf-8")
+    (workspace / "data.txt").write_text("at the top\n", encoding="utf-8")
+    (tmp_path / "work" / "data.txt").write_text("outside\n", encoding="utf-8")
+    os.symlink(x_target, workspace / "x")
+    target = f"{workspace}/x/../data.txt"
+    os.symlink(target, workspace / "shortcut")
+    landed = os.path.realpath(workspace / "shortcut", strict=True)
+    assert os.path.relpath(landed, os.path.realpath(workspace)) == reached
+    for written in (target, "x/../data.txt"):
+        assert tool_drafts.stored_link_target(workspace, ("shortcut",), written) == (
+            None,
+            "link_ambiguous",
+        )
+
+    assert _save(package_root, workspace, copied_in).saved
+
+    files = _files(package_root)
+    assert not os.path.lexists(files / "shortcut")
+    assert os.readlink(files / "x") == x_target
+    assert _manifest(package_root)["attempts"][-1]["omitted"] == [
+        {"path": "shortcut", "reason": "link_ambiguous"}
+    ]
+
+
+def test_an_absolute_target_going_up_from_a_real_directory_is_stored_as_written_and_reads_the_same(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A ``..`` right after a real directory goes where the string says, so such
+    a link is kept: stored as what follows the workspace's path, every component
+    as written -- ``.``, ``..`` and an empty one too -- behind a ``..`` for each
+    directory the link is in, and the copy reads what the workspace did."""
+    package_root = _package(monkeypatch, tmp_path)
+    workspace = _workspace(tmp_path, package_root)
+    copied_in = tool_drafts.tree_digest(workspace)
+    (workspace / "d").mkdir()
+    (workspace / "links").mkdir()
+    (workspace / "data.txt").write_text("at the top\n", encoding="utf-8")
+    links = {
+        "up": (f"{workspace}/d/../data.txt", "d/../data.txt"),
+        "links/up": (f"{workspace}/./d//../data.txt", ".././d//../data.txt"),
+    }
+    for path, (target, _stored) in links.items():
+        os.symlink(target, workspace / path)
+
+    assert _save(package_root, workspace, copied_in).saved
+
+    files = _files(package_root)
+    for path, (_target, stored) in links.items():
+        assert os.readlink(files / path) == stored
+        assert (files / path).read_text(encoding="utf-8") == "at the top\n"
+        assert (workspace / path).read_text(encoding="utf-8") == "at the top\n"
+    assert _manifest(package_root)["attempts"][-1]["omitted"] == []
+
+
+def _resolved_in(root: Path, link: Path) -> str | None:
+    """Where the operating system resolves ``link``, relative to ``root``'s real
+    path -- ``..`` first when outside it -- or None when it resolves nowhere."""
+    try:
+        os.stat(link)
+        landed = os.path.realpath(link, strict=True)
+    except OSError:
+        return None
+    return os.path.relpath(landed, os.path.realpath(root))
+
+
+def _resolution_kind(where: str | None) -> str:
+    if where is None:
+        return "dangling"
+    return "outside" if where == ".." or where.startswith("../") else "inside"
+
+
+def _links_under(root: Path) -> list[str]:
+    """Every link under ``root``, as a path relative to it, never followed."""
+    found: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in dirnames + filenames:
+            path = Path(dirpath) / name
+            if path.is_symlink():
+                found.append(path.relative_to(root).as_posix())
+    return sorted(found)
+
+
+def test_listed_link_shapes_resolve_in_the_copy_as_in_the_workspace_or_are_recorded_not_kept(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every link below is resolved by the operating system in the workspace, and
+    after the save in the copy. One the system resolved inside resolves in the
+    copy to the same place, unless it is a shape the rule declines although the
+    system resolves it inside -- a ``..`` right after a link, a path that climbs
+    above the workspace and comes back, one that begins with the workspace's path
+    spelled another way -- which is not kept and is recorded under that reason.
+    One that resolved nowhere resolves nowhere in the copy either, or is recorded
+    as not kept. One that resolved outside is not in the copy and is recorded as
+    not kept. Nothing in the workspace holds a known secret, so no earlier version
+    is put back. The workspace is reached through a link, so its path as given and
+    as resolved differ, and absolute targets are written both ways."""
+    package_root = _package(monkeypatch, tmp_path)
+    _workspace(tmp_path, package_root)
+    os.symlink("work", tmp_path / "alias")
+    workspace = tmp_path / "alias" / "build"
+    copied_in = tool_drafts.tree_digest(workspace)
+    given, real = os.fspath(workspace), os.path.realpath(workspace)
+    assert given != real
+    (workspace / "d" / "sub").mkdir(parents=True)
+    (workspace / "d" / "data.txt").write_text("in d\n", encoding="utf-8")
+    (workspace / "d" / "sub" / "deep.txt").write_text("deep\n", encoding="utf-8")
+    (workspace / "data.txt").write_text("at the top\n", encoding="utf-8")
+    (workspace / "links").mkdir()
+    (tmp_path / "work" / "outside.txt").write_text("outside\n", encoding="utf-8")
+    (tmp_path / "work" / "build-other").mkdir()
+    (tmp_path / "work" / "build-other" / "data.txt").write_text("beside\n", encoding="utf-8")
+    # link: (target, where the system resolves it, why the rule declines it if it does)
+    roster: dict[str, tuple[str, str, str | None]] = {
+        # the links the others go through
+        "to_d": ("d", "inside", None),
+        "to_sub": ("d/sub", "inside", None),
+        "to_top": (".", "inside", None),
+        # relative
+        "rel": ("data.txt", "inside", None),
+        "rel_dot": ("./data.txt", "inside", None),
+        "rel_empty": ("d//data.txt", "inside", None),
+        "rel_through_dirs": ("d/sub/deep.txt", "inside", None),
+        "rel_up_from_dir": ("d/../data.txt", "inside", None),
+        "rel_through_link": ("to_d/data.txt", "inside", None),
+        "rel_up_from_link": ("to_sub/../data.txt", "inside", "link_ambiguous"),
+        "rel_up_from_top_link": ("to_top/../outside.txt", "outside", None),
+        "rel_top": (".", "inside", None),
+        "rel_out": ("../outside.txt", "outside", None),
+        "rel_out_and_back": ("../build/data.txt", "inside", "link_outside"),
+        "rel_missing": ("missing.txt", "dangling", None),
+        "rel_up_from_missing": ("missing/../data.txt", "dangling", None),
+        "rel_file_as_dir": ("data.txt/", "dangling", None),
+        "links/rel_up": ("../data.txt", "inside", None),
+        "links/rel_top": ("..", "inside", None),
+        "links/rel_out": ("../../outside.txt", "outside", None),
+        # absolute, the workspace's path as given
+        "abs": (f"{given}/data.txt", "inside", None),
+        "abs_dot": (f"{given}/./data.txt", "inside", None),
+        "abs_empty": (f"{given}//data.txt", "inside", None),
+        "abs_through_dirs": (f"{given}/d/sub/deep.txt", "inside", None),
+        "abs_up_from_dir": (f"{given}/d/../data.txt", "inside", None),
+        "abs_through_link": (f"{given}/to_d/data.txt", "inside", None),
+        "abs_up_from_link": (f"{given}/to_sub/../data.txt", "inside", "link_ambiguous"),
+        "abs_up_from_top_link": (f"{given}/to_top/../outside.txt", "outside", None),
+        "abs_top": (given, "inside", None),
+        "abs_top_slash": (f"{given}/", "inside", None),
+        "abs_missing": (f"{given}/missing.txt", "dangling", None),
+        "abs_file_as_dir": (f"{given}/data.txt/", "dangling", None),
+        "abs_out": (f"{os.path.dirname(given)}/outside.txt", "outside", None),
+        "abs_beside": (f"{given}-other/data.txt", "outside", None),
+        "abs_out_and_back": (f"{given}/../build/data.txt", "inside", "link_outside"),
+        "abs_double_slash": (f"/{given}/data.txt", "inside", "link_outside"),
+        # absolute, the workspace's path as resolved
+        "abs_resolved": (f"{real}/data.txt", "inside", None),
+        "abs_resolved_up_from_link": (f"{real}/to_sub/../data.txt", "inside", "link_ambiguous"),
+        "abs_resolved_beside": (f"{real}-other/data.txt", "outside", None),
+        # absolute, from a directory below the top
+        "links/abs": (f"{given}/data.txt", "inside", None),
+        "links/abs_empty": (f"{given}//data.txt", "inside", None),
+        "links/abs_up_from_dir": (f"{real}/d/../data.txt", "inside", None),
+        "links/abs_top": (given, "inside", None),
+        "links/abs_top_slash": (f"{real}/", "inside", None),
+        "links/abs_up_from_link": (f"{given}/to_sub/../data.txt", "inside", "link_ambiguous"),
+        "links/abs_out": (f"{real}/../outside.txt", "outside", None),
+    }
+    for path, (target, _kind, _declined) in roster.items():
+        os.symlink(target, workspace / path)
+    assert _links_under(workspace) == sorted(roster)
+    before = {path: _resolved_in(workspace, workspace / path) for path in roster}
+    for path, (_target, kind, _declined) in roster.items():
+        assert _resolution_kind(before[path]) == kind, path
+
+    assert _save(package_root, workspace, copied_in).saved
+
+    files = _files(package_root)
+    omitted = {
+        item["path"]: item["reason"] for item in _manifest(package_root)["attempts"][-1]["omitted"]
+    }
+    for path, (_target, kind, declined) in roster.items():
+        copied = files / path
+        if kind == "inside" and declined is None:
+            assert os.path.islink(copied), path
+            assert _resolved_in(files, copied) == before[path], path
+        elif kind == "dangling":
+            assert not os.path.lexists(copied) or _resolved_in(files, copied) is None, path
+        else:
+            assert not os.path.lexists(copied), path
+            assert path in omitted, path
+            if declined is not None:
+                assert omitted[path] == declined, path
+    # Recorded as not kept: exactly the listed links the copy does not have.
+    assert sorted(omitted) == sorted(set(roster) - set(_links_under(files)))
 
 
 @pytest.mark.parametrize("put_back", ["file-for-link", "link-for-link"])
