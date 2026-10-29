@@ -175,10 +175,13 @@ _DRAFT_CHANGED_MESSAGE = "草稿已經變更，請重新整理後再確認要不
 _DRAFT_NOT_FOUND_CODE = "draft_not_found"
 _DRAFT_NOT_FOUND_MESSAGE = "這個工具沒有未完成的修正"
 # A discard after which ``draft/`` is not seen gone: the draft may still be there,
-# so this is not an answer that it was discarded. ``{path}`` is ``draft/``.
+# so this is not an answer that it was discarded. ``{path}`` is ``draft/``, reached
+# through a metadata directory that may not have been seen either -- possibly a
+# link to another tool's -- so deleting it by hand is said with that check first.
 _DRAFT_NOT_REMOVED_CODE = "draft_not_removed"
 _DRAFT_NOT_REMOVED_MESSAGE = (
-    "沒能確認草稿已刪除，它可能仍在：{path}。請檢查權限與檔案系統狀態後再放棄一次，或自行刪除。"  # noqa: RUF001
+    "沒能確認草稿已刪除，它可能仍在：{path}。請檢查權限與檔案系統狀態後再放棄一次。"  # noqa: RUF001
+    "要自行刪除，先確認路徑中的 .afterthread.meta 是這個工具自己的目錄、不是連結。"  # noqa: RUF001
 )
 
 
@@ -592,8 +595,10 @@ async def discard_tool_draft(
     sweep at the end of a later install or revise retries. A ``draft/`` that is
     not seen gone afterwards -- the rename refused and the removal in place
     incomplete, or ``draft/`` that cannot be looked at -- is a 500
-    ``draft_not_removed`` naming it: the draft may still be there, so the answer
-    is not that it was discarded.
+    ``draft_not_removed`` naming it, and so is a draft that cannot be looked at
+    to begin with (``draft/`` or the metadata directory above it), which is left
+    as it is: the draft may still be there, so the answer is not that it was
+    discarded.
 
     Declared BEFORE the job poll, which must stay last (see the comment there):
     a tool may be named ``jobs``.

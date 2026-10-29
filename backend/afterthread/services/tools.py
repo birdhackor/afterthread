@@ -2210,8 +2210,7 @@ def list_tools(
     package and the resolution this same scan made. The caller hands it in
     (``tool_drafts.draft_view``, bound to the job table), because reading a draft
     needs to know which jobs are running, and that is not this module's to know.
-    ``tool_drafts.draft_view`` answers a package without ``draft/`` with one
-    ``lstat`` and reads a manifest only where there is one.
+    ``tool_drafts.draft_view`` reads a manifest only where there is one.
     """
     rows = []
     for scan in _scan_all():

@@ -583,6 +583,144 @@ def test_secrets_in_names_and_link_targets_reach_no_byte_under_the_draft(
     assert _manifest(package_root)["attempts"][-1]["omitted_count"] == 4
 
 
+# A secret a link target spells only once it is stored relative: ``./`` folded away.
+_SLASHED_SECRET = "abcdef/ghijkl"
+
+
+def test_a_link_whose_target_spells_a_secret_only_as_stored_is_not_kept(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The round's link points at ``<workspace>/abcdef/./ghijkl``, which does not
+    hold the secret ``abcdef/ghijkl``; stored relative, its target is
+    ``abcdef/ghijkl``, which does. The link is not kept, it is recorded under its
+    link target, and no name, link target or file byte under ``draft/`` holds the
+    secret."""
+    package_root = _package(monkeypatch, tmp_path)
+    tools.register_inflight_secret(_SLASHED_SECRET)
+    workspace = _workspace(tmp_path, package_root)
+    copied_in = tool_drafts.tree_digest(workspace)
+    target = f"{workspace}/abcdef/./ghijkl"
+    os.symlink(target, workspace / "shortcut")
+    assert _SLASHED_SECRET not in target
+    assert tool_drafts.stored_link_target(workspace, ("shortcut",), target) == (
+        _SLASHED_SECRET,
+        None,
+    )
+
+    assert _save(package_root, workspace, copied_in).saved
+
+    assert not os.path.lexists(_files(package_root) / "shortcut")
+    assert _manifest(package_root)["attempts"][-1]["omitted"] == [
+        {"path": "shortcut", "reason": "secret_link_target"}
+    ]
+    under = _all_bytes_under(_draft_dir(package_root))
+    assert not [piece for piece in under if _SLASHED_SECRET in piece]
+
+
+def test_an_earlier_link_put_back_whose_target_spells_a_secret_only_as_stored_is_not_kept(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The round pointed ``x`` at a target holding the secret, so the base's ``x``
+    is put back in its place. That earlier link points at
+    ``<workspace>/abcdef/./ghijkl``: clean as written, ``abcdef/ghijkl`` -- the
+    secret -- once stored relative. Neither version of ``x`` is kept, ``x`` is
+    recorded once, and no name, link target or file byte under ``draft/`` holds
+    the secret."""
+    package_root = _package(monkeypatch, tmp_path)
+    tools.register_inflight_secret(_SLASHED_SECRET)
+    workspace = tmp_path / "work" / "build"
+    earlier_target = f"{workspace}/abcdef/./ghijkl"
+    os.symlink(earlier_target, _version(package_root) / "x")
+    assert _workspace(tmp_path, package_root) == workspace
+    copied_in = tool_drafts.tree_digest(workspace)
+    os.unlink(workspace / "x")
+    os.symlink(f"run-{_SLASHED_SECRET}.py", workspace / "x")
+    assert _SLASHED_SECRET not in earlier_target
+
+    assert _save(package_root, workspace, copied_in).saved
+
+    assert not os.path.lexists(_files(package_root) / "x")
+    assert _manifest(package_root)["attempts"][-1]["omitted"] == [
+        {"path": "x", "reason": "secret_link_target"}
+    ]
+    under = _all_bytes_under(_draft_dir(package_root))
+    assert not [piece for piece in under if _SLASHED_SECRET in piece]
+
+
+def _scan_of_the_copy(
+    patch: pytest.MonkeyPatch, answer: tools.SecretScanDone | tools.SecretScanFailed
+) -> None:
+    """The embedded-secret scan answers ``answer`` for a copy being made
+    (``.incoming-<hex>``), and scans every other tree as it is."""
+    real_scan = tools.scan_embedded_secrets
+
+    def scan(root: Any, secrets: Any = None) -> tools.SecretScan:
+        if tool_drafts._INCOMING_RE.fullmatch(Path(root).name):
+            return answer
+        return real_scan(root, secrets)
+
+    patch.setattr(tools, "scan_embedded_secrets", scan)
+
+
+@pytest.mark.parametrize("round_kind", ["first", "continuing"])
+def test_a_scan_of_the_copy_that_cannot_finish_keeps_no_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, round_kind: str
+) -> None:
+    """The workspace scan finishes; the scan of the copy does not. The round's
+    files are not saved: a first round leaves no draft, a continuing one records
+    the round as not saved with its files directory unchanged, and no copy is
+    left under ``draft/``."""
+    package_root = _package(monkeypatch, tmp_path)
+    previous: tool_drafts.PreviousDraft | None = None
+    first: dict[str, Any] | None = None
+    if round_kind == "first":
+        workspace = _workspace(tmp_path, package_root)
+        copied_in = tool_drafts.tree_digest(workspace)
+    else:
+        _first_draft(tmp_path, package_root)
+        first = _manifest(package_root)
+        workspace, previous, copied_in = _continuing(tmp_path, package_root)
+    (workspace / "run.py").write_text("print('changed again')\n", encoding="utf-8")
+    failed = tool_drafts.REASON_SCAN_FAILED.format(reason="OSError")
+
+    with monkeypatch.context() as patch:
+        _scan_of_the_copy(patch, tools.SecretScanFailed("OSError"))
+        result = _save(package_root, workspace, copied_in, previous=previous)
+
+    assert (result.saved, result.reason) == (False, failed)
+    if first is None:
+        assert not tool_drafts.has_draft(package_root)
+        return
+    second = _manifest(package_root)
+    assert second["files_dir"] == first["files_dir"]
+    assert (second["attempts"][-1]["saved"], second["attempts"][-1]["reason"]) == (False, failed)
+    assert sorted(p.name for p in _draft_dir(package_root).iterdir()) == sorted(
+        [tool_drafts.MANIFEST_FILENAME, first["files_dir"]]
+    )
+
+
+def test_a_path_the_scan_of_the_copy_could_not_search_is_not_kept(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    package_root = _package(monkeypatch, tmp_path)
+    workspace = _workspace(tmp_path, package_root)
+    copied_in = tool_drafts.tree_digest(workspace)
+    (workspace / "run.py").write_text("print('changed')\n", encoding="utf-8")
+    unsearched = tools.SecretScanDone(
+        hits=(), skipped=(tools.SecretScanSkip("run.py", "unreadable"),)
+    )
+
+    with monkeypatch.context() as patch:
+        _scan_of_the_copy(patch, unsearched)
+        assert _save(package_root, workspace, copied_in).saved
+
+    assert not os.path.lexists(_files(package_root) / "run.py")
+    assert (_files(package_root) / "tool.json").is_file()
+    assert _manifest(package_root)["attempts"][-1]["omitted"] == [
+        {"path": "run.py", "reason": "unreadable"}
+    ]
+
+
 def test_a_scan_that_cannot_finish_keeps_no_files(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1293,6 +1431,73 @@ def test_a_discard_token_is_there_for_a_draft_with_no_manifest(tmp_path: Path) -
     assert tool_drafts.discard_token(draft) != token
 
 
+@pytest.mark.parametrize("manifest", ["absent", "unseen"])
+def test_a_draft_without_a_manifest_it_can_see_made_again_on_its_inode_refuses_the_old_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, manifest: str
+) -> None:
+    """A ``draft/`` whose manifest is not there, or cannot be looked at, holds
+    ``files-<a>``; it is discarded, and a ``draft/`` like it holding ``files-<b>``
+    is made where it was, with the inode the first one had -- a filesystem may
+    hand a freed inode number to the next directory. The token taken of the first
+    does not match the second, and a discard naming the first by it is refused,
+    leaving the second."""
+    package_root = _package(monkeypatch, tmp_path)
+    draft = _draft_dir(package_root)
+    if manifest == "unseen":
+        manifest_path = os.fspath(draft / tool_drafts.MANIFEST_FILENAME)
+        seeing_lstat = os.lstat
+
+        def lstat_refusing_the_manifest(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            if os.fspath(path) == manifest_path:
+                raise PermissionError(errno.EACCES, "Permission denied", manifest_path)
+            return seeing_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "lstat", lstat_refusing_the_manifest)
+    draft.mkdir()
+    (draft / ("files-" + "a" * 32)).mkdir()
+    first = os.lstat(draft)
+    old = tool_drafts.discard_token(draft)
+    removed = tool_drafts.discard(package_root, token=old)
+    assert isinstance(removed, tool_drafts.Removal) and removed.removed
+    draft.mkdir()
+    (draft / ("files-" + "b" * 32)).mkdir()
+    real_lstat = os.lstat
+
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        info = real_lstat(path, *args, **kwargs)
+        if os.fspath(path) != os.fspath(draft):
+            return info
+        return os.stat_result((info.st_mode, first.st_ino, first.st_dev, *list(info)[3:]))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "lstat", lstat)
+        assert (os.lstat(draft).st_dev, os.lstat(draft).st_ino) == (first.st_dev, first.st_ino)
+        assert tool_drafts.discard_token(draft) != old
+        assert tool_drafts.discard(package_root, token=old) == "changed"
+
+    assert (draft / ("files-" + "b" * 32)).is_dir()
+
+
+def test_a_draft_with_a_manifest_keeps_its_token_while_the_sweep_takes_its_leftovers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The sweep collects a copy the manifest does not name and a half-made one;
+    the draft the operator saw has not changed, and its token still matches."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    draft = _draft_dir(package_root)
+    _plant(draft, "files-" + "e" * 32)
+    _plant(draft, ".incoming-" + "f" * 32)
+    token = tool_drafts.discard_token(draft)
+
+    _sweep(package_root)
+
+    assert sorted(p.name for p in draft.iterdir()) == sorted(
+        [tool_drafts.MANIFEST_FILENAME, _manifest(package_root)["files_dir"]]
+    )
+    assert tool_drafts.discard_token(draft) == token
+
+
 # --- the state a listing shows --------------------------------------------------
 
 
@@ -1662,5 +1867,43 @@ def test_through_a_link_no_draft_is_listed_counted_saved_marked_taken_away_or_sw
 
     assert (_draft_dir(package_b) / ("files-" + "e" * 32)).is_dir()
     shutil.rmtree(_draft_dir(package_b) / ("files-" + "e" * 32))
+    assert tool_drafts.same_tree(before, tool_drafts.tree_digest(_draft_dir(package_b)))
+    assert _identity(package_b) == seen
+
+
+@pytest.mark.parametrize("named_by", ["draft-id", "token"])
+def test_a_discard_that_cannot_see_whether_the_metadata_directory_is_a_link_leaves_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, named_by: str
+) -> None:
+    """Tool A's ``.afterthread.meta`` is a link to tool B's, and its own ``lstat``
+    fails with EIO, so nothing shows whether it is a link. A discard of A naming
+    B's draft -- by its id or its token -- leaves B's draft exactly as it was, and
+    does not report a removal: it names A's ``draft/`` path as what may still be
+    there."""
+    package_b = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_b)
+    linked = _make_package(package_b.path.parent, name="kc")
+    shutil.rmtree(linked / tools._META_DIRNAME)
+    os.symlink(package_b.path / tools._META_DIRNAME, linked / tools._META_DIRNAME)
+    package_a = tools.PackageRoot(linked)
+    seen = _identity(package_b)
+    token = tool_drafts.discard_token(_draft_dir(package_b))
+    before = tool_drafts.tree_digest(_draft_dir(package_b))
+    unseen = os.fspath(linked / tools._META_DIRNAME)
+    real_lstat = os.lstat
+
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if os.fspath(path) == unseen:
+            raise OSError(errno.EIO, "Input/output error", unseen)
+        return real_lstat(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "lstat", lstat)
+        if named_by == "token":
+            outcome = tool_drafts.discard(package_a, token=token)
+        else:
+            outcome = tool_drafts.discard(package_a, draft_id=seen[0], generation=seen[1])
+
+    assert outcome == tool_drafts.Removal(removed=False, residual_path=_draft_dir(package_a))
     assert tool_drafts.same_tree(before, tool_drafts.tree_digest(_draft_dir(package_b)))
     assert _identity(package_b) == seen

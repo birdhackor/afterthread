@@ -41,6 +41,9 @@ What holds, and why:
   real directory, neither a link. Through a link, ``draft/`` would be another
   package's, so a package whose directory or metadata directory is a link has
   no draft of its own: none is listed, none gates a revise, none is discarded.
+  What cannot be looked at is taken as there by a read and left alone by a
+  write: such a draft is listed and gates a revise, and a discard of it removes
+  nothing and answers that it may still be there (``_seen_own_draft``).
 * TEXT. Every free-text string written into the manifest is masked against the
   secrets known at that moment, then cut to its cap, then made encodable
   (``tools._utf8_safe``): a file name read from disk can carry lone surrogates,
@@ -51,11 +54,20 @@ What holds, and why:
   encodable again, since a hand edit bypasses the writer, and what goes to the
   API is masked once more: a secret registered after the write must not come
   back unmasked.
-* SECRETS. The workspace is scanned with the full embedded-secret scanner before
-  anything is copied. A path whose name holds a known secret is not kept; one
-  whose content or link target does keeps the version the round started from, if
-  that version is clean -- a link, if it also passes LINKS on the copy -- and is
-  not kept at all otherwise. A scan that cannot finish keeps no files. Content is
+* SECRETS. The embedded-secret scanner (``tools.scan_embedded_secrets``) runs on
+  two trees, with the secrets known when the save starts. On the workspace,
+  before anything is copied, it decides what is copied: a path whose name holds
+  a secret is not; one whose content or link target does is replaced by its
+  earlier version -- the one the round started from -- when that is a regular
+  file, or a link LINKS keeps. On the copy, once every entry is in it and its
+  links are judged, before it is made durable, it decides what is kept: every
+  path whose content, name or stored link target holds a secret, or that it
+  could not search, is removed and recorded as not kept. The second scan is
+  what keeps known secrets out of the files the draft keeps, because the copy
+  is not the workspace: an earlier version is put back without being scanned,
+  and an absolute link target inside the workspace is stored relative, with
+  ``.`` and ``..`` folded away, which can spell a secret the target as written
+  did not. A scan of either tree that cannot finish keeps no files. Content is
   never rewritten with redaction markers, which could break the program.
 * LINKS. A link is kept only when its target, resolved as a string from the
   link's own directory, stays inside the tree, and no ``..`` in it follows a
@@ -308,10 +320,12 @@ def _own_meta(package_root: tools.PackageRoot) -> Path | Literal["unseen"] | Non
     following a link, and both must be real directories: through a link,
     ``draft/`` would be another package's. None when either is missing, a link or
     not a directory -- the package then has no draft of its own; ``_UNSEEN`` when
-    either cannot be looked at for another reason. ``has_draft``, ``draft_view``
-    and ``discard`` take that as a ``draft/`` they cannot look at (``_own_draft``),
-    as they take one whose own ``lstat`` fails; a save, the marks around a
-    publish and the sweep write nothing.
+    either cannot be looked at for another reason, which leaves open whether it
+    is a link. What cannot be seen is taken one way by a read and the other way
+    by a write: a read takes it as a draft that is there (``_own_draft``, behind
+    ``has_draft`` and ``draft_view``); a write, a discard included, does nothing
+    to it (``_seen_own_draft``; a save and the sweep go on only with a real
+    directory).
 
     What it does not cover: either directory replaced by a link between this look
     and the caller's use of the path, which only a hand edit does.
@@ -330,11 +344,12 @@ def _own_meta(package_root: tools.PackageRoot) -> Path | Literal["unseen"] | Non
 
 
 def _own_draft(package_root: tools.PackageRoot) -> tuple[Path, os.stat_result | None] | None:
-    """The package's own ``draft/`` and its ``lstat``, or None when it has none.
+    """The package's own ``draft/`` as a read sees it, and its ``lstat``; None when it has none.
 
     Reached through ``_own_meta``. The ``lstat`` is None when ``draft/``, or a
-    directory above it, cannot be looked at: such a draft is there as far as
-    anyone can tell (``has_draft``).
+    directory above it, cannot be looked at: for a read, such a draft is there
+    (``has_draft``). Not for a write, which leaves what it cannot see alone
+    (``_seen_own_draft``).
     """
     meta = _own_meta(package_root)
     if meta is None:
@@ -350,6 +365,27 @@ def _own_draft(package_root: tools.PackageRoot) -> tuple[Path, os.stat_result | 
         return draft_dir, None
 
 
+def _seen_own_draft(package_root: tools.PackageRoot) -> tuple[Path, os.stat_result] | None:
+    """The package's own ``draft/`` and its ``lstat``, for a write; None unless both are seen.
+
+    How the marks around a publish, the removal after one and a discard reach
+    the draft they act on (``_locked_in_package``, ``discard``): ``_own_meta``
+    must give a real directory, and the ``lstat`` of ``draft/`` must succeed.
+    Whatever cannot be looked at is left alone: a metadata directory that cannot
+    may be a link to another package's, and a ``draft/`` that cannot is not known
+    to be there. A save and the sweep make their own demands of what they reach
+    (``_save_locked``, ``sweep_package``).
+    """
+    meta = _own_meta(package_root)
+    if not isinstance(meta, Path):
+        return None
+    draft_dir = meta / DRAFT_DIRNAME
+    try:
+        return draft_dir, os.lstat(draft_dir)
+    except OSError:
+        return None
+
+
 def has_draft(package_root: tools.PackageRoot) -> bool:
     """Whether the package has a draft: ``draft/`` exists, whatever its state.
 
@@ -357,8 +393,11 @@ def has_draft(package_root: tools.PackageRoot) -> bool:
     directory is a link has none. A ``draft/`` without a readable manifest still
     counts. Treated as no draft, the next save would write a manifest beside it
     and the sweep would then take the complete ``files-*`` a crash left there for
-    an orphan. An entry that cannot be looked at counts as present too: the
-    answer gates a new revise, and an operator who sees a draft can discard it.
+    an orphan. It is a read, so what cannot be looked at counts as present: the
+    answer gates a new revise, which must not start beside a draft that may be
+    there. A write takes the same draft the other way: a discard of it, for one,
+    removes nothing and answers that the draft may still be there
+    (``_seen_own_draft``).
     """
     return _own_draft(package_root) is not None
 
@@ -759,22 +798,50 @@ def _entry_identity(path: Path, *, with_change: bool) -> list[Any]:
     return identity
 
 
+def _entries_identity(draft_dir: Path) -> list[Any]:
+    """The names of ``draft/``'s own entries, sorted, each with its ``_entry_identity``."""
+    try:
+        with os.scandir(draft_dir) as listing:
+            names = sorted(entry.name for entry in listing)
+    except OSError as exc:
+        return ["error", exc.errno]
+    return [[name, *_entry_identity(draft_dir / name, with_change=False)] for name in names]
+
+
 def discard_token(draft_dir: Path) -> str:
     """The opaque value that stands for this draft as it is now, for a discard.
 
     Taken from what ``lstat`` says of ``draft/`` and of its manifest, so it exists
     whatever the manifest holds -- unreadable, out of shape, missing, not a file.
-    Every rewrite of the manifest replaces it with a new file (a new inode and
-    ctime), and a draft made again after a discard is a new directory, so a token
-    taken earlier no longer matches either. The manifest's ctime is what carries
-    that: a filesystem may hand a freed inode number to the next file. The
-    directory's own times are left out, because a sweep or a save in progress
-    changes them without changing the draft.
+
+    With a manifest, the manifest's inode, ctime and size carry it: every rewrite
+    of the manifest replaces it with a new file, and a draft made again after a
+    discard writes a new one, so a token taken earlier no longer matches. The
+    ctime is what carries that where a filesystem hands a freed inode number to
+    the next file.
+
+    Without one -- no entry by that name, or one that cannot be looked at -- the
+    names and identities of ``draft/``'s own entries carry it too, when they can
+    be listed. Short of removing the draft, the only backend write that changes
+    them while there is no manifest is the first round making that ``draft/``,
+    which ends by writing one or by taking back what it made, unless the process
+    stops first; a discard never runs beside it (the caller holds the slot). A
+    later first round refuses a ``draft/`` that exists, and a continuation, the
+    marks around a publish and the sweep each need a manifest they can read. A
+    save names what it leaves in ``draft/`` at random (``files-<hex>``,
+    ``.incoming-<hex>``), so a ``draft/`` made again with anything in it does not
+    match, even in a directory with the old inode number. What it does not
+    cover: an empty ``draft/`` made again with the old inode number matches; it
+    holds nothing.
+
+    With a manifest the entries are left out, and the directory's own times
+    always are: the sweep and a save in progress change them without changing
+    the draft.
     """
-    identity = [
-        _entry_identity(draft_dir, with_change=False),
-        _entry_identity(draft_dir / MANIFEST_FILENAME, with_change=True),
-    ]
+    manifest = _entry_identity(draft_dir / MANIFEST_FILENAME, with_change=True)
+    identity = [_entry_identity(draft_dir, with_change=False), manifest]
+    if manifest[0] in ("absent", "error"):
+        identity.append(_entries_identity(draft_dir))
     return hashlib.sha256(json.dumps(identity).encode("ascii")).hexdigest()
 
 
@@ -978,8 +1045,6 @@ class _CopyPlan:
     files: list[tuple[str, Path]] = field(default_factory=list)
     # (relative path, target to store).
     links: list[tuple[str, str]] = field(default_factory=list)
-    # Relative paths whose bytes come from the earlier version: checked again once copied.
-    earlier: list[str] = field(default_factory=list)
     omitted: list[Omitted] = field(default_factory=list)
 
 
@@ -1002,14 +1067,15 @@ def _keep_earlier(
     relative: str,
     parts: tuple[str, ...],
     reason: str,
-    known: list[str],
 ) -> None:
     """Plan the earlier version of a path whose own content or target holds a secret.
 
     The path is recorded as not kept either way: this round's version of it is
-    not in the draft, whether the earlier one takes its place or nothing does. An
-    earlier link is judged here on the workspace and, like every link, again on
-    the copy (``_carry_out``), where what it now stands beside can differ.
+    not in the draft, whether the earlier one takes its place or nothing does.
+    Only a regular file or a link is put back; a link only if the link rule keeps
+    it on the workspace, and, like every link, it is judged again on the copy.
+    Whether the earlier version holds a secret itself is not looked at here: the
+    scan of the copy (``_carry_out``) decides that, on what was copied.
     """
     plan.omitted.append(Omitted(relative, reason))
     source = _earlier_entry(base_root, parts)
@@ -1017,32 +1083,30 @@ def _keep_earlier(
         info = os.lstat(source) if source is not None else None
     except OSError:
         info = None
-    if source is not None and info is not None:
-        if stat.S_ISREG(info.st_mode):
-            plan.files.append((relative, source))
-            plan.earlier.append(relative)
+    if source is None or info is None:
+        return
+    if stat.S_ISREG(info.st_mode):
+        plan.files.append((relative, source))
+    elif stat.S_ISLNK(info.st_mode):
+        try:
+            target = os.readlink(source)
+        except OSError:
             return
-        if stat.S_ISLNK(info.st_mode):
-            try:
-                target = os.readlink(source)
-            except OSError:
-                target = None
-            if target is not None and not any(secret in target for secret in known):
-                stored, _why = stored_link_target(workspace, parts, target)
-                if stored is not None:
-                    plan.links.append((relative, stored))
+        stored, _why = stored_link_target(workspace, parts, target)
+        if stored is not None:
+            plan.links.append((relative, stored))
 
 
 def _plan_copy(
     workspace: Path,
     scan: tools.SecretScanDone,
     base_root: Path | None,
-    known: list[str],
     max_entries: int,
     max_bytes: int,
 ) -> _CopyPlan:
-    """Decide, entry by entry, what the draft keeps of the workspace.
+    """Decide, entry by entry, what the copy takes of the workspace.
 
+    What the copy then keeps of it is decided on the copy (``_carry_out``).
     Raises ``OSError`` when the workspace cannot be walked.
     """
     named = {hit.path for hit in scan.hits if hit.kind == "name"}
@@ -1067,9 +1131,7 @@ def _plan_copy(
                 if relative in skipped:
                     plan.omitted.append(Omitted(relative, "unreadable"))
                 elif relative in in_target:
-                    _keep_earlier(
-                        plan, workspace, base_root, relative, here, "secret_link_target", known
-                    )
+                    _keep_earlier(plan, workspace, base_root, relative, here, "secret_link_target")
                 else:
                     stored, why = stored_link_target(workspace, here, os.readlink(entry.path))
                     if stored is None:
@@ -1083,9 +1145,7 @@ def _plan_copy(
                 if relative in skipped:
                     plan.omitted.append(Omitted(relative, skipped[relative]))
                 elif relative in in_content:
-                    _keep_earlier(
-                        plan, workspace, base_root, relative, here, "secret_content", known
-                    )
+                    _keep_earlier(plan, workspace, base_root, relative, here, "secret_content")
                 else:
                     plan.files.append((relative, Path(entry.path)))
             else:
@@ -1094,8 +1154,8 @@ def _plan_copy(
     return plan
 
 
-class _OverLimit(Exception):
-    """Raised while a copy is made, once it would hold more than its limits allow."""
+class _CopyNotKept(Exception):
+    """Raised while a copy is made, once it cannot be kept: ``reason`` is why, for the round."""
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -1117,12 +1177,12 @@ class _Budget:
     def add_entry(self) -> None:
         self.entries -= 1
         if self.entries < 0:
-            raise _OverLimit(REASON_TOO_MANY_FILES)
+            raise _CopyNotKept(REASON_TOO_MANY_FILES)
 
     def add_bytes(self, length: int) -> None:
         self.data -= length
         if self.data < 0:
-            raise _OverLimit(REASON_TOO_LARGE)
+            raise _CopyNotKept(REASON_TOO_LARGE)
 
 
 def _copy_regular(source: Path, destination: Path, budget: _Budget) -> None:
@@ -1133,7 +1193,7 @@ def _copy_regular(source: Path, destination: Path, budget: _Budget) -> None:
     sticky bits are dropped; the owner keeps read and write, so a later copy or
     removal of the draft is never refused by its own files. Every chunk is taken
     from ``budget`` before it is written, so the copy stops at the chunk that
-    would take it past the budget (``_OverLimit``).
+    would take it past the budget (``_CopyNotKept``).
     """
     fd = os.open(source, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     try:
@@ -1177,18 +1237,66 @@ def _links_failing_on(root: Path) -> list[Omitted]:
     return failing
 
 
+# What the copy records a path as when the embedded-secret scan finds a secret in it.
+_HIT_REASONS: dict[tools.SecretHitKind, OmitReason] = {
+    "content": "secret_content",
+    "name": "secret_name",
+    "link_target": "secret_link_target",
+}
+
+
+def _within(relative: str, removed: set[str]) -> bool:
+    """Whether ``relative`` is one of ``removed`` or lies under one of them."""
+    parts = relative.split("/")
+    return any("/".join(parts[:end]) in removed for end in range(1, len(parts) + 1))
+
+
+def _remove_secrets(root: Path, known: list[str]) -> list[Omitted]:
+    """Scan the copy under ``root`` as it was written, and remove what the scan does not clear.
+
+    ``tools.scan_embedded_secrets`` with ``known``: every path whose content,
+    name or link target holds one of them, or that the scan could not search, is
+    removed -- a directory with everything under it -- and returned as not kept,
+    once, under the first reason the scan gives for it. Raises ``_CopyNotKept``
+    when the scan cannot finish, ``OSError`` when a path cannot be removed.
+    """
+    scan = tools.scan_embedded_secrets(root, known)
+    if isinstance(scan, tools.SecretScanFailed):
+        raise _CopyNotKept(REASON_SCAN_FAILED.format(reason=scan.reason))
+    found = [Omitted(hit.path, _HIT_REASONS[hit.kind]) for hit in scan.hits]
+    found += [Omitted(skip.path, skip.reason) for skip in scan.skipped]
+    removed: list[Omitted] = []
+    gone: set[str] = set()
+    # A stable sort: a path keeps its reasons in the order the scan gave them.
+    for item in sorted(found, key=lambda item: item.path):
+        if _within(item.path, gone):
+            continue
+        path = root / item.path
+        if stat.S_ISDIR(os.lstat(path).st_mode):
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+        gone.add(item.path)
+        removed.append(item)
+    return removed
+
+
 def _carry_out(plan: _CopyPlan, incoming: Path, known: list[str]) -> list[Omitted]:
     """Build the copy under ``incoming`` (which exists); returns what was not kept.
 
     Every entry and every byte of it is counted against the plan's limits as it
     is made (``_Budget``): the check before the scan measured the workspace
-    alone. Once every link is in place, every link of the copy is judged again on
-    the copy (``_links_failing_on``) and those that fail are removed: the copy
-    differs from the workspace wherever an earlier version was put back -- a link
-    where the round left a regular file, a link with another target -- and the
-    link rule holds only on the tree it was applied to. A path already recorded
-    as not kept is not recorded twice. Raises ``_OverLimit`` once the copy would
-    hold more than the limits allow, ``OSError`` when it cannot be made.
+    alone. The copy is not the workspace -- an earlier version was put back in
+    some paths without being scanned, and an absolute link target inside the
+    workspace is stored rewritten, relative -- so once every entry is in place,
+    what was judged on the workspace is judged again on the copy: every link by
+    the link rule (``_links_failing_on``), all judged before any that fails is
+    removed, since the rule holds only on the tree it was applied to; then the
+    whole copy by the embedded-secret scan with ``known``, the secrets the save
+    started with (``_remove_secrets``). What either removes is recorded as not
+    kept, a path already recorded only once. Raises ``_CopyNotKept`` once the
+    copy would hold more than the limits allow or its scan cannot finish,
+    ``OSError`` when it cannot be made.
     """
     budget = _Budget(entries=plan.max_entries, data=plan.max_bytes)
     for relative, _mode in plan.directories:
@@ -1197,14 +1305,6 @@ def _carry_out(plan: _CopyPlan, incoming: Path, known: list[str]) -> list[Omitte
     for relative, source in plan.files:
         budget.add_entry()
         _copy_regular(source, incoming / relative, budget)
-    overlap = max((len(secret) for secret in known), default=1) - 1
-    for relative in plan.earlier:
-        # The earlier version is read from where the operator may edit it, so it
-        # is checked as copied, in this directory nothing else writes to. The
-        # path is already recorded as not kept (``_keep_earlier``).
-        copied = incoming / relative
-        if tools._search_file(os.fspath(copied), known, overlap) is not False:
-            copied.unlink()
     for relative, target in plan.links:
         budget.add_entry()
         os.symlink(target, incoming / relative)
@@ -1212,13 +1312,19 @@ def _carry_out(plan: _CopyPlan, incoming: Path, known: list[str]) -> list[Omitte
     failing = _links_failing_on(incoming)
     for item in failing:
         os.unlink(incoming / item.path)
-    recorded = {item.path for item in plan.omitted}
-    omitted = [*plan.omitted, *(item for item in failing if item.path not in recorded)]
-    omitted.sort(key=lambda item: item.path)
-    # Last, so a directory that refuses writes still received its entries. The
-    # owner keeps full access for the same reason the files keep read and write.
+    # Each directory takes its workspace mode, the owner keeping full access for
+    # the same reason the files keep read and write: neither the removals below
+    # nor a later removal of the draft is refused by a directory of its own.
     for relative, mode in reversed(plan.directories):
         os.chmod(incoming / relative, mode | 0o700)
+    holding = _remove_secrets(incoming, known)
+    omitted = list(plan.omitted)
+    recorded = {item.path for item in omitted}
+    for item in (*failing, *holding):
+        if item.path not in recorded:
+            recorded.add(item.path)
+            omitted.append(item)
+    omitted.sort(key=lambda item: item.path)
     return omitted
 
 
@@ -1277,10 +1383,12 @@ def save_round(
 
     The order is fixed: worth saving (a first round with no change and no notes
     keeps nothing; a continuation with no change records the round only), the
-    size limits on the workspace, the links, the secret scan; then, under the
-    shared tools lock and only in the same package, the copy to
-    ``.incoming-<hex>`` -- counted against the same limits as it is made, the
-    earlier versions put back included -- made durable and renamed to
+    size limits on the workspace, the secret scan of the workspace, the plan of
+    the copy, which judges its links on the workspace; then, under the shared
+    tools lock and only in the same package, the copy to ``.incoming-<hex>``
+    -- counted against the same limits as it is made, the earlier versions put
+    back included, then its links judged again and the whole of it scanned
+    again, on the copy itself (``_carry_out``) -- made durable and renamed to
     ``files-<hex>``, the manifest, and the removal of the previous files
     directory. A first round that fails removes what it made, an empty
     ``draft/`` included; a continuation that fails still records the round, its
@@ -1344,7 +1452,7 @@ def _save_round(
             reason = REASON_SCAN_FAILED.format(reason=scan.reason)
         else:
             try:
-                plan = _plan_copy(workspace, scan, earlier_root, known, max_files, max_bytes)
+                plan = _plan_copy(workspace, scan, earlier_root, max_files, max_bytes)
             except OSError:
                 reason = REASON_UNREADABLE
     if previous is None and reason is not None:
@@ -1508,8 +1616,8 @@ def _copy_and_commit(
         return None, REASON_COPY.format(kind=type(exc).__name__)
     try:
         omitted = _carry_out(plan, incoming, known)
-    except _OverLimit as over:
-        return incoming, over.reason
+    except _CopyNotKept as refused:
+        return incoming, refused.reason
     except OSError as exc:
         return incoming, REASON_COPY.format(kind=type(exc).__name__)
     with contextlib.suppress(OSError):
@@ -1594,8 +1702,8 @@ def _locked_in_package(
     """Run ``act(draft_dir)`` under the shared tools lock in the round's own package.
 
     None, without running it, when the lock cannot be had, the package is no
-    longer the one the round began in, or it has no ``draft/`` of its own that
-    can be looked at (``_own_draft``).
+    longer the one the round began in, or it has no ``draft/`` of its own that is
+    seen (``_seen_own_draft``).
     """
     try:
         lock = tools.acquire_shared_tools_lock()
@@ -1606,8 +1714,8 @@ def _locked_in_package(
     try:
         if not _still_the_package(package_root, package_dir_identity):
             return None
-        found = _own_draft(package_root)
-        if found is None or found[1] is None:
+        found = _seen_own_draft(package_root)
+        if found is None:
             return None
         return act(found[0])
     finally:
@@ -1726,9 +1834,11 @@ def _take_away(draft_dir: Path) -> Path | None:
 class Removal:
     """A draft taken away, or not: ``removed`` once ``draft/`` is seen gone, and what is left.
 
-    ``removed`` False with ``draft/`` itself as ``residual_path``: the removal ran
-    and ``draft/`` is not seen gone, so the draft may still be there. False with
-    no ``residual_path``: nothing was taken away.
+    ``removed`` False with ``draft/`` itself as ``residual_path``: ``draft/`` is
+    not seen gone, so the draft may still be there -- the removal ran and
+    ``draft/`` is still there or cannot be looked at, or a discard could not look
+    at it and left it as it was. False with no ``residual_path``: nothing was
+    taken away.
     """
 
     removed: bool
@@ -1784,10 +1894,14 @@ def discard(
     away. The draft is compared by ``(draft_id, generation)`` or by ``token``
     (``discard_token``, which every draft has, whatever its manifest holds); a
     mismatch is ``changed``. Any state can be discarded, but only the package's
-    own draft (``_own_draft``): through a link to another package's metadata
-    there is nothing to discard. ``Removal.removed`` only once ``draft/`` is seen
-    gone (``_seen_gone``); one that cannot be looked at afterwards is not removed,
-    and is what is left.
+    own draft, and only once it is seen (``_seen_own_draft``). Through a link --
+    the package directory or its metadata directory being one -- or where
+    ``draft/`` is seen not to exist, there is nothing to discard (``not_found``).
+    A draft that cannot be looked at, or whose package or metadata directory
+    cannot, is left as it is and answered as not removed, with ``draft/`` as what
+    is left: it may still be there. ``Removal.removed`` only once ``draft/`` is
+    seen gone (``_seen_gone``); one that cannot be looked at afterwards is not
+    removed either.
 
     Raises ``tools.ToolsLockUnavailableError`` when the lock path is unusable.
     """
@@ -1795,10 +1909,11 @@ def discard(
     if lock is None:
         return "not_found"
     try:
-        if not _is_real_dir(package_root.path):
-            return "not_found"
-        found = _own_draft(package_root)
+        found = _seen_own_draft(package_root)
         if found is None:
+            # Nothing to act on. Asked as a read asks it: may a draft be there?
+            if has_draft(package_root):
+                return Removal(False, draft_path(package_root))
             return "not_found"
         draft_dir, _info = found
         if token is not None:
