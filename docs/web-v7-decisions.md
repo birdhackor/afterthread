@@ -48,13 +48,24 @@ openai SDK（2.45.0）對單一請求的逾時擲 `openai.APITimeoutError`。它
 `stop_and_wait` 先設訊號、再等 task。`_communicate_bounded` 在輪詢時看到訊號，就用它既有、在鎖下的
 拆除流程殺掉並回收；訊號設下之後才要啟動的指令不啟動。
 
-「結束」只認 worker 自己的返回：uvicorn 關閉時 `asyncio.run` 會取消所有 task，被取消的 command task
-看起來已完成，它等待的 threadpool worker 卻還在跑，所以不能用 task 的狀態判定。
+「已停止」只有一個定義：指令的 process group 已殺、leader 已回收（`_communicate_bounded` 的拆除完成），
+或它根本沒有啟動子行程。以下三種替代訊號都試過，也都被推翻：
+- asyncio task 的狀態：uvicorn 關閉時 `asyncio.run` 會取消所有 task，被取消的 command task 看起來已完成，
+  它等待的 threadpool worker 卻還在跑；
+- worker 返回：它可能在啟動子行程之後、拆除之前就被例外打斷，例如讀取執行緒啟動失敗；
+- 時間到：只能說「等不到」，不能說「已停止」。
 
 等待上限是 `tool_install_shell_timeout_seconds` 加上 `_REAP_TIMEOUT_SECONDS`。超過時不剝除、不發布，
 也不清理這一場的暫存目錄：它原地保留，job 失敗並在訊息裡附上路徑；名額照放。這是 DC 在「無法確認
 停止」時的例外。等不到返回的情況只剩 kernel 回收不了的 leader，或被卡住的執行緒（例如已啟動子行程、
 卻在第一次輪詢前停住）。為此把名額扣到重啟，代價大於留下一個只在自己暫存目錄裡跑的殘留指令，
 它碰不到下一個 job 的暫存目錄。
+這個出口不得再等待可能被卡住的資源：worker 回不來的原因之一，就是共用的 threadpool 被佔滿。
 
 不變量 DC 不變。設計 §3.3 第 1 步已照此更新。
+
+## D53（P2）：後端產生的路徑不遮蔽
+
+回報給操作者的暫存目錄、草稿目錄等路徑，只由設定的工具目錄、固定名稱與隨機 id 組成，不含操作者或檔案提供的文字。
+它們不經秘密遮蔽：操作者要原樣複製它們；而遮蔽要掃描工具目錄，必須在 worker 上做。在「無法確認停止」的出口，
+worker 可能正是卡住的資源。
