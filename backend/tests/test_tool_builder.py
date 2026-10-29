@@ -7661,6 +7661,24 @@ def test_revise_result_masks_a_note_before_cutting_it(
     assert len(kept) <= cap
 
 
+@pytest.mark.parametrize(
+    ("field", "cap"),
+    [
+        ("summary", tool_builder._SUMMARY_CAP),
+        ("handoff", tool_builder._HANDOFF_CAP),
+        ("operator_action", tool_builder._OPERATOR_ACTION_CAP),
+    ],
+)
+def test_revise_result_cuts_each_field_at_its_own_cap(field: str, cap: int) -> None:
+    """The result model's mask-then-cap cuts each field at that field's own cap,
+    never at another field's."""
+    result = tool_builder.ReviseResult.model_validate(
+        {"tool_name": "kbsearch", "ready": False, field: "z" * (cap + 100)}
+    )
+
+    assert getattr(result, field) == "z" * cap
+
+
 @pytest.mark.parametrize("field", ["handoff", "operator_action"])
 def test_revise_result_masks_a_note_before_stripping_it(
     monkeypatch: pytest.MonkeyPatch, field: str
@@ -8090,6 +8108,109 @@ def test_run_revise_env_strip_refusal_still_carries_what_the_model_said_masked_o
         assert carried[field_name] == raw.replace(_NOTE_SECRET, tools._REDACTION_MARKER), field_name
         assert masked_on.get(raw), field_name
         assert loop_thread not in masked_on[raw], field_name
+
+
+# A secret exactly at the redactor's floor: the shortest value it masks, so the one
+# whose marker lengthens a text the most.
+_SHORT_SECRET = "Zq7xK2"
+
+
+def _filled_with_secret(cap: int) -> str:
+    """Exactly ``cap`` characters of ``_SHORT_SECRET`` over and over, one comma
+    between each two: back-to-back occurrences would be masked as one run, by a
+    single marker, and the text would shrink instead."""
+    unit = _SHORT_SECRET + ","
+    return (unit * (cap // len(unit) + 1))[:cap]
+
+
+def _masked_stripped_cut(text: str, cap: int) -> str:
+    """What a field must read after a mask that knows ``_SHORT_SECRET``: masked,
+    then stripped, then cut to ``cap`` -- spelled out with the masking primitive,
+    not with the function under test."""
+    return tools._mask_known_secrets(text, [_SHORT_SECRET]).strip()[:cap]
+
+
+def _fake_session_that_learns_a_secret(
+    monkeypatch: pytest.MonkeyPatch, raw: dict[str, Any]
+) -> dict[str, Any]:
+    """Stand in for the builder session: the model's reply goes through the result
+    model -- its FIRST mask -- while no secret is known, and only then does
+    ``_SHORT_SECRET`` become known, the way a value written into some tool's
+    ``.env`` during the session would. So whatever the outcome shows is its
+    SECOND mask. Returns the fields as the first mask left them."""
+    known: set[str] = set()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset(known))
+    first_pass: dict[str, Any] = {}
+
+    async def fake(
+        system_prompt: str, user_prompt: str, model_cls: type[BaseModel], **kwargs: Any
+    ) -> BaseModel:
+        result = model_cls.model_validate(raw)
+        first_pass.update(result.model_dump())
+        known.add(_SHORT_SECRET)
+        return result
+
+    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", fake)
+    _fake_summary_generate(monkeypatch)
+    return first_pass
+
+
+def test_run_revise_caps_each_field_again_after_its_second_mask(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A secret that becomes known between the two masks makes the second one
+    lengthen the text. The summary and both notes, each sent at its cap and full of
+    that secret, come out masked, stripped and cut to their OWN caps again -- so
+    each stays within its cap."""
+    _seed_package(monkeypatch, tmp_path)
+    caps = {
+        "summary": tool_builder._SUMMARY_CAP,
+        "handoff": tool_builder._HANDOFF_CAP,
+        "operator_action": tool_builder._OPERATOR_ACTION_CAP,
+    }
+    sent = {field: _filled_with_secret(cap) for field, cap in caps.items()}
+    first_pass = _fake_session_that_learns_a_secret(
+        monkeypatch, {"tool_name": "kbsearch", "ready": False, **sent}
+    )
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    # The first mask knew no secret: each field came through it whole, at its cap.
+    assert {field: first_pass[field] for field in caps} == sent
+    assert outcome.not_ready is True
+    carried = {
+        "summary": outcome.summary,
+        "handoff": outcome.handoff,
+        "operator_action": outcome.operator_action,
+    }
+    for field, cap in caps.items():
+        value = carried[field]
+        assert value == _masked_stripped_cut(sent[field], cap), field
+        assert value is not None and len(value) <= cap, field
+        assert tools._REDACTION_MARKER in value, field
+
+
+def test_run_install_caps_the_summary_again_after_its_second_mask(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The install's summary takes the same second mask-then-cap when the outcome
+    is built: sent at its cap and full of a secret that became known after the
+    first mask, it comes out masked, stripped and cut to its cap again."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    sent = _filled_with_secret(tool_builder._SUMMARY_CAP)
+    first_pass = _fake_session_that_learns_a_secret(
+        monkeypatch, {"tool_name": "kbsearch", "summary": sent, "ready": False}
+    )
+    _no_fetch(monkeypatch)
+
+    outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build a search tool"))
+
+    assert first_pass["summary"] == sent  # the first mask knew no secret
+    assert outcome.not_ready is True
+    summary = outcome.summary
+    assert summary == _masked_stripped_cut(sent, tool_builder._SUMMARY_CAP)
+    assert summary is not None and len(summary) <= tool_builder._SUMMARY_CAP
+    assert tools._REDACTION_MARKER in summary
 
 
 def test_the_revise_job_reports_the_measured_stop_and_the_notes(

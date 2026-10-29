@@ -234,8 +234,10 @@ LLM。這道檢查在**送出時**先跑一次（不過就回 `409 env_policy`�
 的文字帶「已截斷」標記、參數不完整時照實說無法原樣重現而不要猜。
 
 修訂的結構化回答是 `ReviseResult`：`InstallResult` 加上 `handoff`（至多 4000 字）與
-`operator_action`（至多 1000 字），兩者和 summary 一樣先遮蔽、再 strip、再截斷，結果建構時
-在 worker 上再遮一次。它們只用來顯示與交接，後端不讀它們做任何判斷；安裝仍是 `InstallResult`。
+`operator_action`（至多 1000 字），兩者和 summary 一樣先遮蔽、再 strip、再截斷；結果建構時
+在 worker 上用同一個函式再做一次，所以期間新登記的秘密讓文字變長，也仍在各自的上限內（上限以字元
+計，不是位元組）。兩則筆記只用來顯示與交接，後端不讀它們做任何判斷；安裝仍是 `InstallResult`，
+它的 summary 在結果建構時也經同一個函式再做一次。
 這一場怎麼結束由後端自己量（`llm.StructuredRunStats`）：job 帶 `stopped_by`（`rounds`／
 `conversation`）、`failure`、`rounds_used`、`max_rounds`，LLM 呼叫失敗時也照樣帶出（欄位意義見
 `backend/README.md` 的 job 輪詢說明）。工具頁的修訂卡片不論發布與否，有 `operator_action` 就顯示

@@ -675,6 +675,31 @@ def _revise_system_prompt(name: str) -> str:
     )
 
 
+def _masked_and_capped(text: str, cap: int) -> str:
+    """``text`` with every secret known NOW masked, then stripped, then cut to ``cap``.
+
+    The one definition of that order for the model-authored fields whose contract
+    is a length cap after masking: the summary (``_SUMMARY_CAP``), the handoff
+    (``_HANDOFF_CAP``) and operator_action (``_OPERATOR_ACTION_CAP``). Both
+    maskings of these fields in this module go through it -- the first when the
+    result model validates the model's reply, the second when ``run_install`` or
+    ``run_revise`` builds the outcome. Mask while the text is whole, so a secret
+    straddling the cap is masked rather than cut into an interior fragment no
+    later mask can match; strip after the mask, so a registered value with edge
+    whitespace still matches; cut last, so a mask that lengthens the text -- the
+    marker is longer than a short secret, and a secret registered between the two
+    maskings is masked by the second alone -- cannot carry it past the cap.
+
+    What the cap guarantees: at most ``cap`` characters (code points, not encoded
+    bytes) after each call. What it does not cover: a secret registered after the
+    last call stays unmasked; the cut can leave part of a marker at the end; and a
+    masking that does not go through here has no cap -- the rename refusal's mask
+    of an attempted name, and ``tool_name`` itself, which is cut but never masked,
+    are not among these fields.
+    """
+    return tools.redact_known_secrets(text).strip()[:cap]
+
+
 def _install_result_fields(data: Any) -> dict[str, Any]:
     """``InstallResult``'s three fields, sanitized from the model's raw object.
 
@@ -685,26 +710,15 @@ def _install_result_fields(data: Any) -> dict[str, Any]:
     """
     if not isinstance(data, dict):
         raise ValueError("expected a JSON object")
-    # F1/D36: redact known secret values out of the summary BEFORE the 2000-char
-    # slice (redact->cap, the same order the whole pipeline uses). A secret
-    # straddling the slice edge must be masked while the summary is still WHOLE, or
-    # the cut would leave an unmatchable prefix fragment -- an INTERIOR fragment the
-    # trailing-fragment guard cannot catch. The in-flight install secret is
-    # registered for the whole build (run_install), so it is redactable here inside
-    # generate_structured's model_validate. run_install ALSO redacts the summary at
-    # outcome construction (the belt that additionally covers the non-_sanitize
-    # value used to build the not-ready error); double-redaction is a no-op on the
-    # already-masked marker.
-    # The STRIP likewise runs AFTER the mask, for the same reason one step earlier:
-    # a registered value carrying edge whitespace (a hand-edited .env with a quoted
-    # " secret-token") stops matching once strip eats that edge, so stripping first
-    # would hand the redactor a body it no longer recognizes. Untouched text in,
-    # redaction, THEN the cosmetic trim and the slice.
+    # The summary's first mask-then-cap (``_masked_and_capped`` holds the order and
+    # why). The secrets registered for the session -- an install's form secret, a
+    # revise's package values -- are known here, inside generate_structured's
+    # model_validate. run_install and run_revise mask the summary again when they
+    # build the outcome, through the same function: a secret registered in between
+    # is masked then, and the cap is applied again after it.
     return {
         "tool_name": _coerce_str(data.get("tool_name")).strip()[:_TOOL_NAME_MAX],
-        "summary": tools.redact_known_secrets(_coerce_str(data.get("summary"))).strip()[
-            :_SUMMARY_CAP
-        ],
+        "summary": _masked_and_capped(_coerce_str(data.get("summary")), _SUMMARY_CAP),
         "ready": _coerce_bool(data.get("ready")),
     }
 
@@ -771,17 +785,13 @@ class ReviseResult(InstallResult):
         # own three fields and would drop these two. The three are still built by
         # the same function the parent uses (the not-a-dict refusal included).
         #
-        # Each note in the summary's order, for the summary's reasons: redact while
-        # the text is whole (a secret straddling the cap is masked, never cut into
-        # an unmatchable fragment), then strip (a registered value with edge
-        # whitespace still matches), then cut.
+        # Each note's first mask-then-cap goes through the summary's
+        # ``_masked_and_capped``, with the note's own cap.
         fields = _install_result_fields(data)
-        fields["handoff"] = tools.redact_known_secrets(_coerce_str(data.get("handoff"))).strip()[
-            :_HANDOFF_CAP
-        ]
-        fields["operator_action"] = tools.redact_known_secrets(
-            _coerce_str(data.get("operator_action"))
-        ).strip()[:_OPERATOR_ACTION_CAP]
+        fields["handoff"] = _masked_and_capped(_coerce_str(data.get("handoff")), _HANDOFF_CAP)
+        fields["operator_action"] = _masked_and_capped(
+            _coerce_str(data.get("operator_action")), _OPERATOR_ACTION_CAP
+        )
         return fields
 
 
@@ -2391,17 +2401,19 @@ async def run_install(
         assert result is not None  # exactly one of result/llm_error is set above
 
         # F1/D36: the model is told never to print the secret in its summary, but a
-        # disobedient builder could. Redact the summary ONCE here -- the single choke
-        # point for the outcome -- and derive every InstallOutcome below from the
-        # masked value. It MUST happen HERE, not at job-update time: run_install's
-        # finally (below) discards the in-flight secret before this function returns,
+        # disobedient builder could. Mask the summary again here -- the single choke
+        # point for the outcome -- through the same ``_masked_and_capped`` as its
+        # first mask, so the cap is applied again after a secret registered since
+        # then is masked; derive every InstallOutcome below from that value. It
+        # MUST happen HERE, not at job-update time: run_install's finally (below)
+        # discards the in-flight secret before this function returns,
         # and a FAILED install also deletes the staging .env, so by the time _run_job
         # stores the outcome ``known_secret_values`` would no longer carry the value --
         # redacting then would be a no-op that leaks. The other outcome ``error`` fields
         # are safe by construction: the not-ready error is built from this masked
         # summary, and the llm/promote errors are backend/category strings that never
         # carry the value (str(exc) is category-only; promote errors are fixed zh-TW).
-        summary = tools.redact_known_secrets(result.summary) if result.summary else None
+        summary = _masked_and_capped(result.summary, _SUMMARY_CAP) if result.summary else None
 
         if not result.ready:
             reason = summary or "（AI 未說明原因）"  # noqa: RUF001
@@ -3156,7 +3168,9 @@ async def run_revise(
             "rounds_used": stats.tool_rounds_used,
             "max_rounds": settings.tool_install_max_rounds,
         }
-        # What the model handed back -- its summary and the two notes -- masked
+        # What the model handed back -- its summary and the two notes -- masked and
+        # capped again (``_masked_and_capped``, each field with its own cap, so a
+        # secret registered since the first mask cannot carry it past the cap)
         # BEFORE the first return below, so every outcome returned after a session
         # that produced an answer carries the model's own words, the .env strip
         # refusal's included. The LLM-failure outcome has no answer to carry.
@@ -3173,18 +3187,20 @@ async def run_revise(
         notes: dict[str, Any] = {}
         if result is not None:
             summary = (
-                await run_in_threadpool(tools.redact_known_secrets, result.summary)
+                await run_in_threadpool(_masked_and_capped, result.summary, _SUMMARY_CAP)
                 if result.summary
                 else None
             )
             notes = {
                 "handoff": (
-                    await run_in_threadpool(tools.redact_known_secrets, result.handoff)
+                    await run_in_threadpool(_masked_and_capped, result.handoff, _HANDOFF_CAP)
                     if result.handoff
                     else None
                 ),
                 "operator_action": (
-                    await run_in_threadpool(tools.redact_known_secrets, result.operator_action)
+                    await run_in_threadpool(
+                        _masked_and_capped, result.operator_action, _OPERATOR_ACTION_CAP
+                    )
                     if result.operator_action
                     else None
                 ),
