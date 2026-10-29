@@ -865,6 +865,22 @@ class ToolJobStatus(BaseModel):
     ``published``, ``not_published`` (the builder itself declined to publish --
     possibly an outside cause, possibly a fix it could not make; the card says
     neither), or ``failed``. Null while queued/running.
+
+    A finished revise whose builder session ran also says how that session ended,
+    as the backend MEASURED it (``llm.StructuredRunStats``), never as the model
+    tells it: ``stopped_by`` is the budget that ended the tool phase (``rounds``
+    -- ``rounds_used`` reached ``max_rounds`` -- or ``conversation``, the
+    conversation size; null when neither did), ``failure`` how the session failed
+    (``empty_response``, ``invalid_output``, ``upstream``, ``request_timeout`` --
+    a single request timed out: the SDK's per-request ``OPENAI_TIMEOUT_SECONDS``,
+    or a timeout the request raised itself, not the session's own time --,
+    ``deadline`` -- the whole session's time ran out --, ``not_configured``),
+    null when it returned an answer. Both can be set at once: the round budget
+    forced the final answer, and that answer came back empty. ``handoff`` and
+    ``operator_action`` are the model's own notes (what is done and left; what
+    the operator must do by hand), already masked, for display only. All six are
+    null for an install, a health check, a revise that failed before its session
+    started, and a job that ended in an unexpected error.
     """
 
     job_id: str
@@ -880,6 +896,27 @@ class ToolJobStatus(BaseModel):
     outcome: Literal["published", "not_published", "failed"] | None
     kind: Literal["install", "revise", "health_check"] = "install"
     verification: ToolVerification | None = None
+    # The two vocabularies mirror ``llm.FinalizeTrigger`` / ``llm.RunFailure``
+    # rather than importing them (this module stays free of the service layer).
+    # ``test_tool_job_status_admits_every_run_failure_and_finalize_trigger``
+    # (tests/test_llm_stats.py) pins them equal, since a value missing here would
+    # fail the poll.
+    stopped_by: Literal["rounds", "conversation"] | None = None
+    failure: (
+        Literal[
+            "empty_response",
+            "invalid_output",
+            "upstream",
+            "request_timeout",
+            "deadline",
+            "not_configured",
+        ]
+        | None
+    ) = None
+    rounds_used: int | None = None
+    max_rounds: int | None = None
+    handoff: str | None = None
+    operator_action: str | None = None
 
 
 class ToolSettingsEntry(BaseModel):

@@ -78,11 +78,14 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from starlette.concurrency import run_in_threadpool
 
 from afterthread.config import get_settings
-from afterthread.services import llm_log, token_budget, tool_meta, tools
+from afterthread.services import llm, llm_log, token_budget, tool_meta, tools
 from afterthread.services.llm import (
+    FinalizeTrigger,
     LLMNotConfiguredError,
     LlmTool,
     LLMUpstreamError,
+    RunFailure,
+    StructuredRunStats,
     generate_structured,
 )
 from afterthread.services.memory_ai import _coerce_bool, _coerce_str, _truncate_to
@@ -134,6 +137,12 @@ _LIST_DIR_MAX_ENTRIES = 500
 # length (64); summary is a short human report, capped like a progress note.
 _TOOL_NAME_MAX = 64
 _SUMMARY_CAP = 2000
+
+# ReviseResult's two extra notes. The handoff is the longer one -- what was found,
+# changed, verified and left, for whoever continues -- while operator_action is a
+# few instructions and paste-ready KEY=value lines.
+_HANDOFF_CAP = 4000
+_OPERATOR_ACTION_CAP = 1000
 
 # User-facing (zh-TW) outcome errors that need to be exact in more than one
 # place (tests pin them; the FE renders them verbatim). The fullwidth
@@ -358,6 +367,10 @@ def _fsync_tree(root: Path) -> bool:
 # no other way to learn it -- the runtime that will execute the finished tool
 # is not in the conversation. The suggested loop (write -> test via run_shell
 # -> fix -> ready) is what makes max_tool_rounds=24 a working budget.
+#
+# Its one interpolation, ``{shell_timeout}``, is the backend's own run_shell
+# timeout in seconds (``_builder_base_prompt``): the model sizes its test
+# commands by that number, so it has to be the one that will kill them.
 _BUILDER_SYSTEM_PROMPT = """\
 You are a tool builder. Your working directory (the "workspace") is the future \
 tool package: build a complete, WORKING tool package in it that gives an AI \
@@ -410,8 +423,8 @@ created automatically).
 - list_dir {path?}: recursively list the workspace (directories end with "/").
 - run_shell {command}: run a bash command. It runs with the service's own \
 permissions, starting in the staging directory -- treat the staging directory \
-as your workspace and keep all your work inside it. It has a timeout of a \
-couple of minutes and capped output; it CAN reach the network, so use curl or \
+as your workspace and keep all your work inside it. It has a timeout of \
+{shell_timeout} seconds and capped output; it CAN reach the network, so use curl or \
 python3 to probe the real API and to test your tool end to end, e.g.: \
 echo '{"query":"test"}' | python3 run.py
 
@@ -463,16 +476,44 @@ tool you generate must read {name} from its OWN environment at runtime (the \
 runtime injects the tool's .env into the process environment)."""
 
 
+def _seconds_text(seconds: float) -> str:
+    """A backend duration setting as a prompt states it: ``120``, ``45.5``."""
+    return f"{seconds:g}"
+
+
+def _duration_text(seconds: float) -> str:
+    """A session budget in words: whole minutes when it is a whole number of
+    them, seconds otherwise -- never a rounded figure the deadline does not keep."""
+    if seconds >= 60 and seconds % 60 == 0:
+        minutes = int(seconds // 60)
+        return "1 minute" if minutes == 1 else f"{minutes} minutes"
+    return f"{_seconds_text(seconds)} seconds"
+
+
+def _builder_base_prompt() -> str:
+    """``_BUILDER_SYSTEM_PROMPT`` with its run_shell timeout filled in.
+
+    The value is a number the backend itself enforces -- the same setting the
+    ``run_shell`` meta-tool hands ``_run_shell_subprocess`` on every call -- the
+    only kind of value this prompt's own text is ever interpolated with, never
+    operator or file text.
+    """
+    seconds = get_settings().tool_install_shell_timeout_seconds
+    return _BUILDER_SYSTEM_PROMPT.replace("{shell_timeout}", _seconds_text(seconds))
+
+
 def _builder_system_prompt(secret_name: str | None) -> str:
     """The builder system prompt, plus the secret addendum when one was supplied.
 
     Only the NAME is interpolated (never the value). ``str.replace`` (not
     ``str.format``) so the many literal ``$``/``{`` characters in the shell
-    examples above are left untouched -- only the ``{name}`` token is swapped.
+    examples above are left untouched -- only the ``{name}`` token is swapped,
+    and only inside the addendum, after the base prompt's own number is in.
     """
+    base = _builder_base_prompt()
     if not secret_name:
-        return _BUILDER_SYSTEM_PROMPT
-    return _BUILDER_SYSTEM_PROMPT + _SECRET_PROMPT_ADDENDUM.replace("{name}", secret_name)
+        return base
+    return base + _SECRET_PROMPT_ADDENDUM.replace("{name}", secret_name)
 
 
 # Appended to the builder system prompt for a REVISE session (D40). Same shape
@@ -532,6 +573,57 @@ exactly {name}, because it names the installed package this revision updates \
 is discarded. "summary" reports what you CHANGED and how you verified it."""
 
 
+# Appended after the revise addendum: the session's real limits, how to spend
+# them, how to close when they run out, and what to leave for the operator
+# whether or not the revision is finished. English and model-facing like the
+# rest. Every ``{token}`` here is a number the backend itself enforces, filled in
+# by ``_revise_system_prompt`` with ``str.replace`` -- the tool-call cap per reply
+# straight from ``llm._MAX_TOOL_CALLS_PER_REPLY``, so the prompt can never quote
+# a cap the loop does not apply.
+#
+# ``handoff`` and ``operator_action`` are the model's own account, for display and
+# handover only: nothing in the backend decides anything by reading them, and how
+# the session REALLY ended is what the loop measured (``StructuredRunStats``).
+_REVISE_BUDGET_ADDENDUM = """\
+
+
+BUDGET. The backend enforces these limits on this session:
+- at most {rounds} tool rounds (every reply of yours that calls tools is one \
+round);
+- {session} of wall-clock time for the whole session. When that runs out the \
+session ends at once, and you never get to write your final answer;
+- each run_shell command is killed after {shell_timeout} seconds;
+- the conversation itself, every tool result included, may grow to about \
+{conversation_tokens} tokens.
+When you run out of rounds, or the conversation grows past that size, the tool \
+phase is over: you are told that the tool-call budget is exhausted, no further \
+tool call runs, and your next reply must be the final JSON object.
+
+Save rounds. One reply may call several tools at once, but at most {max_calls} \
+calls of a reply are executed: calls past the first {max_calls} are rejected \
+without running. Combine short tests into ONE run_shell command, as long as the whole \
+command finishes well within {shell_timeout} seconds -- otherwise split it into \
+several commands. Print each case's result on its own line, and treat the whole \
+batch as failed if any one case fails.
+
+If you cannot finish -- including when you are told that the tool-call budget \
+is exhausted:
+- set "ready" to false. Once told the budget is exhausted, answer ready=true \
+only if your last test run already proved that the change works;
+- write "handoff" for whoever continues this work: what you found, what you \
+changed and where, what you verified, what is left, and the next step. Do not \
+copy raw tool arguments, command output or personal content into it.
+When you do finish, leave "handoff" empty.
+
+Whether you finish or not, if the operator has to act outside your workspace \
+(change a setting, replace a credential), write "operator_action": what to do, \
+in the operator's language. For a setting, give the exact KEY=value line(s) to \
+paste into the package's config.env. For example: your change is verified with \
+a new value set in run_shell, but the package's config.env still holds the old \
+one -- finish with ready=true and put the line to paste in "operator_action". \
+Leave "operator_action" empty when the operator has nothing to do."""
+
+
 def _revise_system_prompt(name: str) -> str:
     """The builder system prompt, reframed for revising the package ``name``.
 
@@ -561,10 +653,60 @@ def _revise_system_prompt(name: str) -> str:
     public tool name -- the value is already in the tools listing, the job poll and
     the FE's URL, so the honest answer is that it cannot be kept out of a prompt
     that must name the package.
+
+    The budget addendum's numbers are the settings this session actually runs
+    under -- the ``max_tool_rounds``/``timeout_seconds`` ``run_revise`` passes to
+    ``generate_structured`` and the limits the loop and ``run_shell`` apply -- and
+    each piece is filled in on its own, so no value can land inside another
+    piece's token.
     """
-    return _BUILDER_SYSTEM_PROMPT + _REVISE_PROMPT_ADDENDUM.replace(
-        "{name}", tools.redact_known_secrets(name)
+    settings = get_settings()
+    budget = (
+        _REVISE_BUDGET_ADDENDUM.replace("{rounds}", str(settings.tool_install_max_rounds))
+        .replace("{session}", _duration_text(settings.tool_install_timeout_seconds))
+        .replace("{shell_timeout}", _seconds_text(settings.tool_install_shell_timeout_seconds))
+        .replace("{conversation_tokens}", f"{settings.llm_tool_conversation_budget_tokens:,}")
+        .replace("{max_calls}", str(llm._MAX_TOOL_CALLS_PER_REPLY))
     )
+    return (
+        _builder_base_prompt()
+        + _REVISE_PROMPT_ADDENDUM.replace("{name}", tools.redact_known_secrets(name))
+        + budget
+    )
+
+
+def _install_result_fields(data: Any) -> dict[str, Any]:
+    """``InstallResult``'s three fields, sanitized from the model's raw object.
+
+    The body of ``InstallResult._sanitize``, kept as a function so
+    ``ReviseResult._sanitize`` builds on exactly the same three fields without
+    calling the decorated validator, which the type checker does not see as
+    callable.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("expected a JSON object")
+    # F1/D36: redact known secret values out of the summary BEFORE the 2000-char
+    # slice (redact->cap, the same order the whole pipeline uses). A secret
+    # straddling the slice edge must be masked while the summary is still WHOLE, or
+    # the cut would leave an unmatchable prefix fragment -- an INTERIOR fragment the
+    # trailing-fragment guard cannot catch. The in-flight install secret is
+    # registered for the whole build (run_install), so it is redactable here inside
+    # generate_structured's model_validate. run_install ALSO redacts the summary at
+    # outcome construction (the belt that additionally covers the non-_sanitize
+    # value used to build the not-ready error); double-redaction is a no-op on the
+    # already-masked marker.
+    # The STRIP likewise runs AFTER the mask, for the same reason one step earlier:
+    # a registered value carrying edge whitespace (a hand-edited .env with a quoted
+    # " secret-token") stops matching once strip eats that edge, so stripping first
+    # would hand the redactor a body it no longer recognizes. Untouched text in,
+    # redaction, THEN the cosmetic trim and the slice.
+    return {
+        "tool_name": _coerce_str(data.get("tool_name")).strip()[:_TOOL_NAME_MAX],
+        "summary": tools.redact_known_secrets(_coerce_str(data.get("summary"))).strip()[
+            :_SUMMARY_CAP
+        ],
+        "ready": _coerce_bool(data.get("ready")),
+    }
 
 
 class InstallResult(BaseModel):
@@ -589,30 +731,7 @@ class InstallResult(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _sanitize(cls, data: Any) -> dict[str, Any]:
-        if not isinstance(data, dict):
-            raise ValueError("expected a JSON object")
-        # F1/D36: redact known secret values out of the summary BEFORE the 2000-char
-        # slice (redact->cap, the same order the whole pipeline uses). A secret
-        # straddling the slice edge must be masked while the summary is still WHOLE, or
-        # the cut would leave an unmatchable prefix fragment -- an INTERIOR fragment the
-        # trailing-fragment guard cannot catch. The in-flight install secret is
-        # registered for the whole build (run_install), so it is redactable here inside
-        # generate_structured's model_validate. run_install ALSO redacts the summary at
-        # outcome construction (the belt that additionally covers the non-_sanitize
-        # value used to build the not-ready error); double-redaction is a no-op on the
-        # already-masked marker.
-        # The STRIP likewise runs AFTER the mask, for the same reason one step earlier:
-        # a registered value carrying edge whitespace (a hand-edited .env with a quoted
-        # " secret-token") stops matching once strip eats that edge, so stripping first
-        # would hand the redactor a body it no longer recognizes. Untouched text in,
-        # redaction, THEN the cosmetic trim and the slice.
-        return {
-            "tool_name": _coerce_str(data.get("tool_name")).strip()[:_TOOL_NAME_MAX],
-            "summary": tools.redact_known_secrets(_coerce_str(data.get("summary"))).strip()[
-                :_SUMMARY_CAP
-            ],
-            "ready": _coerce_bool(data.get("ready")),
-        }
+        return _install_result_fields(data)
 
     @model_validator(mode="after")
     def _ready_requires_valid_name(self) -> InstallResult:
@@ -621,6 +740,49 @@ class InstallResult(BaseModel):
                 "a ready result must carry a tool_name matching ^[a-z0-9][a-z0-9_-]{0,63}$"
             )
         return self
+
+
+# A revise session's close: ``InstallResult`` plus two notes for people. Both are
+# the model's own account, kept for display and handover only: no logic reads them
+# to decide anything, and how the session really ended is what the loop measured
+# (``StructuredRunStats``), never taken from here. Only a revise asks for them; the
+# install keeps ``InstallResult``, whose schema has no notes.
+#
+# The docstring is MODEL-FACING: pydantic makes a model's docstring the
+# "description" of its JSON Schema, which ``_schema_guided_system_prompt`` shows
+# the model verbatim. So it says only what the model needs, in the prompt's terms.
+class ReviseResult(InstallResult):
+    """The final answer of a revision. "handoff" is only for an unfinished
+    revision, for whoever continues it: what you found, what you changed and
+    where, what you verified, what is left, and the next step; leave it empty
+    when you finish. "operator_action" is what the operator must still do by
+    hand outside the workspace, whether you finish or not -- such as a line to
+    paste into the package's config.env; leave it empty when there is
+    nothing."""
+
+    handoff: str = ""
+    operator_action: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _sanitize(cls, data: Any) -> dict[str, Any]:
+        # The same name as the parent's validator ON PURPOSE: it replaces it rather
+        # than running beside it, because the parent's rebuilds the dict from its
+        # own three fields and would drop these two. The three are still built by
+        # the same function the parent uses (the not-a-dict refusal included).
+        #
+        # Each note in the summary's order, for the summary's reasons: redact while
+        # the text is whole (a secret straddling the cap is masked, never cut into
+        # an unmatchable fragment), then strip (a registered value with edge
+        # whitespace still matches), then cut.
+        fields = _install_result_fields(data)
+        fields["handoff"] = tools.redact_known_secrets(_coerce_str(data.get("handoff"))).strip()[
+            :_HANDOFF_CAP
+        ]
+        fields["operator_action"] = tools.redact_known_secrets(
+            _coerce_str(data.get("operator_action"))
+        ).strip()[:_OPERATOR_ACTION_CAP]
+        return fields
 
 
 @dataclass(slots=True)
@@ -651,6 +813,20 @@ class InstallOutcome:
     # How the published version did on its own examples.json (web-v6 §8.3): set
     # by a revise that published, None otherwise. A ``_verification_dict``.
     verification: dict[str, Any] | None = None
+    # A revise's builder session as the backend measured it (``StructuredRunStats``),
+    # set on every outcome whose session ran -- a failed one included, since a
+    # failure is when the operator most needs to know which limit, if any, cut it
+    # short. ``stopped_by`` is the budget that ended the tool phase, ``failure``
+    # how the session failed, ``rounds_used`` of ``max_rounds`` the tool rounds.
+    # All None when no session ran (and on every install).
+    stopped_by: FinalizeTrigger | None = None
+    failure: RunFailure | None = None
+    rounds_used: int | None = None
+    max_rounds: int | None = None
+    # The revise model's own notes (``ReviseResult``), masked again at outcome
+    # construction like ``summary``. Display and handover only.
+    handoff: str | None = None
+    operator_action: str | None = None
 
 
 # --- staging containment + meta-tools ---------------------------------------
@@ -1317,6 +1493,19 @@ _FAILING_RUNS_HEADER = (
     "cut: stderr keeps its END, stdout its START)."
 )
 
+# Follows the header, so it is read before the runs themselves: what their masked
+# and cut texts mean for reproducing them. A record keeps a masked value as the
+# marker, and the model would otherwise pipe that marker into the tool and debug a
+# failure it caused itself. Every cut marker on this path (the record's own and
+# this prompt's) contains 已截斷.
+_FAILING_RUNS_CAVEAT = (
+    f"In these texts {tools._REDACTION_MARKER} stands for a hidden value: it is NOT "
+    "what the tool received, so never pass it to the tool or the API as if it were. "
+    "Text that was cut carries a marker containing 已截斷. When a run's stdin "
+    "arguments are incomplete -- a value masked, or the text cut -- say plainly that "
+    "the run cannot be reproduced exactly, and do not guess the missing part."
+)
+
 # Marks the front of a text cut to its END (``_truncate_tail_to``); the head
 # cut's ``_TRUNCATION_MARKER`` turned around.
 _TAIL_TRUNCATION_MARKER = "[內容過長已截斷]…"
@@ -1481,7 +1670,7 @@ def _revise_user_prompt(
             + _truncate_to(tools.redact_known_secrets(", ".join(env_keys)), budget)
         )
     if runs:
-        parts.append(_FAILING_RUNS_HEADER)
+        parts += [_FAILING_RUNS_HEADER, _FAILING_RUNS_CAVEAT]
         parts += [_failing_run_text(run, workspace_vid, budget) for run in runs]
         parts.append(_DEBUG_PROCEDURE)
     return "\n\n".join(parts)
@@ -2932,13 +3121,14 @@ async def run_revise(
         # layers the runtime one -- config.env first, .env on top (web-v6 §4) -- so
         # the builder tests what the tool will actually run with.
         shell_env = {**config_values, **env_values}
-        result: InstallResult | None = None
+        stats = StructuredRunStats()
+        result: ReviseResult | None = None
         llm_error: str | None = None
         try:
             result = await generate_structured(
                 system_prompt,
                 user_prompt,
-                InstallResult,
+                ReviseResult,
                 workflow=_WORKFLOW,
                 # The whole existing .env goes into run_shell's environment (never
                 # into a prompt), so the model can live-test the real API against
@@ -2947,6 +3137,7 @@ async def run_revise(
                 tools=_build_meta_tools(build_root.path, secret_env=shell_env or None),
                 max_tool_rounds=settings.tool_install_max_rounds,
                 timeout_seconds=settings.tool_install_timeout_seconds,
+                stats=stats,
             )
         except LLMNotConfiguredError:
             llm_error = "LLM 尚未設定，無法執行修訂。"  # noqa: RUF001
@@ -2955,6 +3146,16 @@ async def run_revise(
             llm_error = f"AI 修訂工具失敗（{exc}）。"  # noqa: RUF001
 
         llm_log_id = llm_log.last_record_id_for_workflow(_WORKFLOW)
+        # How the session ended as the loop measured it, on EVERY outcome from here
+        # on -- a failed session's above all, since that is when the operator needs
+        # to know whether a limit cut it short, and which one. ``max_rounds`` is the
+        # budget the session was given, so the card can name the setting behind it.
+        facts: dict[str, Any] = {
+            "stopped_by": stats.finalized_by,
+            "failure": stats.failure,
+            "rounds_used": stats.tool_rounds_used,
+            "max_rounds": settings.tool_install_max_rounds,
+        }
         env_keys, env_strip_error = await run_in_threadpool(_strip_builder_env, build_root, base)
         if env_strip_error is not None:
             return InstallOutcome(
@@ -2963,6 +3164,7 @@ async def run_revise(
                 error=env_strip_error,
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
+                **facts,
             )
         if llm_error is not None:
             return InstallOutcome(
@@ -2971,6 +3173,7 @@ async def run_revise(
                 error=llm_error,
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
+                **facts,
             )
         assert result is not None  # exactly one of result/llm_error is set above
 
@@ -2980,12 +3183,27 @@ async def run_revise(
         # On a WORKER for the same reason the prompt build above is (R1-3) -- this
         # is the identical tools-directory scan, just after the LLM call instead of
         # before it. Every ``redact_known_secrets`` call this function makes is off
-        # the loop; the third one is in the rename refusal below.
+        # the loop, the one in the rename refusal below included.
         summary = (
             await run_in_threadpool(tools.redact_known_secrets, result.summary)
             if result.summary
             else None
         )
+        # The two notes take the summary's path for the summary's reason: masked
+        # again here, on a worker, before the in-flight secrets are dropped. They
+        # ride along for display only -- nothing below branches on them.
+        notes: dict[str, Any] = {
+            "handoff": (
+                await run_in_threadpool(tools.redact_known_secrets, result.handoff)
+                if result.handoff
+                else None
+            ),
+            "operator_action": (
+                await run_in_threadpool(tools.redact_known_secrets, result.operator_action)
+                if result.operator_action
+                else None
+            ),
+        }
         # ``tool_name`` on these outcomes is the package the user addressed, never
         # the model's answer: the job's tool_name is what the FE links to.
         if not result.ready:
@@ -2998,6 +3216,8 @@ async def run_revise(
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
                 not_ready=True,
+                **facts,
+                **notes,
             )
         if result.tool_name != name:
             # D40: ``InstallResult._ready_requires_valid_name`` only checks the
@@ -3011,7 +3231,7 @@ async def run_revise(
             # name is run through the redactor first, exactly as ``validate_package``
             # does with the offending path it names, because it is model-authored
             # text and a registered value CAN be a legal package name. On a worker
-            # like the other two (R1-3): rare is not the same as free, and leaving
+            # like the others (R1-3): rare is not the same as free, and leaving
             # one instance of the class behind is how it grows back.
             attempted = await run_in_threadpool(tools.redact_known_secrets, result.tool_name)
             return InstallOutcome(
@@ -3021,6 +3241,8 @@ async def run_revise(
                 error=f"AI 試圖將工具改名為「{attempted}」，修訂已取消。",  # noqa: RUF001
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
+                **facts,
+                **notes,
             )
 
         # The publisher reads immutable provenance from the version whose identity
@@ -3042,6 +3264,8 @@ async def run_revise(
                 error=promote_error,
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
+                **facts,
+                **notes,
             )
         assert published is not None
         # The revision is LIVE as of the line above; everything after it is
@@ -3065,6 +3289,8 @@ async def run_revise(
             llm_log_id=llm_log_id,
             env_keys=env_keys,
             verification=verification,
+            **facts,
+            **notes,
         )
     finally:
         # The package .env was untouched, so its live scan keeps covering these
@@ -3341,6 +3567,16 @@ class InstallJob:
     # result, or the verification that follows a published revise. Updated as
     # each example finishes, so a poll shows progress.
     verification: dict[str, Any] | None = None
+    # Copied from the terminal ``InstallOutcome`` (see its fields): a revise's
+    # session as the loop measured it, and the model's own two notes. None for an
+    # install, a health check, a revise that failed before its session ran, and a
+    # job that ended in ``_run_job``'s unexpected-error backstop.
+    stopped_by: FinalizeTrigger | None = None
+    failure: RunFailure | None = None
+    rounds_used: int | None = None
+    max_rounds: int | None = None
+    handoff: str | None = None
+    operator_action: str | None = None
 
 
 # The three terminal ``InstallJob.outcome`` values.
@@ -3367,6 +3603,12 @@ def _job_dict(job: InstallJob) -> dict[str, Any]:
         "outcome": job.outcome,
         "kind": job.kind,
         "verification": job.verification,
+        "stopped_by": job.stopped_by,
+        "failure": job.failure,
+        "rounds_used": job.rounds_used,
+        "max_rounds": job.max_rounds,
+        "handoff": job.handoff,
+        "operator_action": job.operator_action,
     }
 
 
@@ -3439,6 +3681,12 @@ async def _run_job(
         env_keys=outcome.env_keys,
         outcome=terminal,
         verification=outcome.verification,
+        stopped_by=outcome.stopped_by,
+        failure=outcome.failure,
+        rounds_used=outcome.rounds_used,
+        max_rounds=outcome.max_rounds,
+        handoff=outcome.handoff,
+        operator_action=outcome.operator_action,
         finished_at=_now_iso(),
         **named,
     )

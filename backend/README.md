@@ -216,7 +216,21 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   發布之後的自動驗證），執行中就會逐個更新；`outcome` 是終局的細分
   （`published`／`not_published`／`failed`，進行中為 `null`），`not_published` 指
   builder 自己回 `ready=false`、沒有發布任何東西——前端以橘色而非紅色呈現，且不宣稱
-  原因是外部還是修不好（web-v6 §8.3）。工作已完成的清單被裁剪掉、或後端
+  原因是外部還是修不好（web-v6 §8.3）。修訂的 builder session 跑過之後，工作另帶後端
+  **量到**的結局（`llm.StructuredRunStats`，不是模型的自述）：`stopped_by` 是結束工具
+  階段的預算——`rounds`（用完 `max_rounds` 次工具回合，即 `TOOL_INSTALL_MAX_ROUNDS`）
+  或 `conversation`（對話大小超過 `LLM_TOOL_CONVERSATION_BUDGET_TOKENS`），沒有就是
+  `null`；`failure` 是 session 最後怎麼失敗：`empty_response`（最後的回覆沒有內容）、
+  `invalid_output`（更正一次後格式仍錯）、`upstream`（其他上游錯誤，連線失敗的
+  `APIConnectionError` 也在這一類）、`request_timeout`（單一請求等候回應逾時：SDK 依
+  `OPENAI_TIMEOUT_SECONDS` 擲出的 `APITimeoutError`，或請求本身在整場期限觸發前擲出的
+  builtin `TimeoutError`）、`deadline`（整場時間 `TOOL_INSTALL_TIMEOUT_SECONDS` 用完）、
+  `not_configured`，正常回答為 `null`。兩者可以同時成立，例如回合用完迫使收尾、
+  收尾那次又回了空內容。`rounds_used`／`max_rounds` 是用掉與給定的工具回合數。
+  `handoff`（至多 4000 字，給接手者的交接筆記）與 `operator_action`（至多 1000 字，需要
+  操作者在工作區外動手的事）是模型自己寫的，先遮蔽再截斷，只供顯示與交接，後端不據以做
+  任何判斷。這六個欄位在安裝、跑範例、session 開始前就結束的修訂，以及因未預期錯誤
+  而中止的工作上都是 `null`。工作已完成的清單被裁剪掉、或後端
   重啟過（工作只存在記憶體）則回 404。`llm_log_process` 與側檔那一個是同一個
   token、同一條「沒有 id 就沒有 token」規則，只是**由這個路由在回應當下蓋章**：
   工作表是行程內記憶體，與 id 空間同生共死，所以還答得出來的工作，它的

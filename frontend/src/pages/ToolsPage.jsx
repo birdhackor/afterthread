@@ -28,6 +28,7 @@ import { apiDelete, apiGet, apiPatch, apiPost } from "../api/client.js";
 import { CharCounter } from "../components/CharCounter.jsx";
 import { formatDate } from "../components/DateText.jsx";
 import { EmptyState } from "../components/EmptyState.jsx";
+import { ReviseStopNotice } from "../components/ReviseStopNotice.jsx";
 import { ToolRunStatsBar } from "../components/ToolRunStatsBar.jsx";
 import { ToolRunsSection } from "../components/ToolRunsSection.jsx";
 import { ToolSettingsSection } from "../components/ToolSettingsSection.jsx";
@@ -398,6 +399,7 @@ function ToolJobProgress({
 							fixBlocked={fixBlocked}
 						/>
 					) : null}
+					<ReviseStopNotice job={job} kind={jobKind} />
 					<LogLink
 						llmLogId={job.llm_log_id}
 						llmLogProcess={job.llm_log_process}
@@ -420,6 +422,7 @@ function ToolJobProgress({
 					<Text size="xs" c="dimmed">
 						{view.note}
 					</Text>
+					<ReviseStopNotice job={job} kind={jobKind} />
 					<LogLink
 						llmLogId={job.llm_log_id}
 						llmLogProcess={job.llm_log_process}
@@ -438,6 +441,7 @@ function ToolJobProgress({
 						AI 回報：{job.summary}
 					</Text>
 				) : null}
+				<ReviseStopNotice job={job} kind={jobKind} />
 				<LogLink
 					llmLogId={job.llm_log_id}
 					llmLogProcess={job.llm_log_process}

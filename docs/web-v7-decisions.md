@@ -16,3 +16,24 @@
 | 秘密 | 保存與複製進暫存時都用完整掃描器；命中的路徑保留上一份或不存；掃描失敗就不存 | 草稿會長期保存明文秘密 |
 | 模型自述欄位 | `handoff`、`operator_action` 只用來顯示與交接，任何邏輯都不讀 | 會重開 v6 R11 不採用模型自報分類的理由 |
 | 人接手的出口 | 發布草稿（不經 AI）是 P5 的範圍 | 只差設定的修正必須再付一輪 |
+
+## D49（P1）：單一請求逾時的歸類
+
+openai SDK（2.45.0）對單一請求的逾時擲 `openai.APITimeoutError`。它是 `APIConnectionError` 的子類別、屬於
+`OpenAIError`，不是 builtin `TimeoutError`，所以只認 builtin `TimeoutError` 的歸類會把它算成上游錯誤。設計 §5
+把「單一請求逾時」與「上游錯誤」分開，因此 `StructuredRunStats.failure` 把 `APITimeoutError` 記為
+`request_timeout`，它的父類別與其他 SDK 錯誤仍記 `upstream`；請求本身擲出、整場期限沒有觸發的 builtin
+`TimeoutError` 也記 `request_timeout`。擲出的例外與訊息不變（DJ）。卡片的 `request_timeout` 文案點名
+`OPENAI_TIMEOUT_SECONDS`：`_get_client` 以它建出 client，作為每個請求的逾時。
+
+## D50（P1）：`operator_action` 不限於沒做完
+
+模型可以在 `run_shell` 裡帶新值驗證過程式、回 `ready=true` 發布，而套件的 `config.env` 仍要操作者貼上那一行。
+提示因此要求：只要操作者必須在工作區外動手就寫 `operator_action`，不論做完與否；`handoff` 只在沒做完時寫。
+前端在已發布的修訂卡片上也顯示「需要你動手」與交接筆記；停止原因在已發布的卡片上只在 `stopped_by` 有值
+（預算結束了工具階段）時才顯示。設計 §4.1、§8 已照此更新。
+
+## D51（P1）：前端不寫設定的上限值
+
+設定的上限只定義在 `config.py` 的 `Field(le=…)`，超過上限的值在載入設定時就被拒絕。前端手抄一份，後端改邊界時
+會無聲過時；卡片因此只點名設定名稱，不寫上限數字。

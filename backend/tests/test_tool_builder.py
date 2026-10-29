@@ -47,8 +47,8 @@ from sqlmodel import Session
 
 from afterthread.config import Settings
 from afterthread.models import SQLITE_MAX_INT
-from afterthread.services import llm_log, tool_builder, tool_meta, tool_runs, tools
-from afterthread.services.llm import LLMNotConfiguredError, LLMUpstreamError
+from afterthread.services import llm, llm_log, memory_ai, tool_builder, tool_meta, tool_runs, tools
+from afterthread.services.llm import LLMNotConfiguredError, LLMUpstreamError, StructuredRunStats
 from afterthread.services.tool_builder import (
     _ERROR_NAME_TAKEN,
     _ERROR_OPENAPI_TOO_LARGE,
@@ -626,7 +626,10 @@ def _fake_generate(
     RECEIVED it: the staging workspace exactly as it was copied (a revise), the
     secret registry mid-session, or a package being deleted under a running
     build. The real thing is a multi-minute session, so this window is otherwise
-    unreachable from a test."""
+    unreachable from a test.
+
+    ``model_cls`` and ``stats`` are captured as given (``stats`` is None when the
+    caller passed none, which is what an install does)."""
     captured: dict[str, Any] = {}
 
     async def fake(
@@ -638,14 +641,17 @@ def _fake_generate(
         tools: Any = None,
         max_tool_rounds: int | None = None,
         timeout_seconds: float | None = None,
+        stats: Any = None,
     ) -> BaseModel:
         captured.update(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
+            model_cls=model_cls,
             workflow=workflow,
             tools=tools,
             max_tool_rounds=max_tool_rounds,
             timeout_seconds=timeout_seconds,
+            stats=stats,
         )
         if side_effect is not None:
             side_effect()
@@ -3462,6 +3468,13 @@ def test_router_job_status_and_404(client: TestClient) -> None:
         "outcome": "published",
         "kind": "install",
         "verification": None,
+        # A revise's measured session and notes; an install carries none of them.
+        "stopped_by": None,
+        "failure": None,
+        "rounds_used": None,
+        "max_rounds": None,
+        "handoff": None,
+        "operator_action": None,
     }
 
     missing = client.get("/api/tools/jobs/ghost")
@@ -6509,6 +6522,7 @@ def test_run_revise_exposes_the_env_to_run_shell_only(
         tools: Any = None,
         max_tool_rounds: int | None = None,
         timeout_seconds: float | None = None,
+        stats: Any = None,
     ) -> BaseModel:
         by_name = {t.spec["function"]["name"]: t for t in tools or []}
         captured["shell"] = await by_name["run_shell"].handler(
@@ -6920,6 +6934,7 @@ def test_run_revise_gives_config_env_to_the_shell_and_the_prompt(
         tools: Any = None,
         max_tool_rounds: int | None = None,
         timeout_seconds: float | None = None,
+        stats: Any = None,
     ) -> BaseModel:
         by_name = {t.spec["function"]["name"]: t for t in tools or []}
         captured["prompt"] = user_prompt
@@ -7591,3 +7606,481 @@ def test_the_revise_job_carries_the_verification(
     job = asyncio.run(scenario())
     assert job["kind"] == "revise"
     assert job["verification"] == {"status": "no_examples", "runs": [], "finished": True}
+
+
+# --- revise: the measured stop, the two notes, the budget in the prompt -------------
+
+
+def test_revise_result_keeps_the_install_fields_and_their_rules() -> None:
+    """The three fields a revise shares with an install come out exactly as
+    ``InstallResult`` makes them -- strict ``ready``, capped summary -- and a ready
+    result still needs a valid name."""
+    raw = {
+        "tool_name": "  kbsearch  ",
+        "summary": "  改好了  " + "z" * (tool_builder._SUMMARY_CAP + 50),
+        "ready": "true",
+        "handoff": "h",
+        "operator_action": "a",
+    }
+    revise = tool_builder.ReviseResult.model_validate(raw)
+    install = InstallResult.model_validate(raw)
+
+    assert revise.model_dump(include={"tool_name", "summary", "ready"}) == install.model_dump()
+    assert (revise.handoff, revise.operator_action) == ("h", "a")
+    ambiguous = tool_builder.ReviseResult.model_validate({"ready": "yes", "tool_name": "t"})
+    assert ambiguous.ready is False
+    with pytest.raises(ValidationError):
+        tool_builder.ReviseResult.model_validate({"tool_name": "Bad Name!", "ready": True})
+
+
+@pytest.mark.parametrize(
+    ("field", "cap"),
+    [
+        ("handoff", tool_builder._HANDOFF_CAP),
+        ("operator_action", tool_builder._OPERATOR_ACTION_CAP),
+    ],
+)
+def test_revise_result_masks_a_note_before_cutting_it(
+    monkeypatch: pytest.MonkeyPatch, field: str, cap: int
+) -> None:
+    """Each note is masked while whole, then cut -- the summary's order. A secret
+    straddling the cap would otherwise leave the part inside the cap behind, an
+    interior fragment no later mask can match."""
+    secret = "kb-live-secret-abcdef123456"
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+    note = "x" * (cap - 10) + secret + "y" * 100
+
+    result = tool_builder.ReviseResult.model_validate(
+        {"tool_name": "kbsearch", "summary": "s", "ready": False, field: note}
+    )
+
+    kept = getattr(result, field)
+    assert secret not in kept
+    assert secret[:10] not in kept  # the fragment a cut-first order would keep
+    assert "•••" in kept  # masked before the cut: the marker's start survives it
+    assert len(kept) <= cap
+
+
+@pytest.mark.parametrize("field", ["handoff", "operator_action"])
+def test_revise_result_masks_a_note_before_stripping_it(
+    monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    """A registered value with edge whitespace stops matching once a strip eats
+    that edge, so the mask runs first."""
+    secret = " kb-live-secret-abcdef "
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+
+    result = tool_builder.ReviseResult.model_validate(
+        {"tool_name": "kbsearch", "ready": False, field: secret}
+    )
+
+    assert "kb-live-secret-abcdef" not in getattr(result, field)
+    assert tools._REDACTION_MARKER in getattr(result, field)
+
+
+def test_run_install_still_closes_with_install_result_and_measures_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An install asks for exactly what it always asked for: ``InstallResult``, with
+    no notes in its schema and no stats object passed, so its outcome carries
+    none of a revise's measured fields."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    captured = _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built", "ready": True},
+        files={"tool.json": json.dumps(_package_manifest("kbsearch")), "run.py": _GOOD_RUN_PY},
+    )
+    _no_fetch(monkeypatch)
+
+    outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build a search tool"))
+
+    assert outcome.ok is True
+    assert captured["model_cls"] is InstallResult
+    assert captured["stats"] is None
+    assert set(InstallResult.model_json_schema()["properties"]) == {"tool_name", "summary", "ready"}
+    measured = (outcome.stopped_by, outcome.failure, outcome.rounds_used, outcome.max_rounds)
+    assert measured == (None, None, None, None)
+    assert (outcome.handoff, outcome.operator_action) == (None, None)
+
+
+def test_install_prompt_changes_only_by_its_shell_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """What an install sends is frozen text with ONE backend number in it.
+
+    At a 120-second shell timeout the builder prompt (with and without the secret
+    addendum) and the ``InstallResult`` schema embedded after it are pinned whole,
+    by digest; at any other timeout only that number differs."""
+    _install_settings(monkeypatch, tool_install_shell_timeout_seconds=120)
+    at_120 = tool_builder._builder_system_prompt(None)
+    with_secret = tool_builder._builder_system_prompt("KB_TOKEN")
+    schema = json.dumps(InstallResult.model_json_schema(), ensure_ascii=False)
+
+    def digest(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    changed = "the install's sent text changed; if that is intended, pin the new digest here"
+    assert digest(at_120) == ("f9d5e5849d3699a1aa8b2632defe40010bbd7f4f758bef767de33ad2b5afe376"), (
+        changed
+    )
+    assert digest(with_secret) == (
+        "73a9ee6e9e15fb960bfba10e30157ce0344d5f1b11cc14d39a220c64cdbedd36"
+    ), changed
+    assert digest(schema) == ("0307b2b849ec44e287c32e8981199537891021f3f37fe42e5b3860e2e0ef7229"), (
+        changed
+    )
+    assert "It has a timeout of 120 seconds and capped output" in at_120
+
+    _install_settings(monkeypatch, tool_install_shell_timeout_seconds=45)
+    assert tool_builder._builder_system_prompt(None) == at_120.replace(
+        "a timeout of 120 seconds", "a timeout of 45 seconds"
+    )
+
+
+def test_revise_prompt_states_the_budget_the_session_runs_under(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every number in the revise prompt's budget is the one the session will be held
+    to: the settings ``run_revise`` passes on, and the per-reply cap the loop itself
+    applies -- read from ``llm._MAX_TOOL_CALLS_PER_REPLY``, never a second copy."""
+    _install_settings(
+        monkeypatch,
+        tool_install_max_rounds=17,
+        tool_install_timeout_seconds=780,
+        tool_install_shell_timeout_seconds=45,
+        llm_tool_conversation_budget_tokens=300_000,
+    )
+    monkeypatch.setattr(llm, "_MAX_TOOL_CALLS_PER_REPLY", 7)
+
+    prompt = tool_builder._revise_system_prompt("kbsearch")
+
+    assert "at most 17 tool rounds" in prompt
+    assert "13 minutes of wall-clock time for the whole session" in prompt
+    assert "each run_shell command is killed after 45 seconds" in prompt
+    assert "It has a timeout of 45 seconds" in prompt  # the shared base sentence agrees
+    assert "may grow to about 300,000 tokens" in prompt
+    assert "at most 7 calls of a reply are executed" in prompt
+    assert "calls past the first 7 are rejected without running" in prompt
+    assert "finishes well within 45 seconds" in prompt
+    tokens = ("{rounds}", "{session}", "{shell_timeout}", "{conversation_tokens}", "{max_calls}")
+    for token in tokens:
+        assert token not in prompt
+
+
+def test_revise_prompt_says_how_to_batch_and_hand_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_settings(monkeypatch)
+
+    prompt = tool_builder._revise_system_prompt("kbsearch")
+
+    assert "Combine short tests into ONE run_shell command" in prompt
+    assert "treat the whole batch as failed if any one case fails" in prompt
+    assert "including when you are told that the tool-call budget is exhausted" in prompt
+    assert 'set "ready" to false' in prompt
+    assert (
+        "answer ready=true only if your last test run already proved that the change works"
+        in prompt
+    )
+    assert 'write "handoff" for whoever continues this work' in prompt
+    assert "Do not copy raw tool arguments, command output or personal content" in prompt
+    assert 'write "operator_action": what to do, in the operator\'s language' in prompt
+    assert "exact KEY=value line(s) to paste into the package's config.env" in prompt
+    # The revise schema the model is shown asks for the two notes; the install's
+    # does not (see test_install_prompt_changes_only_by_its_shell_timeout).
+    properties = tool_builder.ReviseResult.model_json_schema()["properties"]
+    assert {"handoff", "operator_action"} <= set(properties)
+
+
+def test_revise_prompt_asks_for_operator_action_whether_or_not_the_revision_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The handoff is only for an unfinished revision, but what the operator must do
+    by hand is asked for either way: a fix verified with a new value in run_shell
+    still needs that value pasted into the package's config.env. The prompt and the
+    schema description the model is shown say the same."""
+    _install_settings(monkeypatch)
+
+    prompt = tool_builder._revise_system_prompt("kbsearch")
+    # The docstring's own line breaks are not part of what it says.
+    description = " ".join(tool_builder.ReviseResult.model_json_schema()["description"].split())
+
+    assert 'When you do finish, leave "handoff" empty.' in prompt
+    assert "Whether you finish or not, if the operator has to act outside your workspace" in prompt
+    assert 'finish with ready=true and put the line to paste in "operator_action"' in prompt
+    assert 'Leave "operator_action" empty when the operator has nothing to do.' in prompt
+    assert '"handoff" is only for an unfinished' in description
+    assert "leave it empty when you finish" in description
+    assert "whether you finish or not" in description
+
+
+@pytest.mark.parametrize(
+    ("seconds", "text"),
+    [
+        (900, "15 minutes"),
+        (60, "1 minute"),
+        (3600, "60 minutes"),
+        (90, "90 seconds"),
+        (100.5, "100.5 seconds"),
+    ],
+)
+def test_session_budget_is_stated_without_rounding(seconds: float, text: str) -> None:
+    """Whole minutes only when the budget is a whole number of them; otherwise the
+    exact seconds, never a rounded figure the deadline would not keep."""
+    assert tool_builder._duration_text(seconds) == text
+
+
+def test_failing_runs_caveat_rides_only_with_attached_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rule about masked and cut record texts is in a prompt exactly when there
+    are records to read, right after their header and before the first of them."""
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset())
+    caveat = tool_builder._FAILING_RUNS_CAVEAT
+
+    with_runs = tool_builder._revise_user_prompt(
+        None, None, runs=(_attached(),), workspace_vid=_TEST_VID
+    )
+    without_runs = tool_builder._revise_user_prompt("加上分頁", None)
+
+    assert f"{tools._REDACTION_MARKER} stands for a hidden value" in caveat
+    assert "the run cannot be reproduced exactly, and do not guess the missing part" in caveat
+    header_at = with_runs.index(tool_builder._FAILING_RUNS_HEADER)
+    assert header_at < with_runs.index(caveat) < with_runs.index("Run #7 at")
+    assert caveat not in without_runs
+    assert "stands for a hidden value" not in tool_builder._revise_system_prompt("kbsearch")
+
+
+def test_every_cut_marker_a_run_text_can_carry_says_so() -> None:
+    """The caveat tells the builder a cut text carries a marker containing 已截斷.
+    Every marker that can cut a text the run section quotes -- the record's own
+    head and tail cuts, the tool-output cap in what the assistant was told, and the
+    prompt's head and tail cuts -- does."""
+    for marker in (
+        tool_runs._HEAD_CUT_MARKER,
+        tool_runs._TAIL_CUT_MARKER,
+        tools._OUTPUT_TRUNCATION_MARKER,
+        memory_ai._TRUNCATION_MARKER,
+        tool_builder._TAIL_TRUNCATION_MARKER,
+    ):
+        assert "已截斷" in marker
+
+
+def _fake_revise_session(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    measure: Callable[[StructuredRunStats], None],
+    result: BaseModel | None = None,
+    raises: BaseException | None = None,
+) -> dict[str, Any]:
+    """Stand in for the revise's ``generate_structured``: record what it was handed,
+    write ``measure``'s facts into the stats object the way the real loop does as
+    it runs, then return ``result`` or raise ``raises``. A ``result`` built with
+    ``model_construct`` skips ``ReviseResult``'s own sanitizer, so whatever masking
+    the outcome shows is ``run_revise``'s own."""
+    captured: dict[str, Any] = {}
+
+    async def fake(
+        system_prompt: str,
+        user_prompt: str,
+        model_cls: type[BaseModel],
+        *,
+        workflow: str = "unknown",
+        tools: Any = None,
+        max_tool_rounds: int | None = None,
+        timeout_seconds: float | None = None,
+        stats: StructuredRunStats | None = None,
+    ) -> BaseModel:
+        captured.update(model_cls=model_cls, stats=stats, max_tool_rounds=max_tool_rounds)
+        assert stats is not None
+        measure(stats)
+        if raises is not None:
+            raise raises
+        assert result is not None
+        return result
+
+    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", fake)
+    _fake_summary_generate(monkeypatch)
+    return captured
+
+
+_NOTE_SECRET = "live-secret-value-123456"
+
+
+def test_run_revise_reports_the_measured_stop_and_masks_the_notes_again(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A session the round budget ended, closing ready=false with both notes: the
+    outcome carries what the loop measured and the budget it was given, and the
+    notes as ``run_revise`` itself masked them -- the model's raw text reaches it
+    here, and the secret it repeats is the package's own key."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / ".env").write_text(f"KB_API_KEY={_NOTE_SECRET}\n", encoding="utf-8")
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_max_rounds=30)
+
+    def measure(stats: StructuredRunStats) -> None:
+        stats.tool_rounds_used = 30
+        stats.completions = 31
+        stats.finalized_by = "rounds"
+
+    captured = _fake_revise_session(
+        monkeypatch,
+        measure=measure,
+        result=tool_builder.ReviseResult.model_construct(
+            tool_name="kbsearch",
+            summary="分頁還沒修完",
+            ready=False,
+            handoff=f"run.py 的 page 參數已加上，用 {_NOTE_SECRET} 測過第一頁",  # noqa: RUF001
+            operator_action=f"在 config.env 加上 PAGE_SIZE=50（金鑰 {_NOTE_SECRET} 不要改）",  # noqa: RUF001
+        ),
+    )
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert captured["model_cls"] is tool_builder.ReviseResult
+    assert isinstance(captured["stats"], StructuredRunStats)
+    assert captured["max_tool_rounds"] == 30
+    assert outcome.not_ready is True
+    measured = (outcome.stopped_by, outcome.failure, outcome.rounds_used, outcome.max_rounds)
+    assert measured == ("rounds", None, 30, 30)
+    for note in (outcome.handoff, outcome.operator_action):
+        assert note is not None
+        assert _NOTE_SECRET not in note
+        assert tools._REDACTION_MARKER in note
+    assert outcome.operator_action is not None and "PAGE_SIZE=50" in outcome.operator_action
+
+
+@pytest.mark.parametrize(
+    ("raises", "facts", "error_part"),
+    [
+        (
+            LLMUpstreamError("EmptyResponse: the LLM returned empty content"),
+            {
+                "tool_rounds_used": 24,
+                "completions": 25,
+                "finalized_by": "rounds",
+                "failure": "empty_response",
+            },
+            "EmptyResponse",
+        ),
+        (
+            LLMUpstreamError("Timeout: the upstream LLM request failed"),
+            {"tool_rounds_used": 9, "completions": 9, "failure": "deadline"},
+            "Timeout",
+        ),
+        (
+            LLMNotConfiguredError("The LLM endpoint is not configured."),
+            {"failure": "not_configured"},
+            "LLM 尚未設定",
+        ),
+    ],
+    ids=["rounds-then-empty", "deadline", "not-configured"],
+)
+def test_run_revise_llm_failure_still_reports_the_measured_stop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    raises: BaseException,
+    facts: dict[str, Any],
+    error_part: str,
+) -> None:
+    """A session that ends in an exception still reports what the loop had measured
+    by then -- the failure that ended it included -- next to the error it always
+    reported. There is no answer, so there are no notes."""
+    _seed_package(monkeypatch, tmp_path)
+
+    def measure(stats: StructuredRunStats) -> None:
+        for key, value in facts.items():
+            setattr(stats, key, value)
+
+    _fake_revise_session(monkeypatch, measure=measure, raises=raises)
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False and outcome.not_ready is False
+    assert outcome.error is not None and error_part in outcome.error
+    assert outcome.stopped_by == facts.get("finalized_by")
+    assert outcome.failure == facts["failure"]
+    assert outcome.rounds_used == facts.get("tool_rounds_used", 0)
+    assert outcome.max_rounds == 24  # the default budget the session was given
+    assert (outcome.handoff, outcome.operator_action) == (None, None)
+
+
+def test_run_revise_masks_the_notes_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The notes' second mask is the same tools-directory scan as the summary's, so
+    it runs on a worker like the summary's does."""
+    _seed_package(monkeypatch, tmp_path)
+    loop_thread = threading.current_thread()
+    calls: list[tuple[str, threading.Thread]] = []
+    real_redact = tools.redact_known_secrets
+
+    def redact_spy(text: str) -> str:
+        calls.append((text, threading.current_thread()))
+        return real_redact(text)
+
+    monkeypatch.setattr(tools, "redact_known_secrets", redact_spy)
+    _fake_revise_session(
+        monkeypatch,
+        measure=lambda stats: None,
+        result=tool_builder.ReviseResult.model_construct(
+            tool_name="kbsearch",
+            summary="s",
+            ready=False,
+            handoff="the handoff note",
+            operator_action="the operator action",
+        ),
+    )
+
+    asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    for note in ("the handoff note", "the operator action"):
+        threads = [thread for text, thread in calls if text == note]
+        assert threads, note
+        assert loop_thread not in threads, note
+
+
+def test_the_revise_job_reports_the_measured_stop_and_the_notes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, client: TestClient
+) -> None:
+    """The six fields travel from the outcome through the job table to the poll."""
+    _seed_package(monkeypatch, tmp_path)
+    reported: dict[str, Any] = {
+        "stopped_by": "rounds",
+        "failure": "empty_response",
+        "rounds_used": 24,
+        "max_rounds": 24,
+        "handoff": "改了 run.py，還沒測第二頁",  # noqa: RUF001
+        "operator_action": "PAGE_SIZE=50",
+    }
+
+    async def fake_run_revise(
+        name: str,
+        feedback: str | None,
+        _resolution: tools.Resolved | None,
+        *,
+        runs: tuple[Any, ...] = (),
+    ) -> InstallOutcome:
+        return InstallOutcome(
+            ok=False,
+            tool_name=name,
+            error="AI 修訂工具失敗（EmptyResponse）。",  # noqa: RUF001
+            **reported,
+        )
+
+    monkeypatch.setattr(tool_builder, "run_revise", fake_run_revise)
+
+    async def scenario() -> dict[str, Any]:
+        started = await tool_builder.start_revise_job("kbsearch", "x", _TEST_VID)
+        assert started.job_id is not None
+        for _ in range(200):
+            job = tool_builder.get_job(started.job_id)
+            assert job is not None
+            if job["state"] not in ("queued", "running"):
+                return job
+            await asyncio.sleep(0.01)
+        raise AssertionError("job did not finish")
+
+    job = asyncio.run(scenario())
+    assert {key: job[key] for key in reported} == reported
+
+    polled = client.get(f"/api/tools/jobs/{job['job_id']}")
+    assert polled.status_code == 200
+    assert {key: polled.json()[key] for key in reported} == reported

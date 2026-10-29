@@ -36,7 +36,7 @@ from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 # The openai SDK pins its OWN httpx<1 as its transport layer: it parses
 # ``openai_base_url`` with ``httpx.URL`` and raises httpx exceptions (e.g.
@@ -53,7 +53,7 @@ from typing import Any, cast
 # transport defaults), so it carries no second httpx dependency and does not
 # violate this boundary either.
 import httpx
-from openai import AsyncOpenAI, DefaultAsyncHttpxClient, OpenAIError
+from openai import APITimeoutError, AsyncOpenAI, DefaultAsyncHttpxClient, OpenAIError
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 from pydantic import BaseModel, ValidationError
 
@@ -308,6 +308,68 @@ class LlmTool:
 
     spec: dict[str, Any]
     handler: Callable[[dict[str, Any]], Awaitable[str]]
+
+
+# Which budget ended the tool phase early (``StructuredRunStats.finalized_by``): the
+# round budget, or the size of the live conversation. Both send the model the same
+# ``_TOOL_BUDGET_EXHAUSTED`` nudge, so only the caller can tell them apart.
+FinalizeTrigger = Literal["rounds", "conversation"]
+
+# How a call finally failed (``StructuredRunStats.failure``), finer than the
+# exception it raised: every value but ``not_configured`` arrives as the same
+# ``LLMUpstreamError``. Each one is described on ``StructuredRunStats``.
+RunFailure = Literal[
+    "empty_response",
+    "invalid_output",
+    "upstream",
+    "request_timeout",
+    "deadline",
+    "not_configured",
+]
+
+
+@dataclass(slots=True)
+class StructuredRunStats:
+    """What one ``generate_structured`` call measured about how it ended.
+
+    The loop fills it in as it goes, so a caller holding it still has the facts
+    after the call raised. Two of them are independent and both kept:
+    ``finalized_by`` says which budget ended the tool phase (None when none did),
+    ``failure`` how the call finally failed (None when it returned a result). A
+    round budget that forced the finalize, followed by an empty finalize reply, is
+    ``finalized_by="rounds"`` AND ``failure="empty_response"``. An exception this
+    module does not raise itself -- an outside cancellation, a bug -- leaves
+    ``failure`` None.
+
+    ``failure`` is one of:
+
+    * ``empty_response`` -- the final reply had no usable content
+      (``_extract_content``'s EmptyResponse / MalformedResponse);
+    * ``invalid_output`` -- still not a valid object after the corrective retry;
+    * ``upstream`` -- any other failure at or after the request: an SDK error
+      other than its request timeout (a connection that failed included), a
+      reply body the SDK could not parse, an ``LLMUpstreamError`` raised by the
+      request itself, a tool_calls flood or oversized reply;
+    * ``request_timeout`` -- a single request timed out: the SDK's own request
+      timeout (``openai.APITimeoutError``, which ``openai_timeout_seconds``
+      sets; an ``OpenAIError``, not the builtin ``TimeoutError``), or a builtin
+      ``TimeoutError`` the request raised while the interaction's deadline had
+      NOT fired. Not the timeout's parent ``openai.APIConnectionError``: that is
+      a connection failing, and ``upstream``;
+    * ``deadline`` -- the interaction's own wall-clock deadline fired;
+    * ``not_configured`` -- no usable endpoint.
+
+    ``completions`` counts the requests that returned a completion, so a call
+    whose first request failed reports 0. Pass a fresh instance per call.
+    Measuring never steers the call: with or without one, the same replies
+    produce the same requests, the same handler calls, and the same result or
+    exception.
+    """
+
+    tool_rounds_used: int = 0
+    completions: int = 0
+    finalized_by: FinalizeTrigger | None = None
+    failure: RunFailure | None = None
 
 
 def normalized_model(settings: Settings) -> str:
@@ -930,6 +992,7 @@ async def _run_structured[ModelT: BaseModel](
     tools: list[LlmTool] | None,
     max_tool_rounds: int,
     timeout_seconds: float,
+    stats: StructuredRunStats | None = None,
 ) -> ModelT:
     """The config gate + agentic attempt loop, feeding ``recorder`` as it goes.
 
@@ -954,15 +1017,30 @@ async def _run_structured[ModelT: BaseModel](
     With ``tools`` None/empty NOTHING about the tool phase runs and the create()
     kwargs are byte-identical to the pre-tool-loop call, so the pinned
     llm-service/llm-log tests are untouched.
+
+    ``stats`` is written at the point each fact becomes true (see
+    ``StructuredRunStats``), so it holds every fact established before this
+    exits, by return or by raise. Every write is a plain attribute store: nothing
+    this function sends, runs, returns or raises reads it back.
     """
+    # Measured unconditionally, so not one branch below differs between a caller
+    # that asked for the facts and one that did not; nobody reads this instance.
+    if stats is None:
+        stats = StructuredRunStats()
+
     if not llm_configured():
         # `from None` severs any context: this gate also fields a syntactically
         # invalid base_url (llm_configured reparses it and reports unconfigured),
         # and suppressing context keeps that path's traceback as free of a URL
         # fragment as the _get_client construction path already is.
+        stats.failure = "not_configured"
         raise LLMNotConfiguredError("The LLM endpoint is not configured.") from None
 
-    client = _get_client()
+    try:
+        client = _get_client()
+    except LLMNotConfiguredError:
+        stats.failure = "not_configured"
+        raise
 
     # Normalize the tool set ONCE. An empty list is treated exactly like None
     # (no tools advertised on ANY create(), kwargs byte-identical to the
@@ -1012,6 +1090,10 @@ async def _run_structured[ModelT: BaseModel](
     # re-append the same nudge.
     conversation_budget_nudged = False
 
+    # Named so the TimeoutError handler at the bottom can ask it whether IT fired:
+    # this deadline and a TimeoutError the request raised itself both end up in
+    # that one handler, and ``expired()`` is asyncio's own record of which.
+    deadline_scope = asyncio.timeout(timeout_seconds)
     try:
         # ONE asyncio.timeout spans the WHOLE loop -- every tool round plus the
         # final try-and-retry -- so the wall-clock budget (the possibly-overridden
@@ -1030,7 +1112,7 @@ async def _run_structured[ModelT: BaseModel](
         # once the deadline is essentially spent (the per-call
         # _TOOL_DEADLINE_FLOOR_SECONDS check below), so at most one call
         # outlives the interaction, by at most one llm_tool_timeout_seconds.
-        async with asyncio.timeout(timeout_seconds):
+        async with deadline_scope:
             # Monotonic deadline on the SAME clock asyncio.timeout uses
             # (loop.time()), so the per-call remaining-budget check in the
             # tool-execution loop agrees with when the timeout will actually fire.
@@ -1075,6 +1157,7 @@ async def _run_structured[ModelT: BaseModel](
                     and not conversation_budget_nudged
                 ):
                     conversation_budget_nudged = True
+                    stats.finalized_by = "conversation"
                     messages.append({"role": "user", "content": _TOOL_BUDGET_EXHAUSTED})
                 # Snapshot the messages ACTUALLY sent for this attempt (the
                 # recorder copies them, since `messages` is rebuilt each round /
@@ -1111,8 +1194,10 @@ async def _run_structured[ModelT: BaseModel](
                     # trap for tooling/readers assuming older syntax rules);
                     # two plain clauses read the same everywhere and are stable
                     # under the formatter.
+                    stats.failure = "not_configured"
                     raise
                 except LLMUpstreamError:
+                    stats.failure = "upstream"
                     raise
                 except TimeoutError:
                     # A genuine builtin TimeoutError raised at the SDK boundary
@@ -1121,6 +1206,7 @@ async def _run_structured[ModelT: BaseModel](
                     # catch -- and is converted to TimeoutError by the async-with
                     # exit). Re-raise so the outer handler maps it to the "Timeout"
                     # category rather than letting `except Exception` mislabel it.
+                    # That handler also tells the two apart for ``stats``.
                     raise
                 except OpenAIError as exc:
                     # Category only (the SDK error's class name) plus the fixed
@@ -1129,8 +1215,15 @@ async def _run_structured[ModelT: BaseModel](
                     # None` severs the cause chain so neither can ride along in
                     # __cause__ into a traceback-logging sink. Transport failure ->
                     # no retry. The same safe category is recorded on the attempt.
+                    # For ``stats`` alone, the SDK's own request timeout counts as the
+                    # one request timing out; its parent ``APIConnectionError`` and every
+                    # other SDK error count as ``upstream``. What is raised is the same
+                    # category message either way.
                     category = f"{type(exc).__name__}: {_UPSTREAM_REASON}"
                     recorder.fail_current_attempt(category)
+                    stats.failure = (
+                        "request_timeout" if isinstance(exc, APITimeoutError) else "upstream"
+                    )
                     raise LLMUpstreamError(category) from None
                 except Exception as exc:
                     # Total boundary. A merely OpenAI-*compatible* endpoint can
@@ -1142,8 +1235,10 @@ async def _run_structured[ModelT: BaseModel](
                     # and sever the chain. Transport-shaped failure -> no retry.
                     category = f"{type(exc).__name__}: {_UPSTREAM_REASON}"
                     recorder.fail_current_attempt(category)
+                    stats.failure = "upstream"
                     raise LLMUpstreamError(category) from None
 
+                stats.completions += 1
                 # Capture usage from whatever completion carried it (per attempt).
                 recorder.record_usage(completion)
 
@@ -1185,6 +1280,7 @@ async def _run_structured[ModelT: BaseModel](
                         if count > _MAX_TOOL_CALLS_ACCEPTED:
                             flood = f"{_TOOL_CALLS_FLOOD_PREFIX}: {count} calls in one reply"
                             recorder.fail_current_attempt(flood)
+                            stats.failure = "upstream"
                             raise LLMUpstreamError(flood) from None
                         # SIZE bound (F4), the sibling guard at the SAME entry point:
                         # a reply UNDER the count cap can still carry a huge aggregate
@@ -1216,6 +1312,7 @@ async def _run_structured[ModelT: BaseModel](
                                 f"{_TOOL_CALLS_OVERSIZED_PREFIX}: {total_bytes} bytes in one reply"
                             )
                             recorder.fail_current_attempt(oversized)
+                            stats.failure = "upstream"
                             raise LLMUpstreamError(oversized) from None
                         # The synthetic trace is THIS attempt's recorded response;
                         # the tool RESULTS then appear inside the next attempt's
@@ -1277,10 +1374,12 @@ async def _run_structured[ModelT: BaseModel](
                             # the round responsive to the deadline regardless.
                             await asyncio.sleep(0)
                         tool_rounds_used += 1
+                        stats.tool_rounds_used = tool_rounds_used
                         # If that spent the last permitted round, append the
                         # finalize nudge NOW so the next (tools-free) create() is
                         # explicitly told to stop calling tools and answer.
                         if tool_rounds_used >= max_tool_rounds:
+                            stats.finalized_by = "rounds"
                             messages.append({"role": "user", "content": _TOOL_BUDGET_EXHAUSTED})
                         continue
 
@@ -1293,6 +1392,7 @@ async def _run_structured[ModelT: BaseModel](
                     # retried. Record the safe category on the attempt (its
                     # response_content stays None) and re-raise the SAME object.
                     recorder.fail_current_attempt(str(exc))
+                    stats.failure = "empty_response"
                     raise
                 recorder.record_response(content)
 
@@ -1314,6 +1414,7 @@ async def _run_structured[ModelT: BaseModel](
                     # with a FIXED, config-free message.
                     recorder.fail_current_attempt(type(exc).__name__)
                     if correction_used:
+                        stats.failure = "invalid_output"
                         raise LLMUpstreamError(_INVALID_STRUCTURED_OUTPUT) from None
                     correction_used = True
                     messages = [
@@ -1332,6 +1433,13 @@ async def _run_structured[ModelT: BaseModel](
         # would stay None forever even though the record's own outcome/error
         # correctly reads "timeout": every attempt in a finished record must
         # carry a classification.
+        #
+        # The raised error stays ONE "Timeout" category; ``stats`` alone tells the
+        # two sources apart. ``expired()`` is True only when this deadline's own
+        # callback ran -- asyncio's record, not a clock comparison -- so a
+        # TimeoutError the request raised while time remained reads as
+        # ``request_timeout``, and the deadline firing reads as ``deadline``.
+        stats.failure = "deadline" if deadline_scope.expired() else "request_timeout"
         recorder.fail_current_attempt("Timeout")
         raise LLMUpstreamError(f"Timeout: {_UPSTREAM_REASON}") from None
 
@@ -1339,6 +1447,7 @@ async def _run_structured[ModelT: BaseModel](
     # raises -- but present so every path provably returns/raises (satisfying the
     # type checker) and a future change to the loop bounds cannot fall through to
     # an implicit `None`.
+    stats.failure = "invalid_output"
     raise LLMUpstreamError(_INVALID_STRUCTURED_OUTPUT)
 
 
@@ -1351,6 +1460,7 @@ async def generate_structured[ModelT: BaseModel](
     tools: list[LlmTool] | None = None,
     max_tool_rounds: int | None = None,
     timeout_seconds: float | None = None,
+    stats: StructuredRunStats | None = None,
 ) -> ModelT:
     """Call the configured LLM under a strict, schema-guided contract and return
     a validated ``model_cls`` instance, with ONE corrective retry on bad output.
@@ -1374,6 +1484,12 @@ async def generate_structured[ModelT: BaseModel](
     (None -> ``settings.openai_timeout_seconds``) overrides the ONE wall-clock
     deadline wrapped around the whole interaction -- the installer (Phase 5c)
     passes a much larger budget for its long tool-building session.
+
+    ``stats`` (optional) is a caller-owned ``StructuredRunStats`` the loop fills
+    in: tool rounds used, completions received, which budget ended the tool
+    phase, and how the call failed. It is measurement only -- omitting it changes
+    nothing about the call -- and it holds its facts whether the call returns or
+    raises.
 
     ``workflow`` names the caller (``capture`` / ``enrich`` / ``assist_update``,
     or the default ``unknown`` for the direct test callers) and is recorded on
@@ -1424,6 +1540,7 @@ async def generate_structured[ModelT: BaseModel](
                 tools=tools,
                 max_tool_rounds=resolved_rounds,
                 timeout_seconds=resolved_timeout,
+                stats=stats,
             )
         except LLMNotConfiguredError as exc:
             recorder.finish(outcome="not_configured", error=str(exc))

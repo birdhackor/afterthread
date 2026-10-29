@@ -219,6 +219,30 @@ LLM。這道檢查在**送出時**先跑一次（不過就回 `409 env_policy`�
 `examples.json` 是版本內容（工具的回歸輸入清單）：builder 安裝時把測過的輸入寫進去，修訂時
 必須把每個範例都重跑一次、全部成功才回 `ready=true`。只放唯讀的輸入。
 
+**預算、批次驗證與交接**：builder 提示裡 `run_shell` 的逾時寫的是
+`TOOL_INSTALL_SHELL_TIMEOUT_SECONDS` 的實際秒數（安裝與修訂相同；安裝提示只有這一個數字
+來自設定）。修訂提示另外寫出這一場的實際上限：工具回合數 `TOOL_INSTALL_MAX_ROUNDS`、整場時間
+`TOOL_INSTALL_TIMEOUT_SECONDS`、對話大小 `LLM_TOOL_CONVERSATION_BUDGET_TOKENS`（超過時與回合
+用完一樣提前收尾），以及一次回覆至多執行 `_MAX_TOOL_CALLS_PER_REPLY`（16）個工具呼叫、其餘不執行。
+它要求把短測試合併成一個 `run_shell` 指令（但要在單一指令的逾時內，超過就分批）、逐例印出結果、
+任一例失敗整批算失敗；做不完時（包括被告知 tool-call budget 已用完）回 `ready=false`，在
+`handoff` 寫下找到什麼、改了哪裡、驗證了什麼、還剩什麼與下一步（不抄原始參數、輸出或個人內容），
+做完就把 `handoff` 留空；被告知預算用完時，除非最後一次測試已經證明修好，否則不回 `ready=true`。
+不論做完與否，需要操作者在工作區外動手時寫 `operator_action`（設定給可直接貼上套件 `config.env`
+的 `KEY=value`）——例如程式已在 `run_shell` 裡用新值驗證過、可以 `ready=true` 發布，但套件的
+`config.env` 仍要由操作者貼上那一行。附上失敗紀錄時，提示另說明紀錄裡的遮蔽標記不是真的值、被截斷
+的文字帶「已截斷」標記、參數不完整時照實說無法原樣重現而不要猜。
+
+修訂的結構化回答是 `ReviseResult`：`InstallResult` 加上 `handoff`（至多 4000 字）與
+`operator_action`（至多 1000 字），兩者和 summary 一樣先遮蔽、再 strip、再截斷，結果建構時
+在 worker 上再遮一次。它們只用來顯示與交接，後端不讀它們做任何判斷；安裝仍是 `InstallResult`。
+這一場怎麼結束由後端自己量（`llm.StructuredRunStats`）：job 帶 `stopped_by`（`rounds`／
+`conversation`）、`failure`、`rounds_used`、`max_rounds`，LLM 呼叫失敗時也照樣帶出（欄位意義見
+`backend/README.md` 的 job 輪詢說明）。工具頁的修訂卡片不論發布與否，有 `operator_action` 就顯示
+醒目的「需要你動手」、有 `handoff` 就顯示收合的交接筆記；停止原因在沒有發布時顯示（碰到預算時寫出
+它的設定名稱；單一請求逾時指向 `OPENAI_TIMEOUT_SECONDS`，只有整場時間用完才指向
+`TOOL_INSTALL_TIMEOUT_SECONDS`），已發布時只在預算逼出最後回答（`stopped_by` 有值）時顯示。
+
 後端自己也會跑範例（web-v6 §10）：修訂發布之後的**自動驗證**（`workflow=verify`），與工具頁的
 「跑一次範例」（`workflow=health_check`，一種 job）。兩者走 AI 請求的同一條執行路徑：取得共享
 tools lock、`bind_request_tools_lock`，用 `checkable_tool` 以 `enabled_llm_tools` 同一組函式建出
