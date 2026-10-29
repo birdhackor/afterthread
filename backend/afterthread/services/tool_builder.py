@@ -327,11 +327,24 @@ def _fsync_directory(path: Path) -> bool:
 
 
 def _fsync_tree(root: Path) -> bool:
-    """Persist regular files and only real directories in this tree, bottom-up."""
+    """Persist regular files and only real directories in this tree, bottom-up.
+
+    False unless the whole tree was seen: ``os.walk`` skips a directory it cannot
+    list, and hands over as a file an entry whose type check fails, never going
+    into it. Verified: a True answer rests on every directory having been listed
+    and every entry told apart. Not covered: an entry added after its directory
+    was listed.
+    """
+
+    def unlisted(error: OSError) -> None:
+        # ``os.walk``'s ``onerror``: a directory it cannot list fails the walk.
+        raise error
 
     try:
         directories = [root]
-        for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        for dirpath, dirnames, filenames in os.walk(
+            root, topdown=True, onerror=unlisted, followlinks=False
+        ):
             here = Path(dirpath)
             dirnames.sort()
             filenames.sort()
@@ -350,6 +363,8 @@ def _fsync_tree(root: Path) -> bool:
             for filename in filenames:
                 path = here / filename
                 info = os.lstat(path)
+                if stat.S_ISDIR(info.st_mode):
+                    raise OSError(f"{path} could not be told a directory, so it was not walked")
                 if not stat.S_ISREG(info.st_mode):
                     continue
                 fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))

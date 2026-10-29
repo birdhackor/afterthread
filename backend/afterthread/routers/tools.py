@@ -601,10 +601,10 @@ async def discard_tool_draft(
     sweep at the end of a later install or revise retries. A ``draft/`` that is
     not seen gone afterwards -- the rename refused and the removal in place
     incomplete, or ``draft/`` that cannot be looked at -- is a 500
-    ``draft_not_removed`` naming it, and so is a draft that cannot be looked at
-    to begin with (``draft/`` or the metadata directory above it), which is left
-    as it is: the draft may still be there, so the answer is not that it was
-    discarded.
+    ``draft_not_removed`` naming it, and so is a draft ``tool_drafts.discard``
+    cannot look at as it needs to before removing anything (its docstring says
+    when), which is left as it is: the draft may still be there, so the answer is
+    not that it was discarded.
 
     Declared BEFORE the job poll, which must stay last (see the comment there):
     a tool may be named ``jobs``.

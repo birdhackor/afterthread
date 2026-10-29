@@ -5318,6 +5318,86 @@ def test_fsync_tree_does_not_downgrade_a_real_directory_fsync_failure(
     assert tool_builder._fsync_tree(root) is False
 
 
+def test_fsync_tree_fails_when_a_directory_of_the_tree_cannot_be_listed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """What is under a directory that cannot be listed was never made durable,
+    though the directory itself opens and fsyncs: the tree is not durable."""
+
+    root = tmp_path / "build"
+    child = root / "real-child"
+    child.mkdir(parents=True)
+    (child / "payload.txt").write_text("content", encoding="utf-8")
+    real_scandir = os.scandir
+    refused: list[str] = []
+
+    def scandir(path: Any = ".", *args: Any, **kwargs: Any) -> Any:
+        if isinstance(path, str | os.PathLike) and os.fspath(path) == os.fspath(child):
+            refused.append(os.fspath(path))
+            raise OSError(errno.EIO, os.strerror(errno.EIO), os.fspath(path))
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+
+    assert tool_builder._fsync_tree(root) is False
+    assert refused == [os.fspath(child)]
+
+
+def test_fsync_tree_fails_when_an_entry_cannot_be_told_a_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A listing entry whose type check raises is handed over as a file by
+    ``os.walk``, which then never descends into it: a real directory reported
+    that way leaves what is under it unsynced, so the tree is not durable."""
+
+    root = tmp_path / "build"
+    child = root / "real-child"
+    child.mkdir(parents=True)
+    (child / "payload.txt").write_text("content", encoding="utf-8")
+    (root / "plain.txt").write_text("content", encoding="utf-8")
+    real_scandir = os.scandir
+    untold: list[str] = []
+
+    class Entry:
+        def __init__(self, entry: os.DirEntry[str]) -> None:
+            self._entry = entry
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._entry, name)
+
+        def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+            if self._entry.path == os.fspath(child):
+                untold.append(self._entry.path)
+                raise OSError(errno.EIO, os.strerror(errno.EIO), self._entry.path)
+            return self._entry.is_dir(follow_symlinks=follow_symlinks)
+
+    class Listing:
+        def __init__(self, listing: Any) -> None:
+            self._listing = listing
+
+        def __enter__(self) -> Listing:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self._listing.close()
+
+        def __iter__(self) -> Any:
+            return (Entry(entry) for entry in self._listing)
+
+    def scandir(path: Any = ".", *args: Any, **kwargs: Any) -> Any:
+        listing = real_scandir(path, *args, **kwargs)
+        if isinstance(path, str | os.PathLike) and os.fspath(path) == os.fspath(root):
+            return Listing(listing)
+        return listing
+
+    monkeypatch.setattr(os, "scandir", scandir)
+
+    assert tool_builder._fsync_tree(root) is False
+    assert untold == [os.fspath(child)]
+
+
 def test_invariant_d_failed_version_rename_leaves_current_on_the_previous_version(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

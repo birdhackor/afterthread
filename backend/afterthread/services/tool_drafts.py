@@ -85,15 +85,21 @@ What holds, and why:
   markers, which could break the program.
 * LINKS. A link is kept only when its target, resolved as a string from the
   link's own directory, stays inside the tree, and no ``..`` in it follows a
-  component that is itself a link (``stored_link_target`` says why). The rule is
-  applied twice: on the
+  component that is itself a link (``stored_link_target`` says why) or that
+  cannot be looked at (``unreadable``). The rule is applied twice: on the
   workspace, to plan the copy, and on the copy once every link is in it, before
   it is made durable, to every link of the copy. The copy differs from the
   workspace wherever an earlier version was put back, and the rule holds only on
   the tree it was applied to. Every link is judged before any is removed; what
-  fails is removed and recorded as not kept. An absolute target is inside the
-  workspace only when it begins with the workspace's own path, as given or as
-  resolved, followed by a separator or by nothing; it is stored relative, as
+  fails is removed and recorded as not kept. Then each link the copy still holds
+  is resolved the way the operating system resolves it, errors raised, and kept
+  only when it lands inside the copy or resolves nowhere at a point inside it
+  (``_links_failing_resolution``): a check of the property itself that rests on
+  nothing the rule decides and changes no stored target. An absolute target is
+  inside the workspace only when it begins with the workspace's own path, as
+  given or as resolved, followed by a separator or by nothing -- the resolved
+  path only when it can be had with errors raised; without it, a target that
+  does not begin with the given path is ``unreadable``. It is stored relative, as
   what follows that path behind a ``..`` for each directory the link is in,
   every component as written but the empty ones a link at the top would begin
   with, and judged by the same walk as a relative target. Folding ``x/..`` away
@@ -110,6 +116,7 @@ What holds, and why:
 """
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -855,27 +862,55 @@ def provenance_line(draft_id: str, attempts: int) -> str:
 # --- discard token ------------------------------------------------------------
 
 
-def _entry_identity(path: Path, *, with_change: bool) -> list[Any]:
+def _entry_identity(path: Path, *, with_change: bool) -> list[Any] | None:
+    """What ``lstat`` says of ``path``; ``["absent"]`` when it is seen not to be
+    there (``ENOENT``, ``ENOTDIR``), None when it cannot be looked at."""
     try:
         info = os.lstat(path)
-    except FileNotFoundError:
+    except FileNotFoundError, NotADirectoryError:
         return ["absent"]
-    except OSError as exc:
-        return ["error", exc.errno]
+    except OSError:
+        return None
     identity: list[Any] = [stat.S_IFMT(info.st_mode), info.st_dev, info.st_ino]
     if with_change:
         identity += [info.st_ctime_ns, info.st_size]
     return identity
 
 
-def _entries_identity(draft_dir: Path) -> list[Any]:
-    """The names of ``draft/``'s own entries, sorted, each with its ``_entry_identity``."""
+def _entries_identity(draft_dir: Path) -> list[Any] | None:
+    """The names of ``draft/``'s own entries, sorted, each with its ``_entry_identity``;
+    ``["absent"]`` when ``draft/`` is seen to hold none (``ENOENT``, ``ENOTDIR``),
+    None when it or an entry cannot be looked at."""
     try:
         with os.scandir(draft_dir) as listing:
             names = sorted(entry.name for entry in listing)
-    except OSError as exc:
-        return ["error", exc.errno]
-    return [[name, *_entry_identity(draft_dir / name, with_change=False)] for name in names]
+    except FileNotFoundError, NotADirectoryError:
+        return ["absent"]
+    except OSError:
+        return None
+    entries: list[Any] = []
+    for name in names:
+        identity = _entry_identity(draft_dir / name, with_change=False)
+        if identity is None:
+            return None
+        entries.append([name, *identity])
+    return entries
+
+
+def _observed_token(draft_dir: Path) -> tuple[str, bool]:
+    """``discard_token``'s value, and whether every look it rests on succeeded.
+
+    Verified: the value stands for the draft only when each look succeeded or saw
+    nothing there -- a look that fails the same way twice says nothing of whether
+    the draft between them is the same one. Not covered: what ``discard_token``
+    names as matching anyway, an empty ``draft/`` made again on the old inode.
+    """
+    manifest = _entry_identity(draft_dir / MANIFEST_FILENAME, with_change=True)
+    observed: list[Any] = [_entry_identity(draft_dir, with_change=False), manifest]
+    if manifest is None or manifest == ["absent"]:
+        observed.append(_entries_identity(draft_dir))
+    token = hashlib.sha256(json.dumps(observed).encode("ascii")).hexdigest()
+    return token, None not in observed
 
 
 def discard_token(draft_dir: Path) -> str:
@@ -883,6 +918,10 @@ def discard_token(draft_dir: Path) -> str:
 
     Taken from what ``lstat`` says of ``draft/`` and of its manifest, so it exists
     whatever the manifest holds -- unreadable, out of shape, missing, not a file.
+    A look that fails other than by seeing nothing there (``ENOENT``,
+    ``ENOTDIR``) leaves the value for display only: a discard takes its own look
+    under the lock and removes nothing unless each look in it succeeds or sees
+    nothing there (``_observed_token``).
 
     With a manifest, the manifest's inode, ctime and size carry it: every rewrite
     of the manifest replaces it with a new file, and a draft made again after a
@@ -891,11 +930,11 @@ def discard_token(draft_dir: Path) -> str:
     the next file.
 
     Without one -- no entry by that name, or one that cannot be looked at -- the
-    names and identities of ``draft/``'s own entries carry it too, when they can
-    be listed. Short of removing the draft, the only backend write that changes
-    them while there is no manifest is the first round making that ``draft/``,
-    which ends by writing one or by taking back what it made, unless the process
-    stops first; a discard never runs beside it (the caller holds the slot). A
+    names and identities of ``draft/``'s own entries carry it too. Short of
+    removing the draft, the only backend write that changes them while there is
+    no manifest is the first round making that ``draft/``, which ends by writing
+    one or by taking back what it made, unless the process stops first; a
+    discard never runs beside it (the caller holds the slot). A
     later first round refuses a ``draft/`` that exists, and a continuation, the
     marks around a publish and the sweep each need a manifest they can read. A
     save names what it leaves in ``draft/`` at random (``files-<hex>``,
@@ -908,11 +947,7 @@ def discard_token(draft_dir: Path) -> str:
     always are: the sweep and a save in progress change them without changing
     the draft.
     """
-    manifest = _entry_identity(draft_dir / MANIFEST_FILENAME, with_change=True)
-    identity = [_entry_identity(draft_dir, with_change=False), manifest]
-    if manifest[0] in ("absent", "error"):
-        identity.append(_entries_identity(draft_dir))
-    return hashlib.sha256(json.dumps(identity).encode("ascii")).hexdigest()
+    return _observed_token(draft_dir)[0]
 
 
 # --- what the list shows --------------------------------------------------------
@@ -1052,6 +1087,22 @@ def _over_limits(root: Path, max_entries: int, max_bytes: int) -> str | None:
     return None
 
 
+def _is_link(path: Path) -> bool:
+    """Whether ``path`` is a link, by its ``lstat``.
+
+    Seen not to exist (``ENOENT``), or under a component that is no directory
+    (``ENOTDIR``), it is no link: the operating system's resolution fails there
+    too. Any other error says nothing about it and is raised (``OSError``):
+    ``os.path.islink`` answers False for it, taking a link it could not see for
+    something else.
+    """
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError, NotADirectoryError:
+        return False
+    return stat.S_ISLNK(info.st_mode)
+
+
 def stored_link_target(
     root: Path, parts: tuple[str, ...], target: str
 ) -> tuple[str | None, str | None]:
@@ -1080,18 +1131,34 @@ def stored_link_target(
     left. The one change: for a link at the top of ``root``, the empty components
     it would begin with are dropped, since written first they would make it
     absolute. One that begins with neither path is ``link_outside``.
+
+    What cannot be looked at keeps no link and is recorded ``unreadable``: a
+    component before a ``..`` whose ``lstat`` fails other than by not being there
+    (``_is_link``), and an absolute target that does not begin with the path as
+    given while the resolved path cannot be had with errors raised -- a
+    resolution that swallows them can hand back a path ``root`` is not at.
+    Verified: every answer rests on a look that succeeded or saw nothing there.
+    Not covered: a component that changes between this look and the
+    operating system's.
     """
     link_dir = list(parts[:-1])
     relative = target
     if os.path.isabs(target):
+        spellings = [os.fspath(root)]
+        try:
+            spellings.append(os.path.realpath(root, strict=True))
+        except OSError:
+            resolved = False
+        else:
+            resolved = True
         inside: list[str] | None = None
-        for spelling in dict.fromkeys((os.fspath(root), os.path.realpath(root))):
+        for spelling in dict.fromkeys(spellings):
             prefix = spelling.rstrip(os.sep)
             if target == prefix or target.startswith(prefix + os.sep):
                 inside = target[len(prefix) :].split(os.sep)[1:]
                 break
         if inside is None:
-            return None, "link_outside"
+            return None, "link_outside" if resolved else "unreadable"
         if not link_dir:
             while inside and not inside[0]:
                 inside.pop(0)
@@ -1103,7 +1170,11 @@ def stored_link_target(
         if component == "..":
             if not stack:
                 return None, "link_outside"
-            if os.path.islink(root.joinpath(*stack)):
+            try:
+                is_link = _is_link(root.joinpath(*stack))
+            except OSError:
+                return None, "unreadable"
+            if is_link:
                 return None, "link_ambiguous"
             stack.pop()
         else:
@@ -1316,6 +1387,77 @@ def _links_failing_on(root: Path) -> list[Omitted]:
     return failing
 
 
+# The errors ``os.path.realpath(..., strict=True)`` raises where the operating
+# system's own resolution fails too: a name that is not there, a component that
+# is no directory, a cycle of links. Any other error -- a denied search, which
+# depends on who asks; a name too long as the resolved string spells it,
+# though not as the link does; an I/O error -- leaves the answer unknown.
+_RESOLVES_NOWHERE = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP})
+
+
+def _within_path(path: str, real_root: str) -> bool:
+    """Whether the resolved ``path`` is ``real_root`` or lies under it."""
+    return path == real_root or path.startswith(real_root.rstrip(os.sep) + os.sep)
+
+
+def _resolution_failure(link: str, real_root: str | None) -> OmitReason | None:
+    """Why the link at ``link`` is not kept, judged by where the operating system
+    resolves it; None when it is kept. ``real_root`` is the tree's resolved path,
+    None when that could not be had."""
+    if real_root is None:
+        return "unreadable"
+    try:
+        landed = os.path.realpath(link, strict=True)
+    except OSError as exc:
+        if exc.errno not in _RESOLVES_NOWHERE or not isinstance(exc.filename, str):
+            return "unreadable"
+        # Where the resolution fails: built from the resolved path, like ``landed``.
+        landed = exc.filename
+    return None if _within_path(landed, real_root) else "link_outside"
+
+
+def _links_failing_resolution(root: Path) -> list[Omitted]:
+    """Every link under ``root`` whose resolution is not seen to stay inside it.
+
+    The copy's second check of its links, after the link rule
+    (``_links_failing_on``) and resting on nothing it decides: each link is
+    resolved with ``os.path.realpath(..., strict=True)``, which raises its errors
+    where the default swallows them. Kept: one that lands inside ``root``'s
+    resolved path, and one that resolves nowhere (``_RESOLVES_NOWHERE``) at a
+    point inside it, since the copy only loses entries after the check. One that
+    lands outside is ``link_outside``, and so is one that resolves nowhere at a
+    point outside: what is written there later -- the draft's manifest, in a
+    first round -- would make it resolve. Any other error, or a ``root`` whose own
+    resolution fails, leaves it unconfirmed: ``unreadable``. Only judges, every
+    link before any is removed, and changes no stored target. Raises ``OSError``
+    when ``root`` cannot be walked.
+
+    Verified: every link it keeps resolves inside ``root`` or nowhere, as the
+    tree is when checked. Not covered: a way out of ``root`` and back into it,
+    which lands inside when checked and may lead elsewhere once what lies
+    outside changes; the link rule refuses every such way.
+    """
+    try:
+        real_root: str | None = os.path.realpath(root, strict=True)
+    except OSError:
+        real_root = None
+    failing: list[Omitted] = []
+    pending: list[tuple[str, str]] = [(os.fspath(root), "")]
+    while pending:
+        directory, prefix = pending.pop()
+        with os.scandir(directory) as listing:
+            children = sorted(listing, key=lambda entry: entry.name)
+        for entry in children:
+            relative = prefix + entry.name
+            if entry.is_symlink():
+                why = _resolution_failure(entry.path, real_root)
+                if why is not None:
+                    failing.append(Omitted(relative, why))
+            elif entry.is_dir(follow_symlinks=False):
+                pending.append((entry.path, relative + "/"))
+    return failing
+
+
 # What the copy records a path as when the embedded-secret scan finds a secret in it.
 _HIT_REASONS: dict[tools.SecretHitKind, OmitReason] = {
     "content": "secret_content",
@@ -1370,11 +1512,13 @@ def _carry_out(plan: _CopyPlan, incoming: Path, known: list[str]) -> list[Omitte
     workspace is stored rewritten, relative -- so once every entry is in place,
     what was judged on the workspace is judged again on the copy: every link by
     the link rule (``_links_failing_on``), all judged before any that fails is
-    removed, since the rule holds only on the tree it was applied to; then the
-    whole copy by the embedded-secret scan with ``known``, the secrets the save
-    started with (``_remove_secrets``). What either removes is recorded as not
-    kept, a path already recorded only once. Raises ``_CopyNotKept`` once the
-    copy would hold more than the limits allow or its scan cannot finish,
+    removed, since the rule holds only on the tree it was applied to; then every
+    link left by where it resolves, the way the operating system resolves it
+    (``_links_failing_resolution``), a check that does not rest on the rule; then
+    the whole copy by the embedded-secret scan with ``known``, the secrets the
+    save started with (``_remove_secrets``). What any of them removes is recorded
+    as not kept, a path already recorded only once. Raises ``_CopyNotKept`` once
+    the copy would hold more than the limits allow or its scan cannot finish,
     ``OSError`` when it cannot be made.
     """
     budget = _Budget(entries=plan.max_entries, data=plan.max_bytes)
@@ -1391,6 +1535,11 @@ def _carry_out(plan: _CopyPlan, incoming: Path, known: list[str]) -> list[Omitte
     failing = _links_failing_on(incoming)
     for item in failing:
         os.unlink(incoming / item.path)
+    # Then what the rule kept, by where the operating system resolves each link;
+    # again all judged first.
+    unresolved = _links_failing_resolution(incoming)
+    for item in unresolved:
+        os.unlink(incoming / item.path)
     # Each directory takes its workspace mode, the owner keeping full access for
     # the same reason the files keep read and write: neither the removals below
     # nor a later removal of the draft is refused by a directory of its own.
@@ -1399,7 +1548,7 @@ def _carry_out(plan: _CopyPlan, incoming: Path, known: list[str]) -> list[Omitte
     holding = _remove_secrets(incoming, known)
     omitted = list(plan.omitted)
     recorded = {item.path for item in omitted}
-    for item in (*failing, *holding):
+    for item in (*failing, *unresolved, *holding):
         if item.path not in recorded:
             recorded.add(item.path)
             omitted.append(item)
@@ -1916,8 +2065,8 @@ class Removal:
     ``removed`` False with ``draft/`` itself as ``residual_path``: ``draft/`` is
     not seen gone, so the draft may still be there -- the removal ran and
     ``draft/`` is still there or cannot be looked at, or a discard could not look
-    at it and left it as it was. False with no ``residual_path``: nothing was
-    taken away.
+    at it whole, or at the directories above it, and left it as it was. False
+    with no ``residual_path``: nothing was taken away.
     """
 
     removed: bool
@@ -1978,15 +2127,27 @@ def discard(
     ``draft/`` is seen not to exist, there is nothing to discard (``not_found``).
     A draft that cannot be looked at, or whose package or metadata directory
     cannot, is left as it is and answered as not removed, with ``draft/`` as what
-    is left: it may still be there. ``Removal.removed`` only once ``draft/`` is
-    seen gone (``_seen_gone``); one that cannot be looked at afterwards is not
-    removed either.
+    is left: it may still be there. So is a draft named by ``token`` when the look
+    this takes under the lock is not whole (``_observed_token``), and any draft
+    when the lock is not taken while the tools directory is not seen gone:
+    without the lock, ``not_found`` only when no tools directory is configured
+    or it is seen not to exist. ``Removal.removed`` only once ``draft/`` is seen
+    gone (``_seen_gone``); one that cannot be looked at afterwards is not removed
+    either.
 
     Raises ``tools.ToolsLockUnavailableError`` when the lock path is unusable.
     """
     lock = tools.acquire_shared_tools_lock()
     if lock is None:
-        return "not_found"
+        # No lock: no tools directory is configured, or it is not seen to be a
+        # directory, a look at it that fails included. Verified: "no draft" only
+        # when none is configured or it is seen gone. Not covered: a tools path
+        # that is there but no directory holds no draft, yet is answered as one
+        # that may.
+        base = tools.tools_dir()
+        if base is None or _seen_gone(base):
+            return "not_found"
+        return Removal(False, draft_path(package_root))
     try:
         found = _seen_own_draft(package_root)
         if found is None:
@@ -1996,7 +2157,10 @@ def discard(
             return "not_found"
         draft_dir, _info = found
         if token is not None:
-            same = discard_token(draft_dir) == token
+            now, whole = _observed_token(draft_dir)
+            if not whole:
+                return Removal(False, draft_dir)
+            same = now == token
         else:
             same = (
                 draft_id is not None
