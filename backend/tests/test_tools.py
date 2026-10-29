@@ -23,6 +23,7 @@ ring is process-wide, so an autouse fixture resets it around every test.
 """
 
 import asyncio
+import contextlib
 import errno
 import fcntl
 import inspect
@@ -1529,6 +1530,49 @@ def test_runtime_timeout_kills_process_group(
     assert elapsed < 5  # killed on expiry, not waited out for 30s
 
 
+def test_a_tool_run_whose_reader_thread_fails_to_start_leaves_no_live_group(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A runtime tool is spawned, then its output reader's thread fails to start,
+    as in a process out of threads. The drain's teardown still kills the tool's
+    process group and reaps its leader before the error leaves the run."""
+    root = tmp_path / "tools"
+    _make_tool(root, "slow", "import time\ntime.sleep(30)\n")
+    _install_tools(monkeypatch, root)
+    real_popen = subprocess.Popen
+    spawned: list[subprocess.Popen[str]] = []
+
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    real_start = threading.Thread.start
+
+    def start(self: threading.Thread) -> None:
+        target = getattr(self, "_target", None)
+        if isinstance(getattr(target, "__self__", None), tools._CappedReader):
+            raise RuntimeError("can't start new thread")
+        real_start(self)
+
+    handler = enabled_llm_tools()[0].handler
+    monkeypatch.setattr(subprocess, "Popen", recording)
+    monkeypatch.setattr(threading.Thread, "start", start)
+    try:
+        with contextlib.suppress(RuntimeError):
+            asyncio.run(handler({}))
+        # Read before the cleanup below, which would reap whatever the run left.
+        ends = [proc.returncode for proc in spawned]
+    finally:
+        for proc in spawned:
+            if proc.returncode is None:  # unreaped, so its pid still names its group
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=10)
+
+    assert ends == [-signal.SIGKILL]  # killed by the drain's teardown, and reaped
+
+
 def test_runtime_output_is_capped(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     root = tmp_path / "tools"
     _make_tool(root, "big", "import sys\nsys.stdout.write('a' * 5000)\n")
@@ -1621,7 +1665,7 @@ def test_communicate_bounded_without_a_stop_signal_ends_as_before(
         text=True,
         start_new_session=True,
     )
-    signal_kwargs = {} if abort == "omitted" else {"abort": threading.Event()}
+    signal_kwargs: dict[str, Any] = {} if abort == "omitted" else {"abort": threading.Event()}
     cap = 1000
 
     started = time.monotonic()

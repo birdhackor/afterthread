@@ -28,7 +28,9 @@ import json
 import logging
 import os
 import shutil
+import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -42,6 +44,8 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from anyio.to_thread import current_default_thread_limiter
+from anyio.to_thread import run_sync as run_on_pool_thread
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import Engine
@@ -8511,11 +8515,12 @@ def test_a_command_its_worker_reaches_after_the_session_stopped_never_outlives_i
         cap: int,
         extra_env: dict[str, str] | None = None,
         abort: threading.Event | None = None,
+        evidence: tool_builder._ShellEvidence | None = None,
     ) -> str:
         stops.append(abort)
         if held_until_stop == "its-check":
             assert abort is not None and abort.wait(15)
-        return real_run(staging, command, timeout, cap, extra_env, abort)
+        return real_run(staging, command, timeout, cap, extra_env, abort, evidence)
 
     def spawn_late(*args: Any, **kwargs: Any) -> Any:
         if held_until_stop == "its-spawn":
@@ -8547,16 +8552,16 @@ def test_a_command_its_worker_reaches_after_the_session_stopped_never_outlives_i
 
 
 @pytest.mark.parametrize("loop_kind", ["asyncio", "uvloop"])
-def test_stop_and_wait_counts_a_command_ended_only_once_its_worker_returns(
+def test_a_cancelled_command_task_counts_as_stopped_only_once_its_teardown_is_confirmed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, loop_kind: str
 ) -> None:
     """The event loop shutting down cancels every task still on it -- the
     session's and its command's own task alike -- and a cancelled task is done
     while the worker it waited on still runs. Here that worker lingers after its
-    command has ended. The session, stopping its commands as it unwinds, is told
-    they ended only once the worker has returned, by which time the command's
-    process group is gone: the shutdown's gather keeps the loop running, so the
-    worker's word reaches it."""
+    command's teardown. The session, stopping its commands as it unwinds, counts
+    the command stopped only on the worker's report of that teardown, by which
+    time the command's process group is gone: the shutdown's gather keeps the
+    loop running, so the report reaches it."""
     if loop_kind == "uvloop":
         new_loop = pytest.importorskip("uvloop").new_event_loop
     else:
@@ -8586,7 +8591,7 @@ def test_stop_and_wait_counts_a_command_ended_only_once_its_worker_returns(
         try:
             await shells.run(staging, f'echo $$ > "{pid_file}"; sleep 30', 20, 4096, None)
         finally:
-            seen["ended"] = await shells.stop_and_wait()
+            seen["stopped"] = await shells.stop_and_wait()
             seen["worker returned"] = worker_returned.is_set()
             group = _pid_in(pid_file)
             seen["group alive"] = group is not None and _group_exists(group)
@@ -8608,13 +8613,82 @@ def test_stop_and_wait_counts_a_command_ended_only_once_its_worker_returns(
         runner.close()
 
     assert sessions[0].cancelled()
-    assert seen == {"ended": True, "worker returned": True, "group alive": False}
+    assert seen == {"stopped": True, "worker returned": True, "group alive": False}
 
 
 def _session_roots(tmp_path: Path) -> list[Path]:
     """The builder session workspaces still under the tools directory."""
     staging = (tmp_path / "tools").resolve() / ".staging"
     return sorted(staging.iterdir()) if staging.is_dir() else []
+
+
+def _record_spawns(monkeypatch: pytest.MonkeyPatch) -> list[subprocess.Popen[str]]:
+    """Every process ``subprocess.Popen`` starts from here on, in order."""
+    real_popen = subprocess.Popen
+    spawned: list[subprocess.Popen[str]] = []
+
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", recording)
+    return spawned
+
+
+def _end_untorn(spawned: list[subprocess.Popen[str]]) -> None:
+    """Kill and reap commands whose drain was bypassed: nothing else will. Each
+    leader is still unreaped here, so its pid still names its group."""
+    for proc in spawned:
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=10)
+
+
+def _drain_that_raises(_proc: subprocess.Popen[str], **_kwargs: Any) -> Any:
+    """Stands in for the whole of ``_communicate_bounded``: an exception out of the
+    drain before any teardown, its own ``finally`` included, has run."""
+    raise RuntimeError("the drain failed before its teardown")
+
+
+def _fail_reader_starts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every output reader thread ``_communicate_bounded`` starts fail to
+    start, as in a process out of threads; every other thread starts as usual."""
+    real_start = threading.Thread.start
+
+    def start(self: threading.Thread) -> None:
+        target = getattr(self, "_target", None)
+        if isinstance(getattr(target, "__self__", None), tools._CappedReader):
+            raise RuntimeError("can't start new thread")
+        real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+
+
+async def _job_when_done(job_id: str | None, *, timeout: float = 30.0) -> dict[str, Any]:
+    assert job_id is not None
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        job = tool_builder.get_job(job_id)
+        assert job is not None
+        if job["state"] not in ("queued", "running"):
+            return job
+        await asyncio.sleep(0.01)
+    raise AssertionError("the job did not end in time")
+
+
+def _tree_state(root: Path) -> list[tuple[str, int, int, int, str]]:
+    """Every entry under ``root``, ``root`` included: its path, mode, size and
+    mtime, and for a regular file a digest of its bytes."""
+    state = []
+    for path in sorted([root, *root.rglob("*")]):
+        info = path.lstat()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest() if stat.S_ISREG(info.st_mode) else ""
+        state.append(
+            (str(path.relative_to(root)), info.st_mode, info.st_size, info.st_mtime_ns, digest)
+        )
+    return state
 
 
 @pytest.mark.parametrize("kind", ["install", "revise"])
@@ -8689,26 +8763,6 @@ def test_a_command_not_confirmed_stopped_keeps_its_workspace_and_the_job_still_e
         assert isinstance(current, tools.Resolved) and current.vid == _TEST_VID
 
 
-def test_the_kept_workspace_error_leaves_its_path_to_the_log_when_masking_fails(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The kept workspace's path is masked before it goes into the job's error,
-    and masking scans the tools directory. When that scan fails, the error says
-    the path is in the backend log instead of carrying it unmasked -- or raising
-    in place of the job's own report."""
-
-    def unavailable(_text: str) -> str:
-        raise RuntimeError("the secret store is unavailable")
-
-    monkeypatch.setattr(tools, "redact_known_secrets", unavailable)
-    session_root = tmp_path / "tools" / ".staging" / uuid4().hex
-
-    error = tool_builder._workspace_kept_error(session_root)
-
-    assert session_root.name not in error
-    assert "路徑見後端記錄" in error
-
-
 @pytest.mark.parametrize("kind", ["install", "revise"])
 def test_a_second_cancellation_cutting_the_wait_short_keeps_the_workspace(
     monkeypatch: pytest.MonkeyPatch,
@@ -8776,3 +8830,509 @@ def test_a_second_cancellation_cutting_the_wait_short_keeps_the_workspace(
     assert len(kept) == 1
     assert (kept[0] / "build").is_dir()
     assert any(str(kept[0]) in record.getMessage() for record in caplog.records)
+
+
+def test_an_exception_before_the_teardown_leaves_the_command_unconfirmed_and_the_workspace_kept(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A command spawned, then an exception out of its drain before any teardown
+    -- here the whole of ``_communicate_bounded`` replaced, so not even its own
+    ``finally`` runs. The worker returns, but with no evidence: the group is still
+    alive, so the session counts the command unconfirmed and keeps the workspace,
+    neither stripped nor removed."""
+    version = _seed_package(monkeypatch, tmp_path)
+    _session_settings(monkeypatch, tmp_path)
+    _endpoint_asking_for_one_command(monkeypatch, "sleep 30")
+    spawned = _record_spawns(monkeypatch)
+    monkeypatch.setattr(tools, "_communicate_bounded", _drain_that_raises)
+    seen = _watch_workspace_steps(monkeypatch, lambda: spawned[0].pid if spawned else None)
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+            outcome = asyncio.run(_run_revise("kbsearch", "fix it"))
+        group_alive = len(spawned) == 1 and _group_exists(spawned[0].pid)
+        kept = _session_roots(tmp_path)
+    finally:
+        _end_untorn(spawned)
+
+    assert group_alive  # nothing tore it down: what a returning worker would hide
+    assert seen == []  # never stripped, never removed
+    assert len(kept) == 1
+    assert (kept[0] / "build").is_dir()
+    assert outcome.ok is False
+    assert str(kept[0]) in (outcome.error or "")
+    assert any(str(kept[0]) in record.getMessage() for record in caplog.records)
+    current = tools.resolve_current(_package_root(version))
+    assert isinstance(current, tools.Resolved) and current.vid == _TEST_VID
+
+
+def test_stop_and_wait_answers_false_at_the_first_unconfirmed_report(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Two commands running when the session stops: one stuck before its first
+    poll, which never reports, and one whose drain raises once the stop is set,
+    before any teardown, so its worker reports it unconfirmed. ``stop_and_wait``
+    answers False on that report instead of waiting out ``_shell_stop_seconds``
+    for the other."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    spawned = _record_spawns(monkeypatch)
+    release = threading.Event()
+    draining: list[subprocess.Popen[str]] = []
+    real_communicate = tools._communicate_bounded
+
+    def stuck_or_raising_at_the_stop(proc: subprocess.Popen[str], **kwargs: Any) -> Any:
+        draining.append(proc)
+        if proc is spawned[0]:
+            release.wait(60)
+            return real_communicate(proc, **kwargs)
+        assert kwargs["abort"].wait(30)
+        return _drain_that_raises(proc)
+
+    monkeypatch.setattr(tools, "_communicate_bounded", stuck_or_raising_at_the_stop)
+
+    async def scenario() -> tuple[bool, float]:
+        shells = tool_builder._BuilderShells()
+        stuck = asyncio.ensure_future(shells.run(staging, "sleep 30", 20, 4096, None))
+        while len(draining) < 1:
+            await asyncio.sleep(0.01)
+        raising = asyncio.ensure_future(shells.run(staging, "sleep 30", 20, 4096, None))
+        while len(draining) < 2:
+            await asyncio.sleep(0.01)
+        started = time.monotonic()
+        answer = await shells.stop_and_wait()
+        elapsed = time.monotonic() - started
+        with pytest.raises(RuntimeError):
+            await raising
+        release.set()
+        assert await stuck == tool_builder._SHELL_STOPPED
+        return answer, elapsed
+
+    try:
+        answer, elapsed = asyncio.run(scenario())
+    finally:
+        release.set()
+        _end_untorn(spawned[1:])
+
+    assert len(spawned) == 2
+    assert answer is False
+    assert elapsed < 5 < tool_builder._shell_stop_seconds()
+
+
+def test_a_builder_reader_that_fails_to_start_leaves_no_live_group_and_the_session_goes_on(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The output reader's thread cannot start once the command is spawned. The
+    drain's teardown still kills and reaps the group before the error leaves it,
+    and that teardown is the evidence: the session goes on -- its next round hands
+    the model the tool's failure, with the group already gone -- the model
+    answers, and the session ends as any other does, its workspace stripped and
+    removed rather than kept."""
+    _session_settings(monkeypatch, tmp_path, tool_install_timeout_seconds=60)
+    _no_fetch(monkeypatch)
+    spawned = _record_spawns(monkeypatch)
+    rounds: list[dict[str, Any]] = []
+    call = SimpleNamespace(
+        id="call_0",
+        type="function",
+        function=SimpleNamespace(name="run_shell", arguments=json.dumps({"command": "sleep 30"})),
+    )
+    answer = {"tool_name": "kbsearch", "summary": "the shell broke; nothing built", "ready": False}
+    replies = [
+        SimpleNamespace(content=None, tool_calls=[call]),
+        SimpleNamespace(content=json.dumps(answer), tool_calls=None),
+    ]
+
+    async def create(**kwargs: Any) -> Any:
+        # Read here, before anything after the session could reap the command.
+        end = spawned[0].returncode if spawned else None
+        rounds.append({"messages": list(kwargs["messages"]), "command ended": end})
+        return SimpleNamespace(choices=[SimpleNamespace(message=replies.pop(0))])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr("afterthread.services.llm._get_client", lambda: client)
+    _fail_reader_starts(monkeypatch)
+    seen = _watch_workspace_steps(monkeypatch, lambda: None)
+
+    try:
+        outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build it"))
+    finally:
+        _end_untorn(spawned)
+
+    assert len(spawned) == 1
+    assert len(rounds) == 2  # the session went on past the failed command
+    results = [message for message in rounds[1]["messages"] if message.get("role") == "tool"]
+    assert [message["content"] for message in results] == ["tool execution failed: RuntimeError"]
+    assert rounds[1]["command ended"] == -signal.SIGKILL  # killed by the drain, and reaped
+    assert outcome.not_ready is True
+    assert outcome.summary == answer["summary"]
+    assert "原地保留" not in (outcome.error or "")
+    assert seen == [("strip", False), ("cleanup", False)]
+    assert _session_roots(tmp_path) == []
+
+
+@pytest.mark.parametrize("case", ["install-deadline", "revise-deadline", "revise-answer"])
+def test_the_unconfirmed_exit_takes_no_pool_thread_while_a_stuck_worker_holds_the_only_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str
+) -> None:
+    """The thread pool has one thread, and a stuck worker holds it. A session
+    whose commands cannot be confirmed stopped still ends its job within the
+    bound: nothing on that exit waits for a pool thread -- not the job's error,
+    and, after a session that answered, not the masking of the model's words."""
+    kind = case.split("-")[0]
+    if kind == "revise":
+        _seed_package(monkeypatch, tmp_path)
+    _session_settings(monkeypatch, tmp_path)
+    _no_fetch(monkeypatch)
+    monkeypatch.setattr(tool_builder, "_shell_stop_seconds", lambda: 0.3)
+    spawned = _record_spawns(monkeypatch)
+    release = threading.Event()
+    holding = threading.Event()
+    stuck_tasks: list[asyncio.Future[None]] = []
+
+    def stuck_worker() -> None:
+        holding.set()
+        release.wait(60)
+
+    if case.endswith("deadline"):
+        # The command's own worker is the stuck one: spawned, then held before its
+        # first poll, on the pool's only thread.
+        real_communicate = tools._communicate_bounded
+
+        def stuck_drain(proc: subprocess.Popen[str], **kwargs: Any) -> Any:
+            stuck_worker()
+            return real_communicate(proc, **kwargs)
+
+        monkeypatch.setattr(tools, "_communicate_bounded", stuck_drain)
+        _endpoint_asking_for_one_command(monkeypatch, "sleep 30")
+    else:
+        # The command's drain raises before any teardown, so its worker reports it
+        # unconfirmed and hands the thread back; the model then answers, after a
+        # stuck worker has taken the pool's only thread.
+        monkeypatch.setattr(tools, "_communicate_bounded", _drain_that_raises)
+
+        async def answering_session(
+            _system_prompt: str, _user_prompt: str, model_cls: type[BaseModel], **kwargs: Any
+        ) -> BaseModel:
+            by_name = {tool.spec["function"]["name"]: tool for tool in kwargs["tools"]}
+            with pytest.raises(RuntimeError):
+                await by_name["run_shell"].handler({"command": "sleep 30"})
+            stuck_tasks.append(asyncio.ensure_future(run_on_pool_thread(stuck_worker)))
+            while not holding.is_set():
+                await asyncio.sleep(0.01)
+            return model_cls.model_validate(
+                {
+                    "tool_name": "kbsearch",
+                    "summary": "改好了",
+                    "ready": True,
+                    "handoff": "交接",
+                    "operator_action": "設定",
+                }
+            )
+
+        monkeypatch.setattr(tool_builder, "generate_structured", answering_session)
+
+    async def job_on_one_thread() -> dict[str, Any]:
+        current_default_thread_limiter().total_tokens = 1
+        if kind == "install":
+            job_id = tool_builder.start_install_job("http://kb.example/openapi.json", "build it")
+        else:
+            job_id = (await tool_builder.start_revise_job("kbsearch", "fix it", _TEST_VID)).job_id
+        return await _job_when_done(job_id, timeout=10)
+
+    try:
+        job = asyncio.run(job_on_one_thread())
+    finally:
+        release.set()
+        if case.endswith("deadline"):
+            if spawned:
+                _wait_for(lambda: not _group_exists(spawned[0].pid))
+        else:
+            _end_untorn(spawned)
+
+    assert holding.is_set()
+    assert job["state"] == "failed"
+    kept = _session_roots(tmp_path)
+    assert len(kept) == 1
+    assert str(kept[0]) in (job["error"] or "")
+
+
+def test_a_kept_workspace_is_left_untouched_by_a_later_successful_job(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Once a workspace is kept, nothing in the backend touches it again: a later
+    job that runs all the way to a published install -- its cleanup and sweep
+    included -- leaves every entry of that workspace as it was, contents and
+    timestamps alike."""
+    _session_settings(monkeypatch, tmp_path)
+    pid_file = tmp_path / "command.pid"
+    _endpoint_asking_for_one_command(
+        monkeypatch, f'echo $$ > "{pid_file}"; echo half-done > notes.txt; sleep 30'
+    )
+    _no_fetch(monkeypatch)
+    release = threading.Event()
+    real_communicate = tools._communicate_bounded
+
+    def stuck_before_its_first_poll(proc: subprocess.Popen[str], **kwargs: Any) -> Any:
+        release.wait(60)
+        return real_communicate(proc, **kwargs)
+
+    monkeypatch.setattr(tools, "_communicate_bounded", stuck_before_its_first_poll)
+    monkeypatch.setattr(tool_builder, "_shell_stop_seconds", lambda: 0.3)
+
+    def install(instructions: str) -> dict[str, Any]:
+        async def run() -> dict[str, Any]:
+            job_id = tool_builder.start_install_job("http://kb.example/openapi.json", instructions)
+            return await _job_when_done(job_id)
+
+        return asyncio.run(run())
+
+    try:
+        first = install("build it")
+        kept = _session_roots(tmp_path)
+        assert len(kept) == 1
+        _wait_for(lambda: (kept[0] / "build" / "notes.txt").exists())
+        before = _tree_state(kept[0])
+        monkeypatch.setattr(tools, "_communicate_bounded", real_communicate)
+        _fake_generate(
+            monkeypatch,
+            result={"tool_name": "kbnew", "summary": "built", "ready": True},
+            files={"tool.json": json.dumps(_package_manifest("kbnew")), "run.py": _GOOD_RUN_PY},
+        )
+        second = install("build another")
+        after = _tree_state(kept[0])
+        left = _session_roots(tmp_path)
+    finally:
+        release.set()
+        group = _pid_in(pid_file)
+        if group is not None:
+            _wait_for(lambda: not _group_exists(group))
+
+    assert first["state"] == "failed"
+    assert second["state"] == "succeeded"
+    assert second["outcome"] == "published"
+    assert left == kept
+    assert after == before
+
+
+def test_a_command_whose_worker_never_entered_counts_as_not_started_and_cleanup_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The pool never runs a command's worker, as when every pool thread is
+    taken. The session's stop finds the worker not entered: whenever it does
+    run, it finds the stop set before it could spawn, so the command counts as
+    never started. The workspace is stripped and removed as on any other exit,
+    with no wait for the worker."""
+    _session_settings(monkeypatch, tmp_path)
+    pid_file = tmp_path / "command.pid"
+    _endpoint_asking_for_one_command(monkeypatch, f'echo $$ > "{pid_file}"; sleep 30')
+    _no_fetch(monkeypatch)
+    real_pool = tool_builder.run_in_threadpool
+    withheld: list[str] = []
+
+    async def pool_that_never_runs_the_worker(func: Any, *args: Any, **kwargs: Any) -> Any:
+        name = getattr(func, "__qualname__", "")
+        if name.endswith("_BuilderShells.run.<locals>.worker"):
+            withheld.append(name)
+            await asyncio.Event().wait()  # never set: cancelled with the loop
+        return await real_pool(func, *args, **kwargs)
+
+    monkeypatch.setattr(tool_builder, "run_in_threadpool", pool_that_never_runs_the_worker)
+    seen = _watch_workspace_steps(monkeypatch, lambda: _pid_in(pid_file))
+
+    started = time.monotonic()
+    outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build it"))
+    elapsed = time.monotonic() - started
+
+    assert len(withheld) == 1  # the command reached the pool, which never ran it
+    assert not pid_file.exists()
+    assert seen == [("strip", False), ("cleanup", False)]
+    assert elapsed < 10 < tool_builder._shell_stop_seconds()
+    assert outcome.ok is False
+    assert "原地保留" not in (outcome.error or "")
+
+
+def test_a_command_whose_spawn_fails_counts_as_stopped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The child cannot enter its working directory, so ``Popen`` raises after
+    the fork -- and CPython reaps that child before it raises. That ``OSError``
+    is evidence: the command counts as stopped, nothing is left running."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    spawned: list[int] = []
+    real_fork_exec = subprocess._fork_exec  # ty: ignore[unresolved-attribute]
+
+    def recording_fork_exec(*args: Any) -> int:
+        pid = real_fork_exec(*args)
+        spawned.append(pid)
+        return pid
+
+    monkeypatch.setattr(subprocess, "_fork_exec", recording_fork_exec)
+
+    async def scenario() -> tuple[str, bool]:
+        shells = tool_builder._BuilderShells()
+        result = await shells.run(tmp_path / "missing", "true", 20, 4096, None)
+        return result, await shells.stop_and_wait()
+
+    result, stopped = asyncio.run(scenario())
+
+    assert result == "command failed to start: FileNotFoundError"
+    assert len(spawned) == 1  # a child was forked, and its exec failed
+    with pytest.raises(ChildProcessError):  # already reaped: nothing left to wait for
+        os.waitpid(spawned[0], os.WNOHANG)
+    assert stopped is True
+
+
+def test_a_command_that_finds_the_stop_set_before_spawning_counts_as_stopped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Its worker entered before the stop and reached the stop check only after
+    it, so it never spawned. That is evidence too: the command counts as
+    stopped."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    spawned = _record_spawns(monkeypatch)
+    real_run = tool_builder._run_shell_subprocess
+    reached: list[threading.Event | None] = []
+
+    def held_until_the_stop(
+        staging: Path,
+        command: str,
+        timeout: float,
+        cap: int,
+        extra_env: dict[str, str] | None = None,
+        abort: threading.Event | None = None,
+        evidence: tool_builder._ShellEvidence | None = None,
+    ) -> str:
+        reached.append(abort)
+        assert abort is not None and abort.wait(15)
+        return real_run(staging, command, timeout, cap, extra_env, abort, evidence)
+
+    monkeypatch.setattr(tool_builder, "_run_shell_subprocess", held_until_the_stop)
+
+    async def scenario() -> tuple[bool, str]:
+        shells = tool_builder._BuilderShells()
+        command = asyncio.ensure_future(shells.run(staging, "sleep 30", 20, 4096, None))
+        while not reached:
+            await asyncio.sleep(0.01)
+        stopped = await shells.stop_and_wait()
+        return stopped, await command
+
+    stopped, result = asyncio.run(scenario())
+
+    assert result == tool_builder._SHELL_NOT_STARTED
+    assert spawned == []
+    assert stopped is True
+
+
+def _shells_run_alone(staging: Path, command: str, timeout: float) -> tuple[str, bool]:
+    """Run one command through a fresh ``_BuilderShells``, then stop it: the
+    command's result text and what ``stop_and_wait`` answered."""
+
+    async def scenario() -> tuple[str, bool]:
+        shells = tool_builder._BuilderShells()
+        result = await shells.run(staging, command, timeout, 4096, None)
+        return result, await shells.stop_and_wait()
+
+    return asyncio.run(scenario())
+
+
+def test_a_command_that_exits_on_its_own_counts_as_stopped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A command that ends by itself leaves its group holding only the exited,
+    unreaped leader when the teardown comes -- a group macOS refuses SIGKILL for
+    with EPERM. Once the leader is reaped the group is gone, and that is the
+    evidence: the command counts as stopped."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+
+    result, stopped = _shells_run_alone(staging, "echo done", 20)
+
+    assert result == "done\n"
+    assert stopped is True
+
+
+def test_a_teardown_whose_reap_fails_gives_no_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The command times out and the drain's teardown signals its group, but
+    ``proc.wait()`` fails, so no return code is left. That is not a teardown that
+    worked: ``on_reaped`` is never called, and although the drain returned, the
+    command counts as unconfirmed."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    real_popen = subprocess.Popen
+    spawned: list[subprocess.Popen[str]] = []
+
+    def popen_whose_wait_fails(*args: Any, **kwargs: Any) -> Any:
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+
+        def failing_wait(timeout: float | None = None) -> int:
+            raise ChildProcessError("the leader could not be reaped")
+
+        proc.wait = failing_wait  # ty: ignore[invalid-assignment]
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", popen_whose_wait_fails)
+    try:
+        result, stopped = _shells_run_alone(staging, "sleep 30", 0.3)
+        ends = [proc.returncode for proc in spawned]
+    finally:
+        for proc in spawned:  # the killed leader the failed wait left unreaped
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(proc.pid, 0)
+
+    assert result == "command timed out after 0.3 seconds"
+    assert ends == [None]  # the drain returned, but nothing reaped the leader
+    assert stopped is False
+
+
+def test_a_group_the_teardown_could_not_signal_gives_no_evidence_while_a_member_lives(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """SIGKILL to the group is refused -- as for a member this process may not
+    kill -- while the leader exits on its own and a member it started lives on.
+    The leader is reaped, but the group is not gone, so there is no evidence:
+    the command counts as unconfirmed."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    spawned = _record_spawns(monkeypatch)
+    real_killpg = os.killpg
+
+    def refusing_sigkill(pgid: int, sig: int) -> None:
+        if sig == signal.SIGKILL:
+            raise PermissionError("operation not permitted")
+        real_killpg(pgid, sig)
+
+    monkeypatch.setattr(tools.os, "killpg", refusing_sigkill)
+    try:
+        # The member lets go of the output pipe, so the drain is not left reading it.
+        result, stopped = _shells_run_alone(staging, "sleep 30 >/dev/null 2>&1 & sleep 0.3", 20)
+        leftover = len(spawned) == 1 and _group_exists(spawned[0].pid)
+    finally:
+        for proc in spawned:  # the leader is reaped; its group lives on in the member
+            with contextlib.suppress(ProcessLookupError):
+                real_killpg(proc.pid, signal.SIGKILL)
+
+    assert result == ""
+    assert leftover  # the member outlived the teardown
+    assert stopped is False

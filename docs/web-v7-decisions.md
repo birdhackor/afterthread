@@ -45,24 +45,42 @@ openai SDK（2.45.0）對單一請求的逾時擲 `openai.APITimeoutError`。它
 `_communicate_bounded` 的 `teardown_lock`／`reaped` 要擋的情形。
 
 實作改為每場 session 一個 `_BuilderShells`：一個 `threading.Event` 加上強參照的 task 集合。
-`stop_and_wait` 先設訊號、再等 task。`_communicate_bounded` 在輪詢時看到訊號，就用它既有、在鎖下的
-拆除流程殺掉並回收；訊號設下之後才要啟動的指令不啟動。
+`stop_and_wait` 先設訊號，再等每個指令的 worker 回報停止證據。`_communicate_bounded` 在輪詢時看到訊號，
+就用它既有、在鎖下的拆除流程殺掉並回收；訊號設下之後才要啟動的指令不啟動。
 
 「已停止」只有一個定義：指令的 process group 已殺、leader 已回收（`_communicate_bounded` 的拆除完成），
-或它根本沒有啟動子行程。以下三種替代訊號都試過，也都被推翻：
+或它根本沒有啟動子行程。證據由 `_communicate_bounded` 的拆除在完成的當下記下（`on_reaped`），不論函式
+之後正常返回還是擲出例外。「已殺」的判定是 `killpg(SIGKILL)` 成功；若被拒，就等 leader 回收之後，用
+signal 0 確認 group 已不存在。macOS 對只剩已退出、未回收 leader 的 group 會回 EPERM，所以需要這一步。
+不涵蓋同時有可殺與殺不了成員的 group：`killpg` 只要有一個成員收到就回成功。
+以下三種替代訊號都試過，也都被推翻：
 - asyncio task 的狀態：uvicorn 關閉時 `asyncio.run` 會取消所有 task，被取消的 command task 看起來已完成，
   它等待的 threadpool worker 卻還在跑；
-- worker 返回：它可能在啟動子行程之後、拆除之前就被例外打斷，例如讀取執行緒啟動失敗；
+- worker 返回：它可能在啟動子行程之後、拆除完成之前就被例外打斷；
 - 時間到：只能說「等不到」，不能說「已停止」。
 
 等待上限是 `tool_install_shell_timeout_seconds` 加上 `_REAP_TIMEOUT_SECONDS`。超過時不剝除、不發布，
-也不清理這一場的暫存目錄：它原地保留，job 失敗並在訊息裡附上路徑；名額照放。這是 DC 在「無法確認
-停止」時的例外。等不到返回的情況只剩 kernel 回收不了的 leader，或被卡住的執行緒（例如已啟動子行程、
-卻在第一次輪詢前停住）。為此把名額扣到重啟，代價大於留下一個只在自己暫存目錄裡跑的殘留指令，
-它碰不到下一個 job 的暫存目錄。
-這個出口不得再等待可能被卡住的資源：worker 回不來的原因之一，就是共用的 threadpool 被佔滿。
+也不清理這一場的暫存目錄：它原地保留，job 失敗並在訊息裡附上路徑；名額照放，理由見下一段。
+等不到證據的情況例如：kernel 回收不了的 leader、回收失敗、SIGKILL 被拒而回收後 group 仍有成員、
+拆除完成之前被例外打斷、被卡住的執行緒（例如已啟動子行程、卻在第一次輪詢前停住）。
+這個出口不得再等待可能被卡住的資源，例如卡住的 worker 佔著的共用 threadpool。至於沒有被排程、根本
+沒進入 worker 的指令，它之後看到訊號就不會啟動，算作沒有啟動子行程（`entered` 握手；這個推導依賴
+GIL 下的單一全序）。
 
-不變量 DC 不變。設計 §3.3 第 1 步已照此更新。
+「名額照放」不是 DC 的例外，而是從 DC 推導出來的：名額守的是後端寫入者之間的互斥（`_admit_job`），
+一場已永久放棄保存、發布、清理的 session 不再是寫入者；殘留的 `run_shell` 指令也不是後端寫入者，它只在
+自己的暫存目錄裡跑，碰不到下一個 job 的暫存目錄。「扣到確認停止」實際上就是扣到重啟，因為不返回的
+worker 生不出證據。
+
+這個推導的前提是：後端永不再碰保留的工作區。目前成立：`.staging` 只對空目錄 `rmdir`，`_sweep_stale_backups` 只收 `_STALE_BACKUP_RE` 與 `versions/*.discarded`，下一場用新的 uuid。
+守衛是一則測試：保留一個工作區之後再跑一場 job，那個目錄原封不動。日後若有步驟會去碰舊的 `.staging` 目錄
+（例如啟動時清掃），名額或每個工作區一個標記就得回來。
+
+不變量 DA 依賴 DC：`scan_embedded_secrets` 以路徑走訪子目錄（`os.scandir`），目錄在分類之後被換成連結時
+會走出工具包；它只在工作區已靜止時才可靠。若日後要掃描別人可能同時在改的樹，改用以 fd 走訪
+（`O_DIRECTORY | O_NOFOLLOW` 加 `os.scandir(fd)`）。
+
+設計 §3.3 第 1 步與 §9 的 DC 已照此更新。
 
 ## D53（P2）：後端產生的路徑不遮蔽
 

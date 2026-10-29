@@ -2991,6 +2991,22 @@ class _CappedReader:
         self.text = joined[: self._cap + 1] if self.overflow else joined
 
 
+def _process_group_is_gone(pgid: int) -> bool:
+    """Whether no process group ``pgid`` exists any more.
+
+    Asked with signal 0, which delivers nothing, so asking after the leader was
+    reaped cannot reach another process. A group id taken up again since then
+    reads as still there: the answer can be a needless "no", never a wrong "yes".
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def _communicate_bounded(
     proc: subprocess.Popen[str],
     *,
@@ -2998,6 +3014,7 @@ def _communicate_bounded(
     cap: int,
     timeout: float,
     abort: threading.Event | None = None,
+    on_reaped: Callable[[], None] | None = None,
 ) -> _BoundedOutput:
     """``communicate`` with a hard per-stream memory cap and a wall-clock timeout.
 
@@ -3020,6 +3037,16 @@ def _communicate_bounded(
     -- so a stop never needs a kill from outside, which could reach a pid already
     reaped and reused. The result then has ``aborted`` set. Without ``abort``,
     the wait is the deadline-only one it always was.
+
+    Every way out passes through that teardown -- a return, and an exception
+    too (a reader thread that cannot start, say) -- so no exit skips the kill and
+    the reap. ``on_reaped``, when given, is called from the teardown itself, at
+    the one point where it is known to have worked: the group is down -- sent
+    SIGKILL, or found gone -- and ``proc.wait()`` has left a return code. It is
+    called the same way whether the function then returns or raises, and not at
+    all when either half failed; a caller that must know the process is gone
+    relies on it, never on the return. It runs under the teardown lock and must
+    not raise. Without it, nothing here changes.
     """
     threads: list[threading.Thread] = []
     # `teardown_lock` + `reaped` make the overflow-kill callback below and the
@@ -3042,112 +3069,137 @@ def _communicate_bounded(
                 return
             _kill_process_group(proc)
 
-    if input_text is not None and proc.stdin is not None:
-        stdin = proc.stdin
-
-        def _write_stdin() -> None:
-            # Best-effort: a child that exits or closes stdin early makes this
-            # raise BrokenPipeError -- not our failure. A SIGKILL later unblocks a
-            # write stalled on a full pipe, so this thread always ends.
-            with contextlib.suppress(Exception):
-                stdin.write(input_text)
-            with contextlib.suppress(Exception):
-                stdin.close()
-
-        # daemon=True on every reader/writer thread is a BACKSTOP, not the
-        # mechanism: the unconditional group kill before the reap below is what
-        # normally reaps a thread whose pipe is held open by a surviving
-        # descendant. But should even that fail (a descendant that escaped the
-        # process group entirely -- see the teardown comment), a NON-daemon
-        # thread stuck in a blocking read/write would keep the interpreter alive at
-        # shutdown; daemon makes that impossible -- at worst one FD leaks until
-        # process exit, never a hung interpreter.
-        writer = threading.Thread(target=_write_stdin, daemon=True)
-        writer.start()
-        threads.append(writer)
-
-    stdout_reader = _CappedReader(proc.stdout, cap, kill) if proc.stdout is not None else None
-    stderr_reader = _CappedReader(proc.stderr, cap, kill) if proc.stderr is not None else None
-    for reader in (stdout_reader, stderr_reader):
-        if reader is not None:
-            # daemon=True for the same backstop reason as the writer above.
-            thread = threading.Thread(target=reader.run, daemon=True)
-            thread.start()
-            threads.append(thread)
-
-    # Watch the leader for exit WITHOUT reaping it, under the wall-clock deadline.
-    # We must NOT ``proc.wait`` here: reaping frees the leader's pid, and the
-    # UNCONDITIONAL group kill below (``os.killpg(proc.pid)``) would then race a
-    # kernel that had already REUSED that pid as another process's group id --
-    # signalling the wrong group. ``os.waitid(..., WEXITED | WNOWAIT | WNOHANG)``
-    # instead DETECTS the exit and leaves the leader a zombie; a zombie's pid (and
-    # therefore its process-GROUP id) is pinned un-reusable until we ``wait`` it,
-    # which is the load-bearing invariant that makes the kill race-free. WNOHANG
-    # makes each probe non-blocking so we poll under our own deadline.
     timed_out = False
     aborted = False
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            info = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
-        except ChildProcessError:
-            # Already reaped somehow (we are the only waiter, so this is defensive):
-            # stop polling and fall through to the kill, which no-ops on a gone group.
-            break
-        if info is not None:
-            break  # leader exited; the zombie is retained, pinning the PGID
-        if abort is not None and abort.is_set():
-            aborted = True
-            break
-        if time.monotonic() >= deadline:
-            timed_out = True
-            break
-        time.sleep(_WAIT_POLL_SECONDS)
+    stdout_reader: _CappedReader | None = None
+    stderr_reader: _CappedReader | None = None
+    # The process exists from here on, so every way out of this function -- the
+    # normal one, or an exception such as a reader thread that cannot start --
+    # passes through the teardown in the ``finally``: none of them leaves the
+    # group running or its leader unreaped.
+    try:
+        if input_text is not None and proc.stdin is not None:
+            stdin = proc.stdin
 
-    # Tear the WHOLE group down and reap, atomically w.r.t. the overflow-kill
-    # callback above (teardown_lock): setting `reaped` before releasing the lock
-    # guarantees no _CappedReader can call getpgid/killpg on the pid we are about
-    # to free below. Within the lock, the kill+reap still run UNCONDITIONALLY --
-    # whether the leader exited on its own, we timed out, or the caller's stop
-    # signal ended the wait. This is the fix for two holes the old "escalate only
-    # if a reader thread is still alive" teardown carried:
-    #  (a) a descendant that CLOSED its inherited stdout/stderr but kept running
-    #      left the readers at EOF and their threads dead, so no escalation ever
-    #      fired and the detached daemon LEAKED. An unconditional kill reaps it;
-    #  (b) killing AFTER ``proc.wait`` reaped the leader targeted a pid the kernel
-    #      had already freed -- a REUSED-pgid hazard. Here the leader is still
-    #      un-reaped (a zombie on natural exit, or alive on timeout or stop), so
-    #      ``proc.pid`` provably still names THIS group (``start_new_session=True``
-    #      made the leader its own group leader, so the group id EQUALS its pid).
-    # A leader that exited NATURALLY is already a dead zombie, so this SIGKILL is a
-    # no-op for it and cannot disturb its recorded exit status -- ``proc.wait`` below
-    # still returns the tool's REAL exit code. A descendant that double-fork/setsid'd
-    # OUT of the group escapes even this and is beyond v1's non-container stance
-    # (D21); the daemon flag on every reader/writer thread is the honest backstop.
-    with teardown_lock:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(proc.pid, signal.SIGKILL)
+            def _write_stdin() -> None:
+                # Best-effort: a child that exits or closes stdin early makes this
+                # raise BrokenPipeError -- not our failure. A SIGKILL later unblocks a
+                # write stalled on a full pipe, so this thread always ends.
+                with contextlib.suppress(Exception):
+                    stdin.write(input_text)
+                with contextlib.suppress(Exception):
+                    stdin.close()
 
-        # Reap the leader now that its group is SIGKILLed: this frees the zombie
-        # (releasing the pinned pid) and, on a natural exit, returns the tool's REAL
-        # returncode -- preserving exit-code semantics for ordinary tools. No timeout
-        # is needed: the group is dead, so a natural-exit zombie is collected at once
-        # and a timed-out leader was just killed (SIGKILL is uncatchable, so it dies
-        # promptly).
-        with contextlib.suppress(Exception):
-            proc.wait()
-        reaped = True
+            # daemon=True on every reader/writer thread is a BACKSTOP, not the
+            # mechanism: the unconditional group kill before the reap below is what
+            # normally reaps a thread whose pipe is held open by a surviving
+            # descendant. But should even that fail (a descendant that escaped the
+            # process group entirely -- see the teardown comment), a NON-daemon
+            # thread stuck in a blocking read/write would keep the interpreter alive at
+            # shutdown; daemon makes that impossible -- at worst one FD leaks until
+            # process exit, never a hung interpreter.
+            writer = threading.Thread(target=_write_stdin, daemon=True)
+            writer.start()
+            threads.append(writer)
 
-    # The group is dead, so every inherited pipe write end is now closed and the
-    # (daemon) reader/writer threads hit EOF and finish. Join them under the short
-    # reap bound purely so a pathologically wedged pipe can never turn cleanup
-    # itself into a hang; with the group gone this join is guaranteed to complete.
-    # OUTSIDE teardown_lock (released above): a reader thread still inside `kill`,
-    # blocked waiting on the lock, must be free to acquire it and no-op before this
-    # join can observe that thread finished -- joining while still holding the lock
-    # could deadlock against it.
-    for thread in threads:
-        thread.join(timeout=_REAP_TIMEOUT_SECONDS)
+        stdout_reader = _CappedReader(proc.stdout, cap, kill) if proc.stdout is not None else None
+        stderr_reader = _CappedReader(proc.stderr, cap, kill) if proc.stderr is not None else None
+        for reader in (stdout_reader, stderr_reader):
+            if reader is not None:
+                # daemon=True for the same backstop reason as the writer above.
+                thread = threading.Thread(target=reader.run, daemon=True)
+                thread.start()
+                threads.append(thread)
+
+        # Watch the leader for exit WITHOUT reaping it, under the wall-clock deadline.
+        # We must NOT ``proc.wait`` here: reaping frees the leader's pid, and the
+        # UNCONDITIONAL group kill below (``os.killpg(proc.pid)``) would then race a
+        # kernel that had already REUSED that pid as another process's group id --
+        # signalling the wrong group. ``os.waitid(..., WEXITED | WNOWAIT | WNOHANG)``
+        # instead DETECTS the exit and leaves the leader a zombie; a zombie's pid (and
+        # therefore its process-GROUP id) is pinned un-reusable until we ``wait`` it,
+        # which is the load-bearing invariant that makes the kill race-free. WNOHANG
+        # makes each probe non-blocking so we poll under our own deadline.
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                info = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+            except ChildProcessError:
+                # Already reaped somehow (we are the only waiter, so this is defensive):
+                # stop polling and fall through to the kill, which no-ops on a gone group.
+                break
+            if info is not None:
+                break  # leader exited; the zombie is retained, pinning the PGID
+            if abort is not None and abort.is_set():
+                aborted = True
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            time.sleep(_WAIT_POLL_SECONDS)
+    finally:
+        # Tear the WHOLE group down and reap, atomically w.r.t. the overflow-kill
+        # callback above (teardown_lock): setting `reaped` before releasing the lock
+        # guarantees no _CappedReader can call getpgid/killpg on the pid we are about
+        # to free below. Within the lock, the kill+reap still run UNCONDITIONALLY --
+        # whether the leader exited on its own, we timed out, or the caller's stop
+        # signal ended the wait. This is the fix for two holes the old "escalate only
+        # if a reader thread is still alive" teardown carried:
+        #  (a) a descendant that CLOSED its inherited stdout/stderr but kept running
+        #      left the readers at EOF and their threads dead, so no escalation ever
+        #      fired and the detached daemon LEAKED. An unconditional kill reaps it;
+        #  (b) killing AFTER ``proc.wait`` reaped the leader targeted a pid the kernel
+        #      had already freed -- a REUSED-pgid hazard. Here the leader is still
+        #      un-reaped (a zombie on natural exit, or alive on timeout or stop), so
+        #      ``proc.pid`` provably still names THIS group (``start_new_session=True``
+        #      made the leader its own group leader, so the group id EQUALS its pid).
+        # A leader that exited NATURALLY is already a dead zombie, so this SIGKILL is a
+        # no-op for it and cannot disturb its recorded exit status -- ``proc.wait`` below
+        # still returns the tool's REAL exit code. A descendant that double-fork/setsid'd
+        # OUT of the group escapes even this and is beyond v1's non-container stance
+        # (D21); the daemon flag on every reader/writer thread is the honest backstop.
+        with teardown_lock:
+            if not reaped:
+                group_down = True
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # no group left to signal
+                except PermissionError:
+                    # Nothing in the group could be signalled: what macOS answers
+                    # for a group that holds only its exited, unreaped leader --
+                    # and what any system answers when every live member is one
+                    # this process may not kill. Only ``on_reaped`` needs the two
+                    # told apart.
+                    group_down = False
+
+                # Reap the leader now that its group is SIGKILLed: this frees the zombie
+                # (releasing the pinned pid) and, on a natural exit, returns the tool's
+                # REAL returncode -- preserving exit-code semantics for ordinary tools. No
+                # timeout is needed: the group is dead, so a natural-exit zombie is
+                # collected at once and a timed-out leader was just killed (SIGKILL is
+                # uncatchable, so it dies promptly).
+                with contextlib.suppress(Exception):
+                    proc.wait()
+                reaped = True
+                if on_reaped is not None and proc.returncode is not None:
+                    if not group_down:
+                        # With the leader reaped, a group that held nothing else is
+                        # gone, while one with a member it could not kill is not.
+                        group_down = _process_group_is_gone(proc.pid)
+                    if group_down:
+                        on_reaped()
+
+        # The group is dead, so every inherited pipe write end is now closed and the
+        # (daemon) reader/writer threads hit EOF and finish. Join them under the short
+        # reap bound purely so a pathologically wedged pipe can never turn cleanup
+        # itself into a hang; with the group gone this join is guaranteed to complete.
+        # OUTSIDE teardown_lock (released above): a reader thread still inside `kill`,
+        # blocked waiting on the lock, must be free to acquire it and no-op before this
+        # join can observe that thread finished -- joining while still holding the lock
+        # could deadlock against it.
+        for thread in threads:
+            thread.join(timeout=_REAP_TIMEOUT_SECONDS)
 
     return _BoundedOutput(
         stdout=stdout_reader.text if stdout_reader is not None else "",

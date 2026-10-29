@@ -902,6 +902,33 @@ _SHELL_NOT_STARTED = "command not run: the session has ended"
 _SHELL_STOPPED = "command stopped: the session has ended"
 
 
+@dataclass(slots=True, eq=False)
+class _ShellEvidence:
+    """What the worker running one run_shell command can vouch for (``_BuilderShells``).
+
+    ``entered`` is set by the worker before anything else, the stop check
+    included; the event loop reads it. ``spawning`` and ``confirmed`` are written
+    on the worker's own thread, at the points ``_run_shell_subprocess`` names --
+    ``confirmed`` by the drain's teardown itself -- and read only by that worker,
+    which reports ``stopped()`` to the loop.
+    """
+
+    entered: threading.Event
+    spawning: bool = False
+    confirmed: bool = False
+
+    def confirm(self) -> None:
+        """Record that the command left no process: its spawn failed, or -- as the
+        drain's ``on_reaped`` -- its group is down and its leader reaped."""
+        self.confirmed = True
+
+    def stopped(self) -> bool:
+        """Whether the command is known to have no process left: the teardown of
+        its process group completed, its spawn failed, or it never got as far as
+        spawning."""
+        return self.confirmed or not self.spawning
+
+
 def _run_shell_subprocess(
     staging: Path,
     command: str,
@@ -909,6 +936,7 @@ def _run_shell_subprocess(
     cap: int,
     extra_env: dict[str, str] | None = None,
     abort: threading.Event | None = None,
+    evidence: _ShellEvidence | None = None,
 ) -> str:
     """Run one builder shell command to completion (or timeout); returns text.
 
@@ -952,6 +980,17 @@ def _run_shell_subprocess(
     this starts, the command is not started at all; set while it runs -- or
     between this check and the spawn -- ``_communicate_bounded`` kills and reaps
     its process group at its next poll. Omitted, nothing here changes.
+
+    ``evidence`` records the only points at which the command is known to be
+    stopped. ``spawning`` is set the instant before ``Popen``. ``confirmed`` is
+    set by the teardown in ``_communicate_bounded``, through ``on_reaped``, once
+    the group is down and the leader reaped -- whether the drain then returns or
+    raises -- or when ``Popen`` raises ``OSError``. CPython raises that before
+    forking, or after reaping a child whose exec failed; the one case read wrongly
+    is an ``OSError`` from closing or reading the pipes CPython has just made,
+    after a fork that succeeded. Whatever happens after ``confirmed`` is set stays
+    confirmed (a redaction that fails closed, say); an exception that leaves the
+    drain before its teardown worked leaves the command unconfirmed.
     """
     if abort is not None and abort.is_set():
         return _SHELL_NOT_STARTED
@@ -960,6 +999,8 @@ def _run_shell_subprocess(
         env["TLS_NO_VERIFY"] = "1"
     if extra_env:
         env.update(extra_env)
+    if evidence is not None:
+        evidence.spawning = True
     try:
         proc = subprocess.Popen(
             ["bash", "-c", command],
@@ -974,10 +1015,17 @@ def _run_shell_subprocess(
             start_new_session=True,
         )
     except OSError as exc:
+        if evidence is not None:
+            evidence.confirm()
         return f"command failed to start: {type(exc).__name__}"
     # One output pipe (stderr is merged into stdout); no stdin (DEVNULL).
     output = tools._communicate_bounded(
-        proc, input_text=None, cap=cap, timeout=timeout, abort=abort
+        proc,
+        input_text=None,
+        cap=cap,
+        timeout=timeout,
+        abort=abort,
+        on_reaped=evidence.confirm if evidence is not None else None,
     )
     if output.aborted:
         return _SHELL_STOPPED
@@ -1005,17 +1053,14 @@ def _workspace_kept_error(session_root: Path) -> str:
     """The job error for a session whose workspace is kept, its commands not
     confirmed stopped (``_BuilderShells``). Appended to the session's own error.
 
-    Blocking: the path goes into the error masked, and masking scans the tools
-    directory. Should that scan fail, the error leaves the path to the backend
-    log, which ``_log_workspace_kept`` writes either way.
+    The path is shown as it is: the backend built it from the configured tools
+    directory, a fixed name and a random id, and the operator has to copy it to
+    act on it. A plain string, built on the event loop: the exit that reports it
+    must not wait on a worker thread.
     """
-    try:
-        where = f"保留在 {tools.redact_known_secrets(str(session_root))}"
-    except Exception:
-        where = "保留（路徑見後端記錄）"  # noqa: RUF001
     return (
-        "工作階段結束後，有 run_shell 指令沒能在時限內確認停止：這次的成果不會發布，"  # noqa: RUF001
-        f"暫存工作區原地{where}，確認沒有殘留的程序後可以手動刪除。"  # noqa: RUF001
+        "工作階段結束後，有 run_shell 指令無法確認已經停止：這次的成果不會發布，"  # noqa: RUF001
+        f"暫存工作區原地保留在 {session_root}，確認沒有殘留的程序後可以手動刪除。"  # noqa: RUF001
     )
 
 
@@ -1036,9 +1081,9 @@ def _shell_stop_seconds() -> float:
     the stop signal: the rest of its own timeout, then the allowance
     ``_communicate_bounded`` gives its one output reader once the group is killed.
     The signal normally ends the wait within one poll and the reap; the bound only
-    matters for a worker that does not get to run at all (a thread pool with no
-    free worker) or cannot finish (a leader SIGKILL cannot reap, a redaction scan
-    that hangs).
+    matters for a worker that entered and cannot report in time (a leader SIGKILL
+    cannot reap, a thread stuck before its first poll, a redaction scan that
+    hangs -- a worker reports only as it returns).
     """
     return get_settings().tool_install_shell_timeout_seconds + tools._REAP_TIMEOUT_SECONDS
 
@@ -1056,54 +1101,77 @@ class _BuilderShells:
     handler's await: the command's task, and the worker thread it waits on, go on
     to their end.
 
-    A command counts as ended only when its worker returns. The worker says so
-    itself, from a ``finally`` around ``_run_shell_subprocess``, through
-    ``loop.call_soon_threadsafe``. A task being done is not that: a cancelled task
-    is done too, and cancelling cannot stop the worker it waits on -- which is
-    exactly what the event loop does to every task as it shuts down. While it
-    shuts down, the loop runs the gather of every cancelled task, the session
-    waiting here among them, so it is still running to take the worker's word for
-    as long as the session waits. A worker that returns after its loop has closed
-    finds nobody waiting; ``call_soon_threadsafe`` raising for the closed loop is
-    swallowed.
+    A command counts as stopped on evidence from the worker running it only
+    (``_ShellEvidence``): the teardown of its process group completed (or its
+    spawn failed), or it never started a subprocess. The worker reports which, from
+    a ``finally`` around ``_run_shell_subprocess``, through
+    ``loop.call_soon_threadsafe``. Nothing else counts. Not the command's task: a
+    cancelled task is done too, and the event loop cancels every task as it shuts
+    down while the worker runs on. Not the worker returning: it can return
+    through an exception after the spawn and before the teardown. Not the clock:
+    running out of time says only that no word came.
 
-    What it guarantees: once ``stop_and_wait`` returns True, every command this
-    session ran has returned from its worker, and every process group one of them
-    spawned has been killed and its leader reaped. ``stop_and_wait`` sets the stop
+    While the loop shuts down it runs the gather of every task it cancelled, the
+    session waiting here among them, so it is still running to take a worker's
+    report for as long as the session waits. A worker reporting after its loop
+    has closed finds nobody waiting; ``call_soon_threadsafe`` raising for the
+    closed loop is swallowed.
+
+    A worker that has not entered when the stop is set never starts its command.
+    The worker sets ``entered`` and only then reads the stop signal;
+    ``stop_and_wait`` sets the stop and only then reads ``entered``. Under the
+    GIL those four steps happen in one order, so a worker read here as not
+    entered reads the stop as set when it gets there, and returns without
+    spawning. Such a command counts as never started, with no wait -- whether
+    its pool runs it later or never.
+
+    What it guarantees: once ``stop_and_wait`` returns True, no command this
+    session ran has a process left: its group was killed and its leader reaped,
+    its spawn failed, or it never started one. ``stop_and_wait`` sets the stop
     signal before it waits: a command still running is killed at
-    ``_communicate_bounded``'s next poll, by that function's own teardown under its
-    own lock, and a command not spawned yet is never started -- or, spawned in the
-    instant after that check, is killed at its first poll. Nothing here kills a
-    process group from outside, so the guard opens no way to signal a pid that has
-    been reaped and reused.
+    ``_communicate_bounded``'s next poll, by that function's own teardown under
+    its own lock, and a command not spawned yet is never started -- or, spawned in
+    the instant after that check, is killed at its first poll. Nothing here kills
+    a process group from outside, so the guard opens no way to signal a pid that
+    has been reaped and reused.
 
     What it does not cover:
 
-    * a descendant that leaves the process group (``setsid``, a double fork):
-      run_shell is a real shell with the service's own rights, not a sandbox, and
-      the group kill is all a stop can do -- as it is all a timeout can do;
-    * a command that cannot be confirmed stopped: its worker has not returned
-      within ``_shell_stop_seconds`` (a leader SIGKILL cannot reap, a thread that
-      is stuck, a worker its pool never ran), or a second cancellation of the
-      session cut the wait short. Then nothing vouches that the workspace is
-      still, and the callers do not strip, publish or remove it: the session's
-      workspace stays where it is, and the backend log names it. When the wait
-      ran out, the job still ends -- failed, its error saying where to find the
-      workspace -- and gives up its slot: holding the slot until a restart would
-      cost more than a leftover command running in its own workspace, which is
-      not another job's.
+    * a descendant that leaves the process group (``setsid``, a double fork), or
+      one the service may not signal (a setuid program) in a group where it can
+      signal another member -- the group SIGKILL then succeeds, and the teardown
+      counts as done while that member lives on: run_shell is a real shell with
+      the service's own rights, not a sandbox, and the group kill is all a stop
+      can do -- as it is all a timeout can do;
+    * a command that cannot be confirmed stopped: its worker reported it
+      unconfirmed, or it entered and sent no report within
+      ``_shell_stop_seconds`` (a leader SIGKILL cannot reap, a thread that is
+      stuck), or a second cancellation of the session cut the wait short. The
+      callers then give up saving, publishing and removing that workspace for
+      good: it stays where it is, named in the backend log, and no later job
+      touches it. Unless the session itself was cancelled, the job still ends --
+      failed, its error naming the workspace -- and gives up its slot: the slot
+      keeps the backend's writers apart, and a session that has given up writing
+      is no longer one. That exit waits on nothing a stuck worker could hold, the
+      shared thread pool above all;
+    * an interpreter without the GIL. Counting a worker read as not entered as
+      never started rests on the four steps of the handshake above happening in
+      one order, which the GIL gives; without it ``Event.is_set`` reads its flag
+      without taking the event's lock, and the argument would have to be made
+      again.
     """
 
-    __slots__ = ("_running", "_stop", "_tasks")
+    __slots__ = ("_commands", "_stop", "_tasks")
 
     def __init__(self) -> None:
         self._stop = threading.Event()
         # Strong references, so a command whose handler stopped waiting is never
         # collected mid-flight.
         self._tasks: set[asyncio.Task[str]] = set()
-        # One future per command whose worker has not returned; only that worker
+        # One entry per command: what its worker keeps, and the future that carries
+        # the worker's report -- stopped or not -- to the loop. Only that worker
         # resolves it.
-        self._running: set[asyncio.Future[None]] = set()
+        self._commands: list[tuple[_ShellEvidence, asyncio.Future[bool]]] = []
 
     async def run(
         self,
@@ -1115,27 +1183,32 @@ class _BuilderShells:
     ) -> str:
         """Run one command for the session; returns run_shell's result text."""
         loop = asyncio.get_running_loop()
-        returned: asyncio.Future[None] = loop.create_future()
-        self._running.add(returned)
+        evidence = _ShellEvidence(threading.Event())
+        report: asyncio.Future[bool] = loop.create_future()
+        self._commands.append((evidence, report))
         stop = self._stop
 
         def worker() -> str:
             try:
-                return _run_shell_subprocess(staging, command, timeout, cap, extra_env, stop)
+                evidence.entered.set()
+                return _run_shell_subprocess(
+                    staging, command, timeout, cap, extra_env, stop, evidence
+                )
             finally:
+                stopped = evidence.stopped()
                 with contextlib.suppress(RuntimeError):
-                    loop.call_soon_threadsafe(self._worker_returned, returned)
+                    loop.call_soon_threadsafe(self._settle, report, stopped)
 
         task = asyncio.ensure_future(run_in_threadpool(worker))
         self._tasks.add(task)
         task.add_done_callback(self._forget)
         return await asyncio.shield(task)
 
-    def _worker_returned(self, returned: asyncio.Future[None]) -> None:
+    @staticmethod
+    def _settle(report: asyncio.Future[bool], stopped: bool) -> None:
         # On the loop, sent there by the worker as it returns.
-        self._running.discard(returned)
-        if not returned.done():
-            returned.set_result(None)
+        if not report.done():
+            report.set_result(stopped)
 
     def _forget(self, task: asyncio.Task[str]) -> None:
         self._tasks.discard(task)
@@ -1146,18 +1219,34 @@ class _BuilderShells:
             task.exception()
 
     async def stop_and_wait(self) -> bool:
-        """Stop every command of this session and wait for each worker to return.
+        """Stop every command of this session and wait for word that each stopped.
 
-        True once every worker has returned. False when one has not within
-        ``_shell_stop_seconds``: nothing then vouches that the workspace is still,
-        and the caller must leave it exactly as it is.
+        True once every command is known to be stopped. False as soon as a worker
+        reports one unconfirmed, or once a worker that had entered has sent no
+        report within ``_shell_stop_seconds``: nothing then vouches that the
+        workspace is still, and the caller must leave it exactly as it is.
         """
         self._stop.set()
-        running = list(self._running)
-        if not running:
-            return True
-        _returned, still_running = await asyncio.wait(running, timeout=_shell_stop_seconds())
-        return not still_running
+        waiting: set[asyncio.Future[bool]] = set()
+        for evidence, report in self._commands:
+            if report.done():
+                if not report.result():
+                    return False
+            elif evidence.entered.is_set():
+                waiting.add(report)
+            # Not entered yet: its worker finds the stop set before it could spawn.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _shell_stop_seconds()
+        while waiting:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            done, waiting = await asyncio.wait(
+                waiting, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done or not all(report.result() for report in done):
+                return False
+        return True
 
 
 def _build_meta_tools(
@@ -2457,8 +2546,11 @@ def _cleanup_staging(staging: Path, base: Path) -> None:
     collectable. The staging logic itself is untouched by this addition.
 
     The exit that never calls this is a session whose run_shell commands could
-    not be confirmed stopped (``_BuilderShells``): its workspace is kept whole,
-    and the sweep is left to the next job.
+    not be confirmed stopped (``_BuilderShells``). Its workspace is kept whole,
+    and nothing in the backend ever collects it: a later job's call removes only
+    its own session root, and ``.staging`` only once empty, while the sweep never
+    looks inside ``.staging``. Only the operator removes it. That session skips
+    the sweep as well; the next job's call runs it.
     """
     try:
         with contextlib.suppress(Exception):
@@ -2573,15 +2665,17 @@ async def run_install(
             # coroutine cancelled -- stop the commands it started and wait for them
             # (``_BuilderShells``) before anything below touches the workspace and
             # before the job gives up its slot. If they cannot be confirmed stopped
-            # -- the wait ran out, or a second cancellation cut it short and this
-            # stays False -- the workspace is not stripped, published or removed.
+            # (``_BuilderShells``), or a second cancellation cuts the wait short and
+            # this stays False, the workspace is not stripped, published or removed.
             shells_ended = await shells.stop_and_wait()
 
         # The builder session ran (even a not-configured exit records one), so
         # link its AI 日誌 record to the outcome NOW -- error paths included.
         llm_log_id = llm_log.last_record_id_for_workflow(_WORKFLOW)
         if not shells_ended:
-            kept = await run_in_threadpool(_workspace_kept_error, session_root)
+            # Given up for good: this returns at once, and nothing on the way out
+            # waits on a worker thread (``_BuilderShells``).
+            kept = _workspace_kept_error(session_root)
             return InstallOutcome(ok=False, error=(llm_error or "") + kept, llm_log_id=llm_log_id)
         env_keys, env_strip_error = await run_in_threadpool(_strip_builder_env, build_root, base)
 
@@ -3384,12 +3478,23 @@ async def run_revise(
             "rounds_used": stats.tool_rounds_used,
             "max_rounds": settings.tool_install_max_rounds,
         }
+        if not shells_ended:
+            # Given up for good, and this exit waits on no worker thread
+            # (``_BuilderShells``) -- not even for the masking below, so it carries
+            # none of the model's words. The AI 日誌 record keeps the whole session.
+            return InstallOutcome(
+                ok=False,
+                tool_name=name,
+                error=(llm_error or "") + _workspace_kept_error(session_root),
+                llm_log_id=llm_log_id,
+                **facts,
+            )
         # What the model handed back -- its summary and the two notes -- masked and
         # capped again (``_masked_and_capped``, each field with its own cap, so a
         # secret registered since the first mask cannot carry it past the cap)
-        # BEFORE the first return below, so every outcome returned after a session
-        # that produced an answer carries the model's own words, the .env strip
-        # refusal's included. The LLM-failure outcome has no answer to carry.
+        # BEFORE the first return below, so every outcome returned below after a
+        # session that produced an answer carries the model's own words, the .env
+        # strip refusal's included. The LLM-failure outcome has no answer to carry.
         #
         # The SAME single choke point run_install uses, and for the same reason:
         # the finally below discards the in-flight secrets before this function
@@ -3421,17 +3526,6 @@ async def run_revise(
                     else None
                 ),
             }
-        if not shells_ended:
-            kept = await run_in_threadpool(_workspace_kept_error, session_root)
-            return InstallOutcome(
-                ok=False,
-                tool_name=name,
-                summary=summary,
-                error=(llm_error or "") + kept,
-                llm_log_id=llm_log_id,
-                **facts,
-                **notes,
-            )
         env_keys, env_strip_error = await run_in_threadpool(_strip_builder_env, build_root, base)
         if env_strip_error is not None:
             return InstallOutcome(

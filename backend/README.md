@@ -232,7 +232,8 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   `handoff`（至多 4000 字，給接手者的交接筆記）與 `operator_action`（至多 1000 字，需要
   操作者在工作區外動手的事）是模型自己寫的，先遮蔽再截斷，只供顯示與交接，後端不據以做
   任何判斷。這六個欄位在安裝、跑範例、session 開始前就結束的修訂，以及因未預期錯誤
-  而中止的工作上都是 `null`。工作已完成的清單被裁剪掉、或後端
+  而中止的工作上都是 `null`；`run_shell` 指令無法確認停止的修訂只帶前四個，`summary`、
+  `handoff`、`operator_action` 都是 `null`（AI 日誌仍有整場紀錄）。工作已完成的清單被裁剪掉、或後端
   重啟過（工作只存在記憶體）則回 404。`llm_log_process` 與側檔那一個是同一個
   token、同一條「沒有 id 就沒有 token」規則，只是**由這個路由在回應當下蓋章**：
   工作表是行程內記憶體，與 id 空間同生共死，所以還答得出來的工作，它的
@@ -390,12 +391,15 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 - **安裝器與提交順序**：每場工作用
   `<TOOLS_DIR>/.staging/<uuid>/{build,shell}`；`finally` 清完整 session root。
   session 結束時（含逾時與被取消），後端先對這一場的每個 `run_shell` 指令發出中止
-  訊號，等它的 worker 自己返回（process group 已殺、leader 已回收），之後才剝除、
-  驗證、發布或清理。唯一的例外是有指令無法確認停止：等了
-  `TOOL_INSTALL_SHELL_TIMEOUT_SECONDS` 加上回收時限，worker 仍未返回，或等待被
-  再次取消打斷。這時不剝除、不發布、也不清這一場的 session root，原地保留，
-  路徑寫進後端記錄；等待逾時的那種，工作照樣以失敗結束、名額照樣釋放，錯誤
-  訊息會附上這個路徑（路徑無法先做秘密遮罩時，改請你看後端記錄）。
+  訊號，等每個指令都有已停止的證據，才剝除、驗證、發布或清理。證據只有兩種：
+  process group 已殺、leader 已回收（由 `_communicate_bounded` 的拆除在完成的當下
+  記下，不論它之後正常返回還是擲出例外），或根本沒有啟動子行程（含啟動失敗）；
+  worker 返回、例外、時間到都不算。拿不到證據就是無法確認停止：
+  worker 回報未確認（例如在拆除完成前被例外打斷）、已開始的 worker 等了
+  `TOOL_INSTALL_SHELL_TIMEOUT_SECONDS` 加上回收時限仍沒有回報，或等待被再次取消
+  打斷。這時這一場的剝除、發布、清理永久放棄，session root 原地保留，路徑寫進
+  後端記錄，之後的工作也不會再碰它；除非 session 本身被取消，工作照樣以失敗結束、
+  錯誤訊息附上這個路徑，名額照樣釋放。
   builder 在 `build` 工作，後端先擷取並剝除 builder 寫的根層 `.env`，再剝除
   版本根層的 `.afterthread.meta/`，然後驗證 `BuildRoot`。legacy
   `.ai_meta.json` 與 `.afterthread-state.json` 在版本層是一般工具內容；同名的舊
