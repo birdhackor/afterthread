@@ -4803,11 +4803,15 @@ def test_read_tool_meta_refuses_oversized_sidecar(tmp_path: Path) -> None:
 def test_read_tool_meta_survives_pathological_nesting(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A deeply nested sidecar exhausts the stack INSIDE json.loads, which raises
-    RecursionError -- not the ValueError the parse guard used to catch alone.
+    """A sidecar nested deeply enough to exhaust the stack INSIDE json.loads
+    raises RecursionError -- not the ValueError the parse guard used to catch
+    alone. It degrades to None like any other unusable sidecar, and the row
+    still lists.
 
-    It degrades to None like any other unusable sidecar, and the row still
-    lists."""
+    Whether such a sidecar can exist at all depends on the interpreter: the
+    nesting has to fit under the reader's size cap AND exhaust the stack. Where
+    it cannot, this skips, and the guard is held on every interpreter by
+    ``test_read_tool_meta_degrades_a_recursion_error_to_none``."""
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
@@ -4815,13 +4819,58 @@ def test_read_tool_meta_survives_pathological_nesting(
     # exhaustion rather than at sys.getrecursionlimit() (setrecursionlimit does
     # not move it), and shallower nesting simply PARSES -- which would leave this
     # test green for the wrong reason: the result would degrade to None on the
-    # not-a-JSON-object check instead of on the guard under test.
-    depth = 120_000
+    # not-a-JSON-object check instead of on the guard under test. A deeper nesting
+    # needs at least as much stack, so the deepest one the size cap admits is the
+    # one to try: if it parses, no admissible depth exhausts the stack.
+    depth = (_AI_META_MAX_BYTES - 1) // 2
     nested = "[" * depth + "]" * depth
     assert len(nested.encode("utf-8")) < _AI_META_MAX_BYTES  # not the size guard refusing it
-    with pytest.raises(RecursionError):
+    try:
         json.loads(nested)
+    except RecursionError:
+        pass
+    else:
+        pytest.skip(
+            "this interpreter does not exhaust its stack within the sidecar size cap: "
+            f"the deepest nesting that fits ({depth} levels) parses"
+        )
     _sidecar(pkg).write_text(nested, encoding="utf-8")
+
+    assert tools.read_tool_meta(_version_root(pkg)) is None
+    listed = list_tools()
+    assert [row["name"] for row in listed] == ["echo"]
+
+
+def test_read_tool_meta_degrades_a_recursion_error_to_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The parse guard itself, on any interpreter: when parsing the sidecar
+    raises RecursionError, the summary degrades to None and the row still lists.
+
+    ``read_tool_meta`` parses the sidecar with the ``json.loads`` of the ``json``
+    module ``tools`` imported. That call is made to raise for the sidecar's text
+    alone; every other parse runs for real. The sidecar is a valid summary, read
+    back as one before the parse is broken, so nothing but the RecursionError
+    guard can turn it into None."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    marker = "summary-whose-parse-overflows"
+    _sidecar(pkg).write_text(
+        json.dumps({"summary": marker, "updated_at": "2026-10-29T00:00:00+00:00"}),
+        encoding="utf-8",
+    )
+    readable = tools.read_tool_meta(_version_root(pkg))
+    assert readable is not None and readable["summary"] == marker
+
+    real_loads = tools.json.loads
+
+    def overflowing_loads(text: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(text, str) and marker in text:
+            raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+        return real_loads(text, *args, **kwargs)
+
+    monkeypatch.setattr(tools.json, "loads", overflowing_loads)
 
     assert tools.read_tool_meta(_version_root(pkg)) is None
     listed = list_tools()
