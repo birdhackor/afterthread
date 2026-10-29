@@ -57,16 +57,21 @@ openai SDK（2.45.0）對單一請求的逾時擲 `openai.APITimeoutError`。它
 group 才會消失，所以確認要輪詢：第一次緊接在回收之後、不先等待，之後持續到拆除的時限為止。回收本身
 若已用掉時限，仍會確認那一次；那時看到的消失仍是真的，只是可能晚於等待的一方放棄。
 
-拆除只有一個時限：開始時以 `_REAP_TIMEOUT_SECONDS` 起算，回收前補送、回收後輪詢與 reader 的 join 共用它。
+拆除只有一個時限：開始時以 `_REAP_TIMEOUT_SECONDS` 起算，回收前補送、回收後輪詢與 reader 的 join 共用它；
+回收 leader 本身沒有上限，SIGKILL 回收不了的 leader 會佔住它的 worker，停止等待仍在自己的上限結束、算無法確認。
 group 一消失，就沒有成員還拿著管線的寫端，join 立刻完成，所以等待上限不必逐段加總。回收前補送只在 macOS 做：
 leader 未回收時 PGID 被它釘住，補送 SIGKILL 直到確認沒有活的成員可送（EPERM）或 group 已不存在（ESRCH），
 或時限到；補送的退出不是證據，回收後的 ESRCH 才是。Linux 不需要也不能這樣做：它的群組訊號連進行中的 fork
 都送得到，而殭屍 leader 未回收時 signal 0 一直回成功，迴圈會燒滿時限。回收之後不再送任何 kill，因為 PGID
 已不再被 leader 釘住。
-只有拆除會回收 leader：輸出超量時的 kill 也直接對 `proc.pid` 送 `killpg`，不經 `getpgid`（macOS 對已退出的
+交給 `_communicate_bounded` 的 leader 只由拆除回收：輸出超量時的 kill 也直接對 `proc.pid` 送 `killpg`，不經 `getpgid`（macOS 對已退出的
 leader 回 ESRCH），也不回落到 `proc.kill()`（它先 `poll()`，會回收已退出的 leader）。
 
-除了上面的送訊結果，以下三種替代訊號也都試過、也都被推翻：
+啟動失敗的指令另有一條路：`_ShellPopen` 保留建構失敗的 `Popen`，依 CPython 留下的記錄判定。沒有 pid 是 fork 之前就失敗，
+算沒有啟動；有 returncode 是 CPython 已回收 exec 失敗的子行程，之後 group 也已不存在才算已停止；fork 了卻沒被回收，
+算無法確認，不殺它（它可能還沒 `setsid`）。例外的型別不是證據。
+
+除了上面的送訊結果與例外型別，以下三種替代訊號也都試過、也都被推翻：
 - asyncio task 的狀態：uvicorn 關閉時 `asyncio.run` 會取消所有 task，被取消的 command task 看起來已完成，
   它等待的 threadpool worker 卻還在跑；
 - worker 返回：它可能在啟動子行程之後、拆除完成之前就被例外打斷；
