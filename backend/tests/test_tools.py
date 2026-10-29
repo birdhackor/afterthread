@@ -3692,6 +3692,87 @@ def test_validate_refuses_a_package_whose_directory_the_scan_cannot_list(
     assert "不得包含秘密值" not in error
 
 
+def _fail_reads_of(monkeypatch: pytest.MonkeyPatch, *paths: Path) -> None:
+    """Let each of ``paths`` open, then fail the stat on that descriptor with
+    EIO: a read error on those files alone, whoever runs the test."""
+    targets = {os.fspath(path) for path in paths}
+    opened: set[int] = set()
+    real_open = os.open
+    real_fstat = os.fstat
+
+    def tracking_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        fd = real_open(path, flags, *args, **kwargs)
+        if isinstance(path, (str, os.PathLike)) and os.fspath(path) in targets:
+            opened.add(fd)
+        return fd
+
+    def failing_fstat(fd: int) -> os.stat_result:
+        if fd in opened:
+            opened.discard(fd)
+            raise OSError(errno.EIO, "input/output error")
+        return real_fstat(fd)
+
+    monkeypatch.setattr(tools.os, "open", tracking_open)
+    monkeypatch.setattr(tools.os, "fstat", failing_fstat)
+
+
+@pytest.mark.parametrize(
+    "unreadable_by",
+    [
+        pytest.param(
+            "mode 000",
+            marks=pytest.mark.skipif(os.geteuid() == 0, reason="root can read a mode-000 file"),
+        ),
+        "a read error",
+    ],
+)
+def test_validate_refuses_files_the_scan_could_not_read_and_names_the_first(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, unreadable_by: str
+) -> None:
+    """Two files the scan cannot read, both holding a known value. Nothing after
+    the gate reads them again, so publishing would ship them unseen: the package
+    is refused, the message names the first of them and says it could not be
+    read -- never that a secret was found."""
+    pkg = _package_with_other_tools_secret(monkeypatch, tmp_path)
+    (pkg / "data").mkdir()
+    blind = [pkg / "data" / "a.txt", pkg / "data" / "b.txt"]
+    for path in blind:
+        path.write_text(f"KEY={_SCAN_SECRET}\n", encoding="utf-8")
+    if unreadable_by == "mode 000":
+        for path in blind:
+            path.chmod(0)
+    else:
+        _fail_reads_of(monkeypatch, *blind)
+    try:
+        error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
+    finally:
+        for path in blind:
+            path.chmod(0o600)
+
+    assert error is not None
+    assert error.startswith("data/a.txt ")
+    assert "data/b.txt" not in error
+    assert "無法讀取" in error
+    assert "不得包含秘密值" not in error
+    assert "含秘密" not in error
+    assert _SCAN_SECRET not in error
+
+
+def test_validate_does_not_refuse_a_package_for_a_fifo_in_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A FIFO is skipped by the scan too, but it has no stored content to hold a
+    value, and its name is checked like every entry's: unlike a file the scan
+    could not read, it does not get the package refused."""
+    pkg = _package_with_other_tools_secret(monkeypatch, tmp_path)
+    os.mkfifo(pkg / "pipe")
+
+    scan = tools.scan_embedded_secrets(tools.BuildRoot(pkg))
+    assert isinstance(scan, tools.SecretScanDone)
+    assert scan.skipped == (tools.SecretScanSkip("pipe", "not_regular"),)
+    assert tools.validate_tool_content(tools.BuildRoot(pkg), "staged") is None
+
+
 # --- known-secret redaction (F1 / F4, D36) ---------------------------------
 
 

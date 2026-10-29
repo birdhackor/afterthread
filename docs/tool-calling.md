@@ -155,7 +155,8 @@ temp file、fsync、`os.replace`、directory fsync 原子發布。
 ### 全新安裝
 
 每場 builder 工作有 `<TOOLS_DIR>/.staging/<uuid>/{build,shell}`；所有出口都清完整
-session root。
+session root，只有一種例外：有 `run_shell` 指令無法確認停止時，session root 原地保留（見
+`backend/README.md`〈安裝器與提交順序〉）。
 
 1. builder 在 `build/` 建立 `tool.json` 與實作並以 `run_shell` 測試。
 2. 後端擷取 builder 根層 `.env` 的 KEY 名後刪檔，再剝除**根層 `.afterthread.meta/`**

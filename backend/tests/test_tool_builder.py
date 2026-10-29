@@ -8546,42 +8546,233 @@ def test_a_command_its_worker_reaches_after_the_session_stopped_never_outlives_i
         assert len(spawned) == 1
 
 
-def test_a_command_still_running_past_the_stop_bound_leaves_nothing_published(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize("loop_kind", ["asyncio", "uvloop"])
+def test_stop_and_wait_counts_a_command_ended_only_once_its_worker_returns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, loop_kind: str
 ) -> None:
-    """A command still running ``_shell_stop_seconds`` after the stop -- a worker
-    the signal cannot reach, standing in for one a full thread pool never started
-    or a leader SIGKILL cannot reap. The run stops waiting rather than hang, and
-    takes nothing from that workspace: it neither strips nor publishes, says so
-    after the session's own error, keeps the measured stop, and still cleans up."""
-    version = _seed_package(monkeypatch, tmp_path)
+    """The event loop shutting down cancels every task still on it -- the
+    session's and its command's own task alike -- and a cancelled task is done
+    while the worker it waited on still runs. Here that worker lingers after its
+    command has ended. The session, stopping its commands as it unwinds, is told
+    they ended only once the worker has returned, by which time the command's
+    process group is gone: the shutdown's gather keeps the loop running, so the
+    worker's word reaches it."""
+    if loop_kind == "uvloop":
+        new_loop = pytest.importorskip("uvloop").new_event_loop
+    else:
+        new_loop = asyncio.new_event_loop
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    pid_file = tmp_path / "command.pid"
+    real_run = tool_builder._run_shell_subprocess
+    worker_returned = threading.Event()
+
+    def lingering_worker(*args: Any) -> str:
+        try:
+            return real_run(*args)
+        finally:
+            time.sleep(0.3)
+            worker_returned.set()
+
+    monkeypatch.setattr(tool_builder, "_run_shell_subprocess", lingering_worker)
+    seen: dict[str, bool] = {}
+    sessions: list[asyncio.Task[None]] = []
+
+    async def session() -> None:
+        shells = tool_builder._BuilderShells()
+        try:
+            await shells.run(staging, f'echo $$ > "{pid_file}"; sleep 30', 20, 4096, None)
+        finally:
+            seen["ended"] = await shells.stop_and_wait()
+            seen["worker returned"] = worker_returned.is_set()
+            group = _pid_in(pid_file)
+            seen["group alive"] = group is not None and _group_exists(group)
+
+    async def start_and_leave_running() -> None:
+        sessions.append(asyncio.ensure_future(session()))
+        for _ in range(1000):
+            if _pid_in(pid_file) is not None:
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("the command never started")
+
+    runner = asyncio.Runner(loop_factory=new_loop)
+    try:
+        runner.run(start_and_leave_running())
+    finally:
+        # What the server's own shutdown does: cancel every task left on the loop,
+        # the command's task among them, and run the loop until they are done.
+        runner.close()
+
+    assert sessions[0].cancelled()
+    assert seen == {"ended": True, "worker returned": True, "group alive": False}
+
+
+def _session_roots(tmp_path: Path) -> list[Path]:
+    """The builder session workspaces still under the tools directory."""
+    staging = (tmp_path / "tools").resolve() / ".staging"
+    return sorted(staging.iterdir()) if staging.is_dir() else []
+
+
+@pytest.mark.parametrize("kind", ["install", "revise"])
+def test_a_command_not_confirmed_stopped_keeps_its_workspace_and_the_job_still_ends(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    """A command spawned, then stuck before its first poll -- so the stop signal
+    never reaches it -- for longer than ``_shell_stop_seconds``. Nothing vouches
+    that its workspace is still, so the job neither strips, publishes nor removes
+    it: the session's workspace stays where it was, the job's error (after the
+    session's own) and the backend log both name it, and the job still ends and
+    gives up the single flight."""
+    version = _seed_package(monkeypatch, tmp_path) if kind == "revise" else None
     _session_settings(monkeypatch, tmp_path)
-    _endpoint_asking_for_one_command(monkeypatch, "true")
+    pid_file = tmp_path / "command.pid"
+    _endpoint_asking_for_one_command(monkeypatch, f'echo $$ > "{pid_file}"; sleep 30')
+    _no_fetch(monkeypatch)
     release = threading.Event()
+    real_communicate = tools._communicate_bounded
 
-    def unstoppable(*_args: Any) -> str:
-        release.wait(30)
-        return "ended late"
+    def stuck_before_its_first_poll(proc: subprocess.Popen[str], **kwargs: Any) -> Any:
+        release.wait(60)
+        return real_communicate(proc, **kwargs)
 
-    monkeypatch.setattr(tool_builder, "_run_shell_subprocess", unstoppable)
-    monkeypatch.setattr(tool_builder, "_shell_stop_seconds", lambda: 0.2)
-    seen = _watch_workspace_steps(monkeypatch, lambda: None)
+    monkeypatch.setattr(tools, "_communicate_bounded", stuck_before_its_first_poll)
+    monkeypatch.setattr(tool_builder, "_shell_stop_seconds", lambda: 0.3)
+    seen = _watch_workspace_steps(monkeypatch, lambda: _pid_in(pid_file))
 
-    started = time.monotonic()
+    async def run_job() -> dict[str, Any]:
+        if kind == "install":
+            job_id = tool_builder.start_install_job("http://kb.example/openapi.json", "build it")
+        else:
+            started = await tool_builder.start_revise_job("kbsearch", "fix it", _TEST_VID)
+            job_id = started.job_id
+        assert job_id is not None
+        for _ in range(3000):
+            job = tool_builder.get_job(job_id)
+            assert job is not None
+            if job["state"] not in ("queued", "running"):
+                return job
+            await asyncio.sleep(0.01)
+        raise AssertionError("the job did not end")
+
     try:
         with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
-            outcome = asyncio.run(_run_revise("kbsearch", "fix it"))
+            job = asyncio.run(run_job())
+        flight_held = tool_builder.any_job_active()
+        kept = _session_roots(tmp_path)
     finally:
         release.set()
-    elapsed = time.monotonic() - started
+        group = _pid_in(pid_file)
+        if group is not None:
+            _wait_for(lambda: not _group_exists(group))
 
-    assert outcome.ok is False
-    assert outcome.error is not None
-    assert outcome.error.startswith("AI 修訂工具失敗（Timeout")  # noqa: RUF001
-    assert outcome.error.endswith(tool_builder._ERROR_SHELL_NOT_STOPPED)
-    assert outcome.failure == "deadline"
-    assert seen == [("cleanup", False)]  # never stripped; cleaned up as on every exit
-    assert elapsed < 10
-    current = tools.resolve_current(_package_root(version))
-    assert isinstance(current, tools.Resolved) and current.vid == _TEST_VID
-    assert any("had not ended 0.2 seconds" in record.getMessage() for record in caplog.records)
+    assert group is not None  # the command was spawned before it got stuck
+    assert job["state"] == "failed"
+    assert flight_held is False
+    assert seen == []  # never stripped, never removed
+    assert len(kept) == 1
+    assert (kept[0] / "build").is_dir()
+    error = job["error"] or ""
+    action = "AI 修訂工具失敗" if kind == "revise" else "AI 建置工具失敗"
+    assert error.startswith(f"{action}（Timeout")  # noqa: RUF001
+    assert str(kept[0]) in error
+    assert any(str(kept[0]) in record.getMessage() for record in caplog.records)
+    if version is not None:
+        assert job["failure"] == "deadline"
+        current = tools.resolve_current(_package_root(version))
+        assert isinstance(current, tools.Resolved) and current.vid == _TEST_VID
+
+
+def test_the_kept_workspace_error_leaves_its_path_to_the_log_when_masking_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The kept workspace's path is masked before it goes into the job's error,
+    and masking scans the tools directory. When that scan fails, the error says
+    the path is in the backend log instead of carrying it unmasked -- or raising
+    in place of the job's own report."""
+
+    def unavailable(_text: str) -> str:
+        raise RuntimeError("the secret store is unavailable")
+
+    monkeypatch.setattr(tools, "redact_known_secrets", unavailable)
+    session_root = tmp_path / "tools" / ".staging" / uuid4().hex
+
+    error = tool_builder._workspace_kept_error(session_root)
+
+    assert session_root.name not in error
+    assert "路徑見後端記錄" in error
+
+
+@pytest.mark.parametrize("kind", ["install", "revise"])
+def test_a_second_cancellation_cutting_the_wait_short_keeps_the_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    """The session is cancelled while its command is stuck before its first poll,
+    then cancelled again while it waits for that command. The second cancellation
+    ends the wait before the command is confirmed stopped, so the workspace is
+    kept just as when the wait runs out: neither stripped nor removed, and named
+    in the backend log."""
+    if kind == "revise":
+        _seed_package(monkeypatch, tmp_path)
+    _session_settings(monkeypatch, tmp_path, tool_install_timeout_seconds=60)
+    pid_file = tmp_path / "command.pid"
+    _endpoint_asking_for_one_command(monkeypatch, f'echo $$ > "{pid_file}"; sleep 30')
+    _no_fetch(monkeypatch)
+    release = threading.Event()
+    stops: list[threading.Event] = []
+    real_communicate = tools._communicate_bounded
+
+    def stuck_before_its_first_poll(proc: subprocess.Popen[str], **kwargs: Any) -> Any:
+        stops.append(kwargs["abort"])
+        release.wait(60)
+        return real_communicate(proc, **kwargs)
+
+    monkeypatch.setattr(tools, "_communicate_bounded", stuck_before_its_first_poll)
+    seen = _watch_workspace_steps(monkeypatch, lambda: _pid_in(pid_file))
+
+    async def cancel_twice() -> None:
+        if kind == "install":
+            run = run_install("http://kb.example/openapi.json", "build it")
+        else:
+            run = _run_revise("kbsearch", "fix it")
+        session = asyncio.ensure_future(run)
+        for _ in range(1000):
+            if stops and _pid_in(pid_file) is not None:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("the command never started")
+        session.cancel()
+        for _ in range(1000):
+            if stops[0].is_set():  # set as the wait begins; nothing in between yields
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("the session never began waiting for its command")
+        session.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await session
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+            asyncio.run(cancel_twice())
+        kept = _session_roots(tmp_path)
+    finally:
+        release.set()
+        group = _pid_in(pid_file)
+        if group is not None:
+            _wait_for(lambda: not _group_exists(group))
+
+    assert seen == []  # never stripped, never removed
+    assert len(kept) == 1
+    assert (kept[0] / "build").is_dir()
+    assert any(str(kept[0]) in record.getMessage() for record in caplog.records)

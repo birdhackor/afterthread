@@ -1484,8 +1484,9 @@ def validate_tool_content(build_root: BuildRoot, expected_name: str) -> str | No
     that baked a known key into any file, but is never re-run on installed packages
     (whose ``.env`` legitimately holds the injected secret post-install). It runs
     ``scan_embedded_secrets``, so it reads every file whole and checks every path
-    and symlink target; a scan that could not finish refuses the package too,
-    with a message that says the scan failed rather than that a secret was found.
+    and symlink target. A scan that could not finish refuses the package too, and
+    so does an entry it could not read; both messages say what went unchecked,
+    never that a secret was found.
     """
     error = _scan_tool_content(build_root, expected_name).error
     if error is not None:
@@ -1517,6 +1518,15 @@ def validate_tool_content(build_root: BuildRoot, expected_name: str) -> str | No
     if scan.hits:
         offender = _mask_known_secrets(scan.hits[0].path, secrets)
         return f"{offender} 不得包含秘密值（請改由環境變數讀取）"  # noqa: RUF001
+    # An entry the scan could not read is content nobody checked: refused like a
+    # failed scan, naming the first one -- whatever it holds would be published
+    # unseen, and nothing after this reads it again. A FIFO, socket or device
+    # (``not_regular``) is not refused: it has no stored content to hold a value,
+    # and its name was checked like every other entry's.
+    unread = [skip.path for skip in scan.skipped if skip.reason == "unreadable"]
+    if unread:
+        unchecked = _mask_known_secrets(unread[0], secrets)
+        return f"{unchecked} 無法讀取，無法確認裡面沒有已知的秘密值。"  # noqa: RUF001
     return None
 
 

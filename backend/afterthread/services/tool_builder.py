@@ -252,12 +252,6 @@ _ERROR_VERSION_ID_WRITE = "無法為工具建立不重複的版本編號，操�
 _ERROR_ORIGIN_WRITE = "無法寫入工具版本的來源資料，操作已取消。"  # noqa: RUF001
 _ERROR_CURRENT_WRITE = "無法發布工具的新版本，操作已取消。"  # noqa: RUF001
 _ERROR_DURABILITY = "無法確認工具資料已安全寫入磁碟，操作已取消。"  # noqa: RUF001
-# A run_shell command of the session had not ended when ``_BuilderShells`` stopped
-# waiting for it, so nothing the session produced is taken as settled. Appended to
-# the session's own error when it has one (in practice its deadline).
-_ERROR_SHELL_NOT_STOPPED = (
-    "工作階段結束後，有 run_shell 指令沒能在時限內確認停止，這次的成果不會發布；詳情見後端記錄。"  # noqa: RUF001
-)
 
 _VID_RETRY_LIMIT = 16
 
@@ -1007,6 +1001,34 @@ def _run_shell_subprocess(
     return tools._cap_output(tools.redact_known_secrets(output.stdout), cap)
 
 
+def _workspace_kept_error(session_root: Path) -> str:
+    """The job error for a session whose workspace is kept, its commands not
+    confirmed stopped (``_BuilderShells``). Appended to the session's own error.
+
+    Blocking: the path goes into the error masked, and masking scans the tools
+    directory. Should that scan fail, the error leaves the path to the backend
+    log, which ``_log_workspace_kept`` writes either way.
+    """
+    try:
+        where = f"保留在 {tools.redact_known_secrets(str(session_root))}"
+    except Exception:
+        where = "保留（路徑見後端記錄）"  # noqa: RUF001
+    return (
+        "工作階段結束後，有 run_shell 指令沒能在時限內確認停止：這次的成果不會發布，"  # noqa: RUF001
+        f"暫存工作區原地{where}，確認沒有殘留的程序後可以手動刪除。"  # noqa: RUF001
+    )
+
+
+def _log_workspace_kept(session_root: Path) -> None:
+    """Say in the backend log where a kept workspace is, and why it was kept."""
+    with contextlib.suppress(Exception):
+        _logger.warning(
+            "Builder workspace kept at %s: its run_shell commands could not be "
+            "confirmed stopped, so it was neither published nor removed.",
+            session_root,
+        )
+
+
 def _shell_stop_seconds() -> float:
     """How long a builder session waits for its run_shell commands once stopped.
 
@@ -1032,7 +1054,18 @@ class _BuilderShells:
     awaited through ``asyncio.shield`` -- the shape of ``tools._make_handler``. The
     session's deadline, or a cancellation of the session, then cancels only the
     handler's await: the command's task, and the worker thread it waits on, go on
-    to their end, which is what ``stop_and_wait`` waits for.
+    to their end.
+
+    A command counts as ended only when its worker returns. The worker says so
+    itself, from a ``finally`` around ``_run_shell_subprocess``, through
+    ``loop.call_soon_threadsafe``. A task being done is not that: a cancelled task
+    is done too, and cancelling cannot stop the worker it waits on -- which is
+    exactly what the event loop does to every task as it shuts down. While it
+    shuts down, the loop runs the gather of every cancelled task, the session
+    waiting here among them, so it is still running to take the worker's word for
+    as long as the session waits. A worker that returns after its loop has closed
+    finds nobody waiting; ``call_soon_threadsafe`` raising for the closed loop is
+    swallowed.
 
     What it guarantees: once ``stop_and_wait`` returns True, every command this
     session ran has returned from its worker, and every process group one of them
@@ -1049,18 +1082,28 @@ class _BuilderShells:
     * a descendant that leaves the process group (``setsid``, a double fork):
       run_shell is a real shell with the service's own rights, not a sandbox, and
       the group kill is all a stop can do -- as it is all a timeout can do;
-    * the session cancelled a second time while ``stop_and_wait`` waits: that
-      cancellation ends the wait, and the cleanup that follows no longer waits;
-    * a command's task cancelled from elsewhere, as the event loop does to every
-      task when it shuts down: the task then ends before its worker does, and the
-      wait cannot tell the two apart.
+    * a command that cannot be confirmed stopped: its worker has not returned
+      within ``_shell_stop_seconds`` (a leader SIGKILL cannot reap, a thread that
+      is stuck, a worker its pool never ran), or a second cancellation of the
+      session cut the wait short. Then nothing vouches that the workspace is
+      still, and the callers do not strip, publish or remove it: the session's
+      workspace stays where it is, and the backend log names it. When the wait
+      ran out, the job still ends -- failed, its error saying where to find the
+      workspace -- and gives up its slot: holding the slot until a restart would
+      cost more than a leftover command running in its own workspace, which is
+      not another job's.
     """
 
-    __slots__ = ("_stop", "_tasks")
+    __slots__ = ("_running", "_stop", "_tasks")
 
     def __init__(self) -> None:
         self._stop = threading.Event()
+        # Strong references, so a command whose handler stopped waiting is never
+        # collected mid-flight.
         self._tasks: set[asyncio.Task[str]] = set()
+        # One future per command whose worker has not returned; only that worker
+        # resolves it.
+        self._running: set[asyncio.Future[None]] = set()
 
     async def run(
         self,
@@ -1071,14 +1114,28 @@ class _BuilderShells:
         extra_env: dict[str, str] | None,
     ) -> str:
         """Run one command for the session; returns run_shell's result text."""
-        task = asyncio.ensure_future(
-            run_in_threadpool(
-                _run_shell_subprocess, staging, command, timeout, cap, extra_env, self._stop
-            )
-        )
+        loop = asyncio.get_running_loop()
+        returned: asyncio.Future[None] = loop.create_future()
+        self._running.add(returned)
+        stop = self._stop
+
+        def worker() -> str:
+            try:
+                return _run_shell_subprocess(staging, command, timeout, cap, extra_env, stop)
+            finally:
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(self._worker_returned, returned)
+
+        task = asyncio.ensure_future(run_in_threadpool(worker))
         self._tasks.add(task)
         task.add_done_callback(self._forget)
         return await asyncio.shield(task)
+
+    def _worker_returned(self, returned: asyncio.Future[None]) -> None:
+        # On the loop, sent there by the worker as it returns.
+        self._running.discard(returned)
+        if not returned.done():
+            returned.set_result(None)
 
     def _forget(self, task: asyncio.Task[str]) -> None:
         self._tasks.discard(task)
@@ -1089,27 +1146,18 @@ class _BuilderShells:
             task.exception()
 
     async def stop_and_wait(self) -> bool:
-        """Stop every command of this session and wait for each to end.
+        """Stop every command of this session and wait for each worker to return.
 
-        True once all have ended. False when some are still running after
-        ``_shell_stop_seconds``: the caller must then not take the workspace as
-        settled. That case is logged here with the bound, never a command.
+        True once every worker has returned. False when one has not within
+        ``_shell_stop_seconds``: nothing then vouches that the workspace is still,
+        and the caller must leave it exactly as it is.
         """
         self._stop.set()
-        pending = [task for task in self._tasks if not task.done()]
-        if not pending:
+        running = list(self._running)
+        if not running:
             return True
-        bound = _shell_stop_seconds()
-        _done, still_running = await asyncio.wait(pending, timeout=bound)
-        if still_running:
-            with contextlib.suppress(Exception):
-                _logger.warning(
-                    "A builder run_shell command had not ended %g seconds after its "
-                    "session stopped it; nothing from that session is published.",
-                    bound,
-                )
-            return False
-        return True
+        _returned, still_running = await asyncio.wait(running, timeout=_shell_stop_seconds())
+        return not still_running
 
 
 def _build_meta_tools(
@@ -2381,7 +2429,7 @@ def _cleanup_staging(staging: Path, base: Path) -> None:
     The rmtree is a DESTRUCTIVE traversal, so it runs ONLY on a root that
     passes the SAME ``_verify_staging_root`` gate ``_promote_staging`` applies
     (R9-1). This is load-bearing, not symmetry for its own sake: ``run_install``'s
-    ``finally`` reaches here UNCONDITIONALLY -- including after promote just
+    ``finally`` reaches here on every exit but one -- including after promote just
     REFUSED the workspace as tampered -- and CPython's rmtree protection only
     refuses a path that is ITSELF a symlink. With the ``.staging`` ANCESTOR
     swapped for a symlink to an external directory holding a real ``<uuid>``
@@ -2395,8 +2443,8 @@ def _cleanup_staging(staging: Path, base: Path) -> None:
     window ``_verify_staging_root``'s own docstring names.
 
     The sweep rides HERE rather than at the head of the next promote, and the
-    reason is reach: this is the one step EVERY tool job passes through
-    unconditionally -- installs as well as revises, failures as well as successes
+    reason is reach: this is the one step EVERY tool job passes through, bar one
+    exit -- installs as well as revises, failures as well as successes
     -- so cleanup-failure remains do not wait for another revise to succeed before
     anything looks at them. The non-blocking exclusive flock makes the same
     sweep safe after a restart: an inherited child keeps its shared reference,
@@ -2407,6 +2455,10 @@ def _cleanup_staging(staging: Path, base: Path) -> None:
     above it: a tampered workspace returns early -- deliberately, see above --
     and that says nothing about whether marked remains elsewhere in ``base`` are
     collectable. The staging logic itself is untouched by this addition.
+
+    The exit that never calls this is a session whose run_shell commands could
+    not be confirmed stopped (``_BuilderShells``): its workspace is kept whole,
+    and the sweep is left to the next job.
     """
     try:
         with contextlib.suppress(Exception):
@@ -2491,11 +2543,14 @@ async def run_install(
     if secret_value:
         tools.register_inflight_secret(secret_value)
 
+    # True until the session starts: an exit before it has no command to wait for.
+    shells_ended = True
     try:
         settings = get_settings()
         result: InstallResult | None = None
         llm_error: str | None = None
         shells = _BuilderShells()
+        shells_ended = False
         try:
             result = await generate_structured(
                 _builder_system_prompt(secret_name),
@@ -2517,20 +2572,17 @@ async def run_install(
             # However the session ended -- an answer, an error, its deadline, or this
             # coroutine cancelled -- stop the commands it started and wait for them
             # (``_BuilderShells``) before anything below touches the workspace and
-            # before the job gives up its slot. If one has not ended within the
-            # bound, the workspace is neither stripped nor published: only the
-            # outer ``finally``'s cleanup still touches it.
+            # before the job gives up its slot. If they cannot be confirmed stopped
+            # -- the wait ran out, or a second cancellation cut it short and this
+            # stays False -- the workspace is not stripped, published or removed.
             shells_ended = await shells.stop_and_wait()
 
         # The builder session ran (even a not-configured exit records one), so
         # link its AI 日誌 record to the outcome NOW -- error paths included.
         llm_log_id = llm_log.last_record_id_for_workflow(_WORKFLOW)
         if not shells_ended:
-            return InstallOutcome(
-                ok=False,
-                error=(llm_error or "") + _ERROR_SHELL_NOT_STOPPED,
-                llm_log_id=llm_log_id,
-            )
+            kept = await run_in_threadpool(_workspace_kept_error, session_root)
+            return InstallOutcome(ok=False, error=(llm_error or "") + kept, llm_log_id=llm_log_id)
         env_keys, env_strip_error = await run_in_threadpool(_strip_builder_env, build_root, base)
 
         if env_strip_error is not None:
@@ -2642,10 +2694,15 @@ async def run_install(
         # Discard the in-flight secret first (its .env now carries it post-move,
         # so redaction continues via the .env scan), then clean staging. A
         # successful move consumed the staging dir; cleanup then only drops the
-        # (possibly empty) .staging shell. Every other exit removes the build.
+        # (possibly empty) .staging shell. Every other exit removes the build --
+        # except one whose commands could not be confirmed stopped, which keeps it.
         if secret_value:
             tools.discard_inflight_secret(secret_value)
-        await run_in_threadpool(_cleanup_staging, session_root, base)
+        if shells_ended:
+            await run_in_threadpool(_cleanup_staging, session_root, base)
+        else:
+            # Kept in place: a command not confirmed stopped may still be using it.
+            _log_workspace_kept(session_root)
 
 
 # --- the revise run -----------------------------------------------------------
@@ -3243,6 +3300,8 @@ async def run_revise(
     session_root = base / _STAGING_DIRNAME / uuid4().hex
     build_root = tools.BuildRoot(session_root / "build")
     shell_root = session_root / "shell"
+    # True until the session starts: an exit before it has no command to wait for.
+    shells_ended = True
     try:
         copy_error = await run_in_threadpool(
             _copy_package_into_staging, resolution.version_root, build_root
@@ -3286,6 +3345,7 @@ async def run_revise(
         result: ReviseResult | None = None
         llm_error: str | None = None
         shells = _BuilderShells()
+        shells_ended = False
         try:
             result = await generate_structured(
                 system_prompt,
@@ -3362,11 +3422,12 @@ async def run_revise(
                 ),
             }
         if not shells_ended:
+            kept = await run_in_threadpool(_workspace_kept_error, session_root)
             return InstallOutcome(
                 ok=False,
                 tool_name=name,
                 summary=summary,
-                error=(llm_error or "") + _ERROR_SHELL_NOT_STOPPED,
+                error=(llm_error or "") + kept,
                 llm_log_id=llm_log_id,
                 **facts,
                 **notes,
@@ -3484,11 +3545,16 @@ async def run_revise(
         )
     finally:
         # The package .env was untouched, so its live scan keeps covering these
-        # values after the temporary registrations are dropped. Cleanup always
-        # targets the complete session root, including any unused shell.
+        # values after the temporary registrations are dropped. Cleanup targets
+        # the complete session root, including any unused shell -- unless the
+        # session's commands could not be confirmed stopped, which keeps it all.
         for value in registered:
             tools.discard_inflight_secret(value)
-        await run_in_threadpool(_cleanup_staging, session_root, base)
+        if shells_ended:
+            await run_in_threadpool(_cleanup_staging, session_root, base)
+        else:
+            # Kept in place: a command not confirmed stopped may still be using it.
+            _log_workspace_kept(session_root)
 
 
 # --- examples: verification and the health check (web-v6 §8.3, §10) --------

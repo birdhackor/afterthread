@@ -388,7 +388,14 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   壞掉可由 API PATCH 原子覆寫修復，非一般檔只能由操作者先移除；單純刪掉檔案只會
   回到 disabled，不會重新開啟。
 - **安裝器與提交順序**：每場工作用
-  `<TOOLS_DIR>/.staging/<uuid>/{build,shell}`；`finally` 永遠清完整 session root。
+  `<TOOLS_DIR>/.staging/<uuid>/{build,shell}`；`finally` 清完整 session root。
+  session 結束時（含逾時與被取消），後端先對這一場的每個 `run_shell` 指令發出中止
+  訊號，等它的 worker 自己返回（process group 已殺、leader 已回收），之後才剝除、
+  驗證、發布或清理。唯一的例外是有指令無法確認停止：等了
+  `TOOL_INSTALL_SHELL_TIMEOUT_SECONDS` 加上回收時限，worker 仍未返回，或等待被
+  再次取消打斷。這時不剝除、不發布、也不清這一場的 session root，原地保留，
+  路徑寫進後端記錄；等待逾時的那種，工作照樣以失敗結束、名額照樣釋放，錯誤
+  訊息會附上這個路徑（路徑無法先做秘密遮罩時，改請你看後端記錄）。
   builder 在 `build` 工作，後端先擷取並剝除 builder 寫的根層 `.env`，再剝除
   版本根層的 `.afterthread.meta/`，然後驗證 `BuildRoot`。legacy
   `.ai_meta.json` 與 `.afterthread-state.json` 在版本層是一般工具內容；同名的舊
@@ -589,10 +596,14 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   提示，模型只拿得到**名字**。
 - **`.staging` 殘留**：清理是 best-effort（所有清理例外都被抑制），正常結束
   時通常會清掉暫存目錄；但後端在建置途中被中斷（當掉、被砍、主機重開機），
-  **或清理本身失敗**（例如 `run_shell` 改了目錄權限）時，會留下
+  **或清理本身失敗**（例如 `run_shell` 改了目錄權限），**或有 `run_shell` 指令
+  無法確認停止**（見「安裝器與提交順序」的例外，路徑寫在後端記錄裡）時，會留下
   `<TOOLS_DIR>/.staging/<uuid>`。這個目錄名稱以 `.` 開頭，registry 掃描
   （`tools._scan_all`）會直接跳過隱藏目錄，不會被列成無效工具，可以安全地手動
-  刪除。
+  刪除；指令無法確認停止而留下的，先確認沒有殘留的程序還在用它（例如
+  `lsof +D <路徑>` 沒有列出任何程序）再刪。這種保留下來的工作區沒有剝除過，裡面可能有
+  builder 寫的 `.env`，安裝時可能就是你在表單填的秘密，而工作結束後它已不在遮蔽名單裡；
+  請盡快刪除。
 - **同一時間只允許一個工具任務**：`start_install_job` 在同一把鎖底下檢查「名額是否
   被佔用」並建立新工作；被佔用時，第二個 submit 回 `409 install_in_progress`。
   **名額由四種動作共用**：安裝工作、AI 修訂工作（同一張 `_JOBS` 表），以及同步的
