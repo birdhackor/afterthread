@@ -258,7 +258,7 @@ session 執行期間不碰草稿目錄；草稿只在保存那一步換成新的
 | 看到 `draft/` 不存在 | `409 draft_gone` |
 | `draft/` 看不到，或說明檔讀不出、形狀不對 | `409 draft_unusable` |
 | `draft_id` 不同 | `409 draft_gone` |
-| `generation` 不同 | `409 draft_changed`：另一個分頁剛接續或放棄過，畫面重讀 |
+| `generation` 不同 | `409 draft_changed`：同一份草稿在畫面讀到之後被改寫過（例如另一個分頁剛接續），畫面重讀。放棄後重建的是另一份，落在上面的 `draft_gone` |
 | 檔案目錄不在，或不是目錄 | `409 draft_unusable` |
 | 有 `publishing`：正在發布、已發布或結果未知（§3.7），不讀 origin | `409 draft_publishing` |
 | 說明檔的 `base_vid` 不是 `current`（後端自己比，不只靠請求的 `expected_vid`） | `409 version_mismatch` |
