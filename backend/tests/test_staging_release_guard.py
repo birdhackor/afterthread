@@ -1,10 +1,11 @@
-"""Every value that can count towards removing the staging of an install, of a
-revise, or of a publish of a draft as it is, is registered here, and so is the
-condition each of the three removes it under.
+"""What an install, a revise and a publish of a draft as it is do as they end,
+registered here and checked against the syntax tree: when each removes its
+staging, the flag two of them keep their secret holds by, and every call and
+binding in each ``finally`` clause of the three.
 
-``tool_builder.run_install`` removes its staging only when its commands and
-writes are confirmed ended (``shells_ended``) and no worker of its promote may
-still be writing it (not ``publish_running``).
+**The staging's release.** ``tool_builder.run_install`` removes its staging only
+when its commands and writes are confirmed ended (``shells_ended``) and no worker
+of its promote may still be writing it (not ``publish_running``).
 ``tool_builder.run_revise`` removes a round's staging only on its release
 condition, written out atom by atom in its comment on ``holding``: the commands
 and writes confirmed ended, no publish worker and no worker copying into it still
@@ -27,18 +28,39 @@ kinds of code produce those atoms:
 * ``run_publish_draft`` itself -- each statement binding ``copy_running``,
   ``publish_running`` or ``holding``.
 
-Each one found by reading the syntax tree must be registered below, with what
-the value claims about which object and the observation it rests on. So must
-the condition each of the three functions calls ``_cleanup_staging`` under, as
-the ``if`` statements and conditional expressions around the call make it. A new
-one fails the guard until it is registered; a registered one that is gone fails
-it too, so the register stays the code as it is.
+Each one found must be registered (``_REGISTERED``), with what the value claims
+about which object and the observation it rests on. So must the condition each
+of the three functions calls ``_cleanup_staging`` under (``_RELEASES``).
 
-The register is written by hand: the guard checks that every producer and each
-condition is registered, not that the observation a row names is made. It
-covers the two files and the three functions named, and the forms the scanners
-know (the tables of forms below). A condition made some other way -- a
-``return`` or ``raise`` before the call, a ``match``, a loop -- is not read.
+**The flag the secret holds are kept by.** ``run_install`` and ``run_revise``
+release the holds they took on secret values (``tools.register_inflight_secret``)
+only when ``cancelled`` is down; each statement binding it in either is
+registered (``_HOLD_FLAG``), as the atoms above are.
+
+**Every finally clause of the three functions** -- the job's own, and the builder
+session's inside it -- read where it is in the function itself, not in a
+definition nested in it. Every call in one, awaited or not -- a helper called by
+name, or one handed by name to a thread in the call's arguments -- every
+``await`` of something other than a call, and every statement that binds or
+unbinds a name, an attribute or a subscript is registered (``_CLOSING``): with
+the condition it runs under, what it releases or rewrites, and which worker may
+still be using that, or ``none`` and why. A helper is registered by its call as
+written, and its row says what it does: the scan does not go into it. A ``def``,
+``class`` or ``import`` there, or an ``except`` clause's name, binds without the
+scan reading it, and what runs inside a definition made there is not read.
+
+A condition is read as the ``if`` statements and conditional expressions around
+a node make it, outermost first, joined by ``and``; ``True`` when none encloses
+it. A condition made some other way -- a ``return`` or ``raise`` before the
+node, a loop, a ``try``, a ``match``, a short-circuit ``and`` or ``or`` -- is not
+read.
+
+A new one fails the guard until it is registered; a registered one that is gone
+fails it too, so the registers stay the code as it is. They are written by hand:
+the guard checks that every one found is registered and every row is found --
+not that what a row says is true, nor that every way out of a job by an
+exception is safe. It covers the two files and the three functions named, and
+the forms the scanners know (the tables of forms below).
 """
 
 import ast
@@ -57,8 +79,14 @@ _ATOMS = ("holding", "shells_ended", "publish_running", "copy_running")
 _PUBLISH_ATOMS = ("copy_running", "publish_running", "holding")
 # The names ``run_install``'s release condition is made of.
 _INSTALL_ATOMS = ("shells_ended", "publish_running")
+# The flag ``run_install`` and ``run_revise`` keep their holds on secret values by.
+_HOLD_ATOMS = ("cancelled",)
 # What removes a job's staging.
 _CLEANUP = "_cleanup_staging"
+# The three jobs whose finally clauses are registered.
+_JOBS = ("run_install", "run_revise", "run_publish_draft")
+# A definition: what it defines does not run where it is defined.
+_DEFINITIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 
 
 def _callee(func: ast.expr) -> str:
@@ -137,11 +165,43 @@ def _negated(test: ast.expr) -> str:
     return f"not ({ast.unparse(test)})"
 
 
+def _looser_than_and(test: ast.expr) -> bool:
+    """Whether ``test`` as written binds looser than ``and``: joined with another
+    condition, it then needs parentheses to read as itself."""
+    return isinstance(test, ast.IfExp | ast.Lambda) or (
+        isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or)
+    )
+
+
+def _condition(node: ast.AST, target: ast.AST, parents: dict[ast.AST, ast.AST]) -> str:
+    """The condition ``node`` is reached under in ``target``, as the enclosing ``if``
+    statements and conditional expressions make it, outermost first, joined by
+    ``and``; ``True`` when none encloses it. A node in an ``if``'s own test is not
+    under that test. A test met true that binds looser than ``and`` is put in
+    parentheses when it is joined with another."""
+    held: list[tuple[ast.expr, bool]] = []
+    child: ast.AST = node
+    while child is not target:
+        parent = parents[child]
+        if isinstance(parent, ast.If | ast.IfExp) and child is not parent.test:
+            in_body = child in parent.body if isinstance(parent, ast.If) else (child is parent.body)
+            held.append((parent.test, in_body))
+        child = parent
+    held.reverse()
+    parts = [
+        _negated(test)
+        if not in_body
+        else f"({ast.unparse(test)})"
+        if len(held) > 1 and _looser_than_and(test)
+        else ast.unparse(test)
+        for test, in_body in held
+    ]
+    return " and ".join(parts) or "True"
+
+
 def _release_conditions(source: str, module: str, function: str) -> list[tuple[str, str]]:
     """The condition each mention of ``_CLEANUP`` in ``function`` of ``source`` is
-    reached under, as the enclosing ``if`` statements and conditional expressions
-    make it, outermost first, joined by ``and``; ``True`` when none encloses it:
-    (``module.function``, the condition)."""
+    reached under (``_condition``): (``module.function``, the condition)."""
     target = _function(source, function)
     parents = _parents(target)
     found: list[tuple[str, str]] = []
@@ -149,25 +209,108 @@ def _release_conditions(source: str, module: str, function: str) -> list[tuple[s
         named = (isinstance(node, ast.Name) and node.id == _CLEANUP) or (
             isinstance(node, ast.Attribute) and node.attr == _CLEANUP
         )
-        if not named:
-            continue
-        held: list[str] = []
-        child: ast.AST = node
-        while child is not target:
-            parent = parents[child]
-            if isinstance(parent, ast.If | ast.IfExp) and child is not parent.test:
-                in_body = (
-                    child in parent.body if isinstance(parent, ast.If) else (child is parent.body)
-                )
-                held.append(ast.unparse(parent.test) if in_body else _negated(parent.test))
-            child = parent
-        found.append((f"{module}.{function}", " and ".join(reversed(held)) or "True"))
+        if named:
+            found.append((f"{module}.{function}", _condition(node, target, parents)))
     return found
+
+
+def _here(node: ast.AST) -> list[ast.AST]:
+    """``node`` and every node under it, but nothing under a definition: the body of
+    a function, a lambda or a class does not run where it is defined."""
+    found: list[ast.AST] = []
+    pending = [node]
+    while pending:
+        current = pending.pop()
+        found.append(current)
+        if not isinstance(current, _DEFINITIONS):
+            pending.extend(ast.iter_child_nodes(current))
+    return found
+
+
+def _finally_clauses(target: ast.FunctionDef | ast.AsyncFunctionDef) -> list[list[ast.stmt]]:
+    """The body of each ``finally`` clause in ``target`` itself, however deep, but not
+    in a definition nested in it."""
+    return [
+        node.finalbody
+        for statement in target.body
+        for node in _here(statement)
+        if isinstance(node, ast.Try | ast.TryStar) and node.finalbody
+    ]
+
+
+def _statement(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> ast.stmt:
+    """The statement ``node`` is part of."""
+    statement = node
+    while not isinstance(statement, ast.stmt):
+        statement = parents[statement]
+    return statement
+
+
+def _closing_actions(source: str, module: str, function: str) -> list[tuple[str, str, str]]:
+    """What each ``finally`` clause of ``function`` in ``source`` does: every call, every
+    ``await`` of something other than a call, and every statement binding or
+    unbinding a name, an attribute or a subscript -- (``module.function``, the call or
+    the ``await`` as written, or the statement's first line, the condition it runs
+    under as ``_condition`` reads it). A node in a finally clause inside another is
+    found once, and so is a statement binding several names."""
+    target = _function(source, function)
+    parents = _parents(target)
+    where = f"{module}.{function}"
+    found: list[tuple[str, str, str]] = []
+    seen: set[ast.AST] = set()
+    bound: set[ast.stmt] = set()
+    for body in _finally_clauses(target):
+        for statement in body:
+            for node in _here(statement):
+                if node in seen:
+                    continue
+                seen.add(node)
+                if isinstance(node, ast.Call) or (
+                    isinstance(node, ast.Await) and not isinstance(node.value, ast.Call)
+                ):
+                    found.append((where, ast.unparse(node), _condition(node, target, parents)))
+                elif isinstance(node, ast.Name | ast.Attribute | ast.Subscript) and isinstance(
+                    node.ctx, ast.Store | ast.Del
+                ):
+                    binding = _statement(node, parents)
+                    if binding not in bound:
+                        bound.add(binding)
+                        line = ast.unparse(binding).splitlines()[0]
+                        found.append((where, line, _condition(binding, target, parents)))
+    return found
+
+
+def _indented(source: str) -> str:
+    """``source`` as the body of a function."""
+    return "".join(f"    {line}\n" for line in source.splitlines())
+
+
+def _finally(body: str) -> str:
+    """A function body that is a ``try`` whose ``finally`` clause is ``body``."""
+    return "try:\n    pass\nfinally:\n" + _indented(body)
+
+
+def _unmatched[T](found: list[T], registered: list[T]) -> tuple[list[T], list[T]]:
+    """What is found more often than registered, and what is registered more often
+    than found -- each as often as it is over."""
+    found_count, registered_count = Counter(found), Counter(registered)
+    over = sorted((found_count - registered_count).elements(), key=repr)
+    gone = sorted((registered_count - found_count).elements(), key=repr)
+    return over, gone
+
+
+def _builder_source() -> str:
+    return Path(tool_builder.__file__).read_text(encoding="utf-8")
+
+
+def _closing(source: str) -> list[tuple[str, str, str]]:
+    """What each finally clause of the three jobs in ``source`` does (``_closing_actions``)."""
+    return [action for job in _JOBS for action in _closing_actions(source, "tool_builder", job)]
 
 
 def _producers() -> list[tuple[str, str]]:
     drafts = Path(tool_drafts.__file__).read_text(encoding="utf-8")
-    builder = Path(tool_builder.__file__).read_text(encoding="utf-8")
+    builder = _builder_source()
     return [
         *_result_claims(drafts, "tool_drafts"),
         *_result_claims(builder, "tool_builder"),
@@ -178,11 +321,19 @@ def _producers() -> list[tuple[str, str]]:
 
 
 def _releases() -> list[tuple[str, str]]:
-    builder = Path(tool_builder.__file__).read_text(encoding="utf-8")
+    builder = _builder_source()
     return [
         *_release_conditions(builder, "tool_builder", "run_install"),
         *_release_conditions(builder, "tool_builder", "run_revise"),
         *_release_conditions(builder, "tool_builder", "run_publish_draft"),
+    ]
+
+
+def _hold_flag_bindings() -> list[tuple[str, str]]:
+    builder = _builder_source()
+    return [
+        *_atom_bindings(builder, "tool_builder", "run_install", _HOLD_ATOMS),
+        *_atom_bindings(builder, "tool_builder", "run_revise", _HOLD_ATOMS),
     ]
 
 
@@ -515,11 +666,335 @@ def test_the_condition_an_install_revise_or_draft_publish_cleans_up_under_is_reg
     found = Counter(_releases())
     registered = Counter((where, condition) for where, condition, _claim in _RELEASES)
     assert found, "the scan found no removal at all: it is not reading the three functions"
-    assert all(claim.strip() for _where, _condition, claim in _RELEASES)
+    assert all(claim.strip() for _where, _under, claim in _RELEASES)
     unregistered = sorted((found - registered).elements())
     stale = sorted((registered - found).elements())
     assert not unregistered, f"removals under a condition not registered: {unregistered}"
     assert not stale, f"registered removal conditions no longer in the code: {stale}"
+
+
+# Each statement binding the flag ``run_install`` and ``run_revise`` keep their
+# holds on secret values by: (where, form, what the value claims and the observation
+# it rests on).
+_HOLD_FLAG: list[tuple[str, str, str]] = [
+    row
+    for where in ("tool_builder.run_install", "tool_builder.run_revise")
+    for row in (
+        (
+            where,
+            "cancelled = False",
+            "nothing has left the job's try yet: a return keeps it down, and the finally then "
+            "releases the job's holds",
+        ),
+        (
+            where,
+            "cancelled = not isinstance(exc, Exception)",
+            "the except clause on the job's try, which runs before any step of the finally: up "
+            "for a BaseException that is not an Exception -- the event loop's shutdown "
+            "cancelling the job, an interrupt, an exit, each the process ending -- and down "
+            "for an Exception; no step of the finally binds it again",
+        ),
+    )
+]
+
+
+def test_each_binding_of_the_flag_the_secret_holds_are_kept_by_is_registered() -> None:
+    found = Counter(_hold_flag_bindings())
+    registered = Counter((where, form) for where, form, _claim in _HOLD_FLAG)
+    assert found, "the scan found no binding of the flag: it is not reading the two functions"
+    assert all(claim.strip() for _where, _form, claim in _HOLD_FLAG)
+    unregistered = sorted((found - registered).elements())
+    stale = sorted((registered - found).elements())
+    assert not unregistered, f"bindings of the flag with no registered claim: {unregistered}"
+    assert not stale, f"registered bindings of the flag no longer in the code: {stale}"
+
+
+def _log_line(helper: str, why: str) -> str:
+    """What one of the log helpers a finally clause calls does."""
+    return (
+        f"{helper}: writes one warning in the backend log naming the session root, which "
+        f"stays: {why}; it releases and rewrites nothing"
+    )
+
+
+# Shared texts of the rows below.
+_TOUCHES_NOTHING = "none: it touches no file and no state a worker uses"
+_A_LOCAL = "none: a local of this frame"
+_STOP_AND_WAIT = (
+    "_BuilderShells.stop_and_wait: sets the session's stop signal, then waits, within one "
+    "deadline, for every run_shell command's stop evidence and every write_file write's word "
+    "that its worker returned; it releases nothing"
+)
+_STOPPED_BY_IT = (
+    "the session's commands and writes: the stop is what ends them, and one not confirmed "
+    "stopped leaves shells_ended down, which keeps the workspace whole"
+)
+_SWEEP = (
+    "_sweep_logged: sweeps the tools directory (_sweep_stale_backups) under the exclusive "
+    "tools lock taken without blocking -- marked packages, discarded versions, draft "
+    "leftovers (.incoming-*, draft.discarded-*), never anything inside .staging -- each "
+    "failure logged; the staging stays"
+)
+_CLEANUP_DOES = (
+    "_cleanup_staging: removes the session root once it passes _verify_staging_root, and "
+    ".staging once that left it empty, then sweeps as _sweep_logged does"
+)
+_NONE_LEFT_TO_USE_THE_HOLDS = (
+    "none: on a return or an Exception every worker that took the known secrets after the "
+    "{held} taken, to make something seen or written -- {workers} -- was awaited to its "
+    "result or to its own exception, or never began; what may still run is a command or a "
+    "write not confirmed stopped, or a read_file or list_dir, and no one receives what they "
+    "make"
+)
+
+# Each call and each binding in a finally clause of the three jobs: (where, the call
+# or binding as the scan reports it, the condition it runs under, what it releases or
+# rewrites, which worker may still be using that -- or none, and why). A form that
+# occurs twice in a function under one condition is registered twice.
+_CLOSING: list[tuple[str, str, str, str, str]] = [
+    # --- run_install: the builder session's finally ----------------------------------
+    ("tool_builder.run_install", "shells.stop_and_wait()", "True", _STOP_AND_WAIT, _STOPPED_BY_IT),
+    (
+        "tool_builder.run_install",
+        "shells_ended = await shells.stop_and_wait()",
+        "True",
+        "rewrites shells_ended, an atom of the staging's release (_REGISTERED)",
+        _A_LOCAL,
+    ),
+    # --- run_install: the job's finally --------------------------------------------------
+    (
+        "tool_builder.run_install",
+        "tools.discard_inflight_secret(secret_value)",
+        "secret_value and (not cancelled)",
+        "releases this job's own hold on the form's secret: the value stays a known secret "
+        "only while another holder holds it or a package's .env does",
+        _NONE_LEFT_TO_USE_THE_HOLDS.format(
+            held="hold was", workers="the promote, the summary's store"
+        ),
+    ),
+    (
+        "tool_builder.run_install",
+        "_log_workspace_kept(session_root)",
+        "not shells_ended",
+        _log_line("_log_workspace_kept", "its commands or writes are not confirmed stopped"),
+        _TOUCHES_NOTHING,
+    ),
+    (
+        "tool_builder.run_install",
+        "_log_publish_running_kept(session_root)",
+        "shells_ended and publish_running",
+        _log_line("_log_publish_running_kept", "the job stopped while its promote still ran"),
+        _TOUCHES_NOTHING,
+    ),
+    (
+        "tool_builder.run_install",
+        "run_in_threadpool(_sweep_logged, base)",
+        "shells_ended and publish_running",
+        _SWEEP,
+        "the promote's worker, the job having stopped while it ran: it writes this session's "
+        "staging and renames its shell to the tool's name, neither of which the sweep collects",
+    ),
+    (
+        "tool_builder.run_install",
+        "run_in_threadpool(_cleanup_staging, session_root, base)",
+        "shells_ended and not (publish_running)",
+        _CLEANUP_DOES,
+        "the strip of the builder's .env, when the job was cancelled while it ran: both only "
+        "remove, the removal passes over an entry already gone, and nothing reads the strip's "
+        "answer; a summary's store still running writes into the installed version, not the "
+        "staging; no command, write or promote worker -- the condition says so",
+    ),
+    # --- run_revise: the builder session's finally -----------------------------------
+    ("tool_builder.run_revise", "shells.stop_and_wait()", "True", _STOP_AND_WAIT, _STOPPED_BY_IT),
+    (
+        "tool_builder.run_revise",
+        "shells_ended = await shells.stop_and_wait()",
+        "True",
+        "rewrites shells_ended, an atom of the staging's release (_REGISTERED)",
+        _A_LOCAL,
+    ),
+    (
+        "tool_builder.run_revise",
+        "holding = shells_ended",
+        "True",
+        "rewrites holding, an atom of the staging's release (_REGISTERED)",
+        _A_LOCAL,
+    ),
+    # --- run_revise: the job's finally ---------------------------------------------------
+    (
+        "tool_builder.run_revise",
+        "for value in registered:",
+        "not cancelled",
+        "rewrites value, the loop's own local",
+        _A_LOCAL,
+    ),
+    (
+        "tool_builder.run_revise",
+        "tools.discard_inflight_secret(value)",
+        "not cancelled",
+        "releases this job's own hold on each .env value it registered: a value stays a known "
+        "secret only while another holder holds it or a package's .env does",
+        _NONE_LEFT_TO_USE_THE_HOLDS.format(
+            held="holds were",
+            workers="the copy of a draft, the prompts, the masks, the save, the record, the "
+            "marks of the manifest, the publish, the summary's store, the examples",
+        ),
+    ),
+    (
+        "tool_builder.run_revise",
+        "_log_workspace_kept(session_root)",
+        "not shells_ended",
+        _log_line("_log_workspace_kept", "its commands or writes are not confirmed stopped"),
+        _TOUCHES_NOTHING,
+    ),
+    (
+        "tool_builder.run_revise",
+        "run_in_threadpool(_strip_builder_env, build_root, base)",
+        "shells_ended and holding and (not env_stripped) and (not publish_running)",
+        "_strip_builder_env: removes the root .env the builder wrote from the staging, once "
+        "the staging root is verified again, reading only its key names",
+        "the first strip's worker, when the round was cancelled while it ran: both remove the "
+        "same entry; the masking of the notes, the record or the look at the workspace may "
+        "still run beside it, and none of them reads the root .env; no save -- one starts "
+        "only after a strip went through, which raises env_stripped",
+    ),
+    (
+        "tool_builder.run_revise",
+        "_late_keys, late_error = await run_in_threadpool(_strip_builder_env, build_root, base)",
+        "shells_ended and holding and (not env_stripped) and (not publish_running)",
+        "rewrites _late_keys and late_error, locals of this frame",
+        "none: locals of this frame",
+    ),
+    (
+        "tool_builder.run_revise",
+        "env_stripped = late_error is None",
+        "shells_ended and holding and (not env_stripped) and (not publish_running)",
+        "rewrites env_stripped, which picks the log line below",
+        _A_LOCAL,
+    ),
+    (
+        "tool_builder.run_revise",
+        "_log_copy_running_kept(session_root)",
+        "shells_ended and (holding or publish_running or copy_running) and copy_running",
+        _log_line("_log_copy_running_kept", "the copy into it may still be writing it"),
+        _TOUCHES_NOTHING,
+    ),
+    (
+        "tool_builder.run_revise",
+        "_log_publish_running_kept(session_root)",
+        "shells_ended and (holding or publish_running or copy_running) and not (copy_running) "
+        "and publish_running",
+        _log_line("_log_publish_running_kept", "the job stopped while its publish still ran"),
+        _TOUCHES_NOTHING,
+    ),
+    (
+        "tool_builder.run_revise",
+        "_log_work_kept(session_root)",
+        "shells_ended and (holding or publish_running or copy_running) and not (copy_running) "
+        "and not (publish_running) and env_stripped",
+        _log_line("_log_work_kept", "no draft is known to hold its work"),
+        _TOUCHES_NOTHING,
+    ),
+    (
+        "tool_builder.run_revise",
+        "_log_work_kept_unstripped(session_root)",
+        "shells_ended and (holding or publish_running or copy_running) and not (copy_running) "
+        "and not (publish_running) and not (env_stripped)",
+        _log_line(
+            "_log_work_kept_unstripped",
+            "no draft is known to hold its work, and the builder's .env may still be in it",
+        ),
+        _TOUCHES_NOTHING,
+    ),
+    (
+        "tool_builder.run_revise",
+        "run_in_threadpool(_sweep_logged, base)",
+        "shells_ended and (holding or publish_running or copy_running)",
+        _SWEEP,
+        "the copy of a draft, a save, a record and a mark of the manifest touch the draft "
+        "only under the shared tools lock, which keeps the sweep out -- it skips when it "
+        "cannot take the exclusive one; the copy of a version and the publish hold no lock, "
+        "and write only this session's staging and versions/<vid>, neither of which the "
+        "sweep collects",
+    ),
+    (
+        "tool_builder.run_revise",
+        "run_in_threadpool(_cleanup_staging, session_root, base)",
+        "shells_ended and not (holding or publish_running or copy_running)",
+        _CLEANUP_DOES,
+        "none writing the staging: what may still run either reads the workspace and has its "
+        "answer dropped -- its digest, its tool.json, whether it holds a config.env, for a "
+        "round cancelled before its session -- or works outside it -- a write of the "
+        "manifest, the removal of the draft, the summary's store, the examples; no command, "
+        "write, copy or publish worker, and no work held -- the condition says so",
+    ),
+    # --- run_publish_draft: the job's finally --------------------------------------------
+    (
+        "tool_builder.run_publish_draft",
+        "_log_publish_draft_kept(session_root, worker=copy_running or publish_running)",
+        "copy_running or publish_running or holding",
+        _log_line(
+            "_log_publish_draft_kept",
+            "a worker copying the draft in or publishing it may still be writing it, or the "
+            "draft is not known to hold what it holds",
+        ),
+        _TOUCHES_NOTHING,
+    ),
+    (
+        "tool_builder.run_publish_draft",
+        "run_in_threadpool(_sweep_logged, base)",
+        "copy_running or publish_running or holding",
+        _SWEEP,
+        "the copy of the draft, the marks of the manifest and the look at the draft touch the "
+        "draft only under the shared tools lock, which keeps the sweep out -- it skips when it "
+        "cannot take the exclusive one; the publish holds no lock, and writes only this "
+        "session's staging and versions/<vid>, neither of which the sweep collects",
+    ),
+    (
+        "tool_builder.run_publish_draft",
+        "run_in_threadpool(_cleanup_staging, session_root, base)",
+        "not (copy_running or publish_running or holding)",
+        _CLEANUP_DOES,
+        "none writing the staging: what may still run works outside it -- the mask of the "
+        "origin's feedback, a mark of the manifest, the removal of the draft, the examples; no "
+        "copy or publish worker, and nothing held -- the condition says so",
+    ),
+]
+
+
+def test_each_call_and_binding_in_each_finally_clause_of_the_three_jobs_is_registered() -> None:
+    source = _builder_source()
+    for function in _JOBS:
+        assert _finally_clauses(_function(source, function)), f"no finally clause in {function}"
+    assert all(text.strip() for row in _CLOSING for text in row[3:])
+    unregistered, stale = _unmatched(_closing(source), [row[:3] for row in _CLOSING])
+    assert not unregistered, f"calls or bindings in a finally clause with no row: {unregistered}"
+    assert not stale, f"rows no call or binding in a finally clause matches: {stale}"
+
+
+def _with_a_call_in_each_finally(source: str, function: str, call: str) -> str:
+    """``source`` with ``call`` added as the last statement of each finally clause of
+    ``function``."""
+    tree = ast.parse(source)
+    target = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == function
+    )
+    for body in _finally_clauses(target):
+        body.append(ast.parse(call).body[0])
+    return ast.unparse(tree)
+
+
+@pytest.mark.parametrize("function", _JOBS)
+def test_a_call_added_to_each_finally_of_a_job_is_named_as_having_no_row(function: str) -> None:
+    added = "tools.release_something(session_root)"
+    source = _with_a_call_in_each_finally(_builder_source(), function, added)
+    clauses = _finally_clauses(_function(source, function))
+    assert clauses
+    unregistered, stale = _unmatched(_closing(source), [row[:3] for row in _CLOSING])
+    assert unregistered == [(f"tool_builder.{function}", added, "True")] * len(clauses)
+    assert stale == []
 
 
 # One row per form the scanner must find: (source, what it reports for it).
@@ -620,6 +1095,7 @@ _RELEASED: list[tuple[str, str]] = [
         "a and not (b)",
     ),
     ("if a:\n    pass\nelif b:\n    _cleanup_staging(root)\n", "not (a) and b"),
+    ("if a or b:\n    if c:\n        _cleanup_staging(root)\n", "(a or b) and c"),
     ("try:\n    pass\nfinally:\n    if a:\n        _cleanup_staging(root)\n", "a"),
     ("x = _cleanup_staging if a else None\n", "a"),
     ("x = None if a else _cleanup_staging\n", "not (a)"),
@@ -682,6 +1158,71 @@ def test_the_staging_release_scanner_lets_a_publish_s_reading_forms_through(sour
     assert _atom_bindings(module, "m", "run_publish_draft", _PUBLISH_ATOMS) == []
 
 
-def _indented(source: str) -> str:
-    """``source`` as the body of a function."""
-    return "".join(f"    {line}\n" for line in source.splitlines())
+# Each form the finally scanner must find, as a function's body: (source, each
+# (call or binding, condition) it holds).
+_FOUND_IN_A_FINALLY: list[tuple[str, list[tuple[str, str]]]] = [
+    (_finally("f(x)\n"), [("f(x)", "True")]),
+    (
+        _finally("tools.discard_inflight_secret(value)\n"),
+        [("tools.discard_inflight_secret(value)", "True")],
+    ),
+    (
+        _finally("await run_in_threadpool(_sweep_logged, base)\n"),
+        [("run_in_threadpool(_sweep_logged, base)", "True")],
+    ),
+    (_finally("h(g())\n"), [("h(g())", "True"), ("g()", "True")]),
+    (_finally("await fut\n"), [("await fut", "True")]),
+    (_finally("f(x=1)\n"), [("f(x=1)", "True")]),
+    (_finally("if a:\n    f()\n"), [("f()", "a")]),
+    (_finally("if a:\n    pass\nelse:\n    f()\n"), [("f()", "not (a)")]),
+    (_finally("if not a:\n    f()\nelif b:\n    g()\n"), [("f()", "not a"), ("g()", "a and b")]),
+    (_finally("if a or b:\n    if c:\n        f()\n"), [("f()", "(a or b) and c")]),
+    (_finally("if f():\n    g()\n"), [("f()", "True"), ("g()", "f()")]),
+    (_finally("x = f() if a else None\n"), [("x = f() if a else None", "True"), ("f()", "a")]),
+    (_finally("if a:\n    x = f()\n"), [("x = f()", "a"), ("f()", "a")]),
+    (_finally("x = 1\n"), [("x = 1", "True")]),
+    (_finally("x: bool = y\n"), [("x: bool = y", "True")]),
+    (_finally("x |= y\n"), [("x |= y", "True")]),
+    (
+        _finally("a, b = await run_in_threadpool(f)\n"),
+        [("a, b = await run_in_threadpool(f)", "True"), ("run_in_threadpool(f)", "True")],
+    ),
+    (_finally("self.flag = True\n"), [("self.flag = True", "True")]),
+    (_finally("d[k] = v\n"), [("d[k] = v", "True")]),
+    (_finally("del x\n"), [("del x", "True")]),
+    (_finally("for v in xs:\n    f(v)\n"), [("for v in xs:", "True"), ("f(v)", "True")]),
+    (_finally("with f() as x:\n    pass\n"), [("with f() as x:", "True"), ("f()", "True")]),
+    (_finally("if (x := f()):\n    pass\n"), [("if (x := f()):", "True"), ("f()", "True")]),
+    (_finally("g = lambda: f()\n"), [("g = lambda: f()", "True")]),
+    (
+        "try:\n    try:\n        pass\n    finally:\n        f()\nfinally:\n    g()\n",
+        [("f()", "True"), ("g()", "True")],
+    ),
+    (_finally("try:\n    pass\nfinally:\n    f()\n"), [("f()", "True")]),
+    ("try:\n    pass\nexcept* ValueError:\n    pass\nfinally:\n    f()\n", [("f()", "True")]),
+]
+
+
+@pytest.mark.parametrize(("source", "found"), _FOUND_IN_A_FINALLY)
+def test_the_finally_scanner_finds_each_listed_form(
+    source: str, found: list[tuple[str, str]]
+) -> None:
+    actions = _closing_actions(f"async def where():\n{_indented(source)}", "m", "where")
+    assert sorted(actions) == sorted(("m.where", action, under) for action, under in found)
+
+
+# What runs in no finally clause, or binds and calls nothing: not found.
+_NOT_IN_A_FINALLY: list[str] = [
+    "try:\n    f()\n    x = 1\nfinally:\n    pass\n",
+    "try:\n    pass\nexcept Exception:\n    f()\n    x = 1\nfinally:\n    pass\n",
+    "try:\n    pass\nexcept Exception:\n    pass\nelse:\n    f()\n",
+    "f()\nx = 1\n",
+    _finally("if a and not b:\n    pass\n"),
+    _finally("def inner():\n    f()\n    x = 1\n"),
+    "def inner():\n    try:\n        pass\n    finally:\n        f()\n",
+]
+
+
+@pytest.mark.parametrize("source", _NOT_IN_A_FINALLY)
+def test_the_finally_scanner_passes_over_what_no_finally_clause_runs(source: str) -> None:
+    assert _closing_actions(f"async def where():\n{_indented(source)}", "m", "where") == []

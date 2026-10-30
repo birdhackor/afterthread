@@ -11866,6 +11866,438 @@ def test_a_first_round_cancelled_while_its_copy_runs_leaves_the_staging_to_the_w
     assert _names_kept_for_the_copy(caplog, session)
 
 
+# --- the secret holds of a job the process's end stops ------------------------------
+#
+# ``run_install`` and ``run_revise`` hold the secret values they were given
+# (``tools.register_inflight_secret``) and release them as they end -- unless a
+# cancellation, an interrupt or an exit ends them: a worker they handed on then goes
+# on without them and may still take the known secrets, so the holds stay until the
+# process ends.
+
+# The install form's secret: in no package's .env until the promote writes it there.
+_FORM_SECRET = "form-secret-value-4821"
+# A revise's .env value, and the one the operator changes it to while the round runs:
+# the old one is from then on known only through the round's hold.
+_OLD_KEY = "old-kb-key-value-5309"
+_NEW_KEY = "new-kb-key-value-77140"
+
+
+def _install_cancelled_while_its_promote_is_held(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    at: str,
+    files: dict[str, str],
+    instructions: str,
+    cleanup_raises: bool = False,
+) -> tuple[tools.Resolved | None, str | None]:
+    """Run one install given the form's secret, and cancel it while its promote's
+    worker is held at ``at`` -- ``"validate_tool_content"``, about to scan the build,
+    or ``"write_origin_meta"``, about to write origin.json, each taking the known
+    secrets first; then let that worker go on. Returns what the promote handed back.
+
+    ``cleanup_raises`` makes the sweep the finally runs beside the staging it keeps
+    raise an ordinary exception: the job then ends in that, not in the cancellation."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built", "ready": True},
+        files={"tool.json": json.dumps(_package_manifest("kbsearch")), **files},
+    )
+    _no_fetch(monkeypatch)
+    entered = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+    answers: list[tuple[tools.Resolved | None, str | None]] = []
+    real_step = getattr(tools, at)
+    real_promote = tool_builder._promote_staging
+
+    def step(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        release.wait(10)
+        return real_step(*args, **kwargs)
+
+    def promote(*args: Any) -> tuple[tools.Resolved | None, str | None]:
+        try:
+            answer = real_promote(*args)
+            answers.append(answer)
+            return answer
+        finally:
+            returned.set()
+
+    def sweep_raising(base: Path) -> None:
+        raise RuntimeError("a cleanup step failing")
+
+    monkeypatch.setattr(tools, at, step)
+    monkeypatch.setattr(tool_builder, "_promote_staging", promote)
+    if cleanup_raises:
+        monkeypatch.setattr(tool_builder, "_sweep_logged", sweep_raising)
+    ended_in: type[BaseException] = RuntimeError if cleanup_raises else asyncio.CancelledError
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            run_install(
+                "http://kb.example/openapi.json",
+                instructions,
+                secret_name="KB_API_KEY",
+                secret_value=_FORM_SECRET,
+            )
+        )
+        for _ in range(1000):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert entered.is_set()
+        task.cancel()
+        with pytest.raises(ended_in):
+            await task
+        release.set()
+        assert await asyncio.to_thread(returned.wait, 10)
+
+    asyncio.run(scenario())
+    [answer] = answers
+    return answer
+
+
+def test_a_cancelled_install_s_promote_still_refuses_a_build_holding_the_form_secret(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cancelled while its promote's worker is about to scan the build: the worker
+    goes on without the job, and the form's secret is in no package's .env yet --
+    the promote writes it there last -- so only the job's hold makes it a known
+    secret. The hold stays, so the scan still finds the value the builder baked into
+    its code: the build is refused, and nothing is installed."""
+    published, error = _install_cancelled_while_its_promote_is_held(
+        monkeypatch,
+        tmp_path,
+        at="validate_tool_content",
+        files={"run.py": f"KEY = {_FORM_SECRET!r}\n{_GOOD_RUN_PY}"},
+        instructions="build a search tool",
+    )
+
+    assert published is None
+    assert error is not None and "不得包含秘密值" in error
+    assert not (tmp_path / "tools" / "kbsearch").exists()
+
+
+def test_a_cleanup_raising_after_a_cancelled_install_does_not_release_its_hold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cancelled while its promote's worker is about to scan the build, and then a
+    step of its finally raises an ordinary exception, which the job ends in. It was
+    cancelled all the same: the hold stays, and the scan still refuses the build that
+    bakes the form's secret into its code."""
+    published, error = _install_cancelled_while_its_promote_is_held(
+        monkeypatch,
+        tmp_path,
+        at="validate_tool_content",
+        files={"run.py": f"KEY = {_FORM_SECRET!r}\n{_GOOD_RUN_PY}"},
+        instructions="build a search tool",
+        cleanup_raises=True,
+    )
+
+    assert published is None
+    assert error is not None and "不得包含秘密值" in error
+    assert not (tmp_path / "tools" / "kbsearch").exists()
+
+
+def test_a_cancelled_install_s_promote_masks_the_form_secret_in_origin_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cancelled while its promote's worker is about to write origin.json, which
+    records the install's instructions -- here naming the form's secret: the worker
+    goes on and installs the tool, and the hold that stays keeps the value masked in
+    the file as written."""
+    published, error = _install_cancelled_while_its_promote_is_held(
+        monkeypatch,
+        tmp_path,
+        at="write_origin_meta",
+        files={"run.py": _GOOD_RUN_PY},
+        instructions=f"build a search tool; its key is {_FORM_SECRET}",
+    )
+
+    assert error is None and published is not None
+    origin = published.version_root.path / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    written = origin.read_bytes()
+    assert _FORM_SECRET.encode() not in written
+    assert tools._REDACTION_MARKER in json.loads(written)["instructions"]
+
+
+def _seed_package_with_old_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """An installed package whose .env holds the old key."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / ".env").write_text(f"KB_API_KEY={_OLD_KEY}\n", encoding="utf-8")
+    return pkg
+
+
+def _key_changed(pkg: Path) -> Callable[[], None]:
+    """The operator changing the package's .env to the new key."""
+
+    def change() -> None:
+        (_package_path(pkg) / ".env").write_text(f"KB_API_KEY={_NEW_KEY}\n", encoding="utf-8")
+
+    return change
+
+
+def _revise_cancelled_while_held_at(
+    monkeypatch: pytest.MonkeyPatch,
+    pkg: Path,
+    *,
+    held: tuple[types.ModuleType, str],
+    answered: str,
+    feedback: str,
+    files: dict[str, str],
+) -> Any:
+    """Run one revise of ``pkg`` whose builder makes ``files`` and is ready to publish,
+    the package's .env changed to the new key as its session begins -- the old key
+    from then on known only through the round's hold -- and cancel it while the
+    worker that calls ``held`` (a module, and a function's name in it) is held there,
+    about to take the known secrets; then let it go on. Returns what that worker's
+    own function -- ``answered``, in tool_builder -- handed back."""
+    entered = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+    answers: list[Any] = []
+    module, name = held
+    real_held = getattr(module, name)
+
+    def hold(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        release.wait(10)
+        return real_held(*args, **kwargs)
+
+    monkeypatch.setattr(module, name, hold)
+    real_answered = getattr(tool_builder, answered)
+
+    def answer(*args: Any, **kwargs: Any) -> Any:
+        try:
+            result = real_answered(*args, **kwargs)
+            answers.append(result)
+            return result
+        finally:
+            returned.set()
+
+    monkeypatch.setattr(tool_builder, answered, answer)
+    _fake_generate(monkeypatch, result=_revise_result(), files=files, side_effect=_key_changed(pkg))
+
+    async def scenario() -> None:
+        task = asyncio.create_task(_run_revise("kbsearch", feedback))
+        for _ in range(1000):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert entered.is_set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        assert await asyncio.to_thread(returned.wait, 10)
+
+    asyncio.run(scenario())
+    [result] = answers
+    return result
+
+
+def test_a_cancelled_revise_s_save_masks_a_changed_env_value_in_the_draft_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The operator changed the package's .env while the round ran, so the old key is
+    known only through the round's hold; the round is cancelled while the save before
+    its publish is about to take the known secrets -- no publish is running yet. The
+    save goes on without the round, and the hold that stays keeps the old key masked
+    in the request the draft's manifest records."""
+    pkg = _seed_package_with_old_key(monkeypatch, tmp_path)
+
+    saved = _revise_cancelled_while_held_at(
+        monkeypatch,
+        pkg,
+        held=(tool_builder, "_save_round_draft"),
+        answered="_save_round_draft",
+        feedback=f"加上分頁 金鑰是 {_OLD_KEY}",
+        files={"run.py": _REVISED_RUN_PY},
+    )
+
+    assert saved.saved is True
+    written = (_draft_dir(pkg) / tool_drafts.MANIFEST_FILENAME).read_bytes()
+    assert _OLD_KEY.encode() not in written
+    assert tools._REDACTION_MARKER in _draft_manifest(pkg)["feedback"]
+
+
+def test_a_cancelled_revise_s_publish_still_refuses_a_build_holding_a_changed_env_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The builder baked the package's key into its code, and the operator changed
+    the .env while the round ran: the old key is known only through the round's
+    hold. Cancelled while its publish's worker is about to scan the build, the worker
+    goes on; the hold stays, so the scan still refuses the build, and ``current``
+    does not move."""
+    pkg = _seed_package_with_old_key(monkeypatch, tmp_path)
+
+    published, error, _content = _revise_cancelled_while_held_at(
+        monkeypatch,
+        pkg,
+        held=(tools, "validate_tool_content"),
+        answered="_publish_revised_version",
+        feedback="加上分頁",
+        files={"run.py": f"KEY = {_OLD_KEY!r}\n{_REVISED_RUN_PY}"},
+    )
+
+    assert published is None
+    assert error is not None and "不得包含秘密值" in error
+    assert _resolved_version(_package_path(pkg)) == pkg
+
+
+def test_a_cancelled_revise_s_publish_masks_a_changed_env_value_in_origin_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The version the round revises records instructions that named the package's
+    key, and the operator changed the .env while the round ran: the old key is known
+    only through the round's hold. Cancelled while its publish's worker is about to
+    write the new version's origin.json, which carries those instructions over, the
+    worker goes on and publishes; the hold that stays keeps the old key masked in the
+    file as written."""
+    pkg = _seed_package_with_old_key(monkeypatch, tmp_path)
+    origin = pkg / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    recorded = json.loads(origin.read_text(encoding="utf-8"))
+    origin.write_text(
+        json.dumps({**recorded, "instructions": f"its key is {_OLD_KEY}"}), encoding="utf-8"
+    )
+
+    published, error, _content = _revise_cancelled_while_held_at(
+        monkeypatch,
+        pkg,
+        held=(tools, "write_origin_meta"),
+        answered="_publish_revised_version",
+        feedback="加上分頁",
+        files={"run.py": _REVISED_RUN_PY},
+    )
+
+    assert error is None and published is not None
+    version = published.resolution.version_root.path
+    written = (version / tools._META_DIRNAME / tools._ORIGIN_FILENAME).read_bytes()
+    assert _OLD_KEY.encode() not in written
+    assert tools._REDACTION_MARKER in json.loads(written)["instructions"]
+
+
+@pytest.mark.parametrize("ending", ["returns", "its-promote-raises"])
+def test_an_install_that_returns_or_whose_worker_raises_releases_only_its_own_hold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ending: str
+) -> None:
+    """An install that returns, or whose promote's worker raises, leaves no worker
+    taking the known secrets for it: it releases its hold on the form's secret -- its
+    own, one count -- and the hold another holder took on the same value stays."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built", "ready": True},
+        files={"tool.json": json.dumps(_package_manifest("kbsearch")), "run.py": _GOOD_RUN_PY},
+    )
+    _no_fetch(monkeypatch)
+
+    def promote_raising(*args: Any) -> Any:
+        raise RuntimeError("the promote's own failure")
+
+    if ending == "its-promote-raises":
+        monkeypatch.setattr(tool_builder, "_promote_staging", promote_raising)
+    tools.register_inflight_secret(_FORM_SECRET)  # another holder of the same value
+    install = run_install(
+        "http://kb.example/openapi.json",
+        "build a search tool",
+        secret_name="KB_API_KEY",
+        secret_value=_FORM_SECRET,
+    )
+
+    if ending == "returns":
+        assert asyncio.run(install).ok is True
+    else:
+        with pytest.raises(RuntimeError):
+            asyncio.run(install)
+
+    with tools._INFLIGHT_LOCK:
+        assert tools._INFLIGHT_SECRETS == {_FORM_SECRET: 1}
+
+
+@pytest.mark.parametrize("ending", ["returns", "its-publish-raises"])
+def test_a_revise_that_returns_or_whose_worker_raises_releases_only_its_own_holds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ending: str
+) -> None:
+    """A revise that returns, or whose publish's worker raises, leaves no worker
+    taking the known secrets for it: it releases its holds on the .env values -- its
+    own, one count each -- and the hold another holder took on the same value stays."""
+    _seed_package_with_old_key(monkeypatch, tmp_path)
+    if ending == "its-publish-raises":
+        monkeypatch.setattr(tool_builder, "_publish_revised_version", _publish_raises)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+    tools.register_inflight_secret(_OLD_KEY)  # another holder of the same value
+    revise = _run_revise("kbsearch", "加上分頁")
+
+    if ending == "returns":
+        assert asyncio.run(revise).ok is True
+    else:
+        with pytest.raises(RuntimeError):
+            asyncio.run(revise)
+
+    with tools._INFLIGHT_LOCK:
+        assert tools._INFLIGHT_SECRETS == {_OLD_KEY: 1}
+
+
+@pytest.mark.parametrize("raised", [KeyboardInterrupt, SystemExit])
+def test_an_install_ended_by_an_interrupt_or_an_exit_keeps_its_hold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, raised: type[BaseException]
+) -> None:
+    """An interrupt or an exit raised while an install runs means the process is
+    ending, as the event loop's shutdown cancelling the job does: the hold on the
+    form's secret stays until the process ends, so the value -- in no package's .env
+    -- is still a known secret after the job."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+
+    def interrupted() -> None:
+        raise raised()
+
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built", "ready": True},
+        side_effect=interrupted,
+    )
+    _no_fetch(monkeypatch)
+
+    with pytest.raises(raised):
+        asyncio.run(
+            run_install(
+                "http://kb.example/openapi.json",
+                "build a search tool",
+                secret_name="KB_API_KEY",
+                secret_value=_FORM_SECRET,
+            )
+        )
+
+    assert _FORM_SECRET in tools.known_secret_values()
+
+
+@pytest.mark.parametrize("raised", [KeyboardInterrupt, SystemExit])
+def test_a_revise_ended_by_an_interrupt_or_an_exit_keeps_its_holds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, raised: type[BaseException]
+) -> None:
+    """An interrupt or an exit raised while a revise runs means the process is
+    ending: the holds on the .env values stay until the process ends, so the old
+    key -- which the operator changed the .env away from while the round ran -- is
+    still a known secret after the job."""
+    pkg = _seed_package_with_old_key(monkeypatch, tmp_path)
+    change = _key_changed(pkg)
+
+    def interrupted() -> None:
+        change()
+        raise raised()
+
+    _fake_generate(monkeypatch, result=_revise_result(), side_effect=interrupted)
+
+    with pytest.raises(raised):
+        asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert _OLD_KEY in tools.known_secret_values()
+
+
 def test_deleting_the_tool_while_its_draft_is_saved_is_refused(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

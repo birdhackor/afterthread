@@ -3292,11 +3292,12 @@ async def run_install(
     # The single {<NAME>: <value>} addition injected into run_shell's env (only
     # when both were supplied); None leaves the builder shell's env from-scratch.
     secret_env = {secret_name: secret_value} if (secret_name and secret_value) else None
-    # Register the VALUE as redactable for the WHOLE build window (D36): llm_log
-    # then masks it out of every builder-session prompt/response it records --
-    # covering the gap BEFORE promote writes it into the package .env (after which
-    # the .env scan in known_secret_values keeps covering it; the discard in the
-    # finally just ends this transient window). Guarded by the try/finally below.
+    # Register the VALUE as redactable for the WHOLE build window: llm_log then
+    # masks it out of every builder-session prompt/response it records -- covering
+    # the gap BEFORE promote writes it into the package .env, after which the .env
+    # scan in known_secret_values covers it too. The finally below releases this
+    # hold on a return or an Exception; a job ended by a cancellation, an interrupt
+    # or an exit keeps it until the process ends -- why, the finally says.
     if secret_value:
         tools.register_inflight_secret(secret_value)
 
@@ -3308,6 +3309,12 @@ async def run_install(
     # worker has returned, or never began -- and a cancellation does not, since
     # the worker goes on without it.
     publish_running = False
+    # Up once a BaseException that is not an Exception leaves the try below: the
+    # event loop's shutdown cancelling the job, an interrupt, an exit -- each the
+    # process ending. Set by the except clause, which runs before any step of the
+    # finally, and never again: a step of the finally that raises afterwards does
+    # not turn the exit into one the hold is released on.
+    cancelled = False
     try:
         settings = get_settings()
         result: InstallResult | None = None
@@ -3464,15 +3471,30 @@ async def run_install(
             llm_log_id=llm_log_id,
             env_keys=env_keys,
         )
+    except BaseException as exc:
+        cancelled = not isinstance(exc, Exception)
+        raise
     finally:
-        # Discard the in-flight secret first (its .env now carries it post-move,
-        # so redaction continues via the .env scan), then clean staging. A
-        # successful move consumed the staging dir; cleanup then only drops the
-        # (possibly empty) .staging shell. Every other exit removes the build --
-        # except one whose commands or writes could not be confirmed stopped, which
-        # keeps it, and one whose promote's worker may still be writing it, which
-        # keeps it while the sweep still runs (it never looks inside ``.staging``).
-        if secret_value:
+        # The hold on the form's secret goes first, on a return or an Exception
+        # only: every worker that took the known secrets after it was registered to
+        # make something seen or written -- the promote, the summary's store -- was
+        # then awaited to its result or to its own exception, or never began. What
+        # may still run is a command or a write not confirmed stopped, or a
+        # read_file or list_dir, and no one receives what they make. Ended any other
+        # way -- cancelled, interrupted, exiting: the process ending each time -- the
+        # job keeps the hold until the process ends. A promote's worker it started
+        # goes on without it, and takes the known secrets to scan the build and to
+        # write origin.json before the value is in an installed package's .env, the
+        # one the scan of known secrets reads -- and a promote that fails never
+        # installs one.
+        #
+        # Then the staging. A successful move consumed the staging dir; cleanup then
+        # only drops the (possibly empty) .staging shell. Every other exit removes
+        # the build -- except one whose commands or writes could not be confirmed
+        # stopped, which keeps it, and one whose promote's worker may still be
+        # writing it, which keeps it while the sweep still runs (it never looks
+        # inside ``.staging``).
+        if secret_value and not cancelled:
             tools.discard_inflight_secret(secret_value)
         if not shells_ended:
             # Kept in place: a command or a write not confirmed stopped may still be
@@ -4494,6 +4516,10 @@ async def run_revise(
     # starts from, or the draft a continuation works on -- may still be writing it;
     # lowered as ``publish_running`` is, never on a cancellation.
     copy_running = False
+    # Up once a BaseException that is not an Exception leaves the try below, set
+    # and kept as run_install's is: the finally then keeps the holds on the .env
+    # values until the process ends.
+    cancelled = False
     try:
         settings = get_settings()
         max_files = settings.tool_draft_max_files
@@ -5011,19 +5037,33 @@ async def run_revise(
             **facts,
             **notes,
         )
+    except BaseException as exc:
+        cancelled = not isinstance(exc, Exception)
+        raise
     finally:
-        # The package .env was untouched, so its live scan keeps covering these
-        # values after the temporary registrations are dropped. Cleanup targets
-        # the complete session root, including any unused shell -- unless the
-        # session's commands or writes could not be confirmed stopped, which keeps
-        # it all, unstripped, or the work in it is held by no one, or a worker
-        # copying into it or publishing it may still be writing it, any of which
-        # keeps it too while the sweep still runs (it never looks inside
+        # The holds on the .env values go first, on a return or an Exception only,
+        # as run_install's does: every worker that took the known secrets after they
+        # were registered to make something seen or written -- the copy of a draft,
+        # the prompts, the masks, the save, the record, the marks of the manifest,
+        # the publish, the summary's store, the examples -- was then awaited to its
+        # result or to its own exception, or never began. Ended any other way --
+        # cancelled, interrupted, exiting -- the round keeps them until the process
+        # ends: a worker it handed a copy, a save, a record, a mark, a publish or the
+        # summary's store to goes on without it and may still take the known
+        # secrets, and the package's .env may no longer hold a value the round was
+        # given -- the operator may have changed it while the round ran.
+        #
+        # Cleanup targets the complete session root, including any unused shell --
+        # unless the session's commands or writes could not be confirmed stopped,
+        # which keeps it all, unstripped, or the work in it is held by no one, or a
+        # worker copying into it or publishing it may still be writing it, any of
+        # which keeps it too while the sweep still runs (it never looks inside
         # ``.staging``). Kept for the work, it is first stripped of a .env the
         # builder wrote, when nothing stripped it yet, and kept all the same when
         # that strip fails: the log then says the .env may still be there.
-        for value in registered:
-            tools.discard_inflight_secret(value)
+        if not cancelled:
+            for value in registered:
+                tools.discard_inflight_secret(value)
         if not shells_ended:
             # Kept in place: a command or a write not confirmed stopped may still be
             # using it.

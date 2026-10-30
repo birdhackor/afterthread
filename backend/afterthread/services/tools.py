@@ -2741,12 +2741,21 @@ def enabled_llm_tools() -> list[LlmTool]:
 # operation, independently of what the ``.env`` scan below can see AT THE MOMENT
 # a body is recorded. Three kinds of holder register here:
 #
-# * a web-installer form secret (``secret_value``), for the whole install
-#   (tool_builder registers/discards around ``run_install``) -- the window BEFORE
-#   promote writes it into the package ``.env``, after which the per-package
-#   ``.env`` scan below is what covers it;
-# * a revise session's ``.env`` values, for the whole builder session, plus
-#   whatever the promote re-vets on its way out;
+# * a web-installer form secret (``secret_value``), for the whole install:
+#   ``tool_builder.run_install`` registers it before the build and releases it
+#   when the install returns or ends in an ``Exception``. It covers the window
+#   BEFORE promote writes the value into the package ``.env``, which the
+#   per-package ``.env`` scan below covers from then on. An install cancelled --
+#   the event loop shutting down -- or ended by an interrupt or an exit keeps it
+#   until the process ends: a promote's worker it started goes on without it, and
+#   still scans the build and writes ``origin.json`` with the known secrets before
+#   the value is in an installed package's ``.env`` -- and a promote that fails
+#   never installs one;
+# * a revise round's ``.env`` values, held by ``tool_builder.run_revise`` from
+#   before its builder session to its end, released and kept the same way: a
+#   worker the round handed a save, a record or a publish to may still take the
+#   known secrets after it, and the package's ``.env`` may no longer hold a value
+#   the round was given;
 # * the ``.env`` values ONE TOOL CALL was handed. ``_build_tool_env`` copies the
 #   package's ``.env`` into the child's environment, and the child can echo any
 #   of it back -- but the redaction of that output happens when the child
@@ -2826,7 +2835,12 @@ def register_inflight_secret(value: str) -> None:
     Every call must be matched by exactly one ``discard_inflight_secret`` from a
     ``finally``: the count is what lets overlapping holders of the same value
     (two calls to the same tool, a revise session and a tool call reading the
-    same ``.env``) each release only their OWN hold.
+    same ``.env``) each release only their OWN hold. One exception: a builder job
+    (``tool_builder.run_install``, ``tool_builder.run_revise``) that a
+    ``BaseException`` other than an ``Exception`` ends -- the event loop's
+    shutdown cancelling it, an interrupt, an exit -- keeps its holds until the
+    process ends, since a worker it handed on goes on without it and may still
+    take the known secrets.
     """
     if not value:
         return
