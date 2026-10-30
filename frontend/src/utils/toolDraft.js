@@ -1,14 +1,16 @@
 // Pure helpers for a tool's draft: the unfinished revision a revise leaves behind
-// when it does not publish, and that later rounds continue. Kept out of the
-// components for the reason every sibling here is: vitest runs in node without
-// jsdom, so a pure function is the only testable surface.
+// when it does not publish, and that later rounds continue, or the operator
+// publishes as it is. Kept out of the components for the reason every sibling here
+// is: vitest runs in node without jsdom, so a pure function is the only testable
+// surface.
 //
 // Five things meet here, and each has one home:
 // * the tools list's `draft` (backend ToolDraft): draftView says what the toolbar
 //   shows for it and which buttons it may offer;
-// * continuing a draft: draftContinuation says whether a draft can be continued and
-//   names it for the request (its id, generation and base version, as the list
-//   gave them); continuationNote checks the words sent with a round;
+// * continuing or publishing a draft: draftContinuation says whether a draft can be
+//   continued, or published as it is, and names it for the request (its id,
+//   generation and base version, as the list gave them); continuationNote checks
+//   the words sent with a round;
 // * what a draft does to the rest of its row: reviseBlockedByDraft says whether a
 //   revise that starts over may be sent and, when it may not, why; recordFixView
 //   says what a run record's fix button becomes while the tool has a draft;
@@ -18,12 +20,18 @@
 //   ask before (draftDiscardConfirmation), what to tell the operator once it is
 //   done (draftDiscardNotification) and how its failures are met
 //   (draftDiscardFailure);
-// * a revise job's `draft` (backend ToolJobDraft): jobDraftView says what the job
-//   card adds about what became of the round's work, and what it may say and offer
-//   about the tool's current draft.
+// * what a finished job reports about its draft: a revise's `draft` (backend
+//   ToolJobDraft) or a publish's `draft_publish` (ToolJobDraftPublish). jobDraftView
+//   says what the job card adds about what became of the round's work, or of the
+//   draft that was published, and what it may say and offer about the tool's current
+//   draft.
+//
+// Publishing a draft as it is has a file of its own, toolDraftPublish.js (what its
+// confirmation records and says); what the toolbar and the cards show for it is
+// here.
 //
 // Every decision here is taken from the backend's own facts (`state`,
-// `interrupted`, `saved`, `retained_path`, ...). What the model wrote
+// `interrupted`, `saved`, `removed`, `retained_path`, ...). What the model wrote
 // (`operator_action`, `summary`) is only shown, as its words: nothing else is
 // decided from it. How a round stopped is worded by toolJobStop.js, the one
 // vocabulary for it.
@@ -42,19 +50,26 @@ import { toolIdentityConsumers } from "./toolSummary.js";
 
 // The buttons a draft can offer, as draftView and jobDraftView name them in
 // `buttons`. 接續修正 sends a round at once; 加上說明後接續… asks for the words of
-// the round first; 放棄 asks before it deletes, and is offered on the toolbar only.
+// the round first; 發布草稿 asks before it publishes the draft's files as they are,
+// with no round; 放棄 asks before it deletes, and is offered on the toolbar only.
 export const CONTINUE_BUTTON = "continue";
 export const CONTINUE_WITH_NOTE_BUTTON = "continue_with_note";
+export const PUBLISH_BUTTON = "publish";
 export const DISCARD_BUTTON = "discard";
 
 const CONTINUE_BUTTONS = [CONTINUE_BUTTON, CONTINUE_WITH_NOTE_BUTTON];
 
+// The buttons that act on the draft as the list names it (its id, its generation and
+// the version it was made from): they exist for a draft that can name itself
+// (draftContinuation), and for no other.
+const DRAFT_ACTION_BUTTONS = [...CONTINUE_BUTTONS, PUBLISH_BUTTON];
+
 // How each state of a draft reads, and what the toolbar may offer for it. `buttons`
 // lists every button the toolbar may show: a draft that can be continued
-// (`open`) offers the two continue buttons and 放棄; a draft a round works on, or a
-// publish is going from, is not taken away from under that job and offers nothing;
-// in every other state it can only be discarded, and its files fetched from the
-// path.
+// (`open`) offers the two continue buttons, 發布草稿 and 放棄; a draft a round works
+// on, or a publish is going from, is not taken away from under that job and offers
+// nothing; in every other state it can only be discarded, and its files fetched
+// from the path.
 //
 // `note` is the one sentence that tells the operator what the state means; it gets
 // the draft and `{ currentVid }`, the version the tool is on now.
@@ -85,16 +100,17 @@ const DRAFT_STATE_VIEW = {
 		note: () =>
 			"曾經開始從這份草稿發布新版本，但後端沒有留下發布的結果。請先確認目前的版本是不是你要的；需要的檔案請到下方路徑取回。",
 	},
-	// The draft a publish went from stays when it could not be removed, but also
-	// when it was found to differ from the round's saved copy, or that could
-	// not be told: it may hold changes no version has, so the note never says
+	// A publish went from this draft: the round of a revise that went live, or the
+	// operator's own 發布草稿. The draft stays when it could not be removed, but
+	// also when it was found to differ from what was published, or that could not
+	// be told: it may hold changes no version has, so the note never says
 	// discarding it is all that is left to do.
 	published: {
 		title: "草稿已發布",
 		color: "blue",
 		buttons: [DISCARD_BUTTON],
 		note: (_draft, { currentVid }) =>
-			`這一輪已經發布成目前的版本${currentVid ? `（${currentVid}）` : ""}，但草稿可能另有沒發布的修改。需要的內容請先到下方路徑取回，再放棄這份草稿。`,
+			`這份草稿已經發布成目前的版本${currentVid ? `（${currentVid}）` : ""}，但草稿可能另有沒發布的修改。需要的內容請先到下方路徑取回，再放棄這份草稿。`,
 	},
 	stale: {
 		title: "草稿已過期",
@@ -106,9 +122,9 @@ const DRAFT_STATE_VIEW = {
 	open: {
 		title: "未完成的修正（草稿）",
 		color: "orange",
-		buttons: [...CONTINUE_BUTTONS, DISCARD_BUTTON],
+		buttons: [...DRAFT_ACTION_BUTTONS, DISCARD_BUTTON],
 		note: () =>
-			"這份草稿可以接續修正：AI 會從草稿目前的檔案接著做，你可以先改好 config.env、憑證或草稿裡的檔案再按。也可以到下方路徑取回需要的檔案，再放棄它。",
+			"這份草稿可以接續修正：AI 會從草稿目前的檔案接著做，你可以先改好 config.env、憑證或草稿裡的檔案再按。如果已經自己改完，可以不經 AI，直接按「發布草稿」把草稿目前的檔案發布成新版本。也可以到下方路徑取回需要的檔案，再放棄它。",
 	},
 };
 
@@ -201,9 +217,10 @@ function keptPaths(draft) {
 // * title / note / color: the state, in words (DRAFT_STATE_VIEW); a state it does
 //   not know is shown as itself and offers nothing, since an action on a state
 //   nobody has worded is not one to offer;
-// * buttons: see DRAFT_STATE_VIEW. The continue buttons are left out when the
-//   draft does not name itself fully (draftContinuation), since a round could not
-//   be sent for it;
+// * buttons: see DRAFT_STATE_VIEW. The buttons that name the draft to the backend
+//   (the two continue buttons and 發布草稿) are left out when the draft does not
+//   name itself fully (draftContinuation), since neither a round nor a publish
+//   could be sent for it;
 // * consequence: what staying costs, said wherever the draft offers anything;
 // * interruption / rounds / lastOutcome / stopReason / omitted: facts about the
 //   rounds, each null when the backend gave none. The stop reason is the card's
@@ -242,7 +259,7 @@ export function draftView(
 			};
 	const canContinue = draftContinuation(draft) !== null;
 	const buttons = entry.buttons.filter(
-		(button) => canContinue || !CONTINUE_BUTTONS.includes(button),
+		(button) => canContinue || !DRAFT_ACTION_BUTTONS.includes(button),
 	);
 	const last = draft.last ?? null;
 	const draftDir = nonBlank(draft.draft_dir);
@@ -284,12 +301,12 @@ export function draftView(
 
 // --- continuing a draft ------------------------------------------------------
 
-// The draft a round may continue, named the way the request names it, or null
-// when this draft cannot be continued: only a draft the backend reads as `open`
-// can, and only one whose manifest gave its id, its generation and the version it
-// was made from. The request sends exactly these -- the list's, never a job's --
-// so a draft written to since the list was read is refused (409 draft_changed)
-// rather than continued unseen.
+// The draft a round may continue, or a publish may go from, named the way their
+// requests name it, or null when this draft can be neither: only a draft the backend
+// reads as `open` can, and only one whose manifest gave its id, its generation and
+// the version it was made from. The requests send exactly these -- the list's, never
+// a job's -- so a draft written to since the list was read is refused (409
+// draft_changed) rather than continued or published unseen.
 export function draftContinuation(draft) {
 	if (draft?.state !== "open") {
 		return null;
@@ -326,7 +343,8 @@ export function continuationNote(note) {
 // continue the draft when it can be continued; otherwise take the files from the
 // draft's path, then discard it -- in the same terms (the tests pin the words they
 // share), so the operator is told the same thing before the click as after it.
-// Publishing a draft is not on the page, and no sentence asks for it.
+// They say how to go on revising; publishing a draft is not a revise, and no
+// sentence here points at it.
 const REVISE_BLOCKED_BY_DRAFT =
 	"這個工具有一份未完成的修正（草稿），所以現在不能送出新的修正。要送出，請先到草稿路徑取回需要的檔案，再放棄這份草稿。";
 const REVISE_BLOCKED_BY_OPEN_DRAFT =
@@ -541,8 +559,8 @@ export function draftDiscardFailure(error) {
 
 // --- the job card ------------------------------------------------------------
 
-// Said on a card whose round left a draft that is no longer the tool's draft: the
-// list, read after the round ended, holds another one. What happened in between is
+// Said on a card whose job left a draft that is no longer the tool's draft: the
+// list, read after the job ended, holds another one. What happened in between is
 // not said -- the list does not tell.
 export const DRAFT_SUPERSEDED = "目前的草稿已不是這張卡片對應的那一份";
 
@@ -611,20 +629,70 @@ function roundResult(job, draft) {
 	};
 }
 
+// A publish's own result, from the job alone: what it did with the draft it went
+// from (the job's `draft_publish`). A publish is not a round, so no round is named
+// and nothing is "saved". The job's `error`, when it failed, is the card's own line
+// and is not repeated here. Null when there is nothing to add.
+function publishResult(job, publish) {
+	const reason = nonBlank(publish.reason);
+	const retainedPath = nonBlank(publish.retained_path);
+	// Where the files the job tried to publish were left, when the backend says.
+	const retained =
+		retainedPath === null
+			? null
+			: {
+					text: `這次要發布的檔案另外留了一份在 ${retainedPath}`,
+					path: retainedPath,
+				};
+	if (job.state === "succeeded") {
+		// Published. `removed` is the backend having seen the draft gone; anything
+		// else is a draft that stays, and `reason` is why.
+		if (publish.removed === true) {
+			return {
+				tone: "published",
+				text: "草稿已刪除",
+				path: null,
+				note: null,
+				retained,
+			};
+		}
+		return {
+			tone: "kept",
+			text: "草稿留著，沒有刪除",
+			path: null,
+			note: reason,
+			retained,
+		};
+	}
+	// Nothing was published. The draft is as it was unless the backend gives a
+	// `reason`: the mark the job put on it could not be taken back.
+	if (reason === null && retained === null) {
+		return null;
+	}
+	return {
+		tone: "failed",
+		text: reason === null ? null : "草稿沒能恢復成發布前的狀態",
+		path: null,
+		note: reason,
+		retained,
+	};
+}
+
 const NO_FOLLOW_UP = { current: null, buttons: [] };
 
 // What the card may say about the tool's CURRENT draft, and offer for it. Only when
 // all of these hold, because otherwise the list the card would read is not about
-// the draft its round left:
+// the draft its job left:
 // * the card belongs to a row of the list (`hasRow`): a card no row owns offers
 //   nothing and claims nothing;
 // * the list on screen comes from a read that started after the job was seen to
 //   end, and succeeded (`listFresh`, from toolList.listReadAfter);
-// * the round left a draft it can name (`draft_id` and `generation`), and the list's
-//   draft names itself too.
+// * the job reports a draft it can name (`draft_id` and `generation`: a revise's
+//   `draft`, a publish's `draft_publish`), and the list's draft names itself too.
 // Then the two drafts are the same one when both id and generation match, and the
-// card offers the continue buttons for it if it can be continued
-// (draftContinuation). When they differ, the card says so and offers nothing.
+// card offers the buttons that act on a draft (the continue buttons and 發布草稿)
+// for it if it can be continued (draftContinuation). When they differ, the card says
+// so and offers nothing.
 function currentDraftFollowUp(jobDraft, { listDraft, listFresh, hasRow }) {
 	if (hasRow !== true || listFresh !== true || listDraft == null) {
 		return NO_FOLLOW_UP;
@@ -642,17 +710,20 @@ function currentDraftFollowUp(jobDraft, { listDraft, listFresh, hasRow }) {
 	}
 	return {
 		current: null,
-		buttons: draftContinuation(listDraft) === null ? [] : [...CONTINUE_BUTTONS],
+		buttons:
+			draftContinuation(listDraft) === null ? [] : [...DRAFT_ACTION_BUTTONS],
 	};
 }
 
-// What a finished revise's card adds about its round's work, or null when there is
-// nothing to add: not a revise, not finished, or a round that had nothing to keep
-// (the job's `draft` is then null).
+// What a finished job's card adds about its draft, or null when there is nothing
+// to add: not a revise or a publish of a draft, not finished, or a job with nothing
+// to report (the job's `draft`, for a revise, or `draft_publish`, for a publish, is
+// then null).
 //
 // Two layers, and only the second depends on the list:
-// * the round's own result, always: it may be the only place the operator learns
-//   where the work is. { tone, text, path, note, retained }:
+// * the job's own result, always: it may be the only place the operator learns
+//   where the work is. { tone, text, path, note, retained }. For a revise, from its
+//   `draft`:
 //   - "saved": the draft holds this round's work, and which round that makes it;
 //     `note` is the backend's note about the save, `retained` where the work was
 //     also left when the save could not be confirmed on disk;
@@ -660,6 +731,13 @@ function currentDraftFollowUp(jobDraft, { listDraft, listFresh, hasRow }) {
 //   - "not_saved": it is in neither, with the reason when the backend gave one;
 //   - "note": a published revise, whose only thing to say is why its draft is still
 //     there. "Saved" is not said of a revise that went live.
+//   For a publish, from its `draft_publish`; it is not a round, and names none:
+//   - "published": it went live and the draft is gone;
+//   - "kept": it went live and the draft stays; `note` is the backend's reason;
+//   - "failed": nothing went live; when the backend gave a reason the draft was not
+//     left as it was, and `text` says so with the reason as `note`;
+//   `retained` is where the files the publish tried to put live were left, whenever
+//   the backend names a place. The job's `error` is the card's own line.
 //   `path` is the path of the sentence itself (copied beside it); `text` is null when
 //   only `retained` has something to say.
 // * the tool's current draft: { current, buttons } -- see currentDraftFollowUp.
@@ -667,18 +745,23 @@ function currentDraftFollowUp(jobDraft, { listDraft, listFresh, hasRow }) {
 //   card says nothing about the current draft and offers nothing.
 // `kind` is the caller's job kind, used until the job's own `kind` is known.
 export function jobDraftView(job, kind, context = {}) {
-	if ((job?.kind ?? kind) !== "revise") {
+	const jobKind = job?.kind ?? kind;
+	if (jobKind !== "revise" && jobKind !== "publish_draft") {
 		return null;
 	}
 	if (!isTerminalToolJobState(job?.state)) {
 		return null;
 	}
-	const draft = job.draft;
-	if (draft == null) {
+	// The draft the job reports on: the round's, or the one a publish went from.
+	const reported = jobKind === "revise" ? job.draft : job.draft_publish;
+	if (reported == null) {
 		return null;
 	}
-	const own = roundResult(job, draft);
-	const followUp = currentDraftFollowUp(draft, {
+	const own =
+		jobKind === "revise"
+			? roundResult(job, reported)
+			: publishResult(job, reported);
+	const followUp = currentDraftFollowUp(reported, {
 		listDraft: context.listDraft ?? null,
 		listFresh: context.listFresh ?? false,
 		hasRow: context.hasRow ?? false,

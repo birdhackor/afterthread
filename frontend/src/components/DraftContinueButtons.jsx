@@ -10,9 +10,10 @@ const NOTE_INTRO =
 	"這段說明會連同草稿的紀錄（原本的意見、上一輪的交接筆記等）一起交給這一輪的 AI；這一輪記進草稿時，說明也一起記下。可以留空。";
 
 // 接續修正 and 加上說明後接續… for a draft that can be continued: on the tool row's
-// draft note, and on a revise card whose round left the tool's current draft. The
-// first sends a round at once, with no words; the second asks for the round's words
-// first -- optional, and bounded like every AI input (continuationNote).
+// draft note, and on a job card (a revise's or a publish's) whose job left the
+// tool's current draft. The first sends a round at once, with no words; the second
+// asks for the round's words first -- optional, and bounded like every AI input
+// (continuationNote).
 //
 // `continuation` is the draft on screen, as the page names it
 // (toolDraft.draftContinuation). 接續修正 calls `onContinue()`, and the page sends a

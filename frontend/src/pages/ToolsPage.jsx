@@ -49,6 +49,7 @@ import {
 } from "../utils/toolDelete.js";
 import {
 	buildDraftDiscardRequest,
+	CONTINUE_BUTTON,
 	draftContinuation,
 	draftDiscardFailure,
 	draftDiscardNotification,
@@ -59,11 +60,17 @@ import {
 	reviseVariables,
 } from "../utils/toolDraft.js";
 import {
+	draftPublishStartedMessage,
+	draftPublishVariables,
+} from "../utils/toolDraftPublish.js";
+import {
 	isHttpUrl,
 	isTerminalToolJobState,
 	isToolJobActive,
+	orphanedJobHeading,
 	secretNameError,
 	secretValueError,
+	toolJobCopy,
 	toolJobOutcomeView,
 	toolJobQueryEnabled,
 	toolJobRefetchInterval,
@@ -80,12 +87,14 @@ import { toolSettingsQueryKey } from "../utils/toolSettings.js";
 import {
 	acceptSummaryForVersion,
 	buildDiscardRequest,
+	buildDraftPublishRequest,
 	buildRegenerateRequest,
 	buildReviseRequest,
 	clearLineageUnavailable,
 	logLinkSearch,
 	markLineageUnavailable,
 	ownSummaryBusy,
+	publishRefusalNotification,
 	reviseRefusalNotification,
 	summaryErrorRevalidates,
 	toolIdentityConsumers,
@@ -316,11 +325,12 @@ function HealthCheckProgress({
 
 // The tool-job progress card: spinner while the job runs (2s poll, stopping
 // on a terminal state -- see toolJobRefetchInterval), then the green/red
-// outcome with a link into the AI 日誌 trace. Shared by BOTH job kinds this
-// one job table serves (D40): `kind` only swaps the zh-TW copy naming what
-// the job WAS ("安裝"/"修訂") -- the queued/running/failed shell is otherwise
-// identical, so this is one component (renamed from the original
-// install-only InstallProgress) rather than a second copy for revise.
+// outcome, with a link into the AI 日誌 trace when the job ran a session. Shared
+// by the kinds of job this one job table serves that have a progress card -- an
+// install, a revise and the publish of a draft: `kind` only swaps the zh-TW copy
+// naming what the job IS (toolInstall.toolJobCopy) -- the queued/running/failed
+// shell is otherwise identical, so this is one component rather than a copy per
+// kind.
 //
 // `draftFollowUp` is the page's word on the tool's current draft for this card
 // (see ReviseDraftResult), or null for a card that offers nothing about it.
@@ -352,29 +362,25 @@ function ToolJobProgress({
 			/>
 		);
 	}
-	const verb = jobKind === "revise" ? "修訂" : "安裝";
+	const copy = toolJobCopy(jobKind);
 
 	if (jobQuery.isError) {
 		// A 404 means the job RECORD is gone (jobs are process-local), NOT that the
-		// work did not happen -- and telling the operator to resubmit was wrong
-		// (R12-1). The backend applies the package change FIRST, generates the
-		// summary SECOND, and marks the job done LAST, so a restart during the
-		// summary step loses the record while the install or revision is already
-		// live. "Resubmit" then buys a second unwanted revision of the already
-		// revised tool (another multi-minute LLM run, another rewrite of content
-		// the user did not ask to change) or an install that fails on a name that
-		// is now taken. What we actually know is that the outcome is unknown, so
-		// that is what this says, and the list has just been refetched for exactly
-		// this reason -- the answer is on screen.
-		const unknownOutcome =
-			kind === "revise"
-				? "找不到這個修訂工作，後端可能已重新啟動。修訂可能已經完成——請先看上方清單與這個工具的總結，確認之後再決定要不要重送。"
-				: "找不到這個安裝工作，後端可能已重新啟動。工具可能已經安裝好了——請先看已安裝工具清單，確認之後再決定要不要重裝。";
+		// work did not happen, so the card does not tell the operator to resubmit.
+		// The backend applies the package change FIRST, generates the summary
+		// SECOND, and marks the job done LAST, so a restart during the summary step
+		// (for a publish of a draft, the examples) loses the record while the
+		// install, revision or publish is already live. "Resubmit" would buy a second
+		// unwanted revision of the already revised tool (another multi-minute LLM
+		// run, another rewrite of content the user did not ask to change) or an
+		// install that fails on a name that is now taken. What we actually know is
+		// that the outcome is unknown, so that is what this says, and the list has
+		// just been refetched for exactly this reason -- the answer is on screen.
 		return (
-			<Alert color="orange" title={`無法確認${verb}結果`}>
+			<Alert color="orange" title={`無法確認${copy.verb}結果`}>
 				<Text size="sm">
 					{jobQuery.error?.status === 404
-						? unknownOutcome
+						? copy.unknownOutcome
 						: (jobQuery.error?.message ?? "請稍後再試")}
 				</Text>
 			</Alert>
@@ -391,9 +397,7 @@ function ToolJobProgress({
 					<Group gap="sm" wrap="nowrap">
 						<Loader size="sm" />
 						<Text size="sm">
-							{checking
-								? `已發布新版本，${checking.title}……`
-								: `AI 正在${verb}工具，可能需要數分鐘……`}
+							{checking ? `已發布新版本，${checking.title}……` : copy.working}
 							{job?.state === "queued" ? "（排隊中）" : ""}
 						</Text>
 					</Group>
@@ -403,7 +407,7 @@ function ToolJobProgress({
 		);
 	}
 
-	const view = toolJobOutcomeView(job, kind);
+	const view = toolJobOutcomeView(job, jobKind);
 
 	if (view.tone === "success") {
 		// The verification of the published version, when there was one. A
@@ -423,11 +427,7 @@ function ToolJobProgress({
 				title={verifyFailed ? `${view.title}，但範例驗證失敗` : view.title}
 			>
 				<Stack gap="xs" align="flex-start">
-					<Text size="sm">
-						{jobKind === "revise"
-							? `已發布工具「${job.tool_name}」的新版本。`
-							: `已安裝工具「${job.tool_name}」。`}
-					</Text>
+					<Text size="sm">{copy.succeeded(job.tool_name)}</Text>
 					{job.summary ? <Text size="sm">{job.summary}</Text> : null}
 					{verification ? (
 						<VerificationSummary
@@ -444,10 +444,12 @@ function ToolJobProgress({
 						followUp={draftFollowUp}
 					/>
 					<ReviseStopNotice job={job} kind={jobKind} />
-					<LogLink
-						llmLogId={job.llm_log_id}
-						llmLogProcess={job.llm_log_process}
-					/>
+					{copy.showsAiLog ? (
+						<LogLink
+							llmLogId={job.llm_log_id}
+							llmLogProcess={job.llm_log_process}
+						/>
+					) : null}
 				</Stack>
 			</Alert>
 		);
@@ -472,10 +474,12 @@ function ToolJobProgress({
 						followUp={draftFollowUp}
 					/>
 					<ReviseStopNotice job={job} kind={jobKind} />
-					<LogLink
-						llmLogId={job.llm_log_id}
-						llmLogProcess={job.llm_log_process}
-					/>
+					{copy.showsAiLog ? (
+						<LogLink
+							llmLogId={job.llm_log_id}
+							llmLogProcess={job.llm_log_process}
+						/>
+					) : null}
 				</Stack>
 			</Alert>
 		);
@@ -492,10 +496,12 @@ function ToolJobProgress({
 				) : null}
 				<ReviseDraftResult job={job} kind={jobKind} followUp={draftFollowUp} />
 				<ReviseStopNotice job={job} kind={jobKind} />
-				<LogLink
-					llmLogId={job.llm_log_id}
-					llmLogProcess={job.llm_log_process}
-				/>
+				{copy.showsAiLog ? (
+					<LogLink
+						llmLogId={job.llm_log_id}
+						llmLogProcess={job.llm_log_process}
+					/>
+				) : null}
 			</Stack>
 		</Alert>
 	);
@@ -798,6 +804,7 @@ function ToolRow({
 	reviseMutation,
 	isSubmittingRevise,
 	reviseJobId,
+	reviseJobKind,
 	reviseJobQuery,
 	reviseJobFollowUp,
 	onFix,
@@ -809,6 +816,8 @@ function ToolRow({
 	isDiscardingDraft,
 	onContinueDraft,
 	onSendNoted,
+	onPublishDraft,
+	isPublishingDraft,
 }) {
 	// Local, independent per row (unlike LlmLogsPage's single-open Accordion):
 	// there is no reason comparing two tools' summaries side by side should
@@ -969,15 +978,15 @@ function ToolRow({
 				) : null}
 
 				{/* The job card lives on the row, whatever started the job (the AI
-				    總結 form, a fix or 跑一次範例 from 最近執行; the card follows the
-				    job's own kind) and whether or not the panel is open: the panel
-				    returns early -- a Loader, 無法載入總結 -- whenever its summary
-				    query has no data, which is exactly the case right after a fix
-				    publishes a new version, so a card inside it could vanish
-				    mid-job. */}
+				    總結 form, a fix or 跑一次範例 from 最近執行, 發布草稿; the card
+				    follows the job's own kind) and whether or not the panel is
+				    open: the panel returns early -- a Loader, 無法載入總結 --
+				    whenever its summary query has no data, which is exactly the case
+				    right after a fix publishes a new version, so a card inside it
+				    could vanish mid-job. */}
 				{reviseJobId !== null ? (
 					<ToolJobProgress
-						kind="revise"
+						kind={reviseJobKind}
 						jobId={reviseJobId}
 						jobQuery={reviseJobQuery}
 						onFixRuns={lineageControls.showVersionControls ? onFix : null}
@@ -992,8 +1001,8 @@ function ToolRow({
 				    operator may need to fetch, so it is shown for every package that
 				    has one. 放棄 shares the page's slot gate (`draftBlocked`) with
 				    the other writes that take the backend's one slot; a round that
-				    continues the draft is a version write and answers to
-				    `writesBlocked`, like 送出修訂. */}
+				    continues the draft, and a publish of it, are version writes and
+				    answer to `writesBlocked`, like 送出修訂. */}
 				{tool.draft ? (
 					<DraftNotice
 						toolName={tool.name}
@@ -1002,10 +1011,12 @@ function ToolRow({
 						blocked={draftBlocked}
 						discarding={isDiscardingDraft}
 						onDiscard={onDiscardDraft}
-						continueBlocked={writesBlocked}
+						writesBlocked={writesBlocked}
 						continuing={isSubmittingRevise}
 						onContinue={onContinueDraft}
 						onSendNoted={onSendNoted}
+						publishing={isPublishingDraft}
+						onPublish={onPublishDraft}
 					/>
 				) : null}
 
@@ -1141,12 +1152,14 @@ function InstalledToolsPanel({
 	const [lineageUnavailableKeys, setLineageUnavailableKeys] = useState(
 		() => new Set(),
 	);
-	// The one revise job this panel is currently tracking, and which tool
-	// INSTANCE it belongs to (the canonical job attribution key captured at
-	// submit time -- see activeJobKey). Mirrors InstallPanel's single `jobId` for the same
-	// reason: the backend's single-flight (D40) admits only ONE install/revise
-	// job at a time across every tool, so there is never more than one to track.
-	const [activeJob, setActiveJob] = useState(null); // { name, jobAttributionKey, jobId } | null
+	// The one job this panel is currently tracking (a revise, a check of the
+	// examples or the publish of a draft), and which tool INSTANCE it belongs to
+	// (the canonical job attribution key captured at submit time -- see
+	// activeJobKey). Mirrors InstallPanel's single `jobId` for the same reason: the
+	// backend admits only ONE tool job at a time across every tool, so there is
+	// never more than one to track. `kind` is what the card calls the job until the
+	// poll names it; a job started without one is shown as a revise.
+	const [activeJob, setActiveJob] = useState(null); // { name, jobAttributionKey, jobId, kind? } | null
 	// Every list read carries the number it started with (toolList.readToolList), so
 	// a revise card can tell whether the list on screen was read after its job ended.
 	const { data, error, isError, isFetching, refetch } = useQuery({
@@ -1454,6 +1467,56 @@ function InstalledToolsPanel({
 		},
 	});
 
+	// 發布草稿: the draft's files made into a new version, with no round of the AI.
+	// What is sent is what the confirmation recorded when it opened
+	// (toolDraftPublish.draftPublishVariables), not the draft the row shows by the
+	// time it is confirmed: a draft that changed since is refused by the backend
+	// with one of DRAFT_REFUSALS' codes, which is met below like the refusals of a
+	// round that continues one. Accepted, the job is tracked like a revise's -- the
+	// same slot, poll, gate and card -- and `kind` is what the card calls it until
+	// the poll names it.
+	const publishDraftMutation = useMutation({
+		mutationFn: (variables) => {
+			const request = buildDraftPublishRequest(variables);
+			return apiPost(request.path, request.body);
+		},
+		onSuccess: (result, { name, jobAttributionKey }) => {
+			setActiveJob({
+				name,
+				jobAttributionKey,
+				jobId: result.job_id,
+				kind: "publish_draft",
+			});
+		},
+		onError: (mutationError, variables) => {
+			// The draft refusals show their own words and read the list again, so
+			// the row shows the draft they talk about; every other failure is an
+			// ordinary failed version write.
+			const refusal = publishRefusalNotification(mutationError);
+			if (refusal !== null) {
+				notifications.show(refusal);
+				reactToVersionWriteConflict(mutationError, variables.jobAttributionKey);
+				return;
+			}
+			const reaction = reactToVersionWriteConflict(
+				mutationError,
+				variables.jobAttributionKey,
+			);
+			notifications.show({
+				color: "red",
+				title: "無法發布草稿",
+				message: toolErrorMessage(
+					mutationError,
+					"無法發布草稿",
+					VERSION_WRITE_CODE_COPY,
+				),
+			});
+			if (reaction === null) {
+				revalidateAfterSummaryError(mutationError, variables.name);
+			}
+		},
+	});
+
 	const jobQuery = useQuery({
 		queryKey: ["tool-job", activeJob?.jobId],
 		queryFn: () => apiGet(`/api/tools/jobs/${activeJob.jobId}`),
@@ -1680,12 +1743,14 @@ function InstalledToolsPanel({
 	// before any job id anywhere existed.
 	const ownBusy = ownSummaryBusy({
 		regeneratePending: regenerateMutation.isPending,
-		// A discard of a draft holds the same backend slot for the length of its
-		// request, so it gates the other writes like a submit does.
+		// A discard of a draft, and a publish of one, hold the same backend slot for
+		// the length of their requests, so they gate the other writes like a submit
+		// does.
 		revisePending:
 			reviseMutation.isPending ||
 			checkMutation.isPending ||
-			discardDraftMutation.isPending,
+			discardDraftMutation.isPending ||
+			publishDraftMutation.isPending,
 		reviseJobActive: reviseJobActive || linkedJobActive,
 	});
 	const summaryBusy = ownBusy || externalBusy;
@@ -1709,7 +1774,8 @@ function InstalledToolsPanel({
 		deleteMutation.isPending ||
 		discardMutation.isPending;
 
-	// THE gate for all version-specific writes -- 重新產生, 送出修訂 and 丟掉這一版.
+	// THE gate for all version-specific writes -- 重新產生, 送出修訂 (a round that
+	// continues a draft included), 發布草稿 and 丟掉這一版.
 	// One value is passed down so a control cannot be gated on only half of the
 	// reasons. The backend's expected_vid check is the authority; this keeps the
 	// operator from authoring or confirming against a list already known to be
@@ -1743,6 +1809,8 @@ function InstalledToolsPanel({
 	// toolIdentityConsumers result at submit time. Association by NAME alone
 	// would follow the name from V to P after a discard.
 	const activeJobKey = activeJob?.jobAttributionKey ?? null;
+	// What the card of the tracked job calls it until the poll names it.
+	const activeJobKind = activeJob?.kind ?? "revise";
 	// ...and if NO row owns it, it is shown at panel level instead (below), so a
 	// job can never become invisible while it is still holding the busy gate.
 	const orphanedJob =
@@ -1811,15 +1879,32 @@ function InstalledToolsPanel({
 		}
 		sendRevise(tool, target, feedback);
 	};
-	// What a revise card may say about the tool's current draft and offer for it
-	// (jobDraftView's second layer, drawn by ReviseDraftResult): `tool` is the card's
-	// row -- null for a card no row owns, which then offers nothing -- and `endMark`
-	// is where the page saw the job end in the order of list reads, so the list on
-	// screen counts only when its read started after it (and so succeeded, since a
-	// failed read leaves no list). 接續修正 goes through continueDraft, after the
-	// card's own conditions are asked again; 加上說明後接續… sends the draft its
-	// dialog opened on (sendNoted).
-	const cardDraftFollowUp = (cardJob, tool, endMark) => {
+	// 發布草稿 for `target`, the draft its confirmation opened on, as it opened on it
+	// (toolDraftPublish.draftPublishTarget). Like sendNoted, only the write gate is
+	// asked again: the draft is not looked up again, and one that changed since is the
+	// backend's to refuse.
+	const publishDraft = (tool, target) => {
+		if (versionWritesBlocked || target == null) {
+			return;
+		}
+		publishDraftMutation.mutate(draftPublishVariables(tool, target), {
+			onSuccess: () =>
+				notifications.show({
+					color: "blue",
+					message: draftPublishStartedMessage(tool.name),
+				}),
+		});
+	};
+	// What a card of a revise, or of the publish of a draft, may say about the tool's
+	// current draft and offer for it (jobDraftView's second layer, drawn by
+	// ReviseDraftResult): `kind` is what the card calls its job until the poll names
+	// it, `tool` is the card's row -- null for a card no row owns, which then offers
+	// nothing -- and `endMark` is where the page saw the job end in the order of list
+	// reads, so the list on screen counts only when its read started after it (and so
+	// succeeded, since a failed read leaves no list). 接續修正 goes through
+	// continueDraft, after the card's own conditions are asked again; 加上說明後接續…
+	// and 發布草稿 send the draft their dialogs opened on (sendNoted, publishDraft).
+	const cardDraftFollowUp = (cardJob, kind, tool, endMark) => {
 		const context = {
 			hasRow: tool != null,
 			listDraft: tool?.draft ?? null,
@@ -1832,10 +1917,15 @@ function InstalledToolsPanel({
 				tool != null &&
 				reviseMutation.isPending &&
 				reviseMutation.variables?.name === tool.name,
+			publishing:
+				tool != null &&
+				publishDraftMutation.isPending &&
+				publishDraftMutation.variables?.name === tool.name,
+			toolName: tool?.name ?? null,
 			continuation: draftContinuation(context.listDraft),
 			onContinue: () => {
-				const offered = jobDraftView(cardJob, "revise", context)?.buttons ?? [];
-				if (tool == null || offered.length === 0) {
+				const offered = jobDraftView(cardJob, kind, context)?.buttons ?? [];
+				if (tool == null || !offered.includes(CONTINUE_BUTTON)) {
 					return;
 				}
 				continueDraft(tool);
@@ -1845,6 +1935,12 @@ function InstalledToolsPanel({
 					return;
 				}
 				sendNoted(tool, target, feedback);
+			},
+			onPublish: (target) => {
+				if (tool == null) {
+					return;
+				}
+				publishDraft(tool, target);
 			},
 		};
 	};
@@ -1956,6 +2052,7 @@ function InstalledToolsPanel({
 						// generation, which a same-name reinstall cannot pass.
 						draftFollowUp={cardDraftFollowUp(
 							linkedJob,
+							"revise",
 							tools.find((tool) => tool.name === linkedJob?.tool_name) ?? null,
 							endMarkOf(linkedEndMark, followedJobId),
 						)}
@@ -2015,8 +2112,9 @@ function InstalledToolsPanel({
 				</Alert>
 			) : null}
 
-			{/* A tracked revise job whose row is no longer in the list -- deleted,
-			    replaced, discarded, or successfully promoted to a new version. The progress card
+			{/* A tracked job (a revise or the publish of a draft) whose row is no longer
+			    in the list -- deleted, replaced, discarded, or successfully promoted
+			    to a new version. The progress card
 			    normally lives INSIDE the row, so when the row went away the job kept
 			    polling and kept summaryBusy set while showing nothing: every other
 			    summary control stayed disabled for minutes with no explanation, and
@@ -2028,12 +2126,10 @@ function InstalledToolsPanel({
 			{orphanedJob ? (
 				<Stack gap="xs">
 					<Text size="sm" c="dimmed">
-						工具「{activeJob.name}
-						」的 AI
-						修訂進度（送出時的版本已不是目前版本，或工具已被刪除；不再對應下方任何一列）
+						{orphanedJobHeading(activeJobKind, activeJob.name)}
 					</Text>
 					<ToolJobProgress
-						kind="revise"
+						kind={activeJobKind}
 						jobId={activeJob.jobId}
 						jobQuery={jobQuery}
 						{...versionActions(activeJob.name, job?.verification?.vid)}
@@ -2115,11 +2211,13 @@ function InstalledToolsPanel({
 						// complements of each other over the same key, so the card is
 						// rendered exactly once, never twice and never nowhere.
 						reviseJobId={rowKey === activeJobKey ? activeJob.jobId : null}
+						reviseJobKind={activeJobKind}
 						reviseJobQuery={jobQuery}
 						reviseJobFollowUp={
 							rowKey === activeJobKey
 								? cardDraftFollowUp(
 										job,
+										activeJobKind,
 										tool,
 										endMarkOf(activeEndMark, activeJob.jobId),
 									)
@@ -2130,6 +2228,11 @@ function InstalledToolsPanel({
 						onContinueDraft={() => continueDraft(tool)}
 						onSendNoted={(target, feedback) =>
 							sendNoted(tool, target, feedback)
+						}
+						onPublishDraft={(target) => publishDraft(tool, target)}
+						isPublishingDraft={
+							publishDraftMutation.isPending &&
+							publishDraftMutation.variables?.name === tool.name
 						}
 						onCheck={() => checkTool(tool)}
 						isSubmittingCheck={

@@ -320,12 +320,23 @@ describe("reviseStopView", () => {
 		expect(reviseStopView(undefined, "revise")).toBeNull();
 	});
 
-	it("is null for an install or a health check", () => {
+	it("is null for an install, a health check or the publish of a draft", () => {
 		expect(
 			reviseStopView(finished({ ...measured, kind: "install" }), "revise"),
 		).toBeNull();
 		expect(
 			reviseStopView(finished({ ...measured, kind: "health_check" }), "revise"),
+		).toBeNull();
+		expect(
+			reviseStopView(
+				finished({
+					...measured,
+					operator_action: "貼上 KEY=value",
+					handoff: "還剩第二頁",
+					kind: "publish_draft",
+				}),
+				"revise",
+			),
 		).toBeNull();
 	});
 

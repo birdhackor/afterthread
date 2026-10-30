@@ -12,35 +12,87 @@
 // InstalledToolsPanel's revise job. The install-only helpers further down
 // (URL/secret validation -- a revise has neither field) keep their original
 // names.
+//
+// Publishing a tool's draft as it is (kind `publish_draft`) is one more kind on the
+// same route and state machine, polled by InstalledToolsPanel like a revise;
+// toolJobCopy and toolJobOutcomeView word it apart from an install and a revise.
 
-// Poll cadence while a tool job (install or revise) is still in flight. 2s:
-// both kinds run for minutes, so this is frequent enough to feel live without
-// hammering a backend that is already busy running the builder session.
+// Poll cadence while a tool job (install, revise or publish of a draft) is still in
+// flight. 2s: a job runs for seconds to minutes, so this is frequent enough to
+// feel live without hammering a backend that is already busy.
 export const TOOL_JOB_POLL_MS = 2000;
 
 // The two states a job can never leave (see backend tool_builder.JobRecord):
-// once reached, polling must stop. True of an install job and a revise job
-// alike -- they share one state machine.
+// once reached, polling must stop. True of every kind of job alike -- they share
+// one state machine.
 const TERMINAL_STATES = new Set(["succeeded", "failed"]);
 
 export function isTerminalToolJobState(state) {
 	return TERMINAL_STATES.has(state);
 }
 
-// How a TERMINAL job is shown (web-v6 §8.3). `state` still has only its two
-// terminal values; the backend's `outcome` splits the failure, and the one that
-// matters here is `not_published`: the builder itself declined to publish. That
-// is not a red failure -- it may be an outside cause the AI found (an expired
-// credential) or a fix it could not make, and the card says neither: orange,
-// with the AI's own words as the body and a note that nothing changed. Any other
-// non-success (including a job from an older backend with no `outcome`) keeps
-// the red card it always had.
+// What a tool-job card calls the job it shows, by the job's kind (`install`,
+// `revise`, `publish_draft`): the verb that titles its outcome, the line while it
+// runs, what it says when the job cannot be found any more, the sentence for a
+// success, and whether the card links to the AI 日誌. An install and a revise run a
+// builder session, and say so; publishing a draft runs none, so its words name
+// neither the AI nor a revision, and it has no session to link to. A kind not
+// listed (a health check has a card of its own) is worded as an install.
+const JOB_COPY = {
+	install: {
+		verb: "安裝",
+		working: "AI 正在安裝工具，可能需要數分鐘……",
+		unknownOutcome:
+			"找不到這個安裝工作，後端可能已重新啟動。工具可能已經安裝好了——請先看已安裝工具清單，確認之後再決定要不要重裝。",
+		succeeded: (name) => `已安裝工具「${name}」。`,
+		showsAiLog: true,
+	},
+	revise: {
+		verb: "修訂",
+		working: "AI 正在修訂工具，可能需要數分鐘……",
+		unknownOutcome:
+			"找不到這個修訂工作，後端可能已重新啟動。修訂可能已經完成——請先看上方清單與這個工具的總結，確認之後再決定要不要重送。",
+		succeeded: (name) => `已發布工具「${name}」的新版本。`,
+		showsAiLog: true,
+	},
+	publish_draft: {
+		verb: "發布草稿",
+		working: "正在把草稿發布成新版本……",
+		unknownOutcome:
+			"找不到這個發布草稿的工作，後端可能已重新啟動。草稿可能已經發布——請先看這個工具的版本與草稿提示，確認之後再決定要不要重送。",
+		succeeded: (name) => `已把草稿的檔案發布成工具「${name}」的新版本。`,
+		showsAiLog: false,
+	},
+};
+
+export function toolJobCopy(kind) {
+	return Object.hasOwn(JOB_COPY, kind) ? JOB_COPY[kind] : JOB_COPY.install;
+}
+
+// The line above a job card that no row of the list owns any more -- the version it
+// was sent from is gone from the list, as a published version's is. It names the
+// tool, because the card is not under it.
+export function orphanedJobHeading(kind, name) {
+	const progress =
+		kind === "publish_draft" ? "的發布草稿進度" : "的 AI 修訂進度";
+	return `工具「${name}」${progress}（送出時的版本已不是目前版本，或工具已被刪除；不再對應下方任何一列）`;
+}
+
+// How a TERMINAL job is shown. `state` has only its two terminal values; the
+// backend's `outcome` splits the failure, and the one that matters here is
+// `not_published`: the builder itself declined to publish. That is not a red
+// failure -- it may be an outside cause the AI found (an expired credential) or a
+// fix it could not make, and the card says neither: orange, with the AI's own
+// words as the body and a note that nothing changed. Any other non-success
+// (including a job from an older backend with no `outcome`) gets the red card. A
+// publish of a draft has no builder to decline, so it is only ever green or red:
+// it is published or it is not.
 export function toolJobOutcomeView(job, kind) {
-	const verb = kind === "revise" ? "修訂" : "安裝";
+	const { verb } = toolJobCopy(kind);
 	if (job?.state === "succeeded") {
 		return { tone: "success", color: "green", title: `${verb}完成` };
 	}
-	if (job?.outcome === "not_published") {
+	if (kind !== "publish_draft" && job?.outcome === "not_published") {
 		return {
 			tone: "not_published",
 			color: "orange",
@@ -116,7 +168,7 @@ export function toolJobQueryEnabled(jobId) {
 	return (query) => isToolJobActive({ jobId, ...toolJobSignals(query) });
 }
 
-// Whether a tool job (install or revise) the caller STARTED is still being
+// Whether a tool job (install, revise or publish of a draft) the caller STARTED is still being
 // tracked: while this holds, its controls stay locked and its progress card
 // keeps polling. The rule itself is isLiveToolJob above (see there for why a
 // non-404 poll error keeps a job tracked); this adds the one term that only a

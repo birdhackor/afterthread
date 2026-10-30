@@ -1,7 +1,8 @@
 // Where the 工具 page's copy of GET /api/tools came from, in the order the page
-// started its reads. A revise card may say something about the tool's CURRENT
-// draft, and offer to continue it, only on a list read that STARTED after the
-// card's job was seen to end and that SUCCEEDED (see jobDraftView in toolDraft.js).
+// started its reads. The card of a revise, or of the publish of a draft, may say
+// something about the tool's CURRENT draft, and offer to continue or publish it,
+// only on a list read that STARTED after the card's job was seen to end and that
+// SUCCEEDED (see jobDraftView in toolDraft.js).
 // Neither "the list has data" nor "the re-read settled" says that:
 //
 // * a read already in flight when the job ended can land after it, with the draft

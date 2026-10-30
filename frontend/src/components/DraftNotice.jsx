@@ -6,9 +6,11 @@ import {
 	draftContinuation,
 	draftDiscardConfirmation,
 	draftView,
+	PUBLISH_BUTTON,
 } from "../utils/toolDraft.js";
 import { CopyPathButton } from "./CopyPathButton.jsx";
 import { DraftContinueButtons } from "./DraftContinueButtons.jsx";
+import { DraftPublishButton } from "./DraftPublishButton.jsx";
 
 // One path the operator may need to open by hand, as a block that selects in one
 // click (for the browser that will not copy it -- see CopyPathButton) and 複製路徑.
@@ -26,9 +28,9 @@ function PathRow({ path }) {
 // through and how the last one ended, what the AI says the operator has to do by
 // hand, where the files are (the files the draft names, the whole draft directory
 // and the old files directories a continued round kept, each to be opened or
-// copied as they are), and the buttons: 接續修正 and 加上說明後接續… for a draft
-// that can be continued, and 放棄. What it says and which buttons a state gets is
-// decided by draftView.
+// copied as they are), and the buttons: 接續修正, 加上說明後接續… and 發布草稿 for a
+// draft that can be continued, and 放棄. What it says and which buttons a state
+// gets is decided by draftView.
 //
 // 放棄 asks first, and the confirmation acts on the draft the operator was looking
 // at when they pressed it (`confirming`), not on whatever the list shows by the
@@ -39,11 +41,12 @@ function PathRow({ path }) {
 //
 // The mutations live in the page, with the other writes of a row: `onDiscard`
 // (with the draft confirmed on), `onContinue` (接續修正: the page names the draft
-// its row shows at the click and checks again) and `onSendNoted` (加上說明後接續…:
-// the draft the dialog opened on, with the words; see DraftContinueButtons).
-// `blocked` is the page's gate for every write that takes the backend's one slot;
-// `continueBlocked` is its gate for the version writes, which a round that
-// continues a draft is.
+// its row shows at the click and checks again), `onSendNoted` (加上說明後接續…:
+// the draft the dialog opened on, with the words; see DraftContinueButtons) and
+// `onPublish` (發布草稿: the draft its confirmation opened on; see
+// DraftPublishButton). `blocked` is the page's gate for every write that takes the
+// backend's one slot; `writesBlocked` is its gate for the version writes, which a
+// round that continues a draft and a publish of it are.
 export function DraftNotice({
 	toolName,
 	draft,
@@ -51,10 +54,12 @@ export function DraftNotice({
 	blocked,
 	discarding,
 	onDiscard,
-	continueBlocked,
+	writesBlocked,
 	continuing,
 	onContinue,
 	onSendNoted,
+	publishing,
+	onPublish,
 }) {
 	const [confirming, setConfirming] = useState(null);
 	const view = draftView(draft, { currentVid });
@@ -63,6 +68,7 @@ export function DraftNotice({
 	}
 	const canDiscard = view.buttons.includes(DISCARD_BUTTON);
 	const canContinue = view.buttons.includes(CONTINUE_BUTTON);
+	const canPublish = view.buttons.includes(PUBLISH_BUTTON);
 	const confirm = () => {
 		const target = confirming;
 		setConfirming(null);
@@ -146,16 +152,25 @@ export function DraftNotice({
 						{view.unlisted}
 					</Text>
 
-					{canContinue || canDiscard ? (
+					{canContinue || canPublish || canDiscard ? (
 						<Group justify="space-between" gap="xs">
 							<Group gap="xs">
 								{canContinue ? (
 									<DraftContinueButtons
 										continuation={draftContinuation(draft)}
-										blocked={continueBlocked}
+										blocked={writesBlocked}
 										submitting={continuing}
 										onContinue={onContinue}
 										onSendNoted={onSendNoted}
+									/>
+								) : null}
+								{canPublish ? (
+									<DraftPublishButton
+										toolName={toolName}
+										continuation={draftContinuation(draft)}
+										blocked={writesBlocked}
+										submitting={publishing}
+										onPublish={onPublish}
 									/>
 								) : null}
 							</Group>

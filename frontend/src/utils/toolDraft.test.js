@@ -118,7 +118,7 @@ describe("the draft state vocabulary", () => {
 
 describe("draftView buttons", () => {
 	const OFFERED = {
-		open: ["continue", "continue_with_note", "discard"],
+		open: ["continue", "continue_with_note", "publish", "discard"],
 		stale: ["discard"],
 		unusable: ["discard"],
 		published: ["discard"],
@@ -138,6 +138,28 @@ describe("draftView buttons", () => {
 			expect(buttons.includes("continue_with_note"), state).toBe(
 				state === "open",
 			);
+		}
+	});
+
+	it("offers 發布草稿 exactly when it offers the continue buttons", () => {
+		const shapes = [
+			{},
+			{ draft_id: null },
+			{ generation: null },
+			{ generation: 0 },
+			{ base_vid: " " },
+		];
+		for (const state of BACKEND_DRAFT_STATES) {
+			for (const fields of shapes) {
+				const { buttons } = draftView(draft({ state, ...fields }));
+				const where = `${state} ${JSON.stringify(fields)}`;
+				expect(buttons.includes("publish"), where).toBe(
+					buttons.includes("continue"),
+				);
+				expect(buttons.includes("publish"), where).toBe(
+					buttons.includes("continue_with_note"),
+				);
+			}
 		}
 	});
 
@@ -264,13 +286,15 @@ describe("reviseBlockedByDraft", () => {
 		}
 	});
 
-	it("says what to do now, and names no button the page does not have yet", () => {
+	it("says what to do now, and names no button the draft's state does not offer", () => {
 		for (const state of KNOWN_DRAFT_STATES) {
 			const reason = reviseBlockedByDraft(draft({ state }));
 			expect(reason, state).toContain("路徑");
 			expect(reason, state).toContain("放棄");
-			// Publishing a draft is not on the page.
-			expect(reason, state).not.toContain("發布草稿");
+			// Only an open draft has 發布草稿.
+			if (state !== "open") {
+				expect(reason, state).not.toContain("發布草稿");
+			}
 		}
 	});
 
@@ -836,6 +860,8 @@ const onTheList = (fields) => ({
 	listDraft: leftByRound({}),
 	...fields,
 });
+// What a card offers for a draft that can be continued.
+const CARD_BUTTONS = ["continue", "continue_with_note", "publish"];
 
 describe("jobDraftView: the round's own result", () => {
 	it("says the progress was kept, with the round it is", () => {
@@ -1040,7 +1066,7 @@ describe("jobDraftView: the round's own result", () => {
 describe("jobDraftView: the tool's current draft", () => {
 	it("offers to continue the draft its round left, once the list read after the end says so", () => {
 		const view = jobDraftView(job({}), "revise", onTheList({}));
-		expect(view.buttons).toEqual(["continue", "continue_with_note"]);
+		expect(view.buttons).toEqual(CARD_BUTTONS);
 		expect(view.current).toBeNull();
 		// ...whatever became of the round's files.
 		const notSaved = jobDraftView(
@@ -1049,7 +1075,7 @@ describe("jobDraftView: the tool's current draft", () => {
 			onTheList({}),
 		);
 		expect(notSaved.text).toBe("未能保存（秘密掃描失敗）");
-		expect(notSaved.buttons).toEqual(["continue", "continue_with_note"]);
+		expect(notSaved.buttons).toEqual(CARD_BUTTONS);
 	});
 
 	it.each([
@@ -1176,9 +1202,7 @@ describe("jobDraftView: the tool's current draft", () => {
 				"revise",
 				onTheList({ listDraft: leftByRound({ state }) }),
 			);
-			expect(view.buttons, state).toEqual(
-				state === "open" ? ["continue", "continue_with_note"] : [],
-			);
+			expect(view.buttons, state).toEqual(state === "open" ? CARD_BUTTONS : []);
 			expect(view.current, state).toBeNull();
 		}
 	});
@@ -1208,6 +1232,252 @@ describe("jobDraftView: the tool's current draft", () => {
 		);
 		expect(superseded.text).toBeNull();
 		expect(superseded.current).toBe(DRAFT_SUPERSEDED);
+	});
+});
+
+// A publish_draft job's `draft_publish` (backend ToolJobDraftPublish) and the job
+// around it. A publish is not a round, so the job's `draft` is always null.
+const RETAINED_VERSION = "/srv/tools/kb/versions/20261030T091500Z-a1b2c3";
+const publishFacts = (fields) => ({
+	draft_id: DRAFT_ID,
+	generation: 5,
+	removed: true,
+	reason: null,
+	retained_path: null,
+	...fields,
+});
+const publishJob = (fields) => ({
+	kind: "publish_draft",
+	state: "succeeded",
+	outcome: "published",
+	draft: null,
+	draft_publish: publishFacts({}),
+	...fields,
+});
+// A publish that went live and left its draft.
+const keptPublish = (facts) =>
+	publishJob({ draft_publish: publishFacts({ removed: false, ...facts }) });
+// A publish that put nothing live.
+const failedPublish = (facts) =>
+	publishJob({
+		state: "failed",
+		outcome: "failed",
+		draft_publish: publishFacts({ removed: false, ...facts }),
+	});
+// The list's draft that this card's publish went from: same id, same generation.
+const leftByPublish = (fields) => draft({ generation: 5, ...fields });
+const onThePublishList = (fields) => ({
+	hasRow: true,
+	listFresh: true,
+	listDraft: leftByPublish({}),
+	...fields,
+});
+// Nothing a publish shows names a round, or says progress was saved: it is not one.
+const namesNoRound = (view) => {
+	const said = JSON.stringify(view);
+	expect(said).not.toMatch(/第 ?\d+ ?輪/);
+	expect(said).not.toContain("進度已保存");
+	expect(said).not.toContain("未能保存");
+	expect(said).not.toContain("未能存成草稿");
+};
+
+describe("jobDraftView: the publish of a draft, its own result", () => {
+	it("says the draft was removed, and names no round", () => {
+		const view = jobDraftView(publishJob({}));
+		expect(view.tone).toBe("published");
+		expect(view.text).toContain("已刪除");
+		expect(view.note).toBeNull();
+		expect(view.retained).toBeNull();
+		namesNoRound(view);
+	});
+
+	it("says the draft stays when it was not removed, with the backend's reason as it came", () => {
+		const reason =
+			"已發布，但這次發布的內容與草稿不完全相同，因此保留草稿。需要的話先從草稿目錄取出，再到工具列放棄這份草稿。\n沒帶進發布的項目：.env";
+		const view = jobDraftView(keptPublish({ reason }));
+		expect(view.tone).toBe("kept");
+		expect(view.note).toBe(reason);
+		expect(view.text).not.toContain("已刪除");
+		expect(view.text).not.toBe(jobDraftView(publishJob({})).text);
+		namesNoRound(view);
+	});
+
+	it("still says the draft stays when the backend gave no reason", () => {
+		const view = jobDraftView(keptPublish({ reason: null }));
+		expect(view.tone).toBe("kept");
+		expect(view.note).toBeNull();
+		expect(view.text).not.toContain("已刪除");
+	});
+
+	it("says where the files a failed publish left are, to be copied, and claims nothing about the draft without a reason", () => {
+		const view = jobDraftView(
+			failedPublish({ retained_path: RETAINED_VERSION }),
+		);
+		expect(view.retained.path).toBe(RETAINED_VERSION);
+		expect(view.retained.text).toContain(RETAINED_VERSION);
+		expect(view.text).toBeNull();
+		expect(view.note).toBeNull();
+		namesNoRound(view);
+	});
+
+	it("says the draft was not left as it was, with the backend's reason", () => {
+		const reason = "無法清除草稿上的發布標記，草稿現在只能放棄。";
+		const view = jobDraftView(failedPublish({ reason }));
+		expect(view.tone).toBe("failed");
+		expect(view.note).toBe(reason);
+		expect(view.text).not.toBeNull();
+		expect(view.retained).toBeNull();
+		namesNoRound(view);
+	});
+
+	it("says both when a failed publish has a reason and left files", () => {
+		const reason = "無法清除草稿上的發布標記。";
+		const view = jobDraftView(
+			failedPublish({ reason, retained_path: RETAINED_VERSION }),
+		);
+		expect(view.note).toBe(reason);
+		expect(view.retained.path).toBe(RETAINED_VERSION);
+	});
+
+	it("adds nothing for a failed publish that left everything as it was", () => {
+		expect(jobDraftView(failedPublish({}))).toBeNull();
+	});
+
+	it("needs no round's `draft` to say what became of the draft", () => {
+		for (const draftOfARound of [null, undefined]) {
+			const view = jobDraftView(publishJob({ draft: draftOfARound }));
+			expect(view.tone).toBe("published");
+		}
+	});
+
+	it("is null when the job carries no report of what it did with the draft", () => {
+		for (const state of ["succeeded", "failed"]) {
+			const job = publishJob({ state, draft_publish: null });
+			expect(jobDraftView(job)).toBeNull();
+			expect(
+				jobDraftView(job, "publish_draft", onThePublishList({})),
+			).toBeNull();
+		}
+	});
+
+	it("is null while the publish is still running, whatever it reports so far", () => {
+		for (const state of ["running", "queued"]) {
+			const reporting = publishJob({
+				state,
+				outcome: null,
+				draft_publish: publishFacts({
+					removed: false,
+					retained_path: RETAINED_VERSION,
+				}),
+			});
+			expect(jobDraftView(reporting), state).toBeNull();
+			expect(
+				jobDraftView(reporting, "publish_draft", onThePublishList({})),
+				state,
+			).toBeNull();
+		}
+	});
+
+	it("takes the job's own kind over the caller's, and the caller's until the job names one", () => {
+		expect(jobDraftView(publishJob({}), "revise")?.tone).toBe("published");
+		const unnamed = { ...publishJob({}), kind: undefined };
+		expect(jobDraftView(unnamed, "publish_draft")?.tone).toBe("published");
+		expect(jobDraftView(unnamed, "revise")).toBeNull();
+	});
+});
+
+describe("jobDraftView: the tool's current draft after a publish", () => {
+	it("offers what a draft that can be continued offers, once the list read after the end says it is the same draft", () => {
+		const view = jobDraftView(
+			failedPublish({}),
+			"publish_draft",
+			onThePublishList({}),
+		);
+		expect(view.buttons).toEqual(CARD_BUTTONS);
+		expect(view.current).toBeNull();
+	});
+
+	it("says the current draft is another one when only the generation differs, and offers nothing", () => {
+		const view = jobDraftView(
+			failedPublish({}),
+			"publish_draft",
+			onThePublishList({ listDraft: leftByPublish({ generation: 6 }) }),
+		);
+		expect(view.current).toBe(DRAFT_SUPERSEDED);
+		expect(view.buttons).toEqual([]);
+	});
+
+	it("says the same when another draft took its place", () => {
+		const view = jobDraftView(
+			failedPublish({}),
+			"publish_draft",
+			onThePublishList({
+				listDraft: leftByPublish({ draft_id: OTHER_DRAFT_ID }),
+			}),
+		);
+		expect(view.current).toBe(DRAFT_SUPERSEDED);
+		expect(view.buttons).toEqual([]);
+	});
+
+	it.each([
+		["the list was not read after the job ended", { listFresh: false }],
+		["the card has no row", { hasRow: false }],
+		["the tool has no draft now", { listDraft: null }],
+	])("keeps the publish's own result and path, and claims and offers nothing, when %s", (_when, fields) => {
+		const view = jobDraftView(
+			failedPublish({
+				reason: "草稿的發布標記沒能清掉",
+				retained_path: RETAINED_VERSION,
+			}),
+			"publish_draft",
+			onThePublishList({
+				...fields,
+				listDraft:
+					"listDraft" in fields
+						? fields.listDraft
+						: leftByPublish({ generation: 6 }),
+			}),
+		);
+		expect(view.retained.path).toBe(RETAINED_VERSION);
+		expect(view.note).toBe("草稿的發布標記沒能清掉");
+		expect(view.current).toBeNull();
+		expect(view.buttons).toEqual([]);
+	});
+
+	it("claims nothing when the list's draft cannot name itself", () => {
+		const view = jobDraftView(
+			failedPublish({ retained_path: RETAINED_VERSION }),
+			"publish_draft",
+			{
+				...onThePublishList({}),
+				listDraft: unreadable(),
+			},
+		);
+		expect(view.current).toBeNull();
+		expect(view.buttons).toEqual([]);
+	});
+
+	it("offers only for an open draft", () => {
+		for (const state of BACKEND_DRAFT_STATES) {
+			const view = jobDraftView(
+				failedPublish({ retained_path: RETAINED_VERSION }),
+				"publish_draft",
+				onThePublishList({ listDraft: leftByPublish({ state }) }),
+			);
+			expect(view.buttons, state).toEqual(state === "open" ? CARD_BUTTONS : []);
+			expect(view.current, state).toBeNull();
+		}
+	});
+
+	it("says nothing of the current draft for a publish that removed its draft", () => {
+		const view = jobDraftView(
+			publishJob({}),
+			"publish_draft",
+			onThePublishList({ listDraft: null }),
+		);
+		expect(view.tone).toBe("published");
+		expect(view.current).toBeNull();
+		expect(view.buttons).toEqual([]);
 	});
 });
 
@@ -1244,7 +1514,7 @@ describe("jobDraftView on the list as the page reads it", () => {
 		calls[1].resolve(listWith(leftByRound({})));
 		expect(
 			jobDraftView(job({}), "revise", cardOn(await after, mark)).buttons,
-		).toEqual(["continue", "continue_with_note"]);
+		).toEqual(CARD_BUTTONS);
 	});
 
 	it("offers nothing when the re-read after the end failed", async () => {
