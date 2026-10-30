@@ -7,6 +7,7 @@ the state a listing shows, the sweep, and the save itself driven directly, a sav
 into a draft that already exists included.
 """
 
+import dataclasses
 import errno
 import json
 import os
@@ -3591,3 +3592,781 @@ def test_a_round_s_note_is_kept_whole_up_to_the_request_s_own_cap(
         ),
     ).saved
     assert _manifest(package_root)["attempts"][-1]["note"] == note
+
+
+# --- publishing the draft as it is: its copy, what may stop it, its mark ----------
+
+
+def _publish_copy(
+    package_root: tools.PackageRoot,
+    workspace: Path,
+    *,
+    expected: tuple[str, int] | None = None,
+    max_files: int = 2000,
+    max_bytes: int = 50_000_000,
+) -> tool_drafts.PublishCopy | str:
+    """``copy_for_publish`` of the draft as it is now, or as ``expected`` names it,
+    in the package as it is now."""
+    return tool_drafts.copy_for_publish(
+        package_root=package_root,
+        package_dir_identity=tool_drafts.directory_identity(package_root.path),
+        expected=_identity(package_root) if expected is None else expected,
+        workspace=workspace,
+        max_files=max_files,
+        max_bytes=max_bytes,
+    )
+
+
+def _copied_for_publish(
+    package_root: tools.PackageRoot, workspace: Path
+) -> tool_drafts.PublishCopy:
+    copied = _publish_copy(package_root, workspace)
+    assert isinstance(copied, tool_drafts.PublishCopy), copied
+    return copied
+
+
+def _as_it_is(package_root: tools.PackageRoot) -> tuple[bytes, tool_drafts.TreeDigest]:
+    """The draft's manifest, byte for byte, and the digest of its files."""
+    digest = tool_drafts.tree_digest(_files(package_root))
+    assert digest is not None
+    return (_draft_dir(package_root) / tool_drafts.MANIFEST_FILENAME).read_bytes(), digest
+
+
+def _case_told_apart(root: Path) -> bool:
+    """Whether the filesystem under ``root`` tells two names that differ only in
+    case apart: probed there, not inferred from the platform."""
+    probe = root / ".case-probe"
+    probe.write_text("x", encoding="utf-8")
+    try:
+        return not os.path.lexists(root / ".CASE-PROBE")
+    finally:
+        probe.unlink()
+
+
+def _unsearchable(patch: pytest.MonkeyPatch, path: Path, answer: Any = "unreadable") -> None:
+    """The embedded-secret scan cannot search the file at ``path``: its search of
+    that one file answers ``answer``, or raises it when it is an exception."""
+    real_search = tools._search_file
+
+    def search(searched: str, secrets: list[str], overlap: int) -> Any:
+        if Path(searched) == path:
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+        return real_search(searched, secrets, overlap)
+
+    patch.setattr(tools, "_search_file", search)
+
+
+def test_a_publish_is_judged_as_a_continuation_is_but_for_the_read_before_the_slot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``judge_draft`` answers the draft named, at its generation and based on
+    ``current``, with its manifest. A continuation judged on the same draft is
+    refused when the route read nothing before the slot; a publish makes no such
+    read and is not. Another generation, or another draft, is refused alike."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    resolution = tools.resolve_current(package_root)
+    draft_id, generation = _identity(package_root)
+    named = (draft_id, generation)
+
+    assert tool_drafts.judge_draft(package_root, resolution, named) == _manifest(package_root)
+    assert tool_drafts.judge_continuation(package_root, resolution, named, None) == (
+        "draft_changed"
+    )
+    assert tool_drafts.judge_draft(package_root, resolution, (draft_id, generation + 1)) == (
+        "draft_changed"
+    )
+    assert tool_drafts.judge_draft(package_root, resolution, ("f" * 32, generation)) == (
+        "draft_gone"
+    )
+
+
+def test_a_publish_copy_of_a_draft_the_backend_saved_receives_all_of_it_and_only_reads_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The operator edited ``run.py`` in the draft and added a module. The workspace
+    receives exactly the draft's files, ``copied_in`` equal to ``copied_out``; the
+    copy names nothing left out, nothing unlooked, no secret, and does not stop the
+    publish. The draft's manifest and files are as they were."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    files = _files(package_root)
+    (files / "run.py").write_text("print('finished by hand')\n", encoding="utf-8")
+    (files / "lib").mkdir()
+    (files / "lib" / "util.py").write_text("X = 1\n", encoding="utf-8")
+    before = _as_it_is(package_root)
+    workspace = tmp_path / "publish" / "build"
+
+    copied = _copied_for_publish(package_root, workspace)
+
+    assert copied.refusal is None
+    assert copied.left_out is None
+    assert copied.not_brought_in == ()
+    assert copied.unlooked == ()
+    assert (copied.secret_paths, copied.withheld_secret_paths) == ((), ())
+    assert copied.files_dir == _manifest(package_root)["files_dir"]
+    assert tool_drafts.same_tree(copied.copied_out, copied.copied_in)
+    assert tool_drafts.same_tree(copied.copied_out, before[1])
+    assert (workspace / "run.py").read_text(encoding="utf-8") == "print('finished by hand')\n"
+    assert _as_it_is(package_root) == before
+
+
+def test_a_publish_copy_withholds_the_root_env_and_metadata_and_their_secrets_stop_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The operator put a ``.env`` and a ``.afterthread.meta/`` at the top of the
+    draft's files, each holding a known secret. Neither reaches the workspace, so
+    neither reaches a version: the secrets in them are named apart and do not stop
+    the publish. The two are named as left out, and the workspace differs from
+    the draft by them."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    files = _files(package_root)
+    (files / ".env").write_text(f"KB_KEY={_SECRET}\n", encoding="utf-8")
+    (files / tools._META_DIRNAME).mkdir()
+    (files / tools._META_DIRNAME / "notes.txt").write_text(f"token {_SECRET}\n", encoding="utf-8")
+    workspace = tmp_path / "publish" / "build"
+
+    copied = _copied_for_publish(package_root, workspace)
+
+    assert copied.refusal is None
+    assert copied.secret_paths == ()
+    assert copied.withheld_secret_paths == (".afterthread.meta/notes.txt", ".env")
+    assert copied.unlooked == ()
+    assert copied.not_brought_in == (
+        tool_drafts.Omitted(".afterthread.meta", "backend_meta"),
+        tool_drafts.Omitted(".env", "env_file"),
+    )
+    assert copied.left_out == tool_drafts.NOTE_NOT_BROUGHT_IN.format(
+        paths=".afterthread.meta、.env"
+    )
+    assert not tool_drafts.same_tree(copied.copied_out, copied.copied_in)
+    assert not os.path.lexists(workspace / ".env")
+    assert not os.path.lexists(workspace / tools._META_DIRNAME)
+    assert not any(_SECRET in text for text in _all_bytes_under(workspace))
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["notes.txt", "sub/.env", "sub/.afterthread.meta/notes.txt", "l"],
+    ids=["a-file", "an-env-below-the-top", "metadata-below-the-top", "a-link-s-target"],
+)
+def test_a_publish_copy_is_refused_for_a_known_secret_outside_the_withheld_root_entries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, path: str
+) -> None:
+    """A known secret in a file, in a ``.env`` or a metadata directory below the
+    top -- content like any file there -- or in a link's target. The publish is
+    refused naming the path; the secret reaches neither the workspace nor the
+    reason, and the draft is as it was."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    files = _files(package_root)
+    if path == "l":
+        os.symlink(f"/nowhere/{_SECRET}", files / path)
+    else:
+        (files / path).parent.mkdir(parents=True, exist_ok=True)
+        (files / path).write_text(f"KB_KEY={_SECRET}\n", encoding="utf-8")
+    before = _as_it_is(package_root)
+    workspace = tmp_path / "publish" / "build"
+
+    copied = _copied_for_publish(package_root, workspace)
+
+    assert copied.secret_paths == (path,)
+    assert copied.withheld_secret_paths == ()
+    assert copied.refusal == tool_drafts.REASON_PUBLISH_SECRETS.format(paths=path)
+    assert not any(_SECRET in text for text in _all_bytes_under(workspace))
+    assert _as_it_is(package_root) == before
+
+
+def test_a_publish_copy_refused_for_a_secret_in_a_name_does_not_spell_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A file of the draft is named after a known secret: the publish is refused,
+    and the reason names the path masked."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    name = f"key-{_SECRET}.txt"
+    (_files(package_root) / name).write_text("plain\n", encoding="utf-8")
+    workspace = tmp_path / "publish" / "build"
+
+    copied = _copied_for_publish(package_root, workspace)
+
+    assert copied.secret_paths == (name,)
+    assert copied.refusal is not None
+    assert copied.refusal.startswith(tool_drafts.REASON_PUBLISH_SECRETS.format(paths=""))
+    assert _SECRET not in copied.refusal
+    assert not os.path.lexists(workspace / name)
+
+
+def test_a_publish_copy_goes_on_without_what_the_link_rule_or_its_kind_leaves_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A FIFO, a link out of the draft, and a link whose ``..`` follows another link
+    are left out of the workspace for what they are, not for a failed look or a
+    secret: the publish is not refused for them. They are named as left out, and
+    the workspace differs from the draft by them."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    files = _files(package_root)
+    os.mkfifo(files / "pipe")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("not the draft's\n", encoding="utf-8")
+    os.symlink(outside, files / "out.txt")
+    (files / "sub").mkdir()
+    os.symlink("sub", files / "to_sub")
+    os.symlink("to_sub/../run.py", files / "around.py")
+    workspace = tmp_path / "publish" / "build"
+
+    copied = _copied_for_publish(package_root, workspace)
+
+    assert copied.refusal is None
+    assert copied.unlooked == ()
+    assert copied.secret_paths == ()
+    assert copied.not_brought_in == (
+        tool_drafts.Omitted("around.py", "link_ambiguous"),
+        tool_drafts.Omitted("out.txt", "link_outside"),
+        tool_drafts.Omitted("pipe", "not_regular"),
+    )
+    assert copied.left_out == tool_drafts.NOTE_NOT_BROUGHT_IN.format(
+        paths="around.py、out.txt、pipe"
+    )
+    assert not tool_drafts.same_tree(copied.copied_out, copied.copied_in)
+    assert os.readlink(workspace / "to_sub") == "sub"
+
+
+@pytest.mark.parametrize(
+    ("unsearchable", "refused"),
+    [(".env", False), (".afterthread.meta/notes.txt", False), ("sub/.env", True)],
+    ids=["the-root-env", "in-the-root-metadata", "an-env-below-the-top"],
+)
+def test_only_a_root_entry_the_copy_withholds_may_be_one_the_scan_cannot_search(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, unsearchable: str, refused: bool
+) -> None:
+    """The scan cannot search one file. In the root ``.env``, or in the root
+    metadata directory, which never reach a version, that stops nothing. The same
+    name below the top is content: it is left out for a failed look, and the
+    publish is refused naming it."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    files = _files(package_root)
+    (files / unsearchable).parent.mkdir(parents=True, exist_ok=True)
+    (files / unsearchable).write_text("KEY=value\n", encoding="utf-8")
+    _unsearchable(monkeypatch, files / unsearchable)
+
+    copied = _copied_for_publish(package_root, tmp_path / "publish" / "build")
+
+    if refused:
+        assert copied.unlooked == (unsearchable,)
+        assert copied.refusal == tool_drafts.REASON_PUBLISH_UNLOOKED.format(paths=unsearchable)
+    else:
+        assert copied.unlooked == ()
+        assert copied.refusal is None
+
+
+@pytest.mark.parametrize("where", ["draft", "copy"])
+def test_a_publish_copy_is_refused_when_the_scan_cannot_search_a_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, where: str
+) -> None:
+    """The scan cannot search ``notes.txt`` -- in the draft's files, or in the copy
+    made of them. A continuation would go on without it; a publish is refused
+    naming it, since whether it may be published is not known. The draft is as it
+    was."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    files = _files(package_root)
+    (files / "notes.txt").write_text("mine\n", encoding="utf-8")
+    before = _as_it_is(package_root)
+    workspace = tmp_path / "publish" / "build"
+    _unsearchable(monkeypatch, (files if where == "draft" else workspace) / "notes.txt")
+
+    copied = _copied_for_publish(package_root, workspace)
+
+    assert copied.not_brought_in == (tool_drafts.Omitted("notes.txt", "unreadable"),)
+    assert copied.unlooked == ("notes.txt",)
+    assert copied.secret_paths == ()
+    assert copied.refusal == tool_drafts.REASON_PUBLISH_UNLOOKED.format(paths="notes.txt")
+    assert _as_it_is(package_root) == before
+
+
+@pytest.mark.parametrize("where", ["draft", "copy"])
+def test_a_publish_copy_is_refused_when_a_look_on_a_link_s_way_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, where: str
+) -> None:
+    """``l -> sub/../run.py``: whether ``sub`` is a link -- which decides where the
+    ``..`` goes -- cannot be looked at, in the draft's files or in the copy made of
+    them. ``l`` is left out for a failed look, and the publish is refused naming
+    it. The draft is as it was."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    files = _files(package_root)
+    (files / "sub").mkdir()
+    os.symlink("sub/../run.py", files / "l")
+    before = _as_it_is(package_root)
+    workspace = tmp_path / "publish" / "build"
+    looked_at = (files if where == "draft" else workspace) / "sub"
+
+    with monkeypatch.context() as patch:
+        failed = _refuse(patch, "lstat", lambda path: Path(path) == looked_at, errno.EIO)
+        copied = _copied_for_publish(package_root, workspace)
+
+    assert failed
+    assert copied.not_brought_in == (tool_drafts.Omitted("l", "unreadable"),)
+    assert copied.unlooked == ("l",)
+    assert copied.refusal == tool_drafts.REASON_PUBLISH_UNLOOKED.format(paths="l")
+    assert _as_it_is(package_root) == before
+
+
+@pytest.mark.parametrize("stopped_by", ["scan-of-the-draft", "scan-of-the-copy", "the-limits"])
+def test_a_publish_copy_that_cannot_be_judged_whole_names_why_and_publishes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stopped_by: str
+) -> None:
+    """The scan of the draft's files, or of the copy made of them, cannot finish;
+    or the draft is over the limits. No copy is handed back, only why, and the
+    draft is as it was."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    files = _files(package_root)
+    (files / "notes.txt").write_text("mine\n", encoding="utf-8")
+    before = _as_it_is(package_root)
+    workspace = tmp_path / "publish" / "build"
+    max_files = 2000
+    if stopped_by == "the-limits":
+        max_files = 1
+    else:
+        where = files if stopped_by == "scan-of-the-draft" else workspace
+        _unsearchable(monkeypatch, where / "notes.txt", RuntimeError("scan broke"))
+
+    answer = _publish_copy(package_root, workspace, max_files=max_files)
+
+    assert answer == (
+        tool_drafts.REASON_TOO_MANY_FILES
+        if stopped_by == "the-limits"
+        else tool_drafts.REASON_SCAN_FAILED.format(reason="RuntimeError")
+    )
+    assert _as_it_is(package_root) == before
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_a_publish_copy_is_refused_while_the_known_secrets_are_not_all_known(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Another tool's directory cannot be looked at, so the known secrets the copy
+    would be scanned for are not whole: nothing is copied, and why says so."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    before = _as_it_is(package_root)
+    other = package_root.path.parent / "other"
+    other.mkdir()
+    (other / ".env").write_text("OTHER_KEY=other-secret-abcdef\n", encoding="utf-8")
+    workspace = tmp_path / "publish" / "build"
+    other.chmod(0)
+    try:
+        answer = _publish_copy(package_root, workspace)
+    finally:
+        other.chmod(0o700)
+
+    assert isinstance(answer, str)
+    assert answer.startswith(tool_drafts.REASON_SECRETS_INCOMPLETE.format(detail=""))
+    assert not os.path.lexists(workspace)
+    assert _as_it_is(package_root) == before
+
+
+@pytest.mark.parametrize(
+    ("same_entry", "holds_secret", "answer"),
+    [
+        (True, True, "withheld"),
+        (False, True, "secret"),
+        (False, False, "brought-in"),
+        (None, False, "unlooked"),
+        (None, True, "secret"),
+    ],
+    ids=[
+        "the-env-holding-a-secret",
+        "another-file-holding-a-secret",
+        "another-file",
+        "unknown",
+        "unknown-holding-a-secret",
+    ],
+)
+def test_a_root_env_spelled_another_way_is_withheld_only_when_it_is_seen_to_be_the_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    same_entry: bool | None,
+    holds_secret: bool,
+    answer: str,
+) -> None:
+    """``.Env`` alone at the top of the draft's files. The look that tells whether
+    it is ``.env`` is answered here as a filesystem answers it: yes where case is
+    not told apart, no where it is, or not at all. Seen to be the ``.env``, it is
+    withheld like it, and a secret in it stops nothing. Seen to be another file,
+    it is content: a secret in it stops the publish, and without one it is brought
+    in. Not known, it is left out, and the publish is refused -- for the secret
+    in it when there is one, else for the failed look."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    files = _files(package_root)
+    value = _SECRET if holds_secret else "placed-by-the-operator"
+    (files / ".Env").write_text(f"KB_KEY={value}\n", encoding="utf-8")
+    monkeypatch.setattr(tool_drafts, "_same_entry", lambda first, second: same_entry)
+    workspace = tmp_path / "publish" / "build"
+
+    copied = _copied_for_publish(package_root, workspace)
+
+    if answer == "brought-in":
+        assert copied.refusal is None
+        assert copied.not_brought_in == ()
+        assert (workspace / ".Env").read_text(encoding="utf-8") == f"KB_KEY={value}\n"
+        return
+    assert not os.path.lexists(workspace / ".Env")
+    if answer == "withheld":
+        assert copied.refusal is None
+        assert copied.not_brought_in == (tool_drafts.Omitted(".Env", "env_file"),)
+        assert copied.withheld_secret_paths == (".Env",)
+    elif answer == "secret":
+        assert copied.secret_paths == (".Env",)
+        assert copied.refusal == tool_drafts.REASON_PUBLISH_SECRETS.format(paths=".Env")
+    else:
+        assert copied.unlooked == (".Env",)
+        assert copied.not_brought_in == (tool_drafts.Omitted(".Env", "unreadable"),)
+        assert copied.refusal == tool_drafts.REASON_PUBLISH_UNLOOKED.format(paths=".Env")
+
+
+def test_a_root_env_alias_where_case_is_not_told_apart_is_withheld_with_its_secret(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """On a filesystem that does not tell case apart, ``.ENV`` is the ``.env``: it
+    is withheld like it, and the known secret in it does not stop the publish."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    files = _files(package_root)
+    if _case_told_apart(files):
+        pytest.skip("this filesystem tells case apart: .ENV is another file here, not the .env")
+    (files / ".ENV").write_text(f"KB_KEY={_SECRET}\n", encoding="utf-8")
+    workspace = tmp_path / "publish" / "build"
+
+    copied = _copied_for_publish(package_root, workspace)
+
+    assert copied.refusal is None
+    assert copied.not_brought_in == (tool_drafts.Omitted(".ENV", "env_file"),)
+    assert copied.withheld_secret_paths == (".ENV",)
+    assert not any(_SECRET in text for text in _all_bytes_under(workspace))
+
+
+@pytest.mark.parametrize("beside", [False, True], ids=["alone", "beside-the-env"])
+def test_a_root_env_spelled_another_way_where_case_is_told_apart_is_content(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, beside: bool
+) -> None:
+    """On a filesystem that tells case apart, ``.ENV`` -- alone, or beside a
+    ``.env`` -- is another file: a known secret in it stops the publish."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    files = _files(package_root)
+    if not _case_told_apart(files):
+        pytest.skip("this filesystem does not tell case apart: .ENV is the .env here")
+    if beside:
+        (files / ".env").write_text("HAND=placed-by-the-operator\n", encoding="utf-8")
+    (files / ".ENV").write_text(f"KB_KEY={_SECRET}\n", encoding="utf-8")
+
+    copied = _copied_for_publish(package_root, tmp_path / "publish" / "build")
+
+    assert copied.secret_paths == (".ENV",)
+    assert copied.refusal == tool_drafts.REASON_PUBLISH_SECRETS.format(paths=".ENV")
+
+
+@pytest.mark.parametrize(
+    ("case", "why"),
+    [
+        ("another-generation", tool_drafts.START_CHANGED),
+        ("another-draft", tool_drafts.START_CHANGED),
+        ("marked", tool_drafts.START_PUBLISHING),
+        ("files-missing", tool_drafts.REASON_FILES_MISSING),
+    ],
+)
+def test_a_publish_copy_of_a_draft_not_as_it_was_judged_copies_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str, why: str
+) -> None:
+    """The draft is no longer the one judged -- another generation, another draft,
+    a publish from it marked meanwhile -- or its files directory is gone: no
+    workspace is made, and the manifest is as it was."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    draft_id, generation = _identity(package_root)
+    expected = (draft_id, generation)
+    if case == "another-generation":
+        expected = (draft_id, generation + 1)
+    elif case == "another-draft":
+        expected = ("f" * 32, generation)
+    elif case == "marked":
+        marked = tool_drafts.mark_publishing(
+            package_root, tool_drafts.directory_identity(package_root.path), expected, _JOB
+        )
+        assert marked is not None
+        expected = (draft_id, marked)
+    else:
+        shutil.rmtree(_files(package_root))
+    manifest = (_draft_dir(package_root) / tool_drafts.MANIFEST_FILENAME).read_bytes()
+    workspace = tmp_path / "publish" / "build"
+
+    answer = _publish_copy(package_root, workspace, expected=expected)
+
+    assert answer == why
+    assert not os.path.lexists(workspace)
+    assert (_draft_dir(package_root) / tool_drafts.MANIFEST_FILENAME).read_bytes() == manifest
+
+
+def test_mark_publishing_says_whether_the_mark_it_wrote_is_on_disk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``durable_out`` receives one answer for the mark written: True when the write
+    is confirmed on disk, False when the manifest was replaced but the fsync of
+    ``draft/`` after it is not confirmed; nothing when no mark was written."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    identity = tool_drafts.directory_identity(package_root.path)
+    draft_id, generation = _identity(package_root)
+
+    on_disk: list[bool] = []
+    marked = tool_drafts.mark_publishing(
+        package_root, identity, (draft_id, generation), _JOB, durable_out=on_disk
+    )
+    unwritten: list[bool] = []
+    stale = tool_drafts.mark_publishing(
+        package_root, identity, (draft_id, generation), _JOB, durable_out=unwritten
+    )
+    real_write = tools._write_package_file_atomic
+
+    def replaced_not_durable(
+        directory: Path, filename: str, data: bytes, expected: Any, **kwargs: Any
+    ) -> bool:
+        out = kwargs.pop("durability_out", None)
+        published = real_write(directory, filename, data, expected, **kwargs)
+        if out is not None:
+            out.append(False)
+        return published
+
+    unconfirmed: list[bool] = []
+    with monkeypatch.context() as patch:
+        patch.setattr(tools, "_write_package_file_atomic", replaced_not_durable)
+        again = tool_drafts.mark_publishing(
+            package_root, identity, (draft_id, generation + 1), _JOB, durable_out=unconfirmed
+        )
+
+    assert (marked, on_disk) == (generation + 1, [True])
+    assert (stale, unwritten) == (None, [])
+    assert (again, unconfirmed) == (generation + 2, [False])
+    assert _manifest(package_root)["publishing"]["job_id"] == _JOB
+
+
+def test_unmark_publishing_takes_back_only_its_own_mark_and_leaves_the_rounds_as_they_were(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A mark another job wrote, or a mark at another generation, is not taken back.
+    The job's own is: one generation on, ``publishing`` cleared, and everything
+    else -- the rounds above all -- as before the mark. With no mark left, there is
+    nothing to take back."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    identity = tool_drafts.directory_identity(package_root.path)
+    before = _manifest(package_root)
+    draft_id = before["draft_id"]
+    marked = tool_drafts.mark_publishing(package_root, identity, _identity(package_root), _JOB)
+    assert marked is not None
+
+    by_another = tool_drafts.unmark_publishing(package_root, identity, (draft_id, marked), "b" * 32)
+    at_another = tool_drafts.unmark_publishing(package_root, identity, (draft_id, marked + 1), _JOB)
+    still_marked = _manifest(package_root)
+    unmarked = tool_drafts.unmark_publishing(package_root, identity, (draft_id, marked), _JOB)
+    after = _manifest(package_root)
+    nothing_left = tool_drafts.unmark_publishing(
+        package_root, identity, (draft_id, marked + 1), _JOB
+    )
+
+    assert (by_another, at_another) == (None, None)
+    assert still_marked["publishing"]["job_id"] == _JOB
+    assert unmarked == marked + 1
+    assert after == {**before, "generation": marked + 1}
+    assert nothing_left is None
+    assert _manifest(package_root) == after
+
+
+def test_holds_copy_only_while_the_draft_is_seen_to_hold_all_the_copy_took(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The draft holds what its copy took: so it is, whatever generation the
+    publish's own marks moved it to. Not for another draft; not for a copy whose
+    two digests differ or are unknown -- both unknown included, the draft itself
+    unreadable too; not for a copy naming another files directory; not once the
+    draft's files differ, held again when they are as they were; not once the
+    draft is gone."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    copied = _copied_for_publish(package_root, tmp_path / "publish" / "build")
+    identity = tool_drafts.directory_identity(package_root.path)
+    draft_id = _identity(package_root)[0]
+    files = _files(package_root)
+    run_py = (files / "run.py").read_text(encoding="utf-8")
+
+    def holds(copy: tool_drafts.PublishCopy = copied, *, named: str = draft_id) -> bool:
+        return tool_drafts.holds_copy(package_root, identity, named, copy, 2000, 50_000_000)
+
+    assert copied.copied_in is not None
+    assert holds()
+    assert tool_drafts.mark_publishing(package_root, identity, _identity(package_root), _JOB)
+    assert holds()
+    assert not holds(named="f" * 32)
+    assert not holds(dataclasses.replace(copied, copied_in=None))
+    assert not holds(dataclasses.replace(copied, copied_out=None))
+    assert not holds(
+        dataclasses.replace(copied, copied_in={**copied.copied_in, "extra": ("d", 0o755)})
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(tool_drafts, "_file_digest", lambda path, budget: None)
+        assert not holds(dataclasses.replace(copied, copied_out=None, copied_in=None))
+    assert not holds(dataclasses.replace(copied, files_dir="files-" + "e" * 32))
+    (files / "run.py").write_text("print('changed after the copy')\n", encoding="utf-8")
+    assert not holds()
+    (files / "run.py").write_text(run_py, encoding="utf-8")
+    assert holds()
+    shutil.rmtree(_draft_dir(package_root))
+    assert not holds()
+
+
+@pytest.mark.parametrize("alias", ["metadata-directory", "package-directory"])
+def test_through_a_link_no_draft_is_copied_for_a_publish_unmarked_or_held(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, alias: str
+) -> None:
+    """Tool A reaches tool B's draft only through a link -- A's metadata directory,
+    or A's whole directory. A publish of A's draft copies nothing, taking A's mark
+    back writes nothing, and B's draft is never seen to hold a copy for A, though
+    it is for B. B's draft is left exactly as it was."""
+    package_b = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_b)
+    copied_b = _copied_for_publish(package_b, tmp_path / "b" / "build")
+    identity_b = tool_drafts.directory_identity(package_b.path)
+    draft_id, generation = _identity(package_b)
+    marked = tool_drafts.mark_publishing(package_b, identity_b, (draft_id, generation), _JOB)
+    assert marked is not None
+    linked = package_b.path.parent / "kc"
+    if alias == "metadata-directory":
+        _make_package(package_b.path.parent, name="kc")
+        shutil.rmtree(linked / tools._META_DIRNAME)
+        os.symlink(package_b.path / tools._META_DIRNAME, linked / tools._META_DIRNAME)
+    else:
+        os.symlink(package_b.path, linked)
+    package_a = tools.PackageRoot(linked)
+    identity_a = tool_drafts.directory_identity(linked)
+    before = tool_drafts.tree_digest(_draft_dir(package_b))
+    workspace_a = tmp_path / "a" / "build"
+
+    copied_a = tool_drafts.copy_for_publish(
+        package_root=package_a,
+        package_dir_identity=identity_a,
+        expected=(draft_id, generation),
+        workspace=workspace_a,
+        max_files=2000,
+        max_bytes=50_000_000,
+    )
+
+    assert isinstance(copied_a, str)
+    assert not os.path.lexists(workspace_a)
+    assert tool_drafts.unmark_publishing(package_a, identity_a, (draft_id, marked), _JOB) is None
+    assert not tool_drafts.holds_copy(package_a, identity_a, draft_id, copied_b, 2000, 50_000_000)
+    assert tool_drafts.holds_copy(package_b, identity_b, draft_id, copied_b, 2000, 50_000_000)
+    assert tool_drafts.same_tree(before, tool_drafts.tree_digest(_draft_dir(package_b)))
+    assert _manifest(package_b)["publishing"]["job_id"] == _JOB
+
+
+@pytest.mark.parametrize(
+    ("withheld", "lookalike"),
+    [(".env", ".env.local"), (tools._META_DIRNAME, f"{tools._META_DIRNAME}.bak")],
+    ids=["beside-the-env", "beside-the-metadata"],
+)
+def test_a_root_name_that_only_begins_with_a_withheld_name_is_not_exempt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, withheld: str, lookalike: str
+) -> None:
+    """The draft holds a root ``.env``, or a root ``.afterthread.meta/``, which the
+    copy withholds; beside it, an entry whose name only begins with that name --
+    ``.env.local``, ``.afterthread.meta.bak`` -- holds a known secret. That entry is
+    another one, content like any file: the publish is refused naming it, and
+    only the withheld entry is left out for its name."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    files = _files(package_root)
+    if withheld == ".env":
+        (files / withheld).write_text("HAND=placed-by-the-operator\n", encoding="utf-8")
+    else:
+        (files / withheld).mkdir()
+        (files / withheld / "notes.txt").write_text("mine\n", encoding="utf-8")
+    (files / lookalike).write_text(f"KB_KEY={_SECRET}\n", encoding="utf-8")
+    withheld_as = {name: why for why, name in tool_drafts.STRIPPED_ROOT_NAMES.items()}[withheld]
+
+    copied = _copied_for_publish(package_root, tmp_path / "publish" / "build")
+
+    assert {item.path: item.reason for item in copied.not_brought_in} == {
+        withheld: withheld_as,
+        lookalike: "secret_content",
+    }
+    assert copied.secret_paths == (lookalike,)
+    assert copied.withheld_secret_paths == ()
+    assert copied.refusal == tool_drafts.REASON_PUBLISH_SECRETS.format(paths=lookalike)
+
+
+def test_a_secret_only_the_scan_of_the_copy_finds_stops_the_publish(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``notes.txt`` is plain when the draft's files are scanned, and a known secret
+    is written into it by hand before the copy reads it: only the scan of the copy
+    finds the secret. The copy leaves the file out for it, and the publish is
+    refused naming it -- not published without the file."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    files = _files(package_root)
+    (files / "notes.txt").write_text("plain\n", encoding="utf-8")
+    workspace = tmp_path / "publish" / "build"
+    real_scan = tools.scan_embedded_secrets
+    scans: list[tuple[Path, Any]] = []
+
+    def scan_then_edit(root: Any, secrets: Any = None) -> Any:
+        scan = real_scan(root, secrets)
+        scans.append((Path(root), scan))
+        if Path(root) == files:
+            (files / "notes.txt").write_text(f"token {_SECRET}\n", encoding="utf-8")
+        return scan
+
+    monkeypatch.setattr(tools, "scan_embedded_secrets", scan_then_edit)
+
+    copied = _copied_for_publish(package_root, workspace)
+
+    [(first_root, first_scan), (second_root, _second_scan)] = scans
+    assert (first_root, second_root) == (files, workspace)
+    assert isinstance(first_scan, tools.SecretScanDone) and first_scan.hits == ()
+    assert copied.not_brought_in == (tool_drafts.Omitted("notes.txt", "secret_content"),)
+    assert copied.secret_paths == ("notes.txt",)
+    assert copied.refusal == tool_drafts.REASON_PUBLISH_SECRETS.format(paths="notes.txt")
+    assert not any(_SECRET in text for text in _all_bytes_under(workspace))
+
+
+def test_an_independent_case_variant_of_a_withheld_root_name_is_not_exempt() -> None:
+    """The judgment on its own, so it holds on any filesystem: the copy withheld
+    ``.env`` and nothing else, and the scan found a known secret in ``.ENV`` beside
+    it -- an entry of its own, as on a filesystem that tells case apart. ``.ENV``
+    is not exempt for spelling ``.env`` in another case: the publish is refused
+    naming it."""
+    copied = tool_drafts._DraftCopy(
+        copied_out=None,
+        scan=tools.SecretScanDone(hits=(tools.SecretHit(".ENV", "content"),), skipped=()),
+        left_out={".env": "env_file"},
+        omitted=[
+            tool_drafts.Omitted(".ENV", "secret_content"),
+            tool_drafts.Omitted(".env", "env_file"),
+        ],
+        unlooked=[],
+    )
+
+    judged = tool_drafts._publish_copy("files-" + "0" * 32, copied, None, [_SECRET])
+
+    assert judged.secret_paths == (".ENV",)
+    assert judged.withheld_secret_paths == ()
+    assert judged.refusal == tool_drafts.REASON_PUBLISH_SECRETS.format(paths=".ENV")

@@ -911,8 +911,22 @@ class ToolReviseRequest(BaseModel):
         return self
 
 
+class ToolDraftPublishRequest(BaseModel):
+    """Payload for publishing a tool's draft as it is, without a model.
+
+    The draft as the page saw it -- ``draft_id`` and ``draft_generation`` -- and
+    ``expected_vid``, the draft's ``base_vid``, compared with ``current`` after the
+    global slot is taken like every version-specific write. All three are required.
+    """
+
+    draft_id: str = Field(pattern=_DRAFT_ID_PATTERN)
+    draft_generation: int = Field(ge=1)
+    expected_vid: str = Field(pattern=_TOOL_VID_PATTERN)
+
+
 class ToolInstallAccepted(BaseModel):
-    """202 body for a queued install or revise: the id to poll."""
+    """202 body for a queued tool job -- an install, a revise, a health check, a
+    draft's publish: the id to poll."""
 
     job_id: str
 
@@ -954,9 +968,12 @@ class ToolJobDraft(BaseModel):
     ``saved``: the draft holds this round's work. ``reason`` says why it does not,
     or, on a published revise, that the draft could not be taken away.
     ``attempts`` is how many rounds the draft has been through, for the card's
-    "round N". ``retained_path`` is set only when the save before a publish failed
-    and the publish failed too: where the work is now, a staging directory or a
-    version directory ``current`` does not name.
+    "round N". ``retained_path`` is where the round's work is kept outside the
+    draft, when that place is known: with ``saved`` false the work is there and
+    not in the draft; with ``saved`` true the draft's manifest was not confirmed
+    on disk, so the work was left there as well. It is the round's staging
+    directory, or a version directory under ``versions/`` that ``current`` does
+    not name, into which a publish that failed part way had moved the work.
     """
 
     saved: bool
@@ -967,8 +984,39 @@ class ToolJobDraft(BaseModel):
     retained_path: BackendPath | None
 
 
+class ToolJobDraftPublish(BaseModel):
+    """What a ``publish_draft`` job did with the draft it published (see ``ToolJobStatus``).
+
+    ``draft_id`` is that draft. ``generation`` is the draft's generation as the job
+    left it: after the job's last write to its manifest -- the ``publishing`` mark,
+    or the write taking that mark back -- or as it was judged when the job wrote
+    nothing to it. A page compares it with the draft the tools list shows.
+
+    ``removed``: ``draft/`` was seen gone after the publish; only a published job
+    has it true. ``reason``, on a published job, is why the draft stays -- it holds
+    what the version does not (and the paths not brought in, when any), it holds
+    more than what was published or something else, that could not be told, or
+    its removal did not complete; null when it was removed. On a job that
+    published nothing, it is set only when the job's ``publishing`` mark could not
+    be taken back and stays on the draft.
+
+    ``retained_path`` is where the copy the job tried to publish is kept, when the
+    publish failed: its staging directory, when the draft is not seen to still
+    hold what that copy holds and the publisher did not refuse that directory as
+    not the one it was given; or the version directory under ``versions/`` --
+    which ``current`` does not name -- that the failed publish had moved it into.
+    Null otherwise.
+    """
+
+    draft_id: str
+    generation: int
+    removed: bool
+    reason: str | None
+    retained_path: BackendPath | None
+
+
 class ToolJobStatus(BaseModel):
-    """One install/revise job's visible state, as polled by the 工具 page.
+    """One tool job's visible state, as polled by the 工具 page.
 
     ``state`` walks queued -> running -> succeeded | failed. ``error`` is the
     friendly zh-TW failure text (failed only); ``tool_name``/``summary`` are
@@ -988,17 +1036,18 @@ class ToolJobStatus(BaseModel):
     the link so the AI 日誌 page can refuse to resolve it (R9-1); the backend
     cannot catch this one alone, because it never SERVES a stale id.
 
-    One model for BOTH job kinds (D40 renamed it from ``ToolInstallJobStatus``
-    without touching a field): an install writes a package into the tools
-    directory and a revise adds a version to one and moves ``current``, and both
-    report through one job table and one poll endpoint. ``env_keys`` names
+    One model for every job kind: an install writes a package into the tools
+    directory, a revise or a draft's publish adds a version to one and moves
+    ``current``, and every kind reports through one job table and one poll
+    endpoint (``routers.tools.tool_job_status``). ``env_keys`` names
     assignments from a builder-written ``.env`` that the backend stripped;
     values never enter the result.
 
-    ``kind`` says which job it is: ``install``, ``revise``, or ``health_check``
-    (跑一次範例, web-v6 §10). ``verification`` is the run of the version's
-    examples -- a health check's whole result, or the check that follows a
-    published revise -- and is filled in while the job runs.
+    ``kind`` says which job it is: ``install``, ``revise``, ``health_check``
+    (跑一次範例), or ``publish_draft`` -- a tool's draft published as it is, with
+    no model. ``verification`` is the run of the version's examples --
+    a health check's whole result, or the check that follows a published revise
+    or draft -- and is filled in while the job runs.
 
     ``outcome`` (web-v6 §8.3) is how a TERMINAL job ended, finer than ``state``:
     ``published``, ``not_published`` (the builder itself declined to publish --
@@ -1025,7 +1074,13 @@ class ToolJobStatus(BaseModel):
     the round had nothing to keep, when it published and its draft was taken
     away, when its commands could not be confirmed stopped (nothing is saved then;
     ``error`` names the workspace kept in place), and wherever the six above are
-    null.
+    null -- a ``publish_draft`` job included.
+
+    ``draft_publish`` is what a ``publish_draft`` job did with the draft it
+    published (``ToolJobDraftPublish``); null for every other kind, while the job
+    runs, and for one that ended in the unexpected-error backstop. Such a job
+    calls no model, so ``summary``, ``llm_log_id`` and the six above are null,
+    ``env_keys`` is empty, and ``outcome`` is ``published`` or ``failed``.
     """
 
     job_id: str
@@ -1039,7 +1094,7 @@ class ToolJobStatus(BaseModel):
     llm_log_process: str | None
     env_keys: list[str]
     outcome: Literal["published", "not_published", "failed"] | None
-    kind: Literal["install", "revise", "health_check"] = "install"
+    kind: Literal["install", "revise", "health_check", "publish_draft"] = "install"
     verification: ToolVerification | None = None
     stopped_by: ToolStoppedBy | None = None
     failure: ToolRunFailure | None = None
@@ -1048,6 +1103,7 @@ class ToolJobStatus(BaseModel):
     handoff: str | None = None
     operator_action: str | None = None
     draft: ToolJobDraft | None = None
+    draft_publish: ToolJobDraftPublish | None = None
 
 
 class ToolSettingsEntry(BaseModel):

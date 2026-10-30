@@ -5,7 +5,9 @@ Both entry points run the same LLM builder session inside
 assembled artifact. A fresh install assembles an entire package shell and makes
 it visible with one rename. A revise copies the resolved version into ``build``,
 commits one new version in ``shell``, renames that version under ``versions/``,
-and only then atomically publishes ``current``.
+and only then atomically publishes ``current``. A tool's draft is also published
+as it is, with no session at all (``run_publish_draft``): its files are copied
+into ``build`` and committed the way a revise commits its own.
 
 The package-layer ``.env`` is never part of a revised version and is untouched
 for the whole revise. Its values are nevertheless registered during the builder
@@ -903,6 +905,9 @@ class InstallOutcome:
     # it. None when the round had nothing to keep, published and took its draft
     # away, or never ran.
     draft: dict[str, Any] | None = None
+    # What a publish of a draft as it is did with that draft (``run_publish_draft``,
+    # ``_draft_publish_report``); None on every other kind of job.
+    draft_publish: dict[str, Any] | None = None
 
 
 # --- staging containment + meta-tools ---------------------------------------
@@ -4934,6 +4939,373 @@ async def run_revise(
                 await run_in_threadpool(_cleanup_staging, session_root, base)
 
 
+# --- publishing a draft as it is, without a model ------------------------------
+
+# Why a publish of a draft as it is published nothing and left the draft as it
+# was: ``{reason}`` is the words of what stopped it, last since it may be sentences.
+_ERROR_PUBLISH_DRAFT_NOT_STARTED = "沒有發布草稿，草稿沒有變動：{reason}"  # noqa: RUF001
+# The draft's base is no longer ``current`` when the job begins.
+_ERROR_PUBLISH_DRAFT_STALE = "工具目前的版本已不是草稿的基底（草稿已過期）"  # noqa: RUF001
+_ERROR_PUBLISH_DRAFT_IDENTITY = "無法確認原工具的內容（`tool.json` 讀取失敗）"  # noqa: RUF001
+_ERROR_PUBLISH_DRAFT_NOT_MARKED = "無法在草稿寫入「正在發布」的標記"
+# The mark was written, but the write is not confirmed on disk: nothing is
+# published, and the job takes its own mark back.
+_ERROR_PUBLISH_DRAFT_MARK_UNCONFIRMED = (
+    "無法確認草稿的「正在發布」標記已安全寫入磁碟，所以沒有發布。"  # noqa: RUF001
+)
+# The publisher answered with a failure, ``current`` not moved.
+_ERROR_PUBLISH_DRAFT_FAILED = "草稿沒有發布：{reason}"  # noqa: RUF001
+# Three of the publisher's own refusals speak of a revise and of sending a request
+# again; a publish of a draft has neither, so these say what it does have.
+_PUBLISH_DRAFT_REWORDED = {
+    _ERROR_REVISE_TARGET_MISSING: "原工具已被刪除。",
+    _ERROR_REVISE_TARGET_ALIAS: "原工具目錄已被替換為連結。",
+    _ERROR_REVISE_TARGET_REPLACED: (
+        "原工具在發布期間被改動或重新安裝（目前的版本已換，或它的 tool.json 被改過），"  # noqa: RUF001
+        "請重新整理後確認草稿的狀態。"
+    ),
+}
+# Why a published draft stays when its workspace did not receive all of it as it
+# was: the draft holds what the version does not. The paths left out follow it
+# when there are any (``tool_drafts.PublishCopy.left_out``). The other reasons a
+# published draft stays are the revise's own: ``_DRAFT_LEFT_REASONS`` -- it holds
+# more, or another copy, or that could not be told -- and ``_DRAFT_NOT_REMOVED``.
+_DRAFT_KEPT_NOT_ALL_PUBLISHED = (
+    "已發布，但這次發布的內容與草稿不完全相同（有項目沒帶進發布、連結改寫成相對路徑、"  # noqa: RUF001
+    "權限位元不同，或帶出時草稿正在變動），因此保留草稿。"  # noqa: RUF001
+    "需要的話先從草稿目錄取出，再到工具列放棄這份草稿。"  # noqa: RUF001
+)
+# The job's own mark could not be taken back after it published nothing.
+_DRAFT_MARK_LEFT = (
+    "沒能清除草稿的「正在發布」標記：工具列會把這份草稿顯示為結果未知，只能放棄；"  # noqa: RUF001
+    "放棄前可以先從草稿目錄取出需要的內容。"
+)
+
+
+def _draft_publish_report(
+    draft_id: str,
+    generation: int,
+    *,
+    removed: bool = False,
+    reason: str | None = None,
+    retained: str | None = None,
+) -> dict[str, Any]:
+    """The job's ``draft_publish``: the draft, at the generation the job left it;
+    whether ``draft/`` was seen gone after the publish; why the draft stays, or what
+    it was left with when it is not as it was; and where the copy the job tried to
+    publish is kept, when no draft is known to hold it."""
+    return {
+        "draft_id": draft_id,
+        "generation": generation,
+        "removed": removed,
+        "reason": reason,
+        "retained_path": retained,
+    }
+
+
+def _publish_draft_failed(
+    name: str,
+    error: str,
+    draft: tuple[str, int],
+    *,
+    marked: bool = False,
+    unmarked: int | None = None,
+    retained: str | None = None,
+) -> InstallOutcome:
+    """A publish of a draft that published nothing. ``draft`` names the draft and a
+    generation: as judged, when the job wrote nothing to it; otherwise the one its
+    mark wrote (``marked``), which the write taking that mark back moves on to
+    ``unmarked`` -- None when there was none, and then the mark stays."""
+    draft_id, generation = draft
+    reason: str | None = None
+    if marked:
+        if unmarked is None:
+            reason = _DRAFT_MARK_LEFT
+        else:
+            generation = unmarked
+    return InstallOutcome(
+        ok=False,
+        tool_name=name,
+        error=error,
+        draft_publish=_draft_publish_report(draft_id, generation, reason=reason, retained=retained),
+    )
+
+
+def _log_publish_draft_kept(session_root: Path, *, worker: bool) -> None:
+    """Say in the backend log where a publish of a draft left its staging, and why:
+    a worker copying the draft into it or publishing it may still be writing it, or
+    the draft is not known to hold what it holds."""
+    with contextlib.suppress(Exception):
+        if worker:
+            _logger.warning(
+                "Draft publish workspace kept at %s: a worker copying the draft into it "
+                "or publishing it may still be writing it.",
+                session_root,
+            )
+        else:
+            _logger.warning(
+                "Draft publish workspace kept at %s: the draft is not known to hold what it holds.",
+                session_root,
+            )
+
+
+async def run_publish_draft(
+    name: str, resolution: tools.Resolved, judged: dict[str, Any]
+) -> InstallOutcome:
+    """Publish the tool's draft as it is: no model, no round, no summary.
+
+    ``resolution`` is the version the request compared, and ``judged`` the draft's
+    manifest as ``tool_drafts.judge_draft`` found it after the slot: the draft the
+    operator named, continuable, based on ``current``. In order:
+
+    1. the draft's files are copied into a new staging workspace, every fact of the
+       copy handed back (``tool_drafts.copy_for_publish``); a copy that found a
+       known secret outside the root entries the strip before a save removes, or
+       left an entry out because a look at it failed, is not published;
+    2. the version's ``origin.feedback`` is made: the draft's request, the notes of
+       its rounds, and last, whole, the line naming the draft as published by the
+       operator without a model (``tool_drafts.operator_publish_line``), by which
+       the tools list reconciles a ``publishing`` mark;
+    3. the draft is marked as being published from (``tool_drafts.mark_publishing``)
+       and only a mark confirmed on disk lets the publish go on: one that is not is
+       taken back, and nothing is published;
+    4. the publish (``_publish_revised_version``): the root metadata stripped, the
+       content validated, the version committed, ``current`` moved;
+    5. published, the draft goes only when the workspace received all of it as it
+       was -- ``copied_out`` equal to ``copied_in``, checked here -- and ``draft/``
+       holds that directory, unchanged since, and the manifest alone
+       (``tool_drafts.remove_after_publish``); otherwise it stays, its mark too,
+       and the job says why. The examples then run (``_verify_published``). Not
+       published, the publisher having answered, the job takes its own mark back
+       (``tool_drafts.unmark_publishing``), the rounds left as they were.
+
+    Nothing asks a model: no builder session, no summary -- the new version has
+    none until one is made on request. Every stop before the mark leaves the
+    draft's manifest as it was. An exception or a cancellation takes no mark back:
+    whether the publish went through is not known then.
+    """
+    expected: tuple[str, int] = (judged["draft_id"], judged["generation"])
+    draft_id = expected[0]
+    base = tools.tools_dir()
+    if base is None:
+        return _publish_draft_failed(
+            name, _ERROR_PUBLISH_DRAFT_NOT_STARTED.format(reason=_ERROR_TOOLS_DISABLED), expected
+        )
+    package_root = resolution.package_root
+    current = await run_in_threadpool(tools.resolve_current, package_root)
+    if isinstance(current, tools.Unresolved) or current.vid != resolution.vid:
+        return _publish_draft_failed(
+            name,
+            _ERROR_PUBLISH_DRAFT_NOT_STARTED.format(reason=_ERROR_PUBLISH_DRAFT_STALE),
+            expected,
+        )
+    package_identity = await run_in_threadpool(_package_identity, resolution.version_root)
+    if package_identity is None:
+        return _publish_draft_failed(
+            name,
+            _ERROR_PUBLISH_DRAFT_NOT_STARTED.format(reason=_ERROR_PUBLISH_DRAFT_IDENTITY),
+            expected,
+        )
+    package_dir_identity = await run_in_threadpool(
+        tool_drafts.directory_identity, package_root.path
+    )
+    settings = get_settings()
+    max_files = settings.tool_draft_max_files
+    max_bytes = settings.tool_draft_max_bytes
+    session_root = base / _STAGING_DIRNAME / uuid4().hex
+    build_root = tools.BuildRoot(session_root / "build")
+    shell_root = session_root / "shell"
+    job_id = _CURRENT_JOB_ID.get()
+    # The release condition, atom by atom: the ``finally`` below removes the
+    # staging only when no worker may still be writing it -- neither the one copying
+    # the draft in (not ``copy_running``) nor the one publishing it (not
+    # ``publish_running``) -- and it holds nothing of the work alone (not
+    # ``holding``). A worker's flag goes up just before it is awaited and comes down
+    # when the await ends with the worker's result or with an ``Exception``, never on
+    # a cancellation: the worker goes on without the coroutine. ``holding`` goes up
+    # just before the publish starts, the staging being from then on what is
+    # published, and comes down only when the version ``current`` names holds the
+    # work (published), when the publish moved the work out of this session's
+    # staging (``content`` not within ``session_root``), or when the draft is seen to
+    # hold what the staging does (``tool_drafts.holds_copy``). Before the publish the
+    # staging is a copy of the draft, which the copy only read.
+    copy_running = False
+    publish_running = False
+    holding = False
+    try:
+        copy_running = True
+        try:
+            copied = await run_in_threadpool(
+                functools.partial(
+                    tool_drafts.copy_for_publish,
+                    package_root=package_root,
+                    package_dir_identity=package_dir_identity,
+                    expected=expected,
+                    workspace=build_root.path,
+                    max_files=max_files,
+                    max_bytes=max_bytes,
+                )
+            )
+        except Exception:
+            # The worker's own exception, or one before it began: either way it
+            # writes the staging no more.
+            copy_running = False
+            raise
+        copy_running = False
+        if isinstance(copied, str):
+            return _publish_draft_failed(
+                name, _ERROR_PUBLISH_DRAFT_NOT_STARTED.format(reason=copied), expected
+            )
+        if copied.refusal is not None:
+            return _publish_draft_failed(
+                name, _ERROR_PUBLISH_DRAFT_NOT_STARTED.format(reason=copied.refusal), expected
+            )
+        # Made before the mark: a mask that fails stops the publish with nothing
+        # written to the draft.
+        notes = tuple(
+            (attempt["number"], attempt["note"])
+            for attempt in judged["attempts"]
+            if attempt["note"]
+        )
+        try:
+            origin_feedback = await run_in_threadpool(
+                _provenance_feedback,
+                judged["feedback"],
+                (),
+                tool_drafts.operator_publish_line(draft_id),
+                notes,
+            )
+        except Exception as exc:
+            unmasked = (
+                _ERROR_ORIGIN_MASK_INCOMPLETE.format(detail=exc)
+                if isinstance(exc, tools.KnownSecretsIncomplete)
+                else _ERROR_ORIGIN_MASK.format(kind=type(exc).__name__)
+            )
+            return _publish_draft_failed(
+                name, _ERROR_PUBLISH_DRAFT_NOT_STARTED.format(reason=unmasked), expected
+            )
+        durable: list[bool] = []
+        marked = await run_in_threadpool(
+            functools.partial(
+                tool_drafts.mark_publishing,
+                package_root,
+                package_dir_identity,
+                expected,
+                job_id,
+                durable_out=durable,
+            )
+        )
+        if marked is None:
+            return _publish_draft_failed(
+                name,
+                _ERROR_PUBLISH_DRAFT_NOT_STARTED.format(reason=_ERROR_PUBLISH_DRAFT_NOT_MARKED),
+                expected,
+            )
+        marked_as = (draft_id, marked)
+        if durable != [True]:
+            # Known not to have published: the publisher was never called. The mark
+            # is this job's own, so it is taken back; that write proves nothing
+            # about the one before it.
+            unmarked = await run_in_threadpool(
+                tool_drafts.unmark_publishing, package_root, package_dir_identity, marked_as, job_id
+            )
+            return _publish_draft_failed(
+                name,
+                _ERROR_PUBLISH_DRAFT_MARK_UNCONFIRMED,
+                marked_as,
+                marked=True,
+                unmarked=unmarked,
+            )
+        holding = True
+        publish_running = True
+        try:
+            published, promote_error, content = await run_in_threadpool(
+                _publish_revised_version,
+                build_root,
+                shell_root,
+                package_root,
+                resolution,
+                package_identity,
+                origin_feedback,
+            )
+        except Exception:
+            # The worker's own exception, or one before it began: either way it
+            # writes the staging no more.
+            publish_running = False
+            raise
+        publish_running = False
+        if promote_error is not None:
+            retained: str | None = None
+            if not tools._is_within(session_root, content):
+                # Moved into ``versions/`` before it failed: that version directory
+                # holds the work, which ``current`` does not name, and it stays.
+                holding = False
+                retained = str(content)
+            else:
+                held = await run_in_threadpool(
+                    tool_drafts.holds_copy,
+                    package_root,
+                    package_dir_identity,
+                    draft_id,
+                    copied,
+                    max_files,
+                    max_bytes,
+                )
+                holding = not held
+                if holding and promote_error not in _STAGING_REFUSALS:
+                    retained = str(content)
+            unmarked = await run_in_threadpool(
+                tool_drafts.unmark_publishing, package_root, package_dir_identity, marked_as, job_id
+            )
+            return _publish_draft_failed(
+                name,
+                _ERROR_PUBLISH_DRAFT_FAILED.format(
+                    reason=_PUBLISH_DRAFT_REWORDED.get(promote_error, promote_error)
+                ),
+                marked_as,
+                marked=True,
+                unmarked=unmarked,
+                retained=retained,
+            )
+        assert published is not None
+        # Published: the version ``current`` names holds the work.
+        holding = False
+        removed = False
+        reason: str | None = None
+        if copied.copied_out is None or copied.copied_in is None:
+            reason = _DRAFT_KEPT_UNCONFIRMED
+        elif not tool_drafts.same_tree(copied.copied_out, copied.copied_in):
+            reason = _DRAFT_KEPT_NOT_ALL_PUBLISHED + (copied.left_out or "")
+        else:
+            removal = await run_in_threadpool(
+                tool_drafts.remove_after_publish,
+                package_root,
+                package_dir_identity,
+                marked_as,
+                tool_drafts.SavedCopy(copied.files_dir, copied.copied_out, max_files, max_bytes),
+            )
+            removed = removal.removed
+            if not removed:
+                reason = (
+                    _DRAFT_NOT_REMOVED
+                    if removal.kept is None
+                    else _DRAFT_LEFT_REASONS[removal.kept]
+                )
+        verification = await _verify_published(name, published.resolution.vid)
+        return InstallOutcome(
+            ok=True,
+            tool_name=name,
+            verification=verification,
+            draft_publish=_draft_publish_report(draft_id, marked, removed=removed, reason=reason),
+        )
+    finally:
+        if copy_running or publish_running or holding:
+            _log_publish_draft_kept(session_root, worker=copy_running or publish_running)
+            await run_in_threadpool(_sweep_logged, base)
+        else:
+            await run_in_threadpool(_cleanup_staging, session_root, base)
+
+
 # --- examples: verification and the health check (web-v6 §8.3, §10) --------
 
 _WORKFLOW_VERIFY = "verify"
@@ -5162,28 +5534,29 @@ _SYNC_OPS: set[str] = set()
 
 # The zh-TW noun each job kind uses in the "unexpected error" backstop below.
 # Parameterizing the NOUN rather than the whole sentence keeps ONE backstop with
-# one shape for both kinds, while leaving the install's existing text (which its
-# tests and the FE see) byte-identical.
+# one shape for every kind that runs through it, while leaving the install's
+# existing text (which its tests and the FE see) byte-identical.
 _ACTION_INSTALL = "安裝"
 _ACTION_REVISE = "修訂"
+_ACTION_PUBLISH_DRAFT = "發布草稿"
 
 
 @dataclass(slots=True)
 class InstallJob:
-    """One install/revise job's visible state, as polled by the FE.
+    """One tool job's visible state, as polled by the FE.
 
-    Both kinds share this record (and the table it lives in) because they are
-    the same thing to a poller: a builder session that ends in a tool being
-    installed or replaced. The KIND is deliberately not a field -- nothing in the
-    contract branches on it, and the FE polls the same endpoint for both.
+    Every kind shares this record and the table it lives in, and the FE polls one
+    endpoint for all of them; ``kind`` says which one a record is, for the page to
+    read it the way that kind needs.
     """
 
     job_id: str
     state: str  # queued | running | succeeded | failed
     created_at: str
-    # install | revise | health_check (web-v6 §10). The first two share every
-    # field; a health check runs a tool's examples and builds nothing, so its
-    # card reads differently, and the poller needs to know which it holds.
+    # install | revise | health_check | publish_draft. An install and a revise share
+    # every field; a health check runs a tool's examples and builds nothing; a
+    # publish of a draft as it is publishes the draft's files with no session, and
+    # says what became of the draft in ``draft_publish``.
     kind: str = "install"
     finished_at: str | None = None
     error: str | None = None
@@ -5212,6 +5585,8 @@ class InstallJob:
     operator_action: str | None = None
     # Copied from the terminal ``InstallOutcome.draft``.
     draft: dict[str, Any] | None = None
+    # Copied from the terminal ``InstallOutcome.draft_publish``.
+    draft_publish: dict[str, Any] | None = None
 
 
 # The three terminal ``InstallJob.outcome`` values.
@@ -5245,6 +5620,7 @@ def _job_dict(job: InstallJob) -> dict[str, Any]:
         "handoff": job.handoff,
         "operator_action": job.operator_action,
         "draft": job.draft,
+        "draft_publish": job.draft_publish,
     }
 
 
@@ -5311,21 +5687,22 @@ async def _run_job(
     run: Callable[[], Awaitable[InstallOutcome]],
     action: str,
 ) -> None:
-    """The background task body: run one builder session, record the outcome.
+    """The background task body: run one job, record the outcome.
 
-    ONE body for both job kinds, taking the run as a zero-argument factory (the
-    caller has already bound its own arguments). Sharing it is the point: the
-    state machine, the field copy-out and the backstop below must be identical
-    for an install and a revise, and a second near-copy is exactly where they
-    would drift.
+    ONE body for an install, a revise and a publish of a draft as it is, taking
+    the run as a zero-argument factory (the caller has already bound its own
+    arguments). Sharing it is the point: the state machine, the field copy-out
+    and the backstop below must be identical for every kind that runs through it,
+    and a second near-copy is exactly where they would drift. A health check has
+    its own body (``_run_check_job``).
 
-    ``run_install``/``run_revise`` already map every EXPECTED failure to a
-    friendly outcome; the except here is the total backstop for a genuine bug,
-    because an exception escaping a fire-and-forget task would otherwise vanish
-    (leaving the job stuck on "running" forever from the FE's point of view).
-    Category only -- a bug's str() could carry anything (and MUST NOT: secret
-    values are threaded through both runs, so a leaky str(exc) is exactly why
-    this is category-only). The one exception is a failure written for the
+    ``run_install``, ``run_revise`` and ``run_publish_draft`` already map every
+    EXPECTED failure to a friendly outcome; the except here is the total backstop
+    for a genuine bug, because an exception escaping a fire-and-forget task would
+    otherwise vanish (leaving the job stuck on "running" forever from the FE's
+    point of view). Category only -- a bug's str() could carry anything (and MUST
+    NOT: secret values are threaded through the runs, so a leaky str(exc) is
+    exactly why this is category-only). The one exception is a failure written for the
     operator (``tools.OperatorFacingError``: a known-secret list that is not
     whole, a tools directory that cannot be resolved), whose message names only
     paths, tool names, type names and what to fix: the job shows that message.
@@ -5374,6 +5751,7 @@ async def _run_job(
         handoff=outcome.handoff,
         operator_action=outcome.operator_action,
         draft=outcome.draft,
+        draft_publish=outcome.draft_publish,
         finished_at=_now_iso(),
         **named,
     )
@@ -5638,6 +6016,76 @@ async def start_revise_job(
                     name, feedback, resolution, runs=runs, continuation=continuation
                 ),
                 _ACTION_REVISE,
+            )
+        )
+    finally:
+        if reservation:
+            release_sync_operation(reservation)
+
+
+# Every way a publish of a draft as it is is refused before a job exists. The
+# route answers each one and is checked to (``routers.tools.publish_tool_draft``):
+# a refusal added here without an answer there fails the type check rather than
+# becoming a 500.
+PublishDraftRefusal = Literal[
+    "job_busy",
+    "not_found",
+    "version_mismatch",
+    "draft_gone",
+    "draft_changed",
+    "draft_unusable",
+    "draft_publishing",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class PublishDraftJobStart:
+    """A submit of a draft's publish: the job id, or why no job was made."""
+
+    job_id: str | None = None
+    refusal: PublishDraftRefusal | None = None
+
+
+async def start_publish_draft_job(
+    name: str, draft_id: str, generation: int, expected_vid: str
+) -> PublishDraftJobStart:
+    """Take the global slot, compare ``expected_vid``, judge the draft, enqueue its publish.
+
+    The order a continuation's submit keeps: everything that names the package's
+    state is read after the slot is taken, so what it reads holds until the job
+    begins but for a hand edit. The draft must be the one named, continuable and
+    based on ``current`` (``tool_drafts.judge_draft``); there is no read of it
+    before the slot to compare with, since a publish attaches no run records. No
+    ``.env`` gate: there is no builder session to hand the package's ``.env`` to.
+    The reservation becomes the queued job atomically, so a refused submit has no
+    job id and starts nothing.
+    """
+    reservation = reserve_sync_operation()
+    if reservation is None:
+        return PublishDraftJobStart(refusal="job_busy")
+    try:
+        package_root = await run_in_threadpool(tools._resolve_package_dir_no_alias, name)
+        if package_root is None:
+            return PublishDraftJobStart(refusal="not_found")
+        resolution = await run_in_threadpool(tools.resolve_current, package_root)
+        if isinstance(resolution, tools.Unresolved):
+            return PublishDraftJobStart(refusal="not_found")
+        if resolution.vid != expected_vid:
+            return PublishDraftJobStart(refusal="version_mismatch")
+        judged = await run_in_threadpool(
+            tool_drafts.judge_draft, package_root, resolution, (draft_id, generation)
+        )
+        if isinstance(judged, str):
+            return PublishDraftJobStart(refusal=judged)
+        job = _admit_job(reservation_token=reservation, kind="publish_draft", tool_name=name)
+        if job is None:
+            return PublishDraftJobStart(refusal="job_busy")
+        reservation = ""
+        return PublishDraftJobStart(
+            job_id=_launch_job(
+                job,
+                functools.partial(run_publish_draft, name, resolution, judged),
+                _ACTION_PUBLISH_DRAFT,
             )
         )
     finally:

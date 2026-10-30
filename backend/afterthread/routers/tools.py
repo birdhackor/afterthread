@@ -52,6 +52,7 @@ from afterthread.schemas import (
     ToolDeleteResponse,
     ToolDiscardResponse,
     ToolDraftDiscardResponse,
+    ToolDraftPublishRequest,
     ToolExpectedVersionRequest,
     ToolInstallAccepted,
     ToolInstallRequest,
@@ -182,6 +183,9 @@ _DRAFT_UNUSABLE_CODE = "draft_unusable"
 _DRAFT_UNUSABLE_MESSAGE = "草稿無法使用（看不到、說明檔讀不出，或檔案目錄不在），只能放棄"  # noqa: RUF001
 _DRAFT_PUBLISHING_CODE = "draft_publishing"
 _DRAFT_PUBLISHING_MESSAGE = "草稿正在發布、已發布或結果未知，不能接續"  # noqa: RUF001
+# The same two refusals, for a publish of the draft as it is.
+_DRAFT_CHANGED_PUBLISH_MESSAGE = "草稿在畫面讀到之後已經變更，請重新整理後再發布"  # noqa: RUF001
+_DRAFT_PUBLISHING_PUBLISH_MESSAGE = "草稿正在發布、已發布或結果未知，不能再發布"  # noqa: RUF001
 _DRAFT_NOT_FOUND_CODE = "draft_not_found"
 _DRAFT_NOT_FOUND_MESSAGE = "這個工具沒有未完成的修正"
 # A discard after which ``draft/`` is not seen gone: the draft may still be there,
@@ -267,6 +271,34 @@ _REVISE_CONFLICT_RESPONSE = _conflict_response(
     (
         _DRAFT_PUBLISHING_CODE,
         _DRAFT_PUBLISHING_MESSAGE,
+        "The draft is being published from, was published, or that is not known",
+    ),
+)
+_PUBLISH_DRAFT_CONFLICT_RESPONSE = _conflict_response(
+    (
+        _VERSION_MISMATCH_CODE,
+        _VERSION_MISMATCH_MESSAGE,
+        "The requested version is stale, or the draft's base is no longer current",
+    ),
+    (_JOB_BUSY_CODE, _JOB_BUSY_MESSAGE, "Another tool operation holds the global slot"),
+    (
+        _DRAFT_GONE_CODE,
+        _DRAFT_GONE_MESSAGE,
+        "The draft named is gone, or another one took its place",
+    ),
+    (
+        _DRAFT_CHANGED_CODE,
+        _DRAFT_CHANGED_PUBLISH_MESSAGE,
+        "The draft named was written to after the caller read it",
+    ),
+    (
+        _DRAFT_UNUSABLE_CODE,
+        _DRAFT_UNUSABLE_MESSAGE,
+        "The draft cannot be looked at, its manifest cannot be read, or its files are missing",
+    ),
+    (
+        _DRAFT_PUBLISHING_CODE,
+        _DRAFT_PUBLISHING_PUBLISH_MESSAGE,
         "The draft is being published from, was published, or that is not known",
     ),
 )
@@ -1050,6 +1082,62 @@ def _conflict(code: str, message: str) -> HTTPException:
     return HTTPException(status_code=409, detail={"code": code, "message": message})
 
 
+@router.post(
+    "/{name}/draft/publish",
+    response_model=ToolInstallAccepted,
+    status_code=202,
+    responses={**_TOOL_NOT_FOUND_RESPONSE, **_PUBLISH_DRAFT_CONFLICT_RESPONSE},
+)
+async def publish_tool_draft(
+    name: ToolName, payload: ToolDraftPublishRequest
+) -> ToolInstallAccepted:
+    """Queue a job that publishes the tool's draft as it is, with no model; poll it
+    via `/jobs/{id}`.
+
+    For an operator who finished the draft's work by hand: the job copies the
+    draft's files into a new staging workspace, refuses them when they hold a
+    known secret or an entry it could not look at, publishes them as a new
+    version, removes the draft when it holds nothing the version does not, and
+    runs the version's examples. It neither starts a revise nor makes a summary.
+
+    ``start_publish_draft_job`` takes the global slot (``job_busy``), resolves the
+    package (404) and compares ``expected_vid`` (``version_mismatch``), then judges
+    the draft named by ``draft_id`` and ``draft_generation`` as a continuation is
+    judged: ``draft_gone``, ``draft_unusable``, ``draft_changed``,
+    ``draft_publishing``, or ``version_mismatch`` when its base is not ``current``.
+    Only then is the reservation converted into a queued job, so a refused submit
+    has no job id.
+
+    Declared BEFORE the job poll, which must stay last (see the comment there): a
+    tool may be named ``jobs`` or ``draft``.
+    """
+    started = await tool_builder.start_publish_draft_job(
+        name, payload.draft_id, payload.draft_generation, payload.expected_vid
+    )
+    match started.refusal:
+        case None:
+            assert started.job_id is not None
+            return ToolInstallAccepted(job_id=started.job_id)
+        case "not_found":
+            raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
+        case "version_mismatch":
+            raise _conflict(_VERSION_MISMATCH_CODE, _VERSION_MISMATCH_MESSAGE)
+        case "job_busy":
+            raise _conflict(_JOB_BUSY_CODE, _JOB_BUSY_MESSAGE)
+        case "draft_gone":
+            raise _conflict(_DRAFT_GONE_CODE, _DRAFT_GONE_MESSAGE)
+        case "draft_changed":
+            raise _conflict(_DRAFT_CHANGED_CODE, _DRAFT_CHANGED_PUBLISH_MESSAGE)
+        case "draft_unusable":
+            raise _conflict(_DRAFT_UNUSABLE_CODE, _DRAFT_UNUSABLE_MESSAGE)
+        case "draft_publishing":
+            raise _conflict(_DRAFT_PUBLISHING_CODE, _DRAFT_PUBLISHING_PUBLISH_MESSAGE)
+        case unanswered:
+            # Unreachable while every refusal above is answered: a refusal added to
+            # ``PublishDraftRefusal`` without a case makes this a type error.
+            assert_never(unanswered)
+
+
 _CHECK_UNAVAILABLE_CODE = "check_unavailable"
 
 
@@ -1197,12 +1285,12 @@ async def list_tool_runs(
     responses=_JOB_NOT_FOUND_RESPONSE,
 )
 async def tool_job_status(job_id: str) -> ToolJobStatus:
-    """One install/revise job's state. 404: unknown id, evicted, or a backend
+    """One tool job's state. 404: unknown id, evicted, or a backend
     restart (jobs are process-local and unpersisted -- see tool_builder).
 
-    ONE endpoint for both kinds (D40): they share a job table, a single-flight
-    admission and a response shape, so a second endpoint would only give the FE
-    two identical pollers to keep in sync. The old `/install/{job_id}` spelling
+    ONE endpoint for every kind: they share a job table, a single-flight
+    admission and a response shape, so an endpoint per kind would only give the FE
+    identical pollers to keep in sync. The old `/install/{job_id}` spelling
     is REMOVED rather than aliased -- the FE and the backend ship in the same
     wheel, so there is no version skew for an alias to protect.
 

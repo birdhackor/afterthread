@@ -22,12 +22,24 @@ same pipeline a save copies with (``copy_into_workspace``), and is recorded when
 it ends -- by its save, or on its own (``record_round``); one that never began
 takes its mark back (``end_unstarted``).
 
+An operator who finished the work by hand publishes the draft as it is, with no
+model and no round (``tool_builder.run_publish_draft``). It is judged the way a
+continuation is, less the route's earlier read (``judge_draft``), and copied into
+a new workspace by the same pipeline, under an outer step of its own that needs
+no ``running`` mark and hands back every fact of the copy -- the known secrets
+found in the root entries it withholds among them -- and whether the publish may
+go on (``copy_for_publish``). The draft is then marked as being published from
+(``mark_publishing``); the mark is taken back only when the publish is known not
+to have gone through, the rounds left as they were (``unmark_publishing``), and
+the draft goes after a publish only once it is seen to hold nothing the version
+does not (``remove_after_publish``).
+
 The draft lives at the package layer, so it goes wherever the package goes: a
 deleted tool takes its draft along, a same-name reinstall starts without one,
 and ``.staging`` keeps its meaning of one session's scratch space. Nothing here
-removes anything from ``.staging``; the one write into it is a continuation's
-copy of the draft into its new, empty workspace, and a workspace there is
-otherwise only read.
+removes anything from ``.staging``; the writes into it are the copies of the
+draft into a new, empty workspace -- a continuation's, and a publish's -- and a
+workspace there is otherwise only read.
 
 What holds, and why:
 
@@ -124,7 +136,9 @@ What holds, and why:
   at all (``REASON_UNLOOKED``): a copy without the entry, committed, could let
   the previous files directory and the staging go while they still held it, and
   the entry would be nowhere. A copy into a continuation's workspace leaves such
-  an entry out, recorded as not brought in; the draft still holds it.
+  an entry out, recorded as not brought in; the draft still holds it. A copy for
+  a publish of the draft as it is does not go on with one: published without
+  it, the version would lack the entry (``copy_for_publish``).
 * DURABILITY. A new copy is written under a temporary name, made durable and
   renamed into place before the manifest names it, and the manifest is replaced
   atomically. A continuation's previous copy is named in ``kept`` by the same
@@ -270,10 +284,10 @@ REASON_FILES_CHANGED = (
 REASON_COPY = "無法複製檔案到草稿（{kind}）"  # noqa: RUF001
 # A save that would leave out an entry because a look at it failed, not because
 # of a decision about it: whether the entry may be kept is not known, so no files
-# are saved. ``{paths}`` names the first ``_UNLOOKED_LISTED`` of them, masked and
-# cut like any text the API serves, and how many there are when there are more.
+# are saved. ``{paths}`` names them as ``_named_paths`` does.
 REASON_UNLOOKED = "有項目查詢失敗，無法確認能否存進草稿，所以這一輪的檔案沒有存：{paths}"  # noqa: RUF001
-_UNLOOKED_LISTED = 5
+# How many paths a reason names (``_named_paths``).
+_PATHS_LISTED = 5
 REASON_DURABILITY = "無法確認草稿已安全寫入磁碟"
 REASON_MANIFEST = "無法寫入草稿的說明檔"
 REASON_MANIFEST_SECRET = "草稿的說明檔寫下去仍會含有已知的秘密值，沒有寫入"  # noqa: RUF001
@@ -281,6 +295,8 @@ REASON_UNEXPECTED = "保存時發生未預期錯誤（{kind}）"  # noqa: RUF001
 # The ``reason`` of a round recorded as ``interrupted``.
 REASON_INTERRUPTED = "這一輪沒有留下結束紀錄，它的進度沒有存進草稿"  # noqa: RUF001
 # Why a continuation did not begin: nothing was spent, and no round is counted.
+# All but the ``kept`` limit are also why a publish of the draft as it is did not
+# copy it (``copy_for_publish``), the draft left as it is.
 START_UNSEEN = "看不到這個工具的草稿"
 START_CHANGED = "草稿在送出之後已經變更"
 START_PUBLISHING = "草稿正在發布、已發布或結果未知"
@@ -291,6 +307,15 @@ START_KEPT_FULL = (
 REASON_FILES_MISSING = "草稿的檔案目錄不在"
 REASON_DRAFT_UNREADABLE = "無法讀取草稿的檔案目錄"
 REASON_COPY_IN = "無法把草稿的檔案複製到暫存工作區（{kind}）"  # noqa: RUF001
+# Why a publish of the draft as it is does not go on, the draft left as it is
+# (``copy_for_publish``): a known secret where it would be published, then an
+# entry a look at failed. ``{paths}`` names them as ``_named_paths`` does.
+REASON_PUBLISH_SECRETS = (
+    "草稿裡有項目含有已知的秘密值（檔名、內容或連結目標），所以沒有發布：{paths}"  # noqa: RUF001
+)
+REASON_PUBLISH_UNLOOKED = "草稿裡有項目查詢失敗，無法確認能否發布，所以沒有發布：{paths}"  # noqa: RUF001
+# The paths of the draft such a publish did not bring into its version, named the same way.
+NOTE_NOT_BROUGHT_IN = "沒帶進發布的項目：{paths}"  # noqa: RUF001
 # A save's note on a previous files directory it did not remove (``SaveResult.reason``
 # of a round that was saved): where it is, and why it stays.
 NOTE_PREVIOUS_KEPT = "上一份檔案目錄沒有刪除，留在 {path}：{why}"  # noqa: RUF001
@@ -381,13 +406,18 @@ class Durability:
 
 @dataclass(frozen=True, slots=True)
 class SavedCopy:
-    """The files directory one save made, and ``tree_digest`` of it as made.
+    """The files directory a removal after a publish compares the draft against
+    (``remove_after_publish``), and ``tree_digest`` of it as the publish had it.
 
-    ``digest`` is taken of the copy once it is durable, before it is renamed into
-    place, with the limits the save counted it against (``max_entries``,
-    ``max_bytes``); None when it could not be read whole. What a removal after a
-    publish compares the draft against (``remove_after_publish``): the copy, not
-    the workspace it came from, which may hold entries the copy does not.
+    For a round's publish, the copy the save before it made: ``digest`` is taken
+    of that copy once it is durable, before it is renamed into place -- the copy,
+    not the workspace it came from, which may hold entries the copy does not. For
+    a publish of the draft as it is (``tool_builder.run_publish_draft``), the
+    files directory it copied into its workspace, and ``copied_out``, taken just
+    before that copy (``PublishCopy``); that the workspace received all of it
+    (``copied_out`` equal to ``copied_in``) is not something this can say, and
+    that caller checks it before asking for a removal. Taken with the limits
+    ``max_entries``, ``max_bytes``; None when it could not be read whole.
     """
 
     files_dir: str
@@ -1068,6 +1098,16 @@ def provenance_line(draft_id: str, attempts: int) -> str:
     return f"草稿 {draft_id}，經過 {attempts} 輪"  # noqa: RUF001
 
 
+def operator_publish_line(draft_id: str) -> str:
+    """The line ``origin.feedback`` carries for a version an operator published from
+    a draft as it is, without a model (``tool_builder.run_publish_draft``).
+
+    It names the draft id as ``provenance_line`` does, whole: the reconciliation in
+    ``draft_view`` (``_published_from``) looks for the draft id in it.
+    """
+    return f"操作者發布的草稿 {draft_id}，未經 AI"  # noqa: RUF001
+
+
 # --- discard token ------------------------------------------------------------
 
 
@@ -1356,18 +1396,19 @@ ContinueRefusal = Literal[
 ]
 
 
-def judge_continuation(
+def judge_draft(
     package_root: tools.PackageRoot,
     resolution: tools.Resolution,
     expected: tuple[str, int],
-    first_seen: tuple[str, int] | None,
 ) -> dict[str, Any] | ContinueRefusal:
-    """Whether a revise naming ``expected`` -- ``(draft_id, generation)`` -- may continue
-    the package's draft: its manifest when it may, else why not.
+    """Whether the package's draft is the one ``expected`` names -- ``(draft_id,
+    generation)`` -- and can be worked from: continued, or published as it is.
+    Its manifest when it can, else why not.
 
     Called after the slot is taken, so what it reads holds until the job begins
-    (only a hand edit changes it meanwhile, which ``begin_round`` checks again).
-    The first of these that holds answers:
+    (only a hand edit changes it meanwhile, which the job's first matched step
+    checks again: ``begin_round``, ``copy_for_publish``). The first of these
+    that holds answers:
 
     1. ``draft/`` is seen not to exist, or the package has no draft of its own
        (``_own_draft``): ``draft_gone``;
@@ -1379,10 +1420,7 @@ def judge_continuation(
     6. ``publishing`` is set -- publishing, published or not known; the origin is
        not read: ``draft_publishing``;
     7. its ``base_vid`` is not ``current``, whatever the request compared:
-       ``version_mismatch``;
-    8. ``first_seen``, what the route read before the slot (None: it read
-       nothing), is not this draft at this generation: ``draft_changed`` -- the
-       records the round would carry are those that manifest kept.
+       ``version_mismatch``.
     """
     seen = _seen_manifest(package_root)
     if seen is None:
@@ -1400,9 +1438,29 @@ def judge_continuation(
         return "draft_publishing"
     if not isinstance(resolution, tools.Resolved) or resolution.vid != manifest["base_vid"]:
         return "version_mismatch"
+    return manifest
+
+
+def judge_continuation(
+    package_root: tools.PackageRoot,
+    resolution: tools.Resolution,
+    expected: tuple[str, int],
+    first_seen: tuple[str, int] | None,
+) -> dict[str, Any] | ContinueRefusal:
+    """Whether a revise naming ``expected`` -- ``(draft_id, generation)`` -- may continue
+    the package's draft: its manifest when it may, else why not.
+
+    ``judge_draft``'s seven answers first, in its order; then an eighth:
+    ``first_seen``, what the route read before the slot (None: it read nothing),
+    is not this draft at this generation: ``draft_changed`` -- the records the
+    round would carry are those that manifest kept.
+    """
+    judged = judge_draft(package_root, resolution, expected)
+    if isinstance(judged, str):
+        return judged
     if first_seen != expected:
         return "draft_changed"
-    return manifest
+    return judged
 
 
 # --- saving a round -------------------------------------------------------------
@@ -1439,14 +1497,20 @@ class LookFailed(Exception):
     about the entry, and a save keeps no files for it (``REASON_UNLOOKED``)."""
 
 
-def _unlooked_reason(paths: list[str], known: list[str]) -> str:
-    """``REASON_UNLOOKED`` naming ``paths``: the first few, masked and cut, and how
-    many there are when there are more."""
+def _named_paths(paths: list[str], known: list[str]) -> str:
+    """``paths`` as a reason names them: the first ``_PATHS_LISTED`` in order, each
+    masked and cut like any text the API serves, and how many there are when there
+    are more."""
     ordered = sorted(set(paths))
-    shown = "、".join(_shown(path, known, _PATH_CAP) or "" for path in ordered[:_UNLOOKED_LISTED])
-    if len(ordered) > _UNLOOKED_LISTED:
+    shown = "、".join(_shown(path, known, _PATH_CAP) or "" for path in ordered[:_PATHS_LISTED])
+    if len(ordered) > _PATHS_LISTED:
         shown += f" 等 {len(ordered)} 項"
-    return REASON_UNLOOKED.format(paths=shown)
+    return shown
+
+
+def _unlooked_reason(paths: list[str], known: list[str]) -> str:
+    """``REASON_UNLOOKED`` naming ``paths`` (``_named_paths``)."""
+    return REASON_UNLOOKED.format(paths=_named_paths(paths, known))
 
 
 def _is_link(path: Path) -> bool:
@@ -2500,11 +2564,11 @@ def _locked_in_package(
     package_dir_identity: tuple[int, int] | None,
     act: Callable[[Path], Any],
 ) -> Any:
-    """Run ``act(draft_dir)`` under the shared tools lock in the round's own package.
+    """Run ``act(draft_dir)`` under the shared tools lock in the job's own package.
 
     None, without running it, when the lock cannot be had, the package is no
-    longer the one the round began in, or it has no ``draft/`` of its own that is
-    seen (``_seen_own_draft``).
+    longer the one the job -- a round, or a publish of the draft as it is -- began
+    in, or it has no ``draft/`` of its own that is seen (``_seen_own_draft``).
     """
     try:
         lock = tools.acquire_shared_tools_lock()
@@ -2535,12 +2599,17 @@ def mark_publishing(
     package_dir_identity: tuple[int, int] | None,
     expected: tuple[str, int],
     job_id: str | None,
+    *,
+    durable_out: list[bool] | None = None,
 ) -> int | None:
     """Record in the manifest that this job is about to publish from the draft.
 
     What lets the list tell, after a restart, a publish that went through from one
     that did not (``draft_view``). Returns the new generation, None when nothing
-    was written. Never raises.
+    was written. Never raises. ``durable_out``, when given, receives whether the
+    write whose generation is returned is confirmed on disk
+    (``_ManifestWrite.durable``); nothing when none was written. A publish of the
+    draft as it is goes on only when it is (``tool_builder.run_publish_draft``).
     """
 
     def act(draft_dir: Path) -> int | None:
@@ -2553,6 +2622,8 @@ def mark_publishing(
             "publishing": {"job_id": job_id, "at": _now_iso()},
         }
         written = _write_manifest(draft_dir, doc, tools._redaction_secrets())
+        if written.replaced and durable_out is not None:
+            durable_out.append(written.durable)
         return doc["generation"] if written.replaced else None
 
     try:
@@ -2594,6 +2665,42 @@ def clear_publishing(
         return None
 
 
+def unmark_publishing(
+    package_root: tools.PackageRoot,
+    package_dir_identity: tuple[int, int] | None,
+    expected: tuple[str, int],
+    job_id: str | None,
+) -> int | None:
+    """Take back this job's own ``publishing`` mark, once a publish of the draft as it
+    is is known not to have gone through. Never raises.
+
+    Only the draft at the generation the mark wrote (``expected``), still marked by
+    this job; it goes one generation on with no ``publishing`` and everything else
+    as it was -- ``attempts`` above all: the last round's outcome and error are the
+    round's, and this publish was no round (``clear_publishing``, for the publish a
+    round made, records the failure on that round). The writer masks the text it
+    writes with the secrets known now, as every write of the manifest does. Returns
+    the new generation, None when nothing was written: the mark then stays, and the
+    list reads the draft as one whose publish is not known.
+    """
+
+    def act(draft_dir: Path) -> int | None:
+        current = _matching_draft(draft_dir, expected)
+        if current is None:
+            return None
+        marked = current["publishing"]
+        if marked is None or marked["job_id"] != job_id:
+            return None
+        doc = {**current, "generation": current["generation"] + 1, "publishing": None}
+        written = _write_manifest(draft_dir, doc, tools._redaction_secrets())
+        return doc["generation"] if written.replaced else None
+
+    try:
+        return _locked_in_package(package_root, package_dir_identity, act)
+    except Exception:
+        return None
+
+
 # --- a continuing round: its mark, its copy, its record ----------------------------
 
 
@@ -2612,10 +2719,11 @@ def _in_own_package(
     package_dir_identity: tuple[int, int] | None,
     act: Callable[[Path], Any],
 ) -> Any:
-    """``act(draft_dir)`` under the shared tools lock in the round's own package, or
+    """``act(draft_dir)`` under the shared tools lock in the job's own package, or
     why it did not run: ``REASON_LOCK``, ``REASON_PACKAGE_GONE`` (not the directory
-    the round began in), ``START_UNSEEN`` (no ``draft/`` of its own that is seen,
-    ``_seen_own_draft``). Raises what ``act`` raises."""
+    the job -- a round, or a publish of the draft as it is -- began in),
+    ``START_UNSEEN`` (no ``draft/`` of its own that is seen, ``_seen_own_draft``).
+    Raises what ``act`` raises."""
     try:
         lock = tools.acquire_shared_tools_lock()
     except tools.ToolsLockUnavailableError:
@@ -2828,6 +2936,74 @@ def _not_brought_in(files: Path) -> dict[str, OmitReason]:
 
 
 @dataclass(frozen=True, slots=True)
+class _DraftCopy:
+    """What one copy of a draft's files directory into a new workspace did, in full
+    (``_copy_draft_files``).
+
+    ``copied_out`` is ``tree_digest`` of the files directory taken just before the
+    copy; ``scan`` the scan of it the copy was planned by, every hit and skip in
+    it -- those inside the root entries the copy withholds as well, which the plan
+    never looks at; ``left_out`` those root entries and why (``_not_brought_in``);
+    ``omitted`` every path the workspace did not receive, and why; ``unlooked`` the
+    paths among them left out because a look failed, in the plan or in the checks
+    of the copy -- not the root names whose identity could not be told, which are
+    in ``left_out`` as ``unreadable``.
+    """
+
+    copied_out: TreeDigest | None
+    scan: tools.SecretScanDone
+    left_out: dict[str, OmitReason]
+    omitted: list[Omitted]
+    unlooked: list[str]
+
+
+def _copy_draft_files(
+    files: Path, workspace: Path, known: list[str], max_files: int, max_bytes: int
+) -> _DraftCopy | str:
+    """Copy the draft's files directory ``files`` into ``workspace``, which must not
+    exist yet; or why not. The one copy a continuation and a publish of the draft
+    as it is both make.
+
+    The pipeline a save copies with, ``files`` as the source: its links judged on
+    the source and stored relative, every entry and byte counted against the
+    limits as it is made, the links judged again on the copy and resolved there,
+    the whole copy scanned for the known secrets ``known`` (``_plan_copy``,
+    ``_carry_out``). What holds a secret is not brought in, and no earlier version
+    takes its place. Nor are the entries ``_not_brought_in`` names. Modes are kept
+    as the copy keeps them -- each file at least owner read and write, each
+    directory owner rwx, as a save already made them -- so for a draft the backend
+    saved, the workspace's digest equals ``copied_out``.
+
+    ``copied_out`` is taken before anything is copied, then the size limits are
+    checked on ``files``, which only refuses early -- the counting as the copy is
+    made is what holds the limits. A copy that cannot be made whole leaves what it
+    made in the workspace, which the job removes with the rest of its session. The
+    caller holds the shared tools lock and has matched the draft's manifest.
+    """
+    copied_out = tree_digest(files, max_entries=max_files, max_bytes=max_bytes)
+    too_big = _over_limits(files, max_files, max_bytes)
+    if too_big is not None:
+        return REASON_DRAFT_UNREADABLE if too_big == REASON_UNREADABLE else too_big
+    scan = tools.scan_embedded_secrets(files, known)
+    if isinstance(scan, tools.SecretScanFailed):
+        return REASON_SCAN_FAILED.format(reason=scan.reason)
+    try:
+        left_out = _not_brought_in(files)
+        plan = _plan_copy(files, scan, None, max_files, max_bytes, left_out=left_out)
+    except OSError:
+        return REASON_DRAFT_UNREADABLE
+    try:
+        workspace.mkdir(parents=True)
+        omitted, unlooked = _carry_out(plan, workspace, known)
+        os.chmod(workspace, stat.S_IMODE(os.lstat(files).st_mode) | 0o700)
+    except _CopyNotKept as refused:
+        return refused.reason
+    except OSError as exc:
+        return REASON_COPY_IN.format(kind=type(exc).__name__)
+    return _DraftCopy(copied_out, scan, left_out, omitted, sorted({*plan.unlooked, *unlooked}))
+
+
+@dataclass(frozen=True, slots=True)
 class CopiedIn:
     """What a continuation's copy of the draft into its workspace did.
 
@@ -2853,24 +3029,9 @@ def copy_into_workspace(
     """Copy the draft's files into a continuing round's new workspace; or why not,
     and then the round does not begin. Never raises.
 
-    The pipeline a save copies with, the draft's files directory as the source
-    and ``workspace`` -- which must not exist yet -- as where the copy is made:
-    its links judged on the source and stored relative, every entry and byte
-    counted against the limits as it is made, the links judged again on the copy
-    and resolved there, the whole copy scanned for the known secrets
-    (``_plan_copy``, ``_carry_out``). What holds a secret is not brought in, and
-    no earlier version takes its place. Nor are the entries ``_not_brought_in``
-    names. Modes are kept as the copy keeps them -- each file at least owner
-    read and write, each directory owner rwx, as a save already made them -- so
-    for a draft the backend saved, the workspace's digest equals ``copied_out``.
-
-    Under the shared tools lock, in the round's own package, on the manifest
-    ``begin_round`` returned (``expected``, marked by ``job_id``):
-    ``copied_out`` is taken before anything is copied, then the size limits are
-    checked on the files directory, which only refuses early -- the counting as
-    the copy is made is what holds the limits. A copy that cannot be made whole
-    leaves what it made in the workspace, which the job removes with the rest of
-    its session.
+    The copy is ``_copy_draft_files``'s. Under the shared tools lock, in the
+    round's own package, on the manifest ``begin_round`` returned (``expected``,
+    marked by ``job_id``).
     """
     try:
         known = tools._redaction_secrets()
@@ -2886,35 +3047,194 @@ def copy_into_workspace(
         files = draft_dir / current["files_dir"]
         if not _is_real_dir(files):
             return REASON_FILES_MISSING
-        copied_out = tree_digest(files, max_entries=max_files, max_bytes=max_bytes)
-        too_big = _over_limits(files, max_files, max_bytes)
-        if too_big is not None:
-            return REASON_DRAFT_UNREADABLE if too_big == REASON_UNREADABLE else too_big
-        scan = tools.scan_embedded_secrets(files, known)
-        if isinstance(scan, tools.SecretScanFailed):
-            return REASON_SCAN_FAILED.format(reason=scan.reason)
-        try:
-            plan = _plan_copy(
-                files, scan, None, max_files, max_bytes, left_out=_not_brought_in(files)
-            )
-        except OSError:
-            return REASON_DRAFT_UNREADABLE
-        try:
-            workspace.mkdir(parents=True)
-            # What a failed look left out -- here or in the plan -- is not brought
-            # in, recorded like the rest; the draft still holds it.
-            omitted, _unlooked = _carry_out(plan, workspace, known)
-            os.chmod(workspace, stat.S_IMODE(os.lstat(files).st_mode) | 0o700)
-        except _CopyNotKept as refused:
-            return refused.reason
-        except OSError as exc:
-            return REASON_COPY_IN.format(kind=type(exc).__name__)
-        return CopiedIn(copied_out, tuple(omitted))
+        copied = _copy_draft_files(files, workspace, known, max_files, max_bytes)
+        if isinstance(copied, str):
+            return copied
+        # What a failed look left out -- in the plan or in the checks of the copy --
+        # is not brought in, recorded like the rest; the draft still holds it.
+        return CopiedIn(copied.copied_out, tuple(copied.omitted))
 
     try:
         return _in_own_package(package_root, package_dir_identity, act)
     except Exception as exc:
         return REASON_UNEXPECTED.format(kind=type(exc).__name__)
+
+
+# --- publishing the draft as it is: its copy, what may stop it ----------------------
+
+# The reasons a copy records a path under when the scan found a known secret in it.
+_SECRET_REASONS = frozenset(_HIT_REASONS.values())
+
+
+@dataclass(frozen=True, slots=True)
+class PublishCopy:
+    """What a publish of the draft as it is brought into its workspace, and whether
+    the publish may go on (``copy_for_publish``).
+
+    ``files_dir`` is the files directory copied out of; ``copied_out`` its
+    ``tree_digest`` taken just before the copy, ``copied_in`` the workspace's taken
+    once the copy is made, both with the limits the copy counted against.
+    ``not_brought_in`` is every path of it the workspace did not receive, and why,
+    in full; ``unlooked`` the paths among them left out because a look failed: the
+    plan's, the copy's checks', and a root name whose identity with a name the
+    strip before a save removes could not be told.
+
+    ``secret_paths`` are the paths the scan found a known secret in -- a name, the
+    content, a link target; in the draft's files, or in the copy -- other than
+    inside a root entry the copy withholds as such a name: one in
+    ``STRIPPED_ROOT_NAMES``, or one confirmed the same entry spelled in another
+    case. ``withheld_secret_paths`` are those inside such an entry, which never
+    reaches a version, so they do not stop the publish.
+
+    ``refusal`` is why the draft may not be published: secret paths first, then
+    unlooked ones, each named as ``_named_paths`` names them; None when it may.
+    ``left_out`` names the paths not brought in, the same way, for the job to say
+    what the draft holds that the version does not; None when every path was.
+    """
+
+    files_dir: str
+    copied_out: TreeDigest | None
+    copied_in: TreeDigest | None
+    not_brought_in: tuple[Omitted, ...]
+    unlooked: tuple[str, ...]
+    secret_paths: tuple[str, ...]
+    withheld_secret_paths: tuple[str, ...]
+    refusal: str | None
+    left_out: str | None
+
+
+def _publish_copy(
+    files_dir: str, copied: _DraftCopy, copied_in: TreeDigest | None, known: list[str]
+) -> PublishCopy:
+    """The facts of one copy for a publish of the draft as it is, and its verdict.
+
+    A root entry the copy withheld as a name the strip before a save removes -- one
+    in ``STRIPPED_ROOT_NAMES``, or one confirmed the same entry in another case --
+    is exempt from both checks: a secret in it, and a look at it that failed, the
+    scan's skip of it included (``_plan_copy`` never visits it). It never reaches
+    the version. A root name whose identity could not be told is no such entry:
+    left out for a failed look, it is among the unlooked, and a secret in it stops
+    the publish like any other.
+    """
+    withheld = {name for name, reason in copied.left_out.items() if reason in STRIPPED_ROOT_NAMES}
+
+    def exempt(path: str) -> bool:
+        return path.split("/", 1)[0] in withheld
+
+    found = {hit.path for hit in copied.scan.hits}
+    found |= {item.path for item in copied.omitted if item.reason in _SECRET_REASONS}
+    secret_paths = sorted(path for path in found if not exempt(path))
+    unseen_aliases = [name for name, reason in copied.left_out.items() if reason == "unreadable"]
+    unlooked = sorted({*copied.unlooked, *unseen_aliases})
+    refusal: str | None = None
+    if secret_paths:
+        refusal = REASON_PUBLISH_SECRETS.format(paths=_named_paths(secret_paths, known))
+    elif unlooked:
+        refusal = REASON_PUBLISH_UNLOOKED.format(paths=_named_paths(unlooked, known))
+    left_out = [item.path for item in copied.omitted]
+    return PublishCopy(
+        files_dir=files_dir,
+        copied_out=copied.copied_out,
+        copied_in=copied_in,
+        not_brought_in=tuple(copied.omitted),
+        unlooked=tuple(unlooked),
+        secret_paths=tuple(secret_paths),
+        withheld_secret_paths=tuple(sorted(path for path in found if exempt(path))),
+        refusal=refusal,
+        left_out=NOTE_NOT_BROUGHT_IN.format(paths=_named_paths(left_out, known))
+        if left_out
+        else None,
+    )
+
+
+def copy_for_publish(
+    *,
+    package_root: tools.PackageRoot,
+    package_dir_identity: tuple[int, int] | None,
+    expected: tuple[str, int],
+    workspace: Path,
+    max_files: int,
+    max_bytes: int,
+) -> PublishCopy | str:
+    """Copy the draft's files into the new workspace a publish of the draft as it is
+    publishes from; or why it was not copied, and then nothing is published. Never
+    raises.
+
+    No round and no ``running`` mark: under the shared tools lock, in the job's own
+    package, on the draft judged after the slot (``expected``, matched by id and
+    generation), while no publish from it is marked. The copy is
+    ``_copy_draft_files``'s, and ``copied_in`` is taken of the workspace once it is
+    made, under the same lock. The draft is only read. Whether the copy may be
+    published is ``PublishCopy.refusal`` (``_publish_copy``).
+    """
+    try:
+        known = tools._redaction_secrets()
+    except tools.KnownSecretsIncomplete as exc:
+        return REASON_SECRETS_INCOMPLETE.format(detail=exc)
+    except Exception as exc:
+        return REASON_SCAN_FAILED.format(reason=type(exc).__name__)
+
+    def act(draft_dir: Path) -> PublishCopy | str:
+        current = _matching_draft(draft_dir, expected)
+        if current is None:
+            return START_CHANGED
+        if current["publishing"] is not None:
+            return START_PUBLISHING
+        files = draft_dir / current["files_dir"]
+        if not _is_real_dir(files):
+            return REASON_FILES_MISSING
+        copied = _copy_draft_files(files, workspace, known, max_files, max_bytes)
+        if isinstance(copied, str):
+            return copied
+        copied_in = tree_digest(workspace, max_entries=max_files, max_bytes=max_bytes)
+        return _publish_copy(current["files_dir"], copied, copied_in, known)
+
+    try:
+        return _in_own_package(package_root, package_dir_identity, act)
+    except Exception as exc:
+        return REASON_COPY_IN.format(kind=type(exc).__name__)
+
+
+def holds_copy(
+    package_root: tools.PackageRoot,
+    package_dir_identity: tuple[int, int] | None,
+    draft_id: str,
+    copy: PublishCopy,
+    max_files: int,
+    max_bytes: int,
+) -> bool:
+    """Whether the draft is seen, now, to hold what a publish of it copied into its
+    workspace: then that workspace holds nothing the draft does not. Never raises.
+
+    Both of: the workspace received the files directory whole -- ``copied_out``
+    equal to ``copied_in``; an entry not brought in, a link rewritten, a file
+    swapped and swapped back during the copy all make them differ -- and that
+    directory, still the one the manifest of the same draft names, is still what
+    was copied out of it: its digest now, with the same limits, equal to
+    ``copied_out``. Under the shared tools lock, in the job's own package; the
+    draft is matched by its id, since the publish's own marks moved its
+    generation. Unknown is never held.
+
+    Not covered: a change after this look and before the caller acts on its
+    answer, which only a hand edit makes.
+    """
+    if not same_tree(copy.copied_out, copy.copied_in):
+        return False
+
+    def act(draft_dir: Path) -> bool:
+        current = read_manifest(draft_dir) if _is_real_dir(draft_dir) else None
+        if current is None or (current["draft_id"], current["files_dir"]) != (
+            draft_id,
+            copy.files_dir,
+        ):
+            return False
+        now = tree_digest(draft_dir / copy.files_dir, max_entries=max_files, max_bytes=max_bytes)
+        return same_tree(copy.copied_out, now)
+
+    try:
+        return _locked_in_package(package_root, package_dir_identity, act) is True
+    except Exception:
+        return False
 
 
 def _discard_name(meta: Path) -> Path:
@@ -2966,7 +3286,7 @@ class Removal:
 
     ``kept`` is set only by ``remove_after_publish`` when it did not begin to
     remove, and says why the draft was left: ``"changed"``, it holds something
-    other than what the save before the publish made; ``"unconfirmed"``, that
+    other than what the publish had of it (``SavedCopy``); ``"unconfirmed"``, that
     could not be told.
     """
 
@@ -2986,14 +3306,15 @@ def _removal(draft_dir: Path) -> Removal:
 def _as_saved(
     draft_dir: Path, current: dict[str, Any], saved: SavedCopy | None
 ) -> Literal["same", "changed", "unconfirmed"]:
-    """Whether ``draft/`` holds only what the save described by ``saved`` made.
+    """Whether ``draft/`` holds only what ``saved`` describes (``SavedCopy``).
 
     What a removal takes is all of ``draft/``, so all of it is compared: the
-    manifest's ``files_dir`` must still be the copy that save made, ``draft/``
-    must hold that directory and the manifest and nothing else, and ``tree_digest``
-    of the copy now must equal the one taken as it was made. A listing or a
-    digest that cannot be had whole, or a save that left none, is
-    ``"unconfirmed"`` -- unknown is never the same, nor shown to differ.
+    manifest's ``files_dir`` must still be the directory ``saved`` names, ``draft/``
+    must hold that directory and the manifest and nothing else -- its actual
+    entries, not the names ``kept`` lists -- and ``tree_digest`` of that directory
+    now must equal ``saved.digest``. A listing or a digest that cannot be had
+    whole, or no ``saved`` digest at all, is ``"unconfirmed"`` -- unknown is never
+    the same, nor shown to differ.
     """
     if saved is None or saved.digest is None:
         return "unconfirmed"
@@ -3022,11 +3343,13 @@ def remove_after_publish(
     """Remove the draft a publish just put live, if it holds nothing more. Never raises.
 
     Only the draft the publish came from, at the generation it marked, and only
-    while it holds just what the save before the publish made: ``saved``, the
-    copy that save made with its fingerprint (``SavedCopy``), not the workspace
-    the publish went from, which may hold entries the copy does not keep. Under
-    the lock, after the manifest is matched, ``_as_saved`` compares all of
-    ``draft/``, since the removal takes all of it. Anything else is left alone,
+    while it holds just what ``saved`` describes (``SavedCopy``): for a round's
+    publish, the copy the save before it made, with its fingerprint -- not the
+    workspace the publish went from, which may hold entries the copy does not
+    keep; for a publish of the draft as it is, the files directory it copied out
+    of, as it was copied out. Under the lock, after the manifest is matched,
+    ``_as_saved`` compares all of ``draft/``, since the removal takes all of it.
+    Anything else is left alone,
     with ``kept`` saying why: ``"changed"`` -- the copy differs, the manifest names
     another one, or ``draft/`` holds more, a directory of the operator's say;
     ``"unconfirmed"`` -- it could not be told, or the draft could not even be

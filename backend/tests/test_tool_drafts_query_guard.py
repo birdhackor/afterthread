@@ -368,13 +368,20 @@ _REASONED: list[tuple[str, str, str]] = [
     (
         "mark_publishing",
         "except Exception: return None",
-        "no mark is claimed: the publish goes on unmarked by design, and the draft reads "
-        "as stale rather than published",
+        "no mark is claimed: a round's publish goes on unmarked by design, and the draft "
+        "reads as stale rather than published; a publish of the draft as it is does not "
+        "go on at all",
     ),
     (
         "clear_publishing",
         "except Exception: return None",
         "no change is claimed written",
+    ),
+    (
+        "unmark_publishing",
+        "except Exception: return None",
+        "no change is claimed written: the mark stays, and the list reads the draft's "
+        "publish as not known",
     ),
     (
         "_seen_gone",
@@ -456,14 +463,31 @@ _REASONED: list[tuple[str, str, str]] = [
         "a failure it did not expect: the round does not begin",
     ),
     (
-        "copy_into_workspace.act",
+        "_copy_draft_files",
         "except OSError: return REASON_DRAFT_UNREADABLE",
-        "the draft's files cannot be listed: the round does not begin",
+        "the draft's files cannot be listed: no copy is handed back, so the round does "
+        "not begin and the publish does not go on",
     ),
     (
-        "copy_into_workspace.act",
+        "_copy_draft_files",
         "except OSError: return REASON_COPY_IN.format(kind=type(exc).__name__)",
-        "the workspace cannot be made whole: the round does not begin",
+        "the workspace cannot be made whole: no copy is handed back, so the round does "
+        "not begin and the publish does not go on",
+    ),
+    (
+        "copy_for_publish",
+        "except Exception: return REASON_SCAN_FAILED.format(reason=type(exc).__name__)",
+        "the known secrets cannot be had: nothing is copied and nothing is published",
+    ),
+    (
+        "copy_for_publish",
+        "except Exception: return REASON_COPY_IN.format(kind=type(exc).__name__)",
+        "a failure it did not expect: no copy is handed back, and nothing is published",
+    ),
+    (
+        "holds_copy",
+        "except Exception: return False",
+        "not seen to hold the copy: the publish's staging is kept",
     ),
 ]
 

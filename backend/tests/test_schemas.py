@@ -17,6 +17,7 @@ from afterthread.schemas import (
     ToolDraftDiscardResponse,
     ToolInstallRequest,
     ToolJobDraft,
+    ToolJobDraftPublish,
 )
 from afterthread.services.memory_ai import SECTION_FIELD_ORDER
 
@@ -206,7 +207,8 @@ def test_only_by_id_routes_declare_404() -> None:
     not exist, TOOLS_DIR being unset included, and POST /api/tools/{name}/revise,
     plus the version-addressed discard, which 404 on the same gate), the draft
     discard (DELETE /api/tools/{name}/draft, a 404 for a missing tool or a tool with
-    no draft), the settings and
+    no draft), the draft publish (POST /api/tools/{name}/draft/publish, a 404 for
+    a missing tool), the settings and
     run-list reads under /api/tools/{name}, and the by-id run record read and delete
     (/api/tool-runs/{run_id}, web-v6 §6), and the 跑一次範例 submit
     (POST /api/tools/{name}/check, web-v6 §10). The collection, review, health,
@@ -238,6 +240,7 @@ def test_only_by_id_routes_declare_404() -> None:
         ("/api/tools/{name}", "delete"),
         ("/api/tools/{name}/versions/{vid}", "delete"),
         ("/api/tools/{name}/draft", "delete"),
+        ("/api/tools/{name}/draft/publish", "post"),
         ("/api/tools/jobs/{job_id}", "get"),
         ("/api/tools/{name}/summary", "get"),
         ("/api/tools/{name}/summary/regenerate", "post"),
@@ -293,6 +296,12 @@ _BACKEND_PATH_FIELDS: dict[tuple[type[BaseModel], str], dict[str, Any]] = {
         "generation": None,
         "attempts": None,
         "reason": "沒能存成草稿",
+    },
+    (ToolJobDraftPublish, "retained_path"): {
+        "draft_id": "0" * 32,
+        "generation": 2,
+        "removed": False,
+        "reason": None,
     },
 }
 # The listed fields that state a list of paths, each one made encodable.
