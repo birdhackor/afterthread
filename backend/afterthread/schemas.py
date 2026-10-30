@@ -605,8 +605,10 @@ class ToolDraft(BaseModel):
     ``attempts`` is how many rounds the draft has been through. ``path`` is where
     its files are, for the operator to open or copy (a ``BackendPath``); for an
     unusable draft, the draft directory itself. ``discard_token`` stands for the
-    draft as it is now, whatever its manifest holds, so an unusable draft can be
-    discarded by it.
+    draft as it is now, whatever its manifest holds. It authorizes a discard only
+    when every look it is taken from succeeds or sees nothing there, both when it
+    is shown and when the discard looks again under the lock; otherwise it is for
+    display only, and a discard by it removes nothing.
     ``draft_id``, ``generation``, ``attempts``, ``base_vid`` and ``last`` are null
     when the manifest cannot be read; an unusable draft whose files are missing
     still has them.

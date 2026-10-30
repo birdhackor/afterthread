@@ -1640,6 +1640,77 @@ def test_cleanup_staging_still_removes_an_honest_staging(tmp_path: Path) -> None
     assert not (base / tool_builder._STAGING_DIRNAME).exists()
 
 
+def _refuse_lstat(
+    monkeypatch: pytest.MonkeyPatch, path: Path, *, active: list[bool] | None = None
+) -> list[str]:
+    """``os.lstat`` of exactly ``path`` fails with EIO -- while ``active[0]`` is
+    true, when given -- and every other path is looked at as before. Returns the
+    paths it failed."""
+    real_lstat = os.lstat
+    target = os.fspath(path)
+    refused: list[str] = []
+
+    def lstat(candidate: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        spelled = os.fspath(candidate) if isinstance(candidate, str | os.PathLike) else None
+        if spelled is not None and spelled == target and (active is None or active[0]):
+            refused.append(spelled)
+            raise OSError(errno.EIO, os.strerror(errno.EIO), spelled)
+        return real_lstat(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    return refused
+
+
+@pytest.mark.parametrize("unseen", ["tools-directory", "staging-shell", "workspace"])
+def test_verify_staging_root_refuses_a_workspace_whose_place_cannot_be_looked_at(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, unseen: str
+) -> None:
+    """That the workspace is still the real directory inside ``<base>/.staging``
+    rests on looking at the tools directory, the shell and the workspace itself.
+    When one of those looks fails it is not known, and the workspace is refused as
+    unverified -- not passed as the honest one a look skipping the failure finds."""
+    base = tmp_path.resolve() / "tools"
+    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
+    staging.mkdir(parents=True)
+    looked_at = {
+        "tools-directory": base,
+        "staging-shell": base / tool_builder._STAGING_DIRNAME,
+        "workspace": staging,
+    }[unseen]
+    refused = _refuse_lstat(monkeypatch, looked_at)
+
+    error = tool_builder._verify_staging_root(staging, base)
+
+    assert error is not None
+    assert error == tool_builder._ERROR_STAGING_UNVERIFIED
+    assert refused
+
+
+def test_cleanup_staging_removes_nothing_through_a_staging_shell_it_cannot_look_at(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The ``.staging`` shell is a link to an external directory holding a real
+    ``<uuid>`` subdirectory, and the shell cannot be looked at. A resolution that
+    skips that failure finds the workspace inside the shell, and the rmtree after
+    it deletes the external directory through the link; the gate refuses what it
+    could not look at, and the external directory survives."""
+    base = tmp_path.resolve() / "tools"
+    base.mkdir()
+    external = tmp_path.resolve() / "external"
+    victim = external / "buildid"
+    victim.mkdir(parents=True)
+    (victim / "keep.txt").write_text("survive", encoding="utf-8")
+    shell = base / tool_builder._STAGING_DIRNAME
+    shell.symlink_to(external, target_is_directory=True)
+    refused = _refuse_lstat(monkeypatch, shell)
+
+    tool_builder._cleanup_staging(shell / "buildid", base)
+
+    assert victim.is_dir()
+    assert (victim / "keep.txt").read_text(encoding="utf-8") == "survive"
+    assert refused
+
+
 def test_cleanup_takes_the_whole_session_including_a_shell_holding_env(tmp_path: Path) -> None:
     """The reason cleanup targets ``session_root`` and not the build directory.
 
@@ -9938,6 +10009,37 @@ def _save_an_unfinished_round(monkeypatch: pytest.MonkeyPatch, pkg: Path) -> dic
     outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
     assert outcome.draft is not None and outcome.draft["saved"] is True
     return _draft_manifest(pkg)
+
+
+def test_a_revise_whose_workspace_cannot_be_confirmed_in_staging_saves_no_draft_and_keeps_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Once the session has ended, the ``.staging`` shell cannot be looked at, so
+    whether the workspace is still the one the round was given is not known. It
+    is not stripped and no draft is saved from it, and cleanup leaves it where it
+    is rather than removing it through a shell it could not see."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
+    base = tools.tools_dir()
+    assert base is not None
+    shell = base / tool_builder._STAGING_DIRNAME
+    ended = [False]
+    real_strip = tool_builder._strip_builder_env
+
+    def strip(build_root: tools.BuildRoot, root: Path) -> tuple[tuple[str, ...], str | None]:
+        ended[0] = True
+        return real_strip(build_root, root)
+
+    monkeypatch.setattr(tool_builder, "_strip_builder_env", strip)
+    refused = _refuse_lstat(monkeypatch, shell, active=ended)
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.draft is not None and outcome.draft["saved"] is False
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    assert outcome.error == tool_builder._ERROR_STAGING_UNVERIFIED
+    assert any(shell.iterdir())
+    assert refused
 
 
 def test_a_revise_that_does_not_publish_keeps_its_work_as_the_tool_s_draft(

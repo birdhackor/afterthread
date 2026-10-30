@@ -396,6 +396,32 @@ describe("draftDiscardFailure", () => {
 		expect(failure.notification.message).toContain("稍後再試");
 	});
 
+	it("shows the backend's own words for a draft not seen gone, keeps them up and re-reads the list", () => {
+		const message =
+			"沒能確認草稿已刪除，它可能仍在：/tools/kb/.afterthread.meta/draft。請檢查權限與檔案系統狀態後再放棄一次。";
+		const failure = draftDiscardFailure({
+			status: 500,
+			code: "draft_not_removed",
+			message,
+		});
+		expect(failure).not.toBeNull();
+		expect(failure.refresh).toBe(true);
+		expect(failure.notification.message).toBe(message);
+		expect(failure.notification.autoClose).toBe(false);
+	});
+
+	it("still says the draft may be there when a draft not seen gone comes without words", () => {
+		const failure = draftDiscardFailure({
+			status: 500,
+			code: "draft_not_removed",
+			message: " ",
+		});
+		expect(failure).not.toBeNull();
+		expect(failure.refresh).toBe(true);
+		expect(failure.notification.message).toContain("可能仍在");
+		expect(failure.notification.autoClose).toBe(false);
+	});
+
 	it("leaves every other error to the ordinary handling", () => {
 		expect(draftDiscardFailure({ status: 404, code: null })).toBeNull();
 		expect(
@@ -422,6 +448,9 @@ describe("draftDiscardFailure", () => {
 		).toBeNull();
 		expect(
 			draftDiscardFailure({ status: 409, code: "draft_not_found" }),
+		).toBeNull();
+		expect(
+			draftDiscardFailure({ status: 409, code: "draft_not_removed" }),
 		).toBeNull();
 	});
 });

@@ -285,7 +285,9 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
     兩種都帶或都沒帶回 422。確認框記住使用者按下「放棄」當下看到的那一份草稿，確認時
     送的就是那一份；其間若換成別份，後端回 `draft_changed`（`draftDiscardFailure`：
     重讀清單並說明），不會刪到沒看過的草稿。`draft_not_found` 重讀清單，`job_busy`
-    請稍後再試；放棄成功而有殘留（`residual_path`）時，通知會說殘留在哪
+    請稍後再試；`500 draft_not_removed`（沒能確認草稿已刪除，或一開始就看不到它而沒動手）
+    照後端的訊息顯示——它寫出 `draft/` 的路徑與下一步——通知不自動關閉，並重讀清單
+    （`draft/` 可能已改名移走、只是之後的查詢失敗）；放棄成功而有殘留（`residual_path`）時，通知會說殘留在哪
     （`draftDiscardNotification`）。放棄的請求佔用後端的全域名額，所以它的 pending
     併入 `ownSummaryBusy`，和其他寫入一起停用。
   - **工作卡片**：`components/ReviseDraftResult.jsx` 依 `jobDraftView` 說這一輪的

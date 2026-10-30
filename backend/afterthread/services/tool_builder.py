@@ -179,6 +179,11 @@ _ERROR_BUILDER_ENV_STRIP = "無法清除建置器寫入的 .env，操作已取�
 # TRUE sibling of ``_ERROR_SIDECAR_STRIP`` (same suffix, same category-only shape):
 # naming what staging turned OUT to be would be naming attacker-controlled content.
 _ERROR_STAGING_TAMPERED = "暫存工作區已被移動或替換，安裝已取消。"  # noqa: RUF001
+# ``_verify_staging_root`` could not look at the workspace, the ``.staging`` shell
+# or the tools directory, so whether staging is still the real, contained
+# directory is not known: refused like a tampered one, but not called tampered --
+# the next step is checking permissions and the filesystem, not hunting a swap.
+_ERROR_STAGING_UNVERIFIED = "無法確認暫存工作區仍是原本的目錄（檔案系統查詢失敗），操作已取消。"  # noqa: RUF001
 
 # D40 revise-only outcomes. Category-only by the same construction as the install
 # ones above: a fixed zh-TW string, never a path and never a value.
@@ -2335,19 +2340,24 @@ def _verify_staging_root(staging: Path, base: Path) -> str | None:
     would otherwise remove a live backend metadata directory through that link,
     before ``validate_package`` ever ran.
 
-    Two independent layers, mirroring the resolve-then-contain house pattern
-    (``tools._resolve_package_dir_no_alias``'s is_symlink-before-resolve
-    composition):
+    Two independent layers:
 
-    * ``is_symlink()`` on the path ITSELF, no resolve: one cheap lstat catches
-      the attack above outright -- a symlink planted AT the staging leaf;
+    * ``lstat`` on the path ITSELF, no resolve: it catches the attack above
+      outright -- a symlink planted AT the staging leaf;
     * containment under the RESOLVED ``<base>/.staging`` shell
-      (``tools._is_within``, the same predicate ``_resolve_in_staging`` and
-      ``tools._resolve_package_dir`` use): catches ANCESTOR substitution the leaf
-      check alone cannot -- e.g. ``.staging`` itself swapped for a symlink, which
-      leaves the staging LEAF a perfectly ordinary directory (so ``is_symlink()``
-      on the full path reports False) while the fully RESOLVED path lands outside
-      the shell entirely.
+      (``tools._is_within``): catches ANCESTOR substitution the leaf check alone
+      cannot -- e.g. ``.staging`` itself swapped for a symlink, which leaves the
+      staging LEAF a perfectly ordinary directory while the fully RESOLVED path
+      lands outside the shell entirely.
+
+    Every look raises its errors (``os.lstat``, ``os.path.realpath`` with
+    ``strict=True``), and one that fails refuses the workspace as unverified
+    (``_ERROR_STAGING_UNVERIFIED``): ``is_symlink()`` answers False for a path it
+    could not look at, and a resolve that is not strict hands back the path
+    unresolved past a component it could not look at -- a shell swapped for a
+    link then passes as the real one, and ``_cleanup_staging``'s rmtree would
+    delete through it. Verified: a None answer rests on three looks that
+    succeeded. Not covered: a swap between this check and the caller's use.
 
     This narrows a window rather than closing one, and is the SAME accepted
     residual class ``_promote_staging``'s own docstring names for its
@@ -2358,10 +2368,14 @@ def _verify_staging_root(staging: Path, base: Path) -> str | None:
     closes is the window the finding actually reported -- the ENTIRE builder
     session, start to finish -- down to that one syscall gap.
     """
-    if staging.is_symlink():
-        return _ERROR_STAGING_TAMPERED
-    staging_root = base.resolve() / _STAGING_DIRNAME
-    if not tools._is_within(staging_root, staging.resolve()):
+    try:
+        if stat.S_ISLNK(os.lstat(staging).st_mode):
+            return _ERROR_STAGING_TAMPERED
+        staging_root = Path(os.path.realpath(base, strict=True)) / _STAGING_DIRNAME
+        resolved = Path(os.path.realpath(staging, strict=True))
+    except OSError:
+        return _ERROR_STAGING_UNVERIFIED
+    if not tools._is_within(staging_root, resolved):
         return _ERROR_STAGING_TAMPERED
     return None
 

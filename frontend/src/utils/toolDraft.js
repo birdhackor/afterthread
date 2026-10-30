@@ -281,7 +281,13 @@ export function draftDiscardNotification(name, result) {
 //   operator looked; the list is read again and they confirm against what is there;
 // * draft_not_found: the tool has no draft any more (discarded elsewhere);
 // * job_busy: another task holds the backend's one slot. Nothing is wrong with the
-//   draft, so nothing is re-read.
+//   draft, so nothing is re-read;
+// * draft_not_removed (500): the draft may still be there -- the backend could not
+//   see it gone, or could not look at it (or at what names it) and left it alone.
+//   Its message names `draft/` and the next step, so that is what is shown, and it
+//   stays up until closed. The list is read again: `draft/` may have been renamed
+//   aside before the look that failed, and then the row would show a draft that is
+//   no longer there.
 export function draftDiscardFailure(error) {
 	const { status, code } = error ?? {};
 	if (status === 409 && code === "draft_changed") {
@@ -313,6 +319,19 @@ export function draftDiscardFailure(error) {
 				color: "orange",
 				title: "暫時無法放棄草稿",
 				message: "已有工具任務正在進行中，請稍後再試",
+			},
+		};
+	}
+	if (status === 500 && code === "draft_not_removed") {
+		return {
+			refresh: true,
+			notification: {
+				color: "red",
+				title: "沒能確認草稿已刪除",
+				message:
+					nonBlank(error.message) ??
+					"沒能確認草稿已刪除，它可能仍在。請檢查權限與檔案系統狀態後再放棄一次。",
+				autoClose: false,
 			},
 		};
 	}
