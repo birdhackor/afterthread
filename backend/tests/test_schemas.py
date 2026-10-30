@@ -260,17 +260,23 @@ _MADE_ENCODABLE = "/srv/tools-���/kb/.afterthread.meta/draft"
 
 # The response fields that state a path on the backend's own filesystem, as
 # decided by hand, with what else each model needs to be valid.
+_UNUSABLE_DRAFT: dict[str, Any] = {
+    "draft_id": None,
+    "generation": None,
+    "attempts": None,
+    "state": "unusable",
+    "interrupted": False,
+    "base_vid": None,
+    "path": "/srv/tools/kb/.afterthread.meta/draft",
+    "draft_dir": "/srv/tools/kb/.afterthread.meta/draft",
+    "kept": [],
+    "discard_token": "0" * 64,
+    "last": None,
+}
 _BACKEND_PATH_FIELDS: dict[tuple[type[BaseModel], str], dict[str, Any]] = {
-    (ToolDraft, "path"): {
-        "draft_id": None,
-        "generation": None,
-        "attempts": None,
-        "state": "unusable",
-        "interrupted": False,
-        "base_vid": None,
-        "discard_token": "0" * 64,
-        "last": None,
-    },
+    (ToolDraft, "path"): _UNUSABLE_DRAFT,
+    (ToolDraft, "draft_dir"): _UNUSABLE_DRAFT,
+    (ToolDraft, "kept"): _UNUSABLE_DRAFT,
     (ToolDraftDiscardResponse, "residual_path"): {},
     (ToolDeleteResponse, "retained_path"): {
         "outcome": "retained",
@@ -289,6 +295,8 @@ _BACKEND_PATH_FIELDS: dict[tuple[type[BaseModel], str], dict[str, Any]] = {
         "reason": "沒能存成草稿",
     },
 }
+# The listed fields that state a list of paths, each one made encodable.
+_BACKEND_PATH_LISTS = {(ToolDraft, "kept")}
 
 
 def _carries(annotation: Any, check: object) -> bool:
@@ -352,10 +360,13 @@ def test_each_listed_backend_path_field_answers_a_path_that_is_not_utf8_made_enc
     """Built with a path that does not encode as UTF-8, the response holds it made
     encodable and serializes: one such character would fail the encode of the
     whole response."""
-    answer = model.model_validate({**_BACKEND_PATH_FIELDS[(model, field)], field: _NOT_UTF8_PATH})
+    listed = (model, field) in _BACKEND_PATH_LISTS
+    sent = [_NOT_UTF8_PATH] if listed else _NOT_UTF8_PATH
+    expected = [_MADE_ENCODABLE] if listed else _MADE_ENCODABLE
+    answer = model.model_validate({**_BACKEND_PATH_FIELDS[(model, field)], field: sent})
 
-    assert getattr(answer, field) == _MADE_ENCODABLE
-    assert json.loads(answer.model_dump_json())[field] == _MADE_ENCODABLE
+    assert getattr(answer, field) == expected
+    assert json.loads(answer.model_dump_json())[field] == expected
 
 
 def test_tools_and_the_schemas_make_text_encodable_with_one_definition() -> None:
@@ -366,3 +377,45 @@ def test_tools_and_the_schemas_make_text_encodable_with_one_definition() -> None
 
     assert tools._utf8_safe is utf8.encodable
     assert typing.get_args(schemas.BackendPath)[1].func is utf8.encodable
+
+
+def test_the_revise_request_takes_a_draft_id_shaped_as_the_draft_store_mints_it() -> None:
+    """The schema spells the draft id's pattern rather than import the tool
+    subsystem; it is the draft store's own."""
+    from afterthread.services import tool_drafts
+
+    assert schemas._DRAFT_ID_PATTERN == tool_drafts.DRAFT_ID_PATTERN
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{"draft_id": "a" * 32}, {"draft_generation": 1}],
+    ids=["id-alone", "generation-alone"],
+)
+def test_a_revise_request_names_a_draft_by_both_its_id_and_generation_or_neither(
+    fields: dict[str, Any],
+) -> None:
+    with pytest.raises(ValidationError):
+        schemas.ToolReviseRequest.model_validate(
+            {"feedback": "x", "expected_vid": "20260728T010203Z-abcdef", **fields}
+        )
+
+
+def test_a_revise_request_attaches_as_many_runs_as_one_revise_carries() -> None:
+    """The request's cap on ``run_ids`` is the number of records a revise carries
+    and a draft keeps: more would be attached and then dropped unseen."""
+    from afterthread.services import tool_drafts, tool_runs
+
+    assert schemas._REVISE_RUN_IDS_MAX == tool_runs.RUNS_PER_REVISE == tool_drafts._RUNS_KEPT
+
+
+def test_a_revise_request_naming_a_draft_needs_neither_feedback_nor_runs() -> None:
+    """Continuing a draft is something to do on its own; without one, a request
+    with neither feedback nor runs still has nothing to do."""
+    continuing = schemas.ToolReviseRequest.model_validate(
+        {"expected_vid": "20260728T010203Z-abcdef", "draft_id": "a" * 32, "draft_generation": 1}
+    )
+
+    assert (continuing.feedback, continuing.run_ids) == (None, [])
+    with pytest.raises(ValidationError):
+        schemas.ToolReviseRequest.model_validate({"expected_vid": "20260728T010203Z-abcdef"})

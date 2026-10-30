@@ -335,8 +335,8 @@ _REASONED: list[tuple[str, str, str]] = [
     ),
     (
         "_save_round",
-        "except Exception: reason = REASON_SCAN_FAILED.format(reason=type(exc).__name__)",
-        "the known secrets cannot be had: the save keeps no files",
+        "except Exception: return _not_saved(REASON_SCAN_FAILED.format(reason=type(exc).__name__))",
+        "the known secrets cannot be had: nothing is saved and nothing is written",
     ),
     (
         "_save_round",
@@ -425,8 +425,54 @@ _REASONED: list[tuple[str, str, str]] = [
     (
         "sweep_package",
         "shutil.rmtree(draft_dir / name, ignore_errors=True)",
-        "removing an orphan copy seen as a real directory that the trusted manifest does "
-        "not name is best effort",
+        "removing a half-made .incoming copy, seen as a real directory beside a trusted "
+        "manifest, is best effort",
+    ),
+    (
+        "_same_entry",
+        "except OSError: return None",
+        "whether two names are one entry is not known: the name is not brought into the "
+        "workspace, and is recorded as unreadable",
+    ),
+    (
+        "begin_round",
+        "except Exception: return REASON_SCAN_FAILED.format(reason=type(exc).__name__)",
+        "the known secrets cannot be had: the round does not begin",
+    ),
+    (
+        "begin_round",
+        "except Exception: return REASON_UNEXPECTED.format(kind=type(exc).__name__)",
+        "a failure it did not expect: the round does not begin",
+    ),
+    (
+        "end_unstarted",
+        "except Exception: return False",
+        "no write is claimed: running stays, for the next round to record",
+    ),
+    (
+        "record_round",
+        "except Exception: return _not_saved(reason or REASON_MANIFEST)",
+        "nothing is claimed recorded: running stays, for the next round to record",
+    ),
+    (
+        "copy_into_workspace",
+        "except Exception: return REASON_SCAN_FAILED.format(reason=type(exc).__name__)",
+        "the known secrets cannot be had: nothing is copied and the round does not begin",
+    ),
+    (
+        "copy_into_workspace",
+        "except Exception: return REASON_UNEXPECTED.format(kind=type(exc).__name__)",
+        "a failure it did not expect: the round does not begin",
+    ),
+    (
+        "copy_into_workspace.act",
+        "except OSError: return REASON_DRAFT_UNREADABLE",
+        "the draft's files cannot be listed: the round does not begin",
+    ),
+    (
+        "copy_into_workspace.act",
+        "except OSError: return REASON_COPY_IN.format(kind=type(exc).__name__)",
+        "the workspace cannot be made whole: the round does not begin",
     ),
 ]
 

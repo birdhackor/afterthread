@@ -1964,10 +1964,12 @@ def _write_package_file_atomic(
 
     The publisher refuses non-regular existing targets, writes and fsyncs a temp
     file in the destination directory, checks an optional version identity at the
-    last instant, replaces the target, and fsyncs the directory. Its bool contract
-    is shared by state, current, origin, and summary callers and reports whether
-    publication happened; the optional one-item out parameter exists solely so
-    ``publish_current`` can expose confirmed directory durability to discard.
+    last instant, replaces the target, and fsyncs the directory. Its bool reports
+    whether publication happened, for every caller. The optional one-item out
+    parameter also reports whether that directory fsync succeeded -- whether the
+    replaced name is confirmed durable -- for a caller that acts on it, such as
+    ``publish_current`` (for discard) and ``tool_drafts._write_manifest`` (for a
+    draft save, which keeps what it would otherwise remove when it is not).
     """
     path = directory / filename
     # The mode to publish under. There is ALWAYS one now (R11): a fresh file

@@ -575,15 +575,17 @@ A response field that states a backend path takes this type.
 class ToolDraftLast(BaseModel):
     """How the latest round of a draft ended (see ``ToolDraft``).
 
-    ``outcome`` is null for a round saved just before it published.
-    ``operator_action`` and ``summary`` are the model's own notes, masked with the
-    secrets known at the time of this read; ``summary`` is an excerpt. ``omitted``
-    counts the workspace paths that round did not keep.
+    ``outcome`` is null for a round saved just before it published, and
+    ``interrupted`` for a round that was marked running and left no record of
+    its end (recorded by the next round that began), whose ``finished_at`` is
+    then null. ``operator_action`` and ``summary`` are the model's own notes,
+    masked with the secrets known at the time of this read; ``summary`` is an
+    excerpt. ``omitted`` counts the workspace paths that round did not keep.
     """
 
     stopped_by: ToolStoppedBy | None
     failure: ToolRunFailure | None
-    outcome: Literal["published", "not_published", "failed"] | None
+    outcome: Literal["published", "not_published", "failed", "interrupted"] | None
     finished_at: str | None
     operator_action: str | None
     summary: str | None
@@ -604,7 +606,12 @@ class ToolDraft(BaseModel):
 
     ``attempts`` is how many rounds the draft has been through. ``path`` is where
     its files are, for the operator to open or copy (a ``BackendPath``); for an
-    unusable draft, the draft directory itself. ``discard_token`` stands for the
+    unusable draft, the draft directory itself. ``draft_dir`` is the whole draft
+    directory, which a discard removes and which may hold more than the paths
+    listed here. ``kept`` are the previous files directories a continuation left
+    in the draft -- one that changed during its round, or one not confirmed
+    removable -- each a path, as long as it is not seen gone; empty when the
+    manifest cannot be read. ``discard_token`` stands for the
     draft as it is now, whatever its manifest holds. It authorizes a discard only
     when every look it is taken from succeeds or sees nothing there, both when it
     is shown and when the discard looks again under the lock; otherwise it is for
@@ -621,6 +628,8 @@ class ToolDraft(BaseModel):
     interrupted: bool
     base_vid: str | None
     path: BackendPath
+    draft_dir: BackendPath
+    kept: list[BackendPath]
     discard_token: str
     last: ToolDraftLast | None
 
@@ -841,6 +850,13 @@ class ToolInstallRequest(BaseModel):
 _REVISE_RUN_IDS_MAX = 3
 
 
+# A draft's id, as the draft store mints it: 32 lowercase hex digits. The same
+# shape as ``tool_drafts.DRAFT_ID_PATTERN``, spelled here rather than importing the
+# tool subsystem into the schema layer; a test pins the two equal.
+_DRAFT_ID_PATTERN = r"^[0-9a-f]{32}$"
+_DRAFT_PAIR_INCOMPLETE = "draft_id and draft_generation go together: give both or neither"
+
+
 class ToolReviseRequest(BaseModel):
     """Payload for an AI revise job (D40): what the user wants changed.
 
@@ -858,6 +874,12 @@ class ToolReviseRequest(BaseModel):
     bound on the request itself); within it a repeated id is attached once. Each
     id is bounded like every request int bound into SQLite
     (``models.SQLITE_MAX_INT``): past it, the lookup would raise, not miss.
+
+    ``draft_id`` with ``draft_generation`` continues the tool's draft, as the page
+    saw it: both or neither (422 otherwise). Then ``feedback`` is this round's
+    note and ``run_ids`` the records newly attached, both optional -- continuing
+    is something to do on its own -- and ``expected_vid`` is the draft's
+    ``base_vid``.
     """
 
     feedback: str | None = Field(default=None, max_length=_MAX_AI_INPUT_CHARS)
@@ -865,6 +887,8 @@ class ToolReviseRequest(BaseModel):
     run_ids: list[Annotated[int, Field(ge=1, le=SQLITE_MAX_INT)]] = Field(
         default_factory=list, max_length=_REVISE_RUN_IDS_MAX
     )
+    draft_id: str | None = Field(default=None, pattern=_DRAFT_ID_PATTERN)
+    draft_generation: int | None = Field(default=None, ge=1)
 
     @field_validator("feedback")
     @classmethod
@@ -880,7 +904,9 @@ class ToolReviseRequest(BaseModel):
 
     @model_validator(mode="after")
     def _something_to_do(self) -> ToolReviseRequest:
-        if self.feedback is None and not self.run_ids:
+        if (self.draft_id is None) != (self.draft_generation is None):
+            raise ValueError(_DRAFT_PAIR_INCOMPLETE)
+        if self.draft_id is None and self.feedback is None and not self.run_ids:
             raise ValueError("feedback or run_ids is required")
         return self
 

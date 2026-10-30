@@ -33,7 +33,7 @@ response status.
 
 import functools
 from collections.abc import Callable
-from typing import Annotated, Any
+from typing import Annotated, Any, assert_never
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi import Path as PathParam
@@ -166,13 +166,22 @@ _RUN_NOT_FOUND_MESSAGE = "找不到附上的執行紀錄（可能已被清除）
 _RUN_NOT_FOR_TOOL_CODE = "run_not_for_tool"
 _RUN_NOT_FOR_TOOL_MESSAGE = "附上的執行紀錄不屬於這個工具"
 _ENV_POLICY_EXAMPLE = tool_builder._ERROR_REVISE_ENV_UNMASKABLE.replace("{keys}", "「CACHE_TTL」")
-# A revise refused because the tool has an unfinished revision (its draft); the
-# message says what can be done about it.
+# A revise that does not name the tool's unfinished revision (its draft) while it
+# has one; the message, by the draft's state, says what can be done about it.
 _DRAFT_PENDING_CODE = "draft_pending"
 # A discard aimed at a draft other than the one the caller saw: it was written to
 # since, or discarded and another one made.
 _DRAFT_CHANGED_CODE = "draft_changed"
 _DRAFT_CHANGED_MESSAGE = "草稿已經變更，請重新整理後再確認要不要放棄"  # noqa: RUF001
+# A revise continuing a draft that cannot be continued as named
+# (``tool_drafts.judge_continuation``).
+_DRAFT_GONE_CODE = "draft_gone"
+_DRAFT_GONE_MESSAGE = "草稿已經不在，或已換成另一份，請重新整理後再試"  # noqa: RUF001
+_DRAFT_CHANGED_REVISE_MESSAGE = "草稿在畫面讀到之後已經變更，請重新整理後再接續"  # noqa: RUF001
+_DRAFT_UNUSABLE_CODE = "draft_unusable"
+_DRAFT_UNUSABLE_MESSAGE = "草稿無法使用（看不到、說明檔讀不出，或檔案目錄不在），只能放棄"  # noqa: RUF001
+_DRAFT_PUBLISHING_CODE = "draft_publishing"
+_DRAFT_PUBLISHING_MESSAGE = "草稿正在發布、已發布或結果未知，不能接續"  # noqa: RUF001
 _DRAFT_NOT_FOUND_CODE = "draft_not_found"
 _DRAFT_NOT_FOUND_MESSAGE = "這個工具沒有未完成的修正"
 # A discard after which ``draft/`` is not seen gone: the draft may still be there,
@@ -237,8 +246,28 @@ _REVISE_CONFLICT_RESPONSE = _conflict_response(
     ),
     (
         _DRAFT_PENDING_CODE,
-        tool_builder._DRAFT_PENDING_MESSAGE,
-        "The tool has an unfinished revision (a draft) to deal with first",
+        tool_builder._DRAFT_PENDING_OPEN,
+        "The tool has an unfinished revision (a draft): continue it or discard it",
+    ),
+    (
+        _DRAFT_GONE_CODE,
+        _DRAFT_GONE_MESSAGE,
+        "The draft named is gone, or another one took its place",
+    ),
+    (
+        _DRAFT_CHANGED_CODE,
+        _DRAFT_CHANGED_REVISE_MESSAGE,
+        "The draft named was written to after the caller read it",
+    ),
+    (
+        _DRAFT_UNUSABLE_CODE,
+        _DRAFT_UNUSABLE_MESSAGE,
+        "The draft cannot be looked at, its manifest cannot be read, or its files are missing",
+    ),
+    (
+        _DRAFT_PUBLISHING_CODE,
+        _DRAFT_PUBLISHING_MESSAGE,
+        "The draft is being published from, was published, or that is not known",
     ),
 )
 _DRAFT_DISCARD_CONFLICT_RESPONSE = _conflict_response(
@@ -932,60 +961,93 @@ async def revise_tool(
     then reserves the global slot, then resolves the package and compares the
     required ``expected_vid``.  An env-policy refusal returns ``env_policy`` with
     the gate's own message (it names the keys to move), missing/aliased packages
-    return 404, a stale version returns ``version_mismatch``, an occupied slot
-    returns ``job_busy``, and a tool with a draft returns ``draft_pending``.  Only
-    a matching version is converted into a queued job, so a refused submit has
-    neither an LLM charge nor even a pollable job id.
+    return 404, a stale version returns ``version_mismatch``, and an occupied slot
+    returns ``job_busy``.  Then the draft: without ``draft_id`` and
+    ``draft_generation`` a tool with a draft returns ``draft_pending``, its
+    message by the draft's state; with them the revise continues that draft, and
+    ``draft_gone``, ``draft_unusable``, ``draft_changed``, ``draft_publishing`` or
+    ``version_mismatch`` (the draft's base is not ``current``) say why it cannot.
+    Only then is the reservation converted into a queued job, so a refused submit
+    has neither an LLM charge nor even a pollable job id.
 
     Attached ``run_ids`` (web-v6 §8.3) are checked and copied FIRST, before any
     of that: an id that does not exist (or was purged) is a 404
     ``run_not_found``, one that belongs to another tool a 422 ``run_not_for_tool``
     -- no job, no slot, no LLM call (invariant M). The copy rides with the job,
-    so a purge after the submit does not change what the builder is shown.
+    so a purge after the submit does not change what the builder is shown. A
+    continuation also reads the draft once, before the slot, for the records
+    its manifest keeps, and reads those again leniently -- one since purged is
+    its summary alone -- the newly attached first, each once, at most three
+    (``tool_runs.merged_for_revise``). Whether that read was of the draft the
+    judgment after the slot sees is part of the judgment.
     """
-    runs: tuple[tool_runs.AttachedRun, ...] = ()
+    attached: tuple[tool_runs.AttachedRun, ...] = ()
     if payload.run_ids:
-        attached = await run_in_threadpool(
+        strict = await run_in_threadpool(
             tool_runs.attach_for_revise, session, name, payload.run_ids
         )
-        if attached.refusal == "run_not_found":
+        if strict.refusal == "run_not_found":
             raise HTTPException(
                 status_code=404,
                 detail={"code": _RUN_NOT_FOUND_CODE, "message": _RUN_NOT_FOUND_MESSAGE},
             )
-        if attached.refusal == "run_not_for_tool":
+        if strict.refusal == "run_not_for_tool":
             raise HTTPException(
                 status_code=422,
                 detail={"code": _RUN_NOT_FOR_TOOL_CODE, "message": _RUN_NOT_FOR_TOOL_MESSAGE},
             )
-        runs = attached.runs
+        attached = strict.runs
+    runs = attached
+    draft: tool_builder.DraftRequest | None = None
+    if payload.draft_id is not None and payload.draft_generation is not None:
+        package_root = await run_in_threadpool(tools_service._resolve_package_dir_no_alias, name)
+        first = (
+            await run_in_threadpool(tool_drafts.first_read, package_root)
+            if package_root is not None
+            else None
+        )
+        if first is not None:
+            reread = await run_in_threadpool(tool_runs.reread_for_revise, session, name, first.runs)
+            runs = tool_runs.merged_for_revise(attached, reread)
+        draft = tool_builder.DraftRequest(
+            draft_id=payload.draft_id,
+            generation=payload.draft_generation,
+            first_seen=None if first is None else (first.draft_id, first.generation),
+            attached=attached,
+        )
     started = await tool_builder.start_revise_job(
-        name, payload.feedback, payload.expected_vid, runs=runs
+        name, payload.feedback, payload.expected_vid, runs=runs, draft=draft
     )
-    if started.refusal == "env_policy":
-        raise HTTPException(
-            status_code=409,
-            detail={"code": _ENV_POLICY_CODE, "message": started.message},
-        )
-    if started.refusal == "draft_pending":
-        raise HTTPException(
-            status_code=409,
-            detail={"code": _DRAFT_PENDING_CODE, "message": started.message},
-        )
-    if started.refusal == "not_found":
-        raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
-    if started.refusal == "version_mismatch":
-        raise HTTPException(
-            status_code=409,
-            detail={"code": _VERSION_MISMATCH_CODE, "message": _VERSION_MISMATCH_MESSAGE},
-        )
-    if started.refusal == "job_busy":
-        raise HTTPException(
-            status_code=409,
-            detail={"code": _JOB_BUSY_CODE, "message": _JOB_BUSY_MESSAGE},
-        )
-    assert started.job_id is not None
-    return ToolInstallAccepted(job_id=started.job_id)
+    match started.refusal:
+        case None:
+            assert started.job_id is not None
+            return ToolInstallAccepted(job_id=started.job_id)
+        case "env_policy" | "draft_pending":
+            code = _ENV_POLICY_CODE if started.refusal == "env_policy" else _DRAFT_PENDING_CODE
+            raise HTTPException(status_code=409, detail={"code": code, "message": started.message})
+        case "not_found":
+            raise HTTPException(status_code=404, detail=_TOOL_NOT_FOUND)
+        case "version_mismatch":
+            raise _conflict(_VERSION_MISMATCH_CODE, _VERSION_MISMATCH_MESSAGE)
+        case "job_busy":
+            raise _conflict(_JOB_BUSY_CODE, _JOB_BUSY_MESSAGE)
+        case "draft_gone":
+            raise _conflict(_DRAFT_GONE_CODE, _DRAFT_GONE_MESSAGE)
+        case "draft_changed":
+            raise _conflict(_DRAFT_CHANGED_CODE, _DRAFT_CHANGED_REVISE_MESSAGE)
+        case "draft_unusable":
+            raise _conflict(_DRAFT_UNUSABLE_CODE, _DRAFT_UNUSABLE_MESSAGE)
+        case "draft_publishing":
+            raise _conflict(_DRAFT_PUBLISHING_CODE, _DRAFT_PUBLISHING_MESSAGE)
+        case unanswered:
+            # Unreachable while every refusal above is answered: a refusal added to
+            # ``ReviseRefusal`` without a case makes this a type error.
+            assert_never(unanswered)
+
+
+def _conflict(code: str, message: str) -> HTTPException:
+    """A 409 with the machine-distinct ``{code, message}`` detail."""
+    return HTTPException(status_code=409, detail={"code": code, "message": message})
 
 
 _CHECK_UNAVAILABLE_CODE = "check_unavailable"

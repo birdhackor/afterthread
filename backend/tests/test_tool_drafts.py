@@ -26,6 +26,8 @@ from afterthread.services import tool_builder, tool_drafts, tools
 
 _VID = "20260728T010203Z-abcdef"
 _OTHER_VID = "20260729T010203Z-123456"
+# The job a continuing round runs in, as ``begin_round`` marks it.
+_JOB = "a" * 32
 # Registered through the package's own .env, as a revise's values are.
 _SECRET = "kb-live-secret-0123456789"
 
@@ -166,7 +168,12 @@ def _save(
         earlier_root=earlier_root,
         copied_in=copied_in,
         draft_round=draft_round
-        or tool_drafts.DraftRound(finished_at=_now(), outcome="not_published", summary="改到一半"),
+        or tool_drafts.DraftRound(
+            finished_at=_now(),
+            outcome="not_published",
+            summary="改到一半",
+            job_id=None if previous is None else _JOB,
+        ),
         start=None
         if previous is not None
         else tool_drafts.DraftStart(base_vid=_VID, feedback="加上分頁"),
@@ -208,17 +215,49 @@ def _first_draft(tmp_path: Path, package_root: tools.PackageRoot) -> Path:
     return _first_save(tmp_path, package_root)[0]
 
 
+def _begin(package_root: tools.PackageRoot, *, job_id: str | None = _JOB) -> dict[str, Any] | str:
+    """``begin_round`` on the draft as it is now, in the package as it is now."""
+    return tool_drafts.begin_round(
+        package_root,
+        tool_drafts.directory_identity(package_root.path),
+        _identity(package_root),
+        job_id,
+        _now(),
+    )
+
+
+def _copy_in(
+    package_root: tools.PackageRoot,
+    begun: dict[str, Any],
+    workspace: Path,
+    *,
+    job_id: str | None = _JOB,
+    max_files: int = 2000,
+    max_bytes: int = 50_000_000,
+) -> tool_drafts.CopiedIn | str:
+    """``copy_into_workspace`` for the round ``begun`` marked."""
+    return tool_drafts.copy_into_workspace(
+        package_root=package_root,
+        package_dir_identity=tool_drafts.directory_identity(package_root.path),
+        expected=(begun["draft_id"], begun["generation"]),
+        job_id=job_id,
+        workspace=workspace,
+        max_files=max_files,
+        max_bytes=max_bytes,
+    )
+
+
 def _continuing(
     tmp_path: Path, package_root: tools.PackageRoot
 ) -> tuple[Path, tool_drafts.PreviousDraft, tool_drafts.TreeDigest | None]:
-    """A continuing round's start: a workspace copied from the draft's files."""
-    manifest = _manifest(package_root)
-    files = _draft_dir(package_root) / manifest["files_dir"]
-    previous = tool_drafts.PreviousDraft(
-        manifest=manifest, copied_out=tool_drafts.tree_digest(files)
-    )
+    """A continuing round's start, as the job makes it: the draft marked running,
+    its files copied into a new workspace, the workspace's digest taken."""
+    begun = _begin(package_root)
+    assert isinstance(begun, dict), begun
     workspace = tmp_path / "work2" / "build"
-    shutil.copytree(files, workspace, symlinks=True)
+    copied = _copy_in(package_root, begun, workspace)
+    assert isinstance(copied, tool_drafts.CopiedIn), copied
+    previous = tool_drafts.PreviousDraft(manifest=begun, copied_out=copied.copied_out)
     return workspace, previous, tool_drafts.tree_digest(workspace)
 
 
@@ -1769,11 +1808,15 @@ def test_a_continuing_round_replaces_the_files_and_removes_the_previous_copy(
     second = _manifest(package_root)
     assert (second["draft_id"], second["generation"], second["attempt_count"]) == (
         first["draft_id"],
-        first["generation"] + 1,
+        previous.manifest["generation"] + 1,
         2,
     )
     assert [attempt["number"] for attempt in second["attempts"]] == [1, 2]
+    # Named in the same write that commits the new copy, then removed: the name
+    # goes once a later write sees it gone, and the list shows none meanwhile.
+    assert (second["kept"], second["running"]) == ([first["files_dir"]], None)
     assert not (_draft_dir(package_root) / first["files_dir"]).exists()
+    assert (result.reason, result.recorded, result.durable) == (None, True, True)
     assert (_files(package_root) / "run.py").read_text(
         encoding="utf-8"
     ) == "print('second round')\n"
@@ -1820,7 +1863,9 @@ def test_the_previous_copy_stays_when_the_new_manifest_is_not_confirmed_on_disk(
 
     assert _save(package_root, workspace, copied_in, previous=previous).saved
 
-    assert _manifest(package_root)["generation"] == first["generation"] + 1
+    second = _manifest(package_root)
+    assert second["generation"] == previous.manifest["generation"] + 1
+    assert second["kept"] == [first["files_dir"]]
     assert (_draft_dir(package_root) / first["files_dir"]).is_dir()
 
 
@@ -1892,7 +1937,8 @@ def test_a_failed_continuing_save_still_records_the_round(
     assert (result.saved, result.reason) == (False, tool_drafts.REASON_TOO_MANY_FILES)
     second = _manifest(package_root)
     assert second["files_dir"] == first["files_dir"]
-    assert second["generation"] == first["generation"] + 1
+    assert second["generation"] == previous.manifest["generation"] + 1
+    assert second["running"] is None
     assert (second["attempts"][-1]["saved"], second["attempts"][-1]["reason"]) == (
         False,
         tool_drafts.REASON_TOO_MANY_FILES,
@@ -2275,8 +2321,8 @@ def test_a_discard_whose_tools_directory_is_seen_not_to_be_there_answers_there_i
 def test_a_draft_with_a_manifest_keeps_its_token_while_the_sweep_takes_its_leftovers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The sweep collects a copy the manifest does not name and a half-made one;
-    the draft the operator saw has not changed, and its token still matches."""
+    """The sweep collects a half-made copy and leaves a copy the manifest does not
+    name; the draft the operator saw has not changed, and its token still matches."""
     package_root = _package(monkeypatch, tmp_path)
     _first_draft(tmp_path, package_root)
     draft = _draft_dir(package_root)
@@ -2287,7 +2333,7 @@ def test_a_draft_with_a_manifest_keeps_its_token_while_the_sweep_takes_its_lefto
     _sweep(package_root)
 
     assert sorted(p.name for p in draft.iterdir()) == sorted(
-        [tool_drafts.MANIFEST_FILENAME, _manifest(package_root)["files_dir"]]
+        [tool_drafts.MANIFEST_FILENAME, _manifest(package_root)["files_dir"], "files-" + "e" * 32]
     )
     assert tool_drafts.discard_token(draft) == token
 
@@ -2510,9 +2556,12 @@ def _plant(directory: Path, name: str) -> Path:
     return path
 
 
-def test_the_sweep_takes_only_unnamed_copies_half_made_ones_and_discard_leftovers(
+def test_the_sweep_takes_only_half_made_copies_and_discard_leftovers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """A half-made ``.incoming-<hex>`` and what a discard left are taken; a
+    ``files-<hex>`` the manifest does not name stays -- not being named is no proof
+    it may go -- and so do names this module never makes and a link."""
     package_root = _package(monkeypatch, tmp_path)
     _first_draft(tmp_path, package_root)
     draft = _draft_dir(package_root)
@@ -2527,8 +2576,8 @@ def test_the_sweep_takes_only_unnamed_copies_half_made_ones_and_discard_leftover
 
     _sweep(package_root)
 
-    assert not unnamed.exists() and not half_made.exists() and not leftover.exists()
-    assert _files(package_root).is_dir()
+    assert not half_made.exists() and not leftover.exists()
+    assert unnamed.is_dir() and _files(package_root).is_dir()
     assert unknown.is_dir() and not_ours.is_dir()
     assert os.path.islink(linked)
 
@@ -2618,9 +2667,6 @@ def test_through_a_link_no_draft_is_listed_counted_saved_marked_taken_away_or_sw
     else:
         os.symlink(package_b.path, linked)
     package_a = tools.PackageRoot(linked)
-    seen = _identity(package_b)
-    token = tool_drafts.discard_token(_draft_dir(package_b))
-    before = tool_drafts.tree_digest(_draft_dir(package_b))
     identity_a = tool_drafts.directory_identity(linked)
     first_workspace = tmp_path / "work-a" / "build"
     shutil.copytree(
@@ -2632,8 +2678,12 @@ def test_through_a_link_no_draft_is_listed_counted_saved_marked_taken_away_or_sw
     )
     first_in = tool_drafts.tree_digest(first_workspace)
     (first_workspace / "run.py").write_text("print('through a link')\n", encoding="utf-8")
+    # B's own round, begun on B's draft: what is compared below is B's draft from here.
     continuing, previous, continuing_in = _continuing(tmp_path, package_b)
     (continuing / "run.py").write_text("print('through a link')\n", encoding="utf-8")
+    seen = _identity(package_b)
+    token = tool_drafts.discard_token(_draft_dir(package_b))
+    before = tool_drafts.tree_digest(_draft_dir(package_b))
 
     assert _view(package_a) is None
     assert not tool_drafts.has_draft(package_a)
@@ -2702,3 +2752,591 @@ def test_a_discard_that_cannot_see_whether_the_metadata_directory_is_a_link_leav
     assert outcome == tool_drafts.Removal(removed=False, residual_path=_draft_dir(package_a))
     assert tool_drafts.same_tree(before, tool_drafts.tree_digest(_draft_dir(package_b)))
     assert _identity(package_b) == seen
+
+
+# --- continuing a draft: its mark, its copy into a workspace, the previous files ---
+
+
+def _first_round_with(
+    tmp_path: Path, package_root: tools.PackageRoot, change: Callable[[Path], None]
+) -> None:
+    """Save one first round whose workspace ``change`` made what it is."""
+    workspace = _workspace(tmp_path, package_root)
+    copied_in = tool_drafts.tree_digest(workspace)
+    change(workspace)
+    assert _save(package_root, workspace, copied_in).saved
+
+
+def _kept_note(old: Path, why: str) -> str:
+    return tool_drafts.NOTE_PREVIOUS_KEPT.format(path=old, why=why)
+
+
+def test_a_continuation_keeps_modes_and_its_previous_files_go_once_all_three_are_seen(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The manifest naming the new copy is on disk, the workspace received the
+    previous copy whole -- an executable kept executable, so the two digests
+    agree -- and nobody changed it during the round: it is removed. Its name stays
+    in ``kept`` until a later write sees it gone, and the list shows none."""
+    package_root = _package(monkeypatch, tmp_path)
+
+    def change(workspace: Path) -> None:
+        (workspace / "run.py").write_text("print('first round')\n", encoding="utf-8")
+        script = workspace / "run.sh"
+        script.write_text("#!/bin/sh\nexec python3 run.py\n", encoding="utf-8")
+        script.chmod(0o755)
+
+    _first_round_with(tmp_path, package_root, change)
+    old = _files(package_root)
+    workspace, previous, copied_in = _continuing(tmp_path, package_root)
+    assert stat.S_IMODE((workspace / "run.sh").stat().st_mode) == 0o755
+    (workspace / "run.py").write_text("print('second round')\n", encoding="utf-8")
+
+    result = _save(package_root, workspace, copied_in, previous=previous)
+
+    assert (result.saved, result.reason, result.durable) == (True, None, True)
+    assert not old.exists()
+    assert _manifest(package_root)["kept"] == [old.name]
+    view = _view(package_root)
+    assert view is not None and view["kept"] == []
+    assert stat.S_IMODE((_files(package_root) / "run.sh").stat().st_mode) == 0o755
+
+
+def test_the_previous_files_stay_when_the_manifest_naming_the_new_ones_is_not_on_disk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Received whole and unchanged, but the fsync after the manifest's replace
+    failed: a crash could bring back the manifest naming the previous copy. It
+    stays, named in ``kept``, and the save -- still saved -- says where and why."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    old = _files(package_root)
+    workspace, previous, copied_in = _continuing(tmp_path, package_root)
+    assert tool_drafts.same_tree(previous.copied_out, copied_in)
+    (workspace / "run.py").write_text("print('second round')\n", encoding="utf-8")
+    real_write = tools._write_package_file_atomic
+
+    def not_durable(
+        directory: Path, filename: str, data: bytes, expected: Any, **kwargs: Any
+    ) -> bool:
+        out = kwargs.pop("durability_out", None)
+        published = real_write(directory, filename, data, expected, **kwargs)
+        if out is not None:
+            out.append(False)
+        return published
+
+    monkeypatch.setattr(tools, "_write_package_file_atomic", not_durable)
+
+    result = _save(package_root, workspace, copied_in, previous=previous)
+
+    assert (result.saved, result.recorded, result.durable) == (True, True, False)
+    assert result.reason == _kept_note(old, tool_drafts.KEPT_NOT_DURABLE)
+    assert old.is_dir()
+    assert _manifest(package_root)["kept"] == [old.name]
+
+
+def test_the_previous_files_stay_when_the_workspace_did_not_receive_all_of_them(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The operator put a ``.env`` into the draft's files; it is not brought into
+    the workspace, so what the round began with is not the previous copy. That copy
+    is unchanged and the manifest is on disk, and it still stays -- with the
+    ``.env`` in it."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    old = _files(package_root)
+    (old / ".env").write_text("HAND_PLACED=value-of-the-operator\n", encoding="utf-8")
+    workspace, previous, copied_in = _continuing(tmp_path, package_root)
+    assert not (workspace / ".env").exists()
+    (workspace / "run.py").write_text("print('second round')\n", encoding="utf-8")
+
+    result = _save(package_root, workspace, copied_in, previous=previous)
+
+    assert (result.saved, result.durable) == (True, True)
+    assert result.reason == _kept_note(old, tool_drafts.KEPT_NOT_ALL_BROUGHT_IN)
+    assert (old / ".env").read_text(encoding="utf-8") == "HAND_PLACED=value-of-the-operator\n"
+    assert _manifest(package_root)["kept"] == [old.name]
+
+
+@pytest.mark.parametrize("afterwards", ["swapped-back", "left-changed"])
+def test_a_draft_file_changed_while_it_is_copied_in_keeps_the_previous_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, afterwards: str
+) -> None:
+    """A draft file changes after ``copied_out`` is taken and before it is copied,
+    so the workspace receives the changed bytes. Swapped back once copied, the
+    previous copy is as it was at the start and only the comparison of what was
+    copied out with what came in shows the difference; left changed, the
+    workspace and the previous copy agree with each other but not with what the
+    round began on. Either way the previous copy stays."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    old = _files(package_root)
+    original = (old / "run.py").read_bytes()
+    begun = _begin(package_root)
+    assert isinstance(begun, dict)
+    real_carry_out = tool_drafts._carry_out
+
+    def swapping(plan: Any, incoming: Path, known: list[str]) -> Any:
+        (old / "run.py").write_bytes(b"print('swapped in')\n")
+        try:
+            return real_carry_out(plan, incoming, known)
+        finally:
+            if afterwards == "swapped-back":
+                (old / "run.py").write_bytes(original)
+
+    monkeypatch.setattr(tool_drafts, "_carry_out", swapping)
+    workspace = tmp_path / "work2" / "build"
+    copied = _copy_in(package_root, begun, workspace)
+    monkeypatch.setattr(tool_drafts, "_carry_out", real_carry_out)
+    assert isinstance(copied, tool_drafts.CopiedIn)
+    copied_in = tool_drafts.tree_digest(workspace)
+    assert (workspace / "run.py").read_bytes() == b"print('swapped in')\n"
+    (workspace / "more.py").write_text("print('more')\n", encoding="utf-8")
+
+    result = _save(
+        package_root,
+        workspace,
+        copied_in,
+        previous=tool_drafts.PreviousDraft(manifest=begun, copied_out=copied.copied_out),
+    )
+
+    assert (result.saved, result.durable) == (True, True)
+    assert result.reason == _kept_note(old, tool_drafts.KEPT_NOT_ALL_BROUGHT_IN)
+    assert old.is_dir()
+    assert _manifest(package_root)["kept"] == [old.name]
+
+
+def test_the_previous_files_changed_during_the_round_stay_and_are_listed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Received whole, the manifest on disk, but the operator edited the previous
+    copy while the round ran: it stays, the save says so, and the list shows it."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    old = _files(package_root)
+    workspace, previous, copied_in = _continuing(tmp_path, package_root)
+    assert tool_drafts.same_tree(previous.copied_out, copied_in)
+    (workspace / "run.py").write_text("print('second round')\n", encoding="utf-8")
+    (old / "run.py").write_text("print('edited by hand')\n", encoding="utf-8")
+
+    result = _save(package_root, workspace, copied_in, previous=previous)
+
+    assert (result.saved, result.durable) == (True, True)
+    assert result.reason == _kept_note(old, tool_drafts.KEPT_CHANGED)
+    assert (old / "run.py").read_text(encoding="utf-8") == "print('edited by hand')\n"
+    view = _view(package_root)
+    assert view is not None and view["kept"] == [str(old)]
+
+
+def test_a_round_that_saves_no_new_files_leaves_the_files_and_the_kept_copies_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A draft whose earlier continuation left a copy in ``kept``. A round that
+    changed nothing records itself only, and a round whose save fails records its
+    failure: neither touches the files directory or what ``kept`` holds."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    old = _files(package_root)
+    workspace, previous, copied_in = _continuing(tmp_path, package_root)
+    (workspace / "run.py").write_text("print('second round')\n", encoding="utf-8")
+    (old / "by_hand.txt").write_text("mine\n", encoding="utf-8")
+    assert _save(package_root, workspace, copied_in, previous=previous).saved
+    files = _files(package_root)
+    before = (tool_drafts.tree_digest(old), tool_drafts.tree_digest(files))
+
+    for limit in (2000, 1):
+        workspace, previous, copied_in = _continuing(tmp_path / f"limit-{limit}", package_root)
+        result = _save(package_root, workspace, copied_in, previous=previous, max_files=limit)
+        manifest = _manifest(package_root)
+        assert result.saved is (limit == 2000)
+        assert result.recorded is True
+        assert (manifest["files_dir"], manifest["kept"]) == (files.name, [old.name])
+        assert tool_drafts.same_tree(before[0], tool_drafts.tree_digest(old))
+        assert tool_drafts.same_tree(before[1], tool_drafts.tree_digest(files))
+
+
+def test_kept_names_go_only_once_seen_gone(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """``kept`` names one copy removed by hand and one whose look fails. A round
+    beginning drops the first and keeps the second -- a failed look says nothing
+    about it -- the list shows the second, and the save that commits new files
+    keeps it too, adding the previous copy."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    draft = _draft_dir(package_root)
+    gone = "files-" + "1" * 32
+    unseen = _plant(draft, "files-" + "2" * 32)
+    _rewrite(package_root, kept=[gone, unseen.name])
+    # Every look at it fails, as under a directory that denies search.
+    failed = _refuse(monkeypatch, "lstat", lambda path: path == os.fspath(unseen), errno.EACCES)
+    _refuse(monkeypatch, "stat", lambda path: path == os.fspath(unseen), errno.EACCES)
+
+    begun = _begin(package_root)
+
+    assert isinstance(begun, dict)
+    assert begun["kept"] == [unseen.name]
+    assert _manifest(package_root)["kept"] == [unseen.name]
+    view = _view(package_root)
+    assert view is not None and view["kept"] == [str(unseen)]
+    assert failed
+    old = _files(package_root)
+    workspace = tmp_path / "work2" / "build"
+    copied = _copy_in(package_root, begun, workspace)
+    assert isinstance(copied, tool_drafts.CopiedIn)
+    copied_in = tool_drafts.tree_digest(workspace)
+    (workspace / "run.py").write_text("print('second round')\n", encoding="utf-8")
+    previous = tool_drafts.PreviousDraft(manifest=begun, copied_out=copied.copied_out)
+    assert _save(package_root, workspace, copied_in, previous=previous).saved
+    assert _manifest(package_root)["kept"] == [unseen.name, old.name]
+    assert _files(package_root) != old
+
+
+@pytest.mark.parametrize("one_seen_gone", [False, True])
+def test_a_round_does_not_begin_while_kept_is_full(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, one_seen_gone: bool
+) -> None:
+    """``kept`` at its limit, every copy there: the round does not begin and the
+    manifest is as it was. With one of them removed by hand, the name seen gone is
+    dropped first, and the round begins."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    draft = _draft_dir(package_root)
+    names = [f"files-{index:032x}" for index in range(1, tool_drafts._KEPT_MAX + 1)]
+    for name in names:
+        (draft / name).mkdir()
+    _rewrite(package_root, kept=names)
+    if one_seen_gone:
+        (draft / names[0]).rmdir()
+    before = _manifest(package_root)
+
+    begun = _begin(package_root)
+
+    if one_seen_gone:
+        assert isinstance(begun, dict)
+        assert begun["kept"] == names[1:]
+    else:
+        assert begun == tool_drafts.START_KEPT_FULL.format(max=tool_drafts._KEPT_MAX)
+        assert _manifest(package_root) == before
+
+
+def test_the_save_takes_the_generation_its_round_began_with(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``begin_round`` returns the manifest as it wrote it -- one generation on,
+    marked as this job's -- and the save matched against it goes through. The
+    manifest as judged before the mark is no longer the draft: a save matched
+    against it writes nothing."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    judged = _manifest(package_root)
+    workspace, previous, copied_in = _continuing(tmp_path, package_root)
+    (workspace / "run.py").write_text("print('second round')\n", encoding="utf-8")
+
+    assert previous.manifest == _manifest(package_root)
+    assert previous.manifest["generation"] == judged["generation"] + 1
+    assert previous.manifest["running"]["job_id"] == _JOB
+    stale = _save(
+        package_root,
+        workspace,
+        copied_in,
+        previous=tool_drafts.PreviousDraft(manifest=judged, copied_out=previous.copied_out),
+    )
+    assert (stale.saved, stale.recorded, stale.reason) == (
+        False,
+        False,
+        tool_drafts.REASON_DRAFT_CHANGED,
+    )
+    assert _manifest(package_root) == previous.manifest
+    assert _save(package_root, workspace, copied_in, previous=previous).saved
+
+
+def test_a_mark_another_job_set_is_neither_cleared_nor_written_over(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The draft is marked as another job's round: taking the mark back, recording
+    a round and saving one, each as this job, write nothing."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    workspace, previous, copied_in = _continuing(tmp_path, package_root)
+    (workspace / "run.py").write_text("print('second round')\n", encoding="utf-8")
+    marked = _manifest(package_root)
+    expected = (marked["draft_id"], marked["generation"])
+    identity = tool_drafts.directory_identity(package_root.path)
+    other = "b" * 32
+    other_round = tool_drafts.DraftRound(finished_at=_now(), outcome="failed", job_id=other)
+
+    assert tool_drafts.end_unstarted(package_root, identity, expected, other) is False
+    recorded = tool_drafts.record_round(package_root, identity, expected, other_round, "失敗")
+    saved = _save(package_root, workspace, copied_in, previous=previous, draft_round=other_round)
+
+    assert (recorded.recorded, saved.recorded, saved.reason) == (
+        False,
+        False,
+        tool_drafts.REASON_DRAFT_CHANGED,
+    )
+    assert _manifest(package_root) == marked
+
+
+def test_a_round_that_left_its_mark_is_recorded_interrupted_by_the_next_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A round marked running left no record of its end. The next round to begin
+    records it first: its job and start from the mark, ``interrupted``, no end
+    time. The manifest reads back, and the list and its schema show it so."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    left = _begin(package_root, job_id="c" * 32)
+    assert isinstance(left, dict)
+
+    begun = _begin(package_root)
+
+    assert isinstance(begun, dict)
+    entry = begun["attempts"][-1]
+    assert (entry["number"], entry["job_id"], entry["started_at"]) == (
+        2,
+        "c" * 32,
+        left["running"]["started_at"],
+    )
+    assert (entry["outcome"], entry["finished_at"], entry["saved"]) == ("interrupted", None, False)
+    assert begun["attempt_count"] == 2
+    assert begun["running"]["job_id"] == _JOB
+    assert _manifest(package_root) == begun
+    view = _view(package_root)
+    assert view is not None
+    assert (view["last"]["outcome"], view["last"]["finished_at"]) == ("interrupted", None)
+    ToolDraft.model_validate(view)
+
+
+def test_a_manifest_written_before_continuations_reads_back_and_can_be_continued(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A round recorded with no list of paths it was not brought -- as every
+    manifest written before continuations is -- reads back with an empty one, is
+    listed, and a round can begin on it."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    manifest = _manifest(package_root)
+    written = _document(
+        draft_id=manifest["draft_id"], files_dir=manifest["files_dir"], generation=4
+    )
+    assert "not_brought_in" not in written["attempts"][0]
+    (_draft_dir(package_root) / tool_drafts.MANIFEST_FILENAME).write_text(
+        json.dumps(written), encoding="utf-8"
+    )
+
+    read = _manifest(package_root)
+
+    attempt = read["attempts"][0]
+    assert (attempt["not_brought_in"], attempt["not_brought_in_count"]) == ([], 0)
+    view = _view(package_root)
+    assert view is not None and view["state"] == "open"
+    ToolDraft.model_validate(view)
+    assert isinstance(_begin(package_root), dict)
+
+
+def test_the_workspace_a_continuation_receives_is_the_draft_as_it_is(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The base has ``old.py``; the first round deleted it and changed ``run.py``;
+    the operator then edited ``run.py`` and added a file in the draft. The new
+    workspace has exactly that: ``old.py`` does not come back from the base, the
+    edit is not undone, the added file is there, and nothing is reported left
+    out."""
+    package_root = _package(monkeypatch, tmp_path)
+    (_version(package_root) / "old.py").write_text("print('old')\n", encoding="utf-8")
+
+    def change(workspace: Path) -> None:
+        (workspace / "old.py").unlink()
+        (workspace / "run.py").write_text("print('first round')\n", encoding="utf-8")
+
+    _first_round_with(tmp_path, package_root, change)
+    files = _files(package_root)
+    (files / "run.py").write_text("print('edited by hand')\n", encoding="utf-8")
+    (files / "notes").mkdir()
+    (files / "notes" / "mine.txt").write_text("the operator's\n", encoding="utf-8")
+    begun = _begin(package_root)
+    assert isinstance(begun, dict)
+    workspace = tmp_path / "work2" / "build"
+
+    copied = _copy_in(package_root, begun, workspace)
+
+    assert isinstance(copied, tool_drafts.CopiedIn)
+    assert copied.not_brought_in == ()
+    assert sorted(
+        os.path.relpath(os.path.join(directory, name), workspace)
+        for directory, dirnames, filenames in os.walk(workspace)
+        for name in dirnames + filenames
+    ) == ["notes", "notes/mine.txt", "run.py", "tool.json"]
+    assert (workspace / "run.py").read_text(encoding="utf-8") == "print('edited by hand')\n"
+    assert tool_drafts.same_tree(copied.copied_out, tool_drafts.tree_digest(workspace))
+
+
+def test_a_link_into_the_draft_is_brought_in_relative_and_one_out_of_it_is_not(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An absolute link to a file of the draft's own copy is brought in rewritten
+    as relative, resolving to the workspace's file; an absolute link to a file
+    outside the draft is not brought in, and is recorded as such."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    files = _files(package_root)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("not the draft's\n", encoding="utf-8")
+    os.symlink(files / "run.py", files / "inside.py")
+    os.symlink(outside, files / "out.txt")
+    begun = _begin(package_root)
+    assert isinstance(begun, dict)
+    workspace = tmp_path / "work2" / "build"
+
+    copied = _copy_in(package_root, begun, workspace)
+
+    assert isinstance(copied, tool_drafts.CopiedIn)
+    assert os.readlink(workspace / "inside.py") == "run.py"
+    assert (workspace / "inside.py").resolve() == (workspace / "run.py").resolve()
+    assert not os.path.lexists(workspace / "out.txt")
+    assert copied.not_brought_in == (tool_drafts.Omitted("out.txt", "link_outside"),)
+
+
+def test_a_draft_s_env_and_metadata_are_not_brought_in(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``.env`` and ``.afterthread.meta/`` at the top of the draft's files are not
+    brought in, and are recorded; a ``.env`` deeper down is content like any file."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    files = _files(package_root)
+    (files / ".env").write_text("HAND=placed-by-the-operator\n", encoding="utf-8")
+    (files / tools._META_DIRNAME).mkdir()
+    (files / tools._META_DIRNAME / "origin.json").write_text("{}", encoding="utf-8")
+    (files / "sub").mkdir()
+    (files / "sub" / ".env").write_text("NESTED=1\n", encoding="utf-8")
+    begun = _begin(package_root)
+    assert isinstance(begun, dict)
+    workspace = tmp_path / "work2" / "build"
+
+    copied = _copy_in(package_root, begun, workspace)
+
+    assert isinstance(copied, tool_drafts.CopiedIn)
+    assert not os.path.lexists(workspace / ".env")
+    assert not os.path.lexists(workspace / tools._META_DIRNAME)
+    assert (workspace / "sub" / ".env").is_file()
+    assert copied.not_brought_in == (
+        tool_drafts.Omitted(".afterthread.meta", "backend_meta"),
+        tool_drafts.Omitted(".env", "env_file"),
+    )
+
+
+def test_an_env_spelled_another_way_is_not_brought_in_when_it_may_be_the_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``.ENV`` alone at the top of the draft's files. Where it is the same entry as
+    ``.env`` -- a filesystem that does not tell case apart -- it is not brought in
+    (``env_file``); where it is another entry it is content. When the look that
+    tells them apart fails, it is not brought in either (``unreadable``)."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    files = _files(package_root)
+    (files / ".ENV").write_text("HAND=placed-by-the-operator\n", encoding="utf-8")
+    same_entry = os.path.lexists(files / ".env")
+    begun = _begin(package_root)
+    assert isinstance(begun, dict)
+
+    seen = _copy_in(package_root, begun, tmp_path / "seen" / "build")
+    with monkeypatch.context() as patch:
+        failed = _refuse(patch, "lstat", lambda path: path == os.fspath(files / ".env"), errno.EIO)
+        unseen = _copy_in(package_root, begun, tmp_path / "unseen" / "build")
+
+    assert isinstance(seen, tool_drafts.CopiedIn) and isinstance(unseen, tool_drafts.CopiedIn)
+    if same_entry:
+        assert seen.not_brought_in == (tool_drafts.Omitted(".ENV", "env_file"),)
+        assert not os.path.lexists(tmp_path / "seen" / "build" / ".ENV")
+    else:
+        assert seen.not_brought_in == ()
+    assert failed
+    assert unseen.not_brought_in == (tool_drafts.Omitted(".ENV", "unreadable"),)
+    assert not os.path.lexists(tmp_path / "unseen" / "build" / ".ENV")
+
+
+def test_a_draft_file_that_grows_while_it_is_copied_in_is_stopped_by_the_count(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The draft's files fit the byte limit when measured; then a file grows before
+    its bytes are copied. The bytes the copy actually writes are counted, so the
+    copy stops at the limit and the round does not begin."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    files = _files(package_root)
+    begun = _begin(package_root)
+    assert isinstance(begun, dict)
+    real_plan = tool_drafts._plan_copy
+
+    def plan_then_grow(*args: Any, **kwargs: Any) -> Any:
+        plan = real_plan(*args, **kwargs)
+        with (files / "run.py").open("a", encoding="utf-8") as grown:
+            grown.write("#" * 5000)
+        return plan
+
+    monkeypatch.setattr(tool_drafts, "_plan_copy", plan_then_grow)
+
+    refused = _copy_in(package_root, begun, tmp_path / "work2" / "build", max_bytes=2000)
+
+    assert refused == tool_drafts.REASON_TOO_LARGE
+    assert _manifest(package_root) == begun
+
+
+def test_a_draft_over_the_limits_is_refused_before_anything_is_copied(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The draft's files are measured before the copy: over the limit, the round
+    does not begin and no workspace is made."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    begun = _begin(package_root)
+    assert isinstance(begun, dict)
+    workspace = tmp_path / "work2" / "build"
+
+    refused = _copy_in(package_root, begun, workspace, max_files=1)
+
+    assert refused == tool_drafts.REASON_TOO_MANY_FILES
+    assert not os.path.lexists(workspace)
+
+
+def test_a_draft_file_holding_a_known_secret_is_not_brought_in(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A file of the draft holds a known secret -- put there by hand after the save:
+    it is not brought into the workspace, nothing takes its place, and it is
+    recorded."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    (_files(package_root) / "notes.txt").write_text(f"token {_SECRET}\n", encoding="utf-8")
+    begun = _begin(package_root)
+    assert isinstance(begun, dict)
+    workspace = tmp_path / "work2" / "build"
+
+    copied = _copy_in(package_root, begun, workspace)
+
+    assert isinstance(copied, tool_drafts.CopiedIn)
+    assert copied.not_brought_in == (tool_drafts.Omitted("notes.txt", "secret_content"),)
+    assert not os.path.lexists(workspace / "notes.txt")
+    assert not any(_SECRET in text for text in _all_bytes_under(workspace))
+
+
+def test_a_round_s_note_is_kept_whole_up_to_the_request_s_own_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A note as long as a request may send is recorded as it is."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    workspace, previous, copied_in = _continuing(tmp_path, package_root)
+    note = "n" * 20_000
+
+    assert _save(
+        package_root,
+        workspace,
+        copied_in,
+        previous=previous,
+        draft_round=tool_drafts.DraftRound(
+            finished_at=_now(), outcome="not_published", job_id=_JOB, note=note
+        ),
+    ).saved
+    assert _manifest(package_root)["attempts"][-1]["note"] == note

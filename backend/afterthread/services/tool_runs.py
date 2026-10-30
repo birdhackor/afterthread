@@ -27,7 +27,7 @@ from sqlmodel import Session, col, create_engine, select
 
 from afterthread.config import get_settings
 from afterthread.db import enable_sqlite_foreign_keys
-from afterthread.models import ToolCheck, ToolRun
+from afterthread.models import SQLITE_MAX_INT, ToolCheck, ToolRun
 from afterthread.services import llm_log, tools
 
 _logger = logging.getLogger("afterthread.tool_runs")
@@ -582,6 +582,11 @@ class AttachedRun:
     purge of the record while the revise is queued or running changes nothing
     about what the builder is shown. The texts are masked against the secrets
     known at that moment, the same second mask a read applies.
+
+    ``purged``: the record is no longer in the database -- a continuation's draft
+    keeps a summary of the records earlier rounds attached, and this is that
+    summary alone, read back from the draft (``reread_for_revise``). It has no
+    texts and cannot be run again; an empty text never means that by itself.
     """
 
     id: int
@@ -594,6 +599,7 @@ class AttachedRun:
     args: str | None
     stdout: str | None
     stderr: str | None
+    purged: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -620,21 +626,107 @@ def attach_for_revise(session: Session, tool_name: str, run_ids: list[int]) -> A
     if any(rows[run_id].tool_name != tool_name for run_id in run_ids):
         return AttachedRuns(refusal="run_not_for_tool")
     secrets = tools._redaction_secrets()
-    attached = []
-    for run_id in run_ids:
-        row = rows[run_id]
-        attached.append(
-            AttachedRun(
-                id=run_id,
-                started_at=_naive_utc(row.started_at).replace(tzinfo=UTC),
-                workflow=row.workflow,
-                vid=row.vid,
-                outcome=row.outcome,
-                exit_code=row.exit_code,
-                message=_masked(row.message, secrets),
-                args=_masked(row.args, secrets),
-                stdout=_masked(row.stdout, secrets),
-                stderr=_masked(row.stderr, secrets),
-            )
-        )
-    return AttachedRuns(runs=tuple(attached))
+    return AttachedRuns(runs=tuple(_copied(rows[run_id], secrets) for run_id in run_ids))
+
+
+def _copied(row: ToolRun, secrets: list[str]) -> AttachedRun:
+    """A record as a revise carries it, its texts masked with ``secrets``."""
+    assert row.id is not None
+    return AttachedRun(
+        id=row.id,
+        started_at=_naive_utc(row.started_at).replace(tzinfo=UTC),
+        workflow=row.workflow,
+        vid=row.vid,
+        outcome=row.outcome,
+        exit_code=row.exit_code,
+        message=_masked(row.message, secrets),
+        args=_masked(row.args, secrets),
+        stdout=_masked(row.stdout, secrets),
+        stderr=_masked(row.stderr, secrets),
+    )
+
+
+def _summary_only(entry: dict[str, Any]) -> AttachedRun | None:
+    """A record a draft keeps a summary of, when the record itself is gone: that
+    summary, marked ``purged``. None when the summary cannot stand for a record
+    -- a field missing, or a start time that does not read as one, as a hand
+    edit or a mask over it leaves it."""
+    workflow = entry.get("workflow")
+    vid = entry.get("vid")
+    outcome = entry.get("outcome")
+    started = entry.get("started_at")
+    if not (
+        isinstance(workflow, str)
+        and isinstance(vid, str)
+        and isinstance(outcome, str)
+        and isinstance(started, str)
+    ):
+        return None
+    try:
+        started_at = datetime.fromisoformat(started)
+    except ValueError:
+        return None
+    return AttachedRun(
+        id=entry["id"],
+        started_at=started_at if started_at.tzinfo else started_at.replace(tzinfo=UTC),
+        workflow=workflow,
+        vid=vid,
+        outcome=outcome,
+        exit_code=entry.get("exit_code"),
+        message=None,
+        args=None,
+        stdout=None,
+        stderr=None,
+        purged=True,
+    )
+
+
+def reread_for_revise(
+    session: Session, tool_name: str, recorded: tuple[dict[str, Any], ...]
+) -> tuple[AttachedRun, ...]:
+    """The records a continued draft keeps (its manifest's ``runs``), read again.
+
+    Lenient, unlike ``attach_for_revise``: a record still in the database for
+    this tool is copied and masked as a newly attached one is; one that is gone --
+    purged, or no longer this tool's -- is answered by the summary the draft
+    keeps, marked ``purged`` (``_summary_only``), never refused. A summary that
+    cannot stand for a record is left out. Fail-closed on the secret scan like
+    every read. An id past what SQLite holds -- a hand edit -- is not looked up,
+    since the lookup would raise rather than miss: no record has it.
+    """
+    ids = [entry["id"] for entry in recorded if entry["id"] <= SQLITE_MAX_INT]
+    rows = (
+        {row.id: row for row in session.exec(select(ToolRun).where(col(ToolRun.id).in_(ids)))}
+        if ids
+        else {}
+    )
+    secrets = tools._redaction_secrets() if rows else []
+    reread: list[AttachedRun] = []
+    for entry in recorded:
+        row = rows.get(entry["id"])
+        if row is not None and row.tool_name == tool_name:
+            reread.append(_copied(row, secrets))
+        elif (summary := _summary_only(entry)) is not None:
+            reread.append(summary)
+    return tuple(reread)
+
+
+# How many records one revise carries -- what one request may attach, which the
+# request schema spells on its own and a test pins equal -- and so how many a
+# draft keeps for its next round.
+RUNS_PER_REVISE = 3
+
+
+def merged_for_revise(
+    attached: tuple[AttachedRun, ...], reread: tuple[AttachedRun, ...]
+) -> tuple[AttachedRun, ...]:
+    """The records a continuing round carries: the newly attached first, then those
+    its draft kept, each id once, at most ``RUNS_PER_REVISE`` -- the order of
+    attaching, not of running."""
+    merged: list[AttachedRun] = []
+    seen: set[int] = set()
+    for run in (*attached, *reread):
+        if run.id not in seen:
+            seen.add(run.id)
+            merged.append(run)
+    return tuple(merged[:RUNS_PER_REVISE])

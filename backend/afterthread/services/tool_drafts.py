@@ -14,14 +14,20 @@ itself, under ``<tools_dir>/<name>/.afterthread.meta/draft/``:
 A round about to publish saves one too, so a failed publish cannot take the only
 copy of the work with it; a successful publish removes it, but only while it
 still holds just what that save made (``remove_after_publish``). One draft per
-tool: while ``draft/`` exists in any state, a new revise is refused
-(``has_draft``).
+tool: while ``draft/`` exists in any state, a revise that does not name it is
+refused (``draft_state``), and one that names it continues it
+(``judge_continuation``). A continuing round marks itself in the manifest
+(``begin_round``), copies the draft's files into its own new workspace with the
+same pipeline a save copies with (``copy_into_workspace``), and is recorded when
+it ends -- by its save, or on its own (``record_round``); one that never began
+takes its mark back (``end_unstarted``).
 
 The draft lives at the package layer, so it goes wherever the package goes: a
 deleted tool takes its draft along, a same-name reinstall starts without one,
 and ``.staging`` keeps its meaning of one session's scratch space. Nothing here
-writes into ``.staging`` or removes anything from it; a workspace there is only
-read.
+removes anything from ``.staging``; the one write into it is a continuation's
+copy of the draft into its new, empty workspace, and a workspace there is
+otherwise only read.
 
 What holds, and why:
 
@@ -112,9 +118,14 @@ What holds, and why:
   kept, itself or a directory it is in.
 * DURABILITY. A new copy is written under a temporary name, made durable and
   renamed into place before the manifest names it, and the manifest is replaced
-  atomically. A previous copy is removed only once the new manifest is confirmed
-  on disk and only if nobody changed it during the round; one that changed stays,
-  listed in ``kept``.
+  atomically. A continuation's previous copy is named in ``kept`` by the same
+  write that names the new one, and removed on the spot only once that manifest
+  is confirmed on disk, the workspace received all of the copy as it was when
+  the round began, and nobody changed it since; otherwise it stays, listed. A
+  name leaves ``kept`` only when a later rewrite sees it gone. The sweep never
+  takes a ``files-<hex>`` the manifest does not name: a crash can bring an older
+  manifest back, and the copy it no longer names may be the one the operator
+  was shown and edited.
 """
 
 import contextlib
@@ -133,7 +144,7 @@ from secrets import token_hex
 from typing import Any, Literal, get_args
 
 from afterthread.services import llm, tools
-from afterthread.services.tool_runs import AttachedRun
+from afterthread.services.tool_runs import RUNS_PER_REVISE, AttachedRun
 
 DRAFT_DIRNAME = "draft"
 MANIFEST_FILENAME = "manifest.json"
@@ -168,18 +179,26 @@ SUMMARY_CAP = 2000
 HANDOFF_CAP = 4000
 OPERATOR_ACTION_CAP = 1000
 ERROR_CAP = 2000
-NOTE_CAP = 2000
+# A round's operator note: the request's own cap on ``feedback``, so a note is
+# kept whole.
+NOTE_CAP = 20_000
 OMITTED_KEPT = 50
 _PATH_CAP = 300
-_RUNS_KEPT = 3
+# The run records a draft keeps: as many as one revise carries, its next round's.
+_RUNS_KEPT = RUNS_PER_REVISE
 _RUN_TEXT_CAP = 200
 # The list shows the last summary as an excerpt.
 _LAST_SUMMARY_CAP = 300
 _READ_CHUNK = 1024 * 1024
 
 DraftState = Literal["running", "unusable", "publishing", "unknown", "published", "stale", "open"]
-RoundOutcome = Literal["published", "not_published", "failed"]
-# Why a path of the workspace is not in the draft.
+# ``interrupted``: a round marked running that left no record of its end, recorded
+# by the next round that began; its ``finished_at`` is null.
+RoundOutcome = Literal["published", "not_published", "failed", "interrupted"]
+# Why a path of the workspace is not in the draft, or a path of the draft is not
+# in a continuing round's workspace. ``env_file`` and ``backend_meta`` are the two
+# root entries a continuation never brings in: a ``.env`` (its values are no known
+# secret, so the model must not read it) and ``.afterthread.meta/``.
 OmitReason = Literal[
     "secret_name",
     "secret_content",
@@ -188,24 +207,32 @@ OmitReason = Literal[
     "link_ambiguous",
     "unreadable",
     "not_regular",
+    "env_file",
+    "backend_meta",
 ]
 _OMIT_REASONS = frozenset(get_args(OmitReason))
 _OUTCOMES = frozenset(get_args(RoundOutcome))
 _STOPPED_BY = frozenset(get_args(llm.FinalizeTrigger))
 _FAILURES = frozenset(get_args(llm.RunFailure))
 
-# Why a round's files were not saved: user-facing (zh-TW, rendered by the 工具
-# page) and category-only, never a path or a value.
+# Why a round's files were not saved, or a continuation did not begin:
+# user-facing (zh-TW, rendered by the 工具 page) and category-only, never a path
+# or a value.
 REASON_STRIP_ENV = "無法清除建置器寫入的 .env"
 REASON_STRIP_SIDECARS = "無法清除工作區裡的後端中繼資料"
-REASON_WORKSPACE = "暫存工作區已被移動或替換"
+# The workspace could not be confirmed to be the staging directory it was given:
+# where it is now is not known, so no path is claimed for it.
+REASON_WORKSPACE = "無法確認暫存工作區仍在原本的路徑"
 REASON_TOO_MANY_FILES = "檔案數超過上限（TOOL_DRAFT_MAX_FILES）"  # noqa: RUF001
 REASON_TOO_LARGE = "總大小超過上限（TOOL_DRAFT_MAX_BYTES）"  # noqa: RUF001
 REASON_UNREADABLE = "無法讀取暫存工作區"
-REASON_SCAN_FAILED = "秘密掃描失敗（{reason}），無法確認要保存的檔案裡沒有已知的秘密值"  # noqa: RUF001
+REASON_SCAN_FAILED = "秘密掃描失敗（{reason}），無法確認檔案裡沒有已知的秘密值"  # noqa: RUF001
 # The known secrets could not all be read: ``detail`` is their own message, which
 # names the ``.env`` and what to check (``tools.KnownSecretsIncomplete``).
-REASON_SECRETS_INCOMPLETE = "無法確認要保存的檔案裡沒有已知的秘密值。{detail}"
+REASON_SECRETS_INCOMPLETE = "無法確認檔案裡沒有已知的秘密值。{detail}"
+# The model's notes could not be masked, the known secrets not being whole: the
+# round ends there, nothing saved and the manifest left as it is.
+REASON_NOTES_UNMASKED = "已知的秘密值清單不完整，無法遮蔽模型交回的筆記"  # noqa: RUF001
 REASON_LOCK = "無法取得工具目錄的鎖"
 REASON_PACKAGE_GONE = "工具已被刪除或替換"
 REASON_DRAFT_EXISTS = "這個工具已經有草稿"
@@ -215,6 +242,25 @@ REASON_DURABILITY = "無法確認草稿已安全寫入磁碟"
 REASON_MANIFEST = "無法寫入草稿的說明檔"
 REASON_MANIFEST_SECRET = "草稿的說明檔寫下去仍會含有已知的秘密值，沒有寫入"  # noqa: RUF001
 REASON_UNEXPECTED = "保存時發生未預期錯誤（{kind}）"  # noqa: RUF001
+# The ``reason`` of a round recorded as ``interrupted``.
+REASON_INTERRUPTED = "這一輪沒有留下結束紀錄，它的進度沒有存進草稿"  # noqa: RUF001
+# Why a continuation did not begin: nothing was spent, and no round is counted.
+START_UNSEEN = "看不到這個工具的草稿"
+START_CHANGED = "草稿在送出之後已經變更"
+START_PUBLISHING = "草稿正在發布、已發布或結果未知"
+START_KEPT_FULL = (
+    "草稿保留的舊檔案目錄已達上限（{max} 份）：請刪掉草稿目錄裡不需要的舊目錄，"  # noqa: RUF001
+    "或取回需要的內容後放棄草稿"
+)
+REASON_FILES_MISSING = "草稿的檔案目錄不在"
+REASON_DRAFT_UNREADABLE = "無法讀取草稿的檔案目錄"
+REASON_COPY_IN = "無法把草稿的檔案複製到暫存工作區（{kind}）"  # noqa: RUF001
+# A save's note on a previous files directory it did not remove (``SaveResult.reason``
+# of a round that was saved): where it is, and why it stays.
+NOTE_PREVIOUS_KEPT = "上一份檔案目錄沒有刪除，留在 {path}：{why}"  # noqa: RUF001
+KEPT_NOT_DURABLE = "這一輪的說明檔沒有確認寫入磁碟"
+KEPT_NOT_ALL_BROUGHT_IN = "它有內容沒有帶進這一輪的工作區，或無法確認帶進來的與它相同"  # noqa: RUF001
+KEPT_CHANGED = "它在這一輪進行中被改過，或無法確認沒有被改過"  # noqa: RUF001
 
 # A relative path -> the fingerprint ``tree_digest`` takes of that entry.
 TreeDigest = dict[str, tuple[Any, ...]]
@@ -258,7 +304,14 @@ class DraftRound:
     summary: str | None = None
     handoff: str | None = None
     operator_action: str | None = None
+    # The operator's note for this round: a continuation's own words (a first
+    # round's are the draft's ``feedback``).
     note: str | None = None
+    # A continuation's: the paths of the draft its workspace did not receive, and
+    # why (``copy_into_workspace``), and the run records it newly attached, which
+    # join the manifest's ``runs`` when the round is recorded.
+    not_brought_in: tuple[Omitted, ...] = ()
+    attached: tuple[AttachedRun, ...] = ()
 
     def has_notes(self) -> bool:
         """Whether the model handed back any of its three notes."""
@@ -269,9 +322,12 @@ class DraftRound:
 class PreviousDraft:
     """The draft a continuing round copied its workspace from.
 
-    ``manifest`` is the manifest as read when the round started; ``copied_out``
-    is ``tree_digest`` of its files directory at that moment, what the save
-    compares before removing that directory.
+    ``manifest`` is the manifest as the round's own ``begin_round`` wrote it --
+    ``running`` naming the round's job -- which every later write of the round
+    is matched against. ``copied_out`` is ``tree_digest`` of its files directory
+    taken just before that directory was copied into the workspace
+    (``copy_into_workspace``): what the save compares, with the workspace as the
+    round received it, before it removes that directory.
     """
 
     manifest: dict[str, Any]
@@ -308,9 +364,20 @@ class SaveResult:
     """What one save did.
 
     ``worth_saving`` False: nothing to keep (no change, no notes), which is not a
-    failure. Otherwise ``saved`` says whether the draft now holds this round's
-    files, and ``reason`` why not. ``copy`` is the files directory a save that
-    copied made (``SavedCopy``).
+    failure. Otherwise three things, every branch that writes the manifest
+    filling in all of them:
+
+    * ``saved``: the draft's files directory holds this round's files -- a new one
+      the save committed, or, for a continuation that changed nothing, the one it
+      already had;
+    * ``recorded``: the manifest records this round (and no longer marks it
+      running). A save that did not save often recorded the round still, with why;
+    * ``durable``: the write that recorded it is confirmed on disk. Never retried:
+      an fsync that failed and then succeeds proves nothing about the write before.
+
+    ``reason`` is why the files were not saved, or, when they were, a note -- a
+    previous files directory left where it is, and why. ``copy`` is the files
+    directory a save that copied made (``SavedCopy``).
     """
 
     worth_saving: bool
@@ -320,6 +387,8 @@ class SaveResult:
     attempts: int | None = None
     reason: str | None = None
     copy: SavedCopy | None = None
+    recorded: bool = False
+    durable: bool = False
 
     def report(
         self,
@@ -446,13 +515,11 @@ def has_draft(package_root: tools.PackageRoot) -> bool:
 
     Its own draft only (``_own_draft``): a package whose directory or metadata
     directory is a link has none. A ``draft/`` without a readable manifest still
-    counts. Treated as no draft, the next save would write a manifest beside it
-    and the sweep would then take the complete ``files-*`` a crash left there for
-    an orphan. It is a read, so what cannot be looked at counts as present: the
-    answer gates a new revise, which must not start beside a draft that may be
-    there. A write takes the same draft the other way: a discard of it, for one,
-    removes nothing and answers that the draft may still be there
-    (``_seen_own_draft``).
+    counts: it may hold the complete ``files-*`` a crash left before its manifest
+    was written, the only copy of that work. It is a read, so what cannot be
+    looked at counts as present. A write takes the same draft the other way: a
+    discard of it, for one, removes nothing and answers that the draft may still
+    be there (``_seen_own_draft``).
     """
     return _own_draft(package_root) is not None
 
@@ -663,16 +730,30 @@ def _omitted_entry(raw: Any, writing: tools._Writing) -> Any:
     )
 
 
+def _omitted_listing(
+    attempt: dict[str, Any], key: str, count_key: str, writing: tools._Writing
+) -> tuple[list[Any], int]:
+    """One of a round's two path lists, at most ``OMITTED_KEPT`` long, and its full count."""
+    entries = [_omitted_entry(item, writing) for item in _listing(attempt.get(key), OMITTED_KEPT)]
+    count = _count(attempt.get(count_key))
+    if count < len(entries):
+        raise _BadShape
+    return entries, count
+
+
 def _attempt_entry(raw: Any, writing: tools._Writing) -> Any:
     attempt = _mapping(raw)
-    omitted = [
-        _omitted_entry(item, writing) for item in _listing(attempt.get("omitted"), OMITTED_KEPT)
-    ]
-    omitted_count = _count(attempt.get("omitted_count"))
-    if omitted_count < len(omitted):
-        raise _BadShape
+    omitted, omitted_count = _omitted_listing(attempt, "omitted", "omitted_count", writing)
+    # A manifest written before continuations existed has no such list: none.
+    if "not_brought_in" not in attempt and "not_brought_in_count" not in attempt:
+        attempt = {**attempt, "not_brought_in": [], "not_brought_in_count": 0}
+    not_brought_in, not_brought_in_count = _omitted_listing(
+        attempt, "not_brought_in", "not_brought_in_count", writing
+    )
+    outcome = _vocabulary(attempt.get("outcome"), _OUTCOMES)
     finished_at = _optional_matching(attempt.get("finished_at"), _TIMESTAMP_RE)
-    if finished_at is None:
+    # Only a round that left no record of its end has no end time, and it has none.
+    if (finished_at is None) != (outcome == "interrupted"):
         raise _BadShape
     return writing.record(
         {
@@ -682,7 +763,7 @@ def _attempt_entry(raw: Any, writing: tools._Writing) -> Any:
                 _optional_matching(attempt.get("started_at"), _TIMESTAMP_RE)
             ),
             "finished_at": writing.fixed(finished_at),
-            "outcome": writing.fixed(_vocabulary(attempt.get("outcome"), _OUTCOMES)),
+            "outcome": writing.fixed(outcome),
             "stopped_by": writing.fixed(_vocabulary(attempt.get("stopped_by"), _STOPPED_BY)),
             "failure": writing.fixed(_vocabulary(attempt.get("failure"), _FAILURES)),
             "rounds_used": writing.fixed(_optional_count(attempt.get("rounds_used"))),
@@ -696,6 +777,8 @@ def _attempt_entry(raw: Any, writing: tools._Writing) -> Any:
             "reason": _free(attempt.get("reason"), ERROR_CAP, writing),
             "omitted": omitted,
             "omitted_count": writing.fixed(omitted_count),
+            "not_brought_in": not_brought_in,
+            "not_brought_in_count": writing.fixed(not_brought_in_count),
         }
     )
 
@@ -859,9 +942,69 @@ def _round_entry(
         "note": draft_round.note,
         "saved": saved,
         "reason": reason,
-        "omitted": [{"path": item.path, "reason": item.reason} for item in omitted[:OMITTED_KEPT]],
+        "omitted": _path_list(omitted),
         "omitted_count": len(omitted),
+        "not_brought_in": _path_list(draft_round.not_brought_in),
+        "not_brought_in_count": len(draft_round.not_brought_in),
     }
+
+
+def _path_list(paths: list[Omitted] | tuple[Omitted, ...]) -> list[dict[str, str]]:
+    """The first ``OMITTED_KEPT`` of ``paths`` as the manifest lists them."""
+    return [{"path": item.path, "reason": item.reason} for item in paths[:OMITTED_KEPT]]
+
+
+def _interrupted_entry(marker: dict[str, Any], number: int) -> dict[str, Any]:
+    """The round a ``running`` mark stands for, when the round that set it left no
+    record of its end: when it began and which job ran it, and nothing else."""
+    return {
+        "number": number,
+        "job_id": marker["job_id"],
+        "started_at": marker["started_at"],
+        "finished_at": None,
+        "outcome": "interrupted",
+        "stopped_by": None,
+        "failure": None,
+        "rounds_used": None,
+        "max_rounds": None,
+        "error": None,
+        "summary": None,
+        "handoff": None,
+        "operator_action": None,
+        "note": None,
+        "saved": False,
+        "reason": REASON_INTERRUPTED,
+        "omitted": [],
+        "omitted_count": 0,
+        "not_brought_in": [],
+        "not_brought_in_count": 0,
+    }
+
+
+def _run_record(run: AttachedRun) -> dict[str, Any]:
+    """One attached run record as the manifest's ``runs`` keeps it: a summary only."""
+    return {
+        "id": run.id,
+        "started_at": run.started_at.isoformat(),
+        "workflow": run.workflow,
+        "vid": run.vid,
+        "outcome": run.outcome,
+        "exit_code": run.exit_code,
+    }
+
+
+def _merged_runs(attached: tuple[AttachedRun, ...], recorded: list[Any]) -> list[Any]:
+    """The manifest's ``runs`` once a continuing round is recorded: what the round
+    newly attached first, then what was recorded before, each id once, the last
+    ``_RUNS_KEPT`` attached. The order is the order of attaching, not of running."""
+    merged: list[Any] = []
+    seen: set[int] = set()
+    for entry in [*(_run_record(run) for run in attached), *recorded]:
+        if entry["id"] in seen:
+            continue
+        seen.add(entry["id"])
+        merged.append(entry)
+    return merged[:_RUNS_KEPT]
 
 
 def _with_round(doc: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
@@ -1000,6 +1143,77 @@ def _published_from(manifest: dict[str, Any], resolution: tools.Resolution) -> b
     )
 
 
+def _running_now(manifest: dict[str, Any], job_active: Callable[[str], bool]) -> bool:
+    running = manifest["running"]
+    return running is not None and running["job_id"] is not None and job_active(running["job_id"])
+
+
+def _state_of(
+    manifest: dict[str, Any],
+    draft_dir: Path,
+    resolution: tools.Resolution,
+    job_active: Callable[[str], bool],
+) -> DraftState:
+    """The state of a draft whose manifest reads back in shape (``draft_state``)."""
+    if _running_now(manifest, job_active):
+        return "running"
+    if not _is_real_dir(draft_dir / manifest["files_dir"]):
+        return "unusable"
+    if manifest["publishing"] is not None:
+        publishing_job = manifest["publishing"]["job_id"]
+        if publishing_job is not None and job_active(publishing_job):
+            return "publishing"
+        return "published" if _published_from(manifest, resolution) else "unknown"
+    if not isinstance(resolution, tools.Resolved) or resolution.vid != manifest["base_vid"]:
+        return "stale"
+    return "open"
+
+
+def _seen_manifest(
+    package_root: tools.PackageRoot,
+) -> tuple[Path, os.stat_result | None, dict[str, Any] | None] | None:
+    """The package's own ``draft/`` as a read sees it, its ``lstat``, and its manifest
+    when that reads back in shape; None when it has no draft (``_own_draft``)."""
+    found = _own_draft(package_root)
+    if found is None:
+        return None
+    draft_dir, info = found
+    manifest = read_manifest(draft_dir) if info is not None and stat.S_ISDIR(info.st_mode) else None
+    return draft_dir, info, manifest
+
+
+def draft_state(
+    package_root: tools.PackageRoot,
+    resolution: tools.Resolution,
+    *,
+    job_active: Callable[[str], bool],
+) -> DraftState | None:
+    """The state of the package's draft, or None when it has none.
+
+    In this order: ``running`` (a continuation of this process is on it),
+    ``unusable`` (``draft/`` cannot be looked at, the manifest cannot be used, or
+    its files directory is not a directory), ``publishing``/``published``/
+    ``unknown`` (a publish from it was started: still going in this process, put
+    live -- ``current`` names it as its origin -- or neither known), ``stale``
+    (``current`` moved off its base), ``open``. The one judgment of it: the list
+    shows it (``draft_view``), and a revise that does not name the draft is told
+    by it what it can do (``tool_builder.start_revise_job``). A read: a draft
+    that cannot be looked at is there, and unusable.
+    """
+    seen = _seen_manifest(package_root)
+    if seen is None:
+        return None
+    draft_dir, _info, manifest = seen
+    if manifest is None:
+        return "unusable"
+    return _state_of(manifest, draft_dir, resolution, job_active)
+
+
+def _kept_paths(draft_dir: Path, manifest: dict[str, Any]) -> list[str]:
+    """The previous files directories ``kept`` names, but those seen gone."""
+    return [str(draft_dir / name) for name in manifest["kept"] if not _seen_gone(draft_dir / name)]
+
+
 def draft_view(
     package_root: tools.PackageRoot,
     resolution: tools.Resolution,
@@ -1009,24 +1223,22 @@ def draft_view(
 ) -> dict[str, Any] | None:
     """The package's draft as the tools list shows it, or None when it has none.
 
-    The state, in this order: ``running`` (a continuation of this process is on
-    it), ``unusable`` (the manifest cannot be used, or its files directory is not
-    a directory), ``publishing``/``published``/``unknown`` (a publish from it was
-    started: still going in this process, put live -- ``current`` names it as its
-    origin -- or neither known), ``stale`` (``current`` moved off its base),
-    ``open``. ``interrupted``: a round marked as running is no longer running.
+    ``state`` is ``draft_state``'s. ``interrupted``: a round marked as running is
+    no longer running. ``path`` is its files directory (``draft/`` itself when it
+    is unusable), ``draft_dir`` all of ``draft/``, which may hold more than the
+    list names, and ``kept`` the previous files directories a continuation left
+    -- every name ``kept`` holds that is not seen gone.
 
     ``job_active`` answers for a job id of this process; ``known`` gives the
     secrets the text is masked with, and lets its failure through: the list fails
     rather than serve text it could not mask. Only the package's own draft is
     shown (``_own_draft``).
     """
-    found = _own_draft(package_root)
-    if found is None:
+    seen = _seen_manifest(package_root)
+    if seen is None:
         return None
-    draft_dir, info = found
+    draft_dir, _info, manifest = seen
     token = discard_token(draft_dir)
-    manifest = read_manifest(draft_dir) if info is not None and stat.S_ISDIR(info.st_mode) else None
     if manifest is None:
         return {
             "draft_id": None,
@@ -1036,31 +1248,13 @@ def draft_view(
             "interrupted": False,
             "base_vid": None,
             "path": str(draft_dir),
+            "draft_dir": str(draft_dir),
+            "kept": [],
             "discard_token": token,
             "last": None,
         }
     files = draft_dir / manifest["files_dir"]
-    running = manifest["running"]
-    running_now = (
-        running is not None and running["job_id"] is not None and job_active(running["job_id"])
-    )
-    state: DraftState
-    if running_now:
-        state = "running"
-    elif not _is_real_dir(files):
-        state = "unusable"
-    elif manifest["publishing"] is not None:
-        publishing_job = manifest["publishing"]["job_id"]
-        if publishing_job is not None and job_active(publishing_job):
-            state = "publishing"
-        elif _published_from(manifest, resolution):
-            state = "published"
-        else:
-            state = "unknown"
-    elif not isinstance(resolution, tools.Resolved) or resolution.vid != manifest["base_vid"]:
-        state = "stale"
-    else:
-        state = "open"
+    state = _state_of(manifest, draft_dir, resolution, job_active)
     secrets = known()
     last = manifest["attempts"][-1]
     return {
@@ -1068,9 +1262,11 @@ def draft_view(
         "generation": manifest["generation"],
         "attempts": manifest["attempt_count"],
         "state": state,
-        "interrupted": running is not None and not running_now,
+        "interrupted": manifest["running"] is not None and not _running_now(manifest, job_active),
         "base_vid": manifest["base_vid"],
         "path": str(draft_dir if state == "unusable" else files),
+        "draft_dir": str(draft_dir),
+        "kept": _kept_paths(draft_dir, manifest),
         "discard_token": token,
         "last": {
             "stopped_by": last["stopped_by"],
@@ -1082,6 +1278,89 @@ def draft_view(
             "omitted": last["omitted_count"],
         },
     }
+
+
+# --- continuing a draft: what a revise that names it is judged by -----------------
+
+
+@dataclass(frozen=True, slots=True)
+class FirstRead:
+    """What the revise route reads of a draft before it takes the slot: which
+    draft, at which generation, and the run records its manifest keeps (``runs``,
+    summaries only), for the route to read again from the database."""
+
+    draft_id: str
+    generation: int
+    runs: tuple[dict[str, Any], ...]
+
+
+def first_read(package_root: tools.PackageRoot) -> FirstRead | None:
+    """The route's look at the package's draft, before the slot; None when it reads nothing.
+
+    Only for the records to read again with the request's database session: what
+    it reads decides nothing until the judgment after the slot
+    (``judge_continuation``) compares it with what it reads then. A draft that
+    cannot be read is answered as nothing read.
+    """
+    seen = _seen_manifest(package_root)
+    if seen is None or seen[2] is None:
+        return None
+    manifest = seen[2]
+    return FirstRead(manifest["draft_id"], manifest["generation"], tuple(manifest["runs"]))
+
+
+ContinueRefusal = Literal[
+    "draft_gone", "draft_unusable", "draft_changed", "draft_publishing", "version_mismatch"
+]
+
+
+def judge_continuation(
+    package_root: tools.PackageRoot,
+    resolution: tools.Resolution,
+    expected: tuple[str, int],
+    first_seen: tuple[str, int] | None,
+) -> dict[str, Any] | ContinueRefusal:
+    """Whether a revise naming ``expected`` -- ``(draft_id, generation)`` -- may continue
+    the package's draft: its manifest when it may, else why not.
+
+    Called after the slot is taken, so what it reads holds until the job begins
+    (only a hand edit changes it meanwhile, which ``begin_round`` checks again).
+    The first of these that holds answers:
+
+    1. ``draft/`` is seen not to exist, or the package has no draft of its own
+       (``_own_draft``): ``draft_gone``;
+    2. ``draft/`` cannot be looked at, is not a directory, or its manifest cannot
+       be read or is out of shape: ``draft_unusable``;
+    3. another ``draft_id``: ``draft_gone`` -- discarded and made again;
+    4. another generation: ``draft_changed``;
+    5. its files directory is not a real directory: ``draft_unusable``;
+    6. ``publishing`` is set -- publishing, published or not known; the origin is
+       not read: ``draft_publishing``;
+    7. its ``base_vid`` is not ``current``, whatever the request compared:
+       ``version_mismatch``;
+    8. ``first_seen``, what the route read before the slot (None: it read
+       nothing), is not this draft at this generation: ``draft_changed`` -- the
+       records the round would carry are those that manifest kept.
+    """
+    seen = _seen_manifest(package_root)
+    if seen is None:
+        return "draft_gone"
+    draft_dir, _info, manifest = seen
+    if manifest is None:
+        return "draft_unusable"
+    if manifest["draft_id"] != expected[0]:
+        return "draft_gone"
+    if manifest["generation"] != expected[1]:
+        return "draft_changed"
+    if not _is_real_dir(draft_dir / manifest["files_dir"]):
+        return "draft_unusable"
+    if manifest["publishing"] is not None:
+        return "draft_publishing"
+    if not isinstance(resolution, tools.Resolved) or resolution.vid != manifest["base_vid"]:
+        return "version_mismatch"
+    if first_seen != expected:
+        return "draft_changed"
+    return manifest
 
 
 # --- saving a round -------------------------------------------------------------
@@ -1277,11 +1556,17 @@ def _plan_copy(
     base_root: Path | None,
     max_entries: int,
     max_bytes: int,
+    *,
+    left_out: dict[str, OmitReason] | None = None,
 ) -> _CopyPlan:
-    """Decide, entry by entry, what the copy takes of the workspace.
+    """Decide, entry by entry, what the copy takes of the tree at ``workspace``.
 
-    What the copy then keeps of it is decided on the copy (``_carry_out``).
-    Raises ``OSError`` when the workspace cannot be walked.
+    ``workspace`` is the source root: a round's workspace when a save copies it
+    into the draft, the draft's files directory when a continuation copies it into
+    its own workspace (``copy_into_workspace``). ``left_out`` names entries at the
+    top of the source the copy does not take, with why. What the copy then keeps
+    of it is decided on the copy (``_carry_out``). Raises ``OSError`` when the
+    source cannot be walked.
     """
     named = {hit.path for hit in scan.hits if hit.kind == "name"}
     in_content = {hit.path for hit in scan.hits if hit.kind == "content"}
@@ -1296,6 +1581,9 @@ def _plan_copy(
         for entry in children:
             relative = prefix + entry.name
             here = (*parts, entry.name)
+            if not parts and left_out and entry.name in left_out:
+                plan.omitted.append(Omitted(relative, left_out[entry.name]))
+                continue
             if relative in named:
                 # A secret in a directory's name is in every path under it too.
                 plan.omitted.append(Omitted(relative, "secret_name"))
@@ -1631,20 +1919,29 @@ def save_round(
     continues it; exactly one is given. ``copied_in`` is ``tree_digest`` of the
     workspace as the round received it, and ``earlier_root`` the version a path
     falls back to when its own content holds a secret: the base version for a
-    first round, the previous files directory for a continuation.
+    first round, the previous files directory for a continuation
+    (``previous_files``). A round whose ``outcome`` is None is the save a publish
+    follows.
 
     The order is fixed: worth saving (a first round with no change and no notes
-    keeps nothing; a continuation with no change records the round only), the
-    size limits on the workspace, the secret scan of the workspace, the plan of
-    the copy, which judges its links on the workspace; then, under the shared
-    tools lock and only in the same package, the copy to ``.incoming-<hex>``
-    -- counted against the same limits as it is made, the earlier versions put
-    back included, then its links judged again and the whole of it scanned
-    again, on the copy itself (``_carry_out``) -- made durable and renamed to
-    ``files-<hex>``, the manifest, and the removal of the previous files
-    directory. A first round that fails removes what it made, an empty
-    ``draft/`` included; a continuation that fails still records the round, its
-    files directory unchanged.
+    keeps nothing; a continuation with no change records the round only, unless
+    a publish follows: that save always copies, so the removal after the publish
+    has a copy this save made to compare against), the known secrets, the size
+    limits on the workspace, the secret scan of the workspace, the plan of the
+    copy, which judges its links on the workspace; then, under the shared tools
+    lock and only in the same package, the copy to ``.incoming-<hex>`` -- counted
+    against the same limits as it is made, the earlier versions put back
+    included, then its links judged again and the whole of it scanned again, on
+    the copy itself (``_carry_out``) -- made durable and renamed to
+    ``files-<hex>``, the manifest, and what becomes of the previous files
+    directory (``_copy_and_commit``). A first round that fails removes what it
+    made, an empty ``draft/`` included; a continuation that fails records the
+    round where it can, its files directory unchanged. It cannot when the known
+    secrets could not all be read -- nothing is written at all -- nor when the
+    lock is not had, the package is not the one the round began in, or the
+    draft is no longer the one the round began on (``begin_round``'s manifest,
+    its ``running`` this round's job): nothing is written into it. Nor, of
+    course, when that write fails. ``SaveResult.recorded`` says which it was.
     """
     try:
         return _save_round(
@@ -1685,20 +1982,21 @@ def _save_round(
     )
     if previous is None and not changed and not draft_round.has_notes():
         return SaveResult(worth_saving=False)
-    # A first round always copies (a draft needs its files); a continuation that
-    # changed nothing keeps its files directory and records the round only.
-    copies = changed or previous is None
+    # A first round always copies (a draft needs its files), and so does the save
+    # a publish follows; a continuation that changed nothing otherwise keeps its
+    # files directory and records the round only.
+    copies = changed or previous is None or draft_round.outcome is None
 
-    reason: str | None = None
-    known: list[str] = []
-    plan: _CopyPlan | None = None
     try:
         known = tools._redaction_secrets()
     except tools.KnownSecretsIncomplete as exc:
-        reason = REASON_SECRETS_INCOMPLETE.format(detail=exc)
+        # The known secrets are not whole: no file is checked, and no text written.
+        return _not_saved(REASON_SECRETS_INCOMPLETE.format(detail=exc))
     except Exception as exc:
-        reason = REASON_SCAN_FAILED.format(reason=type(exc).__name__)
-    if reason is None and copies:
+        return _not_saved(REASON_SCAN_FAILED.format(reason=type(exc).__name__))
+    reason: str | None = None
+    plan: _CopyPlan | None = None
+    if copies:
         reason = _over_limits(workspace, max_files, max_bytes)
     if reason is None and copies:
         scan = tools.scan_embedded_secrets(workspace, known)
@@ -1731,6 +2029,7 @@ def _save_round(
             draft_round=draft_round,
             start=start,
             previous=previous,
+            copied_in=copied_in,
             max_files=max_files,
             max_bytes=max_bytes,
             durability=durability,
@@ -1749,6 +2048,7 @@ def _save_locked(
     draft_round: DraftRound,
     start: DraftStart | None,
     previous: PreviousDraft | None,
+    copied_in: TreeDigest | None,
     max_files: int,
     max_bytes: int,
     durability: Durability,
@@ -1772,19 +2072,22 @@ def _save_locked(
             _undo(draft_dir, None, made_draft_dir)
             return _not_saved(REASON_DURABILITY)
     else:
-        current = read_manifest(draft_dir) if _is_real_dir(draft_dir) else None
-        if current is None or (current["draft_id"], current["generation"]) != (
-            previous.manifest["draft_id"],
-            previous.manifest["generation"],
-        ):
-            # Not the draft the round started from: write nothing into it.
+        current = _running_draft(
+            draft_dir,
+            (previous.manifest["draft_id"], previous.manifest["generation"]),
+            draft_round.job_id,
+        )
+        if current is None:
+            # Not the draft the round began on, or not marked as this round's:
+            # write nothing into it.
             return _not_saved(REASON_DRAFT_CHANGED)
         if reason is None and plan is None:
-            # A continuation that changed nothing: only the round is recorded.
+            # A continuation that changed nothing: only the round is recorded, its
+            # files directory -- which holds what the workspace does -- kept.
             entry = _round_entry(
                 draft_round, current["attempt_count"] + 1, saved=True, reason=None, omitted=[]
             )
-            return _record(draft_dir, _with_round(current, entry), known, saved=True)
+            return _record(draft_dir, _recorded(current, entry, draft_round), known, saved=True)
 
     if reason is None and plan is not None:
         made, outcome = _copy_and_commit(
@@ -1796,6 +2099,7 @@ def _save_locked(
             start,
             current,
             previous,
+            copied_in,
             max_files,
             max_bytes,
             durability,
@@ -1812,30 +2116,48 @@ def _save_locked(
     entry = _round_entry(
         draft_round, current["attempt_count"] + 1, saved=False, reason=failed, omitted=[]
     )
-    recorded = _record(draft_dir, _with_round(current, entry), known, saved=False)
-    return _not_saved(failed, draft=_as_draft(recorded))
+    return _record(
+        draft_dir, _recorded(current, entry, draft_round), known, saved=False, reason=failed
+    )
 
 
-def _as_draft(result: SaveResult) -> dict[str, Any] | None:
-    if result.draft_id is None or result.generation is None or result.attempts is None:
-        return None
+def _recorded(
+    current: dict[str, Any], entry: dict[str, Any], draft_round: DraftRound
+) -> dict[str, Any]:
+    """``current`` with a continuing round recorded: ``entry`` its latest round, no
+    ``running``, the records the round attached joined to ``runs``."""
     return {
-        "draft_id": result.draft_id,
-        "generation": result.generation,
-        "attempt_count": result.attempts,
+        **_with_round(current, entry),
+        "runs": _merged_runs(draft_round.attached, current["runs"]),
     }
 
 
-def _record(draft_dir: Path, doc: dict[str, Any], known: list[str], *, saved: bool) -> SaveResult:
+def _record(
+    draft_dir: Path,
+    doc: dict[str, Any],
+    known: list[str],
+    *,
+    saved: bool,
+    reason: str | None = None,
+) -> SaveResult:
+    """Write ``doc``, which records a round, and say what became of it.
+
+    ``reason`` is the round's own, as it was recorded: why its files were not
+    saved. Not written, the result carries the write's reason instead, and no
+    draft identity: nothing of the round is in the manifest.
+    """
     written = _write_manifest(draft_dir, doc, known)
     if not written.replaced:
-        return _not_saved(written.reason)
+        return _not_saved(reason or written.reason)
     return SaveResult(
         worth_saving=True,
         saved=saved,
         draft_id=doc["draft_id"],
         generation=doc["generation"],
         attempts=doc["attempt_count"],
+        reason=reason,
+        recorded=True,
+        durable=written.durable,
     )
 
 
@@ -1848,6 +2170,31 @@ def _undo(draft_dir: Path, made: Path | None, made_draft_dir: bool) -> None:
             os.rmdir(draft_dir)
 
 
+def _why_previous_stays(
+    old: Path,
+    previous: PreviousDraft,
+    copied_in: TreeDigest | None,
+    durable: bool,
+    max_files: int,
+    max_bytes: int,
+) -> str | None:
+    """Why a continuation's previous files directory, once named in ``kept``, is not
+    removed; None when each of the three is seen: the manifest naming the new one
+    is confirmed on disk; the workspace received all of it as it was when the
+    round began (``copied_out`` equal to ``copied_in``: an entry not brought in, a
+    link rewritten, a file swapped and swapped back during the copy all make them
+    differ); and it is still as it was then. An unknown digest is never the same."""
+    if not durable:
+        return KEPT_NOT_DURABLE
+    if not same_tree(previous.copied_out, copied_in):
+        return KEPT_NOT_ALL_BROUGHT_IN
+    if not same_tree(
+        previous.copied_out, tree_digest(old, max_entries=max_files, max_bytes=max_bytes)
+    ):
+        return KEPT_CHANGED
+    return None
+
+
 def _copy_and_commit(
     draft_dir: Path,
     workspace: Path,
@@ -1857,12 +2204,20 @@ def _copy_and_commit(
     start: DraftStart | None,
     current: dict[str, Any] | None,
     previous: PreviousDraft | None,
+    copied_in: TreeDigest | None,
     max_files: int,
     max_bytes: int,
     durability: Durability,
 ) -> tuple[Path | None, SaveResult | str]:
     """Steps 9 to 11. Returns what it made that a failure must remove, and the
-    result -- or the reason it failed."""
+    result -- or the reason it failed.
+
+    A continuation's previous files directory is named in ``kept`` by the same
+    write that names the new one (whether that write is on disk is only known
+    once it is done), and removed only when ``_why_previous_stays`` finds nothing;
+    otherwise the result's ``reason`` says where it is and why it stays. Names in
+    ``kept`` seen gone are dropped from it on the way.
+    """
     incoming = draft_dir / f".incoming-{token_hex(16)}"
     try:
         os.mkdir(incoming)
@@ -1891,17 +2246,6 @@ def _copy_and_commit(
     if not durability.directory(draft_dir):
         return files, REASON_DURABILITY
 
-    keep_previous = False
-    kept: list[str] = []
-    if current is not None and previous is not None:
-        kept = list(current["kept"])
-        # The previous copy goes only if nobody changed it while the round ran.
-        old = draft_dir / current["files_dir"]
-        keep_previous = not same_tree(
-            previous.copied_out, tree_digest(old, max_entries=max_files, max_bytes=max_bytes)
-        )
-        if keep_previous and current["files_dir"] not in kept:
-            kept.append(current["files_dir"])
     doc: dict[str, Any]
     if current is None:
         assert start is not None
@@ -1912,17 +2256,7 @@ def _copy_and_commit(
             "kept": [],
             "base_vid": start.base_vid,
             "feedback": start.feedback,
-            "runs": [
-                {
-                    "id": run.id,
-                    "started_at": run.started_at.isoformat(),
-                    "workflow": run.workflow,
-                    "vid": run.vid,
-                    "outcome": run.outcome,
-                    "exit_code": run.exit_code,
-                }
-                for run in start.runs[:_RUNS_KEPT]
-            ],
+            "runs": [_run_record(run) for run in start.runs[:_RUNS_KEPT]],
             "attempt_count": 1,
             "attempts": [_round_entry(draft_round, 1, saved=True, reason=None, omitted=omitted)],
             "running": None,
@@ -1932,21 +2266,36 @@ def _copy_and_commit(
         entry = _round_entry(
             draft_round, current["attempt_count"] + 1, saved=True, reason=None, omitted=omitted
         )
-        doc = {**_with_round(current, entry), "files_dir": files_name, "kept": kept}
+        # The previous copy is named before anything decides whether it goes; a
+        # name already seen gone is dropped, and so is the previous one if it is.
+        named = [*current["kept"], current["files_dir"]]
+        doc = {
+            **_recorded(current, entry, draft_round),
+            "files_dir": files_name,
+            "kept": [name for name in named if not _seen_gone(draft_dir / name)],
+        }
     written = _write_manifest(draft_dir, doc, known)
     if not written.replaced:
         return files, written.reason
-    if current is not None and not keep_previous and written.durable:
-        # Only once the new manifest is known to be on disk; otherwise the sweep
-        # takes it later, after its own fsync of the manifest.
-        remove_entry(draft_dir / current["files_dir"])
+    note: str | None = None
+    if current is not None and previous is not None and current["files_dir"] in doc["kept"]:
+        old = draft_dir / current["files_dir"]
+        why = _why_previous_stays(old, previous, copied_in, written.durable, max_files, max_bytes)
+        if why is None:
+            # Its name stays in ``kept`` until a later rewrite sees it gone.
+            remove_entry(old)
+        else:
+            note = NOTE_PREVIOUS_KEPT.format(path=old, why=why)
     return None, SaveResult(
         worth_saving=True,
         saved=True,
         draft_id=doc["draft_id"],
         generation=doc["generation"],
         attempts=doc["attempt_count"],
+        reason=note,
         copy=SavedCopy(files_name, copied, max_files, max_bytes),
+        recorded=True,
+        durable=written.durable,
     )
 
 
@@ -2050,6 +2399,326 @@ def clear_publishing(
         return _locked_in_package(package_root, package_dir_identity, act)
     except Exception:
         return None
+
+
+# --- a continuing round: its mark, its copy, its record ----------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Continuation:
+    """What a revise job continues: the draft as judged after the slot, ``expected``
+    its ``(draft_id, generation)``, and the run records the request newly attached,
+    which join the manifest's ``runs`` when the round is recorded."""
+
+    expected: tuple[str, int]
+    attached: tuple[AttachedRun, ...] = ()
+
+
+def _in_own_package(
+    package_root: tools.PackageRoot,
+    package_dir_identity: tuple[int, int] | None,
+    act: Callable[[Path], Any],
+) -> Any:
+    """``act(draft_dir)`` under the shared tools lock in the round's own package, or
+    why it did not run: ``REASON_LOCK``, ``REASON_PACKAGE_GONE`` (not the directory
+    the round began in), ``START_UNSEEN`` (no ``draft/`` of its own that is seen,
+    ``_seen_own_draft``). Raises what ``act`` raises."""
+    try:
+        lock = tools.acquire_shared_tools_lock()
+    except tools.ToolsLockUnavailableError:
+        lock = None
+    if lock is None:
+        return REASON_LOCK
+    try:
+        if not _still_the_package(package_root, package_dir_identity):
+            return REASON_PACKAGE_GONE
+        found = _seen_own_draft(package_root)
+        if found is None:
+            return START_UNSEEN
+        return act(found[0])
+    finally:
+        tools.release_tools_lock(lock)
+
+
+def _running_draft(
+    draft_dir: Path, expected: tuple[str, int], job_id: str | None
+) -> dict[str, Any] | None:
+    """The manifest when it is still the one a round's ``begin_round`` wrote: the same
+    draft at the same generation, marked running by that round's job. None
+    otherwise, and then nothing of the round is written: the latest manifest is
+    not read again to be written to instead."""
+    current = _matching_draft(draft_dir, expected)
+    if current is None or current["running"] is None or current["running"]["job_id"] != job_id:
+        return None
+    return current
+
+
+def begin_round(
+    package_root: tools.PackageRoot,
+    package_dir_identity: tuple[int, int] | None,
+    expected: tuple[str, int],
+    job_id: str | None,
+    started_at: str,
+) -> dict[str, Any] | str:
+    """Mark the draft as having this round running: the manifest as written, or why
+    not -- and then the round does not begin. Never raises.
+
+    Under the shared tools lock, in the round's own package, on the draft judged
+    after the slot (``expected``) and only while it is not being published from.
+    The names in ``kept`` seen gone are dropped first; when as many as ``kept``
+    may hold are left, the round does not begin (``START_KEPT_FULL``): a round
+    that commits a new files directory names one more. A ``running`` left by a
+    round that recorded no end is recorded as a round of its own, ``interrupted``,
+    with no end time: that round may have run commands, and nothing shows they
+    stopped. One generation on, ``running`` names this round's job; every later
+    write of the round is matched against the manifest returned
+    (``_running_draft``).
+    """
+    try:
+        known = tools._redaction_secrets()
+    except tools.KnownSecretsIncomplete as exc:
+        return REASON_SECRETS_INCOMPLETE.format(detail=exc)
+    except Exception as exc:
+        return REASON_SCAN_FAILED.format(reason=type(exc).__name__)
+
+    def act(draft_dir: Path) -> dict[str, Any] | str:
+        current = _matching_draft(draft_dir, expected)
+        if current is None:
+            return START_CHANGED
+        if current["publishing"] is not None:
+            return START_PUBLISHING
+        kept = [name for name in current["kept"] if not _seen_gone(draft_dir / name)]
+        if len(kept) >= _KEPT_MAX:
+            return START_KEPT_FULL.format(max=_KEPT_MAX)
+        doc = {
+            **current,
+            "generation": current["generation"] + 1,
+            "kept": kept,
+            "running": {"job_id": job_id, "started_at": started_at},
+        }
+        if current["running"] is not None:
+            entry = _interrupted_entry(current["running"], current["attempt_count"] + 1)
+            doc["attempt_count"] = entry["number"]
+            doc["attempts"] = [*current["attempts"], entry][-ATTEMPTS_KEPT:]
+        written = _write_manifest(draft_dir, doc, known)
+        return doc if written.replaced else written.reason
+
+    try:
+        return _in_own_package(package_root, package_dir_identity, act)
+    except Exception as exc:
+        return REASON_UNEXPECTED.format(kind=type(exc).__name__)
+
+
+def end_unstarted(
+    package_root: tools.PackageRoot,
+    package_dir_identity: tuple[int, int] | None,
+    expected: tuple[str, int],
+    job_id: str | None,
+) -> bool:
+    """Take back the ``running`` mark of a round that never began its conversation.
+
+    No round is counted and ``runs`` is left as it is. Only while the manifest is
+    still the one ``begin_round`` returned (``expected`` its identity) and marked
+    by this job (``_running_draft``). Returns whether that write was made; when it
+    was not, ``running`` stays and the next round records it. Never raises.
+    """
+
+    def act(draft_dir: Path) -> bool:
+        current = _running_draft(draft_dir, expected, job_id)
+        if current is None:
+            return False
+        doc = {**current, "generation": current["generation"] + 1, "running": None}
+        return _write_manifest(draft_dir, doc, tools._redaction_secrets()).replaced
+
+    try:
+        return _in_own_package(package_root, package_dir_identity, act) is True
+    except Exception:
+        return False
+
+
+def record_round(
+    package_root: tools.PackageRoot,
+    package_dir_identity: tuple[int, int] | None,
+    expected: tuple[str, int],
+    draft_round: DraftRound,
+    reason: str | None,
+) -> SaveResult:
+    """Record a continuing round its save did not record: only the round, its files
+    not saved, ``reason`` why, ``running`` cleared, and the records it attached
+    joined to ``runs``. Never raises.
+
+    For every exit of a round that ran -- its commands confirmed stopped -- where
+    nothing recorded it yet: a workspace that could not be confirmed, a strip that
+    failed, a save that failed before it wrote or whose write failed, one that
+    ended in an exception it caught. Only while the manifest is still
+    the one ``begin_round`` returned (``expected``) and marked by this round's job
+    (``_running_draft``); otherwise nothing is written, and ``running`` stays for
+    the next round to record. Nor with a known-secret list that is not whole.
+    """
+
+    def act(draft_dir: Path) -> SaveResult:
+        current = _running_draft(draft_dir, expected, draft_round.job_id)
+        if current is None:
+            return _not_saved(reason or REASON_DRAFT_CHANGED)
+        entry = _round_entry(
+            draft_round, current["attempt_count"] + 1, saved=False, reason=reason, omitted=[]
+        )
+        return _record(
+            draft_dir,
+            _recorded(current, entry, draft_round),
+            tools._redaction_secrets(),
+            saved=False,
+            reason=reason,
+        )
+
+    try:
+        done = _in_own_package(package_root, package_dir_identity, act)
+    except Exception:
+        return _not_saved(reason or REASON_MANIFEST)
+    return done if isinstance(done, SaveResult) else _not_saved(reason or done)
+
+
+def previous_files(package_root: tools.PackageRoot, manifest: dict[str, Any]) -> Path | None:
+    """The files directory ``manifest`` names, reached through the package's own
+    metadata directory (``_own_meta``); None when that is not a real directory.
+
+    What a continuing round's save puts back where its own version of a path
+    holds a secret: the version the round began from.
+    """
+    meta = _own_meta(package_root)
+    if not isinstance(meta, Path):
+        return None
+    return meta / DRAFT_DIRNAME / manifest["files_dir"]
+
+
+def _same_entry(first: Path, second: Path) -> bool | None:
+    """Whether two names are one entry, by ``(st_dev, st_ino)``; None when either
+    look fails other than by seeing nothing there, which leaves it unknown."""
+    try:
+        one = os.lstat(first)
+        other = os.lstat(second)
+    except FileNotFoundError, NotADirectoryError:
+        return False
+    except OSError:
+        return None
+    return (one.st_dev, one.st_ino) == (other.st_dev, other.st_ino)
+
+
+def _not_brought_in(files: Path) -> dict[str, OmitReason]:
+    """The entries at the top of a draft's files a continuation's workspace does not
+    receive, with why: ``.afterthread.meta/`` (``backend_meta``), and ``.env``
+    with any name that is the same entry spelled in another case (``env_file``):
+    its values are no known secret, so nothing would mask them once ``read_file``
+    put them in the conversation. Another case of ``.env`` when ``.env`` itself
+    is listed too is another entry -- a filesystem that tells case apart -- and
+    is brought in like any file. When whether it is the same entry cannot be told,
+    it is not brought in (``unreadable``). Raises ``OSError`` when the top cannot
+    be listed.
+    """
+    with os.scandir(files) as listing:
+        names = [entry.name for entry in listing]
+    exact = ".env" in names
+    left_out: dict[str, OmitReason] = {}
+    for name in names:
+        if name == tools._META_DIRNAME:
+            left_out[name] = "backend_meta"
+        elif name == ".env":
+            left_out[name] = "env_file"
+        elif name.casefold() == ".env" and not exact:
+            same = _same_entry(files / name, files / ".env")
+            if same is None:
+                left_out[name] = "unreadable"
+            elif same:
+                left_out[name] = "env_file"
+    return left_out
+
+
+@dataclass(frozen=True, slots=True)
+class CopiedIn:
+    """What a continuation's copy of the draft into its workspace did.
+
+    ``copied_out`` is ``tree_digest`` of the files directory taken just before
+    the copy; ``not_brought_in`` every path of it the workspace did not receive,
+    and why, in full.
+    """
+
+    copied_out: TreeDigest | None
+    not_brought_in: tuple[Omitted, ...]
+
+
+def copy_into_workspace(
+    *,
+    package_root: tools.PackageRoot,
+    package_dir_identity: tuple[int, int] | None,
+    expected: tuple[str, int],
+    job_id: str | None,
+    workspace: Path,
+    max_files: int,
+    max_bytes: int,
+) -> CopiedIn | str:
+    """Copy the draft's files into a continuing round's new workspace; or why not,
+    and then the round does not begin. Never raises.
+
+    The pipeline a save copies with, the draft's files directory as the source
+    and ``workspace`` -- which must not exist yet -- as where the copy is made:
+    its links judged on the source and stored relative, every entry and byte
+    counted against the limits as it is made, the links judged again on the copy
+    and resolved there, the whole copy scanned for the known secrets
+    (``_plan_copy``, ``_carry_out``). What holds a secret is not brought in, and
+    no earlier version takes its place. Nor are the entries ``_not_brought_in``
+    names. Modes are kept as the copy keeps them -- each file at least owner
+    read and write, each directory owner rwx, as a save already made them -- so
+    for a draft the backend saved, the workspace's digest equals ``copied_out``.
+
+    Under the shared tools lock, in the round's own package, on the manifest
+    ``begin_round`` returned (``expected``, marked by ``job_id``):
+    ``copied_out`` is taken before anything is copied, then the size limits are
+    checked on the files directory, which only refuses early -- the counting as
+    the copy is made is what holds the limits. A copy that cannot be made whole
+    leaves what it made in the workspace, which the job removes with the rest of
+    its session.
+    """
+    try:
+        known = tools._redaction_secrets()
+    except tools.KnownSecretsIncomplete as exc:
+        return REASON_SECRETS_INCOMPLETE.format(detail=exc)
+    except Exception as exc:
+        return REASON_SCAN_FAILED.format(reason=type(exc).__name__)
+
+    def act(draft_dir: Path) -> CopiedIn | str:
+        current = _running_draft(draft_dir, expected, job_id)
+        if current is None:
+            return START_CHANGED
+        files = draft_dir / current["files_dir"]
+        if not _is_real_dir(files):
+            return REASON_FILES_MISSING
+        copied_out = tree_digest(files, max_entries=max_files, max_bytes=max_bytes)
+        too_big = _over_limits(files, max_files, max_bytes)
+        if too_big is not None:
+            return REASON_DRAFT_UNREADABLE if too_big == REASON_UNREADABLE else too_big
+        scan = tools.scan_embedded_secrets(files, known)
+        if isinstance(scan, tools.SecretScanFailed):
+            return REASON_SCAN_FAILED.format(reason=scan.reason)
+        try:
+            plan = _plan_copy(
+                files, scan, None, max_files, max_bytes, left_out=_not_brought_in(files)
+            )
+        except OSError:
+            return REASON_DRAFT_UNREADABLE
+        try:
+            workspace.mkdir(parents=True)
+            omitted = _carry_out(plan, workspace, known)
+            os.chmod(workspace, stat.S_IMODE(os.lstat(files).st_mode) | 0o700)
+        except _CopyNotKept as refused:
+            return refused.reason
+        except OSError as exc:
+            return REASON_COPY_IN.format(kind=type(exc).__name__)
+        return CopiedIn(copied_out, tuple(omitted))
+
+    try:
+        return _in_own_package(package_root, package_dir_identity, act)
+    except Exception as exc:
+        return REASON_UNEXPECTED.format(kind=type(exc).__name__)
 
 
 def _discard_name(meta: Path) -> Path:
@@ -2298,14 +2967,18 @@ def sweep_package(package_dir: Path, *, fsync_directory: Callable[[Path], bool])
 
     Called by ``tool_builder._sweep_stale_backups`` for each package, under its
     exclusive tools lock, and takes no lock itself. It touches only names this
-    module makes under ``<package>/.afterthread.meta/``: what a discard left
-    (``draft.discarded-<hex>``), and inside ``draft/`` the ``files-<hex>`` the
-    manifest neither names nor keeps and the ``.incoming-<hex>`` a crash left. The
-    second kind only when the manifest can be trusted: it reads back in shape, its
-    files directory is there, and both it and ``draft/`` are fsynced first, so
-    that nothing it names can be taken back by a crash after the collection. Any
-    doubt leaves all of ``draft/`` alone. Nothing is followed through a link: the
-    metadata directory is reached through ``_own_meta``.
+    module makes under ``<package>/.afterthread.meta/``: what an authorized
+    removal left (``draft.discarded-<hex>``: a discard, a removal after a
+    publish), and inside ``draft/`` the ``.incoming-<hex>`` a crash left half
+    made, a name never shown to anyone. The second kind only when the manifest
+    can be trusted: it reads back in shape, its files directory is there, and
+    both it and ``draft/`` are fsynced first. Any doubt leaves all of ``draft/``
+    alone. A ``files-<hex>`` the manifest neither names nor keeps is never taken:
+    not being named is no proof it may go -- a crash before the manifest naming
+    it was on disk brings the older one back, and the operator may have edited
+    the copy the list had shown -- so it stays until the draft is discarded.
+    Nothing is followed through a link: the metadata directory is reached
+    through ``_own_meta``.
     """
     with contextlib.suppress(Exception):
         meta = _own_meta(tools.PackageRoot(package_dir))
@@ -2323,11 +2996,8 @@ def sweep_package(package_dir: Path, *, fsync_directory: Callable[[Path], bool])
             return
         if not _fsync_file(draft_dir / MANIFEST_FILENAME) or not fsync_directory(draft_dir):
             return
-        keep = {manifest["files_dir"], *manifest["kept"]}
         with os.scandir(draft_dir) as listing:
             names = sorted(entry.name for entry in listing)
         for name in names:
-            unnamed_copy = _FILES_RE.fullmatch(name) is not None and name not in keep
-            half_made = _INCOMING_RE.fullmatch(name) is not None
-            if (unnamed_copy or half_made) and _is_real_dir(draft_dir / name):
+            if _INCOMING_RE.fullmatch(name) is not None and _is_real_dir(draft_dir / name):
                 shutil.rmtree(draft_dir / name, ignore_errors=True)

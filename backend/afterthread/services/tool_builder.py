@@ -71,7 +71,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 import httpx2
@@ -79,7 +79,15 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from starlette.concurrency import run_in_threadpool
 
 from afterthread.config import get_settings
-from afterthread.services import llm, llm_log, token_budget, tool_drafts, tool_meta, tools
+from afterthread.services import (
+    llm,
+    llm_log,
+    token_budget,
+    tool_drafts,
+    tool_meta,
+    tool_runs,
+    tools,
+)
 from afterthread.services.llm import (
     FinalizeTrigger,
     LLMNotConfiguredError,
@@ -89,7 +97,12 @@ from afterthread.services.llm import (
     StructuredRunStats,
     generate_structured,
 )
-from afterthread.services.memory_ai import _coerce_bool, _coerce_str, _truncate_to
+from afterthread.services.memory_ai import (
+    _TRUNCATION_MARKER,
+    _coerce_bool,
+    _coerce_str,
+    _truncate_to,
+)
 from afterthread.services.tool_runs import AttachedRun
 from afterthread.services.tools import _NAME_RE
 
@@ -651,8 +664,25 @@ one -- finish with ready=true and put the line to paste in "operator_action". \
 Leave "operator_action" empty when the operator has nothing to do."""
 
 
-def _revise_system_prompt(name: str) -> str:
+# Appended last for a round that continues a draft. ``{attempt}`` is
+# the round's number in the draft, a count the backend keeps, filled in with
+# ``str.replace`` like the budget's numbers.
+_CONTINUATION_PROMPT_ADDENDUM = """\
+
+
+CONTINUATION. This is attempt {attempt} at this revision. Your workspace is what \
+the earlier attempts left, not a clean copy of the installed version, and it may \
+also hold changes the operator made by hand since. Check its current state \
+first. Do not redo what is already done, and do not undo an earlier change \
+without a reason."""
+
+
+def _revise_system_prompt(name: str, *, attempt: int | None = None) -> str:
     """The builder system prompt, reframed for revising the package ``name``.
+
+    ``attempt`` is the round's number in the draft it continues, None for a first
+    round: the continuation addendum then says which attempt it is and what its
+    workspace holds.
 
     Blocking, and called from a worker (R2-4): ``redact_known_secrets`` below is
     the whole-tools-directory scan, the same reason ``_revise_user_prompt``
@@ -695,10 +725,14 @@ def _revise_system_prompt(name: str) -> str:
         .replace("{conversation_tokens}", f"{settings.llm_tool_conversation_budget_tokens:,}")
         .replace("{max_calls}", str(llm._MAX_TOOL_CALLS_PER_REPLY))
     )
+    continuing = (
+        "" if attempt is None else _CONTINUATION_PROMPT_ADDENDUM.replace("{attempt}", str(attempt))
+    )
     return (
         _builder_base_prompt()
         + _REVISE_PROMPT_ADDENDUM.replace("{name}", tools.redact_known_secrets(name))
         + budget
+        + continuing
     )
 
 
@@ -1934,36 +1968,373 @@ inputs only.
 which examples you added."""
 
 
-def _failing_run_text(run: AttachedRun, workspace_vid: str | None, budget: int) -> str:
-    """One attached run as the builder reads it. Each text is redacted, then cut.
+# What an attached run says about the version it ran, for a round
+# that continues a draft: the workspace is not the base version any more.
+_RAN_THE_BASE = (
+    "It ran the version this draft started from; your workspace may have changed "
+    "since, so check its current state first."
+)
+# A run whose record was purged: its summary is all a continuing round has.
+_RUN_PURGED = (
+    "Its record was purged: only this summary is left, so it cannot be reproduced "
+    "from here. Do not try to re-run it."
+)
+# A run whose texts the prompt's total cap left out.
+_RUN_TEXTS_LEFT_OUT = (
+    "Its recorded texts were left out to keep this prompt within its size limit: "
+    "do not try to re-run it from here."
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _RunTexts:
+    """One attached run as a prompt shows it: its summary lines, and each recorded
+    text masked and then cut to the cap it is stored under, as (label, text,
+    whether its end is the part kept)."""
+
+    summary: str
+    texts: tuple[tuple[str, str, bool], ...]
+
+
+def _run_texts(
+    run: AttachedRun, workspace_vid: str | None, *, base_vid: str | None = None
+) -> _RunTexts:
+    """``run`` masked once, for ``_run_text_shown`` to cut as often as it needs.
 
     A run of another version is called DIFFERENT, not older: an attached record
-    (the API takes any of the tool's runs, D45) may have run a version since
+    (the API takes any of the tool's runs) may have run a version since
     discarded, newer than the workspace's, or one of an earlier package that had
-    the same name.
+    the same name. ``base_vid`` is the base of the draft a continuing round
+    works on: a run of it ran the version the draft started from, which the
+    workspace may since have changed.
     """
+    if base_vid is not None and run.vid == base_vid:
+        version = _RAN_THE_BASE
+    elif base_vid is None and run.vid == workspace_vid:
+        version = "It ran the version that is in your workspace."
+    else:
+        started_from = "this draft started from" if base_vid is not None else "in your workspace"
+        version = (
+            f"It ran a DIFFERENT version ({run.vid}) than the one {started_from}: "
+            "check whether it still fails before changing anything."
+        )
     lines = [
         f"Run #{run.id} at {run.started_at:%Y-%m-%d %H:%M:%S} UTC, "
         f"called from the {run.workflow} workflow.",
-        (
-            "It ran the version that is in your workspace."
-            if run.vid == workspace_vid
-            else f"It ran a DIFFERENT version ({run.vid}) than the one in your "
-            "workspace: check whether it still fails before changing anything."
-        ),
+        version,
         "Outcome: "
         + _RUN_OUTCOME_PROSE.get(run.outcome, run.outcome)
         + (f" (exit code {run.exit_code})." if run.exit_code is not None else "."),
     ]
-    for label, text, cut in (
-        ("What the AI assistant was told", run.message, _truncate_to),
-        ("stdin arguments (JSON)", run.args, _truncate_to),
-        ("stderr", run.stderr, _truncate_tail_to),
-        ("stdout", run.stdout, _truncate_to),
+    if run.purged:
+        lines.append(_RUN_PURGED)
+        return _RunTexts("\n".join(lines), ())
+    texts: list[tuple[str, str, bool]] = []
+    for label, text, cap, keep_end in (
+        ("What the AI assistant was told", run.message, tool_runs.MESSAGE_MAX_CHARS, False),
+        ("stdin arguments (JSON)", run.args, tool_runs.ARGS_MAX_CHARS, False),
+        ("stderr", run.stderr, tool_runs.STDERR_TAIL_MAX_CHARS, True),
+        ("stdout", run.stdout, tool_runs.STDOUT_HEAD_MAX_CHARS, False),
     ):
         if text:
-            lines += [f"{label}:", cut(tools.redact_known_secrets(text), budget)]
+            masked = tools.redact_known_secrets(text)
+            cut = _truncate_tail_to(masked, cap) if keep_end else _truncate_to(masked, cap)
+            texts.append((label, cut, keep_end))
+    return _RunTexts("\n".join(lines), tuple(texts))
+
+
+def _run_text_shown(run: _RunTexts, limit: int | None) -> str:
+    """One run as the prompt carries it: each text cut to ``limit`` more -- its end
+    kept for stderr -- whole when ``limit`` is None, left out when it is 0."""
+    if limit == 0 and run.texts:
+        return f"{run.summary}\n{_RUN_TEXTS_LEFT_OUT}"
+    lines = [run.summary]
+    for label, text, keep_end in run.texts:
+        if limit is not None:
+            text = _truncate_tail_to(text, limit) if keep_end else _truncate_to(text, limit)
+        lines += [f"{label}:", text]
     return "\n".join(lines)
+
+
+# --- the revise prompt's size --------------------------------------------------------
+#
+# Each part of the user turn has a cap of its own, the cap its text has where it is
+# kept, so a text is cut here only when it grew by a mask. The turn as a whole is
+# then held to the smaller of the prompt budget and what the conversation budget's
+# half leaves beside the system prompt (``_fit_prompt``), shrinking its parts in a
+# fixed order, the lowest rank first. Headings, fixed instructions and a run's
+# summary lines carry no rank: only the last resort, a cut of the whole turn, ever
+# shortens them.
+
+_PROMPT_ENDING_CAP = 2000
+_PROMPT_EARLIER_ROUNDS = 4
+_PROMPT_LINE_CAP = 300
+_PROMPT_LIST_ENTRIES = 50
+
+_RANK_LISTS = 1  # earlier rounds, the paths not brought in, the paths changed
+_RANK_RUN_TEXTS = 2
+_RANK_CONFIG = 3  # config.env, and the .env key names
+_RANK_TOOL_JSON = 4
+_RANK_ORIGINAL = 5  # the original request
+_RANK_PREVIOUS = 6  # the previous round's notes
+_RANK_NOTE = 7  # this round's note
+
+
+@dataclass(frozen=True, slots=True)
+class _Shrinkable:
+    """A part of a prompt the total cap may shrink.
+
+    ``render(None)`` is the part whole; ``render(n)`` holds its variable text to
+    ``n`` chars, a text cut down to nothing still saying it was cut. ``size`` is
+    the largest ``n`` that changes anything.
+    """
+
+    rank: int
+    render: Callable[[int | None], str]
+    size: int
+
+
+def _cut(text: str, limit: int) -> str:
+    """``text`` cut to its first ``limit`` chars, marked; at the least the marker."""
+    if len(text) <= limit:
+        return text
+    if limit <= len(_TRUNCATION_MARKER):
+        return _TRUNCATION_MARKER
+    return text[: limit - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+
+
+def _text_part(rank: int, header: str, body: str) -> _Shrinkable:
+    """A heading and a body under it; the body is what shrinks."""
+
+    def render(limit: int | None) -> str:
+        return f"{header}\n\n{body if limit is None else _cut(body, limit)}"
+
+    return _Shrinkable(rank, render, len(body))
+
+
+def _line_part(rank: int, lead: str, body: str) -> _Shrinkable:
+    """One line: fixed words, then a body that shrinks."""
+
+    def render(limit: int | None) -> str:
+        return lead + (body if limit is None else _cut(body, limit))
+
+    return _Shrinkable(rank, render, len(body))
+
+
+def _runs_part(runs: tuple[_RunTexts, ...]) -> _Shrinkable:
+    """The attached runs: each run's texts cut to the same limit."""
+
+    def render(limit: int | None) -> str:
+        return "\n\n".join(_run_text_shown(run, limit) for run in runs)
+
+    longest = max((len(text) for run in runs for _label, text, _end in run.texts), default=0)
+    return _Shrinkable(_RANK_RUN_TEXTS, render, longest)
+
+
+def _fit_prompt(parts: list[str | _Shrinkable], cap: int) -> str:
+    """``parts`` joined as one prompt of at most ``cap`` chars.
+
+    Whole when that fits. Otherwise the parts of the lowest rank shrink first:
+    each rank is shrunk only as far as it must -- the longest common limit that
+    fits -- and only once every lower rank is already as short as it goes. When
+    even every rank at its shortest does not fit, the whole is cut: the last
+    resort, the only one that reaches the fixed text.
+    """
+    limits: dict[int, int] = {}
+
+    def build() -> str:
+        texts = (
+            part if isinstance(part, str) else part.render(limits.get(part.rank)) for part in parts
+        )
+        return "\n\n".join(text for text in texts if text)
+
+    prompt = build()
+    if len(prompt) <= cap:
+        return prompt
+    ranked = [part for part in parts if isinstance(part, _Shrinkable)]
+    for rank in sorted({part.rank for part in ranked}):
+        limits[rank] = 0
+        if len(build()) > cap:
+            continue
+        low, high = 0, max(part.size for part in ranked if part.rank == rank)
+        while low < high:
+            middle = (low + high + 1) // 2
+            limits[rank] = middle
+            if len(build()) <= cap:
+                low = middle
+            else:
+                high = middle - 1
+        limits[rank] = low
+        return build()
+    return _truncate_to(build(), max(cap, 0))
+
+
+def _revise_prompt_cap(system_chars: int) -> int:
+    """How long a revise's user turn may be: within the prompt budget, and, with the
+    system prompt, within half the conversation budget, the other half left for
+    the work."""
+    settings = get_settings()
+    return min(
+        token_budget.char_allowance(settings.llm_prompt_budget_tokens),
+        token_budget.char_allowance(settings.llm_tool_conversation_budget_tokens) // 2
+        - system_chars,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _History:
+    """What a continuing round's prompt says of the draft it continues.
+
+    ``original`` is the draft's own ``feedback``; ``attempts`` the rounds its
+    manifest keeps, oldest first, as ``begin_round`` wrote it; ``not_brought_in``
+    the draft's paths the workspace did not receive, in full; ``changed`` the
+    paths that differ from ``base_vid``'s version, None when that could not be
+    told; ``workspace_config`` whether the workspace holds a ``config.env``.
+    """
+
+    original: str | None
+    attempts: tuple[dict[str, Any], ...]
+    not_brought_in: tuple[tool_drafts.Omitted, ...]
+    changed: tuple[str, ...] | None
+    base_vid: str
+    workspace_config: bool
+
+
+# Why a path of the draft is not in the workspace, for the model.
+_NOT_BROUGHT_IN_PROSE = {
+    "secret_name": "its name holds a known secret",
+    "secret_content": "its content holds a known secret",
+    "secret_link_target": "its link target holds a known secret",
+    "link_outside": "a link that leads outside the draft's files",
+    "link_ambiguous": "a link whose target goes up through another link",
+    "unreadable": "it could not be read, or whether it is a .env could not be told",
+    "not_regular": "not a regular file, directory or link",
+    "env_file": "a .env file: its values are never shown to you",
+    "backend_meta": "the backend's own metadata directory",
+}
+
+_WORKSPACE_CONFIG_NOTE = (
+    "Your workspace has a config.env file: it is NOT loaded when the tool runs. "
+    "The package's own config.env, outside your workspace, is."
+)
+
+
+def _masked_cut(text: str, cap: int) -> str:
+    """Operator- or file-derived text for a prompt: masked whole, then cut."""
+    return _truncate_to(tools.redact_known_secrets(text), cap)
+
+
+def _listed(entries: list[str]) -> str:
+    """Up to ``_PROMPT_LIST_ENTRIES`` lines, each cut to ``_PROMPT_LINE_CAP``, and how
+    many more there are."""
+    shown = [_cut(entry, _PROMPT_LINE_CAP) for entry in entries[:_PROMPT_LIST_ENTRIES]]
+    rest = len(entries) - len(shown)
+    if rest:
+        shown.append(f"... and {rest} more.")
+    return "\n".join(shown)
+
+
+def _ending_text(attempt: dict[str, Any]) -> str:
+    """How a recorded round ended: what the backend measured, then its error."""
+    outcome = attempt["outcome"] or "not recorded (saved just before a publish)"
+    facts = [f"outcome: {outcome}"]
+    if attempt["stopped_by"] is not None:
+        facts.append(f"the tool phase was ended by the {attempt['stopped_by']} budget")
+    if attempt["failure"] is not None:
+        facts.append(f"the session failed: {attempt['failure']}")
+    if attempt["rounds_used"] is not None and attempt["max_rounds"] is not None:
+        facts.append(f"{attempt['rounds_used']} of {attempt['max_rounds']} tool rounds used")
+    facts.append("its files were saved" if attempt["saved"] else "its files were not saved")
+    text = "; ".join(facts) + "."
+    if attempt["error"]:
+        text += "\nError: " + tools.redact_known_secrets(attempt["error"])
+    return _truncate_to(text, _PROMPT_ENDING_CAP)
+
+
+def _previous_round_text(attempt: dict[str, Any]) -> str:
+    """The previous round: how it ended, and its notes and the operator's, each at
+    the cap it is kept under."""
+    if attempt["outcome"] == "interrupted":
+        lines = [
+            "It left no record of how it ended (the backend may have stopped while it "
+            "ran), and its progress was not saved into the draft."
+        ]
+    else:
+        lines = ["How it ended, as the backend measured it: " + _ending_text(attempt)]
+    for label, key, cap in (
+        ("Its summary", "summary", tool_drafts.SUMMARY_CAP),
+        ("Its handoff", "handoff", tool_drafts.HANDOFF_CAP),
+        ("What it asked the operator to do", "operator_action", tool_drafts.OPERATOR_ACTION_CAP),
+        ("The operator's note for that attempt", "note", tool_drafts.NOTE_CAP),
+    ):
+        if attempt[key]:
+            lines.append(f"{label}: {_masked_cut(attempt[key], cap)}")
+    return "\n".join(lines)
+
+
+def _earlier_round_line(attempt: dict[str, Any]) -> str:
+    """One earlier round in a line."""
+    facts = [f"#{attempt['number']}: {attempt['outcome'] or 'outcome not recorded'}"]
+    if attempt["stopped_by"] is not None:
+        facts.append(f"ended by the {attempt['stopped_by']} budget")
+    if attempt["failure"] is not None:
+        facts.append(f"failed: {attempt['failure']}")
+    facts.append("files saved" if attempt["saved"] else "files not saved")
+    line = "; ".join(facts)
+    if attempt["summary"]:
+        line += "; summary: " + tools.redact_known_secrets(attempt["summary"])
+    return _cut(line, _PROMPT_LINE_CAP)
+
+
+def _history_parts(history: _History) -> list[str | _Shrinkable]:
+    """A continuing round's own parts: the previous round, the earlier ones, the
+    draft's paths not brought in, and the paths changed since the base."""
+    parts: list[str | _Shrinkable] = []
+    if history.attempts:
+        latest = history.attempts[-1]
+        parts.append(
+            _text_part(
+                _RANK_PREVIOUS,
+                f"The previous attempt (#{latest['number']}):",
+                _previous_round_text(latest),
+            )
+        )
+        earlier = history.attempts[-1 - _PROMPT_EARLIER_ROUNDS : -1]
+        if earlier:
+            parts.append(
+                _text_part(
+                    _RANK_LISTS,
+                    "Earlier attempts, one line each:",
+                    "\n".join(_earlier_round_line(attempt) for attempt in earlier),
+                )
+            )
+    if history.not_brought_in:
+        entries = [
+            f"- {tools.redact_known_secrets(item.path)}: "
+            + _NOT_BROUGHT_IN_PROSE.get(item.reason, item.reason)
+            for item in history.not_brought_in
+        ]
+        parts.append(
+            _text_part(
+                _RANK_LISTS,
+                "Paths of the draft that are NOT in your workspace, and why:",
+                _listed(entries),
+            )
+        )
+    if history.workspace_config:
+        parts.append(_WORKSPACE_CONFIG_NOTE)
+    changed_header = (
+        f"Paths that differ between your workspace and the installed version "
+        f"{history.base_vid} this draft started from:"
+    )
+    if history.changed is None:
+        parts += [changed_header, "They cannot be listed: one side could not be read whole."]
+    elif not history.changed:
+        parts += [changed_header, "None."]
+    else:
+        changed = [f"- {tools.redact_known_secrets(path)}" for path in history.changed]
+        parts.append(_text_part(_RANK_LISTS, changed_header, _listed(changed)))
+    return parts
 
 
 def _revise_user_prompt(
@@ -1975,8 +2346,10 @@ def _revise_user_prompt(
     *,
     runs: tuple[AttachedRun, ...] = (),
     workspace_vid: str | None = None,
+    system_chars: int = 0,
+    history: _History | None = None,
 ) -> str:
-    """The revise session's user turn: the feedback + the package's manifest.
+    """The revise session's user turn, held to its cap (``_revise_prompt_cap``).
 
     Deliberately NOT a re-fetch of the OpenAPI document (D40): the revision is
     driven by the user's words and by the code already in the workspace, the
@@ -1984,19 +2357,26 @@ def _revise_user_prompt(
     capture), and re-fetching would spend a network round trip on a document the
     model can no longer be told is current.
 
+    The parts, in a fixed order: the request; for a round that
+    continues a draft (``history``), this round's note, the previous round and
+    the earlier ones, the paths of the draft not brought in and the paths
+    changed since its base; the workspace's ``tool.json``; the package's
+    ``config.env`` and ``.env`` key names; the attached runs and how to work on
+    them. For a first round ``feedback`` is the request; for a continuation it is
+    this round's note, and the request is the draft's own.
+
     ``tool.json`` is quoted even though the model can `read_file` it, because it
     is the ONE file whose shape the feedback is most often about (the
     description and parameters an assistant sees) -- having it in the opening
     turn saves a round and keeps the model from revising against a guess.
 
-    Both parts are redacted BEFORE the budget cut, the same redact-then-cap
-    order every prompt site here uses: a secret straddling the cut would become
-    an unmatchable interior fragment. The feedback is redacted where the
-    install's instructions are not -- it is written AFTER the tool has a live
-    ``.env``, so a user quoting their own key is a value we now genuinely know.
-    Each part carries the same per-part budget ``_builder_user_prompt`` gives the
-    document; both are separately request/manifest-bounded already, so the cut is
-    a backstop rather than the usual case.
+    Every operator- or file-derived text is masked BEFORE it is cut, the same
+    redact-then-cap order every prompt site here uses: a secret straddling the
+    cut would become an unmatchable interior fragment. The feedback is redacted
+    where the install's instructions are not -- it is written AFTER the tool has
+    a live ``.env``, so a user quoting their own key is a value we now genuinely
+    know. The backend's own words go in as they are: a registered value that
+    happens to equal one of them would mangle it (see ``_revise_system_prompt``).
 
     Two package-layer facts follow when present (web-v6 §4), because the model
     cannot see either file from its workspace. ``config.env`` is quoted WHOLE --
@@ -2009,58 +2389,84 @@ def _revise_user_prompt(
     has without telling it any of them; ``conflicts`` are the keys both files
     set, where the ``.env`` value is the one that runs.
 
-    ``runs`` are the failing run records the operator attached (web-v6 §8.4):
-    each one's time, workflow, whether it ran the workspace's version
-    (``workspace_vid``), outcome, the string the assistant got, and the masked
-    stdin arguments and output, followed by the fixed debugging procedure.
-    Their texts were masked when the job was submitted and go through the
-    redactor again here, like every operator-derived text in this prompt. A
-    revise with runs and no feedback says so in the feedback slot -- in the
-    backend's own words, which go in as they are: only operator- or
-    filesystem-derived text is redacted (see ``_revise_system_prompt``), and a
-    registered value that happens to equal one of those words would mangle it.
+    ``runs`` are the failing run records attached: each one's time,
+    workflow, which version it ran, outcome, the string the assistant got, and
+    the masked stdin arguments and output, followed by the fixed debugging
+    procedure. Their texts were masked when the job was submitted and go through
+    the redactor again here, then are cut to the caps they are stored under. A
+    record purged since an earlier round attached it is its summary alone, said
+    to be one that cannot be re-run. A revise with runs and no request says so
+    in the request's slot, in the backend's own words.
     """
-    budget = token_budget.char_allowance(get_settings().llm_prompt_budget_tokens)
-    parts = [
-        "Revise the existing tool package as described below.",
-        "User feedback:",
-        (
-            _truncate_to(tools.redact_known_secrets(feedback), budget)
-            if feedback is not None
-            else _NO_FEEDBACK
-        ),
-    ]
+    parts: list[str | _Shrinkable] = ["Revise the existing tool package as described below."]
+    request = feedback if history is None else history.original
+    request_header = "User feedback:" if history is None else "The operator's original request:"
+    if request is not None:
+        parts.append(
+            _text_part(
+                _RANK_ORIGINAL, request_header, _masked_cut(request, tool_drafts.FEEDBACK_CAP)
+            )
+        )
+    else:
+        parts += [request_header, _NO_FEEDBACK]
+    if history is not None:
+        if feedback is not None:
+            parts.append(
+                _text_part(
+                    _RANK_NOTE,
+                    "The operator's note for this attempt:",
+                    _masked_cut(feedback, tool_drafts.NOTE_CAP),
+                )
+            )
+        parts += _history_parts(history)
     if manifest_text is not None:
-        parts += [
-            "The package's current tool.json:",
-            _truncate_to(tools.redact_known_secrets(manifest_text), budget),
-        ]
+        parts.append(
+            _text_part(
+                _RANK_TOOL_JSON,
+                "The workspace's current tool.json:"
+                if history is not None
+                else "The package's current tool.json:",
+                tools.redact_known_secrets(manifest_text),
+            )
+        )
     if config_text.strip():
-        parts += [
-            "The operator's setting overrides for this package (its config.env, "
-            "outside your workspace). These values override the defaults in the "
-            "tool's code at runtime and are already in your run_shell environment. "
-            "If the feedback asks to change one of these settings, changing the code "
-            "default has NO effect while the override stays: say in your summary "
-            "that the operator must edit config.env.",
-            _truncate_to(tools.redact_known_secrets(config_text), budget),
-        ]
+        parts.append(
+            _text_part(
+                _RANK_CONFIG,
+                "The operator's setting overrides for this package (its config.env, "
+                "outside your workspace). These values override the defaults in the "
+                "tool's code at runtime and are already in your run_shell environment. "
+                "If the feedback asks to change one of these settings, changing the code "
+                "default has NO effect while the override stays: say in your summary "
+                "that the operator must edit config.env.",
+                tools.redact_known_secrets(config_text),
+            )
+        )
         if conflicts:
             parts.append(
-                "These keys are also set in the package's .env, whose value wins: "
-                + _truncate_to(tools.redact_known_secrets(", ".join(conflicts)), budget)
+                _line_part(
+                    _RANK_CONFIG,
+                    "These keys are also set in the package's .env, whose value wins: ",
+                    tools.redact_known_secrets(", ".join(conflicts)),
+                )
             )
     if env_keys:
         parts.append(
-            "Variables the package's .env sets in your run_shell environment "
-            "(secrets; values hidden; never print them): "
-            + _truncate_to(tools.redact_known_secrets(", ".join(env_keys)), budget)
+            _line_part(
+                _RANK_CONFIG,
+                "Variables the package's .env sets in your run_shell environment "
+                "(secrets; values hidden; never print them): ",
+                tools.redact_known_secrets(", ".join(env_keys)),
+            )
         )
     if runs:
+        base_vid = history.base_vid if history is not None else None
         parts += [_FAILING_RUNS_HEADER, _FAILING_RUNS_CAVEAT]
-        parts += [_failing_run_text(run, workspace_vid, budget) for run in runs]
+        parts.append(
+            _runs_part(tuple(_run_texts(run, workspace_vid, base_vid=base_vid) for run in runs))
+        )
         parts.append(_DEBUG_PROCEDURE)
-    return "\n\n".join(parts)
+    return _fit_prompt(parts, _revise_prompt_cap(system_chars))
 
 
 # The longest ``origin.feedback`` a revise writes, so ``origin.json`` stays far
@@ -2069,14 +2475,20 @@ _ORIGIN_FEEDBACK_CAP = 20_000
 
 
 def _provenance_feedback(
-    feedback: str | None, runs: tuple[AttachedRun, ...], draft_line: str | None = None
+    feedback: str | None,
+    runs: tuple[AttachedRun, ...],
+    draft_line: str | None = None,
+    notes: tuple[tuple[int, str], ...] = (),
 ) -> str:
-    """The ``origin.feedback`` a revise writes: the operator's words, the runs, the draft.
+    """The ``origin.feedback`` a revise writes: the request, the rounds' notes, the runs,
+    the draft.
 
-    A version records WHY it exists (web-v6 §8.1): for a fix, which failures it
-    was made for -- id, time, outcome and exit code, never the stderr or the
-    arguments (invariant V): the origin is kept as long as the version is, and
-    the record's bodies are the operator's to purge. ``draft_line`` names the
+    A version records WHY it exists: the operator's request -- for
+    a round that continues a draft, the draft's own -- and each round's note
+    (``notes``: round number, note) the draft still keeps; for a fix, which
+    failures it was made for -- id, time, outcome and exit code, never the stderr
+    or the arguments: the origin is kept as long as the version is,
+    and the record's bodies are the operator's to purge. ``draft_line`` names the
     draft the round saved before publishing (``tool_drafts.provenance_line``):
     the tools list finds that draft's id here to tell a publish that went through
     from one that did not -- unless ``write_origin_meta`` writes the whole field
@@ -2090,6 +2502,8 @@ def _provenance_feedback(
     parts = []
     if feedback:
         parts.append(tools.redact_known_secrets(feedback))
+    for number, note in notes:
+        parts.append(f"第 {number} 輪的說明：{tools.redact_known_secrets(note)}")  # noqa: RUF001
     if runs:
         entries = []
         for run in runs:
@@ -3479,11 +3893,13 @@ def _env_policy_message(template: str, keys: list[str]) -> str:
 
 
 def _current_manifest_text(directory: Path) -> str | None:
-    """The installed package's ``tool.json`` text for the revise prompt, or None.
+    """The ``tool.json`` text at the top of ``directory`` for the revise prompt, or None.
 
-    Blocking, and best-effort: a manifest we cannot read is a package the model
-    will simply have to ``read_file`` for itself (or that is already broken), not
-    a reason to refuse the revise the user asked for.
+    Read from the round's workspace once it is made: for a first round that is
+    the installed version as copied, for a continuation the draft's files, which
+    may have changed it. Blocking, and best-effort: a manifest we cannot read is
+    one the model will simply have to ``read_file`` for itself (or that is
+    already broken), not a reason to refuse the revise the user asked for.
     """
     return tools._read_regular_file_capped(directory / "tool.json", tools._MANIFEST_MAX_BYTES)
 
@@ -3493,9 +3909,9 @@ def _current_manifest_text(directory: Path) -> str | None:
 # discarding it all that is left to do; when the draft was left because it holds
 # more, or because that could not be told, it may hold changes no version has,
 # and the note says to take them out first (``tool_drafts.remove_after_publish``).
-_DRAFT_NOT_REMOVED = "已發布，但未能刪除這一輪的草稿，請在工具列放棄它。"  # noqa: RUF001
+_DRAFT_NOT_REMOVED = "已發布，但未能刪除這份草稿，請在工具列放棄它。"  # noqa: RUF001
 _DRAFT_KEPT_CHANGED = (
-    "已發布，但發布期間草稿被改過或多了內容，那些內容還在草稿裡、沒有發布。"  # noqa: RUF001
+    "已發布，但草稿仍有額外的項目，可能含沒發布的內容。"  # noqa: RUF001
     "要保留的話，先從草稿目錄取出，再到工具列放棄這份草稿。"  # noqa: RUF001
 )
 _DRAFT_KEPT_UNCONFIRMED = (
@@ -3504,6 +3920,21 @@ _DRAFT_KEPT_UNCONFIRMED = (
 )
 # By ``tool_drafts.Removal.kept``: why the removal was not attempted.
 _DRAFT_LEFT_REASONS = {"changed": _DRAFT_KEPT_CHANGED, "unconfirmed": _DRAFT_KEPT_UNCONFIRMED}
+# A continuation that published while its save before the publish did not keep
+# the round: no ``publishing`` was written, so the draft stays as the round found
+# it, and the version has what the round did.
+_DRAFT_ROUND_NOT_SAVED = "已發布；這一輪沒有存進草稿，請取回草稿裡需要的內容再放棄它。"  # noqa: RUF001
+
+# Why a continuation did not begin: nothing was spent and no round is counted.
+# ``{reason}`` is ``tool_drafts``' own words, last since it may be sentences.
+_ERROR_CONTINUE_NOT_STARTED = "無法開始接續修正（這一輪沒有開始，也沒有呼叫 AI）：{reason}"  # noqa: RUF001
+_ERROR_CONTINUE_NOT_COPIED = (
+    "無法把草稿帶進新的暫存工作區（這一輪沒有開始，也沒有呼叫 AI）：{reason}"  # noqa: RUF001
+)
+
+# A publish that refused its workspace as not the staging directory it was given:
+# where that workspace is now is not known, so no path is claimed for it.
+_STAGING_REFUSALS = frozenset({_ERROR_STAGING_TAMPERED, _ERROR_STAGING_UNVERIFIED})
 
 
 @dataclass(frozen=True, slots=True)
@@ -3511,7 +3942,11 @@ class _RoundDraft:
     """Everything a revise round's draft save needs, gathered once the session ended.
 
     The notes are the model's own words, already masked and capped; nothing reads
-    them to decide anything (``tool_drafts.DraftRound``).
+    them to decide anything (``tool_drafts.DraftRound``). A continuation also
+    carries the manifest its ``begin_round`` wrote (``begun``), which every
+    write of the round is matched against, ``copied_out`` from its copy of the
+    draft, its own note, the draft's paths it did not receive, and the records
+    it newly attached.
     """
 
     base: Path
@@ -3527,55 +3962,88 @@ class _RoundDraft:
     summary: str | None
     handoff: str | None
     operator_action: str | None
+    begun: dict[str, Any] | None = None
+    copied_out: tool_drafts.TreeDigest | None = None
+    note: str | None = None
+    not_brought_in: tuple[tool_drafts.Omitted, ...] = ()
+    attached: tuple[AttachedRun, ...] = ()
 
 
-def _save_round_draft(
+def _draft_round(
+    context: _RoundDraft, outcome: tool_drafts.RoundOutcome | None, error: str | None
+) -> tool_drafts.DraftRound:
+    """How the round ended, as its draft records it."""
+    facts = context.facts
+    return tool_drafts.DraftRound(
+        finished_at=_now_iso(),
+        job_id=context.job_id,
+        started_at=context.started_at,
+        outcome=outcome,
+        stopped_by=facts.get("stopped_by"),
+        failure=facts.get("failure"),
+        rounds_used=facts.get("rounds_used"),
+        max_rounds=facts.get("max_rounds"),
+        error=error,
+        summary=context.summary,
+        handoff=context.handoff,
+        operator_action=context.operator_action,
+        note=context.note,
+        not_brought_in=context.not_brought_in,
+        attached=context.attached,
+    )
+
+
+def _workspace_confirmed(build_root: tools.BuildRoot, base: Path) -> bool:
+    """Whether the round's workspace is still the real, contained staging directory
+    it was given (``_verify_staging_root``), and there; never raises. A path that
+    fails this is not one a job may name as where the work is."""
+    try:
+        workspace = build_root.path
+        return (
+            _verify_staging_root(workspace, base) is None
+            and tool_drafts.directory_identity(workspace) is not None
+        )
+    except Exception:
+        return False
+
+
+def _save_files(
     context: _RoundDraft, outcome: tool_drafts.RoundOutcome | None, error: str | None
 ) -> tool_drafts.SaveResult:
-    """Save the round's workspace as the tool's draft; never raises.
+    """The save itself: the steps it shares with the publish, then
+    ``tool_drafts.save_round``. Never raises.
 
-    Blocking (runs via ``run_in_threadpool``). The steps a save shares with the
-    publish are here: the caller has confirmed the round's commands stopped and
-    stripped the builder's ``.env``; this strips the root ``.afterthread.meta/``
-    and checks that the workspace is still the real, contained staging directory
-    it was given. ``tool_drafts.save_round`` does the rest, with this module's
-    fsync helpers. ``outcome`` is None for the save a publish is about to follow.
+    The caller has confirmed the round's commands stopped and stripped the
+    builder's ``.env``; this strips the root ``.afterthread.meta/`` and checks
+    that the workspace is still the real, contained staging directory it was
+    given. A workspace that cannot be confirmed is ``REASON_WORKSPACE``: where it
+    is, nothing can say.
     """
     try:
         workspace = context.build_root.path
-        if (
-            _verify_staging_root(workspace, context.base) is not None
-            or tool_drafts.directory_identity(workspace) is None
-        ):
+        if not _workspace_confirmed(context.build_root, context.base):
             return tool_drafts.SaveResult(worth_saving=True, reason=tool_drafts.REASON_WORKSPACE)
         if _strip_builder_sidecars(workspace) is not None:
             return tool_drafts.SaveResult(
                 worth_saving=True, reason=tool_drafts.REASON_STRIP_SIDECARS
             )
         settings = get_settings()
-        facts = context.facts
+        begun = context.begun
         return tool_drafts.save_round(
             package_root=context.package_root,
             package_dir_identity=context.package_dir_identity,
             workspace=workspace,
-            earlier_root=context.base_version.path,
-            copied_in=context.copied_in,
-            draft_round=tool_drafts.DraftRound(
-                finished_at=_now_iso(),
-                job_id=context.job_id,
-                started_at=context.started_at,
-                outcome=outcome,
-                stopped_by=facts.get("stopped_by"),
-                failure=facts.get("failure"),
-                rounds_used=facts.get("rounds_used"),
-                max_rounds=facts.get("max_rounds"),
-                error=error,
-                summary=context.summary,
-                handoff=context.handoff,
-                operator_action=context.operator_action,
+            earlier_root=(
+                context.base_version.path
+                if begun is None
+                else tool_drafts.previous_files(context.package_root, begun)
             ),
-            start=context.start,
-            previous=None,
+            copied_in=context.copied_in,
+            draft_round=_draft_round(context, outcome, error),
+            start=context.start if begun is None else None,
+            previous=(
+                None if begun is None else tool_drafts.PreviousDraft(begun, context.copied_out)
+            ),
             max_files=settings.tool_draft_max_files,
             max_bytes=settings.tool_draft_max_bytes,
             durability=tool_drafts.Durability(tree=_fsync_tree, directory=_fsync_directory),
@@ -3587,28 +4055,97 @@ def _save_round_draft(
         )
 
 
-def _draft_report(saved: tool_drafts.SaveResult) -> dict[str, Any] | None:
-    """The job's ``draft`` for a round that did not publish: None if nothing was worth keeping."""
-    return saved.report() if saved.worth_saving else None
+def _close_unrecorded(
+    context: _RoundDraft,
+    saved: tool_drafts.SaveResult,
+    outcome: tool_drafts.RoundOutcome,
+    error: str | None,
+) -> tool_drafts.SaveResult:
+    """A continuing round that ran, once its end is known: recorded once.
+
+    What its save recorded is not recorded again. A round nothing recorded yet --
+    its workspace not confirmed, a strip that failed, a save that failed before
+    it wrote -- is recorded on its own, its files not saved, why taken from
+    ``saved`` (``tool_drafts.record_round``). A first round has no draft to record
+    in. Never raises.
+    """
+    begun = context.begun
+    if begun is None or not saved.worth_saving or saved.recorded:
+        return saved
+    return tool_drafts.record_round(
+        context.package_root,
+        context.package_dir_identity,
+        (begun["draft_id"], begun["generation"]),
+        _draft_round(context, outcome, error),
+        saved.reason,
+    )
 
 
-def _log_result_kept(session_root: Path) -> None:
-    """Say in the backend log where a failed publish left work no draft holds."""
-    with contextlib.suppress(Exception):
-        _logger.warning(
-            "Builder workspace kept at %s: its publish failed and it could not be "
-            "saved as the tool's draft.",
-            session_root,
+def _save_round_draft(
+    context: _RoundDraft, outcome: tool_drafts.RoundOutcome | None, error: str | None
+) -> tool_drafts.SaveResult:
+    """Save the round's workspace as the tool's draft, and close the round; never raises.
+
+    Blocking (runs via ``run_in_threadpool``). ``outcome`` is None for the save a
+    publish is about to follow, which closes nothing yet: the round is recorded
+    for good once the publish's result is known (``_close_unrecorded``).
+    """
+    saved = _save_files(context, outcome, error)
+    if outcome is None:
+        return saved
+    return _close_unrecorded(context, saved, outcome, error)
+
+
+def _holding(saved: tool_drafts.SaveResult) -> bool:
+    """Whether a round's staging must stay after its save: there was work worth
+    keeping, and no draft is known to hold it -- the files not saved, or the
+    manifest that names them not confirmed on disk."""
+    return saved.worth_saving and not (saved.saved and saved.durable)
+
+
+def _round_report(
+    saved: tool_drafts.SaveResult,
+    context: _RoundDraft,
+    *,
+    retained: str | None,
+    reason: str | None = None,
+) -> dict[str, Any] | None:
+    """The job's ``draft``: None if nothing was worth keeping.
+
+    ``retained`` is where the work is kept besides the draft, when it is; the
+    caller only names a place that was confirmed. A continuation whose round no
+    write recorded still names its draft -- as ``begin_round`` left it.
+    """
+    if not saved.worth_saving:
+        return None
+    report = saved.report(retained_path=retained, reason=reason)
+    begun = context.begun
+    if report["draft_id"] is None and begun is not None:
+        report.update(
+            draft_id=begun["draft_id"],
+            generation=begun["generation"],
+            attempts=begun["attempt_count"],
         )
+    return report
 
 
-def _log_unsaved_work_kept(session_root: Path) -> None:
-    """Say in the backend log where a revise that stopped before its publish was
-    handled left work no draft is known to hold."""
+def _workspace_retained(
+    context: _RoundDraft, saved: tool_drafts.SaveResult, holding: bool
+) -> str | None:
+    """The staging workspace's path for the job, when it is kept for the work in it.
+
+    Not when the workspace itself could not be confirmed to be the staging
+    directory it was given: what is at that path then is not known."""
+    if not holding or saved.reason == tool_drafts.REASON_WORKSPACE:
+        return None
+    return str(context.build_root.path)
+
+
+def _log_work_kept(session_root: Path) -> None:
+    """Say in the backend log where a revise left work no draft is known to hold."""
     with contextlib.suppress(Exception):
         _logger.warning(
-            "Builder workspace kept at %s: the revise stopped before the result of "
-            "its publish was handled, and no draft is known to hold its work.",
+            "Builder workspace kept at %s: no draft is known to hold its work on disk.",
             session_root,
         )
 
@@ -3624,12 +4161,79 @@ def _log_publish_running_kept(session_root: Path) -> None:
         )
 
 
+async def _masked_notes(
+    result: ReviseResult | None,
+) -> tuple[str | None, dict[str, Any], tools.OperatorFacingError | None]:
+    """The model's summary and two notes, masked and capped again; or, when the known
+    secrets cannot be had whole, none of them and the error saying so.
+
+    The same choke point run_install uses (``_masked_and_capped``, each field with
+    its own cap, so a secret registered since the first mask cannot carry it past
+    the cap), and on a worker, since each mask scans the tools directory. The
+    notes ride along for display only -- nothing branches on them.
+    """
+    if result is None:
+        return None, {}, None
+    try:
+        summary = (
+            await run_in_threadpool(_masked_and_capped, result.summary, _SUMMARY_CAP)
+            if result.summary
+            else None
+        )
+        notes = {
+            "handoff": (
+                await run_in_threadpool(_masked_and_capped, result.handoff, _HANDOFF_CAP)
+                if result.handoff
+                else None
+            ),
+            "operator_action": (
+                await run_in_threadpool(
+                    _masked_and_capped, result.operator_action, _OPERATOR_ACTION_CAP
+                )
+                if result.operator_action
+                else None
+            ),
+        }
+    except tools.OperatorFacingError as exc:
+        return None, {}, exc
+    return summary, notes, None
+
+
+def _changed_since_base(
+    version: Path, workspace: tool_drafts.TreeDigest | None, max_entries: int, max_bytes: int
+) -> tuple[str, ...] | None:
+    """The paths that differ between ``version`` and the workspace as the round
+    received it, the version's own ``.afterthread.meta/`` left out; None when
+    either side cannot be read whole -- never "no change"."""
+    if workspace is None:
+        return None
+    base = tool_drafts.tree_digest(version, max_entries=max_entries, max_bytes=max_bytes)
+    if base is None:
+        return None
+    meta = tools._META_DIRNAME
+    return tuple(
+        path
+        for path in tool_drafts.changed_paths(base, workspace)
+        if path != meta and not path.startswith(meta + "/")
+    )
+
+
+def _has_config_env(workspace: Path) -> bool:
+    """Whether the workspace holds a ``config.env`` at its top, which a run never loads."""
+    try:
+        os.lstat(workspace / tools._CONFIG_FILENAME)
+    except OSError:
+        return False
+    return True
+
+
 async def run_revise(
     name: str,
     feedback: str | None,
     resolution: tools.Resolved | None,
     *,
     runs: tuple[AttachedRun, ...] = (),
+    continuation: tool_drafts.Continuation | None = None,
 ) -> InstallOutcome:
     """Build and commit one new version, then publish ``current``.
 
@@ -3638,19 +4242,36 @@ async def run_revise(
     initially resolved version supplies the build content and identity. The
     package toggle and ``.env`` remain package-layer state throughout.
 
+    ``continuation`` is the draft the round continues, judged after the slot
+    (``start_revise_job``): ``feedback`` is then this round's note and the
+    draft's own ``feedback`` the request, and ``runs`` what the round carries --
+    newly attached first, then what the draft kept. Such a round marks itself in
+    the draft (``tool_drafts.begin_round``) and works on a copy of the draft's
+    files (``tool_drafts.copy_into_workspace``), both before anything is spent.
+    How it is closed follows what is known: one that never began its
+    conversation takes its mark back and is not counted; one that ran, its
+    commands confirmed stopped, is recorded once -- by its save, or on its own
+    (``_close_unrecorded``); one whose commands were not confirmed stopped, or
+    that ends in an exception, leaves the manifest alone, its mark for the next
+    round to record as interrupted.
+
     A round that does not publish keeps its work as the tool's draft
     (``tool_drafts``), and a round about to publish saves it first, so a publish
     that fails cannot take the only copy of the work with it; a publish that goes
     through takes the draft away again. Every save comes after the exit for
     commands not confirmed stopped, which leaves the workspace untouched and
-    waits on no worker. A save that fails changes nothing about the round's
-    outcome; only when the save before a publish failed and the publish failed
-    too is the work left where the publish left it, and named on the job: this
-    session's staging, which then stays, or a version ``current`` does not name.
-    An exception or a cancellation that ends the revise from the start of that
-    save until the publish's result is handled leaves the staging in place as
-    well, named in the backend log only, while no draft is known to hold work
-    worth keeping or while the publish's worker may still be writing the staging.
+    waits on no worker, and after the builder's ``.env`` is stripped. A save that
+    fails changes nothing about the round's outcome.
+
+    The staging is removed only once someone holds the work: the draft, with its
+    manifest confirmed on disk (and no publish worker still writing the staging);
+    a version directory -- the one published, or the one a publish that failed
+    part way had moved the work into, which ``current`` does not name; or no one
+    needs to -- nothing was worth keeping. It is removed, too, after a strip of
+    the builder's ``.env`` that failed: it may still hold that file. Every other
+    end keeps it. The job names where the work is when that place is known: the
+    staging workspace, once confirmed to be the one the round was given, or that
+    version directory.
     """
     base = tools.tools_dir()
     if base is None:
@@ -3714,55 +4335,103 @@ async def run_revise(
     session_root = base / _STAGING_DIRNAME / uuid4().hex
     build_root = tools.BuildRoot(session_root / "build")
     shell_root = session_root / "shell"
+    job_id = _CURRENT_JOB_ID.get()
     # True until the session starts: an exit before it has no command to wait for.
     shells_ended = True
-    # Set when a publish failed with its work still in this session's staging and
-    # no draft holding it: the workspace then stays where it is.
-    keep_workspace = False
-    # Two flags keep the staging in place (``finally``) when an exception or a
-    # cancellation ends the revise between the save before a publish and the
-    # handling of the publish's result:
-    # * ``unsaved_work_pending`` is up from the start of that save until the result
-    #   is handled, unless the save kept the work or found nothing worth keeping:
-    #   the staging may hold the only copy of the work;
-    # * ``publish_running`` is up while the publish's worker may still be writing
-    #   the staging. The await ending with the worker's result or with an
-    #   ``Exception`` lowers it -- the worker has returned, or never began -- and a
-    #   cancellation does not, since the worker goes on without it.
-    # Verified (tests/test_tool_builder.py):
-    # test_an_exception_in_the_publish_keeps_the_workspace_no_draft_holds,
-    # test_a_revise_cancelled_before_its_publish_is_handled_keeps_the_workspace_no_draft_holds,
-    # test_a_publish_still_running_when_its_revise_is_cancelled_keeps_the_workspace,
-    # and, that both are down once a draft holds the work and the worker returned,
-    # test_an_exception_in_the_publish_after_its_draft_was_saved_removes_the_workspace.
-    # Not covered: the path goes to the backend log only, never to the job, which
-    # an exception ends in ``_run_job``'s backstop; work already moved into
-    # ``versions/<vid>`` is only that version, which the log does not name; and
-    # before that save, a cancellation still removes the staging beside whatever
-    # worker of the session is running then.
-    unsaved_work_pending = False
+    # Up from the moment the round's commands are confirmed stopped -- raised in
+    # the ``finally`` that gets that word, so an exception or a cancellation from
+    # there on finds it up -- until someone holds the work (see the docstring).
+    # While it is up, the ``finally`` below keeps the staging, after stripping the
+    # builder's ``.env`` if nothing did yet.
+    holding = False
+    env_stripped = False
+    # Up while the publish's worker may still be writing the staging. The await
+    # ending with the worker's result or with an ``Exception`` lowers it -- the
+    # worker has returned, or never began -- and a cancellation does not, since
+    # the worker goes on without it.
     publish_running = False
     try:
-        copy_error = await run_in_threadpool(
-            _copy_package_into_staging, resolution.version_root, build_root
-        )
-        if copy_error is not None:
-            return InstallOutcome(ok=False, error=copy_error)
-
         settings = get_settings()
+        max_files = settings.tool_draft_max_files
+        max_bytes = settings.tool_draft_max_bytes
+        begun: dict[str, Any] | None = None
+        copied_out: tool_drafts.TreeDigest | None = None
+        not_brought_in: tuple[tool_drafts.Omitted, ...] = ()
+        if continuation is None:
+            copy_error = await run_in_threadpool(
+                _copy_package_into_staging, resolution.version_root, build_root
+            )
+            if copy_error is not None:
+                return InstallOutcome(ok=False, error=copy_error)
+        else:
+            marked = await run_in_threadpool(
+                tool_drafts.begin_round,
+                package_root,
+                package_dir_identity,
+                continuation.expected,
+                job_id,
+                started_at,
+            )
+            if isinstance(marked, str):
+                return InstallOutcome(
+                    ok=False,
+                    tool_name=name,
+                    error=_ERROR_CONTINUE_NOT_STARTED.format(reason=marked),
+                )
+            begun = marked
+            copied = await run_in_threadpool(
+                functools.partial(
+                    tool_drafts.copy_into_workspace,
+                    package_root=package_root,
+                    package_dir_identity=package_dir_identity,
+                    expected=(begun["draft_id"], begun["generation"]),
+                    job_id=job_id,
+                    workspace=build_root.path,
+                    max_files=max_files,
+                    max_bytes=max_bytes,
+                )
+            )
+            if isinstance(copied, str):
+                # Never began: its mark is taken back, and no round is counted.
+                await run_in_threadpool(
+                    tool_drafts.end_unstarted,
+                    package_root,
+                    package_dir_identity,
+                    (begun["draft_id"], begun["generation"]),
+                    job_id,
+                )
+                return InstallOutcome(
+                    ok=False,
+                    tool_name=name,
+                    error=_ERROR_CONTINUE_NOT_COPIED.format(reason=copied),
+                )
+            copied_out, not_brought_in = copied.copied_out, copied.not_brought_in
+
         # The workspace as the round receives it, which "the round changed
         # something" is measured against when it ends.
         copied_in = await run_in_threadpool(
             functools.partial(
                 tool_drafts.tree_digest,
                 build_root.path,
-                max_entries=settings.tool_draft_max_files,
-                max_bytes=settings.tool_draft_max_bytes,
+                max_entries=max_files,
+                max_bytes=max_bytes,
             )
         )
-        manifest_text = await run_in_threadpool(
-            _current_manifest_text, resolution.version_root.path
-        )
+        # From the workspace: a continuation's draft may have changed it.
+        manifest_text = await run_in_threadpool(_current_manifest_text, build_root.path)
+        history: _History | None = None
+        if begun is not None:
+            changed = await run_in_threadpool(
+                _changed_since_base, resolution.version_root.path, copied_in, max_files, max_bytes
+            )
+            history = _History(
+                original=begun["feedback"],
+                attempts=tuple(begun["attempts"]),
+                not_brought_in=not_brought_in,
+                changed=changed,
+                base_vid=begun["base_vid"],
+                workspace_config=await run_in_threadpool(_has_config_env, build_root.path),
+            )
         # BOTH prompt builds are BLOCKING work, not the pure string joins they look
         # like (R1-3): each goes through ``tools.redact_known_secrets``, which calls
         # ``known_secret_values`` -- an ``iterdir`` of the whole tools directory plus
@@ -3772,8 +4441,15 @@ async def run_revise(
         # moved ``tool_meta._summary_user_prompt`` off it. A fail-closed redactor
         # failure still propagates out of the ``await`` unchanged, into ``_run_job``'s
         # backstop. The SYSTEM prompt joined them when its interpolated package name
-        # became redactable (R2-4) -- it was a pure join until then.
-        system_prompt = await run_in_threadpool(_revise_system_prompt, name)
+        # became redactable -- it was a pure join until then. The user turn is
+        # held to what the conversation budget leaves beside the system prompt.
+        system_prompt = await run_in_threadpool(
+            functools.partial(
+                _revise_system_prompt,
+                name,
+                attempt=None if begun is None else begun["attempt_count"] + 1,
+            )
+        )
         config_values = revise_env.config_values
         user_prompt = await run_in_threadpool(
             functools.partial(
@@ -3785,6 +4461,8 @@ async def run_revise(
                 tuple(sorted(set(config_values) & set(env_values))),
                 runs=runs,
                 workspace_vid=resolution.vid,
+                system_chars=len(system_prompt),
+                history=history,
             )
         )
         # The run_shell environment is layered exactly as ``tools._build_tool_env``
@@ -3822,6 +4500,7 @@ async def run_revise(
             # The same stop-and-wait as run_install's: before anything below touches
             # the workspace and before the job gives up its slot.
             shells_ended = await shells.stop_and_wait()
+            holding = shells_ended
 
         llm_log_id = llm_log.last_record_id_for_workflow(_WORKFLOW)
         # How the session ended as the loop measured it, on EVERY outcome from here
@@ -3837,7 +4516,8 @@ async def run_revise(
         if not shells_ended:
             # Given up for good, and this exit waits on no worker thread
             # (``_BuilderShells``) -- not even for the masking below, so it carries
-            # none of the model's words. The AI 日誌 record keeps the whole session.
+            # none of the model's words, and it writes nothing into the draft. The
+            # AI 日誌 record keeps the whole session.
             return InstallOutcome(
                 ok=False,
                 tool_name=name,
@@ -3845,62 +4525,19 @@ async def run_revise(
                 llm_log_id=llm_log_id,
                 **facts,
             )
+        # The builder's .env goes first, before anything else reads or keeps the
+        # workspace: whatever becomes of the staging from here on, it does not
+        # hold that file.
+        env_keys, env_strip_error = await run_in_threadpool(_strip_builder_env, build_root, base)
+        env_stripped = env_strip_error is None
         # What the model handed back -- its summary and the two notes -- masked and
-        # capped again (``_masked_and_capped``, each field with its own cap, so a
-        # secret registered since the first mask cannot carry it past the cap)
-        # BEFORE the first return below, so every outcome returned below after a
-        # session that produced an answer carries the model's own words, the .env
-        # strip refusal's included. The LLM-failure outcome has no answer to carry.
-        #
+        # capped again, so every outcome below after a session that produced an
+        # answer carries the model's own words, the .env strip refusal's included
+        # when they could be masked. The LLM-failure outcome has no answer to carry.
         # The SAME single choke point run_install uses, and for the same reason:
         # the finally below discards the in-flight secrets before this function
-        # returns, so redacting at job-update time would be a no-op that leaks. On a
-        # worker, for the same reason the prompt builds above are: this is the
-        # identical tools-directory scan, just after the LLM call instead of before
-        # it. Every ``redact_known_secrets`` call this function makes is off the
-        # loop, the one in the rename refusal below included. The notes ride along
-        # for display only -- nothing below branches on them.
-        summary: str | None = None
-        notes: dict[str, Any] = {}
-        if result is not None:
-            summary = (
-                await run_in_threadpool(_masked_and_capped, result.summary, _SUMMARY_CAP)
-                if result.summary
-                else None
-            )
-            notes = {
-                "handoff": (
-                    await run_in_threadpool(_masked_and_capped, result.handoff, _HANDOFF_CAP)
-                    if result.handoff
-                    else None
-                ),
-                "operator_action": (
-                    await run_in_threadpool(
-                        _masked_and_capped, result.operator_action, _OPERATOR_ACTION_CAP
-                    )
-                    if result.operator_action
-                    else None
-                ),
-            }
-        env_keys, env_strip_error = await run_in_threadpool(_strip_builder_env, build_root, base)
-        if env_strip_error is not None:
-            # A workspace that may still hold the builder's .env keeps no files.
-            return InstallOutcome(
-                ok=False,
-                tool_name=name,
-                summary=summary,
-                error=env_strip_error,
-                llm_log_id=llm_log_id,
-                env_keys=env_keys,
-                draft=tool_drafts.SaveResult(
-                    worth_saving=True, reason=tool_drafts.REASON_STRIP_ENV
-                ).report(),
-                **facts,
-                **notes,
-            )
-        # Each exit below saves the round as the tool's draft, the one that
-        # publishes before it does: every one of them comes after the exit for
-        # commands not confirmed stopped, with the workspace stripped.
+        # returns, so redacting at job-update time would be a no-op that leaks.
+        summary, notes, unmasked = await _masked_notes(result)
         round_draft = _RoundDraft(
             base=base,
             build_root=build_root,
@@ -3909,22 +4546,73 @@ async def run_revise(
             base_version=resolution.version_root,
             copied_in=copied_in,
             start=tool_drafts.DraftStart(base_vid=resolution.vid, feedback=feedback, runs=runs),
-            job_id=_CURRENT_JOB_ID.get(),
+            job_id=job_id,
             started_at=started_at,
             facts=facts,
             summary=summary,
             handoff=notes.get("handoff"),
             operator_action=notes.get("operator_action"),
+            begun=begun,
+            copied_out=copied_out,
+            note=feedback if begun is not None else None,
+            not_brought_in=not_brought_in,
+            attached=continuation.attached if continuation is not None else (),
         )
+        if env_strip_error is not None:
+            # A workspace that may still hold the builder's .env keeps no files and
+            # is removed, not kept.
+            holding = False
+            closed = await run_in_threadpool(
+                _close_unrecorded,
+                round_draft,
+                tool_drafts.SaveResult(worth_saving=True, reason=tool_drafts.REASON_STRIP_ENV),
+                "failed",
+                env_strip_error,
+            )
+            return InstallOutcome(
+                ok=False,
+                tool_name=name,
+                summary=summary,
+                error=env_strip_error,
+                llm_log_id=llm_log_id,
+                env_keys=env_keys,
+                draft=_round_report(closed, round_draft, retained=None),
+                **facts,
+                **notes,
+            )
+        if unmasked is not None:
+            # The model's notes cannot be masked: the known secrets are not whole.
+            # An end like any other, but one that writes nothing into the draft --
+            # not without that list -- and keeps the staging, its .env stripped,
+            # naming it only when it is still the staging it was given.
+            confirmed = await run_in_threadpool(_workspace_confirmed, build_root, base)
+            return InstallOutcome(
+                ok=False,
+                tool_name=name,
+                error=str(unmasked),
+                llm_log_id=llm_log_id,
+                env_keys=env_keys,
+                draft=_round_report(
+                    tool_drafts.SaveResult(
+                        worth_saving=True, reason=tool_drafts.REASON_NOTES_UNMASKED
+                    ),
+                    round_draft,
+                    retained=str(build_root.path) if confirmed else None,
+                ),
+                **facts,
+            )
         if llm_error is not None:
             kept = await run_in_threadpool(_save_round_draft, round_draft, "failed", llm_error)
+            holding = _holding(kept)
             return InstallOutcome(
                 ok=False,
                 tool_name=name,
                 error=llm_error,
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
-                draft=_draft_report(kept),
+                draft=_round_report(
+                    kept, round_draft, retained=_workspace_retained(round_draft, kept, holding)
+                ),
                 **facts,
             )
         assert result is not None  # exactly one of result/llm_error is set above
@@ -3937,6 +4625,7 @@ async def run_revise(
             kept = await run_in_threadpool(
                 _save_round_draft, round_draft, "not_published", not_ready_error
             )
+            holding = _holding(kept)
             return InstallOutcome(
                 ok=False,
                 tool_name=name,
@@ -3945,7 +4634,9 @@ async def run_revise(
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
                 not_ready=True,
-                draft=_draft_report(kept),
+                draft=_round_report(
+                    kept, round_draft, retained=_workspace_retained(round_draft, kept, holding)
+                ),
                 **facts,
                 **notes,
             )
@@ -3966,6 +4657,7 @@ async def run_revise(
             attempted = await run_in_threadpool(tools.redact_known_secrets, result.tool_name)
             rename_error = f"AI 試圖將工具改名為「{attempted}」，修訂已取消。"  # noqa: RUF001
             kept = await run_in_threadpool(_save_round_draft, round_draft, "failed", rename_error)
+            holding = _holding(kept)
             return InstallOutcome(
                 ok=False,
                 tool_name=name,
@@ -3973,36 +4665,56 @@ async def run_revise(
                 error=rename_error,
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
-                draft=_draft_report(kept),
+                draft=_round_report(
+                    kept, round_draft, retained=_workspace_retained(round_draft, kept, holding)
+                ),
                 **facts,
                 **notes,
             )
 
-        # About to publish: the work is saved as a draft first, which the
-        # manifest then marks as being published from. A mark that cannot be
+        # About to publish: the work is saved as a draft first -- always as a new
+        # copy, which the removal after the publish compares against -- and the
+        # manifest then marks it as being published from. A mark that cannot be
         # written does not stop the publish; it only leaves a crash right after
-        # the publish to be read as a stale draft rather than a published one.
-        unsaved_work_pending = True
+        # the publish to be read as a stale draft rather than a published one. A
+        # continuation whose save kept nothing writes no mark: the draft is then
+        # not what is being published.
         kept = await run_in_threadpool(_save_round_draft, round_draft, None, None)
-        unsaved_work_pending = kept.worth_saving and not kept.saved
+        holding = _holding(kept)
         drafted: tuple[str, int] | None = None
         draft_line: str | None = None
         if kept.saved and kept.draft_id is not None and kept.generation is not None:
-            marked = await run_in_threadpool(
+            marked_generation = await run_in_threadpool(
                 tool_drafts.mark_publishing,
                 package_root,
                 package_dir_identity,
                 (kept.draft_id, kept.generation),
                 round_draft.job_id,
             )
-            drafted = (kept.draft_id, kept.generation if marked is None else marked)
+            drafted = (
+                kept.draft_id,
+                kept.generation if marked_generation is None else marked_generation,
+            )
             draft_line = tool_drafts.provenance_line(kept.draft_id, kept.attempts or 1)
+        # The request the version records: a continuation's is its draft's, with
+        # every round's note the draft still keeps, this round's last.
+        request = feedback
+        round_notes: tuple[tuple[int, str], ...] = ()
+        if begun is not None:
+            request = begun["feedback"]
+            round_notes = tuple(
+                (attempt["number"], attempt["note"])
+                for attempt in begun["attempts"]
+                if attempt["note"]
+            )
+            if feedback:
+                round_notes += ((begun["attempt_count"] + 1, feedback),)
         published: _PublishedRevision | None = None
         promote_error: str | None
         content: Path = build_root.path
         try:
             origin_feedback = await run_in_threadpool(
-                _provenance_feedback, feedback, runs, draft_line
+                _provenance_feedback, request, runs, draft_line, round_notes
             )
         except Exception as exc:
             # The masking fails closed (``tools.redact_known_secrets``): a publish
@@ -4033,6 +4745,18 @@ async def run_revise(
                 raise
             publish_running = False
         if promote_error is not None:
+            # The work is where the publish left it -- this session's staging, or a
+            # version ``current`` does not name -- and the draft holds it only when
+            # the save before the publish kept it and is known to be on disk. Where
+            # it is, the job says, unless the publish could not confirm the
+            # workspace it was given.
+            elsewhere = _holding(kept)
+            holding = elsewhere and tools._is_within(session_root, content)
+            confirmed = (
+                kept.reason != tool_drafts.REASON_WORKSPACE
+                and promote_error not in _STAGING_REFUSALS
+            )
+            retained = str(content) if elsewhere and confirmed else None
             failed_draft: dict[str, Any] | None = None
             if drafted is not None:
                 # What was just saved is the work again: ``publishing`` cleared,
@@ -4046,13 +4770,12 @@ async def run_revise(
                 )
                 failed_draft = dataclasses.replace(
                     kept, generation=drafted[1] if cleared is None else cleared
-                ).report()
+                ).report(retained_path=retained)
             elif kept.worth_saving:
-                # Neither a draft nor ``current`` holds the work now: say where it
-                # is, and keep it there if that is this session's staging.
-                keep_workspace = tools._is_within(session_root, content)
-                failed_draft = kept.report(retained_path=str(content))
-            unsaved_work_pending = False
+                closed = await run_in_threadpool(
+                    _close_unrecorded, round_draft, kept, "failed", promote_error
+                )
+                failed_draft = _round_report(closed, round_draft, retained=retained)
             return InstallOutcome(
                 ok=False,
                 tool_name=name,
@@ -4065,7 +4788,8 @@ async def run_revise(
                 **notes,
             )
         assert published is not None
-        unsaved_work_pending = False
+        # Published: the version holds the work.
+        holding = False
         published_draft: dict[str, Any] | None = None
         if drafted is not None:
             # Compared against the copy the save made, which is all the draft may
@@ -4086,6 +4810,14 @@ async def run_revise(
                         else _DRAFT_LEFT_REASONS[removal.kept]
                     )
                 )
+        elif begun is not None and kept.worth_saving:
+            # The draft is as the round found it, and stays: say so, naming it.
+            closed = await run_in_threadpool(
+                _close_unrecorded, round_draft, kept, "published", None
+            )
+            published_draft = _round_report(
+                closed, round_draft, retained=None, reason=_DRAFT_ROUND_NOT_SAVED
+            )
         # The revision is LIVE as of the line above; everything after it is
         # decoration and cannot fail the outcome (``generate_and_store_summary``
         # never raises -- see tool_meta). The sidecar was excluded from staging, so
@@ -4116,25 +4848,30 @@ async def run_revise(
         # values after the temporary registrations are dropped. Cleanup targets
         # the complete session root, including any unused shell -- unless the
         # session's commands could not be confirmed stopped, which keeps it all,
-        # or a failed publish left in it work that no draft holds, or the revise
-        # stopped before its publish was handled with no draft known to hold the
-        # work or with the publish's worker still running, any of which keeps it
-        # too while the sweep still runs (it never looks inside ``.staging``).
+        # unstripped, or the work in it is held by no one, or a publish worker may
+        # still be writing it, either of which keeps it too while the sweep still
+        # runs (it never looks inside ``.staging``). Kept for the work, it never
+        # keeps a .env the builder wrote: one an exception or a cancellation left
+        # is stripped here, and when that fails the staging is removed instead.
         for value in registered:
             tools.discard_inflight_secret(value)
         if not shells_ended:
             # Kept in place: a command not confirmed stopped may still be using it.
             _log_workspace_kept(session_root)
-        elif keep_workspace or unsaved_work_pending or publish_running:
-            if keep_workspace:
-                _log_result_kept(session_root)
-            elif publish_running:
-                _log_publish_running_kept(session_root)
-            else:
-                _log_unsaved_work_kept(session_root)
-            await run_in_threadpool(_sweep_logged, base)
         else:
-            await run_in_threadpool(_cleanup_staging, session_root, base)
+            if holding and not env_stripped and not publish_running:
+                _late_keys, late_error = await run_in_threadpool(
+                    _strip_builder_env, build_root, base
+                )
+                holding = late_error is None
+            if holding or publish_running:
+                if publish_running:
+                    _log_publish_running_kept(session_root)
+                else:
+                    _log_work_kept(session_root)
+                await run_in_threadpool(_sweep_logged, base)
+            else:
+                await run_in_threadpool(_cleanup_staging, session_root, base)
 
 
 # --- examples: verification and the health check (web-v6 §8.3, §10) --------
@@ -4693,13 +5430,30 @@ def start_install_job(
     )
 
 
-# Why a revise is refused while the tool has a draft. There is no way yet to
-# continue a draft, so the message offers the two things that do exist: taking
-# the files from the draft's path, and discarding it.
-_DRAFT_PENDING_MESSAGE = (
-    "這個工具有一份未完成的修正（草稿）。需要裡面的檔案就先到草稿路徑取回，"  # noqa: RUF001
+# Why a revise that does not name the tool's draft is refused (``draft_pending``),
+# by the draft's state (``tool_drafts.draft_state``): one that can be continued
+# offers that and the discard; any other offers taking the files out of it, then
+# the discard, which is all such a draft allows.
+_DRAFT_PENDING_OPEN = "這個工具有一份未完成的修正（草稿）。請接續修正，或在工具列放棄它。"  # noqa: RUF001
+_DRAFT_PENDING_BLOCKED = (
+    "這個工具有一份未完成的修正（草稿），目前不能接續。需要裡面的檔案就先到草稿路徑取回，"  # noqa: RUF001
     "然後在工具列放棄它，才能送出新的修正。"  # noqa: RUF001
 )
+
+# Every way a revise submit is refused before a job exists. The route answers
+# each one and is checked to (``routers.tools.revise_tool``): a refusal added here
+# without an answer there fails the type check rather than becoming a 500.
+ReviseRefusal = Literal[
+    "env_policy",
+    "job_busy",
+    "not_found",
+    "version_mismatch",
+    "draft_pending",
+    "draft_gone",
+    "draft_changed",
+    "draft_unusable",
+    "draft_publishing",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -4708,12 +5462,26 @@ class ReviseJobStart:
 
     ``message`` is set for ``env_policy`` -- the gate's own zh-TW text, which
     names the offending keys and is the refusal whose wording the operator needs
-    in order to act -- and for ``draft_pending``.
+    in order to act -- and for ``draft_pending``, whose words follow the draft's
+    state.
     """
 
     job_id: str | None = None
-    refusal: str | None = None
+    refusal: ReviseRefusal | None = None
     message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DraftRequest:
+    """What a revise that continues a draft names: the draft, as the page saw it
+    (``draft_id``, ``generation``); what the route read of it before the slot
+    (``first_seen``, None when it read nothing, ``tool_drafts.first_read``); and
+    the run records the request newly attached."""
+
+    draft_id: str
+    generation: int
+    first_seen: tuple[str, int] | None
+    attached: tuple[AttachedRun, ...] = ()
 
 
 async def start_revise_job(
@@ -4722,6 +5490,7 @@ async def start_revise_job(
     expected_vid: str,
     *,
     runs: tuple[AttachedRun, ...] = (),
+    draft: DraftRequest | None = None,
 ) -> ReviseJobStart:
     """Check the env policy, take the global slot, compare ``expected_vid``, enqueue.
 
@@ -4739,14 +5508,20 @@ async def start_revise_job(
     the reservation, exactly where it was. ``run_revise`` repeats the gate on
     whatever the files say when the job really starts.
 
-    ``runs`` are the failing run records the route attached and COPIED before
-    calling this (web-v6 §8.3): a database read with no version in it, so it
-    precedes the slot like the env gate, and the copy is what the job keeps --
-    a purge after this point changes nothing about the revise (invariant L).
+    ``runs`` are the run records the job carries, which the route read and
+    COPIED before calling this: a database read with no version in
+    it, so it precedes the slot like the env gate, and the copy is what the job
+    keeps -- a purge after this point changes nothing about the revise.
 
-    A tool that has a draft is refused (``draft_pending``), judged after the slot
-    and the version comparison like everything that names the package's state: a
-    draft made while the slot was held is one this answer sees.
+    The draft is judged after the slot and the version comparison, like
+    everything that names the package's state, so a draft made or changed while
+    the slot was held is one this answer sees. Without ``draft`` the revise is a
+    first round, refused while the tool has a draft in any state
+    (``draft_pending``, its words by that state, ``tool_drafts.draft_state``).
+    With it the revise continues that draft, refused unless
+    ``tool_drafts.judge_continuation`` finds it the one named -- the same one the
+    route read its records from -- usable, not being published from, and still
+    based on ``current``.
     """
 
     package_root = await run_in_threadpool(tools._resolve_package_dir_no_alias, name)
@@ -4767,8 +5542,31 @@ async def start_revise_job(
             return ReviseJobStart(refusal="not_found")
         if resolution.vid != expected_vid:
             return ReviseJobStart(refusal="version_mismatch")
-        if await run_in_threadpool(tool_drafts.has_draft, package_root):
-            return ReviseJobStart(refusal="draft_pending", message=_DRAFT_PENDING_MESSAGE)
+        continuation: tool_drafts.Continuation | None = None
+        if draft is None:
+            state = await run_in_threadpool(
+                functools.partial(
+                    tool_drafts.draft_state, package_root, resolution, job_active=job_is_active
+                )
+            )
+            if state is not None:
+                return ReviseJobStart(
+                    refusal="draft_pending",
+                    message=_DRAFT_PENDING_OPEN if state == "open" else _DRAFT_PENDING_BLOCKED,
+                )
+        else:
+            judged = await run_in_threadpool(
+                tool_drafts.judge_continuation,
+                package_root,
+                resolution,
+                (draft.draft_id, draft.generation),
+                draft.first_seen,
+            )
+            if isinstance(judged, str):
+                return ReviseJobStart(refusal=judged)
+            continuation = tool_drafts.Continuation(
+                expected=(judged["draft_id"], judged["generation"]), attached=draft.attached
+            )
         job = _admit_job(reservation_token=reservation, kind="revise", tool_name=name)
         if job is None:
             return ReviseJobStart(refusal="job_busy")
@@ -4776,7 +5574,9 @@ async def start_revise_job(
         return ReviseJobStart(
             job_id=_launch_job(
                 job,
-                lambda: run_revise(name, feedback, resolution, runs=runs),
+                lambda: run_revise(
+                    name, feedback, resolution, runs=runs, continuation=continuation
+                ),
                 _ACTION_REVISE,
             )
         )
