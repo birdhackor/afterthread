@@ -62,12 +62,16 @@ const DRAFT_STATE_VIEW = {
 		note: () =>
 			"曾經開始從這份草稿發布新版本，但後端沒有留下發布的結果。請先確認目前的版本是不是你要的；需要的檔案請到下方路徑取回。",
 	},
+	// The draft a publish went from stays when it could not be removed, but also
+	// when it was found to differ from the round's saved copy, or that could
+	// not be told: it may hold changes no version has, so the note never says
+	// discarding it is all that is left to do.
 	published: {
 		title: "草稿已發布",
 		color: "blue",
 		buttons: [DISCARD_BUTTON],
 		note: (_draft, { currentVid }) =>
-			`這份草稿的內容已經發布成目前的版本${currentVid ? `（${currentVid}）` : ""}，只是草稿沒能刪掉，放棄它即可。`,
+			`這一輪已經發布成目前的版本${currentVid ? `（${currentVid}）` : ""}，但草稿可能另有沒發布的修改。需要的內容請先到下方路徑取回，再放棄這份草稿。`,
 	},
 	stale: {
 		title: "草稿已過期",

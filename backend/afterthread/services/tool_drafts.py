@@ -12,8 +12,10 @@ itself, under ``<tools_dir>/<name>/.afterthread.meta/draft/``:
   paths were not kept and why.
 
 A round about to publish saves one too, so a failed publish cannot take the only
-copy of the work with it; a successful publish removes it. One draft per tool:
-while ``draft/`` exists in any state, a new revise is refused (``has_draft``).
+copy of the work with it; a successful publish removes it, but only while it
+still holds just what that save made (``remove_after_publish``). One draft per
+tool: while ``draft/`` exists in any state, a new revise is refused
+(``has_draft``).
 
 The draft lives at the package layer, so it goes wherever the package goes: a
 deleted tool takes its draft along, a same-name reinstall starts without one,
@@ -201,6 +203,9 @@ REASON_TOO_MANY_FILES = "檔案數超過上限（TOOL_DRAFT_MAX_FILES）"  # noq
 REASON_TOO_LARGE = "總大小超過上限（TOOL_DRAFT_MAX_BYTES）"  # noqa: RUF001
 REASON_UNREADABLE = "無法讀取暫存工作區"
 REASON_SCAN_FAILED = "秘密掃描失敗（{reason}），無法確認要保存的檔案裡沒有已知的秘密值"  # noqa: RUF001
+# The known secrets could not all be read: ``detail`` is their own message, which
+# names the ``.env`` and what to check (``tools.KnownSecretsIncomplete``).
+REASON_SECRETS_INCOMPLETE = "無法確認要保存的檔案裡沒有已知的秘密值。{detail}"
 REASON_LOCK = "無法取得工具目錄的鎖"
 REASON_PACKAGE_GONE = "工具已被刪除或替換"
 REASON_DRAFT_EXISTS = "這個工具已經有草稿"
@@ -282,12 +287,30 @@ class Durability:
 
 
 @dataclass(frozen=True, slots=True)
+class SavedCopy:
+    """The files directory one save made, and ``tree_digest`` of it as made.
+
+    ``digest`` is taken of the copy once it is durable, before it is renamed into
+    place, with the limits the save counted it against (``max_entries``,
+    ``max_bytes``); None when it could not be read whole. What a removal after a
+    publish compares the draft against (``remove_after_publish``): the copy, not
+    the workspace it came from, which may hold entries the copy does not.
+    """
+
+    files_dir: str
+    digest: TreeDigest | None
+    max_entries: int
+    max_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class SaveResult:
     """What one save did.
 
     ``worth_saving`` False: nothing to keep (no change, no notes), which is not a
     failure. Otherwise ``saved`` says whether the draft now holds this round's
-    files, and ``reason`` why not.
+    files, and ``reason`` why not. ``copy`` is the files directory a save that
+    copied made (``SavedCopy``).
     """
 
     worth_saving: bool
@@ -296,6 +319,7 @@ class SaveResult:
     generation: int | None = None
     attempts: int | None = None
     reason: str | None = None
+    copy: SavedCopy | None = None
 
     def report(
         self,
@@ -1670,6 +1694,8 @@ def _save_round(
     plan: _CopyPlan | None = None
     try:
         known = tools._redaction_secrets()
+    except tools.KnownSecretsIncomplete as exc:
+        reason = REASON_SECRETS_INCOMPLETE.format(detail=exc)
     except Exception as exc:
         reason = REASON_SCAN_FAILED.format(reason=type(exc).__name__)
     if reason is None and copies:
@@ -1852,6 +1878,10 @@ def _copy_and_commit(
         os.chmod(incoming, stat.S_IMODE(os.lstat(workspace).st_mode) | 0o700)
     if not durability.tree(incoming):
         return incoming, REASON_DURABILITY
+    # The copy as made, before any name points at it: what a removal after the
+    # publish compares the draft against. Renaming the directory changes nothing
+    # it covers, since every entry is named relative to the copy.
+    copied = tree_digest(incoming, max_entries=max_files, max_bytes=max_bytes)
     files_name = f"files-{token_hex(16)}"
     files = draft_dir / files_name
     try:
@@ -1916,6 +1946,7 @@ def _copy_and_commit(
         draft_id=doc["draft_id"],
         generation=doc["generation"],
         attempts=doc["attempt_count"],
+        copy=SavedCopy(files_name, copied, max_files, max_bytes),
     )
 
 
@@ -2067,10 +2098,16 @@ class Removal:
     ``draft/`` is still there or cannot be looked at, or a discard could not look
     at it whole, or at the directories above it, and left it as it was. False
     with no ``residual_path``: nothing was taken away.
+
+    ``kept`` is set only by ``remove_after_publish`` when it did not begin to
+    remove, and says why the draft was left: ``"changed"``, it holds something
+    other than what the save before the publish made; ``"unconfirmed"``, that
+    could not be told.
     """
 
     removed: bool
     residual_path: Path | None
+    kept: Literal["changed", "unconfirmed"] | None = None
 
 
 def _removal(draft_dir: Path) -> Removal:
@@ -2081,28 +2118,85 @@ def _removal(draft_dir: Path) -> Removal:
     return Removal(True, left)
 
 
+def _as_saved(
+    draft_dir: Path, current: dict[str, Any], saved: SavedCopy | None
+) -> Literal["same", "changed", "unconfirmed"]:
+    """Whether ``draft/`` holds only what the save described by ``saved`` made.
+
+    What a removal takes is all of ``draft/``, so all of it is compared: the
+    manifest's ``files_dir`` must still be the copy that save made, ``draft/``
+    must hold that directory and the manifest and nothing else, and ``tree_digest``
+    of the copy now must equal the one taken as it was made. A listing or a
+    digest that cannot be had whole, or a save that left none, is
+    ``"unconfirmed"`` -- unknown is never the same, nor shown to differ.
+    """
+    if saved is None or saved.digest is None:
+        return "unconfirmed"
+    if current["files_dir"] != saved.files_dir:
+        return "changed"
+    try:
+        names = set(os.listdir(draft_dir))
+    except OSError:
+        return "unconfirmed"
+    if names != {MANIFEST_FILENAME, saved.files_dir}:
+        return "changed"
+    now = tree_digest(
+        draft_dir / saved.files_dir, max_entries=saved.max_entries, max_bytes=saved.max_bytes
+    )
+    if now is None:
+        return "unconfirmed"
+    return "same" if same_tree(saved.digest, now) else "changed"
+
+
 def remove_after_publish(
     package_root: tools.PackageRoot,
     package_dir_identity: tuple[int, int] | None,
     expected: tuple[str, int],
+    saved: SavedCopy | None,
 ) -> Removal:
-    """Remove the draft a publish just put live. Never raises.
+    """Remove the draft a publish just put live, if it holds nothing more. Never raises.
 
-    Only the draft the publish came from, at the generation it marked: anything
-    else is left alone. Not removed, it stays with ``publishing`` set, and the
-    list reconciles it as published.
+    Only the draft the publish came from, at the generation it marked, and only
+    while it holds just what the save before the publish made: ``saved``, the
+    copy that save made with its fingerprint (``SavedCopy``), not the workspace
+    the publish went from, which may hold entries the copy does not keep. Under
+    the lock, after the manifest is matched, ``_as_saved`` compares all of
+    ``draft/``, since the removal takes all of it. Anything else is left alone,
+    with ``kept`` saying why: ``"changed"`` -- the copy differs, the manifest names
+    another one, or ``draft/`` holds more, a directory of the operator's say;
+    ``"unconfirmed"`` -- it could not be told, or the draft could not even be
+    reached and matched, so the comparison never ran. Neither says the removal
+    failed: it was not attempted. Not removed, the draft stays with
+    ``publishing`` set, and the list reconciles it as published.
+
+    Not covered: a change made after the comparison, before the rename that
+    takes ``draft/`` away; and one made during the comparison to an entry it has
+    already read -- ``tree_digest`` walks by path, so it describes a tree that
+    holds still while it runs. This is no atomic snapshot of the draft. Nor a
+    change made to the copy before its fingerprint was taken, while the save was
+    still making it durable: that one is part of what is compared against.
     """
+    started = [False]
 
     def act(draft_dir: Path) -> Removal:
-        if _matching_draft(draft_dir, expected) is None:
-            return Removal(False, None)
+        current = _matching_draft(draft_dir, expected)
+        if current is None:
+            return Removal(False, None, kept="unconfirmed")
+        verdict = _as_saved(draft_dir, current, saved)
+        if verdict != "same":
+            return Removal(False, None, kept=verdict)
+        started[0] = True
         return _removal(draft_dir)
 
     try:
         done = _locked_in_package(package_root, package_dir_identity, act)
     except Exception:
-        return Removal(False, None)
-    return done if isinstance(done, Removal) else Removal(False, None)
+        # Before the removal began, nothing of the draft was taken; after, it may
+        # have been, and ``draft/`` is not seen gone.
+        if started[0]:
+            return Removal(False, draft_path(package_root))
+        return Removal(False, None, kept="unconfirmed")
+    return done if isinstance(done, Removal) else Removal(False, None, kept="unconfirmed")
 
 
 DiscardOutcome = Removal | Literal["not_found", "changed"]
@@ -2131,22 +2225,28 @@ def discard(
     this takes under the lock is not whole (``_observed_token``), and any draft
     when the lock is not taken while the tools directory is not seen gone:
     without the lock, ``not_found`` only when no tools directory is configured
-    or it is seen not to exist. ``Removal.removed`` only once ``draft/`` is seen
-    gone (``_seen_gone``); one that cannot be looked at afterwards is not removed
-    either.
+    or it is seen not to exist, its path running through a file included; a
+    path that cannot be resolved (``tools.ToolsDirUnresolvedError``) leaves the
+    draft as one that may be there. ``Removal.removed`` only once ``draft/`` is
+    seen gone (``_seen_gone``); one that cannot be looked at afterwards is not
+    removed either.
 
     Raises ``tools.ToolsLockUnavailableError`` when the lock path is unusable.
     """
-    lock = tools.acquire_shared_tools_lock()
-    if lock is None:
-        # No lock: no tools directory is configured, or it is not seen to be a
-        # directory, a look at it that fails included. Verified: "no draft" only
-        # when none is configured or it is seen gone. Not covered: a tools path
-        # that is there but no directory holds no draft, yet is answered as one
-        # that may.
-        base = tools.tools_dir()
-        if base is None or _seen_gone(base):
-            return "not_found"
+    try:
+        lock = tools.acquire_shared_tools_lock()
+        if lock is None:
+            # No lock: no tools directory is configured, or it is not seen to be
+            # a directory, a look at it that fails included. Verified: "no draft"
+            # only when none is configured or it is seen gone. Not covered: a
+            # tools path that is there but no directory holds no draft, yet is
+            # answered as one that may.
+            base = tools.tools_dir()
+            if base is None or _seen_gone(base):
+                return "not_found"
+            return Removal(False, draft_path(package_root))
+    except tools.ToolsDirUnresolvedError:
+        # Its path could not be resolved: not seen gone.
         return Removal(False, draft_path(package_root))
     try:
         found = _seen_own_draft(package_root)

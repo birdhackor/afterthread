@@ -191,13 +191,21 @@ def _files(package_root: tools.PackageRoot) -> Path:
     return _draft_dir(package_root) / _manifest(package_root)["files_dir"]
 
 
-def _first_draft(tmp_path: Path, package_root: tools.PackageRoot) -> Path:
-    """Save one first round that changed ``run.py``; returns its workspace."""
+def _first_save(
+    tmp_path: Path, package_root: tools.PackageRoot
+) -> tuple[Path, tool_drafts.SaveResult]:
+    """Save one first round that changed ``run.py``; returns its workspace and the save."""
     workspace = _workspace(tmp_path, package_root)
     copied_in = tool_drafts.tree_digest(workspace)
     (workspace / "run.py").write_text("print('first round')\n", encoding="utf-8")
-    assert _save(package_root, workspace, copied_in).saved
-    return workspace
+    saved = _save(package_root, workspace, copied_in)
+    assert saved.saved
+    return workspace, saved
+
+
+def _first_draft(tmp_path: Path, package_root: tools.PackageRoot) -> Path:
+    """Save one first round that changed ``run.py``; returns its workspace."""
+    return _first_save(tmp_path, package_root)[0]
 
 
 def _continuing(
@@ -970,6 +978,37 @@ def test_a_scan_that_cannot_finish_keeps_no_files(
     assert not result.saved
     assert result.reason == tool_drafts.REASON_SCAN_FAILED.format(reason="OSError")
     assert not tool_drafts.has_draft(package_root)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_a_save_while_another_tools_env_cannot_be_read_keeps_no_files_and_says_which(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Another tool's directory cannot be looked at, so its ``.env`` -- and the
+    value in it -- is not in the known list, while the workspace holds that value.
+    The list is not whole: nothing is saved, no draft is made, and the reason says
+    which ``.env`` could not be read and what to check. Red before the fix: the
+    list was taken as whole, and the file with the other tool's value was saved."""
+    package_root = _package(monkeypatch, tmp_path)
+    other = package_root.path.parent / "other"
+    other.mkdir()
+    (other / ".env").write_text("OTHER_KEY=other-secret-abcdef\n", encoding="utf-8")
+    workspace = _workspace(tmp_path, package_root)
+    copied_in = tool_drafts.tree_digest(workspace)
+    (workspace / "run.py").write_text("print('other-secret-abcdef')\n", encoding="utf-8")
+    other.chmod(0)
+    try:
+        result = _save(package_root, workspace, copied_in)
+    finally:
+        other.chmod(0o700)
+
+    assert not result.saved
+    assert not tool_drafts.has_draft(package_root)
+    assert result.reason is not None
+    assert result.reason.startswith(tool_drafts.REASON_SECRETS_INCOMPLETE.format(detail=""))
+    assert "「other」" in result.reason
+    assert os.fspath(other / ".env") in result.reason
+    assert "權限" in result.reason
 
 
 @pytest.mark.parametrize(
@@ -2013,16 +2052,39 @@ def test_a_removal_after_a_publish_that_cannot_see_the_draft_gone_does_not_repor
     report it removed -- the revise then asks the operator to discard it -- and it
     names ``draft/`` as what is left."""
     package_root = _package(monkeypatch, tmp_path)
-    _first_draft(tmp_path, package_root)
+    _workspace_used, saved = _first_save(tmp_path, package_root)
     draft = _draft_dir(package_root)
     seen = _identity(package_root)
     identity = tool_drafts.directory_identity(package_root.path)
     with monkeypatch.context() as patch:
         _draft_out_of_sight(patch, draft, once_renamed=True)
-        removal = tool_drafts.remove_after_publish(package_root, identity, seen)
+        removal = tool_drafts.remove_after_publish(package_root, identity, seen, saved.copy)
 
     assert removal == tool_drafts.Removal(removed=False, residual_path=draft)
     assert tool_drafts.has_draft(package_root)
+
+
+def test_a_removal_after_a_publish_that_cannot_list_the_draft_leaves_it_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The copy is as the save made it, but ``draft/`` itself cannot be listed, so
+    whether it holds anything besides the copy and the manifest is not known:
+    nothing is removed, and the removal says it could not confirm -- not that it
+    found a change, nor that it failed. Before the fix the removal took no copy to
+    compare and listed nothing; this is red for one that, when the listing fails,
+    goes on as if ``draft/`` held only the copy and the manifest."""
+    package_root = _package(monkeypatch, tmp_path)
+    _workspace_used, saved = _first_save(tmp_path, package_root)
+    draft = _draft_dir(package_root)
+    seen = _identity(package_root)
+    identity = tool_drafts.directory_identity(package_root.path)
+    with monkeypatch.context() as patch:
+        failed = _refuse(patch, "listdir", lambda path: path == os.fspath(draft), errno.EACCES)
+        removal = tool_drafts.remove_after_publish(package_root, identity, seen, saved.copy)
+
+    assert tool_drafts.has_draft(package_root)
+    assert failed
+    assert removal == tool_drafts.Removal(False, None, kept="unconfirmed")
 
 
 def test_an_unusable_draft_is_discarded_by_its_token_until_it_changes(
@@ -2140,8 +2202,9 @@ def test_a_discard_that_cannot_see_the_tools_directory_does_not_answer_there_is_
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, code: int
 ) -> None:
     """The shared lock is not taken because the tools directory cannot be looked
-    at. Nothing shows that the draft is not there, so the answer is that it may
-    still be -- ``draft/`` as what is left -- not that there is none."""
+    at: resolving its path raises (``tools.ToolsDirUnresolvedError``). Nothing
+    shows that the draft is not there, so the answer is that it may still be --
+    ``draft/`` as what is left -- not that there is none."""
     package_root = _package(monkeypatch, tmp_path)
     _first_draft(tmp_path, package_root)
     draft = _draft_dir(package_root)
@@ -2150,7 +2213,33 @@ def test_a_discard_that_cannot_see_the_tools_directory_does_not_answer_there_is_
     with monkeypatch.context() as patch:
         for name in ("stat", "lstat"):
             _refuse(patch, name, lambda path: path == base, code)
-        assert tools.acquire_shared_tools_lock() is None
+        with pytest.raises(tools.ToolsDirUnresolvedError):
+            tools.acquire_shared_tools_lock()
+        outcome = tool_drafts.discard(package_root, token=token)
+
+    assert outcome == tool_drafts.Removal(removed=False, residual_path=draft)
+    assert tool_drafts.has_draft(package_root)
+
+
+def test_a_discard_whose_second_look_cannot_resolve_the_tools_dir_says_the_draft_may_be_there(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No lock was taken -- the tools directory was not seen to be a directory --
+    and the look that tells "gone" from "not seen" cannot resolve its path.
+    Nothing shows that the draft is not there, so the answer is that it may still
+    be, not a failure out of the discard. Red before the fix: the second look's
+    failure escaped the discard as ``PermissionError``."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    draft = _draft_dir(package_root)
+    token = tool_drafts.discard_token(draft)
+
+    def unresolvable(path: Any, *args: Any, **kwargs: Any) -> str:
+        raise PermissionError(errno.EACCES, "Permission denied", os.fspath(path))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(tools, "acquire_shared_tools_lock", lambda: None)
+        patch.setattr(os.path, "realpath", unresolvable)
         outcome = tool_drafts.discard(package_root, token=token)
 
     assert outcome == tool_drafts.Removal(removed=False, residual_path=draft)
@@ -2163,20 +2252,23 @@ def test_a_discard_whose_tools_directory_is_seen_not_to_be_there_answers_there_i
 ) -> None:
     """The shared lock is not taken because the tools directory is seen not to
     exist -- removed (``ENOENT``), or under a path component that is a regular
-    file (``ENOTDIR``): there is no draft to discard."""
+    file (``ENOTDIR``, its path kept as configured): there is no draft to
+    discard."""
     if gone == "removed":
         package_root = _package(monkeypatch, tmp_path)
         _first_draft(tmp_path, package_root)
         token = tool_drafts.discard_token(_draft_dir(package_root))
         shutil.rmtree(package_root.path.parent)
+        assert tools.acquire_shared_tools_lock() is None
     else:
         (tmp_path / "plain").write_text("a file\n", encoding="utf-8")
         base = tmp_path / "plain" / "tools"
         _settings(monkeypatch, base)
         package_root = tools.PackageRoot(base / "kb")
         token = "0" * 64
+        assert tools.tools_dir() == base
+        assert tools.acquire_shared_tools_lock() is None
 
-    assert tools.acquire_shared_tools_lock() is None
     assert tool_drafts.discard(package_root, token=token) == "not_found"
 
 
@@ -2517,7 +2609,7 @@ def test_through_a_link_no_draft_is_listed_counted_saved_marked_taken_away_or_sw
     ``remove_after_publish`` and ``sweep_package`` do not reach through A. B's
     draft is left exactly as it was."""
     package_b = _package(monkeypatch, tmp_path)
-    _first_draft(tmp_path, package_b)
+    _workspace_b, saved_b = _first_save(tmp_path, package_b)
     linked = package_b.path.parent / "kc"
     if alias == "metadata-directory":
         _make_package(package_b.path.parent, name="kc")
@@ -2561,9 +2653,10 @@ def test_through_a_link_no_draft_is_listed_counted_saved_marked_taken_away_or_sw
     assert tool_drafts.discard(package_a, draft_id=seen[0], generation=seen[1]) == "not_found"
     assert tool_drafts.mark_publishing(package_a, identity_a, seen, None) is None
     assert tool_drafts.clear_publishing(package_a, identity_a, seen, "failed") is None
-    assert tool_drafts.remove_after_publish(package_a, identity_a, seen) == tool_drafts.Removal(
-        False, None
-    )
+    # With B's own copy as what was saved: reaching B's draft through A would take it.
+    assert tool_drafts.remove_after_publish(
+        package_a, identity_a, seen, saved_b.copy
+    ) == tool_drafts.Removal(False, None, kept="unconfirmed")
     _plant(_draft_dir(package_b), "files-" + "e" * 32)
     tool_drafts.sweep_package(linked, fsync_directory=tool_builder._fsync_directory)
 

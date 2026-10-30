@@ -185,7 +185,7 @@ def test_stored_body_at_or_under_cap_is_unchanged(monkeypatch: pytest.MonkeyPatc
     untruncated -- the cap must never touch a body that already fits."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_body_max_chars=1000))
     text = "x" * 1000
-    stored, truncated = llm_log._stored_body(text, [])
+    stored, truncated = llm_log._stored_body(text, llm_log._SecretSnapshot([], True))
     assert stored == text
     assert truncated is False
 
@@ -195,7 +195,7 @@ def test_stored_body_over_cap_is_hard_cut_with_marker(monkeypatch: pytest.Monkey
     marker appended in place of the last characters (not merely a bare
     slice), and reports truncated=True."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_body_max_chars=1000))
-    stored, truncated = llm_log._stored_body("y" * 5000, [])
+    stored, truncated = llm_log._stored_body("y" * 5000, llm_log._SecretSnapshot([], True))
     assert truncated is True
     assert len(stored) == 1000
     assert stored.endswith(llm_log._BODY_TRUNCATION_MARKER)
@@ -214,7 +214,7 @@ def test_stored_body_cap_smaller_than_marker_hard_cuts_without_it(
     Confirms the marker is DROPPED (not partially appended) and the result is
     a bare hard cut to exactly ``cap`` chars."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: SimpleNamespace(llm_log_body_max_chars=5))
-    stored, truncated = llm_log._stored_body("z" * 100, [])
+    stored, truncated = llm_log._stored_body("z" * 100, llm_log._SecretSnapshot([], True))
     assert truncated is True
     assert stored == "zzzzz"
 
@@ -356,7 +356,7 @@ def test_redaction_masks_known_secret_in_request_and_response(
         "get_settings",
         lambda: Settings(llm_log_file=str(log_file), llm_log_max_entries=50),
     )
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {secret})
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({secret}, True))
     llm_log._reset_for_tests()
 
     _record(
@@ -398,7 +398,7 @@ def test_a_body_that_spells_a_secret_only_as_written_reaches_no_byte_of_the_json
         "get_settings",
         lambda: Settings(llm_log_file=str(log_file), llm_log_max_entries=50),
     )
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {secret})
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({secret}, True))
     llm_log._reset_for_tests()
 
     _record(messages=[{"role": "user", "content": text}], response=text)
@@ -429,7 +429,7 @@ def test_advertised_tool_names_go_through_the_same_redaction(
         "get_settings",
         lambda: Settings(llm_log_file=str(log_file), llm_log_max_entries=50),
     )
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {secret})
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({secret}, True))
     llm_log._reset_for_tests()
 
     _record(workflow="capture", tools_advertised=[secret, "notes"])
@@ -451,7 +451,7 @@ def test_advertised_tool_names_keep_none_and_empty_apart(
     at all) stays None, and [] (a tools parameter rode, but nothing in it carried
     a readable name) stays []."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {"kb-live-key-abcdef"})
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({"kb-live-key-abcdef"}, True))
     llm_log._reset_for_tests()
 
     _record(workflow="capture", tools_advertised=[])
@@ -481,9 +481,9 @@ def test_one_secret_sweep_per_attempt_however_many_names(
     calls: list[int] = []
     secret = "kbsearch-tool"  # also the name of an installed tool
 
-    def counting_provider() -> set[str]:
+    def counting_provider() -> tuple[set[str], bool]:
         calls.append(1)
-        return {secret}
+        return {secret}, True
 
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
     monkeypatch.setattr(llm_log, "_secret_provider", counting_provider)
@@ -630,7 +630,7 @@ def test_redaction_skips_values_shorter_than_min(monkeypatch: pytest.MonkeyPatch
     """A too-short (<6 char) provider value is NEVER redacted: masking a 1-5 char
     value would shred ordinary prose, and a real key is never that short."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {"abc", "12345"})  # both < 6
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({"abc", "12345"}, True))  # both < 6
     llm_log._reset_for_tests()
 
     _record(response="abc appears here and 12345 too")
@@ -652,7 +652,7 @@ def test_redaction_runs_before_truncation(monkeypatch: pytest.MonkeyPatch) -> No
         "get_settings",
         lambda: Settings(llm_log_body_max_chars=1000, llm_log_max_entries=50),
     )
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {secret})
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({secret}, True))
     llm_log._reset_for_tests()
     # 990 filler + the 16-char secret + trailing: the secret spans indices
     # 990..1006, so truncate-first would keep secret[:10] inside the 1000 cap.
@@ -665,47 +665,51 @@ def test_redaction_runs_before_truncation(monkeypatch: pytest.MonkeyPatch) -> No
     assert "SECRETABCD" not in body  # not even the prefix truncate-first would leak
 
 
-def test_redaction_provider_failure_records_unredacted(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_provider_that_raises_does_not_break_the_recording_and_stores_the_body_unrecorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A provider that RAISES must never break recording (the no-observer-failure
-    invariant): the interaction is still recorded, just unredacted."""
+    invariant): the interaction is still recorded, with its outcome. But a failure
+    to ask says nothing about what the secrets are, so the body is not checked
+    against nothing as if there were none: it is stored as the marker saying it
+    was not recorded."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
 
-    def _boom() -> set[str]:
+    def _boom() -> tuple[set[str], bool]:
         raise RuntimeError("secret provider exploded")
 
     monkeypatch.setattr(llm_log, "_secret_provider", _boom)
     llm_log._reset_for_tests()
 
     _record(response="a normal body with sk-secret-value inside")  # must not raise
-    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    summary = llm_log.list_summaries(1)[0]
+    record = llm_log.get_record(summary["id"])
     assert record is not None
-    # Recorded, and unredacted (provider failed -> degrade to raw text).
-    assert record["attempts"][0]["response_content"] == "a normal body with sk-secret-value inside"
+    assert summary["outcome"] == "ok"
+    assert record["attempts"][0]["response_content"] == llm_log._UNCHECKED_MARKER
 
 
-def test_redaction_provider_iterator_raising_midyield_records_unredacted(
+def test_a_provider_whose_values_raise_midyield_stores_the_body_unrecorded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """F5: the provider values are materialized INSIDE _redact's guard, so a LAZY
-    provider (a generator) that raises PARTWAY through iteration -- not at call time --
-    still degrades to 'record unredacted' rather than breaking the recording. Without
-    the list() being inside the try, iterating the generator would raise straight into
-    the recorder."""
+    """The provider values are materialized INSIDE the snapshot's guard, so a
+    LAZY iterable that raises PARTWAY through iteration -- not at call time --
+    does not break the recording. What was yielded before it raised is not the
+    whole list either, so the body is stored as the marker saying it was not
+    recorded."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
 
-    def _lazy() -> Any:
+    def _values() -> Any:
         yield "first-secret-value-abcdef"
         raise RuntimeError("iterator exploded mid-yield")
 
-    monkeypatch.setattr(llm_log, "_secret_provider", _lazy)
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: (_values(), True))
     llm_log._reset_for_tests()
 
     _record(response="body with first-secret-value-abcdef inside")  # must not raise
     record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
     assert record is not None
-    # Iteration raised before completing -> the whole redact degrades to raw text,
-    # so even the already-yielded value is left in place rather than half-masked.
-    assert record["attempts"][0]["response_content"] == "body with first-secret-value-abcdef inside"
+    assert record["attempts"][0]["response_content"] == llm_log._UNCHECKED_MARKER
 
 
 def test_redaction_filters_non_string_provider_values(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -714,7 +718,7 @@ def test_redaction_filters_non_string_provider_values(monkeypatch: pytest.Monkey
     still masked."""
     secret = "real-secret-value-abcdef"
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: [None, 123456, secret])
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ([None, 123456, secret], True))
     llm_log._reset_for_tests()
 
     _record(response=f"body with {secret} inside")  # must not raise
@@ -730,7 +734,7 @@ def test_redaction_longest_first_leaves_no_suffix(monkeypatch: pytest.MonkeyPatc
     (a prefix of the longer) never leaves the longer's suffix exposed. Had the shorter
     run first, 'XYZ789' would survive after 'abcdef' was masked inside the longer."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {"abcdef", "abcdefXYZ789"})
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({"abcdef", "abcdefXYZ789"}, True))
     llm_log._reset_for_tests()
 
     _record(response="key=abcdefXYZ789 end")
@@ -747,7 +751,7 @@ def test_redaction_masks_trailing_prefix_fragment(monkeypatch: pytest.MonkeyPatc
     by an upstream boundary before _redact runs, so the full value never appears -- is
     masked at the tail, mirroring tools.redact_known_secrets."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {"abcdefGHIJKLMN"})
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({"abcdefGHIJKLMN"}, True))
     llm_log._reset_for_tests()
 
     _record(response="body ends with abcdefGHIJ")  # first 10 chars of the secret
@@ -765,7 +769,7 @@ def test_redaction_ranges_computed_on_original_text(monkeypatch: pytest.MonkeyPa
     ending in a 12-char prefix of the long secret must not leak a 6+-char run -- the old
     replace-first order masked the ``GHIJKL`` occurrence and stranded ``ABCDEF``."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {"ABCDEFGHIJKLmnop", "GHIJKL"})
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({"ABCDEFGHIJKLmnop", "GHIJKL"}, True))
     llm_log._reset_for_tests()
 
     _record(response="tail=ABCDEFGHIJKL")  # 12-char prefix of the long secret
@@ -776,15 +780,16 @@ def test_redaction_ranges_computed_on_original_text(monkeypatch: pytest.MonkeyPa
     assert body.endswith(llm_log._REDACTION_MARKER)
 
 
-def test_redaction_helper_failure_records_unredacted(monkeypatch: pytest.MonkeyPatch) -> None:
-    """D36 round-5: ``_mask_known_secrets`` now runs INSIDE the same guard as the
-    provider call -- a MemoryError (or any other surprise) from the masking step
-    itself must still degrade to 'record unredacted', the SAME no-observer-failure
-    invariant the provider-failure tests above already cover for the provider side.
-    Before this fix the call sat OUTSIDE the try, so this exact failure would have
-    escaped straight into the recorder."""
+def test_a_masking_failure_does_not_break_the_recording_and_stores_the_body_unrecorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_mask_known_secrets`` runs inside guards -- a MemoryError (or
+    any other surprise) from the masking itself must not escape into the recorder.
+    ``_redact`` keeps the text when it fails; the check of the text as written
+    fails the same way, and a body it could not check is stored as the marker
+    saying it was not recorded: no secret was found, none was looked for."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {"real-secret-value-abcdef"})
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({"real-secret-value-abcdef"}, True))
 
     def _boom(text: str, secrets: list[str]) -> str:
         raise MemoryError("mask blew up")
@@ -795,7 +800,122 @@ def test_redaction_helper_failure_records_unredacted(monkeypatch: pytest.MonkeyP
     _record(response="a normal body, must not raise")  # must not raise
     record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
     assert record is not None
-    assert record["attempts"][0]["response_content"] == "a normal body, must not raise"
+    assert record["attempts"][0]["response_content"] == llm_log._UNCHECKED_MARKER
+
+
+def test_a_list_that_is_not_whole_stores_every_body_unrecorded_and_keeps_the_rest(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The provider says the values it gives are not all of them -- a ``.env`` could
+    not be read. Every body is stored as the marker saying it was not recorded: the
+    request messages, the advertised names and the response, in the ring and in
+    the JSONL file, and none of their text reaches either. What the record says
+    about the call itself is kept: its outcome, its usage, how many attempts."""
+    log_file = tmp_path / "llm.jsonl"
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_file=str(log_file), llm_log_max_entries=50),
+    )
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({"kb-live-key-abcdef"}, False))
+    llm_log._reset_for_tests()
+
+    recorder = llm_log.LlmInteractionRecorder(workflow="capture", model="m")
+    recorder.begin_attempt([{"role": "user", "content": "plain words"}], tools_advertised=["notes"])
+    recorder.record_usage(
+        SimpleNamespace(usage={"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8})
+    )
+    recorder.record_response("plain answer")
+    recorder.finish(outcome="ok", error=None)
+
+    summary = llm_log.list_summaries(1)[0]
+    record = llm_log.get_record(summary["id"])
+    assert record is not None
+    attempt = record["attempts"][0]
+    assert attempt["request_messages"][0]["content"] == llm_log._UNCHECKED_MARKER
+    assert attempt["tools_advertised"] == [llm_log._UNCHECKED_MARKER]
+    assert attempt["response_content"] == llm_log._UNCHECKED_MARKER
+    assert (summary["outcome"], summary["attempts"]) == ("ok", 1)
+    assert summary["usage"] == {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8}
+    file_text = log_file.read_text(encoding="utf-8")
+    assert "plain words" not in file_text
+    assert "plain answer" not in file_text
+
+
+def test_a_whole_list_with_no_secrets_keeps_every_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No known secrets, and that is all of them: nothing to mask, nothing
+    withheld. The empty list that is whole is not the empty list that is not. Not
+    red at HEAD, which kept every body; red for a marker stored on any empty list."""
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: (set(), True))
+    llm_log._reset_for_tests()
+
+    _record(messages=[{"role": "user", "content": "plain words"}], response="plain answer")
+
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    attempt = record["attempts"][0]
+    assert attempt["request_messages"][0]["content"] == "plain words"
+    assert attempt["response_content"] == "plain answer"
+
+
+def test_checked_as_written_stores_a_body_unrecorded_for_a_list_that_is_not_whole() -> None:
+    """The last stage on its own: a body that holds nothing a partial list knows is
+    still not called clean, since the values the list lacks are unknown. The
+    recorder tests above show the same through the whole pipeline."""
+    whole = llm_log._SecretSnapshot(["kb-live-key-abcdef"], True)
+    partial = llm_log._SecretSnapshot(["kb-live-key-abcdef"], False)
+
+    assert llm_log._checked_as_written("plain words", whole) == "plain words"
+    assert llm_log._checked_as_written("plain words", partial) == llm_log._UNCHECKED_MARKER
+    assert llm_log._checked_as_written("", partial) == llm_log._UNCHECKED_MARKER
+
+
+def test_a_secret_found_and_a_body_not_checked_are_told_apart_in_the_log(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two recordings of the same body. With the whole list, the body spells a
+    known secret as written, so it is stored as the marker saying a secret was
+    found. With a list that is not whole, nothing was found -- nothing could be
+    looked for -- so it is stored as the marker saying it was not recorded, which
+    a reader cannot take for a secret having been there. Red before the fix: the
+    list that was not whole stored the marker saying a secret was found."""
+    secret = "kb-pem-head\\nkb-pem-body"
+    text = "it signs with kb-pem-head\nkb-pem-body"
+    log_file = tmp_path / "llm.jsonl"
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_file=str(log_file), llm_log_max_entries=50),
+    )
+    stored: list[str] = []
+    for complete in (True, False):
+        monkeypatch.setattr(llm_log, "_secret_provider", lambda c=complete: ({secret}, c))
+        llm_log._reset_for_tests()
+        _record(response=text)
+        record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+        assert record is not None
+        stored.append(record["attempts"][0]["response_content"])
+
+    found, unchecked = stored
+    assert found == llm_log._REDACTION_MARKER
+    assert unchecked != llm_log._REDACTION_MARKER
+    assert unchecked == llm_log._UNCHECKED_MARKER
+    assert secret.encode("utf-8") not in log_file.read_bytes()
+
+
+@pytest.mark.parametrize("name", ["_REDACTION_MARKER", "_UNCHECKED_MARKER"])
+def test_no_key_or_token_can_spell_a_marker(name: str) -> None:
+    """Each marker is a CJK body in the •••[…]••• fence, and no run of ASCII
+    characters in it is as long as the redactor's floor: a value of ASCII
+    characters, as keys and tokens are, can neither equal a marker nor be found
+    in one, so masking never cuts into a marker and a marker is never read as a
+    value. Red before the fix for the marker saying a body was not recorded, which
+    did not exist; the redaction marker was already written this way."""
+    marker = getattr(llm_log, name)
+
+    assert marker.startswith("•••[") and marker.endswith("]•••")
+    assert max(map(len, re.findall(r"[\x00-\x7f]+", marker)), default=0) < llm_log._MIN_SECRET_LEN
 
 
 def test_file_sink_writes_valid_jsonl(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:

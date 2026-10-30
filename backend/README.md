@@ -69,7 +69,7 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 | `LLM_LOG_BODY_MAX_CHARS` | `200000` | 單次互動中，任一則請求/回應內容儲存時的字元數上限，邊界 `[1000, 2000000]`；與 `LLM_LOG_MAX_ENTRIES` 一起讓記憶體用量在兩個軸上都有界。 |
 | `LLM_LOG_FILE` | 未設定 | 選填。設定後，每次 LLM 互動會額外追加寫入這個 JSONL 檔案（與記憶體環狀緩衝相同的紀錄，一樣受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；預設關閉——記錄含個人記憶內容，落不落地是使用者自己的隱私選擇。 |
 | `LLM_LOG_FILE_MAX_BYTES` | `50000000` | 上述 JSONL sink 的輪替門檻（位元組）：檔案超過此大小就改名成帶 UTC 時間戳後綴、另開新檔（守磁碟；RAM 由環狀緩衝負責），邊界 `[1000000, 1000000000]`。僅在有設定 `LLM_LOG_FILE` 時有意義；輪替後的舊檔不會自動刪除，交由使用者自行清理。 |
-| `TOOLS_DIR` | dev 未設定／打包模式自動注入 `<data-dir>/tools` | 已安裝工具套件所在目錄；留空＝工具功能整個關閉（`GET /api/tools` 回空清單，AI workflow 不帶任何工具，prompt 與無工具版本逐字相同）。相對路徑或指向此基底的 symlink 會在設定邊界 canonicalize 成同一個絕對路徑；這不會跟隨或放寬任何 package/version symlink 的拒絕。dev 模式要用工具功能，需自行在 `backend/.env` 設定這個變數。 |
+| `TOOLS_DIR` | dev 未設定／打包模式自動注入 `<data-dir>/tools` | 已安裝工具套件所在目錄；留空＝工具功能整個關閉（`GET /api/tools` 回空清單，AI workflow 不帶任何工具，prompt 與無工具版本逐字相同）。相對路徑或指向此基底的 symlink 會在設定邊界 canonicalize 成同一個絕對路徑；這不會跟隨或放寬任何 package/version symlink 的拒絕。路徑裡還不存在的部分照原樣保留（工具目錄還沒建立時照常）；某一段是檔案時同樣是那裡沒有工具目錄：照設定的路徑使用（只轉成絕對路徑，不解析連結、不化簡 `..`），沒有工具，AI workflow 照常不帶工具，已知秘密的清單照常完整。解析時遇到其他錯誤（上層目錄無法搜尋、連結迴圈、I/O 錯誤）不會被當成功能關閉：工具清單、capture／enrich／assist-update 等用到工具目錄的請求回 `500 tools_dir_unresolved`，訊息寫出設定的路徑、錯誤型別與下一步（檢查上層目錄的權限、連結與磁碟狀態，或清空這個設定），已知秘密的清單也因此不完整。dev 模式要用工具功能，需自行在 `backend/.env` 設定這個變數。 |
 | `LLM_TOOL_ROUNDS_MAX` | `8` | 一次 AI workflow 呼叫最多允許幾輪工具呼叫，邊界 `[1, 64]`。 |
 | `LLM_TOOL_TIMEOUT_SECONDS` | `60` | 單次工具子行程的逾時秒數（到期整個 process group 被砍），邊界 `(0, 600]`。 |
 | `LLM_TOOL_OUTPUT_MAX_CHARS` | `50000` | 工具 stdout 餵回給模型的字元數上限，邊界 `[1000, 500000]`。 |
@@ -153,6 +153,13 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
 `502 llm_upstream_error`（上游呼叫失敗或輸出無法解析，即使重試一次後仍失敗）、
 `409 conflict`（enrich／assist-update 於 LLM 呼叫期間，項目被別的請求改動——樂觀
 並發偵測）。
+
+給操作者照著修的兩種 500（`afterthread/main.py` 的 app 層處理，任何路由都適用）：
+`500 tools_dir_unresolved`（`TOOLS_DIR` 的路徑解析不了，見上方設定表）與
+`500 known_secrets_incomplete`（有 `.env` 或工具目錄讀不到，已知秘密的清單不完整）。
+`detail.message` 只寫路徑、工具名、錯誤型別與下一步，不含任何值，結尾不帶句號（頁面可能接著寫下去）；
+路徑在 Linux 上不是 UTF-8 的位元組會換成替代字元（U+FFFD）。修訂、安裝的背景工作因這兩種錯誤停下時，
+job 的 `error` 也是這段訊息（帶結尾句號）；其他未預期錯誤仍只寫型別名。
 
 **Tools**（`afterthread/routers/tools.py`，前綴 `/api/tools`；即「工具」頁的
 後端）。回應裡的後端路徑（欄位型別 `schemas.BackendPath`），以及 `500 tools_lock_unavailable` 與
@@ -257,7 +264,7 @@ AI 路由的錯誤語意：`503 llm_not_configured`（未設定端點）、
   而中止的工作上都是 `null`；`run_shell` 指令無法確認停止的修訂只帶前四個，`summary`、
   `handoff`、`operator_action` 都是 `null`（AI 日誌仍有整場紀錄）。修訂另帶 `draft`：這一輪的草稿怎麼了
   （`{saved, draft_id, generation, attempts, reason, retained_path}`）。`saved` 是草稿是否存了這一輪的
-  成果，`reason` 是沒存的原因（發布成功卻刪不掉草稿時，是請你放棄它的說明）；`attempts` 是這份草稿
+  成果，`reason` 是沒存的原因；發布成功而草稿留下時，是它為何留下的說明：確認過草稿只有發布前存的那份、刪除卻沒完成時請你放棄它，發布期間草稿被改過或多了內容、或無法確認內容仍與發布前相同時，請你先取出需要的內容再放棄；`attempts` 是這份草稿
   累計的輪數；`retained_path` 只在發布前的保存失敗、接著發布也失敗時才有，指出成果現在在哪裡：
   暫存目錄，或已搬進 `versions/` 但 `current` 沒有指到的那一版。沒有值得存的東西、發布成功且草稿已
   刪除、指令無法確認停止（什麼都不存）時，以及上面六個欄位為 `null` 的情況，`draft` 都是 `null`。
@@ -391,7 +398,10 @@ last}`：`state` 依序判定為 `running`（本行程有一輪正在處理它�
   ```
 
   套件層只有後端狀態與操作者的 `.env`、`config.env`；工具內容全部在版本層。
-  `.env` 的每個值都是遮蔽器的秘密；`config.env` 的值不是秘密、不進遮蔽集合、
+  `.env` 的每個值都是遮蔽器的秘密；收集時不存在（`ENOENT`／`ENOTDIR`）、是連結或特殊檔、超過大小上限的 `.env`
+  沒有值，其他讀取錯誤（權限、I/O）則讓已知秘密的清單不完整：需要它的遮蔽與檢查不放行（保存與發布失敗並寫出
+  讀不到的 `.env` 與下一步，清單與紀錄的讀取回 `500 known_secrets_incomplete`，工具與 `run_shell` 的輸出不交出），AI 日誌的每段本文改存「無法確認是否含已知秘密，本文未記錄」的標記（不是表示命中秘密的遮蔽標記）；
+  `config.env` 的值不是秘密、不進遮蔽集合、
   沒有長度下限，修訂時整份交給 builder。執行環境的順序是透傳 → `TLS_NO_VERIFY`
   → `config.env` → `.env`，同一個 key 以 `.env` 為準。
   `tool.json` 的 `name` 必須等於套件名並符合
@@ -478,7 +488,7 @@ last}`：`state` 依序判定為 `running`（本行程有一輪正在處理它�
   會避開 `versions/` 下所有以候選 vid 開頭的項目，包括 `.discarded`。
 - **沒發布的修訂留成草稿**（`services/tool_drafts.py`）：一輪修訂沒有發布時——builder 自己回
   `ready=false`、session 失敗、試圖改名——工作區存成工具的草稿，在
-  `<name>/.afterthread.meta/draft/`；準備發布的那一輪也先存一份，發布成功後刪除，發布失敗時清掉
+  `<name>/.afterthread.meta/draft/`；準備發布的那一輪也先存一份，發布成功後刪除——只在鎖內確認 `draft/` 裡只有說明檔與那次保存的複本、而且複本的指紋（存好時取的 `tree_digest`，不是工作區）沒變時才刪；被改過、多了東西（例如操作者自己的目錄）或讀不完整就整份保留（比對完到改名之間的修改、比對走訪中已讀過又被改的項目不在保證內）——發布失敗時清掉
   「正在發布」的標記、把錯誤記在那一輪。每一次保存都排在「指令無法確認停止」那個出口之後、
   builder 的 `.env` 與根層 `.afterthread.meta/` 剝除之後；剝除失敗就不存檔案。順序是固定的：
   值不值得存（第一輪相對開工時複製進來的內容沒有變更、模型也沒交回任何筆記，就什麼都不建）、
@@ -555,8 +565,10 @@ last}`：`state` 依序判定為 `running`（本行程有一輪正在處理它�
   **型別**的 WARNING（資料庫錯誤的文字會帶 SQL 參數，也就是內文），工具結果照常回給模型。
   寫入在共享鎖釋放之前完成，所以刪除工具（需要 exclusive）不會插在一次執行與它的紀錄之間
   （兩種在取得鎖之前就拒絕的呼叫沒有鎖可持有，但它們什麼也沒執行）。呼叫在後端這一側拋出例外
-  （例如遮蔽用的已知秘密掃描失敗、tools lock 無法使用）也會記一筆 `error`，內容只有模型收到的
-  `tool execution failed: <型別>`，例外照樣往上拋。
+  （例如 tools lock 無法使用）也會記一筆 `error`，內容只有模型收到的
+  `tool execution failed: <型別>`，例外照樣往上拋。工具已經執行、只是輸出遮蔽不了（例如已知秘密的清單不完整）時
+  不拋例外：模型收到 `tool ran (exit N), but its output is withheld: ...`，照實說它執行過，紀錄同樣是 `error`、
+  沒有內文；builder 的 `run_shell` 同理（`command ran (exit N), ...`）。
   內文只在**啟動過而且失敗**的執行才有：先在整段文字上遮蔽（非零 exit 時與給模型的那份共用
   同一刻的已知秘密、同樣 fail-closed），再 `_utf8_safe`、再截斷；逾時與無法啟動兩條路徑的遮蔽
   只為紀錄而做，掃描失敗就不存內文，不影響呼叫。`workflow` 與 AI 日誌連結來自

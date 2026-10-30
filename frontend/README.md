@@ -274,7 +274,9 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
     `components/DraftNotice.jsx`，掛在該列的修訂工作卡片之下。**`buttons` 只會是
     `["discard"]` 或 `[]`**：處理中（`running`）與發布中（`publishing`）不給按鈕，其餘
     狀態（可接續、已過期、無法使用、已發布、結果未知）只能放棄。現在沒有接續或發布
-    草稿的 API，所以任何文案都不能叫人按那兩個動作。後端 `ToolDraft.state` 的每個值
+    草稿的 API，所以任何文案都不能叫人按那兩個動作。「已發布」的說明不說放棄就好：
+    發布後草稿留下來，可能是沒能刪掉，也可能是後端發現它和發布前存的那份不同（被改過或
+    多了東西）、或無法確認，所以說明句請使用者先到路徑取回需要的內容再放棄。後端 `ToolDraft.state` 的每個值
     都要有文案：`toolDraft.test.js` 手抄一份後端的狀態清單，斷言 `KNOWN_DRAFT_STATES`
     與它相同；後端新增狀態時，要先補這份清單，測試才會要求補文案。
   - **「無法使用」有兩種形狀**：說明檔讀不出來時，`draft_id`、`generation`、
@@ -292,7 +294,8 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
     併入 `ownSummaryBusy`，和其他寫入一起停用。
   - **工作卡片**：`components/ReviseDraftResult.jsx` 依 `jobDraftView` 說這一輪的
     成果去了哪——「進度已保存（第 N 輪）」、「未能保存（原因）」、發布前保存失敗而發布
-    也失敗時的「成果留在 <路徑>，未能存成草稿」，以及已發布的修訂沒能刪掉草稿的說明
+    也失敗時的「成果留在 <路徑>，未能存成草稿」，以及已發布的修訂留下草稿時後端寫的說明
+    ——沒能刪掉；發布期間草稿被改過或多了內容；或無法確認內容仍與發布前相同——原樣顯示
     （已發布的修訂不說「進度已保存」）。它和 `ReviseStopNotice`（說這一輪為何停止）
     各管一件事，分開。
   - 上一輪的停止原因沿用 `utils/toolJobStop.js` 的詞彙（`toolJobStopReason`）；草稿

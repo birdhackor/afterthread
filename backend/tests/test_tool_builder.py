@@ -368,6 +368,35 @@ def test_run_shell_happy_and_nonzero_exit(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert failed.startswith("command failed (exit 3): bad")
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_run_shell_whose_output_cannot_be_masked_says_the_command_ran_and_hands_none_over(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The command ran and printed an installed tool's secret, and that tool's
+    directory cannot be looked at, so its ``.env`` -- and the secret -- is not in
+    the known list. None of the output is handed to the builder, and it is told
+    the command ran and how it ended, so it does not run it again as one that
+    never ran. Red before the fix: the list was taken as whole without that
+    ``.env``, and the secret reached the builder unmasked."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    secret = "installed-tool-secret-abcdef"
+    package = root / "kb"
+    package.mkdir(parents=True)
+    (package / ".env").write_text(f"KB_KEY={secret}\n", encoding="utf-8")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    meta = _meta_by_name(staging)
+    package.chmod(0)
+    try:
+        result = _call(meta["run_shell"].handler, {"command": f"echo {secret}"})
+    finally:
+        package.chmod(0o700)
+
+    assert secret not in result
+    assert result == tools.output_withheld_text("command", 0)
+
+
 def test_run_shell_cwd_is_staging(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
     staging = tmp_path / "staging"
@@ -3137,6 +3166,77 @@ def test_router_list_tools_empty_when_unconfigured(
     assert response.json() == {"tools": []}
 
 
+def test_router_answers_an_operator_facing_failure_without_its_full_stop(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure written for the operator goes out as its message, under its
+    code, with the closing full stop left off: the page may go on after it (the
+    tools list's note on a stale list does). Red before the fix: a bare 500 with
+    no message."""
+    gap = tools.SecretSourceGap("kb", "/srv/tools/kb/.env", "PermissionError")
+    failure = tools.KnownSecretsIncomplete((gap,))
+
+    def failing(**_kwargs: Any) -> list[dict[str, Any]]:
+        raise failure
+
+    monkeypatch.setattr(tools, "list_tools", failing)
+    lenient = TestClient(client.app, raise_server_exceptions=False)
+
+    response = lenient.get("/api/tools")
+
+    assert str(failure).endswith("。")
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json"), response.text
+    assert response.json() == {
+        "detail": {"code": "known_secrets_incomplete", "message": str(failure)[: -len("。")]}
+    }
+
+
+def test_router_list_tools_empty_when_the_tools_dir_runs_through_a_file(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``TOOLS_DIR`` runs through a regular file: no tools directory can be
+    there, as surely as one not made yet, so the list is empty -- not a 500. Red
+    before the fix: resolving the setting raised ``NotADirectoryError`` out of the
+    route."""
+    (tmp_path / "plain").write_text("a file\n", encoding="utf-8")
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "plain" / "tools"))
+    lenient = TestClient(client.app, raise_server_exceptions=False)
+
+    response = lenient.get("/api/tools")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"tools": []}
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_router_list_says_which_tools_dir_it_cannot_resolve_and_what_to_do(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``TOOLS_DIR`` runs through a directory that cannot be searched, so its path
+    cannot be resolved. The list is a 500 in the error shape the page reads,
+    under its own code, and the message names the configured path, the failure's
+    type and what to do. Red before the fix: a bare 500 with no message."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    configured = locked / "inner" / "tools"
+    _install_settings(monkeypatch, tools_dir=str(configured))
+    lenient = TestClient(client.app, raise_server_exceptions=False)
+    locked.chmod(0)
+    try:
+        response = lenient.get("/api/tools")
+    finally:
+        locked.chmod(0o700)
+
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json"), response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "tools_dir_unresolved"
+    assert str(configured) in detail["message"]
+    assert "PermissionError" in detail["message"]
+    assert "TOOLS_DIR" in detail["message"]
+
+
 def test_router_patch_toggles_enabled(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4986,7 +5086,7 @@ def test_invariant_f_revised_package_immediately_redacts_package_env_from_logs(
     assert outcome.ok is True
     assert env_path.stat().st_ino == env_inode
     assert secret in tools.known_secret_values()
-    monkeypatch.setattr(llm_log, "_secret_provider", tools.known_secret_values)
+    monkeypatch.setattr(llm_log, "_secret_provider", tools.known_secrets_for_log)
     recorder = llm_log.LlmInteractionRecorder(workflow="probe", model="m")
     recorder.begin_attempt([{"role": "user", "content": f"use {secret}"}])
     recorder.record_response(f"used {secret}")
@@ -4997,7 +5097,9 @@ def test_invariant_f_revised_package_immediately_redacts_package_env_from_logs(
     assert record is not None
     stored = json.dumps(record, ensure_ascii=False)
     assert secret not in stored
-    assert llm_log._REDACTION_MARKER in stored
+    attempt = record["attempts"][0]
+    assert attempt["request_messages"][0]["content"] == f"use {llm_log._REDACTION_MARKER}"
+    assert attempt["response_content"] == f"used {llm_log._REDACTION_MARKER}"
 
 
 def test_run_revise_preserves_a_crlf_env_byte_for_byte(
@@ -7340,6 +7442,51 @@ def test_job_outcome_separates_not_published_from_failed(
     assert polled is not None
     assert polled["state"] == expected_state
     assert polled["outcome"] == expected_outcome
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_a_revise_whose_prompt_meets_a_list_that_is_not_whole_fails_naming_the_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Another tool's directory cannot be looked at while the revise builds its
+    prompt, so the known secrets the prompt is masked with are not whole: no
+    prompt is built and no model is called. The job fails with the message that
+    names that ``.env`` and what to check, not only the failure's type name. Red
+    before the fix: the job said only that the revise met an unexpected
+    ``KnownSecretsIncomplete``."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    captured = _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
+    built: list[str] = []
+    real_prompt = tool_builder._revise_system_prompt
+
+    def building(name: str) -> str:
+        built.append(name)
+        return real_prompt(name)
+
+    monkeypatch.setattr(tool_builder, "_revise_system_prompt", building)
+    other = _package_path(pkg).parent / "other"
+    other.mkdir()
+    (other / ".env").write_text("OTHER_KEY=other-secret-abcdef\n", encoding="utf-8")
+    job = tool_builder._admit_job()
+    assert job is not None
+    other.chmod(0)
+    try:
+        asyncio.run(
+            tool_builder._run_job(
+                job.job_id, lambda: _run_revise("kbsearch", "加上分頁"), tool_builder._ACTION_REVISE
+            )
+        )
+    finally:
+        other.chmod(0o700)
+
+    polled = tool_builder.get_job(job.job_id)
+    assert polled is not None
+    assert (polled["state"], polled["outcome"]) == ("failed", "failed")
+    assert str(other / ".env") in polled["error"]
+    assert "請檢查" in polled["error"]
+    assert "other-secret-abcdef" not in polled["error"]
+    assert built == ["kbsearch"]
+    assert captured == {}
 
 
 def test_job_outcome_of_an_unexpected_exception_is_failed() -> None:
@@ -10295,6 +10442,140 @@ def test_a_draft_a_publish_could_not_take_away_lists_as_published(
     assert row["draft"]["state"] == "published"
 
 
+def _during_the_publish(monkeypatch: pytest.MonkeyPatch, act: Callable[[], object]) -> None:
+    """Run ``act`` once the round's draft is saved and marked, as its publish begins."""
+    real_publish = tool_builder._publish_revised_version
+
+    def publish(*args: Any) -> Any:
+        act()
+        return real_publish(*args)
+
+    monkeypatch.setattr(tool_builder, "_publish_revised_version", publish)
+
+
+def test_a_draft_file_edited_while_its_round_publishes_stays_and_the_job_says_it_changed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The operator edits a file of the copy the round saved, while the publish
+    runs from the staging workspace: the edit is in no version, so the draft is
+    left with it, and the job says the draft changed during the publish -- take
+    out what is needed first, then discard. Red before the fix: the draft was
+    removed with the edit in it."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    edited = "print('edited by hand')\n"
+    _during_the_publish(
+        monkeypatch, lambda: (_draft_files(pkg) / "run.py").write_text(edited, encoding="utf-8")
+    )
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert tool_drafts.has_draft(_package_root(pkg))
+    assert (_draft_files(pkg) / "run.py").read_text(encoding="utf-8") == edited
+    assert (_current_version(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert outcome.draft is not None
+    assert outcome.draft["reason"] == tool_builder._DRAFT_KEPT_CHANGED
+    assert outcome.draft["generation"] == _draft_manifest(pkg)["generation"]
+
+
+def test_a_directory_added_to_the_draft_while_its_round_publishes_keeps_the_whole_draft(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The copy itself is untouched, but ``draft/`` gains a directory of the
+    operator's: the removal takes all of ``draft/``, which the copy's fingerprint
+    does not cover, so nothing is removed. Red before the fix: ``draft/`` went,
+    the notes with it."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+
+    def add_notes() -> None:
+        notes = _draft_dir(pkg) / "operator-notes"
+        notes.mkdir()
+        (notes / "todo.txt").write_text("分頁參數要再確認\n", encoding="utf-8")
+
+    _during_the_publish(monkeypatch, add_notes)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    notes = _draft_dir(pkg) / "operator-notes" / "todo.txt"
+    assert notes.read_text(encoding="utf-8") == "分頁參數要再確認\n"
+    assert (_draft_files(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert outcome.draft is not None
+    assert outcome.draft["reason"] == tool_builder._DRAFT_KEPT_CHANGED
+
+
+def test_a_draft_whose_copy_left_out_a_link_is_still_removed_when_nobody_changed_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The workspace holds a link to a file outside it, which the save does not
+    keep, so the saved copy differs from the workspace although nobody touched
+    either. The publish carries the link; the removal compares the draft against
+    the copy as saved, not against the workspace, and takes it away. Not red at
+    HEAD, which removed every matching draft; red for a fingerprint taken of the
+    workspace instead of the copy."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("not in the tool\n", encoding="utf-8")
+
+    def link_outside() -> None:
+        [session] = _session_roots(tmp_path)
+        os.symlink(outside, session / "build" / "elsewhere")
+
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY},
+        side_effect=link_outside,
+    )
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert os.readlink(_current_version(pkg) / "elsewhere") == str(outside)
+    assert outcome.draft is None
+    assert not tool_drafts.has_draft(_package_root(pkg))
+
+
+def test_a_draft_whose_files_cannot_be_read_whole_before_the_removal_stays_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When the removal comes, the saved copy cannot be listed: whether it is
+    still what was saved is not known, so the draft stays, and the job says that
+    it could not be confirmed -- not that a change was found. Red before the fix:
+    the draft was removed without being looked at."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    real_remove = tool_drafts.remove_after_publish
+    refused: list[str] = []
+
+    def remove(*args: Any) -> tool_drafts.Removal:
+        files = os.fspath(_draft_files(pkg))
+        real_scandir = os.scandir
+
+        def scandir(path: Any = ".") -> Any:
+            if os.fspath(path) == files:
+                refused.append(files)
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), files)
+            return real_scandir(path)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "scandir", scandir)
+            return real_remove(*args)
+
+    monkeypatch.setattr(tool_drafts, "remove_after_publish", remove)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert tool_drafts.has_draft(_package_root(pkg))
+    assert (_draft_files(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert refused
+    assert outcome.draft is not None
+    assert outcome.draft["reason"] == tool_builder._DRAFT_KEPT_UNCONFIRMED
+
+
 _PUBLISH_FAULTS = [
     "validation",
     "embedded-secret",
@@ -10489,6 +10770,50 @@ def test_a_publish_whose_origin_text_cannot_be_masked_fails_and_names_the_kept_w
     assert any(str(session) in record.getMessage() for record in caplog.records)
     assert not tool_drafts.has_draft(_package_root(pkg))
     assert _resolved_version(_package_path(pkg)) == pkg
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_a_publish_while_a_tools_env_cannot_be_read_saves_nothing_publishes_nothing_and_says_which(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """From the save before the publish on, another tool's directory cannot be
+    looked at, so the known list is not whole. The save keeps nothing and says
+    which ``.env`` and what to check; the publish does not go ahead, its error
+    saying the same; the version stays where it was. Red before the fix: the list
+    was taken as whole without that ``.env``, and the round was saved and
+    published."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    other = _package_path(pkg).parent / "other"
+    other.mkdir()
+    (other / ".env").write_text("OTHER_KEY=other-secret-abcdef\n", encoding="utf-8")
+    real_save = tool_builder._save_round_draft
+
+    def save_then_lose_the_env(
+        context: Any, outcome: tool_drafts.RoundOutcome | None, error: str | None
+    ) -> tool_drafts.SaveResult:
+        if outcome is None:  # the save a publish follows
+            other.chmod(0)
+        return real_save(context, outcome, error)
+
+    monkeypatch.setattr(tool_builder, "_save_round_draft", save_then_lose_the_env)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    try:
+        outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+    finally:
+        other.chmod(0o700)
+
+    assert outcome.ok is False
+    assert _resolved_version(_package_path(pkg)) == pkg
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    env = os.fspath(other / ".env")
+    assert outcome.error is not None
+    assert outcome.error.startswith(tool_builder._ERROR_ORIGIN_MASK_INCOMPLETE.format(detail=""))
+    assert "「other」" in outcome.error and env in outcome.error
+    assert outcome.draft is not None
+    reason = outcome.draft["reason"]
+    assert reason.startswith(tool_drafts.REASON_SECRETS_INCOMPLETE.format(detail=""))
+    assert "「other」" in reason and env in reason and "權限" in reason
 
 
 def _publish_raises(*args: Any) -> Any:
@@ -10846,6 +11171,73 @@ def test_router_list_fails_rather_than_serve_draft_text_it_could_not_mask(
     assert lenient.get("/api/tools").status_code == 500
     shutil.rmtree(_draft_dir(pkg))
     assert lenient.get("/api/tools").status_code == 200
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_router_list_sends_no_draft_text_while_a_tools_env_cannot_be_read(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The draft's summary holds a value that became another tool's secret after
+    the save, and that tool's directory cannot be looked at, so the value is not
+    in the known list. The listing is a 500 with none of the draft's text in it;
+    once the directory can be read again, the text is served masked. Red before
+    the fix: the list was taken as whole without that ``.env``, and the value was
+    served unmasked."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    late = "late-secret-abcdef"
+    _fake_generate(
+        monkeypatch,
+        result={**_UNFINISHED, "summary": f"API 沒有分頁參數 {late}"},
+        files={"run.py": _REVISED_RUN_PY},
+    )
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+    assert outcome.draft is not None and outcome.draft["saved"] is True
+    other = _package_path(pkg).parent / "other"
+    other.mkdir()
+    (other / ".env").write_text(f"OTHER_KEY={late}\n", encoding="utf-8")
+    lenient = TestClient(client.app, raise_server_exceptions=False)
+    other.chmod(0)
+    try:
+        response = lenient.get("/api/tools")
+    finally:
+        other.chmod(0o700)
+
+    assert late not in response.text
+    assert response.status_code == 500
+    served = client.get("/api/tools")
+    assert served.status_code == 200
+    assert late not in served.text
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_router_list_with_a_draft_says_which_env_it_cannot_read_and_what_to_do(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tool has a draft, and another tool's directory cannot be looked at, so the
+    known secrets the draft's text is masked with are not whole. The list is a 500
+    in the error shape the page reads, under its own code; the message names that
+    ``.env`` and what to check, and holds none of the draft's text. Red before the
+    fix: a bare 500 with no message."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _save_an_unfinished_round(monkeypatch, pkg)
+    other = _package_path(pkg).parent / "other"
+    other.mkdir()
+    (other / ".env").write_text("OTHER_KEY=other-secret-abcdef\n", encoding="utf-8")
+    lenient = TestClient(client.app, raise_server_exceptions=False)
+    other.chmod(0)
+    try:
+        response = lenient.get("/api/tools")
+    finally:
+        other.chmod(0o700)
+
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json"), response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "known_secrets_incomplete"
+    assert str(other / ".env") in detail["message"]
+    assert "PermissionError" in detail["message"]
+    assert _UNFINISHED["summary"] not in response.text
+    assert "other-secret-abcdef" not in response.text
 
 
 def test_router_discards_only_the_draft_the_caller_names(

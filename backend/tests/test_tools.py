@@ -3917,6 +3917,34 @@ def test_validate_refuses_when_the_known_secrets_cannot_be_read_and_says_why(
     assert "含秘密" not in error
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_validate_refuses_while_another_tools_env_cannot_be_read_and_names_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The staged package holds another tool's value, and that tool's directory
+    cannot be looked at, so the value is not in the known list. The package is
+    refused as unchecked, and the message names the ``.env`` and what to check --
+    never that a secret was found. Red before the fix: the list was taken as
+    whole without that ``.env``, and the package passed."""
+    pkg = _package_with_other_tools_secret(monkeypatch, tmp_path)
+    (pkg / "notes.txt").write_text(f"key: {_SCAN_SECRET}\n", encoding="utf-8")
+    base = tools.tools_dir()
+    assert base is not None
+    other = base / "other"
+    other.chmod(0)
+    try:
+        error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
+    finally:
+        other.chmod(0o700)
+
+    assert error is not None
+    assert "「other」" in error
+    assert os.fspath(other / ".env") in error
+    assert "權限" in error and "重試" in error
+    assert "不得包含秘密值" not in error
+    assert _SCAN_SECRET not in error
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root can list a mode-000 directory")
 def test_validate_refuses_a_package_whose_directory_the_scan_cannot_list(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -4106,18 +4134,575 @@ def test_known_secret_values_still_caches_an_unchanged_env(
     tools._ENV_VALUE_CACHE.clear()
 
     parses: list[Path] = []
-    real_loader = tools._load_tool_dotenv
+    real_read = tools._read_package_dotenv
 
-    def counting_loader(directory: tools.PackageRoot) -> dict[str, str]:
-        parses.append(directory.path)
-        return real_loader(directory)
+    def counting_read(env_file: Path) -> Any:
+        parses.append(env_file)
+        return real_read(env_file)
 
-    monkeypatch.setattr(tools, "_load_tool_dotenv", counting_loader)
+    monkeypatch.setattr(tools, "_read_package_dotenv", counting_read)
 
     assert "cached-secret-abcdef" in tools.known_secret_values()
     assert len(parses) == 1  # the miss
     assert "cached-secret-abcdef" in tools.known_secret_values()
     assert len(parses) == 1  # ... and the hit, with no second read
+
+
+# --- the known secrets: what each source answers, and whether that is all ----
+
+
+def _failing_at(
+    patch: pytest.MonkeyPatch, name: str, target: Path, code: int, *, times: int | None = None
+) -> list[str]:
+    """``os.<name>`` of exactly ``target`` fails with ``code`` -- the first ``times``
+    calls, or every one -- and works as before for any other path. Returns the
+    paths it failed."""
+    real = getattr(os, name)
+    spelled_target = os.fspath(target)
+    failed: list[str] = []
+
+    def fake(path: Any, *args: Any, **kwargs: Any) -> Any:
+        spelled = os.fspath(path) if isinstance(path, str | os.PathLike) else None
+        if spelled == spelled_target and (times is None or len(failed) < times):
+            failed.append(spelled_target)
+            raise OSError(code, "a-failure-text-never-shown", spelled_target)
+        return real(path, *args, **kwargs)
+
+    patch.setattr(os, name, fake)
+    return failed
+
+
+class _ReadFails:
+    """A file handle whose read fails, as a disk error would make it."""
+
+    def __init__(self, handle: Any) -> None:
+        self._handle = handle
+
+    def __enter__(self) -> _ReadFails:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._handle.close()
+
+    def read(self, *args: Any) -> str:
+        raise OSError(errno.EIO, "a-failure-text-never-shown")
+
+
+def _reads_failing_at(patch: pytest.MonkeyPatch, target: Path) -> list[str]:
+    """Reading ``target`` through ``os.fdopen`` fails with EIO; it still opens."""
+    real_fdopen = os.fdopen
+    failed: list[str] = []
+
+    def fdopen(fd: int, *args: Any, **kwargs: Any) -> Any:
+        handle = real_fdopen(fd, *args, **kwargs)
+        if os.path.samestat(os.fstat(fd), os.stat(target, follow_symlinks=False)):
+            failed.append(os.fspath(target))
+            return _ReadFails(handle)
+        return handle
+
+    patch.setattr(os, "fdopen", fdopen)
+    return failed
+
+
+def _two_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, Path]:
+    """Tools ``kb`` and ``other`` under one tools directory, each with a secret in
+    its ``.env``; returns both package directories, spelled as the scan spells them."""
+    root = tmp_path / "tools"
+    kb = _package_path(_make_tool(root, "kb", "print('x')\n", dotenv="KB_KEY=kb-secret-abcdef\n"))
+    other = _package_path(
+        _make_tool(root, "other", "print('x')\n", dotenv="OTHER_KEY=other-secret-abcdef\n")
+    )
+    _install_tools(monkeypatch, root)
+    tools._ENV_VALUE_CACHE.clear()
+    return kb.resolve(), other.resolve()
+
+
+@pytest.mark.parametrize("code", [errno.ENOENT, errno.ENOTDIR], ids=["ENOENT", "ENOTDIR"])
+def test_a_source_seen_not_to_be_there_holds_no_value_and_the_list_stays_whole(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, code: int
+) -> None:
+    """Not there is an answer: the ``.env`` a look finds missing -- ``ENOENT``, or
+    ``ENOTDIR`` -- holds no value, and the list is whole without it. So is an
+    entry of the tools directory that is no package: a link to nothing, a file, a
+    hidden directory. Not red at HEAD, which answered every source this way; it
+    keeps "not there" apart from a look that failed (the next test)."""
+    kb, other = _two_tools(monkeypatch, tmp_path)
+    root = kb.parent
+    os.symlink(root / "nowhere", root / "dangling")
+    (root / "notes.txt").write_text("not a package\n", encoding="utf-8")
+    hidden = root / ".staging"
+    hidden.mkdir()
+    (hidden / ".env").write_text("HIDDEN=hidden-secret-abcdef\n", encoding="utf-8")
+    with monkeypatch.context() as patch:
+        _failing_at(patch, "lstat", other / ".env", code)
+        _failing_at(patch, "stat", other / ".env", code)
+        values = tools.known_secret_values()
+        collected = tools._collect_known_secrets()
+        for_log = tools.known_secrets_for_log()
+
+    assert values == frozenset({"kb-secret-abcdef"})
+    assert collected == tools.KnownSecrets(frozenset({"kb-secret-abcdef"}))
+    assert collected.complete
+    assert for_log == (frozenset({"kb-secret-abcdef"}), True)
+
+
+_FAILED_LOOKS = ["list-tools-directory", "check-package", "look-at-env", "open-env", "read-env"]
+
+
+@pytest.mark.parametrize("look", _FAILED_LOOKS)
+def test_a_look_that_fails_leaves_the_list_not_whole_and_says_where(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, look: str
+) -> None:
+    """Listing the tools directory, checking what an entry is, looking at the
+    ``.env``, opening it or reading it fails with something other than "not
+    there": what that source holds is unknown. The masks refuse the list
+    (``known_secret_values`` raises), the gap names the tool and the ``.env`` (the
+    tools directory itself for the first), and llm_log is told it is not whole,
+    while the sources that could be read still are. Red before the fix: the
+    other sources came back as the whole list -- for the listing, a bare
+    ``PermissionError`` that named nothing."""
+    kb, other = _two_tools(monkeypatch, tmp_path)
+    env = other / ".env"
+    root = kb.parent
+    with monkeypatch.context() as patch:
+        if look == "list-tools-directory":
+            failed = _failing_at(patch, "listdir", root, errno.EACCES)
+            failed += _failing_at(patch, "scandir", root, errno.EACCES)
+            where = (None, os.fspath(root), "PermissionError")
+        elif look == "check-package":
+            failed = _failing_at(patch, "stat", other, errno.EIO)
+            where = ("other", os.fspath(env), "OSError")
+        elif look == "look-at-env":
+            failed = _failing_at(patch, "lstat", env, errno.EACCES)
+            _failing_at(patch, "stat", env, errno.EACCES)
+            where = ("other", os.fspath(env), "PermissionError")
+        elif look == "open-env":
+            failed = _failing_at(patch, "open", env, errno.EACCES)
+            where = ("other", os.fspath(env), "PermissionError")
+        else:
+            failed = _reads_failing_at(patch, env)
+            where = ("other", os.fspath(env), "OSError")
+        with pytest.raises(Exception) as raised:
+            tools.known_secret_values()
+        assert type(raised.value).__name__ == "KnownSecretsIncomplete"
+        collected = tools._collect_known_secrets()
+        for_log = tools.known_secrets_for_log()
+
+    assert failed
+    gap = tools.SecretSourceGap(*where)
+    assert isinstance(raised.value, tools.KnownSecretsIncomplete)
+    assert raised.value.gaps == (gap,)
+    assert not collected.complete
+    assert collected.gaps == (gap,)
+    assert for_log == (frozenset(), False)
+    if look != "list-tools-directory":
+        assert "kb-secret-abcdef" in collected.values
+
+
+@pytest.mark.parametrize("kind", ["link", "fifo", "directory", "link-loop"])
+def test_an_env_that_is_no_regular_file_holds_no_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kind: str
+) -> None:
+    """The runtime neither follows a link nor reads a special file
+    (``_load_tool_dotenv``), so a ``.env`` seen to be one holds no value anyone is
+    given -- a link to a file full of secrets, a loop of links, a FIFO, a
+    directory -- and the list is whole without it. Not red at HEAD, which answered
+    them the same way; it keeps them apart from a look that failed."""
+    _kb, other = _two_tools(monkeypatch, tmp_path)
+    env = other / ".env"
+    env.unlink()
+    if kind == "link":
+        target = tmp_path / "elsewhere.env"
+        target.write_text("LINKED=linked-secret-abcdef\n", encoding="utf-8")
+        os.symlink(target, env)
+    elif kind == "fifo":
+        os.mkfifo(env)
+    elif kind == "directory":
+        env.mkdir()
+    else:
+        os.symlink(env, env)
+
+    assert tools.known_secret_values() == frozenset({"kb-secret-abcdef"})
+    assert tools._collect_known_secrets() == tools.KnownSecrets(frozenset({"kb-secret-abcdef"}))
+
+
+def test_the_shared_read_tells_a_link_it_refused_from_a_loop_above_the_file(
+    tmp_path: Path,
+) -> None:
+    """``ELOOP`` from the open is a link the open would not follow only when a look
+    at the final component sees that link; a loop among the directories above it
+    leaves the file unknown. The read that says why (``_read_regular_text_capped``)
+    tells them apart; the old answer, text or None, stays the same for both."""
+    loop = tmp_path / "loop"
+    os.symlink(loop, loop)
+    target = tmp_path / "real.env"
+    target.write_text("K=v\n", encoding="utf-8")
+    link = tmp_path / "link.env"
+    os.symlink(target, link)
+
+    above = tools._read_regular_text_capped(loop / ".env", 100)
+    at = tools._read_regular_text_capped(link, 100)
+
+    assert (above.text, above.refusal, above.error) == (None, "failed", "OSError")
+    assert (at.text, at.refusal) == (None, "not_regular")
+    assert tools._read_regular_file_capped(loop / ".env", 100) is None
+    assert tools._read_regular_file_capped(link, 100) is None
+    assert tools._read_regular_file_capped(target, 100) == "K=v\n"
+
+
+def test_a_package_entry_whose_links_loop_leaves_the_list_not_whole(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A package is an entry that is a directory once links are followed. An entry
+    whose links loop cannot be told either way, so the list is not whole. Red
+    before the fix: the entry was skipped as no directory."""
+    kb, _other = _two_tools(monkeypatch, tmp_path)
+    loop = kb.parent / "looping"
+    os.symlink(loop, loop)
+
+    with pytest.raises(Exception) as raised:
+        tools.known_secret_values()
+
+    assert isinstance(raised.value, tools.KnownSecretsIncomplete)
+    assert raised.value.gaps == (
+        tools.SecretSourceGap("looping", os.fspath(loop / ".env"), "OSError"),
+    )
+
+
+def test_an_env_over_the_cap_holds_no_value_judged_by_its_text_not_its_size(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The loader refuses a ``.env`` whose TEXT is over the cap, so such a file
+    holds no value given to anyone, and the list is whole without it. One whose
+    bytes are over the cap but whose text is not is read like any other, and its
+    value is in the list: the runtime hands it to the tool. Not red at HEAD; red
+    for a judgement made on the file's size."""
+    kb, other = _two_tools(monkeypatch, tmp_path)
+    cap = tools._ENV_FILE_MAX_BYTES
+    (other / ".env").write_text(
+        "OTHER_KEY=other-secret-abcdef\n#" + "x" * cap + "\n", encoding="utf-8"
+    )
+    wide = "# " + "密" * (cap // 3) + "\nKB_KEY=kb-wide-secret-abcdef\n"
+    assert len(wide.encode("utf-8")) > cap >= len(wide)
+    (kb / ".env").write_text(wide, encoding="utf-8")
+
+    assert tools.known_secret_values() == frozenset({"kb-wide-secret-abcdef"})
+    assert tools._collect_known_secrets().complete
+
+
+def test_an_env_the_parser_reads_in_part_gives_exactly_what_it_gives(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Text that was read is a definite answer whatever the parser makes of it:
+    the non-empty values it gives -- some lines, or none -- and the list is whole.
+    Not red at HEAD; it keeps a parse that gives little apart from a read that
+    failed."""
+    kb, other = _two_tools(monkeypatch, tmp_path)
+    (kb / ".env").write_text("not a line at all\nEMPTY=\nKB_KEY=kb-part-abcdef\n", encoding="utf-8")
+    (other / ".env").write_text("=== nothing here ===\n", encoding="utf-8")
+
+    assert tools.known_secret_values() == frozenset({"kb-part-abcdef"})
+    assert tools._collect_known_secrets().complete
+
+
+def test_a_read_that_failed_is_not_cached_nor_does_a_cached_answer_stand_in_for_a_failed_look(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only a read that gave an answer is cached. A read that failed leaves the list
+    not whole and nothing behind it, so the next collection reads the file again
+    and finds its value. A cached answer is not used when the look at the file
+    fails: the list is then not whole, and the entry is dropped. Red before the
+    fix: the failed read was cached as no values, so the value stayed missing,
+    and a failed look was answered as no values."""
+    _kb, other = _two_tools(monkeypatch, tmp_path)
+    env = other / ".env"
+    with monkeypatch.context() as patch:
+        _failing_at(patch, "open", env, errno.EIO, times=1)
+        with pytest.raises(Exception) as first:
+            tools.known_secret_values()
+        second = tools.known_secret_values()
+
+    assert isinstance(first.value, tools.KnownSecretsIncomplete)
+    assert "other-secret-abcdef" in second
+    assert os.fspath(env) in tools._ENV_VALUE_CACHE
+
+    with monkeypatch.context() as patch:
+        _failing_at(patch, "lstat", env, errno.EACCES)
+        _failing_at(patch, "stat", env, errno.EACCES)
+        with pytest.raises(Exception) as third:
+            tools.known_secret_values()
+
+    assert isinstance(third.value, tools.KnownSecretsIncomplete)
+    assert os.fspath(env) not in tools._ENV_VALUE_CACHE
+
+
+def test_a_whole_list_with_no_secrets_is_empty_and_whole_before_and_after_its_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``.env`` files with no values: the list is empty and whole, the masks get
+    it without raising, and a second collection served from the cache says the
+    same -- an empty whole list is never mistaken for one that is not whole. Not
+    red at HEAD, which had no other answer; it keeps the whole empty list apart
+    from the lists that are not whole above."""
+    kb, other = _two_tools(monkeypatch, tmp_path)
+    (kb / ".env").write_text("EMPTY=\n", encoding="utf-8")
+    (other / ".env").write_text("# nothing\n", encoding="utf-8")
+
+    assert tools.known_secret_values() == frozenset()
+    assert tools._redaction_secrets() == []
+    first = tools._collect_known_secrets()
+    second = tools._collect_known_secrets()
+
+    assert first == second == tools.KnownSecrets(frozenset())
+    assert first.complete and second.complete
+    assert tools.known_secrets_for_log() == (frozenset(), True)
+
+
+def test_the_masks_refuse_a_list_that_is_not_whole_naming_the_env_and_what_to_do(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``_redaction_secrets`` -- the list every mask takes -- raises the dedicated
+    exception, and so does the live mask. Its message names the tool and the
+    ``.env`` and says what to check; it carries the failure's type name but not
+    its text, nothing of the ``.env``, and never says a secret was found. Red
+    before the fix: the list came back without the other tool's value."""
+    _kb, other = _two_tools(monkeypatch, tmp_path)
+    env = other / ".env"
+    with monkeypatch.context() as patch:
+        _failing_at(patch, "lstat", env, errno.EACCES)
+        _failing_at(patch, "stat", env, errno.EACCES)
+        with pytest.raises(Exception) as raised:
+            tools._redaction_secrets()
+        with pytest.raises(Exception) as live:
+            tools.redact_known_secrets("text with other-secret-abcdef")
+
+    assert isinstance(raised.value, tools.KnownSecretsIncomplete)
+    assert isinstance(live.value, tools.KnownSecretsIncomplete)
+    message = str(raised.value)
+    assert "「other」" in message
+    assert os.fspath(env) in message
+    assert "PermissionError" in message
+    assert "權限" in message and "磁碟狀態" in message and "重試" in message
+    assert "a-failure-text-never-shown" not in message
+    assert "other-secret-abcdef" not in message and "OTHER_KEY" not in message
+    assert "發現" not in message and "含有" not in message
+
+
+def test_every_source_that_cannot_be_read_is_a_gap_and_the_message_counts_the_rest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Each source that could not be read is a gap; the message names the first
+    and how many more there are. Red before the fix: the list came back without
+    either tool's value."""
+    kb, other = _two_tools(monkeypatch, tmp_path)
+    with monkeypatch.context() as patch:
+        _failing_at(patch, "lstat", kb / ".env", errno.EIO)
+        _failing_at(patch, "stat", kb / ".env", errno.EIO)
+        _failing_at(patch, "open", other / ".env", errno.EACCES)
+        with pytest.raises(Exception) as raised:
+            tools.known_secret_values()
+
+    assert isinstance(raised.value, tools.KnownSecretsIncomplete)
+    assert [gap.tool for gap in raised.value.gaps] == ["kb", "other"]
+    assert "另有 1 處也讀不到" in str(raised.value)
+
+
+def test_tools_dir_keeps_a_path_not_made_yet_and_the_list_whole(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Components that do not exist yet are kept as written: a tools directory not
+    created yet still has its path, holds no packages, and the list is whole. Not
+    red at HEAD; it pins what the stricter resolution must not take away."""
+    root = tmp_path / "not-yet" / "tools"
+    _install_tools(monkeypatch, root)
+
+    assert tools.tools_dir() == root.resolve()
+    assert tools.known_secret_values() == frozenset()
+    assert tools._collect_known_secrets() == tools.KnownSecrets(frozenset())
+
+
+def test_a_tools_dir_whose_link_cannot_be_looked_at_raises_and_leaves_the_list_not_whole(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``via`` is a link and the setting reads ``via/../tools``: resolved, that is
+    ``tools`` beside the link's target. When the look at ``via`` fails, nothing
+    can tell it is a link, so the path is not resolved at all -- the lookup raises
+    ``ToolsDirUnresolvedError``, naming the configured path, the failure's type
+    and what to do -- rather than answered with ``tools`` beside ``via``, another
+    directory, by folding ``..`` as text. Nothing turns that into "no tools" or
+    "no secrets": the known secrets are not whole. Red before the fix: the lookup
+    raised the bare ``PermissionError``, which named neither the path nor what to
+    do."""
+    base = tmp_path.resolve()
+    (base / "deep" / "inner").mkdir(parents=True)
+    os.symlink(base / "deep" / "inner", base / "via")
+    configured = base / "via" / ".." / "tools"
+    _install_tools(monkeypatch, configured)
+    assert tools.tools_dir() == base / "deep" / "tools"
+
+    with monkeypatch.context() as patch:
+        _failing_at(patch, "lstat", base / "via", errno.EACCES)
+        with pytest.raises(Exception) as unresolved:
+            tools.tools_dir()
+        with pytest.raises(tools.KnownSecretsIncomplete) as raised:
+            tools.known_secret_values()
+
+    assert type(unresolved.value).__name__ == "ToolsDirUnresolvedError"
+    assert isinstance(unresolved.value, tools.ToolsDirUnresolvedError)
+    assert (unresolved.value.path, unresolved.value.error) == (str(configured), "PermissionError")
+    message = str(unresolved.value)
+    assert str(configured) in message
+    assert "PermissionError" in message
+    assert "TOOLS_DIR" in message
+    [gap] = raised.value.gaps
+    assert (gap.tool, gap.path, gap.error) == (None, str(configured), "PermissionError")
+
+
+def test_a_tools_dir_in_a_link_loop_raises_naming_it_and_the_list_is_not_whole(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``loop`` is a link to itself, so the setting ``loop/tools`` cannot be
+    resolved. That is no "nothing there" -- only ``ENOENT`` and ``ENOTDIR`` are
+    -- so the lookup raises ``ToolsDirUnresolvedError`` naming the configured
+    path and the failure's type, and the known secrets are not whole. Red before
+    the fix: the lookup raised the bare ``OSError``, which named neither the path
+    nor what to do."""
+    base = tmp_path.resolve()
+    os.symlink(base / "loop", base / "loop")
+    configured = base / "loop" / "tools"
+    _install_tools(monkeypatch, configured)
+
+    with pytest.raises(Exception) as unresolved:
+        tools.tools_dir()
+    with pytest.raises(tools.KnownSecretsIncomplete) as raised:
+        tools.known_secret_values()
+
+    assert type(unresolved.value).__name__ == "ToolsDirUnresolvedError"
+    assert isinstance(unresolved.value, tools.ToolsDirUnresolvedError)
+    assert (unresolved.value.path, unresolved.value.error) == (str(configured), "OSError")
+    assert str(configured) in str(unresolved.value)
+    [gap] = raised.value.gaps
+    assert (gap.tool, gap.path, gap.error) == (None, str(configured), "OSError")
+
+
+def test_a_tools_dir_under_a_file_is_kept_as_configured_and_holds_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The setting reads ``via/../plain/tools``, where ``via`` is a link into
+    ``deep/inner`` and ``deep/plain`` is a regular file: the path runs through a
+    file, so no directory can be there, as surely as one not made yet. It is
+    answered as configured, made absolute only -- the link not followed and
+    ``..`` not folded, which would name ``plain/tools`` beside ``via``, a
+    directory holding a package -- and nothing is under it: no packages, not the
+    feature being off, and the known secrets are whole without that package's
+    value. Red before the fix: resolving the setting raised
+    ``NotADirectoryError``."""
+    base = tmp_path.resolve()
+    (base / "deep" / "inner").mkdir(parents=True)
+    (base / "deep" / "plain").write_text("a file\n", encoding="utf-8")
+    os.symlink(base / "deep" / "inner", base / "via")
+    _make_tool(base / "plain" / "tools", "kb", "print('x')\n", dotenv="KB_KEY=beside-via-abcdef\n")
+    configured = base / "via" / ".." / "plain" / "tools"
+    _install_tools(monkeypatch, configured)
+
+    assert str(tools.tools_dir()) == str(configured)
+    assert tools.list_tools() == []
+    assert tools.acquire_shared_tools_lock() is None
+    assert tools.known_secret_values() == frozenset()
+    assert tools._collect_known_secrets() == tools.KnownSecrets(frozenset())
+
+
+def test_a_relative_tools_dir_under_a_file_is_made_absolute(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A relative setting whose path runs through a file is answered against the
+    working directory, as an absolute path. Red before the fix: resolving it
+    raised ``NotADirectoryError``."""
+    (tmp_path / "plain").write_text("a file\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    _install_tools(monkeypatch, Path("plain") / "tools")
+
+    assert tools.tools_dir() == Path(os.getcwd()) / "plain" / "tools"
+
+
+def test_a_tools_dir_under_a_file_that_cannot_be_made_absolute_raises_naming_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relative setting whose path runs through a file is made absolute against
+    the working directory; when that directory is gone, it cannot be, and the
+    lookup raises ``ToolsDirUnresolvedError`` like any other failure to resolve
+    the path, not the bare failure of the working directory. Red before the fix:
+    the lookup raised the bare ``NotADirectoryError``."""
+    _install_tools(monkeypatch, Path("plain") / "tools")
+
+    def through_a_file(path: Any, *args: Any, **kwargs: Any) -> str:
+        raise NotADirectoryError(errno.ENOTDIR, "Not a directory", os.fspath(path))
+
+    def gone() -> str:
+        raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os.path, "realpath", through_a_file)
+        patch.setattr(os, "getcwd", gone)
+        with pytest.raises(Exception) as unresolved:
+            tools.tools_dir()
+
+    assert type(unresolved.value).__name__ == "ToolsDirUnresolvedError"
+    assert isinstance(unresolved.value, tools.ToolsDirUnresolvedError)
+    assert (unresolved.value.path, unresolved.value.error) == (
+        os.path.join("plain", "tools"),
+        "FileNotFoundError",
+    )
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_a_body_masked_whole_live_but_recorded_while_its_env_is_unreadable_is_not_recorded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A PEM-like value registered from a single-quoted ``.env`` line keeps ``\\n``
+    as two characters; the text holds it with a real line break, so the live mask,
+    with the whole list, finds nothing to mask. When the body is recorded the
+    tool's directory cannot be looked at, so the list is not whole: each body is
+    stored as the marker saying it was not recorded -- not the one saying a secret
+    was found -- and no byte of the JSONL file holds the value, which the file's
+    own escaping would otherwise spell. Red before the fix: each body was stored
+    as the marker saying a secret was found."""
+    from afterthread import main
+
+    root = tmp_path / "tools"
+    secret = "kb-pem-head\\nkb-pem-body"
+    version = _make_tool(root, "kb", "print('x')\n", dotenv="KB_KEY='kb-pem-head\\nkb-pem-body'\n")
+    _install_tools(monkeypatch, root)
+    tools._ENV_VALUE_CACHE.clear()
+    text = "it signs with kb-pem-head\nkb-pem-body"
+    assert secret in tools.known_secret_values()
+    assert tools.redact_known_secrets(text) == text
+    log_file = tmp_path / "llm.jsonl"
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_file=str(log_file), llm_log_max_entries=50),
+    )
+    monkeypatch.setattr(llm_log, "_secret_provider", llm_log._secret_provider)
+    main._configure_secret_redaction()
+    llm_log._reset_for_tests()
+    package = _package_path(version)
+    package.chmod(0)
+    try:
+        recorder = llm_log.LlmInteractionRecorder(workflow="probe", model="m")
+        recorder.begin_attempt([{"role": "user", "content": text}])
+        recorder.record_response(text)
+        recorder.finish(outcome="ok", error=None)
+    finally:
+        package.chmod(0o700)
+
+    assert secret.encode("utf-8") not in log_file.read_bytes()
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    attempt = record["attempts"][0]
+    assert attempt["request_messages"][0]["content"] != llm_log._REDACTION_MARKER
+    assert attempt["request_messages"][0]["content"] == llm_log._UNCHECKED_MARKER
+    assert attempt["response_content"] == llm_log._UNCHECKED_MARKER
 
 
 def test_redaction_marker_matches_llm_log() -> None:

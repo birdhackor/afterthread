@@ -10,6 +10,7 @@ database costs the record at most, never the call; W -- route declaration order.
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import sys
 import time
@@ -326,31 +327,59 @@ def test_no_recorder_means_no_record_and_the_same_result(
 def test_a_call_the_backend_fails_is_recorded_as_error_and_still_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, records: list[tools.ToolRunRecord]
 ) -> None:
-    """Every call is recorded -- also one that dies in the backend after the tool ran.
+    """Every call is recorded -- also one the backend fails with an exception.
 
-    The fail-closed redaction is the realistic case: the tool exited non-zero and
-    the secret scan masking its stderr raised. The exception still reaches the
-    llm loop, which tells the model what it always did; the record stores the
-    same words and keeps no bodies.
+    The exception still reaches the llm loop, which tells the model its category;
+    the record stores the same words and keeps no bodies.
     """
     root = tmp_path / "tools"
-    _make_tool(root, "boom", "import sys\nsys.stderr.write('bad')\nsys.exit(1)\n")
+    _make_tool(root, "boom", "print('never run')\n")
     _install_tools(monkeypatch, root)
     [tool] = enabled_llm_tools()
 
-    def _broken_scan() -> frozenset[str]:
-        raise OSError("tools directory unreadable")
+    def _broken_run(*args: Any) -> tools.ToolRunResult:
+        raise RuntimeError("the backend failed the call")
 
-    monkeypatch.setattr(tools, "known_secret_values", _broken_scan)
+    monkeypatch.setattr(tools, "_run_tool_subprocess", _broken_run)
 
-    with pytest.raises(OSError):
+    with pytest.raises(RuntimeError):
         asyncio.run(tool.handler({"q": "x"}))
     model_text = asyncio.run(llm._invoke_tool_handler(tool, '{"q": "x"}'))
 
-    assert model_text == "tool execution failed: OSError"
+    assert model_text == "tool execution failed: RuntimeError"
     assert [run.outcome for run in records] == [tools.RUN_ERROR, tools.RUN_ERROR]
     assert records[0].message == model_text
     assert (records[0].args, records[0].stdout, records[0].stderr) == (None, None, None)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_a_tool_that_ran_but_whose_output_cannot_be_masked_says_it_ran_and_hands_none_over(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, records: list[tools.ToolRunRecord]
+) -> None:
+    """The tool ran and wrote another tool's secret to stderr, and that other
+    tool's directory cannot be looked at, so its ``.env`` -- and the secret -- is
+    not in the known list. Nothing of the output is handed over, to the model or
+    to the record, and the model is told the tool ran and how it ended, not that
+    it failed to run. Red before the fix: the list was taken as whole without that
+    ``.env``, and the secret reached the model unmasked."""
+    root = tmp_path / "tools"
+    secret = "other-tool-secret-abcdef"
+    _make_tool(root, "boom", f"import sys\nsys.stderr.write('leak {secret}')\nsys.exit(1)\n")
+    other = _make_tool(root, "other", "print('x')\n", dotenv=f"OTHER_KEY={secret}\n")
+    _install_tools(monkeypatch, root)
+    [tool, _other_tool] = enabled_llm_tools()
+    assert tool.spec["function"]["name"] == "boom"
+    other.chmod(0)
+    try:
+        model_text = asyncio.run(llm._invoke_tool_handler(tool, '{"q": "x"}'))
+    finally:
+        other.chmod(0o700)
+
+    assert secret not in model_text
+    assert model_text == tools.output_withheld_text("tool", 1)
+    [run] = records
+    assert (run.outcome, run.message) == (tools.RUN_ERROR, model_text)
+    assert (run.args, run.stdout, run.stderr) == (None, None, None)
 
 
 def test_a_call_cut_off_by_the_interaction_deadline_still_ends_and_is_recorded(
@@ -1324,8 +1353,8 @@ def test_successes_refusals_and_backend_errors_are_not_reported_as_tool_failures
             await tool.handler({})
             set_enabled("fine", True)
             monkeypatch.setattr(tools, "known_secret_values", _broken_scan)
-            with pytest.raises(OSError):
-                await tool.handler({})
+            # It ran; only its output is withheld: a backend error, not the tool's.
+            await tool.handler({})
             return list(failures)
 
     assert asyncio.run(_request()) == []

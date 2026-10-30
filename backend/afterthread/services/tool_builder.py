@@ -259,6 +259,9 @@ _ERROR_ORIGIN_WRITE = "無法寫入工具版本的來源資料，操作已取消
 # A revise's origin text (``_provenance_feedback``) is masked with the known
 # secrets, and that query fails closed; ``{kind}`` is the exception's type name.
 _ERROR_ORIGIN_MASK = "無法遮蔽工具版本來源資料裡的秘密值（{kind}），操作已取消。"  # noqa: RUF001
+# The same, when it is the known secrets that could not all be read: their own
+# message names the ``.env`` and what to check (``tools.KnownSecretsIncomplete``).
+_ERROR_ORIGIN_MASK_INCOMPLETE = "無法遮蔽工具版本來源資料裡的秘密值，操作已取消。{detail}"  # noqa: RUF001
 _ERROR_CURRENT_WRITE = "無法發布工具的新版本，操作已取消。"  # noqa: RUF001
 _ERROR_DURABILITY = "無法確認工具資料已安全寫入磁碟，操作已取消。"  # noqa: RUF001
 
@@ -1131,12 +1134,18 @@ def _run_shell_subprocess(
     # the taken branch only, so known_secret_values is computed once.
     # Streamed past the cap: return the truncated (already marked) output whatever
     # the kill-induced exit code, mirroring the runtime tool's over-cap handling.
-    if output.stdout_overflow:
+    try:
+        if output.stdout_overflow:
+            return tools._cap_output(tools.redact_known_secrets(output.stdout), cap)
+        if proc.returncode != 0:
+            body = tools._cap_output(tools.redact_known_secrets(output.stdout).strip(), cap)
+            return f"command failed (exit {proc.returncode}): {body}"
         return tools._cap_output(tools.redact_known_secrets(output.stdout), cap)
-    if proc.returncode != 0:
-        body = tools._cap_output(tools.redact_known_secrets(output.stdout).strip(), cap)
-        return f"command failed (exit {proc.returncode}): {body}"
-    return tools._cap_output(tools.redact_known_secrets(output.stdout), cap)
+    except Exception:
+        # The command RAN; only its output could not be checked against the known
+        # secrets, so none of it is handed over. Said as it is, the way the
+        # runtime tool says it: told it failed, the builder may run it again.
+        return tools.output_withheld_text("command", proc.returncode)
 
 
 def _workspace_kept_error(session_root: Path) -> str:
@@ -3479,9 +3488,22 @@ def _current_manifest_text(directory: Path) -> str | None:
     return tools._read_regular_file_capped(directory / "tool.json", tools._MANIFEST_MAX_BYTES)
 
 
-# The job's note on a published revise whose draft could not be taken away: the
-# list shows it as published, and only discarding it is left to do.
+# The job's note on a published revise whose draft stayed. Only when the removal
+# ran on a draft found to be what the save made, and it is not seen gone, is
+# discarding it all that is left to do; when the draft was left because it holds
+# more, or because that could not be told, it may hold changes no version has,
+# and the note says to take them out first (``tool_drafts.remove_after_publish``).
 _DRAFT_NOT_REMOVED = "已發布，但未能刪除這一輪的草稿，請在工具列放棄它。"  # noqa: RUF001
+_DRAFT_KEPT_CHANGED = (
+    "已發布，但發布期間草稿被改過或多了內容，那些內容還在草稿裡、沒有發布。"  # noqa: RUF001
+    "要保留的話，先從草稿目錄取出，再到工具列放棄這份草稿。"  # noqa: RUF001
+)
+_DRAFT_KEPT_UNCONFIRMED = (
+    "已發布，但無法確認草稿內容仍與發布前相同，因此保留。"  # noqa: RUF001
+    "草稿裡可能有沒發布的修改：需要的話先從草稿目錄取出，再到工具列放棄這份草稿。"  # noqa: RUF001
+)
+# By ``tool_drafts.Removal.kept``: why the removal was not attempted.
+_DRAFT_LEFT_REASONS = {"changed": _DRAFT_KEPT_CHANGED, "unconfirmed": _DRAFT_KEPT_UNCONFIRMED}
 
 
 @dataclass(frozen=True, slots=True)
@@ -3985,7 +4007,11 @@ async def run_revise(
         except Exception as exc:
             # The masking fails closed (``tools.redact_known_secrets``): a publish
             # that failed before it began, the work where the round left it.
-            promote_error = _ERROR_ORIGIN_MASK.format(kind=type(exc).__name__)
+            promote_error = (
+                _ERROR_ORIGIN_MASK_INCOMPLETE.format(detail=exc)
+                if isinstance(exc, tools.KnownSecretsIncomplete)
+                else _ERROR_ORIGIN_MASK.format(kind=type(exc).__name__)
+            )
         else:
             # The publisher reads immutable provenance from the version whose
             # identity was captured before the builder session.
@@ -4042,13 +4068,23 @@ async def run_revise(
         unsaved_work_pending = False
         published_draft: dict[str, Any] | None = None
         if drafted is not None:
+            # Compared against the copy the save made, which is all the draft may
+            # hold to be taken away.
             removal = await run_in_threadpool(
-                tool_drafts.remove_after_publish, package_root, package_dir_identity, drafted
+                tool_drafts.remove_after_publish,
+                package_root,
+                package_dir_identity,
+                drafted,
+                kept.copy,
             )
             if not removal.removed:
                 # The generation the publish marked, which is what a discard names.
                 published_draft = dataclasses.replace(kept, generation=drafted[1]).report(
-                    reason=_DRAFT_NOT_REMOVED
+                    reason=(
+                        _DRAFT_NOT_REMOVED
+                        if removal.kept is None
+                        else _DRAFT_LEFT_REASONS[removal.kept]
+                    )
                 )
         # The revision is LIVE as of the line above; everything after it is
         # decoration and cannot fail the outcome (``generate_and_store_summary``
@@ -4492,17 +4528,24 @@ async def _run_job(
     (leaving the job stuck on "running" forever from the FE's point of view).
     Category only -- a bug's str() could carry anything (and MUST NOT: secret
     values are threaded through both runs, so a leaky str(exc) is exactly why
-    this is category-only).
+    this is category-only). The one exception is a failure written for the
+    operator (``tools.OperatorFacingError``: a known-secret list that is not
+    whole, a tools directory that cannot be resolved), whose message names only
+    paths, tool names, type names and what to fix: the job shows that message.
     """
     _update_job(job_id, state="running")
     job_token = _CURRENT_JOB_ID.set(job_id)
     try:
         outcome = await run()
     except Exception as exc:
+        if isinstance(exc, tools.OperatorFacingError):
+            error = str(exc)
+        else:
+            error = f"{action}過程發生未預期錯誤（{type(exc).__name__}）。"  # noqa: RUF001
         _update_job(
             job_id,
             state="failed",
-            error=f"{action}過程發生未預期錯誤（{type(exc).__name__}）。",  # noqa: RUF001
+            error=error,
             outcome=_OUTCOME_FAILED,
             finished_at=_now_iso(),
         )

@@ -197,6 +197,18 @@ describe("draftView text", () => {
 		expect(view.note).not.toContain("undefined");
 	});
 
+	// A published draft stays also when it holds more than the round published, so
+	// its note sends the operator to fetch what they need before discarding.
+	it("does not say discarding is all a published draft needs", () => {
+		const view = draftView(draft({ state: "published" }), {
+			currentVid: "20260801T000000Z-aaaaaa",
+		});
+		expect(view.note).not.toContain("放棄它即可");
+		expect(view.note).toContain("可能另有沒發布的修改");
+		expect(view.note).toContain("先到下方路徑取回");
+		expect(view.buttons).toEqual(["discard"]);
+	});
+
 	it("names the base version a stale draft was made from", () => {
 		const view = draftView(draft({ state: "stale" }));
 		expect(view.title).toBe("草稿已過期");

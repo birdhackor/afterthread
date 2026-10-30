@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import fcntl
 import io
 import json
@@ -35,7 +36,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, Any, Literal
+from typing import IO, Any, ClassVar, Literal
 from uuid import uuid4
 
 from dotenv import dotenv_values
@@ -458,11 +459,62 @@ def tools_dir() -> Path | None:
     ``VersionRoot`` one spelling. It deliberately does not resolve a package
     child: package/version symlink refusals still inspect their own final
     components before anything follows them.
+
+    Resolved with errors raised, except where a look on the way sees nothing
+    there. Components which do not exist yet are kept as written
+    (``ALLOW_MISSING``), so a tools directory not created yet still has its
+    path. A component that is a file (``ENOTDIR``) means as surely that no
+    directory is there: the configured path is returned as it is, made absolute
+    only -- not resolved, its ``..`` kept -- so every look under it sees nothing
+    there too. Any other failure of a look on the way -- a directory above it
+    that cannot be searched, a link loop, an I/O error -- raises
+    ``ToolsDirUnresolvedError``: a lookup that skipped it would read a link it
+    could not see as no link, fold the ``..`` after it as text, and answer with
+    another directory. It is never turned into None, which means the feature is
+    off.
     """
     raw = get_settings().tools_dir.strip()
     if not raw:
         return None
-    return Path(raw).expanduser().resolve()
+    configured = os.path.expanduser(raw)
+    try:
+        try:
+            return Path(os.path.realpath(configured, strict=os.path.ALLOW_MISSING))
+        except NotADirectoryError:
+            return Path(configured).absolute()
+    except OSError as exc:
+        raise ToolsDirUnresolvedError(configured, type(exc).__name__) from exc
+
+
+class OperatorFacingError(Exception):
+    """A failure whose message is written for the operator, to be shown as it is.
+
+    The message names only paths, tool names, failure type names and what to do
+    next: never a value, never a failure's own text. The API answers one as a 500
+    carrying that message under ``code`` (``main``), and an install or revise job
+    that ends on one shows it as the job's error (``tool_builder._run_job``).
+    """
+
+    code: ClassVar[str]
+
+
+class ToolsDirUnresolvedError(OperatorFacingError):
+    """The configured tools directory's path could not be looked up (``tools_dir``).
+
+    ``path`` is the configured path, ``error`` the failure's type name, never its
+    text. The message names those two and what to do next.
+    """
+
+    code = "tools_dir_unresolved"
+
+    def __init__(self, path: str, error: str) -> None:
+        self.path = path
+        self.error = error
+        super().__init__(
+            f"無法解析工具目錄的設定路徑 {_utf8_safe(path)}（{error}）。"  # noqa: RUF001
+            "請檢查這個路徑上層各目錄的權限、連結與磁碟狀態後重試，"  # noqa: RUF001
+            "或清空 TOOLS_DIR 設定（工具功能隨之關閉）。"  # noqa: RUF001
+        )
 
 
 _REQUEST_TOOLS_LOCK_FD: ContextVar[int | None] = ContextVar("_REQUEST_TOOLS_LOCK_FD", default=None)
@@ -741,24 +793,74 @@ def _read_regular_file_capped(path: Path, cap: int) -> str | None:
     OWNERSHIP of the fd, so once it succeeds its context manager owns the close;
     ``fd_owned`` tracks the handoff so the ``finally`` closes the raw fd on exactly
     the paths that never reached ``fdopen`` (never a double close).
+
+    The read itself is ``_read_regular_text_capped``, which also says why there is
+    no text; this keeps only the text, so missing, refused and failed are all None.
+    """
+    return _read_regular_text_capped(path, cap).text
+
+
+@dataclass(frozen=True, slots=True)
+class _CappedText:
+    """One ``_read_regular_text_capped``: the text, or why there is none.
+
+    ``text`` is None exactly when ``refusal`` is set:
+
+    * ``"absent"`` -- the open found nothing there (``ENOENT``, ``ENOTDIR``);
+    * ``"not_regular"`` -- what is there is not read: the final component is a
+      link the open would not follow (a ``lstat`` saw the link itself), or
+      ``fstat`` of what opened is not a regular file;
+    * ``"failed"`` -- any other failure to open, look at or read it, the
+      ``ELOOP`` of a link loop above it included; ``error`` is its type name.
+
+    ``identity`` is ``(st_dev, st_ino, st_mtime_ns, st_ctime_ns, st_size)`` from
+    the ``fstat`` of the descriptor the text was read from.
+    """
+
+    text: str | None
+    refusal: Literal["absent", "not_regular", "failed"] | None = None
+    error: str | None = None
+    identity: tuple[int, int, int, int, int] | None = None
+
+
+def _is_link_itself(path: Path) -> bool:
+    """Whether a ``lstat`` of ``path`` sees a link; False when the look fails."""
+    try:
+        return stat.S_ISLNK(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _read_regular_text_capped(path: Path, cap: int) -> _CappedText:
+    """``_read_regular_file_capped``'s read, saying why it has no text (``_CappedText``).
+
+    The same open flags, the same regular-file gate, the same decoding and the
+    same ``cap + 1`` bound; only the answer is fuller. An ``ELOOP`` from the open
+    is a link the open refused to follow only when a ``lstat`` sees the final
+    component is one; a loop among the directories above it is a failure.
     """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-    except OSError:
-        # Missing (ENOENT), a symlinked leaf O_NOFOLLOW refused (ELOOP), a FIFO
-        # with no writer on some platforms, a permission error, ... -- every open
-        # failure degrades to None rather than raising into the caller.
-        return None
+    except FileNotFoundError, NotADirectoryError:
+        return _CappedText(None, "absent")
+    except OSError as exc:
+        # A symlinked leaf O_NOFOLLOW refused (ELOOP), a FIFO with no writer on
+        # some platforms, a permission error, ...: never raised into the caller.
+        if exc.errno == errno.ELOOP and _is_link_itself(path):
+            return _CappedText(None, "not_regular")
+        return _CappedText(None, "failed", type(exc).__name__)
     fd_owned = True  # we own the raw fd until fdopen takes it over
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return _CappedText(None, "not_regular")
+        identity = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size)
         handle = os.fdopen(fd, encoding="utf-8", errors="replace")
         fd_owned = False  # fdopen now owns fd; closing the handle closes it
         with handle:
-            return handle.read(cap + 1)
-    except OSError:
-        return None
+            return _CappedText(handle.read(cap + 1), identity=identity)
+    except OSError as exc:
+        return _CappedText(None, "failed", type(exc).__name__)
     finally:
         if fd_owned:
             os.close(fd)
@@ -1515,8 +1617,10 @@ def validate_tool_content(build_root: BuildRoot, expected_name: str) -> str | No
     (whose ``.env`` legitimately holds the injected secret post-install). It runs
     ``scan_embedded_secrets``, so it reads every file whole and checks every path
     and symlink target. A scan that could not finish refuses the package too, and
-    so does an entry it could not read; both messages say what went unchecked,
-    never that a secret was found.
+    so does an entry it could not read, and a known-secret list some ``.env``
+    could not be read into (``KnownSecretsIncomplete``, whose message names it and
+    what to check); each message says what went unchecked, never that a secret
+    was found.
     """
     error = _scan_tool_content(build_root, expected_name).error
     if error is not None:
@@ -1544,6 +1648,9 @@ def validate_tool_content(build_root: BuildRoot, expected_name: str) -> str | No
     # value would hide that copy from the mask.
     try:
         secrets = _redaction_secrets()
+    except KnownSecretsIncomplete as exc:
+        # Which ``.env`` could not be read, and what to check: the operator's next step.
+        return f"無法確認工具包裡沒有已知的秘密值。{exc}"
     except Exception as exc:
         return _secret_scan_failed_error(type(exc).__name__)
     scan = scan_embedded_secrets(build_root, secrets)
@@ -2431,7 +2538,7 @@ def enabled_llm_tools() -> list[LlmTool]:
 # llm_log redacts every KNOWN secret VALUE out of the prompt/response bodies it
 # stores, at its storage choke point. But llm_log is a leaf observability module
 # and must not import THIS one -- so it takes a provider CALLABLE and main wires
-# in ``known_secret_values`` below (the same leaf/provider inversion llm_log's
+# in ``known_secrets_for_log`` below (the same leaf/provider inversion llm_log's
 # own logger config uses). The inversion is about THAT direction only: this
 # module imports llm_log directly (for ``process_token``, see
 # ``store_summary_meta``), which is the direction that keeps llm_log a leaf.
@@ -2439,6 +2546,13 @@ def enabled_llm_tools() -> list[LlmTool]:
 # static value, because it genuinely CHANGES at runtime: an install writes a new
 # tool ``.env``, and an in-flight install registers its form secret before that
 # ``.env`` even exists.
+#
+# Every collection says whether it is whole (``_collect_known_secrets``): a
+# ``.env`` that could not be read contributes no values, and a list missing them
+# must not be taken for the whole list. The masks refuse to work from one
+# (``known_secret_values`` raises ``KnownSecretsIncomplete``); llm_log stores, in
+# place of a body checked against one, a marker saying the body was not recorded
+# (``llm_log._UNCHECKED_MARKER``).
 
 # In-flight secrets: values that must stay redactable for the DURATION of one
 # operation, independently of what the ``.env`` scan below can see AT THE MOMENT
@@ -2477,8 +2591,11 @@ _INFLIGHT_SECRETS: dict[str, int] = {}
 _INFLIGHT_LOCK = threading.Lock()
 
 # Cache of one package's parsed ``.env`` VALUES, keyed by the ``.env`` path and
-# tagged with a FILE IDENTITY taken from its ``stat``, so ``known_secret_values``
-# re-parses a package only when its ``.env`` actually changed. This matters
+# tagged with a FILE IDENTITY, so ``_collect_known_secrets`` re-parses a package
+# only when its ``.env`` actually changed. Only a read that gave an answer is
+# stored, tagged with the ``fstat`` of the file it read; a look or a read that
+# failed is never stored, and it drops the entry, so an entry can never stand in
+# for a file that could not be looked at. This matters
 # because the provider runs once PER STORED LOG BODY (every request message +
 # every response of every attempt), and a busy installer session records the
 # whole GROWING conversation on each of dozens of rounds -- without the cache,
@@ -2575,47 +2692,181 @@ def _inflight_secrets(values: frozenset[str]) -> Iterator[None]:
             discard_inflight_secret(value)
 
 
-def _cached_env_values(package_root: PackageRoot) -> frozenset[str]:
-    """The redactable VALUES of one package's ``.env``, cached per (path, identity).
+@dataclass(frozen=True, slots=True)
+class SecretSourceGap:
+    """One place the known secrets could not be read from.
 
-    Reuses the ONE bounded ``.env`` loader (``_load_tool_dotenv``) rather than
-    hand-rolling a second parser, so the FIFO/symlink/oversize hardening and the
-    drop-bare-keys behavior are inherited unchanged. Empty values are dropped so
-    a ``KEY=`` line contributes nothing (``_redact`` also guards empties, but not
-    seeding them keeps the set tidy).
+    ``tool`` is the package directory's name, None for the tools directory
+    itself; ``path`` is the ``.env`` that could not be read -- for a package
+    whose directory could not be looked at, the ``.env`` it would hold -- or the
+    tools directory; ``error`` is the failure's type name, never its text.
+    """
+
+    tool: str | None
+    path: str
+    error: str
+
+
+@dataclass(frozen=True, slots=True)
+class KnownSecrets:
+    """One collection of the known secret values, and whether it is whole.
+
+    ``gaps`` names every source that could not be read; ``values`` then lacks
+    whatever those hold. ``complete`` only when there are none: an empty set
+    that is complete means there are no secrets, one that is not means nothing.
+    """
+
+    values: frozenset[str]
+    gaps: tuple[SecretSourceGap, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        return not self.gaps
+
+
+def _incomplete_message(gaps: tuple[SecretSourceGap, ...]) -> str:
+    """What the operator is told when the known secrets cannot all be read.
+
+    Names the first place, says how many more there are and what to check. It
+    holds no value and no failure text, only the failure's type name, and it never
+    says a secret was found: none was looked for.
+    """
+    first = gaps[0]
+    where = _utf8_safe(first.path)
+    if first.tool is None:
+        text = (
+            f"已知秘密的清單不完整：讀不到工具目錄 {where}（{first.error}），"  # noqa: RUF001
+            "無法得知各工具 .env 裡的值。"
+        )
+        subject = "這個目錄"
+    else:
+        text = (
+            f"已知秘密的清單不完整：讀不到工具「{_utf8_safe(first.tool)}」的 "  # noqa: RUF001
+            f"{where}（{first.error}）。"  # noqa: RUF001
+        )
+        subject = "這個檔案"
+    if len(gaps) > 1:
+        text += f"另有 {len(gaps) - 1} 處也讀不到。"
+    return text + f"請檢查{subject}與它上層目錄的權限、磁碟狀態後重試。"
+
+
+class KnownSecretsIncomplete(OperatorFacingError):
+    """The known secrets could not all be read, so no mask can be whole.
+
+    Raised by ``known_secret_values`` -- and so by ``_redaction_secrets`` and
+    ``redact_known_secrets`` -- instead of answering with the values it did read.
+    ``gaps`` is every source that could not be read (``SecretSourceGap``); the
+    message is ``_incomplete_message``'s.
+    """
+
+    code = "known_secrets_incomplete"
+
+    def __init__(self, gaps: tuple[SecretSourceGap, ...]) -> None:
+        self.gaps = gaps
+        super().__init__(_incomplete_message(gaps))
+
+
+def _forget_env_values(key: str) -> None:
+    with _ENV_VALUE_CACHE_LOCK:
+        _ENV_VALUE_CACHE.pop(key, None)
+
+
+def _cached_env_values(package_root: PackageRoot) -> frozenset[str] | SecretSourceGap:
+    """The redactable VALUES of one package's ``.env``, or where it could not be read.
+
+    Read the way the runtime reads it (``_read_package_dotenv``, the loader
+    ``_load_tool_dotenv`` uses): a link is not followed and a FIFO, a directory or
+    any other file that is not regular is not read, so neither holds a value
+    anyone is given. Each answer, by what is seen:
+
+    * not there -- ``ENOENT`` or ``ENOTDIR`` from the ``lstat`` or the open: none;
+    * a ``lstat``, or the ``fstat`` of what opened, that sees something not a
+      regular file, a link above all: none. An ``ELOOP`` from the open counts as a
+      link only when a ``lstat`` sees the ``.env`` itself is one; a loop above it
+      is a failure;
+    * text over the loader's cap, judged on the text as read: none;
+    * text within it: exactly the non-empty values the parser gives, which may be
+      some of the lines, or none of them;
+    * any other failure to look at, open or read it: the ``SecretSourceGap``.
 
     The path is the cache KEY and the file's identity is the TAG (see
     ``_ENV_VALUE_CACHE`` for what is in it and for the measurements that chose
     the fields): a path answers "whose ``.env`` is this", and only the identity
-    can answer "is it still the same file with the same contents". Both come out
-    of the one ``stat`` this function already made.
+    can answer "is it still the same file with the same contents". The entry is
+    looked up by the ``lstat`` of the path, stored with the ``fstat`` of the file
+    read, and only for a read that gave an answer; every other answer drops it.
+    Empty values are dropped so a ``KEY=`` line contributes nothing.
     """
     env_file = package_root.path / ".env"
     key = str(env_file)
     try:
-        info = env_file.stat()
-    except OSError:
-        # No ``.env`` (the common case) or an unstattable path: nothing to
-        # contribute. Forget any stale cache entry so a LATER-created ``.env`` is
-        # picked up fresh next time.
-        with _ENV_VALUE_CACHE_LOCK:
-            _ENV_VALUE_CACHE.pop(key, None)
+        info = os.lstat(env_file)
+    except FileNotFoundError, NotADirectoryError:
+        _forget_env_values(key)
+        return frozenset()
+    except OSError as exc:
+        _forget_env_values(key)
+        return SecretSourceGap(package_root.path.name, key, type(exc).__name__)
+    if not stat.S_ISREG(info.st_mode):
+        _forget_env_values(key)
         return frozenset()
     identity = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size)
     with _ENV_VALUE_CACHE_LOCK:
         cached = _ENV_VALUE_CACHE.get(key)
         if cached is not None and cached[0] == identity:
             return cached[1]
-    # Parse OUTSIDE the lock (it does file I/O); the (path, identity) key makes a
+    # Read OUTSIDE the lock (it does file I/O); the (path, identity) key makes a
     # concurrent double-parse harmless -- both produce the identical set.
-    values = frozenset(value for value in _load_tool_dotenv(package_root).values() if value)
+    read = _read_package_dotenv(env_file)
+    if read.unread is not None:
+        _forget_env_values(key)
+        return SecretSourceGap(package_root.path.name, key, read.unread)
+    values = frozenset(value for value in read.values.values() if value)
+    if read.identity is None:
+        # Gone, or no regular file, since the ``lstat``: nothing to keep.
+        _forget_env_values(key)
+        return values
     with _ENV_VALUE_CACHE_LOCK:
-        _ENV_VALUE_CACHE[key] = (identity, values)
+        _ENV_VALUE_CACHE[key] = (read.identity, values)
     return values
 
 
-def known_secret_values() -> frozenset[str]:
-    """Every value llm_log should redact out of stored prompt/response bodies (D36).
+def _collect_package_values(base: Path, values: set[str], gaps: list[SecretSourceGap]) -> None:
+    """Add every package's ``.env`` values under ``base`` to ``values``; record the gaps.
+
+    The packages are what they have always been here: each entry not hidden that
+    is a directory once links are followed. A listing or a look at an entry that
+    fails other than with "not there" is a gap, never a package without values.
+    """
+    try:
+        names = sorted(os.listdir(base))
+    except FileNotFoundError, NotADirectoryError:
+        return
+    except OSError as exc:
+        gaps.append(SecretSourceGap(None, os.fspath(base), type(exc).__name__))
+        return
+    for name in names:
+        if name.startswith("."):
+            continue
+        child = base / name
+        try:
+            info = os.stat(child)
+        except FileNotFoundError, NotADirectoryError:
+            continue
+        except OSError as exc:
+            gaps.append(SecretSourceGap(name, os.fspath(child / ".env"), type(exc).__name__))
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            continue
+        found = _cached_env_values(PackageRoot(child))
+        if isinstance(found, SecretSourceGap):
+            gaps.append(found)
+        else:
+            values |= found
+
+
+def _collect_known_secrets() -> KnownSecrets:
+    """Every known secret value, and whether that is all of them (``KnownSecrets``).
 
     The union of three sources:
 
@@ -2624,29 +2875,66 @@ def known_secret_values() -> frozenset[str]:
       it into a body), but redacting it too means even a tool that somehow echoed
       it back cannot surface it in the log;
     * every VALUE in every installed tool package's ``.env`` (a KB API key etc.),
-      cached per (path, file identity) so a call per record stays cheap;
+      cached per (path, file identity) so a call per record stays cheap
+      (``_cached_env_values`` says what each ``.env`` answers);
     * every value currently HELD in-flight (see ``_INFLIGHT_SECRETS``) -- an
       install's form secret before promote writes it, a revise session's values,
       and the values a running tool call handed its child. Each covers a window
       the directory scan above cannot answer for, because the file it reads is
       whatever is on disk NOW rather than what the holder was given.
 
-    Wired as llm_log's secret provider by main. llm_log calls this INSIDE its own
-    ``except Exception`` guard (the no-observer-failure invariant), so a hiccup
-    here only ever degrades to "record unredacted", never breaks a recording.
+    A tools directory that is not configured, not there, or under a component
+    that is a file holds no packages. One whose path cannot be resolved
+    (``ToolsDirUnresolvedError``), or whose listing fails, is a gap, and so is
+    every package or ``.env`` that cannot be looked at, opened or read: those
+    failures are answered here, never raised. Private on purpose: a caller must
+    not take ``values`` without ``complete`` -- ``known_secret_values`` and
+    ``known_secrets_for_log`` are the ways in.
     """
-    secrets: set[str] = set()
+    values: set[str] = set()
+    gaps: list[SecretSourceGap] = []
     api_key = get_settings().openai_api_key.strip()
     if api_key:
-        secrets.add(api_key)
-    base = tools_dir()
-    if base is not None and base.is_dir():
-        for child in sorted(base.iterdir()):
-            if child.is_dir() and not child.name.startswith("."):
-                secrets |= _cached_env_values(PackageRoot(child))
+        values.add(api_key)
+    try:
+        base = tools_dir()
+    except ToolsDirUnresolvedError as exc:
+        base = None
+        gaps.append(SecretSourceGap(None, exc.path, exc.error))
+    if base is not None:
+        _collect_package_values(base, values, gaps)
     with _INFLIGHT_LOCK:
-        secrets |= set(_INFLIGHT_SECRETS)
-    return frozenset(secrets)
+        values |= set(_INFLIGHT_SECRETS)
+    return KnownSecrets(frozenset(values), tuple(gaps))
+
+
+def known_secret_values() -> frozenset[str]:
+    """Every known secret value, only when that is all of them.
+
+    Raises ``KnownSecretsIncomplete`` when some source could not be read
+    (``_collect_known_secrets``): a mask built from the rest would leave what that
+    source holds in plain sight while looking whole.
+    """
+    collected = _collect_known_secrets()
+    if not collected.complete:
+        raise KnownSecretsIncomplete(collected.gaps)
+    return collected.values
+
+
+def known_secrets_for_log() -> tuple[frozenset[str], bool]:
+    """llm_log's secret provider: ``(values, complete)``. Never raises.
+
+    Wired by main. llm_log is an observer and must not fail the call it records,
+    so a collection that is not whole, or that failed, is answered as
+    ``(frozenset(), False)`` rather than raised; llm_log then stores, in place of
+    each body, the marker saying it was not recorded
+    (``llm_log._checked_as_written``). Goes through ``known_secret_values``, so
+    the same answer serves both.
+    """
+    try:
+        return known_secret_values(), True
+    except Exception:
+        return frozenset(), False
 
 
 # The exact-match marker every redacted secret VALUE is replaced with, in BOTH the
@@ -2802,6 +3090,8 @@ def _redaction_secrets() -> list[str]:
 
     Unguarded, like the scan it wraps: a caller that must not fail on it says so
     itself (``_record_bodies``); every other caller wants the failure to propagate.
+    That failure includes ``KnownSecretsIncomplete``, a list some ``.env`` could
+    not be read into: never answered with the rest.
     """
     return [value for value in known_secret_values() if len(value) >= _MIN_SECRET_LEN]
 
@@ -2829,7 +3119,8 @@ def redact_known_secrets(text: str) -> str:
     it exists to hide. ``known_secret_values`` is called WITHOUT a guard here, so any
     surprise it raised PROPAGATES to the caller's fail-closed handling (the llm loop's
     and meta-tools' own ``except`` degrade it into a safe failed-tool-result string),
-    never a silent leak.
+    never a silent leak. A list some ``.env`` could not be read into is such a
+    failure (``KnownSecretsIncomplete``), not a shorter list.
     """
     secrets = _redaction_secrets()
     # Bare call, deliberately unguarded (see the docstring above): a failure here must
@@ -2981,25 +3272,54 @@ def package_settings(package_root: PackageRoot) -> dict[str, Any]:
     }
 
 
-def _load_package_dotenv(env_file: Path) -> dict[str, str]:
+@dataclass(frozen=True, slots=True)
+class _DotenvRead:
+    """One package env file as ``_read_package_dotenv`` read it.
+
+    ``values`` is what the parse gave, {} unless the file was read and within the
+    cap. ``unread`` is the type name of a failure that left the file unread (a
+    look, an open or a read that failed other than with "not there"); None when
+    the answer is definite, values or none. ``identity`` is the ``fstat`` identity
+    of the file the text came from (``_CappedText``), when there was text.
+    """
+
+    values: dict[str, str]
+    unread: str | None = None
+    identity: tuple[int, int, int, int, int] | None = None
+
+
+def _read_package_dotenv(env_file: Path) -> _DotenvRead:
     """The bounded read + interpolate=False parse both package env files share."""
-    # Read through the ONE bounded-regular-file helper (F3a): its O_NONBLOCK+S_ISREG
+    # Read through the ONE bounded-regular-file read (F3a): its O_NONBLOCK+S_ISREG
     # gate refuses a FIFO an operator (or a post-install mutation) could `mkfifo` in
     # place of .env -- which dotenv_values(path) would reopen and BLOCK on forever --
     # its O_NOFOLLOW refuses a symlinked .env, and its cap+1 read bounds the per-CALL
     # memory the parse would otherwise slurp whole into the child's exec env block.
-    # None (missing / FIFO / symlink / read error) and an over-cap length BOTH
-    # degrade to {} -- the SAME degrade-to-no-extra-env contract the malformed-.env
+    # No text (missing / FIFO / symlink / read error) and an over-cap length BOTH
+    # give {} -- the SAME degrade-to-no-extra-env contract the malformed-.env
     # fallback below gives -- so a runaway or mutated .env can never bloat per call.
-    text = _read_regular_file_capped(env_file, _ENV_FILE_MAX_BYTES)
-    if text is None or len(text) > _ENV_FILE_MAX_BYTES:
-        return {}
+    # The over-cap test is on the text as read, the loader's own unit, never the
+    # file's size.
+    read = _read_regular_text_capped(env_file, _ENV_FILE_MAX_BYTES)
+    if read.text is None:
+        return _DotenvRead({}, unread=read.error if read.refusal == "failed" else None)
+    if len(read.text) > _ENV_FILE_MAX_BYTES:
+        return _DotenvRead({}, identity=read.identity)
     # Parse the ALREADY-READ text (never dotenv_values(path)): handing python-dotenv the
     # path would make it REOPEN the file -- a second, UNBOUNDED read that also re-follows a
     # symlink -- defeating the bounded, O_NOFOLLOW'd read above. ``_parse_dotenv_text`` is
     # the shared interpolate=False parser (see there); both reads must be the same bytes
     # and the same regular-file decision.
-    return _parse_dotenv_text(text)
+    return _DotenvRead(_parse_dotenv_text(read.text), identity=read.identity)
+
+
+def _load_package_dotenv(env_file: Path) -> dict[str, str]:
+    """The env file's values, {} whenever there are none to give (``_read_package_dotenv``).
+
+    The runtime's degrade: a file that cannot be read gives no extra env, the same
+    as one that is not there.
+    """
+    return _read_package_dotenv(env_file).values
 
 
 def _build_tool_env(package_root: PackageRoot) -> tuple[dict[str, str], frozenset[str]]:
@@ -3471,7 +3791,9 @@ _TOOL_DISABLED_RESULT = "tool not run: this tool was disabled after it was offer
 # How one call ended, as its run record states it. ``refused`` is the tool never
 # running (disabled, replaced, identity changed); ``error`` is the BACKEND failing
 # the call -- the secret scan behind the redaction, the tools lock -- whether or
-# not the tool had run, which the model reads as ``tool execution failed: <type>``.
+# not the tool had run. One that raised the model reads as ``tool execution
+# failed: <type>``; a tool that ran and whose output could not be masked, as
+# ``output_withheld_text``, which says it ran.
 # Every other non-ok value is a way a tool that DID start can fail.
 # ``output_overflow`` is the one the model's string cannot tell apart: stderr past
 # the cap kills the process group, so the model sees ``tool failed (exit -9)`` --
@@ -3490,13 +3812,28 @@ RUN_ERROR = "error"
 RUN_FAILURE_OUTCOMES = frozenset({RUN_FAILED, RUN_OUTPUT_OVERFLOW, RUN_TIMEOUT, RUN_START_FAILED})
 
 
+def output_withheld_text(what: str, exit_code: int | None) -> str:
+    """The result of a command that ran but whose output could not be checked.
+
+    ``what`` is "tool" (an installed tool) or "command" (the builder's
+    ``run_shell``). Says that it ran and how it ended, so that it is not taken
+    for a call that never happened, and that its output is withheld because it
+    could not be checked for known secrets -- none of it, nor why in more detail,
+    is in the text.
+    """
+    return (
+        f"{what} ran (exit {exit_code}), but its output is withheld: "
+        "it could not be checked for known secrets"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ToolRunResult:
     """One call's outcome: the string the model gets, plus what its record keeps.
 
-    ``text`` is the agent-visible result, byte-identical to what this module
-    returned before run records existed (invariant F) -- the record is an
-    observer and must not change the conversation. ``args``/``stdout``/``stderr``
+    ``text`` is the agent-visible result, the same whether or not a recorder is
+    wired (invariant F) -- the record is an observer and must not change the
+    conversation. ``args``/``stdout``/``stderr``
     are set only for a run that started and failed, already REDACTED and not yet
     CUT: the recorder applies its own caps afterwards, the redact->cap order.
     """
@@ -3735,29 +4072,38 @@ def _run_tool_subprocess(
     # regardless of the (kill-induced, negative) exit code the overflow kill left
     # behind: the tool produced its answer, we just stopped reading it. _cap_output
     # trims the retained cap+1 chars down to the cap behind the marker.
-    if output.stdout_overflow:
-        return ToolRunResult(
-            _cap_output(redact_known_secrets(output.stdout), output_cap), RUN_OK, truncated=True
-        )
-    if proc.returncode != 0:
-        # One snapshot of the known secrets serves the model's string AND the
-        # record, so this branch still scans once. Fail-closed exactly as
-        # ``redact_known_secrets`` is: these are the same two calls it makes.
-        secrets = _redaction_secrets()
-        stderr = _mask_known_secrets(output.stderr, secrets)
-        # ``output_overflow`` only when the overflow KILL ended it: a tool that
-        # wrote past the cap and exited with its own code first is a plain failure
-        # (its code is what the model was told). Exit 0 never reaches here.
-        killed_for_output = output.stderr_overflow and proc.returncode == -signal.SIGKILL
-        return ToolRunResult(
-            f"tool failed (exit {proc.returncode}): {_cap_output(stderr.strip(), output_cap)}",
-            RUN_OUTPUT_OVERFLOW if killed_for_output else RUN_FAILED,
-            exit_code=proc.returncode,
-            args=_mask_known_secrets(args_json, secrets),
-            stdout=_mask_known_secrets(output.stdout, secrets),
-            stderr=stderr,
-        )
-    return ToolRunResult(_cap_output(redact_known_secrets(output.stdout), output_cap), RUN_OK)
+    try:
+        if output.stdout_overflow:
+            return ToolRunResult(
+                _cap_output(redact_known_secrets(output.stdout), output_cap),
+                RUN_OK,
+                truncated=True,
+            )
+        if proc.returncode != 0:
+            # One snapshot of the known secrets serves the model's string AND the
+            # record, so this branch still scans once. Fail-closed exactly as
+            # ``redact_known_secrets`` is: these are the same two calls it makes.
+            secrets = _redaction_secrets()
+            stderr = _mask_known_secrets(output.stderr, secrets)
+            # ``output_overflow`` only when the overflow KILL ended it: a tool that
+            # wrote past the cap and exited with its own code first is a plain failure
+            # (its code is what the model was told). Exit 0 never reaches here.
+            killed_for_output = output.stderr_overflow and proc.returncode == -signal.SIGKILL
+            return ToolRunResult(
+                f"tool failed (exit {proc.returncode}): {_cap_output(stderr.strip(), output_cap)}",
+                RUN_OUTPUT_OVERFLOW if killed_for_output else RUN_FAILED,
+                exit_code=proc.returncode,
+                args=_mask_known_secrets(args_json, secrets),
+                stdout=_mask_known_secrets(output.stdout, secrets),
+                stderr=stderr,
+            )
+        return ToolRunResult(_cap_output(redact_known_secrets(output.stdout), output_cap), RUN_OK)
+    except Exception:
+        # The tool RAN; only what it wrote could not be checked against the known
+        # secrets (a ``.env`` that cannot be read, say), so none of it is handed
+        # over, to the model or to the record. Said as it is: told the call failed,
+        # a model may run it again, and the tool may act on something real.
+        return ToolRunResult(output_withheld_text("tool", proc.returncode), RUN_ERROR)
 
 
 @dataclass(slots=True, weakref_slot=True)

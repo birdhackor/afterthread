@@ -397,9 +397,15 @@ _REASONED: list[tuple[str, str, str]] = [
         "a look seeing it gone reports it removed",
     ),
     (
+        "_as_saved",
+        "except OSError: return 'unconfirmed'",
+        "a draft/ that cannot be listed is not known to hold only the copy: nothing is removed",
+    ),
+    (
         "remove_after_publish",
-        "except Exception: return Removal(False, None)",
-        "nothing is reported taken away: the draft stays with publishing set",
+        "except Exception: if started[0]:",
+        "nothing is reported taken away: before the removal began the draft is left as "
+        "unconfirmed, after it draft/ is named as what may be left",
     ),
     (
         "_fsync_file",

@@ -206,6 +206,33 @@ def test_capture_holds_shared_tools_lock_through_error_and_releases_it(
         assert acquired_after_error is True
 
 
+def test_capture_with_a_tools_dir_under_a_file_runs_with_no_tools(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``TOOLS_DIR`` runs through a regular file: no tools directory can be there,
+    as surely as one not made yet. The capture goes on with no tools advertised
+    -- not a 500. Red before the fix: resolving the setting raised
+    ``NotADirectoryError`` and the capture answered 500."""
+    (tmp_path / "plain").write_text("a file\n", encoding="utf-8")
+    settings = Settings(tools_dir=str(tmp_path / "plain" / "tools"))
+    monkeypatch.setattr("afterthread.services.tools.get_settings", lambda: settings)
+    advertised: list[object] = []
+
+    async def drafting(
+        system: str, user: str, model_cls: type[BaseModel], **kwargs: object
+    ) -> BaseModel:
+        advertised.append(kwargs.get("tools"))
+        return model_cls.model_validate(_DRAFT)
+
+    monkeypatch.setattr("afterthread.services.memory_ai.generate_structured", drafting)
+    lenient = TestClient(client.app, raise_server_exceptions=False)
+
+    response = lenient.post("/api/capture", json={"raw_text": "raw"})
+
+    assert response.status_code == 201, response.text
+    assert advertised == [None]
+
+
 def test_capture_invalid_draft_returns_502_and_no_rows(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -350,6 +350,15 @@ def _aggregate_usage(attempts: list[LlmAttempt]) -> dict[str, int | None] | None
 # duplicated rather than shared -- llm_log stays leaf); a test pins the two equal.
 _REDACTION_MARKER = "•••[秘密已遮蔽]•••"
 
+# Stored in place of a body that could not be checked against the whole list of
+# known secrets (``_checked_as_written``): it says the body was not recorded and
+# why, and not that a secret was found -- which is what ``_REDACTION_MARKER`` says,
+# and what may send a reader to rotate a key. Written the way that marker is, a
+# CJK body in the •••[…]••• fence: no run of ASCII characters in it is as long as
+# ``_MIN_SECRET_LEN``, so no value of ASCII characters, as keys and tokens are,
+# can equal it or be found in it.
+_UNCHECKED_MARKER = "•••[無法確認是否含已知秘密，本文未記錄]•••"  # noqa: RUF001
+
 # Values shorter than this are NEVER redacted (see `_redact`): a 1-5 char value
 # would shred ordinary prose (imagine redacting every "1234"), and a real API
 # key / token is never that short -- so the floor costs no real coverage while
@@ -374,21 +383,27 @@ _MAX_MASK_RANGES = 10_000
 # The known-secret provider. A CALLABLE, deliberately not a static set, because
 # the secret set CHANGES at runtime: installing a tool adds its .env values, and
 # an in-flight install registers its form secret before that .env even exists
-# (see tools.known_secret_values). llm_log is a leaf OBSERVABILITY module and
+# (see tools._collect_known_secrets). llm_log is a leaf OBSERVABILITY module and
 # must not import the tool subsystem to learn where secrets come from, so it
 # takes this hook and the application entrypoint (main._configure_secret_
-# redaction) injects tools.known_secret_values once at startup -- the same
+# redaction) injects tools.known_secrets_for_log once at startup -- the same
 # leaf/provider inversion _configure_app_logging uses for the log handler.
-_secret_provider: Callable[[], Iterable[str]] | None = None
+#
+# It answers ``(values, complete)``: the values it could read, and whether that
+# is all of them. A provider never has to raise to say it could not read some
+# source -- it says so -- and a body is never checked against a list that is
+# missing values as if that list were whole (see ``_checked_as_written``).
+_secret_provider: Callable[[], tuple[Iterable[str], bool]] | None = None
 
 
-def set_secret_provider(provider: Callable[[], Iterable[str]] | None) -> None:
-    """Install the callable that yields the values `_redact` masks out.
+def set_secret_provider(provider: Callable[[], tuple[Iterable[str], bool]] | None) -> None:
+    """Install the callable that yields the values `_redact` masks out, and whether
+    they are all of them.
 
     Idempotent overwrite (last writer wins) -- main calls it once at startup, and
     a test may swap in its own provider and restore it. Passing None disables
-    redaction entirely (the default state before wiring), which is exactly the
-    byte-identical "no known secrets" behavior every path had before D36.
+    redaction entirely (the default state before wiring): there are then no known
+    secrets, which is a whole answer, not a missing one.
     """
     global _secret_provider
     _secret_provider = provider
@@ -503,15 +518,34 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     return "".join(out)
 
 
-def _secret_snapshot() -> list[str]:
-    """The redactable known-secret values, materialized ONCE. [] when there are
-    none, when no provider is wired, or when asking failed.
+@dataclass(frozen=True, slots=True)
+class _SecretSnapshot:
+    """One recorded step's known secrets: the values, and whether they are all of them.
+
+    ``values`` are the provider's strings at the redactor's floor. ``complete``
+    False means some source could not be read, or asking failed: the values are
+    then a part of the list, and nothing checked against them can be called
+    clean (``_checked_as_written``).
+    """
+
+    values: list[str]
+    complete: bool
+
+
+def _secret_snapshot() -> _SecretSnapshot:
+    """The redactable known-secret values, materialized ONCE, and whether that is all.
+
+    Empty and complete when no provider is wired: there are no known secrets.
+    Empty and NOT complete when asking failed -- the call, the iteration, or an
+    answer that is not a ``(values, complete)`` pair: a failure says nothing about
+    what the secrets are, and must not read as "there are none". Otherwise the
+    provider's own word on completeness.
 
     Taken ONE per recorded step (an attempt's whole message list and its advertised
     names together, a response on its own) and handed down to every ``_stored_body``
     that step performs, rather than being re-derived per string. That is a real
-    cost, not tidiness: the provider is ``tools.known_secret_values``, which walks
-    every installed package -- an ``iterdir`` plus a ``stat`` per package, plus a
+    cost, not tidiness: the provider is ``tools.known_secrets_for_log``, which walks
+    every installed package -- an ``listdir`` plus a ``stat`` per package, plus a
     ``.env`` read on every cache miss -- and it runs on the EVENT LOOP, before the
     upstream request goes out. One sweep per string made an attempt that advertises
     N tools do N sweeps over N packages: quadratic filesystem work, synchronously,
@@ -519,15 +553,15 @@ def _secret_snapshot() -> list[str]:
 
     The provider is called INSIDE a broad `except Exception` because of the
     no-observer-failure invariant: the recorder is a pure observer of the LLM
-    call, so a broken/misconfigured secret provider must degrade to "record
-    unredacted", never raise into `begin_attempt`/`record_response`/the sink and
-    turn a successful call into a logging crash. The materialization+filter runs
-    INSIDE that guard (F5): the provider may be a LAZY iterable that raises at YIELD
-    time, and a non-str element would raise downstream, so we keep only ``str`` values
-    meeting ``_MIN_SECRET_LEN`` in the same guarded pass -- any failure (call,
-    iteration, or a bad element) still degrades to "record unredacted". The length
-    floor also drops the empty string (``str.replace("", m)`` would splice the marker
-    between every character) and a 1-5 char value (see that constant).
+    call, so a broken/misconfigured secret provider must never raise into
+    `begin_attempt`/`record_response`/the sink and turn a successful call into a
+    logging crash. The materialization+filter runs INSIDE that guard: the
+    provider may hand back a LAZY iterable that raises at YIELD time, and a non-str
+    element would raise downstream, so we keep only ``str`` values meeting
+    ``_MIN_SECRET_LEN`` in the same guarded pass -- any failure (call, iteration, or
+    a bad element) still ends in an incomplete snapshot. The length floor also
+    drops the empty string (``str.replace("", m)`` would splice the marker between
+    every character) and a 1-5 char value (see that constant).
 
     Snapshotting also makes one step's masking SELF-CONSISTENT: every string in an
     attempt is now judged against the same secret set, instead of message 1 seeing
@@ -538,15 +572,15 @@ def _secret_snapshot() -> list[str]:
     """
     provider = _secret_provider
     if provider is None:
-        return []
+        return _SecretSnapshot([], True)
     try:
-        return [
-            value
-            for value in provider()
-            if isinstance(value, str) and len(value) >= _MIN_SECRET_LEN
+        found, complete = provider()
+        values = [
+            value for value in found if isinstance(value, str) and len(value) >= _MIN_SECRET_LEN
         ]
     except Exception:
-        return []
+        return _SecretSnapshot([], False)
+    return _SecretSnapshot(values, complete is True)
 
 
 def _redact(text: str, secrets: list[str]) -> str:
@@ -556,10 +590,10 @@ def _redact(text: str, secrets: list[str]) -> str:
     a secret must be scrubbed BEFORE truncation could split it, or half of a key
     straddling the cap edge would survive in the record.
 
-    ``secrets`` is a ``_secret_snapshot`` the CALLER took (see there for why the
-    snapshot is per step rather than per string); an empty list means "nothing to
-    mask", which is the byte-identical no-known-secrets behaviour every path had
-    before D36.
+    ``secrets`` is the values of a ``_secret_snapshot`` the CALLER took (see there
+    for why the snapshot is per step rather than per string); an empty list means
+    "nothing to mask". Whether that list is whole is not this stage's question:
+    ``_checked_as_written`` answers it for the stored text.
 
     The masking itself -- the shared ``_mask_known_secrets`` (byte-identical to
     ``tools``' copy, see that helper) -- runs inside this function's OWN guard (D36
@@ -624,7 +658,7 @@ def _utf8_safe(text: str) -> str:
 _BODY_TRUNCATION_MARKER = "…[紀錄過長已截斷]"
 
 
-def _stored_body(text: str, secrets: list[str]) -> tuple[str, bool]:
+def _stored_body(text: str, secrets: _SecretSnapshot) -> tuple[str, bool]:
     """Make ``text`` safe AND small enough to store; return (stored, truncated).
 
     The single choke point every request-message/response body passes through
@@ -634,7 +668,8 @@ def _stored_body(text: str, secrets: list[str]) -> tuple[str, bool]:
     ``_BODY_TRUNCATION_MARKER`` appended when a cut happens), and last the check
     of what is stored in the form a JSON line writes it
     (``_checked_as_written``): a body whose escapes, or whose replacement
-    characters, spell a known secret is stored as the marker. "Body" is its
+    characters, spell a known secret is stored as the redaction marker, and one
+    that could not be checked as the marker saying it was not recorded. "Body" is its
     origin, not its scope: an attempt's advertised tool NAMES run through it too
     (see ``LlmInteractionRecorder.begin_attempt``), so that every stored string a
     record holds that could carry operator/LLM/filesystem text reaches its sinks
@@ -677,9 +712,10 @@ def _stored_body(text: str, secrets: list[str]) -> tuple[str, bool]:
     called once per string, while the sweep behind that list is per-package
     filesystem work on the event loop (see ``_secret_snapshot``). A default would
     make "forgot to hoist it" the quiet, working spelling -- which is exactly the
-    shape the advertised names were written in.
+    shape the advertised names were written in. A snapshot that is not whole
+    stores ``_UNCHECKED_MARKER`` in place of the body (``_checked_as_written``).
     """
-    safe = _utf8_safe(_redact(text, secrets))
+    safe = _utf8_safe(_redact(text, secrets.values))
     cap = get_settings().llm_log_body_max_chars
     if len(safe) <= cap:
         return _checked_as_written(safe, secrets), False
@@ -689,8 +725,8 @@ def _stored_body(text: str, secrets: list[str]) -> tuple[str, bool]:
     return _checked_as_written(safe[: cap - marker_len] + _BODY_TRUNCATION_MARKER, secrets), True
 
 
-def _checked_as_written(stored: str, secrets: list[str]) -> str:
-    """``stored``, or the redaction marker when its form in a JSON line holds a known secret.
+def _checked_as_written(stored: str, secrets: _SecretSnapshot) -> str:
+    """``stored``, or a marker when its form in a JSON line holds a known secret or may.
 
     The last stage of ``_stored_body``. ``_redact`` works on the text, while the
     JSONL sink writes it as a JSON string literal (``json.dumps(...,
@@ -702,25 +738,34 @@ def _checked_as_written(stored: str, secrets: list[str]) -> str:
     breaks would land on disk as exactly the secret's bytes. The literal is
     checked with this module's own matcher (``_mask_known_secrets``, so a whole
     value, a trailing prefix of one and the range cap all count), and a body it
-    would change is stored as the marker, whole: masking inside the literal would
-    mean cutting into escapes.
+    would change is stored as ``_REDACTION_MARKER``, whole: masking inside the
+    literal would mean cutting into escapes.
+
+    It can only call a body clean against a list that is whole. When the snapshot
+    is not complete -- some ``.env`` could not be read, or asking failed -- a value
+    it lacks may be exactly what the escapes spell, and nothing here can tell, so
+    ``_UNCHECKED_MARKER`` is stored instead of the body: not recorded, which is not
+    "a secret was found". The same when this check itself fails: unchecked is not
+    clean. Either way the recording goes on, and the call it records is untouched:
+    only the body is withheld.
 
     What it does not cover: a difference of representation an exact match cannot
     see -- a secret registered with a real line break that a body spells as the
     two characters ``\\n``, a value encoded another way (base64, say), a ``.env``
     value whose undecodable bytes were replaced when it was read.
-
-    Like ``_redact``, it swallows its own failure and keeps ``stored`` as it is:
-    the recorder is a pure observer and must never raise into the call it records.
     """
-    with contextlib.suppress(Exception):
+    if not secrets.complete:
+        return _UNCHECKED_MARKER
+    try:
         literal = json.dumps(stored, ensure_ascii=False)[1:-1]
-        if _mask_known_secrets(literal, secrets) != literal:
+        if _mask_known_secrets(literal, secrets.values) != literal:
             return _REDACTION_MARKER
+    except Exception:
+        return _UNCHECKED_MARKER
     return stored
 
 
-def _message_text(content: Any, secrets: list[str]) -> tuple[str, bool]:
+def _message_text(content: Any, secrets: _SecretSnapshot) -> tuple[str, bool]:
     """Coerce a message ``content`` to its STORED (safe, size-capped) text.
 
     Every message this codebase sends carries a plain string content, so the
@@ -772,7 +817,7 @@ def _names_elision_marker(count: int) -> str:
     return f"…[另 {count} 項工具已省略以控制紀錄大小]"
 
 
-def _bounded_tool_names(names: list[str], secrets: list[str]) -> tuple[list[str], bool]:
+def _bounded_tool_names(names: list[str], secrets: _SecretSnapshot) -> tuple[list[str], bool]:
     """Store one attempt's advertised tool names, BOUNDED. Returns (stored, cut).
 
     Each name goes through ``_stored_body`` -- the same choke point every message
