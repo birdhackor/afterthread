@@ -1971,6 +1971,76 @@ def test_a_failed_continuing_save_still_records_the_round(
     )
 
 
+@pytest.mark.parametrize("fails_at", ["limit", "scan", "plan", "copy", "manifest"])
+def test_a_failed_continuing_save_a_publish_follows_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fails_at: str
+) -> None:
+    """The save a publish follows fails at a step where a save that no publish
+    follows records the round: over the limits, the scan, the plan, the copy, or
+    the write naming the new copy -- refused once, so a second write would go
+    through. Nothing is written: the manifest stays as the round's start wrote
+    it, ``running`` still marking the round, and the draft directory holds what
+    it held. The result says the round is not recorded, and why the files were
+    not saved."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    workspace, previous, copied_in = _continuing(tmp_path, package_root)
+    (workspace / "run.py").write_text("print('second round')\n", encoding="utf-8")
+    manifest_file = _draft_dir(package_root) / tool_drafts.MANIFEST_FILENAME
+    before = manifest_file.read_bytes()
+    entries = sorted(os.listdir(_draft_dir(package_root)))
+    max_files = 2000
+
+    def refused(*args: Any) -> Any:
+        raise OSError("refused")
+
+    if fails_at == "limit":
+        max_files = 1
+        expected = tool_drafts.REASON_TOO_MANY_FILES
+    elif fails_at == "scan":
+        monkeypatch.setattr(
+            tools, "scan_embedded_secrets", lambda *args: tools.SecretScanFailed("OSError")
+        )
+        expected = tool_drafts.REASON_SCAN_FAILED.format(reason="OSError")
+    elif fails_at == "plan":
+        monkeypatch.setattr(tool_drafts, "_plan_copy", refused)
+        expected = tool_drafts.REASON_UNREADABLE
+    elif fails_at == "copy":
+        monkeypatch.setattr(tool_drafts, "_carry_out", refused)
+        expected = tool_drafts.REASON_COPY.format(kind="OSError")
+    else:
+        real_write = tool_drafts._write_manifest
+        writes: list[dict[str, Any]] = []
+
+        def refused_once(draft_dir: Path, doc: dict[str, Any], known: list[str]) -> Any:
+            writes.append(doc)
+            if len(writes) == 1:
+                return tool_drafts._ManifestWrite(replaced=False)
+            return real_write(draft_dir, doc, known)
+
+        monkeypatch.setattr(tool_drafts, "_write_manifest", refused_once)
+        expected = tool_drafts.REASON_MANIFEST
+
+    result = _save(
+        package_root,
+        workspace,
+        copied_in,
+        previous=previous,
+        draft_round=tool_drafts.DraftRound(finished_at=_now(), job_id=_JOB),
+        max_files=max_files,
+    )
+
+    assert (result.worth_saving, result.saved, result.recorded, result.reason) == (
+        True,
+        False,
+        False,
+        expected,
+    )
+    assert manifest_file.read_bytes() == before
+    assert _manifest(package_root)["running"]["job_id"] == _JOB
+    assert sorted(os.listdir(_draft_dir(package_root))) == entries
+
+
 def test_a_continuing_save_writes_nothing_into_a_draft_changed_meanwhile(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

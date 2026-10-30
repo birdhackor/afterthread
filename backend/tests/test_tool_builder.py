@@ -12248,13 +12248,14 @@ def test_a_round_whose_workspace_cannot_be_confirmed_at_its_save_names_no_path(
     assert refused
 
 
-def test_a_continuation_that_publishes_without_its_round_saved_marks_nothing_and_says_so(
+def test_a_continuation_published_without_its_round_saved_marks_nothing_and_records_it_published(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The save before the publish keeps no files -- over the limit -- but records
-    the round; the publish goes through. Nothing marks the draft as published from,
-    it stays as it was, and the job names it as that save left it, saying the
-    round is not in it."""
+    """The save before the publish keeps no files -- over the limit -- and writes
+    nothing; the publish goes through. Nothing marks the draft as published from,
+    its files stay as they were, and the round is recorded once, as published,
+    its files not saved and the save's reason why. The job names the draft as that
+    write left it, saying the round is not in it."""
     pkg = _seed_package(monkeypatch, tmp_path)
     first = _first_round(monkeypatch, pkg)
     _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"), tool_draft_max_files=3)
@@ -12278,12 +12279,12 @@ def test_a_continuation_that_publishes_without_its_round_saved_marks_nothing_and
     assert _resolved_version(_package_path(pkg)) != pkg
     manifest = _draft_manifest(pkg)
     assert marked == []
-    assert manifest["publishing"] is None
+    assert (manifest["publishing"], manifest["running"]) == (None, None)
     assert manifest["files_dir"] == first["files_dir"]
-    assert (manifest["attempts"][-1]["saved"], manifest["attempts"][-1]["reason"]) == (
-        False,
-        tool_drafts.REASON_TOO_MANY_FILES,
-    )
+    assert manifest["attempts"][:-1] == first["attempts"]
+    latest = manifest["attempts"][-1]
+    assert (latest["number"], latest["outcome"], latest["error"]) == (2, "published", None)
+    assert (latest["saved"], latest["reason"]) == (False, tool_drafts.REASON_TOO_MANY_FILES)
     assert outcome.draft == {
         "saved": False,
         "draft_id": first["draft_id"],
@@ -12292,6 +12293,85 @@ def test_a_continuation_that_publishes_without_its_round_saved_marks_nothing_and
         "reason": tool_builder._DRAFT_ROUND_NOT_SAVED,
         "retained_path": None,
     }
+
+
+def test_a_publish_failing_after_a_continuation_save_failed_records_the_round_with_its_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The save before the publish keeps no files -- over the limit -- and writes
+    nothing; the publish then fails on the round's ``tool.json``. The round is
+    recorded once, when that is known: failed, with the publish's error, its files
+    not saved and the save's reason why, no longer marked running. The draft's
+    files stay as they were, and the staging, holding the work, stays and is
+    named."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    first = _first_round(monkeypatch, pkg)
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"), tool_draft_max_files=3)
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"tool.json": "{ not json at all", "a.py": "A = 1\n", "b.py": "B = 1\n"},
+    )
+
+    outcome = asyncio.run(_continue_revise(pkg, "發布吧"))
+
+    assert outcome.ok is False
+    assert (outcome.error or "").startswith("工具包驗證失敗")
+    assert _resolved_version(_package_path(pkg)) == pkg
+    manifest = _draft_manifest(pkg)
+    assert (manifest["publishing"], manifest["running"]) == (None, None)
+    assert manifest["files_dir"] == first["files_dir"]
+    assert manifest["attempts"][:-1] == first["attempts"]
+    latest = manifest["attempts"][-1]
+    assert (latest["number"], latest["outcome"], latest["error"]) == (2, "failed", outcome.error)
+    assert (latest["saved"], latest["reason"]) == (False, tool_drafts.REASON_TOO_MANY_FILES)
+    [session] = _session_roots(tmp_path)
+    assert outcome.draft == {
+        "saved": False,
+        "draft_id": first["draft_id"],
+        "generation": manifest["generation"],
+        "attempts": 2,
+        "reason": tool_drafts.REASON_TOO_MANY_FILES,
+        "retained_path": str(session / "build"),
+    }
+    assert (session / "build" / "tool.json").read_text(encoding="utf-8") == "{ not json at all"
+
+
+def test_a_continuation_whose_publish_raises_after_its_save_failed_leaves_its_mark(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The save before the publish keeps no files -- over the limit -- and writes
+    nothing; the publish then ends in an exception no outcome describes. The
+    manifest is left as the round's start wrote it -- marked running, no round
+    added, the files as they were -- and the next round records the round as
+    interrupted."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    first = _first_round(monkeypatch, pkg)
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"), tool_draft_max_files=3)
+    monkeypatch.setattr(tool_builder, "_publish_revised_version", _publish_raises)
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY, "a.py": "A = 1\n", "b.py": "B = 1\n"},
+    )
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(_continue_revise(pkg, "發布吧"))
+
+    after = _draft_manifest(pkg)
+    assert after["running"] is not None
+    assert (after["generation"], after["attempt_count"], after["attempts"]) == (
+        first["generation"] + 1,
+        first["attempt_count"],
+        first["attempts"],
+    )
+    assert after["files_dir"] == first["files_dir"]
+    _fake_generate(monkeypatch, result=_UNFINISHED)
+
+    asyncio.run(_continue_revise(pkg, "再試一次"))
+
+    outcomes = [attempt["outcome"] for attempt in _draft_manifest(pkg)["attempts"]]
+    assert outcomes == ["not_published", "interrupted", "not_published"]
 
 
 def test_a_continuation_that_publishes_beside_a_kept_copy_leaves_the_draft_and_says_why(

@@ -3931,8 +3931,9 @@ _DRAFT_KEPT_UNCONFIRMED = (
 # By ``tool_drafts.Removal.kept``: why the removal was not attempted.
 _DRAFT_LEFT_REASONS = {"changed": _DRAFT_KEPT_CHANGED, "unconfirmed": _DRAFT_KEPT_UNCONFIRMED}
 # A continuation that published while its save before the publish did not keep
-# the round: no ``publishing`` was written, so the draft stays as the round found
-# it, and the version has what the round did.
+# the round: no ``publishing`` was written, the round left the draft's files as
+# they are, and the version has what the round did. The round is recorded in the
+# manifest once the publish went through (``_close_unrecorded``).
 _DRAFT_ROUND_NOT_SAVED = "已發布；這一輪沒有存進草稿，請取回草稿裡需要的內容再放棄它。"  # noqa: RUF001
 
 # Why a continuation did not begin: nothing was spent and no round is counted.
@@ -4075,9 +4076,10 @@ def _close_unrecorded(
 
     What its save recorded is not recorded again. A round nothing recorded yet --
     its workspace not confirmed, a strip that failed, a save that failed before
-    it wrote -- is recorded on its own, its files not saved, why taken from
-    ``saved`` (``tool_drafts.record_round``). A first round has no draft to record
-    in. Never raises.
+    it wrote, the save a publish follows that did not save -- is recorded on its
+    own, its files not saved, why taken from ``saved``
+    (``tool_drafts.record_round``). A first round has no draft to record in.
+    Never raises.
     """
     begun = context.begun
     if begun is None or not saved.worth_saving or saved.recorded:
@@ -4097,8 +4099,11 @@ def _save_round_draft(
     """Save the round's workspace as the tool's draft, and close the round; never raises.
 
     Blocking (runs via ``run_in_threadpool``). ``outcome`` is None for the save a
-    publish is about to follow, which closes nothing yet: the round is recorded
-    for good once the publish's result is known (``_close_unrecorded``).
+    publish is about to follow, which closes nothing yet. A save that kept the
+    round recorded it, and a failed publish puts its error on that round
+    (``tool_drafts.clear_publishing``); one that did not wrote nothing, and a
+    continuation's round is then recorded once the publish's result is known
+    (``_close_unrecorded``).
     """
     saved = _save_files(context, outcome, error)
     if outcome is None:
@@ -4721,7 +4726,10 @@ async def run_revise(
         # written does not stop the publish; it only leaves a crash right after
         # the publish to be read as a stale draft rather than a published one. A
         # continuation whose save kept nothing writes no mark: the draft is then
-        # not what is being published.
+        # not what is being published. Nor has it recorded the round: that is done
+        # once the publish's result is known (``_close_unrecorded``), and an
+        # exception in the publish leaves the round's mark for the next round to
+        # record.
         kept = await run_in_threadpool(_save_round_draft, round_draft, None, None)
         holding = _holding(kept)
         drafted: tuple[str, int] | None = None

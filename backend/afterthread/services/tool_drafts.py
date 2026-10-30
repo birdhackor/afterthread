@@ -380,7 +380,8 @@ class SaveResult:
       already had, once it is seen still to be what the round copied out of it
       (``_still_as_copied_out``);
     * ``recorded``: the manifest records this round (and no longer marks it
-      running). A save that did not save often recorded the round still, with why;
+      running). A save that did not save often recorded the round still, with
+      why -- never the save a publish follows (``save_round``);
     * ``durable``: the write that recorded it is confirmed on disk. Never retried:
       an fsync that failed and then succeeds proves nothing about the write before.
 
@@ -1952,7 +1953,10 @@ def save_round(
     lock is not had, the package is not the one the round began in, or the
     draft is no longer the one the round began on (``begin_round``'s manifest,
     its ``running`` this round's job): nothing is written into it. Nor, of
-    course, when that write fails. ``SaveResult.recorded`` says which it was.
+    course, when that write fails. A continuation's save a publish follows
+    writes nothing when it fails, even where it could: ``running`` stays, for the
+    round to be recorded once the publish's result is known (``record_round``).
+    ``SaveResult.recorded`` says which it was.
     """
     try:
         return _save_round(
@@ -2131,6 +2135,11 @@ def _save_locked(
     if current is None:
         _undo(draft_dir, None, made_draft_dir)
         return _not_saved(failed)
+    if draft_round.outcome is None:
+        # The save a publish follows writes nothing: ``running`` stays, for the
+        # round to be recorded with the publish's end once that is known
+        # (``record_round``).
+        return _not_saved(failed)
     entry = _round_entry(
         draft_round, current["attempt_count"] + 1, saved=False, reason=failed, omitted=[]
     )
@@ -2161,8 +2170,9 @@ def _record(
     """Write ``doc``, which records a round, and say what became of it.
 
     ``reason`` is the round's own, as it was recorded: why its files were not
-    saved. Not written, the result carries the write's reason instead, and no
-    draft identity: nothing of the round is in the manifest.
+    saved. Not written, the result keeps that reason -- the write's own only when
+    there is none -- and carries no draft identity: nothing of the round is in the
+    manifest.
     """
     written = _write_manifest(draft_dir, doc, known)
     if not written.replaced:
@@ -2586,7 +2596,9 @@ def record_round(
     For every exit of a round that ran -- its commands confirmed stopped -- where
     nothing recorded it yet: a workspace that could not be confirmed, a strip that
     failed, a save that failed before it wrote or whose write failed, one that
-    ended in an exception it caught. Only while the manifest is still
+    ended in an exception it caught, and the save a publish followed that did not
+    save, once the publish's result is known -- ``draft_round`` then the
+    publish's end, ``reason`` the save's. Only while the manifest is still
     the one ``begin_round`` returned (``expected``) and marked by this round's job
     (``_running_draft``); otherwise nothing is written, and ``running`` stays for
     the next round to record. Nor with a known-secret list that is not whole.
