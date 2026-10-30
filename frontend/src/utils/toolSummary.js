@@ -85,8 +85,28 @@ export function acceptSummaryForVersion(currentVid, detail) {
 // A revise may attach failing run records (web-v6 §8.1): `runIds`. The one-click
 // fix sends ONLY those and the expected version -- no words, no form -- so an
 // empty feedback is left out of the body rather than sent blank.
-export function buildReviseRequest({ name, currentVid, feedback, runIds }) {
-	const body = { expected_vid: currentVid };
+//
+// A round that continues the tool's draft names that draft: `continuation` is
+// toolDraft.draftContinuation's answer for the list's draft, or null for a revise
+// that starts over. Its id and generation go as `draft_id` / `draft_generation`,
+// and the version expected is the one the draft was made from (`base_vid`), not
+// the row's: the backend checks the round against the draft it continues. Words
+// and records are optional then too -- the round's own `feedback`, and records
+// attached to it.
+export function buildReviseRequest({
+	name,
+	currentVid,
+	feedback,
+	runIds,
+	continuation = null,
+}) {
+	const body = {
+		expected_vid: continuation === null ? currentVid : continuation.baseVid,
+	};
+	if (continuation !== null) {
+		body.draft_id = continuation.draftId;
+		body.draft_generation = continuation.generation;
+	}
 	if (feedback) {
 		body.feedback = feedback;
 	}
@@ -109,14 +129,57 @@ export function buildDiscardRequest({ name, currentVid }) {
 	};
 }
 
+// A round that continues a draft is refused when the draft it names is not the
+// tool's draft as the backend reads it now. Each refusal says what happened, in our
+// words, chosen by its code alone, and the list is read again
+// (versionWriteConflictReaction) so the row shows the draft as it is:
+// * draft_gone: the draft is not there any more, or another one took its place (a
+//   draft made again after a discard has a new id);
+// * draft_changed: the same draft was written to since the list was read (another
+//   round continued it, for one);
+// * draft_unusable: it cannot be seen, its manifest cannot be read, or its files
+//   directory is gone -- it can only be discarded, so the files come first;
+// * draft_publishing: a publish from it is going, went through, or did not say how
+//   it ended -- it cannot be continued.
+// The last two stay until dismissed: the next step is on the draft, not a retry.
+const DRAFT_REFUSALS = {
+	draft_gone: {
+		title: "接續未送出：草稿已不在",
+		message:
+			"要接續的草稿已經不在了，或已換成另一份。正在重新讀取清單，請看過目前的狀態再決定。",
+	},
+	draft_changed: {
+		title: "接續未送出：草稿已經變更",
+		message:
+			"草稿在你看到之後已經變更（例如在另一個分頁接續過）。正在重新讀取清單，請看過最新的草稿再決定要不要接續。",
+	},
+	draft_unusable: {
+		title: "接續未送出：草稿無法使用",
+		message:
+			"這份草稿目前無法使用：看不到它、說明檔讀不出來，或檔案目錄不在了。正在重新讀取清單；需要的檔案請先到草稿目錄取回，再放棄它。",
+		autoClose: false,
+	},
+	draft_publishing: {
+		title: "接續未送出：草稿正在發布或已發布",
+		message:
+			"這份草稿正在發布、已經發布，或不確定發布有沒有完成，所以不能接續。正在重新讀取清單，請照草稿提示的說明處理。",
+		autoClose: false,
+	},
+};
+
+// The codes a continued round's refusal can carry beyond the ones every revise
+// can: the four above.
+export const DRAFT_REFUSAL_CODES = Object.freeze(Object.keys(DRAFT_REFUSALS));
+
 // The revise submit's refusals whose MESSAGE is the instruction: `env_policy`
 // comes back before any job exists, and its text names the .env/config.env keys the
-// operator has to move; `draft_pending` comes back when the tool has a draft, and
-// its text says to fetch the files from the draft's path and discard the draft on
-// the tool's row. So each gets its own title and stays on screen until dismissed --
-// the next step is editing a file or discarding a draft, and a toast that closes
-// after a few seconds takes the key names, or the instruction, with it. Every other
-// error keeps the generic red notification (null here).
+// operator has to move; `draft_pending` comes back when a revise that starts over
+// meets a draft, and its text says what the draft allows (continue it or discard
+// it, or only discard it). So each gets its own title and stays on screen until
+// dismissed -- the next step is editing a file or acting on a draft, and a toast
+// that closes after a few seconds takes the key names, or the instruction, with it.
+// The four refusals of a continued round are worded above. Every other error keeps
+// the generic red notification (null here).
 //
 // The attached run records (web-v6 §8.3) are the other refusal made before any
 // job: a record purged meanwhile (404 -- whose ApiError message is the generic
@@ -130,6 +193,9 @@ export function reviseRefusalNotification(error) {
 			message: error.message,
 			autoClose: false,
 		};
+	}
+	if (error?.status === 409 && Object.hasOwn(DRAFT_REFUSALS, error?.code)) {
+		return { color: "orange", ...DRAFT_REFUSALS[error.code] };
 	}
 	if (error?.status === 404 && error?.code === "run_not_found") {
 		return {
@@ -163,9 +229,10 @@ export function versionWriteConflictReaction({ status, code } = {}) {
 		return "refresh";
 	}
 	// The tool has a draft the list on screen may not show (made by a job this page
-	// did not see end, or from another tab): the list is read again so the row
-	// shows what the refusal talks about.
-	if (code === "draft_pending") {
+	// did not see end, or from another tab), or the draft a continued round named is
+	// not the one the backend has: the list is read again so the row shows what the
+	// refusal talks about.
+	if (code === "draft_pending" || DRAFT_REFUSAL_CODES.includes(code)) {
 		return "refresh";
 	}
 	if (code === "job_busy" || code === "ai_job_in_progress") {

@@ -49,9 +49,13 @@ import {
 } from "../utils/toolDelete.js";
 import {
 	buildDraftDiscardRequest,
+	draftContinuation,
 	draftDiscardFailure,
 	draftDiscardNotification,
+	jobDraftView,
+	recordFixView,
 	reviseBlockedByDraft,
+	reviseStartedMessage,
 } from "../utils/toolDraft.js";
 import {
 	isHttpUrl,
@@ -63,6 +67,12 @@ import {
 	toolJobQueryEnabled,
 	toolJobRefetchInterval,
 } from "../utils/toolInstall.js";
+import {
+	listReadAfter,
+	markListReads,
+	readToolList,
+	rereadToolList,
+} from "../utils/toolList.js";
 import { lastRunHint, toolRunsQueryKey } from "../utils/toolRuns.js";
 import { toolRunStatsQueryKey } from "../utils/toolRunsPurge.js";
 import { toolSettingsQueryKey } from "../utils/toolSettings.js";
@@ -310,6 +320,9 @@ function HealthCheckProgress({
 // the job WAS ("安裝"/"修訂") -- the queued/running/failed shell is otherwise
 // identical, so this is one component (renamed from the original
 // install-only InstallProgress) rather than a second copy for revise.
+//
+// `draftFollowUp` is the page's word on the tool's current draft for this card
+// (see ReviseDraftResult), or null for a card that offers nothing about it.
 function ToolJobProgress({
 	kind,
 	jobId,
@@ -318,6 +331,7 @@ function ToolJobProgress({
 	onDiscardVersion = null,
 	fixBlocked = false,
 	blockedByDraft = null,
+	draftFollowUp = null,
 }) {
 	if (jobId === null) {
 		return null;
@@ -423,7 +437,11 @@ function ToolJobProgress({
 							blockedByDraft={blockedByDraft}
 						/>
 					) : null}
-					<ReviseDraftResult job={job} kind={jobKind} />
+					<ReviseDraftResult
+						job={job}
+						kind={jobKind}
+						followUp={draftFollowUp}
+					/>
 					<ReviseStopNotice job={job} kind={jobKind} />
 					<LogLink
 						llmLogId={job.llm_log_id}
@@ -447,7 +465,11 @@ function ToolJobProgress({
 					<Text size="xs" c="dimmed">
 						{view.note}
 					</Text>
-					<ReviseDraftResult job={job} kind={jobKind} />
+					<ReviseDraftResult
+						job={job}
+						kind={jobKind}
+						followUp={draftFollowUp}
+					/>
 					<ReviseStopNotice job={job} kind={jobKind} />
 					<LogLink
 						llmLogId={job.llm_log_id}
@@ -467,7 +489,7 @@ function ToolJobProgress({
 						AI 回報：{job.summary}
 					</Text>
 				) : null}
-				<ReviseDraftResult job={job} kind={jobKind} />
+				<ReviseDraftResult job={job} kind={jobKind} followUp={draftFollowUp} />
 				<ReviseStopNotice job={job} kind={jobKind} />
 				<LogLink
 					llmLogId={job.llm_log_id}
@@ -776,12 +798,15 @@ function ToolRow({
 	isSubmittingRevise,
 	reviseJobId,
 	reviseJobQuery,
+	reviseJobFollowUp,
 	onFix,
+	onFixRecord,
 	onCheck,
 	isSubmittingCheck,
 	onDiscardDraft,
 	draftBlocked,
 	isDiscardingDraft,
+	onContinueDraft,
 }) {
 	// Local, independent per row (unlike LlmLogsPage's single-open Accordion):
 	// there is no reason comparing two tools' summaries side by side should
@@ -797,11 +822,17 @@ function ToolRow({
 	const [runsExpanded, { toggle: toggleRuns }] = useDisclosure(false);
 	const lineageControls = toolLineageControls(tool, lineageUnavailable);
 	const runHint = lastRunHint(tool.last_run, tool.current_vid);
-	// The sentence saying this tool's draft keeps a revise from being sent, or
-	// null. Every control of the row that sends a revise follows it, and the fix
-	// handler of the page asks again when one is pressed. 跑一次範例, 重新產生,
-	// 丟掉這一版, 刪除 and 放棄 are not revises and do not.
+	// The sentence saying this tool's draft keeps a revise that starts over from
+	// being sent, or null. Every control of the row that sends one follows it (送出
+	// 修訂, and the fix of a check's failed examples), and the page's handlers ask
+	// again when one is pressed. 跑一次範例, 重新產生, 丟掉這一版, 刪除 and 放棄 are
+	// not revises and do not.
 	const blockedByDraft = reviseBlockedByDraft(tool.draft);
+	// What the fix of a run record is for this draft (the newest run's in the
+	// header, each record's under 最近執行): with a draft that can be continued, the
+	// round that continues it and attaches the record; otherwise the fix above,
+	// blocked by a draft in any other state.
+	const recordFix = recordFixView(tool.draft);
 	// Whether the header offers the one-click fix for the newest run: the backend's
 	// `fixable` (a failure of the version that is current), on a row whose current
 	// version can be revised.
@@ -853,17 +884,19 @@ function ToolRow({
 								</Text>
 								{/* The one-click fix (web-v6 §8.2) for the newest run, offered on
 								    the backend's `fixable` alone: a failure of the version that
-								    is current. Gated like 送出修訂, because it IS a revise. */}
+								    is current. Gated like 送出修訂, because it IS a revise --
+								    or, with a draft that can be continued, the round that
+								    continues it (recordFix). */}
 								{offersLastRunFix ? (
 									<Button
 										size="compact-xs"
 										variant="light"
 										color="red"
-										disabled={writesBlocked || blockedByDraft !== null}
+										disabled={writesBlocked || recordFix.blockedReason !== null}
 										loading={isSubmittingRevise}
-										onClick={() => onFix([tool.last_run.id])}
+										onClick={() => onFixRecord([tool.last_run.id])}
 									>
-										請 AI 修正
+										{recordFix.label}
 									</Button>
 								) : null}
 							</Group>
@@ -930,7 +963,7 @@ function ToolRow({
 				    and a sentence this long there squeezes the switch's label onto
 				    two lines. */}
 				{offersLastRunFix ? (
-					<ReviseBlockedNote reason={blockedByDraft} />
+					<ReviseBlockedNote reason={recordFix.blockedReason} />
 				) : null}
 
 				{/* The job card lives on the row, whatever started the job (the AI
@@ -948,6 +981,7 @@ function ToolRow({
 						onFixRuns={lineageControls.showVersionControls ? onFix : null}
 						fixBlocked={writesBlocked}
 						blockedByDraft={blockedByDraft}
+						draftFollowUp={reviseJobFollowUp}
 					/>
 				) : null}
 
@@ -955,7 +989,9 @@ function ToolRow({
 				    package still resolves a current version: it is files on disk the
 				    operator may need to fetch, so it is shown for every package that
 				    has one. 放棄 shares the page's slot gate (`draftBlocked`) with
-				    the other writes that take the backend's one slot. */}
+				    the other writes that take the backend's one slot; a round that
+				    continues the draft is a version write and answers to
+				    `writesBlocked`, like 送出修訂. */}
 				{tool.draft ? (
 					<DraftNotice
 						toolName={tool.name}
@@ -964,6 +1000,9 @@ function ToolRow({
 						blocked={draftBlocked}
 						discarding={isDiscardingDraft}
 						onDiscard={onDiscardDraft}
+						continueBlocked={writesBlocked}
+						continuing={isSubmittingRevise}
+						onContinue={onContinueDraft}
 					/>
 				) : null}
 
@@ -1065,9 +1104,9 @@ function ToolRow({
 						<ToolRunsSection
 							name={tool.name}
 							expanded={runsExpanded}
-							onFix={lineageControls.showVersionControls ? onFix : null}
+							onFix={lineageControls.showVersionControls ? onFixRecord : null}
 							fixBlocked={writesBlocked}
-							blockedByDraft={blockedByDraft}
+							recordFix={recordFix}
 							isSubmittingFix={isSubmittingRevise}
 							onCheck={lineageControls.showVersionControls ? onCheck : null}
 							isSubmittingCheck={isSubmittingCheck}
@@ -1102,9 +1141,11 @@ function InstalledToolsPanel({
 	// reason: the backend's single-flight (D40) admits only ONE install/revise
 	// job at a time across every tool, so there is never more than one to track.
 	const [activeJob, setActiveJob] = useState(null); // { name, jobAttributionKey, jobId } | null
+	// Every list read carries the number it started with (toolList.readToolList), so
+	// a revise card can tell whether the list on screen was read after its job ended.
 	const { data, error, isError, isFetching, refetch } = useQuery({
 		queryKey: ["tools"],
-		queryFn: () => apiGet("/api/tools"),
+		queryFn: () => readToolList(apiGet),
 	});
 
 	const toggleMutation = useMutation({
@@ -1244,12 +1285,14 @@ function InstalledToolsPanel({
 	// disable the other rows against the backend's global tool-job slot.
 
 	// Re-read both the detail and list after a revise job settles. The detail uses
-	// a name prefix because the revision creates a new current_vid.
+	// a name prefix because the revision creates a new current_vid. The list read is
+	// a NEW one (rereadToolList), not one already in flight: a card's word on the
+	// tool's current draft waits for a list read that started after the job ended.
 	const revalidateSummaryAndList = useCallback(
 		(name) =>
 			Promise.all([
 				queryClient.invalidateQueries({ queryKey: toolSummaryKeyPrefix(name) }),
-				queryClient.invalidateQueries({ queryKey: ["tools"] }),
+				rereadToolList(queryClient),
 				// A published revision moves current_vid, which every record's
 				// vid_state and fixable were judged against -- and a revise's
 				// verification or a health check has just written records.
@@ -1344,16 +1387,26 @@ function InstalledToolsPanel({
 		},
 	});
 
-	// Called from two places: submitRevise (the summary form) and fixTool. Each turns
-	// a tool that has a draft away before it gets here (reviseBlockedByDraft); a new
-	// caller has to do the same, since the backend refuses the request otherwise.
+	// Called from submitRevise (the summary form) and from sendRevise (fixTool,
+	// fixRecord, continueDraft). A revise that starts over is turned away for a tool
+	// that has a draft before it gets here (reviseBlockedByDraft); a round that
+	// continues the draft carries the draft's identity from the list
+	// (`continuation`, toolDraft.draftContinuation). A new caller has to do one or
+	// the other, since the backend refuses the request otherwise.
 	const reviseMutation = useMutation({
-		mutationFn: ({ name, currentVid, feedback, runIds }) => {
+		mutationFn: ({
+			name,
+			currentVid,
+			feedback,
+			runIds,
+			continuation = null,
+		}) => {
 			const request = buildReviseRequest({
 				name,
 				currentVid,
 				feedback,
 				runIds,
+				continuation,
 			});
 			return apiPost(request.path, request.body);
 		},
@@ -1365,9 +1418,9 @@ function InstalledToolsPanel({
 		onError: (mutationError, variables) => {
 			// env_policy (web-v6 §5.2) is refused before any job exists and its text
 			// names the keys to move: not a version conflict, nothing to refetch. A
-			// draft_pending refusal is shown the same way, and its reaction (read the
-			// list again, so the row shows the draft the message talks about) is
-			// taken too.
+			// draft_pending refusal, and a continued round's draft refusals, are shown
+			// the same way, and their reaction (read the list again, so the row shows
+			// the draft the message talks about) is taken too.
 			const refusal = reviseRefusalNotification(mutationError);
 			if (refusal !== null) {
 				notifications.show(refusal);
@@ -1460,11 +1513,18 @@ function InstalledToolsPanel({
 	const [settledJobId, setSettledJobId] = useState(null);
 	const settlingJobEnd =
 		activeJob !== null && jobEnded && settledJobId !== activeJob.jobId;
+	// Where in the order of list reads the page saw the job end (toolList's mark),
+	// taken before the re-read below starts. Settling is no proof the list is new
+	// -- `finally` runs after a failed re-read too, and a read that started before
+	// the end can be the one that lands -- so a card's word on the tool's current
+	// draft compares the list's own read number with this mark (listReadAfter).
+	const [activeEndMark, setActiveEndMark] = useState(null); // { jobId, mark } | null
 	useEffect(() => {
 		if (!(activeJob && jobEnded) || settledJobId === activeJob.jobId) {
 			return;
 		}
 		const endedJobId = activeJob.jobId;
+		setActiveEndMark({ jobId: endedJobId, mark: markListReads() });
 		// Prefix filter (partial match), so it reaches this tool's entry whatever
 		// current_vid it is keyed under -- which matters precisely here because a
 		// successful revise publishes a new version.
@@ -1554,15 +1614,18 @@ function InstalledToolsPanel({
 	const [settledLinkedJobId, setSettledLinkedJobId] = useState(null);
 	const settlingLinkedJobEnd =
 		linkedJobEnded && settledLinkedJobId !== followedJobId;
+	// The linked job's end, marked like activeEndMark above.
+	const [linkedEndMark, setLinkedEndMark] = useState(null); // { jobId, mark } | null
 	useEffect(() => {
 		if (!linkedJobEnded || settledLinkedJobId === followedJobId) {
 			return;
 		}
 		const endedJobId = followedJobId;
+		setLinkedEndMark({ jobId: endedJobId, mark: markListReads() });
 		const name = linkedJob?.tool_name;
 		(name
 			? revalidateSummaryAndList(name)
-			: queryClient.invalidateQueries({ queryKey: ["tools"] })
+			: rereadToolList(queryClient)
 		).finally(() => setSettledLinkedJobId(endedJobId));
 	}, [
 		linkedJobEnded,
@@ -1681,18 +1744,11 @@ function InstalledToolsPanel({
 				toolIdentityConsumers(tool.name, tool.current_vid).jobAttributionKey ===
 				activeJobKey,
 		);
-	// The one-click fix (web-v6 §8): a revise that attaches failing run records
-	// -- the same mutation, single-flight gate and job card as 送出修訂, with the
-	// gate re-checked here like the other AI writes. `feedback` is set only by
-	// 加上說明….
-	//
-	// The backend refuses a revise of a tool that has a draft. The controls that
-	// call this are off for such a tool, and it asks again here -- on the row it
-	// was given, the list as of this render -- because a rendering is not a gate.
-	const fixTool = (tool, runIds, feedback = "") => {
-		if (versionWritesBlocked || reviseBlockedByDraft(tool.draft) !== null) {
-			return;
-		}
+	// The revise the handlers below send for a row: the same mutation, single-flight
+	// gate and job card as 送出修訂. `continuation` names the draft a round
+	// continues (from the list, toolDraft.draftContinuation), or is null for a
+	// revise that starts over.
+	const sendRevise = (tool, { runIds = [], feedback = "", continuation }) => {
 		reviseMutation.mutate(
 			{
 				name: tool.name,
@@ -1701,16 +1757,83 @@ function InstalledToolsPanel({
 					.jobAttributionKey,
 				feedback,
 				runIds,
+				continuation,
 			},
 			{
 				onSuccess: () =>
 					notifications.show({
 						color: "blue",
-						message: `已請 AI 修正「${tool.name}」，進度顯示在這個工具下方`,
+						message: reviseStartedMessage(tool.name, { continuation, runIds }),
 					}),
 			},
 		);
 	};
+	// The one-click fix of a check's failed examples: a revise that starts over and
+	// attaches failing run records, with the gate re-checked here like the other AI
+	// writes.
+	//
+	// The backend refuses such a revise of a tool that has a draft. The controls
+	// that call this are off for such a tool, and it asks again here -- on the row
+	// it was given, the list as of this render -- because a rendering is not a gate.
+	const fixTool = (tool, runIds, feedback = "") => {
+		if (versionWritesBlocked || reviseBlockedByDraft(tool.draft) !== null) {
+			return;
+		}
+		sendRevise(tool, { runIds, feedback, continuation: null });
+	};
+	// The fix of a run record (the row's newest failure, a record under 最近執行;
+	// `feedback` is set only by 加上說明…): what recordFixView says it is for the
+	// row's draft -- the round that continues a draft that can be continued, with
+	// the record attached; the fix above when there is no draft; nothing while a
+	// draft in any other state is there. Asked again here, like fixTool.
+	const fixRecord = (tool, runIds, feedback = "") => {
+		const fix = recordFixView(tool.draft);
+		if (versionWritesBlocked || fix.blockedReason !== null) {
+			return;
+		}
+		sendRevise(tool, { runIds, feedback, continuation: fix.continuation });
+	};
+	// 接續修正 / 加上說明後接續… for the row's draft, named as the list gives it
+	// (draft_id, generation, base_vid). Nothing is sent unless the draft can be
+	// continued, and not while the write gate holds.
+	const continueDraft = (tool, feedback = "") => {
+		const continuation = draftContinuation(tool.draft);
+		if (versionWritesBlocked || continuation === null) {
+			return;
+		}
+		sendRevise(tool, { feedback, continuation });
+	};
+	// What a revise card may say about the tool's current draft and offer for it
+	// (jobDraftView's second layer, drawn by ReviseDraftResult): `tool` is the card's
+	// row -- null for a card no row owns, which then offers nothing -- and `endMark`
+	// is where the page saw the job end in the order of list reads, so the list on
+	// screen counts only when its read started after it (and so succeeded, since a
+	// failed read leaves no list). The round goes through continueDraft, after the
+	// card's own conditions are asked again.
+	const cardDraftFollowUp = (cardJob, tool, endMark) => {
+		const context = {
+			hasRow: tool != null,
+			listDraft: tool?.draft ?? null,
+			listFresh: listReadAfter(data, endMark),
+		};
+		return {
+			context,
+			blocked: versionWritesBlocked,
+			submitting:
+				tool != null &&
+				reviseMutation.isPending &&
+				reviseMutation.variables?.name === tool.name,
+			onContinue: (feedback) => {
+				const offered = jobDraftView(cardJob, "revise", context)?.buttons ?? [];
+				if (tool == null || offered.length === 0) {
+					return;
+				}
+				continueDraft(tool, feedback);
+			},
+		};
+	};
+	const endMarkOf = (endMark, jobId) =>
+		endMark !== null && endMark.jobId === jobId ? endMark.mark : null;
 	const checkTool = (tool) => {
 		if (versionWritesBlocked) {
 			return;
@@ -1811,6 +1934,14 @@ function InstalledToolsPanel({
 						{...versionActions(
 							linkedJob?.tool_name,
 							linkedJob?.verification?.vid,
+						)}
+						// Its row is the tool it names; whether the row's draft is the
+						// one the round left is jobDraftView's check of draft_id and
+						// generation, which a same-name reinstall cannot pass.
+						draftFollowUp={cardDraftFollowUp(
+							linkedJob,
+							tools.find((tool) => tool.name === linkedJob?.tool_name) ?? null,
+							endMarkOf(linkedEndMark, followedJobId),
 						)}
 					/>
 				</Stack>
@@ -1969,7 +2100,20 @@ function InstalledToolsPanel({
 						// rendered exactly once, never twice and never nowhere.
 						reviseJobId={rowKey === activeJobKey ? activeJob.jobId : null}
 						reviseJobQuery={jobQuery}
+						reviseJobFollowUp={
+							rowKey === activeJobKey
+								? cardDraftFollowUp(
+										job,
+										tool,
+										endMarkOf(activeEndMark, activeJob.jobId),
+									)
+								: null
+						}
 						onFix={(runIds, feedback = "") => fixTool(tool, runIds, feedback)}
+						onFixRecord={(runIds, feedback = "") =>
+							fixRecord(tool, runIds, feedback)
+						}
+						onContinueDraft={(feedback = "") => continueDraft(tool, feedback)}
 						onCheck={() => checkTool(tool)}
 						isSubmittingCheck={
 							checkMutation.isPending &&

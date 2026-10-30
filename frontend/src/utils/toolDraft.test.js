@@ -1,16 +1,28 @@
-import { describe, expect, it } from "vitest";
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
+import { describe, expect, it, vi } from "vitest";
 import {
 	buildDraftDiscardRequest,
+	continuationNote,
+	DRAFT_SUPERSEDED,
+	draftContinuation,
 	draftDiscardConfirmation,
 	draftDiscardFailure,
 	draftDiscardNotification,
 	draftView,
 	jobDraftView,
 	KNOWN_DRAFT_STATES,
+	recordFixView,
 	reviseBlockedByDraft,
+	reviseStartedMessage,
 } from "./toolDraft.js";
 import { fixRefusalMessage } from "./toolFailures.js";
 import { KNOWN_FAILURES, toolJobStopReason } from "./toolJobStop.js";
+import {
+	listReadAfter,
+	markListReads,
+	readToolList,
+	rereadToolList,
+} from "./toolList.js";
 
 // A copy of ToolDraft.state in backend/afterthread/schemas.py, kept by hand: the
 // vocabulary test below holds the toolbar's wording to this list, so it is this
@@ -26,10 +38,14 @@ const BACKEND_DRAFT_STATES = [
 ];
 
 const DRAFT_ID = "0123456789abcdef0123456789abcdef";
+const OTHER_DRAFT_ID = "fedcba9876543210fedcba9876543210";
 const TOKEN = "f".repeat(64);
 const BASE_VID = "20260728T010203Z-abcdef";
 const FILES_PATH = "/srv/tools/kb/.afterthread.meta/draft/files-0a1b2c";
 const DRAFT_DIR = "/srv/tools/kb/.afterthread.meta/draft";
+const KEPT_A = "/srv/tools/kb/.afterthread.meta/draft/files-99aa00";
+const KEPT_B = "/srv/tools/kb/.afterthread.meta/draft/files-77bb11";
+const RETAINED = "/srv/tools/.staging/0123456789abcdef/build";
 
 const lastRound = (fields) => ({
 	stopped_by: null,
@@ -51,6 +67,8 @@ const draft = (fields) => ({
 	interrupted: false,
 	base_vid: BASE_VID,
 	path: FILES_PATH,
+	draft_dir: DRAFT_DIR,
+	kept: [],
 	discard_token: TOKEN,
 	last: lastRound({}),
 	...fields,
@@ -98,7 +116,7 @@ describe("the draft state vocabulary", () => {
 
 describe("draftView buttons", () => {
 	const OFFERED = {
-		open: ["discard"],
+		open: ["continue", "continue_with_note", "discard"],
 		stale: ["discard"],
 		unusable: ["discard"],
 		published: ["discard"],
@@ -107,10 +125,18 @@ describe("draftView buttons", () => {
 		publishing: [],
 	};
 
-	it.each(
-		BACKEND_DRAFT_STATES,
-	)("offers only what %s allows: 放棄 or nothing", (state) => {
+	it.each(BACKEND_DRAFT_STATES)("offers exactly what %s allows", (state) => {
 		expect(draftView(draft({ state })).buttons).toEqual(OFFERED[state]);
+	});
+
+	it("offers the continue buttons for an open draft and for no other state", () => {
+		for (const state of BACKEND_DRAFT_STATES) {
+			const { buttons } = draftView(draft({ state }));
+			expect(buttons.includes("continue"), state).toBe(state === "open");
+			expect(buttons.includes("continue_with_note"), state).toBe(
+				state === "open",
+			);
+		}
 	});
 
 	it("offers 放棄 and nothing else for the states that can only be discarded", () => {
@@ -124,15 +150,82 @@ describe("draftView buttons", () => {
 		expect(draftView(draft({ state: "publishing" })).buttons).toEqual([]);
 	});
 
+	it("does not offer to continue an open draft that does not name itself", () => {
+		expect(draftView(draft({ draft_id: null })).buttons).toEqual(["discard"]);
+		expect(draftView(draft({ base_vid: null })).buttons).toEqual(["discard"]);
+	});
+
 	it("is null for a tool without a draft", () => {
 		expect(draftView(null)).toBeNull();
 		expect(draftView(undefined)).toBeNull();
 	});
 });
 
-// The backend refuses a revise of a tool that has a draft, whatever the draft's
-// state (409 draft_pending). This says so before the click, and every control that
-// would send a revise draws its answer.
+describe("draftView consequence", () => {
+	it("says an open draft is where the tool's fixes go on from", () => {
+		const { consequence } = draftView(draft({ state: "open" }));
+		expect(consequence).toContain("接著做");
+		expect(consequence).toContain("放棄");
+	});
+
+	it("says any other draft is in the way until it is discarded", () => {
+		for (const state of ["stale", "unusable", "published", "unknown"]) {
+			const { consequence } = draftView(draft({ state }));
+			expect(consequence, state).toBe(
+				"放棄這份草稿之前，這個工具不能送出新的修正。",
+			);
+		}
+		expect(draftView(draft({ state: "running" })).consequence).toBeNull();
+	});
+});
+
+describe("draftContinuation", () => {
+	it("names an open draft the way a round's request names it", () => {
+		expect(draftContinuation(draft({}))).toEqual({
+			draftId: DRAFT_ID,
+			generation: 3,
+			baseVid: BASE_VID,
+		});
+	});
+
+	it("is null for a draft in any other state", () => {
+		for (const state of BACKEND_DRAFT_STATES.filter((s) => s !== "open")) {
+			expect(draftContinuation(draft({ state })), state).toBeNull();
+		}
+		expect(draftContinuation(draft({ state: "something_new" }))).toBeNull();
+		expect(draftContinuation(null)).toBeNull();
+	});
+
+	it("is null for an open draft missing its id, generation or base version", () => {
+		expect(draftContinuation(draft({ draft_id: null }))).toBeNull();
+		expect(draftContinuation(draft({ generation: null }))).toBeNull();
+		expect(draftContinuation(draft({ generation: 0 }))).toBeNull();
+		expect(draftContinuation(draft({ base_vid: " " }))).toBeNull();
+	});
+});
+
+describe("continuationNote", () => {
+	it("sends the trimmed words, and nothing when there are none", () => {
+		expect(continuationNote("  先試第二頁  ")).toEqual({
+			feedback: "先試第二頁",
+			error: null,
+		});
+		expect(continuationNote("")).toEqual({ feedback: "", error: null });
+		expect(continuationNote(undefined)).toEqual({ feedback: "", error: null });
+	});
+
+	it("bounds the words by code point, like every other AI input", () => {
+		// 20,000 characters outside the BMP are 40,000 UTF-16 units: still allowed.
+		expect(continuationNote("😀".repeat(20_000)).error).toBeNull();
+		const tooLong = continuationNote("字".repeat(20_001));
+		expect(tooLong.error).toContain("20000");
+		expect(tooLong.feedback).toBeNull();
+	});
+});
+
+// The backend refuses a revise that starts over for a tool that has a draft,
+// whatever the draft's state (409 draft_pending). This says so before the click,
+// and every control that would send one draws its answer.
 describe("reviseBlockedByDraft", () => {
 	it("lets a tool without a draft send a revise", () => {
 		expect(reviseBlockedByDraft(null)).toBeNull();
@@ -158,14 +251,24 @@ describe("reviseBlockedByDraft", () => {
 		expect(reviseBlockedByDraft(filesGone())).not.toBeNull();
 	});
 
+	it("points an open draft at 接續修正, and no other draft", () => {
+		expect(reviseBlockedByDraft(draft({ state: "open" }))).toContain(
+			"「接續修正」",
+		);
+		for (const state of KNOWN_DRAFT_STATES.filter((s) => s !== "open")) {
+			expect(reviseBlockedByDraft(draft({ state })), state).not.toContain(
+				"接續",
+			);
+		}
+	});
+
 	it("says what to do now, and names no button the page does not have yet", () => {
-		const reason = reviseBlockedByDraft(draft({}));
-		expect(reason).toContain("路徑");
-		expect(reason).toContain("放棄");
-		// Continuing a draft and publishing one are not on the page; 加上說明… is, on
-		// a record, and is a different button.
-		for (const missing of ["接續", "發布草稿"]) {
-			expect(reason, missing).not.toContain(missing);
+		for (const state of KNOWN_DRAFT_STATES) {
+			const reason = reviseBlockedByDraft(draft({ state }));
+			expect(reason, state).toContain("路徑");
+			expect(reason, state).toContain("放棄");
+			// Publishing a draft is not on the page.
+			expect(reason, state).not.toContain("發布草稿");
 		}
 	});
 
@@ -174,11 +277,61 @@ describe("reviseBlockedByDraft", () => {
 			{ status: 409, code: "draft_pending" },
 			"kb",
 		);
-		const reason = reviseBlockedByDraft(draft({}));
-		for (const phrase of ["未完成的修正（草稿）", "取回", "放棄"]) {
-			expect(refusal, phrase).toContain(phrase);
-			expect(reason, phrase).toContain(phrase);
+		for (const state of ["open", "stale"]) {
+			const reason = reviseBlockedByDraft(draft({ state }));
+			for (const phrase of ["未完成的修正（草稿）", "取回", "放棄"]) {
+				expect(refusal, phrase).toContain(phrase);
+				expect(reason, `${state} ${phrase}`).toContain(phrase);
+			}
 		}
+		expect(refusal).toContain("「接續修正」");
+	});
+});
+
+describe("recordFixView", () => {
+	it("is the fix that starts a revise for a tool without a draft", () => {
+		expect(recordFixView(null)).toMatchObject({
+			label: "請 AI 修正",
+			noteSubmit: "送出修正",
+			continuation: null,
+			blockedReason: null,
+		});
+	});
+
+	it("continues an open draft and attaches the record", () => {
+		const fix = recordFixView(draft({}));
+		expect(fix.label).toBe("接續修正（附上這筆）");
+		expect(fix.continuation).toEqual(draftContinuation(draft({})));
+		expect(fix.blockedReason).toBeNull();
+		expect(fix.noteTitle).toContain("接續");
+		expect(fix.noteSubmit).toBe("接續修正");
+	});
+
+	it("keeps the plain fix, off and with the reason, for a draft in any other state", () => {
+		for (const state of KNOWN_DRAFT_STATES.filter((s) => s !== "open")) {
+			const fix = recordFixView(draft({ state }));
+			expect(fix.label, state).toBe("請 AI 修正");
+			expect(fix.continuation, state).toBeNull();
+			expect(fix.blockedReason, state).toBe(
+				reviseBlockedByDraft(draft({ state })),
+			);
+		}
+		expect(recordFixView(unreadable()).blockedReason).not.toBeNull();
+	});
+});
+
+describe("reviseStartedMessage", () => {
+	it("says which revise was accepted", () => {
+		expect(
+			reviseStartedMessage("kb", { continuation: null, runIds: [7] }),
+		).toBe("已請 AI 修正「kb」，進度顯示在這個工具下方");
+		const continuation = draftContinuation(draft({}));
+		expect(reviseStartedMessage("kb", { continuation, runIds: [] })).toBe(
+			"已接續「kb」的草稿，進度顯示在這個工具下方",
+		);
+		expect(reviseStartedMessage("kb", { continuation, runIds: [7] })).toBe(
+			"已接續「kb」的草稿並附上紀錄，進度顯示在這個工具下方",
+		);
 	});
 });
 
@@ -215,6 +368,13 @@ describe("draftView text", () => {
 		expect(view.note).toContain(BASE_VID);
 	});
 
+	it("does not say which round an open draft's files are from", () => {
+		const { note } = draftView(draft({ state: "open", attempts: 4 }));
+		expect(note).toContain("接續修正");
+		expect(note).not.toMatch(/第 ?\d+ ?輪/);
+		expect(note).not.toContain("上一輪");
+	});
+
 	it("points an unusable draft's path at the draft directory", () => {
 		const view = draftView(unreadable());
 		expect(view.path).toBe(DRAFT_DIR);
@@ -222,17 +382,13 @@ describe("draftView text", () => {
 		expect(draftView(draft({})).pathLabel).toBe("草稿檔案");
 	});
 
-	it("says what an interrupted round left, with the round it ended on", () => {
-		expect(
-			draftView(draft({ interrupted: true, attempts: 4 })).interruption,
-		).toBe("上一輪被中斷，草稿是第 4 輪結束時的狀態");
+	it("says an interrupted round's work is not in the draft, and not which round the files are from", () => {
+		for (const attempts of [4, null]) {
+			expect(
+				draftView(draft({ interrupted: true, attempts })).interruption,
+			).toBe("上一輪沒有正常結束，它的進度沒有存進草稿");
+		}
 		expect(draftView(draft({ interrupted: false })).interruption).toBeNull();
-	});
-
-	it("still says a round was interrupted when the round count is not known", () => {
-		expect(
-			draftView(draft({ interrupted: true, attempts: null })).interruption,
-		).toBe("上一輪被中斷");
 	});
 
 	it("counts rounds and says when the last one ended", () => {
@@ -246,6 +402,26 @@ describe("draftView text", () => {
 		expect(draftView(unreadable()).rounds).toBeNull();
 		const view = draftView(draft({ attempts: 1, last: null }));
 		expect(view.rounds).toBe("已經過 1 輪");
+	});
+
+	it("shows a last round recorded as not ended normally, with no end time", () => {
+		const formatted = [];
+		const view = draftView(
+			draft({
+				attempts: 3,
+				last: lastRound({ outcome: "interrupted", finished_at: null }),
+			}),
+			{
+				formatTime: (value) => {
+					formatted.push(value);
+					return `<${value}>`;
+				},
+			},
+		);
+		expect(view.lastOutcome).toBe("沒有正常結束（沒有留下結束紀錄）");
+		expect(view.rounds).toBe("已經過 3 輪");
+		expect(view.stopReason).toBeNull();
+		expect(formatted).toEqual([]);
 	});
 
 	it("states the last round's outcome in the revise card's own words", () => {
@@ -294,6 +470,41 @@ describe("draftView text", () => {
 		);
 		expect(view.operatorAction).toBe("貼上 KEY=value");
 		expect(view.buttons).toEqual(["discard"]);
+	});
+});
+
+describe("draftView paths", () => {
+	it("lists the whole draft directory beside the files the draft names", () => {
+		const view = draftView(draft({}));
+		expect(view.path).toBe(FILES_PATH);
+		expect(view.draftDir).toBe(DRAFT_DIR);
+	});
+
+	it("does not list the draft directory twice when it is the path", () => {
+		const view = draftView(unreadable());
+		expect(view.path).toBe(DRAFT_DIR);
+		expect(view.draftDir).toBeNull();
+	});
+
+	it("lists each kept directory and says what they are", () => {
+		const view = draftView(draft({ kept: [KEPT_A, KEPT_B] }));
+		expect(view.kept).toEqual([KEPT_A, KEPT_B]);
+		expect(view.keptNote).toContain("舊檔案目錄");
+		expect(view.keptNote).toContain("取回");
+	});
+
+	it("lists no kept directory when there is none, and drops blank ones", () => {
+		expect(draftView(draft({ kept: [] })).kept).toEqual([]);
+		expect(draftView(draft({ kept: [] })).keptNote).toBeNull();
+		expect(draftView(draft({ kept: undefined })).kept).toEqual([]);
+		expect(draftView(draft({ kept: [" ", KEPT_A] })).kept).toEqual([KEPT_A]);
+	});
+
+	it("says the draft directory may hold directories nobody listed", () => {
+		for (const view of [draftView(draft({})), draftView(unreadable())]) {
+			expect(view.unlisted).toContain("沒列出的目錄");
+			expect(view.unlisted).toContain("整個草稿目錄");
+		}
 	});
 });
 
@@ -493,43 +704,68 @@ describe("draftDiscardNotification", () => {
 });
 
 describe("draftDiscardConfirmation", () => {
-	it("names the tool and says the files are deleted for good", () => {
-		const text = draftDiscardConfirmation("kb");
+	it("says the whole draft directory goes, kept directories and all, and to fetch first", () => {
+		const text = draftDiscardConfirmation(
+			"kb",
+			draft({ kept: [KEPT_A], draft_dir: DRAFT_DIR }),
+		);
 		expect(text).toContain("「kb」");
+		expect(text).toContain(`整個草稿目錄（${DRAFT_DIR}）都會刪掉`);
+		expect(text).toContain("包括保留下來的舊目錄與其他內容");
 		expect(text).toContain("無法復原");
-		expect(text).toContain("草稿路徑");
+		expect(text).toContain("需要的請先取回");
+	});
+
+	it("still says the whole directory goes when the draft names none", () => {
+		const text = draftDiscardConfirmation("kb", draft({ draft_dir: null }));
+		expect(text).toContain("整個草稿目錄都會刪掉");
+		expect(text).not.toContain("null");
+		expect(draftDiscardConfirmation("kb")).toContain("整個草稿目錄都會刪掉");
 	});
 
 	it("says a busy slot or a changed draft deletes nothing", () => {
-		const text = draftDiscardConfirmation("kb");
+		const text = draftDiscardConfirmation("kb", draft({}));
 		expect(text).toContain("其他工具任務");
 		expect(text).toContain("已經變動");
 	});
 });
 
-describe("jobDraftView", () => {
-	const jobDraft = (fields) => ({
-		saved: true,
-		draft_id: DRAFT_ID,
-		generation: 1,
-		attempts: 1,
-		reason: null,
-		retained_path: null,
-		...fields,
-	});
-	const job = (fields) => ({
-		kind: "revise",
-		state: "failed",
-		outcome: "not_published",
-		draft: jobDraft({}),
-		...fields,
-	});
+// A revise job's `draft` (backend ToolJobDraft) and the job around it.
+const jobDraft = (fields) => ({
+	saved: true,
+	draft_id: DRAFT_ID,
+	generation: 4,
+	attempts: 3,
+	reason: null,
+	retained_path: null,
+	...fields,
+});
+const job = (fields) => ({
+	kind: "revise",
+	state: "failed",
+	outcome: "not_published",
+	draft: jobDraft({}),
+	...fields,
+});
+// The list's draft that this card's round left: same id, same generation.
+const leftByRound = (fields) =>
+	draft({ generation: 4, attempts: 3, ...fields });
+// The card's word on the list: its row's draft, read after the job ended.
+const onTheList = (fields) => ({
+	hasRow: true,
+	listFresh: true,
+	listDraft: leftByRound({}),
+	...fields,
+});
 
+describe("jobDraftView: the round's own result", () => {
 	it("says the progress was kept, with the round it is", () => {
-		expect(jobDraftView(job({ draft: jobDraft({ attempts: 3 }) }))).toEqual({
+		expect(jobDraftView(job({}))).toMatchObject({
 			tone: "saved",
 			text: "進度已保存（第 3 輪）",
 			path: null,
+			note: null,
+			retained: null,
 		});
 	});
 
@@ -537,6 +773,13 @@ describe("jobDraftView", () => {
 		expect(
 			jobDraftView(job({ draft: jobDraft({ attempts: null }) })).text,
 		).toBe("進度已保存");
+	});
+
+	it("adds the backend's note to a kept round", () => {
+		const reason = `保留了上一份檔案目錄（${KEPT_A}）：那一輪進行中它被改過。`;
+		const view = jobDraftView(job({ draft: jobDraft({ reason }) }));
+		expect(view.text).toBe("進度已保存（第 3 輪）");
+		expect(view.note).toBe(reason);
 	});
 
 	it("says why the progress was not kept", () => {
@@ -552,10 +795,11 @@ describe("jobDraftView", () => {
 					}),
 				}),
 			),
-		).toEqual({
+		).toMatchObject({
 			tone: "not_saved",
 			text: "未能保存（無法取得工具目錄的鎖）",
 			path: null,
+			retained: null,
 		});
 	});
 
@@ -566,8 +810,7 @@ describe("jobDraftView", () => {
 		expect(view.text).toBe("未能保存");
 	});
 
-	it("says where the work is when neither a draft nor a version holds it", () => {
-		const retained = "/srv/tools/.staging/0123456789abcdef/build";
+	it("says where the work is when the draft does not hold it", () => {
 		const view = jobDraftView(
 			job({
 				state: "failed",
@@ -578,14 +821,14 @@ describe("jobDraftView", () => {
 					generation: null,
 					attempts: null,
 					reason: "無法取得工具目錄的鎖",
-					retained_path: retained,
+					retained_path: RETAINED,
 				}),
 			}),
 		);
 		expect(view.tone).toBe("retained");
-		expect(view.path).toBe(retained);
+		expect(view.path).toBe(RETAINED);
 		expect(view.text).toBe(
-			`成果留在 ${retained}，未能存成草稿（無法取得工具目錄的鎖）`,
+			`成果留在 ${RETAINED}，未能存成草稿（無法取得工具目錄的鎖）`,
 		);
 	});
 
@@ -608,9 +851,70 @@ describe("jobDraftView", () => {
 			}),
 		);
 		expect(view.tone).toBe("not_saved");
+		expect(view.retained).toBeNull();
 	});
 
-	it("shows only what could not be taken away for a published revise", () => {
+	it("says a kept round's work was also left elsewhere, never that it was not saved", () => {
+		const view = jobDraftView(
+			job({ draft: jobDraft({ saved: true, retained_path: RETAINED }) }),
+		);
+		expect(view.tone).toBe("saved");
+		expect(view.text).toBe("進度已保存（第 3 輪）");
+		expect(view.retained).toEqual({
+			text: `沒能確認草稿已經安全寫入磁碟，所以這一輪的成果另外留了一份在 ${RETAINED}`,
+			path: RETAINED,
+		});
+		expect(JSON.stringify(view)).not.toContain("未能存成草稿");
+		expect(JSON.stringify(view)).not.toContain("未能保存");
+	});
+
+	it("words the three ways a round's work ends up apart", () => {
+		const savedAndLeft = jobDraftView(
+			job({
+				draft: jobDraft({
+					saved: true,
+					retained_path: RETAINED,
+					reason: "保留了上一份檔案目錄",
+				}),
+			}),
+		);
+		const notSavedAndLeft = jobDraftView(
+			job({
+				draft: jobDraft({
+					saved: false,
+					retained_path: RETAINED,
+					reason: "說明檔寫入失敗",
+				}),
+			}),
+		);
+		const published = jobDraftView(
+			job({
+				state: "succeeded",
+				outcome: "published",
+				draft: jobDraft({
+					saved: false,
+					reason: "已發布；這一輪沒存進草稿，請取回草稿裡需要的內容再放棄。",
+				}),
+			}),
+		);
+		const say = (view) =>
+			[view.text, view.note, view.retained?.text].filter(Boolean).join("|");
+		expect(say(savedAndLeft)).toBe(
+			`進度已保存（第 3 輪）|保留了上一份檔案目錄|沒能確認草稿已經安全寫入磁碟，所以這一輪的成果另外留了一份在 ${RETAINED}`,
+		);
+		expect(say(notSavedAndLeft)).toBe(
+			`成果留在 ${RETAINED}，未能存成草稿（說明檔寫入失敗）`,
+		);
+		expect(say(published)).toBe(
+			"已發布；這一輪沒存進草稿，請取回草稿裡需要的內容再放棄。",
+		);
+		expect(published.tone).toBe("note");
+		expect(
+			new Set([say(savedAndLeft), say(notSavedAndLeft), say(published)]).size,
+		).toBe(3);
+	});
+
+	it("shows only why the draft is still there for a published revise", () => {
 		const reason = "已發布，但未能刪除這一輪的草稿，請在工具列放棄它。";
 		expect(
 			jobDraftView(
@@ -620,7 +924,7 @@ describe("jobDraftView", () => {
 					draft: jobDraft({ saved: true, reason }),
 				}),
 			),
-		).toEqual({ tone: "note", text: reason, path: null });
+		).toMatchObject({ tone: "note", text: reason, path: null, note: null });
 	});
 
 	it("says nothing of progress for a published revise with no note", () => {
@@ -651,5 +955,244 @@ describe("jobDraftView", () => {
 		const unnamed = { ...job({}), kind: undefined };
 		expect(jobDraftView(unnamed, "revise")?.tone).toBe("saved");
 		expect(jobDraftView(unnamed, "install")).toBeNull();
+	});
+});
+
+describe("jobDraftView: the tool's current draft", () => {
+	it("offers to continue the draft its round left, once the list read after the end says so", () => {
+		const view = jobDraftView(job({}), "revise", onTheList({}));
+		expect(view.buttons).toEqual(["continue", "continue_with_note"]);
+		expect(view.current).toBeNull();
+		// ...whatever became of the round's files.
+		const notSaved = jobDraftView(
+			job({ draft: jobDraft({ saved: false, reason: "秘密掃描失敗" }) }),
+			"revise",
+			onTheList({}),
+		);
+		expect(notSaved.text).toBe("未能保存（秘密掃描失敗）");
+		expect(notSaved.buttons).toEqual(["continue", "continue_with_note"]);
+	});
+
+	it.each([
+		["the list was not read after the job ended", { listFresh: false }],
+		["the card has no row", { hasRow: false }],
+		[
+			"the list's draft is another one",
+			{ listDraft: leftByRound({ generation: 5 }) },
+		],
+		["the tool has no draft now", { listDraft: null }],
+	])("keeps the round's own result and path, and offers nothing, when %s", (_when, fields) => {
+		for (const saved of [true, false]) {
+			const view = jobDraftView(
+				job({
+					draft: jobDraft({ saved, retained_path: RETAINED }),
+				}),
+				"revise",
+				onTheList(fields),
+			);
+			const shown = view.retained?.path ?? view.path;
+			expect(shown, `saved=${saved}`).toBe(RETAINED);
+			expect(view.text, `saved=${saved}`).toBe(
+				saved ? "進度已保存（第 3 輪）" : `成果留在 ${RETAINED}，未能存成草稿`,
+			);
+			expect(view.buttons, `saved=${saved}`).toEqual([]);
+		}
+	});
+
+	it("keeps the round's own result when no list is given at all", () => {
+		const view = jobDraftView(
+			job({ draft: jobDraft({ retained_path: RETAINED }) }),
+			"revise",
+		);
+		expect(view.retained.path).toBe(RETAINED);
+		expect(view.buttons).toEqual([]);
+		expect(view.current).toBeNull();
+	});
+
+	it("says the current draft is another one when the generation differs, and offers nothing", () => {
+		const view = jobDraftView(
+			job({}),
+			"revise",
+			onTheList({ listDraft: leftByRound({ generation: 5 }) }),
+		);
+		expect(view.current).toBe(DRAFT_SUPERSEDED);
+		expect(view.current).toBe("目前的草稿已不是這張卡片對應的那一份");
+		expect(view.buttons).toEqual([]);
+	});
+
+	it("claims nothing about the current draft when the tool has none now", () => {
+		const view = jobDraftView(
+			job({}),
+			"revise",
+			onTheList({ listDraft: null }),
+		);
+		expect(view.text).toBe("進度已保存（第 3 輪）");
+		expect(view.current).toBeNull();
+		expect(view.buttons).toEqual([]);
+	});
+
+	it("says the same when another draft took its place", () => {
+		const view = jobDraftView(
+			job({}),
+			"revise",
+			onTheList({ listDraft: leftByRound({ draft_id: OTHER_DRAFT_ID }) }),
+		);
+		expect(view.current).toBe(DRAFT_SUPERSEDED);
+		expect(view.buttons).toEqual([]);
+	});
+
+	it("claims nothing about the current draft before the list read after the end has landed", () => {
+		const view = jobDraftView(
+			job({}),
+			"revise",
+			onTheList({
+				listFresh: false,
+				listDraft: leftByRound({ generation: 5 }),
+			}),
+		);
+		expect(view.current).toBeNull();
+		expect(view.buttons).toEqual([]);
+	});
+
+	it("offers nothing and claims nothing on a card no row owns", () => {
+		for (const listDraft of [leftByRound({}), leftByRound({ generation: 5 })]) {
+			const view = jobDraftView(
+				job({}),
+				"revise",
+				onTheList({ hasRow: false, listDraft }),
+			);
+			expect(view.buttons).toEqual([]);
+			expect(view.current).toBeNull();
+		}
+	});
+
+	it("claims nothing when either side cannot name its draft", () => {
+		const unnamedRound = jobDraftView(
+			job({
+				draft: jobDraft({
+					saved: false,
+					draft_id: null,
+					generation: null,
+					attempts: null,
+					reason: "寫入失敗",
+				}),
+			}),
+			"revise",
+			onTheList({}),
+		);
+		expect(unnamedRound.current).toBeNull();
+		expect(unnamedRound.buttons).toEqual([]);
+		const unreadableNow = jobDraftView(job({}), "revise", {
+			...onTheList({}),
+			listDraft: unreadable(),
+		});
+		expect(unreadableNow.current).toBeNull();
+		expect(unreadableNow.buttons).toEqual([]);
+	});
+
+	it("offers to continue only an open draft", () => {
+		for (const state of BACKEND_DRAFT_STATES) {
+			const view = jobDraftView(
+				job({}),
+				"revise",
+				onTheList({ listDraft: leftByRound({ state }) }),
+			);
+			expect(view.buttons, state).toEqual(
+				state === "open" ? ["continue", "continue_with_note"] : [],
+			);
+			expect(view.current, state).toBeNull();
+		}
+	});
+
+	it("has something to show for a published revise only when the list's draft is another one", () => {
+		// After a publish the draft that stays reads as published (or stale): it
+		// cannot be continued, so the same draft adds nothing.
+		const published = job({
+			state: "succeeded",
+			outcome: "published",
+			draft: jobDraft({ saved: true, reason: null }),
+		});
+		for (const state of ["published", "stale"]) {
+			expect(
+				jobDraftView(
+					published,
+					"revise",
+					onTheList({ listDraft: leftByRound({ state }) }),
+				),
+				state,
+			).toBeNull();
+		}
+		const superseded = jobDraftView(
+			published,
+			"revise",
+			onTheList({ listDraft: leftByRound({ generation: 9 }) }),
+		);
+		expect(superseded.text).toBeNull();
+		expect(superseded.current).toBe(DRAFT_SUPERSEDED);
+	});
+});
+
+// The card's word on the list comes from toolList: the list's own read number
+// against the mark the page took when it saw the job end.
+describe("jobDraftView on the list as the page reads it", () => {
+	function scriptedGet() {
+		const calls = [];
+		const get = () =>
+			new Promise((resolve, reject) => {
+				calls.push({ resolve, reject });
+			});
+		return { get, calls };
+	}
+	const listWith = (listDraft) => ({
+		tools: [{ name: "kb", draft: listDraft }],
+	});
+	const cardOn = (list, mark) => ({
+		hasRow: true,
+		listDraft: list.tools[0].draft,
+		listFresh: listReadAfter(list, mark),
+	});
+
+	it("offers nothing on a list whose read started before the job was seen to end", async () => {
+		const { get, calls } = scriptedGet();
+		const before = readToolList(get);
+		const mark = markListReads();
+		calls[0].resolve(listWith(leftByRound({})));
+		const stale = await before;
+		expect(
+			jobDraftView(job({}), "revise", cardOn(stale, mark)).buttons,
+		).toEqual([]);
+		const after = readToolList(get);
+		calls[1].resolve(listWith(leftByRound({})));
+		expect(
+			jobDraftView(job({}), "revise", cardOn(await after, mark)).buttons,
+		).toEqual(["continue", "continue_with_note"]);
+	});
+
+	it("offers nothing when the re-read after the end failed", async () => {
+		const client = new QueryClient({
+			defaultOptions: {
+				queries: { retry: false, staleTime: 5_000, networkMode: "always" },
+			},
+		});
+		const { get, calls } = scriptedGet();
+		const observer = new QueryObserver(client, {
+			queryKey: ["tools"],
+			queryFn: () => readToolList(get),
+		});
+		const unsubscribe = observer.subscribe(() => {});
+		calls[0].resolve(listWith(leftByRound({})));
+		await vi.waitFor(() =>
+			expect(client.getQueryData(["tools"])).toBeDefined(),
+		);
+		const mark = markListReads();
+		const rereading = rereadToolList(client);
+		await vi.waitFor(() => expect(calls).toHaveLength(2), { timeout: 500 });
+		calls[1].reject(new Error("boom"));
+		await rereading;
+		const shown = client.getQueryData(["tools"]);
+		const view = jobDraftView(job({}), "revise", cardOn(shown, mark));
+		expect(view.text).toBe("進度已保存（第 3 輪）");
+		expect(view.buttons).toEqual([]);
+		unsubscribe();
 	});
 });

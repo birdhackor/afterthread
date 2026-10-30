@@ -24,6 +24,7 @@ import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { formatDuration, formatTimestamp } from "../utils/format.js";
 import { codePointLength } from "../utils/text.js";
 import { canRunExamples, verificationStateText } from "../utils/toolChecks.js";
+import { recordFixView } from "../utils/toolDraft.js";
 import {
 	runDetailSections,
 	runHasDetails,
@@ -78,19 +79,22 @@ const STALE_LIST_NOTE =
 // The section also says how the current version did on its examples.json
 // (web-v6 §9) and offers 跑一次範例 (`onCheck`, a job in the same gate).
 //
-// `blockedByDraft` is the sentence (reviseBlockedByDraft) saying the tool's draft
-// keeps any revise from being sent, or null: it turns off every control here that
-// sends or prepares one -- 請 AI 修正, 加上說明… and the modal's 送出修正 -- and is
-// said under each record that has them, since a list of records is as long as the
-// operator's failures and one sentence above it would soon be a screen away from
-// the control it explains. 跑一次範例 is not a revise and answers to `fixBlocked`
-// alone.
+// `recordFix` is what a record's fix is for the tool's draft (recordFixView): with a
+// draft that can be continued, 接續修正（附上這筆） -- the round continues the draft
+// and attaches the record, and 加上說明… adds words to that round; with a draft in
+// any other state, the fix is off and `recordFix.blockedReason` says why. The
+// reason turns off every control here that sends or prepares a fix -- the record's
+// two buttons and the modal's submit -- and is said under each record that has
+// them, since a list of records is as long as the operator's failures and one
+// sentence above it would soon be a screen away from the control it explains.
+// Which draft a round continues is the page's to name when `onFix` is called.
+// 跑一次範例 is not a revise and answers to `fixBlocked` alone.
 export function ToolRunsSection({
 	name,
 	expanded,
 	onFix = null,
 	fixBlocked = false,
-	blockedByDraft = null,
+	recordFix = recordFixView(null),
 	isSubmittingFix = false,
 	onCheck = null,
 	isSubmittingCheck = false,
@@ -150,7 +154,7 @@ export function ToolRunsSection({
 		);
 	}
 	const blocked =
-		fixBlocked || isFetching || isError || blockedByDraft !== null;
+		fixBlocked || isFetching || isError || recordFix.blockedReason !== null;
 	return (
 		<Stack gap="xs" pt="xs">
 			{/* Reached with data in hand: a BACKGROUND refetch failed and left the
@@ -199,7 +203,8 @@ export function ToolRunsSection({
 						run.fixable && onFix
 							? {
 									blocked,
-									blockedByDraft,
+									label: recordFix.label,
+									blockedReason: recordFix.blockedReason,
 									submitting: isSubmittingFix,
 									now: () => onFix([run.id]),
 									withNote: () => setNoteRun(run),
@@ -211,7 +216,7 @@ export function ToolRunsSection({
 			<FixNoteModal
 				run={noteRun}
 				blocked={blocked}
-				blockedByDraft={blockedByDraft}
+				recordFix={recordFix}
 				onClose={() => setNoteRun(null)}
 				onSubmit={(feedback) => {
 					onFix?.([noteRun.id], feedback);
@@ -264,7 +269,7 @@ function ToolRunRow({ name, run, fix }) {
 							loading={fix.submitting}
 							onClick={fix.now}
 						>
-							請 AI 修正
+							{fix.label}
 						</Button>
 						<Button
 							size="compact-xs"
@@ -274,7 +279,7 @@ function ToolRunRow({ name, run, fix }) {
 						>
 							加上說明…
 						</Button>
-						<ReviseBlockedNote reason={fix.blockedByDraft} />
+						<ReviseBlockedNote reason={fix.blockedReason} />
 					</>
 				) : null}
 			</Group>
@@ -403,10 +408,12 @@ function ToolRunDetail({ name, run, expanded }) {
 }
 
 // 加上說明… (web-v6 §8.1): the same fix, with words. The record rides along; the
-// note is optional, and bounded like every other AI input. The modal can be open
-// when the tool's draft appears (a list read again behind it), so it answers to
-// `blocked` as the rows do and says the draft's sentence beside 送出修正.
-function FixNoteModal({ run, blocked, blockedByDraft, onClose, onSubmit }) {
+// note is optional, and bounded like every other AI input. Its title and words
+// follow the fix (`recordFix`): a round that continues the draft says so. The modal
+// can be open when the tool's draft appears or changes (a list read again behind
+// it), so it answers to `blocked` as the rows do and says the draft's sentence
+// beside its submit.
+function FixNoteModal({ run, blocked, recordFix, onClose, onSubmit }) {
 	const [note, setNote] = useState("");
 	const tooLong = codePointLength(note.trim()) > SECTION_MAX_LENGTH;
 	// Every way out clears the draft, so the next record never opens with a note
@@ -419,14 +426,11 @@ function FixNoteModal({ run, blocked, blockedByDraft, onClose, onSubmit }) {
 		<Modal
 			opened={run !== null}
 			onClose={close}
-			title="請 AI 修正這次失敗"
+			title={recordFix.noteTitle}
 			centered
 		>
 			<Stack gap="sm">
-				<Text size="sm">
-					這次失敗的參數與錯誤輸出會一起交給 AI。想補充背景（例如這個 API
-					最近改了什麼）就寫在下面，可以留空。
-				</Text>
+				<Text size="sm">{recordFix.noteIntro}</Text>
 				<div>
 					<Textarea
 						label="補充說明（選填）"
@@ -438,7 +442,7 @@ function FixNoteModal({ run, blocked, blockedByDraft, onClose, onSubmit }) {
 					/>
 					<CharCounter value={note} max={SECTION_MAX_LENGTH} />
 				</div>
-				<ReviseBlockedNote reason={blockedByDraft} />
+				<ReviseBlockedNote reason={recordFix.blockedReason} />
 				<Group justify="flex-end" gap="sm">
 					<Button variant="default" onClick={close}>
 						取消
@@ -452,7 +456,7 @@ function FixNoteModal({ run, blocked, blockedByDraft, onClose, onSubmit }) {
 							onSubmit(feedback);
 						}}
 					>
-						送出修正
+						{recordFix.noteSubmit}
 					</Button>
 				</Group>
 			</Stack>

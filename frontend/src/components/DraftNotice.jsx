@@ -1,26 +1,46 @@
 import { Alert, Button, Code, Group, Modal, Stack, Text } from "@mantine/core";
 import { useState } from "react";
 import {
+	CONTINUE_BUTTON,
 	DISCARD_BUTTON,
 	draftDiscardConfirmation,
 	draftView,
 } from "../utils/toolDraft.js";
 import { CopyPathButton } from "./CopyPathButton.jsx";
+import { DraftContinueButtons } from "./DraftContinueButtons.jsx";
+
+// One path the operator may need to open by hand, as a block that selects in one
+// click (for the browser that will not copy it -- see CopyPathButton) and 複製路徑.
+function PathRow({ path }) {
+	return (
+		<Group gap="xs" align="flex-start" wrap="nowrap">
+			<Code style={{ wordBreak: "break-all", userSelect: "all" }}>{path}</Code>
+			<CopyPathButton path={path} />
+		</Group>
+	);
+}
 
 // The tool row's note about its draft -- the unfinished revision a revise left
 // when it did not publish: what state it is in, how many rounds it has been
 // through and how the last one ended, what the AI says the operator has to do by
-// hand, where the files are (to be opened or copied as they are), and 放棄. What it
-// says and which buttons a state gets is decided by draftView.
+// hand, where the files are (the files the draft names, the whole draft directory
+// and the old files directories a continued round kept, each to be opened or
+// copied as they are), and the buttons: 接續修正 and 加上說明後接續… for a draft
+// that can be continued, and 放棄. What it says and which buttons a state gets is
+// decided by draftView.
 //
 // 放棄 asks first, and the confirmation acts on the draft the operator was looking
 // at when they pressed it (`confirming`), not on whatever the list shows by the
 // time they confirm: the request names that draft (by id and generation, or by
 // token), so one that changed meanwhile is refused by the backend instead of
-// discarded unseen.
+// discarded unseen. The confirmation names the whole draft directory, since that
+// is what goes.
 //
-// `blocked` is the page's gate for every write that takes the backend's one slot;
-// the mutation lives in the page (`onDiscard`), with the other writes of a row.
+// The mutations live in the page, with the other writes of a row: `onDiscard`
+// (with the draft confirmed on) and `onContinue` (with the round's words; the page
+// names the draft from the list and checks again). `blocked` is the page's gate for
+// every write that takes the backend's one slot; `continueBlocked` is its gate for
+// the version writes, which a round that continues a draft is.
 export function DraftNotice({
 	toolName,
 	draft,
@@ -28,6 +48,9 @@ export function DraftNotice({
 	blocked,
 	discarding,
 	onDiscard,
+	continueBlocked,
+	continuing,
+	onContinue,
 }) {
 	const [confirming, setConfirming] = useState(null);
 	const view = draftView(draft, { currentVid });
@@ -35,6 +58,7 @@ export function DraftNotice({
 		return null;
 	}
 	const canDiscard = view.buttons.includes(DISCARD_BUTTON);
+	const canContinue = view.buttons.includes(CONTINUE_BUTTON);
 	const confirm = () => {
 		const target = confirming;
 		setConfirming(null);
@@ -88,28 +112,59 @@ export function DraftNotice({
 						<Text size="xs" c="dimmed">
 							{view.pathLabel}
 						</Text>
-						<Group gap="xs" align="flex-start" wrap="nowrap">
-							{/* One click selects the whole path, for the browser that will
-							    not copy it (see CopyPathButton). */}
-							<Code style={{ wordBreak: "break-all", userSelect: "all" }}>
-								{view.path}
-							</Code>
-							<CopyPathButton path={view.path} />
-						</Group>
+						<PathRow path={view.path} />
 					</Stack>
 
-					{canDiscard ? (
-						<Group justify="flex-end">
-							<Button
-								size="xs"
-								color="red"
-								variant="light"
-								loading={discarding}
-								disabled={blocked}
-								onClick={() => setConfirming(draft)}
-							>
-								放棄
-							</Button>
+					{view.draftDir ? (
+						<Stack gap={2}>
+							<Text size="xs" c="dimmed">
+								整個草稿目錄
+							</Text>
+							<PathRow path={view.draftDir} />
+						</Stack>
+					) : null}
+
+					{view.kept.length > 0 ? (
+						<Stack gap={2}>
+							<Text size="xs" c="dimmed">
+								保留下來的舊檔案目錄
+							</Text>
+							{view.kept.map((path) => (
+								<PathRow key={path} path={path} />
+							))}
+							<Text size="xs" c="dimmed">
+								{view.keptNote}
+							</Text>
+						</Stack>
+					) : null}
+
+					<Text size="xs" c="dimmed">
+						{view.unlisted}
+					</Text>
+
+					{canContinue || canDiscard ? (
+						<Group justify="space-between" gap="xs">
+							<Group gap="xs">
+								{canContinue ? (
+									<DraftContinueButtons
+										blocked={continueBlocked}
+										submitting={continuing}
+										onContinue={onContinue}
+									/>
+								) : null}
+							</Group>
+							{canDiscard ? (
+								<Button
+									size="xs"
+									color="red"
+									variant="light"
+									loading={discarding}
+									disabled={blocked}
+									onClick={() => setConfirming(draft)}
+								>
+									放棄
+								</Button>
+							) : null}
 						</Group>
 					) : null}
 				</Stack>
@@ -122,7 +177,9 @@ export function DraftNotice({
 				centered
 			>
 				<Stack gap="md">
-					<Text>{draftDiscardConfirmation(toolName)}</Text>
+					<Text style={{ wordBreak: "break-all" }}>
+						{draftDiscardConfirmation(toolName, confirming)}
+					</Text>
 					<Group justify="flex-end">
 						<Button variant="default" onClick={() => setConfirming(null)}>
 							取消
