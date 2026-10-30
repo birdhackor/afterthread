@@ -8598,14 +8598,13 @@ def test_run_revise_env_strip_refusal_still_carries_what_the_model_said_masked_o
     assert outcome.ok is False
     assert outcome.error == tool_builder._ERROR_BUILDER_ENV_STRIP
     assert not tool_drafts.has_draft(_package_root(pkg))
+    [session] = _session_roots(tmp_path)
     assert outcome.draft is not None
     assert (outcome.draft["saved"], outcome.draft["reason"], outcome.draft["retained_path"]) == (
         False,
         tool_drafts.REASON_STRIP_ENV,
-        None,
+        str(session / "build"),
     )
-    # It may still hold the builder's .env: removed, not kept for the work in it.
-    assert _session_roots(tmp_path) == []
     carried = {
         "summary": outcome.summary,
         "handoff": outcome.handoff,
@@ -10195,8 +10194,8 @@ def test_a_revise_whose_workspace_cannot_be_confirmed_in_staging_saves_no_draft_
 ) -> None:
     """Once the session has ended, the ``.staging`` shell cannot be looked at, so
     whether the workspace is still the one the round was given is not known. It
-    is not stripped and no draft is saved from it, and cleanup leaves it where it
-    is rather than removing it through a shell it could not see."""
+    is not stripped, no draft is saved from it, and it stays where it is, though
+    the job names no path for it: what is at that path is not known."""
     pkg = _seed_package(monkeypatch, tmp_path)
     _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
     base = tools.tools_dir()
@@ -10215,6 +10214,7 @@ def test_a_revise_whose_workspace_cannot_be_confirmed_in_staging_saves_no_draft_
     outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     assert outcome.draft is not None and outcome.draft["saved"] is False
+    assert outcome.draft["retained_path"] is None
     assert not tool_drafts.has_draft(_package_root(pkg))
     assert outcome.error == tool_builder._ERROR_STAGING_UNVERIFIED
     assert any(shell.iterdir())
@@ -11988,11 +11988,12 @@ def test_a_round_whose_notes_cannot_be_masked_names_no_workspace_it_cannot_confi
 
 
 def test_an_exception_before_the_env_strip_strips_it_before_keeping_the_workspace(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The commands stopped, then an exception before anything stripped the
     builder's ``.env``: the work is held by no one, so the staging stays -- but
-    only once that ``.env`` is stripped."""
+    only once that ``.env`` is stripped, and the backend log, naming it, does not
+    say a ``.env`` may remain."""
     pkg = _seed_package(monkeypatch, tmp_path)
 
     def broken(workflow: str) -> int | None:
@@ -12013,13 +12014,134 @@ def test_an_exception_before_the_env_strip_strips_it_before_keeping_the_workspac
         files={"run.py": _REVISED_RUN_PY, ".env": "BUILDER_KEY=written-by-the-model\n"},
     )
 
-    with pytest.raises(RuntimeError):
+    with (
+        caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"),
+        pytest.raises(RuntimeError),
+    ):
         asyncio.run(_run_revise("kbsearch", "加上分頁"))
 
     [session] = _session_roots(tmp_path)
     assert stripping == [True]
     assert not os.path.lexists(session / "build" / ".env")
     assert (session / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert any(str(session) in record.getMessage() for record in caplog.records)
+    assert not _says_the_env_may_remain(caplog, session)
+    assert not tool_drafts.has_draft(_package_root(pkg))
+
+
+_BUILDER_ENV = "BUILDER_KEY=written-by-the-model\n"
+
+
+def _refuse_env_removal(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """The strip's removal of the builder's ``.env`` fails, as a workspace the builder
+    made read-only fails it; ``_strip_builder_env`` itself runs as it is, and every
+    other removal goes through. Returns the paths refused."""
+    real_remove = tool_builder._remove_reserved_sidecar_path
+    refused: list[Path] = []
+
+    def remove(path: Path) -> None:
+        if path.name == ".env":
+            refused.append(path)
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), os.fspath(path))
+        real_remove(path)
+
+    monkeypatch.setattr(tool_builder, "_remove_reserved_sidecar_path", remove)
+    return refused
+
+
+def _says_the_env_may_remain(caplog: pytest.LogCaptureFixture, session: Path) -> bool:
+    """Whether the backend log, where it names ``session``, says a .env may be there."""
+    return any(
+        str(session) in record.getMessage() and ".env" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("kind", ["first-round", "continuation"])
+def test_a_builder_env_that_cannot_be_stripped_keeps_the_staging_with_the_work_in_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture, kind: str
+) -> None:
+    """The builder's ``.env`` cannot be removed. No files are saved, and the staging
+    stays whole -- the ``.env`` with the work, a file in a subdirectory too: a
+    removal would most likely fail on that file the same way and take the rest.
+    The job names the workspace and why no files were saved, the backend log says
+    the ``.env`` may still be there, and a continuing round is recorded as
+    failed."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    if kind == "continuation":
+        _first_round(monkeypatch, pkg)
+    _fake_generate(
+        monkeypatch,
+        result=_UNFINISHED,
+        files={"run.py": _REVISED_RUN_PY, "lib/helper.py": "X = 1\n", ".env": _BUILDER_ENV},
+    )
+    refused = _refuse_env_removal(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+        if kind == "continuation":
+            outcome = asyncio.run(_continue_revise(pkg, "再試一次"))
+        else:
+            outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert refused
+    [session] = _session_roots(tmp_path)
+    build = session / "build"
+    assert (build / ".env").read_text(encoding="utf-8") == _BUILDER_ENV
+    assert (build / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert (build / "lib" / "helper.py").read_text(encoding="utf-8") == "X = 1\n"
+    assert outcome.error == tool_builder._ERROR_BUILDER_ENV_STRIP
+    assert outcome.draft is not None
+    assert (outcome.draft["saved"], outcome.draft["reason"], outcome.draft["retained_path"]) == (
+        False,
+        tool_drafts.REASON_STRIP_ENV,
+        str(build),
+    )
+    assert _says_the_env_may_remain(caplog, session)
+    if kind == "continuation":
+        manifest = _draft_manifest(pkg)
+        latest = manifest["attempts"][-1]
+        assert (latest["number"], latest["outcome"], latest["saved"], latest["reason"]) == (
+            2,
+            "failed",
+            False,
+            tool_drafts.REASON_STRIP_ENV,
+        )
+        assert manifest["running"] is None
+    else:
+        assert not tool_drafts.has_draft(_package_root(pkg))
+
+
+def test_an_exception_before_the_env_strip_keeps_the_staging_even_when_the_late_strip_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The commands stopped, then an exception before anything stripped the
+    builder's ``.env``, and the strip made on the way out fails too: the work is
+    held by no one, so the staging stays, the ``.env`` still in it, and the
+    backend log says so."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+
+    def broken(workflow: str) -> int | None:
+        raise RuntimeError("a bug before the strip")
+
+    monkeypatch.setattr(llm_log, "last_record_id_for_workflow", broken)
+    _fake_generate(
+        monkeypatch,
+        result=_UNFINISHED,
+        files={"run.py": _REVISED_RUN_PY, ".env": _BUILDER_ENV},
+    )
+    refused = _refuse_env_removal(monkeypatch)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"),
+        pytest.raises(RuntimeError),
+    ):
+        asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert len(refused) == 1
+    [session] = _session_roots(tmp_path)
+    assert (session / "build" / ".env").read_text(encoding="utf-8") == _BUILDER_ENV
+    assert (session / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert _says_the_env_may_remain(caplog, session)
     assert not tool_drafts.has_draft(_package_root(pkg))
 
 

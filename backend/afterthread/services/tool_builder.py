@@ -3084,8 +3084,8 @@ def _cleanup_staging(staging: Path, base: Path) -> None:
     OSError for that case is the mechanism, not an accident.
 
     The rmtree is a DESTRUCTIVE traversal, so it runs ONLY on a root that
-    passes the SAME ``_verify_staging_root`` gate ``_promote_staging`` applies
-    (R9-1). This is load-bearing, not symmetry for its own sake: ``run_install``'s
+    passes the SAME ``_verify_staging_root`` gate ``_promote_staging`` applies.
+    This is load-bearing, not symmetry for its own sake: ``run_install``'s
     ``finally`` reaches here on every exit but one -- including after promote just
     REFUSED the workspace as tampered -- and CPython's rmtree protection only
     refuses a path that is ITSELF a symlink. With the ``.staging`` ANCESTOR
@@ -3095,30 +3095,34 @@ def _cleanup_staging(staging: Path, base: Path) -> None:
     deleted straight through the link. A workspace that fails the gate is left
     IN PLACE, parent shell included: it is evidence of tampering (or of a race
     worth seeing), not garbage -- and the orphan it leaves is the same accepted
-    residue class as the refused-cleanup orphan symlink pinned by the r8 tests.
+    residue class as the refused-cleanup orphan symlink.
     The check-to-rmtree instant remains the accepted check-then-act residual
     window ``_verify_staging_root``'s own docstring names.
 
     The sweep rides HERE rather than at the head of the next promote, and the
-    reason is reach: this is the one step EVERY tool job passes through, bar one
-    exit -- installs as well as revises, failures as well as successes
-    -- so cleanup-failure remains do not wait for another revise to succeed before
+    reason is reach: every tool job ends here, bar the exits named below --
+    installs as well as revises, failures as well as successes -- and a revise
+    that keeps its staging runs the same sweep on its own (``_sweep_logged``), so
+    cleanup-failure remains do not wait for another revise to succeed before
     anything looks at them. The non-blocking exclusive flock makes the same
     sweep safe after a restart: an inherited child keeps its shared reference,
     so the new process skips instead of mistaking an empty local registry for
-    proof. This placement also keeps the promote's pre-publication sequence (which
-    r4/r10/r11/r12 spent four rounds ordering) free of a new destructive
-    traversal. It hangs off a ``finally`` because it is INDEPENDENT of everything
-    above it: a tampered workspace returns early -- deliberately, see above --
-    and that says nothing about whether marked remains elsewhere in ``base`` are
-    collectable. The staging logic itself is untouched by this addition.
+    proof. This placement also keeps the promote's pre-publication sequence free
+    of a new destructive traversal. It hangs off a ``finally`` because it is
+    INDEPENDENT of everything above it: a tampered workspace returns early --
+    deliberately, see above -- and that says nothing about whether marked remains
+    elsewhere in ``base`` are collectable. The staging logic itself is untouched
+    by this addition.
 
-    The exit that never calls this is a session whose run_shell commands could
-    not be confirmed stopped (``_BuilderShells``). Its workspace is kept whole,
-    and nothing in the backend ever collects it: a later job's call removes only
-    its own session root, and ``.staging`` only once empty, while the sweep never
-    looks inside ``.staging``. Only the operator removes it. That session skips
-    the sweep as well; the next job's call runs it.
+    Two kinds of exit never call this. One is a session whose run_shell commands
+    could not be confirmed stopped (``_BuilderShells``): its workspace is kept
+    whole, and that session skips the sweep as well -- the next job's call runs
+    it. The other is a revise that keeps its staging, for work no one holds or
+    for a publish worker that may still be writing it (``run_revise``), and runs
+    the sweep without removing anything. Nothing in the backend ever collects
+    what either keeps: a later job's call removes only its own session root, and
+    ``.staging`` only once empty, while the sweep never looks inside
+    ``.staging``. Only the operator removes it.
     """
     try:
         with contextlib.suppress(Exception):
@@ -4150,6 +4154,18 @@ def _log_work_kept(session_root: Path) -> None:
         )
 
 
+def _log_work_kept_unstripped(session_root: Path) -> None:
+    """Say in the backend log where a revise left work no draft is known to hold,
+    in a workspace the builder's ``.env`` could not be stripped from."""
+    with contextlib.suppress(Exception):
+        _logger.warning(
+            "Builder workspace kept at %s: no draft is known to hold its work on disk, "
+            "and the .env the builder wrote could not be removed from it, so it may "
+            "still be there. Take out what is needed, then delete the whole directory.",
+            session_root,
+        )
+
+
 def _log_publish_running_kept(session_root: Path) -> None:
     """Say in the backend log where a revise that stopped while its publish still
     ran left its staging, which that publish may still be writing."""
@@ -4267,11 +4283,14 @@ async def run_revise(
     manifest confirmed on disk (and no publish worker still writing the staging);
     a version directory -- the one published, or the one a publish that failed
     part way had moved the work into, which ``current`` does not name; or no one
-    needs to -- nothing was worth keeping. It is removed, too, after a strip of
-    the builder's ``.env`` that failed: it may still hold that file. Every other
-    end keeps it. The job names where the work is when that place is known: the
-    staging workspace, once confirmed to be the one the round was given, or that
-    version directory.
+    needs to -- nothing was worth keeping. Every other end keeps it, a strip of
+    the builder's ``.env`` that failed among them: a removal would most likely
+    fail on that file the same way -- a workspace the builder made read-only
+    fails both -- and so leave the ``.env`` while taking the rest of the work.
+    Before the staging is kept, a ``.env`` nothing stripped yet is stripped; when
+    that fails, the backend log says the ``.env`` may still be there. The job
+    names where the work is when that place is known: the staging workspace, once
+    confirmed to be the one the round was given, or that version directory.
     """
     base = tools.tools_dir()
     if base is None:
@@ -4341,9 +4360,11 @@ async def run_revise(
     # Up from the moment the round's commands are confirmed stopped -- raised in
     # the ``finally`` that gets that word, so an exception or a cancellation from
     # there on finds it up -- until someone holds the work (see the docstring).
-    # While it is up, the ``finally`` below keeps the staging, after stripping the
-    # builder's ``.env`` if nothing did yet.
+    # While it is up, the ``finally`` below keeps the staging, stripping the
+    # builder's ``.env`` first if nothing did yet, and keeping it all the same when
+    # that strip fails.
     holding = False
+    # Up once a strip of the builder's ``.env`` went through.
     env_stripped = False
     # Up while the publish's worker may still be writing the staging. The await
     # ending with the worker's result or with an ``Exception`` lowers it -- the
@@ -4559,9 +4580,11 @@ async def run_revise(
             attached=continuation.attached if continuation is not None else (),
         )
         if env_strip_error is not None:
-            # A workspace that may still hold the builder's .env keeps no files and
-            # is removed, not kept.
-            holding = False
+            # A workspace that may still hold the builder's .env keeps no files in
+            # the draft, and the staging stays all the same: a removal would most
+            # likely fail on that file the same way, leaving the .env and taking the
+            # rest of the work. The job names the workspace only when it is still the
+            # staging it was given.
             closed = await run_in_threadpool(
                 _close_unrecorded,
                 round_draft,
@@ -4569,6 +4592,7 @@ async def run_revise(
                 "failed",
                 env_strip_error,
             )
+            confirmed = await run_in_threadpool(_workspace_confirmed, build_root, base)
             return InstallOutcome(
                 ok=False,
                 tool_name=name,
@@ -4576,7 +4600,9 @@ async def run_revise(
                 error=env_strip_error,
                 llm_log_id=llm_log_id,
                 env_keys=env_keys,
-                draft=_round_report(closed, round_draft, retained=None),
+                draft=_round_report(
+                    closed, round_draft, retained=str(build_root.path) if confirmed else None
+                ),
                 **facts,
                 **notes,
             )
@@ -4850,9 +4876,10 @@ async def run_revise(
         # session's commands could not be confirmed stopped, which keeps it all,
         # unstripped, or the work in it is held by no one, or a publish worker may
         # still be writing it, either of which keeps it too while the sweep still
-        # runs (it never looks inside ``.staging``). Kept for the work, it never
-        # keeps a .env the builder wrote: one an exception or a cancellation left
-        # is stripped here, and when that fails the staging is removed instead.
+        # runs (it never looks inside ``.staging``). Kept for the work, it is first
+        # stripped of a .env the builder wrote, when nothing stripped it yet, and
+        # kept all the same when that strip fails: the log then says the .env may
+        # still be there.
         for value in registered:
             tools.discard_inflight_secret(value)
         if not shells_ended:
@@ -4863,12 +4890,14 @@ async def run_revise(
                 _late_keys, late_error = await run_in_threadpool(
                     _strip_builder_env, build_root, base
                 )
-                holding = late_error is None
+                env_stripped = late_error is None
             if holding or publish_running:
                 if publish_running:
                     _log_publish_running_kept(session_root)
-                else:
+                elif env_stripped:
                     _log_work_kept(session_root)
+                else:
+                    _log_work_kept_unstripped(session_root)
                 await run_in_threadpool(_sweep_logged, base)
             else:
                 await run_in_threadpool(_cleanup_staging, session_root, base)
