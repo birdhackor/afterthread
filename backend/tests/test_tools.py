@@ -29,6 +29,7 @@ import fcntl
 import inspect
 import json
 import os
+import random
 import shutil
 import signal
 import stat
@@ -4840,6 +4841,18 @@ def test_match_forms_source_identical_in_both_modules() -> None:
     assert inspect.getsource(tools._match_forms) == inspect.getsource(llm_log._match_forms)
 
 
+@pytest.mark.parametrize("name", ["_Fixed", "_Record", "_encode_spans", "_touches_free_text"])
+def test_the_encoder_and_search_a_written_text_is_checked_with_are_source_identical_in_both_modules(
+    name: str,
+) -> None:
+    """``llm_log`` keeps its own copy of the encoder that writes a JSON line and
+    marks its fixed content, and of the search that checks it, for the same
+    leaf/layering reason it keeps its own mask. A JSON file and a JSONL line are
+    written and checked alike only while the copies are the same; an edit
+    applied to one copy and not the other fails here."""
+    assert inspect.getsource(getattr(tools, name)) == inspect.getsource(getattr(llm_log, name))
+
+
 def test_min_secret_len_matches_llm_log() -> None:
     """tools._MIN_SECRET_LEN and llm_log._MIN_SECRET_LEN MUST be the same value:
     each ``_match_forms`` looks the floor up BY NAME in its own module, so identical
@@ -6715,11 +6728,7 @@ def test_a_summary_that_spells_a_secret_only_as_written_is_the_marker_by_its_fie
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({_PEM_SECRET}))
-    monkeypatch.setattr(
-        tools,
-        "_encode_checked",
-        lambda build, secrets, encode: encode(build(tools._Writing(secrets))),
-    )
+    monkeypatch.setattr(tools, "_touches_free_text", lambda *args: False)
 
     assert _write_meta(pkg, summary=_PEM_TEXT) is True
 
@@ -6732,9 +6741,9 @@ def test_a_summary_that_spells_a_secret_only_as_written_is_the_marker_by_its_fie
 def test_a_sidecar_text_the_field_check_lets_through_is_caught_by_the_whole_file_check(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The field check passes the summary as it is; the check of the whole file,
-    less what a shape check fixed, still sees the secret it spells, and the
-    summary is written as the marker."""
+    """The field check passes the summary as it is; the check of the whole file as
+    it is written still sees the secret its JSON spells inside the summary, and
+    the summary is written as the marker."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({_PEM_SECRET}))
@@ -6752,8 +6761,8 @@ def test_write_tool_meta_writes_nothing_when_a_field_no_check_fixed_holds_a_secr
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """``llm_log_process`` is written as the caller gives it, through no field
-    check and no shape check. A known secret in it is still in the file once the
-    summary is the marker, so nothing is written."""
+    check and no shape check: free text no marker replaces. A known secret in it
+    is still in the file once the summary is the marker, so nothing is written."""
     secret = "process-borne-secret-abcdef"
     pkg = tmp_path / "pkg"
     pkg.mkdir()
@@ -6764,12 +6773,442 @@ def test_write_tool_meta_writes_nothing_when_a_field_no_check_fixed_holds_a_secr
     assert not _sidecar(pkg).exists()
 
 
+# --- a JSON file checked as it is written -----------------------------------
+
+
+def _unmarked(value: Any) -> Any:
+    """``value`` with the marks of ``tools._encode_spans`` taken off."""
+    if isinstance(value, tools._Fixed):
+        return _unmarked(value.value)
+    if isinstance(value, tools._Record):
+        return {key: _unmarked(item) for key, item in value.fields.items()}
+    if isinstance(value, dict):
+        return {key: _unmarked(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_unmarked(item) for item in value]
+    return value
+
+
+# Characters that each take a different way through the encoder: plain, every
+# escape, a control character, DEL, non-ASCII, an astral one, a lone surrogate.
+_ENCODER_ALPHABET = list('ab"\\\n\r\t\b\f\x00\x1f\x7f 中😀\udcff•/')
+
+
+def _random_text(rng: random.Random) -> str:
+    return "".join(rng.choice(_ENCODER_ALPHABET) for _ in range(rng.randint(0, 5)))
+
+
+def _random_marked(rng: random.Random, depth: int) -> Any:
+    """Random JSON data, some of it marked, nested at most four containers deep."""
+    kind = rng.randint(0, 11 if depth < 4 else 6)
+    if kind == 0:
+        return None
+    if kind == 1:
+        return rng.choice([True, False])
+    if kind == 2:
+        return rng.randint(-(10**15), 10**15)
+    if kind == 3:
+        return rng.choice([0.5, -1.25, 1e300, 0.0, float("nan"), float("inf")])
+    if kind in (4, 5, 6):
+        return _random_text(rng)
+    if kind == 7:
+        return tools._Fixed(_random_marked(rng, depth + 1))
+    if kind == 8:
+        return [_random_marked(rng, depth + 1) for _ in range(rng.randint(0, 3))]
+    if kind == 9:
+        return tuple(_random_marked(rng, depth + 1) for _ in range(rng.randint(0, 3)))
+    fields = {
+        _random_text(rng) + str(index): _random_marked(rng, depth + 1)
+        for index in range(rng.randint(0, 3))
+    }
+    return tools._Record(fields) if kind == 10 else fields
+
+
+def test_the_written_text_is_what_json_dumps_writes_for_every_shape() -> None:
+    """The encoder the whole-file checks look at writes, character for character,
+    what ``json.dumps(..., ensure_ascii=False)`` writes for the same data with the
+    marks taken off, flat and indented: empty and nested containers, tuples,
+    every escape, lone surrogates, numbers of every kind. Its free ranges lie in
+    the text, in order and apart. Seeded, so a failing case comes back."""
+    rng = random.Random(20261031)
+    for case in range(3000):
+        value = _random_marked(rng, 0)
+        for indent in (None, 2):
+            text, free = tools._encode_spans(value, indent)
+            expected = json.dumps(_unmarked(value), ensure_ascii=False, indent=indent)
+            assert text == expected, (case, indent)
+            reached = 0
+            for start, end in free:
+                assert reached <= start < end <= len(text), (case, indent, free)
+                reached = end
+
+
+# Each part of a written text, and what of it is free text: (marked data, indent,
+# the free text in order). Everything not listed is fixed content.
+_FIXED_OR_FREE: dict[str, tuple[Any, int | None, list[str]]] = {
+    "the keys of a record": (tools._Record({"summary": tools._Fixed("s")}), None, []),
+    "a fixed string": (
+        tools._Record({"updated_at": tools._Fixed("2026-10-31T00:00:00+00:00")}),
+        None,
+        [],
+    ),
+    "fixed numbers, null, true and false": (
+        tools._Record({"n": tools._Fixed(7), "none": None, "yes": True, "no": tools._Fixed(False)}),
+        None,
+        [],
+    ),
+    "a fixed list, indented": (
+        tools._Record({"kept": tools._Fixed(["files-a", "files-b"])}),
+        2,
+        [],
+    ),
+    "a fixed mapping, keys and all": (tools._Fixed({"k": "v", "n": [1, "x"]}), None, []),
+    "a text, escapes as written": (tools._Record({"summary": 'a\n"b'}), None, ['a\\n\\"b']),
+    "an empty text": (tools._Record({"summary": ""}), None, []),
+    "the marker a degrade puts in": (
+        tools._Record({"summary": tools._Fixed(tools._REDACTION_MARKER)}),
+        None,
+        [],
+    ),
+    "a marker inside a text": (
+        tools._Record({"summary": tools._REDACTION_MARKER}),
+        None,
+        [tools._REDACTION_MARKER],
+    ),
+    "a value nothing vouched for": (tools._Record({"process": "tok", "n": 7}), None, ["tok", "7"]),
+    "a record in a list, indented": (
+        tools._Record(
+            {"omitted": [tools._Record({"path": "x.txt", "reason": tools._Fixed("secret_name")})]}
+        ),
+        2,
+        ["x.txt"],
+    ),
+    "the keys of a mapping that is not a record": ({"k": tools._Fixed("v")}, None, ["k"]),
+}
+
+
+@pytest.mark.parametrize("part", list(_FIXED_OR_FREE))
+def test_each_part_of_a_written_text_is_free_text_or_fixed_content_as_it_is_written(
+    part: str,
+) -> None:
+    """The free ranges hold exactly the listed text: what is between the quotes of
+    a text, as written, and the whole of a value nothing vouched for. Quotes,
+    punctuation, indentation, keys of a record, ``null``/``true``/``false``,
+    everything fixed and the marker a degrade puts in are fixed content; a marker
+    that is part of a text is text."""
+    value, indent, expected = _FIXED_OR_FREE[part]
+
+    text, free = tools._encode_spans(value, indent)
+
+    assert [text[start:end] for start, end in free] == expected
+
+
+def test_an_occurrence_overlapping_one_in_fixed_content_is_still_found() -> None:
+    """``aaaaaa`` begins at the start, wholly in fixed content, and passes there.
+    It begins again one and two characters later, where it takes in the free
+    ``aa``: those are found. A search that steps past the whole value after an
+    occurrence, as the mask's own does, would miss them."""
+    assert tools._touches_free_text("aaaaaaaa", [(6, 8)], ["aaaaaa"]) is True
+
+
+def test_an_occurrence_passes_in_fixed_content_and_counts_when_it_takes_in_free_text() -> None:
+    """Each occurrence is judged, not each value: one wholly in fixed content
+    passes, and the same value where it takes in even one free character -- at
+    either end of the free range -- counts."""
+    assert tools._touches_free_text("abcdefgh|xyz", [(9, 12)], ["abcdefgh"]) is False
+    assert tools._touches_free_text("abcdefgh|abcdefgh", [(9, 17)], ["abcdefgh"]) is True
+    assert tools._touches_free_text("abcdefXY", [(6, 8)], ["bcdefX"]) is True
+    assert tools._touches_free_text("XYabcdef", [(0, 2)], ["Yabcde"]) is True
+    assert tools._touches_free_text("XYabcdef", [(0, 2)], ["abcdef"]) is False
+
+
+def test_an_occurrence_ending_on_the_first_free_character_is_found_after_an_exempt_one() -> None:
+    """``aaaaaa`` begins at the start, wholly in fixed content, and passes there.
+    It begins once more, one character later, where its last character is the
+    first free one, and nowhere after that. The search past the exempt
+    occurrence starts early enough to see that one: it is found."""
+    assert tools._touches_free_text("aaaaaaab", [(6, 8)], ["aaaaaa"]) is True
+
+
+def test_an_occurrence_ending_where_free_text_begins_takes_in_none_of_it_and_passes() -> None:
+    """``abcdef`` ends at the position where the free ``XY`` begins: it holds no
+    free character, so it passes."""
+    assert tools._touches_free_text("abcdefXY", [(6, 8)], ["abcdef"]) is False
+
+
+def test_summary_json_is_written_as_it_is_when_a_known_value_lies_only_in_its_timestamp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A known value equal to a stretch of ``updated_at`` lies wholly in fixed
+    content: the file holds it, and the summary is written as it is, not as the
+    marker."""
+    stamp_part = "2026-01-01T00:00"
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({stamp_part}))
+
+    assert _write_meta(pkg, summary="這個工具會查 KB") is True
+
+    assert stamp_part.encode("utf-8") in _sidecar(pkg).read_bytes()
+    stored = tools.read_tool_meta(_version_root(pkg))
+    assert stored is not None
+    assert stored["summary"] == "這個工具會查 KB"
+
+
+def test_an_occurrence_ending_where_the_summary_text_begins_is_fixed_and_the_text_is_kept(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The known value ``{"summary": "`` is all that comes before the summary
+    text: the brace, the key, the separator and the opening quote. It ends
+    exactly where the summary text begins and takes in none of it. It is fixed
+    content: the file holds it, and the summary is written as it is, not as the
+    marker."""
+    opening = '{"summary": "'
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({opening}))
+
+    assert _write_meta(pkg, summary="這個工具會查 KB") is True
+
+    written = _sidecar(pkg).read_bytes()
+    assert written.startswith((opening + "這個工具會查 KB").encode("utf-8"))
+    stored = tools.read_tool_meta(_version_root(pkg))
+    assert stored is not None
+    assert stored["summary"] == "這個工具會查 KB"
+
+
+@pytest.mark.parametrize("field", ["instructions", "summary"])
+def test_a_known_value_from_a_key_into_a_text_reaches_no_byte_of_the_sidecar(
+    field: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The value begins in a key and the punctuation after it, and runs into the
+    start of the text: neither the text alone nor the key does hold it, the file
+    as written does. That text is written as the marker."""
+    secret = f'{field}": "DO-NOT-STORE-12345'
+    text = "DO-NOT-STORE-12345 more"
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+
+    if field == "summary":
+        assert _write_meta(pkg, summary=text) is True
+    else:
+        assert _write_meta(pkg, summary="s", origin={"instructions": text}) is True
+
+    meta = pkg / tools._META_DIRNAME
+    for name in (tools._SUMMARY_FILENAME, tools._ORIGIN_FILENAME):
+        if (meta / name).exists():
+            assert secret.encode("utf-8") not in (meta / name).read_bytes()
+    stored = tools.read_tool_meta(_version_root(pkg))
+    assert stored is not None
+    written = stored["summary"] if field == "summary" else stored["origin"]["instructions"]
+    assert written == tools._REDACTION_MARKER
+
+
+def test_a_known_value_from_a_text_into_the_timestamp_after_it_reaches_no_byte_of_summary_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The summary is ``abc``, shorter than the trailing fragment the mask
+    guards, and the value runs on through the quote and the next key into the
+    timestamp, which is fixed content. The file as written would hold it whole;
+    the summary is written as the marker."""
+    secret = 'abc", "updated_at": "2026-01-01T00:00:00+00:00'
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+
+    assert _write_meta(pkg, summary="abc") is True
+
+    assert secret.encode("utf-8") not in _sidecar(pkg).read_bytes()
+    stored = tools.read_tool_meta(_version_root(pkg))
+    assert stored is not None
+    assert stored["summary"] == tools._REDACTION_MARKER
+
+
+def test_a_known_value_across_two_texts_and_the_key_between_them_reaches_no_byte_of_origin_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The value runs from the end of ``source``, through the key of the next
+    field, into the start of ``openapi_url``: two texts with fixed content
+    between. Both are written as the marker."""
+    secret = 'left", "openapi_url": "right'
+    root = tmp_path / "build"
+    (root / tools._META_DIRNAME).mkdir(parents=True)
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+
+    written = tools.write_origin_meta(
+        tools.BuildRoot(root),
+        {
+            "source": "from the left",
+            "openapi_url": "right/openapi.json",
+            "instructions": None,
+            "feedback": None,
+            "previous": None,
+        },
+    )
+
+    assert written is True
+    data = (root / tools._META_DIRNAME / tools._ORIGIN_FILENAME).read_bytes()
+    assert secret.encode("utf-8") not in data
+    origin = json.loads(data)
+    assert origin["source"] == origin["openapi_url"] == tools._REDACTION_MARKER
+
+
+def test_a_known_value_wholly_in_the_marker_and_the_next_key_is_written_once_the_text_is_the_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The first value takes in the summary, so every text is written as the
+    marker. The second runs from the end of that marker through the next key:
+    once the marker is in, it lies wholly in fixed content -- the marker a
+    degrade puts in, a quote, a key -- and the file is written with it."""
+    takes_in_the_text = 'summary": "plain'
+    across_the_marker = '秘密已遮蔽]•••", "updated_at": "'
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(
+        tools, "known_secret_values", lambda: frozenset({takes_in_the_text, across_the_marker})
+    )
+
+    assert _write_meta(pkg, summary="plain words") is True
+
+    data = _sidecar(pkg).read_bytes()
+    assert takes_in_the_text.encode("utf-8") not in data
+    assert across_the_marker.encode("utf-8") in data
+    stored = tools.read_tool_meta(_version_root(pkg))
+    assert stored is not None
+    assert stored["summary"] == tools._REDACTION_MARKER
+
+
+def test_a_known_value_from_the_marker_into_llm_log_process_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Once the summary is the marker, the second value runs from that marker,
+    through every fixed field, into ``llm_log_process`` -- written as the caller
+    gives it, vouched for by nothing. The marker beside it does not vouch for it
+    either: nothing is written."""
+    takes_in_the_text = 'summary": "plain'
+    into_the_process = (
+        '•••", "updated_at": "2026-01-01T00:00:00+00:00", "llm_log_id": null, '
+        '"llm_log_process": "tok'
+    )
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(
+        tools, "known_secret_values", lambda: frozenset({takes_in_the_text, into_the_process})
+    )
+
+    assert _write_meta(pkg, summary="plain words", llm_log_process="tok-1") is False
+
+    assert not _sidecar(pkg).exists()
+
+
+@pytest.mark.parametrize("field_check", ["whole", "mask only", "none"])
+def test_a_marker_inside_a_text_is_text_to_the_whole_file_check(
+    field_check: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Two values are known: ``abcdef``, and one that holds the marker. Masking
+    ``xabcdefy`` spells the second exactly, and a text can hold it as typed. The
+    field check catches it; with the field check cut down to the mask alone, or
+    taken away, the whole-file check still does: a marker inside a text is part
+    of the text, and only the marker a degrade puts in is fixed content."""
+    spelled = "x" + tools._REDACTION_MARKER + "y"
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({"abcdef", spelled}))
+    if field_check == "mask only":
+        monkeypatch.setattr(
+            tools,
+            "_redacted",
+            lambda value, secrets, cap=None: tools._mask_known_secrets(value, secrets),
+        )
+    elif field_check == "none":
+        monkeypatch.setattr(tools, "_redacted", lambda value, *rest: value)
+    summary = spelled if field_check == "none" else "xabcdefy"
+
+    assert _write_meta(pkg, summary=summary) is True
+
+    assert spelled.encode("utf-8") not in _sidecar(pkg).read_bytes()
+    stored = tools.read_tool_meta(_version_root(pkg))
+    assert stored is not None
+    assert stored["summary"] == tools._REDACTION_MARKER
+
+
+def test_sidecars_in_which_nothing_known_occurs_are_json_dumps_byte_for_byte(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Nothing known occurs in them: ``origin.json`` is ``json.dumps`` and a new
+    line, and ``summary.json`` is ``json.dumps``, byte for byte -- non-ASCII,
+    escapes, a fixed vid, ``null`` and a number included."""
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({"kb-live-key-abcdef"}))
+    pkg = tmp_path / "pkg"
+    meta_dir = pkg / tools._META_DIRNAME
+    meta_dir.mkdir(parents=True)
+    origin = {
+        "source": '來源 "引號"\n第二行',
+        "openapi_url": None,
+        "instructions": "指示\t與\\反斜線",
+        "feedback": "回饋",
+        "previous": "20260101T000000Z-abcdef",
+    }
+    summary = {
+        "summary": '說明 "引號"\n',
+        "updated_at": "2026-01-01T00:00:00+00:00",
+        "llm_log_id": 7,
+        "llm_log_process": "token-0123",
+    }
+
+    assert tools.write_origin_meta(tools.BuildRoot(pkg), origin) is True
+    assert tools.write_tool_meta(_version_root(pkg), summary) is True
+
+    origin_text = json.dumps(origin, ensure_ascii=False) + "\n"
+    assert (meta_dir / tools._ORIGIN_FILENAME).read_bytes() == origin_text.encode("utf-8")
+    summary_text = json.dumps(summary, ensure_ascii=False)
+    assert (meta_dir / tools._SUMMARY_FILENAME).read_bytes() == summary_text.encode("utf-8")
+
+
+# What one lone surrogate in a name is written as once it is made encodable.
+_SPELLED_BY_THE_SCRUB = "kb-���-key"
+
+
+@pytest.mark.parametrize("found", ["a hit", "an unreadable entry"])
+def test_validate_checks_the_path_it_names_again_after_its_surrogates_are_replaced(
+    found: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``kb-\\udcff-key`` holds no known value as it is read. Making it encodable
+    for the message writes three U+FFFD for the lone surrogate, which complete
+    ``kb-���-key``. The path the refusal names is checked after that, so the value
+    does not reach the message -- named for a hit, or for an entry the scan
+    could not read."""
+    pkg = _staged_pkg(
+        tmp_path / "stage", tool_json=_kbsearch_manifest(), run_py="import sys\nprint('x')\n"
+    )
+    monkeypatch.setattr(
+        tools, "_redaction_secrets", lambda: tools._match_forms([_SPELLED_BY_THE_SCRUB])
+    )
+    name = "kb-\udcff-key"
+    scan = (
+        tools.SecretScanDone(hits=(tools.SecretHit(path=name, kind="name"),), skipped=())
+        if found == "a hit"
+        else tools.SecretScanDone(
+            hits=(), skipped=(tools.SecretScanSkip(path=name, reason="unreadable"),)
+        )
+    )
+    monkeypatch.setattr(tools, "scan_embedded_secrets", lambda root, secrets=None: scan)
+
+    error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
+
+    assert error is not None
+    assert _SPELLED_BY_THE_SCRUB not in error
+    assert error.startswith(tools._REDACTION_MARKER)
+
+
 def test_write_tool_meta_requires_updated_at_in_the_shape_the_backend_stamps(
     tmp_path: Path,
 ) -> None:
-    """``updated_at`` is left out of the whole-file check because its shape is
-    fixed: ``datetime.now(UTC).isoformat()``, what ``store_summary_meta`` stamps.
-    A string of any other shape is refused rather than written unchecked."""
+    """``updated_at`` is fixed content to the whole-file check because its shape
+    is fixed: ``datetime.now(UTC).isoformat()``, what ``store_summary_meta``
+    stamps. A string of any other shape is refused rather than written as fixed
+    content."""
     pkg = tmp_path / "pkg"
     (pkg / tools._META_DIRNAME).mkdir(parents=True)
     for stamp in ("yesterday", "2026-01-01", "2026-01-01T00:00:00Z"):

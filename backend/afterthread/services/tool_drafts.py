@@ -75,11 +75,13 @@ What holds, and why:
   check here fixes -- an identifier, a timestamp this module wrote, a number, a
   vocabulary word -- is checked against that shape instead of masked; a mask
   could only corrupt it. What a run record hands over is free text. The keys
-  are this module's literals. Before anything is written, the whole file is
-  checked the same way, less what a shape check fixed and less the keys
-  (``tools._encode_checked``), so a text that reached it some other way is seen
-  too: when that check finds a secret, every free text is written as the
-  marker, and when it still finds one, nothing is written
+  are this module's literals. Before anything is written, the text of the whole
+  file is checked as it is written (``tools._encode_checked``), so a text that
+  reached it some other way is seen too, and so is a known value that runs
+  across a key, a quote or two fields: an occurrence that lies wholly in fixed
+  content -- keys, punctuation, what a shape check fixed -- is written as it is,
+  and one that takes in free text sends every free text to the marker; when one
+  still takes in free text, nothing is written
   (``REASON_MANIFEST_SECRET``). What it does not cover: a secret registered with
   a real line break that a text spells as the two characters ``\\n``, a value
   encoded another way (base64, say), a ``.env`` value whose undecodable bytes
@@ -718,7 +720,7 @@ class _BadShape(Exception):
     """Raised inside the manifest checks; never leaves this module."""
 
 
-def _free(value: Any, cap: int, writing: tools._Writing) -> str | None:
+def _free(value: Any, cap: int, writing: tools._Writing) -> str | tools._Fixed | None:
     """A free-text value of the manifest, as ``writing`` writes it (``tools._redacted``)."""
     if value is not None and not isinstance(value, str):
         raise _BadShape
@@ -878,12 +880,12 @@ def _document(raw: Any, writing: tools._Writing) -> Any:
 
     The ONE description of the manifest's shape, and every value goes to
     ``writing`` (``tools._Writing``) as what it is: fixed by a shape check, or
-    free text. The writer runs it over what it is about to write -- for the
-    file, with the secrets known now, so every text is masked, cut and checked as
-    written, and for the probe its backstop looks at -- and the reader over what
-    it read back (with no secrets, which still makes every text encodable and
-    cut). Keys are this function's literals, never the input's. Raises
-    ``_BadShape`` on anything out of shape.
+    free text. The writer runs it over what it is about to write, with the
+    secrets known now and every value marked for the check of the written text
+    (``tools._encode_checked``), so every text is masked, cut and checked as
+    written; the reader runs it over what it read back (with no secrets, which
+    still makes every text encodable and cut). Keys are this function's
+    literals, never the input's. Raises ``_BadShape`` on anything out of shape.
     """
     doc = _mapping(raw)
     files_dir = _matching(doc.get("files_dir"), _FILES_RE)
@@ -892,7 +894,7 @@ def _document(raw: Any, writing: tools._Writing) -> Any:
         raise _BadShape
     raw_attempts = _listing(doc.get("attempts"), ATTEMPTS_KEPT)
     attempts = [_attempt_entry(item, writing) for item in raw_attempts]
-    # Taken from what was just checked: what ``writing`` gives back may be a probe.
+    # Taken from what was just checked: what ``writing`` gives back may be marked.
     numbers = [item["number"] for item in raw_attempts]
     attempt_count = _count(doc.get("attempt_count"), minimum=1)
     if (
@@ -919,19 +921,19 @@ def _document(raw: Any, writing: tools._Writing) -> Any:
     )
 
 
-def _manifest_text(payload: Any) -> str:
-    return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-
-
 def _manifest_data(doc: dict[str, Any], known: list[str]) -> bytes | str:
     """The manifest file for ``doc``, or the reason there is none.
 
-    ``REASON_MANIFEST_SECRET`` when it would hold a known secret even with every
-    free text written as the marker (``tools._encode_checked``);
-    ``REASON_MANIFEST`` when it is out of shape or too large.
+    The file is the document indented by two, and a new line.
+    ``REASON_MANIFEST_SECRET`` when a known value in its written text would still
+    take in free text with every text written as the marker
+    (``tools._encode_checked``); ``REASON_MANIFEST`` when it is out of shape or too
+    large.
     """
     try:
-        text = tools._encode_checked(lambda writing: _document(doc, writing), known, _manifest_text)
+        text = tools._encode_checked(
+            lambda writing: _document(doc, writing), known, indent=2, end="\n"
+        )
     except _BadShape, TypeError, ValueError:
         return REASON_MANIFEST
     if text is None:
@@ -1205,11 +1207,11 @@ def discard_token(draft_dir: Path) -> str:
 
 
 def _shown(text: str | None, known: list[str], cap: int | None = None) -> str | None:
-    """Read text as the API serves it: masked with the secrets known now, then cut."""
+    """Read text as the API serves it (``tools._masked_as_shown``): masked with the
+    secrets known now, cut, made encodable, and checked after the last of these."""
     if text is None:
         return None
-    masked = tools._mask_known_secrets(text, known)
-    return tools._utf8_safe(masked if cap is None else masked[:cap])
+    return tools._masked_as_shown(text, known, cap)
 
 
 def _published_from(manifest: dict[str, Any], resolution: tools.Resolution) -> bool:

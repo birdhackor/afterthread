@@ -67,7 +67,7 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 | `LLM_PROMPT_BUDGET_TOKENS` | `200000` | enrich / assist-update / 工具安裝組 prompt 時，內容序列化後的 **token** 預算，邊界 `[4000, 1000000]`。實際套用時經動態「字元↔token 比值」換算成字元上限（比值由近期互動的 usage 學得，冷啟動用保守值 1.0，比值下限 0.1 兼作絕對字元兜底——見 `services/token_budget.py`、`docs/tool-calling.md`）。改名自舊的 `LLM_PROMPT_BUDGET_CHARS`（舊鍵會被靜默忽略）。 |
 | `LLM_LOG_MAX_ENTRIES` | `50` | 「AI 日誌」頁／`GET /api/llm/logs` 顯示的最近互動筆數上限（記憶體內環狀緩衝，隨程序重啟清空），邊界 `[1, 1000]`。 |
 | `LLM_LOG_BODY_MAX_CHARS` | `200000` | 單次互動中，任一則請求/回應內容儲存時的字元數上限，邊界 `[1000, 2000000]`；與 `LLM_LOG_MAX_ENTRIES` 一起讓記憶體用量在兩個軸上都有界。 |
-| `LLM_LOG_FILE` | 未設定 | 選填。設定後，每次 LLM 互動會額外追加寫入這個 JSONL 檔案（與記憶體環狀緩衝相同的紀錄，一樣受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；預設關閉——記錄含個人記憶內容，落不落地是使用者自己的隱私選擇。 |
+| `LLM_LOG_FILE` | 未設定 | 選填。設定後，每次 LLM 互動會額外追加寫入這個 JSONL 檔案（與記憶體環狀緩衝形狀相同的紀錄，一樣受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；預設關閉——記錄含個人記憶內容，落不落地是使用者自己的隱私選擇。每一行連同行尾換行，追加前以寫出的樣子再檢查一次：已知秘密的某一處出現碰到文字欄位（本文、回覆、錯誤、工具名稱、model）時，這一行的文字欄位全部換成遮蔽標記，字數跟著改；仍碰到時（只會是沒分類的欄位）不寫這一行，只記一筆不含內容的警告；寫出時已知秘密的清單不完整，這一行的文字欄位全部改存「本文未記錄」的標記。整處落在鍵、標點、時間、計數與小寫識別字（workflow、outcome、role）裡的出現照寫。每一行各自檢查，橫跨兩行的值看不到。記憶體環狀緩衝與 AI 日誌頁照舊顯示原本的紀錄。 |
 | `LLM_LOG_FILE_MAX_BYTES` | `50000000` | 上述 JSONL sink 的輪替門檻（位元組）：檔案超過此大小就改名成帶 UTC 時間戳後綴、另開新檔（守磁碟；RAM 由環狀緩衝負責），邊界 `[1000000, 1000000000]`。僅在有設定 `LLM_LOG_FILE` 時有意義；輪替後的舊檔不會自動刪除，交由使用者自行清理。 |
 | `TOOLS_DIR` | dev 未設定／打包模式自動注入 `<data-dir>/tools` | 已安裝工具套件所在目錄；留空＝工具功能整個關閉（`GET /api/tools` 回空清單，AI workflow 不帶任何工具，prompt 與無工具版本逐字相同）。相對路徑或指向此基底的 symlink 會在設定邊界 canonicalize 成同一個絕對路徑；這不會跟隨或放寬任何 package/version symlink 的拒絕。路徑裡還不存在的部分照原樣保留（工具目錄還沒建立時照常）；某一段是檔案時同樣是那裡沒有工具目錄：照設定的路徑使用（只轉成絕對路徑，不解析連結、不化簡 `..`），沒有工具，AI workflow 照常不帶工具，已知秘密的清單照常完整。解析時遇到其他錯誤（上層目錄無法搜尋、連結迴圈、I/O 錯誤）不會被當成功能關閉：工具清單、capture／enrich／assist-update 等用到工具目錄的請求回 `500 tools_dir_unresolved`，訊息寫出設定的路徑、錯誤型別與下一步（檢查上層目錄的權限、連結與磁碟狀態，或清空這個設定），已知秘密的清單也因此不完整。dev 模式要用工具功能，需自行在 `backend/.env` 設定這個變數。 |
 | `LLM_TOOL_ROUNDS_MAX` | `8` | 一次 AI workflow 呼叫最多允許幾輪工具呼叫，邊界 `[1, 64]`。 |
@@ -443,7 +443,7 @@ discard_token, last}`：`state` 依序判定為 `running`（本行程有一輪�
   長度下限只看原值，換成 LF 後變短的形式照樣比對。
   收集時不存在（`ENOENT`／`ENOTDIR`）、是連結或特殊檔、超過大小上限的 `.env`
   沒有值，其他讀取錯誤（權限、I/O）則讓已知秘密的清單不完整：需要它的遮蔽與檢查不放行（保存與發布失敗並寫出
-  讀不到的 `.env` 與下一步，清單與紀錄的讀取回 `500 known_secrets_incomplete`，工具與 `run_shell` 的輸出不交出），AI 日誌的每段本文改存「無法確認是否含已知秘密，本文未記錄」的標記（不是表示命中秘密的遮蔽標記）；
+  讀不到的 `.env` 與下一步，清單與紀錄的讀取回 `500 known_secrets_incomplete`，工具與 `run_shell` 的輸出不交出），AI 日誌的每段本文改存「無法確認是否含已知秘密，本文未記錄」的標記（不是表示命中秘密的遮蔽標記），JSONL 檔的那一行在寫出時清單不完整，整行的文字欄位都改存這個標記；
   `config.env` 的值不是秘密、不進遮蔽集合、
   沒有長度下限，修訂時整份交給 builder。執行環境的順序是透傳 → `TLS_NO_VERIFY`
   → `config.env` → `.env`，同一個 key 以 `.env` 為準。
@@ -594,9 +594,10 @@ discard_token, last}`：`state` 依序判定為 `running`（本行程有一輪�
   保存失敗會收回它建的東西，連空的 `draft/` 一起。說明檔的文字先遮蔽、再截斷、再處理孤立的
   surrogate，最後以寫進檔案的樣子（JSON 字串字面）用同一個比對器再檢查一次（`tools._redacted`）：
   跳脫字元（`\n`、`\"`、`\\`、`\uXXXX`）或替代字元拼出已知秘密的欄位，整欄寫成遮蔽標記；識別碼、
-  時間、數字與詞彙值改為檢查形狀。寫入前再對整份檔案做同樣的檢查當底線（`tools._encode_checked`），
-  檢查的是去掉形狀固定的值與鍵之後剩下的部分：命中就把所有文字欄位都寫成遮蔽標記再查一次，仍命中
-  就不寫，保存以「說明檔寫下去仍會含有已知的秘密值」失敗。精確比對看不到表示法的差異：以真換行登記、
+  時間、數字與詞彙值改為檢查形狀。寫入前再以寫出的整份文字做一次底線（`tools._encode_checked`）：
+  已知秘密的每一處出現都看，重疊的也看；整處落在固定內容（鍵、JSON 標點與空白、形狀固定的值、退化時
+  放進去的遮蔽標記）裡的照寫，碰到文字欄位的——包括橫跨鍵名、引號或兩個欄位的——就把所有文字欄位都
+  寫成遮蔽標記再查一次，仍碰到就不寫，保存以「說明檔寫下去仍會含有已知的秘密值」失敗。精確比對看不到表示法的差異：以真換行登記、
   文字卻寫成 `\n` 兩個字元的秘密，base64 等其他編碼，`.env` 讀入時壞位元組已被替換的值，都不在這個
   保證內。一個工具一份草稿：`draft/` 存在時，沒指名草稿的修訂一律拒絕（`draft_pending`），要嘛接續、
   要嘛照現在的檔案發布（見「發布草稿（不經 AI）」）、要嘛放棄。新版本 `origin.feedback` 的文字遮蔽不了
@@ -772,8 +773,9 @@ discard_token, last}`：`state` 依序判定為 `running`（本行程有一輪�
   可重新產生的 `.afterthread.meta/summary.json` 保存 summary、updated time 與
   AI log identity。兩者都經 typed／bounded／secret-redacted／fail-closed／atomic
   publisher：文字欄位先遮蔽，再以寫進檔案的樣子檢查（拼出已知秘密就整欄寫成遮蔽標記，與草稿說明檔
-  同一套），整份檔案扣掉形狀固定的欄位（`previous`、`updated_at`、`llm_log_id`）與鍵之後再做一次底線
-  檢查，仍命中就不寫；`updated_at` 必須是 `datetime.now(UTC).isoformat()` 的形狀，否則拒寫。
+  同一套），寫出的整份文字再做一次同樣的底線：鍵、標點與形狀固定的欄位（`previous`、`updated_at`、
+  `llm_log_id`）是固定內容，`llm_log_process` 照呼叫者給的寫、算文字但不換成標記，所以碰到它的出現
+  會讓整份不寫；`updated_at` 必須是 `datetime.now(UTC).isoformat()` 的形狀，否則拒寫。
   `origin.json` 寫不出來就是發布失敗、成果保留。來源 URL 在捕捉時先收斂成不帶 userinfo/path/query/fragment 的
   provenance。summary 缺席或損壞是「尚無可用總結」，不會使版本失效；安裝／修訂
   上線後的自動產生是 best-effort，失敗不能翻轉已完成的提交。

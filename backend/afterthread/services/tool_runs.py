@@ -80,8 +80,10 @@ def _storable(text: str | None, cut: Any, cap: int) -> str | None:
     surrogate as three U+FFFD, so a known value that itself holds three U+FFFD in
     a row can be completed by it in the stored text. Only the arguments and the
     message can carry a surrogate: the output is decoded with errors="replace"
-    before it is redacted. The reads that hand the bodies on (``view``,
-    ``attach_for_revise``) mask them again.
+    before it is redacted. The cut can complete one too: ``_head`` and ``_tail``
+    put a marker beside what they keep, and a known value that holds the marker's
+    text can be completed by the marker and the text kept next to it. The reads
+    that hand the bodies on (``view``, ``attach_for_revise``) mask them again.
     """
     if text is None:
         return None

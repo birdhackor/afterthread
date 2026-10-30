@@ -14,6 +14,7 @@ version identity; a call runs that exact version with its directory as cwd.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import contextlib
 import errno
 import fcntl
@@ -1646,11 +1647,11 @@ def validate_tool_content(build_root: BuildRoot, expected_name: str) -> str | No
     # offending relative path, never the value. The path is masked before it lands in
     # the message, because a builder can write a file whose very NAME is an expanded
     # ``$SECRET``. One snapshot of the known secrets serves the scan and the mask, so
-    # the value a hit was found by is the one masked out of its path. Only then are
-    # the path's lone surrogates replaced (``_utf8_safe``): a name that is not UTF-8
-    # is read back with them, and the message must encode to be shown. Not before the
-    # mask: a known value can hold one too, and replacing it in the path's copy of the
-    # value would hide that copy from the mask.
+    # the value a hit was found by is the one masked out of its path. The path is
+    # shown as ``_masked_as_shown`` shows a text: masked first, then its lone
+    # surrogates replaced -- a name that is not UTF-8 is read back with them, and the
+    # message must encode to be shown -- and then checked again, since the three
+    # U+FFFD the scrub writes for one can complete a known value.
     try:
         secrets = _redaction_secrets()
     except KnownSecretsIncomplete as exc:
@@ -1662,17 +1663,17 @@ def validate_tool_content(build_root: BuildRoot, expected_name: str) -> str | No
     if isinstance(scan, SecretScanFailed):
         return _secret_scan_failed_error(scan.reason)
     if scan.hits:
-        offender = _utf8_safe(_mask_known_secrets(scan.hits[0].path, secrets))
+        offender = _masked_as_shown(scan.hits[0].path, secrets)
         return f"{offender} 不得包含秘密值（請改由環境變數讀取）"  # noqa: RUF001
     # An entry the scan could not read is content nobody checked: refused like a
     # failed scan, naming the first one -- whatever it holds would be published
     # unseen, and nothing after this reads it again. A FIFO, socket or device
     # (``not_regular``) is not refused: it has no stored content to hold a value,
-    # and its name was checked like every other entry's. Its path is masked, then
-    # made encodable, the same way.
+    # and its name was checked like every other entry's. Its path is shown the same
+    # way.
     unread = [skip.path for skip in scan.skipped if skip.reason == "unreadable"]
     if unread:
-        unchecked = _utf8_safe(_mask_known_secrets(unread[0], secrets))
+        unchecked = _masked_as_shown(unread[0], secrets)
         return f"{unchecked} 無法讀取，無法確認裡面沒有已知的秘密值。"  # noqa: RUF001
     return None
 
@@ -1861,62 +1862,243 @@ def _redacted(value: str | None, secrets: list[str], cap: int | None = None) -> 
     return _REDACTION_MARKER if _spells_a_secret(text, secrets) else text
 
 
+def _masked_as_shown(text: str, secrets: list[str], cap: int | None = None) -> str:
+    """``text`` as a message or a screen shows it: masked, cut to ``cap`` when there
+    is one, made encodable, and checked after the last of these.
+
+    The mask works on the text as given, before the scrub: a known value can hold
+    a lone surrogate itself, and the scrub would hide the text's copy of it from
+    the mask. The scrub writes three U+FFFD for one lone surrogate, and those can
+    complete a known value the text did not hold, so what is shown is checked
+    once more after it, with the mask's own matcher (``_holds_a_secret``): one
+    that holds a known value is shown as the redaction marker, whole, as
+    ``_redacted`` writes a field. What a caller puts beside the answer afterwards
+    -- a template, a separator -- is outside this check.
+    """
+    masked = _mask_known_secrets(text, secrets)
+    shown = _utf8_safe(masked if cap is None else masked[:cap])
+    return _REDACTION_MARKER if _holds_a_secret(shown, secrets) else shown
+
+
+@dataclass(frozen=True, slots=True)
+class _Fixed:
+    """A value written as fixed content, whole, for ``_encode_spans``.
+
+    Everything inside is fixed: a string with its quotes, a number, a list or a
+    mapping with its keys. It marks what the backend decides, never text it was
+    handed.
+    """
+
+    value: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _Record:
+    """A mapping keyed by the backend's own literals, for ``_encode_spans``: its keys
+    are fixed content, and each value is marked by what it is."""
+
+    fields: dict[str, Any]
+
+
+def _encode_spans(value: Any, indent: int | None) -> tuple[str, list[tuple[int, int]]]:
+    """``value`` as ``json.dumps(value, ensure_ascii=False, indent=indent)`` writes it,
+    and where in that text the free text is.
+
+    ``value`` is JSON data with parts marked (``_Fixed``, ``_Record``). The text is
+    the same, character for character, as ``json.dumps`` writes the data with the
+    marks taken off: the same separators (``", "`` and ``": "``, or ``","`` and a
+    new line indented by ``indent`` per level), ``[]`` and ``{}`` for an empty
+    container, and each string and number as ``json.dumps`` writes it alone.
+
+    Free text is what a check of the written text has to take as coming from
+    outside: what is between the quotes of a string, escapes as written, and the
+    digits of a number, unless it is inside a ``_Fixed``; and the keys of a
+    mapping that is not a ``_Record``. Everything else is fixed content:
+    punctuation and white space, the quotes of every string, ``null``, ``true``
+    and ``false`` (they hold no character of anything given), the keys of a
+    ``_Record``, and all of a ``_Fixed``. The free text comes back as
+    ``(start, end)`` ranges of the text, in order and apart.
+
+    A key that is not a string raises ``TypeError``, as a value of a type JSON has
+    no form for does.
+    """
+    pieces: list[str] = []
+    free: list[tuple[int, int]] = []
+    size = 0
+
+    def put(text: str, start: int = 0, end: int = 0) -> None:
+        # ``text[start:end]`` is free text.
+        nonlocal size
+        if start < end:
+            free.append((size + start, size + end))
+        pieces.append(text)
+        size += len(text)
+
+    def layout(level: int) -> tuple[str, str, str]:
+        # What opens, separates and closes the items of a container at ``level``.
+        if indent is None:
+            return "", ", ", ""
+        inner = "\n" + " " * (indent * (level + 1))
+        return inner, "," + inner, "\n" + " " * (indent * level)
+
+    def walk(item: Any, level: int, fixed: bool) -> None:
+        if isinstance(item, _Fixed):
+            walk(item.value, level, True)
+        elif isinstance(item, _Record):
+            mapping(item.fields, level, fixed, True)
+        elif isinstance(item, dict):
+            mapping(item, level, fixed, fixed)
+        elif isinstance(item, (list, tuple)):
+            if not item:
+                put("[]")
+                return
+            opening, separator, closing = layout(level)
+            put("[" + opening)
+            for index, element in enumerate(item):
+                if index:
+                    put(separator)
+                walk(element, level + 1, fixed)
+            put(closing + "]")
+        elif item is None or item is True or item is False:
+            put(json.dumps(item))
+        elif isinstance(item, str):
+            literal = json.dumps(item, ensure_ascii=False)
+            put(literal, 1, 0 if fixed else len(literal) - 1)
+        elif isinstance(item, (int, float)):
+            literal = json.dumps(item)
+            put(literal, 0, 0 if fixed else len(literal))
+        else:
+            raise TypeError(f"Object of type {type(item).__name__} is not JSON serializable")
+
+    def mapping(fields: dict[Any, Any], level: int, fixed: bool, keys_fixed: bool) -> None:
+        if not fields:
+            put("{}")
+            return
+        opening, separator, closing = layout(level)
+        put("{" + opening)
+        for index, (key, item) in enumerate(fields.items()):
+            if not isinstance(key, str):
+                raise TypeError(f"keys must be str, not {type(key).__name__}")
+            if index:
+                put(separator)
+            literal = json.dumps(key, ensure_ascii=False)
+            put(literal, 1, 0 if keys_fixed else len(literal) - 1)
+            put(": ")
+            walk(item, level + 1, fixed)
+        put(closing + "}")
+
+    walk(value, 0, False)
+    return "".join(pieces), free
+
+
+def _touches_free_text(text: str, free: list[tuple[int, int]], secrets: list[str]) -> bool:
+    """Whether a known value occurs in ``text`` where the occurrence takes in free text.
+
+    ``free`` is where the free text is, as ``_encode_spans`` gives it. Every
+    occurrence of every value counts, overlapping ones too; one that lies wholly
+    outside ``free`` -- in fixed content -- passes, since the backend's own
+    characters spell it. Only whole occurrences count: the text was not cut.
+
+    After an occurrence that passes, the search goes on from the first place an
+    occurrence could reach the next free range: those it skips lie in fixed
+    content, and every occurrence that takes in free text is still seen. Nothing
+    found is kept, and the first occurrence that takes in free text ends the
+    search; per value, the work is one pass over the text and one search for each
+    free range at most.
+    """
+    ends = [end for _, end in free]
+    for value in secrets:
+        if not value:
+            # Found everywhere and never a secret: no match form is empty.
+            continue
+        size = len(value)
+        at = text.find(value)
+        while at != -1:
+            index = bisect.bisect_right(ends, at)
+            if index == len(ends):
+                break
+            start = free[index][0]
+            if start < at + size:
+                return True
+            at = text.find(value, start - size + 1)
+    return False
+
+
 @dataclass(frozen=True, slots=True)
 class _Writing:
-    """How a builder hands over the values of one JSON file: for the file, or for its probe.
+    """How a builder hands over the values of one JSON file: as they are, or marked.
 
     A builder of such a file (``write_tool_meta``'s, ``write_origin_meta``'s,
     ``tool_drafts._document``) hands a value over through one of these methods by
-    what it is, so the probe ``_encode_checked`` looks at comes from the same code
-    as the file:
+    what it is, so the check of the written text (``_encode_checked``) learns what
+    the file is made of from the same code that makes it:
 
     * ``fixed`` -- a value whose shape a check fixed (a vid, a timestamp, an id, a
-      number, a word of a closed vocabulary): as it is, and ``""`` in the probe.
-      Nothing such a check passes can carry text, and a mask could only corrupt it;
-    * ``record`` -- a mapping keyed by the builder's own literals: as it is, and its
-      values alone in the probe, since a key is fixed too;
+      number, a word of a closed vocabulary): as it is. Nothing such a check
+      passes can carry text, and a mask could only corrupt it;
+    * ``record`` -- a mapping keyed by the builder's own literals, its keys fixed;
     * ``text`` -- free text: through ``_redacted``, or the redaction marker when
       ``degraded``.
 
-    A value a builder writes without one of them -- as ``write_tool_meta`` writes
-    ``llm_log_process`` -- is in the probe as it is.
+    ``marked`` hands the values to ``_encode_spans``: what ``fixed`` and ``record``
+    give is marked (``_Fixed``, ``_Record``), and so is the marker ``text`` gives
+    when ``degraded``, which is fixed content. A text otherwise is free text, and
+    so is a value a builder writes without one of these methods -- as
+    ``write_tool_meta`` writes ``llm_log_process`` --, which no marker ever
+    replaces: nothing vouched for it, and the marker cannot either. Unmarked,
+    every value is plain data, which is how ``tool_drafts.read_manifest`` reads a
+    manifest back.
     """
 
     secrets: list[str]
-    probe: bool = False
     degraded: bool = False
+    marked: bool = False
 
     def fixed(self, value: Any) -> Any:
-        return "" if self.probe else value
+        return _Fixed(value) if self.marked else value
 
     def record(self, fields: dict[str, Any]) -> Any:
-        return list(fields.values()) if self.probe else fields
+        return _Record(fields) if self.marked else fields
 
-    def text(self, value: str | None, cap: int | None = None) -> str | None:
+    def text(self, value: str | None, cap: int | None = None) -> str | _Fixed | None:
         if value is None:
             return None
         if self.degraded:
-            return _REDACTION_MARKER
+            return _Fixed(_REDACTION_MARKER) if self.marked else _REDACTION_MARKER
         return _redacted(value, self.secrets, cap)
 
 
 def _encode_checked(
-    build: Callable[[_Writing], Any], secrets: list[str], encode: Callable[[Any], str]
+    build: Callable[[_Writing], Any],
+    secrets: list[str],
+    *,
+    indent: int | None = None,
+    end: str = "",
 ) -> str | None:
-    """The file ``build`` makes, as ``encode`` writes it; None when it would hold a known secret.
+    """The file ``build`` makes, as written; None when a known value in it takes in free text.
 
-    The backstop behind the field check (``_redacted``): before anything is
-    written, the probe -- ``build`` once more, with what a shape check fixed left
-    out (``_Writing``) -- is encoded the same way and checked with the same
-    matcher (``_holds_a_secret``), so a text that reached the file without the
-    field check is seen too. When the probe holds a secret, every free text is
-    written as the marker and the probe is checked again; one that still holds a
-    secret holds it outside any free text, and nothing is written.
+    The text is ``json.dumps(..., ensure_ascii=False, indent=indent)`` of what
+    ``build`` hands over, followed by ``end``. ``_encode_spans`` makes it from the
+    values ``build`` marks (``_Writing``), so the check looks at exactly the text
+    that is written and knows which of it is fixed content: keys, punctuation and
+    white space, ``end``, what a shape check fixed, ``null``, ``true`` and
+    ``false``. Every occurrence of every known value counts, overlapping ones too
+    (``_touches_free_text``). One wholly in fixed content passes -- an identifier
+    is written as it is. One that takes in any free text sends every text to the
+    redaction marker, which is fixed content, and the file is made and checked
+    again; one that still takes in free text takes in a value no check vouched
+    for, and nothing is written.
+
+    The field check (``_redacted``) runs first, inside ``build``. This is the
+    floor behind it, and sees what reached the file some other way, across a key,
+    a quote or the boundary between two fields as well as inside one value.
     """
     for degraded in (False, True):
-        probe = encode(build(_Writing(secrets, probe=True, degraded=degraded)))
-        if not _holds_a_secret(probe, secrets):
-            return encode(build(_Writing(secrets, degraded=degraded)))
+        writing = _Writing(secrets, degraded=degraded, marked=True)
+        text, free = _encode_spans(build(writing), indent)
+        text += end
+        if not _touches_free_text(text, free, secrets):
+            return text
     return None
 
 
@@ -2143,10 +2325,11 @@ def write_tool_meta(
     LIVE path deliberately propagates rather than degrading to unmasked, see
     ``redact_known_secrets``) writes NOTHING and returns False. The field check
     (``_redacted``) is applied to ``summary``, the one field that carries
-    operator/LLM text; the backstop (``_encode_checked``) to the whole file but
-    its keys and ``updated_at`` and ``llm_log_id``, whose shapes are checked above.
-    ``llm_log_process`` is written as the caller gives it, so the backstop sees it
-    whole: a known secret in it writes nothing.
+    operator/LLM text; the check of the written text (``_encode_checked``) to the
+    whole file, in which the keys, ``updated_at`` and ``llm_log_id`` -- shapes
+    checked above -- are fixed content. ``llm_log_process`` is written as the
+    caller gives it, so it is free text that no marker replaces: a known value
+    that takes in any of it writes nothing.
 
     The serialized payload is bounded by ``_AI_META_MAX_BYTES``, the SAME cap
     ``read_tool_meta`` refuses past, so this can never produce a file that reads
@@ -2225,7 +2408,7 @@ def write_tool_meta(
                 "summary": writing.text(summary),
                 "updated_at": writing.fixed(updated_at),
                 "llm_log_id": writing.fixed(log_id),
-                # Written as the caller gives it: the probe sees it whole.
+                # Written as the caller gives it: free text no marker replaces.
                 "llm_log_process": log_process,
             }
         )
@@ -2233,14 +2416,12 @@ def write_tool_meta(
     try:
         # ensure_ascii=False keeps CJK readable in the file (and is what the byte
         # cap below is measured against). Every value is a str/int/None we just
-        # built, so dumps cannot fail on an unserializable type -- but the ENCODE
-        # can still raise on a surrogate-bearing ``llm_log_process``, which is why
-        # both steps sit inside this guard (see the docstring). The cap is checked
-        # on the ENCODED length, because that is the unit the writer's half of the
-        # read/write symmetry is stated in (see _AI_META_MAX_BYTES).
-        text = _encode_checked(
-            build, _redaction_secrets(), lambda payload: json.dumps(payload, ensure_ascii=False)
-        )
+        # built, so the JSON text cannot fail on an unserializable type -- but the
+        # ENCODE can still raise on a surrogate-bearing ``llm_log_process``, which
+        # is why both steps sit inside this guard (see the docstring). The cap is
+        # checked on the ENCODED length, because that is the unit the writer's half
+        # of the read/write symmetry is stated in (see _AI_META_MAX_BYTES).
+        text = _encode_checked(build, _redaction_secrets())
         if text is None:
             return False
         data = text.encode("utf-8")
@@ -2263,11 +2444,11 @@ def write_tool_meta(
 def write_origin_meta(build_root: BuildRoot, origin: dict[str, Any]) -> bool:
     """Publish immutable, sanitized ``origin.json`` before a version is installed.
 
-    Its four text fields go through the field check (``_redacted``) and the file
-    through the backstop (``_encode_checked``); the vid of the version before it
-    is the one field whose shape a check fixes. Every False writes nothing, among
-    them a failure to read the known secrets and a file that would hold one even
-    with every text written as the marker.
+    Its four text fields go through the field check (``_redacted``) and the
+    written file through the check of its text (``_encode_checked``), in which the
+    keys and the vid of the version before it -- the one field whose shape a
+    check fixes -- are fixed content. Every False writes nothing, among them a
+    failure to read the known secrets.
     """
 
     source = origin.get("source")
@@ -2289,11 +2470,7 @@ def write_origin_meta(build_root: BuildRoot, origin: dict[str, Any]) -> bool:
         )
 
     try:
-        text = _encode_checked(
-            build,
-            _redaction_secrets(),
-            lambda payload: json.dumps(payload, ensure_ascii=False) + "\n",
-        )
+        text = _encode_checked(build, _redaction_secrets(), end="\n")
         if text is None:
             return False
         data = text.encode("utf-8")
@@ -3042,6 +3219,12 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     before it is ever sorted, the merge in step (2) is O(n log n) on that bounded n
     rather than on the size of ``text``, and step (3)'s output build remains the single
     pass it always was.
+
+    What it checks is the text it is given. Text a caller puts beside the answer
+    afterwards -- a heading, a prefix, a separator, a truncation marker -- is outside
+    it, and with the text next to it can spell a known value that holds that text; so
+    can a marker this puts in, with the text beside it. A caller that needs its text
+    checked as it is finally used checks it there.
     """
     if not secrets:
         return text
@@ -3141,7 +3324,10 @@ def redact_known_secrets(text: str) -> str:
     the next round's ``role:"tool"`` message -- where the model can read it and copy it
     onward (into an install ``summary``, another tool call, ...). Masking every known
     value at each boundary where raw tool output enters the conversation/state closes
-    that class: the model only ever sees the marker, never the value.
+    that class for the text it masks: a known value in it reaches the model as the
+    marker, never as itself. What a caller attaches beside the answer afterwards -- a
+    heading, a prefix, a separator, a truncation marker -- is outside this check, and
+    with the masked text it can spell a known value that holds that text.
 
     Values come from ``known_secret_values`` (our key + every installed tool's .env
     values + the in-flight install secret); in their match forms (``_match_forms``:

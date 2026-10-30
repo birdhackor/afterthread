@@ -515,13 +515,16 @@ def _document(*, attempt_fields: dict[str, Any] | None = None, **overrides: Any)
 
 def test_the_manifest_masks_its_text_and_keeps_identifiers_as_they_are() -> None:
     """Free text is masked, cut and made encodable; ids and the base vid are not
-    masked even when a known value is part of them -- a mask would break them."""
+    masked even when a known value is part of them -- a mask would break them.
+    An occurrence wholly inside an id is fixed content, so the texts that hold no
+    known value are written as they are, not as the marker."""
     secret = "aaaaaaaa"  # is a substring of the draft id
     data = tool_drafts.manifest_bytes(
         _document(
             feedback=f"key {_SECRET} here",
             attempt_fields={
                 "summary": f"used {_SECRET}",
+                "handoff": "沒有秘密的交接",
                 "omitted": [{"path": f"{_SECRET}.txt", "reason": "secret_name"}],
                 "omitted_count": 1,
             },
@@ -533,6 +536,104 @@ def test_the_manifest_masks_its_text_and_keeps_identifiers_as_they_are() -> None
     assert _SECRET not in text
     assert tools._REDACTION_MARKER in text
     assert json.loads(text)["draft_id"] == "a" * 32
+    assert json.loads(text)["attempts"][0]["handoff"] == "沒有秘密的交接"
+
+
+@pytest.mark.parametrize(
+    ("secret", "feedback"),
+    [
+        ('feedback": "DO-NOT-STORE-12345', "DO-NOT-STORE-12345 more"),
+        ('abc",\n  "runs": [', "abc"),
+    ],
+    ids=["from a key into the text", "from the text into the next key"],
+)
+def test_a_known_value_across_a_key_and_a_text_reaches_no_manifest_byte(
+    secret: str, feedback: str
+) -> None:
+    """The value runs between a key with its punctuation and the feedback, one way
+    or the other: neither the text nor the key holds it, the indented file as
+    written does. The feedback is written as the marker, and the manifest is
+    written without the value."""
+    data = tool_drafts.manifest_bytes(_document(feedback=feedback), [secret])
+
+    assert data is not None
+    assert secret.encode("utf-8") not in data
+    assert json.loads(data)["feedback"] == tools._REDACTION_MARKER
+
+
+def test_a_known_value_across_two_rounds_reaches_no_manifest_byte() -> None:
+    """The value runs from the end of one round's reason, through every fixed
+    field between, into the start of the next round's error: two records of the
+    attempts list. The whole file as written holds it, and both texts are
+    written as the marker. It begins with fewer characters of the reason than
+    the mask's trailing guard covers, so no check of one field can see it."""
+    base = _document()["attempts"][0]
+    first = {**base, "number": 1, "reason": "first-round-reason-tail"}
+    second = {**base, "number": 2, "error": "second-round-error-head"}
+    document = _document(attempt_count=2, attempts=[first, second])
+    plain = tool_drafts.manifest_bytes(document, [])
+    assert plain is not None
+    text = plain.decode("utf-8")
+    start = text.index("first-round-reason-tail") + len("first-round-reason-tail") - 3
+    secret = text[start : text.index("second-round") + len("second-round")]
+
+    data = tool_drafts.manifest_bytes(document, [secret])
+
+    assert data is not None
+    assert secret.encode("utf-8") not in data
+    attempts = json.loads(data)["attempts"]
+    assert attempts[0]["reason"] == attempts[1]["error"] == tools._REDACTION_MARKER
+
+
+def test_a_known_value_ending_on_a_texts_first_character_is_caught_after_an_exempt_one() -> None:
+    """``y": "r`` lies wholly in fixed content in ``"stopped_by": "rounds"``. It
+    occurs once more, from the end of the ``summary`` key into the first character
+    of the summary ``rounds ran out``, and nowhere after that. No check of the
+    summary alone sees it, since the value only ends in it. The search past the
+    exempt occurrence still finds that one: the summary is written as the marker,
+    and the manifest holds the value only where fixed content does."""
+    secret = 'y": "r'
+    document = _document(attempt_fields={"stopped_by": "rounds", "summary": "rounds ran out"})
+    plain = tool_drafts.manifest_bytes(document, [])
+    assert plain is not None
+    assert plain.decode("utf-8").count(secret) == 2
+
+    data = tool_drafts.manifest_bytes(document, [secret])
+
+    assert data is not None
+    text = data.decode("utf-8")
+    assert '"stopped_by": "rounds"' in text
+    assert text.count(secret) == 1
+    assert json.loads(text)["attempts"][0]["summary"] == tools._REDACTION_MARKER
+
+
+def test_a_manifest_in_which_no_known_value_takes_in_a_text_is_json_dumps_byte_for_byte() -> None:
+    """One known value is nowhere in it, and six spaces lie only in the
+    indentation: the manifest is ``json.dumps`` indented by two and a new line,
+    byte for byte, every text as written."""
+    document = _text_in_the_listed_fields('說明 "引號"\n第二行\t\\')
+    known = ["kb-live-key-abcdef", " " * 6]
+
+    data = tool_drafts.manifest_bytes(document, known)
+
+    assert data is not None
+    written = tool_drafts._document(document, tools._Writing(known))
+    expected = json.dumps(written, ensure_ascii=False, indent=2) + "\n"
+    assert data == expected.encode("utf-8")
+
+
+def test_a_path_the_api_shows_is_checked_again_after_its_surrogates_are_replaced() -> None:
+    """``kb-\\udcff-key`` holds no known value as it is read. Making it encodable
+    writes three U+FFFD for the lone surrogate, which complete ``kb-���-key``.
+    What is shown is checked after that: the path is the marker, alone and in a
+    reason that names it."""
+    spelled = "kb-���-key"
+    known = tools._match_forms([spelled])
+
+    assert tool_drafts._shown("kb-\udcff-key", known) == tools._REDACTION_MARKER
+    reason = tool_drafts._unlooked_reason(["kb-\udcff-key"], known)
+    assert spelled not in reason
+    assert reason == tool_drafts.REASON_UNLOOKED.format(paths=tools._REDACTION_MARKER)
 
 
 # (secret, text): the text does not hold the secret, but the JSON the text is
@@ -619,8 +720,8 @@ def test_text_spelling_a_secret_only_as_written_reaches_no_manifest_byte_from_th
 def test_text_a_field_check_lets_through_is_caught_by_the_whole_file_check(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The field check passes every text as it is; the check of the whole file,
-    less what a shape check fixed, still sees the secret its JSON spells. Every
+    """The field check passes every text as it is; the check of the whole file as
+    it is written still sees the secret its JSON spells inside the summary. Every
     free text is then written as the marker -- the plain note too -- and the
     manifest is written without the secret."""
     secret, text = _SPELLED_AS_WRITTEN["newline"]

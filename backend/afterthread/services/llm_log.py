@@ -31,7 +31,9 @@ Three sinks, in decreasing durability, all fed from one finished record:
    request) could inflate a "bounded" 50-entry ring to hundreds of MB;
 2. an OPTIONAL JSONL file (``settings.llm_log_file``), off by default because a
    record carries personal memory content and landing it on disk must be an
-   operator choice, not a default;
+   operator choice, not a default. Each line is checked once more as it is
+   appended (``_checked_line``), so a line can hold a marker where the ring holds
+   a body: the same shape, not always the same text;
 3. the single stdlib INFO summary line above, which is what the uvicorn console
    shows live.
 
@@ -44,10 +46,12 @@ the INFO log are done OUTSIDE that lock so a slow disk never serializes every
 concurrent interaction behind one writer.
 """
 
+import bisect
 import contextlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -84,7 +88,9 @@ class LlmAttempt:
     never rewrite an already-recorded attempt. Every message's content here has
     already passed through ``_stored_body`` (UTF-8-safe, then size-capped at
     ``settings.llm_log_body_max_chars``), so ``request_messages`` is exactly
-    what a reader of the ring/JSONL/detail API sees -- never the raw original.
+    what a reader of the ring and the detail API sees, and what a JSONL line
+    holds unless its own check put a marker in place of a body
+    (``_checked_line``) -- never the raw original.
 
     ``response_content`` is the raw completion text, likewise passed through
     ``_stored_body`` (or None when the attempt produced no usable content or
@@ -468,6 +474,12 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     before it is ever sorted, the merge in step (2) is O(n log n) on that bounded n
     rather than on the size of ``text``, and step (3)'s output build remains the single
     pass it always was.
+
+    What it checks is the text it is given. Text a caller puts beside the answer
+    afterwards -- a heading, a prefix, a separator, a truncation marker -- is outside
+    it, and with the text next to it can spell a known value that holds that text; so
+    can a marker this puts in, with the text beside it. A caller that needs its text
+    checked as it is finally used checks it there.
     """
     if not secrets:
         return text
@@ -717,8 +729,11 @@ def _stored_body(text: str, secrets: _SecretSnapshot) -> tuple[str, bool]:
     harmless either way -- API keys/tokens are plain ASCII, which the surrogate
     pass never alters -- but redact-first is the correct, edge-independent order
     regardless.) Because this is the ONE choke point, redaction reaches ALL
-    stored bodies -- every request message and every response -- and both sinks
-    (the ring and the JSONL file) see the SAME already-redacted record.
+    stored bodies -- every request message and every response. The ring and the
+    detail API hold what this stores. The JSONL sink writes it too, but checks
+    each whole line once more as it is appended (``_checked_line``), so a line
+    can hold a marker where the ring holds the body: the two sinks have the same
+    shape, not always the same text.
 
     ``_utf8_safe`` must in turn run before the slice: it never enlarges the text
     (one surrogate becomes one U+FFFD), and once it has run the string holds
@@ -1005,6 +1020,7 @@ class LlmInteractionRecorder:
         "_attempts",
         "_finished",
         "_id",
+        "_known",
         "_model",
         "_started_at",
         "_started_monotonic",
@@ -1018,6 +1034,10 @@ class LlmInteractionRecorder:
         self._started_at = datetime.now(UTC).isoformat()
         self._started_monotonic = time.monotonic()
         self._attempts: list[LlmAttempt] = []
+        # Every known value a step's snapshot held, for the check of the JSONL line
+        # (``_write_file_sink``): a value no longer registered when the line is
+        # written is still looked for there.
+        self._known: set[str] = set()
         self._finished = False
 
     @property
@@ -1096,6 +1116,7 @@ class LlmInteractionRecorder:
         over N packages. See ``_secret_snapshot``.
         """
         secrets = _secret_snapshot()
+        self._known.update(secrets.values)
         stored: list[dict[str, str]] = []
         truncated = False
         for msg in messages:
@@ -1153,7 +1174,9 @@ class LlmInteractionRecorder:
         """
         if self._attempts:
             attempt = self._attempts[-1]
-            stored, was_truncated = _stored_body(content, _secret_snapshot())
+            secrets = _secret_snapshot()
+            self._known.update(secrets.values)
+            stored, was_truncated = _stored_body(content, secrets)
             attempt.response_content = stored
             attempt.response_chars = len(stored)
             attempt.truncated = attempt.truncated or was_truncated
@@ -1201,7 +1224,7 @@ class LlmInteractionRecorder:
                 _get_ring().append(record)
             # Both sinks below run OUTSIDE the lock: a slow disk or logging
             # handler must not serialize concurrent interactions behind it.
-            _write_file_sink(record)
+            _write_file_sink(record, self._known)
             _log_summary(record)
         except Exception:
             # Last-resort guard: the record is best-effort. Emit one safe line
@@ -1229,7 +1252,9 @@ def _record_detail(record: LlmInteractionRecord) -> dict[str, Any]:
     """Full record as a JSON-ready dict, attempt bodies included.
 
     Shared by ``get_record`` (the detail API) and the JSONL sink, so the two can
-    never disagree on the on-the-wire shape. Per-attempt ``request_chars`` /
+    never disagree on the on-the-wire shape. The sink checks the line it makes
+    from this once more (``_checked_line``) and can write a marker in place of a
+    text, which leaves the shape as it is. Per-attempt ``request_chars`` /
     ``response_chars`` / ``usage`` / ``truncated`` are this attempt's OWN
     figures (see ``LlmAttempt``) -- distinct from the top-level ``usage``
     above, which is the INTERACTION-level sum across every attempt.
@@ -1279,6 +1304,269 @@ def _record_summary(record: LlmInteractionRecord) -> dict[str, Any]:
         "usage": record.usage,
         "attempts": len(record.attempts),
     }
+
+
+# --- a JSONL line, checked as written ---------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _Fixed:
+    """A value written as fixed content, whole, for ``_encode_spans``.
+
+    Everything inside is fixed: a string with its quotes, a number, a list or a
+    mapping with its keys. It marks what the backend decides, never text it was
+    handed.
+    """
+
+    value: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _Record:
+    """A mapping keyed by the backend's own literals, for ``_encode_spans``: its keys
+    are fixed content, and each value is marked by what it is."""
+
+    fields: dict[str, Any]
+
+
+def _encode_spans(value: Any, indent: int | None) -> tuple[str, list[tuple[int, int]]]:
+    """``value`` as ``json.dumps(value, ensure_ascii=False, indent=indent)`` writes it,
+    and where in that text the free text is.
+
+    ``value`` is JSON data with parts marked (``_Fixed``, ``_Record``). The text is
+    the same, character for character, as ``json.dumps`` writes the data with the
+    marks taken off: the same separators (``", "`` and ``": "``, or ``","`` and a
+    new line indented by ``indent`` per level), ``[]`` and ``{}`` for an empty
+    container, and each string and number as ``json.dumps`` writes it alone.
+
+    Free text is what a check of the written text has to take as coming from
+    outside: what is between the quotes of a string, escapes as written, and the
+    digits of a number, unless it is inside a ``_Fixed``; and the keys of a
+    mapping that is not a ``_Record``. Everything else is fixed content:
+    punctuation and white space, the quotes of every string, ``null``, ``true``
+    and ``false`` (they hold no character of anything given), the keys of a
+    ``_Record``, and all of a ``_Fixed``. The free text comes back as
+    ``(start, end)`` ranges of the text, in order and apart.
+
+    A key that is not a string raises ``TypeError``, as a value of a type JSON has
+    no form for does.
+    """
+    pieces: list[str] = []
+    free: list[tuple[int, int]] = []
+    size = 0
+
+    def put(text: str, start: int = 0, end: int = 0) -> None:
+        # ``text[start:end]`` is free text.
+        nonlocal size
+        if start < end:
+            free.append((size + start, size + end))
+        pieces.append(text)
+        size += len(text)
+
+    def layout(level: int) -> tuple[str, str, str]:
+        # What opens, separates and closes the items of a container at ``level``.
+        if indent is None:
+            return "", ", ", ""
+        inner = "\n" + " " * (indent * (level + 1))
+        return inner, "," + inner, "\n" + " " * (indent * level)
+
+    def walk(item: Any, level: int, fixed: bool) -> None:
+        if isinstance(item, _Fixed):
+            walk(item.value, level, True)
+        elif isinstance(item, _Record):
+            mapping(item.fields, level, fixed, True)
+        elif isinstance(item, dict):
+            mapping(item, level, fixed, fixed)
+        elif isinstance(item, (list, tuple)):
+            if not item:
+                put("[]")
+                return
+            opening, separator, closing = layout(level)
+            put("[" + opening)
+            for index, element in enumerate(item):
+                if index:
+                    put(separator)
+                walk(element, level + 1, fixed)
+            put(closing + "]")
+        elif item is None or item is True or item is False:
+            put(json.dumps(item))
+        elif isinstance(item, str):
+            literal = json.dumps(item, ensure_ascii=False)
+            put(literal, 1, 0 if fixed else len(literal) - 1)
+        elif isinstance(item, (int, float)):
+            literal = json.dumps(item)
+            put(literal, 0, 0 if fixed else len(literal))
+        else:
+            raise TypeError(f"Object of type {type(item).__name__} is not JSON serializable")
+
+    def mapping(fields: dict[Any, Any], level: int, fixed: bool, keys_fixed: bool) -> None:
+        if not fields:
+            put("{}")
+            return
+        opening, separator, closing = layout(level)
+        put("{" + opening)
+        for index, (key, item) in enumerate(fields.items()):
+            if not isinstance(key, str):
+                raise TypeError(f"keys must be str, not {type(key).__name__}")
+            if index:
+                put(separator)
+            literal = json.dumps(key, ensure_ascii=False)
+            put(literal, 1, 0 if keys_fixed else len(literal) - 1)
+            put(": ")
+            walk(item, level + 1, fixed)
+        put(closing + "}")
+
+    walk(value, 0, False)
+    return "".join(pieces), free
+
+
+def _touches_free_text(text: str, free: list[tuple[int, int]], secrets: list[str]) -> bool:
+    """Whether a known value occurs in ``text`` where the occurrence takes in free text.
+
+    ``free`` is where the free text is, as ``_encode_spans`` gives it. Every
+    occurrence of every value counts, overlapping ones too; one that lies wholly
+    outside ``free`` -- in fixed content -- passes, since the backend's own
+    characters spell it. Only whole occurrences count: the text was not cut.
+
+    After an occurrence that passes, the search goes on from the first place an
+    occurrence could reach the next free range: those it skips lie in fixed
+    content, and every occurrence that takes in free text is still seen. Nothing
+    found is kept, and the first occurrence that takes in free text ends the
+    search; per value, the work is one pass over the text and one search for each
+    free range at most.
+    """
+    ends = [end for _, end in free]
+    for value in secrets:
+        if not value:
+            # Found everywhere and never a secret: no match form is empty.
+            continue
+        size = len(value)
+        at = text.find(value)
+        while at != -1:
+            index = bisect.bisect_right(ends, at)
+            if index == len(ends):
+                break
+            start = free[index][0]
+            if start < at + size:
+                return True
+            at = text.find(value, start - size + 1)
+    return False
+
+
+# A word a record holds from the backend's own vocabulary -- a workflow, an outcome,
+# a message's role -- is a lowercase identifier, which is the shape the callers pass
+# in. A value of this shape is fixed content in a JSON line; any other is text.
+_WORD_SHAPE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+def _line_document(detail: dict[str, Any], marker: str | None) -> _Record:
+    """``detail`` (``_record_detail``) marked for ``_encode_spans``, as a JSON line holds it.
+
+    Fixed content: every key -- this module's own literals, written by
+    ``_record_detail``, ``begin_attempt``, ``_apply_total_budget`` and
+    ``_extract_usage`` -- and the values whose shape the backend decides: ``id``
+    (``_allocate_id``), ``started_at`` and ``finished_at``
+    (``datetime.now(UTC).isoformat()``), ``duration_ms``, ``usage``
+    (``_extract_usage``, ``_aggregate_usage``), ``request_chars``,
+    ``response_chars`` and ``truncated``; and ``workflow``, ``outcome`` and a
+    message's ``role`` when each has ``_WORD_SHAPE``. Text: ``model``, ``error``,
+    a message's ``content``, ``response_content``, each advertised name, and a
+    word of any other shape. The value of a key not named here is free text no
+    marker replaces: nothing vouched for it.
+
+    With ``marker``, every text is the marker, fixed content, and an attempt's
+    ``request_chars`` and ``response_chars`` count the marker the line holds in
+    place of each body. Every container is new: ``detail`` holds the record's own
+    lists, which the ring keeps.
+    """
+
+    def text(value: Any) -> Any:
+        return _Fixed(marker) if marker is not None and isinstance(value, str) else value
+
+    def word(value: Any) -> Any:
+        if isinstance(value, str) and _WORD_SHAPE.fullmatch(value):
+            return _Fixed(value)
+        return text(value)
+
+    def message(item: Any) -> Any:
+        if not isinstance(item, dict):
+            return item
+        return _Record(
+            {
+                key: word(value) if key == "role" else text(value) if key == "content" else value
+                for key, value in item.items()
+            }
+        )
+
+    def attempt(item: Any) -> Any:
+        if not isinstance(item, dict):
+            return item
+        fields: dict[str, Any] = {}
+        for key, value in item.items():
+            if key in ("request_chars", "response_chars", "usage", "truncated"):
+                fields[key] = _Fixed(value)
+            elif key in ("response_content", "error"):
+                fields[key] = text(value)
+            elif key == "request_messages" and isinstance(value, list):
+                fields[key] = [message(entry) for entry in value]
+            elif key == "tools_advertised" and isinstance(value, list):
+                fields[key] = [text(name) for name in value]
+            else:
+                fields[key] = value
+        if marker is not None:
+            messages = item.get("request_messages")
+            if "request_chars" in fields and isinstance(messages, list):
+                bodies = sum(
+                    isinstance(entry, dict) and isinstance(entry.get("content"), str)
+                    for entry in messages
+                )
+                fields["request_chars"] = _Fixed(len(marker) * bodies)
+            if "response_chars" in fields and isinstance(item.get("response_content"), str):
+                fields["response_chars"] = _Fixed(len(marker))
+        return _Record(fields)
+
+    fields: dict[str, Any] = {}
+    for key, value in detail.items():
+        if key in ("id", "started_at", "finished_at", "duration_ms", "usage"):
+            fields[key] = _Fixed(value)
+        elif key in ("workflow", "outcome"):
+            fields[key] = word(value)
+        elif key in ("model", "error"):
+            fields[key] = text(value)
+        elif key == "attempts" and isinstance(value, list):
+            fields[key] = [attempt(entry) for entry in value]
+        else:
+            fields[key] = value
+    return _Record(fields)
+
+
+def _checked_line(detail: dict[str, Any], secrets: _SecretSnapshot) -> str | None:
+    """The line the file sink appends for ``detail``, its new line included; None for none.
+
+    ``json.dumps(detail, ensure_ascii=False)`` and a new line, made by
+    ``_encode_spans`` from ``_line_document`` and checked as it is appended, the
+    new line as fixed content: every occurrence of a known value counts,
+    overlapping ones too, and one wholly in fixed content passes
+    (``_touches_free_text``). One that takes in free text -- a key and the start
+    of a body, the end of a body and the new line -- sends every text of the line
+    to ``_REDACTION_MARKER`` and the line is checked again; one that still takes
+    in free text is in a value nothing vouched for, and there is no line. A list
+    that is not whole calls no text clean: every text of the line is
+    ``_UNCHECKED_MARKER``, and there is a line only when no free text is left.
+    Only the line changes; the ring and the detail API keep the record as stored.
+
+    Each line is checked on its own: a known value that would run from the end of
+    one line into the start of the next is not seen.
+    """
+    markers: tuple[str | None, ...] = (
+        (None, _REDACTION_MARKER) if secrets.complete else (_UNCHECKED_MARKER,)
+    )
+    for marker in markers:
+        line, free = _encode_spans(_line_document(detail, marker), None)
+        line += "\n"
+        if not free or (secrets.complete and not _touches_free_text(line, free, secrets.values)):
+            return line
+    return None
 
 
 # Serializes the ENTIRE stat -> maybe-rotate -> append sequence of the JSONL sink
@@ -1355,7 +1643,7 @@ def _rotate_file_sink(path: str) -> None:
         os.rename(path, target)
 
 
-def _write_file_sink(record: LlmInteractionRecord) -> None:
+def _write_file_sink(record: LlmInteractionRecord, known: Iterable[str] = ()) -> None:
     """Append the full record as one JSON line to ``settings.llm_log_file``.
 
     Off entirely when the setting is empty (the default). Opened/written/closed
@@ -1363,20 +1651,40 @@ def _write_file_sink(record: LlmInteractionRecord) -> None:
     the file between calls. Before each append, ``_rotate_file_sink`` renames the
     file aside if it has grown past ``llm_log_file_max_bytes`` (D34), so the
     still-per-write open below lands on a fresh file after a rotation. A write
-    failure must NEVER break the LLM call, so the catch below is ``Exception``,
+    failure must NEVER break the LLM call, so the catches below are ``Exception``,
     not just ``OSError``: the stated contract is "sink failures never break the
     LLM call", full stop, and an OSError-only catch does not actually keep it --
     e.g. a body that ever reached here without going through ``_utf8_safe`` could
     raise ``UnicodeEncodeError`` (a ``ValueError`` subclass, not an ``OSError``)
     on the ``.write`` below, and a future non-JSON-safe field could raise from
-    ``json.dumps`` itself. The filename is the operator's own config (not a
+    the encoder itself. The filename is the operator's own config (not a
     secret) so naming it is fine and useful, but only its CATEGORY is logged,
     never ``str(exc)`` (which could carry additional path detail without adding
     diagnostic value). ``ensure_ascii=False`` keeps CJK memory content readable
     in the file rather than escaped.
+
+    What is appended is checked as it is appended (``_checked_line``), against
+    ``known`` -- every value the recorder's steps knew, so one no longer
+    registered is still looked for -- and a snapshot taken here, which also says
+    whether the list is whole: one more sweep of the provider, made only while
+    the sink is on. When there is no line to append, one warning says so, with
+    the record's id and nothing of its content.
     """
     path = get_settings().llm_log_file.strip()
     if not path:
+        return
+    try:
+        fresh = _secret_snapshot()
+        secrets = _SecretSnapshot(sorted({*fresh.values, *known}), fresh.complete)
+        line = _checked_line(_record_detail(record), secrets)
+    except Exception as exc:
+        logger.warning("llm log file sink write failed (%s): %s", path, type(exc).__name__)
+        return
+    if line is None:
+        logger.warning(
+            "llm log file sink left out record %s: its line would hold a known secret value",
+            record.id,
+        )
         return
     # F8(a): serialize the ENTIRE rotate + append under the dedicated _FILE_SINK_LOCK
     # (never the ring's _LOCK -- see that lock's comment) so two interactions
@@ -1384,7 +1692,6 @@ def _write_file_sink(record: LlmInteractionRecord) -> None:
     with _FILE_SINK_LOCK:
         _rotate_file_sink(path)
         try:
-            line = json.dumps(_record_detail(record), ensure_ascii=False)
             with open(path, "a", encoding="utf-8") as handle:
                 # A failure mid-write (e.g. disk full) can still leave a truncated,
                 # unparsable final line even though the whole write sits inside
@@ -1393,7 +1700,7 @@ def _write_file_sink(record: LlmInteractionRecord) -> None:
                 # transactional write (temp file + atomic rename) here, so a JSONL
                 # consumer should tolerate/skip a trailing line that fails to
                 # json.loads rather than assume every line is well-formed.
-                handle.write(line + "\n")
+                handle.write(line)
         except Exception as exc:
             logger.warning("llm log file sink write failed (%s): %s", path, type(exc).__name__)
 
