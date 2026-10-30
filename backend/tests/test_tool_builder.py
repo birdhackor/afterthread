@@ -11315,6 +11315,145 @@ def test_router_shows_and_discards_no_draft_through_another_tool_s_metadata_dire
     assert tool_drafts.same_tree(before, tool_drafts.tree_digest(_draft_dir(pkg)))
 
 
+def _first_looks_fail(patch: pytest.MonkeyPatch, target: Path, times: int) -> list[str]:
+    """The first ``times`` ``os.lstat`` calls on exactly ``target`` fail with EIO;
+    every other one works. Returns the paths it failed."""
+    real_lstat = os.lstat
+    spelled_target = os.fspath(target)
+    failed: list[str] = []
+
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        spelled = os.fspath(path) if isinstance(path, str | os.PathLike) else None
+        if spelled == spelled_target and len(failed) < times:
+            failed.append(spelled_target)
+            raise OSError(errno.EIO, "Input/output error", spelled_target)
+        return real_lstat(path, *args, **kwargs)
+
+    patch.setattr(os, "lstat", lstat)
+    return failed
+
+
+def _alias_to(name: str = "kbsearch") -> Path:
+    """``<tools_dir>/alias``, made a link to the package ``name``, as ``tools_dir``
+    spells it."""
+    base = tools.tools_dir()
+    assert base is not None
+    alias = base / "alias"
+    alias.symlink_to(base / name, target_is_directory=True)
+    return alias
+
+
+def test_router_discards_no_draft_through_an_alias_whose_first_look_fails(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``alias`` is a link to ``kbsearch``, which has a draft, and the first look
+    at the link fails. A discard addressed to the alias with the token of
+    ``kbsearch``'s draft is 404, as it is with no fault, and that draft is left
+    exactly as it was. Red before the fix: the name was handed ``kbsearch`` and
+    its draft was removed."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _save_an_unfinished_round(monkeypatch, pkg)
+    alias = _alias_to()
+    draft = _draft_dir(pkg)
+    token = tool_drafts.discard_token(draft)
+    before = tool_drafts.tree_digest(draft)
+    assert (
+        client.delete("/api/tools/alias/draft", params={"discard_token": token}).status_code == 404
+    )
+
+    with monkeypatch.context() as patch:
+        failed = _first_looks_fail(patch, alias, 1)
+        refused = client.delete("/api/tools/alias/draft", params={"discard_token": token})
+
+    assert failed == [str(alias)]
+    assert refused.status_code == 404
+    assert tool_drafts.has_draft(_package_root(pkg))
+    assert tool_drafts.same_tree(before, tool_drafts.tree_digest(draft))
+
+
+def test_router_discards_nothing_through_an_alias_handed_out_as_itself(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Both looks at ``alias`` the name's resolve takes fail, so the alias path
+    itself is handed out, not ``kbsearch``. The discard looks at the package
+    directory without following the link and finds no draft of its own there:
+    404 ``draft_not_found``, and ``kbsearch``'s draft is left exactly as it was.
+    Not red before the fix: it pins what refuses an alias the check on the
+    resolve's result cannot see."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _save_an_unfinished_round(monkeypatch, pkg)
+    alias = _alias_to()
+    draft = _draft_dir(pkg)
+    token = tool_drafts.discard_token(draft)
+    before = tool_drafts.tree_digest(draft)
+
+    with monkeypatch.context() as patch:
+        failed = _first_looks_fail(patch, alias, 2)
+        refused = client.delete("/api/tools/alias/draft", params={"discard_token": token})
+
+    assert failed == [str(alias)] * 2
+    assert refused.status_code == 404
+    assert refused.json()["detail"]["code"] == "draft_not_found"
+    assert tool_drafts.has_draft(_package_root(pkg))
+    assert tool_drafts.same_tree(before, tool_drafts.tree_digest(draft))
+
+
+def test_a_revise_through_an_alias_handed_out_as_itself_starts_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The revise's name is resolved twice, before its slot and in it, and each
+    time both looks at ``alias`` fail, so the alias path itself is handed out.
+    The version check looks at the package directory without following the link
+    and refuses it: the revise is refused as not found, no job starts, no model
+    is called and no draft is made. Not red before the fix: it pins what refuses
+    an alias the check on the resolve's result cannot see."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    captured = _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
+    alias = _alias_to()
+    looked: list[Path] = []
+    real_resolve_current = tools.resolve_current
+
+    def resolve_current(package_root: tools.PackageRoot) -> tools.Resolution:
+        looked.append(package_root.path)
+        return real_resolve_current(package_root)
+
+    monkeypatch.setattr(tools, "resolve_current", resolve_current)
+
+    with monkeypatch.context() as patch:
+        failed = _first_looks_fail(patch, alias, 4)
+        start = asyncio.run(tool_builder.start_revise_job("alias", "加上分頁", _TEST_VID))
+
+    assert failed == [str(alias)] * 4
+    assert (start.job_id, start.refusal) == (None, "not_found")
+    assert looked == [alias]
+    assert captured == {}
+    assert not tool_drafts.has_draft(_package_root(pkg))
+
+
+def test_router_discards_no_version_through_an_alias_whose_first_look_fails(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``alias`` is a link to ``kbsearch``, whose current version has one before
+    it, and the first look at the link fails. Discarding that version by the
+    alias's name is 404, as with no fault, and ``kbsearch`` keeps it current. Red
+    before the fix: the name was handed ``kbsearch`` and its current version was
+    discarded."""
+    first = _seed_package(monkeypatch, tmp_path)
+    second_vid = "20260728T020304Z-fedcba"
+    _copy_committed_version(first, second_vid)
+    assert tools.publish_current(_package_root(first), second_vid)
+    alias = _alias_to()
+
+    with monkeypatch.context() as patch:
+        failed = _first_looks_fail(patch, alias, 1)
+        refused = client.delete(f"/api/tools/alias/versions/{second_vid}")
+
+    assert failed == [str(alias)]
+    assert refused.status_code == 404
+    current = tools.resolve_current(_package_root(first))
+    assert isinstance(current, tools.Resolved) and current.vid == second_vid
+
+
 def test_router_answers_a_discard_that_cannot_see_the_draft_gone_as_not_done(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

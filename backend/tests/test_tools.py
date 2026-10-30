@@ -5930,6 +5930,200 @@ def test_set_enabled_refuses_internal_alias(
     assert real["enabled"] is True  # the real package's flag never flipped
 
 
+def _real_and_alias(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, Path]:
+    """``tools/real``, a package, and ``tools/alias``, a link to it, spelled as
+    ``tools_dir`` spells them."""
+    root = tmp_path / "tools"
+    _make_tool(root, "real", "import sys\nsys.stdout.write('x')\n")
+    (root / "alias").symlink_to(root / "real", target_is_directory=True)
+    _install_tools(monkeypatch, root)
+    base = tools.tools_dir()
+    assert base is not None
+    return base / "real", base / "alias"
+
+
+def test_an_alias_whose_first_look_fails_addresses_no_package(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The look ``is_symlink`` takes at ``tools/alias`` fails once and answers "not
+    a link"; the resolve after it follows the link to ``tools/real``. What the
+    resolve gave is not ``tools/alias``, so the name addresses no package. Red
+    before the fix: the name was handed ``tools/real``."""
+    real, alias = _real_and_alias(monkeypatch, tmp_path)
+    assert tools._resolve_package_dir_no_alias("real") == tools.PackageRoot(real)
+
+    with monkeypatch.context() as patch:
+        failed = _failing_at(patch, "lstat", alias, errno.EIO, times=1)
+        found = tools._resolve_package_dir_no_alias("alias")
+
+    assert failed == [str(alias)]
+    assert found is None
+
+
+def test_an_alias_to_a_same_named_directory_under_another_parent_addresses_no_package(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``tools/alias`` is a link to ``tools/nested/alias``: a real directory inside
+    the root, so the containment passes, with the same last name as the link. The
+    look at the link fails once, and what the resolve gave is compared whole:
+    ``tools/nested/alias`` is not ``tools/alias``, so the name addresses no
+    package. Red before the fix: the name was handed ``tools/nested/alias``."""
+    root = tmp_path / "tools"
+    _make_tool(root / "nested", "alias", "import sys\nsys.stdout.write('x')\n")
+    (root / "alias").symlink_to(root / "nested" / "alias", target_is_directory=True)
+    _install_tools(monkeypatch, root)
+    base = tools.tools_dir()
+    assert base is not None
+
+    with monkeypatch.context() as patch:
+        failed = _failing_at(patch, "lstat", base / "alias", errno.EIO, times=1)
+        found = tools._resolve_package_dir_no_alias("alias")
+
+    assert failed == [str(base / "alias")]
+    assert found is None
+
+
+@pytest.mark.parametrize("failing", [0, 1, 2], ids=["no-fault", "first-look", "both-looks"])
+def test_a_real_package_is_addressed_when_its_first_looks_fail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failing: int
+) -> None:
+    """A real package's name hands out its directory with no fault, and when the
+    first looks at it fail -- ``is_symlink``'s, then the resolve's too, which keeps
+    a component it cannot look at as written: the package's own path. A failed
+    look never turns a real package into no package, which the record purges
+    would take for one that is gone. Not red before the fix; red for an alias
+    check made a strict ``lstat``."""
+    real, _alias = _real_and_alias(monkeypatch, tmp_path)
+
+    with monkeypatch.context() as patch:
+        failed = _failing_at(patch, "lstat", real, errno.EIO, times=failing)
+        found = tools._resolve_package_dir_no_alias("real")
+
+    assert found == tools.PackageRoot(real)
+    assert len(failed) == failing
+
+
+def test_an_alias_whose_looks_all_fail_is_handed_out_as_itself_never_its_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Both looks at ``tools/alias`` fail, ``is_symlink``'s and the resolve's, so
+    nothing tells it is a link and the resolve keeps it as written. The name is
+    handed ``tools/alias`` itself, never ``tools/real``, and what acts on a
+    package looks at it without following the link: it has no current version.
+    Not red before the fix: it pins what refuses an alias the check on the
+    result cannot see."""
+    _real, alias = _real_and_alias(monkeypatch, tmp_path)
+
+    with monkeypatch.context() as patch:
+        failed = _failing_at(patch, "lstat", alias, errno.EIO, times=2)
+        found = tools._resolve_package_dir_no_alias("alias")
+
+    assert failed == [str(alias)] * 2
+    assert found == tools.PackageRoot(alias)
+    assert found is not None and isinstance(tools.resolve_current(found), tools.Unresolved)
+
+
+def test_an_alias_seen_by_its_first_look_is_refused_when_the_resolve_cannot_look_at_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``is_symlink`` sees ``tools/alias`` is a link, while the resolve cannot look
+    at it and keeps the alias path as written -- which the check on the result
+    then finds equal. The pre-check is what refuses it. Not red before the fix:
+    it pins the pre-check the check on the result does not replace."""
+    _real, alias = _real_and_alias(monkeypatch, tmp_path)
+    real_realpath = os.path.realpath
+
+    def realpath(path: Any, *args: Any, **kwargs: Any) -> str:
+        if isinstance(path, str | os.PathLike) and os.fspath(path) == str(alias):
+            return str(alias)
+        return real_realpath(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os.path, "realpath", realpath)
+        found = tools._resolve_package_dir_no_alias("alias")
+
+    assert found is None
+
+
+def test_a_real_package_under_a_root_spelled_in_another_case_is_addressed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """On a file system that ignores case, a ``TOOLS_DIR`` spelled in another case
+    than its directory still names it, and both ``tools_dir`` and the resolve keep
+    that spelling: the real package's path is its own. Not red before the fix: it
+    pins that the check on the result refuses no package for the root's case."""
+    _make_tool(tmp_path / "Tools", "real", "import sys\nsys.stdout.write('x')\n")
+    if not (tmp_path / "TOOLS").exists():
+        pytest.skip("this file system tells case apart")
+    _install_tools(monkeypatch, tmp_path / "TOOLS")
+    base = tools.tools_dir()
+    assert base is not None and base.name == "TOOLS"
+
+    assert tools._resolve_package_dir_no_alias("real") == tools.PackageRoot(base / "real")
+
+
+def test_a_root_through_a_file_addresses_no_package_the_configured_path_cannot_reach(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``TOOLS_DIR`` reads ``file/..``, where ``file`` is a regular file and
+    ``real`` beside it a package. The configured path cannot pass through the
+    file, so ``tools_dir`` keeps it as configured; the resolve of ``file/../real``
+    folds the ``..`` as text and lands on ``real``, which the configured path
+    cannot reach, so the name addresses no package. Red before the fix: the name
+    was handed ``real``."""
+    base_dir = tmp_path.resolve()
+    _make_tool(base_dir, "real", "import sys\nsys.stdout.write('x')\n")
+    (base_dir / "file").write_text("a file\n", encoding="utf-8")
+    configured = base_dir / "file" / ".."
+    _install_tools(monkeypatch, configured)
+    assert str(tools.tools_dir()) == str(configured)
+
+    assert tools._resolve_package_dir_no_alias("real") is None
+
+
+def test_a_root_whose_answer_changes_during_the_lookup_still_addresses_its_package(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``tools_dir`` answers with one root, then a moment later with another, and
+    both hold a package ``real``. The root is taken once: the resolve and the check
+    on it work from the first answer, and the package under it is addressed --
+    not refused, which the record purges would take for a package that is gone.
+    Red before the fix: the package was looked up under the second root."""
+    first = tmp_path.resolve() / "first"
+    second = tmp_path.resolve() / "second"
+    for root in (first, second):
+        _make_tool(root, "real", "import sys\nsys.stdout.write('x')\n")
+    answers = iter([first, second])
+    monkeypatch.setattr(tools, "tools_dir", lambda: next(answers))
+
+    assert tools._resolve_package_dir_no_alias("real") == tools.PackageRoot(first / "real")
+
+
+def test_set_enabled_refuses_an_alias_whose_every_look_says_it_is_no_link(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every ``is_symlink`` answer for ``tools/alias`` is "not a link", the answer
+    a look that fails gives, while the resolve follows the link to ``tools/real``.
+    The toggle's own alias check lets the name through; the recheck before the
+    write refuses it, since what the resolve gave is not ``tools/alias``, and the
+    real package keeps its flag. Red before the fix: the toggle switched off
+    ``real``."""
+    _real, alias = _real_and_alias(monkeypatch, tmp_path)
+    real_islink = os.path.islink
+
+    def islink(path: Any) -> bool:
+        if isinstance(path, str | os.PathLike) and os.fspath(path) == str(alias):
+            return False
+        return real_islink(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os.path, "islink", islink)
+        toggled = set_enabled("alias", False)
+
+    assert toggled is False
+    assert {t["name"]: t["enabled"] for t in list_tools()}["real"] is True
+
+
 def test_set_enabled_toggles_a_package_whose_manifest_is_oversized(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

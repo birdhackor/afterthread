@@ -4754,39 +4754,55 @@ def _resolve_package_dir(name: str) -> Path | None:
 
 
 def _resolve_package_dir_no_alias(name: str) -> PackageRoot | None:
-    """``_resolve_package_dir`` PLUS the INTERNAL-alias refusal, in one helper.
+    """The package directory ``<tools_dir>/<name>`` itself, never one reached through a link.
 
-    ``_resolve_package_dir`` resolves ``tools/<name>`` and then checks
-    containment -- which an INTERNAL symlink ``tools/alias -> tools/real``
-    PASSES, because it resolves to a path genuinely inside the tools root. The
-    alias/real distinction is erased by that ``resolve()``, so a caller handed
-    the result cannot tell it was addressed through an alias, and every
-    by-name operation on it silently acts on the REAL package instead
-    (a regenerate spending an LLM session rewriting the summary of REAL's live
-    version, a discard by that name retiring it). ``set_enabled`` calls
-    that out at length and hard-blocks it before its own resolve, for exactly
-    this reason (see its H3 comment); ``delete_tool`` carries its own variant
-    because it has a SAFE alias action (unlink just the link).
+    Every route and service that addresses a package BY NAME goes through here,
+    so that none acts on another package through an alias: an internal link
+    ``tools/alias -> tools/real`` resolves inside the tools root and would hand
+    ``real`` to whatever the caller does next -- a discard by the alias's name
+    removing ``real``'s draft or retiring its current version, a regenerate
+    rewriting its summary. ``delete_tool`` and ``set_enabled`` handle an alias
+    themselves before ``_resolve_package_dir``, which follows one.
 
-    Every route/service that addresses a package BY NAME with no such special
-    case goes through here instead of composing the three steps itself, so the
-    hard-block cannot be forgotten by the next one added: name regex + tools_dir
-    gate, then ``is_symlink`` (which does NOT follow the final component, so it
-    sees the alias itself) BEFORE the resolve, then the containment resolve, and
-    finally the "is anything actually installed there" ``is_dir``. None is the
-    single did-not-happen answer for all four.
+    In order: the name pattern and the feature being on; ``is_symlink`` on
+    ``<tools_dir>/<name>``, which sees an alias without following it; the resolve
+    of that path; the check on what the resolve gave, which must be exactly
+    ``<tools_dir>/<name>`` with the base as ``tools_dir`` spelled it, not resolved
+    again; and ``is_dir``, something installed there. The check on the result is
+    what refuses an alias: ``is_symlink`` answers "not a link" when its look
+    fails, while a resolve that follows the link gives another path -- the
+    target, wherever it is, a directory of the same name under another parent in
+    the root included. The check makes no query of its own, so it has no failure
+    to misread, and a path equal to ``<tools_dir>/<name>`` is inside the root by
+    construction. It also refuses a base from ``tools_dir``'s ``ENOTDIR`` branch,
+    a configured path that runs through a file with its ``..`` kept: the resolve
+    folds every ``..`` and lands in a directory the configured path cannot
+    reach. The base is taken once, so the resolve and the check work from one
+    root even if ``tools_dir`` would answer with another a moment later.
 
-    ``_resolve_package_dir`` is deliberately left alone: ``delete_tool`` must
-    keep reaching an alias to unlink it, so the refusal belongs in this
-    composition, not in the shared resolve.
+    A look at a real package that fails does not refuse it: ``is_symlink`` stays
+    a pre-check rather than a strict ``lstat``, and a resolve that cannot look at
+    a component keeps it as written. None is read as a package that is gone by
+    the record purges (``tool_runs.orphan_names``, ``_delete_gone_verdicts``).
+
+    What it does not cover: an alias whose looks all fail, ``is_symlink``'s and
+    the resolve's, is handed out as the alias path itself, never its target. What
+    acts on a package looks at its directory without following a link and
+    refuses it (``resolve_current``, ``tool_drafts._own_meta``); the settings and
+    the run records' version state are read through it. Nor does it cover a link
+    put in place meanwhile: after this answer, or during it in the root's own
+    path, which gives None.
     """
     base = tools_dir()
     if base is None or not _NAME_RE.match(name):
         return None
-    if (base / name).is_symlink():
+    package = base / name
+    if package.is_symlink():
         return None
-    directory = _resolve_package_dir(name)
-    return PackageRoot(directory) if directory is not None and directory.is_dir() else None
+    directory = package.resolve()
+    if directory != package or not directory.is_dir():
+        return None
+    return PackageRoot(directory)
 
 
 def set_enabled(name: str, enabled: bool) -> bool:
