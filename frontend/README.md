@@ -322,7 +322,8 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
       `versionWritesBlocked` 管。「放棄」仍只在工具列。
     - **先開框、後送出**：按下先開確認框，不直接送。框的說明（`draftPublishConfirmation`）講
       不經 AI 與不產生 AI 總結、哪些情況不發布（草稿裡有項目含已知的秘密值或查不了；根目錄的
-      `.env` 與 `.afterthread.meta` 不會進新版本，也不因此拒絕）、哪些情況發布後草稿仍留著。
+      `.env` 與 `.afterthread.meta` 不會進新版本，它們裡面有秘密或有檔案打不開，不會因此拒絕）、哪些情況發布後
+      草稿仍留著。
       開框時記下要發布的那一份（`draftPublishTarget`：工具名、`draft_id`、`generation`、草稿的
       `base_vid`），確認時照記下的送：`buildDraftPublishRequest` 把它組成
       `POST /api/tools/{name}/draft/publish`，body 恰為 `draft_id`、`draft_generation`、
