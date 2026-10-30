@@ -3352,6 +3352,78 @@ def test_an_env_spelled_another_way_is_not_brought_in_when_it_may_be_the_env(
     assert not os.path.lexists(tmp_path / "unseen" / "build" / ".ENV")
 
 
+def test_a_metadata_directory_spelled_another_way_is_not_brought_in_when_it_may_be_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``.AFTERTHREAD.META/`` alone at the top of the draft's files, holding the
+    operator's notes. Where it is the same entry as ``.afterthread.meta/`` -- a
+    filesystem that does not tell case apart, where the strip before the save
+    would remove it -- it is not brought in (``backend_meta``); where it is another
+    entry it is content. When whether it is the same entry cannot be told, it is not
+    brought in either (``unreadable``)."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    files = _files(package_root)
+    (files / ".AFTERTHREAD.META").mkdir()
+    (files / ".AFTERTHREAD.META" / "notes.txt").write_text("mine\n", encoding="utf-8")
+    same_entry = os.path.lexists(files / tools._META_DIRNAME)
+    begun = _begin(package_root)
+    assert isinstance(begun, dict)
+
+    seen = _copy_in(package_root, begun, tmp_path / "seen" / "build")
+    with monkeypatch.context() as patch:
+        patch.setattr(tool_drafts, "_same_entry", lambda first, second: None)
+        unseen = _copy_in(package_root, begun, tmp_path / "unseen" / "build")
+
+    assert isinstance(seen, tool_drafts.CopiedIn) and isinstance(unseen, tool_drafts.CopiedIn)
+    if same_entry:
+        assert seen.not_brought_in == (tool_drafts.Omitted(".AFTERTHREAD.META", "backend_meta"),)
+        assert not os.path.lexists(tmp_path / "seen" / "build" / ".AFTERTHREAD.META")
+    else:
+        assert seen.not_brought_in == ()
+        notes = tmp_path / "seen" / "build" / ".AFTERTHREAD.META" / "notes.txt"
+        assert notes.read_text(encoding="utf-8") == "mine\n"
+    assert unseen.not_brought_in == (tool_drafts.Omitted(".AFTERTHREAD.META", "unreadable"),)
+    assert not os.path.lexists(tmp_path / "unseen" / "build" / ".AFTERTHREAD.META")
+
+
+def test_each_name_in_stripped_root_names_and_a_case_alias_of_it_is_not_brought_in(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every root name ``tool_drafts.STRIPPED_ROOT_NAMES`` lists is withheld from a
+    continuation's workspace under the reason it is keyed by: spelled as listed,
+    and spelled in another case where that is the same entry -- the look that
+    tells is answered yes here, as a filesystem that does not tell case apart
+    answers it -- while the other listed names are at the top as listed."""
+    stripped = {name: reason for reason, name in tool_drafts.STRIPPED_ROOT_NAMES.items()}
+    assert stripped
+    # Neither as listed nor all in capitals: ``.Env``.
+    aliases = {name: name.title() for name in stripped}
+    assert all(alias not in (name, name.upper()) for name, alias in aliases.items())
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    files = _files(package_root)
+    begun = _begin(package_root)
+    assert isinstance(begun, dict)
+    monkeypatch.setattr(tool_drafts, "_same_entry", lambda first, second: True)
+
+    def withheld(top: dict[str, tool_drafts.OmitReason], into: str) -> dict[str, str]:
+        for name in [*stripped, *aliases.values()]:
+            (files / name).unlink(missing_ok=True)
+        for name in top:
+            (files / name).write_text("placed by hand\n", encoding="utf-8")
+        copied = _copy_in(package_root, begun, tmp_path / into / "build")
+        assert isinstance(copied, tool_drafts.CopiedIn)
+        assert [name for name in top if os.path.lexists(tmp_path / into / "build" / name)] == []
+        return {item.path: item.reason for item in copied.not_brought_in}
+
+    assert withheld(stripped, "listed") == stripped
+    for name, reason in stripped.items():
+        top = {other: why for other, why in stripped.items() if other != name}
+        top[aliases[name]] = reason
+        assert withheld(top, f"aliased-{reason}") == top
+
+
 def test_a_draft_file_that_grows_while_it_is_copied_in_is_stopped_by_the_count(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

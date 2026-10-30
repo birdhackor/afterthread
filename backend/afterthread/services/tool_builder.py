@@ -2685,13 +2685,15 @@ def _strip_builder_env(
     on a case-sensitive filesystem a copied ``.ENV`` is ordinary version
     content, while on a case-insensitive filesystem opening ``.env`` naturally
     addresses the same entry.  The staging-root guard runs first because removal
-    is destructive and the builder has unjailed shell access.
+    is destructive and the builder has unjailed shell access. The name is
+    ``tool_drafts.STRIPPED_ROOT_NAMES``' ``env_file``, the list a continuation's
+    copy of a draft withholds.
     """
 
     root_error = _verify_staging_root(build_root.path, base)
     if root_error is not None:
         return (), root_error
-    env_file = build_root.path / ".env"
+    env_file = build_root.path / tool_drafts.STRIPPED_ROOT_NAMES["env_file"]
     try:
         info = os.lstat(env_file)
     except FileNotFoundError:
@@ -2738,8 +2740,12 @@ def _strip_builder_sidecars(staging: Path) -> str | None:
     directory shape is removed without following it. The preliminary walk deletes
     nothing; it preserves the existing fail-closed rule that an unreadable subtree
     cannot be silently omitted from inspection.
+
+    The name is ``tool_drafts.STRIPPED_ROOT_NAMES``' ``backend_meta``, the list a
+    continuation's copy of a draft withholds: on a filesystem that does not tell
+    case apart, the path here reaches a name spelled in another case too.
     """
-    metadata = staging / tools._META_DIRNAME
+    metadata = staging / tool_drafts.STRIPPED_ROOT_NAMES["backend_meta"]
     try:
         for _entry in os.walk(staging, onerror=_reraise_walk_error):
             pass

@@ -196,9 +196,9 @@ DraftState = Literal["running", "unusable", "publishing", "unknown", "published"
 # by the next round that began; its ``finished_at`` is null.
 RoundOutcome = Literal["published", "not_published", "failed", "interrupted"]
 # Why a path of the workspace is not in the draft, or a path of the draft is not
-# in a continuing round's workspace. ``env_file`` and ``backend_meta`` are the two
-# root entries a continuation never brings in: a ``.env`` (its values are no known
-# secret, so the model must not read it) and ``.afterthread.meta/``.
+# in a continuing round's workspace. ``env_file`` and ``backend_meta`` are why a
+# continuation does not bring in a root entry the strip before the save removes
+# (``STRIPPED_ROOT_NAMES``).
 OmitReason = Literal[
     "secret_name",
     "secret_content",
@@ -211,6 +211,20 @@ OmitReason = Literal[
     "backend_meta",
 ]
 _OMIT_REASONS = frozenset(get_args(OmitReason))
+# The entries at the root of a round's workspace that are stripped before its work
+# is saved: the builder's ``.env`` (``tool_builder._strip_builder_env``) and the
+# backend's metadata directory (``tool_builder._strip_builder_sidecars``), each
+# strip finding what it removes by its name here; a strip of another root name
+# takes its name from here too. A continuation's copy of the draft withholds each,
+# under the reason it is keyed by, and any name that is the same entry spelled in
+# another case (``_not_brought_in``): brought in, it would be stripped before the
+# save -- through a name here, which on a filesystem that does not tell case apart
+# reaches the alias too -- and the new files directory would lack it, while the
+# previous one, brought in whole and unchanged, would go.
+STRIPPED_ROOT_NAMES: dict[OmitReason, str] = {
+    "env_file": ".env",
+    "backend_meta": tools._META_DIRNAME,
+}
 _OUTCOMES = frozenset(get_args(RoundOutcome))
 _STOPPED_BY = frozenset(get_args(llm.FinalizeTrigger))
 _FAILURES = frozenset(get_args(llm.RunFailure))
@@ -2654,30 +2668,29 @@ def _same_entry(first: Path, second: Path) -> bool | None:
 
 def _not_brought_in(files: Path) -> dict[str, OmitReason]:
     """The entries at the top of a draft's files a continuation's workspace does not
-    receive, with why: ``.afterthread.meta/`` (``backend_meta``), and ``.env``
-    with any name that is the same entry spelled in another case (``env_file``):
-    its values are no known secret, so nothing would mask them once ``read_file``
-    put them in the conversation. Another case of ``.env`` when ``.env`` itself
-    is listed too is another entry -- a filesystem that tells case apart -- and
-    is brought in like any file. When whether it is the same entry cannot be told,
-    it is not brought in (``unreadable``). Raises ``OSError`` when the top cannot
-    be listed.
+    receive, with why: each name in ``STRIPPED_ROOT_NAMES``, under the reason it is
+    keyed by, and any name that is the same entry spelled in another case. A
+    ``.env``'s values are no known secret either, so nothing would mask them once
+    ``read_file`` put them in the conversation. Another case of a listed name when
+    the name itself is at the top too is another entry -- a filesystem that tells
+    case apart -- and is brought in like any file. When whether it is the same
+    entry cannot be told, it is not brought in (``unreadable``). Raises ``OSError``
+    when the top cannot be listed.
     """
     with os.scandir(files) as listing:
         names = [entry.name for entry in listing]
-    exact = ".env" in names
     left_out: dict[str, OmitReason] = {}
-    for name in names:
-        if name == tools._META_DIRNAME:
-            left_out[name] = "backend_meta"
-        elif name == ".env":
-            left_out[name] = "env_file"
-        elif name.casefold() == ".env" and not exact:
-            same = _same_entry(files / name, files / ".env")
-            if same is None:
-                left_out[name] = "unreadable"
-            elif same:
-                left_out[name] = "env_file"
+    for reason, stripped in STRIPPED_ROOT_NAMES.items():
+        exact = stripped in names
+        for name in names:
+            if name == stripped:
+                left_out[name] = reason
+            elif name.casefold() == stripped.casefold() and not exact:
+                same = _same_entry(files / name, files / stripped)
+                if same is None:
+                    left_out[name] = "unreadable"
+                elif same:
+                    left_out[name] = reason
     return left_out
 
 

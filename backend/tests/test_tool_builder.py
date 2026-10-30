@@ -1283,6 +1283,34 @@ def test_strip_builder_sidecars_removes_only_root_version_metadata(tmp_path: Pat
     assert (staging / "sub" / tools._META_DIRNAME / "keep").read_text(encoding="utf-8") == "content"
 
 
+def test_the_env_and_metadata_strips_take_their_names_from_stripped_root_names(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``_strip_builder_env`` and ``_strip_builder_sidecars`` find what they remove
+    by the names ``tool_drafts.STRIPPED_ROOT_NAMES`` lists -- the list a
+    continuation's copy of a draft withholds: with every name there changed, the
+    two strips together remove each changed name and nothing else."""
+    renamed = {reason: f".renamed-{reason}" for reason in tool_drafts.STRIPPED_ROOT_NAMES}
+    assert renamed
+    for reason, name in renamed.items():
+        monkeypatch.setitem(tool_drafts.STRIPPED_ROOT_NAMES, reason, name)
+    base = tmp_path.resolve() / "tools"
+    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
+    staging.mkdir(parents=True)
+    for name in renamed.values():
+        (staging / name).write_text("KEY=placed\n", encoding="utf-8")
+    (staging / ".env").write_text("KEY=kept\n", encoding="utf-8")
+    (staging / tools._META_DIRNAME).mkdir()
+
+    _keys, env_error = tool_builder._strip_builder_env(tools.BuildRoot(staging), base)
+    sidecar_error = tool_builder._strip_builder_sidecars(staging)
+
+    assert (env_error, sidecar_error) == (None, None)
+    assert sorted(entry.name for entry in staging.iterdir()) == sorted(
+        [".env", tools._META_DIRNAME]
+    )
+
+
 def test_strip_builder_sidecars_unlinks_root_metadata_symlink_only(tmp_path: Path) -> None:
     """The backend metadata link is removed without following its target."""
     staging = tmp_path / "staging"
@@ -11788,6 +11816,42 @@ def test_an_unchanged_continuation_is_saved_only_while_its_files_are_as_it_copie
         assert tool_drafts.same_tree(as_copied, tool_drafts.tree_digest(moved_to))
     else:
         assert tool_drafts.same_tree(as_copied, tool_drafts.tree_digest(files))
+
+
+def test_a_continuation_keeps_a_metadata_alias_the_operator_added_to_the_draft(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The operator added ``.AFTERTHREAD.META/notes.txt`` to the draft's files, on a
+    filesystem that does not tell case apart: the same entry as
+    ``.afterthread.meta/``, which the strip before the save removes. The round
+    changes another file and saves a new files directory. The alias was not
+    brought in, so the previous files directory, holding the notes, stays in
+    ``kept``, and the job says why."""
+    if _case_sensitive_filesystem(tmp_path):
+        pytest.skip(
+            "this filesystem tells .afterthread.meta and .AFTERTHREAD.META apart: the "
+            "alias is another entry, which the strip does not reach"
+        )
+    pkg = _seed_package(monkeypatch, tmp_path)
+    first = _first_round(monkeypatch, pkg)
+    previous = _draft_files(pkg)
+    (previous / ".AFTERTHREAD.META").mkdir()
+    (previous / ".AFTERTHREAD.META" / "notes.txt").write_text("mine\n", encoding="utf-8")
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"page.py": "PAGE = 1\n"})
+
+    outcome = asyncio.run(_continue_revise(pkg, "再試一次"))
+
+    manifest = _draft_manifest(pkg)
+    assert manifest["files_dir"] != first["files_dir"]
+    assert manifest["kept"] == [first["files_dir"]]
+    assert (previous / ".AFTERTHREAD.META" / "notes.txt").read_text(encoding="utf-8") == "mine\n"
+    assert manifest["attempts"][-1]["not_brought_in"] == [
+        {"path": ".AFTERTHREAD.META", "reason": "backend_meta"}
+    ]
+    assert outcome.draft is not None
+    assert outcome.draft["reason"] == tool_drafts.NOTE_PREVIOUS_KEPT.format(
+        path=previous, why=tool_drafts.KEPT_NOT_ALL_BROUGHT_IN
+    )
 
 
 def test_a_continuation_whose_draft_keeps_as_many_copies_as_it_may_calls_no_model(
