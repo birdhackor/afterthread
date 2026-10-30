@@ -85,8 +85,9 @@
 
 - 刪除工具時整個套件目錄一次搬走，草稿跟著消失；同名重裝不會繼承舊草稿；沒有孤兒草稿，也不必和
   執行紀錄的 purge 互相牽扯。
-- `.staging` 維持今天的語意（一場 session 的暫存，結束就刪），README 與文件站的「`.staging` 殘留
-  可以直接手動刪除」仍然成立；把草稿留在 `.staging` 會讓這句話變成刪除唯一成果的指示。
+- `.staging` 仍是一場 session 的暫存。成果沒有人接住，或還可能有 worker、程序在寫時，它會被刻意保留（§3.3、D52、
+  D56），清理規則是：先確認沒有 worker 或程序還在用，再取回需要的成果，最後才刪。把草稿留在 `.staging`，每一份草稿
+  都會落進這種不能直接刪的殘留。
 - session 仍在 `.staging` 裡跑，builder 從不在套件目錄裡起跑，既有 staging 防護不變。
 - 套件層 `.afterthread.meta/` 的讀取只讀固定檔名（`_resolve_current_data`、`_read_enabled_state`、
   遷移的 `_has_our_state_marker`），多一個 `draft/` 不影響它們；v5 §4 的版面要補上它。
