@@ -407,15 +407,16 @@ def test_a_dot_dot_after_a_component_that_cannot_be_looked_at_keeps_no_link(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, code: int
 ) -> None:
     """Whether a ``..`` follows a link turns on what the component before it is.
-    ``x`` cannot be looked at, so that is not known: the link is not kept and is
-    recorded as unreadable -- not judged as if ``x`` were a directory. Here ``x``
-    is a link into ``d/sub``, so ``x/../f`` reaches ``d/f``, not the top's ``f``."""
+    ``x`` cannot be looked at, so that is not known: the judgment raises
+    ``LookFailed`` -- not judged as if ``x`` were a directory. Here ``x`` is a link
+    into ``d/sub``, so ``x/../f`` reaches ``d/f``, not the top's ``f``."""
     root = tmp_path / "work"
     (root / "d" / "sub").mkdir(parents=True)
     os.symlink("d/sub", root / "x")
     refused = _refuse(monkeypatch, "lstat", lambda path: path == os.fspath(root / "x"), code)
 
-    assert tool_drafts.stored_link_target(root, ("l",), "x/../f") == (None, "unreadable")
+    with pytest.raises(tool_drafts.LookFailed):
+        tool_drafts.stored_link_target(root, ("l",), "x/../f")
     assert refused == [os.fspath(root / "x")]
 
 
@@ -442,8 +443,8 @@ def test_an_absolute_target_matching_only_a_resolved_path_that_cannot_be_confirm
     """The tree's resolved path is asked for with its errors raised. When that
     fails, the path a resolution that swallows its errors hands back may not be
     where the tree is, so only the path as given is matched: a target beginning
-    with the other path is recorded as unreadable, and one beginning with the
-    given path is kept."""
+    with the other path raises ``LookFailed``, and one beginning with the given
+    path is kept."""
     work = tmp_path / "work"
     work.mkdir()
     given = tmp_path / "given"
@@ -460,10 +461,8 @@ def test_an_absolute_target_matching_only_a_resolved_path_that_cannot_be_confirm
 
     monkeypatch.setattr(os.path, "realpath", realpath)
 
-    assert tool_drafts.stored_link_target(given, ("l",), f"{elsewhere}/data.txt") == (
-        None,
-        "unreadable",
-    )
+    with pytest.raises(tool_drafts.LookFailed):
+        tool_drafts.stored_link_target(given, ("l",), f"{elsewhere}/data.txt")
     assert tool_drafts.stored_link_target(given, ("l",), f"{given}/data.txt") == (
         "data.txt",
         None,
@@ -809,6 +808,52 @@ def test_a_path_whose_earlier_version_holds_the_secret_too_is_not_kept(
     ]["omitted"]
 
 
+@pytest.mark.parametrize(
+    ("earlier", "path"),
+    [
+        ("no-entry", "conf.py"),
+        ("no-directory", "new/conf.py"),
+        ("a-file-for-a-directory", "sub/conf.py"),
+        ("a-directory", "conf.py"),
+        ("a-link-the-rule-does-not-keep", "conf.py"),
+    ],
+)
+def test_a_round_still_saves_where_the_earlier_version_is_seen_to_have_nothing_to_put_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, earlier: str, path: str
+) -> None:
+    """Seeing that the earlier version has nothing to put back for a path holding
+    the secret -- no such entry, a directory on the way missing or not a directory,
+    a directory where the path is, a link the link rule does not keep there -- is
+    a decision about the path, not a failed look: it is left out and the round
+    saves."""
+    package_root = _package(monkeypatch, tmp_path)
+    base = _version(package_root)
+    if earlier == "a-file-for-a-directory":
+        (base / "sub").write_text("a file\n", encoding="utf-8")
+    elif earlier == "a-directory":
+        (base / "conf.py").mkdir()
+        (base / "conf.py" / "inner.txt").write_text("inside\n", encoding="utf-8")
+    elif earlier == "a-link-the-rule-does-not-keep":
+        os.symlink("../../outside.py", base / "conf.py")
+    workspace = _workspace(tmp_path, package_root)
+    copied_in = tool_drafts.tree_digest(workspace)
+    for taken in (workspace / "sub", workspace / "conf.py"):
+        if taken.is_symlink() or taken.is_file():
+            taken.unlink()
+        elif taken.is_dir():
+            shutil.rmtree(taken)
+    (workspace / path).parent.mkdir(exist_ok=True)
+    (workspace / path).write_text(f"KEY = '{_SECRET}'\n", encoding="utf-8")
+
+    result = _save(package_root, workspace, copied_in)
+
+    assert result.saved, result.reason
+    assert not os.path.lexists(_files(package_root) / path)
+    latest = _manifest(package_root)["attempts"][-1]
+    assert latest["saved"] is True
+    assert {"path": path, "reason": "secret_content"} in latest["omitted"]
+
+
 def test_secrets_in_names_and_link_targets_reach_no_byte_under_the_draft(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -953,9 +998,12 @@ def test_a_scan_of_the_copy_that_cannot_finish_keeps_no_files(
     )
 
 
-def test_a_path_the_scan_of_the_copy_could_not_search_is_not_kept(
+def test_a_path_the_scan_of_the_copy_could_not_search_keeps_no_files(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """The scan of the copy could not search ``run.py``: whether it may be kept is
+    not known, so the save keeps no files and says which; a first round leaves no
+    draft."""
     package_root = _package(monkeypatch, tmp_path)
     workspace = _workspace(tmp_path, package_root)
     copied_in = tool_drafts.tree_digest(workspace)
@@ -966,13 +1014,14 @@ def test_a_path_the_scan_of_the_copy_could_not_search_is_not_kept(
 
     with monkeypatch.context() as patch:
         _scan_of_the_copy(patch, unsearched)
-        assert _save(package_root, workspace, copied_in).saved
+        result = _save(package_root, workspace, copied_in)
 
-    assert not os.path.lexists(_files(package_root) / "run.py")
-    assert (_files(package_root) / "tool.json").is_file()
-    assert _manifest(package_root)["attempts"][-1]["omitted"] == [
-        {"path": "run.py", "reason": "unreadable"}
-    ]
+    assert (result.worth_saving, result.saved, result.reason) == (
+        True,
+        False,
+        tool_drafts.REASON_UNLOOKED.format(paths="run.py"),
+    )
+    assert not tool_drafts.has_draft(package_root)
 
 
 def test_a_manifest_that_would_hold_a_secret_with_every_text_masked_is_not_saved_and_says_why(
@@ -1495,12 +1544,12 @@ def _up_through_a_put_back_link(workspace: Path) -> None:
     os.symlink("x/../manifest.json", workspace / "l")
 
 
-def test_a_link_judged_on_the_copy_past_a_component_that_cannot_be_looked_at_is_not_kept(
+def test_a_link_judged_on_the_copy_past_a_component_that_cannot_be_looked_at_keeps_no_files(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """When the copy's ``l -> x/../manifest.json`` is judged, ``x`` cannot be
-    looked at, so whether the ``..`` follows a link is not known: ``l`` is not
-    kept and is recorded as unreadable, not judged as if ``x`` were a directory."""
+    looked at, so whether the ``..`` follows a link is not known -- not judged as
+    if ``x`` were a directory: the save keeps no files and names ``l``."""
     package_root = _package(monkeypatch, tmp_path)
     os.symlink(".", _version(package_root) / "x")
     workspace = _workspace(tmp_path, package_root)
@@ -1508,13 +1557,14 @@ def test_a_link_judged_on_the_copy_past_a_component_that_cannot_be_looked_at_is_
     _up_through_a_put_back_link(workspace)
     refused = _refuse(monkeypatch, "lstat", _in_the_copy("x"), errno.EIO, times=1)
 
-    assert _save(package_root, workspace, copied_in).saved
+    result = _save(package_root, workspace, copied_in)
 
     assert len(refused) == 1
-    files = _files(package_root)
-    assert not os.path.lexists(files / "l")
-    assert os.readlink(files / "x") == "."
-    assert _omitted(package_root) == {"l": "unreadable", "x": "secret_content"}
+    assert (result.saved, result.reason) == (
+        False,
+        tool_drafts.REASON_UNLOOKED.format(paths="l"),
+    )
+    assert not tool_drafts.has_draft(package_root)
 
 
 @pytest.mark.parametrize("round_kind", ["first", "continuing"])
@@ -1537,7 +1587,7 @@ def test_a_link_that_leaves_the_copy_is_not_kept_even_where_the_link_rule_misses
         _first_draft(tmp_path, package_root)
         workspace, previous, copied_in = _continuing(tmp_path, package_root)
     _up_through_a_put_back_link(workspace)
-    monkeypatch.setattr(tool_drafts, "_links_failing_on", lambda root: [])
+    monkeypatch.setattr(tool_drafts, "_links_failing_on", lambda root: ([], []))
 
     assert _save(package_root, workspace, copied_in, previous=previous).saved
 
@@ -1575,12 +1625,12 @@ def test_a_link_seen_to_resolve_nowhere_inside_the_copy_is_kept(
     assert _omitted(package_root) == {}
 
 
-def test_a_link_whose_resolution_cannot_be_told_is_not_kept(
+def test_a_link_whose_resolution_cannot_be_told_keeps_no_files(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """``l -> run.py``: while the copy's links are resolved, ``run.py`` cannot be
-    looked at, so where ``l`` lands is not known. It is not kept and is recorded
-    as unreadable; ``run.py`` itself is kept."""
+    looked at, so where ``l`` lands is not known. The save keeps no files and
+    names ``l``."""
     package_root = _package(monkeypatch, tmp_path)
     workspace = _workspace(tmp_path, package_root)
     copied_in = tool_drafts.tree_digest(workspace)
@@ -1603,11 +1653,11 @@ def test_a_link_whose_resolution_cannot_be_told_is_not_kept(
 
     result = _save(package_root, workspace, copied_in)
 
-    assert result.saved
-    files = _files(package_root)
-    assert not os.path.lexists(files / "l")
-    assert (files / "run.py").read_text(encoding="utf-8") == "print('base')\n"
-    assert _omitted(package_root) == {"l": "unreadable"}
+    assert (result.saved, result.reason) == (
+        False,
+        tool_drafts.REASON_UNLOOKED.format(paths="l"),
+    )
+    assert not tool_drafts.has_draft(package_root)
     assert len(refused) == 1
 
 
@@ -3487,6 +3537,39 @@ def test_a_draft_file_holding_a_known_secret_is_not_brought_in(
     assert copied.not_brought_in == (tool_drafts.Omitted("notes.txt", "secret_content"),)
     assert not os.path.lexists(workspace / "notes.txt")
     assert not any(_SECRET in text for text in _all_bytes_under(workspace))
+
+
+@pytest.mark.parametrize("scanned", ["draft", "copy"])
+def test_a_draft_file_the_scan_cannot_search_is_left_out_and_the_round_begins(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scanned: str
+) -> None:
+    """Copying the draft into a continuation's workspace, the scan cannot search
+    ``notes.txt`` -- in the draft's files, or in the copy made of them. Unlike a
+    save, the copy goes on: ``notes.txt`` is not brought in and is recorded as
+    unreadable, and the draft still holds it."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    files = _files(package_root)
+    (files / "notes.txt").write_text("mine\n", encoding="utf-8")
+    begun = _begin(package_root)
+    assert isinstance(begun, dict)
+    workspace = tmp_path / "work2" / "build"
+    where = files if scanned == "draft" else workspace
+    real_search = tools._search_file
+
+    def search(path: str, secrets: list[str], overlap: int) -> Any:
+        if Path(path) == where / "notes.txt":
+            return "unreadable"
+        return real_search(path, secrets, overlap)
+
+    monkeypatch.setattr(tools, "_search_file", search)
+
+    copied = _copy_in(package_root, begun, workspace)
+
+    assert isinstance(copied, tool_drafts.CopiedIn)
+    assert copied.not_brought_in == (tool_drafts.Omitted("notes.txt", "unreadable"),)
+    assert not os.path.lexists(workspace / "notes.txt")
+    assert (files / "notes.txt").read_text(encoding="utf-8") == "mine\n"
 
 
 def test_a_round_s_note_is_kept_whole_up_to_the_request_s_own_cap(

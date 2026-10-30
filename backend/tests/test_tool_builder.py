@@ -11854,6 +11854,292 @@ def test_a_continuation_keeps_a_metadata_alias_the_operator_added_to_the_draft(
     )
 
 
+def _top_of(path: Any, name: str, tree: str) -> bool:
+    """Whether ``path`` is ``name`` at the top of the round's ``workspace`` (its
+    ``build`` directory), of the ``copy`` a save is making (``.incoming-<hex>``), or
+    of the ``previous`` files directory (``files-<hex>``)."""
+    candidate = Path(os.fspath(path))
+    parent = candidate.parent.name
+    return (
+        candidate.name == name
+        and {
+            "workspace": parent == "build",
+            "copy": parent.startswith(".incoming-"),
+            "previous": parent.startswith("files-"),
+        }[tree]
+    )
+
+
+def _eio(path: Any) -> OSError:
+    return OSError(errno.EIO, os.strerror(errno.EIO), os.fspath(path))
+
+
+def _fail_a_look_at_the_save(monkeypatch: pytest.MonkeyPatch, case: str, armed: list[bool]) -> None:
+    """Make the look ``case`` names fail while ``armed`` -- set once the round has
+    its workspace, so the copy of the draft into it is untouched."""
+    if case in ("workspace-scan-file", "copy-scan", "copy-scan-put-back"):
+        tree = "workspace" if case == "workspace-scan-file" else "copy"
+        real_search = tools._search_file
+
+        def search(path: str, secrets: list[str], overlap: int) -> Any:
+            if armed[0] and _top_of(path, "user-only.txt", tree):
+                return "unreadable"
+            return real_search(path, secrets, overlap)
+
+        monkeypatch.setattr(tools, "_search_file", search)
+    elif case == "workspace-scan-link":
+        scanning = [False]
+        real_scan = tools._scan_tree
+        real_readlink = os.readlink
+
+        def scan_tree(root: Path, secrets: list[str]) -> Any:
+            scanning[0] = True
+            try:
+                return real_scan(root, secrets)
+            finally:
+                scanning[0] = False
+
+        def readlink(path: Any, *args: Any, **kwargs: Any) -> Any:
+            if armed[0] and scanning[0] and _top_of(path, "user-link", "workspace"):
+                raise _eio(path)
+            return real_readlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(tools, "_scan_tree", scan_tree)
+        monkeypatch.setattr(os, "readlink", readlink)
+    elif case in ("workspace-link-rule", "put-back-link-rule", "copy-link-rule"):
+        tree = "copy" if case == "copy-link-rule" else "workspace"
+        real_is_link = tool_drafts._is_link
+
+        def is_link(path: Path) -> bool:
+            if armed[0] and _top_of(path, "sub", tree):
+                raise _eio(path)
+            return real_is_link(path)
+
+        monkeypatch.setattr(tool_drafts, "_is_link", is_link)
+    elif case == "put-back-unreachable":
+        real_previous = tool_drafts.previous_files
+
+        def previous_files(package_root: Any, manifest: dict[str, Any]) -> Path | None:
+            return None if armed[0] else real_previous(package_root, manifest)
+
+        monkeypatch.setattr(tool_drafts, "previous_files", previous_files)
+    elif case in ("put-back-directory", "put-back-entry"):
+        real_lstat = os.lstat
+
+        def lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            candidate = Path(os.fspath(path))
+            if case == "put-back-directory":
+                hit = (
+                    candidate.name.startswith("files-")
+                    and candidate.parent.name == tool_drafts.DRAFT_DIRNAME
+                )
+            else:
+                hit = _top_of(path, "user-only.txt", "previous")
+            if armed[0] and hit:
+                raise _eio(path)
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "lstat", lstat)
+    elif case == "put-back-link-read":
+        real_readlink = os.readlink
+
+        def readlink(path: Any, *args: Any, **kwargs: Any) -> Any:
+            if armed[0] and _top_of(path, "user-link", "previous"):
+                raise _eio(path)
+            return real_readlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "readlink", readlink)
+    else:
+        assert case in ("copy-resolution", "copy-resolution-root"), case
+        real_realpath = os.path.realpath
+
+        def realpath(path: Any, *, strict: Any = False) -> Any:
+            if case == "copy-resolution":
+                hit = _top_of(path, "user-link", "copy")
+            else:
+                hit = Path(os.fspath(path)).name.startswith(".incoming-")
+            if armed[0] and strict and hit:
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), os.fspath(path))
+            return real_realpath(path, strict=strict)
+
+        monkeypatch.setattr(os.path, "realpath", realpath)
+
+
+def _entry_at(root: Path, name: str) -> str:
+    """A link's target, or a file's text."""
+    return (
+        os.readlink(root / name)
+        if (root / name).is_symlink()
+        else (root / name).read_text(encoding="utf-8")
+    )
+
+
+# Every place a save leaves an entry out because a look failed rather than by a
+# decision about it: (case, the entry left out, whether the round wrote the secret
+# into it -- the draft's own version of it then being what a save puts back).
+_UNLOOKED_AT_SAVE = [
+    ("workspace-scan-file", "user-only.txt", False),
+    ("workspace-scan-link", "user-link", False),
+    ("workspace-link-rule", "user-link", False),
+    ("put-back-unreachable", "user-only.txt", True),
+    ("put-back-directory", "user-only.txt", True),
+    ("put-back-entry", "user-only.txt", True),
+    ("put-back-link-read", "user-link", True),
+    ("put-back-link-rule", "user-link", True),
+    ("copy-link-rule", "user-link", False),
+    ("copy-resolution", "user-link", False),
+    ("copy-resolution-root", "user-link", False),
+    ("copy-scan", "user-only.txt", False),
+    ("copy-scan-put-back", "user-only.txt", True),
+]
+
+
+@pytest.mark.parametrize(("case", "entry", "put_back"), _UNLOOKED_AT_SAVE)
+def test_a_continuation_that_cannot_look_at_an_entry_saves_no_files_and_keeps_both_copies(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str, entry: str, put_back: bool
+) -> None:
+    """The draft holds the operator's ``user-only.txt``, ``sub/`` and
+    ``user-link -> sub/../user-only.txt``, all brought in; the round changes
+    ``run.py``, and a look the save makes at ``entry`` fails. No files are saved:
+    the round is recorded as not saved, saying which entry; the draft's files
+    directory is the one it had, no copy added to ``kept``, and it still holds the
+    entry; the staging stays, named, holding the entry as the round left it."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / ".env").write_text(f"KB_API_KEY={_DRAFT_SECRET}\n", encoding="utf-8")
+    first = _first_round(monkeypatch, pkg)
+    previous = _draft_files(pkg)
+    (previous / "user-only.txt").write_text("the operator's own\n", encoding="utf-8")
+    (previous / "sub").mkdir()
+    os.symlink("sub/../user-only.txt", previous / "user-link")
+    in_the_draft = _entry_at(previous, entry)
+    armed = [False]
+    _fail_a_look_at_the_save(monkeypatch, case, armed)
+    files = {"run.py": _REVISED_RUN_PY + "# second\n"}
+    in_the_round = in_the_draft
+    if put_back:
+        in_the_round = (
+            f"gone-{_DRAFT_SECRET}" if entry == "user-link" else f"KEY = '{_DRAFT_SECRET}'\n"
+        )
+    if put_back and entry == "user-only.txt":
+        files["user-only.txt"] = in_the_round
+
+    def begin() -> None:
+        workspace = _staging_dir(tmp_path / "tools")
+        if put_back and entry == "user-link":
+            os.unlink(workspace / "user-link")
+            os.symlink(in_the_round, workspace / "user-link")
+        armed[0] = True
+
+    _fake_generate(monkeypatch, result=_UNFINISHED, files=files, side_effect=begin)
+
+    outcome = asyncio.run(_continue_revise(pkg, "再試一次"))
+    armed[0] = False
+
+    reason = tool_drafts.REASON_UNLOOKED.format(paths=entry)
+    manifest = _draft_manifest(pkg)
+    assert (manifest["files_dir"], manifest["kept"]) == (first["files_dir"], first["kept"])
+    assert _entry_at(previous, entry) == in_the_draft
+    latest = manifest["attempts"][-1]
+    assert (latest["number"], latest["saved"], latest["reason"]) == (2, False, reason)
+    [session] = _session_roots(tmp_path)
+    assert outcome.draft == {
+        "saved": False,
+        "draft_id": first["draft_id"],
+        "generation": manifest["generation"],
+        "attempts": 2,
+        "reason": reason,
+        "retained_path": str(session / "build"),
+    }
+    assert _entry_at(session / "build", entry) == in_the_round
+
+
+def test_a_continuation_whose_copy_fails_one_open_keeps_the_entry_it_could_not_scan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The operator added ``user-only.txt`` to the draft; it is brought in whole and
+    nobody changes it. The round changes only ``run.py``, and while the copy is
+    scanned again one ``open`` of its ``user-only.txt`` fails (EIO). Nothing is
+    saved: the previous files directory still holds ``user-only.txt``, the staging
+    stays, and the job says the round was not saved, and why."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / ".env").write_text(f"KB_API_KEY={_DRAFT_SECRET}\n", encoding="utf-8")
+    first = _first_round(monkeypatch, pkg)
+    previous = _draft_files(pkg)
+    (previous / "user-only.txt").write_text("the operator's own\n", encoding="utf-8")
+    failed: list[str] = []
+    real_open = os.open
+
+    def open_once_failing(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if not failed and _top_of(path, "user-only.txt", "copy"):
+            failed.append(os.fspath(path))
+            raise _eio(path)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", open_once_failing)
+    _fake_generate(
+        monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY + "# second\n"}
+    )
+
+    outcome = asyncio.run(_continue_revise(pkg, "再試一次"))
+
+    assert len(failed) == 1
+    assert _draft_manifest(pkg)["files_dir"] == first["files_dir"]
+    assert (previous / "user-only.txt").read_text(encoding="utf-8") == "the operator's own\n"
+    [session] = _session_roots(tmp_path)
+    assert outcome.draft is not None
+    assert (outcome.draft["saved"], outcome.draft["reason"], outcome.draft["retained_path"]) == (
+        False,
+        tool_drafts.REASON_UNLOOKED.format(paths="user-only.txt"),
+        str(session / "build"),
+    )
+    assert (session / "build" / "user-only.txt").read_text(encoding="utf-8") == (
+        "the operator's own\n"
+    )
+
+
+_HELPER_PY = "def page(items, size):\n    return items[:size]\n"
+
+
+@pytest.mark.parametrize("scanned", ["workspace", "copy"])
+def test_a_first_round_that_cannot_search_a_file_it_wrote_makes_no_draft_and_keeps_the_staging(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scanned: str
+) -> None:
+    """The round writes ``helper.py``, a file the base version does not have, and
+    the scan of the ``scanned`` tree -- the workspace, while the copy is planned,
+    or the copy -- cannot search it. No files directory is committed, no draft at
+    all, and the reason names the file; the staging stays, named, holding it --
+    the only place the file is."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / ".env").write_text(f"KB_API_KEY={_DRAFT_SECRET}\n", encoding="utf-8")
+    real_search = tools._search_file
+
+    def search(path: str, secrets: list[str], overlap: int) -> Any:
+        if _top_of(path, "helper.py", scanned):
+            return "unreadable"
+        return real_search(path, secrets, overlap)
+
+    monkeypatch.setattr(tools, "_search_file", search)
+    _fake_generate(
+        monkeypatch,
+        result=_UNFINISHED,
+        files={"run.py": _REVISED_RUN_PY, "helper.py": _HELPER_PY},
+    )
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    [session] = _session_roots(tmp_path)
+    assert outcome.draft == {
+        "saved": False,
+        "draft_id": None,
+        "generation": None,
+        "attempts": None,
+        "reason": tool_drafts.REASON_UNLOOKED.format(paths="helper.py"),
+        "retained_path": str(session / "build"),
+    }
+    assert (session / "build" / "helper.py").read_text(encoding="utf-8") == _HELPER_PY
+
+
 def test_a_continuation_whose_draft_keeps_as_many_copies_as_it_may_calls_no_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

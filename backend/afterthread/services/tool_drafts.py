@@ -82,19 +82,19 @@ What holds, and why:
   earlier version -- the one the round started from -- when that is a regular
   file, or a link LINKS keeps. On the copy, once every entry is in it and its
   links are judged, before it is made durable, it decides what is kept: every
-  path whose content, name or stored link target holds a secret, or that it
-  could not search, is removed and recorded as not kept. The second scan is
-  what keeps known secrets out of the files the draft keeps, because the copy
-  is not the workspace: an earlier version is put back without being scanned,
-  and an absolute link target inside the workspace is stored relative, behind a
-  ``../`` for each directory the link is in: added text, which with what follows
-  it can spell a secret the target as written did not. A scan of either tree
-  that cannot finish keeps no files. Content is never rewritten with redaction
-  markers, which could break the program.
+  path whose content, name or stored link target holds a secret is removed and
+  recorded as not kept; one it could not search is removed too (LOOKS). The
+  second scan is what keeps known secrets out of the files the draft keeps,
+  because the copy is not the workspace: an earlier version is put back without
+  being scanned, and an absolute link target inside the workspace is stored
+  relative, behind a ``../`` for each directory the link is in: added text,
+  which with what follows it can spell a secret the target as written did not.
+  A scan of either tree that cannot finish keeps no files. Content is never
+  rewritten with redaction markers, which could break the program.
 * LINKS. A link is kept only when its target, resolved as a string from the
   link's own directory, stays inside the tree, and no ``..`` in it follows a
   component that is itself a link (``stored_link_target`` says why) or that
-  cannot be looked at (``unreadable``). The rule is applied twice: on the
+  cannot be looked at (``unreadable``, LOOKS). The rule is applied twice: on the
   workspace, to plan the copy, and on the copy once every link is in it, before
   it is made durable, to every link of the copy. The copy differs from the
   workspace wherever an earlier version was put back, and the rule holds only on
@@ -116,6 +116,15 @@ What holds, and why:
   keep -- a link that failed, a FIFO -- dangles in the copy and is not recorded
   on its own: dangling is safe, and what it runs through is recorded as not
   kept, itself or a directory it is in.
+* LOOKS. A save leaves an entry of the workspace out by a decision about it -- a
+  known secret, a link not kept, an entry seen to be no regular file, directory
+  or link -- or because a look at it failed: the scan could not search it, a
+  look on a link's way or at where it resolves failed (``LookFailed``), the
+  earlier version to put back could not be looked at. The second keeps no files
+  at all (``REASON_UNLOOKED``): a copy without the entry, committed, could let
+  the previous files directory and the staging go while they still held it, and
+  the entry would be nowhere. A copy into a continuation's workspace leaves such
+  an entry out, recorded as not brought in; the draft still holds it.
 * DURABILITY. A new copy is written under a temporary name, made durable and
   renamed into place before the manifest names it, and the manifest is replaced
   atomically. A continuation's previous copy is named in ``kept`` by the same
@@ -230,8 +239,8 @@ _STOPPED_BY = frozenset(get_args(llm.FinalizeTrigger))
 _FAILURES = frozenset(get_args(llm.RunFailure))
 
 # Why a round's files were not saved, or a continuation did not begin:
-# user-facing (zh-TW, rendered by the 工具 page) and category-only, never a path
-# or a value.
+# user-facing (zh-TW, rendered by the 工具 page) and category-only, never a value,
+# and a path only in the one reason that must name its entries (``REASON_UNLOOKED``).
 REASON_STRIP_ENV = "無法清除建置器寫入的 .env"
 REASON_STRIP_SIDECARS = "無法清除工作區裡的後端中繼資料"
 # The workspace could not be confirmed to be the staging directory it was given:
@@ -259,6 +268,12 @@ REASON_FILES_CHANGED = (
     "所以這一輪的檔案沒有存進草稿"
 )
 REASON_COPY = "無法複製檔案到草稿（{kind}）"  # noqa: RUF001
+# A save that would leave out an entry because a look at it failed, not because
+# of a decision about it: whether the entry may be kept is not known, so no files
+# are saved. ``{paths}`` names the first ``_UNLOOKED_LISTED`` of them, masked and
+# cut like any text the API serves, and how many there are when there are more.
+REASON_UNLOOKED = "有項目查詢失敗，無法確認能否存進草稿，所以這一輪的檔案沒有存：{paths}"  # noqa: RUF001
+_UNLOOKED_LISTED = 5
 REASON_DURABILITY = "無法確認草稿已安全寫入磁碟"
 REASON_MANIFEST = "無法寫入草稿的說明檔"
 REASON_MANIFEST_SECRET = "草稿的說明檔寫下去仍會含有已知的秘密值，沒有寫入"  # noqa: RUF001
@@ -389,10 +404,13 @@ class SaveResult:
     failure. Otherwise three things, every branch that writes the manifest
     filling in all of them:
 
-    * ``saved``: the draft's files directory holds this round's files -- a new one
-      the save committed, or, for a continuation that changed nothing, the one it
-      already had, once it is seen still to be what the round copied out of it
-      (``_still_as_copied_out``);
+    * ``saved``: the draft's files directory holds every entry of this round's
+      workspace but those left out by a decision about them (a known secret, a
+      link not kept, an entry seen to be no regular file, directory or link) -- a
+      new one the save committed, which it does only when no entry was left out
+      because a look at it failed (``REASON_UNLOOKED``), or, for a continuation
+      that changed nothing, the one it already had, once it is seen still to be
+      what the round copied out of it (``_still_as_copied_out``);
     * ``recorded``: the manifest records this round (and no longer marks it
       running). A save that did not save often recorded the round still, with
       why -- never the save a publish follows (``save_round``);
@@ -1414,6 +1432,23 @@ def _over_limits(root: Path, max_entries: int, max_bytes: int) -> str | None:
     return None
 
 
+class LookFailed(Exception):
+    """A look at an entry failed other than by seeing nothing there, so what it was
+    to decide is not known. Raised where the look is made: what the caller then
+    leaves out is left out because of a failed look, never because of a decision
+    about the entry, and a save keeps no files for it (``REASON_UNLOOKED``)."""
+
+
+def _unlooked_reason(paths: list[str], known: list[str]) -> str:
+    """``REASON_UNLOOKED`` naming ``paths``: the first few, masked and cut, and how
+    many there are when there are more."""
+    ordered = sorted(set(paths))
+    shown = "、".join(_shown(path, known, _PATH_CAP) or "" for path in ordered[:_UNLOOKED_LISTED])
+    if len(ordered) > _UNLOOKED_LISTED:
+        shown += f" 等 {len(ordered)} 項"
+    return REASON_UNLOOKED.format(paths=shown)
+
+
 def _is_link(path: Path) -> bool:
     """Whether ``path`` is a link, by its ``lstat``.
 
@@ -1459,10 +1494,10 @@ def stored_link_target(
     it would begin with are dropped, since written first they would make it
     absolute. One that begins with neither path is ``link_outside``.
 
-    What cannot be looked at keeps no link and is recorded ``unreadable``: a
-    component before a ``..`` whose ``lstat`` fails other than by not being there
-    (``_is_link``), and an absolute target that does not begin with the path as
-    given while the resolved path cannot be had with errors raised -- a
+    What cannot be looked at raises ``LookFailed``, and the caller keeps no link:
+    a component before a ``..`` whose ``lstat`` fails other than by not being
+    there (``_is_link``), and an absolute target that does not begin with the path
+    as given while the resolved path cannot be had with errors raised -- a
     resolution that swallows them can hand back a path ``root`` is not at.
     Verified: every answer rests on a look that succeeded or saw nothing there.
     Not covered: a component that changes between this look and the
@@ -1472,12 +1507,11 @@ def stored_link_target(
     relative = target
     if os.path.isabs(target):
         spellings = [os.fspath(root)]
+        unresolved: OSError | None = None
         try:
             spellings.append(os.path.realpath(root, strict=True))
-        except OSError:
-            resolved = False
-        else:
-            resolved = True
+        except OSError as exc:
+            unresolved = exc
         inside: list[str] | None = None
         for spelling in dict.fromkeys(spellings):
             prefix = spelling.rstrip(os.sep)
@@ -1485,7 +1519,9 @@ def stored_link_target(
                 inside = target[len(prefix) :].split(os.sep)[1:]
                 break
         if inside is None:
-            return None, "link_outside" if resolved else "unreadable"
+            if unresolved is not None:
+                raise LookFailed from unresolved
+            return None, "link_outside"
         if not link_dir:
             while inside and not inside[0]:
                 inside.pop(0)
@@ -1499,8 +1535,8 @@ def stored_link_target(
                 return None, "link_outside"
             try:
                 is_link = _is_link(root.joinpath(*stack))
-            except OSError:
-                return None, "unreadable"
+            except OSError as exc:
+                raise LookFailed from exc
             if is_link:
                 return None, "link_ambiguous"
             stack.pop()
@@ -1523,24 +1559,47 @@ class _CopyPlan:
     # (relative path, target to store).
     links: list[tuple[str, str]] = field(default_factory=list)
     omitted: list[Omitted] = field(default_factory=list)
+    # The paths the plan leaves out because a look failed -- the scan could not
+    # search them, a look on a link's way failed, the earlier version to put back
+    # could not be looked at -- each also in ``omitted``. A save keeps no files
+    # when there is one (``REASON_UNLOOKED``); a copy into a continuation's
+    # workspace leaves them out like the rest.
+    unlooked: list[str] = field(default_factory=list)
 
 
-def _earlier_entry(base_root: Path | None, parts: tuple[str, ...]) -> Path | None:
-    """The same path in the earlier version, reached through real directories only."""
-    if base_root is None or not _is_real_dir(base_root):
+def _earlier_entry(
+    base_root: Path | Literal["unseen"] | None, parts: tuple[str, ...]
+) -> Path | None:
+    """The same path in the earlier version, reached through real directories only.
+
+    None when there is seen to be none: no earlier version (``base_root`` None),
+    or a directory on the way seen not to be there or not to be one. Raises
+    ``LookFailed`` when one of them cannot be looked at, or when the earlier
+    version could not be reached at all (``_UNSEEN``).
+    """
+    if base_root is None:
         return None
-    here = base_root
+    if not isinstance(base_root, Path):
+        raise LookFailed
+    directories = [base_root]
     for name in parts[:-1]:
-        here = here / name
-        if not _is_real_dir(here):
+        directories.append(directories[-1] / name)
+    for directory in directories:
+        try:
+            info = os.lstat(directory)
+        except FileNotFoundError, NotADirectoryError:
             return None
-    return here / parts[-1]
+        except OSError as exc:
+            raise LookFailed from exc
+        if not stat.S_ISDIR(info.st_mode):
+            return None
+    return directories[-1] / parts[-1]
 
 
 def _keep_earlier(
     plan: _CopyPlan,
     workspace: Path,
-    base_root: Path | None,
+    base_root: Path | Literal["unseen"] | None,
     relative: str,
     parts: tuple[str, ...],
     reason: str,
@@ -1552,32 +1611,35 @@ def _keep_earlier(
     Only a regular file or a link is put back; a link only if the link rule keeps
     it on the workspace, and, like every link, it is judged again on the copy.
     Whether the earlier version holds a secret itself is not looked at here: the
-    scan of the copy (``_carry_out``) decides that, on what was copied.
+    scan of the copy (``_carry_out``) decides that, on what was copied. Nothing is
+    put back where the earlier version is seen to have no such path, or to hold
+    something else there; where a look at it fails -- other than by seeing nothing
+    there -- nothing is put back either, and the path goes in ``plan.unlooked``:
+    whether it had an earlier version to keep is not known.
     """
     plan.omitted.append(Omitted(relative, reason))
-    source = _earlier_entry(base_root, parts)
     try:
-        info = os.lstat(source) if source is not None else None
-    except OSError:
-        info = None
-    if source is None or info is None:
-        return
-    if stat.S_ISREG(info.st_mode):
-        plan.files.append((relative, source))
-    elif stat.S_ISLNK(info.st_mode):
-        try:
-            target = os.readlink(source)
-        except OSError:
+        source = _earlier_entry(base_root, parts)
+        if source is None:
             return
-        stored, _why = stored_link_target(workspace, parts, target)
-        if stored is not None:
-            plan.links.append((relative, stored))
+        try:
+            info = os.lstat(source)
+        except FileNotFoundError, NotADirectoryError:
+            return
+        if stat.S_ISREG(info.st_mode):
+            plan.files.append((relative, source))
+        elif stat.S_ISLNK(info.st_mode):
+            stored, _why = stored_link_target(workspace, parts, os.readlink(source))
+            if stored is not None:
+                plan.links.append((relative, stored))
+    except OSError, LookFailed:
+        plan.unlooked.append(relative)
 
 
 def _plan_copy(
     workspace: Path,
     scan: tools.SecretScanDone,
-    base_root: Path | None,
+    base_root: Path | Literal["unseen"] | None,
     max_entries: int,
     max_bytes: int,
     *,
@@ -1587,10 +1649,15 @@ def _plan_copy(
 
     ``workspace`` is the source root: a round's workspace when a save copies it
     into the draft, the draft's files directory when a continuation copies it into
-    its own workspace (``copy_into_workspace``). ``left_out`` names entries at the
-    top of the source the copy does not take, with why. What the copy then keeps
-    of it is decided on the copy (``_carry_out``). Raises ``OSError`` when the
-    source cannot be walked.
+    its own workspace (``copy_into_workspace``). ``base_root`` is the earlier
+    version a path whose own version holds a secret is put back from: None when
+    there is none, ``_UNSEEN`` when it could not be reached. ``left_out`` names
+    entries at the top of the source the copy does not take, with why. What the
+    copy then keeps of it is decided on the copy (``_carry_out``). An entry the
+    scan could not search, or whose link cannot be judged for a failed look, is
+    left out and in ``plan.unlooked``, as is one whose earlier version could not
+    be looked at (``_keep_earlier``). Raises ``OSError`` when the source cannot be
+    walked.
     """
     named = {hit.path for hit in scan.hits if hit.kind == "name"}
     in_content = {hit.path for hit in scan.hits if hit.kind == "content"}
@@ -1615,26 +1682,37 @@ def _plan_copy(
             info = entry.stat(follow_symlinks=False)
             if stat.S_ISLNK(info.st_mode):
                 if relative in skipped:
+                    # The scan could not read its target.
                     plan.omitted.append(Omitted(relative, "unreadable"))
+                    plan.unlooked.append(relative)
                 elif relative in in_target:
                     _keep_earlier(plan, workspace, base_root, relative, here, "secret_link_target")
                 else:
-                    stored, why = stored_link_target(workspace, here, os.readlink(entry.path))
-                    if stored is None:
-                        plan.omitted.append(Omitted(relative, why or "link_outside"))
+                    target = os.readlink(entry.path)
+                    try:
+                        stored, why = stored_link_target(workspace, here, target)
+                    except LookFailed:
+                        plan.omitted.append(Omitted(relative, "unreadable"))
+                        plan.unlooked.append(relative)
                     else:
-                        plan.links.append((relative, stored))
+                        if stored is None:
+                            plan.omitted.append(Omitted(relative, why or "link_outside"))
+                        else:
+                            plan.links.append((relative, stored))
             elif stat.S_ISDIR(info.st_mode):
                 plan.directories.append((relative, stat.S_IMODE(info.st_mode)))
                 pending.append((entry.path, relative + "/", here))
             elif stat.S_ISREG(info.st_mode):
                 if relative in skipped:
+                    # A regular file the scan could not search, whatever it says why.
                     plan.omitted.append(Omitted(relative, skipped[relative]))
+                    plan.unlooked.append(relative)
                 elif relative in in_content:
                     _keep_earlier(plan, workspace, base_root, relative, here, "secret_content")
                 else:
                     plan.files.append((relative, Path(entry.path)))
             else:
+                # Seen to be no regular file, directory or link: a FIFO, say.
                 plan.omitted.append(Omitted(relative, "not_regular"))
     plan.omitted.sort(key=lambda item: item.path)
     return plan
@@ -1698,14 +1776,23 @@ def _copy_regular(source: Path, destination: Path, budget: _Budget) -> None:
     os.utime(destination, ns=(info.st_atime_ns, info.st_mtime_ns))
 
 
-def _links_failing_on(root: Path) -> list[Omitted]:
+# What a check of the copy leaves out, and the paths among it left out because a
+# look failed (``LookFailed``, a scan that could not search) rather than by a
+# decision about them.
+_Judged = tuple[list[Omitted], list[str]]
+
+
+def _links_failing_on(root: Path) -> _Judged:
     """Every link under ``root`` that ``stored_link_target``, judged on ``root``, does not keep.
 
     Walks ``root`` without following a link. Only judges: the caller removes
     what fails once every link has been judged, so no answer depends on the order
-    of the walk. Raises ``OSError`` when ``root`` cannot be walked.
+    of the walk. A link whose judgment fails for a look (``LookFailed``) fails as
+    ``unreadable``, and its path is among the unlooked. Raises ``OSError`` when
+    ``root`` cannot be walked.
     """
     failing: list[Omitted] = []
+    unlooked: list[str] = []
     pending: list[tuple[str, str, tuple[str, ...]]] = [(os.fspath(root), "", ())]
     while pending:
         directory, prefix, parts = pending.pop()
@@ -1715,12 +1802,18 @@ def _links_failing_on(root: Path) -> list[Omitted]:
             relative = prefix + entry.name
             here = (*parts, entry.name)
             if entry.is_symlink():
-                stored, why = stored_link_target(root, here, os.readlink(entry.path))
+                target = os.readlink(entry.path)
+                try:
+                    stored, why = stored_link_target(root, here, target)
+                except LookFailed:
+                    failing.append(Omitted(relative, "unreadable"))
+                    unlooked.append(relative)
+                    continue
                 if stored is None:
                     failing.append(Omitted(relative, why or "link_outside"))
             elif entry.is_dir(follow_symlinks=False):
                 pending.append((entry.path, relative + "/", here))
-    return failing
+    return failing, unlooked
 
 
 # The errors ``os.path.realpath(..., strict=True)`` raises where the operating
@@ -1739,20 +1832,22 @@ def _within_path(path: str, real_root: str) -> bool:
 def _resolution_failure(link: str, real_root: str | None) -> OmitReason | None:
     """Why the link at ``link`` is not kept, judged by where the operating system
     resolves it; None when it is kept. ``real_root`` is the tree's resolved path,
-    None when that could not be had."""
+    None when that could not be had. Raises ``LookFailed`` when where it lands is
+    not known: no ``real_root``, or a resolution failing other than by resolving
+    nowhere."""
     if real_root is None:
-        return "unreadable"
+        raise LookFailed
     try:
         landed = os.path.realpath(link, strict=True)
     except OSError as exc:
         if exc.errno not in _RESOLVES_NOWHERE or not isinstance(exc.filename, str):
-            return "unreadable"
+            raise LookFailed from exc
         # Where the resolution fails: built from the resolved path, like ``landed``.
         landed = exc.filename
     return None if _within_path(landed, real_root) else "link_outside"
 
 
-def _links_failing_resolution(root: Path) -> list[Omitted]:
+def _links_failing_resolution(root: Path) -> _Judged:
     """Every link under ``root`` whose resolution is not seen to stay inside it.
 
     The copy's second check of its links, after the link rule
@@ -1764,9 +1859,9 @@ def _links_failing_resolution(root: Path) -> list[Omitted]:
     lands outside is ``link_outside``, and so is one that resolves nowhere at a
     point outside: what is written there later -- the draft's manifest, in a
     first round -- would make it resolve. Any other error, or a ``root`` whose own
-    resolution fails, leaves it unconfirmed: ``unreadable``. Only judges, every
-    link before any is removed, and changes no stored target. Raises ``OSError``
-    when ``root`` cannot be walked.
+    resolution fails, leaves it unconfirmed: ``unreadable``, its path among the
+    unlooked (``LookFailed``). Only judges, every link before any is removed, and
+    changes no stored target. Raises ``OSError`` when ``root`` cannot be walked.
 
     Verified: every link it keeps resolves inside ``root`` or nowhere, as the
     tree is when checked. Not covered: a way out of ``root`` and back into it,
@@ -1778,6 +1873,7 @@ def _links_failing_resolution(root: Path) -> list[Omitted]:
     except OSError:
         real_root = None
     failing: list[Omitted] = []
+    unlooked: list[str] = []
     pending: list[tuple[str, str]] = [(os.fspath(root), "")]
     while pending:
         directory, prefix = pending.pop()
@@ -1786,12 +1882,17 @@ def _links_failing_resolution(root: Path) -> list[Omitted]:
         for entry in children:
             relative = prefix + entry.name
             if entry.is_symlink():
-                why = _resolution_failure(entry.path, real_root)
+                try:
+                    why = _resolution_failure(entry.path, real_root)
+                except LookFailed:
+                    failing.append(Omitted(relative, "unreadable"))
+                    unlooked.append(relative)
+                    continue
                 if why is not None:
                     failing.append(Omitted(relative, why))
             elif entry.is_dir(follow_symlinks=False):
                 pending.append((entry.path, relative + "/"))
-    return failing
+    return failing, unlooked
 
 
 # What the copy records a path as when the embedded-secret scan finds a secret in it.
@@ -1808,24 +1909,29 @@ def _within(relative: str, removed: set[str]) -> bool:
     return any("/".join(parts[:end]) in removed for end in range(1, len(parts) + 1))
 
 
-def _remove_secrets(root: Path, known: list[str]) -> list[Omitted]:
+def _remove_secrets(root: Path, known: list[str]) -> _Judged:
     """Scan the copy under ``root`` as it was written, and remove what the scan does not clear.
 
     ``tools.scan_embedded_secrets`` with ``known``: every path whose content,
     name or link target holds one of them, or that the scan could not search, is
     removed -- a directory with everything under it -- and returned as not kept,
-    once, under the first reason the scan gives for it. Raises ``_CopyNotKept``
-    when the scan cannot finish, ``OSError`` when a path cannot be removed.
+    once, under the first reason the scan gives for it. A path removed because
+    the scan could not search it, whatever reason the scan gives, is among the
+    unlooked; one inside a path already removed for a hit is not. Raises
+    ``_CopyNotKept`` when the scan cannot finish, ``OSError`` when a path cannot
+    be removed.
     """
     scan = tools.scan_embedded_secrets(root, known)
     if isinstance(scan, tools.SecretScanFailed):
         raise _CopyNotKept(REASON_SCAN_FAILED.format(reason=scan.reason))
-    found = [Omitted(hit.path, _HIT_REASONS[hit.kind]) for hit in scan.hits]
-    found += [Omitted(skip.path, skip.reason) for skip in scan.skipped]
+    found = [(Omitted(hit.path, _HIT_REASONS[hit.kind]), False) for hit in scan.hits]
+    found += [(Omitted(skip.path, skip.reason), True) for skip in scan.skipped]
     removed: list[Omitted] = []
+    unlooked: list[str] = []
     gone: set[str] = set()
-    # A stable sort: a path keeps its reasons in the order the scan gave them.
-    for item in sorted(found, key=lambda item: item.path):
+    # A stable sort: a path keeps its reasons in the order the scan gave them,
+    # its hits before its skips.
+    for item, unsearched in sorted(found, key=lambda pair: pair[0].path):
         if _within(item.path, gone):
             continue
         path = root / item.path
@@ -1835,11 +1941,15 @@ def _remove_secrets(root: Path, known: list[str]) -> list[Omitted]:
             os.unlink(path)
         gone.add(item.path)
         removed.append(item)
-    return removed
+        if unsearched:
+            unlooked.append(item.path)
+    return removed, unlooked
 
 
-def _carry_out(plan: _CopyPlan, incoming: Path, known: list[str]) -> list[Omitted]:
-    """Build the copy under ``incoming`` (which exists); returns what was not kept.
+def _carry_out(plan: _CopyPlan, incoming: Path, known: list[str]) -> _Judged:
+    """Build the copy under ``incoming`` (which exists); returns what was not kept,
+    and the paths the checks of the copy left out because a look failed (``_Judged``;
+    the plan's own are ``plan.unlooked``).
 
     Every entry and every byte of it is counted against the plan's limits as it
     is made (``_Budget``): the check before the scan measured the workspace
@@ -1868,12 +1978,12 @@ def _carry_out(plan: _CopyPlan, incoming: Path, known: list[str]) -> list[Omitte
         budget.add_entry()
         os.symlink(target, incoming / relative)
     # All judged before any is removed: a removal would change the later answers.
-    failing = _links_failing_on(incoming)
+    failing, failing_unlooked = _links_failing_on(incoming)
     for item in failing:
         os.unlink(incoming / item.path)
     # Then what the rule kept, by where the operating system resolves each link;
     # again all judged first.
-    unresolved = _links_failing_resolution(incoming)
+    unresolved, unresolved_unlooked = _links_failing_resolution(incoming)
     for item in unresolved:
         os.unlink(incoming / item.path)
     # Each directory takes its workspace mode, the owner keeping full access for
@@ -1881,7 +1991,7 @@ def _carry_out(plan: _CopyPlan, incoming: Path, known: list[str]) -> list[Omitte
     # nor a later removal of the draft is refused by a directory of its own.
     for relative, mode in reversed(plan.directories):
         os.chmod(incoming / relative, mode | 0o700)
-    holding = _remove_secrets(incoming, known)
+    holding, holding_unlooked = _remove_secrets(incoming, known)
     omitted = list(plan.omitted)
     recorded = {item.path for item in omitted}
     for item in (*failing, *unresolved, *holding):
@@ -1889,7 +1999,11 @@ def _carry_out(plan: _CopyPlan, incoming: Path, known: list[str]) -> list[Omitte
             recorded.add(item.path)
             omitted.append(item)
     omitted.sort(key=lambda item: item.path)
-    return omitted
+    # Taken apart from ``omitted``, where a path is recorded once under its first
+    # reason: a path left out for a secret may then be one whose put-back version
+    # the copy's scan could not search.
+    unlooked = sorted({*failing_unlooked, *unresolved_unlooked, *holding_unlooked})
+    return omitted, unlooked
 
 
 def remove_entry(path: Path) -> None:
@@ -1960,17 +2074,24 @@ def save_round(
     included, then its links judged again and the whole of it scanned again, on
     the copy itself (``_carry_out``) -- made durable and renamed to
     ``files-<hex>``, the manifest, and what becomes of the previous files
-    directory (``_copy_and_commit``). A first round that fails removes what it
-    made, an empty ``draft/`` included; a continuation that fails records the
-    round where it can, its files directory unchanged. It cannot when the known
-    secrets could not all be read -- nothing is written at all -- nor when the
-    lock is not had, the package is not the one the round began in, or the
-    draft is no longer the one the round began on (``begin_round``'s manifest,
-    its ``running`` this round's job): nothing is written into it. Nor, of
-    course, when that write fails. A continuation's save a publish follows
-    writes nothing when it fails, even where it could: ``running`` stays, for the
-    round to be recorded once the publish's result is known (``record_round``).
-    ``SaveResult.recorded`` says which it was.
+    directory (``_copy_and_commit``). The plan and the checks of the copy leave an
+    entry out by a decision about it -- a known secret, a link not kept, an entry
+    seen to be no regular file, directory or link -- or because a look at it
+    failed (``LookFailed``, an entry the scan could not search, an earlier
+    version to put back that could not be looked at); the second fails the save
+    like a size limit does (``REASON_UNLOOKED``), the copy, when one was made,
+    removed: committed without the entry, it could let the previous files
+    directory and the staging go while they still held it. A first round that
+    fails removes what it made, an empty ``draft/`` included; a continuation that
+    fails records the round where it can, its files directory unchanged. It
+    cannot when the known secrets could not all be read -- nothing is written at
+    all -- nor when the lock is not had, the package is not the one the round
+    began in, or the draft is no longer the one the round began on
+    (``begin_round``'s manifest, its ``running`` this round's job): nothing is
+    written into it. Nor, of course, when that write fails. A continuation's save
+    a publish follows writes nothing when it fails, even where it could:
+    ``running`` stays, for the round to be recorded once the publish's result is
+    known (``record_round``). ``SaveResult.recorded`` says which it was.
     """
     try:
         return _save_round(
@@ -2032,10 +2153,17 @@ def _save_round(
         if isinstance(scan, tools.SecretScanFailed):
             reason = REASON_SCAN_FAILED.format(reason=scan.reason)
         else:
+            # A save always has an earlier version: without its path, the earlier
+            # version could not be reached (``previous_files``).
+            base = _UNSEEN if earlier_root is None else earlier_root
             try:
-                plan = _plan_copy(workspace, scan, earlier_root, max_files, max_bytes)
+                plan = _plan_copy(workspace, scan, base, max_files, max_bytes)
             except OSError:
                 reason = REASON_UNREADABLE
+            else:
+                if plan.unlooked:
+                    # An entry left out for a failed look: no files are saved.
+                    reason = _unlooked_reason(plan.unlooked, known)
     if previous is None and reason is not None:
         # Nothing exists yet to record the round in.
         return _not_saved(reason)
@@ -2284,11 +2412,16 @@ def _copy_and_commit(
     except OSError as exc:
         return None, REASON_COPY.format(kind=type(exc).__name__)
     try:
-        omitted = _carry_out(plan, incoming, known)
+        omitted, unlooked = _carry_out(plan, incoming, known)
     except _CopyNotKept as refused:
         return incoming, refused.reason
     except OSError as exc:
         return incoming, REASON_COPY.format(kind=type(exc).__name__)
+    if unlooked:
+        # The copy lacks what a failed look left out, so it may not stand for the
+        # round: committed, the previous files directory and the staging could go
+        # with that entry still in them.
+        return incoming, _unlooked_reason(unlooked, known)
     with contextlib.suppress(OSError):
         os.chmod(incoming, stat.S_IMODE(os.lstat(workspace).st_mode) | 0o700)
     if not durability.tree(incoming):
@@ -2768,7 +2901,9 @@ def copy_into_workspace(
             return REASON_DRAFT_UNREADABLE
         try:
             workspace.mkdir(parents=True)
-            omitted = _carry_out(plan, workspace, known)
+            # What a failed look left out -- here or in the plan -- is not brought
+            # in, recorded like the rest; the draft still holds it.
+            omitted, _unlooked = _carry_out(plan, workspace, known)
             os.chmod(workspace, stat.S_IMODE(os.lstat(files).st_mode) | 0o700)
         except _CopyNotKept as refused:
             return refused.reason

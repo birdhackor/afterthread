@@ -224,7 +224,7 @@ _REASONED: list[tuple[str, str, str]] = [
     (
         "_is_real_dir",
         "except OSError: return False",
-        "not seen as a real directory: no continuation, sweep or put-back acts on it",
+        "not seen as a real directory: no continuation or sweep acts on it",
     ),
     (
         "_file_digest",
@@ -259,25 +259,15 @@ _REASONED: list[tuple[str, str, str]] = [
     ),
     (
         "stored_link_target",
-        "except OSError: resolved = False",
+        "except OSError: unresolved = exc",
         "the resolved spelling is not had: only the given one is matched, and a target "
-        "not matching it is unreadable, not kept",
-    ),
-    (
-        "stored_link_target",
-        "except OSError: return (None, 'unreadable')",
-        "whether the component is a link is not known: the link is not kept",
+        "not matching it raises LookFailed -- no link kept, and a save keeps no files",
     ),
     (
         "_keep_earlier",
-        "except OSError: info = None",
+        "except (OSError, LookFailed): plan.unlooked.append(relative)",
         "the earlier version cannot be looked at: nothing is put back, and the path is "
-        "already recorded as not kept",
-    ),
-    (
-        "_keep_earlier",
-        "except OSError: return",
-        "the earlier link cannot be read: nothing is put back",
+        "unlooked -- a save keeps no files",
     ),
     (
         "_links_failing_on",
@@ -295,12 +285,13 @@ _REASONED: list[tuple[str, str, str]] = [
         "except OSError: if exc.errno not in _RESOLVES_NOWHERE or not "
         "isinstance(exc.filename, str):",
         "classifies the error: resolving nowhere at a point inside the copy keeps the "
-        "link, any other failure is unreadable and not kept",
+        "link, any other failure raises LookFailed -- not kept, and a save keeps no files",
     ),
     (
         "_links_failing_resolution",
         "except OSError: real_root = None",
-        "the copy's own path is not had: every link is unreadable and not kept",
+        "the copy's own path is not had: every link's resolution raises LookFailed -- "
+        "not kept, and a save keeps no files",
     ),
     (
         "_links_failing_resolution",

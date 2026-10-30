@@ -155,8 +155,10 @@ _REGISTERED: list[tuple[str, str, str]] = [
         "_round_entry(saved=True)",
         "the saved atom for a first round, as the manifest records it: the new files "
         "directory holds the round's files -- the copy made from the workspace under the "
-        "lock (_carry_out), made durable (Durability.tree) and renamed into place, which "
-        "the manifest being written names",
+        "lock (_carry_out), with no entry left out because a look at it failed (the "
+        "plan's unlooked and _carry_out's both empty: the save stopped earlier otherwise), "
+        "made durable (Durability.tree) and renamed into place, which the manifest being "
+        "written names",
     ),
     (
         "tool_drafts._copy_and_commit",
