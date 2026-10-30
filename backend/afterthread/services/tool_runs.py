@@ -16,6 +16,7 @@ added to a ``.env`` after the run was written is hidden too (invariant I).
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -646,11 +647,37 @@ def _copied(row: ToolRun, secrets: list[str]) -> AttachedRun:
     )
 
 
+# What a run record is written with, for a kept summary to be read as one. The
+# outcomes are the writer's own constants (``tools.RUN_*``), which the API spells
+# on its own (``schemas.ToolRunOutcome``) and a test pins equal; the workflows have
+# no one definition -- each caller names its own (``capture``, ``verify``, ...) --
+# so a workflow is checked against their common shape, a lowercase identifier.
+_RUN_OUTCOMES = frozenset(
+    {
+        tools.RUN_OK,
+        tools.RUN_FAILED,
+        tools.RUN_OUTPUT_OVERFLOW,
+        tools.RUN_TIMEOUT,
+        tools.RUN_START_FAILED,
+        tools.RUN_REFUSED,
+        tools.RUN_ERROR,
+    }
+)
+_WORKFLOW_SHAPE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
 def _summary_only(entry: dict[str, Any]) -> AttachedRun | None:
     """A record a draft keeps a summary of, when the record itself is gone: that
     summary, marked ``purged``. None when the summary cannot stand for a record
-    -- a field missing, or a start time that does not read as one, as a hand
-    edit or a mask over it leaves it."""
+    -- a field missing, or one not of the shape the backend writes it in, as a
+    hand edit or a mask over it leaves it: a start time that does not read as
+    one, a vid that is not one (``tools._VID_RE``), an outcome not among those a
+    run is recorded with, a workflow that is not a lowercase identifier.
+
+    The manifest writes these fields as free text, masked with the secrets known
+    then; checked here, they are backend values again and go into a prompt as a
+    record's from the database do.
+    """
     workflow = entry.get("workflow")
     vid = entry.get("vid")
     outcome = entry.get("outcome")
@@ -660,6 +687,12 @@ def _summary_only(entry: dict[str, Any]) -> AttachedRun | None:
         and isinstance(vid, str)
         and isinstance(outcome, str)
         and isinstance(started, str)
+    ):
+        return None
+    if not (
+        _WORKFLOW_SHAPE.fullmatch(workflow)
+        and tools._VID_RE.fullmatch(vid)
+        and outcome in _RUN_OUTCOMES
     ):
         return None
     try:

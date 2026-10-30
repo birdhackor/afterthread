@@ -237,6 +237,13 @@ REASON_LOCK = "無法取得工具目錄的鎖"
 REASON_PACKAGE_GONE = "工具已被刪除或替換"
 REASON_DRAFT_EXISTS = "這個工具已經有草稿"
 REASON_DRAFT_CHANGED = "草稿在這一輪進行中被改動過"
+# A continuation that changed nothing, whose files directory is not seen to be what
+# the round copied out of it: the directory is left as it is, and the round's
+# files are not in the draft.
+REASON_FILES_CHANGED = (
+    "草稿的檔案目錄在這一輪進行中被改過、被移走，或無法確認沒有變動，"  # noqa: RUF001
+    "所以這一輪的檔案沒有存進草稿"
+)
 REASON_COPY = "無法複製檔案到草稿（{kind}）"  # noqa: RUF001
 REASON_DURABILITY = "無法確認草稿已安全寫入磁碟"
 REASON_MANIFEST = "無法寫入草稿的說明檔"
@@ -326,8 +333,9 @@ class PreviousDraft:
     ``running`` naming the round's job -- which every later write of the round
     is matched against. ``copied_out`` is ``tree_digest`` of its files directory
     taken just before that directory was copied into the workspace
-    (``copy_into_workspace``): what the save compares, with the workspace as the
-    round received it, before it removes that directory.
+    (``copy_into_workspace``): what the save compares that directory against --
+    before it removes it, once a new one is committed, and before it keeps it as
+    the draft's for a round that changed nothing (``_still_as_copied_out``).
     """
 
     manifest: dict[str, Any]
@@ -369,7 +377,8 @@ class SaveResult:
 
     * ``saved``: the draft's files directory holds this round's files -- a new one
       the save committed, or, for a continuation that changed nothing, the one it
-      already had;
+      already had, once it is seen still to be what the round copied out of it
+      (``_still_as_copied_out``);
     * ``recorded``: the manifest records this round (and no longer marks it
       running). A save that did not save often recorded the round still, with why;
     * ``durable``: the write that recorded it is confirmed on disk. Never retried:
@@ -1924,9 +1933,11 @@ def save_round(
     follows.
 
     The order is fixed: worth saving (a first round with no change and no notes
-    keeps nothing; a continuation with no change records the round only, unless
-    a publish follows: that save always copies, so the removal after the publish
-    has a copy this save made to compare against), the known secrets, the size
+    keeps nothing; a continuation with no change records the round only -- as
+    saved while its files directory is seen still to be what the round copied
+    out of it, as not saved otherwise -- unless a publish follows: that save
+    always copies, so the removal after the publish has a copy this save made to
+    compare against), the known secrets, the size
     limits on the workspace, the secret scan of the workspace, the plan of the
     copy, which judges its links on the workspace; then, under the shared tools
     lock and only in the same package, the copy to ``.incoming-<hex>`` -- counted
@@ -2082,12 +2093,19 @@ def _save_locked(
             # write nothing into it.
             return _not_saved(REASON_DRAFT_CHANGED)
         if reason is None and plan is None:
-            # A continuation that changed nothing: only the round is recorded, its
-            # files directory -- which holds what the workspace does -- kept.
-            entry = _round_entry(
-                draft_round, current["attempt_count"] + 1, saved=True, reason=None, omitted=[]
-            )
-            return _record(draft_dir, _recorded(current, entry, draft_round), known, saved=True)
+            # A continuation that changed nothing: only the round is recorded, and
+            # its files directory stays the draft's. That directory holds the round's
+            # files only if it is seen, now, to be what the round copied out of it;
+            # edited or moved during the round, or not to be told, it is left as it
+            # is and the round is recorded below as not saved.
+            if _still_as_copied_out(
+                draft_dir / current["files_dir"], previous, max_files, max_bytes
+            ):
+                entry = _round_entry(
+                    draft_round, current["attempt_count"] + 1, saved=True, reason=None, omitted=[]
+                )
+                return _record(draft_dir, _recorded(current, entry, draft_round), known, saved=True)
+            reason = REASON_FILES_CHANGED
 
     if reason is None and plan is not None:
         made, outcome = _copy_and_commit(
@@ -2170,6 +2188,25 @@ def _undo(draft_dir: Path, made: Path | None, made_draft_dir: bool) -> None:
             os.rmdir(draft_dir)
 
 
+def _still_as_copied_out(
+    files: Path, previous: PreviousDraft, max_files: int, max_bytes: int
+) -> bool:
+    """Whether the files directory ``files`` is seen, now, to be what the round
+    copied out of it: its digest, taken now with the limits the copy counted
+    against, equal to ``copied_out``. Unknown either way -- not taken when the
+    round began, or not to be taken now (moved, not read whole) -- is not the
+    same.
+
+    Not covered: a change after this look and before the caller acts on it (a
+    removal, a manifest naming the directory as the draft's). Only a hand edit
+    makes one in that window, as in every look-then-act on the draft; and the
+    digest describes a tree that holds still while it is taken (``tree_digest``).
+    """
+    return same_tree(
+        previous.copied_out, tree_digest(files, max_entries=max_files, max_bytes=max_bytes)
+    )
+
+
 def _why_previous_stays(
     old: Path,
     previous: PreviousDraft,
@@ -2183,14 +2220,13 @@ def _why_previous_stays(
     is confirmed on disk; the workspace received all of it as it was when the
     round began (``copied_out`` equal to ``copied_in``: an entry not brought in, a
     link rewritten, a file swapped and swapped back during the copy all make them
-    differ); and it is still as it was then. An unknown digest is never the same."""
+    differ); and it is still as it was then (``_still_as_copied_out``). An unknown
+    digest is never the same."""
     if not durable:
         return KEPT_NOT_DURABLE
     if not same_tree(previous.copied_out, copied_in):
         return KEPT_NOT_ALL_BROUGHT_IN
-    if not same_tree(
-        previous.copied_out, tree_digest(old, max_entries=max_files, max_bytes=max_bytes)
-    ):
+    if not _still_as_copied_out(old, previous, max_files, max_bytes):
         return KEPT_CHANGED
     return None
 

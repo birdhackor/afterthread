@@ -1838,6 +1838,32 @@ def test_a_continuing_round_that_changed_nothing_records_the_round_only(
     assert second["attempt_count"] == 2
 
 
+def test_an_unchanged_round_whose_files_were_not_digested_when_copied_out_is_not_saved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The files directory's digest could not be taken when the round copied it
+    out: whether the directory is still what the round received is not known, so
+    the round that changed nothing is recorded as not saved, and the directory is
+    left as it is."""
+    package_root = _package(monkeypatch, tmp_path)
+    _first_draft(tmp_path, package_root)
+    first = _manifest(package_root)
+    workspace, previous, copied_in = _continuing(tmp_path, package_root)
+    unknown = tool_drafts.PreviousDraft(manifest=previous.manifest, copied_out=None)
+
+    result = _save(package_root, workspace, copied_in, previous=unknown)
+
+    second = _manifest(package_root)
+    assert (result.saved, result.recorded, result.reason) == (
+        False,
+        True,
+        tool_drafts.REASON_FILES_CHANGED,
+    )
+    assert (second["files_dir"], second["kept"]) == (first["files_dir"], [])
+    latest = second["attempts"][-1]
+    assert (latest["saved"], latest["reason"]) == (False, tool_drafts.REASON_FILES_CHANGED)
+
+
 def test_the_previous_copy_stays_when_the_new_manifest_is_not_confirmed_on_disk(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

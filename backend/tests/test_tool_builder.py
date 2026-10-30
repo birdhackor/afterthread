@@ -11723,6 +11723,73 @@ def test_a_continuation_works_on_the_draft_tells_the_model_where_it_is_and_recor
     assert tool_builder._RUN_PURGED in purged_text and "stderr:" not in purged_text
 
 
+@pytest.mark.parametrize(
+    "meanwhile",
+    ["untouched", "untouched-its-env-not-brought-in", "edited", "moved", "unreadable"],
+)
+def test_an_unchanged_continuation_is_saved_only_while_its_files_are_as_it_copied_them_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, meanwhile: str
+) -> None:
+    """A continuing round that changes nothing in its workspace -- the builder stops
+    short -- keeps the draft's files directory as the draft's. It is recorded as
+    saved, and its staging goes, only while that directory is seen to be what the
+    round copied out of it, a root ``.env`` the round was not given included.
+    Edited during the round, moved away, or not to be read: the round is recorded
+    as not saved and says why, the directory is left as it is -- an edit stays the
+    draft's files, not moved to ``kept`` -- and the staging, holding what the round
+    began with, stays and is named."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    files = _draft_files(pkg)
+    if meanwhile == "untouched-its-env-not-brought-in":
+        (files / ".env").write_text("DRAFT_KEY=put-there-by-hand\n", encoding="utf-8")
+    before = _draft_manifest(pkg)
+    as_copied = tool_drafts.tree_digest(files)
+    unseen = [False]
+    _refuse_lstat(monkeypatch, files, active=unseen)
+    moved_to = tmp_path / "moved-aside"
+
+    def meddle() -> None:
+        if meanwhile == "edited":
+            (files / "run.py").write_text("print('edited by hand')\n", encoding="utf-8")
+        elif meanwhile == "moved":
+            files.rename(moved_to)
+        elif meanwhile == "unreadable":
+            unseen[0] = True
+
+    _fake_generate(monkeypatch, result=_UNFINISHED, side_effect=meddle)
+
+    outcome = asyncio.run(_continue_revise(pkg, "再試一次"))
+    unseen[0] = False
+
+    after = _draft_manifest(pkg)
+    latest = after["attempts"][-1]
+    assert (after["files_dir"], after["kept"], after["running"]) == (before["files_dir"], [], None)
+    assert outcome.draft is not None
+    report = (outcome.draft["saved"], outcome.draft["reason"], outcome.draft["retained_path"])
+    if meanwhile.startswith("untouched"):
+        assert report == (True, None, None)
+        assert (latest["number"], latest["saved"], latest["reason"]) == (2, True, None)
+        assert _session_roots(tmp_path) == []
+        assert tool_drafts.same_tree(as_copied, tool_drafts.tree_digest(files))
+        return
+    [session] = _session_roots(tmp_path)
+    assert report == (False, tool_drafts.REASON_FILES_CHANGED, str(session / "build"))
+    assert (latest["number"], latest["saved"], latest["reason"]) == (
+        2,
+        False,
+        tool_drafts.REASON_FILES_CHANGED,
+    )
+    assert (session / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    if meanwhile == "edited":
+        assert (files / "run.py").read_text(encoding="utf-8") == "print('edited by hand')\n"
+    elif meanwhile == "moved":
+        assert not os.path.lexists(files)
+        assert tool_drafts.same_tree(as_copied, tool_drafts.tree_digest(moved_to))
+    else:
+        assert tool_drafts.same_tree(as_copied, tool_drafts.tree_digest(files))
+
+
 def test_a_continuation_whose_draft_keeps_as_many_copies_as_it_may_calls_no_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -12768,6 +12835,81 @@ def test_a_continuation_prompt_tells_of_the_previous_round_and_four_before_it(
     )
     assert "started from:\n\nThey cannot be listed" in untold
     assert "None." not in untold
+
+
+def test_a_continuation_prompt_masks_or_leaves_out_each_listed_manifest_text_registered_later(
+    session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Each free-text field of the manifest listed here, which a continuing round's
+    prompt is built from, holds a secret of its own, registered only after the
+    manifest was written: the draft's request; the latest round's summary,
+    handoff, request to the operator, note and error; an earlier round's summary;
+    and the workflow, vid and outcome of three purged run records, one field each.
+    The user turn built for the round holds none of them: the texts are there
+    masked, and a run summary not of the backend's shapes is left out."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    fields = (
+        "request",
+        "summary",
+        "handoff",
+        "operator_action",
+        "note",
+        "error",
+        "earlier_summary",
+        "workflow",
+        "vid",
+        "outcome",
+    )
+    secret = {field: f"Later{index:02d}Secret-{field}" for index, field in enumerate(fields)}
+    labelled = {field: f"{field.upper()} {secret[field]}" for field in fields[:7]}
+    earlier = {
+        **_recorded_round(1, ""),
+        "summary": labelled["earlier_summary"],
+        "error": None,
+        "handoff": None,
+        "operator_action": None,
+        "note": None,
+    }
+    latest = {
+        **_recorded_round(2, ""),
+        **{field: labelled[field] for field in ("summary", "handoff", "operator_action")},
+        "note": labelled["note"],
+        "error": labelled["error"],
+    }
+    summary = {
+        "started_at": "2026-10-29T01:02:03+00:00",
+        "workflow": "verify",
+        "vid": _TEST_VID,
+        "outcome": tools.RUN_FAILED,
+        "exit_code": 1,
+    }
+    _rewrite_draft(
+        pkg,
+        feedback=labelled["request"],
+        attempts=[earlier, latest],
+        attempt_count=2,
+        runs=[
+            {**summary, "id": 101, "workflow": secret["workflow"]},
+            {**summary, "id": 102, "vid": secret["vid"]},
+            {**summary, "id": 103, "outcome": secret["outcome"]},
+        ],
+    )
+    for value in secret.values():
+        tools.register_inflight_secret(value)
+    first = tool_drafts.first_read(_package_root(pkg))
+    assert first is not None and len(first.runs) == 3
+    runs = tool_runs.reread_for_revise(session, "kbsearch", first.runs)
+    captured = _fake_generate(monkeypatch, result=_UNFINISHED)
+
+    asyncio.run(_continue_revise(pkg, "這一輪的說明", runs=runs))
+
+    prompt = captured["user_prompt"]
+    for field, value in secret.items():
+        assert value not in prompt, field
+    marker = tools._REDACTION_MARKER
+    for field in fields[:7]:
+        assert f"{field.upper()} {marker}" in prompt, field
 
 
 def test_deleting_the_tool_while_its_draft_is_copied_into_a_workspace_is_refused(

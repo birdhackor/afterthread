@@ -2351,7 +2351,7 @@ def _revise_user_prompt(
 ) -> str:
     """The revise session's user turn, held to its cap (``_revise_prompt_cap``).
 
-    Deliberately NOT a re-fetch of the OpenAPI document (D40): the revision is
+    Deliberately NOT a re-fetch of the OpenAPI document: the revision is
     driven by the user's words and by the code already in the workspace, the
     original URL is kept only as provenance (and is reduced to a host on
     capture), and re-fetching would spend a network round trip on a document the
@@ -2377,14 +2377,20 @@ def _revise_user_prompt(
     a live ``.env``, so a user quoting their own key is a value we now genuinely
     know. The backend's own words go in as they are: a registered value that
     happens to equal one of them would mangle it (see ``_revise_system_prompt``).
+    A field a draft's manifest writes as free text is free text each time it is
+    read back -- masked when written, with the secrets known then -- unless the
+    reader checks its shape: the draft's request and its rounds' notes, errors
+    and summaries are masked here; a kept run summary whose workflow, vid and
+    outcome were checked to be of the backend's shapes (``tool_runs._summary_only``)
+    goes in as it is, like a record read from the database.
 
-    Two package-layer facts follow when present (web-v6 §4), because the model
+    Two package-layer facts follow when present, because the model
     cannot see either file from its workspace. ``config.env`` is quoted WHOLE --
     its comments are part of what the operator meant, and its values are settings
     by the operator's own choice of file -- yet still through the redactor like
     every operator-derived text here, so a secret pasted into the wrong file is
     masked as long as ``.env`` holds it too. Without it the model changes a code
-    default that an override silently shadows and reports success (v5 §3). The
+    default that an override silently shadows and reports success. The
     ``.env`` part is KEY NAMES only, which tells the model what credentials it
     has without telling it any of them; ``conflicts`` are the keys both files
     set, where the ``.env`` value is the one that runs.
@@ -4355,14 +4361,25 @@ async def run_revise(
     build_root = tools.BuildRoot(session_root / "build")
     shell_root = session_root / "shell"
     job_id = _CURRENT_JOB_ID.get()
+    # The release condition, atom by atom: the ``finally`` below removes the
+    # staging only when the commands are confirmed stopped (``shells_ended``), no
+    # publish worker may still be writing it (not ``publish_running``), and no
+    # one is left to hold its work for (not ``holding``). ``holding`` is raised
+    # when the commands are confirmed stopped and lowered only by one of:
+    #   * nothing worth keeping (``SaveResult.worth_saving`` False);
+    #   * the draft holds the work: its files directory holds this round's files
+    #     (``SaveResult.saved``) and the manifest naming them is on disk
+    #     (``SaveResult.durable``) -- the two read together by ``_holding``;
+    #   * published: the version ``current`` names holds the work;
+    #   * moved out: a publish that failed part way moved the work out of this
+    #     session's staging (``content`` not within ``session_root``).
+    #
     # True until the session starts: an exit before it has no command to wait for.
     shells_ended = True
-    # Up from the moment the round's commands are confirmed stopped -- raised in
-    # the ``finally`` that gets that word, so an exception or a cancellation from
-    # there on finds it up -- until someone holds the work (see the docstring).
-    # While it is up, the ``finally`` below keeps the staging, stripping the
-    # builder's ``.env`` first if nothing did yet, and keeping it all the same when
-    # that strip fails.
+    # Raised in the ``finally`` that gets the commands' stop evidence, so an
+    # exception or a cancellation from there on finds it up. While it is up, the
+    # ``finally`` below keeps the staging, stripping the builder's ``.env`` first
+    # if nothing did yet, and keeping it all the same when that strip fails.
     holding = False
     # Up once a strip of the builder's ``.env`` went through.
     env_stripped = False

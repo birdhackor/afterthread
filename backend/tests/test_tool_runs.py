@@ -14,6 +14,7 @@ import os
 import sqlite3
 import sys
 import time
+import typing
 from collections.abc import Callable, Generator
 from datetime import UTC, datetime
 from functools import partial
@@ -27,6 +28,7 @@ from pydantic import BaseModel
 from sqlalchemy import Engine
 from sqlmodel import Session, SQLModel, col, select
 
+from afterthread import schemas
 from afterthread.config import Settings
 from afterthread.db import get_session
 from afterthread.main import app
@@ -1359,3 +1361,84 @@ def test_successes_refusals_and_backend_errors_are_not_reported_as_tool_failures
 
     assert asyncio.run(_request()) == []
     assert [run.outcome for run in records] == [tools.RUN_OK, tools.RUN_REFUSED, tools.RUN_ERROR]
+
+
+# --- the run summaries a draft keeps, read back -----------------------------------
+
+_KEPT_SUMMARY: dict[str, Any] = {
+    "id": 7,
+    "started_at": "2026-10-29T01:02:03+00:00",
+    "workflow": "verify",
+    "vid": _TEST_VID,
+    "outcome": tools.RUN_FAILED,
+    "exit_code": 1,
+}
+
+
+def test_a_kept_run_summary_of_the_backend_s_shapes_stands_for_its_record() -> None:
+    """A purged record's summary whose every field is of the shape the backend
+    writes it in is read back as that record, marked purged: each outcome a run
+    is recorded with, and the workflows the AI requests and checks name."""
+    run = tool_runs._summary_only(_KEPT_SUMMARY)
+
+    assert run is not None
+    assert (run.id, run.workflow, run.vid, run.outcome, run.exit_code, run.purged) == (
+        7,
+        "verify",
+        _TEST_VID,
+        tools.RUN_FAILED,
+        1,
+        True,
+    )
+    assert run.started_at == datetime(2026, 10, 29, 1, 2, 3, tzinfo=UTC)
+    assert tool_runs._RUN_OUTCOMES
+    for outcome in tool_runs._RUN_OUTCOMES:
+        assert tool_runs._summary_only({**_KEPT_SUMMARY, "outcome": outcome}) is not None
+    for workflow in ("capture", "enrich", "assist_update", "health_check", "unknown"):
+        assert tool_runs._summary_only({**_KEPT_SUMMARY, "workflow": workflow}) is not None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("vid", "20261029T010203Z-ABCDEF"),
+        ("vid", f"{_TEST_VID}\n"),
+        ("vid", _SECRET),
+        ("outcome", "crashed"),
+        ("outcome", "FAILED"),
+        ("workflow", "Verify"),
+        ("workflow", "verify now"),
+        ("workflow", _SECRET),
+        ("vid", _MARKER),
+        ("outcome", _MARKER),
+        ("workflow", _MARKER),
+        ("started_at", _MARKER),
+    ],
+    ids=[
+        "vid-uppercase-hex",
+        "vid-trailing-newline",
+        "vid-free-text",
+        "outcome-unknown",
+        "outcome-uppercase",
+        "workflow-uppercase",
+        "workflow-with-a-space",
+        "workflow-free-text",
+        "vid-masked",
+        "outcome-masked",
+        "workflow-masked",
+        "started-at-masked",
+    ],
+)
+def test_a_kept_run_summary_with_a_field_out_of_the_backend_s_shape_is_left_out(
+    field: str, value: str
+) -> None:
+    """The manifest writes these fields as free text, so a hand edit or the mask of
+    a secret known when it was written can leave one of them out of the shape the
+    backend writes it in: then the summary cannot stand for a record."""
+    assert tool_runs._summary_only({**_KEPT_SUMMARY, field: value}) is None
+
+
+def test_the_outcomes_a_kept_run_summary_may_carry_are_those_a_run_is_served_with() -> None:
+    """The writer's own constants, collected for the read back, and the API's
+    literal of a run's outcome name the same values."""
+    assert set(typing.get_args(schemas.ToolRunOutcome)) == tool_runs._RUN_OUTCOMES
