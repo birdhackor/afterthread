@@ -47,6 +47,8 @@
 | `TOOL_INSTALL_MAX_ROUNDS` | 24 | [4, 64] | 安裝一個工具時,建置 session 的工具輪數上限。 |
 | `TOOL_INSTALL_TIMEOUT_SECONDS` | 900 | (0, 3600] | 整個安裝 session 的總時間上限(15 分鐘)。 |
 | `TOOL_INSTALL_SHELL_TIMEOUT_SECONDS` | 120 | (0, 600] | 安裝過程中單一 `run_shell` 指令的逾時秒數。 |
+| `TOOL_DRAFT_MAX_FILES` | 2000 | [1, 100000] | 沒發布的修正存成草稿時,工作區與存進草稿的複本最多幾個項目(檔案、目錄、連結都算);接續與發布草稿時複製的內容也是。超過就不存、不開始那一輪,或不發布。 |
+| `TOOL_DRAFT_MAX_BYTES` | 50000000 | [1000000, 2000000000] | 同上,檔案內容的總位元組上限。 |
 
 ## 資料庫與其他
 

@@ -4,8 +4,9 @@ import { useClipboard } from "@mantine/hooks";
 // 複製路徑 for a path the operator has to open by hand (a draft's files, a
 // workspace a failed publish left behind). The browser only offers the clipboard to
 // a secure context (https or localhost), so a backend opened by its network address
-// cannot copy: that is said, and callers show the path in a block that selects in
-// one click, so copying by hand always works.
+// cannot copy: that is said, and callers show the path itself as text -- the draft
+// note in a block that selects in one click, a job card inside its sentence -- so
+// copying by hand always works.
 export function CopyPathButton({ path }) {
 	const clipboard = useClipboard({ timeout: 1500 });
 	return (
