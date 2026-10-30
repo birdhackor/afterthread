@@ -362,7 +362,9 @@ _UNCHECKED_MARKER = "•••[無法確認是否含已知秘密，本文未記�
 # Values shorter than this are NEVER redacted (see `_redact`): a 1-5 char value
 # would shred ordinary prose (imagine redacting every "1234"), and a real API
 # key / token is never that short -- so the floor costs no real coverage while
-# removing the false-positive hazard entirely.
+# removing the false-positive hazard entirely. The floor is a value's own: the
+# newline-normalized form of a value at it is matched whatever its length
+# (`_match_forms`).
 _MIN_SECRET_LEN = 6
 
 # Hard ceiling on how many mask ranges a single call collects before giving up on
@@ -417,10 +419,12 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     copy of this. It is DUPLICATED in each module, not hoisted into a shared home, for
     the same leaf/layering reason the marker is (see ``_REDACTION_MARKER``); the two
     copies MUST stay byte-for-byte in LOCKSTEP so a value masked in a live tool result
-    and one masked in the log are indistinguishable. ``secrets`` are the known values
-    already filtered to ``>= _MIN_SECRET_LEN`` -- each caller produces that list under
-    its OWN failure direction (tools lets a provider error propagate/fail-closed; llm_log
-    swallows one and records unredacted), then hands the masking here.
+    and one masked in the log are indistinguishable. ``secrets`` are the known values in
+    their match forms (``_match_forms``: each value at ``_MIN_SECRET_LEN`` or above, and
+    its newline-normalized form, which may be shorter) -- each caller produces that list
+    under its OWN failure direction (tools lets a provider error propagate/fail-closed;
+    llm_log swallows one and stores, in place of the body, the marker saying it was not
+    recorded), then hands the masking here.
 
     Every mask range is computed against the PRISTINE ``text`` and only THEN applied,
     which is load-bearing (H1). The older order -- full-value ``str.replace`` FIRST, then
@@ -437,9 +441,10 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     secret cut by an EARLIER truncation boundary leaves a prefix the full-value match can
     never catch; a false positive only masks a tail of already-truncated text, and
     INTERIOR fragments are prevented at their sources -- the summary/openapi slices in
-    tool_builder and the tool-args preview in llm.py all redact BEFORE they cut); (2)
-    merge overlapping/adjacent ranges; (3) build the output in ONE pass, emitting exactly
-    one marker per merged range.
+    tool_builder and the tool-args preview in llm.py all redact BEFORE they cut) -- a
+    form shorter than the floor only ever matches whole; (2) merge overlapping/adjacent
+    ranges; (3) build the output in ONE pass, emitting exactly one marker per merged
+    range.
 
     Collecting every occurrence in step (1) is BOUNDED two ways (D36 round-5), because a
     legitimate secret can itself be adversarial input to this search. First, the find
@@ -449,11 +454,12 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     happens to look like that -- step past each other instead of registering one range
     per shifted start. This can still leave a residual of up to ``len(value) - 1``
     characters at a repeated run's tail (a strict remainder of the run length modulo
-    ``len(value)``); at the ``_MIN_SECRET_LEN`` floor -- the shortest value ever reaches
-    here, and exactly the reported case -- that residual is itself under the floor,
-    exactly as unredactable as any other short substring by the SAME rationale that
-    floor already encodes, and a residual landing at the very END of ``text`` is still
-    separately caught by the trailing-fragment guard above regardless of length. Second,
+    ``len(value)``); for a value at the ``_MIN_SECRET_LEN`` floor -- exactly the reported
+    case -- that residual is itself under the floor, and for a normalized form shorter
+    than the floor it is shorter still, exactly as unredactable as any other short
+    substring by the SAME rationale that floor already encodes, and a residual landing at
+    the very END of ``text`` is still separately caught by the trailing-fragment guard
+    above regardless of length. Second,
     stepping is not sufficient by itself: a sufficiently large low-entropy document can
     still cross ``_MAX_MASK_RANGES`` one ``len(value)``-sized step at a time, so
     collection STOPS the instant it would and this returns the marker ALONE for the
@@ -518,14 +524,37 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     return "".join(out)
 
 
+def _match_forms(values: Iterable[str]) -> list[str]:
+    """The forms known values are matched and masked in, sorted: each value at the
+    ``_MIN_SECRET_LEN`` floor or above, and that value with its line breaks
+    normalized -- each CRLF, then each lone CR, made an LF.
+
+    Text read in universal-newline mode -- a file read as text, the output of a
+    subprocess -- has its line breaks normalized that way before anything matches
+    or masks it, so a value holding a CR is found there only in its normalized
+    form. The floor is the value's own: a value under it adds no form at all, and
+    the normalized form of a value at it is kept whatever its length -- a derived
+    form may be shorter than the floor. Text that differs from a value only in its
+    line breaks counts as holding it.
+
+    Passing the answer through again gives the same answer: a normalized form under
+    the floor is there beside the value it came from, and a normalized form
+    normalizes to itself. A list that went through this once can go through it again
+    without losing a form.
+    """
+    held = {value for value in values if len(value) >= _MIN_SECRET_LEN}
+    return sorted(held | {value.replace("\r\n", "\n").replace("\r", "\n") for value in held})
+
+
 @dataclass(frozen=True, slots=True)
 class _SecretSnapshot:
     """One recorded step's known secrets: the values, and whether they are all of them.
 
-    ``values`` are the provider's strings at the redactor's floor. ``complete``
-    False means some source could not be read, or asking failed: the values are
-    then a part of the list, and nothing checked against them can be called
-    clean (``_checked_as_written``).
+    ``values`` are the provider's strings in their match forms (``_match_forms``:
+    each one at the redactor's floor, and its newline-normalized form, whatever that
+    form's length). ``complete`` False means some source could not be read, or
+    asking failed: the values are then a part of the list, and nothing checked
+    against them can be called clean (``_checked_as_written``).
     """
 
     values: list[str]
@@ -557,11 +586,15 @@ def _secret_snapshot() -> _SecretSnapshot:
     `begin_attempt`/`record_response`/the sink and turn a successful call into a
     logging crash. The materialization+filter runs INSIDE that guard: the
     provider may hand back a LAZY iterable that raises at YIELD time, and a non-str
-    element would raise downstream, so we keep only ``str`` values meeting
-    ``_MIN_SECRET_LEN`` in the same guarded pass -- any failure (call, iteration, or
-    a bad element) still ends in an incomplete snapshot. The length floor also
-    drops the empty string (``str.replace("", m)`` would splice the marker between
-    every character) and a 1-5 char value (see that constant).
+    element would raise downstream, so we keep only ``str`` values, put in their
+    match forms (``_match_forms``) in the same guarded pass -- any failure (call,
+    iteration, or a bad element) still ends in an incomplete snapshot. The
+    provider hands over the values themselves; ``_match_forms`` applies the length
+    floor to each one -- dropping the empty string (``str.replace("", m)`` would
+    splice the marker between every character) and a 1-5 char value (see that
+    constant) -- and adds the newline-normalized form of each value it keeps,
+    whatever that form's length: text this module stores was often read with
+    universal newlines, which leaves a value holding a CR only in that form.
 
     Snapshotting also makes one step's masking SELF-CONSISTENT: every string in an
     attempt is now judged against the same secret set, instead of message 1 seeing
@@ -575,9 +608,7 @@ def _secret_snapshot() -> _SecretSnapshot:
         return _SecretSnapshot([], True)
     try:
         found, complete = provider()
-        values = [
-            value for value in found if isinstance(value, str) and len(value) >= _MIN_SECRET_LEN
-        ]
+        values = _match_forms(value for value in found if isinstance(value, str))
     except Exception:
         return _SecretSnapshot([], False)
     return _SecretSnapshot(values, complete is True)

@@ -1472,8 +1472,11 @@ def scan_embedded_secrets(
     ``.env`` -- or any file the service uid can -- and bake a live key into what it
     produces: into a file, a file or directory name, or a symlink's target. This
     finds every such place. ``secrets`` defaults to the values known now
-    (``_redaction_secrets``); a value shorter than ``_MIN_SECRET_LEN``, the
-    redactor's floor, is never looked for.
+    (``_redaction_secrets``). Whichever list it is, it is looked for in its match
+    forms (``_match_forms``): a value shorter than ``_MIN_SECRET_LEN``, the
+    redactor's floor, is never looked for, and a value at the floor is looked for
+    as given and with its line breaks normalized, whatever the length of that
+    form.
 
     What it checks:
 
@@ -1482,8 +1485,8 @@ def scan_embedded_secrets(
     * every symlink's target string, read with ``os.readlink``; the link is never
       followed, opened or descended into;
     * the whole content of every regular file. Each ``_SECRET_SCAN_CHUNK_CHARS``
-      read is searched together with the last "longest secret minus one"
-      characters before it, so a value split across two reads is still found
+      read is searched together with the last "longest form looked for, minus
+      one" characters before it, so a value split across two reads is still found
       whole, while memory stays at one read plus that overlap however large the
       file is. Files are opened like ``_read_regular_file_capped`` opens them
       (``O_NOFOLLOW``, ``O_NONBLOCK``, ``S_ISREG`` on the descriptor), without
@@ -1499,17 +1502,19 @@ def scan_embedded_secrets(
     that cannot be classified, a read failing with anything other than
     ``OSError``.
 
-    What it does not cover: content is decoded as UTF-8 with replacement and
-    universal newlines, as ``_read_regular_file_capped`` decodes it, so a value
-    stored in another encoding, or one containing a carriage return, is not
-    found; the root itself is listed as given, link or not; and the tree can
-    change after the scan returns -- keeping writers away is the caller's job.
+    Content is decoded as UTF-8 with replacement and universal newlines, as
+    ``_read_regular_file_capped`` decodes it: a value holding a carriage return is
+    found there through its normalized form, and content that differs from a value
+    only in its line breaks counts as holding it.
+
+    What it does not cover: a value stored in another encoding is not found; the
+    root itself is listed as given, link or not; and the tree can change after the
+    scan returns -- keeping writers away is the caller's job.
     """
     path = root.path if isinstance(root, BuildRoot) else root
     try:
         values = _redaction_secrets() if secrets is None else list(secrets)
-        looked_for = sorted({value for value in values if len(value) >= _MIN_SECRET_LEN})
-        return _scan_tree(path, looked_for)
+        return _scan_tree(path, _match_forms(values))
     except Exception as exc:
         return SecretScanFailed(type(exc).__name__)
 
@@ -2930,7 +2935,8 @@ def known_secrets_for_log() -> tuple[frozenset[str], bool]:
     ``(frozenset(), False)`` rather than raised; llm_log then stores, in place of
     each body, the marker saying it was not recorded
     (``llm_log._checked_as_written``). Goes through ``known_secret_values``, so
-    the same answer serves both.
+    the same answer serves both. It hands over the values themselves: llm_log puts
+    them in their match forms with its own copy of ``_match_forms``.
     """
     try:
         return known_secret_values(), True
@@ -2958,7 +2964,9 @@ _REDACTION_MARKER = "•••[秘密已遮蔽]•••"
 # uses: masking a 1-5 char value would shred ordinary prose (imagine redacting every
 # "1234"), and a real API key/token is never that short. F3 makes the install-form
 # secret schema reject a <6-char value up front precisely so a legitimately-supplied
-# secret is always long enough to be redactable here.
+# secret is always long enough to be redactable here. The floor is a value's own: the
+# newline-normalized form of a value at it is matched whatever its length
+# (``_match_forms``).
 _MIN_SECRET_LEN = 6
 
 # Hard ceiling on how many mask ranges a single call collects before giving up on
@@ -2985,10 +2993,12 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     copy of this. It is DUPLICATED in each module, not hoisted into a shared home, for
     the same leaf/layering reason the marker is (see ``_REDACTION_MARKER``); the two
     copies MUST stay byte-for-byte in LOCKSTEP so a value masked in a live tool result
-    and one masked in the log are indistinguishable. ``secrets`` are the known values
-    already filtered to ``>= _MIN_SECRET_LEN`` -- each caller produces that list under
-    its OWN failure direction (tools lets a provider error propagate/fail-closed; llm_log
-    swallows one and records unredacted), then hands the masking here.
+    and one masked in the log are indistinguishable. ``secrets`` are the known values in
+    their match forms (``_match_forms``: each value at ``_MIN_SECRET_LEN`` or above, and
+    its newline-normalized form, which may be shorter) -- each caller produces that list
+    under its OWN failure direction (tools lets a provider error propagate/fail-closed;
+    llm_log swallows one and stores, in place of the body, the marker saying it was not
+    recorded), then hands the masking here.
 
     Every mask range is computed against the PRISTINE ``text`` and only THEN applied,
     which is load-bearing (H1). The older order -- full-value ``str.replace`` FIRST, then
@@ -3005,9 +3015,10 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     secret cut by an EARLIER truncation boundary leaves a prefix the full-value match can
     never catch; a false positive only masks a tail of already-truncated text, and
     INTERIOR fragments are prevented at their sources -- the summary/openapi slices in
-    tool_builder and the tool-args preview in llm.py all redact BEFORE they cut); (2)
-    merge overlapping/adjacent ranges; (3) build the output in ONE pass, emitting exactly
-    one marker per merged range.
+    tool_builder and the tool-args preview in llm.py all redact BEFORE they cut) -- a
+    form shorter than the floor only ever matches whole; (2) merge overlapping/adjacent
+    ranges; (3) build the output in ONE pass, emitting exactly one marker per merged
+    range.
 
     Collecting every occurrence in step (1) is BOUNDED two ways (D36 round-5), because a
     legitimate secret can itself be adversarial input to this search. First, the find
@@ -3017,11 +3028,12 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     happens to look like that -- step past each other instead of registering one range
     per shifted start. This can still leave a residual of up to ``len(value) - 1``
     characters at a repeated run's tail (a strict remainder of the run length modulo
-    ``len(value)``); at the ``_MIN_SECRET_LEN`` floor -- the shortest value ever reaches
-    here, and exactly the reported case -- that residual is itself under the floor,
-    exactly as unredactable as any other short substring by the SAME rationale that
-    floor already encodes, and a residual landing at the very END of ``text`` is still
-    separately caught by the trailing-fragment guard above regardless of length. Second,
+    ``len(value)``); for a value at the ``_MIN_SECRET_LEN`` floor -- exactly the reported
+    case -- that residual is itself under the floor, and for a normalized form shorter
+    than the floor it is shorter still, exactly as unredactable as any other short
+    substring by the SAME rationale that floor already encodes, and a residual landing at
+    the very END of ``text`` is still separately caught by the trailing-fragment guard
+    above regardless of length. Second,
     stepping is not sufficient by itself: a sufficiently large low-entropy document can
     still cross ``_MAX_MASK_RANGES`` one ``len(value)``-sized step at a time, so
     collection STOPS the instant it would and this returns the marker ALONE for the
@@ -3086,15 +3098,38 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     return "".join(out)
 
 
+def _match_forms(values: Iterable[str]) -> list[str]:
+    """The forms known values are matched and masked in, sorted: each value at the
+    ``_MIN_SECRET_LEN`` floor or above, and that value with its line breaks
+    normalized -- each CRLF, then each lone CR, made an LF.
+
+    Text read in universal-newline mode -- a file read as text, the output of a
+    subprocess -- has its line breaks normalized that way before anything matches
+    or masks it, so a value holding a CR is found there only in its normalized
+    form. The floor is the value's own: a value under it adds no form at all, and
+    the normalized form of a value at it is kept whatever its length -- a derived
+    form may be shorter than the floor. Text that differs from a value only in its
+    line breaks counts as holding it.
+
+    Passing the answer through again gives the same answer: a normalized form under
+    the floor is there beside the value it came from, and a normalized form
+    normalizes to itself. A list that went through this once can go through it again
+    without losing a form.
+    """
+    held = {value for value in values if len(value) >= _MIN_SECRET_LEN}
+    return sorted(held | {value.replace("\r\n", "\n").replace("\r", "\n") for value in held})
+
+
 def _redaction_secrets() -> list[str]:
-    """``known_secret_values`` at the redactor's floor: the list every mask takes.
+    """``known_secret_values`` in their match forms (``_match_forms``): the list
+    every mask, scan and check as written takes.
 
     Unguarded, like the scan it wraps: a caller that must not fail on it says so
     itself (``_record_bodies``); every other caller wants the failure to propagate.
     That failure includes ``KnownSecretsIncomplete``, a list some ``.env`` could
     not be read into: never answered with the rest.
     """
-    return [value for value in known_secret_values() if len(value) >= _MIN_SECRET_LEN]
+    return _match_forms(known_secret_values())
 
 
 def redact_known_secrets(text: str) -> str:
@@ -3109,11 +3144,12 @@ def redact_known_secrets(text: str) -> str:
     that class: the model only ever sees the marker, never the value.
 
     Values come from ``known_secret_values`` (our key + every installed tool's .env
-    values + the in-flight install secret); those at least ``_MIN_SECRET_LEN`` long are
-    handed to the shared ``_mask_known_secrets`` (byte-identical to ``llm_log``'s copy),
-    which computes every mask range on the PRISTINE text and merges them -- see that
-    helper for why the range-based order is load-bearing (H1) and how the trailing
-    fragment guard fits in.
+    values + the in-flight install secret); in their match forms (``_match_forms``:
+    those at least ``_MIN_SECRET_LEN`` long, and each one's newline-normalized form)
+    they are handed to the shared ``_mask_known_secrets`` (byte-identical to
+    ``llm_log``'s copy), which computes every mask range on the PRISTINE text and
+    merges them -- see that helper for why the range-based order is load-bearing (H1)
+    and how the trailing fragment guard fits in.
 
     Unlike ``llm_log._redact``, this is on the LIVE path, so it does NOT swallow a
     provider failure into "return the text unmasked" -- that would leak the very value
@@ -3233,10 +3269,12 @@ def package_settings(package_root: PackageRoot) -> dict[str, Any]:
 
     Blocking. ``.env`` contributes KEY NAMES only; its values are read solely to
     flag conflicts and never leave this function. ``config.env`` contributes its
-    pairs, but a value that CONTAINS a known secret -- an exact substring of some
-    registered value at the redactor's floor -- is flagged ``contains_secret`` and
-    served as the marker alone: the file holds settings by the operator's choice,
-    and a secret pasted into it by mistake is exactly what must not be served back.
+    pairs, but a value that CONTAINS a known secret -- one of the known values'
+    match forms (``_match_forms``: a registered value at the redactor's floor, or
+    its newline-normalized form, since the file is read with universal newlines) as
+    an exact substring -- is flagged ``contains_secret`` and served as the marker
+    alone: the file holds settings by the operator's choice, and a secret pasted
+    into it by mistake is exactly what must not be served back.
 
     Exact containment, deliberately NOT ``redact_known_secrets``' own answer (P1
     review C1): that redactor also masks a text that merely ENDS with the first six

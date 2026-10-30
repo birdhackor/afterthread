@@ -641,6 +641,40 @@ def test_redaction_skips_values_shorter_than_min(monkeypatch: pytest.MonkeyPatch
     assert llm_log._REDACTION_MARKER not in body
 
 
+def test_redaction_adds_no_form_for_a_value_under_the_floor_though_it_holds_a_crlf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``ab\\r\\nc`` is five characters, under the floor: it adds no form -- not
+    itself, and not its normalized form -- so a body holding either is stored as
+    it is."""
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({"ab\r\nc"}, True))
+    llm_log._reset_for_tests()
+
+    _record(response="x ab\r\nc y ab\nc z")
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    assert record["attempts"][0]["response_content"] == "x ab\r\nc y ab\nc z"
+
+
+def test_redaction_masks_a_value_and_its_normalized_form_in_one_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``ab\\r\\nab`` and its normalized form ``ab\\nab`` overlap in the body: the
+    value's occurrence ends where the form's begins. Both are found on the body as
+    it is and their ranges merged, so one marker covers the two, and the body's
+    other line breaks stay as they were."""
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({"ab\r\nab"}, True))
+    llm_log._reset_for_tests()
+
+    _record(response="head\r\nab\r\nab\nab tail\r\n")
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    body = record["attempts"][0]["response_content"]
+    assert body == f"head\r\n{llm_log._REDACTION_MARKER} tail\r\n"
+
+
 def test_redaction_runs_before_truncation(monkeypatch: pytest.MonkeyPatch) -> None:
     """Redaction runs BEFORE the size cut, so a secret straddling the truncation
     edge is fully masked and never half-survives. Positioned so that -- had

@@ -1072,7 +1072,7 @@ class ToolJobStatus(BaseModel):
 
     ``draft`` is what became of the round's draft (``ToolJobDraft``): null when
     the round had nothing to keep, when it published and its draft was taken
-    away, when its commands could not be confirmed stopped (nothing is saved then;
+    away, when its commands or writes could not be confirmed stopped (nothing is saved then;
     ``error`` names the workspace kept in place), and wherever the six above are
     null -- a ``publish_draft`` job included.
 

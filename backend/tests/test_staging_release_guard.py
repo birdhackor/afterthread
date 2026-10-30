@@ -1,22 +1,27 @@
-"""Every value that can count towards removing the staging of a revise, or of a
-publish of a draft as it is, is registered here, and so is the condition each
-of the two removes it under.
+"""Every value that can count towards removing the staging of an install, of a
+revise, or of a publish of a draft as it is, is registered here, and so is the
+condition each of the three removes it under.
 
+``tool_builder.run_install`` removes its staging only when its commands and
+writes are confirmed ended (``shells_ended``) and no worker of its promote may
+still be writing it (not ``publish_running``).
 ``tool_builder.run_revise`` removes a round's staging only on its release
 condition, written out atom by atom in its comment on ``holding``: the commands
-confirmed stopped, no publish worker and no worker copying into it still
+and writes confirmed ended, no publish worker and no worker copying into it still
 writing, and ``holding`` lowered -- nothing worth keeping, the draft holding the
 work (``saved`` and ``durable``), published, or moved out.
 ``tool_builder.run_publish_draft`` removes its staging
 only on its own, written out in its comment above its flags: no worker copying
 the draft in or publishing it still writing, and ``holding`` lowered --
-published, moved out, or the draft seen to hold what the staging does. Three
+published, moved out, or the draft seen to hold what the staging does. Four
 kinds of code produce those atoms:
 
 * a save's result -- each keyword ``saved``, ``durable`` or ``worth_saving``
   handed a value that can count towards the removal (anything but the constant
   ``False``, or for ``worth_saving`` anything but ``True``), in
   ``tool_drafts.py`` and ``tool_builder.py``;
+* ``run_install`` itself -- each statement binding ``shells_ended`` or
+  ``publish_running``;
 * ``run_revise`` itself -- each statement binding ``holding``, ``shells_ended``,
   ``publish_running`` or ``copy_running``;
 * ``run_publish_draft`` itself -- each statement binding ``copy_running``,
@@ -24,14 +29,14 @@ kinds of code produce those atoms:
 
 Each one found by reading the syntax tree must be registered below, with what
 the value claims about which object and the observation it rests on. So must
-the condition each of the two functions calls ``_cleanup_staging`` under, as
+the condition each of the three functions calls ``_cleanup_staging`` under, as
 the ``if`` statements and conditional expressions around the call make it. A new
 one fails the guard until it is registered; a registered one that is gone fails
 it too, so the register stays the code as it is.
 
 The register is written by hand: the guard checks that every producer and each
 condition is registered, not that the observation a row names is made. It
-covers the two files and the two functions named, and the forms the scanners
+covers the two files and the three functions named, and the forms the scanners
 know (the tables of forms below). A condition made some other way -- a
 ``return`` or ``raise`` before the call, a ``match``, a loop -- is not read.
 """
@@ -50,6 +55,8 @@ _KEEPING = {"saved": False, "durable": False, "worth_saving": True}
 _ATOMS = ("holding", "shells_ended", "publish_running", "copy_running")
 # The names ``run_publish_draft``'s release condition is made of.
 _PUBLISH_ATOMS = ("copy_running", "publish_running", "holding")
+# The names ``run_install``'s release condition is made of.
+_INSTALL_ATOMS = ("shells_ended", "publish_running")
 # What removes a job's staging.
 _CLEANUP = "_cleanup_staging"
 
@@ -164,6 +171,7 @@ def _producers() -> list[tuple[str, str]]:
     return [
         *_result_claims(drafts, "tool_drafts"),
         *_result_claims(builder, "tool_builder"),
+        *_atom_bindings(builder, "tool_builder", "run_install", _INSTALL_ATOMS),
         *_atom_bindings(builder, "tool_builder", "run_revise"),
         *_atom_bindings(builder, "tool_builder", "run_publish_draft", _PUBLISH_ATOMS),
     ]
@@ -172,6 +180,7 @@ def _producers() -> list[tuple[str, str]]:
 def _releases() -> list[tuple[str, str]]:
     builder = Path(tool_builder.__file__).read_text(encoding="utf-8")
     return [
+        *_release_conditions(builder, "tool_builder", "run_install"),
         *_release_conditions(builder, "tool_builder", "run_revise"),
         *_release_conditions(builder, "tool_builder", "run_publish_draft"),
     ]
@@ -245,28 +254,67 @@ _REGISTERED: list[tuple[str, str, str]] = [
         "the durable atom, passed on from the manifest write that names the new copy",
     ),
     (
+        "tool_builder.run_install",
+        "shells_ended = True",
+        "no session yet: no command or write was started, so none can be using the staging",
+    ),
+    (
+        "tool_builder.run_install",
+        "shells_ended = False",
+        "the session starts: commands and writes may run from here, the claim withdrawn "
+        "until the stop evidence",
+    ),
+    (
+        "tool_builder.run_install",
+        "shells_ended = await shells.stop_and_wait()",
+        "the shells_ended atom: every run_shell command's stop evidence and every "
+        "write_file write's word that its worker returned (_BuilderShells.stop_and_wait)",
+    ),
+    (
+        "tool_builder.run_install",
+        "publish_running = False",
+        "no promote worker has started",
+    ),
+    (
+        "tool_builder.run_install",
+        "publish_running = True",
+        "the promote's worker is about to start writing the staging",
+    ),
+    (
+        "tool_builder.run_install",
+        "publish_running = False",
+        "the promote ended in an exception, the worker's own or one before it began: no "
+        "worker writes the staging any more",
+    ),
+    (
+        "tool_builder.run_install",
+        "publish_running = False",
+        "the promote's worker returned its result: it writes the staging no more",
+    ),
+    (
         "tool_builder.run_revise",
         "shells_ended = True",
-        "no session yet: no command was started, so none can be using the staging; a "
-        "worker that may still be copying the round's start into it is copy_running's",
+        "no session yet: no command or write was started, so none can be using the "
+        "staging; a worker that may still be copying the round's start into it is "
+        "copy_running's",
     ),
     (
         "tool_builder.run_revise",
         "shells_ended = False",
-        "the session starts: commands may run from here, the claim withdrawn until the "
-        "stop evidence",
+        "the session starts: commands and writes may run from here, the claim withdrawn "
+        "until the stop evidence",
     ),
     (
         "tool_builder.run_revise",
         "shells_ended = await shells.stop_and_wait()",
-        "the shells_ended atom: every run_shell command's stop evidence "
-        "(_BuilderShells.stop_and_wait)",
+        "the shells_ended atom: every run_shell command's stop evidence and every "
+        "write_file write's word that its worker returned (_BuilderShells.stop_and_wait)",
     ),
     (
         "tool_builder.run_revise",
         "holding = False",
-        "before the commands are confirmed stopped there is no work to hold: the staging "
-        "holds only the copy the round was given",
+        "before the commands and writes are confirmed ended there is no work to hold: the "
+        "staging holds only the copy the round was given",
     ),
     (
         "tool_builder.run_revise",
@@ -426,12 +474,19 @@ _REGISTERED: list[tuple[str, str, str]] = [
 # condition, what it claims and where each of its atoms is registered).
 _RELEASES: list[tuple[str, str, str]] = [
     (
+        "tool_builder.run_install",
+        "shells_ended and not (publish_running)",
+        "the staging is removed only when every run_shell command is confirmed stopped "
+        "and every write_file write has ended, and no worker of the promote may still be "
+        "writing it; the bindings of each atom are registered above",
+    ),
+    (
         "tool_builder.run_revise",
         "shells_ended and not (holding or publish_running or copy_running)",
-        "the staging is removed only when every run_shell command is confirmed stopped, "
-        "neither a publish worker nor a worker copying into it may still be writing it, "
-        "and nothing in it is held for the operator; the bindings of each atom are "
-        "registered above",
+        "the staging is removed only when every run_shell command is confirmed stopped "
+        "and every write_file write has ended, neither a publish worker nor a worker "
+        "copying into it may still be writing it, and nothing in it is held for the "
+        "operator; the bindings of each atom are registered above",
     ),
     (
         "tool_builder.run_publish_draft",
@@ -443,7 +498,9 @@ _RELEASES: list[tuple[str, str, str]] = [
 ]
 
 
-def test_each_value_counting_towards_a_revise_or_draft_publish_cleanup_is_registered() -> None:
+def test_each_value_counting_towards_an_install_revise_or_draft_publish_cleanup_is_registered() -> (
+    None
+):
     found = Counter(_producers())
     registered = Counter((where, form) for where, form, _claim in _REGISTERED)
     assert found, "the scan found nothing at all: it is not reading the two files"
@@ -454,10 +511,10 @@ def test_each_value_counting_towards_a_revise_or_draft_publish_cleanup_is_regist
     assert not stale, f"registered producers no longer in the code: {stale}"
 
 
-def test_the_condition_run_revise_and_run_publish_draft_clean_up_under_is_registered() -> None:
+def test_the_condition_an_install_revise_or_draft_publish_cleans_up_under_is_registered() -> None:
     found = Counter(_releases())
     registered = Counter((where, condition) for where, condition, _claim in _RELEASES)
-    assert found, "the scan found no removal at all: it is not reading the two functions"
+    assert found, "the scan found no removal at all: it is not reading the three functions"
     assert all(claim.strip() for _where, _condition, claim in _RELEASES)
     unregistered = sorted((found - registered).elements())
     stale = sorted((registered - found).elements())

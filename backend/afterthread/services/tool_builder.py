@@ -971,6 +971,9 @@ def _tool_spec(name: str, description: str, properties: dict[str, Any]) -> dict[
 # though by then the session that would read it is over.
 _SHELL_NOT_STARTED = "command not run: the session has ended"
 _SHELL_STOPPED = "command stopped: the session has ended"
+# What write_file hands back for a write whose worker began only after its session
+# had stopped: the file was not written. Model-facing English, like the two above.
+_WRITE_NOT_DONE = "write_file not done: the session has ended"
 
 
 @dataclass(slots=True, eq=False)
@@ -1188,8 +1191,9 @@ def _run_shell_subprocess(
 
 
 def _workspace_kept_error(session_root: Path) -> str:
-    """The job error for a session whose workspace is kept, its commands not
-    confirmed stopped (``_BuilderShells``). Appended to the session's own error.
+    """The job error for a session whose workspace is kept, its commands or its
+    writes not confirmed ended (``_BuilderShells``). Appended to the session's own
+    error.
 
     The path is shown as it is: the backend built it from the configured tools
     directory, a fixed name and a random id, and the operator has to copy it to
@@ -1197,8 +1201,8 @@ def _workspace_kept_error(session_root: Path) -> str:
     must not wait on a worker thread.
     """
     return (
-        "工作階段結束後，有 run_shell 指令無法確認已經停止：這次的成果不會發布，"  # noqa: RUF001
-        f"暫存工作區原地保留在 {session_root}，確認沒有殘留的程序後可以手動刪除。"  # noqa: RUF001
+        "工作階段結束後，有 run_shell 指令或 write_file 寫入無法確認已經停止：這次的成果不會發布，"  # noqa: RUF001
+        f"暫存工作區原地保留在 {session_root}，確認沒有殘留的程序還在用它後可以手動刪除。"  # noqa: RUF001
     )
 
 
@@ -1206,40 +1210,53 @@ def _log_workspace_kept(session_root: Path) -> None:
     """Say in the backend log where a kept workspace is, and why it was kept."""
     with contextlib.suppress(Exception):
         _logger.warning(
-            "Builder workspace kept at %s: its run_shell commands could not be "
-            "confirmed stopped, so it was neither published nor removed.",
+            "Builder workspace kept at %s: its run_shell commands or write_file writes "
+            "could not be confirmed stopped, so it was neither published nor removed.",
             session_root,
         )
 
 
 def _shell_stop_seconds() -> float:
-    """How long a builder session waits for its run_shell commands once stopped.
+    """How long a builder session waits, once stopped, for its run_shell commands
+    and its write_file writes: one limit for all of them together.
 
     The bounded part of what a command already running could still take without
     the stop signal: the rest of its own timeout, then the teardown in
     ``_communicate_bounded``, whose bounded waits -- the re-sent group kill, the
     watch for the group to be gone, the join of its one output reader -- share
     the single limit ``_REAP_TIMEOUT_SECONDS``; its reap of the leader has no
-    bound. The signal normally ends the wait within one poll and the teardown;
-    the bound only matters for a worker that entered and cannot report in time
-    (a leader SIGKILL cannot reap, a thread stuck before its first poll, a
-    redaction scan that hangs -- a worker reports only as it returns).
+    bound. A write has no limit of its own and shares this one. The signal
+    normally ends the wait within one poll and the teardown, and a write ends as
+    soon as it is written; the bound only matters for a worker that entered and
+    cannot report in time (a leader SIGKILL cannot reap, a thread stuck before its
+    first poll or in a write the kernel does not finish, a redaction scan that
+    hangs -- a worker reports only as it returns).
     """
     return get_settings().tool_install_shell_timeout_seconds + tools._REAP_TIMEOUT_SECONDS
 
 
 class _BuilderShells:
-    """The run_shell commands of ONE builder session, and the signal that stops them.
+    """The run_shell commands and write_file writes of ONE builder session, and the
+    signal that stops them.
 
     ``run_install``/``run_revise`` create one per session and hand it to
     ``_build_meta_tools``; it is never module state, because other work (a health
     check, an AI request's tool call) runs subprocesses of its own meanwhile.
 
-    Each command runs as a task of its own, kept here by a strong reference and
-    awaited through ``asyncio.shield`` -- the shape of ``tools._make_handler``. The
-    session's deadline, or a cancellation of the session, then cancels only the
-    handler's await: the command's task, and the worker thread it waits on, go on
-    to their end.
+    Each command, and each write, runs as a task of its own, kept here by a strong
+    reference and awaited through ``asyncio.shield`` -- the shape of
+    ``tools._make_handler``. The session's deadline, or a cancellation of the
+    session, then cancels only the handler's await: the task, and the worker thread
+    it waits on, go on to their end.
+
+    The two count as ended on different evidence, each from the worker running it,
+    and neither stands in for the other.
+
+    A write counts as ended once its worker has returned, its write done or failed:
+    a worker that has returned writes no more. The worker reports that from a
+    ``finally`` around the write, through ``loop.call_soon_threadsafe``. Not the
+    write's task: a cancelled task is done while its worker writes on. Not the
+    handler's await: the deadline cancels it with the file cut short.
 
     A command counts as stopped on evidence from the worker running it only
     (``_ShellEvidence``): its leader was reaped -- by the drain's teardown, or by
@@ -1261,24 +1278,26 @@ class _BuilderShells:
     has closed finds nobody waiting; ``call_soon_threadsafe`` raising for the
     closed loop is swallowed.
 
-    A worker that has not entered when the stop is set never starts its command.
-    The worker sets ``entered`` and only then reads the stop signal;
-    ``stop_and_wait`` sets the stop and only then reads ``entered``. Under the
-    GIL those four steps happen in one order, so a worker read here as not
+    A worker that has not entered when the stop is set never starts its command,
+    nor its write. The worker sets ``entered`` and only then reads the stop
+    signal; ``stop_and_wait`` sets the stop and only then reads ``entered``. Under
+    the GIL those four steps happen in one order, so a worker read here as not
     entered reads the stop as set when it gets there, and returns without
-    spawning. Such a command counts as never started, with no wait -- whether
-    its pool runs it later or never.
+    spawning or writing. Such a command counts as never started, and such a write
+    as never written, with no wait -- whether its pool runs it later or never.
 
     What it guarantees: once ``stop_and_wait`` returns True, no command this
     session ran has a process left: its leader was reaped and its process group
     was then seen gone, or it never started one -- it did not get as far as
-    starting, or its start failed before the fork. ``stop_and_wait`` sets the
-    stop signal before it waits: a command still running is killed at
-    ``_communicate_bounded``'s next poll, by that function's own teardown under
-    its own lock, and a command not spawned yet is never started -- or, spawned
-    in the instant after that check, is killed at its first poll. Nothing here
-    kills a process group from outside, so the guard opens no way to signal a pid
-    that has been reaped and reused.
+    starting, or its start failed before the fork. And no write of this session
+    is still writing: its worker returned, or never entered and so never wrote.
+    ``stop_and_wait`` sets the stop signal before it waits: a command still
+    running is killed at ``_communicate_bounded``'s next poll, by that function's
+    own teardown under its own lock, and a command not spawned yet is never
+    started -- or, spawned in the instant after that check, is killed at its first
+    poll. Nothing here kills a process group from outside, so the guard opens no
+    way to signal a pid that has been reaped and reused. A write already in its
+    worker is not stopped: it is waited for.
 
     What it does not cover:
 
@@ -1288,17 +1307,18 @@ class _BuilderShells:
       -- as it is all a timeout can do. A member the service may not signal (a
       setuid program) is not such a case: it keeps the group in existence, so the
       command counts as unconfirmed;
-    * a command that cannot be confirmed stopped: its worker reported it
-      unconfirmed, or it entered and sent no report within
-      ``_shell_stop_seconds`` (a leader SIGKILL cannot reap, a thread that is
-      stuck), or a second cancellation of the session cut the wait short. The
-      callers then give up saving, publishing and removing that workspace for
-      good: it stays where it is, named in the backend log, and no later job
-      touches it. Unless the session itself was cancelled, the job still ends --
-      failed, its error naming the workspace -- and gives up its slot: the slot
-      keeps the backend's writers apart, and a session that has given up writing
-      is no longer one. That exit waits on nothing a stuck worker could hold, the
-      shared thread pool above all;
+    * a command or a write that cannot be confirmed ended: a command's worker
+      reported it unconfirmed, or a worker -- a command's or a write's -- entered
+      and sent no report within ``_shell_stop_seconds``, one limit for all of them
+      (a leader SIGKILL cannot reap, a thread that is stuck), or a second
+      cancellation of the session cut the wait short. The callers then give up
+      saving, publishing and removing that workspace for good: it stays where it
+      is, named in the backend log, and no later job touches it. Unless the
+      session itself was cancelled, the job still ends -- failed, its error naming
+      the workspace -- and gives up its slot: the slot keeps the backend's writers
+      apart, and a session that has given up writing is no longer one. That exit
+      waits on nothing a stuck worker could hold, the shared thread pool above
+      all;
     * an interpreter without the GIL. Counting a worker read as not entered as
       never started rests on the four steps of the handshake above happening in
       one order, which the GIL gives; without it ``Event.is_set`` reads its flag
@@ -1306,17 +1326,21 @@ class _BuilderShells:
       again.
     """
 
-    __slots__ = ("_commands", "_stop", "_tasks")
+    __slots__ = ("_commands", "_stop", "_tasks", "_writes")
 
     def __init__(self) -> None:
         self._stop = threading.Event()
-        # Strong references, so a command whose handler stopped waiting is never
-        # collected mid-flight.
+        # Strong references, so a command or a write whose handler stopped waiting
+        # is never collected mid-flight.
         self._tasks: set[asyncio.Task[str]] = set()
         # One entry per command: what its worker keeps, and the future that carries
         # the worker's report -- stopped or not -- to the loop. Only that worker
         # resolves it.
         self._commands: list[tuple[_ShellEvidence, asyncio.Future[bool]]] = []
+        # One entry per write: the event its worker sets as it enters, and the
+        # future that carries the worker's word that it returned. Only that worker
+        # resolves it.
+        self._writes: list[tuple[threading.Event, asyncio.Future[bool]]] = []
 
     async def run(
         self,
@@ -1349,37 +1373,70 @@ class _BuilderShells:
         task.add_done_callback(self._forget)
         return await asyncio.shield(task)
 
+    async def write(self, perform: Callable[[], str]) -> str:
+        """Run one write for the session; returns write_file's result text.
+
+        ``perform`` makes the write, on the worker, and gives the result text. A
+        worker that enters once the session has stopped does not call it.
+        """
+        loop = asyncio.get_running_loop()
+        entered = threading.Event()
+        report: asyncio.Future[bool] = loop.create_future()
+        self._writes.append((entered, report))
+        stop = self._stop
+
+        def worker() -> str:
+            try:
+                entered.set()
+                if stop.is_set():
+                    return _WRITE_NOT_DONE
+                return perform()
+            finally:
+                # Returned or raised: either way this worker writes no more.
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(self._settle, report, True)
+
+        task = asyncio.ensure_future(run_in_threadpool(worker))
+        self._tasks.add(task)
+        task.add_done_callback(self._forget)
+        return await asyncio.shield(task)
+
     @staticmethod
-    def _settle(report: asyncio.Future[bool], stopped: bool) -> None:
+    def _settle(report: asyncio.Future[bool], ended: bool) -> None:
         # On the loop, sent there by the worker as it returns.
         if not report.done():
-            report.set_result(stopped)
+            report.set_result(ended)
 
     def _forget(self, task: asyncio.Task[str]) -> None:
         self._tasks.discard(task)
-        # Retrieved, so a command that failed after its handler stopped waiting is
-        # not logged as "Task exception was never retrieved": nobody is left to
-        # read its result.
+        # Retrieved, so a command or a write that failed after its handler stopped
+        # waiting is not logged as "Task exception was never retrieved": nobody is
+        # left to read its result.
         if not task.cancelled():
             task.exception()
 
     async def stop_and_wait(self) -> bool:
-        """Stop every command of this session and wait for word that each stopped.
+        """Stop every command and write of this session and wait for word that each
+        ended.
 
-        True once every command is known to be stopped. False as soon as a worker
-        reports one unconfirmed, or once a worker that had entered has sent no
-        report within ``_shell_stop_seconds``: nothing then vouches that the
-        workspace is still, and the caller must leave it exactly as it is.
+        True once every command is known to be stopped and every write to have
+        returned. False as soon as a worker reports a command unconfirmed, or once
+        a worker that had entered -- a command's or a write's -- has sent no report
+        within ``_shell_stop_seconds``, one limit for all of them together: nothing
+        then vouches that the workspace is still, and the caller must leave it
+        exactly as it is.
         """
         self._stop.set()
         waiting: set[asyncio.Future[bool]] = set()
-        for evidence, report in self._commands:
+        commands = [(evidence.entered, report) for evidence, report in self._commands]
+        for entered, report in [*commands, *self._writes]:
             if report.done():
                 if not report.result():
                     return False
-            elif evidence.entered.is_set():
+            elif entered.is_set():
                 waiting.add(report)
-            # Not entered yet: its worker finds the stop set before it could spawn.
+            # Not entered yet: its worker finds the stop set before it could spawn
+            # its command or make its write.
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _shell_stop_seconds()
         while waiting:
@@ -1412,8 +1469,11 @@ def _build_meta_tools(
     never see it) and never any prompt; the ``config.env`` TEXT reaches the
     prompt separately, through ``_revise_user_prompt``.
 
-    ``shells`` is the session's ``_BuilderShells``: every run_shell command runs
-    through it, so the session can stop them all and wait for them to end.
+    ``shells`` is the session's ``_BuilderShells``: every run_shell command and
+    every write_file write runs through it, so the session can stop them all and
+    wait for them to end. read_file and list_dir only read, and hand their reads
+    to the thread pool themselves: nothing the session does once it has stopped
+    waits for them.
     """
 
     async def write_file(args: dict[str, Any]) -> str:
@@ -1447,7 +1507,7 @@ def _build_meta_tools(
             return f"wrote {target.relative_to(staging.resolve())} ({len(content)} characters)"
 
         try:
-            return await run_in_threadpool(_write)
+            return await shells.write(_write)
         except Exception as exc:
             return f"write_file failed: {type(exc).__name__}"
 
@@ -3106,8 +3166,9 @@ def _cleanup_staging(staging: Path, base: Path) -> None:
     The rmtree is a DESTRUCTIVE traversal, so it runs ONLY on a root that
     passes the SAME ``_verify_staging_root`` gate ``_promote_staging`` applies.
     This is load-bearing, not symmetry for its own sake: ``run_install``'s
-    ``finally`` reaches here on every exit but one -- including after promote just
-    REFUSED the workspace as tampered -- and CPython's rmtree protection only
+    ``finally`` reaches here on every exit but the two named below -- including
+    after promote just REFUSED the workspace as tampered -- and CPython's rmtree
+    protection only
     refuses a path that is ITSELF a symlink. With the ``.staging`` ANCESTOR
     swapped for a symlink to an external directory holding a real ``<uuid>``
     subdir, ``staging.is_dir()`` follows the link and the rmtree LEAF is an
@@ -3135,14 +3196,15 @@ def _cleanup_staging(staging: Path, base: Path) -> None:
     by this addition.
 
     Two kinds of exit never call this. One is a session whose run_shell commands
-    could not be confirmed stopped (``_BuilderShells``): its workspace is kept
-    whole, and that session skips the sweep as well -- the next job's call runs
-    it. The other is a revise or a publish of a draft that keeps its staging -- for
-    work no one holds, or for a worker copying into it or publishing it that may
-    still be writing it (``run_revise``, ``run_publish_draft``) -- and runs the
-    sweep without removing anything. Nothing in the backend ever collects
-    what either keeps: a later job's call removes only its own session root, and
-    ``.staging`` only once empty, while the sweep never looks inside
+    or write_file writes could not be confirmed stopped (``_BuilderShells``): its
+    workspace is kept whole, and that session skips the sweep as well -- the next
+    job's call runs it. The other is a job that keeps its staging -- a revise or a
+    publish of a draft for work no one holds, or any of the three for a worker
+    copying into it or publishing it that may still be writing it, an install's
+    promote among them (``run_install``, ``run_revise``, ``run_publish_draft``) --
+    and runs the sweep without removing anything. Nothing in the backend ever
+    collects what either keeps: a later job's call removes only its own session
+    root, and ``.staging`` only once empty, while the sweep never looks inside
     ``.staging``. Only the operator removes it.
     """
     try:
@@ -3238,8 +3300,14 @@ async def run_install(
     if secret_value:
         tools.register_inflight_secret(secret_value)
 
-    # True until the session starts: an exit before it has no command to wait for.
+    # True until the session starts: an exit before it has no command or write to
+    # wait for.
     shells_ended = True
+    # Up while the promote's worker may still be writing the staging. The await
+    # ending with the worker's result or with an ``Exception`` lowers it -- the
+    # worker has returned, or never began -- and a cancellation does not, since
+    # the worker goes on without it.
+    publish_running = False
     try:
         settings = get_settings()
         result: InstallResult | None = None
@@ -3265,11 +3333,12 @@ async def run_install(
             llm_error = f"AI 建置工具失敗（{exc}）。"  # noqa: RUF001
         finally:
             # However the session ended -- an answer, an error, its deadline, or this
-            # coroutine cancelled -- stop the commands it started and wait for them
-            # (``_BuilderShells``) before anything below touches the workspace and
-            # before the job gives up its slot. If they cannot be confirmed stopped
-            # (``_BuilderShells``), or a second cancellation cuts the wait short and
-            # this stays False, the workspace is not stripped, published or removed.
+            # coroutine cancelled -- stop the commands and writes it started and wait
+            # for them (``_BuilderShells``) before anything below touches the
+            # workspace and before the job gives up its slot. If they cannot be
+            # confirmed ended (``_BuilderShells``), or a second cancellation cuts the
+            # wait short and this stays False, the workspace is not stripped,
+            # published or removed.
             shells_ended = await shells.stop_and_wait()
 
         # The builder session ran (even a not-configured exit records one), so
@@ -3324,21 +3393,29 @@ async def run_install(
                 not_ready=True,
             )
 
-        published, promote_error = await run_in_threadpool(
-            _promote_staging,
-            build_root,
-            shell_root,
-            result.tool_name,
-            base,
-            {
-                "source": "builder-install",
-                "openapi_url": tool_meta._sanitized_origin_url(openapi_url),
-                "instructions": instructions,
-                "feedback": None,
-            },
-            secret_name,
-            secret_value,
-        )
+        publish_running = True
+        try:
+            published, promote_error = await run_in_threadpool(
+                _promote_staging,
+                build_root,
+                shell_root,
+                result.tool_name,
+                base,
+                {
+                    "source": "builder-install",
+                    "openapi_url": tool_meta._sanitized_origin_url(openapi_url),
+                    "instructions": instructions,
+                    "feedback": None,
+                },
+                secret_name,
+                secret_value,
+            )
+        except Exception:
+            # The worker's own exception, or one before it began: either way
+            # nothing of it writes into the staging any more.
+            publish_running = False
+            raise
+        publish_running = False
         if promote_error is not None:
             return InstallOutcome(
                 ok=False,
@@ -3392,14 +3469,20 @@ async def run_install(
         # so redaction continues via the .env scan), then clean staging. A
         # successful move consumed the staging dir; cleanup then only drops the
         # (possibly empty) .staging shell. Every other exit removes the build --
-        # except one whose commands could not be confirmed stopped, which keeps it.
+        # except one whose commands or writes could not be confirmed stopped, which
+        # keeps it, and one whose promote's worker may still be writing it, which
+        # keeps it while the sweep still runs (it never looks inside ``.staging``).
         if secret_value:
             tools.discard_inflight_secret(secret_value)
-        if shells_ended:
-            await run_in_threadpool(_cleanup_staging, session_root, base)
-        else:
-            # Kept in place: a command not confirmed stopped may still be using it.
+        if not shells_ended:
+            # Kept in place: a command or a write not confirmed stopped may still be
+            # using it.
             _log_workspace_kept(session_root)
+        elif publish_running:
+            _log_publish_running_kept(session_root)
+            await run_in_threadpool(_sweep_logged, base)
+        else:
+            await run_in_threadpool(_cleanup_staging, session_root, base)
 
 
 # --- the revise run -----------------------------------------------------------
@@ -3723,7 +3806,7 @@ def _unmaskable_env_error(text: str, values: dict[str, str]) -> str | None:
     policy, differing only in WHY the mask would miss:
 
     * TOO SHORT (R1-1): ``tools.redact_known_secrets`` and ``llm_log._redact``
-      deliberately ignore everything under ``tools._MIN_SECRET_LEN``, because
+      deliberately ignore every value under ``tools._MIN_SECRET_LEN``, because
       masking a 1-5 char value would shred ordinary prose. Registering ``1234``
       therefore protects nothing;
     * SPELLED REVERSIBLY (R5-1): the redactors only ever see the value dotenv
@@ -4183,11 +4266,12 @@ def _log_copy_running_kept(session_root: Path) -> None:
 
 
 def _log_publish_running_kept(session_root: Path) -> None:
-    """Say in the backend log where a revise that stopped while its publish still
-    ran left its staging, which that publish may still be writing."""
+    """Say in the backend log where a job -- an install or a revise -- that stopped
+    while its publish still ran left its staging, which that publish may still be
+    writing."""
     with contextlib.suppress(Exception):
         _logger.warning(
-            "Builder workspace kept at %s: the revise stopped while its publish was "
+            "Builder workspace kept at %s: the job stopped while its publish was "
             "still running, and that publish may still be writing it.",
             session_root,
         )
@@ -4282,18 +4366,18 @@ async def run_revise(
     files (``tool_drafts.copy_into_workspace``), both before anything is spent.
     How it is closed follows what is known: one that never began its
     conversation takes its mark back and is not counted; one that ran, its
-    commands confirmed stopped, is recorded once -- by its save, or on its own
-    (``_close_unrecorded``); one whose commands were not confirmed stopped, or
-    that ends in an exception, leaves the manifest alone, its mark for the next
-    round to record as interrupted.
+    commands and writes confirmed ended, is recorded once -- by its save, or on
+    its own (``_close_unrecorded``); one whose commands or writes were not
+    confirmed ended, or that ends in an exception, leaves the manifest alone, its
+    mark for the next round to record as interrupted.
 
     A round that does not publish keeps its work as the tool's draft
     (``tool_drafts``), and a round about to publish saves it first, so a publish
     that fails cannot take the only copy of the work with it; a publish that goes
     through takes the draft away again. Every save comes after the exit for
-    commands not confirmed stopped, which leaves the workspace untouched and
-    waits on no worker, and after the builder's ``.env`` is stripped. A save that
-    fails changes nothing about the round's outcome.
+    commands or writes not confirmed ended, which leaves the workspace untouched
+    and waits on no worker, and after the builder's ``.env`` is stripped. A save
+    that fails changes nothing about the round's outcome.
 
     The staging is removed only once someone holds the work: the draft, with its
     manifest confirmed on disk (and no publish worker still writing the staging);
@@ -4376,11 +4460,12 @@ async def run_revise(
     shell_root = session_root / "shell"
     job_id = _CURRENT_JOB_ID.get()
     # The release condition, atom by atom: the ``finally`` below removes the
-    # staging only when the commands are confirmed stopped (``shells_ended``), no
-    # publish worker may still be writing it (not ``publish_running``), no worker
-    # copying into it may still be writing it (not ``copy_running``), and no one is
-    # left to hold its work for (not ``holding``). ``holding`` is raised
-    # when the commands are confirmed stopped and lowered only by one of:
+    # staging only when the commands and writes are confirmed ended
+    # (``shells_ended``), no publish worker may still be writing it (not
+    # ``publish_running``), no worker copying into it may still be writing it (not
+    # ``copy_running``), and no one is left to hold its work for (not ``holding``).
+    # ``holding`` is raised when the commands and writes are confirmed ended and
+    # lowered only by one of:
     #   * nothing worth keeping (``SaveResult.worth_saving`` False);
     #   * the draft holds the work: its files directory holds this round's files
     #     (``SaveResult.saved``) and the manifest naming them is on disk
@@ -4389,12 +4474,14 @@ async def run_revise(
     #   * moved out: a publish that failed part way moved the work out of this
     #     session's staging (``content`` not within ``session_root``).
     #
-    # True until the session starts: an exit before it has no command to wait for.
+    # True until the session starts: an exit before it has no command or write to
+    # wait for.
     shells_ended = True
-    # Raised in the ``finally`` that gets the commands' stop evidence, so an
-    # exception or a cancellation from there on finds it up. While it is up, the
-    # ``finally`` below keeps the staging, stripping the builder's ``.env`` first
-    # if nothing did yet, and keeping it all the same when that strip fails.
+    # Raised in the ``finally`` that gets the stop evidence of the commands and
+    # writes, so an exception or a cancellation from there on finds it up. While it
+    # is up, the ``finally`` below keeps the staging, stripping the builder's
+    # ``.env`` first if nothing did yet, and keeping it all the same when that
+    # strip fails.
     holding = False
     # Up once a strip of the builder's ``.env`` went through.
     env_stripped = False
@@ -4928,17 +5015,18 @@ async def run_revise(
         # The package .env was untouched, so its live scan keeps covering these
         # values after the temporary registrations are dropped. Cleanup targets
         # the complete session root, including any unused shell -- unless the
-        # session's commands could not be confirmed stopped, which keeps it all,
-        # unstripped, or the work in it is held by no one, or a worker copying into
-        # it or publishing it may still be writing it, any of which keeps it too
-        # while the sweep still runs (it never looks inside ``.staging``). Kept for
-        # the work, it is first stripped of a .env the builder wrote, when nothing
-        # stripped it yet, and kept all the same when that strip fails: the log then
-        # says the .env may still be there.
+        # session's commands or writes could not be confirmed stopped, which keeps
+        # it all, unstripped, or the work in it is held by no one, or a worker
+        # copying into it or publishing it may still be writing it, any of which
+        # keeps it too while the sweep still runs (it never looks inside
+        # ``.staging``). Kept for the work, it is first stripped of a .env the
+        # builder wrote, when nothing stripped it yet, and kept all the same when
+        # that strip fails: the log then says the .env may still be there.
         for value in registered:
             tools.discard_inflight_secret(value)
         if not shells_ended:
-            # Kept in place: a command not confirmed stopped may still be using it.
+            # Kept in place: a command or a write not confirmed stopped may still be
+            # using it.
             _log_workspace_kept(session_root)
         else:
             if holding and not env_stripped and not publish_running:

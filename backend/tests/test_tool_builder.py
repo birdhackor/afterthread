@@ -72,7 +72,12 @@ from afterthread.services import (
     tool_runs,
     tools,
 )
-from afterthread.services.llm import LLMNotConfiguredError, LLMUpstreamError, StructuredRunStats
+from afterthread.services.llm import (
+    LLMNotConfiguredError,
+    LlmTool,
+    LLMUpstreamError,
+    StructuredRunStats,
+)
 from afterthread.services.tool_builder import (
     _ERROR_NAME_TAKEN,
     _ERROR_OPENAPI_TOO_LARGE,
@@ -396,6 +401,34 @@ def test_run_shell_whose_output_cannot_be_masked_says_the_command_ran_and_hands_
 
     assert secret not in result
     assert result == tools.output_withheld_text("command", 0)
+
+
+@pytest.mark.parametrize("tool", ["read_file", "run_shell"])
+def test_a_meta_tool_masks_a_known_value_holding_a_crlf_in_the_text_it_reads_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tool: str
+) -> None:
+    """An installed tool's ``.env`` gives a value holding a CRLF, and the builder
+    reads its very bytes back: a staged file through read_file, a command's output
+    through run_shell. Both read text with universal newlines, so what comes back
+    holds the value with an LF in place of the CRLF -- and that form is masked
+    too, though it is shorter than the floor."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    package = root / "kb"
+    package.mkdir(parents=True)
+    (package / ".env").write_text('KB_KEY="ab\\r\\ncd"\n', encoding="utf-8")
+    assert "ab\r\ncd" in tools.known_secret_values()
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "notes.txt").write_bytes(b"prefix ab\r\ncd suffix")
+    meta = _meta_by_name(staging)
+
+    if tool == "read_file":
+        result = _call(meta["read_file"].handler, {"path": "notes.txt"})
+    else:
+        result = _call(meta["run_shell"].handler, {"command": "cat notes.txt"})
+
+    assert result == f"prefix {tools._REDACTION_MARKER} suffix"
 
 
 def test_run_shell_cwd_is_staging(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -8998,13 +9031,16 @@ def _session_settings(
     return settings
 
 
-def _endpoint_asking_for_one_command(monkeypatch: pytest.MonkeyPatch, command: str) -> None:
-    """The first request is answered with ONE run_shell call. No later request
-    ever returns, so the session ends by its deadline or by a cancellation."""
+def _endpoint_asking_for_one_call(
+    monkeypatch: pytest.MonkeyPatch, tool: str, arguments: dict[str, Any]
+) -> None:
+    """The first request is answered with ONE call of the meta-tool ``tool``. No
+    later request ever returns, so the session ends by its deadline or by a
+    cancellation."""
     call = SimpleNamespace(
         id="call_0",
         type="function",
-        function=SimpleNamespace(name="run_shell", arguments=json.dumps({"command": command})),
+        function=SimpleNamespace(name=tool, arguments=json.dumps(arguments)),
     )
     message = SimpleNamespace(content=None, tool_calls=[call])
     replies = [SimpleNamespace(choices=[SimpleNamespace(message=message)])]
@@ -9017,6 +9053,11 @@ def _endpoint_asking_for_one_command(monkeypatch: pytest.MonkeyPatch, command: s
 
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     monkeypatch.setattr("afterthread.services.llm._get_client", lambda: client)
+
+
+def _endpoint_asking_for_one_command(monkeypatch: pytest.MonkeyPatch, command: str) -> None:
+    """The first request is answered with ONE run_shell call (``_endpoint_asking_for_one_call``)."""
+    _endpoint_asking_for_one_call(monkeypatch, "run_shell", {"command": command})
 
 
 def _group_exists(pgid: int) -> bool:
@@ -10346,6 +10387,530 @@ def test_a_group_kill_sent_again_reaches_a_member_left_by_a_leader_that_exited(
     with pytest.raises(ProcessLookupError):
         os.kill(member, 0)  # gone, reaped
     assert stopped is True
+
+
+# --- write_file writes end with their session ---------------------------------
+#
+# A write runs on a pool thread the session's deadline cannot stop: the session
+# waits for its worker to return before anything touches the workspace, within the
+# same one limit its commands get.
+
+
+def _watch_the_write_and_the_workspace(
+    monkeypatch: pytest.MonkeyPatch, content: str, seen: list[str]
+) -> None:
+    """Record, in order: the write of ``content`` returning, the session's stop
+    answering, and each strip, save and cleanup of the workspace.
+
+    That write goes through the real ``tools._write_regular_file``, held as its
+    open has cut the file short: it goes on only once the session's stop has been
+    asked for, and 0.3 seconds after that. A stop that does not wait for it
+    answers inside that window, and the order shows it."""
+    real_write = tools._write_regular_file
+    real_stop = tool_builder._BuilderShells.stop_and_wait
+    real_strip = tool_builder._strip_builder_env
+    real_save = tool_builder._save_round_draft
+    real_cleanup = tool_builder._cleanup_staging
+    stopping = threading.Event()
+
+    def write(path: Path, text: str) -> bool:
+        if text != content:
+            return real_write(path, text)
+        try:
+            path.write_text("", encoding="utf-8")  # what the truncating open leaves
+            assert stopping.wait(15)
+            time.sleep(0.3)
+            return real_write(path, text)
+        finally:
+            seen.append("write returned")
+
+    async def stop_and_wait(self: tool_builder._BuilderShells) -> bool:
+        stopping.set()
+        answer = await real_stop(self)
+        seen.append(f"stop answered {answer}")
+        return answer
+
+    def strip(build_root: tools.BuildRoot, base: Path) -> Any:
+        seen.append("strip")
+        return real_strip(build_root, base)
+
+    def save(
+        context: Any, outcome: tool_drafts.RoundOutcome | None, error: str | None
+    ) -> tool_drafts.SaveResult:
+        seen.append("save")
+        return real_save(context, outcome, error)
+
+    def cleanup(staging: Path, base: Path) -> None:
+        seen.append("cleanup")
+        real_cleanup(staging, base)
+
+    monkeypatch.setattr(tools, "_write_regular_file", write)
+    monkeypatch.setattr(tool_builder._BuilderShells, "stop_and_wait", stop_and_wait)
+    monkeypatch.setattr(tool_builder, "_strip_builder_env", strip)
+    monkeypatch.setattr(tool_builder, "_save_round_draft", save)
+    monkeypatch.setattr(tool_builder, "_cleanup_staging", cleanup)
+
+
+@pytest.mark.parametrize("kind", ["install", "revise"])
+def test_a_deadline_mid_write_waits_for_the_write_before_the_workspace_is_touched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kind: str
+) -> None:
+    """The session's deadline fires while a write_file write is under way, its
+    file cut short and the rest not yet written. The stop answers only once the
+    write's worker has returned, and only then is the workspace stripped, saved
+    and removed: a revise's draft holds the whole file the write made, never the
+    file cut short."""
+    version = _seed_package(monkeypatch, tmp_path) if kind == "revise" else None
+    _session_settings(monkeypatch, tmp_path)
+    _endpoint_asking_for_one_call(
+        monkeypatch, "write_file", {"path": "run.py", "content": _REVISED_RUN_PY}
+    )
+    _no_fetch(monkeypatch)
+    seen: list[str] = []
+    _watch_the_write_and_the_workspace(monkeypatch, _REVISED_RUN_PY, seen)
+
+    if kind == "install":
+        outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build it"))
+    else:
+        outcome = asyncio.run(_run_revise("kbsearch", "fix it"))
+
+    assert outcome.ok is False
+    assert outcome.error is not None and "Timeout" in outcome.error
+    touched = ["strip", "cleanup"] if version is None else ["strip", "save", "cleanup"]
+    assert seen == ["write returned", "stop answered True", *touched]
+    if version is not None:
+        assert (_draft_files(version) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert _session_roots(tmp_path) == []
+
+
+def _meta_tools_by_name(staging: Path, shells: tool_builder._BuilderShells) -> dict[str, LlmTool]:
+    return {
+        tool.spec["function"]["name"]: tool for tool in _build_meta_tools(staging, shells=shells)
+    }
+
+
+def test_a_write_whose_worker_has_not_entered_at_the_stop_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The pool runs a write_file write's worker only after the session has
+    stopped, as when every pool thread is taken. The stop finds the worker not
+    entered and answers at once, with no wait; the worker, run then, finds the
+    stop set and writes nothing, and the model is told the write was not done."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "run.py").write_text("print('before')\n", encoding="utf-8")
+    real_pool = tool_builder.run_in_threadpool
+
+    async def scenario() -> tuple[str, bool, float]:
+        reached = asyncio.Event()
+        release = asyncio.Event()
+
+        async def pool_running_the_write_late(func: Any, *args: Any, **kwargs: Any) -> Any:
+            if getattr(func, "__qualname__", "").endswith("_BuilderShells.write.<locals>.worker"):
+                reached.set()
+                await release.wait()
+            return await real_pool(func, *args, **kwargs)
+
+        monkeypatch.setattr(tool_builder, "run_in_threadpool", pool_running_the_write_late)
+        shells = tool_builder._BuilderShells()
+        by_name = _meta_tools_by_name(staging, shells)
+        write = asyncio.ensure_future(
+            by_name["write_file"].handler({"path": "run.py", "content": _REVISED_RUN_PY})
+        )
+        await asyncio.wait_for(reached.wait(), 10)
+        started = time.monotonic()
+        stopped = await shells.stop_and_wait()
+        elapsed = time.monotonic() - started
+        release.set()
+        return await write, stopped, elapsed
+
+    result, stopped, elapsed = asyncio.run(scenario())
+
+    assert stopped is True
+    assert elapsed < 5 < tool_builder._shell_stop_seconds()
+    assert result == tool_builder._WRITE_NOT_DONE
+    assert (staging / "run.py").read_text(encoding="utf-8") == "print('before')\n"
+
+
+class _StopSignalWithAHeldRead(threading.Event):
+    """A session's stop signal whose first read by a worker thread is held: the
+    value is taken at the read and handed back only once ``release`` is set, so the
+    stop can be set, and can look at whether the worker entered, in between. Every
+    later read, and every read on the thread that made it, answers at once."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._owner = threading.get_ident()
+        self._held = threading.Lock()
+        self._first = True
+        self.read = threading.Event()
+        self.release = threading.Event()
+
+    def is_set(self) -> bool:
+        value = super().is_set()
+        if threading.get_ident() == self._owner:
+            return value
+        with self._held:
+            first, self._first = self._first, False
+        if first:
+            self.read.set()
+            self.release.wait(15)
+        return value
+
+
+@pytest.mark.parametrize("kind", ["write", "command"])
+def test_a_worker_registers_its_entry_before_it_reads_the_stop_so_the_stop_never_skips_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kind: str
+) -> None:
+    """A write_file write's worker, or a run_shell command's, reads the session's
+    stop signal as not set, and that read is held while the stop is set and looks
+    at whether the worker entered. The worker registered its entry before it read
+    the stop, so the stop waits for it: it answers only once the worker has
+    returned -- the write written, the command killed and reaped -- never while
+    the worker goes on as one that never entered."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    seen: list[str] = []
+    spawned = _record_spawns(monkeypatch)
+    real_run = tool_builder._run_shell_subprocess
+
+    def recorded_run(*args: Any) -> str:
+        try:
+            return real_run(*args)
+        finally:
+            seen.append("worker returned")
+
+    def write() -> str:
+        (staging / "notes.txt").write_text("whole", encoding="utf-8")
+        seen.append("worker returned")
+        return "wrote"
+
+    monkeypatch.setattr(tool_builder, "_run_shell_subprocess", recorded_run)
+
+    async def scenario() -> tuple[bool, bool, str]:
+        shells = tool_builder._BuilderShells()
+        stop = _StopSignalWithAHeldRead()
+        shells._stop = stop
+        if kind == "write":
+            work = asyncio.ensure_future(shells.write(write))
+        else:
+            work = asyncio.ensure_future(shells.run(staging, "sleep 30", 20, 4096, None))
+        assert await asyncio.to_thread(stop.read.wait, 15)
+        stopping = asyncio.ensure_future(shells.stop_and_wait())
+        stopping.add_done_callback(lambda task: seen.append(f"stop answered {task.result()}"))
+        for _ in range(5):
+            await asyncio.sleep(0)  # the stop sets the signal and looks at the worker
+        answered_while_held = stopping.done()
+        stop.release.set()
+        answer = await stopping
+        return answered_while_held, answer, await work
+
+    try:
+        answered_while_held, answer, result = asyncio.run(scenario())
+    finally:
+        _end_untorn(spawned)
+
+    assert answered_while_held is False
+    assert answer is True
+    assert seen == ["worker returned", "stop answered True"]
+    if kind == "write":
+        assert result == "wrote"
+        assert (staging / "notes.txt").read_text(encoding="utf-8") == "whole"
+    else:
+        assert result == tool_builder._SHELL_STOPPED
+        assert len(spawned) == 1 and not _group_exists(spawned[0].pid)
+
+
+@pytest.mark.parametrize("kind", ["install", "revise"])
+def test_a_write_not_confirmed_returned_keeps_its_workspace_and_the_job_still_ends(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    """A write_file write stuck in its worker, as on a disk that does not answer,
+    for longer than ``_shell_stop_seconds``. Nothing vouches that the workspace is
+    still, so the job neither strips, saves, publishes nor removes it: the
+    workspace stays where it was, the job's error and the backend log both name
+    it, and the job still ends and gives up the single flight."""
+    version = _seed_package(monkeypatch, tmp_path) if kind == "revise" else None
+    _session_settings(monkeypatch, tmp_path)
+    _endpoint_asking_for_one_call(
+        monkeypatch, "write_file", {"path": "run.py", "content": _REVISED_RUN_PY}
+    )
+    _no_fetch(monkeypatch)
+    held = threading.Event()
+    release = threading.Event()
+    real_write = tools._write_regular_file
+
+    def stuck(path: Path, text: str) -> bool:
+        if text == _REVISED_RUN_PY:
+            held.set()
+            release.wait(60)
+        return real_write(path, text)
+
+    monkeypatch.setattr(tools, "_write_regular_file", stuck)
+    monkeypatch.setattr(tool_builder, "_shell_stop_seconds", lambda: 0.3)
+    seen = _watch_workspace_steps(monkeypatch, lambda: None)
+
+    async def run_job() -> dict[str, Any]:
+        if kind == "install":
+            job_id = tool_builder.start_install_job("http://kb.example/openapi.json", "build it")
+        else:
+            job_id = (await tool_builder.start_revise_job("kbsearch", "fix it", _TEST_VID)).job_id
+        return await _job_when_done(job_id)
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+            job = asyncio.run(run_job())
+        flight_held = tool_builder.any_job_active()
+        kept = _session_roots(tmp_path)
+    finally:
+        release.set()
+
+    assert held.is_set()  # the write was under way when the session stopped
+    assert job["state"] == "failed"
+    assert flight_held is False
+    assert seen == []  # never stripped, never removed
+    assert len(kept) == 1
+    assert (kept[0] / "build").is_dir()
+    error = job["error"] or ""
+    assert "write_file" in error
+    assert str(kept[0]) in error
+    assert any(str(kept[0]) in record.getMessage() for record in caplog.records)
+    if version is not None:
+        assert not tool_drafts.has_draft(_package_root(version))
+        current = tools.resolve_current(_package_root(version))
+        assert isinstance(current, tools.Resolved) and current.vid == _TEST_VID
+
+
+def test_a_returned_write_does_not_vouch_for_a_command_left_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A session ran a write_file write, whose worker returned, and a run_shell
+    command whose drain raised before any teardown, whose worker returned as well
+    -- with no evidence that its process group is gone, and the group is indeed
+    still there. Every worker has returned, and the stop still answers False: a
+    worker that returned is a write's evidence, never a command's."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    spawned = _record_spawns(monkeypatch)
+    monkeypatch.setattr(tools, "_communicate_bounded", _drain_that_raises)
+
+    async def scenario() -> tuple[str, bool]:
+        shells = tool_builder._BuilderShells()
+        by_name = _meta_tools_by_name(staging, shells)
+        with pytest.raises(RuntimeError):
+            await shells.run(staging, "sleep 30", 20, 4096, None)
+        wrote = await by_name["write_file"].handler({"path": "notes.txt", "content": "half"})
+        return wrote, await shells.stop_and_wait()
+
+    try:
+        wrote, stopped = asyncio.run(scenario())
+        group_alive = len(spawned) == 1 and _group_exists(spawned[0].pid)
+    finally:
+        _end_untorn(spawned)
+
+    assert wrote.startswith("wrote")
+    assert group_alive  # what counting a returned worker as evidence would hide
+    assert stopped is False
+
+
+@pytest.mark.parametrize("first", ["command", "write"])
+def test_a_command_and_a_write_share_one_limit_whichever_reports_first(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, first: str
+) -> None:
+    """A run_shell command stuck before its first poll and a write_file write
+    stuck in its worker, both under way when the session stops. One of them is
+    let go partway through ``_shell_stop_seconds`` and reports; the other never
+    does. The stop answers False once the limit has passed since it began: one
+    limit for the two together, not a fresh one after the first report."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    limit = 1.0
+    monkeypatch.setattr(tool_builder, "_shell_stop_seconds", lambda: limit)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    spawned = _record_spawns(monkeypatch)
+    release = {"command": threading.Event(), "write": threading.Event()}
+    draining = threading.Event()
+    writing = threading.Event()
+    real_communicate = tools._communicate_bounded
+
+    def stuck_before_its_first_poll(proc: subprocess.Popen[str], **kwargs: Any) -> Any:
+        draining.set()
+        release["command"].wait(60)
+        return real_communicate(proc, **kwargs)
+
+    def stuck_write() -> str:
+        writing.set()
+        release["write"].wait(60)
+        return "wrote"
+
+    monkeypatch.setattr(tools, "_communicate_bounded", stuck_before_its_first_poll)
+
+    async def scenario() -> tuple[bool, float, str, str]:
+        shells = tool_builder._BuilderShells()
+        command = asyncio.ensure_future(shells.run(staging, "sleep 30", 20, 4096, None))
+        write = asyncio.ensure_future(shells.write(stuck_write))
+        while not (draining.is_set() and writing.is_set()):
+            await asyncio.sleep(0.01)
+        started = time.monotonic()
+        stopping = asyncio.ensure_future(shells.stop_and_wait())
+        await asyncio.sleep(limit * 0.6)
+        release[first].set()
+        answer = await stopping
+        elapsed = time.monotonic() - started
+        for event in release.values():
+            event.set()
+        return answer, elapsed, await command, await write
+
+    try:
+        answer, elapsed, ran, wrote = asyncio.run(scenario())
+    finally:
+        for event in release.values():
+            event.set()
+        if spawned:
+            _wait_for(lambda: not _group_exists(spawned[0].pid))
+
+    assert answer is False
+    assert limit * 0.9 <= elapsed < limit * 1.4  # the one limit, not a fresh one
+    assert ran == tool_builder._SHELL_STOPPED
+    assert wrote == "wrote"
+
+
+@pytest.mark.parametrize("loop_kind", ["asyncio", "uvloop"])
+def test_a_cancelled_write_task_counts_as_ended_only_once_its_worker_returns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, loop_kind: str
+) -> None:
+    """The event loop shutting down cancels every task still on it -- the
+    session's and its write's own task alike -- and a cancelled task is done
+    while the worker it waited on still writes. The session, stopping as it
+    unwinds, counts the write ended only on its worker's word that it returned,
+    by which time the file holds the whole write: the shutdown's gather keeps the
+    loop running, so the word reaches it."""
+    if loop_kind == "uvloop":
+        new_loop = pytest.importorskip("uvloop").new_event_loop
+    else:
+        new_loop = asyncio.new_event_loop
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    target = tmp_path / "notes.txt"
+    entered = threading.Event()
+
+    def slow_write() -> str:
+        entered.set()
+        time.sleep(0.3)  # still writing as the loop shuts down
+        target.write_text("whole", encoding="utf-8")
+        return "wrote"
+
+    seen: dict[str, Any] = {}
+    sessions: list[asyncio.Task[None]] = []
+
+    async def session() -> None:
+        shells = tool_builder._BuilderShells()
+        try:
+            await shells.write(slow_write)
+        finally:
+            seen["stopped"] = await shells.stop_and_wait()
+            seen["written"] = target.read_text(encoding="utf-8") if target.exists() else None
+
+    async def start_and_leave_running() -> None:
+        sessions.append(asyncio.ensure_future(session()))
+        for _ in range(1000):
+            if entered.is_set():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("the write never started")
+
+    runner = asyncio.Runner(loop_factory=new_loop)
+    try:
+        runner.run(start_and_leave_running())
+    finally:
+        # What the server's own shutdown does: cancel every task left on the loop,
+        # the write's task among them, and run the loop until they are done.
+        runner.close()
+
+    assert sessions[0].cancelled()
+    assert seen == {"stopped": True, "written": "whole"}
+
+
+def test_an_install_cancelled_while_its_promote_runs_lets_the_promote_finish(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The install is cancelled while its promote runs on its worker, held where
+    it is about to assemble the package from the staging. That worker goes on, so
+    the staging it installs from is not removed beside it: nothing cleans it up,
+    the session's root stays, named in the backend log, and once the worker is let
+    go the package is installed from it."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built", "ready": True},
+        files={"tool.json": json.dumps(_package_manifest("kbsearch")), "run.py": _GOOD_RUN_PY},
+    )
+    _no_fetch(monkeypatch)
+    entered = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+    real_validate = tools.validate_tool_content
+    real_promote = tool_builder._promote_staging
+    real_cleanup = tool_builder._cleanup_staging
+    cleaned: list[Path] = []
+
+    def validate(build_root: tools.BuildRoot, *, expected_name: str) -> str | None:
+        entered.set()
+        release.wait(10)
+        return real_validate(build_root, expected_name=expected_name)
+
+    def promote(*args: Any) -> Any:
+        try:
+            return real_promote(*args)
+        finally:
+            returned.set()
+
+    def cleanup(staging: Path, base: Path) -> None:
+        cleaned.append(staging)
+        real_cleanup(staging, base)
+
+    monkeypatch.setattr(tools, "validate_tool_content", validate)
+    monkeypatch.setattr(tool_builder, "_promote_staging", promote)
+    monkeypatch.setattr(tool_builder, "_cleanup_staging", cleanup)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(run_install("http://kb.example/openapi.json", "build it"))
+        for _ in range(1000):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert entered.is_set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        assert await asyncio.to_thread(returned.wait, 10)
+
+    with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+        asyncio.run(scenario())
+
+    assert cleaned == []
+    [session] = _session_roots(tmp_path)
+    assert any(str(session) in record.getMessage() for record in caplog.records)
+    current = tools.resolve_current(tools.PackageRoot(root / "kbsearch"))
+    assert isinstance(current, tools.Resolved)
+    assert (current.version_root.path / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY
 
 
 # --- drafts: what a revise round keeps with the tool (tool_drafts) -------------

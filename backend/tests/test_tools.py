@@ -3781,6 +3781,73 @@ def test_scan_embedded_secrets_fails_when_the_known_secrets_cannot_be_read(
     assert not hasattr(scan, "hits")
 
 
+def test_scan_embedded_secrets_finds_a_known_value_holding_a_crlf_by_its_normalized_form(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An installed tool's ``.env`` gives a value holding a CRLF, and a file holds
+    that value's very bytes. The scan reads text with universal newlines, so the
+    file holds the value with an LF in place of the CRLF: it is found by that
+    form, though the form is shorter than the floor."""
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n", dotenv='KB_KEY="ab\\r\\ncd"\n')
+    _install_tools(monkeypatch, root)
+    tools._ENV_VALUE_CACHE.clear()
+    assert "ab\r\ncd" in tools.known_secret_values()
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "notes.txt").write_bytes(b"prefix ab\r\ncd suffix")
+
+    scan = tools.scan_embedded_secrets(tree)
+
+    assert scan == tools.SecretScanDone(hits=(tools.SecretHit("notes.txt", "content"),), skipped=())
+
+
+def test_scan_embedded_secrets_finds_a_value_holding_a_lone_cr_in_a_file_of_its_bytes(
+    tmp_path: Path,
+) -> None:
+    """A value holding a lone CR, and a file holding exactly its bytes. Read with
+    universal newlines, the file holds the value with an LF in the CR's place,
+    and that form is found."""
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "data.bin").write_bytes(b"alpha\rbeta")
+
+    scan = tools.scan_embedded_secrets(tree, ["alpha\rbeta"])
+
+    assert scan == tools.SecretScanDone(hits=(tools.SecretHit("data.bin", "content"),), skipped=())
+
+
+def test_scan_embedded_secrets_finds_a_value_holding_an_lf_in_a_file_with_crlf_line_breaks(
+    tmp_path: Path,
+) -> None:
+    """A value holding an LF, and a file that differs from it only in its line
+    breaks -- written with CRLF. That counts as holding it: the file is found."""
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "key.pem").write_bytes(b"-----BEGIN-----\r\nline-one\r\nline-two\r\n-----END-----\r\n")
+
+    scan = tools.scan_embedded_secrets(tree, ["line-one\nline-two"])
+
+    assert scan == tools.SecretScanDone(hits=(tools.SecretHit("key.pem", "content"),), skipped=())
+
+
+def test_a_value_under_the_floor_adds_no_form_though_it_holds_a_crlf(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``ab\\r\\nc`` is five characters, under the floor, so it adds no form -- not
+    itself, and not its normalized form: text holding either is masked nowhere,
+    and no scan finds a file holding either."""
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({"ab\r\nc"}))
+    text = "x ab\r\nc y ab\nc z"
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "notes.txt").write_bytes(text.encode("utf-8"))
+
+    assert tools._match_forms(["ab\r\nc"]) == []
+    assert tools.redact_known_secrets(text) == text
+    assert tools.scan_embedded_secrets(tree) == tools.SecretScanDone(hits=(), skipped=())
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root can list a mode-000 directory")
 def test_scan_embedded_secrets_fails_when_a_directory_cannot_be_listed(tmp_path: Path) -> None:
     """A directory the scan cannot list may hold anything, so the scan fails
@@ -4705,6 +4772,37 @@ def test_a_body_masked_whole_live_but_recorded_while_its_env_is_unreadable_is_no
     assert attempt["response_content"] == llm_log._UNCHECKED_MARKER
 
 
+def test_the_ai_log_masks_a_known_value_holding_a_crlf_in_its_normalized_form_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The AI log, wired to the tools registry the way the app wires it, masks a
+    value an installed tool's ``.env`` gives with a CRLF both as it is and with
+    an LF in the CRLF's place -- the form text read with universal newlines holds
+    it in."""
+    from afterthread import main
+
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n", dotenv='KB_KEY="kb-head\\r\\nkb-tail"\n')
+    _install_tools(monkeypatch, root)
+    tools._ENV_VALUE_CACHE.clear()
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    monkeypatch.setattr(llm_log, "_secret_provider", llm_log._secret_provider)
+    main._configure_secret_redaction()
+    llm_log._reset_for_tests()
+
+    recorder = llm_log.LlmInteractionRecorder(workflow="probe", model="m")
+    recorder.begin_attempt([{"role": "user", "content": "it read kb-head\nkb-tail back"}])
+    recorder.record_response("and wrote kb-head\r\nkb-tail too")
+    recorder.finish(outcome="ok", error=None)
+
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    attempt = record["attempts"][0]
+    marker = llm_log._REDACTION_MARKER
+    assert attempt["request_messages"][0]["content"] == f"it read {marker} back"
+    assert attempt["response_content"] == f"and wrote {marker} too"
+
+
 def test_redaction_marker_matches_llm_log() -> None:
     """tools._REDACTION_MARKER and llm_log._REDACTION_MARKER MUST be byte-identical:
     a secret masked in a live tool result and one masked in the AI 日誌 have to be
@@ -4734,6 +4832,21 @@ def test_mask_known_secrets_source_identical_in_both_modules() -> None:
     )
 
 
+def test_match_forms_source_identical_in_both_modules() -> None:
+    """tools._match_forms and llm_log._match_forms MUST be byte-for-byte identical:
+    the live mask and the stored-body mask take the same values in the same forms,
+    so a value masked in a live tool result is masked in the AI 日誌 too. A future
+    edit applied to one copy and not mirrored to the other fails here."""
+    assert inspect.getsource(tools._match_forms) == inspect.getsource(llm_log._match_forms)
+
+
+def test_min_secret_len_matches_llm_log() -> None:
+    """tools._MIN_SECRET_LEN and llm_log._MIN_SECRET_LEN MUST be the same value:
+    each ``_match_forms`` looks the floor up BY NAME in its own module, so identical
+    source would still keep different values if the two modules disagreed."""
+    assert tools._MIN_SECRET_LEN == llm_log._MIN_SECRET_LEN
+
+
 def test_redact_known_secrets_masks_and_skips_short(monkeypatch: pytest.MonkeyPatch) -> None:
     """redact_known_secrets masks every known value and SKIPS values under the
     6-char floor (mirroring llm_log._redact), replacing with the shared marker."""
@@ -4754,6 +4867,21 @@ def test_redact_known_secrets_longest_first(monkeypatch: pytest.MonkeyPatch) -> 
     assert "abcdefXYZ789" not in out
     assert "XYZ789" not in out  # the suffix a shorter-first pass would have leaked
     assert out.count(tools._REDACTION_MARKER) == 1
+
+
+def test_redact_known_secrets_masks_a_value_and_its_normalized_form_in_one_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``ab\\r\\nab`` and its normalized form ``ab\\nab`` overlap in the text: the
+    value's occurrence ends where the form's begins. Both are found on the text as
+    it is and their ranges merged, so one marker covers the two -- masking one and
+    then looking for the other would leave a piece of it -- and the text's other
+    line breaks stay as they were."""
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({"ab\r\nab"}))
+
+    out = tools.redact_known_secrets("head\r\nab\r\nab\nab tail\r\n")
+
+    assert out == f"head\r\n{tools._REDACTION_MARKER} tail\r\n"
 
 
 def test_redact_known_secrets_masks_trailing_prefix_fragment(
