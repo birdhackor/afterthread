@@ -5474,6 +5474,76 @@ def test_sweep_collects_marked_backup_without_local_provenance(tmp_path: Path) -
     assert not no_manifest.exists()
 
 
+def _discarded_version(package: Path) -> Path:
+    """``<package>/versions/<vid>.discarded``, as a discard that could not remove the
+    committed version it moved aside leaves it: its ``origin.json`` and a file."""
+    parked = package / tools._VERSIONS_DIRNAME / f"{_TEST_VID}.discarded"
+    (parked / tools._META_DIRNAME).mkdir(parents=True)
+    (parked / tools._META_DIRNAME / tools._ORIGIN_FILENAME).write_text(
+        json.dumps(
+            {
+                "source": "test-fixture",
+                "openapi_url": None,
+                "instructions": None,
+                "feedback": None,
+                "previous": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (parked / "run.py").write_text("print('x')\n", encoding="utf-8")
+    assert tools.read_origin_meta(tools.VersionRoot(parked)) is not None
+    return parked
+
+
+@pytest.mark.parametrize("failing", [1, 100], ids=["first-look", "every-look"])
+def test_the_sweep_does_not_go_into_a_package_alias_whose_look_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failing: int
+) -> None:
+    """``alias`` in the tools directory is a link to a package outside it, whose
+    ``versions/`` holds a discarded committed version, and the look at the link
+    fails. The sweep passes over what it could not see: the version there stays, and
+    the alias is still a link. It goes on to the next package all the same, and
+    collects that one's own discarded version."""
+    base = tmp_path / "tools"
+    base.mkdir()
+    outside = _discarded_version(tmp_path / "elsewhere" / "kbsearch")
+    alias = base / "alias"
+    alias.symlink_to(outside.parents[1], target_is_directory=True)
+    own = _discarded_version(base / "zzreal")
+
+    with monkeypatch.context() as patch:
+        failed = _first_looks_fail(patch, alias, failing)
+        tool_builder._sweep_stale_backups(base)
+
+    assert failed
+    assert (outside / "run.py").is_file()
+    assert alias.is_symlink()
+    assert not own.exists()
+
+
+def test_the_sweep_does_not_go_through_a_versions_directory_that_is_a_link(
+    tmp_path: Path,
+) -> None:
+    """A package in the tools directory whose ``versions/`` is a link to the
+    ``versions/`` of a package outside it, which holds a discarded committed
+    version: the sweep does not go through the link, so that version stays. It still
+    collects the next package's own discarded version."""
+    base = tmp_path / "tools"
+    base.mkdir()
+    outside = _discarded_version(tmp_path / "elsewhere" / "kbsearch")
+    linked = base / "kbsearch"
+    linked.mkdir()
+    (linked / tools._VERSIONS_DIRNAME).symlink_to(outside.parent, target_is_directory=True)
+    own = _discarded_version(base / "zzreal")
+
+    tool_builder._sweep_stale_backups(base)
+
+    assert (outside / "run.py").is_file()
+    assert (linked / tools._VERSIONS_DIRNAME).is_symlink()
+    assert not own.exists()
+
+
 def test_fsync_tree_skips_directory_symlinks_outside_the_build(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -6616,27 +6686,26 @@ def test_run_revise_keeps_a_hard_linked_root_env_case_variant(
     assert (_package_path(pkg) / ".env").read_text(encoding="utf-8") == shared  # ... and restored
 
 
-def test_is_preserved_env_name_excludes_the_variant_a_lone_listing_carries(
+def test_withheld_root_names_tells_a_lone_case_alias_by_its_lstat_identity(
     tmp_path: Path,
 ) -> None:
-    """The one shape only a case-INSENSITIVE filesystem produces, tested directly
-    (R6-2).
+    """The one shape only a case-INSENSITIVE filesystem produces, tested directly.
 
     ``run_revise`` cannot reach it on this host: a case-insensitive filesystem
     carries ONE entry for the pair, which is a listing without ``.env`` where
     ``<root>/.env`` still opens the variant -- and no case-sensitive host can
-    produce that combination end to end. Passing ``exact_present=False`` over a
-    hard-linked pair reproduces exactly what the callback would see there, so the
-    branch that keeps live credentials out of staging on macOS is pinned rather
-    than assumed.
+    produce that combination end to end. Handing ``tool_drafts.withheld_root_names``
+    a listing without ``.env`` over a hard-linked pair reproduces exactly what a
+    first round's copy (``_revise_copy_ignore``) is handed there, so the branch that
+    keeps live credentials out of staging on macOS is pinned rather than assumed.
 
     The rest of the matrix goes with it, because the discriminator is the pair of
-    conditions and not either half: the exact name always excluded, the variant
-    NEVER excluded once the listing also carries ``.env`` (however the two are
+    conditions and not either half: the exact name always left out, the variant
+    NEVER left out once the listing also carries ``.env`` (however the two are
     linked), no ``.env`` at all meaning nothing to be the same entry as, and a
     SYMLINK staying ordinary content -- the reason the identity test is ``lstat``
-    and not a following stat, since excluding a distinct entry that is never
-    restored is the deletion bug all over again."""
+    and not a following stat, since leaving out a distinct entry would drop it from
+    the next version."""
     if not _case_sensitive_filesystem(tmp_path):
         # The fixtures below need two entries to exist at once to SIMULATE the one
         # this branch is about; a case-insensitive host cannot hold them.
@@ -6646,27 +6715,119 @@ def test_is_preserved_env_name_excludes_the_variant_a_lone_listing_carries(
     (root / ".env").write_text("MODE=\n", encoding="utf-8")
     os.link(root / ".env", root / ".ENV")
 
+    def withheld(*listed: str) -> dict[str, str]:
+        return dict(tool_drafts.withheld_root_names(root, listed))
+
     # The exact name is the managed file whatever else the listing holds.
-    assert tool_builder._is_preserved_env_name(root, ".env", exact_present=True) is True
-    assert tool_builder._is_preserved_env_name(root, ".env", exact_present=False) is True
+    assert withheld(".env") == {".env": "env_file"}
     # A listing WITHOUT the exact name = the case-insensitive one-entry world.
-    assert tool_builder._is_preserved_env_name(root, ".ENV", exact_present=False) is True
+    assert withheld(".ENV") == {".ENV": "env_file"}
     # A listing WITH it = two entries, so the variant is the package's own content.
-    assert tool_builder._is_preserved_env_name(root, ".ENV", exact_present=True) is False
+    assert withheld(".env", ".ENV") == {".env": "env_file"}
     # An unrelated name is never in question.
-    assert tool_builder._is_preserved_env_name(root, "env", exact_present=False) is False
+    assert withheld("env") == {}
 
     (root / ".ENV").unlink()
     (root / ".env").unlink()
     # Nothing for the variant to BE the same entry as -> ordinary content.
     (root / ".ENV").write_text("MODE=\n", encoding="utf-8")
-    assert tool_builder._is_preserved_env_name(root, ".ENV", exact_present=False) is False
+    assert withheld(".ENV") == {}
     (root / ".ENV").unlink()
 
     # A SYMLINK is a distinct entry: lstat keeps it one, a following stat would not.
     (root / ".env").write_text("MODE=\n", encoding="utf-8")
     (root / ".ENV").symlink_to(".env")
-    assert tool_builder._is_preserved_env_name(root, ".ENV", exact_present=False) is False
+    assert withheld(".ENV") == {}
+
+
+def _first_round_copy(version: Path, tmp_path: Path) -> Path:
+    """``version`` copied as a first round copies the version it starts from
+    (``_copy_package_into_staging``); the copy, which must have been made."""
+    staging = tmp_path / "staging" / "build"
+    made = tool_builder._copy_package_into_staging(
+        tools.VersionRoot(version), tools.BuildRoot(staging)
+    )
+    assert made is None
+    return staging
+
+
+def _version_with(tmp_path: Path, *top: str) -> Path:
+    """A version-shaped directory holding ``run.py`` and, at its top, a file under
+    each name in ``top``."""
+    version = tmp_path / "version"
+    version.mkdir()
+    (version / "run.py").write_text("print('x')\n", encoding="utf-8")
+    for name in top:
+        (version / name).write_text("placed by hand\n", encoding="utf-8")
+    return version
+
+
+def test_a_first_round_copy_leaves_out_each_root_name_stripped_root_names_lists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A name added to ``tool_drafts.STRIPPED_ROOT_NAMES`` is left out of a first
+    round's copy of the version at its root, as the names already there are; below
+    the root the same names are the tool's own content and are copied."""
+    added = typing.cast(tool_drafts.OmitReason, "sentinel")
+    monkeypatch.setitem(tool_drafts.STRIPPED_ROOT_NAMES, added, ".sentinel-root-name")
+    stripped = sorted(tool_drafts.STRIPPED_ROOT_NAMES.values())
+    version = _version_with(tmp_path, *stripped)
+    (version / "sub").mkdir()
+    for name in stripped:
+        (version / "sub" / name).write_text("placed below the root\n", encoding="utf-8")
+
+    staging = _first_round_copy(version, tmp_path)
+
+    assert sorted(os.listdir(staging)) == ["run.py", "sub"]
+    assert sorted(os.listdir(staging / "sub")) == stripped
+
+
+@pytest.mark.parametrize("reason", sorted(tool_drafts.STRIPPED_ROOT_NAMES))
+def test_a_first_round_copy_leaves_out_a_case_alias_whose_identity_cannot_be_told(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reason: tool_drafts.OmitReason
+) -> None:
+    """At the root of the version, a name ``tool_drafts.STRIPPED_ROOT_NAMES`` lists,
+    spelled in another case and alone, and the look at the name as listed fails:
+    whether the two are one entry cannot be told, so a first round's copy leaves it
+    out -- it is not known not to be that entry. The version keeps it."""
+    listed = tool_drafts.STRIPPED_ROOT_NAMES[reason]
+    alias = listed.title()
+    version = _version_with(tmp_path, alias)
+
+    with monkeypatch.context() as patch:
+        failed = _first_looks_fail(patch, version / listed, 100)
+        staging = _first_round_copy(version, tmp_path)
+
+    assert sorted(os.listdir(staging)) == ["run.py"]
+    assert failed  # the look this is about was made, and failed
+    assert (version / alias).read_text(encoding="utf-8") == "placed by hand\n"
+
+
+@pytest.mark.parametrize("same", [True, False], ids=["same-entry", "another-entry"])
+@pytest.mark.parametrize("reason", sorted(tool_drafts.STRIPPED_ROOT_NAMES))
+def test_a_first_round_copy_leaves_out_a_case_alias_only_when_it_is_the_same_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reason: tool_drafts.OmitReason, same: bool
+) -> None:
+    """At the root of the version, a name ``tool_drafts.STRIPPED_ROOT_NAMES`` lists,
+    spelled in another case and alone. Where it is the same entry -- a filesystem
+    that does not tell case apart, as the look ``tool_drafts._same_entry`` makes
+    answers here -- a first round's copy leaves it out; where it is another entry it
+    is the tool's own content, and is copied."""
+    listed = tool_drafts.STRIPPED_ROOT_NAMES[reason]
+    alias = listed.title()
+    version = _version_with(tmp_path, alias)
+    asked: list[tuple[str, str]] = []
+
+    def same_entry(first: Path, second: Path) -> bool:
+        asked.append((first.name, second.name))
+        return same
+
+    monkeypatch.setattr(tool_drafts, "_same_entry", same_entry)
+
+    staging = _first_round_copy(version, tmp_path)
+
+    assert sorted(os.listdir(staging)) == (["run.py"] if same else [alias, "run.py"])
+    assert asked == [(alias, listed)]  # the one look that answers it was made
 
 
 def test_run_revise_keeps_a_root_env_case_variant_that_is_a_symlink(
@@ -11010,6 +11171,134 @@ def test_a_publish_still_running_when_its_revise_is_cancelled_keeps_the_workspac
     assert (_draft_files(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
     [session] = _session_roots(tmp_path)
     assert (session / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+
+
+def _revise_cancelled_while_copying(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pkg: Path, *, continuing: bool
+) -> list[Path]:
+    """Run one revise -- a round continuing ``pkg``'s draft when ``continuing``, a
+    first round otherwise -- and cancel it while its copy into the staging runs on
+    its worker; then let that worker go on to its end. Returns the session
+    workspaces there are once the cancellation has gone through, before the worker
+    goes on.
+
+    The worker held is the real one: a continuation's where it is about to write
+    the copy of the draft (``tool_drafts._carry_out``), a first round's once its
+    copy of the version is made, before it returns."""
+    entered = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+
+    def hold() -> None:
+        entered.set()
+        release.wait(10)
+
+    if continuing:
+        real_carry_out = tool_drafts._carry_out
+        real_copy_in = tool_drafts.copy_into_workspace
+
+        def carry_out(plan: Any, incoming: Path, known: list[str]) -> Any:
+            hold()
+            return real_carry_out(plan, incoming, known)
+
+        def copy_in(**kwargs: Any) -> Any:
+            try:
+                return real_copy_in(**kwargs)
+            finally:
+                returned.set()
+
+        monkeypatch.setattr(tool_drafts, "_carry_out", carry_out)
+        monkeypatch.setattr(tool_drafts, "copy_into_workspace", copy_in)
+    else:
+        real_copy = tool_builder._copy_package_into_staging
+
+        def copy(source: tools.VersionRoot, staging: tools.BuildRoot) -> str | None:
+            try:
+                answer = real_copy(source, staging)
+                hold()
+                return answer
+            finally:
+                returned.set()
+
+        monkeypatch.setattr(tool_builder, "_copy_package_into_staging", copy)
+    during: list[Path] = []
+
+    async def scenario() -> None:
+        revise = (
+            _continue_revise(pkg, "分頁從 1 開始")
+            if continuing
+            else _run_revise("kbsearch", "加上分頁")
+        )
+        task = asyncio.create_task(revise)
+        for _ in range(1000):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert entered.is_set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        during.extend(_session_roots(tmp_path))
+        release.set()
+        assert await asyncio.to_thread(returned.wait, 10)
+
+    asyncio.run(scenario())
+    return during
+
+
+def _names_kept_for_the_copy(caplog: pytest.LogCaptureFixture, session: Path) -> bool:
+    """Whether the backend log, where it names ``session``, says a copy into it may
+    still be writing it."""
+    return any(
+        str(session) in record.getMessage() and "copy" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_a_continuation_cancelled_while_its_copy_runs_leaves_the_staging_to_the_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Cancelled while the copy of the draft into its staging runs on its worker:
+    the worker goes on, so the staging is not removed beside it -- it is there once
+    the cancellation has gone through, holds the whole copy once the worker is done,
+    and the backend log names it. The draft, which the copy only read, keeps its
+    files, and its manifest keeps the round's ``running`` mark for the next round to
+    record."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    files_before = _file_bytes(_draft_files(pkg))
+
+    with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+        during = _revise_cancelled_while_copying(monkeypatch, tmp_path, pkg, continuing=True)
+
+    [session] = _session_roots(tmp_path)
+    assert during == [session]
+    assert _file_bytes(session / "build") == files_before
+    assert _file_bytes(_draft_files(pkg)) == files_before
+    assert _draft_manifest(pkg)["running"] is not None
+    assert _names_kept_for_the_copy(caplog, session)
+
+
+def test_a_first_round_cancelled_while_its_copy_runs_leaves_the_staging_to_the_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Cancelled while the copy of the version into its staging runs on its worker
+    -- made, not yet returned: the staging is not removed beside it -- it is there
+    once the cancellation has gone through, holds the copy once the worker is done,
+    and the backend log names it. The round never began, so no draft is made."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+        during = _revise_cancelled_while_copying(monkeypatch, tmp_path, pkg, continuing=False)
+
+    [session] = _session_roots(tmp_path)
+    assert during == [session]
+    assert _file_bytes(session / "build") == {
+        "run.py": (pkg / "run.py").read_bytes(),
+        "tool.json": (pkg / "tool.json").read_bytes(),
+    }
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    assert _names_kept_for_the_copy(caplog, session)
 
 
 def test_deleting_the_tool_while_its_draft_is_saved_is_refused(

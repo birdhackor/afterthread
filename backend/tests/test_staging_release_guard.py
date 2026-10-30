@@ -4,9 +4,10 @@ of the two removes it under.
 
 ``tool_builder.run_revise`` removes a round's staging only on its release
 condition, written out atom by atom in its comment on ``holding``: the commands
-confirmed stopped, no publish worker still writing, and ``holding`` lowered --
-nothing worth keeping, the draft holding the work (``saved`` and ``durable``),
-published, or moved out. ``tool_builder.run_publish_draft`` removes its staging
+confirmed stopped, no publish worker and no worker copying into it still
+writing, and ``holding`` lowered -- nothing worth keeping, the draft holding the
+work (``saved`` and ``durable``), published, or moved out.
+``tool_builder.run_publish_draft`` removes its staging
 only on its own, written out in its comment above its flags: no worker copying
 the draft in or publishing it still writing, and ``holding`` lowered --
 published, moved out, or the draft seen to hold what the staging does. Three
@@ -16,8 +17,8 @@ kinds of code produce those atoms:
   handed a value that can count towards the removal (anything but the constant
   ``False``, or for ``worth_saving`` anything but ``True``), in
   ``tool_drafts.py`` and ``tool_builder.py``;
-* ``run_revise`` itself -- each statement binding ``holding``, ``shells_ended``
-  or ``publish_running``;
+* ``run_revise`` itself -- each statement binding ``holding``, ``shells_ended``,
+  ``publish_running`` or ``copy_running``;
 * ``run_publish_draft`` itself -- each statement binding ``copy_running``,
   ``publish_running`` or ``holding``.
 
@@ -46,7 +47,7 @@ from afterthread.services import tool_builder, tool_drafts
 # A save's result: each keyword, and the one constant that counts for keeping.
 _KEEPING = {"saved": False, "durable": False, "worth_saving": True}
 # The names ``run_revise``'s release condition is made of.
-_ATOMS = ("holding", "shells_ended", "publish_running")
+_ATOMS = ("holding", "shells_ended", "publish_running", "copy_running")
 # The names ``run_publish_draft``'s release condition is made of.
 _PUBLISH_ATOMS = ("copy_running", "publish_running", "holding")
 # What removes a job's staging.
@@ -246,8 +247,8 @@ _REGISTERED: list[tuple[str, str, str]] = [
     (
         "tool_builder.run_revise",
         "shells_ended = True",
-        "no session yet: no command was started, so none can be using the staging, which "
-        "holds only the copy the round was given",
+        "no session yet: no command was started, so none can be using the staging; a "
+        "worker that may still be copying the round's start into it is copy_running's",
     ),
     (
         "tool_builder.run_revise",
@@ -316,6 +317,36 @@ _REGISTERED: list[tuple[str, str, str]] = [
         "publish_running = False",
         "the worker returned its result: it writes the staging no more",
     ),
+    (
+        "tool_builder.run_revise",
+        "copy_running = False",
+        "no copy worker has started",
+    ),
+    *[
+        row
+        for copied in (
+            "the version a first round starts from",
+            "the draft a continuation works on",
+        )
+        for row in (
+            (
+                "tool_builder.run_revise",
+                "copy_running = True",
+                f"the worker copying {copied} into the staging is about to start writing it",
+            ),
+            (
+                "tool_builder.run_revise",
+                "copy_running = False",
+                "the copy ended in an exception, the worker's own or one before it began: no "
+                "worker writes the staging any more",
+            ),
+            (
+                "tool_builder.run_revise",
+                "copy_running = False",
+                "the copy worker returned its result: it writes the staging no more",
+            ),
+        )
+    ],
     (
         "tool_builder.run_publish_draft",
         "copy_running = False",
@@ -396,10 +427,11 @@ _REGISTERED: list[tuple[str, str, str]] = [
 _RELEASES: list[tuple[str, str, str]] = [
     (
         "tool_builder.run_revise",
-        "shells_ended and not (holding or publish_running)",
+        "shells_ended and not (holding or publish_running or copy_running)",
         "the staging is removed only when every run_shell command is confirmed stopped, "
-        "no publish worker may still be writing it, and nothing in it is held for the "
-        "operator; the bindings of each atom are registered above",
+        "neither a publish worker nor a worker copying into it may still be writing it, "
+        "and nothing in it is held for the operator; the bindings of each atom are "
+        "registered above",
     ),
     (
         "tool_builder.run_publish_draft",
@@ -479,6 +511,8 @@ _BOUND: list[tuple[str, str]] = [
         "shells_ended = await shells.stop_and_wait()",
     ),
     ("publish_running = True\n", "publish_running = True"),
+    ("copy_running = True\n", "copy_running = True"),
+    ("try:\n    pass\nexcept Exception:\n    copy_running = False\n", "copy_running = False"),
     ("def inner():\n    nonlocal holding\n    holding = True\n", "holding = True"),
 ]
 

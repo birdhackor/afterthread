@@ -515,8 +515,10 @@ discard_token, last}`：`state` 依序判定為 `running`（本行程有一輪�
   `secret_name`／`secret_value` 是另一條後端受控路徑：值注入 `run_shell`、全程
   遮蔽，最後才由後端寫進 package `.env`，從未交給 builder。
 - **修訂只新增版本，不再換整包**：`run_revise` 從目前的 `VersionRoot` 複製工具
-  內容到 `build`（接續時改從草稿的檔案目錄複製，見下方「接續草稿」）；只排除該版後端自己的根層
-  `.afterthread.meta/` 與 package `.env`。版本中的 legacy `.ai_meta.json`、FOREIGN
+  內容到 `build`（接續時改從草稿的檔案目錄複製，見下方「接續草稿」）；只排除根層裡保存前會被剝掉的名字
+  （`tool_drafts.STRIPPED_ROOT_NAMES`：該版後端自己的 `.afterthread.meta/` 與 `.env`），各含大小寫不同、
+  確認是同一個條目的名字，判斷不了是不是同一個條目時也排除（版本裡仍有它）——與接續時不帶入的根目錄條目
+  是同一條規則。子目錄裡的同名項目都是工具內容。版本中的 legacy `.ai_meta.json`、FOREIGN
   `.afterthread-state.json`（包含 migration 帶入者）及其巢狀同名檔都是工具內容，
   會進工作區並隨新版本保留。package `.env` 不被複製或改寫，只把解析後的值注入
   `run_shell` 供實測與遮蔽；`config.env` 的值墊在它底下一起注入，文字與 `.env`
@@ -597,7 +599,9 @@ discard_token, last}`：`state` 依序判定為 `running`（本行程有一輪�
   筆記時已知秘密讀不完整（這時說明檔什麼都不寫）、builder 的 `.env` 剝除失敗（不存檔案）：成果在暫存目錄
   就原地不動（sweep 照常執行，它不看 `.staging`），後端記錄寫出它的路徑；發布失敗時成果已搬進
   `versions/<vid>`（`current` 沒指到的那一版），就留著那一版，暫存目錄照常清掉。工作的
-  `draft.retained_path` 寫出成果當下所在的路徑（工作區本身確認不了時不給）。
+  `draft.retained_path` 寫出成果當下所在的路徑（工作區本身確認不了時不給）。開始對話之前，工作在複製進
+  暫存工作區（第一輪從版本、接續從草稿）的途中被取消時，暫存目錄也不清：取消不會停下複製的 worker，它可能
+  還在寫；暫存原地保留，後端記錄寫出路徑。
   保留之前一律先剝除 builder 的 `.env`：指令確認停止後先剝除，再遮蔽筆記、再保存；之後若因例外或取消
   （例如後端正常關閉）中止，保留之前補剝。剝除或補剝失敗時照樣保留，不清掉：讓剝除的 `unlink` 失敗的原因
   （例如 builder 把工作區改成唯讀）通常也會讓清除對同一個檔案失敗，清掉只會留下那個 `.env`、刪掉其他還刪
@@ -619,8 +623,9 @@ discard_token, last}`：`state` 依序判定為 `running`（本行程有一輪�
   權限位元（至少擁有者可讀寫）。保存前會被剝掉的根目錄名字——`.env` 與 `.afterthread.meta/`，各含大小寫
   不同、其實是同一個條目的名字，判斷不了時也算——不帶入：帶進來的話，保存前的剝除會把它刪掉（在不分大小寫
   的檔案系統上，剝除用的路徑也碰得到別名），新的一份就沒有它，上一份又因為整份都帶進來、沒被改過而被刪；
-  草稿裡的 `.env` 的值也不是已知秘密，`read_file` 讀進對話就沒有東西遮得掉它。這份名單與兩個剝除
-  （`_strip_builder_env`、`_strip_builder_sidecars`）取自同一個定義 `tool_drafts.STRIPPED_ROOT_NAMES`。
+  草稿裡的 `.env` 的值也不是已知秘密，`read_file` 讀進對話就沒有東西遮得掉它。這份名單、兩個剝除
+  （`_strip_builder_env`、`_strip_builder_sidecars`）與第一輪從版本複製時排除的名字，取自同一個定義
+  `tool_drafts.STRIPPED_ROOT_NAMES`。
   沒帶入的路徑記在那一輪，也告訴模型。複製、掃描或大小上限不過時，清掉自己的 `running`，不算
   一輪。之後每個正常出口（對話結束、指令確認停止）都把這一輪記進說明檔一次並清掉 `running`：保存已經記下
   的不再記；工作區確認不了、剝除失敗、保存沒寫成時，另外寫一次只記這一輪。接著要發布的那次保存沒存成時，

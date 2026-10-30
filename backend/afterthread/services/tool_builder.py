@@ -3044,8 +3044,13 @@ def _sweep_stale_backups(base: Path) -> None:
     observed-running judgements. If any request or orphaned tool child still
     holds the shared side, the whole sweep is skipped and a later tool job
     retries. Hidden entries outside the marked namespace and symlinks are never
-    traversed. A package's draft leftovers are ``tool_drafts.sweep_package``'s,
-    which runs under this same lock and takes none of its own.
+    traversed. A package directory and its ``versions/`` are gone into only when
+    one ``lstat`` of each sees a real directory (``tool_drafts._is_real_dir``): one
+    seen to be a link, or that cannot be looked at, is passed over, since through
+    a link the discarded versions would be another package's -- maybe one outside
+    the tools directory. A package's draft leftovers are
+    ``tool_drafts.sweep_package``'s, which runs under this same lock and takes none
+    of its own.
     """
     with tools.exclusive_tools_lock(base) as acquired:
         if not acquired:
@@ -3063,14 +3068,12 @@ def _sweep_stale_backups(base: Path) -> None:
             # best-effort cleanup fails. Retry only the exact committed namespace;
             # ordinary retained versions never match.
             for child in sorted(base.iterdir()):
-                if (
-                    not tools._NAME_RE.fullmatch(child.name)
-                    or child.is_symlink()
-                    or not child.is_dir()
-                ):
+                if not tools._NAME_RE.fullmatch(child.name) or not tool_drafts._is_real_dir(child):
                     continue
                 tool_drafts.sweep_package(child, fsync_directory=_fsync_directory)
                 versions = child / tools._VERSIONS_DIRNAME
+                if not tool_drafts._is_real_dir(versions):
+                    continue
                 try:
                     entries = sorted(versions.iterdir())
                 except OSError:
@@ -3134,9 +3137,10 @@ def _cleanup_staging(staging: Path, base: Path) -> None:
     Two kinds of exit never call this. One is a session whose run_shell commands
     could not be confirmed stopped (``_BuilderShells``): its workspace is kept
     whole, and that session skips the sweep as well -- the next job's call runs
-    it. The other is a revise that keeps its staging, for work no one holds or
-    for a publish worker that may still be writing it (``run_revise``), and runs
-    the sweep without removing anything. Nothing in the backend ever collects
+    it. The other is a revise or a publish of a draft that keeps its staging -- for
+    work no one holds, or for a worker copying into it or publishing it that may
+    still be writing it (``run_revise``, ``run_publish_draft``) -- and runs the
+    sweep without removing anything. Nothing in the backend ever collects
     what either keeps: a later job's call removes only its own session root, and
     ``.staging`` only once empty, while the sweep never looks inside
     ``.staging``. Only the operator removes it.
@@ -3401,49 +3405,28 @@ async def run_install(
 # --- the revise run -----------------------------------------------------------
 
 
-def _is_preserved_env_name(root: Path, filename: str, *, exact_present: bool) -> bool:
-    """Identify the exact package-root ``.env`` entry withheld from a build.
-
-    Case variants are ordinary version content when the filesystem carries both
-    names. A lone case-folded alias is withheld only when it is the same entry.
-    """
-    if filename == ".env":
-        return True
-    if exact_present or filename.casefold() != ".env":
-        return False
-    try:
-        candidate = os.lstat(root / filename)
-        managed = os.lstat(root / ".env")
-    except OSError:
-        return False
-    return (candidate.st_dev, candidate.st_ino) == (managed.st_dev, managed.st_ino)
-
-
 def _revise_copy_ignore(root: Path, source_dir: Any, names: list[str]) -> set[str]:
-    """Exclude backend metadata and the package ``.env`` from a version copy.
+    """The names ``shutil.copytree`` leaves out of a first round's copy of the
+    version at ``root``: in ``root`` itself, those ``tool_drafts.withheld_root_names``
+    leaves out, by the rule a copy of a draft keeps too -- the root entries the strip
+    before a save removes (``tool_drafts.STRIPPED_ROOT_NAMES``), and a name that is
+    one of them spelled in another case, or that cannot be told not to be. The
+    version keeps whatever is left out. Nothing in a directory below ``root``.
 
-    The source root is a VersionRoot, not a PackageRoot. At this scope the two
-    legacy package-reserved filenames are ordinary tool content: migration may
-    have put a FOREIGN ``.afterthread-state.json`` here byte-for-byte, and
-    ``.ai_meta.json`` has no v5 reader here either. Applying the package-root
-    reserved-name tuple here silently omitted those files from the next current
-    version.
+    The source root is a VersionRoot, not a PackageRoot: the two legacy
+    package-reserved filenames are ordinary tool content at this scope, since
+    migration may have put a FOREIGN ``.afterthread-state.json`` here byte-for-byte,
+    and ``.ai_meta.json`` has no v5 reader here either. So are nested names, and a
+    case-variant that is an entry of its own.
 
-    Only the root ``.afterthread.meta/`` is backend-owned version data. The exact
-    package-layer ``.env`` is withheld as well; nested names and distinct
-    case-variants remain tool content.
+    ``copytree`` calls this once for each directory it copies, with the names it
+    listed there, before it makes that directory in the copy; it neither copies nor
+    goes into a name this returns. Each look it makes is ``tool_drafts._same_entry``'s,
+    which answers a failed one with None rather than raising.
     """
-    at_root = Path(source_dir) == root
-    exact_env_present = ".env" in names
-    return {
-        name
-        for name in names
-        if at_root
-        and (
-            name == tools._META_DIRNAME
-            or _is_preserved_env_name(root, name, exact_present=exact_env_present)
-        )
-    }
+    if Path(source_dir) != root:
+        return set()
+    return set(tool_drafts.withheld_root_names(root, names))
 
 
 def _copy_package_into_staging(source: tools.VersionRoot, staging: tools.BuildRoot) -> str | None:
@@ -3464,7 +3447,7 @@ def _copy_package_into_staging(source: tools.VersionRoot, staging: tools.BuildRo
     Any ``OSError`` -- including ``shutil.Error``, which subclasses it and is
     what ``copytree`` raises for per-file failures collected during the walk --
     becomes the friendly outcome. An unreadable subtree therefore FAILS the
-    revise loudly here (裁決紀錄 #4 noted this path would surface exactly that).
+    revise loudly here.
     """
     try:
         shutil.copytree(
@@ -4188,6 +4171,17 @@ def _log_work_kept_unstripped(session_root: Path) -> None:
         )
 
 
+def _log_copy_running_kept(session_root: Path) -> None:
+    """Say in the backend log where a revise that stopped while its copy into the
+    staging still ran left that staging, which the copy may still be writing."""
+    with contextlib.suppress(Exception):
+        _logger.warning(
+            "Builder workspace kept at %s: the revise stopped while the copy into it "
+            "was still running, and that copy may still be writing it.",
+            session_root,
+        )
+
+
 def _log_publish_running_kept(session_root: Path) -> None:
     """Say in the backend log where a revise that stopped while its publish still
     ran left its staging, which that publish may still be writing."""
@@ -4309,6 +4303,10 @@ async def run_revise(
     the builder's ``.env`` that failed among them: a removal would most likely
     fail on that file the same way -- a workspace the builder made read-only
     fails both -- and so leave the ``.env`` while taking the rest of the work.
+    Nor is it removed while the copy the round begins with -- of the version, or of
+    the draft it continues -- may still be writing it: a round cancelled while that
+    copy runs on its worker leaves the worker going on without it, so the staging is
+    kept, and the backend log names it.
     Before the staging is kept, a ``.env`` nothing stripped yet is stripped; when
     that fails, the backend log says the ``.env`` may still be there. The job
     names where the work is when that place is known: the staging workspace, once
@@ -4379,8 +4377,9 @@ async def run_revise(
     job_id = _CURRENT_JOB_ID.get()
     # The release condition, atom by atom: the ``finally`` below removes the
     # staging only when the commands are confirmed stopped (``shells_ended``), no
-    # publish worker may still be writing it (not ``publish_running``), and no
-    # one is left to hold its work for (not ``holding``). ``holding`` is raised
+    # publish worker may still be writing it (not ``publish_running``), no worker
+    # copying into it may still be writing it (not ``copy_running``), and no one is
+    # left to hold its work for (not ``holding``). ``holding`` is raised
     # when the commands are confirmed stopped and lowered only by one of:
     #   * nothing worth keeping (``SaveResult.worth_saving`` False);
     #   * the draft holds the work: its files directory holds this round's files
@@ -4404,6 +4403,10 @@ async def run_revise(
     # worker has returned, or never began -- and a cancellation does not, since
     # the worker goes on without it.
     publish_running = False
+    # Up while the worker copying into the staging -- the version a first round
+    # starts from, or the draft a continuation works on -- may still be writing it;
+    # lowered as ``publish_running`` is, never on a cancellation.
+    copy_running = False
     try:
         settings = get_settings()
         max_files = settings.tool_draft_max_files
@@ -4412,9 +4415,17 @@ async def run_revise(
         copied_out: tool_drafts.TreeDigest | None = None
         not_brought_in: tuple[tool_drafts.Omitted, ...] = ()
         if continuation is None:
-            copy_error = await run_in_threadpool(
-                _copy_package_into_staging, resolution.version_root, build_root
-            )
+            copy_running = True
+            try:
+                copy_error = await run_in_threadpool(
+                    _copy_package_into_staging, resolution.version_root, build_root
+                )
+            except Exception:
+                # The worker's own exception, or one before it began: either way
+                # nothing of it writes into the staging any more.
+                copy_running = False
+                raise
+            copy_running = False
             if copy_error is not None:
                 return InstallOutcome(ok=False, error=copy_error)
         else:
@@ -4433,18 +4444,26 @@ async def run_revise(
                     error=_ERROR_CONTINUE_NOT_STARTED.format(reason=marked),
                 )
             begun = marked
-            copied = await run_in_threadpool(
-                functools.partial(
-                    tool_drafts.copy_into_workspace,
-                    package_root=package_root,
-                    package_dir_identity=package_dir_identity,
-                    expected=(begun["draft_id"], begun["generation"]),
-                    job_id=job_id,
-                    workspace=build_root.path,
-                    max_files=max_files,
-                    max_bytes=max_bytes,
+            copy_running = True
+            try:
+                copied = await run_in_threadpool(
+                    functools.partial(
+                        tool_drafts.copy_into_workspace,
+                        package_root=package_root,
+                        package_dir_identity=package_dir_identity,
+                        expected=(begun["draft_id"], begun["generation"]),
+                        job_id=job_id,
+                        workspace=build_root.path,
+                        max_files=max_files,
+                        max_bytes=max_bytes,
+                    )
                 )
-            )
+            except Exception:
+                # The worker's own exception, or one before it began: either way
+                # nothing of it writes into the staging any more.
+                copy_running = False
+                raise
+            copy_running = False
             if isinstance(copied, str):
                 # Never began: its mark is taken back, and no round is counted.
                 await run_in_threadpool(
@@ -4910,12 +4929,12 @@ async def run_revise(
         # values after the temporary registrations are dropped. Cleanup targets
         # the complete session root, including any unused shell -- unless the
         # session's commands could not be confirmed stopped, which keeps it all,
-        # unstripped, or the work in it is held by no one, or a publish worker may
-        # still be writing it, either of which keeps it too while the sweep still
-        # runs (it never looks inside ``.staging``). Kept for the work, it is first
-        # stripped of a .env the builder wrote, when nothing stripped it yet, and
-        # kept all the same when that strip fails: the log then says the .env may
-        # still be there.
+        # unstripped, or the work in it is held by no one, or a worker copying into
+        # it or publishing it may still be writing it, any of which keeps it too
+        # while the sweep still runs (it never looks inside ``.staging``). Kept for
+        # the work, it is first stripped of a .env the builder wrote, when nothing
+        # stripped it yet, and kept all the same when that strip fails: the log then
+        # says the .env may still be there.
         for value in registered:
             tools.discard_inflight_secret(value)
         if not shells_ended:
@@ -4927,8 +4946,10 @@ async def run_revise(
                     _strip_builder_env, build_root, base
                 )
                 env_stripped = late_error is None
-            if holding or publish_running:
-                if publish_running:
+            if holding or publish_running or copy_running:
+                if copy_running:
+                    _log_copy_running_kept(session_root)
+                elif publish_running:
                     _log_publish_running_kept(session_root)
                 elif env_stripped:
                     _log_work_kept(session_root)

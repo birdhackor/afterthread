@@ -3475,6 +3475,33 @@ def test_each_name_in_stripped_root_names_and_a_case_alias_of_it_is_not_brought_
         assert withheld(top, f"aliased-{reason}") == top
 
 
+@pytest.mark.parametrize("answer", [True, None], ids=["same-entry", "cannot-tell"])
+def test_a_case_variant_listed_with_its_exact_name_is_another_entry_whose_identity_is_not_asked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, answer: bool | None
+) -> None:
+    """A listing that holds a name ``tool_drafts.STRIPPED_ROOT_NAMES`` lists and,
+    beside it, that name spelled in another case holds two entries -- only a
+    filesystem that tells case apart can list both -- so ``withheld_root_names``
+    leaves out the name and not the variant, which is the tool's own content. Nor
+    does it ask the variant's identity: not when the look would answer that the two
+    are one entry, nor when it would answer that it cannot tell."""
+    stripped = {name: reason for reason, name in tool_drafts.STRIPPED_ROOT_NAMES.items()}
+    assert stripped
+    asked: list[tuple[str, str]] = []
+
+    def same_entry(first: Path, second: Path) -> bool | None:
+        asked.append((first.name, second.name))
+        return answer
+
+    monkeypatch.setattr(tool_drafts, "_same_entry", same_entry)
+
+    for name, reason in stripped.items():
+        variant = name.upper()
+        assert variant != name
+        assert tool_drafts.withheld_root_names(tmp_path, (name, variant)) == {name: reason}
+    assert asked == []
+
+
 def test_a_draft_file_that_grows_while_it_is_copied_in_is_stopped_by_the_count(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

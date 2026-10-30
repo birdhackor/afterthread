@@ -2127,10 +2127,9 @@ def write_tool_meta(
     docstring named a second line of defence -- a revise copies the installed
     package into a staging build, and ``validate_package``'s embedded-secret gate
     scans EVERY file there -- and that has not been true since the revise flow
-    took its final shape: ``tool_builder._revise_copy_ignore`` withholds the
-    sidecar's reserved namespace at EVERY depth, and ``_strip_builder_sidecars``
-    deletes any sidecar found in staging BEFORE validation runs, so no sidecar
-    ever reaches that gate. The correction matters rather than being pedantic: a
+    took its final shape: ``_strip_builder_sidecars`` deletes any sidecar found in
+    staging BEFORE validation runs, so no sidecar ever reaches that gate. The
+    correction matters rather than being pedantic: a
     maintainer who believed a downstream gate would catch an unmasked value could
     reasonably relax the refusal below into "write it unmasked", and nothing
     downstream would catch anything.

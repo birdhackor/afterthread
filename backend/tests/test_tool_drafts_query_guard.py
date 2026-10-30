@@ -429,8 +429,9 @@ _REASONED: list[tuple[str, str, str]] = [
     (
         "_same_entry",
         "except OSError: return None",
-        "whether two names are one entry is not known: the name is not brought into the "
-        "workspace, and is recorded as unreadable",
+        "whether two names are one entry is not known: the name is left out of the "
+        "workspace (withheld_root_names) -- a copy of the draft records it as unreadable, "
+        "and a first round's copy of the version leaves it there",
     ),
     (
         "begin_round",

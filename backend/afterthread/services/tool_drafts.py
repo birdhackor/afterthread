@@ -159,7 +159,7 @@ import os
 import re
 import shutil
 import stat
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -240,10 +240,12 @@ _OMIT_REASONS = frozenset(get_args(OmitReason))
 # strip finding what it removes by its name here; a strip of another root name
 # takes its name from here too. A continuation's copy of the draft withholds each,
 # under the reason it is keyed by, and any name that is the same entry spelled in
-# another case (``_not_brought_in``): brought in, it would be stripped before the
-# save -- through a name here, which on a filesystem that does not tell case apart
-# reaches the alias too -- and the new files directory would lack it, while the
-# previous one, brought in whole and unchanged, would go.
+# another case, or that cannot be told not to be (``withheld_root_names``): brought
+# in, it would be stripped before the save -- through a name here, which on a
+# filesystem that does not tell case apart reaches the alias too -- and the new
+# files directory would lack it, while the previous one, brought in whole and
+# unchanged, would go. A first round's copy of the version withholds the same names
+# (``tool_builder._revise_copy_ignore``).
 STRIPPED_ROOT_NAMES: dict[OmitReason, str] = {
     "env_file": ".env",
     "backend_meta": tools._META_DIRNAME,
@@ -2907,19 +2909,21 @@ def _same_entry(first: Path, second: Path) -> bool | None:
     return (one.st_dev, one.st_ino) == (other.st_dev, other.st_ino)
 
 
-def _not_brought_in(files: Path) -> dict[str, OmitReason]:
-    """The entries at the top of a draft's files a continuation's workspace does not
-    receive, with why: each name in ``STRIPPED_ROOT_NAMES``, under the reason it is
-    keyed by, and any name that is the same entry spelled in another case. A
-    ``.env``'s values are no known secret either, so nothing would mask them once
-    ``read_file`` put them in the conversation. Another case of a listed name when
-    the name itself is at the top too is another entry -- a filesystem that tells
-    case apart -- and is brought in like any file. When whether it is the same
-    entry cannot be told, it is not brought in (``unreadable``). Raises ``OSError``
-    when the top cannot be listed.
+def withheld_root_names(top: Path, names: Collection[str]) -> dict[str, OmitReason]:
+    """Of ``names``, the entries listed at the top of ``top``, those a copy of ``top``
+    into a workspace leaves out, with why: each name in ``STRIPPED_ROOT_NAMES``,
+    under the reason it is keyed by, and any name that is the same entry spelled in
+    another case. A ``.env``'s values are no known secret either, so in a workspace
+    a model works in nothing would mask them once ``read_file`` put them in the
+    conversation. Another case of a listed name when the name itself is listed too
+    is another entry -- a filesystem that tells case apart -- and is copied like any
+    file. When whether it is the same entry cannot be told (``_same_entry`` answers
+    None), it is left out too (``unreadable``): it is not known not to be it.
+
+    The one rule every copy into a workspace keeps: of the draft's files, a
+    continuation's and a publish's of the draft as it is (``_not_brought_in``), and
+    a first round's of the version (``tool_builder._revise_copy_ignore``).
     """
-    with os.scandir(files) as listing:
-        names = [entry.name for entry in listing]
     left_out: dict[str, OmitReason] = {}
     for reason, stripped in STRIPPED_ROOT_NAMES.items():
         exact = stripped in names
@@ -2927,12 +2931,22 @@ def _not_brought_in(files: Path) -> dict[str, OmitReason]:
             if name == stripped:
                 left_out[name] = reason
             elif name.casefold() == stripped.casefold() and not exact:
-                same = _same_entry(files / name, files / stripped)
+                same = _same_entry(top / name, top / stripped)
                 if same is None:
                     left_out[name] = "unreadable"
                 elif same:
                     left_out[name] = reason
     return left_out
+
+
+def _not_brought_in(files: Path) -> dict[str, OmitReason]:
+    """The entries at the top of a draft's files a continuation's workspace does not
+    receive, with why (``withheld_root_names``). Raises ``OSError`` when the top
+    cannot be listed.
+    """
+    with os.scandir(files) as listing:
+        names = [entry.name for entry in listing]
+    return withheld_root_names(files, names)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2977,8 +2991,11 @@ def _copy_draft_files(
     ``copied_out`` is taken before anything is copied, then the size limits are
     checked on ``files``, which only refuses early -- the counting as the copy is
     made is what holds the limits. A copy that cannot be made whole leaves what it
-    made in the workspace, which the job removes with the rest of its session. The
-    caller holds the shared tools lock and has matched the draft's manifest.
+    made in the workspace. The job removes it with the rest of its session once the
+    copy has returned; a job cancelled while the copy still runs keeps the session,
+    which the copy may still be writing (``tool_builder.run_revise``,
+    ``tool_builder.run_publish_draft``). The caller holds the shared tools lock and
+    has matched the draft's manifest.
     """
     copied_out = tree_digest(files, max_entries=max_files, max_bytes=max_bytes)
     too_big = _over_limits(files, max_files, max_bytes)
