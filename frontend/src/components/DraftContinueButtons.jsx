@@ -14,25 +14,36 @@ const NOTE_INTRO =
 // first sends a round at once, with no words; the second asks for the round's words
 // first -- optional, and bounded like every AI input (continuationNote).
 //
-// Which draft a round continues, and whether one may be sent now, are the page's:
-// `onContinue` gets the words (possibly empty) and checks again before it sends;
-// `blocked` is the page's gate for the writes that take the backend's one slot, and
-// the dialog answers to it too, since the list can change behind an open dialog.
-// `size` is the buttons' size where they sit (a card's are compact).
+// `continuation` is the draft on screen, as the page names it
+// (toolDraft.draftContinuation). 接續修正 calls `onContinue()`, and the page sends a
+// round for the draft its row shows at the click. 加上說明後接續… keeps
+// `continuation` as it is when the dialog opens, and sends that, with the words,
+// through `onSendNoted(target, feedback)`: the words are written for the draft the
+// operator was looking at, so a list read again behind the open dialog changes
+// neither what the dialog says nor what it sends, and a draft that changed is the
+// backend's to refuse (toolDraft.reviseVariables). The dialog lives with these
+// buttons: when they leave the screen -- the draft gone, or no longer one that can
+// be continued, or a card no longer offering a round -- it closes with them and
+// sends nothing. `blocked` is the page's gate for the writes that take the backend's
+// one slot; the dialog's submit answers to it too. `size` is the buttons' size where
+// they sit (a card's are compact).
 export function DraftContinueButtons({
+	continuation,
 	blocked,
 	submitting,
 	onContinue,
+	onSendNoted,
 	size = "xs",
 }) {
-	const [noting, setNoting] = useState(false);
+	// The draft the open dialog is for; null while it is closed.
+	const [noting, setNoting] = useState(null);
 	const [note, setNote] = useState("");
 	const checked = continuationNote(note);
 	// Every way out clears the words, so the next round never opens with words
 	// written for another one.
 	const close = () => {
 		setNote("");
-		setNoting(false);
+		setNoting(null);
 	};
 	return (
 		<>
@@ -40,19 +51,24 @@ export function DraftContinueButtons({
 				size={size}
 				loading={submitting}
 				disabled={blocked}
-				onClick={() => onContinue("")}
+				onClick={() => onContinue()}
 			>
 				接續修正
 			</Button>
 			<Button
 				size={size}
 				variant="light"
-				disabled={blocked}
-				onClick={() => setNoting(true)}
+				disabled={blocked || continuation == null}
+				onClick={() => setNoting(continuation)}
 			>
 				加上說明後接續…
 			</Button>
-			<Modal opened={noting} onClose={close} title="加上說明後接續" centered>
+			<Modal
+				opened={noting !== null}
+				onClose={close}
+				title="加上說明後接續"
+				centered
+			>
 				<Stack gap="sm">
 					<Text size="sm">{NOTE_INTRO}</Text>
 					<div>
@@ -73,9 +89,10 @@ export function DraftContinueButtons({
 						<Button
 							disabled={blocked || checked.error !== null}
 							onClick={() => {
+								const target = { continuation: noting, runIds: [] };
 								const feedback = checked.feedback;
 								close();
-								onContinue(feedback);
+								onSendNoted(target, feedback);
 							}}
 						>
 							接續修正

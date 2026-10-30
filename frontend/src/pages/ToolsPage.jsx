@@ -56,6 +56,7 @@ import {
 	recordFixView,
 	reviseBlockedByDraft,
 	reviseStartedMessage,
+	reviseVariables,
 } from "../utils/toolDraft.js";
 import {
 	isHttpUrl,
@@ -807,6 +808,7 @@ function ToolRow({
 	draftBlocked,
 	isDiscardingDraft,
 	onContinueDraft,
+	onSendNoted,
 }) {
 	// Local, independent per row (unlike LlmLogsPage's single-open Accordion):
 	// there is no reason comparing two tools' summaries side by side should
@@ -1003,6 +1005,7 @@ function ToolRow({
 						continueBlocked={writesBlocked}
 						continuing={isSubmittingRevise}
 						onContinue={onContinueDraft}
+						onSendNoted={onSendNoted}
 					/>
 				) : null}
 
@@ -1105,6 +1108,9 @@ function ToolRow({
 							name={tool.name}
 							expanded={runsExpanded}
 							onFix={lineageControls.showVersionControls ? onFixRecord : null}
+							onSendNoted={
+								lineageControls.showVersionControls ? onSendNoted : null
+							}
 							fixBlocked={writesBlocked}
 							recordFix={recordFix}
 							isSubmittingFix={isSubmittingRevise}
@@ -1388,11 +1394,13 @@ function InstalledToolsPanel({
 	});
 
 	// Called from submitRevise (the summary form) and from sendRevise (fixTool,
-	// fixRecord, continueDraft). A revise that starts over is turned away for a tool
-	// that has a draft before it gets here (reviseBlockedByDraft); a round that
-	// continues the draft carries the draft's identity from the list
-	// (`continuation`, toolDraft.draftContinuation). A new caller has to do one or
-	// the other, since the backend refuses the request otherwise.
+	// fixRecord, continueDraft, sendNoted). A control that sends at once turns a
+	// revise that starts over away for a tool that has a draft before it gets here
+	// (reviseBlockedByDraft), and names a round that continues the draft by the
+	// identity its row shows (`continuation`, toolDraft.draftContinuation). A dialog
+	// sends what it opened on (toolDraft.reviseVariables): a draft changed since
+	// is refused by the backend (draft_gone, draft_changed, draft_pending), and the
+	// refusal is met below like any other.
 	const reviseMutation = useMutation({
 		mutationFn: ({
 			name,
@@ -1745,28 +1753,17 @@ function InstalledToolsPanel({
 				activeJobKey,
 		);
 	// The revise the handlers below send for a row: the same mutation, single-flight
-	// gate and job card as 送出修訂. `continuation` names the draft a round
-	// continues (from the list, toolDraft.draftContinuation), or is null for a
-	// revise that starts over.
-	const sendRevise = (tool, { runIds = [], feedback = "", continuation }) => {
-		reviseMutation.mutate(
-			{
-				name: tool.name,
-				currentVid: tool.current_vid,
-				jobAttributionKey: toolIdentityConsumers(tool.name, tool.current_vid)
-					.jobAttributionKey,
-				feedback,
-				runIds,
-				continuation,
-			},
-			{
-				onSuccess: () =>
-					notifications.show({
-						color: "blue",
-						message: reviseStartedMessage(tool.name, { continuation, runIds }),
-					}),
-			},
-		);
+	// gate and job card as 送出修訂. `target` is the revise the control committed to
+	// -- `continuation`, the draft a round continues, or null for a revise that
+	// starts over, and `runIds` -- and `feedback` its words (toolDraft.reviseVariables).
+	const sendRevise = (tool, target, feedback = "") => {
+		reviseMutation.mutate(reviseVariables(tool, target, feedback), {
+			onSuccess: () =>
+				notifications.show({
+					color: "blue",
+					message: reviseStartedMessage(tool.name, target),
+				}),
+		});
 	};
 	// The one-click fix of a check's failed examples: a revise that starts over and
 	// attaches failing run records, with the gate re-checked here like the other AI
@@ -1775,41 +1772,53 @@ function InstalledToolsPanel({
 	// The backend refuses such a revise of a tool that has a draft. The controls
 	// that call this are off for such a tool, and it asks again here -- on the row
 	// it was given, the list as of this render -- because a rendering is not a gate.
-	const fixTool = (tool, runIds, feedback = "") => {
+	const fixTool = (tool, runIds) => {
 		if (versionWritesBlocked || reviseBlockedByDraft(tool.draft) !== null) {
 			return;
 		}
-		sendRevise(tool, { runIds, feedback, continuation: null });
+		sendRevise(tool, { continuation: null, runIds });
 	};
-	// The fix of a run record (the row's newest failure, a record under 最近執行;
-	// `feedback` is set only by 加上說明…): what recordFixView says it is for the
-	// row's draft -- the round that continues a draft that can be continued, with
-	// the record attached; the fix above when there is no draft; nothing while a
-	// draft in any other state is there. Asked again here, like fixTool.
-	const fixRecord = (tool, runIds, feedback = "") => {
+	// The one-click fix of a run record (the row's newest failure, a record under
+	// 最近執行): what recordFixView says it is for the row's draft at the click --
+	// the round that continues a draft that can be continued, with the record
+	// attached; the fix above when there is no draft; nothing while a draft in any
+	// other state is there. Asked again here, like fixTool.
+	const fixRecord = (tool, runIds) => {
 		const fix = recordFixView(tool.draft);
 		if (versionWritesBlocked || fix.blockedReason !== null) {
 			return;
 		}
-		sendRevise(tool, { runIds, feedback, continuation: fix.continuation });
+		sendRevise(tool, { continuation: fix.continuation, runIds });
 	};
-	// 接續修正 / 加上說明後接續… for the row's draft, named as the list gives it
+	// 接續修正 for the row's draft, named as the list gives it at the click
 	// (draft_id, generation, base_vid). Nothing is sent unless the draft can be
 	// continued, and not while the write gate holds.
-	const continueDraft = (tool, feedback = "") => {
+	const continueDraft = (tool) => {
 		const continuation = draftContinuation(tool.draft);
 		if (versionWritesBlocked || continuation === null) {
 			return;
 		}
-		sendRevise(tool, { feedback, continuation });
+		sendRevise(tool, { continuation, runIds: [] });
+	};
+	// What a dialog sends -- 加上說明後接續…, a record's 加上說明… -- with its words:
+	// `target`, the revise it opened on, as it opened on it. Only the write gate is
+	// asked again; the draft is not looked up again, since the words were written for
+	// the one the dialog opened on, and a draft changed since is the backend's to
+	// refuse (toolDraft.reviseVariables).
+	const sendNoted = (tool, target, feedback) => {
+		if (versionWritesBlocked) {
+			return;
+		}
+		sendRevise(tool, target, feedback);
 	};
 	// What a revise card may say about the tool's current draft and offer for it
 	// (jobDraftView's second layer, drawn by ReviseDraftResult): `tool` is the card's
 	// row -- null for a card no row owns, which then offers nothing -- and `endMark`
 	// is where the page saw the job end in the order of list reads, so the list on
 	// screen counts only when its read started after it (and so succeeded, since a
-	// failed read leaves no list). The round goes through continueDraft, after the
-	// card's own conditions are asked again.
+	// failed read leaves no list). 接續修正 goes through continueDraft, after the
+	// card's own conditions are asked again; 加上說明後接續… sends the draft its
+	// dialog opened on (sendNoted).
 	const cardDraftFollowUp = (cardJob, tool, endMark) => {
 		const context = {
 			hasRow: tool != null,
@@ -1823,12 +1832,19 @@ function InstalledToolsPanel({
 				tool != null &&
 				reviseMutation.isPending &&
 				reviseMutation.variables?.name === tool.name,
-			onContinue: (feedback) => {
+			continuation: draftContinuation(context.listDraft),
+			onContinue: () => {
 				const offered = jobDraftView(cardJob, "revise", context)?.buttons ?? [];
 				if (tool == null || offered.length === 0) {
 					return;
 				}
-				continueDraft(tool, feedback);
+				continueDraft(tool);
+			},
+			onSendNoted: (target, feedback) => {
+				if (tool == null) {
+					return;
+				}
+				sendNoted(tool, target, feedback);
 			},
 		};
 	};
@@ -2109,11 +2125,12 @@ function InstalledToolsPanel({
 									)
 								: null
 						}
-						onFix={(runIds, feedback = "") => fixTool(tool, runIds, feedback)}
-						onFixRecord={(runIds, feedback = "") =>
-							fixRecord(tool, runIds, feedback)
+						onFix={(runIds) => fixTool(tool, runIds)}
+						onFixRecord={(runIds) => fixRecord(tool, runIds)}
+						onContinueDraft={() => continueDraft(tool)}
+						onSendNoted={(target, feedback) =>
+							sendNoted(tool, target, feedback)
 						}
-						onContinueDraft={(feedback = "") => continueDraft(tool, feedback)}
 						onCheck={() => checkTool(tool)}
 						isSubmittingCheck={
 							checkMutation.isPending &&

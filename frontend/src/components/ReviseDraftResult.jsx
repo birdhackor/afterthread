@@ -14,9 +14,11 @@ import { DraftContinueButtons } from "./DraftContinueButtons.jsx";
 // about how the session stopped: this is about where the work went. What is said,
 // and when, is decided by jobDraftView.
 //
-// `followUp` comes from the page: { context, blocked, submitting, onContinue } --
-// `context` is jobDraftView's view of the card's row; null for a card that offers
-// nothing about the current draft (an install, a card no row owns).
+// `followUp` comes from the page: { context, blocked, submitting, continuation,
+// onContinue, onSendNoted } -- `context` is jobDraftView's view of the card's row,
+// `continuation` the row's draft a round from here continues, and the rest go to
+// DraftContinueButtons; null for a card that offers nothing about the current draft
+// (an install, a card no row owns).
 export function ReviseDraftResult({ job, kind, followUp = null }) {
 	const view = jobDraftView(job, kind, followUp?.context);
 	if (view === null) {
@@ -63,9 +65,11 @@ export function ReviseDraftResult({ job, kind, followUp = null }) {
 				<Group gap="xs">
 					<DraftContinueButtons
 						size="compact-xs"
+						continuation={followUp.continuation}
 						blocked={followUp.blocked}
 						submitting={followUp.submitting}
 						onContinue={followUp.onContinue}
+						onSendNoted={followUp.onSendNoted}
 					/>
 				</Group>
 			) : null}

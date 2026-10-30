@@ -293,7 +293,21 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
     沒看過的那一份。「接續修正」「加上說明後接續…」在 `components/DraftContinueButtons.jsx`
     （草稿提示與工作卡片共用）；說明的上限與其他 AI 輸入一樣是 20,000 個 code point
     （`continuationNote`），可以留空。接續是一次版本寫入，所以按鈕跟「送出修訂」一樣受
-    `versionWritesBlocked` 管，頁面的 handler（`continueDraft`）按下時再查一次。
+    `versionWritesBlocked` 管；「接續修正」的 handler（`continueDraft`）按下時再查一次寫入閘
+    與該列的草稿，說明框的送出（`sendNoted`）只再查寫入閘（見下一條）。
+  - **先開框、後送出的按鈕，送的是開框時看到的那一份**：「加上說明後接續…」（草稿提示與工作
+    卡片）與「最近執行」每一筆的「加上說明…」，在開框時記下要做的事，送出時照記下的送：
+    前者記下畫面上那份草稿的身分（`draftContinuation`），後者記下當時的 `recordFixView`——接續
+    哪一份，或從目前版本重新開始——框裡的標題、說明與送出鈕也照它。送出時的請求由
+    `toolDraft.js` 的 `reviseVariables(tool, target, feedback)` 組成，`target` 是記下的那件事，
+    不從送出當下的清單重新推。框開著時草稿被換掉、被接續過或被放棄，後端回 `draft_gone`、
+    `draft_changed`；記下的是重新開始而工具已經有草稿時回 `draft_pending`。這些碼照
+    `reviseRefusalNotification` 說明、照 `versionWriteConflictReaction` 重讀清單；前端不在
+    送出前自己比對清單、改送另一個動作。記下的接續帶著草稿的 `base_vid`；重新開始用該列的
+    版本，版本一換整列重掛（`toolIdentityConsumers` 的 `rowKey`），框也跟著關掉。草稿提示與
+    卡片的說明框跟它的按鈕在一起：按鈕離開畫面（草稿不在了、不能再接續、卡片不再提供），
+    框也關掉，什麼都不送。工具頁上按下就送、沒有框的按鈕（「接續修正」、「接續修正（附上
+    這筆）」、紀錄與範例驗證的「請 AI 修正」）按下時畫面上的就是清單的，照舊在按下時從該列取。
   - **附上紀錄的修正**：草稿可接續時，該列上一筆失敗與「最近執行」每一筆的「請 AI 修正」
     換成「接續修正（附上這筆）」，旁邊的「加上說明…」也是接續（`recordFixView`）；其他狀態
     照舊停用並說明原因。範例驗證失敗的「請 AI 修正」不接續，有草稿時照舊停用。

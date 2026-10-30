@@ -3,6 +3,7 @@ import { useState } from "react";
 import {
 	CONTINUE_BUTTON,
 	DISCARD_BUTTON,
+	draftContinuation,
 	draftDiscardConfirmation,
 	draftView,
 } from "../utils/toolDraft.js";
@@ -37,10 +38,12 @@ function PathRow({ path }) {
 // is what goes.
 //
 // The mutations live in the page, with the other writes of a row: `onDiscard`
-// (with the draft confirmed on) and `onContinue` (with the round's words; the page
-// names the draft from the list and checks again). `blocked` is the page's gate for
-// every write that takes the backend's one slot; `continueBlocked` is its gate for
-// the version writes, which a round that continues a draft is.
+// (with the draft confirmed on), `onContinue` (接續修正: the page names the draft
+// its row shows at the click and checks again) and `onSendNoted` (加上說明後接續…:
+// the draft the dialog opened on, with the words; see DraftContinueButtons).
+// `blocked` is the page's gate for every write that takes the backend's one slot;
+// `continueBlocked` is its gate for the version writes, which a round that
+// continues a draft is.
 export function DraftNotice({
 	toolName,
 	draft,
@@ -51,6 +54,7 @@ export function DraftNotice({
 	continueBlocked,
 	continuing,
 	onContinue,
+	onSendNoted,
 }) {
 	const [confirming, setConfirming] = useState(null);
 	const view = draftView(draft, { currentVid });
@@ -147,9 +151,11 @@ export function DraftNotice({
 							<Group gap="xs">
 								{canContinue ? (
 									<DraftContinueButtons
+										continuation={draftContinuation(draft)}
 										blocked={continueBlocked}
 										submitting={continuing}
 										onContinue={onContinue}
+										onSendNoted={onSendNoted}
 									/>
 								) : null}
 							</Group>

@@ -14,6 +14,7 @@ import {
 	recordFixView,
 	reviseBlockedByDraft,
 	reviseStartedMessage,
+	reviseVariables,
 } from "./toolDraft.js";
 import { fixRefusalMessage } from "./toolFailures.js";
 import { KNOWN_FAILURES, toolJobStopReason } from "./toolJobStop.js";
@@ -23,6 +24,7 @@ import {
 	readToolList,
 	rereadToolList,
 } from "./toolList.js";
+import { buildReviseRequest, toolIdentityConsumers } from "./toolSummary.js";
 
 // A copy of ToolDraft.state in backend/afterthread/schemas.py, kept by hand: the
 // vocabulary test below holds the toolbar's wording to this list, so it is this
@@ -317,6 +319,83 @@ describe("recordFixView", () => {
 			);
 		}
 		expect(recordFixView(unreadable()).blockedReason).not.toBeNull();
+	});
+});
+
+describe("reviseVariables: a dialog sends the revise it opened on", () => {
+	// A row of the tools list, carrying `draftOnRow`.
+	const row = (draftOnRow) => ({
+		name: "kb",
+		current_vid: BASE_VID,
+		draft: draftOnRow,
+	});
+	// The request the page's mutation makes of what is sent.
+	const sent = (tool, target, feedback) =>
+		buildReviseRequest(reviseVariables(tool, target, feedback));
+	// What the dialogs keep when they open: 加上說明後接續… the draft on screen, a
+	// record's 加上說明… what recordFixView says for the draft on screen, with the
+	// record.
+	const continueDialog = (onScreen) => ({
+		continuation: draftContinuation(onScreen),
+		runIds: [],
+	});
+	const recordDialog = (onScreen, runId) => ({
+		continuation: recordFixView(onScreen).continuation,
+		runIds: [runId],
+	});
+
+	it("continues the draft it opened on when the list shows another one now", () => {
+		const opened = continueDialog(draft({}));
+		// Discarded in another tab, and another made from the same version.
+		const now = row(draft({ draft_id: OTHER_DRAFT_ID, generation: 1 }));
+		expect(sent(now, opened, "written for the first")).toEqual({
+			path: "/api/tools/kb/revise",
+			body: {
+				expected_vid: BASE_VID,
+				draft_id: DRAFT_ID,
+				draft_generation: 3,
+				feedback: "written for the first",
+			},
+		});
+	});
+
+	it("continues the draft it opened on when the list shows no draft now", () => {
+		const opened = recordDialog(draft({}), 7);
+		expect(sent(row(null), opened, "written for it")).toEqual({
+			path: "/api/tools/kb/revise",
+			body: {
+				expected_vid: BASE_VID,
+				draft_id: DRAFT_ID,
+				draft_generation: 3,
+				feedback: "written for it",
+				run_ids: [7],
+			},
+		});
+	});
+
+	it("starts over, naming no draft, when it opened on none and the list shows one now", () => {
+		const opened = recordDialog(null, 7);
+		expect(sent(row(draft({})), opened, "no draft then")).toEqual({
+			path: "/api/tools/kb/revise",
+			body: {
+				expected_vid: BASE_VID,
+				feedback: "no draft then",
+				run_ids: [7],
+			},
+		});
+	});
+
+	it("names the row's tool and keys the job card to that row", () => {
+		const opened = continueDialog(draft({}));
+		expect(reviseVariables(row(draft({})), opened, "")).toEqual({
+			name: "kb",
+			currentVid: BASE_VID,
+			jobAttributionKey: toolIdentityConsumers("kb", BASE_VID)
+				.jobAttributionKey,
+			feedback: "",
+			runIds: [],
+			continuation: draftContinuation(draft({})),
+		});
 	});
 });
 

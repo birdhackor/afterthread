@@ -12,6 +12,8 @@
 // * what a draft does to the rest of its row: reviseBlockedByDraft says whether a
 //   revise that starts over may be sent and, when it may not, why; recordFixView
 //   says what a run record's fix button becomes while the tool has a draft;
+//   reviseVariables sends the revise a control committed to, which for a dialog is
+//   the one it opened on;
 // * discarding a draft: the request it becomes (buildDraftDiscardRequest), what to
 //   ask before (draftDiscardConfirmation), what to tell the operator once it is
 //   done (draftDiscardNotification) and how its failures are met
@@ -36,6 +38,7 @@ import { formatTimestamp } from "./format.js";
 import { codePointLength } from "./text.js";
 import { isTerminalToolJobState, toolJobOutcomeView } from "./toolInstall.js";
 import { toolJobStopReason } from "./toolJobStop.js";
+import { toolIdentityConsumers } from "./toolSummary.js";
 
 // The buttons a draft can offer, as draftView and jobDraftView name them in
 // `buttons`. 接續修正 sends a round at once; 加上說明後接續… asks for the words of
@@ -393,6 +396,35 @@ export function recordFixView(draft) {
 		noteSubmit: "送出修正",
 		continuation: null,
 		blockedReason: reviseBlockedByDraft(draft),
+	};
+}
+
+// The reviseMutation's variables for a revise of `tool`, the row as the page has it
+// when the revise is sent. `target` is the revise a control committed to:
+// `continuation`, the draft the round continues (draftContinuation), or null for a
+// revise that starts over from the row's version; and `runIds`, the records it
+// attaches. `feedback` is the words written for it.
+//
+// A control that sends at once commits at the click, so its target is read off the
+// row it was clicked on. A dialog that asks for words first -- the draft's
+// 加上說明後接續…, a record's 加上說明… -- commits when it opens, keeps that target
+// while it is open, and is sent with it: the words were written for it. By then the
+// row may show another draft, or none, or one where there was none; what is sent is
+// still what the dialog opened on. A draft that changed is the backend's to refuse
+// -- draft_gone or draft_changed for a round that continues one, draft_pending for a
+// revise that starts over -- and the page reads the list again on those codes
+// (versionWriteConflictReaction). A revise that starts over expects the row's
+// version: a change of version remounts the row (toolIdentityConsumers' rowKey),
+// and any dialog open in it goes with it.
+export function reviseVariables(tool, target, feedback = "") {
+	return {
+		name: tool.name,
+		currentVid: tool.current_vid,
+		jobAttributionKey: toolIdentityConsumers(tool.name, tool.current_vid)
+			.jobAttributionKey,
+		feedback,
+		runIds: target.runIds ?? [],
+		continuation: target.continuation ?? null,
 	};
 }
 
