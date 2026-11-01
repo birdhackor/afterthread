@@ -699,3 +699,31 @@ v7 之前就有的缺陷（`delete_tool`、`_delete_tool_locked`、`_resolve_pac
   實際套件不動。
 - purge 的孤兒範圍（`tool_runs.orphan_names`、`_delete_gone_verdicts`）把查詢失敗交出的 None 讀成已不在：不在這次範圍，
   已回報使用者另開工作。
+
+## D59（P8）：發版前的三個修正
+
+都是 v7 之前就有的問題，使用者授權修完再發版。主 agent 依 D58 的同一個機制（查詢失敗被讀成確定的答案）與先前登記的
+後續定案，沒有另做設計諮詢；審查迴圈照常。
+
+- **清除紀錄的孤兒，只認看到的「不在」**：`tool_runs.orphan_names` 與 `_delete_gone_verdicts` 原本把
+  `_resolve_package_dir_no_alias` 的 None 讀成工具已不在，而那個 None 也包括查詢失敗與名稱上的連結。改成自己判斷
+  `<tools_dir>/<name>`：
+  - 不在：名稱不可能是套件名；`lstat` 回不存在或某一層不是目錄；看到的是目錄與連結以外的東西（那裡不可能有套件）。
+  - 在：看到目錄或連結。掃描會列出它（連結列成無效的一列），刪除那一列時它的紀錄一起刪。原本名稱上的連結算孤兒，
+    這是行為改變。
+  - 不知道：`lstat` 其他失敗，當作在，不刪。
+  - `stats` 的孤兒數用同一個判斷；tools 根目錄未設定或不是目錄時仍然沒有孤兒。D58 剩餘風險的第二項由此結清，共用的
+    查找不再有人把它的 None 讀成已不在。
+- **非同步取共享鎖，被取消也交還**：`run_in_threadpool` 走 anyio 的 `to_thread.run_sync`（`abandon_on_cancel=False`），
+  等待中被取消時，會等執行緒做完再丟掉回傳值。取鎖的執行緒拿到的 descriptor 因此沒人關，共享鎖一直被佔著，之後的
+  刪除、丟版本與 sweep 都拿不到排他鎖，直到重啟（主 agent 實驗重現）。
+  - 三個呼叫點（`routers/ai.py` 的請求範圍、`run_examples`、handler 的 `_call`）改經同一個 helper：執行緒先把拿到的
+    descriptor 交給 helper 記下，等待被取消時由 helper 關掉再往外拋。
+  - 這依賴 anyio 在取消時等執行緒結束；一道守衛確認沒有別處在執行緒裡直接取這把鎖。
+- **小修**：
+  - tools 根目錄不是目錄（例如設定的路徑不存在）時，刪除回 404，不再回 409「AI 工作進行中」。
+  - `load_examples` 只在看到 `examples.json` 不存在時才當作沒有範例；查詢失敗時照常去讀，回報讀不到。
+  - `e2e/README.md` 補上前置需求：`smoke.sh` 需要 bash 4 以上，`wheel_smoke.sh` 需要 `setsid`（macOS 都沒有）。
+- **不在這次範圍**：程式關閉途中，共用的寫入者（說明檔、版本、摘要、sweep）與執行紀錄、範例結論的收尾，沒有 job
+  層的登記。要守它，需要受影響套件的阻擋與完成證據，屬於設計層的工作；關閉時沒有下一個 job 會開始，行程隨後結束。
+  記在 release notes 的已知限制。
