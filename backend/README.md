@@ -236,12 +236,12 @@ job 的 `error` 也是這段訊息（帶結尾句號）；其他未預期錯誤�
 - `POST /api/tools/install` — 送出 KB 網頁安裝器工作（見下方「工具（KB 網頁
   安裝器）」）；202 + `job_id`，建置在背景執行。`TOOLS_DIR` 未設定回 `503
   tools_not_configured`；名額被佔用時回 `409 install_in_progress`。**那個名額
-  不是安裝專屬的**：安裝、AI 修訂與同步的「重新產生總結」共用同一個 single-flight
-  （見下方三條路由與「依意見修訂既有工具」），所以這個 409 最常見的來源其實是
-  別的分頁正在修訂。代碼與訊息字串維持既有的 `install_in_progress`／
+  不是安裝專屬的**：所有工具工作與同步的「重新產生總結」、discard 共用同一個
+  single-flight（成員見下方「同一時間只允許一個工具任務」），所以這個 409 最常見的
+  來源其實是別的分頁正在修訂。代碼與訊息字串維持既有的 `install_in_progress`／
   「已有安裝正在進行中，請等待其完成」（前端有 pin 住的分支，不動），但前端**刻意
-  覆寫**成中性文案「已有工具任務正在進行中（安裝、AI 修訂或重新產生總結），請等待
-  完成後再安裝」——指名一個使用者從沒送出的「安裝」只會讓他去找一個不存在的東西。
+  覆寫**成不點名任務種類的「已有工具任務正在進行中，請等待完成後再安裝」——指名一個
+  使用者從沒送出的「安裝」只會讓使用者去找一個不存在的東西。
 - `GET /api/tools/jobs/{job_id}` — 輪詢一個工具工作（安裝、修訂、跑一次範例或發布草稿）的狀態
   （`queued`／`running`／`succeeded`／`failed` + 完成後的 `tool_name`／
   `summary`／`llm_log_id`／`llm_log_process`／`outcome`／`kind`／`verification`）；`kind` 是

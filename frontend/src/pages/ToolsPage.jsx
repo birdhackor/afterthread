@@ -129,10 +129,10 @@ const VERSION_WRITE_CODE_COPY = {
 // message.
 // * `install_in_progress` -- _INSTALL_IN_PROGRESS_MESSAGE is 「已有安裝正在進行
 //   中，請等待其完成」, which names INSTALL. That was true when only installs
-//   contended for the slot; since D40 the SAME admission (`_JOBS`/`_SYNC_OPS`)
-//   is taken by a revise job and by a synchronous regenerate too, and
-//   `POST /api/tools/install` still answers all three refusals with this one
-//   install-flavoured code (routers/tools.py: `start_install_job` returning None
+//   contended for the slot; the SAME admission (`_JOBS`/`_SYNC_OPS`) is now
+//   taken by every other tool job and by the synchronous regenerate and
+//   discards too, and `POST /api/tools/install` answers every such refusal
+//   with this one install-flavoured code (routers/tools.py: `start_install_job` returning None
 //   -> _INSTALL_IN_PROGRESS_CODE; backend test_tool_builder.py pins install
 //   getting exactly this code while a REGENERATE holds the slot). So an install
 //   refused because another tab is revising told the user to wait for an install
@@ -2367,17 +2367,18 @@ function InstallPanel({ externalBusy = false, onBusyChange }) {
 			//
 			// Local copy, via toolErrorMessage's opt-in codeCopy override (the same
 			// mechanism used by other name-addressed mutation conflicts): the backend's
-			// message for this code says 「已有安裝正在進行中」, but since D40 the
-			// slot it reports on is shared with AI 修訂 and 重新產生總結 -- so the
-			// most common way to see this is an install refused because the OTHER
-			// tab, or another browser, is revising. Naming an install that nobody
-			// started sends the user looking for it. The 404 arm of toolErrorMessage
-			// is unreachable from here: this branch is entered only on a 409.
+			// message for this code says 「已有安裝正在進行中」, but the slot it
+			// reports on is shared by every tool job and by the synchronous
+			// regenerate and discards (backend/README.md lists them) -- so the most
+			// common way to see this is an install refused because the OTHER tab, or
+			// another browser, is revising. Naming an install that nobody started
+			// sends the user looking for it, so the local copy names no kind of task.
+			// The 404 arm of toolErrorMessage is unreachable from here: this branch
+			// is entered only on a 409.
 			if (submitError?.code === "install_in_progress") {
 				setConflictMessage(
 					toolErrorMessage(submitError, "已有工具任務正在進行中，請等待完成", {
-						install_in_progress:
-							"已有工具任務正在進行中（安裝、AI 修訂或重新產生總結），請等待完成後再安裝",
+						install_in_progress: "已有工具任務正在進行中，請等待完成後再安裝",
 					}),
 				);
 				return;
