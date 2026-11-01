@@ -37,16 +37,18 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Awaitable, Callable, Generator
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal
 
+import anyio
 import pytest
 from pydantic import BaseModel, ConfigDict
 
 from afterthread.config import Settings
+from afterthread.routers.ai import _advertised_tools_lock
 from afterthread.services import llm_log, tools
 from afterthread.services.llm import (
     _MAX_TOOL_CALLS_ACCEPTED,
@@ -5759,6 +5761,219 @@ def test_a_delete_landing_while_a_call_prepares_is_locked_out(
 
     assert asyncio.run(handler({})) == "OLD"
     assert _package_path(pkg).is_dir()
+
+
+# --- the shared lock taken from a coroutine: handed back however the wait ends ---
+
+
+def _counting_handover() -> tuple[tools._LockHandover, list[int]]:
+    closed: list[int] = []
+    return tools._LockHandover(close=closed.append), closed
+
+
+def test_a_descriptor_taken_after_its_waiter_gave_up_is_closed_once_by_the_worker() -> None:
+    handover, closed = _counting_handover()
+
+    handover.abandon()
+    assert closed == []
+    assert handover.hand_over(7) is None
+
+    assert closed == [7]
+
+
+def test_a_descriptor_handed_over_before_its_waiter_gave_up_is_closed_once_by_the_waiter() -> None:
+    handover, closed = _counting_handover()
+
+    assert handover.hand_over(7) == 7
+    assert closed == []
+    handover.abandon()
+
+    assert closed == [7]
+
+
+def test_a_failed_acquisition_goes_out_of_the_coroutine_as_it_is(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Not None, which reads as the feature being off: a request would go on unlocked."""
+    failure = tools.ToolsLockUnavailableError(Path("/nowhere/.lock"), "open failed: injected")
+
+    def fail() -> int | None:
+        raise failure
+
+    monkeypatch.setattr(tools, "acquire_shared_tools_lock", fail)
+
+    with pytest.raises(tools.ToolsLockUnavailableError) as raised:
+        asyncio.run(tools.acquire_shared_tools_lock_async())
+    assert raised.value is failure
+
+
+def _observed_acquisitions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[threading.Event, threading.Event]:
+    """Events set as a worker enters ``acquire_shared_tools_lock`` and as it returns."""
+    real = tools.acquire_shared_tools_lock
+    entered, returned = threading.Event(), threading.Event()
+
+    def observed() -> int | None:
+        entered.set()
+        try:
+            return real()
+        finally:
+            returned.set()
+
+    monkeypatch.setattr(tools, "acquire_shared_tools_lock", observed)
+    return entered, returned
+
+
+def _exclusive_lock_free(root: Path) -> bool:
+    with tools.exclusive_tools_lock(root) as acquired:
+        return acquired
+
+
+async def _until(condition: Callable[[], bool], *, timeout: float = 5.0) -> bool:
+    """Whether ``condition`` holds within ``timeout``, checked as the loop runs."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.01)
+    return True
+
+
+def _cancelled_while_waiting_for_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    root: Path,
+    start: Callable[[], Awaitable[object]],
+    to_cancel: Callable[[asyncio.Future[Any]], asyncio.Future[Any]] = lambda task: task,
+) -> bool:
+    """Whether the exclusive lock comes free after ``start`` is cancelled waiting for
+    the shared lock behind a destroyer.
+
+    ``to_cancel`` picks the task to cancel from the one running ``start``, once a
+    worker is in ``acquire_shared_tools_lock``; the destroyer lets go after that
+    cancellation, and the worker takes the lock before the exclusive lock is tried.
+    """
+    entered, returned = _observed_acquisitions(monkeypatch)
+    holder = tools._open_tools_lock(root)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+
+    async def scenario() -> bool:
+        task = asyncio.ensure_future(start())
+        try:
+            assert await _until(entered.is_set)
+            to_cancel(task).cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            os.close(holder)
+        assert await _until(returned.is_set)
+        return await _until(lambda: _exclusive_lock_free(root))
+
+    return asyncio.run(scenario())
+
+
+def test_a_wait_for_the_shared_lock_cancelled_behind_a_destroyer_hands_the_lock_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    root.mkdir()
+    _install_tools(monkeypatch, root)
+
+    assert _cancelled_while_waiting_for_the_lock(
+        monkeypatch, root, tools.acquire_shared_tools_lock_async
+    )
+
+
+def test_an_ai_request_cancelled_while_it_waits_for_the_tools_lock_hands_it_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    root.mkdir()
+    _install_tools(monkeypatch, root)
+
+    async def request() -> None:
+        async with _advertised_tools_lock():
+            raise AssertionError("the request went on without being cancelled")
+
+    assert _cancelled_while_waiting_for_the_lock(monkeypatch, root, request)
+
+
+def test_examples_cancelled_while_they_wait_for_the_tools_lock_hand_it_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    root.mkdir()
+    _install_tools(monkeypatch, root)
+
+    def check() -> Awaitable[tools.CheckResult]:
+        return tools.run_examples("kb", check_id="c", workflow="health_check", budget_seconds=5)
+
+    assert _cancelled_while_waiting_for_the_lock(monkeypatch, root, check)
+
+
+def test_a_tool_call_cancelled_while_it_waits_for_its_own_tools_lock_hands_it_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A handler built outside a request scope takes the lock in its own call task,
+    which is shielded from the caller: that task is the one cancelled."""
+    root = tmp_path / "tools"
+    _make_tool(root, "echo", "import sys\nsys.stdout.write('ok')\n")
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler
+    before = set(tools._CALL_TASKS)
+
+    def the_call_task(_caller: asyncio.Future[Any]) -> asyncio.Future[Any]:
+        [task] = tools._CALL_TASKS - before
+        return task
+
+    assert _cancelled_while_waiting_for_the_lock(
+        monkeypatch, root, lambda: handler({}), to_cancel=the_call_task
+    )
+
+
+def test_an_ai_request_scope_cancelled_by_an_anyio_scope_hands_the_tools_lock_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An anyio scope's cancellation lands at every await inside it, an await in the
+    ``finally`` included, before what it awaits has run."""
+    root = tmp_path / "tools"
+    root.mkdir()
+    _install_tools(monkeypatch, root)
+
+    async def scenario() -> None:
+        with anyio.CancelScope() as scope:
+            async with _advertised_tools_lock():
+                scope.cancel()
+                await asyncio.sleep(0)
+                raise AssertionError("the cancelled scope let the request go on")
+
+    asyncio.run(scenario())
+
+    assert _exclusive_lock_free(root)
+
+
+def test_examples_cancelled_by_an_anyio_scope_hand_the_tools_lock_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    root.mkdir()
+    _install_tools(monkeypatch, root)
+    scopes: list[anyio.CancelScope] = []
+
+    def cancel_then_find_nothing(_name: str) -> str:
+        scopes[0].cancel()
+        return "not_found"
+
+    monkeypatch.setattr(tools, "checkable_tool", cancel_then_find_nothing)
+
+    async def scenario() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            await tools.run_examples("kb", check_id="c", workflow="health_check", budget_seconds=5)
+
+    asyncio.run(scenario())
+
+    assert _exclusive_lock_free(root)
 
 
 def test_a_toggle_landing_while_a_call_prepares_still_refuses_before_popen(

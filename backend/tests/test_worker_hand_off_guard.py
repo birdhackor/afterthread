@@ -38,6 +38,10 @@ What it does not read: a primitive reached through another name (an alias, a
 variable holding it), a helper two calls away, a hand-off made outside a function
 call expression. The register is written by hand: the guard checks that every
 hand-off has a row and every row a hand-off, not that what a row says is true.
+
+One more check runs the same scanner over every module of the backend, not only
+``tool_builder``: no tools-lock function (``_LOCK_FUNCTIONS``) is handed to a
+thread by name.
 """
 
 import ast
@@ -1472,3 +1476,72 @@ _NOT_FOUND: dict[str, str] = {
 @pytest.mark.parametrize("form", list(_NOT_FOUND))
 def test_the_hand_off_scanner_passes_over_what_hands_off_nothing(form: str) -> None:
     assert _hand_offs(_NOT_FOUND[form]) == []
+
+
+# --- the tools lock, handed to a thread by name, anywhere in the backend ----------
+
+# The tools-lock functions no coroutine hands to a thread by name. A coroutine takes
+# the shared lock through ``tools.acquire_shared_tools_lock_async``, which hands back
+# what its worker takes however the wait ends, and releases it by calling
+# ``tools.release_tools_lock`` itself, which no cancellation can skip.
+_LOCK_FUNCTIONS = frozenset({"acquire_shared_tools_lock", "release_tools_lock"})
+
+
+def _named(worker: str) -> str | None:
+    """The name a hand-off's worker is written as: a plain name, or the last part of an
+    attribute; None for anything else (a lambda, a call)."""
+    expression = ast.parse(worker, mode="eval").body
+    if isinstance(expression, ast.Name):
+        return expression.id
+    if isinstance(expression, ast.Attribute):
+        return expression.attr
+    return None
+
+
+def _lock_functions_handed_over_by_name(source: str) -> list[HandOff]:
+    return [
+        hand_off for hand_off in _hand_offs(source) if _named(hand_off.worker) in _LOCK_FUNCTIONS
+    ]
+
+
+def test_no_backend_module_hands_a_tools_lock_function_to_a_thread_by_name() -> None:
+    """Checks: every module under ``afterthread/``, each hand-off the scanner finds whose
+    worker is a tools-lock function by name or as an attribute, ``partial`` taken off.
+    Not covered: the function reached through an alias, a lambda, or a nested def that
+    calls it -- the way ``acquire_shared_tools_lock_async`` hands over its own worker."""
+    package = Path(tool_builder.__file__).parents[1]
+    sources = sorted(package.rglob("*.py"))
+    assert sources
+    found = [
+        (str(path.relative_to(package.parent)), *hand_off.key)
+        for path in sources
+        for hand_off in _lock_functions_handed_over_by_name(path.read_text(encoding="utf-8"))
+    ]
+    assert found == []
+
+
+# Each spelling of a lock function handed over, found once by the step that reads the
+# worker's name.
+_LOCK_HANDED_OVER: dict[str, str] = {
+    "acquire-by-name": (
+        "async def f():\n    x = await run_in_threadpool(acquire_shared_tools_lock)\n"
+    ),
+    "acquire-as-an-attribute": (
+        "async def f():\n    x = await run_in_threadpool(tools.acquire_shared_tools_lock)\n"
+    ),
+    "acquire-in-a-partial": (
+        "async def f():\n    x = await run_in_threadpool(partial(acquire_shared_tools_lock))\n"
+    ),
+    "release-by-name": "async def f():\n    await run_in_threadpool(release_tools_lock, fd)\n",
+    "release-as-an-attribute": (
+        "async def f():\n    await run_in_threadpool(tools.release_tools_lock, fd)\n"
+    ),
+    "release-in-a-partial": (
+        "async def f():\n    await run_in_threadpool(partial(release_tools_lock, fd))\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("form", list(_LOCK_HANDED_OVER))
+def test_the_lock_check_reads_each_spelling_of_a_lock_function_handed_over(form: str) -> None:
+    assert len(_lock_functions_handed_over_by_name(_LOCK_HANDED_OVER[form])) == 1

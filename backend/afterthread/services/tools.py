@@ -631,9 +631,10 @@ def acquire_shared_tools_lock() -> int | None:
     """Take the request-wide shared lock, blocking only behind a destroyer.
 
     ``None`` means the feature is unconfigured or its root does not exist, in
-    which case no installed tool can be advertised. The router calls this on a
-    worker before scanning/advertising and holds the returned descriptor through
-    the complete LLM request.
+    which case no installed tool can be advertised. A coroutine takes it through
+    ``acquire_shared_tools_lock_async``: the router does so before
+    scanning/advertising and holds the returned descriptor through the complete
+    LLM request.
     """
 
     base = tools_dir()
@@ -649,10 +650,83 @@ def acquire_shared_tools_lock() -> int | None:
 
 
 def release_tools_lock(fd: int | None) -> None:
-    """Close one parent reference; the kernel releases on the last reference."""
+    """Close one parent reference; the kernel releases on the last reference.
+
+    A close never waits behind another holder, so a coroutine calls it directly
+    in its ``finally``: an await there can be stopped before it runs by a
+    cancellation still in force (an anyio scope's), which would leave the
+    reference open.
+    """
 
     if fd is not None:
         os.close(fd)
+
+
+class _LockHandover:
+    """Where a worker thread hands a lock descriptor to the coroutine waiting for it.
+
+    Whichever side comes second closes it: the worker, when the waiter has
+    already given up by the time it has the descriptor; the waiter, when it
+    gives up after the worker handed it over. Both answer under one
+    ``threading.Lock``, so exactly one of them closes it, in either order.
+    ``close`` is how (``release_tools_lock``).
+    """
+
+    def __init__(self, close: Callable[[int], None] = release_tools_lock) -> None:
+        self._guard = threading.Lock()
+        self._abandoned = False
+        self._handed: int | None = None
+        self._close = close
+
+    def hand_over(self, fd: int | None) -> int | None:
+        """The worker's side: ``fd`` for the waiter, or None, having closed ``fd``,
+        when the waiter has already given up."""
+        if fd is None:
+            return None
+        with self._guard:
+            if not self._abandoned:
+                self._handed = fd
+                return fd
+        self._close(fd)
+        return None
+
+    def abandon(self) -> None:
+        """The waiter's side, giving up: nothing is handed over from now on, and a
+        descriptor already handed over is closed."""
+        with self._guard:
+            self._abandoned = True
+            fd, self._handed = self._handed, None
+        if fd is not None:
+            self._close(fd)
+
+
+async def acquire_shared_tools_lock_async() -> int | None:
+    """``acquire_shared_tools_lock`` for a coroutine: taken on a worker thread, and
+    handed back however the wait ends.
+
+    The worker and the waiter meet in a ``_LockHandover``, and whichever comes
+    second closes the descriptor. A wait that ends before the worker hands it
+    over -- a plain ``Task.cancel`` ends it at once, the worker perhaps still
+    waiting for the lock -- leaves the worker to close what it takes; a wait that
+    ends after closes it itself. A cancellation that waits for the worker (an
+    anyio scope's) does not end the wait: the descriptor is returned, and the
+    caller's next await raises inside the ``try`` that releases it. A failure of
+    the acquisition itself goes out as it is, with no descriptor: the acquisition
+    closes its own.
+
+    The caller owns a returned descriptor: it enters the ``try`` whose
+    ``finally`` calls ``release_tools_lock`` before any other await.
+    """
+    handover = _LockHandover()
+
+    def _acquire() -> int | None:
+        return handover.hand_over(acquire_shared_tools_lock())
+
+    try:
+        return await run_in_threadpool(_acquire)
+    except BaseException:
+        handover.abandon()
+        raise
 
 
 @contextlib.contextmanager
@@ -4628,7 +4702,7 @@ def _make_handler(
             try:
                 tools_lock_fd = owned_lock_fd
                 if identity is not None and tools_lock_fd is None:
-                    owned_lock_fd = await run_in_threadpool(acquire_shared_tools_lock)
+                    owned_lock_fd = await acquire_shared_tools_lock_async()
                     tools_lock_fd = owned_lock_fd
                 # Timed from here: a direct caller may have waited for a destroyer
                 # to let go of the lock, and that wait is not the tool's duration.
@@ -4661,8 +4735,7 @@ def _make_handler(
             )
             return result
         finally:
-            if owned_lock_fd is not None:
-                await run_in_threadpool(release_tools_lock, owned_lock_fd)
+            release_tools_lock(owned_lock_fd)
 
     async def _handler(arguments: dict[str, Any]) -> str:
         try:
@@ -4869,7 +4942,7 @@ async def run_examples(
     all of them down), and once ``budget_seconds`` is spent the rest are not run
     (invariant S). ``on_progress`` sees the result after every example.
     """
-    fd = await run_in_threadpool(acquire_shared_tools_lock)
+    fd = await acquire_shared_tools_lock_async()
     if fd is None:
         return CheckResult(status="not_found")
     try:
@@ -4900,7 +4973,7 @@ async def run_examples(
             await _write_check(name, check_id, workflow, result)
             return result
     finally:
-        await run_in_threadpool(release_tools_lock, fd)
+        release_tools_lock(fd)
 
 
 async def _write_check(name: str, check_id: str, workflow: str, result: CheckResult) -> None:

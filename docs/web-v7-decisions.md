@@ -733,6 +733,20 @@ v7 之前就有的缺陷（`delete_tool`、`_delete_tool_locked`、`_resolve_pac
     的連結沒有列，也就沒有刪除鈕可以清它的紀錄。跟著連結的查詢有其他失敗時，當作在。上面「在：看到目錄或連結」依此縮小。
   - 「共用的查找不再有人把它的 None 讀成已不在」只對刪除成立。執行紀錄的列表與詳情（`tool_runs.PackageVersions`）仍把
     它的 None 顯示成 `vid_state: gone`；那只是顯示，`fixable` 同時是 false，不刪任何東西，不在這次範圍。
+- **更正：取消時交還鎖（實作時定案，經 fable 複審兩則）**：
+  - 上面「等待中被取消時，會等執行緒做完再丟掉回傳值」只對 anyio 的取消範圍成立，而且那時 await 把值交回、不拋例外。
+    `asyncio.timeout` 與事件迴圈關閉用的一般取消（`Task.cancel`）會立刻結束 await，執行緒照樣做完，取到的 descriptor
+    掉進沒人讀的 future。所以「helper 關掉執行緒已交出的 descriptor」修不好（實作者的實驗推翻，主 agent 重跑確認）。
+    `docs/web-v2-decisions.md` F2 的措辭帶有同一個誤讀；F2 的補救不依賴它。
+  - 改成：取鎖的執行緒與等待的一方在 `tools._LockHandover` 交接，兩邊在同一把 `threading.Lock` 底下決定，後到的一方關。
+    三處的 `finally` 直接呼叫 `release_tools_lock`，不經執行緒：anyio 的取消範圍會讓 `finally` 裡經執行緒的釋放在排進去
+    之前就被拋掉。
+  - 目前只有關閉程式時會在取鎖途中取消（`llm.py` 的期限在鎖之內、工具呼叫是 shield 起來的獨立 task、builder job 沒有
+    取消路徑）；這是預防性的修正，不寫 CHANGELOG。
+  - 守衛留下，理由改了：它確認 backend 裡沒有任何地方以名字直接把取鎖或放鎖交給執行緒（helper 交的是自己的內層函式），
+    別名、lambda 與巢狀函式它讀不到；它沿用 `test_worker_hand_off_guard.py` 的掃描器。同一個掃描器盤點過 `tool_builder.py`
+    以外的 42 處交接，交回需要呼叫者釋放的東西的只有這把鎖（另有兩條執行緒由啟動它的 worker 自己 join）。
+  - 開頭「沒有另做設計諮詢」不適用於這一項。
 
 ## D60（總體審查續）：AI 日誌的本文，存下的那份也要檢查
 
