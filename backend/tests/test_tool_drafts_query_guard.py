@@ -307,7 +307,7 @@ _REASONED: list[tuple[str, str, str]] = [
         "remove_entry",
         "except OSError: return",
         "removal is best effort and reports nothing; what it leaves is judged by a "
-        "later look (_seen_gone) or collected by the sweep",
+        "later look (tools._seen_gone) or collected by the sweep",
     ),
     (
         "remove_entry",
@@ -382,11 +382,6 @@ _REASONED: list[tuple[str, str, str]] = [
         "except Exception: return None",
         "no change is claimed written: the mark stays, and the list reads the draft's "
         "publish as not known",
-    ),
-    (
-        "_seen_gone",
-        "except OSError: return False",
-        "a look that fails is not 'gone': nothing is reported removed",
     ),
     (
         "_take_away",

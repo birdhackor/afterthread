@@ -510,8 +510,9 @@ async def delete_installed_tool(name: ToolName, session: SessionDep) -> ToolDele
 
     A request or inherited child holding the shared tools lock produces the
     distinct retryable ``ai_job_in_progress`` 409 without renaming or deleting
-    anything. Otherwise the 200 response says ``removed`` after physical
-    deletion or ``retained`` with the cleanup-failure path (a ``BackendPath``).
+    anything. Otherwise the 200 response says ``removed`` once what was renamed
+    away is seen gone, or ``retained`` with its path (a ``BackendPath``) when the
+    cleanup failed or its result cannot be seen.
 
     The tool's run records go once the package is gone -- ``removed`` and
     ``retained`` alike, since either way the tool has left the registry -- and

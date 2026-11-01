@@ -1297,7 +1297,9 @@ def draft_state(
 
 def _kept_paths(draft_dir: Path, manifest: dict[str, Any]) -> list[str]:
     """The previous files directories ``kept`` names, but those seen gone."""
-    return [str(draft_dir / name) for name in manifest["kept"] if not _seen_gone(draft_dir / name)]
+    return [
+        str(draft_dir / name) for name in manifest["kept"] if not tools._seen_gone(draft_dir / name)
+    ]
 
 
 def draft_view(
@@ -2533,7 +2535,7 @@ def _copy_and_commit(
         doc = {
             **_recorded(current, entry, draft_round),
             "files_dir": files_name,
-            "kept": [name for name in named if not _seen_gone(draft_dir / name)],
+            "kept": [name for name in named if not tools._seen_gone(draft_dir / name)],
         }
     written = _write_manifest(draft_dir, doc, known)
     if not written.replaced:
@@ -2792,7 +2794,7 @@ def begin_round(
             return START_CHANGED
         if current["publishing"] is not None:
             return START_PUBLISHING
-        kept = [name for name in current["kept"] if not _seen_gone(draft_dir / name)]
+        kept = [name for name in current["kept"] if not tools._seen_gone(draft_dir / name)]
         if len(kept) >= _KEPT_MAX:
             return START_KEPT_FULL.format(max=_KEPT_MAX)
         doc = {
@@ -3260,37 +3262,22 @@ def _discard_name(meta: Path) -> Path:
     return meta / f"{DRAFT_DIRNAME}.discarded-{token_hex(16)}"
 
 
-def _seen_gone(path: Path) -> bool:
-    """Whether ``path`` is seen not to exist: its ``lstat`` says so, and nothing else.
-
-    An ``lstat`` that fails any other way -- a directory above it denies search,
-    say -- says nothing about it, so it is not gone as far as anyone can tell.
-    """
-    try:
-        os.lstat(path)
-    except FileNotFoundError, NotADirectoryError:
-        return True
-    except OSError:
-        return False
-    return False
-
-
 def _take_away(draft_dir: Path) -> Path | None:
     """Rename ``draft/`` aside, then remove it; returns what is not seen gone.
 
     The rename makes the draft disappear in one step; what its removal leaves is
     under a name only the sweep collects. When even the rename is refused, the
     draft is removed where it is, as far as that goes. A path counts as removed
-    only once it is seen gone (``_seen_gone``).
+    only once it is seen gone (``tools._seen_gone``).
     """
     aside = _discard_name(draft_dir.parent)
     try:
         os.rename(draft_dir, aside)
     except OSError:
         remove_entry(draft_dir)
-        return None if _seen_gone(draft_dir) else draft_dir
+        return None if tools._seen_gone(draft_dir) else draft_dir
     remove_entry(aside)
-    return None if _seen_gone(aside) else aside
+    return None if tools._seen_gone(aside) else aside
 
 
 @dataclass(frozen=True, slots=True)
@@ -3317,7 +3304,7 @@ class Removal:
 def _removal(draft_dir: Path) -> Removal:
     """Take ``draft/`` away and say what became of it, from what is seen afterwards."""
     left = _take_away(draft_dir)
-    if not _seen_gone(draft_dir):
+    if not tools._seen_gone(draft_dir):
         return Removal(False, draft_dir)
     return Removal(True, left)
 
@@ -3435,7 +3422,7 @@ def discard(
     or it is seen not to exist, its path running through a file included; a
     path that cannot be resolved (``tools.ToolsDirUnresolvedError``) leaves the
     draft as one that may be there. ``Removal.removed`` only once ``draft/`` is
-    seen gone (``_seen_gone``); one that cannot be looked at afterwards is not
+    seen gone (``tools._seen_gone``); one that cannot be looked at afterwards is not
     removed either.
 
     Raises ``tools.ToolsLockUnavailableError`` when the lock path is unusable.
@@ -3449,7 +3436,7 @@ def discard(
             # tools path that is there but no directory holds no draft, yet is
             # answered as one that may.
             base = tools.tools_dir()
-            if base is None or _seen_gone(base):
+            if base is None or tools._seen_gone(base):
                 return "not_found"
             return Removal(False, draft_path(package_root))
     except tools.ToolsDirUnresolvedError:

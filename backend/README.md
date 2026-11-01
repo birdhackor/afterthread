@@ -195,18 +195,18 @@ job 的 `error` 也是這段訊息（帶結尾句號）；其他未預期錯誤�
   `runs_deleted` 說明有沒有刪成（`false` 時工具照樣已刪除，紀錄改由 purge 的孤兒範圍清掉）；
   404／409 時紀錄不動。
   取得 lock 後先把套件改成隱藏的 `.stale-` 名稱，再盡力遞迴移除；這個 rename 是為了
-  讓 registry 消失與失敗後清理可重試，不再負責保護執行中的目錄。成功回 200
-  `{outcome: "removed", retained_path: null, retention_reason: null}`；若遞迴清理失敗，
+  讓 registry 消失與失敗後清理可重試，不再負責保護執行中的目錄。成功（清理後的 `lstat` 回「不存在」或「某一層不是目錄」）回 200
+  `{outcome: "removed", retained_path: null, retention_reason: null}`；若遞迴清理失敗或無法確認已清掉，
   回 `{outcome: "retained", retained_path: "<隱藏目錄的絕對路徑>",
   retention_reason: "cleanup_failed"}`。兩種回應下工具都已不可見；後者表示設定與
-  金鑰檔仍在磁碟，修復權限／檔案系統問題後才手動清理。
+  金鑰檔仍在、或可能仍在磁碟，修復權限／檔案系統問題後才手動清理。
 - `DELETE /api/tools/{name}/versions/{vid}` — 丟掉畫面所指的**精確目前版本**。後端先
   取得全域工具名額，再比對 path 裡的 `vid`；不相符回
   `409 version_mismatch`。`lineage=usable` 時把 `current` 原子切回
   `origin.json.previous`，之後才盡力清掉原版本。和整包刪除一樣，未取得非阻塞
   exclusive tools lock 時回 `409 ai_job_in_progress`，不發布 pointer、不移動檔案。
-  pointer 的目錄 fsync 已確認後，原版本先改名成 `<vid>.discarded` 再刪除；成功回
-  `{outcome: "removed", retained_path: null, retention_reason: null}`。清理失敗回
+  pointer 的目錄 fsync 已確認後，原版本先改名成 `<vid>.discarded` 再刪除；成功（清理後的 `lstat` 回「不存在」或「某一層不是目錄」）回
+  `{outcome: "removed", retained_path: null, retention_reason: null}`。清理失敗或無法確認已清掉時回
   `retention_reason: "cleanup_failed"`，UI 提示檢查權限／檔案系統後處理；若
   `current=P` 已換上但目錄 fsync 未確認，V 保留原位並回
   `retention_reason: "durability_unconfirmed"`，UI 明確禁止手動刪除，要求先修復

@@ -5065,6 +5065,21 @@ def set_enabled(name: str, enabled: bool) -> bool:
     return write_package_state(package_root, enabled)
 
 
+def _seen_gone(path: Path) -> bool:
+    """Whether ``path`` is seen not to exist: its ``lstat`` says so, and nothing else.
+
+    An ``lstat`` that fails any other way -- a directory above it denies search,
+    say -- says nothing about it, so it is not gone as far as anyone can tell.
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError, NotADirectoryError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 type ToolRemovalOutcome = Literal["removed", "retained"]
 type ToolRetentionReason = Literal["durability_unconfirmed", "cleanup_failed"]
 
@@ -5168,7 +5183,7 @@ def _discard_version_locked(package_root: PackageRoot, expected_vid: str) -> Dis
 
     with contextlib.suppress(Exception):
         shutil.rmtree(parked)
-    if os.path.lexists(parked):
+    if not _seen_gone(parked):
         return ToolRemovalResult("retained", parked, "cleanup_failed")
     return ToolRemovalResult("removed", None, None)
 
@@ -5264,9 +5279,10 @@ def _delete_tool_locked(base: Path, name: str) -> ToolRemovalResult | None:
         # not happen" -- the same answer a failed removal gave before.
         return None
     # Best-effort from here: the tool is already gone as far as every registry
-    # reader is concerned, so partial removal is reported as retained and retried
-    # by the exclusive stale sweep.
+    # reader is concerned. Removed only once the stale path is seen gone; what is
+    # not -- partial removal, or remains a look cannot see -- is reported as
+    # retained with its path and retried by the exclusive stale sweep.
     shutil.rmtree(stale, ignore_errors=True)
-    if os.path.lexists(stale):
+    if not _seen_gone(stale):
         return ToolRemovalResult("retained", stale, "cleanup_failed")
     return ToolRemovalResult("removed", None, None)

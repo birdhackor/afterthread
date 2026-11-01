@@ -1023,6 +1023,39 @@ def test_invariant_e_discard_succeeds_when_old_version_removal_fails(
     assert not tools._ADVERTISEMENT_GENERATIONS
 
 
+def test_discard_reports_removed_only_once_the_parked_version_is_seen_gone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every look at ``<vid>.discarded`` fails, so nothing can tell whether the
+    parked version's removal finished. The discard reports it retained, with
+    that path, rather than removed, and the parked version is still there once
+    the looks work again. A check that reads a failed look as "not there", as
+    ``os.path.lexists`` does, would report it removed."""
+    root = tmp_path / "tools"
+    first = _make_tool(root, "echo", "import sys\n")
+    package = _package_path(first)
+    second_vid = "20260728T020304Z-fedcba"
+    second = _add_committed_version(package, second_vid, description="second", output="SECOND")
+    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    resolution = tools.resolve_current(tools.PackageRoot(package))
+    assert isinstance(resolution, tools.Resolved)
+    parked = second.with_name(f"{second_vid}.discarded")
+
+    with monkeypatch.context() as patch:
+        failed = _failing_at(patch, "lstat", parked, errno.EIO)
+        discarded = tools.discard_version(resolution.package_root, resolution.vid)
+
+    assert isinstance(discarded, tools.ToolRemovalResult)
+    assert (discarded.outcome, discarded.retained_path, discarded.retention_reason) == (
+        "retained",
+        parked,
+        "cleanup_failed",
+    )
+    assert len(failed) >= 1
+    assert _resolved_version(package) == first  # the discard itself stands
+    assert parked.is_dir()
+
+
 def test_discard_parks_then_removes_under_the_exclusive_lock(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -5374,6 +5407,70 @@ def test_delete_tool_removes_package(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert list_tools() == []
     assert [entry.name for entry in root.iterdir()] == [tools._TOOLS_LOCK_FILENAME]
     assert _delete_outcome("echo") is None  # already gone
+
+
+@pytest.mark.parametrize(
+    ("where", "look_fails", "seen_gone"),
+    [
+        ("missing", False, True),
+        ("file/child", False, True),
+        ("present", True, False),
+        ("present", False, False),
+    ],
+    ids=["missing", "under-a-file", "look-fails", "present"],
+)
+def test_seen_gone_only_when_the_look_says_nothing_is_there(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    where: str,
+    look_fails: bool,
+    seen_gone: bool,
+) -> None:
+    """``_seen_gone`` is True only when ``lstat`` says nothing is there: no such
+    entry, or a component above it that is a file. A look that fails any other
+    way says nothing about the path, and a path that is there is not gone."""
+    (tmp_path / "present").mkdir()
+    (tmp_path / "file").write_text("a file\n", encoding="utf-8")
+    path = tmp_path / where
+
+    with monkeypatch.context() as patch:
+        failed = _failing_at(patch, "lstat", path, errno.EIO) if look_fails else []
+        answer = tools._seen_gone(path)
+
+    assert answer is seen_gone
+    assert len(failed) == int(look_fails)
+
+
+def test_delete_reports_removed_only_once_its_remains_are_seen_gone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every look at the stale path the package is renamed to fails, so nothing
+    can tell whether its removal finished. The deletion reports it retained,
+    with that path, rather than removed, and the directory, keys included, is
+    still there once the looks work again. A check that reads a failed look as
+    "not there", as ``os.path.lexists`` does, would report it removed."""
+    root = tmp_path / "tools"
+    _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", dotenv="KEY=value\n")
+    _install_tools(monkeypatch, root)
+    base = tools.tools_dir()
+    assert base is not None
+    token = "0123456789abcdef" * 2
+    monkeypatch.setattr(tools, "uuid4", lambda: SimpleNamespace(hex=token))
+    stale = tools._stale_backup_path(base, "echo", token)
+
+    with monkeypatch.context() as patch:
+        failed = _failing_at(patch, "lstat", stale, errno.EIO)
+        result = delete_tool("echo")
+
+    assert isinstance(result, tools.ToolRemovalResult)
+    assert (result.outcome, result.retained_path, result.retention_reason) == (
+        "retained",
+        stale,
+        "cleanup_failed",
+    )
+    assert len(failed) >= 1
+    assert stale.is_dir()
+    assert (stale / ".env").is_file()
 
 
 def test_delete_during_an_execution_returns_busy_and_leaves_package_untouched(
