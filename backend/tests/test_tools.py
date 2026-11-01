@@ -5940,39 +5940,53 @@ def test_set_enabled_refuses_a_symlinked_state_file(
 def test_a_publish_whose_package_becomes_a_symlink_at_the_boundary_is_refused(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The last containment re-check refuses an ancestor swapped for a symlink.
+    """A package that becomes a link after the first lookup is not written through.
 
     The publisher's own pre-write ``lstat`` protects the FINAL component but not
     its ancestors: it -- like ``mkstemp(dir=...)`` and ``os.replace`` -- follows
-    directories above the state filename. ``set_enabled`` therefore resolves the
-    package once to identify it, then checks containment again immediately before
-    calling the publisher.
+    directories above the state filename. ``set_enabled`` therefore looks the
+    package up once to identify it, and again before the write.
 
-    Driven at exactly that instant rather than by timing a filesystem race: the
-    re-check is replaced by a wrapper that swaps the package before delegating.
+    Driven between those two lookups rather than by timing a filesystem race: both
+    go through ``_resolve_package_dir_no_alias``, and a wrapper lets the first hand
+    back the real package unchanged, then swaps the package for a link just before
+    the second, so it is the recheck that sees the link and refuses. The first
+    lookup cannot refuse this: the package is a real directory when it looks.
+    ``resolve_current``'s ``lstat`` of the package directory, after the recheck,
+    would refuse this link as well; the tools directory itself replaced by a
+    link, which that ``lstat`` follows, is what only the recheck refuses, and it
+    is not driven here.
 
     What must hold is BOTH halves -- the toggle reports "did not happen" (the route
     turns that into a 404) and the link's target is left without so much as a temp
-    file in it."""
+    file in it, the real package's state file unchanged."""
     root = tmp_path / "tools"
     version = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", enabled=True)
     pkg = _package_path(version)
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     _install_tools(monkeypatch, root)
+    base = tools.tools_dir()
+    assert base is not None
     aside = root / ".moved-aside"
     before = (pkg / tools._META_DIRNAME / tools._PACKAGE_STATE_FILENAME).read_bytes()
     real_resolve = tools._resolve_package_dir_no_alias
+    answers: list[tools.PackageRoot | None] = []
 
-    def swap_before_recheck(name: str) -> tools.PackageRoot | None:
-        os.rename(pkg, aside)  # the package the toggle resolved, moved away
-        pkg.symlink_to(elsewhere, target_is_directory=True)
-        return real_resolve(name)
+    def swap_before_the_second_lookup(name: str) -> tools.PackageRoot | None:
+        if len(answers) == 1:  # the first lookup has identified the package
+            os.rename(pkg, aside)  # the package the toggle resolved, moved away
+            pkg.symlink_to(elsewhere, target_is_directory=True)
+        answer = real_resolve(name)
+        answers.append(answer)
+        return answer
 
-    monkeypatch.setattr(tools, "_resolve_package_dir_no_alias", swap_before_recheck)
+    monkeypatch.setattr(tools, "_resolve_package_dir_no_alias", swap_before_the_second_lookup)
 
     assert set_enabled("echo", False) is False
 
+    # The first lookup handed back the real package; the recheck, after the swap, refused it.
+    assert answers == [tools.PackageRoot(base / "echo"), None]
     assert list(elsewhere.iterdir()) == []  # nothing written THROUGH the link
     assert (
         aside / tools._META_DIRNAME / tools._PACKAGE_STATE_FILENAME
@@ -6154,11 +6168,11 @@ def test_set_enabled_refuses_internal_alias(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """set_enabled must never act on a package THROUGH an internal alias:
-    tools/<alias> -> tools/<real> resolves inside the root, so absent the
-    pre-resolve symlink block a toggle on the alias would land the state file
-    INSIDE the REAL package -- switching off a tool the operator addressed by
-    another name. The alias PATCH is refused (False) and the real package is left
-    byte-for-byte untouched, state file included."""
+    tools/<alias> -> tools/<real> resolves inside the root. The lookup sees the
+    link at the name and refuses it; a lookup that followed the link would land
+    the state file INSIDE the REAL package -- switching off a tool the operator
+    addressed by another name. The alias PATCH is refused (False) and the real
+    package is left byte-for-byte untouched, state file included."""
     root = tmp_path / "tools"
     real_version = _make_tool(root, "real", "import sys\nsys.stdout.write('x')\n", enabled=True)
     (root / "alias").symlink_to(root / "real", target_is_directory=True)
@@ -6346,9 +6360,9 @@ def test_set_enabled_refuses_an_alias_whose_every_look_says_it_is_no_link(
 ) -> None:
     """Every ``is_symlink`` answer for ``tools/alias`` is "not a link", the answer
     a look that fails gives, while the resolve follows the link to ``tools/real``.
-    The toggle's own alias check lets the name through; the recheck before the
-    write refuses it, since what the resolve gave is not ``tools/alias``, and the
-    real package keeps its flag. Red before the fix: the toggle switched off
+    The first lookup refuses the name, since what the resolve gave is not
+    ``tools/alias``: the toggle reports "did not happen" and the real package
+    keeps its flag. Red without that check on the result: the toggle switches off
     ``real``."""
     _real, alias = _real_and_alias(monkeypatch, tmp_path)
     real_islink = os.path.islink

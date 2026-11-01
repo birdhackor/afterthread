@@ -930,8 +930,8 @@ def _resolve_in_staging(staging: Path, raw: object) -> Path | None:
       target outside staging and containment fails -- checking the unresolved
       string could never catch this one.
 
-    Mirrors tools.py's ``_resolve_package_dir`` defense (same reasoning, same
-    ``_is_within`` predicate), applied to the installer's boundary.
+    The containment check is ``tools._is_within`` between the resolved staging
+    root and the resolved path.
     """
     if not isinstance(raw, str) or not raw.strip():
         return None

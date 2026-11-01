@@ -504,7 +504,8 @@ async def delete_installed_tool(name: ToolName, session: SessionDep) -> ToolDele
     The registry's ``delete_tool`` re-validates the name AND resolved-path
     containment under the tools dir before it touches anything (the
     path-traversal / symlink-escape hard-block lives THERE, not in this router),
-    and returns None for a missing package, or when its look at the name fails
+    and returns None for a missing package, when its look at the name fails, or
+    when the name resolves to something other than the package directory itself
     -> 404.
 
     A request or inherited child holding the shared tools lock produces the

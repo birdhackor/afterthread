@@ -56,8 +56,9 @@ _logger = logging.getLogger("afterthread.tools")
 # A package (and directory) name: lowercase alnum start, then up to 63 more of
 # alnum/underscore/hyphen. Admits no ".", "/", or whitespace, so a traversal
 # name (``".."``, ``"../evil"``, ``"/etc/x"``) can never match -- the regex is
-# the first line of the path-traversal defense, backed by the resolved-path
-# containment check in ``_resolve_package_dir``.
+# the first line of the path-traversal defense, backed by the check in
+# ``_resolve_package_dir_no_alias`` that what the resolve gave is exactly
+# ``<tools_dir>/<name>``.
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _VID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$")
 _META_DIRNAME = ".afterthread.meta"
@@ -732,10 +733,7 @@ def _valid_entry(entry: Any) -> bool:
 def _is_within(base: Path, candidate: Path) -> bool:
     """True when the RESOLVED ``candidate`` lies at or under the RESOLVED ``base``.
 
-    ``relative_to`` raises ValueError when it does not -- the containment test
-    used both to validate an entry file (it must live inside its package) and to
-    hard-block a package path that escapes ``tools_dir`` (a symlink, a traversal
-    name that somehow reached here).
+    ``relative_to`` raises ValueError when it does not.
     """
     try:
         candidate.relative_to(base)
@@ -4965,33 +4963,6 @@ async def _run_loaded_examples(
 # --- mutation (name-validated + containment-checked) -----------------------
 
 
-def _resolve_package_dir(name: str) -> Path | None:
-    """Resolve ``<tools_dir>/<name>`` for a mutation, or None if it is unsafe.
-
-    The path-traversal hard-block, in two independent layers:
-
-    1. ``name`` must match ``_NAME_RE`` -- which admits no ".", "/", or
-       whitespace, so ``".."`` / ``"../evil"`` / ``"/etc/passwd"`` never even
-       reach the filesystem;
-    2. the RESOLVED candidate must still be contained under the RESOLVED
-       ``tools_dir``. Redundant with (1) for a plain name, but it is what
-       actually stops a package that is a SYMLINK pointing outside the tools dir
-       (or any future loosening of the regex) from letting ``delete_tool``
-       ``rmtree`` an arbitrary path. Attack blocked: a request to
-       ``set_enabled("../../etc")`` or a symlinked ``evil`` package escaping the
-       directory returns None here and the caller no-ops.
-
-    None also covers the feature being off (``tools_dir`` unset).
-    """
-    base = tools_dir()
-    if base is None or not _NAME_RE.match(name):
-        return None
-    candidate = (base / name).resolve()
-    if not _is_within(base.resolve(), candidate):
-        return None
-    return candidate
-
-
 def _resolve_package_dir_no_alias(name: str) -> PackageRoot | None:
     """The package directory ``<tools_dir>/<name>`` itself, never one reached through a link.
 
@@ -5000,9 +4971,8 @@ def _resolve_package_dir_no_alias(name: str) -> PackageRoot | None:
     ``tools/alias -> tools/real`` resolves inside the tools root and would hand
     ``real`` to whatever the caller does next -- a discard by the alias's name
     removing ``real``'s draft or retiring its current version, a regenerate
-    rewriting its summary. ``set_enabled`` handles an alias itself before
-    ``_resolve_package_dir``, which follows one; ``_delete_tool_locked`` takes a
-    strict ``lstat`` of its own first, then asks here.
+    rewriting its summary. ``_delete_tool_locked`` alone looks at the name
+    itself first, with a strict ``lstat``, and then asks here.
 
     In order: the name pattern and the feature being on; ``is_symlink`` on
     ``<tools_dir>/<name>``, which sees an alias without following it; the resolve
@@ -5056,22 +5026,18 @@ def set_enabled(name: str, enabled: bool) -> bool:
     base = tools_dir()
     if base is None or not _NAME_RE.match(name):
         return False
-    # INTERNAL-alias hard-block (H3), BEFORE resolve: an internal symlink
-    # ``tools/<name> -> tools/real`` RESOLVES inside the tools root, so the
-    # resolve-then-contain check below would PASS and this toggle would write the
-    # state file INTO the REAL package THROUGH the alias -- switching off a tool
-    # the operator addressed by another name. ``is_symlink`` does not follow the
-    # final component, so it detects the alias itself; refuse outright -- set_enabled
-    # has no safe action on an alias, unlike delete_tool which can at least drop
-    # just the dangling link. Checked before resolve precisely because
-    # ``resolve()`` erases the alias/real distinction. External-symlink escapes are
-    # separately caught by ``_resolve_package_dir``'s containment check.
-    if (base / name).is_symlink():
+    # The lookup refuses a link at the name, wherever it points: its own look
+    # sees the link, and where that look fails, what a resolve that follows the
+    # link gives is not exactly ``<tools_dir>/<name>``. An alias whose looks all
+    # fail, ``is_symlink``'s and the resolve's, is handed back as the alias path
+    # itself, never its target, and ``resolve_current`` below refuses it: its
+    # ``lstat`` of the package directory takes neither a failed look nor a link
+    # for a package directory. So the toggle needs no strict ``lstat`` of its
+    # own the way deletion does: deletion must be able to remove a package that
+    # ``resolve_current`` refuses, and this toggle refuses one.
+    package_root = _resolve_package_dir_no_alias(name)
+    if package_root is None:
         return False
-    directory = _resolve_package_dir(name)
-    if directory is None or not directory.is_dir():
-        return False
-    package_root = PackageRoot(directory)
     # The one write is atomic: a torn
     # state file is an UNREADABLE one, and an unreadable one takes the package out
     # of the registry (see ``_read_enabled_state``), so publishing this by
@@ -5214,12 +5180,13 @@ type DeleteToolResult = ToolRemovalResult | Literal["ai_job_in_progress"]
 def delete_tool(name: str) -> DeleteToolResult | None:
     """Delete a package (``rmtree``), or unlink an alias; return its outcome.
 
-    Name-validated and containment-checked exactly like ``set_enabled`` (the
-    traversal hard-block is what makes an ``rmtree`` here safe), so it can only
-    ever remove a directory that genuinely sits inside ``tools_dir``. None when
-    the name is unsafe, the package is absent, the look at this name fails, what
-    the name resolves to is not the package directory itself, or it could not be
-    taken out of the registry at all.
+    Name-validated, then one strict ``lstat`` of its own, then
+    ``_resolve_package_dir_no_alias`` (the traversal hard-block is what makes an
+    ``rmtree`` here safe), so it can only ever remove a directory that sits
+    exactly at ``<tools_dir>/<name>``. None when the name is unsafe, the package
+    is absent, the look at this name fails, what the name resolves to is not the
+    package directory itself, or it could not be taken out of the registry at
+    all.
 
     Destruction occurs only under the non-blocking exclusive tools lock. An
     ordinary request holds the shared side from advertisement through response,
