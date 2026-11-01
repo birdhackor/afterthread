@@ -747,6 +747,8 @@ v7 之前就有的缺陷（`delete_tool`、`_delete_tool_locked`、`_resolve_pac
     別名、lambda 與巢狀函式它讀不到；它沿用 `test_worker_hand_off_guard.py` 的掃描器。同一個掃描器盤點過 `tool_builder.py`
     以外的 42 處交接，交回需要呼叫者釋放的東西的只有這把鎖（另有兩條執行緒由啟動它的 worker 自己 join）。
   - 開頭「沒有另做設計諮詢」不適用於這一項。
+- **更正：e2e 的前置需求**（實作者讀腳本確認）：`smoke.sh` 也要 `setsid`，另外要 `curl` 與支援 `+%N` 的 `date`；
+  `wheel_smoke.sh` 沒有用到 bash 4 的功能，但要 `curl`、`python3` 與 GNU `stat`（`stat -c`）。`e2e/README.md` 照此寫。
 
 ## D60（總體審查續）：AI 日誌的本文，存下的那份也要檢查
 

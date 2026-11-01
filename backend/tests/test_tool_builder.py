@@ -3333,6 +3333,23 @@ def test_router_rejects_invalid_names_as_422(
     assert client.delete(f"/api/tools/{bad_name}").status_code == 422
 
 
+@pytest.mark.parametrize("root_is_a_file", [False, True], ids=["not-there", "a-file"])
+def test_router_delete_with_the_tools_directory_not_there_is_not_found_not_busy(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, root_is_a_file: bool
+) -> None:
+    """No tool can be deleted from a tools directory that is not there: 404, as for a
+    missing package, not the retryable 409 of an AI job holding the lock."""
+    root = tmp_path / "not-there"
+    if root_is_a_file:
+        root.write_text("not a directory\n", encoding="utf-8")
+    _install_settings(monkeypatch, tools_dir=str(root))
+
+    response = client.delete("/api/tools/kb")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Tool not found"}
+
+
 def test_router_delete_tool_response_distinguishes_removed_from_retained(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -8,6 +8,7 @@ while a check runs, delete and discard are refused and touch nothing.
 """
 
 import asyncio
+import errno
 import json
 import os
 import shutil
@@ -170,6 +171,37 @@ def test_examples_load_in_order_and_a_missing_file_is_none(tmp_path: Path) -> No
     assert (
         tools.load_examples(tools.VersionRoot(without / "versions" / _VID)) == tools.ExamplesFile()
     )
+
+
+def test_an_examples_file_that_cannot_be_looked_at_is_unreadable_not_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only a look that sees no file there means no examples. Here every look fails, as
+    under a version directory that denies search: the read says it could not."""
+    package = _make_tool(tmp_path, "kb", "print('x')\n", examples=_examples("a"))
+    version = package / "versions" / _VID
+    target = os.fspath(version / "examples.json")
+    failed: list[str] = []
+
+    def failing(name: str) -> Callable[..., Any]:
+        real = getattr(os, name)
+
+        def fake(path: Any, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(path, str | os.PathLike) and os.fspath(path) == target:
+                failed.append(name)
+                raise OSError(errno.EACCES, "a-failure-text-never-shown", target)
+            return real(path, *args, **kwargs)
+
+        return fake
+
+    for name in ("lstat", "stat", "open"):
+        monkeypatch.setattr(os, name, failing(name))
+
+    loaded = tools.load_examples(tools.VersionRoot(version))
+
+    assert failed
+    assert loaded.examples == ()
+    assert loaded.error is not None
 
 
 # --- P: the same path, only the examples ---------------------------------------------

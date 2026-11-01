@@ -4793,9 +4793,13 @@ def load_examples(version_root: VersionRoot) -> ExamplesFile:
     file goes through. The shape is ``{"examples": [{"name": str, "args": {...}},
     ...]}`` with at most ``EXAMPLES_MAX`` entries; each ``args`` is a JSON object,
     because that is what a tool is called with.
+
+    No examples only when ``examples.json`` is seen not to exist (``_seen_gone``).
+    A look at it that fails reads on, so the read reports a file it could not
+    read instead of passing for no examples.
     """
     path = version_root.path / _EXAMPLES_FILENAME
-    if not os.path.lexists(path):
+    if _seen_gone(path):
         return ExamplesFile()
     text = _read_regular_file_capped(path, _EXAMPLES_MAX_BYTES)
     if text is None:
@@ -5286,10 +5290,13 @@ def delete_tool(name: str) -> DeleteToolResult | None:
     Name-validated, then one strict ``lstat`` of its own, then
     ``_resolve_package_dir_no_alias`` (the traversal hard-block is what makes an
     ``rmtree`` here safe), so it can only ever remove a directory that sits
-    exactly at ``<tools_dir>/<name>``. None when the name is unsafe, the package
-    is absent, the look at this name fails, what the name resolves to is not the
-    package directory itself, or it could not be taken out of the registry at
-    all.
+    exactly at ``<tools_dir>/<name>``. None when the name is unsafe, the tools
+    directory is not seen as a directory (not there, or a look at it that fails),
+    the package is absent, the look at this name fails, what the name resolves
+    to is not the package directory itself, or it could not be taken out of the
+    registry at all. The tools directory is looked at before any lock is tried:
+    ``exclusive_tools_lock`` answers False for a root that is not a directory,
+    which would read as an AI job in progress.
 
     Destruction occurs only under the non-blocking exclusive tools lock. An
     ordinary request holds the shared side from advertisement through response,
@@ -5303,7 +5310,7 @@ def delete_tool(name: str) -> DeleteToolResult | None:
     sweep; no local generation/provenance judgement participates.
     """
     base = tools_dir()
-    if base is None or not _NAME_RE.match(name):
+    if base is None or not _NAME_RE.match(name) or not base.is_dir():
         return None
     with exclusive_tools_lock(base) as acquired:
         if not acquired:
