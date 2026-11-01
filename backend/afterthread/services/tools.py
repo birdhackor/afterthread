@@ -5000,8 +5000,9 @@ def _resolve_package_dir_no_alias(name: str) -> PackageRoot | None:
     ``tools/alias -> tools/real`` resolves inside the tools root and would hand
     ``real`` to whatever the caller does next -- a discard by the alias's name
     removing ``real``'s draft or retiring its current version, a regenerate
-    rewriting its summary. ``delete_tool`` and ``set_enabled`` handle an alias
-    themselves before ``_resolve_package_dir``, which follows one.
+    rewriting its summary. ``set_enabled`` handles an alias itself before
+    ``_resolve_package_dir``, which follows one; ``_delete_tool_locked`` takes a
+    strict ``lstat`` of its own first, then asks here.
 
     In order: the name pattern and the feature being on; ``is_symlink`` on
     ``<tools_dir>/<name>``, which sees an alias without following it; the resolve
@@ -5027,10 +5028,11 @@ def _resolve_package_dir_no_alias(name: str) -> PackageRoot | None:
     What it does not cover: an alias whose looks all fail, ``is_symlink``'s and
     the resolve's, is handed out as the alias path itself, never its target. What
     acts on a package looks at its directory without following a link and
-    refuses it (``resolve_current``, ``tool_drafts._own_meta``); the settings and
-    the run records' version state are read through it. Nor does it cover a link
-    put in place meanwhile: after this answer, or during it in the root's own
-    path, which gives None.
+    refuses it (``resolve_current``, ``tool_drafts._own_meta``), or looks before
+    it asks here (``_delete_tool_locked``'s ``lstat``, which goes no further when
+    that look fails or sees a link); the settings and the run records' version
+    state are read through it. Nor does it cover a link put in place meanwhile:
+    after this answer, or during it in the root's own path, which gives None.
     """
     base = tools_dir()
     if base is None or not _NAME_RE.match(name):
@@ -5215,8 +5217,9 @@ def delete_tool(name: str) -> DeleteToolResult | None:
     Name-validated and containment-checked exactly like ``set_enabled`` (the
     traversal hard-block is what makes an ``rmtree`` here safe), so it can only
     ever remove a directory that genuinely sits inside ``tools_dir``. None when
-    the name is unsafe, the package is absent, or it could not be taken out of
-    the registry at all.
+    the name is unsafe, the package is absent, the look at this name fails, what
+    the name resolves to is not the package directory itself, or it could not be
+    taken out of the registry at all.
 
     Destruction occurs only under the non-blocking exclusive tools lock. An
     ordinary request holds the shared side from advertisement through response,
@@ -5241,34 +5244,51 @@ def delete_tool(name: str) -> DeleteToolResult | None:
 def _delete_tool_locked(base: Path, name: str) -> ToolRemovalResult | None:
     """Delete one validated name while the exclusive tools lock is held."""
 
-    # INTERNAL-alias hard-block (H3), BEFORE resolve: an internal symlink
-    # ``tools/<name> -> tools/real`` RESOLVES inside the tools root, so the
-    # resolve-then-contain check below would PASS and ``rmtree`` would recurse
-    # through the alias and DELETE THE REAL PACKAGE -- user-triggerable data loss,
-    # since the scan lists the alias as an invalid row and the UI offers 刪除 on
-    # invalid rows. ``is_symlink`` does not follow the final component, so it
-    # detects the alias itself; ``unlink`` removes ONLY the link (its target,
-    # internal OR external, is never touched), so the phantom row disappears and
-    # the real package survives. This is a genuine deletion of what the user saw
-    # (the alias row), so it reports removed. It runs before resolve precisely
-    # because ``resolve()`` would erase the alias/real distinction; the
-    # resolve-then-contain check below still guards a non-symlink external escape.
+    # Two guards stand between the name and the ``rmtree`` below.
+    #
+    # First, one ``lstat`` that raises decides what the name is: a link, a
+    # directory, or anything else, which is refused. A look that fails cannot
+    # tell a link from a directory, so it touches nothing, and the answer is
+    # None, as for a missing package. Taken for "not a link" -- what
+    # ``is_symlink`` answers when its look fails -- an alias
+    # ``tools/<name> -> tools/real`` would go on as a package directory, and
+    # what becomes of it would be left to later looks that can fail the same
+    # way: the lookup below refuses ``real``, where a resolve that follows the
+    # alias lands, but when its looks fail too, ``is_symlink``'s and the
+    # resolve's, it hands back the link itself, to be renamed in place of a
+    # package and reported retained.
     candidate = base / name
-    if candidate.is_symlink():
+    try:
+        info = os.lstat(candidate)
+    except OSError:
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        # ``unlink`` removes only the link: what it points at, inside the root
+        # or out, is never touched. A link to a directory is listed as an
+        # invalid row and the UI offers 刪除 on it, so this removes what the
+        # operator saw and reports removed.
         try:
             candidate.unlink()
         except OSError:
             return None
         return ToolRemovalResult("removed", None, None)
-    directory = _resolve_package_dir(name)
-    if directory is None or not directory.is_dir():
+    if not stat.S_ISDIR(info.st_mode):
         return None
-    # ``directory.parent`` rather than ``base``: the containment check above
-    # already proved the resolved package sits directly under the resolved tools
-    # root, so this is that root -- and taking it FROM the path being renamed is
-    # what makes "the new name lands in the same directory" true by construction
-    # rather than by re-deriving it. A rename inside one directory is also the
-    # only shape that cannot cross a filesystem, and the only one that is atomic.
+    # Second, the package lookup hands back only ``<tools_dir>/<name>`` itself,
+    # never a path reached through a link: what its resolve gave must be exactly
+    # that path. The look above sees only its own moment, so this is what keeps
+    # a directory replaced by a link after it from handing this deletion the
+    # package the link points at.
+    package_root = _resolve_package_dir_no_alias(name)
+    if package_root is None:
+        return None
+    directory = package_root.path
+    # ``directory.parent`` rather than ``base``: the lookup's check proved the
+    # package is exactly ``<tools_dir>/<name>``, so its parent is the tools root
+    # -- and taking it FROM the path being renamed is what makes "the new name
+    # lands in the same directory" true by construction rather than by
+    # re-deriving it. A rename inside one directory is also the only shape that
+    # cannot cross a filesystem, and the only one that is atomic.
     stale = _stale_backup_path(directory.parent, name, uuid4().hex)
     try:
         os.rename(directory, stale)

@@ -187,6 +187,8 @@ job 的 `error` 也是這段訊息（帶結尾句號）；其他未預期錯誤�
   因為沒有一個版本可讓該列描述。**另一條 404 的理由**：`state.json` 是可讀但沒有
   backend marker 的 foreign 檔案時，這條路由拒絕而不是覆蓋（見下方）。
 - `DELETE /api/tools/{name}` — 將整個工具套件從 registry 移除；找不到回 404。
+  名稱本身是連結時只移除連結，不碰它指向的地方。這一筆的查詢失敗（看不出它是連結還是目錄），
+  或解析出來不是 `<tools_dir>/<name>` 本身時，也回 404，不動任何檔案。
   只有非阻塞 exclusive tools lock 取得成功才會改名或刪除；AI request 或繼承 shared
   descriptor 的工具子行程仍活著時，回獨立的 `409 ai_job_in_progress`，套件完全不動。
   工具從清單消失（`removed` 或 `retained`）之後，它的執行紀錄一併刪除，回應的

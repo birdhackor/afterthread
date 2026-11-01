@@ -6049,6 +6049,107 @@ def test_delete_internal_alias_removes_only_link(
     assert "alias" not in listed  # the phantom invalid row is gone
 
 
+def _stale_entries_for(base: Path, name: str) -> list[str]:
+    """The entries under ``base`` awaiting collection for ``name``, recognized by
+    the name ``_stale_backup_path`` gives them."""
+    prefix = tools._stale_backup_path(base, name, "").name
+    return sorted(entry for entry in os.listdir(base) if entry.startswith(prefix))
+
+
+def _assert_package_intact(package: Path) -> None:
+    """``package`` is still a real directory whose current version has its manifest."""
+    assert stat.S_ISDIR(os.lstat(package).st_mode)
+    assert (_resolved_version(package) / "tool.json").is_file()
+
+
+def test_delete_leaves_an_alias_and_its_target_untouched_when_its_look_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The deletion's look at ``tools/alias`` fails once; the next look would see
+    the link, and a resolve that follows it lands on ``tools/real``. A look that
+    fails cannot tell a link from a directory, so the deletion touches nothing:
+    the answer is None (the route's 404), ``real`` keeps its files, the alias is
+    still the same link, and nothing of the alias's sits in the stale namespace.
+    The one failure is spent on the deletion's first look at the alias."""
+    real, alias = _real_and_alias(monkeypatch, tmp_path)
+    link_text = os.readlink(alias)
+
+    with monkeypatch.context() as patch:
+        failed = _failing_at(patch, "lstat", alias, errno.EIO, times=1)
+        outcome = _delete_outcome("alias")
+
+    assert outcome is None
+    assert failed == [str(alias)]
+    _assert_package_intact(real)
+    assert os.readlink(alias) == link_text
+    assert _stale_entries_for(alias.parent, "alias") == []
+
+
+def test_delete_never_renames_an_alias_whose_every_look_fails_into_the_stale_namespace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every look at ``tools/alias`` fails, so nothing can tell it is a link: a
+    lookup whose looks all fail hands the alias path back as written, and
+    renaming that would move the link itself into the stale namespace, report it
+    retained, and leave it there, since the stale sweep never collects a link.
+    The deletion's failed look touches nothing: the answer is None, the alias is
+    still the same link where it was, and ``real`` keeps its files."""
+    real, alias = _real_and_alias(monkeypatch, tmp_path)
+    link_text = os.readlink(alias)
+
+    with monkeypatch.context() as patch:
+        failed = _failing_at(patch, "lstat", alias, errno.EIO)
+        outcome = _delete_outcome("alias")
+
+    assert outcome is None
+    assert len(failed) >= 1
+    _assert_package_intact(real)
+    assert os.readlink(alias) == link_text
+    assert _stale_entries_for(alias.parent, "alias") == []
+
+
+def test_delete_never_reaches_the_target_of_a_link_put_in_place_after_its_look(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``tools/alias`` is a real, empty directory when the deletion's one look
+    sees it, and becomes a link to ``tools/real`` right after. A look cannot see
+    a change that comes after it, so it passes the name on as a directory. What
+    keeps ``real`` safe is the package lookup the deletion then asks: it looks at
+    the name again without following it, and takes what its resolve gave only if
+    that is exactly ``<tools_dir>/alias``; either check alone refuses the link
+    here. The answer is None, ``real`` keeps its files, and the link is left
+    where it was. This case is why the deletion goes through that lookup after
+    its own look. Red for a lookup that follows the link: ``real`` was renamed
+    and removed."""
+    root = tmp_path / "tools"
+    _make_tool(root, "real", "import sys\nsys.stdout.write('x')\n")
+    (root / "alias").mkdir()
+    _install_tools(monkeypatch, root)
+    base = tools.tools_dir()
+    assert base is not None
+    real, alias = base / "real", base / "alias"
+    real_lstat = os.lstat
+    swapped: list[str] = []
+
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        answer = real_lstat(path, *args, **kwargs)
+        if not swapped and isinstance(path, str | os.PathLike) and os.fspath(path) == str(alias):
+            swapped.append(str(alias))
+            os.rmdir(alias)
+            os.symlink(real, alias, target_is_directory=True)
+        return answer
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "lstat", lstat)
+        outcome = _delete_outcome("alias")
+
+    assert swapped == [str(alias)]
+    assert outcome is None
+    _assert_package_intact(real)
+    assert os.readlink(alias) == str(real)
+    assert _stale_entries_for(base, "alias") == []
+
+
 def test_set_enabled_refuses_internal_alias(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
