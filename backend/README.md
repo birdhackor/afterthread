@@ -400,8 +400,11 @@ discard_token, last}`：`state` 依序判定為 `running`（本行程有一輪�
   不存在的紀錄照樣回應（`vid_state: gone`、`fixable: false`）。找不到回 404。
 - `DELETE /api/tool-runs/{run_id}` — 刪除一筆；204，找不到回 404。
 - `GET /api/tool-runs/stats` — `{total, not_ok, orphans, tools: [{tool_name, total, not_ok}]}`：
-  `not_ok` 是成功以外的全部（被拒也算），`orphans` 是套件已不存在的紀錄數（`TOOLS_DIR`
-  未設定、或設定了但目錄不在時一律 0，因為那時沒有任何名稱判斷得出來）。宣告在 `/{run_id}`
+  `not_ok` 是成功以外的全部（被拒也算），`orphans` 是看得到套件已不在的紀錄數。算：名稱不
+  可能是套件名；`<TOOLS_DIR>/<名稱>` 不存在；那裡是目錄與連結以外的東西（例如一般檔）；那裡
+  是連結，而它指向的地方不存在、不是目錄，或連結繞回自己。不算：查詢失敗（例如權限不足、I/O 錯誤）；指向
+  目錄的連結（工具清單把它列成無效的一列）。`orphans_only` 的清除用同一個判斷。`TOOLS_DIR`
+  未設定、或設定了但目錄不在時一律 0，因為那時沒有任何名稱判斷得出來。宣告在 `/{run_id}`
   之前。
 - `POST /api/tool-runs/purge` — body `{tool?, outcome?: all|ok|not_ok, before?, orphans_only?,
   dry_run = true, max_id?}`，回 `{matched, deleted, max_id}`（web-v6 §7）。條件只會縮小範圍；

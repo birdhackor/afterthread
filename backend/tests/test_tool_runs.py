@@ -8,6 +8,7 @@ database costs the record at most, never the call; W -- route declaration order.
 """
 
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -32,8 +33,8 @@ from afterthread import schemas
 from afterthread.config import Settings
 from afterthread.db import get_session
 from afterthread.main import app
-from afterthread.models import SQLITE_MAX_INT, ToolRun
-from afterthread.services import llm, llm_log, tool_runs, tools
+from afterthread.models import SQLITE_MAX_INT, ToolCheck, ToolRun
+from afterthread.services import llm, llm_log, tool_builder, tool_runs, tools
 from afterthread.services.llm import LLMUpstreamError
 from afterthread.services.tools import enabled_llm_tools, set_enabled
 
@@ -1058,6 +1059,195 @@ def test_a_missing_tools_directory_makes_no_record_an_orphan(
 
     assert _purge(client, orphans_only=True)["matched"] == 0
     assert client.get("/api/tool-runs/stats").json()["orphans"] == 0
+
+
+def _looks_failing_at(
+    patch: pytest.MonkeyPatch,
+    target: Path,
+    code: int,
+    looks: tuple[str, ...] = ("lstat", "stat"),
+) -> list[str]:
+    """The ``os`` looks named in ``looks`` fail with ``code`` on exactly ``target``;
+    any other path is looked at as before. Both by default, as both fail under a
+    directory that denies search. Returns the names of the looks it failed."""
+    spelled_target = os.fspath(target)
+    failed: list[str] = []
+
+    def failing(name: str) -> Callable[..., Any]:
+        real = getattr(os, name)
+
+        def fake(path: Any, *args: Any, **kwargs: Any) -> Any:
+            spelled = os.fspath(path) if isinstance(path, str | os.PathLike) else None
+            if spelled == spelled_target:
+                failed.append(name)
+                raise OSError(code, "a-failure-text-never-shown", spelled_target)
+            return real(path, *args, **kwargs)
+
+        return fake
+
+    for name in looks:
+        patch.setattr(os, name, failing(name))
+    return failed
+
+
+def _seed_verdicts(session: Session, *names: str) -> None:
+    for name in names:
+        session.add(
+            ToolCheck(
+                check_id=f"{name}-check",
+                tool_name=name,
+                vid=_TEST_VID,
+                workflow="health_check",
+                total=1,
+                passed=1,
+                failed=0,
+            )
+        )
+    session.commit()
+
+
+def _verdict_names(session: Session) -> list[str]:
+    session.expire_all()
+    return sorted(row.tool_name for row in session.exec(select(ToolCheck)))
+
+
+def test_a_failed_look_at_a_tool_makes_no_orphan_of_its_records_or_verdicts(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only a look that sees no package there makes an orphan; a failed one saw nothing."""
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n")
+    _install_tools(monkeypatch, root)
+    kb, gone = _seed_rows(session, _record(tool_name="kb"), _record(tool_name="gone"))
+    _seed_verdicts(session, "kb", "gone")
+    failed_looks = _looks_failing_at(monkeypatch, root.resolve() / "kb", errno.EACCES)
+
+    assert client.get("/api/tool-runs/stats").json()["orphans"] == 1
+    assert _purge(client, orphans_only=True) == {"matched": 1, "deleted": 0, "max_id": gone}
+    # The bound covers kb's record as well: only the scope keeps it.
+    assert _purge(client, orphans_only=True, dry_run=False, max_id=gone)["deleted"] == 1
+    assert failed_looks
+    assert _ids(session) == [kb]
+    assert _verdict_names(session) == ["kb"]
+
+
+def _listed(client: TestClient) -> list[str]:
+    return [row["name"] for row in client.get("/api/tools").json()["tools"]]
+
+
+def test_a_link_at_a_tool_s_name_that_leads_to_a_directory_makes_no_orphan(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The tools list shows such a link as a row, and its 刪除 removes the link alone,
+    the records and verdicts of its name with it."""
+    root = tmp_path / "tools"
+    _make_tool(root, "real", "print('x')\n")
+    (root / "alias").symlink_to(root / "real", target_is_directory=True)
+    _install_tools(monkeypatch, root)
+    alias, gone = _seed_rows(session, _record(tool_name="alias"), _record(tool_name="gone"))
+    _seed_verdicts(session, "alias", "gone")
+
+    assert "alias" in _listed(client)
+    assert client.get("/api/tool-runs/stats").json()["orphans"] == 1
+    assert _purge(client, orphans_only=True) == {"matched": 1, "deleted": 0, "max_id": gone}
+    assert _purge(client, orphans_only=True, dry_run=False, max_id=gone)["deleted"] == 1
+    assert _ids(session) == [alias]
+    assert _verdict_names(session) == ["alias"]
+
+    assert client.delete("/api/tools/alias").json()["runs_deleted"] is True
+    assert _ids(session) == []
+    assert _verdict_names(session) == []
+    assert (root / "real").is_dir()
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["nowhere", "a-file/inside", "a-file", "alias"],
+    ids=["dangling", "through-a-file", "to-a-file", "into-itself"],
+)
+def test_a_link_at_a_tool_s_name_that_leads_to_no_directory_makes_orphans(
+    client: TestClient,
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    target: str,
+) -> None:
+    """The tools list has no row for such a link, so the orphan purge is where the
+    records and verdicts of its name go."""
+    root = tmp_path / "tools"
+    root.mkdir()
+    (root / "a-file").write_text("not a package\n", encoding="utf-8")
+    (root / "alias").symlink_to(root / target)
+    _install_tools(monkeypatch, root)
+    [alias] = _seed_rows(session, _record(tool_name="alias"))
+    _seed_verdicts(session, "alias")
+
+    assert "alias" not in _listed(client)
+    assert client.get("/api/tool-runs/stats").json()["orphans"] == 1
+    assert _purge(client, orphans_only=True) == {"matched": 1, "deleted": 0, "max_id": alias}
+    assert _purge(client, orphans_only=True, dry_run=False, max_id=alias)["deleted"] == 1
+    assert _ids(session) == []
+    assert _verdict_names(session) == []
+
+
+def test_a_link_whose_target_cannot_be_looked_at_makes_no_orphan(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The link itself is seen, but following it fails, as it does into a directory that
+    denies search: that look saw nothing, so the link's records and verdicts stay."""
+    root = tmp_path / "tools"
+    _make_tool(root, "real", "print('x')\n")
+    (root / "alias").symlink_to(root / "real", target_is_directory=True)
+    _install_tools(monkeypatch, root)
+    alias, gone = _seed_rows(session, _record(tool_name="alias"), _record(tool_name="gone"))
+    _seed_verdicts(session, "alias", "gone")
+    failed_looks = _looks_failing_at(
+        monkeypatch, root.resolve() / "alias", errno.EACCES, looks=("stat",)
+    )
+
+    assert client.get("/api/tool-runs/stats").json()["orphans"] == 1
+    assert _purge(client, orphans_only=True) == {"matched": 1, "deleted": 0, "max_id": gone}
+    assert _purge(client, orphans_only=True, dry_run=False, max_id=gone)["deleted"] == 1
+    assert failed_looks
+    assert _ids(session) == [alias]
+    assert _verdict_names(session) == ["alias"]
+
+
+def test_a_record_name_no_package_can_have_is_an_orphan_even_where_a_directory_sits(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The installer's staging directory is never a package, whatever is in it."""
+    root = tmp_path / "tools"
+    (root / tool_builder._STAGING_DIRNAME).mkdir(parents=True)
+    _install_tools(monkeypatch, root)
+    [staged] = _seed_rows(session, _record(tool_name=tool_builder._STAGING_DIRNAME))
+    _seed_verdicts(session, tool_builder._STAGING_DIRNAME)
+
+    assert client.get("/api/tool-runs/stats").json()["orphans"] == 1
+    assert _purge(client, orphans_only=True) == {"matched": 1, "deleted": 0, "max_id": staged}
+    assert _purge(client, orphans_only=True, dry_run=False, max_id=staged)["deleted"] == 1
+    assert _ids(session) == []
+    assert _verdict_names(session) == []
+
+
+def test_a_file_at_a_tool_s_name_makes_orphans_of_its_records_and_verdicts(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No package can be where a file is, and deleting the tool by that name refuses it:
+    the orphan purge is where its records and verdicts go."""
+    root = tmp_path / "tools"
+    root.mkdir()
+    (root / "kb").write_text("not a package\n", encoding="utf-8")
+    _install_tools(monkeypatch, root)
+    [kb] = _seed_rows(session, _record(tool_name="kb"))
+    _seed_verdicts(session, "kb")
+
+    assert client.delete("/api/tools/kb").status_code == 404
+    assert client.get("/api/tool-runs/stats").json()["orphans"] == 1
+    assert _purge(client, orphans_only=True) == {"matched": 1, "deleted": 0, "max_id": kb}
+    assert _purge(client, orphans_only=True, dry_run=False, max_id=kb)["deleted"] == 1
+    assert _ids(session) == []
+    assert _verdict_names(session) == []
 
 
 def test_a_purge_with_an_unknown_condition_is_refused_not_widened(client: TestClient) -> None:

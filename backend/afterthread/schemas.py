@@ -1239,9 +1239,10 @@ class ToolRunPurgeRequest(BaseModel):
 
     Every condition narrows: ``tool`` (one package name), ``outcome`` (``ok`` or
     ``not_ok`` -- anything but a success, refusals included), ``before`` (records
-    that started before this instant), ``orphans_only`` (records whose package no
-    longer exists). ``before`` is absolute so that the preview and the
-    confirmation count the same records; the page computes it once.
+    that started before this instant), ``orphans_only`` (records whose package is
+    seen gone: a look that fails makes no orphan, nor does a link at the name
+    that leads to a directory). ``before`` is absolute so that the preview and
+    the confirmation count the same records; the page computes it once.
 
     ``dry_run`` (the default) only counts. A real run must carry the ``max_id``
     its preview returned and deletes nothing newer than it.
@@ -1284,8 +1285,10 @@ class ToolRunStatsEntry(BaseModel):
 class ToolRunStats(BaseModel):
     """Run-record counts for the 工具 page header (web-v6 §7).
 
-    ``orphans`` counts records whose package no longer exists (zero while
-    TOOLS_DIR is unset, when no name can be judged).
+    ``orphans`` counts records whose package is seen gone -- a look that fails
+    does not count, nor does a link at the name that leads to a directory -- and
+    is zero while TOOLS_DIR is unset or not a directory, when no name can be
+    judged.
     """
 
     total: int

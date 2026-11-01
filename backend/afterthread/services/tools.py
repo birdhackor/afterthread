@@ -5004,10 +5004,11 @@ def _resolve_package_dir_no_alias(name: str) -> PackageRoot | None:
     reach. The base is taken once, so the resolve and the check work from one
     root even if ``tools_dir`` would answer with another a moment later.
 
-    A look at a real package that fails does not refuse it: ``is_symlink`` stays
-    a pre-check rather than a strict ``lstat``, and a resolve that cannot look at
-    a component keeps it as written. None is read as a package that is gone by
-    the record purges (``tool_runs.orphan_names``, ``_delete_gone_verdicts``).
+    A failed ``is_symlink`` look does not refuse a real package -- it stays a
+    pre-check rather than a strict ``lstat``, and a resolve that cannot look at a
+    component keeps it as written -- but a failed ``is_dir`` look gives None.
+    The record purges do not read its None: they look at the name themselves
+    (``tool_runs._package_seen_gone``).
 
     What it does not cover: an alias whose looks all fail, ``is_symlink``'s and
     the resolve's, is handed out as the alias path itself, never its target. What

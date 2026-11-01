@@ -15,11 +15,15 @@ added to a ``.env`` after the run was written is hidden too (invariant I).
 
 from __future__ import annotations
 
+import errno
 import logging
+import os
 import re
+import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import ColumnElement, Engine, case, func
@@ -384,20 +388,66 @@ class PurgeScope:
     orphans_only: bool = False
 
 
-def orphan_names(session: Session) -> list[str]:
-    """The record names whose package no longer exists, sorted.
+def _package_seen_gone(base: Path, name: str) -> bool:
+    """Whether a look sees that no package is at ``<base>/<name>``, not merely none seen.
 
-    Empty when the tools directory is not configured OR not there (an unmounted
-    volume, a renamed directory): then NO name resolves, and calling every
-    record an orphan would hand a purge the whole table for a condition the
-    operator may fix in a minute. The same "missing root is the feature off"
-    reading ``tools._scan_all`` and the tools lock apply.
+    A package here is what the tools list has a row for (``tools._scan_all``): a
+    directory at the name, or a link there that leads to a directory, listed as
+    an invalid row whose 刪除 removes the link alone, its records with it.
+
+    Gone: a name no package can have (``tools._NAME_RE``), whatever is there; an
+    ``lstat`` that says nothing is there, or that something above it is not a
+    directory; something there that is neither a directory nor a link -- a file,
+    a socket -- which deleting the tool by that name refuses; or a link whose
+    ``stat``, which follows it, says the same of where it leads, finds the links
+    lead back into themselves (``ELOOP``), or sees no directory there.
+
+    There, as far as anyone can tell, when either look fails any other way -- a
+    directory on the way that denies search, an I/O error: that look saw nothing.
+
+    No existing look answers this. ``tools._seen_gone`` takes anything it sees
+    for present, a file included; the lookup by name
+    (``tools._resolve_package_dir_no_alias``) answers None when its ``is_dir``
+    look fails and for a link alike; the scan's ``is_dir`` reads a failed look as
+    no directory.
+    """
+    if not tools._NAME_RE.match(name):
+        return True
+    path = base / name
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError, NotADirectoryError:
+        return True
+    except OSError:
+        return False
+    if stat.S_ISLNK(mode):
+        try:
+            mode = os.stat(path).st_mode
+        except FileNotFoundError, NotADirectoryError:
+            return True
+        except OSError as error:
+            return error.errno == errno.ELOOP
+    return not stat.S_ISDIR(mode)
+
+
+def orphan_names(session: Session) -> list[str]:
+    """The record names whose package is seen gone (``_package_seen_gone``), sorted.
+
+    A look that fails makes no orphan, nor does a link at the name that leads to
+    a directory.
+
+    Empty when the tools directory is not configured OR not seen as a directory
+    (an unmounted volume, a renamed directory): a look under a directory that is
+    not there says gone for every name, and calling every record an orphan would
+    hand a purge the whole table for a condition the operator may fix in a
+    minute. The same "missing root is the feature off" reading
+    ``tools._scan_all`` and the tools lock apply.
     """
     base = tools.tools_dir()
     if base is None or not base.is_dir():
         return []
     names = session.exec(select(ToolRun.tool_name).distinct()).all()
-    return sorted(name for name in names if tools._resolve_package_dir_no_alias(name) is None)
+    return sorted(name for name in names if _package_seen_gone(base, name))
 
 
 def _conditions(session: Session, scope: PurgeScope) -> list[ColumnElement[bool]] | None:
@@ -437,11 +487,13 @@ def purge(
     between -- is never swept along with it (invariant J). Ids only grow
     (AUTOINCREMENT), which is what makes the bound exact.
 
-    The orphan scope also drops the verdicts (``tool_check``) of tools that no
-    longer exist: a tool's delete normally removes them with its records, and
-    when that failed this scope is where the operator is sent (``delete_for_tool``).
-    They are not counted -- they are not records, and nothing shows them once
-    their tool is gone.
+    The orphan scope also drops the verdicts (``tool_check``) of tools whose
+    package is seen gone: a tool's delete normally removes them with its records,
+    and when that failed this scope is where the operator is sent
+    (``delete_for_tool``). Gone is read as for the records
+    (``_package_seen_gone``), so a tool whose look fails keeps both. They are not
+    counted -- they are not records, and nothing shows them once their tool is
+    gone.
     """
     conditions = _conditions(session, scope)
     if dry_run:
@@ -472,16 +524,17 @@ def purge(
 
 
 def _delete_gone_verdicts(session: Session) -> None:
-    """Delete the verdicts of every tool whose package no longer exists.
+    """Delete the verdicts of every tool whose package is seen gone.
 
-    The same reading of "gone" as ``orphan_names``, over the verdicts' own
-    names: nothing at all while the tools directory is unset or missing.
+    The same reading of "gone" as ``orphan_names`` (``_package_seen_gone``), over
+    the verdicts' own names: nothing at all while the tools directory is unset
+    or not seen as a directory.
     """
     base = tools.tools_dir()
     if base is None or not base.is_dir():
         return
     names = session.exec(select(ToolCheck.tool_name).distinct()).all()
-    gone = [name for name in names if tools._resolve_package_dir_no_alias(name) is None]
+    gone = [name for name in names if _package_seen_gone(base, name)]
     if gone:
         session.exec(
             sql_delete(ToolCheck)
