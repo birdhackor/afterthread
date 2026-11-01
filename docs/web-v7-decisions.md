@@ -660,3 +660,42 @@ API 回應裡的後端路徑都換成可編碼的形式（欄位用同一個型�
 - job 死在寫 `publishing` 之後、切 `current` 之前：草稿顯示結果未知，只能放棄；放棄前可以從草稿目錄取回。
 - 另一個分頁在寫 `publishing` 之前看到可接續的按鈕：按下去回 `job_busy`。
 - 放寬刪草稿的前提（例如有 `.env` 也刪）會讓不可逆的刪除多一類，並改變 DL 的承諾。要另外裁決，不是改一個判斷的小事。
+
+## D58（P7）：刪除工具時，看不到就不動手
+
+v7 之前就有的缺陷（`delete_tool`、`_delete_tool_locked`、`_resolve_package_dir` 在 v7 期間沒有改動），使用者決定在本分支修。
+開工前做了兩則設計諮詢（Agent，因為 Codex 額度用完）：第一則只給問題、現行程式與選項，第二則對照主 agent 的推理與
+先前的紀錄。主 agent 據此定案。
+
+- **缺陷**：刪除先用 `Path.is_symlink()` 判斷這一筆是不是別名。`os.path.islink` 在 `lstat` 失敗時回 False，所以那一次查詢
+  失敗、接著不帶 `strict` 的 `resolve()` 查詢成功時，內部別名 `tools/alias -> tools/real` 會被解析成 `tools/real` 並通過
+  containment，實際套件整個被改名、刪除（所有版本、`.env`、`config.env`、草稿），別名留著懸空。
+  - `lstat` 持續失敗而 `stat` 成功時，被改名的是連結本身，回報 retained。這個形狀在實際檔案系統上幾乎只在測試裡出現
+    （兩次查詢都要走過同一個連結），但 retained 的訊息請操作者手動刪除那個路徑，而 BSD 的 `rm -rf <連結>/` 會刪掉連結
+    指向的整個目錄；`_sweep_stale_backups` 也從不收連結，那個路徑會一直留著。
+  - 父目錄無法 search 的形狀到不了這裡：取 tools lock 時就以 `ToolsLockUnavailableError` 停下（500）。
+- **決定**：
+  - 刪除改用一次會傳出錯誤的 `os.lstat` 決定這一筆是什麼：查詢失敗 → 不動手（404）；連結 → 只移除連結本身；目錄 → 往下；
+    其他 → 404。切換在動手前經 `resolve_current`，它對套件目錄的 `lstat` 失敗時拒絕；刪除不能這樣做，因為它必須能刪
+    解析不了的套件，所以自己看這一次。
+  - 往下改經 `_resolve_package_dir_no_alias`：解析結果必須正好是 `tools_dir()` 接上名稱，所以在前一步之後才換成連結的
+    目錄也被拒絕。
+  - 移除會跟隨連結的 `_resolve_package_dir`。`set_enabled` 的第一次查找也改經 `_resolve_package_dir_no_alias`，寫入前的
+    重查不變；每次查詢都失敗的別名，由 `resolve_current` 的 `lstat` 拒絕。
+  - 刪除與丟掉某一版在清理之後，只有查詢回「不存在」才回報 removed（`_seen_gone`，從 `tool_drafts` 移到 `tools`，只留
+    一份定義）；查詢失敗時回 retained 並附路徑。原本用的 `os.path.lexists` 在查詢失敗時回 False，會把可能還在的目錄
+    （含設定與金鑰檔）報成已刪除。
+- **不採用**：
+  - 刪除一律拒絕別名、請操作者手動刪（使用者問過）：拒絕坐在同一個會吞錯的判斷後面，出事的那一次不會執行。
+    `set_enabled` 就是先例：它一直拒絕別名，仍有同樣的漏洞，靠寫入前對解析結果的重查才補上。保留「只移除連結」：
+    移除連結不會碰到它指向的東西。
+  - 把共用的 `_resolve_package_dir_no_alias` 改成嚴格的 `lstat`：理由同 D55，它的 None 被 purge 讀成「已不在」。刪除的
+    嚴格查詢只在刪除裡，它的 None 是「沒有發生」：路由只在 removed／retained 時刪執行紀錄。
+  - 為暫時性的查詢失敗另開回應碼：重新整理後那一列還在，重試即成；`lstat` 與 `stat` 都持續失敗時，掃描（`_scan_all`
+    以跟隨連結的 `is_dir()` 篩選）也列不出那一列，404 與清單一致。
+
+**剩餘風險**（負責人：主 agent）：
+- 前一步看到目錄、之後換成連結，而 `_resolve_package_dir_no_alias` 的查詢又同時失敗：被改名的是連結本身，回報 retained，
+  實際套件不動。
+- purge 的孤兒範圍（`tool_runs.orphan_names`、`_delete_gone_verdicts`）把查詢失敗交出的 None 讀成已不在：不在這次範圍，
+  已回報使用者另開工作。
