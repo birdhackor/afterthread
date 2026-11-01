@@ -415,8 +415,14 @@ def _with_last_runs(session: Session, rows: list[dict[str, Any]]) -> list[dict[s
     ``fixable`` is judged against the row's own ``current_vid`` -- the version
     the same scan just resolved -- so the button and the version it would revise
     come from one reading.
+
+    Only a row whose name is a tool name (``_NAME_RE``) is looked up: a run is
+    recorded under such a name alone, so any other row -- a directory whose name
+    is not one, such as a name that is not UTF-8 -- has no record to find, and its
+    name is not handed to the database.
     """
-    newest = tool_runs.last_runs_by_name(session, [row["name"] for row in rows])
+    names = [row["name"] for row in rows if _NAME_RE.fullmatch(row["name"])]
+    newest = tool_runs.last_runs_by_name(session, names)
     return [
         {
             **row,

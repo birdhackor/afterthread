@@ -1502,9 +1502,19 @@ def _build_meta_tools(
             # the write out of staging), and it creates parent dirs itself (this
             # tool's auto-create-parents contract). False => a non-regular /
             # symlinked / reader-less-FIFO target: the model-facing failure below.
+            #
+            # The path the success names is the RESOLVED one: written through an
+            # internal link, it is the name of the file the link leads to, which the
+            # model may never have seen and which can embed a known secret -- or hold
+            # a lone surrogate, read back from disk, that would fail the encode of the
+            # next request. So it is shown as ``tools.redact_known_secrets_as_shown``
+            # shows a text, and that is done BEFORE the write: when the known secrets
+            # cannot be collected, the failure propagates as for any other meta-tool
+            # and nothing has been written, so the failure the model is told is true.
+            shown = tools.redact_known_secrets_as_shown(str(target.relative_to(staging.resolve())))
             if not tools._write_regular_file(target, content):
                 return "write_file failed: target is not a regular file"
-            return f"wrote {target.relative_to(staging.resolve())} ({len(content)} characters)"
+            return f"wrote {shown} ({len(content)} characters)"
 
         try:
             return await shells.write(_write)
@@ -1608,11 +1618,14 @@ def _build_meta_tools(
                 entries.append(
                     f"... (truncated at {_LIST_DIR_MAX_ENTRIES} entries; more not shown)"
                 )
-            # F1/D36: a staged FILENAME could embed a known secret (e.g. the model ran
-            # `... > "$KB_API_KEY.txt"` in run_shell), so mask any such value out of the
-            # listing before it enters the LIVE builder conversation, uniformly with the
-            # other meta-tools.
-            return tools.redact_known_secrets("\n".join(entries))
+            # The listing goes back to the model as shown. A staged FILENAME can embed a
+            # known secret (the model ran `... > "$KB_API_KEY.txt"` in run_shell), so
+            # every such value is masked out of it before it enters the LIVE builder
+            # conversation, uniformly with the other meta-tools. A name ``os.walk``
+            # read on Linux can also hold a lone surrogate, and one of those would fail
+            # the encode of the next request, the whole conversation with it: it is
+            # made encodable, and the listing is checked again after that.
+            return tools.redact_known_secrets_as_shown("\n".join(entries))
 
         try:
             return await run_in_threadpool(_list)
@@ -2353,7 +2366,13 @@ def _earlier_round_line(attempt: dict[str, Any]) -> str:
 
 def _history_parts(history: _History) -> list[str | _Shrinkable]:
     """A continuing round's own parts: the previous round, the earlier ones, the
-    draft's paths not brought in, and the paths changed since the base."""
+    draft's paths not brought in, and the paths changed since the base.
+
+    Each path of the two lists is read from disk, so on Linux it can hold a lone
+    surrogate, and one of those fails the encode of the whole request: each path
+    goes in as shown (``tools.redact_known_secrets_as_shown``), masked, made
+    encodable, and checked after that.
+    """
     parts: list[str | _Shrinkable] = []
     if history.attempts:
         latest = history.attempts[-1]
@@ -2375,7 +2394,7 @@ def _history_parts(history: _History) -> list[str | _Shrinkable]:
             )
     if history.not_brought_in:
         entries = [
-            f"- {tools.redact_known_secrets(item.path)}: "
+            f"- {tools.redact_known_secrets_as_shown(item.path)}: "
             + _NOT_BROUGHT_IN_PROSE.get(item.reason, item.reason)
             for item in history.not_brought_in
         ]
@@ -2397,7 +2416,7 @@ def _history_parts(history: _History) -> list[str | _Shrinkable]:
     elif not history.changed:
         parts += [changed_header, "None."]
     else:
-        changed = [f"- {tools.redact_known_secrets(path)}" for path in history.changed]
+        changed = [f"- {tools.redact_known_secrets_as_shown(path)}" for path in history.changed]
         parts.append(_text_part(_RANK_LISTS, changed_header, _listed(changed)))
     return parts
 

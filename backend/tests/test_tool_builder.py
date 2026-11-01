@@ -48,10 +48,12 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
+import httpx
 import pytest
 from anyio.to_thread import current_default_thread_limiter
 from anyio.to_thread import run_sync as run_on_pool_thread
 from fastapi.testclient import TestClient
+from openai import AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import Engine
 from sqlmodel import Session
@@ -145,6 +147,60 @@ def _meta_by_name(staging: Path) -> dict[str, Any]:
 
 def _call(handler: Any, args: dict[str, Any]) -> str:
     return asyncio.run(handler(args))
+
+
+# How Linux reads back a file name that is not UTF-8 (``os.fsdecode`` of
+# ``b"notes-\xff.txt"``): a lone surrogate for the byte. APFS refuses such a name, so
+# the tests hand it over themselves.
+_NOT_UTF8_NAME = b"notes-\xff.txt".decode("utf-8", "surrogateescape")
+# That name made encodable: three U+FFFD for its one lone surrogate.
+_NOT_UTF8_SHOWN = "notes-" + "�" * 3 + ".txt"
+# A known value holding three U+FFFD -- what a ``.env`` read with replacement keeps
+# for three bytes that are not UTF-8 -- and a name, read back with one lone surrogate,
+# that spells it whole once it is made encodable.
+_SPELLED_SECRET = "key-" + "�" * 3 + "-zz"
+_SPELLS_IT_ENCODED = b"key-\xff-zz".decode("utf-8", "surrogateescape")
+
+
+def _sent_by_the_sdk(messages: list[dict[str, Any]]) -> list[bytes]:
+    """Send ``messages`` as one chat request through the real OpenAI SDK, over a mock
+    HTTP transport that answers every request; the bodies of the requests that went out.
+
+    The SDK encodes the body as UTF-8 before it sends anything: a message holding a
+    lone surrogate raises there, and no request goes out."""
+    sent: list[bytes] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        sent.append(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "m",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "ok"},
+                    }
+                ],
+            },
+        )
+
+    async def send() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as http_client:
+            client = AsyncOpenAI(
+                api_key="test-key",
+                base_url="http://llm.test/v1",
+                http_client=http_client,
+                max_retries=0,
+            )
+            await client.chat.completions.create(model="m", messages=typing.cast(Any, messages))
+
+    asyncio.run(send())
+    return sent
 
 
 # --- meta-tools: containment -------------------------------------------------
@@ -358,6 +414,171 @@ def test_list_dir_caps_entries_during_walk(monkeypatch: pytest.MonkeyPatch, tmp_
     kept = lines[:cap]
     assert kept == sorted(kept)
     assert kept[0] == "f00000.txt"
+
+
+def test_list_dir_hands_back_a_name_that_is_not_utf8_in_a_form_the_next_request_carries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``os.walk`` hands back a name that is not UTF-8, as Linux reads one back: with
+    a lone surrogate for the byte. The listing names it with replacement characters,
+    and the request that carries the listing back to the model goes out."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    staging = tmp_path / "staging"
+    staging.mkdir()
+
+    def walk(top: Any, *_args: Any, **_kwargs: Any) -> Generator[tuple[str, list[str], list[str]]]:
+        yield os.fspath(top), [], [_NOT_UTF8_NAME]
+
+    monkeypatch.setattr(tool_builder.os, "walk", walk)
+    meta = _meta_by_name(staging)
+
+    listing = _call(meta["list_dir"].handler, {"path": ""})
+
+    assert listing == _NOT_UTF8_SHOWN
+    sent = _sent_by_the_sdk(
+        [
+            {"role": "user", "content": "Build the tool."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "list_dir", "arguments": '{"path": ""}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": listing},
+        ]
+    )
+    assert len(sent) == 1
+    assert json.loads(sent[0])["messages"][-1]["content"] == _NOT_UTF8_SHOWN
+
+
+@pytest.mark.parametrize(
+    ("name", "secret", "shown"),
+    [
+        (
+            "note-kb-secret-0123456789.txt",
+            "kb-secret-0123456789",
+            f"note-{tools._REDACTION_MARKER}.txt",
+        ),
+        (_SPELLS_IT_ENCODED, _SPELLED_SECRET, tools._REDACTION_MARKER),
+    ],
+    ids=["embeds_the_value", "spells_it_once_made_encodable"],
+)
+def test_list_dir_hands_the_model_no_known_value_a_name_holds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str, secret: str, shown: str
+) -> None:
+    """A staged name embeds a known value, or -- read back with a lone surrogate --
+    spells one once its replacement characters are in. The listing the model is
+    handed does not hold the value: an embedded one is masked in place, and a
+    listing that spells one only once it is made encodable is the marker, whole."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    tools.register_inflight_secret(secret)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+
+    def walk(top: Any, *_args: Any, **_kwargs: Any) -> Generator[tuple[str, list[str], list[str]]]:
+        yield os.fspath(top), [], [name]
+
+    monkeypatch.setattr(tool_builder.os, "walk", walk)
+    meta = _meta_by_name(staging)
+
+    assert _call(meta["list_dir"].handler, {"path": ""}) == shown
+
+
+def test_write_file_through_an_internal_link_names_what_it_wrote_with_known_values_masked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The workspace holds a file whose name embeds a known value, and a link to it
+    under a plain name. A write through the link writes that file, and the success
+    names the file it wrote -- where the link leads -- with the value masked: the
+    model, which named only the link, is not handed the value."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    secret = "kb-secret-0123456789"
+    tools.register_inflight_secret(secret)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / f"note-{secret}.txt").write_text("old")
+    (staging / "link.txt").symlink_to(f"note-{secret}.txt")
+    meta = _meta_by_name(staging)
+
+    result = _call(meta["write_file"].handler, {"path": "link.txt", "content": "new"})
+
+    assert result == f"wrote note-{tools._REDACTION_MARKER}.txt (3 characters)"
+    assert (staging / f"note-{secret}.txt").read_text() == "new"
+
+
+def test_write_file_names_a_path_that_is_not_utf8_in_a_form_the_next_request_carries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A write whose resolved path holds a lone surrogate -- a name that is not
+    UTF-8, as Linux reads one back: the success names it with replacement
+    characters, and it encodes. APFS refuses such a name, so the write itself is
+    stood in for."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    written: list[Path] = []
+
+    def write(target: Path, content: str) -> bool:
+        written.append(target)
+        return True
+
+    monkeypatch.setattr(tools, "_write_regular_file", write)
+    meta = _meta_by_name(staging)
+
+    result = _call(meta["write_file"].handler, {"path": _NOT_UTF8_NAME, "content": "x"})
+
+    assert written == [staging.resolve() / _NOT_UTF8_NAME]
+    assert result == f"wrote {_NOT_UTF8_SHOWN} (1 characters)"
+    assert result.encode("utf-8")
+
+
+def test_write_file_names_a_path_that_spells_a_known_value_once_made_encodable_as_the_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A write's resolved path holds a lone surrogate, and with the replacement
+    characters made for it the path spells a known value whole: the success names
+    the path as the redaction marker. APFS refuses such a name, so the write itself
+    is stood in for."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    tools.register_inflight_secret(_SPELLED_SECRET)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    monkeypatch.setattr(tools, "_write_regular_file", lambda _target, _content: True)
+    meta = _meta_by_name(staging)
+
+    result = _call(meta["write_file"].handler, {"path": _SPELLS_IT_ENCODED, "content": "x"})
+
+    assert result == f"wrote {tools._REDACTION_MARKER} (1 characters)"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_write_file_whose_path_cannot_be_masked_writes_nothing_and_says_it_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An installed tool's directory cannot be looked at, so the known secrets are
+    not whole and the path a success would name cannot be masked: the write is not
+    made, and the model is told it failed, which is so."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    package = root / "kb"
+    package.mkdir(parents=True)
+    (package / ".env").write_text("KB_KEY=installed-tool-secret-abcdef\n", encoding="utf-8")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    meta = _meta_by_name(staging)
+    package.chmod(0)
+    try:
+        result = _call(meta["write_file"].handler, {"path": "notes.txt", "content": "x"})
+    finally:
+        package.chmod(0o700)
+
+    assert result == "write_file failed: KnownSecretsIncomplete"
+    assert not (staging / "notes.txt").exists()
 
 
 # --- meta-tools: run_shell -----------------------------------------------------
@@ -14638,6 +14859,71 @@ def test_a_continuation_prompt_tells_of_the_previous_round_and_four_before_it(
     )
     assert "started from:\n\nThey cannot be listed" in untold
     assert "None." not in untold
+
+
+@pytest.mark.parametrize("listed", ["not_brought_in", "changed"])
+def test_a_continuation_prompt_listing_a_path_that_is_not_utf8_goes_out_with_it_encodable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, listed: str
+) -> None:
+    """A path of the draft not brought in, or a path changed since the base, read
+    back from disk the way Linux reads a name that is not UTF-8: with a lone
+    surrogate. The round's request still goes out -- one request, its body JSON --
+    and names the path with replacement characters."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    history = tool_builder._History(
+        original="加上分頁",
+        attempts=(),
+        not_brought_in=(
+            (tool_drafts.Omitted(_NOT_UTF8_NAME, "unreadable"),)
+            if listed == "not_brought_in"
+            else ()
+        ),
+        changed=(_NOT_UTF8_NAME,) if listed == "changed" else (),
+        base_vid=_TEST_VID,
+        workspace_config=False,
+    )
+    system = tool_builder._revise_system_prompt("kbsearch", attempt=2)
+    prompt = tool_builder._revise_user_prompt(
+        "這一輪", None, workspace_vid=_TEST_VID, system_chars=len(system), history=history
+    )
+
+    sent = _sent_by_the_sdk(
+        [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+    )
+
+    assert len(sent) == 1
+    user_turn = json.loads(sent[0])["messages"][1]["content"]
+    assert f"\n- {_NOT_UTF8_SHOWN}" in user_turn
+
+
+def test_a_continuation_path_whose_replacement_characters_complete_a_known_value_is_masked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A known value holds three U+FFFD -- what a ``.env`` read with replacement
+    keeps for three bytes that are not UTF-8 -- and a listed path holds the value's
+    other characters around one lone surrogate. Made encodable, the path gets three
+    U+FFFD for the surrogate and spells the value whole, so it is shown as the
+    redaction marker in both lists: the check comes after the last conversion."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    tools.register_inflight_secret(_SPELLED_SECRET)
+    assert tools._utf8_safe(_SPELLS_IT_ENCODED) == _SPELLED_SECRET
+    history = tool_builder._History(
+        original="加上分頁",
+        attempts=(),
+        not_brought_in=(tool_drafts.Omitted(_SPELLS_IT_ENCODED, "unreadable"),),
+        changed=(_SPELLS_IT_ENCODED,),
+        base_vid=_TEST_VID,
+        workspace_config=False,
+    )
+
+    prompt = tool_builder._revise_user_prompt(
+        "這一輪", None, workspace_vid=_TEST_VID, history=history
+    )
+
+    marker = tools._REDACTION_MARKER
+    assert _SPELLED_SECRET not in prompt
+    assert f"\n- {marker}: {tool_builder._NOT_BROUGHT_IN_PROSE['unreadable']}" in prompt
+    assert f"started from:\n\n- {marker}" in prompt
 
 
 def test_a_continuation_prompt_masks_or_leaves_out_each_listed_manifest_text_registered_later(

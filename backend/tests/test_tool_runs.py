@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 from sqlalchemy import Engine
@@ -34,6 +35,7 @@ from afterthread.config import Settings
 from afterthread.db import get_session
 from afterthread.main import app
 from afterthread.models import SQLITE_MAX_INT, ToolCheck, ToolRun
+from afterthread.routers import tools as tools_router
 from afterthread.services import llm, llm_log, tool_builder, tool_runs, tools
 from afterthread.services.llm import LLMUpstreamError
 from afterthread.services.tools import enabled_llm_tools, set_enabled
@@ -801,6 +803,78 @@ def test_fixable_is_a_failure_of_the_current_version(
         "vid": vid,
         "fixable": fixable,
     }
+
+
+def test_a_directory_whose_name_is_not_utf8_lists_as_an_invalid_row_nothing_looks_up_or_reaches(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The tools directory holds an entry whose name is not UTF-8, which Linux reads
+    back with a lone surrogate for the byte (APFS refuses such a name, so the scan of
+    it is added to the listing). The list still loads: the other tool is listed with
+    its newest run, and that entry is a row of its own -- invalid, its name made
+    encodable, no run looked up for it. No per-tool route takes the name the row
+    shows, and whatever such a directory holds, it does not scan valid: the
+    manifest's name must equal the directory's."""
+    root = tmp_path / "tools"
+    package = _make_tool(root, "kb", "print('x')\n")
+    _install_tools(monkeypatch, root)
+    [run_id] = _seed_rows(session, _record())
+    not_utf8 = b"pkg-\xff".decode("utf-8", "surrogateescape")
+    real_scan_all = tools._scan_all
+    monkeypatch.setattr(
+        tools,
+        "_scan_all",
+        lambda: [*real_scan_all(), tools.scan_installed(tools.PackageRoot(root / not_utf8))],
+    )
+    real_lookup = tool_runs.last_runs_by_name
+    looked_up: list[list[str]] = []
+
+    def lookup(session: Session, names: list[str]) -> dict[str, ToolRun]:
+        looked_up.append(list(names))
+        return real_lookup(session, names)
+
+    monkeypatch.setattr(tool_runs, "last_runs_by_name", lookup)
+
+    response = client.get("/api/tools")
+
+    assert response.status_code == 200
+    rows = {row["name"]: row for row in response.json()["tools"]}
+    shown = "pkg-" + "�" * 3
+    assert set(rows) == {"kb", shown}
+    assert (rows["kb"]["valid"], rows["kb"]["last_run"]["id"]) == (True, run_id)
+    assert (rows[shown]["valid"], rows[shown]["last_run"]) == (False, None)
+    assert rows[shown]["error"]
+    assert looked_up == [["kb"]]
+    per_tool = [
+        route
+        for route in tools_router.router.routes
+        if isinstance(route, APIRoute) and route.path.startswith("/tools/{name}")
+    ]
+    # The filter finds at least these.
+    assert {
+        ("PATCH", "/tools/{name}"),
+        ("DELETE", "/tools/{name}"),
+        ("DELETE", "/tools/{name}/versions/{vid}"),
+        ("DELETE", "/tools/{name}/draft"),
+        ("GET", "/tools/{name}/summary"),
+        ("POST", "/tools/{name}/summary/regenerate"),
+        ("POST", "/tools/{name}/revise"),
+        ("POST", "/tools/{name}/draft/publish"),
+        ("POST", "/tools/{name}/check"),
+        ("GET", "/tools/{name}/settings"),
+        ("GET", "/tools/{name}/runs"),
+    } <= {(method, route.path) for route in per_tool for method in route.methods or set()}
+    for route in per_tool:
+        path = "/api" + route.path.replace("{name}", shown).replace("{vid}", _TEST_VID)
+        assert route.methods, route.path
+        for method in route.methods:
+            refused = client.request(method, path, json={})
+            assert refused.status_code == 422, (method, route.path)
+            assert ["path", "name"] in [error["loc"] for error in refused.json()["detail"]]
+    version = tools.VersionRoot(package / tools._VERSIONS_DIRNAME / _TEST_VID)
+    assert tools._scan_tool_content(version, not_utf8).error == (
+        "name does not match the package name"
+    )
 
 
 def test_an_older_version_that_still_exists_is_older_not_gone(

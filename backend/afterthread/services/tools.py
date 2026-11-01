@@ -2706,7 +2706,14 @@ def list_tools(
     rows = []
     for scan in _scan_all():
         row: dict[str, Any] = {
-            "name": scan.name,
+            # The directory's own name, made encodable: read on Linux, a name holds a
+            # lone surrogate for each byte that does not decode as UTF-8, and one of
+            # them fails the encode of the whole listing. Such a name is never a tool name
+            # (``_NAME_RE``), so its row never scans valid -- the manifest's name must
+            # equal it -- and a route addressed by it is refused before it runs (the
+            # routes take ``_NAME_RE`` names only); the replacement characters cannot
+            # make it one.
+            "name": _utf8_safe(scan.name),
             "description": scan.description,
             "enabled": scan.enabled,
             "valid": scan.valid,
@@ -3450,6 +3457,27 @@ def redact_known_secrets(text: str) -> str:
     # PROPAGATE fail-closed, the opposite of llm_log._redact's guarded degrade-to-
     # unredacted direction (D36 round-5).
     return _mask_known_secrets(text, secrets)
+
+
+def redact_known_secrets_as_shown(text: str) -> str:
+    """``text`` as the model or a screen is shown it, with every known secret VALUE
+    masked: ``_masked_as_shown`` with the secrets known now.
+
+    For live-path text that can hold a lone surrogate: a file name or path read
+    from disk -- on Linux, the bytes of a name that do not decode as UTF-8 come
+    back as one each -- and a message built from one. ``redact_known_secrets`` leaves such a
+    character where it is, and one of them fails the UTF-8 encode of the whole
+    request or response the text rides in. Here each becomes three U+FFFD, and
+    because those can complete a known value the text did not hold, the answer is
+    checked once more with the mask's own matcher: one that holds a known value is
+    the redaction marker, whole.
+
+    The secrets and the failure direction are ``redact_known_secrets``'s: the list
+    is ``_redaction_secrets``, collected without a guard, so a failure to collect
+    it -- ``KnownSecretsIncomplete`` among them -- propagates to the caller. What a
+    caller puts beside the answer afterwards is outside the check, as there.
+    """
+    return _masked_as_shown(text, _redaction_secrets())
 
 
 # --- execution -------------------------------------------------------------

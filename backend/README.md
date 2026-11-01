@@ -68,7 +68,7 @@ ty check / pytest 全綠；`uvicorn` 啟動後 `GET /api/health` 回
 | `LLM_LOG_MAX_ENTRIES` | `50` | 「AI 日誌」頁／`GET /api/llm/logs` 顯示的最近互動筆數上限（記憶體內環狀緩衝，隨程序重啟清空），邊界 `[1, 1000]`。 |
 | `LLM_LOG_BODY_MAX_CHARS` | `200000` | 單次互動中，任一則請求/回應內容儲存時的字元數上限，邊界 `[1000, 2000000]`；與 `LLM_LOG_MAX_ENTRIES` 一起讓記憶體用量在兩個軸上都有界。 |
 | `LLM_LOG_FILE` | 未設定 | 選填。設定後，每次 LLM 互動會額外追加寫入這個 JSONL 檔案（與記憶體環狀緩衝形狀相同的紀錄，一樣受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；預設關閉——記錄含個人記憶內容，落不落地是使用者自己的隱私選擇。每一行連同行尾換行，追加前以寫出的樣子再檢查一次：已知秘密的某一處出現碰到文字欄位（本文、回覆、錯誤、工具名稱、model）時，這一行的文字欄位全部換成遮蔽標記，字數跟著改；仍碰到時（只會是沒分類的欄位）不寫這一行，只記一筆不含內容的警告；寫出時已知秘密的清單不完整，這一行的文字欄位全部改存「本文未記錄」的標記。整處落在鍵、標點、時間、計數與小寫識別字（workflow、outcome、role）裡的出現照寫。每一行各自檢查，橫跨兩行的值看不到。記憶體環狀緩衝與 AI 日誌頁照舊顯示原本的紀錄。 |
-| `LLM_LOG_FILE_MAX_BYTES` | `50000000` | 上述 JSONL sink 的輪替門檻（位元組）：檔案超過此大小就改名成帶 UTC 時間戳後綴、另開新檔（守磁碟；RAM 由環狀緩衝負責），邊界 `[1000000, 1000000000]`。僅在有設定 `LLM_LOG_FILE` 時有意義；輪替後的舊檔不會自動刪除，交由使用者自行清理。 |
+| `LLM_LOG_FILE_MAX_BYTES` | `50000000` | 上述 JSONL sink 的輪替門檻（位元組）：檔案超過此大小就改名成帶 UTC 時間戳後綴、另開新檔（守磁碟；RAM 由環狀緩衝負責），邊界 `[1000000, 1000000000]`。同一秒內已有同名的舊檔時改用 `-1`、`-2`…後綴，不會蓋掉它；查不到某個名稱是否已被占用時，這一次不輪替、照常寫在原檔，下一筆再試。僅在有設定 `LLM_LOG_FILE` 時有意義；輪替後的舊檔不會自動刪除，交由使用者自行清理。 |
 | `TOOLS_DIR` | dev 未設定／打包模式自動注入 `<data-dir>/tools` | 已安裝工具套件所在目錄；留空＝工具功能整個關閉（`GET /api/tools` 回空清單，AI workflow 不帶任何工具，prompt 與無工具版本逐字相同）。相對路徑或指向此基底的 symlink 會在設定邊界 canonicalize 成同一個絕對路徑；這不會跟隨或放寬任何 package/version symlink 的拒絕。路徑裡還不存在的部分照原樣保留（工具目錄還沒建立時照常）；某一段是檔案時同樣是那裡沒有工具目錄：照設定的路徑使用（只轉成絕對路徑，不解析連結、不化簡 `..`），沒有工具，AI workflow 照常不帶工具，已知秘密的清單照常完整。解析時遇到其他錯誤（上層目錄無法搜尋、連結迴圈、I/O 錯誤）不會被當成功能關閉：工具清單、capture／enrich／assist-update 等用到工具目錄的請求回 `500 tools_dir_unresolved`，訊息寫出設定的路徑、錯誤型別與下一步（檢查上層目錄的權限、連結與磁碟狀態，或清空這個設定），已知秘密的清單也因此不完整。dev 模式要用工具功能，需自行在 `backend/.env` 設定這個變數。 |
 | `LLM_TOOL_ROUNDS_MAX` | `8` | 一次 AI workflow 呼叫最多允許幾輪工具呼叫，邊界 `[1, 64]`。 |
 | `LLM_TOOL_TIMEOUT_SECONDS` | `60` | 單次工具子行程的逾時秒數（到期整個 process group 被砍），邊界 `(0, 600]`。 |
@@ -173,7 +173,9 @@ job 的 `error` 也是這段訊息（帶結尾句號）；其他未預期錯誤�
   一列可供清理。若非空套件完全沒有 `.afterthread.meta/`，只有 migration legacy
   preflight 也接受的扁平 shape（尤其不能已經有 `versions/`）才會提示執行
   `python -m afterthread.migrate_tools_v5`；保有 target namespace 的模糊 shape 會
-  回報損壞、要求人工檢查，不會推薦一條 migration 必然拒絕的指令。
+  回報損壞、要求人工檢查，不會推薦一條 migration 必然拒絕的指令。在 Linux 上，工具目錄裡名稱不是 UTF-8
+  的資料夾也列成一列：`name` 裡那些位元組換成替代字元（U+FFFD），`valid=false`、`last_run` 為 `null`。
+  這樣的名稱不是合法的工具名稱，`/api/tools/{name}` 底下的路由都以 422 拒絕它；要在檔案系統上自行改名或移除。
 - `PATCH /api/tools/{name}` — 切換某工具的 `enabled`；找不到回 404。寫的是套件的
   `.afterthread.meta/state.json`（見下方「工具套件格式」），**完全不碰任何版本的
   `tool.json`**——所以一次

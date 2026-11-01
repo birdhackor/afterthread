@@ -20,8 +20,10 @@ monkeypatching ``llm_log.get_settings`` where a test needs a specific value.
 """
 
 import asyncio
+import errno
 import json
 import logging
+import os
 import re
 from collections.abc import Generator
 from types import SimpleNamespace
@@ -1485,6 +1487,45 @@ def test_file_sink_rotation_same_second_uses_unique_targets(
     assert (tmp_path / "llm.jsonl.20260716-120000Z-1").read_text(encoding="utf-8").startswith("y")
     # The live file holds only the newest record.
     assert "second fresh line" in log_file.read_text(encoding="utf-8")
+
+
+def test_file_sink_rotation_that_cannot_look_at_its_target_name_rotates_nothing(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An earlier segment holds the stamped name, and the ``lstat`` of that name
+    fails with EIO: whether anything is there is not known, so this rotation does
+    not happen. The earlier segment keeps its content, nothing else is renamed, and
+    the record is appended to the oversized file."""
+    log_file = tmp_path / "llm.jsonl"
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(
+            llm_log_file=str(log_file), llm_log_file_max_bytes=1_000_000, llm_log_max_entries=50
+        ),
+    )
+    monkeypatch.setattr(llm_log, "_rotation_stamp", lambda: "20260716-120000Z")
+    llm_log._reset_for_tests()
+    earlier = tmp_path / "llm.jsonl.20260716-120000Z"
+    earlier.write_text("earlier segment\n", encoding="utf-8")
+    log_file.write_text("x" * 1_000_050 + "\n", encoding="utf-8")
+    real_lstat = os.lstat
+
+    def lstat(target: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if os.fspath(target) == os.fspath(earlier):
+            raise OSError(errno.EIO, os.strerror(errno.EIO), os.fspath(target))
+        return real_lstat(target, *args, **kwargs)
+
+    monkeypatch.setattr(llm_log.os, "lstat", lstat)
+
+    _record(workflow="capture", response="appended without a rotation")
+
+    assert earlier.read_text(encoding="utf-8") == "earlier segment\n"
+    rotated = sorted(p.name for p in tmp_path.iterdir() if p.name.startswith("llm.jsonl."))
+    assert rotated == ["llm.jsonl.20260716-120000Z"]
+    appended = log_file.read_text(encoding="utf-8")
+    assert appended.startswith("x" * 1_000_050 + "\n")
+    assert "appended without a rotation" in appended
 
 
 class _RaisingHandler(logging.Handler):

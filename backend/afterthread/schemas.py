@@ -667,6 +667,12 @@ class ToolSummary(BaseModel):
     (bad manifest, name mismatch, missing entry file); such a package is listed
     so it can be deleted, but is never advertised to the model or executable.
 
+    ``name`` is the package directory's name, made encodable as UTF-8 (on Linux,
+    the bytes of a name that do not decode as UTF-8 come back as replacement
+    characters). A name that is not a tool name -- such a one among them -- is
+    always on a ``valid=False`` row, and every per-tool route refuses it (422):
+    that row is deleted on disk, not here.
+
     The summary text itself is fetched per tool on demand
     (``ToolSummaryDetail``), since it is far too long for a list row.
     ``last_run`` is the tool's newest run record, null when it has none.

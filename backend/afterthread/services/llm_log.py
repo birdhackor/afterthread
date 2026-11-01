@@ -1618,11 +1618,22 @@ def _rotate_file_sink(path: str) -> None:
     the deliberate operator-robustness choice, and rotation slots in AHEAD of it
     rather than holding a long-lived handle).
 
+    A rename onto a name a file already holds replaces that file, so the target
+    is a name seen empty. Two rotations within the same second share a stamp: the
+    target is the first of ``<stamp>``, ``<stamp>-1``, ... ``<stamp>-100`` that a
+    ``lstat`` sees is not there (``FileNotFoundError``); a name where it sees
+    anything -- a file, a broken link -- is passed over for the next one. A
+    ``lstat`` that fails any other way says nothing about what is there, so that
+    rotation does not happen; neither does one with all 101 names taken. What it
+    does not cover: an entry another process makes at the name between the look
+    and the rename (this process's rotations take ``_FILE_SINK_LOCK`` in turn).
+
     Every failure is fully suppressed -- the same never-break-the-caller contract
     the sink itself carries. A missing file (the first-ever write) makes
     ``getsize`` raise ``OSError`` and simply means "nothing to rotate"; a failed
-    rename leaves the file in place and the append proceeds onto it (oversized,
-    but recorded), never surfacing an error. The broad final ``except Exception``
+    rename, or a rotation given up as above, leaves the file in place and the
+    append proceeds onto it (oversized, but recorded; the next append tries
+    again), never surfacing an error. The broad final ``except Exception``
     backstops even a pathological ``get_settings``/``strftime``, because this
     helper runs OUTSIDE ``_write_file_sink``'s own try and MUST NOT be the thing
     that breaks a recording. NO retention/deletion of the rotated segments is
@@ -1640,22 +1651,18 @@ def _rotate_file_sink(path: str) -> None:
         return
     stamp = _rotation_stamp()
     with contextlib.suppress(Exception):
-        # F8(b): two rotations within the SAME second would collide on the timestamped
-        # name (and, absent the _FILE_SINK_LOCK serialization, could clobber each
-        # other). Find a free target: ``<stamp>``, then ``<stamp>-1``, ``-2``, ... --
-        # ``lexists`` so a broken symlink or any pre-existing entry still counts as
-        # taken. Bounded: after 100 tries, GIVE UP rotating and return (the append that
-        # follows lands on the still-oversized file, one write past the cap, which the
-        # next write rotates) -- all inside the suppress, since rotation is best-effort
-        # and must never break the sink.
-        target = f"{path}.{stamp}"
-        suffix = 0
-        while os.path.lexists(target):
-            suffix += 1
-            if suffix > 100:
+        for suffix in range(101):
+            target = f"{path}.{stamp}" if suffix == 0 else f"{path}.{stamp}-{suffix}"
+            try:
+                os.lstat(target)
+            except FileNotFoundError:
+                # Seen not to be there: the only answer that lets the rename use it.
+                os.rename(path, target)
                 return
-            target = f"{path}.{stamp}-{suffix}"
-        os.rename(path, target)
+            except OSError:
+                # The look failed: an earlier segment may be there. No rotation this time.
+                return
+            # Something is there: try the next name.
 
 
 def _write_file_sink(record: LlmInteractionRecord, known: Iterable[str] = ()) -> None:
