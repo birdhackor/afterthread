@@ -411,6 +411,57 @@ def test_a_body_that_spells_a_secret_only_as_written_reaches_no_byte_of_the_json
     assert attempt["response_content"] == llm_log._REDACTION_MARKER
 
 
+def _decoded_strings(value: Any) -> list[str]:
+    """Every string in a decoded JSON value, the keys of its objects included."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for key, item in value.items() for s in (key, *_decoded_strings(item))]
+    if isinstance(value, list):
+        return [s for item in value for s in _decoded_strings(item)]
+    return []
+
+
+@pytest.mark.parametrize("entry", ["response", "request message", "advertised name"])
+def test_a_text_that_spells_a_secret_only_as_stored_reaches_no_string_the_detail_api_serves(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, entry: str
+) -> None:
+    """The text as received holds a lone surrogate where the known value has three
+    U+FFFD, so masking has nothing to find; ``_utf8_safe`` then makes the stored
+    string exactly the value. Its JSON literal writes the value's quote as ``\\"``,
+    so a check of the literal alone passes it. A response, a request message and an
+    advertised name go through the same choke point, and each is stored as the
+    redaction marker: no string the detail API serves holds the value."""
+    secret = 'abc\ufffd\ufffd\ufffd"'
+    text = 'abc\udcff"'
+    assert secret not in text
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({secret}, True))
+    llm_log._reset_for_tests()
+
+    if entry == "response":
+        _record(response=text)
+    elif entry == "request message":
+        _record(messages=[{"role": "user", "content": text}])
+    else:
+        _record(tools_advertised=[text])
+
+    log_id = client.get("/api/llm/logs").json()["logs"][0]["id"]
+    served = client.get(f"/api/llm/logs/{log_id}")
+    assert served.status_code == 200
+    detail = served.json()
+    attempt = detail["attempts"][0]
+    if entry == "response":
+        assert attempt["response_content"] == llm_log._REDACTION_MARKER
+    elif entry == "request message":
+        assert attempt["request_messages"][0]["content"] == llm_log._REDACTION_MARKER
+    else:
+        assert attempt["tools_advertised"] == [llm_log._REDACTION_MARKER]
+    # Decoded first: the response's own text escapes the quote, as a JSON literal
+    # does, so it would not hold the value even when a string served is the value.
+    assert [s for s in _decoded_strings(detail) if secret in s] == []
+
+
 def test_advertised_tool_names_go_through_the_same_redaction(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
@@ -819,9 +870,10 @@ def test_a_masking_failure_does_not_break_the_recording_and_stores_the_body_unre
 ) -> None:
     """``_mask_known_secrets`` runs inside guards -- a MemoryError (or
     any other surprise) from the masking itself must not escape into the recorder.
-    ``_redact`` keeps the text when it fails; the check of the text as written
-    fails the same way, and a body it could not check is stored as the marker
-    saying it was not recorded: no secret was found, none was looked for."""
+    ``_redact`` keeps the text when it fails; the last check, of the text as
+    stored and as written, fails the same way, and a body it could not check is
+    stored as the marker saying it was not recorded: no secret was found, none was
+    looked for."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
     monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({"real-secret-value-abcdef"}, True))
 
@@ -893,16 +945,60 @@ def test_a_whole_list_with_no_secrets_keeps_every_body(monkeypatch: pytest.Monke
     assert attempt["response_content"] == "plain answer"
 
 
-def test_checked_as_written_stores_a_body_unrecorded_for_a_list_that_is_not_whole() -> None:
+def test_the_last_check_stores_a_body_unrecorded_for_a_list_that_is_not_whole() -> None:
     """The last stage on its own: a body that holds nothing a partial list knows is
     still not called clean, since the values the list lacks are unknown. The
     recorder tests above show the same through the whole pipeline."""
     whole = llm_log._SecretSnapshot(["kb-live-key-abcdef"], True)
     partial = llm_log._SecretSnapshot(["kb-live-key-abcdef"], False)
+    check = llm_log._checked_as_stored_and_written
 
-    assert llm_log._checked_as_written("plain words", whole) == "plain words"
-    assert llm_log._checked_as_written("plain words", partial) == llm_log._UNCHECKED_MARKER
-    assert llm_log._checked_as_written("", partial) == llm_log._UNCHECKED_MARKER
+    assert check("plain words", whole) == "plain words"
+    assert check("plain words", partial) == llm_log._UNCHECKED_MARKER
+    assert check("", partial) == llm_log._UNCHECKED_MARKER
+
+
+def test_the_last_check_keeps_a_body_only_when_neither_form_holds_a_known_value() -> None:
+    """The last stage on its own, with a whole list. The string as stored is what
+    the ring, the detail API and the AI 日誌 page hand on; its JSON literal is what
+    a JSONL line writes. A body that holds a known value in only one of the two is
+    the redaction marker either way, and one that holds none in either is kept."""
+    # Three U+FFFD and a quote. The literal writes the quote as \", so of the two
+    # forms of a body that is this value, only the string as stored holds it.
+    known_as_stored = 'abc\ufffd\ufffd\ufffd"'
+    # A backslash and an n, which is how the literal writes a real line break, so
+    # of a body holding that line break, only the literal holds this value.
+    known_as_written = "kb-pem-head\\nkb-pem-body"
+    secrets = llm_log._SecretSnapshot(sorted([known_as_stored, known_as_written]), True)
+    check = llm_log._checked_as_stored_and_written
+
+    def literal(text: str) -> str:
+        return json.dumps(text, ensure_ascii=False)[1:-1]
+
+    stored_only = known_as_stored
+    written_only = "it signs with kb-pem-head\nkb-pem-body"
+    assert known_as_stored not in literal(stored_only)
+    assert known_as_written not in written_only and known_as_written in literal(written_only)
+
+    assert check(stored_only, secrets) == llm_log._REDACTION_MARKER
+    assert check(written_only, secrets) == llm_log._REDACTION_MARKER
+    assert check("plain words", secrets) == "plain words"
+
+
+def test_the_last_check_counts_the_start_of_a_known_value_ending_the_stored_string() -> None:
+    """The string as stored is checked with the same matcher as its literal, so the
+    start of a known value at its end counts there too: the end of a body may be
+    where a value was cut off. This body ends with the first seven characters of the
+    value, a quote among them, which the literal writes as ``\\"``, so only the
+    string as stored ends with them; the value is not whole in either."""
+    known = 'abc\ufffd\ufffd\ufffd"-and-the-rest'
+    body = 'it ends abc\ufffd\ufffd\ufffd"'
+    secrets = llm_log._SecretSnapshot([known], True)
+    literal = json.dumps(body, ensure_ascii=False)[1:-1]
+    assert known not in body
+    assert llm_log._mask_known_secrets(literal, secrets.values) == literal
+
+    assert llm_log._checked_as_stored_and_written(body, secrets) == llm_log._REDACTION_MARKER
 
 
 def test_a_secret_found_and_a_body_not_checked_are_told_apart_in_the_log(

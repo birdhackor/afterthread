@@ -1804,14 +1804,14 @@ def _written_literal(text: str) -> str:
     return json.dumps(text, ensure_ascii=False)[1:-1]
 
 
-def _holds_a_secret(written: str, secrets: list[str]) -> bool:
-    """Whether ``_mask_known_secrets`` would change ``written``: the mask's own matcher.
+def _holds_a_secret(text: str, secrets: list[str]) -> bool:
+    """Whether ``_mask_known_secrets`` would change ``text``: the mask's own matcher.
 
     So the same three things count as a hit: a whole known value, a trailing
     prefix of one at least ``_MIN_SECRET_LEN`` long, and more matches than the
     mask collects.
     """
-    return _mask_known_secrets(written, secrets) != written
+    return _mask_known_secrets(text, secrets) != text
 
 
 def _spells_a_secret(text: str, secrets: list[str]) -> bool:
@@ -1825,15 +1825,26 @@ def _redacted(value: str | None, secrets: list[str], cap: int | None = None) -> 
     The field check of every JSON file this module and ``tool_drafts`` write with
     text in them (``summary.json``, ``origin.json``, a draft's manifest): masked
     with ``secrets``, cut to ``cap`` when there is one, surrogate-scrubbed, and
-    then checked in the form the file holds it (``_spells_a_secret``), with the
-    mask's own matcher. The mask works on the text and the file holds it encoded,
-    and the two differ: the encoder writes a line break as ``\\n``, a quote as
-    ``\\"``, a backslash as ``\\\\``, a control character as ``\\uXXXX``, and the
-    scrub leaves three U+FFFD for one lone surrogate. A PEM registered from a
-    single-quoted ``.env`` line keeps its ``\\n`` as those two characters, so a
-    text holding that key with real line breaks is written as exactly the
-    secret's bytes. A value whose written form holds a secret is written as the
-    redaction marker, whole: masking it in place would mean cutting into escapes.
+    then checked with the mask's own matcher in both forms the value takes. A
+    reader decodes the file and has the text itself -- the tool summary API hands
+    it on as it is -- so the text is checked (``_holds_a_secret``); the file holds
+    it encoded, so that form is checked too (``_spells_a_secret``). The mask
+    worked on the text before the scrub and the encoding, and each form can hold
+    what the masked text did not:
+
+    * the text: the scrub leaves three U+FFFD for one lone surrogate, and with the
+      characters beside them they can complete a known value that holds them;
+    * the file: the encoder writes a line break as ``\\n``, a quote as ``\\"``, a
+      backslash as ``\\\\``, a control character as ``\\uXXXX``. A PEM registered
+      from a single-quoted ``.env`` line keeps its ``\\n`` as those two
+      characters, so a text holding that key with real line breaks is written as
+      exactly the secret's bytes.
+
+    Neither form answers for the other: a known value of three U+FFFD and a quote
+    can be whole in the text and absent from the file, which writes the quote as
+    ``\\"``, and an escape is only in the file. A value that holds a secret in
+    either form is written as the redaction marker, whole: masking it in place
+    would mean cutting into escapes.
 
     What it does not cover: a difference of representation an exact match cannot
     see -- a secret registered with a real line break that a text spells as the
@@ -1857,7 +1868,9 @@ def _redacted(value: str | None, secrets: list[str], cap: int | None = None) -> 
         return None
     masked = _mask_known_secrets(value, secrets)
     text = _utf8_safe(masked if cap is None else masked[:cap])
-    return _REDACTION_MARKER if _spells_a_secret(text, secrets) else text
+    if _holds_a_secret(text, secrets) or _spells_a_secret(text, secrets):
+        return _REDACTION_MARKER
+    return text
 
 
 def _masked_as_shown(text: str, secrets: list[str], cap: int | None = None) -> str:
@@ -3123,9 +3136,10 @@ def known_secrets_for_log() -> tuple[frozenset[str], bool]:
     so a collection that is not whole, or that failed, is answered as
     ``(frozenset(), False)`` rather than raised; llm_log then stores, in place of
     each body, the marker saying it was not recorded
-    (``llm_log._checked_as_written``). Goes through ``known_secret_values``, so
-    the same answer serves both. It hands over the values themselves: llm_log puts
-    them in their match forms with its own copy of ``_match_forms``.
+    (``llm_log._checked_as_stored_and_written``). Goes through
+    ``known_secret_values``, so the same answer serves both. It hands over the
+    values themselves: llm_log puts them in their match forms with its own copy of
+    ``_match_forms``.
     """
     try:
         return known_secret_values(), True

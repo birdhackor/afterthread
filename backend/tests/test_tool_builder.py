@@ -4063,6 +4063,33 @@ def test_router_get_summary_returns_the_sidecar(
     }
 
 
+def test_a_summary_that_spells_a_secret_only_as_decoded_reaches_no_string_the_summary_api_serves(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The summary holds a lone surrogate where the known value has three U+FFFD,
+    so the mask finds nothing, and the scrub then makes the text exactly the value.
+    The file writes the value's quote as ``\\"``, so the field's written form and
+    the whole file both pass it; the summary API decodes the file and hands the
+    text on as it is. The summary is written as the marker, and no string the API
+    serves holds the value."""
+    secret = 'abc\ufffd\ufffd\ufffd"'
+    text = 'abc\udcff"'
+    assert secret not in text
+    pkg = _seed_package(monkeypatch, tmp_path)
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+
+    assert tools.write_tool_meta(
+        _version_root(pkg), {"summary": text, "updated_at": "2026-07-26T00:00:00+00:00"}
+    )
+
+    response = client.get("/api/tools/kbsearch/summary")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["summary"] == tools._REDACTION_MARKER
+    # Decoded first: the response's own text escapes the quote, as the file does.
+    assert [value for value in body.values() if isinstance(value, str) and secret in value] == []
+
+
 def test_router_get_summary_drops_a_log_link_a_restart_invalidated(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -11187,6 +11214,39 @@ def test_origin_feedback_that_spells_a_secret_only_as_written_reaches_no_byte_of
     # Nor a prefix of it as long as the mask's trailing guard covers, ending a string.
     for end in range(tools._MIN_SECRET_LEN, len(encoded)):
         assert encoded[:end] + b'"' not in data
+    origin = tools.read_origin_meta(tools.VersionRoot(version))
+    assert origin is not None
+    assert (origin["feedback"], origin["instructions"]) == (tools._REDACTION_MARKER, "查 KB")
+
+
+def test_origin_feedback_that_spells_a_secret_only_as_decoded_reads_back_as_the_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The operator's words hold a lone surrogate where the known value has three
+    U+FFFD: the mask finds nothing, and the scrub then makes the text exactly the
+    value, whose quote ``origin.json`` writes as ``\\"``. The origin reads back with
+    the feedback as the marker and the instructions as they were: the field check
+    caught it, which the whole-file check cannot, since the file holds the quote
+    escaped."""
+    secret = 'abc\ufffd\ufffd\ufffd"'
+    text = 'abc\udcff"'
+    assert secret not in text
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+    version = tmp_path / "version"
+    (version / tools._META_DIRNAME).mkdir(parents=True)
+
+    written = tools.write_origin_meta(
+        tools.BuildRoot(version),
+        {
+            "source": "builder-revise",
+            "openapi_url": None,
+            "instructions": "查 KB",
+            "feedback": tool_builder._provenance_feedback(text, ()),
+            "previous": _TEST_VID,
+        },
+    )
+
+    assert written is True
     origin = tools.read_origin_meta(tools.VersionRoot(version))
     assert origin is not None
     assert (origin["feedback"], origin["instructions"]) == (tools._REDACTION_MARKER, "查 KB")

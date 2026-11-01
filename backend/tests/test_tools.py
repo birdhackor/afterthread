@@ -6950,6 +6950,21 @@ def test_a_summary_that_spells_a_secret_only_as_written_is_the_marker_by_its_fie
     assert stored["summary"] == tools._REDACTION_MARKER
 
 
+def test_the_field_check_counts_the_start_of_a_known_value_ending_the_text() -> None:
+    """The text is checked with the mask's own matcher, as its written form is, so
+    the start of a known value at its end counts there too: the end of a text may
+    be where a value was cut off. After the scrub, this text ends with the first
+    seven characters of the value, a quote among them, which the file writes as
+    ``\\"``, so only the text ends with them; the value is not whole in either."""
+    known = 'abc\ufffd\ufffd\ufffd"-and-the-rest'
+    value = 'it ends abc\udcff"'
+    scrubbed = tools._utf8_safe(value)
+    assert known not in scrubbed
+    assert not tools._spells_a_secret(scrubbed, [known])
+
+    assert tools._redacted(value, [known]) == tools._REDACTION_MARKER
+
+
 def test_a_sidecar_text_the_field_check_lets_through_is_caught_by_the_whole_file_check(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

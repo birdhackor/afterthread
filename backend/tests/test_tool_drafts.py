@@ -717,6 +717,29 @@ def test_text_spelling_a_secret_only_as_written_reaches_no_manifest_byte_from_th
     assert (last["summary"], last["note"]) == (tools._REDACTION_MARKER, _PLAIN_NOTE)
 
 
+def test_text_spelling_a_secret_only_as_decoded_reads_back_from_the_manifest_as_the_marker(
+    tmp_path: Path,
+) -> None:
+    """A lone surrogate where the known value has three U+FFFD: the mask finds
+    nothing, the scrub makes the text exactly the value, and the manifest writes
+    its quote as ``\\"``. Read back, the field is the marker and the plain note is
+    kept: the field check caught it, which the whole-file check cannot, since the
+    file holds the quote escaped."""
+    secret = 'abc\ufffd\ufffd\ufffd"'
+    text = 'abc\udcff"'
+    assert secret not in text
+
+    data = tool_drafts.manifest_bytes(
+        _document(attempt_fields={"summary": text, "note": _PLAIN_NOTE}), [secret]
+    )
+
+    assert data is not None
+    read = _reads_back(tmp_path, data)
+    assert read is not None
+    last = read["attempts"][-1]
+    assert (last["summary"], last["note"]) == (tools._REDACTION_MARKER, _PLAIN_NOTE)
+
+
 def test_text_a_field_check_lets_through_is_caught_by_the_whole_file_check(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -68,10 +68,11 @@ What holds, and why:
   secrets known at that moment, cut to its cap, made encodable
   (``tools._utf8_safe``: a file name read from disk can carry lone surrogates,
   which the UTF-8 encode of the whole document would refuse), and then checked
-  in the form the file holds it, a JSON string literal, with the mask's own
-  matcher (``tools._redacted``): an escape the encoder writes, or the replacement
-  characters the scrub leaves, can spell a known value the text did not, and
-  such a string is written as the redaction marker, whole. A value whose shape a
+  both as the text a reader decodes and in the form the file holds it, a JSON
+  string literal, with the mask's own matcher (``tools._redacted``): the
+  replacement characters the scrub leaves, or an escape the encoder writes, can
+  spell a known value the masked text did not, and such a string is written as
+  the redaction marker, whole. A value whose shape a
   check here fixes -- an identifier, a timestamp this module wrote, a number, a
   vocabulary word -- is checked against that shape instead of masked; a mask
   could only corrupt it. What a run record hands over is free text. The keys

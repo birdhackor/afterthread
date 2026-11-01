@@ -357,12 +357,12 @@ def _aggregate_usage(attempts: list[LlmAttempt]) -> dict[str, int | None] | None
 _REDACTION_MARKER = "•••[秘密已遮蔽]•••"
 
 # Stored in place of a body that could not be checked against the whole list of
-# known secrets (``_checked_as_written``): it says the body was not recorded and
-# why, and not that a secret was found -- which is what ``_REDACTION_MARKER`` says,
-# and what may send a reader to rotate a key. Written the way that marker is, a
-# CJK body in the •••[…]••• fence: no run of ASCII characters in it is as long as
-# ``_MIN_SECRET_LEN``, so no value of ASCII characters, as keys and tokens are,
-# can equal it or be found in it.
+# known secrets (``_checked_as_stored_and_written``): it says the body was not
+# recorded and why, and not that a secret was found -- which is what
+# ``_REDACTION_MARKER`` says, and what may send a reader to rotate a key. Written
+# the way that marker is, a CJK body in the •••[…]••• fence: no run of ASCII
+# characters in it is as long as ``_MIN_SECRET_LEN``, so no value of ASCII
+# characters, as keys and tokens are, can equal it or be found in it.
 _UNCHECKED_MARKER = "•••[無法確認是否含已知秘密，本文未記錄]•••"  # noqa: RUF001
 
 # Values shorter than this are NEVER redacted (see `_redact`): a 1-5 char value
@@ -400,7 +400,7 @@ _MAX_MASK_RANGES = 10_000
 # It answers ``(values, complete)``: the values it could read, and whether that
 # is all of them. A provider never has to raise to say it could not read some
 # source -- it says so -- and a body is never checked against a list that is
-# missing values as if that list were whole (see ``_checked_as_written``).
+# missing values as if that list were whole (see ``_checked_as_stored_and_written``).
 _secret_provider: Callable[[], tuple[Iterable[str], bool]] | None = None
 
 
@@ -566,7 +566,7 @@ class _SecretSnapshot:
     each one at the redactor's floor, and its newline-normalized form, whatever that
     form's length). ``complete`` False means some source could not be read, or
     asking failed: the values are then a part of the list, and nothing checked
-    against them can be called clean (``_checked_as_written``).
+    against them can be called clean (``_checked_as_stored_and_written``).
     """
 
     values: list[str]
@@ -636,7 +636,7 @@ def _redact(text: str, secrets: list[str]) -> str:
     ``secrets`` is the values of a ``_secret_snapshot`` the CALLER took (see there
     for why the snapshot is per step rather than per string); an empty list means
     "nothing to mask". Whether that list is whole is not this stage's question:
-    ``_checked_as_written`` answers it for the stored text.
+    ``_checked_as_stored_and_written`` answers it for the stored text.
 
     The masking itself -- the shared ``_mask_known_secrets`` (byte-identical to
     ``tools``' copy, see that helper) -- runs inside this function's OWN guard (D36
@@ -658,7 +658,7 @@ def _redact(text: str, secrets: list[str]) -> str:
         return text
 
 
-# --- stored-body safety: redact, UTF-8-safe, size-capped, checked as written ---
+# --- stored-body safety: redact, UTF-8-safe, size-capped, checked as stored and as written ---
 
 
 def _utf8_safe(text: str) -> str:
@@ -709,12 +709,13 @@ def _stored_body(text: str, secrets: _SecretSnapshot) -> tuple[str, bool]:
     guards a distinct hazard: ``_redact`` FIRST, then ``_utf8_safe``, then the
     hard cut to ``settings.llm_log_body_max_chars`` (with
     ``_BODY_TRUNCATION_MARKER`` appended when a cut happens), and last the check
-    of what is stored in the form a JSON line writes it
-    (``_checked_as_written``): a body whose escapes, or whose replacement
-    characters, spell a known secret is stored as the redaction marker, and one
-    that could not be checked as the marker saying it was not recorded. "Body" is its
-    origin, not its scope: an attempt's advertised tool NAMES run through it too
-    (see ``LlmInteractionRecorder.begin_attempt``), so that every stored string a
+    of what is stored, both as the string itself and in the form a JSON line
+    writes it (``_checked_as_stored_and_written``): a body that spells a known
+    secret in either form -- through its replacement characters, the cut or its
+    escapes -- is stored as the redaction marker, and one that could not be
+    checked as the marker saying it was not recorded. "Body" is its origin, not
+    its scope: an attempt's advertised tool NAMES run through it too (see
+    ``LlmInteractionRecorder.begin_attempt``), so that every stored string a
     record holds that could carry operator/LLM/filesystem text reaches its sinks
     through here. The one string that does not is a message's ``role``, and that
     is deliberate: it is a closed vocabulary this codebase writes itself
@@ -726,22 +727,19 @@ def _stored_body(text: str, secrets: _SecretSnapshot) -> tuple[str, bool]:
     size cut is the load-bearing reason: a secret value straddling the
     truncation edge must not be half-scrubbed and half-survive, so it has to be
     replaced while the body is still whole. (Against ``_utf8_safe`` the order is
-    harmless either way -- API keys/tokens are plain ASCII, which the surrogate
-    pass never alters -- but redact-first is the correct, edge-independent order
-    regardless.) Because this is the ONE choke point, redaction reaches ALL
-    stored bodies -- every request message and every response. The ring and the
-    detail API hold what this stores. The JSONL sink writes it too, but checks
-    each whole line once more as it is appended (``_checked_line``), so a line
-    can hold a marker where the ring holds the body: the two sinks have the same
-    shape, not always the same text.
+    not what keeps a body clean: the U+FFFD it puts in after masking can complete
+    a known value that holds them, and the last stage, which checks the stored
+    string itself, is what catches that.) Because this is the ONE choke point,
+    redaction reaches ALL stored bodies -- every request message and every
+    response. The ring and the detail API hold what this stores. The JSONL sink
+    writes it too, but checks each whole line once more as it is appended
+    (``_checked_line``), so a line can hold a marker where the ring holds the
+    body: the two sinks have the same shape, not always the same text.
 
-    ``_utf8_safe`` must in turn run before the slice: it never enlarges the text
-    (one surrogate becomes one U+FFFD), and once it has run the string holds
-    only valid Unicode scalar values, so slicing it by Python's
-    code-point-based indexing can never land inside what used to be a lone
-    surrogate. Truncating first would risk cutting a bare surrogate at the
-    boundary and handing ``_utf8_safe`` a different (index-shifted) string than
-    the one actually stored.
+    ``_utf8_safe`` must in turn run before the slice: it can lengthen the text --
+    one lone surrogate becomes three U+FFFD -- so only a cut made after it holds
+    the stored body to the cap, and the string it hands on holds only valid
+    Unicode scalar values, which any slice of it does too.
 
     Without the size cap, a broken or hostile OpenAI-*compatible* gateway
     returning a multi-MB body would be kept in full (per attempt, and echoed
@@ -759,41 +757,56 @@ def _stored_body(text: str, secrets: _SecretSnapshot) -> tuple[str, bool]:
     filesystem work on the event loop (see ``_secret_snapshot``). A default would
     make "forgot to hoist it" the quiet, working spelling -- which is exactly the
     shape the advertised names were written in. A snapshot that is not whole
-    stores ``_UNCHECKED_MARKER`` in place of the body (``_checked_as_written``).
+    stores ``_UNCHECKED_MARKER`` in place of the body
+    (``_checked_as_stored_and_written``).
     """
     safe = _utf8_safe(_redact(text, secrets.values))
     cap = get_settings().llm_log_body_max_chars
     if len(safe) <= cap:
-        return _checked_as_written(safe, secrets), False
+        return _checked_as_stored_and_written(safe, secrets), False
     marker_len = len(_BODY_TRUNCATION_MARKER)
     if cap <= marker_len:
-        return _checked_as_written(safe[:cap], secrets), True
-    return _checked_as_written(safe[: cap - marker_len] + _BODY_TRUNCATION_MARKER, secrets), True
+        return _checked_as_stored_and_written(safe[:cap], secrets), True
+    cut = safe[: cap - marker_len] + _BODY_TRUNCATION_MARKER
+    return _checked_as_stored_and_written(cut, secrets), True
 
 
-def _checked_as_written(stored: str, secrets: _SecretSnapshot) -> str:
-    """``stored``, or a marker when its form in a JSON line holds a known secret or may.
+def _checked_as_stored_and_written(stored: str, secrets: _SecretSnapshot) -> str:
+    """``stored``, or a marker when it holds a known secret, as stored or as written, or may.
 
-    The last stage of ``_stored_body``. ``_redact`` works on the text, while the
-    JSONL sink writes it as a JSON string literal (``json.dumps(...,
-    ensure_ascii=False)``, as ``_write_file_sink`` does), and the two differ: a
-    line break is written as ``\\n``, a quote as ``\\"``, a backslash as ``\\\\``, a
-    control character as ``\\uXXXX``, and ``_utf8_safe`` leaves three U+FFFD for
-    one lone surrogate. A PEM registered from a single-quoted ``.env`` line keeps
-    its ``\\n`` as those two characters, so a body holding that key with real line
-    breaks would land on disk as exactly the secret's bytes. The literal is
-    checked with this module's own matcher (``_mask_known_secrets``, so a whole
-    value, a trailing prefix of one and the range cap all count), and a body it
-    would change is stored as ``_REDACTION_MARKER``, whole: masking inside the
-    literal would mean cutting into escapes.
+    The last stage of ``_stored_body``. It looks at two forms of the same string,
+    because the record is handed on in two: the ring, the detail API and the
+    AI 日誌 page take ``stored`` itself, and the JSONL sink writes it as a JSON
+    string literal (``json.dumps(..., ensure_ascii=False)``, as
+    ``_write_file_sink`` does). ``_redact`` worked on the text before either form
+    existed, and each can hold what that text did not:
+
+    * as stored: what the stages after masking put in -- three U+FFFD where
+      ``_utf8_safe`` met one lone surrogate, ``_BODY_TRUNCATION_MARKER`` after a
+      cut -- was not there when the text was masked, and with the characters
+      beside it can complete a known value that holds it;
+    * as written: a line break is written as ``\\n``, a quote as ``\\"``, a
+      backslash as ``\\\\``, a control character as ``\\uXXXX``. A PEM registered
+      from a single-quoted ``.env`` line keeps its ``\\n`` as those two
+      characters, so a body holding that key with real line breaks would land on
+      disk as exactly the secret's bytes.
+
+    Neither form answers for the other. A known value that holds a character JSON
+    escapes -- three U+FFFD and a quote, say -- can be whole in ``stored`` and
+    absent from its literal, which writes the quote as ``\\"``; an escape is only
+    in the literal. Each form is checked with this module's own matcher
+    (``_mask_known_secrets``, so a whole value, a trailing prefix of one and the
+    range cap all count), and a body it would change in either form is stored as
+    ``_REDACTION_MARKER``, whole: masking inside the literal would mean cutting
+    into escapes.
 
     It can only call a body clean against a list that is whole. When the snapshot
     is not complete -- some ``.env`` could not be read, or asking failed -- a value
-    it lacks may be exactly what the escapes spell, and nothing here can tell, so
-    ``_UNCHECKED_MARKER`` is stored instead of the body: not recorded, which is not
-    "a secret was found". The same when this check itself fails: unchecked is not
-    clean. Either way the recording goes on, and the call it records is untouched:
-    only the body is withheld.
+    it lacks may be exactly what the replacement characters or the escapes spell,
+    and nothing here can tell, so ``_UNCHECKED_MARKER`` is stored instead of the
+    body: not recorded, which is not "a secret was found". The same when this
+    check itself fails: unchecked is not clean. Either way the recording goes on,
+    and the call it records is untouched: only the body is withheld.
 
     What it does not cover: a difference of representation an exact match cannot
     see -- a secret registered with a real line break that a body spells as the
@@ -803,6 +816,8 @@ def _checked_as_written(stored: str, secrets: _SecretSnapshot) -> str:
     if not secrets.complete:
         return _UNCHECKED_MARKER
     try:
+        if _mask_known_secrets(stored, secrets.values) != stored:
+            return _REDACTION_MARKER
         literal = json.dumps(stored, ensure_ascii=False)[1:-1]
         if _mask_known_secrets(literal, secrets.values) != literal:
             return _REDACTION_MARKER

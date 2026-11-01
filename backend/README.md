@@ -594,8 +594,8 @@ discard_token, last}`：`state` 依序判定為 `running`（本行程有一輪�
   或 `draft/` 的 `lstat` 是「不存在」以外的錯誤）讀取時當作有：清單列出、擋修訂；寫入（含放棄）時不動手：
   保存不寫、發布前後的標記與發布後的刪除都不做，放棄原樣不動並回 `500 draft_not_removed`。第一輪
   保存失敗會收回它建的東西，連空的 `draft/` 一起。說明檔的文字先遮蔽、再截斷、再處理孤立的
-  surrogate，最後以寫進檔案的樣子（JSON 字串字面）用同一個比對器再檢查一次（`tools._redacted`）：
-  跳脫字元（`\n`、`\"`、`\\`、`\uXXXX`）或替代字元拼出已知秘密的欄位，整欄寫成遮蔽標記；識別碼、
+  surrogate，最後用同一個比對器把文字本身與它寫進檔案的樣子（JSON 字串字面）各再檢查一次（`tools._redacted`）：
+  替代字元或跳脫字元（`\n`、`\"`、`\\`、`\uXXXX`）在任一種樣子裡拼出已知秘密的欄位，整欄寫成遮蔽標記；識別碼、
   時間、數字與詞彙值改為檢查形狀。寫入前再以寫出的整份文字做一次底線（`tools._encode_checked`）：
   已知秘密的每一處出現都看，重疊的也看；整處落在固定內容（鍵、JSON 標點與空白、形狀固定的值、退化時
   放進去的遮蔽標記）裡的照寫，碰到文字欄位的——包括橫跨鍵名、引號或兩個欄位的——就把所有文字欄位都
@@ -774,7 +774,7 @@ discard_token, last}`：`state` 依序判定為 `running`（本行程有一輪�
   `.afterthread.meta/origin.json` 保存來源、安裝指示、修訂意見與 previous；
   可重新產生的 `.afterthread.meta/summary.json` 保存 summary、updated time 與
   AI log identity。兩者都經 typed／bounded／secret-redacted／fail-closed／atomic
-  publisher：文字欄位先遮蔽，再以寫進檔案的樣子檢查（拼出已知秘密就整欄寫成遮蔽標記，與草稿說明檔
+  publisher：文字欄位先遮蔽，再以文字本身與寫進檔案的樣子各檢查一次（任一種拼出已知秘密就整欄寫成遮蔽標記，與草稿說明檔
   同一套），寫出的整份文字再做一次同樣的底線：鍵、標點與形狀固定的欄位（`previous`、`updated_at`、
   `llm_log_id`）是固定內容，`llm_log_process` 照呼叫者給的寫、算文字但不換成標記，所以碰到它的出現
   會讓整份不寫；`updated_at` 必須是 `datetime.now(UTC).isoformat()` 的形狀，否則拒寫。
