@@ -25,6 +25,7 @@ import { Link, useSearch } from "@tanstack/react-router";
 import { useCallback, useEffect, useState } from "react";
 import { Controller, useForm } from "react-hook-form";
 import { apiDelete, apiGet, apiPatch, apiPost } from "../api/client.js";
+import { toolApiPath, toolJobApiPath } from "../api/toolPaths.js";
 import { CharCounter } from "../components/CharCounter.jsx";
 import { formatDate } from "../components/DateText.jsx";
 import { DraftNotice } from "../components/DraftNotice.jsx";
@@ -554,7 +555,7 @@ function ToolSummaryPanel({
 		queryFn: async () =>
 			acceptSummaryForVersion(
 				currentVid,
-				await apiGet(`/api/tools/${name}/summary`),
+				await apiGet(toolApiPath(name, "summary")),
 			),
 		enabled: expanded,
 	});
@@ -1168,8 +1169,7 @@ function InstalledToolsPanel({
 	});
 
 	const toggleMutation = useMutation({
-		mutationFn: ({ name, enabled }) =>
-			apiPatch(`/api/tools/${name}`, { enabled }),
+		mutationFn: ({ name, enabled }) => apiPatch(toolApiPath(name), { enabled }),
 		onSuccess: async (updated) => {
 			notifications.show({
 				color: "green",
@@ -1189,7 +1189,7 @@ function InstalledToolsPanel({
 	});
 
 	const deleteMutation = useMutation({
-		mutationFn: (name) => apiDelete(`/api/tools/${name}`),
+		mutationFn: (name) => apiDelete(toolApiPath(name)),
 		onSuccess: async (data, name) => {
 			setDeleteTarget(null);
 			notifications.show(toolDeleteNotification(name, data));
@@ -1519,7 +1519,7 @@ function InstalledToolsPanel({
 
 	const jobQuery = useQuery({
 		queryKey: ["tool-job", activeJob?.jobId],
-		queryFn: () => apiGet(`/api/tools/jobs/${activeJob.jobId}`),
+		queryFn: () => apiGet(toolJobApiPath(activeJob.jobId)),
 		// Functional `enabled`, computed by the SAME rule that stops the poll (see
 		// toolJobQueryEnabled): a plain `activeJob !== null` stayed true forever
 		// after the job settled, and with the app's refetchOnWindowFocus + 5s
@@ -1619,7 +1619,7 @@ function InstalledToolsPanel({
 	// examples, a switched-off tool) is the operator's to act on.
 	const checkMutation = useMutation({
 		mutationFn: ({ name, currentVid }) =>
-			apiPost(`/api/tools/${name}/check`, { expected_vid: currentVid }),
+			apiPost(toolApiPath(name, "check"), { expected_vid: currentVid }),
 		onSuccess: (result, { name, jobAttributionKey }) => {
 			setActiveJob({ name, jobAttributionKey, jobId: result.job_id });
 		},
@@ -1667,7 +1667,7 @@ function InstalledToolsPanel({
 			: null;
 	const linkedJobQuery = useQuery({
 		queryKey: ["tool-job", followedJobId],
-		queryFn: () => apiGet(`/api/tools/jobs/${followedJobId}`),
+		queryFn: () => apiGet(toolJobApiPath(followedJobId)),
 		enabled: toolJobQueryEnabled(followedJobId),
 		refetchInterval: toolJobRefetchInterval,
 	});
@@ -2392,7 +2392,7 @@ function InstallPanel({ externalBusy = false, onBusyChange }) {
 
 	const jobQuery = useQuery({
 		queryKey: ["tool-install", jobId],
-		queryFn: () => apiGet(`/api/tools/jobs/${jobId}`),
+		queryFn: () => apiGet(toolJobApiPath(jobId)),
 		// Same rule as the revise poll's own `enabled` (see InstalledToolsPanel):
 		// once the install has settled -- or its id has 404'd -- nothing more can
 		// be learned by asking again, and leaving it enabled meant every window

@@ -41,6 +41,7 @@
 // so the files can be older than the newest round. The one round a sentence names
 // is the round a job card belongs to, when it just saved.
 
+import { toolApiPath } from "../api/toolPaths.js";
 import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { formatTimestamp } from "./format.js";
 import { codePointLength } from "./text.js";
@@ -462,7 +463,9 @@ export function buildDraftDiscardRequest({ name, draft }) {
 	const query = byIdentity
 		? { draft_id: draft.draft_id, generation: draft.generation }
 		: { discard_token: draft.discard_token };
-	return { path: `/api/tools/${name}/draft?${new URLSearchParams(query)}` };
+	return {
+		path: `${toolApiPath(name, "draft")}?${new URLSearchParams(query)}`,
+	};
 }
 
 // What 放棄 asks before it deletes: the whole draft directory goes -- the files the

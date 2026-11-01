@@ -78,6 +78,11 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   中文，狀態／階段的顯示文字集中在 `constants/labels.js`（`STATUS_META` /
   `STAGE_META`）避免各處重覆定義；API 錯誤訊息的 zh-TW 映射集中在
   `api/client.js` 的 `messageFor`。
+- **`/api/tools/` 底下帶值的路徑一律由 `api/toolPaths.js` 組**：帶工具名稱的用
+  `toolApiPath(name, ...words)`，工作的用 `toolJobApiPath(jobId)`；每一段都經
+  `encodeURIComponent`，名稱裡有 `#`、`?`、`/`、`%`、空白或替代字元（U+FFFD）也只是
+  一段，不會把路徑截斷或打到別的路由。路由自己的字（`summary`、`draft`）各當一個參數
+  傳，查詢字串接在回傳的路徑後面。不要把值直接插進 `/api/tools/` 的字串或用 `+` 接。
 - **Code-point 長度計數**：任何鏡射後端長度上限的前端驗證，一律用
   `utils/text.js` 的 `codePointLength`，而不是 JS 原生的 `.length` /
   `maxLength`。原生 `.length` 數的是 UTF-16 code unit，多數 emoji 與部分 CJK

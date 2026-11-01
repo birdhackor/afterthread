@@ -653,10 +653,21 @@ describe("draftView stop reason", () => {
 	});
 });
 
+// A discard path read apart: the route, and the query's parameters.
+function discardPathParts(path) {
+	const [route, query] = path.split("?");
+	return { route, params: Object.fromEntries(new URLSearchParams(query)) };
+}
+
+const BY_TOKEN = {
+	route: "/api/tools/kb/draft",
+	params: { discard_token: TOKEN },
+};
+
 describe("buildDraftDiscardRequest", () => {
 	it("names a readable draft by its id and generation", () => {
 		expect(buildDraftDiscardRequest({ name: "kb", draft: draft({}) })).toEqual({
-			path: `/api/tools/kb/draft?draft_id=${DRAFT_ID}&generation=3`,
+			path: "/api/tools/kb/draft?draft_id=0123456789abcdef0123456789abcdef&generation=3",
 		});
 	});
 
@@ -665,7 +676,7 @@ describe("buildDraftDiscardRequest", () => {
 			name: "kb",
 			draft: unreadable(),
 		});
-		expect(path).toBe(`/api/tools/kb/draft?discard_token=${TOKEN}`);
+		expect(discardPathParts(path)).toEqual(BY_TOKEN);
 		expect(path).not.toContain("draft_id");
 		expect(path).not.toContain("generation");
 	});
@@ -675,7 +686,7 @@ describe("buildDraftDiscardRequest", () => {
 			name: "kb",
 			draft: filesGone(),
 		});
-		expect(path).toBe(`/api/tools/kb/draft?discard_token=${TOKEN}`);
+		expect(discardPathParts(path)).toEqual(BY_TOKEN);
 	});
 
 	it("sends one way of naming the draft, never both", () => {
@@ -694,7 +705,7 @@ describe("buildDraftDiscardRequest", () => {
 			name: "kb",
 			draft: draft({ draft_id: null, generation: null }),
 		});
-		expect(path).toBe(`/api/tools/kb/draft?discard_token=${TOKEN}`);
+		expect(discardPathParts(path)).toEqual(BY_TOKEN);
 	});
 });
 

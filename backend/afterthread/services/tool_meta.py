@@ -446,19 +446,19 @@ def _summary_user_prompt(
     for relative_path, content in _package_files(directory):
         # The CONTENT is already masked by _package_files; the header carrying
         # the path is not, and a filename can embed a value just as a file body
-        # can. R6-3: the header can also carry something no MASK fixes -- a
-        # POSIX filename that is not valid UTF-8 (e.g. one a builder's
-        # run_shell wrote as raw bytes) is decoded by ``os.walk`` through the
-        # OS's own surrogateescape convention into a ``str`` carrying a LONE
-        # SURROGATE, which no substring-based redaction touches and which
-        # then dies at the LLM request's strict UTF-8 serialization -- the
-        # SAME filesystem-boundary failure r3's ``tools._utf8_safe`` exists to
-        # close (there, a hand-edited sidecar; here, a hand-edited/generated
-        # filename). Applied AFTER the redaction, mirroring ``tools._redacted``'s
-        # own order: the redactor matches a REGISTERED value against untouched
-        # text, and the scrub only ever replaces a surrogate with U+FFFD, which
-        # carries nothing to mask -- so running it second changes nothing the
-        # redaction pass would otherwise catch.
+        # can. The header can also carry something no MASK fixes -- a POSIX
+        # filename that is not valid UTF-8 (e.g. one a builder's run_shell wrote
+        # as raw bytes) is decoded by ``os.walk`` through the OS's own
+        # surrogateescape convention into a ``str`` carrying a LONE SURROGATE,
+        # which no substring-based redaction touches and which then dies at the
+        # LLM request's strict UTF-8 serialization -- so ``tools._utf8_safe``
+        # replaces it. The scrub comes AFTER the redaction, as in
+        # ``tools._masked_as_shown``: the redactor matches a REGISTERED value
+        # against untouched text. That order leaves a gap here: the three U+FFFD
+        # the scrub writes for one surrogate can complete a known value the masked
+        # header did not hold. What closes it is the final pass at the end of this
+        # function, which masks the whole assembled prompt again, after every
+        # scrub.
         safe_relative_path = tools._utf8_safe(tools.redact_known_secrets(relative_path))
         parts.append(f"{safe_relative_path}:\n{content}")
     keys = _env_key_names(package_root)

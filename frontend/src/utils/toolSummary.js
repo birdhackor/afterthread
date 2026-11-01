@@ -11,6 +11,8 @@
 // AI 日誌 deep link it hands out, and the AI 日誌 page's rule for resolving one.
 // Both halves live together deliberately -- see that section's header.
 
+import { toolApiPath } from "../api/toolPaths.js";
+
 // --- react-query cache keys for one tool's summary ---------------------------
 
 const TOOL_SUMMARY_KEY_ROOT = "tool-summary";
@@ -113,7 +115,7 @@ export function buildReviseRequest({
 	if (runIds?.length) {
 		body.run_ids = runIds;
 	}
-	return { path: `/api/tools/${name}/revise`, body };
+	return { path: toolApiPath(name, "revise"), body };
 }
 
 // A tool's draft published as it is, with no round of the AI. The body names the
@@ -129,7 +131,7 @@ export function buildDraftPublishRequest({
 	baseVid,
 }) {
 	return {
-		path: `/api/tools/${name}/draft/publish`,
+		path: toolApiPath(name, "draft", "publish"),
 		body: {
 			draft_id: draftId,
 			draft_generation: generation,
@@ -140,14 +142,14 @@ export function buildDraftPublishRequest({
 
 export function buildRegenerateRequest({ name, currentVid }) {
 	return {
-		path: `/api/tools/${name}/summary/regenerate`,
+		path: toolApiPath(name, "summary", "regenerate"),
 		body: { expected_vid: currentVid },
 	};
 }
 
 export function buildDiscardRequest({ name, currentVid }) {
 	return {
-		path: `/api/tools/${name}/versions/${currentVid}`,
+		path: toolApiPath(name, "versions", currentVid),
 	};
 }
 

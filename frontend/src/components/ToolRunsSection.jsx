@@ -20,6 +20,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useState } from "react";
 import { apiDelete, apiGet } from "../api/client.js";
+import { toolApiPath } from "../api/toolPaths.js";
 import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { formatDuration, formatTimestamp } from "../utils/format.js";
 import { codePointLength } from "../utils/text.js";
@@ -117,7 +118,8 @@ export function ToolRunsSection({
 	const [noteOpen, setNoteOpen] = useState(false);
 	const { data, error, isError, isFetching } = useQuery({
 		queryKey: toolRunsQueryKey(name),
-		queryFn: () => apiGet(`/api/tools/${name}/runs?limit=${TOOL_RUNS_LIMIT}`),
+		queryFn: () =>
+			apiGet(`${toolApiPath(name, "runs")}?limit=${TOOL_RUNS_LIMIT}`),
 		enabled: expanded,
 	});
 

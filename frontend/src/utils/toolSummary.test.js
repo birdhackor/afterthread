@@ -291,7 +291,7 @@ describe("Invariant K — every version-specific write carries the vid", () => {
 
 	it("puts the expected vid in the discard path", () => {
 		expect(buildDiscardRequest({ name, currentVid })).toEqual({
-			path: `/api/tools/kb_search/versions/${currentVid}`,
+			path: "/api/tools/kb_search/versions/20260728T010203Z-abc123",
 		});
 	});
 });

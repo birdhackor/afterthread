@@ -11,6 +11,7 @@ import {
 } from "@mantine/core";
 import { useQuery } from "@tanstack/react-query";
 import { apiGet } from "../api/client.js";
+import { toolApiPath } from "../api/toolPaths.js";
 import {
 	configEntryFlags,
 	occurrenceKeys,
@@ -33,7 +34,7 @@ import {
 export function ToolSettingsSection({ name, expanded }) {
 	const { data, error, isError, isFetching } = useQuery({
 		queryKey: toolSettingsQueryKey(name),
-		queryFn: () => apiGet(`/api/tools/${name}/settings`),
+		queryFn: () => apiGet(toolApiPath(name, "settings")),
 		enabled: expanded,
 	});
 

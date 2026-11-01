@@ -1367,6 +1367,30 @@ def test_run_install_rejects_manifest_name_mismatch(
     assert not (root / "kbsearch").exists()
 
 
+def test_run_install_refuses_a_manifest_with_a_string_that_cannot_be_encoded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The builder wrote a tool.json whose description holds an unpaired surrogate
+    escape: the install fails as it is about to publish, with the scan's own
+    reason, and nothing is installed -- no version that would only list invalid
+    afterwards."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    manifest = {**_package_manifest("kbsearch"), "description": "search \ud800 the kb"}
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "s", "ready": True},
+        files={"tool.json": json.dumps(manifest), "run.py": _GOOD_RUN_PY},
+    )
+    _no_fetch(monkeypatch)
+
+    outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build"))
+
+    assert outcome.ok is False
+    assert outcome.error == "工具包驗證失敗：" + tools._MANIFEST_UNENCODABLE  # noqa: RUF001
+    assert not (root / "kbsearch").exists()
+
+
 def test_run_install_rejects_existing_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     root = tmp_path / "tools"
     (root / "kbsearch").mkdir(parents=True)  # pre-existing package of that name

@@ -45,6 +45,7 @@ from typing import Any, Literal
 
 import anyio
 import pytest
+from fastapi.testclient import TestClient
 from pydantic import BaseModel, ConfigDict
 
 from afterthread.config import Settings
@@ -6848,6 +6849,73 @@ def test_parameters_schema_over_size_limit_listed_invalid(
     assert "schema is too large" in (listed["bigschema"]["error"] or "")
     # It's the SCHEMA bound that tripped, not the file bound: the file is small.
     assert (big_version / "tool.json").stat().st_size < _MANIFEST_MAX_BYTES
+
+
+# Where a manifest can hold a lone surrogate once it is parsed: an unpaired
+# \uD800-\uDFFF escape -- what ``json.dumps`` writes for one -- in any string, a key
+# or a value, at any depth.
+_UNENCODABLE_PLACES: dict[str, dict[str, Any]] = {
+    "description": {"description": "search \ud800 the kb"},
+    "a_parameter_description": {
+        "parameters": {
+            "type": "object",
+            "properties": {"q": {"type": "string", "description": "q \udcff"}},
+        }
+    },
+    "a_parameter_name": {
+        "parameters": {"type": "object", "properties": {"q\udfff": {"type": "string"}}}
+    },
+    "a_field_nothing_reads": {"x-notes": ["fine", "\udbff"]},
+}
+
+
+def _manifest_with_unencodable_text(name: str, place: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "description": "test tool",
+        "parameters": {"type": "object", "properties": {}},
+        "entry": [sys.executable, "run.py"],
+        **_UNENCODABLE_PLACES[place],
+    }
+
+
+@pytest.mark.parametrize("place", list(_UNENCODABLE_PLACES))
+def test_a_manifest_with_a_string_that_cannot_be_encoded_lists_invalid_without_its_text(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, place: str
+) -> None:
+    """A manifest holds an unpaired surrogate escape in ``place``. The tools list
+    still loads, with the other tool as usual; that version is invalid, its error
+    says why, and none of its text -- its description -- is on the row."""
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n", tool_json=_manifest_with_unencodable_text("kb", place))
+    _make_tool(root, "plain", "print('x')\n")
+    _install_tools(monkeypatch, root)
+
+    response = client.get("/api/tools")
+
+    assert response.status_code == 200
+    rows = {row["name"]: row for row in response.json()["tools"]}
+    assert (rows["kb"]["valid"], rows["kb"]["error"]) == (False, tools._MANIFEST_UNENCODABLE)
+    assert not rows["kb"]["description"]
+    assert (rows["plain"]["valid"], rows["plain"]["description"]) == (True, "test tool")
+
+
+@pytest.mark.parametrize("place", list(_UNENCODABLE_PLACES))
+def test_a_manifest_with_a_string_that_cannot_be_encoded_is_neither_advertised_nor_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, place: str
+) -> None:
+    """The same manifest: the tool is not among the tools an AI request advertises,
+    whose specs encode, and a check of its examples is refused as an invalid tool."""
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n", tool_json=_manifest_with_unencodable_text("kb", place))
+    _make_tool(root, "plain", "print('x')\n")
+    _install_tools(monkeypatch, root)
+
+    advertised = enabled_llm_tools()
+
+    assert [tool.spec["function"]["name"] for tool in advertised] == ["plain"]
+    assert json.dumps([tool.spec for tool in advertised], ensure_ascii=False).encode("utf-8")
+    assert tools.checkable_tool("kb") == "invalid"
 
 
 def test_hidden_directories_never_listed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

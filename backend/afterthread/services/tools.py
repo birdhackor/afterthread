@@ -1323,8 +1323,49 @@ def _manifest_identity(directory: Path) -> tuple[int, int, int] | None:
     return (info.st_dev, info.st_ino, info.st_ctime_ns)
 
 
+# Why a manifest holding such a string is invalid (``_holds_unencodable_text``).
+_MANIFEST_UNENCODABLE = (
+    "tool.json has a string that cannot be encoded as UTF-8 (an unpaired \\uD800-\\uDFFF escape)"
+)
+
+
+def _holds_unencodable_text(value: object) -> bool:
+    """Whether a parsed JSON value holds a string -- a key or a value, at any depth
+    -- that cannot be encoded as UTF-8.
+
+    ``json.loads`` turns an unpaired ``\\uD800``-``\\uDFFF`` escape into a lone
+    surrogate: a legal ``str`` that a strict UTF-8 encode refuses, so one of them in
+    a manifest fails whatever it rides in -- the tools listing, the tool spec of
+    every AI request that advertises the tool. A text read from a file decodes
+    with replacement and holds none; only such an escape brings one. The value is
+    walked with a list of what is left to look at, so its depth costs no
+    recursion.
+    """
+    pending: list[object] = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            try:
+                item.encode("utf-8")
+            except UnicodeEncodeError:
+                return True
+        elif isinstance(item, dict):
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return False
+
+
 def _scan_tool_content(root: BuildRoot | VersionRoot, expected_name: str) -> _ContentScan:
-    """One implementation of manifest, entry, containment, and content rules."""
+    """One implementation of manifest, entry, containment, and content rules.
+
+    The scan of an installed version (``scan_installed``) and the check of a build
+    before it is published (``validate_tool_content``) are both this function, so
+    a manifest one refuses the other refuses too: among others, one holding a
+    string that cannot be encoded as UTF-8 (``_holds_unencodable_text``), whose
+    description is then not taken.
+    """
 
     directory = root.path
 
@@ -1366,6 +1407,8 @@ def _scan_tool_content(root: BuildRoot | VersionRoot, expected_name: str) -> _Co
         return invalid("tool.json is not valid JSON")
     if not isinstance(raw, dict):
         return invalid("tool.json is not a JSON object")
+    if _holds_unencodable_text(raw):
+        return invalid(_MANIFEST_UNENCODABLE)
 
     name_field = raw.get("name")
     if not isinstance(name_field, str) or not _NAME_RE.fullmatch(name_field):
