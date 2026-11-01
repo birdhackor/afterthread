@@ -1190,6 +1190,11 @@ def _run_shell_subprocess(
         return tools.output_withheld_text("command", proc.returncode)
 
 
+# The README section that holds the one rule for deleting a kept staging; a
+# message that tells the operator to delete one points here.
+_STAGING_CLEANUP_SECTION = "README〈.staging 殘留清理〉"
+
+
 def _workspace_kept_error(session_root: Path) -> str:
     """The job error for a session whose workspace is kept, its commands or its
     writes not confirmed ended (``_BuilderShells``). Appended to the session's own
@@ -1204,7 +1209,7 @@ def _workspace_kept_error(session_root: Path) -> str:
         "工作階段結束後，有 run_shell 指令或 write_file 寫入無法確認已經停止：這次的成果不會發布，"  # noqa: RUF001
         f"暫存工作區原地保留在 {session_root}。先重新啟動後端；"  # noqa: RUF001
         "AI 的指令可能留下後端看不到的背景程序，找出並停掉之後再刪，"  # noqa: RUF001
-        "做法見 README〈.staging 殘留清理〉。"
+        f"做法見 {_STAGING_CLEANUP_SECTION}。"
     )
 
 
@@ -4292,8 +4297,10 @@ def _log_work_kept_unstripped(session_root: Path) -> None:
         _logger.warning(
             "Builder workspace kept at %s: no draft is known to hold its work on disk, "
             "and the .env the builder wrote could not be removed from it, so it may "
-            "still be there. Take out what is needed, then delete the whole directory.",
+            "still be there. Take out what is needed; before deleting the whole "
+            "directory, follow %s.",
             session_root,
+            _STAGING_CLEANUP_SECTION,
         )
 
 
